@@ -74,6 +74,13 @@ public final class QwenTokenizer {
       throw QwenTokenizerError.fileNotFound(tokenizerConfigURL)
     }
 
+    // Idempotently inline `chat_template.jinja` into `tokenizer_config.json`
+    // when the HF snapshot uses the modern jinja-sidecar layout. This
+    // replaces the manual /tmp/inject_chat_template.py operator workaround
+    // that would otherwise have to be re-run any time the snapshot is
+    // resynced. Operators can opt out with `ZIMAGE_NO_TOKENIZER_PATCH=1`.
+    try? ensureInlineChatTemplate(in: tokenizerDirectory)
+
     let tokenizerConfig = try hubApi.configuration(fileURL: tokenizerConfigURL)
     let addedTokensURL = tokenizerDirectory.appending(path: "added_tokens.json")
     var addedTokens: [String: Int] = [:]
@@ -403,6 +410,80 @@ public final class QwenTokenizer {
       return tokenizerPath
     }
     return directory
+  }
+
+  /// When a HuggingFace tokenizer ships its chat template as a sidecar
+  /// `chat_template.jinja` instead of inlining it in `tokenizer_config.json`,
+  /// swift-transformers' `applyChatTemplate` trips over `missingChatTemplate`
+  /// because it only reads the inline field. Upstream snapshots of
+  /// `Tongyi-MAI/Z-Image-Turbo` (and many modern HF model cards) ship the
+  /// jinja-sidecar layout.
+  ///
+  /// This helper merges the sidecar into the inline field at load time,
+  /// atomically and idempotently, with a `.bak` of the original config on
+  /// first patch. Subsequent loads see the inline field and no-op.
+  ///
+  /// Opt out via `ZIMAGE_NO_TOKENIZER_PATCH=1` (e.g. when running against a
+  /// read-only snapshot mount or a model whose chat_template must not be
+  /// augmented).
+  ///
+  /// Errors are swallowed by the caller — a failure here degrades to the
+  /// pre-existing `missingChatTemplate` error at `applyChatTemplate` time,
+  /// which is strictly no worse than the status quo.
+  static func ensureInlineChatTemplate(
+    in tokenizerDirectory: URL,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) throws {
+    if environment["ZIMAGE_NO_TOKENIZER_PATCH"] == "1" {
+      return
+    }
+
+    let configURL = tokenizerDirectory.appending(path: "tokenizer_config.json")
+    let jinjaURL = tokenizerDirectory.appending(path: "chat_template.jinja")
+    let fm = FileManager.default
+
+    guard fm.fileExists(atPath: configURL.path),
+          fm.fileExists(atPath: jinjaURL.path) else {
+      // Nothing to do — either the config is missing (caller will surface a
+      // clearer error) or there is no sidecar to merge.
+      return
+    }
+
+    let configData = try Data(contentsOf: configURL)
+    guard var configJSON = try JSONSerialization.jsonObject(with: configData, options: []) as? [String: Any] else {
+      return
+    }
+
+    // Already inlined — no-op. We treat any non-empty string as "inlined",
+    // matching what swift-transformers will accept downstream.
+    if let existing = configJSON["chat_template"] as? String, !existing.isEmpty {
+      return
+    }
+
+    let jinjaTemplate = try String(contentsOf: jinjaURL, encoding: .utf8)
+    guard !jinjaTemplate.isEmpty else { return }
+
+    configJSON["chat_template"] = jinjaTemplate
+
+    // Write backup on first patch (never overwrite an existing .bak).
+    let backupURL = configURL.appendingPathExtension("bak")
+    if !fm.fileExists(atPath: backupURL.path) {
+      try? fm.copyItem(at: configURL, to: backupURL)
+    }
+
+    // Atomic write via temp sibling + rename, so readers never see a
+    // torn file. .sortedKeys for stable diffs on subsequent patches.
+    let tmpURL = configURL.appendingPathExtension("patch.\(UUID().uuidString).tmp")
+    let patchedData = try JSONSerialization.data(
+      withJSONObject: configJSON,
+      options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    )
+    try patchedData.write(to: tmpURL, options: [.atomic])
+    _ = try fm.replaceItemAt(configURL, withItemAt: tmpURL)
+
+    FileHandle.standardError.write(Data(
+      "[zimage] inlined chat_template.jinja (\(jinjaTemplate.count) chars) into \(configURL.path); backup at \(backupURL.lastPathComponent)\n".utf8
+    ))
   }
 
   private static let promptPrefix: String = """

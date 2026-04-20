@@ -40,6 +40,15 @@ public enum ZImageFiles {
   public static let defaultTextEncoderDirectory = "text_encoder"
   public static let preferredTextEncoderDirectory = "text_encoder QWen Large"
   public static let textEncoderEnvironmentVariable = "ZIMAGE_ENCODER_PATH"
+  /// When set to "plain", forces `resolvePromptEncodingMode` to return `.plain`
+  /// regardless of what tokenizer assets are present. Used by operators whose
+  /// text encoder variant was trained on bare (un-templated) prompts.
+  /// Default (unset or any other value) is `.chatTemplate`, which matches the
+  /// upstream z-image-turbo training recipe.
+  public static let promptModeEnvironmentVariable = "ZIMAGE_PROMPT_MODE"
+  /// Standard filename for the HF chat-template fallback when a tokenizer
+  /// doesn't embed the template inline in `tokenizer_config.json`.
+  public static let chatTemplateJinjaFilename = "chat_template.jinja"
   // Legacy defaults for current snapshot; dynamic resolvers should be preferred.
   public static let transformerWeights = [
     "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
@@ -105,20 +114,39 @@ public enum ZImageFiles {
     return TextEncoderSelection(directory: defaultDirectory, source: .defaultDirectory)
   }
 
+  /// Determine whether prompts should be encoded via the tokenizer's chat
+  /// template (`<|im_start|>user\n...<|im_end|>...`) or tokenized plain.
+  ///
+  /// Historically this was decided by whether the selected text-encoder
+  /// directory was the default `text_encoder/` or an alternate (e.g. the
+  /// preferred single-file `text_encoder QWen Large/`). That heuristic was
+  /// wrong for z-image-turbo: all three known encoder shardings for the
+  /// same underlying model (2-shard, 4-shard legacy, single-file Large)
+  /// are identical in training and so all expect chat-templated input.
+  /// Routing the Large variant through plain mode produced the mosaic /
+  /// NaN-conditioning regression fixed here.
+  ///
+  /// New contract:
+  ///   - Default: `.chatTemplate` — matches upstream z-image-turbo training.
+  ///   - Opt out by setting `ZIMAGE_PROMPT_MODE=plain` (exposed as
+  ///     `promptModeEnvironmentVariable`) for encoders trained on bare
+  ///     prompts.
+  ///
+  /// `snapshot` and `selection` are kept in the signature for source and
+  /// binary compatibility with existing callers, and so future versions
+  /// can probe the tokenizer assets if we ever need a third mode.
   public static func resolvePromptEncodingMode(
     at snapshot: URL?,
-    selection: TextEncoderSelection?
+    selection: TextEncoderSelection?,
+    environment: [String: String] = ProcessInfo.processInfo.environment
   ) -> PromptEncodingMode {
-    guard let snapshot, let selection else {
-      return .chatTemplate
+    _ = snapshot
+    _ = selection
+    if let raw = environment[promptModeEnvironmentVariable]?.lowercased(),
+       raw == "plain" {
+      return .plain
     }
-
-    let defaultDirectory = snapshot
-      .appendingPathComponent(defaultTextEncoderDirectory, isDirectory: true)
-      .standardizedFileURL
-    let selectedDirectory = selection.directory.standardizedFileURL
-
-    return selectedDirectory == defaultDirectory ? .chatTemplate : .plain
+    return .chatTemplate
   }
 
   // MARK: - Dynamic weight resolution
