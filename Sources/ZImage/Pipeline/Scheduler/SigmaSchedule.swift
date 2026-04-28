@@ -109,8 +109,14 @@ public enum SigmaSchedule {
 
   /// Beta-distribution-inspired sigma schedule.
   ///
-  /// Uses a polynomial approximation of the beta PDF (no scipy dependency).
-  /// Matches chroma-generate's fallback path in `SigmaSchedule.beta`.
+  /// Uses the beta CDF (inverse quantile function) to redistribute timesteps
+  /// non-uniformly within [sigmaMin, sigmaMax]. With alpha=beta=0.6 (U-shaped
+  /// PDF), the schedule concentrates more steps near the beginning and end of
+  /// the denoising process, where the most critical noise transitions occur.
+  ///
+  /// The CDF is computed via numerical integration of the beta PDF at high
+  /// resolution, then sampled at uniform quantiles via binary search — no
+  /// scipy dependency required.
   public static func beta(
     numSteps: Int,
     sigmaMin: Float = 0.02,
@@ -119,14 +125,44 @@ public enum SigmaSchedule {
     betaParam: Float = 0.6
   ) -> [Float] {
     guard numSteps > 0 else { return [0.0] }
+
+    // Build CDF via numerical integration of beta PDF at high resolution.
+    // PDF(x; a, b) ∝ x^(a-1) * (1-x)^(b-1)
+    let resolution = 10000
+    var cdf = [Float](repeating: 0.0, count: resolution + 1)
+    var running: Float = 0
+    for i in 0...resolution {
+      let x = Float(i) / Float(resolution)
+      let safeX = max(x, 1e-10)
+      let safe1mX = max(1.0 - x, 1e-10)
+      let pdfVal = powf(safeX, alpha - 1) * powf(safe1mX, betaParam - 1)
+      running += pdfVal
+      cdf[i] = running
+    }
+    // Normalize CDF to [0, 1].
+    let total = running
+    guard total > 0 else {
+      // Degenerate case — fall back to exponential.
+      return exponential(numSteps: numSteps, sigmaMin: sigmaMin, sigmaMax: sigmaMax)
+    }
+    for i in 0...resolution {
+      cdf[i] /= total
+    }
+
+    // For each step, find the inverse CDF (quantile) via binary search,
+    // then map to log-space sigma.
     let logMin = logf(sigmaMin)
     let logMax = logf(sigmaMax)
     var sigmas: [Float] = (0..<numSteps).map { i in
-      let x = 0.01 + 0.98 * Float(i) / Float(max(1, numSteps - 1))
-      let betaApprox = powf(x * (1.0 - x), 0.5)
-      let maxVal = powf(0.25, 0.5)  // peak of x*(1-x) at x=0.5
-      let normalized = maxVal > 1e-10 ? betaApprox / maxVal : 1.0
-      return expf(logMax + (logMin - logMax) * normalized)
+      let t = Float(i) / Float(max(1, numSteps - 1))
+      // Binary search: find smallest index where cdf[idx] >= t
+      var lo = 0, hi = resolution
+      while lo < hi {
+        let mid = (lo + hi) / 2
+        if cdf[mid] < t { lo = mid + 1 } else { hi = mid }
+      }
+      let x = Float(lo) / Float(resolution)
+      return expf(logMax + (logMin - logMax) * x)
     }
     sigmas.append(0.0)
     return sigmas

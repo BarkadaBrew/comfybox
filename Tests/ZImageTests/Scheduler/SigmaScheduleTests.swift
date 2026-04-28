@@ -188,6 +188,33 @@ final class SigmaScheduleTests: XCTestCase {
     XCTAssertEqual(sigmas, [0.0])
   }
 
+  func testBetaMonotonicallyDecreasing() {
+    let sigmas = SigmaSchedule.beta(numSteps: 20, sigmaMin: 0.02, sigmaMax: 100.0)
+    for i in 1..<(sigmas.count - 1) {
+      XCTAssertLessThanOrEqual(
+        sigmas[i], sigmas[i - 1],
+        "Beta sigmas should decrease monotonically (index \(i): \(sigmas[i]) > \(sigmas[i-1]))"
+      )
+    }
+  }
+
+  func testBetaFirstAndLastValues() {
+    let sigmas = SigmaSchedule.beta(numSteps: 9, sigmaMin: 0.001, sigmaMax: 1.0)
+    // First sigma should be close to sigmaMax, last (before sentinel) close to sigmaMin.
+    XCTAssertEqual(sigmas[0], 1.0, accuracy: 1e-4, "First sigma should be ~sigmaMax")
+    XCTAssertEqual(sigmas[8], 0.001, accuracy: 1e-4, "Last sigma should be ~sigmaMin")
+    XCTAssertEqual(sigmas[9], 0.0, accuracy: 1e-10, "Trailing sentinel should be 0")
+  }
+
+  func testBetaFlowMatchingBounds() {
+    // With flow-matching bounds (0.001 to 1.0), all sigmas should be in [0, 1].
+    let sigmas = SigmaSchedule.beta(numSteps: 9, sigmaMin: 0.001, sigmaMax: 1.0)
+    for i in 0..<(sigmas.count - 1) {
+      XCTAssertGreaterThanOrEqual(sigmas[i], 0.001 - 1e-6)
+      XCTAssertLessThanOrEqual(sigmas[i], 1.0 + 1e-6)
+    }
+  }
+
   // MARK: - Linspace Helper
 
   func testLinspaceTwoElements() {

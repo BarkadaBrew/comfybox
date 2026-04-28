@@ -115,11 +115,30 @@ public enum SchedulerFactory {
     case .flow:
       return SigmaSchedule.flow(numSteps: numSteps, config: config, mu: mu)
     case .karras:
-      return SigmaSchedule.karras(numSteps: numSteps)
+      let (lo, hi) = flowMatchingSigmaBounds(config: config)
+      return SigmaSchedule.karras(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
     case .exponential:
-      return SigmaSchedule.exponential(numSteps: numSteps)
+      let (lo, hi) = flowMatchingSigmaBounds(config: config)
+      return SigmaSchedule.exponential(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
     case .beta:
-      return SigmaSchedule.beta(numSteps: numSteps)
+      let (lo, hi) = flowMatchingSigmaBounds(config: config)
+      return SigmaSchedule.beta(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
     }
+  }
+
+  /// Derive sigma bounds that match the flow-matching model's native range.
+  ///
+  /// Z-Image Turbo uses velocity-prediction flow matching where sigmas
+  /// represent noise fraction in [0, 1]. Alternative schedules (karras,
+  /// exponential, beta) redistribute points within this range instead of
+  /// using their DDPM defaults (0.02..100).
+  private static func flowMatchingSigmaBounds(
+    config: ZImageSchedulerConfig
+  ) -> (sigmaMin: Float, sigmaMax: Float) {
+    let numTrainTimesteps = Float(config.numTrainTimesteps)
+    let shift = config.shift
+    let initSigmaMin = 1.0 / numTrainTimesteps
+    let shiftedSigmaMin = shift * initSigmaMin / (1 + (shift - 1) * initSigmaMin)
+    return (shiftedSigmaMin, 1.0)
   }
 }
