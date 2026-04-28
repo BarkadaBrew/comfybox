@@ -106,11 +106,7 @@ final class DEISSchedulerTests: XCTestCase {
     // its output should differ visibly from a plain Euler step.
     // We use the exponential schedule where step-size ratios are large,
     // and float32 samples so bfloat16 rounding doesn't eat the difference.
-    let config = FlowMatchSchedulerTests.makeConfig()
-    let expSigmas = SigmaSchedule.exponential(
-      numSteps: 15,
-      config: config
-    )
+    let expSigmas = SigmaSchedule.exponential(numSteps: 15)
 
     var deis = DEISScheduler(
       numInferenceSteps: 15,
