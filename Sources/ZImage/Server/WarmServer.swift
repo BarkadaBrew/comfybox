@@ -659,6 +659,9 @@ private struct GeneratePayload: Decodable, Sendable {
   let guidance: Float?
   let seed: UInt64?
   let outputPath: String?
+  let scheduler: String?
+  let sigmaSchedule: String?
+  let eta: Float?
 
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
@@ -671,6 +674,9 @@ private struct GeneratePayload: Decodable, Sendable {
       outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("zimage-\(UUID().uuidString).png")
     }
+
+    let schedulerKind = scheduler.flatMap { SchedulerKind(rawValue: $0) } ?? .euler
+    let sigmaScheduleKind = sigmaSchedule.flatMap { SigmaScheduleKind(rawValue: $0) } ?? .flow
 
     return ZImageGenerationRequest(
       prompt: prompt,
@@ -687,7 +693,10 @@ private struct GeneratePayload: Decodable, Sendable {
       loras: activeLoRAs,
       enhancePrompt: false,
       enhanceMaxTokens: 512,
-      forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly
+      forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly,
+      schedulerKind: schedulerKind,
+      sigmaSchedule: sigmaScheduleKind,
+      eta: eta
     )
   }
 }

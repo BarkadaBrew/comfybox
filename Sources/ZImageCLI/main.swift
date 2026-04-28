@@ -64,6 +64,9 @@ struct ZImageCLI {
     var forceTransformerOverrideOnly = false
     var generateSVG = false
     var svgPreset = "default"
+    var schedulerKind: SchedulerKind = .euler
+    var sigmaSchedule: SigmaScheduleKind = .flow
+    var eta: Float?
 
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
@@ -112,6 +115,22 @@ struct ZImageCLI {
         noProgress = true
       case "--audit-weights":
         auditWeights = true
+      case "--scheduler", "--sampler":
+        let raw = nextValue(for: arg, iterator: &iterator)
+        guard let kind = SchedulerKind(rawValue: raw) else {
+          let valid = SchedulerKind.allCases.map(\.rawValue).joined(separator: ", ")
+          fatalError("Unknown scheduler '\(raw)'. Valid: \(valid)")
+        }
+        schedulerKind = kind
+      case "--sigma-schedule":
+        let raw = nextValue(for: arg, iterator: &iterator)
+        guard let kind = SigmaScheduleKind(rawValue: raw) else {
+          let valid = SigmaScheduleKind.allCases.map(\.rawValue).joined(separator: ", ")
+          fatalError("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
+        }
+        sigmaSchedule = kind
+      case "--eta":
+        eta = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
       case "--svg":
         generateSVG = true
       case "--svg-preset":
@@ -193,7 +212,10 @@ struct ZImageCLI {
       loras: loraConfigs,
       enhancePrompt: enhancePrompt,
       enhanceMaxTokens: enhanceMaxTokens,
-      forceTransformerOverrideOnly: forceTransformerOverrideOnly
+      forceTransformerOverrideOnly: forceTransformerOverrideOnly,
+      schedulerKind: schedulerKind,
+      sigmaSchedule: sigmaSchedule,
+      eta: eta
     )
 
     let pipeline = ZImagePipeline(logger: logger)
@@ -306,6 +328,9 @@ struct ZImageCLI {
       --lora-scale           LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths           Comma-separated LoRA paths or HuggingFace IDs (quoted commas unsupported)
       --lora-scales          Comma-separated LoRA scale overrides (default: 1.0)
+      --scheduler, --sampler  Sampler algorithm: euler, heun, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
+      --sigma-schedule       Sigma schedule: flow, karras, exponential, beta (default: flow)
+      --eta                  Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
       --enhance, -e          Enhance prompt using LLM (requires ~5GB extra VRAM)
       --enhance-max-tokens   Max tokens for prompt enhancement (default: 512)
       --no-progress          Disable progress output
@@ -350,6 +375,9 @@ struct ZImageCLI {
       ZImageCLI -p "a cut a cat" --lora ostris/z_image_turbo_childrens_drawings
       ZImageCLI -p "portrait" --lora mood.safetensors=0.8 --lora detail.safetensors --lora-scale 0.3
       ZImageCLI -p "cat" --enhance  # Enhanced prompt generation
+      ZImageCLI -p "portrait" --scheduler dpmpp-2m --sigma-schedule beta  # Best photorealism combo
+      ZImageCLI -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
+      ZImageCLI -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
       ZImageCLI serve -m ./models/z-image-turbo --port 7862
     """)
   }
@@ -698,6 +726,9 @@ struct ZImageCLI {
     var loraEntries: [String] = []
     var loraScaleOverrides: [Float] = []
     var noProgress = false
+    var schedulerKind: SchedulerKind = .euler
+    var sigmaSchedule: SigmaScheduleKind = .flow
+    var eta: Float?
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -748,6 +779,22 @@ struct ZImageCLI {
         loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
       case "--no-progress":
         noProgress = true
+      case "--scheduler", "--sampler":
+        let raw = nextValue(for: arg, iterator: &iterator)
+        guard let kind = SchedulerKind(rawValue: raw) else {
+          let valid = SchedulerKind.allCases.map(\.rawValue).joined(separator: ", ")
+          fatalError("Unknown scheduler '\(raw)'. Valid: \(valid)")
+        }
+        schedulerKind = kind
+      case "--sigma-schedule":
+        let raw = nextValue(for: arg, iterator: &iterator)
+        guard let kind = SigmaScheduleKind(rawValue: raw) else {
+          let valid = SigmaScheduleKind.allCases.map(\.rawValue).joined(separator: ", ")
+          fatalError("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
+        }
+        sigmaSchedule = kind
+      case "--eta":
+        eta = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
       case "--help", "-h":
         printControlUsage()
         return
@@ -848,7 +895,10 @@ struct ZImageCLI {
       controlnetWeightsFile: controlnetWeightsFile,
       maxSequenceLength: maxSequenceLength,
       loras: loraConfigs,
-      progressCallback: progressCallback
+      progressCallback: progressCallback,
+      schedulerKind: schedulerKind,
+      sigmaSchedule: sigmaSchedule,
+      eta: eta
     )
 
     let pipeline = ZImageControlPipeline(logger: logger)
@@ -895,6 +945,9 @@ struct ZImageCLI {
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs (quoted commas unsupported)
       --lora-scales             Comma-separated LoRA scale overrides (default: 1.0)
+      --scheduler, --sampler    Sampler algorithm: euler, heun, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
+      --sigma-schedule          Sigma schedule: flow, karras, exponential, beta (default: flow)
+      --eta                     Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
       --no-progress             Disable progress output
       --help, -h                Show help
 
