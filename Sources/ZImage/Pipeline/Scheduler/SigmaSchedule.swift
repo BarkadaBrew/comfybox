@@ -109,14 +109,15 @@ public enum SigmaSchedule {
 
   /// Beta-distribution-inspired sigma schedule.
   ///
-  /// Uses the beta CDF (inverse quantile function) to redistribute timesteps
-  /// non-uniformly within [sigmaMin, sigmaMax]. With alpha=beta=0.6 (U-shaped
-  /// PDF), the schedule concentrates more steps near the beginning and end of
-  /// the denoising process, where the most critical noise transitions occur.
+  /// Warps uniform timesteps through the beta CDF to redistribute step
+  /// density. With alpha=beta=0.6 (U-shaped PDF), the CDF rises steeply
+  /// at both edges and slowly through the middle. When used as the
+  /// interpolation factor, this concentrates more sigma steps in the
+  /// mid-noise range where denoising quality matters most, while
+  /// spending fewer steps at extreme noise levels.
   ///
-  /// The CDF is computed via numerical integration of the beta PDF at high
-  /// resolution, then sampled at uniform quantiles via binary search — no
-  /// scipy dependency required.
+  /// The CDF is computed via numerical integration of the beta PDF at
+  /// high resolution — no scipy dependency required.
   public static func beta(
     numSteps: Int,
     sigmaMin: Float = 0.02,
@@ -126,43 +127,37 @@ public enum SigmaSchedule {
   ) -> [Float] {
     guard numSteps > 0 else { return [0.0] }
 
-    // Build CDF via numerical integration of beta PDF at high resolution.
+    // Build CDF via midpoint-rule integration of beta PDF.
     // PDF(x; a, b) ∝ x^(a-1) * (1-x)^(b-1)
+    // Midpoint rule avoids the singularities at x=0 and x=1 when alpha,beta < 1.
     let resolution = 10000
     var cdf = [Float](repeating: 0.0, count: resolution + 1)
-    var running: Float = 0
-    for i in 0...resolution {
-      let x = Float(i) / Float(resolution)
-      let safeX = max(x, 1e-10)
-      let safe1mX = max(1.0 - x, 1e-10)
-      let pdfVal = powf(safeX, alpha - 1) * powf(safe1mX, betaParam - 1)
-      running += pdfVal
-      cdf[i] = running
+    cdf[0] = 0.0  // CDF(0) = 0 by definition
+    for i in 1...resolution {
+      let xMid = (Float(i) - 0.5) / Float(resolution)  // midpoint of bin
+      let pdfVal = powf(xMid, alpha - 1) * powf(1.0 - xMid, betaParam - 1)
+      cdf[i] = cdf[i - 1] + pdfVal
     }
-    // Normalize CDF to [0, 1].
-    let total = running
+    // Normalize so CDF(1) = 1.
+    let total = cdf[resolution]
     guard total > 0 else {
-      // Degenerate case — fall back to exponential.
       return exponential(numSteps: numSteps, sigmaMin: sigmaMin, sigmaMax: sigmaMax)
     }
-    for i in 0...resolution {
+    for i in 1...resolution {
       cdf[i] /= total
     }
 
-    // For each step, find the inverse CDF (quantile) via binary search,
-    // then map to log-space sigma.
+    // Evaluate CDF at uniform timesteps and use as interpolation factor.
+    // CDF(t) warps the uniform spacing: steep CDF regions = big sigma
+    // jumps (fewer effective steps), flat CDF regions = small sigma
+    // changes (more effective steps concentrated there).
     let logMin = logf(sigmaMin)
     let logMax = logf(sigmaMax)
     var sigmas: [Float] = (0..<numSteps).map { i in
       let t = Float(i) / Float(max(1, numSteps - 1))
-      // Binary search: find smallest index where cdf[idx] >= t
-      var lo = 0, hi = resolution
-      while lo < hi {
-        let mid = (lo + hi) / 2
-        if cdf[mid] < t { lo = mid + 1 } else { hi = mid }
-      }
-      let x = Float(lo) / Float(resolution)
-      return expf(logMax + (logMin - logMax) * x)
+      let idx = min(Int(t * Float(resolution)), resolution)
+      let warped = cdf[idx]
+      return expf(logMax + (logMin - logMax) * warped)
     }
     sigmas.append(0.0)
     return sigmas
