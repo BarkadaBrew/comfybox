@@ -102,17 +102,29 @@ final class DEISSchedulerTests: XCTestCase {
   }
 
   func testDEISDiffersFromEuler() {
-    // DEIS uses exponential weighting, so at enough steps its output
-    // should differ from a plain Euler step.
-    var deis = Self.makeScheduler(steps: 15)
+    // DEIS uses exponential weighting, so with a non-uniform sigma schedule
+    // its output should differ visibly from a plain Euler step.
+    // We use the exponential schedule where step-size ratios are large,
+    // and float32 samples so bfloat16 rounding doesn't eat the difference.
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let expSigmas = SigmaSchedule.exponential(
+      numSteps: 15,
+      config: config
+    )
+
+    var deis = DEISScheduler(
+      numInferenceSteps: 15,
+      sigmaValues: expSigmas,
+      numTrainTimesteps: 1000
+    )
     var euler = FlowMatchEulerScheduler(
       numInferenceSteps: 15,
-      sigmaValues: Self.defaultSigmas(steps: 15),
+      sigmaValues: expSigmas,
       numTrainTimesteps: 1000
     )
 
-    let sample = Self.makeSample()
-    let modelOutput = Self.makeModelOutput()
+    let sample = Self.makeSample(values: [1.0, 2.0, 3.0, 4.0]).asType(.float32)
+    let modelOutput = Self.makeModelOutput(values: [0.5, 1.0, 1.5, 2.0]).asType(.float32)
 
     let deisResult = deis.step(
       modelOutput: modelOutput, timestepIndex: 0, sample: sample
