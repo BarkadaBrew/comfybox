@@ -110,9 +110,9 @@ public struct DDIMScheduler: ZImageScheduler {
     guard let key = randomKey else {
       return MLXRandom.normal(shape)
     }
-    let split = MLXRandom.split(key: key)
-    let noise = MLXRandom.normal(shape, key: split[0])
-    randomKey = split[1]
+    let (k1, k2) = MLXRandom.split(key: key)
+    let noise = MLXRandom.normal(shape, key: k1)
+    randomKey = k2
     return noise
   }
 }
