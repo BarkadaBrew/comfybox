@@ -57,10 +57,10 @@ public final class ZImageTransformerBlock: Module {
       let mod = adaLNModule[0](c)
       let chunkSize = dim
 
-      let attnScale = (1 + mod[0..., 0..<chunkSize])[.ellipsis, .newAxis, 0...]
-      let attnGate = MLX.tanh(mod[0..., chunkSize..<(2*chunkSize)])[.ellipsis, .newAxis, 0...]
-      let mlpScale = (1 + mod[0..., (2*chunkSize)..<(3*chunkSize)])[.ellipsis, .newAxis, 0...]
-      let mlpGate = MLX.tanh(mod[0..., (3*chunkSize)..<(4*chunkSize)])[.ellipsis, .newAxis, 0...]
+      let attnScale = (1 + mod[0..., 0..<chunkSize]).expandedDimensions(axis: 1)
+      let attnGate = MLX.tanh(mod[0..., chunkSize..<(2*chunkSize)]).expandedDimensions(axis: 1)
+      let mlpScale = (1 + mod[0..., (2*chunkSize)..<(3*chunkSize)]).expandedDimensions(axis: 1)
+      let mlpGate = MLX.tanh(mod[0..., (3*chunkSize)..<(4*chunkSize)]).expandedDimensions(axis: 1)
 
       let xNormed = attentionNorm1(out)
       let xScaled = xNormed * attnScale
