@@ -81,8 +81,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(scheduler.timesteps.dim(0), steps)
 
     let sigmas = scheduler.sigmas.asArray(Float.self)
-    // Karras sigmas are much larger than flow sigmas (sigmaMax=100 vs 1.0)
-    XCTAssertGreaterThan(sigmas[0], 10.0)
+    // With flow-matching bounds, sigmas are in [0, 1] range.
+    XCTAssertEqual(sigmas[0], 1.0, accuracy: 1e-3,
+                   "Karras first sigma should be ~1.0 (flow-matching sigmaMax)")
     XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)
   }
 
@@ -99,7 +100,8 @@ final class SchedulerFactoryTests: XCTestCase {
 
     XCTAssertEqual(scheduler.numInferenceSteps, steps)
     let sigmas = scheduler.sigmas.asArray(Float.self)
-    XCTAssertGreaterThan(sigmas[0], 10.0)
+    XCTAssertEqual(sigmas[0], 1.0, accuracy: 1e-3,
+                   "Exponential first sigma should be ~1.0 (flow-matching sigmaMax)")
     XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)
   }
 
@@ -281,8 +283,8 @@ final class SchedulerFactoryTests: XCTestCase {
       XCTAssertEqual(scheduler.numInferenceSteps, 9,
                      "Scheduler \(kind.rawValue) with Karras should have 9 steps")
       let sigmas = scheduler.sigmas.asArray(Float.self)
-      XCTAssertGreaterThan(sigmas[0], 10.0,
-                           "Karras sigmas should be large for \(kind.rawValue)")
+      XCTAssertEqual(sigmas[0], 1.0, accuracy: 1e-3,
+                     "Karras first sigma should be ~1.0 for \(kind.rawValue)")
       XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10,
                      "Last sigma should be 0 for \(kind.rawValue)")
     }
