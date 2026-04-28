@@ -204,6 +204,36 @@ final class FlowMatchSchedulerTests: XCTestCase {
     }
   }
 
+  // MARK: - Protocol Conformance
+
+  func testProtocolConformance() {
+    let config = Self.makeConfig()
+    let scheduler: any ZImageScheduler = FlowMatchEulerScheduler(
+      numInferenceSteps: 9, config: config
+    )
+    // Verify it satisfies the protocol requirements.
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testSecondInitWithPrecomputedSigmas() {
+    let sigmaValues: [Float] = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
+    let scheduler = FlowMatchEulerScheduler(
+      numInferenceSteps: 5,
+      sigmaValues: sigmaValues,
+      numTrainTimesteps: 1000
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 5)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 6)
+    XCTAssertEqual(scheduler.timesteps.dim(0), 5)
+
+    let storedSigmas = scheduler.sigmas.asArray(Float.self)
+    for i in 0..<sigmaValues.count {
+      XCTAssertEqual(storedSigmas[i], sigmaValues[i], accuracy: 1e-6)
+    }
+  }
+
   // MARK: - Helper Functions
 
   private func calculateTestMu(
