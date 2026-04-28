@@ -1079,13 +1079,15 @@ public class ZImageControlPipeline {
         let timestepArray = MLXArray([normalizedTimestep], [1])
         var modelLatents = latents
         var embeds = promptEmbeds
+        var modelTimestep = timestepArray
         if doCFG, let ne = negativeEmbeds {
           modelLatents = MLX.concatenated([latents, latents], axis: 0)
           embeds = MLX.concatenated([promptEmbeds, ne], axis: 0)
+          modelTimestep = MLX.concatenated([timestepArray, timestepArray], axis: 0)
         }
         let noisePred = transformer.forward(
           latents: modelLatents,
-          timestep: timestepArray,
+          timestep: modelTimestep,
           promptEmbeds: embeds,
           controlContext: controlContext,
           controlContextScale: request.controlContextScale
@@ -1110,13 +1112,15 @@ public class ZImageControlPipeline {
           let intermediateTimestepArray = MLXArray([intermediateNormalized], [1])
           var intermediateModelLatents = intermediateSample
           var intermediateEmbeds = promptEmbeds
+          var intermediateModelTimestep = intermediateTimestepArray
           if doCFG, let ne = negativeEmbeds {
             intermediateModelLatents = MLX.concatenated([intermediateSample, intermediateSample], axis: 0)
             intermediateEmbeds = MLX.concatenated([promptEmbeds, ne], axis: 0)
+            intermediateModelTimestep = MLX.concatenated([intermediateTimestepArray, intermediateTimestepArray], axis: 0)
           }
           let intermediateNoisePred = transformer.forward(
             latents: intermediateModelLatents,
-            timestep: intermediateTimestepArray,
+            timestep: intermediateModelTimestep,
             promptEmbeds: intermediateEmbeds,
             controlContext: controlContext,
             controlContextScale: request.controlContextScale
@@ -1361,13 +1365,15 @@ public class ZImageControlPipeline {
         let timestepArray = MLXArray([normalizedTimestep], [1])
         var modelLatents = latents
         var embeds = promptEmbeds
+        var modelTimestep = timestepArray
         if doCFG, let ne = negativeEmbeds {
           modelLatents = MLX.concatenated([latents, latents], axis: 0)
           embeds = MLX.concatenated([promptEmbeds, ne], axis: 0)
+          modelTimestep = MLX.concatenated([timestepArray, timestepArray], axis: 0)
         }
         let noisePred = transformer.forward(
           latents: modelLatents,
-          timestep: timestepArray,
+          timestep: modelTimestep,
           promptEmbeds: embeds,
           controlContext: controlContext,
           controlContextScale: request.controlContextScale
@@ -1392,13 +1398,15 @@ public class ZImageControlPipeline {
           let intermediateTimestepArray = MLXArray([intermediateNormalized], [1])
           var intermediateModelLatents = intermediateSample
           var intermediateEmbeds = promptEmbeds
+          var intermediateModelTimestep = intermediateTimestepArray
           if doCFG, let ne = negativeEmbeds {
             intermediateModelLatents = MLX.concatenated([intermediateSample, intermediateSample], axis: 0)
             intermediateEmbeds = MLX.concatenated([promptEmbeds, ne], axis: 0)
+            intermediateModelTimestep = MLX.concatenated([intermediateTimestepArray, intermediateTimestepArray], axis: 0)
           }
           let intermediateNoisePred = transformer.forward(
             latents: intermediateModelLatents,
-            timestep: intermediateTimestepArray,
+            timestep: intermediateModelTimestep,
             promptEmbeds: intermediateEmbeds,
             controlContext: controlContext,
             controlContextScale: request.controlContextScale
