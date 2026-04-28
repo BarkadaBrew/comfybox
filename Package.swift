@@ -39,7 +39,8 @@ let package = Package(
       name: "ZImageTests",
       dependencies: [
         "ZImage",
-        .product(name: "MLX", package: "mlx-swift")
+        .product(name: "MLX", package: "mlx-swift"),
+        .product(name: "MLXRandom", package: "mlx-swift")
       ],
       path: "Tests/ZImageTests"
     ),

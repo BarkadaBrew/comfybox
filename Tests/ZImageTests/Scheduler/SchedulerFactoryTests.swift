@@ -132,6 +132,11 @@ final class SchedulerFactoryTests: XCTestCase {
 
   func testValidSchedulerKindFromString() {
     XCTAssertEqual(SchedulerKind(rawValue: "euler"), .euler)
+    XCTAssertEqual(SchedulerKind(rawValue: "heun"), .heun)
+    XCTAssertEqual(SchedulerKind(rawValue: "dpmpp-2m"), .dpmplusplus2m)
+    XCTAssertEqual(SchedulerKind(rawValue: "dpmpp-2s-a"), .dpmplusplus2sa)
+    XCTAssertEqual(SchedulerKind(rawValue: "deis"), .deis)
+    XCTAssertEqual(SchedulerKind(rawValue: "ddim"), .ddim)
   }
 
   func testUnknownSigmaScheduleKindFromString() {
@@ -174,6 +179,112 @@ final class SchedulerFactoryTests: XCTestCase {
       )
       XCTAssertEqual(scheduler.numInferenceSteps, 9,
                      "Sigma schedule \(scheduleKind.rawValue) should produce 9 steps")
+    }
+  }
+
+  // MARK: - Phase 2 Sampler Creation
+
+  func testDPMPlusPlus2MCreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .dpmplusplus2m,
+      numInferenceSteps: 9,
+      config: config
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 10)
+    XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testDDIMCreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .ddim,
+      numInferenceSteps: 9,
+      config: config,
+      eta: 0.5
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 10)
+    XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testDDIMWithSeed() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .ddim,
+      numInferenceSteps: 9,
+      config: config,
+      seed: 42,
+      eta: 1.0
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+  }
+
+  func testDEISCreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .deis,
+      numInferenceSteps: 9,
+      config: config
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 10)
+    XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testDPMPlusPlus2SACreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .dpmplusplus2sa,
+      numInferenceSteps: 9,
+      config: config,
+      seed: 42
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 10)
+    XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testHeunCreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .heun,
+      numInferenceSteps: 9,
+      config: config
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 10)
+    XCTAssertTrue(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testPhase2SamplersWithKarrasSchedule() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let phase2Kinds: [SchedulerKind] = [
+      .dpmplusplus2m, .ddim, .deis, .dpmplusplus2sa, .heun
+    ]
+
+    for kind in phase2Kinds {
+      let scheduler = SchedulerFactory.create(
+        kind: kind,
+        sigmaSchedule: .karras,
+        numInferenceSteps: 9,
+        config: config,
+        seed: 42
+      )
+      XCTAssertEqual(scheduler.numInferenceSteps, 9,
+                     "Scheduler \(kind.rawValue) with Karras should have 9 steps")
+      let sigmas = scheduler.sigmas.asArray(Float.self)
+      XCTAssertGreaterThan(sigmas[0], 10.0,
+                           "Karras sigmas should be large for \(kind.rawValue)")
+      XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10,
+                     "Last sigma should be 0 for \(kind.rawValue)")
     }
   }
 

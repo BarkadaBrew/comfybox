@@ -1,15 +1,15 @@
 import Foundation
 import MLX
+import MLXRandom
 
 /// Identifies a sampler algorithm.
 public enum SchedulerKind: String, CaseIterable, Sendable {
   case euler = "euler"
-  // Phase 2+
-  // case heun = "heun"
-  // case dpmplusplus2m = "dpmpp-2m"
-  // case dpmplusplus2sa = "dpmpp-2s-a"
-  // case deis = "deis"
-  // case ddim = "ddim"
+  case heun = "heun"
+  case dpmplusplus2m = "dpmpp-2m"
+  case dpmplusplus2sa = "dpmpp-2s-a"
+  case deis = "deis"
+  case ddim = "ddim"
 }
 
 /// Creates scheduler instances by kind.
@@ -25,8 +25,8 @@ public enum SchedulerFactory {
   ///   - numInferenceSteps: Number of denoising steps.
   ///   - config: The model's scheduler configuration.
   ///   - mu: Dynamic shifting parameter (pass non-nil when `config.useDynamicShifting`).
-  ///   - seed: Random seed for stochastic samplers (reserved for Phase 2).
-  ///   - eta: DDIM stochasticity parameter (reserved for Phase 2).
+  ///   - seed: Random seed for stochastic samplers (DPM++ 2S-A, DDIM with eta > 0).
+  ///   - eta: DDIM stochasticity parameter (0 = deterministic, 1 = full DDPM).
   /// - Returns: A type-erased ``ZImageScheduler``.
   public static func create(
     kind: SchedulerKind,
@@ -55,6 +55,47 @@ public enum SchedulerFactory {
         )
       }
       return FlowMatchEulerScheduler(
+        numInferenceSteps: numInferenceSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps
+      )
+
+    case .dpmplusplus2m:
+      return DPMPlusPlus2MScheduler(
+        numInferenceSteps: numInferenceSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps
+      )
+
+    case .ddim:
+      let randomKey = seed.map { MLXRandom.key($0) }
+      return DDIMScheduler(
+        numInferenceSteps: numInferenceSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps,
+        eta: eta ?? 0.0,
+        randomKey: randomKey
+      )
+
+    case .deis:
+      return DEISScheduler(
+        numInferenceSteps: numInferenceSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps
+      )
+
+    case .dpmplusplus2sa:
+      let randomKey = seed.map { MLXRandom.key($0) }
+      return DPMPlusPlus2SAScheduler(
+        numInferenceSteps: numInferenceSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps,
+        eta: 1.0,
+        randomKey: randomKey
+      )
+
+    case .heun:
+      return HeunScheduler(
         numInferenceSteps: numInferenceSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps
