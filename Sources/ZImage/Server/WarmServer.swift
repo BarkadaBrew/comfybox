@@ -37,10 +37,8 @@ public final class WarmServer {
   private let logger: Logger
   private let coordinator: WarmServerCoordinator
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
-  private let shutdownSemaphore = DispatchSemaphore(value: 0)
   private let lifecycleLock = NSLock()
   private var listener: NWListener?
-  private var terminalError: Error?
   private var shutdownSignalled = false
 
   public init(configuration: WarmServerConfiguration, logger: Logger = Logger(label: "z-image.warm-server")) {
@@ -56,6 +54,28 @@ public final class WarmServer {
       throw WarmServerError.invalidPort(configuration.port)
     }
 
+    // Ignore SIGHUP — prevents session loss from killing the daemon
+    // when run under launchd, nohup, or after SSH disconnect.
+    signal(SIGHUP, SIG_IGN)
+
+    // Handle SIGTERM for clean launchd stop/restart.
+    let sigTermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: listenerQueue)
+    signal(SIGTERM, SIG_IGN)
+    sigTermSource.setEventHandler { [weak self] in
+      self?.logger.info("Received SIGTERM, shutting down gracefully...")
+      self?.initiateShutdown()
+    }
+    sigTermSource.resume()
+
+    // Handle SIGINT for clean Ctrl-C during development.
+    let sigIntSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: listenerQueue)
+    signal(SIGINT, SIG_IGN)
+    sigIntSource.setEventHandler { [weak self] in
+      self?.logger.info("Received SIGINT, shutting down...")
+      self?.initiateShutdown()
+    }
+    sigIntSource.resume()
+
     let listener = try NWListener(using: .tcp, on: port)
     self.listener = listener
 
@@ -67,11 +87,13 @@ public final class WarmServer {
     }
 
     listener.start(queue: listenerQueue)
-    shutdownSemaphore.wait()
 
-    if let terminalError {
-      throw terminalError
-    }
+    // Use dispatchMain() instead of semaphore.wait() for daemon reliability.
+    // DispatchSemaphore.wait() blocks without processing GCD events, which
+    // causes NWListener to enter .cancelled state when the process loses its
+    // controlling terminal (SSH disconnect, launchd restart, nohup).
+    // dispatchMain() keeps the main dispatch loop alive properly.
+    dispatchMain()
   }
 
   private func preparePipeline() throws {
@@ -93,9 +115,21 @@ public final class WarmServer {
       logger.info("Warm server listening on http://127.0.0.1:\(self.configuration.port)")
     case .failed(let error):
       logger.error("Warm server listener failed: \(error.localizedDescription)")
-      signalShutdown(error: error)
+      initiateShutdown(exitCode: 1)
     case .cancelled:
-      signalShutdown()
+      // Only exit if we intentionally cancelled (via /v1/shutdown or signal).
+      // NWListener can be cancelled by macOS when the process loses its
+      // controlling terminal — we must NOT treat that as a shutdown request.
+      lifecycleLock.lock()
+      let wasIntentional = shutdownSignalled
+      lifecycleLock.unlock()
+
+      if wasIntentional {
+        logger.info("Listener cancelled (intentional shutdown)")
+        exit(0)
+      } else {
+        logger.warning("Listener cancelled unexpectedly — ignoring (daemon will continue)")
+      }
     default:
       break
     }
@@ -152,26 +186,25 @@ public final class WarmServer {
   }
 
   fileprivate func requestShutdownAfterResponse() {
-    lifecycleLock.lock()
-    defer { lifecycleLock.unlock() }
-
-    guard !shutdownSignalled else { return }
-    shutdownSignalled = true
-    listener?.cancel()
-    shutdownSemaphore.signal()
+    initiateShutdown()
   }
 
-  private func signalShutdown(error: Error? = nil) {
+  /// Initiate a clean shutdown. Cancels the listener and exits.
+  /// Safe to call from any thread — idempotent via shutdownSignalled flag.
+  private func initiateShutdown(exitCode: Int32 = 0) {
     lifecycleLock.lock()
     defer { lifecycleLock.unlock() }
 
-    if let error, terminalError == nil {
-      terminalError = error
-    }
-
     guard !shutdownSignalled else { return }
     shutdownSignalled = true
-    shutdownSemaphore.signal()
+
+    logger.info("Server shutting down (exit code \(exitCode))...")
+    listener?.cancel()
+
+    // Give in-flight connections 1 second to drain, then exit.
+    DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+      exit(exitCode)
+    }
   }
 
   private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
