@@ -362,6 +362,7 @@ public final class ZImageControlTransformer2DModel: Module {
     let controlPad = (seqMultiOf - (controlTokens % seqMultiOf)) % seqMultiOf
     if controlPad > 0 {
       let last = controlImage[0..., controlTokens - 1, 0...]
+        .expandedDimensions(axis: 1)
       let pad = MLX.broadcast(last, to: [batch, controlPad, controlImage.dim(2)])
       controlImage = MLX.concatenated([controlImage, pad], axis: 1)
     }
@@ -484,6 +485,7 @@ public final class ZImageControlTransformer2DModel: Module {
     var capFeat = promptEmbeds
     if cached.capPad > 0 {
       let last = promptEmbeds[0..., capOriLen - 1, 0...]
+        .expandedDimensions(axis: 1)
       let pad = MLX.broadcast(last, to: [batch, cached.capPad, promptEmbeds.dim(2)])
       capFeat = MLX.concatenated([promptEmbeds, pad], axis: 1)
     }
@@ -502,6 +504,7 @@ public final class ZImageControlTransformer2DModel: Module {
 
     if cached.imgPad > 0 {
       let last = image[0..., cached.imageTokens - 1, 0...]
+        .expandedDimensions(axis: 1)
       let pad = MLX.broadcast(last, to: [batch, cached.imgPad, image.dim(2)])
       image = MLX.concatenated([image, pad], axis: 1)
     }

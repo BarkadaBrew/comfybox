@@ -232,26 +232,20 @@ public final class ZImageTransformer2DModel: Module {
     let tScaled = timestep * MLXArray(configuration.tScale)
     var tEmb = tEmbedder(tScaled)
 
-    print("[DBG] tEmb shape: \(tEmb.shape), promptEmbeds shape: \(promptEmbeds.shape), batch=\(batch)")
-
     var capFeat = promptEmbeds
     if cached.capPad > 0 {
       let last = promptEmbeds[0..., capOriLen - 1, 0...]
-      print("[DBG] cap last shape: \(last.shape), target: [\(batch), \(cached.capPad), \(promptEmbeds.dim(2))]")
-      let lastExpanded = last.expandedDimensions(axis: 1)
-      let pad = MLX.broadcast(lastExpanded, to: [batch, cached.capPad, promptEmbeds.dim(2)])
+        .expandedDimensions(axis: 1)
+      let pad = MLX.broadcast(last, to: [batch, cached.capPad, promptEmbeds.dim(2)])
       capFeat = MLX.concatenated([promptEmbeds, pad], axis: 1)
     }
-    print("[DBG] capFeat shape after padding: \(capFeat.shape)")
     capFeat = capEmbedLinear(capEmbedNorm(capFeat))
-    print("[DBG] capFeat shape after projection: \(capFeat.shape)")
 
     if let capPadToken, let capPadMask = cached.capPadMask {
       let padDim = capPadToken.dim(capPadToken.ndim - 1)
       let pad = MLX.broadcast(capPadToken.reshaped(1, 1, padDim), to: [batch, cached.capSeqLen, padDim])
       capFeat = MLX.where(MLX.expandedDimensions(capPadMask, axis: 2), pad, capFeat)
     }
-    print("[DBG] capFeat shape after masking: \(capFeat.shape)")
 
     var image = latentsWithFrame
       .reshaped(batch, channels, cached.fTokens, fPatchSize, cached.hTokens, patchSize, cached.wTokens, patchSize)
@@ -260,21 +254,19 @@ public final class ZImageTransformer2DModel: Module {
 
     if cached.imgPad > 0 {
       let last = image[0..., cached.imageTokens - 1, 0...]
-      let lastExpanded = last.expandedDimensions(axis: 1)
-      let pad = MLX.broadcast(lastExpanded, to: [batch, cached.imgPad, image.dim(2)])
+        .expandedDimensions(axis: 1)
+      let pad = MLX.broadcast(last, to: [batch, cached.imgPad, image.dim(2)])
       image = MLX.concatenated([image, pad], axis: 1)
     }
 
     image = xEmbed(image)
     tEmb = tEmb.asType(image.dtype)
-    print("[DBG] image shape after embed: \(image.shape), tEmb dtype: \(tEmb.dtype)")
 
     if let xPadToken, let imgPadMask = cached.imgPadMask {
       let padDim = xPadToken.dim(xPadToken.ndim - 1)
       let pad = MLX.broadcast(xPadToken.reshaped(1, 1, padDim), to: [batch, cached.imgSeqLen, padDim])
       image = MLX.where(MLX.expandedDimensions(imgPadMask, axis: 2), pad, image)
     }
-    print("[DBG] entering noise refiner, image shape: \(image.shape)")
 
     var noiseStream = image
     for block in noiseRefiner {
@@ -296,17 +288,13 @@ public final class ZImageTransformer2DModel: Module {
       )
     }
 
-    print("[DBG] noiseStream: \(noiseStream.shape), capStream: \(capStream.shape)")
     var unified = MLX.concatenated([noiseStream, capStream], axis: 1)
-    print("[DBG] unified shape: \(unified.shape), entering main layers")
 
-    for (idx, block) in layers.enumerated() {
+    for block in layers {
       unified = block(unified, attnMask: nil, freqsCis: cached.unifiedFreqsCis, adalnInput: tEmb)
-      if idx == 0 { print("[DBG] after main layer 0: \(unified.shape)") }
     }
 
     let imageOut = unified[0..., 0..<cached.imageTokens, 0...]
-    print("[DBG] imageOut: \(imageOut.shape), entering finalLayer")
     let projected = finalLayer(imageOut, conditioning: tEmb)
     let outChannels = configuration.inChannels
 
