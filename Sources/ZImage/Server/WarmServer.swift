@@ -201,11 +201,11 @@ public final class WarmServer {
   private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest) async throws -> ComfyBridgeGenerateResult {
     let payload = GeneratePayload(
       prompt: request.prompt,
-      negativePrompt: request.negativePrompt,
+      negativePrompt: nil,  // Z-Image Turbo: negative prompts cause broadcast_shapes crash
       width: request.width,
       height: request.height,
       steps: request.steps,
-      guidance: request.guidance,
+      guidance: 0.0,  // Z-Image Turbo: designed for cfg=0
       seed: request.seed,
       outputPath: nil
     )
