@@ -109,41 +109,134 @@ enum InpaintUtilities {
 
   // MARK: - Mask to Latent
 
-  /// Convert a pixel-space mask image to latent-space mask.
+  /// Convert a pixel-space mask image to latent-space mask with optional grow and feather.
   ///
   /// Input: CGImage mask where white (255) = region to regenerate, black (0) = preserve.
   /// Output: MLXArray of shape [1, 1, latentH, latentW] with 1.0 = regenerate, 0.0 = preserve.
   ///
-  /// The mask is downsampled to latent dimensions using nearest-neighbor interpolation
-  /// (preserves sharp mask boundaries).
-  static func pixelMaskToLatent(_ maskImage: CGImage, latentH: Int, latentW: Int) throws -> MLXArray {
+  /// Processing pipeline:
+  /// 1. Convert to grayscale float array at working resolution
+  /// 2. Grow (dilate) the mask using conv2d with ones kernel + threshold
+  /// 3. Feather (blur) the mask edges with separable Gaussian convolution
+  /// 4. Downsample to latent dimensions
+  static func pixelMaskToLatent(
+    _ maskImage: CGImage,
+    latentH: Int,
+    latentW: Int,
+    grow: Int = 0,
+    feather: Int = 0,
+    logger: Logger? = nil
+  ) throws -> MLXArray {
     #if canImport(CoreGraphics)
     guard let rgbaMask = convertToRGBA(maskImage) else {
       throw InpaintError.maskLoadFailed("Failed to convert mask to RGBA")
     }
 
-    // Resize mask to latent dimensions
+    // Work at pixel resolution for grow/feather, then downsample.
+    // Cap at 8x latent dims to avoid excessive memory usage.
+    let workH = min(maskImage.height, latentH * 8)
+    let workW = min(maskImage.width, latentW * 8)
+
+    // Load mask at working resolution — NHWC format [1, H, W, C]
     let maskArray = try QwenImageIO.resizedPixelArray(
       from: rgbaMask,
-      width: latentW,
-      height: latentH,
+      width: workW,
+      height: workH,
       addBatchDimension: true,
-      dtype: .float32,
-      interpolation: .none  // Nearest-neighbor for sharp edges
+      dtype: .float32
     )
 
-    // Convert to grayscale and binarize (threshold at 0.5)
-    let grayscale = MLX.mean(maskArray, axis: 1, keepDims: true)  // [1, 1, H, W]
-    let binarized = MLX.where(grayscale .>= 0.5, MLXArray(Float(1.0)), MLXArray(Float(0.0)))
+    // Convert to single-channel grayscale [1, H, W, 1]
+    var mask = MLX.mean(maskArray, axis: -1, keepDims: true)
+    // Binarize at 0.5 threshold
+    mask = MLX.where(mask .>= 0.5, MLXArray(Float(1.0)), MLXArray(Float(0.0)))
+    MLX.eval(mask)
 
-    MLX.eval(binarized)
-    return binarized
+    // Scale grow/feather from original pixel space to working resolution
+    let scale = Float(workW) / Float(maskImage.width)
+
+    // --- Grow (dilate) using conv2d with ones kernel + threshold ---
+    let scaledGrow = max(0, Int(Float(grow) * scale))
+    if scaledGrow > 0 {
+      let kernelSize = scaledGrow * 2 + 1
+      // Conv2d weight: [Cout, kH, kW, Cin] = [1, k, k, 1], all ones
+      let onesKernel = MLXArray.ones([1, kernelSize, kernelSize, 1])
+      // Pad input to maintain spatial dimensions
+      let padded = MLX.padded(mask, widths: [IntOrPair((0, 0)), IntOrPair((scaledGrow, scaledGrow)), IntOrPair((scaledGrow, scaledGrow)), IntOrPair((0, 0))])
+      // Convolve — any overlap with a white pixel gives a positive value
+      let dilated = conv2d(padded, onesKernel)
+      // Threshold: > 0 means at least one white pixel was in the kernel
+      mask = MLX.where(dilated .> 0, MLXArray(Float(1.0)), MLXArray(Float(0.0)))
+      MLX.eval(mask)
+      logger?.info("InpaintUtilities: mask grown by \(scaledGrow)px (kernel \(kernelSize))")
+    }
+
+    // --- Feather (Gaussian blur) using separable convolution ---
+    let scaledFeather = max(0, Int(Float(feather) * scale))
+    if scaledFeather > 0 {
+      let sigma = Float(scaledFeather) / 3.0  // 3-sigma rule
+      let kSize = scaledFeather * 2 + 1
+
+      // Build 1D Gaussian kernel
+      var kernel1D: [Float] = []
+      var sum: Float = 0
+      for i in 0..<kSize {
+        let x = Float(i - scaledFeather)
+        let g = exp(-(x * x) / (2.0 * sigma * sigma))
+        kernel1D.append(g)
+        sum += g
+      }
+      kernel1D = kernel1D.map { $0 / sum }
+
+      // Horizontal pass: weight [1, 1, kSize, 1]
+      let hKernel = MLXArray(kernel1D).reshaped([1, 1, kSize, 1])
+      let hPadded = MLX.padded(mask, widths: [IntOrPair((0, 0)), IntOrPair((0, 0)), IntOrPair((scaledFeather, scaledFeather)), IntOrPair((0, 0))], mode: .edge)
+      let blurH = conv2d(hPadded, hKernel)
+
+      // Vertical pass: weight [1, kSize, 1, 1]
+      let vKernel = MLXArray(kernel1D).reshaped([1, kSize, 1, 1])
+      let vPadded = MLX.padded(blurH, widths: [IntOrPair((0, 0)), IntOrPair((scaledFeather, scaledFeather)), IntOrPair((0, 0)), IntOrPair((0, 0))], mode: .edge)
+      mask = conv2d(vPadded, vKernel)
+      MLX.eval(mask)
+      logger?.info("InpaintUtilities: mask feathered with radius \(scaledFeather)px")
+    }
+
+    // --- Downsample to latent dimensions ---
+    // Use QwenImageIO for reliable resize, then extract single channel
+    // First convert back to CGImage for resize
+    let clampedMask = MLX.clip(mask, min: 0.0, max: 1.0)
+
+    // Simple nearest-neighbor downsample via stride
+    // mask is [1, workH, workW, 1], need [1, 1, latentH, latentW]
+    let strideH = max(1, workH / latentH)
+    let strideW = max(1, workW / latentW)
+    let downsampled = clampedMask[0..., .stride(by: strideH), .stride(by: strideW), 0...]
+    // Trim or pad to exact latent dimensions
+    let trimH = min(downsampled.dim(1), latentH)
+    let trimW = min(downsampled.dim(2), latentW)
+    var result = downsampled[0..<1, 0..<trimH, 0..<trimW]
+
+    // If trimmed dimensions don't match, pad with zeros
+    if trimH < latentH || trimW < latentW {
+      result = MLX.padded(result, widths: [
+        IntOrPair((0, 0)),
+        IntOrPair((0, latentH - trimH)),
+        IntOrPair((0, latentW - trimW))
+      ])
+    }
+
+    // Reshape to [1, 1, latentH, latentW] for NCHW format expected by the denoising loop
+    let final = result.reshaped([1, 1, latentH, latentW])
+    MLX.eval(final)
+
+    logger?.info("InpaintUtilities: final mask shape \(final.shape), range [\(final.min().item(Float.self)), \(final.max().item(Float.self))]")
+    return final
     #else
     throw InpaintError.maskLoadFailed("CoreGraphics not available")
     #endif
   }
 
-  // MARK: - Image Compositing
+    // MARK: - Image Compositing
 
   /// Composite generated output onto original image using mask.
   ///

@@ -54,6 +54,10 @@ public struct ZImageGenerationRequest: Sendable {
   /// Denoising strength for inpainting (0.0–1.0). Lower values preserve more of the original.
   /// Default: 1.0 (full denoise, equivalent to txt2img).
   public var denoise: Float
+  /// Mask expansion in pixels (default 0 = no expansion).
+  public var maskGrow: Int
+  /// Mask feather radius in pixels (default 0 = hard edges).
+  public var maskFeather: Int
 
   public init(
     prompt: String,
@@ -78,7 +82,9 @@ public struct ZImageGenerationRequest: Sendable {
     dyPE: DyPEConfig = .disabled,
     inpaintImageData: Data? = nil,
     maskData: Data? = nil,
-    denoise: Float = 1.0
+    denoise: Float = 1.0,
+    maskGrow: Int = 0,
+    maskFeather: Int = 0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -102,6 +108,8 @@ public struct ZImageGenerationRequest: Sendable {
     self.inpaintImageData = inpaintImageData
     self.maskData = maskData
     self.denoise = denoise
+    self.maskGrow = maskGrow
+    self.maskFeather = maskFeather
   }
 }
 
@@ -945,9 +953,10 @@ public final class ZImagePipeline {
       )
       originalLatents = origLatents
 
-      // Convert pixel mask to latent-space mask (1 = regenerate, 0 = preserve)
+      // Convert pixel mask to latent-space mask with optional grow/feather
       latentMask = try InpaintUtilities.pixelMaskToLatent(
-        maskCG, latentH: latentH, latentW: latentW
+        maskCG, latentH: latentH, latentW: latentW,
+        grow: request.maskGrow, feather: request.maskFeather, logger: logger
       )
 
       // Store the initial noise for sigma blending at each step
