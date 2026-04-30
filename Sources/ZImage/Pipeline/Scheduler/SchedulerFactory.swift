@@ -90,7 +90,7 @@ public enum SchedulerFactory {
         numInferenceSteps: numInferenceSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,
-        eta: 1.0,
+        eta: eta ?? 1.0,
         randomKey: randomKey
       )
 

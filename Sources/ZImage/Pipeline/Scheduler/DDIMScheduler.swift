@@ -72,6 +72,15 @@ public struct DDIMScheduler: ZImageScheduler {
     let alphaT = (1.0 - t).asType(sample.dtype)
     let alphaPrev = (1.0 - tPrev).asType(sample.dtype)
 
+    // Guard: when sigma ~ 1.0 (step 0), alphaT ~ 0 and the x_0 prediction
+    // degenerates (division by sqrt(~0) amplifies latents ~10^8x). Fall back
+    // to a velocity-based Euler step which is numerically stable at all sigmas.
+    let alphaThreshold = MLXArray(Float(1e-4)).asType(sample.dtype)
+    if MLX.all(alphaT .< alphaThreshold).item(Bool.self) {
+      let dt = (tPrev - t).asType(sample.dtype)
+      return sample + modelOutput * dt
+    }
+
     // Clamp to avoid sqrt of negative or division by zero.
     let epsScalar = MLXArray(Float(1e-8)).asType(sample.dtype)
     let sqrtAlphaT = MLX.sqrt(MLX.maximum(alphaT, epsScalar))

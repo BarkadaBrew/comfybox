@@ -87,8 +87,8 @@ public struct DPMPlusPlus2SAScheduler: ZImageScheduler {
     // Ancestral noise injection when eta > 0 and not at the final sigma.
     let epsScalar = MLXArray(Float(1e-8)).asType(sample.dtype)
     if eta > 0, MLX.all(sigmaNext .> epsScalar).item(Bool.self) {
-      // sigma_up = sigma_next * eta * sqrt(1 - (sigma_t / sigma_next)^2)
-      let ratio = sigmaT / MLX.maximum(sigmaNext, epsScalar)
+      // sigma_up = sigma_next * eta * sqrt(1 - (sigma_next / sigma_t)^2)
+      let ratio = sigmaNext / MLX.maximum(sigmaT, epsScalar)
       let sigmaUp = sigmaNext * MLXArray(eta).asType(sample.dtype)
         * MLX.sqrt(MLX.maximum(1.0 - ratio * ratio, epsScalar))
 
