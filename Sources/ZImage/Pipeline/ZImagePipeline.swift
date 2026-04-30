@@ -870,6 +870,12 @@ public final class ZImagePipeline {
       guard let transformer = transformer else {
         throw PipelineError.transformerNotLoaded
       }
+
+      // Configure DyPE for high-resolution generation
+      transformer.dyPEConfig = request.dyPE
+      if request.dyPE.enabled {
+        logger.info("DyPE enabled: \(request.dyPE.method.rawValue) (base \(request.dyPE.baseResolution)px → \(request.width)x\(request.height))")
+      }
       for stepIndex in 0..<request.steps {
         try Task.checkCancellation()
         progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepIndex, totalSteps: request.steps))

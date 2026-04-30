@@ -34,6 +34,9 @@ public struct TransformerCache: @unchecked Sendable {
     public let hTokens: Int
     public let wTokens: Int
 
+    /// Position IDs for image tokens (retained for DyPE per-step recomputation).
+    public let imgPosIds: MLXArray?
+
     public init(
         capFreqs: MLXArray,
         capPadMask: MLXArray?,
@@ -47,7 +50,8 @@ public struct TransformerCache: @unchecked Sendable {
         unifiedFreqsCis: MLXArray,
         fTokens: Int,
         hTokens: Int,
-        wTokens: Int
+        wTokens: Int,
+        imgPosIds: MLXArray? = nil
     ) {
         self.capFreqs = capFreqs
         self.capPadMask = capPadMask
@@ -62,6 +66,29 @@ public struct TransformerCache: @unchecked Sendable {
         self.fTokens = fTokens
         self.hTokens = hTokens
         self.wTokens = wTokens
+        self.imgPosIds = imgPosIds
+    }
+
+    /// Create a new cache with updated image frequencies (for DyPE per-step recomputation).
+    /// Caption frequencies and all geometry fields are preserved.
+    public func withUpdatedImageFreqs(_ newImgFreqs: MLXArray) -> TransformerCache {
+        let newUnified = MLX.concatenated([newImgFreqs, capFreqs], axis: 0)
+        return TransformerCache(
+            capFreqs: capFreqs,
+            capPadMask: capPadMask,
+            capSeqLen: capSeqLen,
+            capPad: capPad,
+            imgFreqs: newImgFreqs,
+            imgPadMask: imgPadMask,
+            imgSeqLen: imgSeqLen,
+            imgPad: imgPad,
+            imageTokens: imageTokens,
+            unifiedFreqsCis: newUnified,
+            fTokens: fTokens,
+            hTokens: hTokens,
+            wTokens: wTokens,
+            imgPosIds: imgPosIds
+        )
     }
 }
 
@@ -75,7 +102,8 @@ public struct TransformerCacheBuilder {
         capOriLen: Int,
         patchSize: Int,
         fPatchSize: Int,
-        ropeEmbedder: ZImageRopeEmbedder
+        ropeEmbedder: ZImageRopeEmbedder,
+        retainImagePosIds: Bool = false
     ) -> TransformerCache {
         let capPad = (seqMultiOf - (capOriLen % seqMultiOf)) % seqMultiOf
         let capSeqLen = capOriLen + capPad
@@ -137,7 +165,8 @@ public struct TransformerCacheBuilder {
             unifiedFreqsCis: unifiedFreqsCis,
             fTokens: fTokens,
             hTokens: hTokens,
-            wTokens: wTokens
+            wTokens: wTokens,
+            imgPosIds: retainImagePosIds ? imgPosIds : nil
         )
     }
 }

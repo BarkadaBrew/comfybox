@@ -20,6 +20,17 @@ public final class ZImageTransformer2DModel: Module {
   private var cache: TransformerCache?
   private var cacheKey: TransformerCacheKey?
 
+  /// DyPE configuration — set before generation to enable high-res RoPE scaling.
+  public var dyPEConfig: DyPEConfig = .disabled {
+    didSet {
+      ropeEmbedder.dyPE = dyPEConfig
+      // Invalidate cache when DyPE config changes
+      if oldValue.enabled != dyPEConfig.enabled || oldValue.method != dyPEConfig.method {
+        clearCache()
+      }
+    }
+  }
+
   public init(configuration: ZImageTransformerConfig) {
     self.configuration = configuration
     let outSize = min(configuration.dim, 256)
@@ -185,7 +196,8 @@ public final class ZImageTransformer2DModel: Module {
       capOriLen: capOriLen,
       patchSize: patchSize,
       fPatchSize: fPatchSize,
-      ropeEmbedder: ropeEmbedder
+      ropeEmbedder: ropeEmbedder,
+      retainImagePosIds: dyPEConfig.enabled
     )
 
     self.cache = newCache
@@ -214,7 +226,7 @@ public final class ZImageTransformer2DModel: Module {
     }
 
     let capOriLen = promptEmbeds.dim(1)
-    let cached = getOrBuildCache(
+    var cached = getOrBuildCache(
       batch: batch,
       height: height,
       width: width,
@@ -223,6 +235,23 @@ public final class ZImageTransformer2DModel: Module {
       patchSize: patchSize,
       fPatchSize: fPatchSize
     )
+
+    // DyPE: recompute image frequencies with spatial scale factors
+    if dyPEConfig.enabled, let imgPosIds = cached.imgPosIds {
+      // Compute scale: current spatial tokens vs base training resolution tokens
+      // Base: 1024px / patchSize(2) = 512 latent / 1 = 512 tokens per axis? No:
+      // baseResolution / (patchSize * latentDivisor) — but we use hTokens/wTokens directly
+      let baseTokens = Float(dyPEConfig.baseResolution / patchSize)  // 1024/2 = 512
+      let hScale = Float(cached.hTokens) / baseTokens
+      let wScale = Float(cached.wTokens) / baseTokens
+
+      if hScale > 1.0 || wScale > 1.0 {
+        let newImgFreqs = ropeEmbedder.imageFreqs(
+          ids: imgPosIds, hScale: hScale, wScale: wScale
+        )
+        cached = cached.withUpdatedImageFreqs(newImgFreqs)
+      }
+    }
 
     var latentsWithFrame = latents
     if !hasFrameDim {
