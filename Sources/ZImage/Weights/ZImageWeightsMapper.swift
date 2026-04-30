@@ -33,11 +33,15 @@ public struct ZImageWeightsMapper {
   }
 
   public func loadTextEncoder(dtype: DType? = .bfloat16) throws -> [String: MLXArray] {
+    if hasQuantization() {
+      // Quantized models: always load from snapshot's text_encoder/ directory
+      // to preserve native dtypes (uint32 weights, float32 scales/biases).
+      // The textEncoderDirectory override is for non-quantized encoder variants
+      // and must NOT be used here — loadStandardComponent would convert U32→BF16.
+      return try loadQuantizedComponent("text_encoder")
+    }
     if let textEncoderDirectory {
       return try loadStandardComponent(urls: ZImageFiles.resolveWeightFiles(in: textEncoderDirectory, componentName: "text_encoder"), dtype: dtype)
-    }
-    if hasQuantization() {
-      return try loadQuantizedComponent("text_encoder")
     }
     return try loadStandardComponent(files: ZImageFiles.resolveTextEncoderWeights(at: snapshot), dtype: dtype)
   }
