@@ -36,6 +36,7 @@ public final class WarmServer {
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private let coordinator: WarmServerCoordinator
+  let comfyBridge: ComfyBridge
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
   private let shutdownSemaphore = DispatchSemaphore(value: 0)
   private let lifecycleLock = NSLock()
@@ -47,6 +48,7 @@ public final class WarmServer {
     self.configuration = configuration
     self.logger = logger
     self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
+    self.comfyBridge = ComfyBridge(logger: logger)
   }
 
   public func run() throws {
@@ -111,6 +113,11 @@ public final class WarmServer {
   }
 
   fileprivate func respond(to request: HTTPRequest) async -> RoutedResponse {
+    // Try ComfyUI bridge routes first.
+    if let bridgeResponse = comfyBridge.route(request) {
+      return bridgeResponse
+    }
+
     switch (request.method, request.path) {
     case ("GET", "/health"):
       let memoryBytes = Self.currentMemoryFootprintBytes()
@@ -429,7 +436,8 @@ private actor WarmServerCoordinator {
 
 private final class ConnectionHandler {
   private static let headerDelimiter = Data("\r\n\r\n".utf8)
-  private static let maximumRequestBytes = 1_048_576
+  /// 10 MB — raised from 1 MB to support ComfyUI image uploads via PUT /api/etn/image/.
+  private static let maximumRequestBytes = 10_485_760
 
   private let connection: NWConnection
   private let queue: DispatchQueue
@@ -531,12 +539,15 @@ private final class ConnectionHandler {
 
     let body = buffer.subdata(in: bodyStart..<totalLength)
     let rawPath = String(requestParts[1])
-    let path = rawPath.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? rawPath
+    let pathAndQuery = rawPath.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+    let path = pathAndQuery.first.map(String.init) ?? rawPath
+    let queryString: String? = pathAndQuery.count > 1 ? String(pathAndQuery[1]) : nil
 
     return .request(
       HTTPRequest(
         method: String(requestParts[0]).uppercased(),
         path: path,
+        queryString: queryString,
         headers: headers,
         body: body
       )
@@ -549,6 +560,28 @@ private final class ConnectionHandler {
       return
     }
 
+    // Check for WebSocket upgrade before entering the async router.
+    if request.path == "/ws",
+       request.method == "GET",
+       let wsResponse = server.comfyBridge.handleWebSocketUpgrade(request: request, connection: connection, queue: queue) {
+      // Send the upgrade response, then keep the connection alive for WebSocket framing.
+      guard !responseSent else { return }
+      responseSent = true
+      connection.send(content: wsResponse, completion: .contentProcessed { [weak self] _ in
+        guard let self, let server = self.server else { return }
+        let clientId = request.queryParameters["clientId"] ?? UUID().uuidString
+        server.comfyBridge.wsManager.registerConnection(
+          clientId: clientId,
+          connection: self.connection,
+          queue: self.queue
+        )
+        // Release the ConnectionHandler — the WS manager now owns the NWConnection.
+        // Do NOT cancel the connection; only release our retain cycle.
+        self.retainSelf = nil
+      })
+      return
+    }
+
     Task {
       let routed = await server.respond(to: request)
       switch routed {
@@ -558,6 +591,8 @@ private final class ConnectionHandler {
         self.finish(with: response)
       case .shutdown(let response):
         self.finish(with: response, shutdownAfterSend: true)
+      case .websocketUpgrade:
+        break // Already handled above; should not reach here.
       }
     }
   }
@@ -577,29 +612,56 @@ private final class ConnectionHandler {
   }
 }
 
-private struct HTTPRequest {
+struct HTTPRequest {
   let method: String
   let path: String
+  let queryString: String?
   let headers: [String: String]
   let body: Data
+
+  /// Parse query parameters from the query string.
+  var queryParameters: [String: String] {
+    guard let qs = queryString, !qs.isEmpty else { return [:] }
+    var params: [String: String] = [:]
+    for pair in qs.split(separator: "&") {
+      let parts = pair.split(separator: "=", maxSplits: 1)
+      if parts.count == 2 {
+        params[String(parts[0])] = String(parts[1])
+      } else if parts.count == 1 {
+        params[String(parts[0])] = ""
+      }
+    }
+    return params
+  }
 }
 
-private enum HTTPParseResult {
+enum HTTPParseResult {
   case incomplete
   case request(HTTPRequest)
   case error(HTTPResponse)
 }
 
-private struct HTTPResponse {
+struct HTTPResponse {
   let status: Int
   let reasonPhrase: String
+  let contentType: String
   let body: Data
 
   static func json<T: Encodable>(status: Int, payload: T) -> HTTPResponse {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
     let body = (try? encoder.encode(payload)) ?? Data("{\"success\":false,\"error\":\"encoding failure\"}".utf8)
-    return HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), body: body)
+    return HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: "application/json", body: body)
+  }
+
+  /// Create a JSON response from pre-encoded Data (no snake_case conversion).
+  static func rawJSON(status: Int, data: Data) -> HTTPResponse {
+    HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: "application/json", body: data)
+  }
+
+  /// Create a binary response with a specified content type.
+  static func binary(status: Int, contentType: String, data: Data) -> HTTPResponse {
+    HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: contentType, body: data)
   }
 
   static func error(status: Int, message: String) -> HTTPResponse {
@@ -610,7 +672,7 @@ private struct HTTPResponse {
     var data = Data()
     let header = [
       "HTTP/1.1 \(status) \(reasonPhrase)",
-      "Content-Type: application/json",
+      "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
       "Connection: close",
       "",
@@ -621,7 +683,7 @@ private struct HTTPResponse {
     return data
   }
 
-  private static func reasonPhrase(for status: Int) -> String {
+  static func reasonPhrase(for status: Int) -> String {
     switch status {
     case 200: return "OK"
     case 400: return "Bad Request"
@@ -636,10 +698,12 @@ private struct HTTPResponse {
   }
 }
 
-private enum RoutedResponse {
+enum RoutedResponse {
   case json(HTTPResponse)
   case shutdown(HTTPResponse)
   case error(HTTPResponse)
+  /// WebSocket upgrade — the bridge takes ownership of the connection.
+  case websocketUpgrade
 
   static func json<T: Encodable>(status: Int, payload: T) -> RoutedResponse {
     .json(.json(status: status, payload: payload))
@@ -764,7 +828,7 @@ private struct LoRAState: Encodable, Sendable {
   }
 }
 
-private struct ErrorPayload: Encodable {
+struct ErrorPayload: Encodable {
   let success: Bool
   let error: String
 }
