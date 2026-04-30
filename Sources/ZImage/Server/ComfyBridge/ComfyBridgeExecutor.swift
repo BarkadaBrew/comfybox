@@ -67,10 +67,34 @@ final class ComfyBridgeExecutor {
       lock.unlock()
     }
 
-    let promptPreview = request.prompt.count > 80
-      ? String(request.prompt.prefix(77)) + "..."
-      : request.prompt
-    logger.info("ComfyBridge: executing prompt_id=\(request.promptId) — \(request.width)x\(request.height), \(request.steps) steps, cfg=\(request.guidance)")
+    // --- Load inpaint images from cache if this is an inpaint request ---
+    var mutableRequest = request
+    if let imageId = request.inpaintImageId {
+      guard let imageData = imageCache.retrieve(id: imageId) else {
+        logger.error("ComfyBridge: inpaint image not found in cache: \(imageId)")
+        sendError(promptId: request.promptId, clientId: request.clientId,
+                  message: "Inpaint image not found: \(imageId)")
+        return
+      }
+      mutableRequest.inpaintImageData = imageData
+      logger.info("ComfyBridge: loaded inpaint image \(imageId) (\(imageData.count) bytes)")
+    }
+    if let maskId = request.maskImageId {
+      guard let maskData = imageCache.retrieve(id: maskId) else {
+        logger.error("ComfyBridge: mask image not found in cache: \(maskId)")
+        sendError(promptId: request.promptId, clientId: request.clientId,
+                  message: "Mask image not found: \(maskId)")
+        return
+      }
+      mutableRequest.maskImageData = maskData
+      logger.info("ComfyBridge: loaded mask image \(maskId) (\(maskData.count) bytes)")
+    }
+
+    let promptPreview = mutableRequest.prompt.count > 80
+      ? String(mutableRequest.prompt.prefix(77)) + "..."
+      : mutableRequest.prompt
+    let modeLabel = mutableRequest.isInpaint ? "inpaint" : "txt2img"
+    logger.info("ComfyBridge: executing \(modeLabel) prompt_id=\(mutableRequest.promptId) — \(mutableRequest.width)x\(mutableRequest.height), \(mutableRequest.steps) steps, denoise=\(mutableRequest.denoise)")
     logger.info("ComfyBridge: prompt — \"\(promptPreview)\"")
 
     // --- Phase 1: execution_start ---
@@ -113,7 +137,7 @@ final class ComfyBridgeExecutor {
         }
       }
 
-      let result = try await handler(request, progressCallback)
+      let result = try await handler(mutableRequest, progressCallback)
 
       // Read the output image.
       let outputURL = URL(fileURLWithPath: result.outputPath)

@@ -4,6 +4,7 @@
 // steps, seed, etc.) and maps them to ZImageCLI's internal format.
 //
 // Phase 2: txt2img workflow parsing.
+// Phase 3: inpaint workflow parsing (latent-space inpainting).
 
 import Foundation
 
@@ -21,6 +22,23 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let batchSize: Int
   /// The node ID of the output node (ETN_SaveImageCache or PreviewImage).
   let outputNodeId: String
+
+  // --- Phase 3: Inpainting fields ---
+
+  /// Image cache ID of the input image to inpaint (from ETN_LoadImageCache node).
+  let inpaintImageId: String?
+  /// Image cache ID of the mask image (from ETN_LoadImageCache node).
+  let maskImageId: String?
+  /// Denoising strength (0.0–1.0). Higher = more change. Default 1.0 for txt2img.
+  let denoise: Float
+
+  /// Whether this is an inpainting request.
+  var isInpaint: Bool { inpaintImageId != nil }
+
+  // Populated by executor before passing to generate handler.
+  // Not set by parser — must be filled from image cache.
+  var inpaintImageData: Data?
+  var maskImageData: Data?
 }
 
 /// Result of a ComfyUI bridge generation.
@@ -93,6 +111,8 @@ enum ComfyBridgeWorkflowParser {
     }
 
     // --- Dimensions ---
+    // For txt2img: from EmptySD3LatentImage/EmptyLatentImage node.
+    // For inpaint: from the input image (or fall back to latent node if present).
     let latentNode = nodes.values.first {
       $0.classType == "EmptySD3LatentImage" || $0.classType == "EmptyLatentImage"
     }
@@ -103,6 +123,10 @@ enum ComfyBridgeWorkflowParser {
     // --- Steps ---
     let schedulerNode = nodes.values.first { $0.classType == "BasicScheduler" }
     let steps = intValue(schedulerNode?.inputs["steps"]) ?? 9
+
+    // --- Denoise strength ---
+    // BasicScheduler has an optional "denoise" input. Default 1.0 (full denoise for txt2img).
+    let denoise = floatValue(schedulerNode?.inputs["denoise"]) ?? 1.0
 
     // --- CFG ---
     let cfg: Float
@@ -123,9 +147,14 @@ enum ComfyBridgeWorkflowParser {
     } else if let previewNode = nodes.values.first(where: { $0.classType == "PreviewImage" }) {
       outputNodeId = previewNode.id
     } else {
-      // Use the highest node ID as a fallback.
       outputNodeId = nodes.keys.sorted { $0.localizedStandardCompare($1) == .orderedDescending }.first ?? "1"
     }
+
+    // --- Phase 3: Inpainting detection ---
+    // Detect inpaint workflows by finding ETN_LoadImageCache nodes.
+    // The first one is typically the input image, the second is the mask.
+    // Node connections determine which is image vs mask.
+    let (inpaintImageId, maskImageId) = extractInpaintImageIds(nodes: nodes)
 
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
@@ -138,8 +167,91 @@ enum ComfyBridgeWorkflowParser {
       guidance: cfg,
       seed: seed,
       batchSize: max(batchSize, 1),
-      outputNodeId: outputNodeId
+      outputNodeId: outputNodeId,
+      inpaintImageId: inpaintImageId,
+      maskImageId: maskImageId,
+      denoise: denoise
     )
+  }
+
+  // MARK: - Inpaint Detection
+
+  /// Extract inpaint image and mask IDs from ETN_LoadImageCache nodes.
+  ///
+  /// Heuristic: The plugin uploads images via PUT /api/etn/image/<id> where <id>
+  /// is a CRC32 hash. ETN_LoadImageCache nodes reference these by ID.
+  ///
+  /// To distinguish image from mask, we trace node connections:
+  /// - If a LoadImageCache feeds into VAEEncode or INPAINT_MaskedBlur → it's the image
+  /// - If a LoadImageCache feeds into SetLatentNoiseMask or INPAINT_ExpandMask → it's the mask
+  /// - Fallback: first by node ID order (lower = image, higher = mask)
+  private static func extractInpaintImageIds(nodes: [String: WorkflowNode]) -> (String?, String?) {
+    let loadCacheNodes = nodes.values
+      .filter { $0.classType == "ETN_LoadImageCache" }
+      .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+
+    guard !loadCacheNodes.isEmpty else { return (nil, nil) }
+
+    // Build reverse dependency map: for each node, which nodes consume its output?
+    var consumers: [String: [(nodeId: String, inputKey: String)]] = [:]
+    for (_, node) in nodes {
+      for (key, value) in node.inputs {
+        if let ref = value as? [Any], let refNodeId = ref.first as? String {
+          consumers[refNodeId, default: []].append((nodeId: node.id, inputKey: key))
+        }
+      }
+    }
+
+    var imageId: String?
+    var maskId: String?
+
+    for cacheNode in loadCacheNodes {
+      let id = cacheNode.inputs["id"] as? String ?? cacheNode.inputs["image_id"] as? String
+      guard let cacheId = id else { continue }
+
+      // Check what consumes this node's output.
+      let nodeConsumers = consumers[cacheNode.id] ?? []
+      var isImage = false
+      var isMask = false
+
+      for consumer in nodeConsumers {
+        let consumerNode = nodes[consumer.nodeId]
+        let consumerClass = consumerNode?.classType ?? ""
+
+        // Image consumers
+        if ["VAEEncode", "INPAINT_MaskedBlur", "INPAINT_ColorMatch",
+            "ETN_ApplyMaskToImage", "ZImageFunControlnet"].contains(consumerClass) {
+          if consumer.inputKey == "image" || consumer.inputKey == "inpaint_image" ||
+             consumer.inputKey == "pixels" || consumer.inputKey == "source" {
+            isImage = true
+          }
+          if consumer.inputKey == "mask" {
+            isMask = true
+          }
+        }
+
+        // Mask consumers
+        if ["SetLatentNoiseMask", "INPAINT_ExpandMask", "INPAINT_StabilizeMask",
+            "INPAINT_ShrinkMask", "DifferentialDiffusion"].contains(consumerClass) {
+          isMask = true
+        }
+        if consumer.inputKey == "mask" {
+          isMask = true
+        }
+      }
+
+      if isImage && !isMask {
+        imageId = cacheId
+      } else if isMask && !isImage {
+        maskId = cacheId
+      } else if imageId == nil {
+        imageId = cacheId  // Fallback: first = image
+      } else if maskId == nil {
+        maskId = cacheId   // Fallback: second = mask
+      }
+    }
+
+    return (imageId, maskId)
   }
 
   // MARK: - Node Graph Traversal

@@ -207,7 +207,10 @@ public final class WarmServer {
       steps: min(request.steps, 9),  // Z-Image Turbo: optimal at 9 steps, clamp plugin defaults
       guidance: 0.0,  // Z-Image Turbo: designed for cfg=0
       seed: request.seed,
-      outputPath: nil
+      outputPath: nil,
+      inpaintImageData: request.inpaintImageData,
+      maskData: request.maskImageData,
+      denoise: request.denoise
     )
 
     // Convert bridge progress callback to pipeline progress handler.
@@ -788,7 +791,7 @@ enum RoutedResponse {
   }
 }
 
-private struct GeneratePayload: Decodable, Sendable {
+private struct GeneratePayload: Sendable {
   let prompt: String
   let negativePrompt: String?
   let width: Int?
@@ -801,6 +804,55 @@ private struct GeneratePayload: Decodable, Sendable {
   let sigmaSchedule: String?
   let eta: Float?
   let dype: String?
+  // Phase 3: Inpainting data (set by bridge, not by HTTP API)
+  let inpaintImageData: Data?
+  let maskData: Data?
+  let denoise: Float?
+
+  /// Default memberwise init for bridge-created payloads.
+  init(
+    prompt: String, negativePrompt: String? = nil,
+    width: Int? = nil, height: Int? = nil, steps: Int? = nil,
+    guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
+    scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
+    dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
+    denoise: Float? = nil
+  ) {
+    self.prompt = prompt; self.negativePrompt = negativePrompt
+    self.width = width; self.height = height; self.steps = steps
+    self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
+    self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
+    self.eta = eta; self.dype = dype
+    self.inpaintImageData = inpaintImageData; self.maskData = maskData
+    self.denoise = denoise
+  }
+}
+
+extension GeneratePayload: Decodable {
+  private enum CodingKeys: String, CodingKey {
+    case prompt, negativePrompt, width, height, steps, guidance, seed
+    case outputPath, scheduler, sigmaSchedule, eta, dype
+    // inpaintImageData, maskData, denoise are excluded from JSON decoding
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    prompt = try c.decode(String.self, forKey: .prompt)
+    negativePrompt = try c.decodeIfPresent(String.self, forKey: .negativePrompt)
+    width = try c.decodeIfPresent(Int.self, forKey: .width)
+    height = try c.decodeIfPresent(Int.self, forKey: .height)
+    steps = try c.decodeIfPresent(Int.self, forKey: .steps)
+    guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
+    seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
+    outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
+    eta = try c.decodeIfPresent(Float.self, forKey: .eta)
+    dype = try c.decodeIfPresent(String.self, forKey: .dype)
+    inpaintImageData = nil
+    maskData = nil
+    denoise = nil
+  }
 
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
@@ -853,7 +905,10 @@ private struct GeneratePayload: Decodable, Sendable {
       schedulerKind: schedulerKind,
       sigmaSchedule: sigmaScheduleKind,
       eta: eta,
-      dyPE: dyPEConfig
+      dyPE: dyPEConfig,
+      inpaintImageData: inpaintImageData,
+      maskData: maskData,
+      denoise: denoise ?? 1.0
     )
   }
 }
