@@ -138,7 +138,7 @@ public final class ZImageRopeEmbedder {
       return MLX.concatenated(outputs, axis: 1)
     }
 
-// YaRN is not yet implemented — fall back to NTK with a warning.
+    // YaRN is not yet implemented — fall back to NTK with a warning.
     // YaRN adds timestep-aware damping on top of NTK. For now, NTK-only.
     if dyPE.method == .yarn {
       print("[DyPE] WARNING: YaRN method requested but not yet implemented — falling back to NTK scaling")
