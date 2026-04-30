@@ -10,7 +10,12 @@ import Logging
 
 /// Callback type for generating images via the warm server pipeline.
 /// Accepts a ComfyBridgeGenerateRequest and returns the output path + timing.
-typealias ComfyBridgeGenerateHandler = @Sendable (ComfyBridgeGenerateRequest) async throws -> ComfyBridgeGenerateResult
+/// Progress callback sent during generation — maps to WebSocket progress events.
+typealias ComfyBridgeProgressHandler = @Sendable (Int, Int) -> Void  // (stepIndex, totalSteps)
+
+/// Callback type for generating images via the warm server pipeline.
+/// Accepts a request and optional progress callback, returns output path + timing.
+typealias ComfyBridgeGenerateHandler = @Sendable (ComfyBridgeGenerateRequest, ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult
 
 /// Manages async generation execution and WebSocket event dispatch.
 final class ComfyBridgeExecutor {
@@ -92,7 +97,23 @@ final class ComfyBridgeExecutor {
 
     // --- Phase 3: run actual generation ---
     do {
-      let result = try await handler(request)
+      // Create a progress callback that sends WebSocket events.
+      let progressCallback: ComfyBridgeProgressHandler = { [wsManager, clientId = request.clientId, promptId = request.promptId] step, total in
+        let event: [String: Any] = [
+          "type": "progress",
+          "data": [
+            "prompt_id": promptId,
+            "value": step,
+            "max": total
+          ] as [String: Any]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: event),
+           let text = String(data: data, encoding: .utf8) {
+          wsManager.send(to: clientId, text: text)
+        }
+      }
+
+      let result = try await handler(request, progressCallback)
 
       // Read the output image.
       let outputURL = URL(fileURLWithPath: result.outputPath)
