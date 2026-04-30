@@ -87,7 +87,7 @@ final class ComfyWebSocketManager {
 
   /// Compute the Sec-WebSocket-Accept value per RFC 6455 Section 4.2.2.
   static func computeAcceptKey(from clientKey: String) -> String {
-    let magic = "258EAFA5-E914-47DA-95CA-5AB5DC11AD35"
+    let magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     let combined = clientKey + magic
     let data = Data(combined.utf8)
     let digest = Insecure.SHA1.hash(data: data)
