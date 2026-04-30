@@ -468,17 +468,14 @@ enum ComfyBridgeObjectInfo {
   }
 
   private static func zimageControlnetModels() -> [String] {
-    [
-      "z-image-turbo-fun-controlnet-union-2.1",
-      "z-image-turbo-fun-controlnet-tile-2.1",
-    ]
+    // Phase 3: no control model weights available yet.
+    // Empty list forces Krita to use latent-space inpainting fallback.
+    []
   }
 
   private static func zimageControlnetPatchModels() -> [String] {
-    [
-      "z-image-turbo-fun-controlnet-union-2.1",
-      "z-image-turbo-fun-controlnet-tile-2.1",
-    ]
+    // Phase 3: no control model weights available yet.
+    []
   }
 
   private static func zimageUpscaleModels() -> [String] {
