@@ -238,10 +238,11 @@ public final class ZImageTransformer2DModel: Module {
 
     // DyPE: recompute image frequencies with spatial scale factors
     if dyPEConfig.enabled, let imgPosIds = cached.imgPosIds {
-      // Compute scale: current spatial tokens vs base training resolution tokens
-      // Base: 1024px / patchSize(2) = 512 latent / 1 = 512 tokens per axis? No:
-      // baseResolution / (patchSize * latentDivisor) — but we use hTokens/wTokens directly
-      let baseTokens = Float(dyPEConfig.baseResolution / patchSize)  // 1024/2 = 512
+      // Compute scale: current spatial tokens vs base training resolution tokens.
+      // hTokens/wTokens are in latent-patch units: pixels / latentDivisor(8) / patchSize(2).
+      // Base must use the same units: 1024 / 8 / 2 = 64 tokens per axis at training res.
+      let latentDivisor = 8  // VAE downsampling factor
+      let baseTokens = Float(dyPEConfig.baseResolution / (latentDivisor * patchSize))  // 1024/16 = 64
       let hScale = Float(cached.hTokens) / baseTokens
       let wScale = Float(cached.wTokens) / baseTokens
 
