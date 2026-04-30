@@ -112,13 +112,33 @@ enum ComfyBridgeWorkflowParser {
 
     // --- Dimensions ---
     // For txt2img: from EmptySD3LatentImage/EmptyLatentImage node.
-    // For inpaint: from the input image (or fall back to latent node if present).
+    // For inpaint: from ImageCrop node (contains actual selection dimensions).
+    // Dimensions are rounded to nearest 16 for latent space alignment.
     let latentNode = nodes.values.first {
       $0.classType == "EmptySD3LatentImage" || $0.classType == "EmptyLatentImage"
     }
-    let width = intValue(latentNode?.inputs["width"]) ?? 1024
-    let height = intValue(latentNode?.inputs["height"]) ?? 1024
-    let batchSize = intValue(latentNode?.inputs["batch_size"]) ?? 1
+    let cropNode = nodes.values.first { $0.classType == "ImageCrop" }
+
+    let width: Int
+    let height: Int
+    let batchSize: Int
+
+    if let ln = latentNode {
+      // txt2img: dimensions from empty latent node
+      width = roundTo16(intValue(ln.inputs["width"]) ?? 1024)
+      height = roundTo16(intValue(ln.inputs["height"]) ?? 1024)
+      batchSize = intValue(ln.inputs["batch_size"]) ?? 1
+    } else if let cn = cropNode {
+      // Inpaint: dimensions from ImageCrop node (actual selection size)
+      width = roundTo16(intValue(cn.inputs["width"]) ?? 1024)
+      height = roundTo16(intValue(cn.inputs["height"]) ?? 1024)
+      batchSize = 1
+    } else {
+      // Fallback
+      width = 1024
+      height = 1024
+      batchSize = 1
+    }
 
     // --- Steps ---
     let schedulerNode = nodes.values.first { $0.classType == "BasicScheduler" }
@@ -287,6 +307,10 @@ enum ComfyBridgeWorkflowParser {
     if let i = value as? Int { return UInt64(i) }
     if let n = value as? NSNumber { return n.uint64Value }
     return nil
+  }
+
+  private static func roundTo16(_ value: Int) -> Int {
+    return ((value + 15) / 16) * 16
   }
 }
 
