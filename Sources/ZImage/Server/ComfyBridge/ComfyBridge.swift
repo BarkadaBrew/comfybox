@@ -78,8 +78,17 @@ final class ComfyBridge {
         }
       }
 
-      // Model info endpoint (placeholder for Phase 2+).
+      // Model info endpoint — returns metadata for our available models.
       if request.path.hasPrefix("/api/etn/model_info/") {
+        let folder = String(request.path.dropFirst("/api/etn/model_info/".count))
+        return handleModelInfo(folder: folder, queryString: request.queryString)
+      }
+
+      // Translation languages endpoint.
+      if request.path == "/api/etn/languages" {
+        if let data = try? JSONSerialization.data(withJSONObject: [] as [Any]) {
+          return .json(.rawJSON(status: 200, data: data))
+        }
         return .json(status: 200, payload: EmptyObject())
       }
 
@@ -236,6 +245,42 @@ final class ComfyBridge {
     }
 
     return .json(.binary(status: 200, contentType: "image/png", data: data))
+  }
+
+
+  // MARK: - GET /api/etn/model_info/{folder}
+
+  private func handleModelInfo(folder: String, queryString: String?) -> RoutedResponse {
+    // Parse offset/limit from query string for pagination.
+    var offset = 0
+    var limit = 8
+    if let qs = queryString {
+      for param in qs.split(separator: "&") {
+        let parts = param.split(separator: "=", maxSplits: 1)
+        if parts.count == 2 {
+          if parts[0] == "offset", let v = Int(parts[1]) { offset = v }
+          if parts[0] == "limit", let v = Int(parts[1]) { limit = v }
+        }
+      }
+    }
+
+    let models = ComfyBridgeModelInfo.models(for: folder)
+    let total = models.count
+
+    // Apply pagination.
+    let keys = Array(models.keys).sorted()
+    let pageKeys = Array(keys.dropFirst(offset).prefix(limit))
+    var page: [String: Any] = [:]
+    for key in pageKeys {
+      page[key] = models[key]
+    }
+    page["_meta"] = ["total": total]
+
+    if let data = try? JSONSerialization.data(withJSONObject: page) {
+      logger.info("ComfyBridge: /api/etn/model_info/\(folder) — \(pageKeys.count)/\(total) models (offset=\(offset))")
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize model_info"))
   }
 
   // MARK: - WebSocket Upgrade
