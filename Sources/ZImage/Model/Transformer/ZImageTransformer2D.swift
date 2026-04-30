@@ -20,6 +20,17 @@ public final class ZImageTransformer2DModel: Module {
   private var cache: TransformerCache?
   private var cacheKey: TransformerCacheKey?
 
+  /// DyPE configuration — set before generation to enable high-res RoPE scaling.
+  public var dyPEConfig: DyPEConfig = .disabled {
+    didSet {
+      ropeEmbedder.dyPE = dyPEConfig
+      // Invalidate cache when DyPE config changes
+      if oldValue.enabled != dyPEConfig.enabled || oldValue.method != dyPEConfig.method {
+        clearCache()
+      }
+    }
+  }
+
   public init(configuration: ZImageTransformerConfig) {
     self.configuration = configuration
     let outSize = min(configuration.dim, 256)
@@ -185,7 +196,8 @@ public final class ZImageTransformer2DModel: Module {
       capOriLen: capOriLen,
       patchSize: patchSize,
       fPatchSize: fPatchSize,
-      ropeEmbedder: ropeEmbedder
+      ropeEmbedder: ropeEmbedder,
+      retainImagePosIds: dyPEConfig.enabled
     )
 
     self.cache = newCache
@@ -214,7 +226,7 @@ public final class ZImageTransformer2DModel: Module {
     }
 
     let capOriLen = promptEmbeds.dim(1)
-    let cached = getOrBuildCache(
+    var cached = getOrBuildCache(
       batch: batch,
       height: height,
       width: width,
@@ -223,6 +235,24 @@ public final class ZImageTransformer2DModel: Module {
       patchSize: patchSize,
       fPatchSize: fPatchSize
     )
+
+    // DyPE: recompute image frequencies with spatial scale factors
+    if dyPEConfig.enabled, let imgPosIds = cached.imgPosIds {
+      // Compute scale: current spatial tokens vs base training resolution tokens.
+      // hTokens/wTokens are in latent-patch units: pixels / latentDivisor(8) / patchSize(2).
+      // Base must use the same units: 1024 / 8 / 2 = 64 tokens per axis at training res.
+      let latentDivisor = 8  // VAE downsampling factor
+      let baseTokens = Float(dyPEConfig.baseResolution / (latentDivisor * patchSize))  // 1024/16 = 64
+      let hScale = Float(cached.hTokens) / baseTokens
+      let wScale = Float(cached.wTokens) / baseTokens
+
+      if hScale > 1.0 || wScale > 1.0 {
+        let newImgFreqs = ropeEmbedder.imageFreqs(
+          ids: imgPosIds, hScale: hScale, wScale: wScale
+        )
+        cached = cached.withUpdatedImageFreqs(newImgFreqs)
+      }
+    }
 
     var latentsWithFrame = latents
     if !hasFrameDim {
@@ -235,6 +265,7 @@ public final class ZImageTransformer2DModel: Module {
     var capFeat = promptEmbeds
     if cached.capPad > 0 {
       let last = promptEmbeds[0..., capOriLen - 1, 0...]
+        .expandedDimensions(axis: 1)
       let pad = MLX.broadcast(last, to: [batch, cached.capPad, promptEmbeds.dim(2)])
       capFeat = MLX.concatenated([promptEmbeds, pad], axis: 1)
     }
@@ -253,6 +284,7 @@ public final class ZImageTransformer2DModel: Module {
 
     if cached.imgPad > 0 {
       let last = image[0..., cached.imageTokens - 1, 0...]
+        .expandedDimensions(axis: 1)
       let pad = MLX.broadcast(last, to: [batch, cached.imgPad, image.dim(2)])
       image = MLX.concatenated([image, pad], axis: 1)
     }

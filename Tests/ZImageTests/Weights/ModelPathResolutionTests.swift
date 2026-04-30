@@ -82,7 +82,62 @@ final class ModelPathResolutionTests: XCTestCase {
     XCTAssertEqual(defaultSelection.source, .defaultDirectory)
   }
 
-  func testPromptEncodingModeUsesChatForDefaultDirectoryEvenWhenSelectedExplicitly() throws {
+  func testPromptEncodingModeDefaultsToChatTemplateForAllSelections() throws {
+    // New contract (post-mosaic fix): every encoder directory routes through
+    // the chat template unless explicitly opted out. Previously, any
+    // non-default directory (including the auto-preferred
+    // "text_encoder QWen Large") silently flipped to `.plain`, which
+    // corrupted conditioning embeddings and produced mosaic artifacts.
+    let modelDir = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: modelDir) }
+
+    let standardDir = modelDir.appendingPathComponent("text_encoder")
+    let preferredDir = modelDir.appendingPathComponent("text_encoder QWen Large")
+    let customDir = modelDir.appendingPathComponent("encoder-override")
+    try makeDirectory(standardDir)
+    try makeDirectory(preferredDir)
+    try makeDirectory(customDir)
+    FileManager.default.createFile(atPath: standardDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
+    FileManager.default.createFile(atPath: preferredDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
+    FileManager.default.createFile(atPath: customDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
+
+    let defaultSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: nil,
+      environment: [:]
+    )
+    XCTAssertEqual(defaultSelection.source, .autoDetectedPreferred,
+      "with both dirs present, the preferred dir is auto-selected; that's the hot path that used to trigger the bug")
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: defaultSelection, environment: [:]),
+      .chatTemplate,
+      "auto-preferred QWen Large directory MUST now resolve to chatTemplate, not plain"
+    )
+
+    let overrideSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: customDir.path,
+      environment: [:]
+    )
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: overrideSelection, environment: [:]),
+      .chatTemplate,
+      "override path MUST route through chatTemplate by default"
+    )
+
+    let environmentSelection = ZImageFiles.resolveTextEncoderSelection(
+      at: modelDir,
+      overridePath: nil,
+      environment: ["ZIMAGE_ENCODER_PATH": standardDir.path]
+    )
+    XCTAssertEqual(
+      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: environmentSelection, environment: [:]),
+      .chatTemplate,
+      "env-selected path MUST route through chatTemplate by default"
+    )
+  }
+
+  func testPromptEncodingModeOptsOutToPlainWhenEnvRequests() throws {
     let modelDir = try makeTempDirectory()
     defer { try? FileManager.default.removeItem(at: modelDir) }
 
@@ -94,72 +149,49 @@ final class ModelPathResolutionTests: XCTestCase {
       attributes: nil
     )
 
-    let defaultSelection = ZImageFiles.resolveTextEncoderSelection(
+    let selection = ZImageFiles.resolveTextEncoderSelection(
       at: modelDir,
       overridePath: nil,
       environment: [:]
     )
     XCTAssertEqual(
-      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: defaultSelection),
-      .chatTemplate
+      ZImageFiles.resolvePromptEncodingMode(
+        at: modelDir,
+        selection: selection,
+        environment: ["ZIMAGE_PROMPT_MODE": "plain"]
+      ),
+      .plain,
+      "explicit opt-out via ZIMAGE_PROMPT_MODE=plain must be honored"
     )
 
-    let overrideSelection = ZImageFiles.resolveTextEncoderSelection(
-      at: modelDir,
-      overridePath: standardDir.path,
-      environment: [:]
-    )
     XCTAssertEqual(
-      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: overrideSelection),
-      .chatTemplate
+      ZImageFiles.resolvePromptEncodingMode(
+        at: modelDir,
+        selection: selection,
+        environment: ["ZIMAGE_PROMPT_MODE": "PLAIN"]
+      ),
+      .plain,
+      "opt-out is case-insensitive"
     )
 
-    let environmentSelection = ZImageFiles.resolveTextEncoderSelection(
-      at: modelDir,
-      overridePath: nil,
-      environment: ["ZIMAGE_ENCODER_PATH": standardDir.path]
-    )
     XCTAssertEqual(
-      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: environmentSelection),
-      .chatTemplate
+      ZImageFiles.resolvePromptEncodingMode(
+        at: modelDir,
+        selection: selection,
+        environment: ["ZIMAGE_PROMPT_MODE": "chat"]
+      ),
+      .chatTemplate,
+      "any value other than 'plain' preserves the default chatTemplate"
     )
-  }
 
-  func testPromptEncodingModeUsesPlainForNonDefaultEncoderDirectory() throws {
-    let modelDir = try makeTempDirectory()
-    defer { try? FileManager.default.removeItem(at: modelDir) }
-
-    let standardDir = modelDir.appendingPathComponent("text_encoder")
-    let preferredDir = modelDir.appendingPathComponent("text_encoder QWen Large")
-    let customDir = modelDir.appendingPathComponent("encoder-override")
-
-    try makeDirectory(standardDir)
-    try makeDirectory(preferredDir)
-    try makeDirectory(customDir)
-
-    FileManager.default.createFile(atPath: standardDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
-    FileManager.default.createFile(atPath: preferredDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
-    FileManager.default.createFile(atPath: customDir.appendingPathComponent("model.safetensors").path, contents: Data(), attributes: nil)
-
-    let autoSelection = ZImageFiles.resolveTextEncoderSelection(
-      at: modelDir,
-      overridePath: nil,
-      environment: [:]
-    )
-    XCTAssertEqual(autoSelection.source, .autoDetectedPreferred)
     XCTAssertEqual(
-      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: autoSelection),
-      .plain
-    )
-
-    let overrideSelection = ZImageFiles.resolveTextEncoderSelection(
-      at: modelDir,
-      overridePath: customDir.path,
-      environment: [:]
-    )
-    XCTAssertEqual(
-      ZImageFiles.resolvePromptEncodingMode(at: modelDir, selection: overrideSelection),
-      .plain
+      ZImageFiles.resolvePromptEncodingMode(
+        at: modelDir,
+        selection: selection,
+        environment: [:]
+      ),
+      .chatTemplate,
+      "unset env variable preserves the default chatTemplate"
     )
   }
 

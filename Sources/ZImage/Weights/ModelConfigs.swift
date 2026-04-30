@@ -1,5 +1,73 @@
 import Foundation
 
+// MARK: - DyPE Configuration
+
+/// DyPE (Dynamic Position Extrapolation) method for high-resolution generation.
+/// Modifies RoPE frequency bases at inference time to handle resolutions beyond training scale.
+public enum DyPEMethod: String, Codable, Sendable {
+  /// No extrapolation — use base RoPE frequencies (default behavior).
+  case none
+  /// NTK-aware frequency scaling — adjusts theta to spread frequencies.
+  case ntk
+  /// YaRN — NTK + linear interpolation blend with damping. Full DyPE pipeline.
+  case yarn
+}
+
+/// Configuration for DyPE high-resolution generation.
+public struct DyPEConfig: Codable, Sendable {
+  /// Whether DyPE is enabled. When false, all RoPE behavior is vanilla.
+  public var enabled: Bool
+
+  /// The extrapolation method. `.ntk` is simpler and faster; `.yarn` adds damping for better quality.
+  public var method: DyPEMethod
+
+  /// Base resolution the model was trained at (pixels). Used to compute the scale factor.
+  /// Default: 1024 (Z-Image-Turbo training resolution).
+  public var baseResolution: Int
+
+  /// YaRN damping range lower bound. Controls which frequency bands get interpolated vs extrapolated.
+  /// Only used when method == .yarn. Default: 1.0
+  public var beta0: Float
+
+  /// YaRN damping range upper bound. Default: 32.0
+  public var beta1: Float
+
+  /// YaRN timestep damping range lower bound. Default: 1.0
+  public var gamma0: Float
+
+  /// YaRN timestep damping range upper bound. Default: 32.0
+  public var gamma1: Float
+
+  public init(
+    enabled: Bool = false,
+    method: DyPEMethod = .ntk,
+    baseResolution: Int = 1024,
+    beta0: Float = 1.0,
+    beta1: Float = 32.0,
+    gamma0: Float = 1.0,
+    gamma1: Float = 32.0
+  ) {
+    self.enabled = enabled
+    self.method = method
+    self.baseResolution = baseResolution
+    self.beta0 = beta0
+    self.beta1 = beta1
+    self.gamma0 = gamma0
+    self.gamma1 = gamma1
+  }
+
+  /// Default config with DyPE disabled.
+  public static let disabled = DyPEConfig()
+
+  /// Default NTK-only config.
+  public static let ntk = DyPEConfig(enabled: true, method: .ntk)
+
+  /// Default YaRN config (full DyPE pipeline).
+  public static let yarn = DyPEConfig(enabled: true, method: .yarn)
+}
+
+// MARK: - Model Configs
+
 public struct ZImageTransformerConfig: Decodable {
   public let inChannels: Int
   public let dim: Int

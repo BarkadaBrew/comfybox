@@ -31,6 +31,20 @@ public struct ZImageGenerationRequest: Sendable {
   public var enhanceMaxTokens: Int
   public var forceTransformerOverrideOnly: Bool
 
+  /// The sampler algorithm to use for denoising. Default: `.euler`.
+  public var schedulerKind: SchedulerKind
+
+  /// The sigma schedule for noise level progression. Default: `.flow`.
+  public var sigmaSchedule: SigmaScheduleKind
+
+  /// Stochasticity parameter for DDIM (0 = deterministic, 1 = DDPM).
+  /// Also used by DPM++ 2S-A. Ignored by other samplers.
+  public var eta: Float?
+
+  /// DyPE (Dynamic Position Extrapolation) config for native high-resolution generation.
+  /// When enabled, modifies RoPE frequencies to support resolutions above training scale.
+  public var dyPE: DyPEConfig
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -47,7 +61,11 @@ public struct ZImageGenerationRequest: Sendable {
     loras: [LoRAConfiguration] = [],
     enhancePrompt: Bool = false,
     enhanceMaxTokens: Int = 512,
-    forceTransformerOverrideOnly: Bool = false
+    forceTransformerOverrideOnly: Bool = false,
+    schedulerKind: SchedulerKind = .euler,
+    sigmaSchedule: SigmaScheduleKind = .flow,
+    eta: Float? = nil,
+    dyPE: DyPEConfig = .disabled
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -64,6 +82,10 @@ public struct ZImageGenerationRequest: Sendable {
     self.enhancePrompt = enhancePrompt
     self.enhanceMaxTokens = enhanceMaxTokens
     self.forceTransformerOverrideOnly = forceTransformerOverrideOnly
+    self.schedulerKind = schedulerKind
+    self.sigmaSchedule = sigmaSchedule
+    self.eta = eta
+    self.dyPE = dyPE
   }
 }
 
@@ -830,18 +852,29 @@ public final class ZImagePipeline {
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
 
-    let scheduler = FlowMatchEulerScheduler(
+    var scheduler = SchedulerFactory.create(
+      kind: request.schedulerKind,
+      sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,
       config: modelConfigs.scheduler,
-      mu: modelConfigs.scheduler.useDynamicShifting ? mu : nil
+      mu: mu,
+      seed: request.seed,
+      eta: request.eta
     )
 
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
+    let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
 
-    logger.info("Running \(request.steps) denoising steps...")
+    logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue))...")
     do {
       guard let transformer = transformer else {
         throw PipelineError.transformerNotLoaded
+      }
+
+      // Configure DyPE for high-resolution generation
+      transformer.dyPEConfig = request.dyPE
+      if request.dyPE.enabled {
+        logger.info("DyPE enabled: \(request.dyPE.method.rawValue) (base \(request.dyPE.baseResolution)px → \(request.width)x\(request.height))")
       }
       for stepIndex in 0..<request.steps {
         try Task.checkCancellation()
@@ -852,12 +885,14 @@ public final class ZImagePipeline {
 
         var modelLatents = latents
         var embeds = promptEmbeds
+        var modelTimestep = timestepArray
         if doCFG, let ne = negativeEmbeds {
           modelLatents = MLX.concatenated([latents, latents], axis: 0)
           embeds = MLX.concatenated([promptEmbeds, ne], axis: 0)
+          modelTimestep = MLX.concatenated([timestepArray, timestepArray], axis: 0)
         }
 
-        let noisePred = transformer.forward(latents: modelLatents, timestep: timestepArray, promptEmbeds: embeds)
+        let noisePred = transformer.forward(latents: modelLatents, timestep: modelTimestep, promptEmbeds: embeds)
         let guidedNoise: MLXArray
         if doCFG, negativeEmbeds != nil {
           let batch = latents.dim(0)
@@ -868,7 +903,50 @@ public final class ZImagePipeline {
           guidedNoise = noisePred
         }
 
-        latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+        // Multi-evaluation schedulers (e.g. Heun) need a second model forward pass
+        if scheduler.requiresIntermediateEvaluation,
+           let intermediateSample = scheduler.intermediateStep(
+             modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
+           ) {
+          // Derive timestep at the intermediate point (sigma[stepIndex+1])
+          let nextSigma = scheduler.sigmas[stepIndex + 1].item(Float.self)
+          let intermediateTimestepValue = nextSigma * numTrainTimestepsF
+          let intermediateNormalized = (1000.0 - intermediateTimestepValue) / 1000.0
+          let intermediateTimestepArray = MLXArray([intermediateNormalized], [1])
+
+          var intermediateModelLatents = intermediateSample
+          var intermediateEmbeds = promptEmbeds
+          var intermediateModelTimestep = intermediateTimestepArray
+          if doCFG, let ne = negativeEmbeds {
+            intermediateModelLatents = MLX.concatenated([intermediateSample, intermediateSample], axis: 0)
+            intermediateEmbeds = MLX.concatenated([promptEmbeds, ne], axis: 0)
+            intermediateModelTimestep = MLX.concatenated([intermediateTimestepArray, intermediateTimestepArray], axis: 0)
+          }
+
+          let intermediateNoisePred = transformer.forward(
+            latents: intermediateModelLatents,
+            timestep: intermediateModelTimestep,
+            promptEmbeds: intermediateEmbeds
+          )
+          let intermediateGuidedNoise: MLXArray
+          if doCFG, negativeEmbeds != nil {
+            let batch = latents.dim(0)
+            let positive = intermediateNoisePred[0 ..< batch, 0..., 0..., 0...]
+            let negative = intermediateNoisePred[batch ..< batch * 2, 0..., 0..., 0...]
+            intermediateGuidedNoise = positive + request.guidanceScale * (positive - negative)
+          } else {
+            intermediateGuidedNoise = intermediateNoisePred
+          }
+
+          latents = scheduler.finalizeStep(
+            originalOutput: -guidedNoise,
+            intermediateOutput: -intermediateGuidedNoise,
+            timestepIndex: stepIndex,
+            sample: latents
+          )
+        } else {
+          latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+        }
         MLX.eval(latents)
       }
       transformer.clearCache()
