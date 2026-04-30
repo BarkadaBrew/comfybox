@@ -4,6 +4,7 @@
 // so the Krita AI Diffusion plugin can connect directly.
 //
 // Phase 1: Discovery endpoints (static responses) + WebSocket skeleton + image cache.
+// Phase 2: Workflow parsing + async generation + WebSocket progress events.
 
 import Foundation
 import Logging
@@ -13,12 +14,16 @@ import Network
 /// ComfyUI protocol bridge — translates ComfyUI API calls into ZImageCLI operations.
 ///
 /// Phase 1 implements discovery endpoints that satisfy the Krita plugin's connection
-/// handshake and node validation. The bridge is designed as a clean layer that can be
-/// enabled/disabled without affecting the existing `/v1/generate` API.
+/// handshake and node validation. Phase 2 adds workflow parsing and actual generation
+/// routed through the warm server pipeline.
 final class ComfyBridge {
   private let logger: Logger
   let wsManager: ComfyWebSocketManager
-  private let imageCache: ComfyImageCache
+  let imageCache: ComfyImageCache
+
+  /// The executor handles async generation and WebSocket event dispatch.
+  /// Configured after init via `configureExecutor()`.
+  private(set) var executor: ComfyBridgeExecutor?
 
   // Lazily built and cached on first request. Guarded by cacheLock.
   private let cacheLock = NSLock()
@@ -29,6 +34,18 @@ final class ComfyBridge {
     self.logger = logger
     self.wsManager = ComfyWebSocketManager(logger: logger)
     self.imageCache = ComfyImageCache(logger: logger)
+  }
+
+  /// Configure the executor with a generation handler.
+  /// Called by WarmServer after init to wire in the coordinator.
+  func configureExecutor(generateHandler: @escaping ComfyBridgeGenerateHandler) {
+    self.executor = ComfyBridgeExecutor(
+      logger: logger,
+      wsManager: wsManager,
+      imageCache: imageCache,
+      generateHandler: generateHandler
+    )
+    logger.info("ComfyBridge: executor configured — Phase 2 generation enabled")
   }
 
   // MARK: - Route Dispatch
@@ -78,13 +95,13 @@ final class ComfyBridge {
         }
       }
 
-      // Model info endpoint — returns metadata for our available models.
+      // Model info endpoint with pagination.
       if request.path.hasPrefix("/api/etn/model_info/") {
         let folder = String(request.path.dropFirst("/api/etn/model_info/".count))
         return handleModelInfo(folder: folder, queryString: request.queryString)
       }
 
-      // Translation languages endpoint.
+      // Languages endpoint.
       if request.path == "/api/etn/languages" {
         if let data = try? JSONSerialization.data(withJSONObject: [] as [Any]) {
           return .json(.rawJSON(status: 200, data: data))
@@ -110,8 +127,6 @@ final class ComfyBridge {
     let deviceName = queryMetalDeviceName()
     let totalMemory = ProcessInfo.processInfo.physicalMemory
 
-    // Build the response manually to avoid snake_case encoding of the fields
-    // that ComfyUI expects in their exact casing.
     let stats: [String: Any] = [
       "devices": [
         [
@@ -133,7 +148,6 @@ final class ComfyBridge {
     return .error(.error(status: 500, message: "Failed to serialize system_stats"))
   }
 
-  /// Query the Metal device name. Falls back to a sensible default.
   private func queryMetalDeviceName() -> String {
     if let device = MTLCreateSystemDefaultDevice() {
       return device.name
@@ -168,9 +182,9 @@ final class ComfyBridge {
   // MARK: - GET /queue
 
   private func handleGetQueue() -> RoutedResponse {
-    // Phase 1: always report empty queues.
+    let isRunning = executor?.isExecuting ?? false
     let queue: [String: Any] = [
-      "queue_running": [] as [Any],
+      "queue_running": isRunning ? [["placeholder"]] as [Any] : [] as [Any],
       "queue_pending": [] as [Any]
     ]
     if let data = try? JSONSerialization.data(withJSONObject: queue) {
@@ -182,14 +196,12 @@ final class ComfyBridge {
   // MARK: - POST /queue (delete queued jobs)
 
   private func handlePostQueue() -> RoutedResponse {
-    // Phase 1: acknowledge the delete request, nothing to cancel.
     return .json(status: 200, payload: EmptyObject())
   }
 
   // MARK: - POST /prompt
 
   private func handlePrompt(_ request: HTTPRequest) -> RoutedResponse {
-    // Phase 1: validate the shape, echo back prompt_id, don't execute.
     guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
       return .error(.error(status: 400, message: "Invalid JSON body"))
     }
@@ -203,14 +215,35 @@ final class ComfyBridge {
     }
 
     let clientId = json["client_id"] as? String ?? "unknown"
-    logger.info("ComfyBridge: /prompt received — prompt_id=\(promptId), client_id=\(clientId)")
 
-    // Phase 2 will extract workflow parameters and route to the pipeline.
-    // For now, just acknowledge.
-    let response: [String: Any] = [
-      "prompt_id": promptId
-    ]
+    // Phase 2: parse the workflow and dispatch async generation.
+    guard let executor = executor else {
+      // No executor configured — acknowledge but don't generate (Phase 1 behavior).
+      logger.info("ComfyBridge: /prompt received (no executor) — prompt_id=\(promptId), client_id=\(clientId)")
+      let response: [String: Any] = ["prompt_id": promptId]
+      if let data = try? JSONSerialization.data(withJSONObject: response) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize prompt response"))
+    }
 
+    // Parse the workflow into generation parameters.
+    let generateRequest: ComfyBridgeGenerateRequest
+    do {
+      generateRequest = try ComfyBridgeWorkflowParser.parse(json)
+    } catch {
+      logger.error("ComfyBridge: workflow parse failed — \(error)")
+      return .error(.error(status: 400, message: "Workflow parse error: \(error)"))
+    }
+
+    logger.info("ComfyBridge: /prompt — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, cfg=\(generateRequest.guidance), seed=\(generateRequest.seed.map(String.init) ?? "random")")
+
+    // Acknowledge immediately — generation runs async via WebSocket events.
+    Task {
+      await executor.execute(generateRequest)
+    }
+
+    let response: [String: Any] = ["prompt_id": promptId]
     if let data = try? JSONSerialization.data(withJSONObject: response) {
       return .json(.rawJSON(status: 200, data: data))
     }
@@ -220,8 +253,11 @@ final class ComfyBridge {
   // MARK: - POST /interrupt
 
   private func handleInterrupt() -> RoutedResponse {
-    // Phase 1: acknowledge, nothing to cancel yet.
-    logger.info("ComfyBridge: /interrupt received (no active job)")
+    if let executor, executor.interrupt() {
+      logger.info("ComfyBridge: /interrupt — active generation interrupted")
+    } else {
+      logger.info("ComfyBridge: /interrupt — no active generation")
+    }
     return .json(status: 200, payload: EmptyObject())
   }
 
@@ -247,29 +283,31 @@ final class ComfyBridge {
     return .json(.binary(status: 200, contentType: "image/png", data: data))
   }
 
-
-  // MARK: - GET /api/etn/model_info/{folder}
+  // MARK: - Model Info
 
   private func handleModelInfo(folder: String, queryString: String?) -> RoutedResponse {
-    // Parse offset/limit from query string for pagination.
     var offset = 0
     var limit = 8
+
     if let qs = queryString {
-      for param in qs.split(separator: "&") {
-        let parts = param.split(separator: "=", maxSplits: 1)
-        if parts.count == 2 {
-          if parts[0] == "offset", let v = Int(parts[1]) { offset = v }
-          if parts[0] == "limit", let v = Int(parts[1]) { limit = v }
+      for pair in qs.split(separator: "&") {
+        let parts = pair.split(separator: "=", maxSplits: 1)
+        guard parts.count == 2 else { continue }
+        let key = String(parts[0])
+        let val = String(parts[1])
+        switch key {
+        case "offset": offset = max(0, Int(val) ?? 0)
+        case "limit": limit = max(1, min(100, Int(val) ?? 8))
+        default: break
         }
       }
     }
 
     let models = ComfyBridgeModelInfo.models(for: folder)
     let total = models.count
-
-    // Apply pagination.
     let keys = Array(models.keys).sorted()
     let pageKeys = Array(keys.dropFirst(offset).prefix(limit))
+
     var page: [String: Any] = [:]
     for key in pageKeys {
       page[key] = models[key]
@@ -277,7 +315,6 @@ final class ComfyBridge {
     page["_meta"] = ["total": total]
 
     if let data = try? JSONSerialization.data(withJSONObject: page) {
-      logger.info("ComfyBridge: /api/etn/model_info/\(folder) — \(pageKeys.count)/\(total) models (offset=\(offset))")
       return .json(.rawJSON(status: 200, data: data))
     }
     return .error(.error(status: 500, message: "Failed to serialize model_info"))
@@ -286,31 +323,20 @@ final class ComfyBridge {
   // MARK: - WebSocket Upgrade
 
   /// Build the HTTP 101 WebSocket upgrade response for a validated request.
-  /// Returns the raw response bytes to send, or nil if the request is not a valid upgrade.
-  ///
-  /// Validates RFC 6455 Section 4.2.1 requirements:
-  /// - Upgrade: websocket header present
-  /// - Connection header contains "Upgrade"
-  /// - Sec-WebSocket-Key is a valid 16-byte base64 value
-  /// - Sec-WebSocket-Version is 13
   func handleWebSocketUpgrade(request: HTTPRequest, connection: NWConnection, queue: DispatchQueue) -> Data? {
-    // Validate Upgrade header.
     guard request.headers["upgrade"]?.lowercased() == "websocket" else {
       return nil
     }
 
-    // Validate Connection header contains "Upgrade" (case-insensitive, may be comma-separated).
     guard let connectionHeader = request.headers["connection"],
           connectionHeader.lowercased().contains("upgrade") else {
       return nil
     }
 
-    // Validate Sec-WebSocket-Version is 13.
     guard request.headers["sec-websocket-version"] == "13" else {
       return nil
     }
 
-    // Validate Sec-WebSocket-Key is present and is a valid 16-byte base64 value.
     guard let wsKey = request.headers["sec-websocket-key"],
           let decoded = Data(base64Encoded: wsKey),
           decoded.count == 16 else {
