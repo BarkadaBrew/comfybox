@@ -20,7 +20,8 @@ final class ComfyBridge {
   let wsManager: ComfyWebSocketManager
   private let imageCache: ComfyImageCache
 
-  // Lazily built and cached on first request.
+  // Lazily built and cached on first request. Guarded by cacheLock.
+  private let cacheLock = NSLock()
   private var cachedSystemStats: Data?
   private var cachedObjectInfo: Data?
 
@@ -89,7 +90,11 @@ final class ComfyBridge {
   // MARK: - GET /system_stats
 
   private func handleSystemStats() -> RoutedResponse {
-    if let cached = cachedSystemStats {
+    cacheLock.lock()
+    let cached = cachedSystemStats
+    cacheLock.unlock()
+
+    if let cached {
       return .json(.rawJSON(status: 200, data: cached))
     }
 
@@ -109,7 +114,9 @@ final class ComfyBridge {
     ]
 
     if let data = try? JSONSerialization.data(withJSONObject: stats) {
+      cacheLock.lock()
       cachedSystemStats = data
+      cacheLock.unlock()
       logger.info("ComfyBridge: /system_stats — \(deviceName), \(totalMemory / (1024*1024*1024))GB")
       return .json(.rawJSON(status: 200, data: data))
     }
@@ -128,14 +135,20 @@ final class ComfyBridge {
   // MARK: - GET /object_info
 
   private func handleObjectInfo() -> RoutedResponse {
-    if let cached = cachedObjectInfo {
+    cacheLock.lock()
+    let cached = cachedObjectInfo
+    cacheLock.unlock()
+
+    if let cached {
       return .json(.rawJSON(status: 200, data: cached))
     }
 
     let info = ComfyBridgeObjectInfo.build()
 
     if let data = try? JSONSerialization.data(withJSONObject: info) {
+      cacheLock.lock()
       cachedObjectInfo = data
+      cacheLock.unlock()
       logger.info("ComfyBridge: /object_info — \(info.count) nodes declared")
       return .json(.rawJSON(status: 200, data: data))
     }
@@ -210,7 +223,9 @@ final class ComfyBridge {
       return .error(.error(status: 400, message: "Empty image body"))
     }
 
-    imageCache.store(id: id, data: body)
+    guard imageCache.store(id: id, data: body) else {
+      return .error(.error(status: 500, message: "Failed to persist image \(id)"))
+    }
     logger.info("ComfyBridge: stored image \(id) (\(body.count) bytes)")
     return .json(status: 200, payload: EmptyObject())
   }
@@ -227,9 +242,33 @@ final class ComfyBridge {
 
   /// Build the HTTP 101 WebSocket upgrade response for a validated request.
   /// Returns the raw response bytes to send, or nil if the request is not a valid upgrade.
+  ///
+  /// Validates RFC 6455 Section 4.2.1 requirements:
+  /// - Upgrade: websocket header present
+  /// - Connection header contains "Upgrade"
+  /// - Sec-WebSocket-Key is a valid 16-byte base64 value
+  /// - Sec-WebSocket-Version is 13
   func handleWebSocketUpgrade(request: HTTPRequest, connection: NWConnection, queue: DispatchQueue) -> Data? {
-    guard request.headers["upgrade"]?.lowercased() == "websocket",
-          let wsKey = request.headers["sec-websocket-key"] else {
+    // Validate Upgrade header.
+    guard request.headers["upgrade"]?.lowercased() == "websocket" else {
+      return nil
+    }
+
+    // Validate Connection header contains "Upgrade" (case-insensitive, may be comma-separated).
+    guard let connectionHeader = request.headers["connection"],
+          connectionHeader.lowercased().contains("upgrade") else {
+      return nil
+    }
+
+    // Validate Sec-WebSocket-Version is 13.
+    guard request.headers["sec-websocket-version"] == "13" else {
+      return nil
+    }
+
+    // Validate Sec-WebSocket-Key is present and is a valid 16-byte base64 value.
+    guard let wsKey = request.headers["sec-websocket-key"],
+          let decoded = Data(base64Encoded: wsKey),
+          decoded.count == 16 else {
       return nil
     }
 

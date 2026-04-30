@@ -97,7 +97,8 @@ final class ComfyWebSocketManager {
 
 // MARK: - WebSocket Connection
 
-/// A single WebSocket connection handling RFC 6455 framing.
+/// A single WebSocket connection handling RFC 6455 framing with proper
+/// buffering, extended payload lengths, and continuation frame support.
 private final class WebSocketConnection {
   private let clientId: String
   private let connection: NWConnection
@@ -108,6 +109,16 @@ private final class WebSocketConnection {
   private var isActive = true
   /// Self-retention to keep the connection alive while frames are being processed.
   private var retainSelf: WebSocketConnection?
+
+  /// Receive buffer for assembling frames from partial TCP reads.
+  private var receiveBuffer = Data()
+  /// Buffer for reassembling fragmented messages (continuation frames).
+  private var fragmentBuffer = Data()
+  /// Opcode of the first frame in a fragmented sequence.
+  private var fragmentOpcode: WebSocketOpcode?
+
+  /// Maximum single message size (16 MB) to prevent memory exhaustion.
+  private static let maxMessageSize = 16 * 1024 * 1024
 
   init(
     clientId: String,
@@ -128,7 +139,7 @@ private final class WebSocketConnection {
     // Send the initial status message that triggers Krita's "connected" event.
     let statusMsg = #"{"type":"status"}"#
     sendText(statusMsg)
-    receiveFrame()
+    receiveLoop()
   }
 
   func close() {
@@ -167,12 +178,15 @@ private final class WebSocketConnection {
 
   // MARK: - Receive
 
-  private func receiveFrame() {
+  private func receiveLoop() {
     guard isActive else { return }
 
-    // Read at least 2 bytes (minimum WebSocket frame header).
-    connection.receive(minimumIncompleteLength: 2, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
       guard let self, self.isActive else { return }
+
+      if let data, !data.isEmpty {
+        self.receiveBuffer.append(data)
+      }
 
       if isComplete || error != nil {
         self.close()
@@ -180,41 +194,127 @@ private final class WebSocketConnection {
         return
       }
 
-      guard let data, data.count >= 2 else {
-        self.receiveFrame()
-        return
-      }
-
-      self.handleReceivedData(data)
-      self.receiveFrame()
+      // Parse as many complete frames as possible from the buffer.
+      self.drainFrames()
+      self.receiveLoop()
     }
   }
 
-  private func handleReceivedData(_ data: Data) {
-    let byte0 = data[data.startIndex]
+  /// Parse and handle all complete frames currently in the receive buffer.
+  private func drainFrames() {
+    while isActive {
+      guard let frame = parseFrame() else { break }
+      handleFrame(frame)
+    }
+  }
+
+  /// Attempt to parse one WebSocket frame from the receive buffer.
+  /// Returns nil if the buffer does not contain a complete frame.
+  /// Consumes the frame bytes from the buffer on success.
+  private func parseFrame() -> ParsedFrame? {
+    let buf = receiveBuffer
+    guard buf.count >= 2 else { return nil }
+
+    let byte0 = buf[buf.startIndex]
+    let byte1 = buf[buf.startIndex + 1]
+
+    let fin = (byte0 & 0x80) != 0
     let opcode = WebSocketOpcode(rawValue: byte0 & 0x0F) ?? .text
+    let masked = (byte1 & 0x80) != 0
+    let lengthField = byte1 & 0x7F
 
-    switch opcode {
-    case .ping:
-      // Respond with pong, echoing the payload.
-      let maskBit = data[data.startIndex + 1]
-      let payloadLength = Int(maskBit & 0x7F)
-      let maskStart = data.startIndex + 2
-      let dataStart = maskStart + (maskBit & 0x80 != 0 ? 4 : 0)
+    var headerSize = 2
+    var payloadLength: Int
 
-      if dataStart + payloadLength <= data.endIndex {
-        var payload = Data(data[dataStart..<(dataStart + payloadLength)])
-        // Unmask if masked (client frames are always masked per RFC 6455).
-        if maskBit & 0x80 != 0, maskStart + 4 <= data.endIndex {
-          let mask = Array(data[maskStart..<(maskStart + 4)])
-          for i in 0..<payload.count {
-            payload[payload.startIndex + i] ^= mask[i % 4]
-          }
-        }
-        sendPong(payload: payload)
-      } else {
-        sendPong(payload: Data())
+    if lengthField < 126 {
+      payloadLength = Int(lengthField)
+    } else if lengthField == 126 {
+      // 16-bit extended payload length.
+      guard buf.count >= 4 else { return nil }
+      payloadLength = Int(buf[buf.startIndex + 2]) << 8 | Int(buf[buf.startIndex + 3])
+      headerSize = 4
+    } else {
+      // 64-bit extended payload length.
+      guard buf.count >= 10 else { return nil }
+      payloadLength = 0
+      for i in 0..<8 {
+        payloadLength = (payloadLength << 8) | Int(buf[buf.startIndex + 2 + i])
       }
+      headerSize = 10
+
+      // Sanity check — reject frames larger than our limit.
+      if payloadLength > Self.maxMessageSize {
+        logger.warning("ComfyWS: frame too large (\(payloadLength) bytes), closing \(clientId)")
+        closeWithProtocolError()
+        return nil
+      }
+    }
+
+    let maskSize = masked ? 4 : 0
+    let totalFrameSize = headerSize + maskSize + payloadLength
+
+    guard buf.count >= totalFrameSize else { return nil }
+
+    // Extract and unmask payload.
+    let maskStart = buf.startIndex + headerSize
+    let dataStart = maskStart + maskSize
+
+    var payload = Data(buf[dataStart..<(dataStart + payloadLength)])
+    if masked {
+      let mask = Array(buf[maskStart..<(maskStart + 4)])
+      for i in 0..<payload.count {
+        payload[payload.startIndex + i] ^= mask[i % 4]
+      }
+    }
+
+    // Consume the frame from the buffer.
+    receiveBuffer.removeSubrange(receiveBuffer.startIndex..<(receiveBuffer.startIndex + totalFrameSize))
+
+    return ParsedFrame(fin: fin, opcode: opcode, payload: payload)
+  }
+
+  /// Handle a fully parsed WebSocket frame, including fragmentation reassembly.
+  private func handleFrame(_ frame: ParsedFrame) {
+    switch frame.opcode {
+    case .continuation:
+      // Continuation frame — append to fragment buffer.
+      guard fragmentOpcode != nil else {
+        logger.warning("ComfyWS: unexpected continuation frame for \(clientId)")
+        closeWithProtocolError()
+        return
+      }
+      fragmentBuffer.append(frame.payload)
+      if fragmentBuffer.count > Self.maxMessageSize {
+        logger.warning("ComfyWS: fragmented message too large for \(clientId)")
+        closeWithProtocolError()
+        return
+      }
+      if frame.fin {
+        // Reassembly complete.
+        let completePayload = fragmentBuffer
+        let opcode = fragmentOpcode!
+        fragmentBuffer.removeAll()
+        fragmentOpcode = nil
+        handleMessage(opcode: opcode, payload: completePayload)
+      }
+
+    case .text, .binary:
+      if frame.fin {
+        // Single-frame message.
+        handleMessage(opcode: frame.opcode, payload: frame.payload)
+      } else {
+        // First frame of a fragmented message.
+        fragmentOpcode = frame.opcode
+        fragmentBuffer = frame.payload
+      }
+
+    case .ping:
+      // Control frames may appear between fragmented data frames.
+      sendPong(payload: frame.payload)
+
+    case .pong:
+      // Received pong — connection is alive, nothing to do.
+      break
 
     case .close:
       // Send close frame back and tear down.
@@ -225,16 +325,29 @@ private final class WebSocketConnection {
           self?.onClose(clientId)
         }
       })
-
-    case .text, .binary:
-      // Phase 1: log and ignore incoming data frames.
-      // Phase 2 may need to handle client commands.
-      break
-
-    case .pong:
-      // Received pong — connection is alive, nothing to do.
-      break
     }
+  }
+
+  /// Handle a complete (possibly reassembled) WebSocket message.
+  private func handleMessage(opcode: WebSocketOpcode, payload: Data) {
+    // Phase 1: log and ignore incoming data frames.
+    // Phase 2 may need to handle client commands.
+    _ = opcode
+    _ = payload
+  }
+
+  private func closeWithProtocolError() {
+    // Send close frame with 1002 (protocol error) status code.
+    var payload = Data()
+    payload.append(UInt8(1002 >> 8))
+    payload.append(UInt8(1002 & 0xFF))
+    let frame = encodeFrame(opcode: .close, payload: payload)
+    connection.send(content: frame, completion: .contentProcessed { [weak self] _ in
+      self?.close()
+      if let clientId = self?.clientId {
+        self?.onClose(clientId)
+      }
+    })
   }
 
   private func sendPong(payload: Data) {
@@ -271,9 +384,18 @@ private final class WebSocketConnection {
   }
 }
 
+// MARK: - Parsed Frame
+
+private struct ParsedFrame {
+  let fin: Bool
+  let opcode: WebSocketOpcode
+  let payload: Data
+}
+
 // MARK: - WebSocket Opcodes
 
 private enum WebSocketOpcode: UInt8 {
+  case continuation = 0x0
   case text = 0x1
   case binary = 0x2
   case close = 0x8

@@ -594,24 +594,27 @@ private final class ConnectionHandler {
     }
 
     // Check for WebSocket upgrade before entering the async router.
-    if request.path == "/ws",
-       request.method == "GET",
-       let wsResponse = server.comfyBridge.handleWebSocketUpgrade(request: request, connection: connection, queue: queue) {
-      // Send the upgrade response, then keep the connection alive for WebSocket framing.
-      guard !responseSent else { return }
-      responseSent = true
-      connection.send(content: wsResponse, completion: .contentProcessed { [weak self] _ in
-        guard let self, let server = self.server else { return }
-        let clientId = request.queryParameters["clientId"] ?? UUID().uuidString
-        server.comfyBridge.wsManager.registerConnection(
-          clientId: clientId,
-          connection: self.connection,
-          queue: self.queue
-        )
-        // Release the ConnectionHandler — the WS manager now owns the NWConnection.
-        // Do NOT cancel the connection; only release our retain cycle.
-        self.retainSelf = nil
-      })
+    if request.path == "/ws", request.method == "GET" {
+      if let wsResponse = server.comfyBridge.handleWebSocketUpgrade(request: request, connection: connection, queue: queue) {
+        // Send the upgrade response, then keep the connection alive for WebSocket framing.
+        guard !responseSent else { return }
+        responseSent = true
+        connection.send(content: wsResponse, completion: .contentProcessed { [weak self] _ in
+          guard let self, let server = self.server else { return }
+          let clientId = request.queryParameters["clientId"] ?? UUID().uuidString
+          server.comfyBridge.wsManager.registerConnection(
+            clientId: clientId,
+            connection: self.connection,
+            queue: self.queue
+          )
+          // Release the ConnectionHandler — the WS manager now owns the NWConnection.
+          // Do NOT cancel the connection; only release our retain cycle.
+          self.retainSelf = nil
+        })
+      } else {
+        // Invalid WebSocket upgrade request — send 400 and close.
+        finish(with: .error(status: 400, message: "Invalid WebSocket upgrade request"))
+      }
       return
     }
 
@@ -625,7 +628,8 @@ private final class ConnectionHandler {
       case .shutdown(let response):
         self.finish(with: response, shutdownAfterSend: true)
       case .websocketUpgrade:
-        break // Already handled above; should not reach here.
+        // Should not reach here — /ws is handled above before async dispatch.
+        self.finish(with: .error(status: 400, message: "Invalid WebSocket upgrade request"))
       }
     }
   }
