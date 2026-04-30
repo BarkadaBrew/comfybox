@@ -121,7 +121,7 @@ enum ComfyBridgeObjectInfo {
     info["IPAdapter"] = nodeDefinition(
       required: [
         "model": modelInput(),
-        "ipadapter": stringInput(),
+        "ipadapter": ipadapterInput(),
         "image": imageInput(),
       ],
       optional: [
@@ -183,7 +183,12 @@ enum ComfyBridgeObjectInfo {
     // --- Z-Image custom nodes ---
     info["NunchakuZImageDiTLoader"] = nodeDefinition(
       required: [
-        "unet_name": optionInput(zimageUnetModels()),
+        "model_name": optionInput(zimageUnetModels()),
+      ],
+      optional: [
+        "cpu_offload": optionInput(["disable", "enable"]),
+        "num_blocks_on_gpu": intInput(default: 0),
+        "use_pin_memory": optionInput(["disable", "enable"]),
       ],
       outputs: ["MODEL"]
     )
@@ -196,7 +201,7 @@ enum ComfyBridgeObjectInfo {
     info["ZImageFunControlnet"] = nodeDefinition(
       required: [
         "model": modelInput(),
-        "model_patch": stringInput(),
+        "model_patch": modelPatchInput(),
         "inpaint_image": imageInput(),
         "mask": maskInput(),
         "vae": vaeInput(),
@@ -302,6 +307,38 @@ enum ComfyBridgeObjectInfo {
       outputs: ["MODEL"]
     )
 
+    // --- Additional loader nodes (probed by Krita during connect/resource discovery) ---
+    info["CLIPVisionLoader"] = nodeDefinition(
+      required: [:],
+      optional: [
+        "clip_name": optionInput(zimageClipVisionModels()),
+      ],
+      outputs: ["CLIP_VISION"]
+    )
+    info["StyleModelLoader"] = nodeDefinition(
+      required: [:],
+      optional: [
+        "style_model_name": optionInput(zimageStyleModels()),
+      ],
+      outputs: ["STYLE_MODEL"]
+    )
+    info["LoraLoader"] = nodeDefinition(
+      required: [
+        "model": modelInput(),
+        "clip": clipInput(),
+        "lora_name": optionInput(zimageLoraModels()),
+        "strength_model": floatInput(default: 1.0),
+        "strength_clip": floatInput(default: 1.0),
+      ],
+      outputs: ["MODEL", "CLIP"]
+    )
+    info["INPAINT_LoadInpaintModel"] = nodeDefinition(
+      required: [
+        "model_name": stringInput(),
+      ],
+      outputs: ["INPAINT_MODEL"]
+    )
+
     // --- Image utility nodes ---
     info["ETN_ApplyMaskToImage"] = nodeDefinition(
       required: [
@@ -322,7 +359,7 @@ enum ComfyBridgeObjectInfo {
     )
     info["ImageUpscaleWithModel"] = nodeDefinition(
       required: [
-        "upscale_model": stringInput(),
+        "upscale_model": upscaleModelInput(),
         "image": imageInput(),
       ],
       outputs: ["IMAGE"]
@@ -383,6 +420,9 @@ enum ComfyBridgeObjectInfo {
   private static func guiderInput() -> [Any] { return ["GUIDER"] }
   private static func samplerInput() -> [Any] { return ["SAMPLER"] }
   private static func sigmasInput() -> [Any] { return ["SIGMAS"] }
+  private static func ipadapterInput() -> [Any] { return ["IPADAPTER"] }
+  private static func modelPatchInput() -> [Any] { return ["MODEL_PATCH"] }
+  private static func upscaleModelInput() -> [Any] { return ["UPSCALE_MODEL"] }
 
   // MARK: - Model Discovery
 
@@ -431,5 +471,22 @@ enum ComfyBridgeObjectInfo {
       "4x-UltraSharp",
       "RealESRGAN_x4",
     ]
+  }
+
+  private static func zimageClipVisionModels() -> [String] {
+    [
+      "clip-vit-large-patch14",
+    ]
+  }
+
+  private static func zimageStyleModels() -> [String] {
+    [
+      "style-model-default",
+    ]
+  }
+
+  private static func zimageLoraModels() -> [String] {
+    // Phase 2+ can scan the filesystem for available LoRA files.
+    []
   }
 }
