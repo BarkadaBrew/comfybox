@@ -67,6 +67,8 @@ struct ZImageCLI {
     var schedulerKind: SchedulerKind = .euler
     var sigmaSchedule: SigmaScheduleKind = .flow
     var eta: Float?
+    var dyPEMethod: DyPEMethod = .none
+    var dyPEDisabled = false
 
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
@@ -131,6 +133,17 @@ struct ZImageCLI {
         sigmaSchedule = kind
       case "--eta":
         eta = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
+      case "--dype":
+        let raw = nextValue(for: arg, iterator: &iterator).lowercased()
+        switch raw {
+        case "ntk": dyPEMethod = .ntk
+        case "yarn": dyPEMethod = .yarn
+        case "none", "off": dyPEMethod = .none
+        default:
+          fatalError("Unknown DyPE method '\(raw)'. Valid: ntk, yarn, none")
+        }
+      case "--no-dype":
+        dyPEDisabled = true
       case "--svg":
         generateSVG = true
       case "--svg-preset":
@@ -197,6 +210,21 @@ struct ZImageCLI {
       logger.info("Using \(loraConfigs.count) LoRA(s)")
     }
 
+    // Build DyPE config — auto-enable when resolution exceeds base training size
+    let dyPEConfig: DyPEConfig
+    if dyPEDisabled {
+      dyPEConfig = .disabled
+    } else if dyPEMethod != .none {
+      dyPEConfig = DyPEConfig(enabled: true, method: dyPEMethod)
+      logger.info("DyPE enabled: \(dyPEMethod.rawValue) (target \(width)x\(height))")
+    } else if max(width, height) > 1024 {
+      // Auto-enable NTK when generating above training resolution
+      dyPEConfig = .ntk
+      logger.info("DyPE auto-enabled: ntk (target \(width)x\(height) exceeds 1024 training resolution)")
+    } else {
+      dyPEConfig = .disabled
+    }
+
     let request = ZImageGenerationRequest(
       prompt: prompt,
       negativePrompt: negativePrompt,
@@ -215,7 +243,8 @@ struct ZImageCLI {
       forceTransformerOverrideOnly: forceTransformerOverrideOnly,
       schedulerKind: schedulerKind,
       sigmaSchedule: sigmaSchedule,
-      eta: eta
+      eta: eta,
+      dyPE: dyPEConfig
     )
 
     let pipeline = ZImagePipeline(logger: logger)
@@ -331,6 +360,8 @@ struct ZImageCLI {
       --scheduler, --sampler  Sampler algorithm: euler, heun, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
       --sigma-schedule       Sigma schedule: flow, karras, exponential, beta (default: flow)
       --eta                  Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
+      --dype <method>        DyPE high-res mode: ntk, yarn, none (auto-enables for >1024px)
+      --no-dype              Disable DyPE even for high-res generation
       --enhance, -e          Enhance prompt using LLM (requires ~5GB extra VRAM)
       --enhance-max-tokens   Max tokens for prompt enhancement (default: 512)
       --no-progress          Disable progress output

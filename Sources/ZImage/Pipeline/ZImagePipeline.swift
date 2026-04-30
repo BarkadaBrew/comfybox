@@ -41,6 +41,10 @@ public struct ZImageGenerationRequest: Sendable {
   /// Also used by DPM++ 2S-A. Ignored by other samplers.
   public var eta: Float?
 
+  /// DyPE (Dynamic Position Extrapolation) config for native high-resolution generation.
+  /// When enabled, modifies RoPE frequencies to support resolutions above training scale.
+  public var dyPE: DyPEConfig
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -60,7 +64,8 @@ public struct ZImageGenerationRequest: Sendable {
     forceTransformerOverrideOnly: Bool = false,
     schedulerKind: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .flow,
-    eta: Float? = nil
+    eta: Float? = nil,
+    dyPE: DyPEConfig = .disabled
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -80,6 +85,7 @@ public struct ZImageGenerationRequest: Sendable {
     self.schedulerKind = schedulerKind
     self.sigmaSchedule = sigmaSchedule
     self.eta = eta
+    self.dyPE = dyPE
   }
 }
 
