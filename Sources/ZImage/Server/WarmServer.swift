@@ -49,6 +49,9 @@ public final class WarmServer {
     self.logger = logger
     self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
     self.comfyBridge = ComfyBridge(logger: logger)
+    self.comfyBridge.configureExecutor(generateHandler: { [unowned self] request in
+      try await self.bridgeGenerate(request)
+    })
   }
 
   public func run() throws {
@@ -156,6 +159,27 @@ public final class WarmServer {
       }
       return .error(.error(status: 404, message: "Not found"))
     }
+  }
+
+
+  /// Bridge a ComfyUI workflow request to the internal generate pipeline.
+  /// Called by ComfyBridgeExecutor via the closure set in init.
+  private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest) async throws -> ComfyBridgeGenerateResult {
+    let payload = GeneratePayload(
+      prompt: request.prompt,
+      negativePrompt: request.negativePrompt,
+      width: request.width,
+      height: request.height,
+      steps: request.steps,
+      guidance: request.guidance,
+      seed: request.seed,
+      outputPath: nil
+    )
+    let result = try await coordinator.enqueueGenerate(payload)
+    return ComfyBridgeGenerateResult(
+      outputPath: result.outputPath,
+      durationMs: result.durationMs
+    )
   }
 
   fileprivate func requestShutdownAfterResponse() {
