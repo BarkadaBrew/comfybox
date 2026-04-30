@@ -695,6 +695,7 @@ private struct GeneratePayload: Decodable, Sendable {
   let scheduler: String?
   let sigmaSchedule: String?
   let eta: Float?
+  let dype: String?
 
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
@@ -711,11 +712,28 @@ private struct GeneratePayload: Decodable, Sendable {
     let schedulerKind = scheduler.flatMap { SchedulerKind(rawValue: $0) } ?? .euler
     let sigmaScheduleKind = sigmaSchedule.flatMap { SigmaScheduleKind(rawValue: $0) } ?? .flow
 
+    // Build DyPE config — auto-enable for high-res requests
+    let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
+    let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
+    let dyPEConfig: DyPEConfig
+    if let dypeRaw = dype?.lowercased() {
+      switch dypeRaw {
+      case "ntk": dyPEConfig = .ntk
+      case "yarn": dyPEConfig = .yarn
+      case "none", "off": dyPEConfig = .disabled
+      default: dyPEConfig = .disabled
+      }
+    } else if max(resolvedWidth, resolvedHeight) > 1024 {
+      dyPEConfig = .ntk  // Auto-enable for high-res
+    } else {
+      dyPEConfig = .disabled
+    }
+
     return ZImageGenerationRequest(
       prompt: prompt,
       negativePrompt: negativePrompt,
-      width: width ?? ZImageModelMetadata.recommendedWidth,
-      height: height ?? ZImageModelMetadata.recommendedHeight,
+      width: resolvedWidth,
+      height: resolvedHeight,
       steps: steps ?? ZImageModelMetadata.recommendedInferenceSteps,
       guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
@@ -729,7 +747,8 @@ private struct GeneratePayload: Decodable, Sendable {
       forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly,
       schedulerKind: schedulerKind,
       sigmaSchedule: sigmaScheduleKind,
-      eta: eta
+      eta: eta,
+      dyPE: dyPEConfig
     )
   }
 }
