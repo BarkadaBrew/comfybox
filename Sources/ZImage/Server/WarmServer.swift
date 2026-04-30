@@ -47,8 +47,8 @@ public final class WarmServer {
     self.logger = logger
     self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
     self.comfyBridge = ComfyBridge(logger: logger)
-    self.comfyBridge.configureExecutor(generateHandler: { [unowned self] request in
-      try await self.bridgeGenerate(request)
+    self.comfyBridge.configureExecutor(generateHandler: { [unowned self] request, progressCallback in
+      try await self.bridgeGenerate(request, progressCallback: progressCallback)
     })
   }
 
@@ -198,18 +198,28 @@ public final class WarmServer {
 
   /// Bridge a ComfyUI workflow request to the internal generate pipeline.
   /// Called by ComfyBridgeExecutor via the closure set in init.
-  private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest) async throws -> ComfyBridgeGenerateResult {
+  private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult {
     let payload = GeneratePayload(
       prompt: request.prompt,
       negativePrompt: nil,  // Z-Image Turbo: negative prompts cause broadcast_shapes crash
       width: request.width,
       height: request.height,
-      steps: request.steps,
+      steps: min(request.steps, 9),  // Z-Image Turbo: optimal at 9 steps, clamp plugin defaults
       guidance: 0.0,  // Z-Image Turbo: designed for cfg=0
       seed: request.seed,
       outputPath: nil
     )
-    let result = try await coordinator.enqueueGenerate(payload)
+
+    // Convert bridge progress callback to pipeline progress handler.
+    let pipelineProgress: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = progressCallback.map { callback in
+      return { progress in
+        if progress.stage == .denoising {
+          callback(progress.stepIndex, progress.totalSteps)
+        }
+      }
+    }
+
+    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress)
     return ComfyBridgeGenerateResult(
       outputPath: result.outputPath,
       durationMs: result.durationMs
@@ -343,7 +353,10 @@ private actor WarmServerCoordinator {
     logger.info("Warm server pipeline ready")
   }
 
-  func enqueueGenerate(_ payload: GeneratePayload) async throws -> GenerateResponse {
+  func enqueueGenerate(
+    _ payload: GeneratePayload,
+    progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil
+  ) async throws -> GenerateResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -352,7 +365,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.generate(payload, ContinuationBox(continuation)))
+      pending.append(.generate(payload, ContinuationBox(continuation), progressHandler))
       startProcessingIfNeeded()
     }
   }
@@ -424,8 +437,8 @@ private actor WarmServerCoordinator {
 
       let operation = pending.removeFirst()
       switch operation {
-      case .generate(let payload, let continuation):
-        await runGenerate(payload, continuation: continuation)
+      case .generate(let payload, let continuation, let progressHandler):
+        await runGenerate(payload, continuation: continuation, progressHandler: progressHandler)
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
       case .shutdown(let continuation):
@@ -439,7 +452,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+  private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -448,7 +461,7 @@ private actor WarmServerCoordinator {
         configuration: configuration,
         activeLoRAs: activeLoRAs
       )
-      let outputURL = try await pipeline.generateFromRequest(request)
+      let outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
@@ -923,7 +936,7 @@ struct ErrorPayload: Encodable {
 }
 
 private enum QueuedOperation: Sendable {
-  case generate(GeneratePayload, ContinuationBox<GenerateResponse>)
+  case generate(GeneratePayload, ContinuationBox<GenerateResponse>, (@Sendable (ZImagePipeline.GenerationProgress) -> Void)?)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
