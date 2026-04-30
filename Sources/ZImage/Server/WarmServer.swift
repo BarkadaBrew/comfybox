@@ -210,7 +210,9 @@ public final class WarmServer {
       outputPath: nil,
       inpaintImageData: request.inpaintImageData,
       maskData: request.maskImageData,
-      denoise: request.denoise
+      denoise: request.denoise,
+      maskGrow: request.maskGrow,
+      maskFeather: request.maskFeather
     )
 
     // Convert bridge progress callback to pipeline progress handler.
@@ -808,6 +810,8 @@ private struct GeneratePayload: Sendable {
   let inpaintImageData: Data?
   let maskData: Data?
   let denoise: Float?
+  let maskGrow: Int?
+  let maskFeather: Int?
 
   /// Default memberwise init for bridge-created payloads.
   init(
@@ -816,7 +820,7 @@ private struct GeneratePayload: Sendable {
     guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
-    denoise: Float? = nil
+    denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil
   ) {
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -824,7 +828,7 @@ private struct GeneratePayload: Sendable {
     self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
     self.eta = eta; self.dype = dype
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
-    self.denoise = denoise
+    self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
   }
 }
 
@@ -852,6 +856,8 @@ extension GeneratePayload: Decodable {
     inpaintImageData = nil
     maskData = nil
     denoise = nil
+    maskGrow = nil
+    maskFeather = nil
   }
 
   func makePipelineRequest(
@@ -908,7 +914,9 @@ extension GeneratePayload: Decodable {
       dyPE: dyPEConfig,
       inpaintImageData: inpaintImageData,
       maskData: maskData,
-      denoise: denoise ?? 1.0
+      denoise: denoise ?? 1.0,
+      maskGrow: maskGrow ?? 0,
+      maskFeather: maskFeather ?? 0
     )
   }
 }

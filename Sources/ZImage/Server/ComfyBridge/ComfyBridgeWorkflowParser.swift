@@ -31,6 +31,10 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let maskImageId: String?
   /// Denoising strength (0.0–1.0). Higher = more change. Default 1.0 for txt2img.
   let denoise: Float
+  /// Mask expansion in pixels (from INPAINT_ExpandMask grow parameter).
+  let maskGrow: Int
+  /// Mask feather radius in pixels (from INPAINT_ExpandMask feather parameter).
+  let maskFeather: Int
 
   /// Whether this is an inpainting request.
   var isInpaint: Bool { inpaintImageId != nil }
@@ -176,6 +180,12 @@ enum ComfyBridgeWorkflowParser {
     // Node connections determine which is image vs mask.
     let (inpaintImageId, maskImageId) = extractInpaintImageIds(nodes: nodes)
 
+    // --- Phase 3: Mask preprocessing parameters ---
+    // Extract grow and feather from INPAINT_ExpandMask node.
+    let expandNode = nodes.values.first { $0.classType == "INPAINT_ExpandMask" }
+    let maskGrow = intValue(expandNode?.inputs["grow"]) ?? 0
+    let maskFeather = intValue(expandNode?.inputs["feather"]) ?? 0
+
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
       clientId: clientId,
@@ -190,7 +200,9 @@ enum ComfyBridgeWorkflowParser {
       outputNodeId: outputNodeId,
       inpaintImageId: inpaintImageId,
       maskImageId: maskImageId,
-      denoise: denoise
+      denoise: denoise,
+      maskGrow: maskGrow,
+      maskFeather: maskFeather
     )
   }
 
