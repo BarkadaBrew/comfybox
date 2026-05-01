@@ -9,7 +9,7 @@ import MLXNN
 /// ```
 /// Input: (B, L, dim), vid_shape (B, 3) = [T', H', W']
 ///   → Linear(dim, out_channels * pt * ph * pw)
-///   → reshape to (B, T', H', W', out_channels, pt, ph, pw)
+///   → reshape to (B, T', H', W', pt, ph, pw, out_channels)
 ///   → transpose to (B, out_channels, T'*pt, H'*ph, W'*pw)
 ///   → output (B, out_channels, T, H, W)
 /// ```
@@ -63,11 +63,11 @@ public final class SeedVR2PatchOut: Module {
     let hPatches = Int(vidShape[0, 1].item(Int32.self))
     let wPatches = Int(vidShape[0, 2].item(Int32.self))
 
-    // (B, T', H', W', outChannels, pt, ph, pw)
-    x = x.reshaped(bSize, tPatches, hPatches, wPatches, outChannels, pt, ph, pw)
+    // (B, T', H', W', pt, ph, pw, outChannels) — channel LAST, matching Python
+    x = x.reshaped(bSize, tPatches, hPatches, wPatches, pt, ph, pw, outChannels)
 
-    // → (B, outChannels, T', pt, H', ph, W', pw)
-    x = x.transposed(0, 4, 1, 5, 2, 6, 3, 7)
+    // → (B, outChannels, T'*pt, H'*ph, W'*pw) via transpose
+    x = x.transposed(0, 7, 1, 4, 2, 5, 3, 6)
 
     // → (B, outChannels, T'*pt, H'*ph, W'*pw)
     x = x.reshaped(bSize, outChannels, tPatches * pt, hPatches * ph, wPatches * pw)
