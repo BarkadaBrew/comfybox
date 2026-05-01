@@ -35,6 +35,9 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let maskGrow: Int
   /// Mask feather radius in pixels (from INPAINT_ExpandMask feather parameter).
   let maskFeather: Int
+  /// ImageCrop x,y offset — used to crop full-canvas mask to selection bounds.
+  let maskCropX: Int
+  let maskCropY: Int
 
   /// Whether this is an inpainting request.
   var isInpaint: Bool { inpaintImageId != nil }
@@ -127,15 +130,24 @@ enum ComfyBridgeWorkflowParser {
     let height: Int
     let batchSize: Int
 
-    if let ln = latentNode {
+    // Detect inpaint early to choose correct dimension source
+    let hasInpaintImages = nodes.values.contains { $0.classType == "ETN_LoadImageCache" }
+
+    if let cn = cropNode, hasInpaintImages {
+      // Inpaint with selection crop: use ImageCrop dimensions
+      width = roundTo16(intValue(cn.inputs["width"]) ?? 1024)
+      height = roundTo16(intValue(cn.inputs["height"]) ?? 1024)
+      batchSize = 1
+    } else if let ln = latentNode {
       // txt2img: dimensions from empty latent node
       width = roundTo16(intValue(ln.inputs["width"]) ?? 1024)
       height = roundTo16(intValue(ln.inputs["height"]) ?? 1024)
       batchSize = intValue(ln.inputs["batch_size"]) ?? 1
-    } else if let cn = cropNode {
-      // Inpaint: dimensions from ImageCrop node (actual selection size)
-      width = roundTo16(intValue(cn.inputs["width"]) ?? 1024)
-      height = roundTo16(intValue(cn.inputs["height"]) ?? 1024)
+    } else if hasInpaintImages {
+      // Inpaint without ImageCrop or EmptyLatentImage — set width/height to 0
+      // to signal downstream code to derive from the actual inpaint image
+      width = 0
+      height = 0
       batchSize = 1
     } else {
       // Fallback
@@ -146,11 +158,24 @@ enum ComfyBridgeWorkflowParser {
 
     // --- Steps ---
     let schedulerNode = nodes.values.first { $0.classType == "BasicScheduler" }
+    // Also check KSampler for denoise (Krita may use KSampler instead of BasicScheduler)
+    let kSamplerNode = nodes.values.first { $0.classType == "KSampler" || $0.classType == "KSamplerAdvanced" }
     let steps = intValue(schedulerNode?.inputs["steps"]) ?? 9
 
     // --- Denoise strength ---
     // BasicScheduler has an optional "denoise" input. Default 1.0 (full denoise for txt2img).
-    let denoise = floatValue(schedulerNode?.inputs["denoise"]) ?? 1.0
+    // Krita AI Diffusion uses SplitSigmas to control effective denoise: it generates the
+    // full sigma schedule (denoise=1.0) then splits at a step, using only the second half.
+    // Effective denoise = 1.0 - (splitStep / totalSteps).
+    let splitNode = nodes.values.first { $0.classType == "SplitSigmas" }
+    let splitStep = intValue(splitNode?.inputs["step"])
+    let baseDenoise = floatValue(schedulerNode?.inputs["denoise"]) ?? floatValue(kSamplerNode?.inputs["denoise"]) ?? 1.0
+    let denoise: Float
+    if let split = splitStep, split > 0 {
+      denoise = 1.0 - (Float(split) / Float(steps))
+    } else {
+      denoise = baseDenoise
+    }
 
     // --- CFG ---
     let cfg: Float
@@ -185,6 +210,12 @@ enum ComfyBridgeWorkflowParser {
     let expandNode = nodes.values.first { $0.classType == "INPAINT_ExpandMask" }
     let maskGrow = intValue(expandNode?.inputs["grow"]) ?? 0
     let maskFeather = intValue(expandNode?.inputs["feather"]) ?? 0
+    let maskCropX = intValue(cropNode?.inputs["x"]) ?? 0
+    let maskCropY = intValue(cropNode?.inputs["y"]) ?? 0
+
+    // Debug: log workflow structure
+    let _nodeTypes = nodes.values.map { $0.classType }.sorted()
+    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise)")
 
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
@@ -202,7 +233,9 @@ enum ComfyBridgeWorkflowParser {
       maskImageId: maskImageId,
       denoise: denoise,
       maskGrow: maskGrow,
-      maskFeather: maskFeather
+      maskFeather: maskFeather,
+      maskCropX: maskCropX,
+      maskCropY: maskCropY
     )
   }
 
