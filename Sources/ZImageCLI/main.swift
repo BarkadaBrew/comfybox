@@ -163,6 +163,9 @@ struct ZImageCLI {
       case "serve":
         try runServe(args: Array(args.dropFirst()))
         return
+      case "upscale":
+        try runUpscale(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -399,6 +402,15 @@ struct ZImageCLI {
         --lora, -l           Initial LoRA(s)
         Use 'ZImageCLI serve --help' for full options
 
+      upscale                Upscale image via SeedVR2
+        --input, -i          Input image path (required)
+        --output, -o         Output image path (default: input-upscaled.png)
+        --resolution, -r     Target resolution (default: 2048)
+        --steps              Inference steps (default: 1)
+        --seed               Random seed
+        --weights, -w        Path to SeedVR2 model weights directory
+        --softness           Preprocessing softness 0.0-1.0 (default: 0.0)
+
     Examples:
       ZImageCLI -p "a cute cat" -o cat.png
       ZImageCLI -p "a sunset" -m models/z-image-turbo-q8
@@ -410,6 +422,7 @@ struct ZImageCLI {
       ZImageCLI -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
       ZImageCLI -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
       ZImageCLI serve -m ./models/z-image-turbo --port 7862
+      ZImageCLI upscale -i photo.jpg -w ./models/seedvr2 -r 2048
     """)
   }
 
@@ -1094,6 +1107,104 @@ struct ZImageCLI {
     Float(nextValue(for: arg, iterator: &iterator)) ?? fallback
   }
 
+  // MARK: - Upscale Subcommand
+
+  #if canImport(CoreGraphics)
+  private static func runUpscale(args: [String]) throws {
+    var inputPath: String?
+    var outputPath: String?
+    var resolution = 2048
+    var steps = 1
+    var seed: Int?
+    var weightsPath: String?
+    var softness: Float = 0.0
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--input", "-i":
+        inputPath = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--resolution", "-r":
+        resolution = intValue(for: arg, iterator: &iterator, minimum: 256, fallback: resolution)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed":
+        if let s = Int(nextValue(for: arg, iterator: &iterator)) {
+          seed = s
+        }
+      case "--weights", "-w":
+        weightsPath = nextValue(for: arg, iterator: &iterator)
+      case "--softness":
+        softness = floatValue(for: arg, iterator: &iterator, fallback: softness)
+      case "--help", "-h":
+        print("""
+        SeedVR2 Image Upscaler
+
+        Usage: ZImageCLI upscale --input <path> --weights <path> [options]
+
+          --input, -i          Input image path (required)
+          --output, -o         Output image path (default: input-upscaled.png)
+          --resolution, -r     Target resolution for shortest side (default: 2048)
+          --steps              Inference steps (default: 1)
+          --seed               Random seed for reproducibility
+          --weights, -w        Path to SeedVR2 model weights directory (required)
+          --softness           Preprocessing softness 0.0-1.0 (default: 0.0)
+          --help, -h           Show this help
+
+        Examples:
+          ZImageCLI upscale -i photo.jpg -w ./models/seedvr2
+          ZImageCLI upscale -i photo.jpg -w ./models/seedvr2 -r 4096 --seed 42
+          ZImageCLI upscale -i low-res.png -w ./models/seedvr2 --softness 0.3 -o high-res.png
+        """)
+        return
+      default:
+        logger.warning("Unknown upscale argument: \(arg)")
+      }
+    }
+
+    guard let input = inputPath else {
+      fputs("Error: --input is required for upscale\n", stderr)
+      exit(1)
+    }
+
+    guard let weights = weightsPath else {
+      fputs("Error: --weights is required for upscale\n", stderr)
+      exit(1)
+    }
+
+    guard FileManager.default.fileExists(atPath: input) else {
+      fputs("Error: Input file not found: \(input)\n", stderr)
+      exit(1)
+    }
+
+    let startTime = CFAbsoluteTimeGetCurrent()
+
+    let pipeline = try SeedVR2Pipeline(
+      weightsPath: weights,
+      steps: steps,
+      logger: logger
+    )
+
+    let savedPath = try pipeline.upscaleAndSave(
+      imagePath: input,
+      outputPath: outputPath,
+      targetResolution: resolution,
+      seed: seed,
+      softness: softness
+    )
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+    logger.info("Upscale complete in \(String(format: "%.1f", elapsed))s -> \(savedPath)")
+  }
+  #else
+  private static func runUpscale(args: [String]) throws {
+    fputs("Error: SeedVR2 upscale requires CoreGraphics (macOS)\n", stderr)
+    exit(1)
+  }
+  #endif
+
 }
 
 // MARK: - Progress Helpers
@@ -1185,6 +1296,8 @@ private final class ProgressBar {
     if m > 0 { return String(format: "%dm%02ds", m, s) }
     return String(format: "%ds", s)
   }
+
+
 }
 
 do {
