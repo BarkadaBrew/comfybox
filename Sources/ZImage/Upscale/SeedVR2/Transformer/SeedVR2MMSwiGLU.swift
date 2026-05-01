@@ -41,7 +41,7 @@ public final class SeedVR2MMSwiGLU: Module {
   public func callAsFunction(_ vid: MLXArray, _ txt: MLXArray) -> (MLXArray, MLXArray) {
     if sharedWeights {
       let vidOut = mlpAll!(vid)
-      let txtOut = isLastLayer ? txt : mlpAll!(txt)
+      let txtOut = mlpAll!(txt)  // Shared mode always processes text (matches Python)
       return (vidOut, txtOut)
     } else {
       let vidOut = mlpVid!(vid)
