@@ -507,25 +507,19 @@ enum ComfyBridgeObjectInfo {
     ]
   }
 
+  /// Default LoRA directory path. Matches the wrapper script's --lora location.
+  private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
+
   private static func zimageLoraModels() -> [String] {
-    // Z-Image LoRAs available on this system.
-    [
-      "nudeart6-e10.safetensors",
-      "RealisticSnapshot-Zimage-Turbov5.safetensors",
-      "darkBeast_darkblitz6_r128.safetensors",
-      "deedee_amateur_photography_zimage_base_and_turbo_v1.safetensors",
-      "moodyPornMix_v10DPO_zimage_turbo_lora_r128.safetensors",
-      "moodyRealMix_zitV4DPO_zimage_turbo_lora_r128.safetensors",
-      "Jibs_Realistic_z-image_lora_V1.safetensors",
-      "beyond_reality_3.0_zimage_lora_r128.safetensors",
-      "NIceAsians_Zimage.safetensors",
-      "Z Seasian.safetensors",
-      "algertiles.safetensors",
-      "algertiles2.safetensors",
-      "algertiles3.safetensors",
-      "algertiles4.safetensors",
-      "oxman-tiles-v2.safetensors",
-      "zimage_flat_color_v2.1.safetensors",
-    ]
+    // Dynamically scan LoRA directory for .safetensors files.
+    let loraDir = loraDirectoryPath
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: loraDir) else {
+      // Fallback: return empty if directory is inaccessible.
+      return []
+    }
+    return entries
+      .filter { $0.hasSuffix(".safetensors") }
+      .sorted()
   }
 }
