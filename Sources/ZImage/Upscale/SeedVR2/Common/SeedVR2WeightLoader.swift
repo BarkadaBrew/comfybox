@@ -237,13 +237,10 @@ public enum SeedVR2WeightLoader {
       }
     }
 
-    // MLP shared weight duplication for blocks with .all. pattern (3B blocks 10-31)
-    if key.contains(".mlp.all.") {
-      return [
-        key.replacingOccurrences(of: ".mlp.all.", with: ".mlp.vid."),
-        key.replacingOccurrences(of: ".mlp.all.", with: ".mlp.txt."),
-      ]
-    }
+    // MLP shared weights: pass through unchanged.
+    // SeedVR2MMSwiGLU registers shared MLP as @ModuleInfo(key: "all"),
+    // so .mlp.all. keys map directly to the module tree.
+    // (Unlike attention, which always creates both vid/txt modules.)
 
     // Default: key passes through unchanged.
     return [key]
