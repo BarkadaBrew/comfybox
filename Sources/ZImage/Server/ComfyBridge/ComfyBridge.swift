@@ -227,6 +227,18 @@ final class ComfyBridge {
       return .error(.error(status: 500, message: "Failed to serialize prompt response"))
     }
 
+    // Debug: dump raw workflow JSON
+    if let dumpData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
+       let dumpStr = String(data: dumpData, encoding: .utf8) {
+      try? dumpStr.write(toFile: "/tmp/zimage-debug-workflow.json", atomically: true, encoding: .utf8)
+      logger.info("ComfyBridge: dumped workflow to /tmp/zimage-debug-workflow.json (\(dumpData.count) bytes)")
+      // Also log the node class types
+      if let prompt = json["prompt"] as? [String: [String: Any]] {
+        let nodeTypes = prompt.values.compactMap { ($0["class_type"] as? String) }.sorted()
+        logger.info("ComfyBridge: workflow node types: \(nodeTypes.joined(separator: ", "))")
+      }
+    }
+
     // Parse the workflow into generation parameters.
     let generateRequest: ComfyBridgeGenerateRequest
     do {

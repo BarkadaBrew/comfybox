@@ -198,12 +198,41 @@ public final class WarmServer {
 
   /// Bridge a ComfyUI workflow request to the internal generate pipeline.
   /// Called by ComfyBridgeExecutor via the closure set in init.
+  /// Read PNG dimensions from IHDR chunk (bytes 16-23 of a valid PNG).
+  private func pngDimensions(from data: Data) -> (width: Int, height: Int)? {
+    guard data.count >= 24 else { return nil }
+    let w = Int(data[16]) << 24 | Int(data[17]) << 16 | Int(data[18]) << 8 | Int(data[19])
+    let h = Int(data[20]) << 24 | Int(data[21]) << 16 | Int(data[22]) << 8 | Int(data[23])
+    return (w, h)
+  }
+
+  /// Round up to nearest multiple of 16 (for latent alignment).
+  private func roundTo16(_ n: Int) -> Int {
+    return ((n + 15) / 16) * 16
+  }
+
   private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult {
+    // Derive dimensions from inpaint image if parser returned 0x0
+    // (happens when workflow has no ImageCrop or EmptyLatentImage nodes)
+    var genWidth = request.width
+    var genHeight = request.height
+    if genWidth == 0 || genHeight == 0, let imgData = request.inpaintImageData {
+      if let dims = pngDimensions(from: imgData) {
+        genWidth = roundTo16(dims.width)
+        genHeight = roundTo16(dims.height)
+        logger.info("WarmServer: derived dimensions from inpaint image: \(dims.width)x\(dims.height) -> \(genWidth)x\(genHeight)")
+      } else {
+        genWidth = 1024
+        genHeight = 1024
+        logger.warning("WarmServer: could not read inpaint image dimensions, falling back to 1024x1024")
+      }
+    }
+
     let payload = GeneratePayload(
       prompt: request.prompt,
       negativePrompt: nil,  // Z-Image Turbo: negative prompts cause broadcast_shapes crash
-      width: request.width,
-      height: request.height,
+      width: genWidth,
+      height: genHeight,
       steps: min(request.steps, 9),  // Z-Image Turbo: optimal at 9 steps, clamp plugin defaults
       guidance: 0.0,  // Z-Image Turbo: designed for cfg=0
       seed: request.seed,
@@ -212,7 +241,9 @@ public final class WarmServer {
       maskData: request.maskImageData,
       denoise: request.denoise,
       maskGrow: request.maskGrow,
-      maskFeather: request.maskFeather
+      maskFeather: request.maskFeather,
+      maskCropX: request.maskCropX,
+      maskCropY: request.maskCropY
     )
 
     // Convert bridge progress callback to pipeline progress handler.
@@ -812,6 +843,8 @@ private struct GeneratePayload: Sendable {
   let denoise: Float?
   let maskGrow: Int?
   let maskFeather: Int?
+  let maskCropX: Int?
+  let maskCropY: Int?
 
   /// Default memberwise init for bridge-created payloads.
   init(
@@ -820,7 +853,8 @@ private struct GeneratePayload: Sendable {
     guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
-    denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil
+    denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
+    maskCropX: Int? = nil, maskCropY: Int? = nil
   ) {
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -829,6 +863,7 @@ private struct GeneratePayload: Sendable {
     self.eta = eta; self.dype = dype
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
     self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
+    self.maskCropX = maskCropX; self.maskCropY = maskCropY
   }
 }
 
@@ -858,6 +893,8 @@ extension GeneratePayload: Decodable {
     denoise = nil
     maskGrow = nil
     maskFeather = nil
+    maskCropX = nil
+    maskCropY = nil
   }
 
   func makePipelineRequest(
@@ -916,7 +953,9 @@ extension GeneratePayload: Decodable {
       maskData: maskData,
       denoise: denoise ?? 1.0,
       maskGrow: maskGrow ?? 0,
-      maskFeather: maskFeather ?? 0
+      maskFeather: maskFeather ?? 0,
+      maskCropX: maskCropX ?? 0,
+      maskCropY: maskCropY ?? 0
     )
   }
 }

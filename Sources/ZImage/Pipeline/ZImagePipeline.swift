@@ -58,6 +58,9 @@ public struct ZImageGenerationRequest: Sendable {
   public var maskGrow: Int
   /// Mask feather radius in pixels (default 0 = hard edges).
   public var maskFeather: Int
+  /// ImageCrop x,y offset for cropping full-canvas mask to selection bounds.
+  public var maskCropX: Int
+  public var maskCropY: Int
 
   public init(
     prompt: String,
@@ -84,7 +87,9 @@ public struct ZImageGenerationRequest: Sendable {
     maskData: Data? = nil,
     denoise: Float = 1.0,
     maskGrow: Int = 0,
-    maskFeather: Int = 0
+    maskFeather: Int = 0,
+    maskCropX: Int = 0,
+    maskCropY: Int = 0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -110,6 +115,8 @@ public struct ZImageGenerationRequest: Sendable {
     self.denoise = denoise
     self.maskGrow = maskGrow
     self.maskFeather = maskFeather
+    self.maskCropX = maskCropX
+    self.maskCropY = maskCropY
   }
 }
 
@@ -939,6 +946,7 @@ public final class ZImagePipeline {
       logger.info("Inpainting mode: encoding input image and mask...")
       let cgImage = try InpaintUtilities.loadCGImage(from: imageData)
       let maskCG = try InpaintUtilities.loadCGImage(from: maskDataRaw)
+      logger.info("Inpainting: source=\(cgImage.width)x\(cgImage.height), mask=\(maskCG.width)x\(maskCG.height), gen=\(request.width)x\(request.height), cropXY=(\(request.maskCropX),\(request.maskCropY))")
 
       let pixelH = latentH * vaeDivisor
       let pixelW = latentW * vaeDivisor
@@ -956,7 +964,10 @@ public final class ZImagePipeline {
       // Convert pixel mask to latent-space mask with optional grow/feather
       latentMask = try InpaintUtilities.pixelMaskToLatent(
         maskCG, latentH: latentH, latentW: latentW,
-        grow: request.maskGrow, feather: request.maskFeather, logger: logger
+        grow: request.maskGrow, feather: request.maskFeather,
+        cropX: request.maskCropX, cropY: request.maskCropY,
+        cropWidth: request.width, cropHeight: request.height,
+        logger: logger
       )
 
       // Store the initial noise for sigma blending at each step

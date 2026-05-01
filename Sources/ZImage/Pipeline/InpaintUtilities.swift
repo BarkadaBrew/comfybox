@@ -125,35 +125,70 @@ enum InpaintUtilities {
     latentW: Int,
     grow: Int = 0,
     feather: Int = 0,
+    cropX: Int = 0,
+    cropY: Int = 0,
+    cropWidth: Int = 0,
+    cropHeight: Int = 0,
     logger: Logger? = nil
   ) throws -> MLXArray {
     #if canImport(CoreGraphics)
-    guard let rgbaMask = convertToRGBA(maskImage) else {
+    // If crop coordinates are provided, crop the full-canvas mask to selection bounds.
+    // The Krita AI Diffusion plugin sends masks at full canvas resolution, but the
+    // source image is pre-cropped to the selection bounding box. The ImageCrop node
+    // in the workflow specifies the crop region.
+    var effectiveMask = maskImage
+    // Crop when mask dimensions differ from the target generation dimensions.
+    // Krita "Selection bounds" sends mask at full canvas resolution but source image
+    // is pre-cropped to the selection bounding box.
+    let needsCrop = cropWidth > 0 && cropHeight > 0 && (maskImage.width != cropWidth || maskImage.height != cropHeight)
+    if needsCrop {
+      let cropRect = CGRect(x: cropX, y: cropY, width: cropWidth, height: cropHeight)
+      if let cropped = maskImage.cropping(to: cropRect) {
+        logger?.info("InpaintUtilities: cropped mask from \(maskImage.width)x\(maskImage.height) to \(cropped.width)x\(cropped.height) at (\(cropX),\(cropY))")
+        effectiveMask = cropped
+      } else {
+        logger?.warning("InpaintUtilities: mask crop failed for rect \(cropRect), using full mask")
+      }
+    }
+
+    guard let rgbaMask = convertToRGBA(effectiveMask) else {
       throw InpaintError.maskLoadFailed("Failed to convert mask to RGBA")
     }
 
     // Work at pixel resolution for grow/feather, then downsample.
     // Cap at 8x latent dims to avoid excessive memory usage.
-    let workH = min(maskImage.height, latentH * 8)
-    let workW = min(maskImage.width, latentW * 8)
+    let workH = min(effectiveMask.height, latentH * 8)
+    let workW = min(effectiveMask.width, latentW * 8)
 
-    // Load mask at working resolution — NHWC format [1, H, W, C]
-    let maskArray = try QwenImageIO.resizedPixelArray(
+    // Load mask at working resolution — resizedPixelArray returns NCHW [1, 3, H, W]
+    let maskArrayNCHW = try QwenImageIO.resizedPixelArray(
       from: rgbaMask,
       width: workW,
       height: workH,
       addBatchDimension: true,
       dtype: .float32
     )
+    // Transpose to NHWC [1, H, W, 3] for conv2d operations downstream
+    let maskArray = maskArrayNCHW.transposed(0, 2, 3, 1)
 
     // Convert to single-channel grayscale [1, H, W, 1]
     var mask = MLX.mean(maskArray, axis: -1, keepDims: true)
     // Binarize at 0.5 threshold
+    // Pre-binarization stats
+    let preBinMin = MLX.min(mask).item(Float.self)
+    let preBinMax = MLX.max(mask).item(Float.self)
+    let preBinMean = MLX.mean(mask).item(Float.self)
+    let preBinNonzero = MLX.sum(MLX.where(mask .> 0.01, MLXArray(Float(1.0)), MLXArray(Float(0.0)))).item(Float.self)
+    logger?.info("InpaintUtilities: pre-binarize grayscale — min=\(preBinMin), max=\(preBinMax), mean=\(String(format: "%.4f", preBinMean)), nonzero(>0.01)=\(Int(preBinNonzero))/\(workH*workW)")
+
     mask = MLX.where(mask .>= 0.5, MLXArray(Float(1.0)), MLXArray(Float(0.0)))
     MLX.eval(mask)
+    
+    let postBinWhite = MLX.sum(mask).item(Float.self)
+    logger?.info("InpaintUtilities: post-binarize — white=\(Int(postBinWhite))/\(workH*workW) (\(String(format: "%.1f", (postBinWhite / Float(workH*workW)) * 100))%)")
 
     // Scale grow/feather from original pixel space to working resolution
-    let scale = Float(workW) / Float(maskImage.width)
+    let scale = Float(workW) / Float(effectiveMask.width)
 
     // --- Grow (dilate) using conv2d with ones kernel + threshold ---
     let scaledGrow = max(0, Int(Float(grow) * scale))
@@ -229,7 +264,10 @@ enum InpaintUtilities {
     let final = result.reshaped([1, 1, latentH, latentW])
     MLX.eval(final)
 
-    logger?.info("InpaintUtilities: final mask shape \(final.shape), range [\(final.min().item(Float.self)), \(final.max().item(Float.self))]")
+    let totalPixels = Float(latentH * latentW)
+    let regeneratePixels = final.sum().item(Float.self)
+    let pct = (regeneratePixels / totalPixels) * 100.0
+    logger?.info("InpaintUtilities: final mask shape \(final.shape), range [\(final.min().item(Float.self)), \(final.max().item(Float.self))], regenerate=\(Int(regeneratePixels))/\(Int(totalPixels)) (\(String(format: "%.1f", pct))%)")
     return final
     #else
     throw InpaintError.maskLoadFailed("CoreGraphics not available")
