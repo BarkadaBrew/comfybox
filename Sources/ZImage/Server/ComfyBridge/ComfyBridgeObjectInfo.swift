@@ -467,15 +467,42 @@ enum ComfyBridgeObjectInfo {
     ]
   }
 
+  /// Default ControlNet directory path — matches zimageLoraModels pattern.
+  private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
+
   private static func zimageControlnetModels() -> [String] {
-    // Phase 3: no control model weights available yet.
-    // Empty list forces Krita to use latent-space inpainting fallback.
-    []
+    // Phase 4: dynamically scan ControlNet directory for weights.
+    // Supports .safetensors files and subdirectories containing them.
+    let controlnetDir = controlnetDirectoryPath
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: controlnetDir) else {
+      return []
+    }
+    var models: [String] = []
+    for entry in entries {
+      let fullPath = controlnetDir + "/" + entry
+      var isDir: ObjCBool = false
+      if fm.fileExists(atPath: fullPath, isDirectory: &isDir) {
+        if isDir.boolValue {
+          // Subdirectory containing .safetensors — use directory name as model name
+          if let subEntries = try? fm.contentsOfDirectory(atPath: fullPath),
+             subEntries.contains(where: { $0.hasSuffix(".safetensors") }) {
+            models.append(entry)
+          }
+        } else if entry.hasSuffix(".safetensors") {
+          // Single safetensors file
+          models.append(entry)
+        }
+      }
+    }
+    // Also include HuggingFace model IDs that are known to work
+    models.append("alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1")
+    return models.sorted()
   }
 
   private static func zimageControlnetPatchModels() -> [String] {
-    // Phase 3: no control model weights available yet.
-    []
+    // Phase 4: ModelPatchLoader uses the same model list as ControlNetLoader.
+    zimageControlnetModels()
   }
 
   private static func zimageUpscaleModels() -> [String] {

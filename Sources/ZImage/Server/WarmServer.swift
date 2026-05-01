@@ -214,6 +214,9 @@ public final class WarmServer {
   /// Default LoRA directory path — matches ComfyBridgeObjectInfo discovery path.
   private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
 
+  /// Default ControlNet directory path — matches ComfyBridgeObjectInfo discovery path.
+  private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
+
   private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult {
     // --- Phase 4: Dynamic LoRA swap ---
     // If the workflow contains LoraLoader nodes, swap LoRAs before generating.
@@ -248,6 +251,114 @@ public final class WarmServer {
         genHeight = 1024
         logger.warning("WarmServer: could not read inpaint image dimensions, falling back to 1024x1024")
       }
+    }
+
+    // --- Phase 4: ControlNet routing ---
+    // If the workflow contains ControlNet nodes, route to ZImageControlPipeline
+    // instead of the standard ZImagePipeline.
+    if request.isControlNet, let controlnetModel = request.controlnetModel {
+      logger.info("WarmServer: routing to ControlNet pipeline — model=\(controlnetModel), strength=\(request.controlnetStrength)")
+
+      // Resolve controlnet model name to a path or HuggingFace ID
+      let resolvedControlnetWeights: String
+      if controlnetModel.contains("/") || controlnetModel.hasPrefix("~") || controlnetModel.hasPrefix(".") {
+        // Already a path or HuggingFace ID — use as-is
+        resolvedControlnetWeights = controlnetModel
+      } else {
+        // Bare name — check if it's a local directory/file in the controlnet dir
+        let localPath = Self.controlnetDirectoryPath + "/" + controlnetModel
+        if FileManager.default.fileExists(atPath: localPath) {
+          resolvedControlnetWeights = localPath
+        } else {
+          // Treat as HuggingFace ID
+          resolvedControlnetWeights = controlnetModel
+        }
+      }
+
+      // Write control image data to a temp file if we have it
+      var controlImageURL: URL? = nil
+      if let controlData = request.controlImageData {
+        let tempPath = NSTemporaryDirectory() + "zimage-control-\(UUID().uuidString).png"
+        try controlData.write(to: URL(fileURLWithPath: tempPath))
+        controlImageURL = URL(fileURLWithPath: tempPath)
+        logger.info("WarmServer: wrote control image to \(tempPath) (\(controlData.count) bytes)")
+      }
+
+      // Write inpaint image to temp file if present
+      var inpaintImageURL: URL? = nil
+      if let inpaintData = request.inpaintImageData {
+        let tempPath = NSTemporaryDirectory() + "zimage-inpaint-\(UUID().uuidString).png"
+        try inpaintData.write(to: URL(fileURLWithPath: tempPath))
+        inpaintImageURL = URL(fileURLWithPath: tempPath)
+      }
+
+      // Write mask to temp file if present
+      var maskImageURL: URL? = nil
+      if let maskData = request.maskImageData {
+        let tempPath = NSTemporaryDirectory() + "zimage-mask-\(UUID().uuidString).png"
+        try maskData.write(to: URL(fileURLWithPath: tempPath))
+        maskImageURL = URL(fileURLWithPath: tempPath)
+      }
+
+      let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("zimage-\(UUID().uuidString).png")
+
+      // Build LoRA configurations for the control pipeline
+      let controlLoRAs: [LoRAConfiguration] = request.loras.map { lora in
+        let resolvedPath: String
+        if lora.name.contains("/") || lora.name.hasPrefix("~") {
+          resolvedPath = lora.name
+        } else {
+          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+        }
+        return .local(resolvedPath, scale: lora.scale)
+      }
+
+      let controlRequest = ZImageControlGenerationRequest(
+        prompt: request.prompt,
+        negativePrompt: nil,
+        controlImage: controlImageURL,
+        inpaintImage: inpaintImageURL,
+        maskImage: maskImageURL,
+        controlContextScale: request.controlnetStrength,
+        width: genWidth,
+        height: genHeight,
+        steps: request.steps,
+        guidanceScale: 0.0,
+        seed: request.seed,
+        outputPath: outputURL,
+        model: nil,
+        textEncoderPath: configuration.textEncoderPath,
+        controlnetWeights: resolvedControlnetWeights,
+        // For HuggingFace repos with multiple safetensors, specify the 8-step variant
+        controlnetWeightsFile: resolvedControlnetWeights.contains("alibaba-pai")
+          ? "Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors" : nil,
+        maxSequenceLength: configuration.maxSequenceLength,
+        loras: controlLoRAs,
+        progressCallback: progressCallback.map { callback in
+          return { progress in
+            if progress.stage == "Denoising" {
+              callback(progress.stepIndex, progress.totalSteps)
+            }
+          }
+        },
+        enhancePrompt: false,
+        enhanceMaxTokens: 512
+      )
+
+      let start = Date()
+      let result = try await coordinator.enqueueControlGenerate(controlRequest)
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+
+      // Clean up temp files
+      if let url = controlImageURL { try? FileManager.default.removeItem(at: url) }
+      if let url = inpaintImageURL { try? FileManager.default.removeItem(at: url) }
+      if let url = maskImageURL { try? FileManager.default.removeItem(at: url) }
+
+      return ComfyBridgeGenerateResult(
+        outputPath: result.outputPath,
+        durationMs: result.durationMs
+      )
     }
 
     let payload = GeneratePayload(
@@ -380,6 +491,8 @@ private actor WarmServerCoordinator {
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private let pipeline: ZImagePipeline
+  /// Lazy-initialized ControlNet pipeline — only created when first ControlNet request arrives.
+  private var controlPipeline: ZImageControlPipeline?
   private let startTime = Date()
   private var activeLoRAs: [LoRAConfiguration]
   private var pending: [QueuedOperation] = []
@@ -442,6 +555,20 @@ private actor WarmServerCoordinator {
     }
   }
 
+  func enqueueControlGenerate(_ request: ZImageControlGenerationRequest) async throws -> GenerateResponse {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(.controlGenerate(request, ContinuationBox(continuation)))
+      startProcessingIfNeeded()
+    }
+  }
+
   func enqueueShutdown() async throws -> ShutdownResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -497,6 +624,8 @@ private actor WarmServerCoordinator {
       switch operation {
       case .generate(let payload, let continuation, let progressHandler):
         await runGenerate(payload, continuation: continuation, progressHandler: progressHandler)
+      case .controlGenerate(let request, let continuation):
+        await runControlGenerate(request, continuation: continuation)
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
       case .shutdown(let continuation):
@@ -520,6 +649,39 @@ private actor WarmServerCoordinator {
         activeLoRAs: activeLoRAs
       )
       let outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      successfulRenderCount += 1
+      lastRenderDurationMs = durationMs
+      lastError = nil
+      activeRenderStartedAt = nil
+
+      continuation.resume(
+        returning: GenerateResponse(
+          success: true,
+          outputPath: outputURL.path,
+          durationMs: durationMs
+        )
+      )
+    } catch {
+      failedRenderCount += 1
+      lastError = error.localizedDescription
+      activeRenderStartedAt = nil
+      continuation.resume(throwing: error)
+    }
+  }
+
+  private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
+    activeRenderStartedAt = Date()
+    let start = Date()
+
+    do {
+      // Lazy-init the control pipeline on first ControlNet request
+      if controlPipeline == nil {
+        logger.info("Initializing ControlNet pipeline (first use)...")
+        controlPipeline = ZImageControlPipeline(logger: logger)
+      }
+
+      let outputURL = try await controlPipeline!.generate(request)
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
@@ -1061,6 +1223,7 @@ struct ErrorPayload: Encodable {
 
 private enum QueuedOperation: Sendable {
   case generate(GeneratePayload, ContinuationBox<GenerateResponse>, (@Sendable (ZImagePipeline.GenerationProgress) -> Void)?)
+  case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }

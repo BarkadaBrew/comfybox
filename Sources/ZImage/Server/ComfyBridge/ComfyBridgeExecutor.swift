@@ -89,11 +89,21 @@ final class ComfyBridgeExecutor {
       mutableRequest.maskImageData = maskData
       logger.info("ComfyBridge: loaded mask image \(maskId) (\(maskData.count) bytes)")
     }
+    if let controlImageId = request.controlImageId {
+      guard let controlData = imageCache.retrieve(id: controlImageId) else {
+        logger.error("ComfyBridge: control image not found in cache: \(controlImageId)")
+        sendError(promptId: request.promptId, clientId: request.clientId,
+                  message: "Control image not found: \(controlImageId)")
+        return
+      }
+      mutableRequest.controlImageData = controlData
+      logger.info("ComfyBridge: loaded control image \(controlImageId) (\(controlData.count) bytes)")
+    }
 
     let promptPreview = mutableRequest.prompt.count > 80
       ? String(mutableRequest.prompt.prefix(77)) + "..."
       : mutableRequest.prompt
-    let modeLabel = mutableRequest.isInpaint ? "inpaint" : "txt2img"
+    let modeLabel = mutableRequest.isControlNet ? "controlnet" : (mutableRequest.isInpaint ? "inpaint" : "txt2img")
     logger.info("ComfyBridge: executing \(modeLabel) prompt_id=\(mutableRequest.promptId) — \(mutableRequest.width)x\(mutableRequest.height), \(mutableRequest.steps) steps, denoise=\(mutableRequest.denoise)")
     logger.info("ComfyBridge: prompt — \"\(promptPreview)\"")
 

@@ -45,13 +45,30 @@ struct ComfyBridgeGenerateRequest: Sendable {
   /// Each entry is (filename, strength_model scale).
   let loras: [(name: String, scale: Float)]
 
+  // --- Phase 4: ControlNet fields ---
+
+  /// ControlNet model name or path (from ControlNetLoader or ModelPatchLoader node).
+  let controlnetModel: String?
+  /// ControlNet strength (0.0-1.0). Default 0.5.
+  let controlnetStrength: Float
+  /// ControlNet start percent (when to start applying control). Default 0.0.
+  let controlnetStart: Float
+  /// ControlNet end percent (when to stop applying control). Default 1.0.
+  let controlnetEnd: Float
+  /// Image cache ID of the control image (depth map, canny edges, etc.).
+  let controlImageId: String?
+
   /// Whether this is an inpainting request.
   var isInpaint: Bool { inpaintImageId != nil }
+
+  /// Whether this request uses ControlNet.
+  var isControlNet: Bool { controlnetModel != nil }
 
   // Populated by executor before passing to generate handler.
   // Not set by parser — must be filled from image cache.
   var inpaintImageData: Data?
   var maskImageData: Data?
+  var controlImageData: Data?
 }
 
 /// Result of a ComfyUI bridge generation.
@@ -235,10 +252,56 @@ enum ComfyBridgeWorkflowParser {
       loras.append((name: loraName, scale: strengthModel))
     }
 
+    // --- Phase 4: ControlNet extraction ---
+    // Krita sends ZImageFunControlnet nodes for Z-Image native controlnet workflows,
+    // or ControlNetLoader nodes for standard ComfyUI controlnet workflows.
+    // We also check ModelPatchLoader which Krita uses for our custom node.
+    let controlnetModel: String?
+    var controlnetStrength: Float = 0.5
+    var controlnetStart: Float = 0.0
+    var controlnetEnd: Float = 1.0
+    var controlImageId: String?
+
+    // Check for ZImageFunControlnet node first (our custom node)
+    if let funControlNode = nodes.values.first(where: { $0.classType == "ZImageFunControlnet" }) {
+      // The model_patch input links to a ModelPatchLoader node
+      if let patchRef = funControlNode.inputs["model_patch"] as? [Any],
+         let patchNodeId = patchRef.first as? String,
+         let patchNode = nodes[patchNodeId],
+         patchNode.classType == "ModelPatchLoader" {
+        controlnetModel = patchNode.inputs["name"] as? String
+      } else {
+        controlnetModel = nil
+      }
+      controlnetStrength = floatValue(funControlNode.inputs["strength"]) ?? 0.5
+      controlnetStart = floatValue(funControlNode.inputs["start"]) ?? 0.0
+      controlnetEnd = floatValue(funControlNode.inputs["end"]) ?? 1.0
+      // The inpaint_image input links to ETN_LoadImageCache or another image source
+      if let imgRef = funControlNode.inputs["inpaint_image"] as? [Any],
+         let imgNodeId = imgRef.first as? String,
+         let imgNode = nodes[imgNodeId] {
+        if imgNode.classType == "ETN_LoadImageCache" {
+          controlImageId = imgNode.inputs["id"] as? String
+        }
+      }
+    }
+    // Fallback: standard ControlNetLoader node
+    else if let controlNetLoader = nodes.values.first(where: { $0.classType == "ControlNetLoader" }) {
+      controlnetModel = controlNetLoader.inputs["control_net_name"] as? String
+    }
+    // Fallback: standalone ModelPatchLoader node
+    else if let modelPatchLoader = nodes.values.first(where: { $0.classType == "ModelPatchLoader" }) {
+      controlnetModel = modelPatchLoader.inputs["name"] as? String
+    }
+    else {
+      controlnetModel = nil
+    }
+
     // Debug: log workflow structure
     let _nodeTypes = nodes.values.map { $0.classType }.sorted()
     let _loraDesc = loras.isEmpty ? "none" : loras.map { "\($0.name)@\($0.scale)" }.joined(separator: ", ")
-    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc)")
+    let _cnDesc = controlnetModel ?? "none"
+    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc) controlnet=\(_cnDesc)")
 
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
@@ -259,7 +322,12 @@ enum ComfyBridgeWorkflowParser {
       maskFeather: maskFeather,
       maskCropX: maskCropX,
       maskCropY: maskCropY,
-      loras: loras
+      loras: loras,
+      controlnetModel: controlnetModel,
+      controlnetStrength: controlnetStrength,
+      controlnetStart: controlnetStart,
+      controlnetEnd: controlnetEnd,
+      controlImageId: controlImageId
     )
   }
 
