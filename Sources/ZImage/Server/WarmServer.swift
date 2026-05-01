@@ -211,7 +211,29 @@ public final class WarmServer {
     return ((n + 15) / 16) * 16
   }
 
+  /// Default LoRA directory path — matches ComfyBridgeObjectInfo discovery path.
+  private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
+
   private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult {
+    // --- Phase 4: Dynamic LoRA swap ---
+    // If the workflow contains LoraLoader nodes, swap LoRAs before generating.
+    // The coordinator serializes operations, so swap completes before generate starts.
+    if !request.loras.isEmpty {
+      let loraEntries = request.loras.map { lora -> LoRAEntry in
+        // Resolve bare filenames to full paths in the LoRA directory.
+        let resolvedPath: String
+        if lora.name.contains("/") || lora.name.hasPrefix("~") {
+          resolvedPath = lora.name
+        } else {
+          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+        }
+        return LoRAEntry(path: resolvedPath, scale: lora.scale)
+      }
+      let swapPayload = LoRASwapPayload(loras: loraEntries)
+      let swapResult = try await coordinator.enqueueSwap(swapPayload)
+      logger.info("WarmServer: bridge LoRA swap complete — \(swapResult.loraCount) LoRA(s) active")
+    }
+
     // Derive dimensions from inpaint image if parser returned 0x0
     // (happens when workflow has no ImageCrop or EmptyLatentImage nodes)
     var genWidth = request.width

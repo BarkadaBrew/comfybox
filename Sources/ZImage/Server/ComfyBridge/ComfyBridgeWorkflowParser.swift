@@ -39,6 +39,12 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let maskCropX: Int
   let maskCropY: Int
 
+  // --- Phase 4: LoRA fields ---
+
+  /// LoRAs extracted from LoraLoader nodes in the workflow.
+  /// Each entry is (filename, strength_model scale).
+  let loras: [(name: String, scale: Float)]
+
   /// Whether this is an inpainting request.
   var isInpaint: Bool { inpaintImageId != nil }
 
@@ -213,9 +219,26 @@ enum ComfyBridgeWorkflowParser {
     let maskCropX = intValue(cropNode?.inputs["x"]) ?? 0
     let maskCropY = intValue(cropNode?.inputs["y"]) ?? 0
 
+    // --- Phase 4: LoRA extraction ---
+    // Find all LoraLoader nodes and extract lora_name + strength_model.
+    // LoraLoader nodes chain: each feeds its MODEL output to the next's model input.
+    // We collect all of them regardless of chain order — the pipeline applies them all.
+    let loraLoaderNodes = nodes.values
+      .filter { $0.classType == "LoraLoader" }
+      .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    var loras: [(name: String, scale: Float)] = []
+    for loraNode in loraLoaderNodes {
+      guard let loraName = loraNode.inputs["lora_name"] as? String, !loraName.isEmpty else {
+        continue
+      }
+      let strengthModel = floatValue(loraNode.inputs["strength_model"]) ?? 1.0
+      loras.append((name: loraName, scale: strengthModel))
+    }
+
     // Debug: log workflow structure
     let _nodeTypes = nodes.values.map { $0.classType }.sorted()
-    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise)")
+    let _loraDesc = loras.isEmpty ? "none" : loras.map { "\($0.name)@\($0.scale)" }.joined(separator: ", ")
+    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc)")
 
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
@@ -235,7 +258,8 @@ enum ComfyBridgeWorkflowParser {
       maskGrow: maskGrow,
       maskFeather: maskFeather,
       maskCropX: maskCropX,
-      maskCropY: maskCropY
+      maskCropY: maskCropY,
+      loras: loras
     )
   }
 
