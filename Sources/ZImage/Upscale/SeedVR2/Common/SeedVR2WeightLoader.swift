@@ -82,7 +82,7 @@ public enum SeedVR2WeightLoader {
     into transformer: SeedVR2Transformer,
     from directory: URL,
     fileName: String,
-    dtype: DType = .bfloat16,
+    dtype: DType = .float16,
     logger: Logger
   ) throws {
     let fileURL = directory.appendingPathComponent(fileName)
@@ -123,7 +123,7 @@ public enum SeedVR2WeightLoader {
     into vae: SeedVR2VAE,
     from directory: URL,
     fileName: String = vaeWeightFile,
-    dtype: DType = .bfloat16,
+    dtype: DType = .float16,
     logger: Logger
   ) throws {
     let fileURL = directory.appendingPathComponent(fileName)

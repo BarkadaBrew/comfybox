@@ -122,10 +122,13 @@ public final class SeedVR2Decoder3D: Module {
   /// - Parameter z: Latent tensor of shape `(B, latentChannels, T_lat, H_lat, W_lat)`.
   /// - Returns: Decoded tensor of shape `(B, 3, T, H, W)`.
   public func callAsFunction(_ z: MLXArray) -> MLXArray {
+
+
     var hidden = convIn(z)
+
     hidden = midBlock(hidden)
 
-    for upBlock in upBlocks {
+    for (i, upBlock) in upBlocks.enumerated() {
       hidden = upBlock(hidden)
     }
 
@@ -135,6 +138,7 @@ public final class SeedVR2Decoder3D: Module {
     hidden = hidden.transposed(0, 4, 1, 2, 3)
 
     hidden = silu(hidden)
+
     hidden = convOut(hidden)
 
     return hidden

@@ -141,7 +141,7 @@ public final class SeedVR2Pipeline {
 
     // 2. VAE encode
     logger.info("Step 2: VAE encoding...")
-    let encodedLatent = vae.encode(preprocessed.tensor)
+    let encodedLatent = vae.tiledEncode(preprocessed.tensor)
     MLX.eval(encodedLatent)
     logger.info("Encoded latent shape: \(encodedLatent.shape)")
 
@@ -170,7 +170,10 @@ public final class SeedVR2Pipeline {
     for t in 0..<numSteps {
       let modelInput = MLX.concatenated([latents, condition], axis: 1)
       let timestep = scheduler.timesteps[t]
+
       let noise = transformer(vid: modelInput, txt: txtPos, timestep: timestep)
+      MLX.eval(noise)
+
       latents = scheduler.step(modelOutput: noise, timestepIndex: t, sample: latents)
       MLX.eval(latents)
       logger.info("  Step \(t + 1)/\(numSteps) complete")
@@ -178,7 +181,7 @@ public final class SeedVR2Pipeline {
 
     // 7. VAE decode
     logger.info("Step 7: VAE decoding...")
-    var decoded = vae.decode(latents)
+    var decoded = vae.tiledDecode(latents)
     MLX.eval(decoded)
 
     // 8. Crop to true dimensions
