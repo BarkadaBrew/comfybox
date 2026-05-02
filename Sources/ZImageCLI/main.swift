@@ -194,6 +194,9 @@ struct ZImageCLI {
       case "upscale":
         try runUpscale(args: Array(args.dropFirst()))
         return
+      case "models":
+        runModels(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -809,6 +812,9 @@ struct ZImageCLI {
         --seed               Random seed
         --weights, -w        Path to SeedVR2 model weights directory
         --softness           Preprocessing softness 0.0-1.0 (default: 0.0)
+
+      models                 List known model families with installation status
+        --paths, -v          Show filesystem paths for installed models
 
     Examples:
       ZImageCLI -p "a cute cat" -o cat.png
@@ -1606,6 +1612,277 @@ struct ZImageCLI {
     exit(1)
   }
   #endif
+
+  // MARK: - Models Subcommand
+
+  /// Known model families with their HuggingFace IDs and local directory names.
+  private struct ModelFamily {
+    let family: String
+    let variant: String
+    let directoryName: String
+    let huggingFaceId: String?
+
+    static let all: [ModelFamily] = [
+      ModelFamily(family: "flux", variant: "schnell", directoryName: "flux-schnell-4bit", huggingFaceId: "black-forest-labs/FLUX.1-schnell"),
+      ModelFamily(family: "flux", variant: "dev", directoryName: "flux-dev-4bit", huggingFaceId: "black-forest-labs/FLUX.1-dev"),
+      ModelFamily(family: "flux", variant: "coffeeshop-8bit", directoryName: "coffeeshop-8bit", huggingFaceId: "carsenk/z-image-turbo-mflux-8bit"),
+      ModelFamily(family: "fibo", variant: "8b", directoryName: "fibo-8b-4bit", huggingFaceId: "briaai/FIBO"),
+      ModelFamily(family: "fibo", variant: "vlm", directoryName: "fibo-vlm", huggingFaceId: "briaai/FIBO-vlm"),
+      ModelFamily(family: "seedvr2", variant: "3b", directoryName: "seedvr2-3b", huggingFaceId: "numz/SeedVR2_comfyUI"),
+      ModelFamily(family: "seedvr2", variant: "7b", directoryName: "seedvr2-7b", huggingFaceId: nil),
+      ModelFamily(family: "redux", variant: "encoder", directoryName: "redux-encoder", huggingFaceId: "DiffSynth-Studio/General-Image-Encoders"),
+      ModelFamily(family: "kontext", variant: "default", directoryName: "kontext", huggingFaceId: nil),
+      ModelFamily(family: "flux2", variant: "klein-4b", directoryName: "flux2-klein-4b", huggingFaceId: "black-forest-labs/FLUX.2-klein-4B"),
+      ModelFamily(family: "qwen", variant: "default", directoryName: "qwen", huggingFaceId: nil),
+    ]
+  }
+
+  private enum ModelStatus: String {
+    case installed = "installed"
+    case notFound = "not found"
+  }
+
+  private static func runModels(args: [String]) {
+    var showPaths = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--paths", "-v":
+        showPaths = true
+      case "--help", "-h":
+        printModelsUsage()
+        return
+      default:
+        logger.warning("Unknown models argument: \(arg)")
+      }
+    }
+
+    let fm = FileManager.default
+    let searchPaths = modelSearchPaths()
+
+    // Header
+    print("")
+    let header = padRight("FAMILY", 14) + " " + padRight("VARIANT", 16) + " " + padRight("STATUS", 10) + " " + padLeft("SIZE", 10) + "   " + "QUANT"
+    print(header)
+    print(String(repeating: "-", count: header.count + 10))
+
+    var installedCount = 0
+    var totalSize: UInt64 = 0
+
+    fflush(stderr)
+    for model in ModelFamily.all {
+      fflush(stderr)
+      let (status, path, size) = resolveModelStatus(model: model, searchPaths: searchPaths, fm: fm)
+      fflush(stderr)
+
+      let sizeStr: String
+      if let size {
+        sizeStr = formatBytes(size)
+        totalSize += size
+      } else {
+        sizeStr = "-"
+      }
+
+      let statusStr: String
+      switch status {
+      case .installed:
+        statusStr = "installed"
+        installedCount += 1
+      case .notFound:
+        statusStr = "not found"
+      }
+
+      let quant = detectQuantization(at: path, fm: fm)
+
+      let row = padRight(model.family, 14) + " " + padRight(model.variant, 16) + " " + padRight(statusStr, 10) + " " + padLeft(sizeStr, 10) + "   " + quant
+      print(row)
+
+      if showPaths, let path {
+        print("               \(path)")
+      }
+    }
+
+    print(String(repeating: "-", count: header.count + 10))
+    print("\(installedCount)/\(ModelFamily.all.count) installed, \(formatBytes(totalSize)) total")
+    print("")
+    fflush(stdout)
+    _exit(0)
+  }
+
+  /// Build ordered list of directories to search for models.
+  private static func modelSearchPaths() -> [URL] {
+    var paths: [URL] = []
+    let fm = FileManager.default
+    let home = fm.homeDirectoryForCurrentUser
+
+    // 1. HuggingFace cache
+    let env = ProcessInfo.processInfo.environment
+    if let hubCache = env["HF_HUB_CACHE"], !hubCache.isEmpty {
+      paths.append(URL(fileURLWithPath: hubCache))
+    } else if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+      paths.append(URL(fileURLWithPath: hfHome).appendingPathComponent("hub"))
+    } else {
+      paths.append(home.appendingPathComponent(".cache/huggingface/hub"))
+    }
+
+    // 2. ~/models
+    paths.append(home.appendingPathComponent("models"))
+
+    // 3. ./models
+    let cwdModels = URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("models")
+    if !paths.contains(where: { $0.path == cwdModels.path }) {
+      paths.append(cwdModels)
+    }
+
+    return paths
+  }
+
+  /// Try to find a model in the search paths. Returns (status, path, sizeInBytes).
+  private static func resolveModelStatus(
+    model: ModelFamily,
+    searchPaths: [URL],
+    fm: FileManager
+  ) -> (ModelStatus, String?, UInt64?) {
+    for base in searchPaths {
+      // Direct directory name match (e.g. ~/models/seedvr2-3b)
+      let direct = base.appendingPathComponent(model.directoryName)
+      if fm.fileExists(atPath: direct.path) {
+        let size = directorySize(at: direct, fm: fm)
+        return (.installed, direct.path, size)
+      }
+
+      // HuggingFace cache layout: models--ORG--REPO/snapshots/<commit>/
+      if let hfId = model.huggingFaceId {
+        let repoCacheRoot = base.appendingPathComponent("models--\(hfId.replacingOccurrences(of: "/", with: "--"))")
+        let snapshotsRoot = repoCacheRoot.appendingPathComponent("snapshots")
+        if fm.fileExists(atPath: snapshotsRoot.path),
+           let snapshots = try? fm.contentsOfDirectory(at: snapshotsRoot, includingPropertiesForKeys: nil),
+           let first = snapshots.first {
+          let size = directorySize(at: first, fm: fm)
+          return (.installed, first.path, size)
+        }
+      }
+    }
+
+    return (.notFound, nil, nil)
+  }
+
+  /// Recursively compute the total size of a directory in bytes.
+  /// Follows symlinks to get real file sizes (needed for HuggingFace cache layout).
+  private static func directorySize(at url: URL, fm: FileManager) -> UInt64 {
+    guard let enumerator = fm.enumerator(
+      at: url,
+      includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .isRegularFileKey],
+      options: [.skipsHiddenFiles]
+    ) else {
+      return 0
+    }
+
+    var total: UInt64 = 0
+    for case let fileURL as URL in enumerator {
+      // Resolve symlinks to get the real file
+      let resolved = fileURL.resolvingSymlinksInPath()
+      guard let values = try? resolved.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .isRegularFileKey, .fileSizeKey]),
+            values.isRegularFile == true else {
+        continue
+      }
+      // Prefer allocated size, fall back to logical size
+      let size = values.totalFileAllocatedSize ?? values.fileSize ?? 0
+      total += UInt64(size)
+    }
+    return total
+  }
+
+  /// Detect quantization level from directory contents.
+  private static func detectQuantization(at path: String?, fm: FileManager) -> String {
+    guard let path else { return "-" }
+    let url = URL(fileURLWithPath: path)
+
+    // Check for quantization.json (written by our quantize subcommand)
+    let quantFile = url.appendingPathComponent("quantization.json")
+    if fm.fileExists(atPath: quantFile.path),
+       let data = try? Data(contentsOf: quantFile),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let bits = json["bits"] as? Int,
+       let groupSize = json["group_size"] as? Int {
+      return "q\(bits)_g\(groupSize)"
+    }
+
+    // Check subdirectories for quantization.json
+    for sub in ["transformer", "text_encoder", "vae"] {
+      let subQuantFile = url.appendingPathComponent(sub).appendingPathComponent("quantization.json")
+      if fm.fileExists(atPath: subQuantFile.path),
+         let data = try? Data(contentsOf: subQuantFile),
+         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let bits = json["bits"] as? Int,
+         let groupSize = json["group_size"] as? Int {
+        return "q\(bits)_g\(groupSize)"
+      }
+    }
+
+    // Infer from directory name (check multiple levels for HF cache paths)
+    let pathStr = url.path.lowercased()
+    if pathStr.contains("q4") || pathStr.contains("4bit") || pathStr.contains("4-bit") { return "q4" }
+    if pathStr.contains("q8") || pathStr.contains("8bit") || pathStr.contains("8-bit") { return "q8" }
+    if pathStr.contains("bf16") { return "bf16" }
+
+    // Check if safetensors files look quantized by checking for quantization config
+    let transformerDir = url.appendingPathComponent("transformer")
+    if let contents = try? fm.contentsOfDirectory(at: transformerDir, includingPropertiesForKeys: nil) {
+      let safetensors = contents.filter { $0.pathExtension == "safetensors" }
+      if !safetensors.isEmpty {
+        // If model has fp16 in parent path or is a standard HF snapshot, assume fp16
+        return "fp16"
+      }
+    }
+
+    return "-"
+  }
+
+  /// Format bytes as human-readable string (e.g. "4.2 GB", "128 MB").
+  private static func formatBytes(_ bytes: UInt64) -> String {
+    let gb = Double(bytes) / (1024.0 * 1024.0 * 1024.0)
+    if gb >= 1.0 {
+      return String(format: "%.1f GB", gb)
+    }
+    let mb = Double(bytes) / (1024.0 * 1024.0)
+    if mb >= 1.0 {
+      return String(format: "%.0f MB", mb)
+    }
+    let kb = Double(bytes) / 1024.0
+    return String(format: "%.0f KB", kb)
+  }
+
+  private static func padRight(_ s: String, _ width: Int) -> String {
+    if s.count >= width { return s }
+    return s + String(repeating: " ", count: width - s.count)
+  }
+
+  private static func padLeft(_ s: String, _ width: Int) -> String {
+    if s.count >= width { return s }
+    return String(repeating: " ", count: width - s.count) + s
+  }
+
+  private static func printModelsUsage() {
+    print("""
+    List known model families with installation status.
+
+    Usage: ZImageCLI models [options]
+      --paths, -v   Show filesystem paths for installed models
+      --help, -h    Show help
+
+    Search paths (in order):
+      1. $HF_HUB_CACHE or $HF_HOME/hub or ~/.cache/huggingface/hub
+      2. ~/models
+      3. ./models
+
+    Example:
+      ZImageCLI models
+      ZImageCLI models --paths
+    """)
+  }
+
 
 }
 
