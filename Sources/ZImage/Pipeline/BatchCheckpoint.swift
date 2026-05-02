@@ -64,6 +64,7 @@ public struct BatchCheckpoint: Sendable {
         if let handle = FileHandle(forWritingAtPath: checkpointPath) {
             handle.seekToEndOfFile()
             handle.write(Data(line.utf8))
+            handle.synchronizeFile()
             handle.closeFile()
         } else {
             try? line.write(toFile: checkpointPath, atomically: true, encoding: .utf8)

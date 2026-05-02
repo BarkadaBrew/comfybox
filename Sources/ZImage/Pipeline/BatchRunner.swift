@@ -115,8 +115,13 @@ public struct BatchRunner {
             // Re-read prompt file if configured
             let prompt: String?
             if let promptFilePath = config.promptFilePath {
-                prompt = try? String(contentsOfFile: promptFilePath, encoding: .utf8)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                do {
+                    prompt = try String(contentsOfFile: promptFilePath, encoding: .utf8)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                } catch {
+                    fputs("[batch] WARNING: Failed to read prompt file \(promptFilePath): \(error). Using original prompt.\n", stderr)
+                    prompt = nil
+                }
             } else {
                 prompt = nil
             }
