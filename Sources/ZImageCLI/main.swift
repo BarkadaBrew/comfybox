@@ -75,6 +75,11 @@ struct ZImageCLI {
     var resumeBatchPath: String?
     var promptFilePath: String?
 
+    // --- Img2img ---
+    var imagePath: String?
+    var imageStrength: Float?
+    var imageCreativity: Float?
+
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
 
@@ -165,6 +170,12 @@ struct ZImageCLI {
         resumeBatchPath = nextValue(for: arg, iterator: &iterator)
       case "--prompt-file":
         promptFilePath = nextValue(for: arg, iterator: &iterator)
+      case "--image-path", "--image":
+        imagePath = nextValue(for: arg, iterator: &iterator)
+      case "--image-strength":
+        imageStrength = floatValue(for: arg, iterator: &iterator, fallback: 0.3)
+      case "--creativity":
+        imageCreativity = floatValue(for: arg, iterator: &iterator, fallback: 0.7)
       case "--help", "-h":
         printUsage()
         return
@@ -252,6 +263,19 @@ struct ZImageCLI {
     guard let prompt else {
       printUsage()
       return
+    }
+
+    // Validate img2img flags
+    if imageStrength != nil && imageCreativity != nil {
+      fputs("Error: --image-strength and --creativity are mutually exclusive.\n", stderr)
+      exit(1)
+    }
+    if imagePath != nil && (imageStrength == nil && imageCreativity == nil) {
+      imageStrength = 0.3
+    }
+    if (imageStrength != nil || imageCreativity != nil) && imagePath == nil {
+      fputs("Error: --image-strength/--creativity requires --image-path.\n", stderr)
+      exit(1)
     }
 
     if let limit = cacheLimit {
@@ -403,6 +427,137 @@ struct ZImageCLI {
           print("Checkpoint: \(checkpoint)")
         }
       }
+      return
+    }
+
+    // === IMG2IMG PATH ===
+    if let imagePath {
+      let resolvedStrength: Float
+      let specifiedAs: Img2ImgRequest.Img2ImgSpecifier
+      if let creativity = imageCreativity {
+        resolvedStrength = 1.0 - max(0.01, min(0.99, creativity))
+        specifiedAs = .creativity
+      } else {
+        resolvedStrength = imageStrength ?? 0.3
+        specifiedAs = .strength
+      }
+      let specifiedValue = specifiedAs == .creativity ? (imageCreativity ?? 0.7) : resolvedStrength
+
+      let img2imgRequest = Img2ImgRequest(
+        prompt: prompt,
+        negativePrompt: negativePrompt,
+        width: width == ZImageModelMetadata.recommendedWidth ? nil : width,
+        height: height == ZImageModelMetadata.recommendedHeight ? nil : height,
+        steps: steps,
+        guidanceScale: guidance,
+        seed: seed,
+        outputPath: URL(fileURLWithPath: outputPath),
+        model: model,
+        textEncoderPath: textEncoderPath,
+        maxSequenceLength: maxSequenceLength,
+        loras: loraConfigs,
+        enhancePrompt: enhancePrompt,
+        enhanceMaxTokens: enhanceMaxTokens,
+        forceTransformerOverrideOnly: forceTransformerOverrideOnly,
+        schedulerKind: schedulerKind,
+        sigmaSchedule: sigmaSchedule,
+        eta: eta,
+        dyPE: dyPEConfig,
+        sourceImagePath: imagePath,
+        strength: resolvedStrength,
+        specifiedAs: specifiedAs
+      )
+
+      let pipeline = ZImagePipeline(logger: logger)
+      nonisolated(unsafe) let semaphore = DispatchSemaphore(value: 0)
+      let shouldWriteMetadata = writeMetadata
+      let capturedStartTime = Date()
+      let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
+      let bar = useBar ? ProgressBar(total: steps) : nil
+      let finalOutputPath = URL(fileURLWithPath: outputPath)
+      let shouldGenerateSVG = generateSVG
+      let svgPresetCopy = svgPreset
+      let capturedSeed = seed
+      let capturedModel = model
+      let capturedLoraConfigs = loraConfigs
+      let capturedImagePath = imagePath
+      let capturedStrength = resolvedStrength
+      let capturedSpecifiedAs = specifiedAs.rawValue
+      let capturedSpecifiedValue = specifiedValue
+      Task {
+        do {
+          _ = try await pipeline.generateImg2Img(img2imgRequest, progressHandler: { progress in
+            guard !noProgress else { return }
+            guard progress.stage == .denoising else { return }
+            let completed = min(progress.totalSteps, max(0, progress.stepIndex))
+            if let bar {
+              bar.update(completed: completed)
+              if completed == progress.totalSteps {
+                bar.finish(forceNewline: true)
+              }
+            } else {
+              PlainProgress.shared.report(completed: completed, total: progress.totalSteps)
+            }
+          })
+          if let bar { bar.finish(forceNewline: true) }
+          if shouldWriteMetadata {
+            let loraInfos = capturedLoraConfigs.map { lora -> LoRAInfo in
+              let path: String
+              switch lora.source {
+              case .local(let url): path = url.path
+              case .huggingFace(let id, _): path = id
+              }
+              return LoRAInfo(path: path, scale: lora.scale)
+            }
+            let metadata = GenerationMetadata(
+              pipeline: .img2img,
+              model: ModelInfo(
+                family: "zimage",
+                variant: "turbo",
+                path: capturedModel ?? ZImageRepository.id
+              ),
+              parameters: GenerationParameters(
+                prompt: prompt,
+                negativePrompt: negativePrompt,
+                seed: capturedSeed ?? 0,
+                steps: steps,
+                guidance: guidance,
+                width: width,
+                height: height,
+                scheduler: schedulerKind.rawValue,
+                sigmaSchedule: sigmaSchedule == .flow ? nil : sigmaSchedule.rawValue
+              ),
+              img2img: Img2ImgInfo(
+                sourceImage: capturedImagePath,
+                strength: capturedStrength,
+                specifiedAs: capturedSpecifiedAs,
+                specifiedValue: capturedSpecifiedValue
+              ),
+              loras: loraInfos,
+              output: OutputInfo(
+                path: finalOutputPath.path,
+                width: width,
+                height: height,
+                renderTimeSeconds: Date().timeIntervalSince(capturedStartTime)
+              )
+            )
+            if let written = MetadataWriter.write(metadata, for: finalOutputPath.path) {
+              logger.info("Metadata written: \(written)")
+            }
+          }
+          if shouldGenerateSVG {
+            let svgOutputPath = finalOutputPath.deletingPathExtension().appendingPathExtension("svg")
+            logger.info("Converting to SVG: \(svgOutputPath.path)")
+            try convertToSVG(input: finalOutputPath, output: svgOutputPath, preset: svgPresetCopy)
+            logger.info("SVG generated: \(svgOutputPath.path)")
+          }
+        } catch {
+          logger.error("Img2img generation failed: \(error)")
+          if let bar { bar.finish(forceNewline: true) }
+        }
+        semaphore.signal()
+      }
+      semaphore.wait()
       return
     }
 
@@ -609,6 +764,12 @@ struct ZImageCLI {
       --seed                 Random seed (repeatable for batch: --seed 42 --seed 99)
       --resume-batch <path>  Resume batch from checkpoint file
       --prompt-file <path>   Re-read prompt from file before each batch iteration
+
+    Img2img:
+      --image-path, --image  Source image for img2img transformation
+      --image-strength       Strength (0.0-1.0): 0.3=heavy rework (default), 0.7=light touch
+      --creativity           Creativity (0.0-1.0): 0.7=heavy rework, 0.3=light touch (inverse of strength)
+                             Cannot be used with --image-strength
       --help, -h             Show help
 
     Subcommands:
