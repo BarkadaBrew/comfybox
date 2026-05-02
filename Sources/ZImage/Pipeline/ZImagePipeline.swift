@@ -45,6 +45,23 @@ public struct ZImageGenerationRequest: Sendable {
   /// When enabled, modifies RoPE frequencies to support resolutions above training scale.
   public var dyPE: DyPEConfig
 
+  // --- Latent-space inpainting (Phase 3) ---
+
+  /// Raw PNG data of the image to inpaint. When set, enables latent-space inpainting.
+  public var inpaintImageData: Data?
+  /// Raw PNG data of the mask. White (255) = regenerate, black (0) = preserve original.
+  public var maskData: Data?
+  /// Denoising strength for inpainting (0.0–1.0). Lower values preserve more of the original.
+  /// Default: 1.0 (full denoise, equivalent to txt2img).
+  public var denoise: Float
+  /// Mask expansion in pixels (default 0 = no expansion).
+  public var maskGrow: Int
+  /// Mask feather radius in pixels (default 0 = hard edges).
+  public var maskFeather: Int
+  /// ImageCrop x,y offset for cropping full-canvas mask to selection bounds.
+  public var maskCropX: Int
+  public var maskCropY: Int
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -65,7 +82,14 @@ public struct ZImageGenerationRequest: Sendable {
     schedulerKind: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .flow,
     eta: Float? = nil,
-    dyPE: DyPEConfig = .disabled
+    dyPE: DyPEConfig = .disabled,
+    inpaintImageData: Data? = nil,
+    maskData: Data? = nil,
+    denoise: Float = 1.0,
+    maskGrow: Int = 0,
+    maskFeather: Int = 0,
+    maskCropX: Int = 0,
+    maskCropY: Int = 0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -86,6 +110,13 @@ public struct ZImageGenerationRequest: Sendable {
     self.sigmaSchedule = sigmaSchedule
     self.eta = eta
     self.dyPE = dyPE
+    self.inpaintImageData = inpaintImageData
+    self.maskData = maskData
+    self.denoise = denoise
+    self.maskGrow = maskGrow
+    self.maskFeather = maskFeather
+    self.maskCropX = maskCropX
+    self.maskCropY = maskCropY
   }
 }
 
@@ -116,6 +147,8 @@ public final class ZImagePipeline {
   private var textEncoder: QwenTextEncoder?
   private var transformer: ZImageTransformer2DModel?
   private var vae: VAEImageDecoding?
+  /// Full VAE with encoder — lazily loaded on first inpaint request.
+  private var fullVAE: AutoencoderKL?
   private var modelConfigs: ZImageModelConfigs?
   private var quantManifest: ZImageQuantizationManifest?
   private var isModelLoaded: Bool = false
@@ -151,6 +184,7 @@ public final class ZImagePipeline {
     textEncoder = nil
     transformer = nil
     vae = nil
+    fullVAE = nil
     modelConfigs = nil
     quantManifest = nil
     isModelLoaded = false
@@ -279,6 +313,43 @@ public final class ZImagePipeline {
       sampleSize: config.sampleSize,
       midBlockAddAttention: config.midBlockAddAttention
     ))
+  }
+
+  /// Load the full VAE with encoder for inpainting.
+  /// Called lazily on first inpaint request. Encoder weights are loaded from the same snapshot.
+  private func ensureFullVAE() throws -> AutoencoderKL {
+    if let existing = fullVAE { return existing }
+
+    guard let configs = modelConfigs else {
+      throw PipelineError.modelNotLoaded
+    }
+    guard let snapshot = modelSnapshot else {
+      throw PipelineError.modelNotLoaded
+    }
+
+    logger.info("Loading full VAE with encoder for inpainting...")
+    let vaeConfig = configs.vae
+    let v = AutoencoderKL(configuration: .init(
+      inChannels: vaeConfig.inChannels,
+      outChannels: vaeConfig.outChannels,
+      latentChannels: vaeConfig.latentChannels,
+      scalingFactor: vaeConfig.scalingFactor,
+      shiftFactor: vaeConfig.shiftFactor,
+      blockOutChannels: vaeConfig.blockOutChannels,
+      layersPerBlock: vaeConfig.layersPerBlock,
+      normNumGroups: vaeConfig.normNumGroups,
+      sampleSize: vaeConfig.sampleSize,
+      midBlockAddAttention: vaeConfig.midBlockAddAttention
+    ))
+
+    // Load ALL VAE weights (encoder + decoder)
+    let weightsMapper = ZImageWeightsMapper(snapshot: snapshot, logger: logger)
+    let allVAEWeights = try weightsMapper.loadVAE()
+    try ZImageWeightsMapping.applyVAE(weights: allVAEWeights, to: v, manifest: quantManifest, logger: logger)
+
+    fullVAE = v
+    logger.info("Full VAE loaded (encoder + decoder)")
+    return v
   }
 
   private func encodePrompt(_ prompt: String, tokenizer: QwenTokenizer, textEncoder: QwenTextEncoder, maxLength: Int) throws -> (MLXArray, MLXArray) {
@@ -865,6 +936,55 @@ public final class ZImagePipeline {
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
 
+    // --- Latent-space inpainting setup ---
+    var originalLatents: MLXArray?
+    var latentMask: MLXArray?
+    var inpaintNoise: MLXArray?
+    var inpaintStartStep = 0
+
+    if let imageData = request.inpaintImageData, let maskDataRaw = request.maskData {
+      logger.info("Inpainting mode: encoding input image and mask...")
+      let cgImage = try InpaintUtilities.loadCGImage(from: imageData)
+      let maskCG = try InpaintUtilities.loadCGImage(from: maskDataRaw)
+      logger.info("Inpainting: source=\(cgImage.width)x\(cgImage.height), mask=\(maskCG.width)x\(maskCG.height), gen=\(request.width)x\(request.height), cropXY=(\(request.maskCropX),\(request.maskCropY))")
+
+      let pixelH = latentH * vaeDivisor
+      let pixelW = latentW * vaeDivisor
+
+      // Need full VAE (with encoder) for inpainting
+      let encoderVAE = try ensureFullVAE()
+
+      // VAE-encode the input image to latent space
+      let origLatents = try InpaintUtilities.encodeImageToLatents(
+        cgImage: cgImage, vae: encoderVAE, vaeConfig: modelConfigs.vae,
+        pixelH: pixelH, pixelW: pixelW, logger: logger
+      )
+      originalLatents = origLatents
+
+      // Convert pixel mask to latent-space mask with optional grow/feather
+      latentMask = try InpaintUtilities.pixelMaskToLatent(
+        maskCG, latentH: latentH, latentW: latentW,
+        grow: request.maskGrow, feather: request.maskFeather,
+        cropX: request.maskCropX, cropY: request.maskCropY,
+        cropWidth: request.width, cropHeight: request.height,
+        logger: logger
+      )
+
+      // Store the initial noise for sigma blending at each step
+      inpaintNoise = latents
+
+      // Handle denoise < 1.0: start from partially noised original
+      if request.denoise < 1.0 {
+        inpaintStartStep = max(0, request.steps - Int(ceil(Float(request.steps) * request.denoise)))
+        let startSigma = scheduler.sigmas[inpaintStartStep].item(Float.self)
+        latents = MLXArray(startSigma) * latents + MLXArray(1.0 - startSigma) * origLatents
+        MLX.eval(latents)
+        logger.info("Inpaint: denoise=\(request.denoise), starting at step \(inpaintStartStep)/\(request.steps), sigma=\(startSigma)")
+      } else {
+        logger.info("Inpaint: full denoise (1.0), running all \(request.steps) steps")
+      }
+    }
+
     logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue))...")
     do {
       guard let transformer = transformer else {
@@ -876,7 +996,7 @@ public final class ZImagePipeline {
       if request.dyPE.enabled {
         logger.info("DyPE enabled: \(request.dyPE.method.rawValue) (base \(request.dyPE.baseResolution)px → \(request.width)x\(request.height))")
       }
-      for stepIndex in 0..<request.steps {
+      for stepIndex in inpaintStartStep..<request.steps {
         try Task.checkCancellation()
         progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepIndex, totalSteps: request.steps))
         let timestep = timestepsArray[stepIndex]
@@ -946,6 +1066,18 @@ public final class ZImagePipeline {
           )
         } else {
           latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+        }
+        // Inpaint: blend with original in unmasked regions at current noise level
+        if let origLatents = originalLatents, let mask = latentMask, let noise = inpaintNoise {
+          let nextSigma = scheduler.sigmas[stepIndex + 1].item(Float.self)
+          if nextSigma > 0 {
+            // Noise the original to the current noise level for seamless blending
+            let noisedOriginal = MLXArray(nextSigma) * noise + MLXArray(1.0 - nextSigma) * origLatents
+            latents = mask * latents + (1.0 - mask) * noisedOriginal
+          } else {
+            // Final step: blend clean original (no noise)
+            latents = mask * latents + (1.0 - mask) * origLatents
+          }
         }
         MLX.eval(latents)
       }

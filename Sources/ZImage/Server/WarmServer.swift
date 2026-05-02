@@ -36,6 +36,7 @@ public final class WarmServer {
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private let coordinator: WarmServerCoordinator
+  let comfyBridge: ComfyBridge
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
   private let lifecycleLock = NSLock()
   private var listener: NWListener?
@@ -45,6 +46,10 @@ public final class WarmServer {
     self.configuration = configuration
     self.logger = logger
     self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
+    self.comfyBridge = ComfyBridge(logger: logger)
+    self.comfyBridge.configureExecutor(generateHandler: { [unowned self] request, progressCallback in
+      try await self.bridgeGenerate(request, progressCallback: progressCallback)
+    })
   }
 
   public func run() throws {
@@ -145,6 +150,11 @@ public final class WarmServer {
   }
 
   fileprivate func respond(to request: HTTPRequest) async -> RoutedResponse {
+    // Try ComfyUI bridge routes first.
+    if let bridgeResponse = comfyBridge.route(request) {
+      return bridgeResponse
+    }
+
     switch (request.method, request.path) {
     case ("GET", "/health"):
       let memoryBytes = Self.currentMemoryFootprintBytes()
@@ -183,6 +193,206 @@ public final class WarmServer {
       }
       return .error(.error(status: 404, message: "Not found"))
     }
+  }
+
+
+  /// Bridge a ComfyUI workflow request to the internal generate pipeline.
+  /// Called by ComfyBridgeExecutor via the closure set in init.
+  /// Read PNG dimensions from IHDR chunk (bytes 16-23 of a valid PNG).
+  private func pngDimensions(from data: Data) -> (width: Int, height: Int)? {
+    guard data.count >= 24 else { return nil }
+    let w = Int(data[16]) << 24 | Int(data[17]) << 16 | Int(data[18]) << 8 | Int(data[19])
+    let h = Int(data[20]) << 24 | Int(data[21]) << 16 | Int(data[22]) << 8 | Int(data[23])
+    return (w, h)
+  }
+
+  /// Round up to nearest multiple of 16 (for latent alignment).
+  private func roundTo16(_ n: Int) -> Int {
+    return ((n + 15) / 16) * 16
+  }
+
+  /// Default LoRA directory path — matches ComfyBridgeObjectInfo discovery path.
+  private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
+
+  /// Default ControlNet directory path — matches ComfyBridgeObjectInfo discovery path.
+  private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
+
+  private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult {
+    // --- Phase 4: Dynamic LoRA swap ---
+    // If the workflow contains LoraLoader nodes, swap LoRAs before generating.
+    // The coordinator serializes operations, so swap completes before generate starts.
+    if !request.loras.isEmpty {
+      let loraEntries = request.loras.map { lora -> LoRAEntry in
+        // Resolve bare filenames to full paths in the LoRA directory.
+        let resolvedPath: String
+        if lora.name.contains("/") || lora.name.hasPrefix("~") {
+          resolvedPath = lora.name
+        } else {
+          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+        }
+        return LoRAEntry(path: resolvedPath, scale: lora.scale)
+      }
+      let swapPayload = LoRASwapPayload(loras: loraEntries)
+      let swapResult = try await coordinator.enqueueSwap(swapPayload)
+      logger.info("WarmServer: bridge LoRA swap complete — \(swapResult.loraCount) LoRA(s) active")
+    }
+
+    // Derive dimensions from inpaint image if parser returned 0x0
+    // (happens when workflow has no ImageCrop or EmptyLatentImage nodes)
+    var genWidth = request.width
+    var genHeight = request.height
+    if genWidth == 0 || genHeight == 0, let imgData = request.inpaintImageData {
+      if let dims = pngDimensions(from: imgData) {
+        genWidth = roundTo16(dims.width)
+        genHeight = roundTo16(dims.height)
+        logger.info("WarmServer: derived dimensions from inpaint image: \(dims.width)x\(dims.height) -> \(genWidth)x\(genHeight)")
+      } else {
+        genWidth = 1024
+        genHeight = 1024
+        logger.warning("WarmServer: could not read inpaint image dimensions, falling back to 1024x1024")
+      }
+    }
+
+    // --- Phase 4: ControlNet routing ---
+    // If the workflow contains ControlNet nodes, route to ZImageControlPipeline
+    // instead of the standard ZImagePipeline.
+    if request.isControlNet, let controlnetModel = request.controlnetModel {
+      logger.info("WarmServer: routing to ControlNet pipeline — model=\(controlnetModel), strength=\(request.controlnetStrength)")
+
+      // Resolve controlnet model name to a path or HuggingFace ID
+      let resolvedControlnetWeights: String
+      if controlnetModel.contains("/") || controlnetModel.hasPrefix("~") || controlnetModel.hasPrefix(".") {
+        // Already a path or HuggingFace ID — use as-is
+        resolvedControlnetWeights = controlnetModel
+      } else {
+        // Bare name — check if it's a local directory/file in the controlnet dir
+        let localPath = Self.controlnetDirectoryPath + "/" + controlnetModel
+        if FileManager.default.fileExists(atPath: localPath) {
+          resolvedControlnetWeights = localPath
+        } else {
+          // Treat as HuggingFace ID
+          resolvedControlnetWeights = controlnetModel
+        }
+      }
+
+      // Write control image data to a temp file if we have it
+      var controlImageURL: URL? = nil
+      if let controlData = request.controlImageData {
+        let tempPath = NSTemporaryDirectory() + "zimage-control-\(UUID().uuidString).png"
+        try controlData.write(to: URL(fileURLWithPath: tempPath))
+        controlImageURL = URL(fileURLWithPath: tempPath)
+        logger.info("WarmServer: wrote control image to \(tempPath) (\(controlData.count) bytes)")
+      }
+
+      // Write inpaint image to temp file if present
+      var inpaintImageURL: URL? = nil
+      if let inpaintData = request.inpaintImageData {
+        let tempPath = NSTemporaryDirectory() + "zimage-inpaint-\(UUID().uuidString).png"
+        try inpaintData.write(to: URL(fileURLWithPath: tempPath))
+        inpaintImageURL = URL(fileURLWithPath: tempPath)
+      }
+
+      // Write mask to temp file if present
+      var maskImageURL: URL? = nil
+      if let maskData = request.maskImageData {
+        let tempPath = NSTemporaryDirectory() + "zimage-mask-\(UUID().uuidString).png"
+        try maskData.write(to: URL(fileURLWithPath: tempPath))
+        maskImageURL = URL(fileURLWithPath: tempPath)
+      }
+
+      let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("zimage-\(UUID().uuidString).png")
+
+      // Build LoRA configurations for the control pipeline
+      let controlLoRAs: [LoRAConfiguration] = request.loras.map { lora in
+        let resolvedPath: String
+        if lora.name.contains("/") || lora.name.hasPrefix("~") {
+          resolvedPath = lora.name
+        } else {
+          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+        }
+        return .local(resolvedPath, scale: lora.scale)
+      }
+
+      let controlRequest = ZImageControlGenerationRequest(
+        prompt: request.prompt,
+        negativePrompt: nil,
+        controlImage: controlImageURL,
+        inpaintImage: inpaintImageURL,
+        maskImage: maskImageURL,
+        controlContextScale: request.controlnetStrength,
+        width: genWidth,
+        height: genHeight,
+        steps: request.steps,
+        guidanceScale: 0.0,
+        seed: request.seed,
+        outputPath: outputURL,
+        model: nil,
+        textEncoderPath: configuration.textEncoderPath,
+        controlnetWeights: resolvedControlnetWeights,
+        // For HuggingFace repos with multiple safetensors, specify the 8-step variant
+        controlnetWeightsFile: resolvedControlnetWeights.contains("alibaba-pai")
+          ? "Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors" : nil,
+        maxSequenceLength: configuration.maxSequenceLength,
+        loras: controlLoRAs,
+        progressCallback: progressCallback.map { callback in
+          return { progress in
+            if progress.stage == "Denoising" {
+              callback(progress.stepIndex, progress.totalSteps)
+            }
+          }
+        },
+        enhancePrompt: false,
+        enhanceMaxTokens: 512
+      )
+
+      let start = Date()
+      let result = try await coordinator.enqueueControlGenerate(controlRequest)
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+
+      // Clean up temp files
+      if let url = controlImageURL { try? FileManager.default.removeItem(at: url) }
+      if let url = inpaintImageURL { try? FileManager.default.removeItem(at: url) }
+      if let url = maskImageURL { try? FileManager.default.removeItem(at: url) }
+
+      return ComfyBridgeGenerateResult(
+        outputPath: result.outputPath,
+        durationMs: result.durationMs
+      )
+    }
+
+    let payload = GeneratePayload(
+      prompt: request.prompt,
+      negativePrompt: nil,  // Z-Image Turbo: negative prompts cause broadcast_shapes crash
+      width: genWidth,
+      height: genHeight,
+      steps: min(request.steps, 9),  // Z-Image Turbo: optimal at 9 steps, clamp plugin defaults
+      guidance: 0.0,  // Z-Image Turbo: designed for cfg=0
+      seed: request.seed,
+      outputPath: nil,
+      inpaintImageData: request.inpaintImageData,
+      maskData: request.maskImageData,
+      denoise: request.denoise,
+      maskGrow: request.maskGrow,
+      maskFeather: request.maskFeather,
+      maskCropX: request.maskCropX,
+      maskCropY: request.maskCropY
+    )
+
+    // Convert bridge progress callback to pipeline progress handler.
+    let pipelineProgress: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = progressCallback.map { callback in
+      return { progress in
+        if progress.stage == .denoising {
+          callback(progress.stepIndex, progress.totalSteps)
+        }
+      }
+    }
+
+    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress)
+    return ComfyBridgeGenerateResult(
+      outputPath: result.outputPath,
+      durationMs: result.durationMs
+    )
   }
 
   fileprivate func requestShutdownAfterResponse() {
@@ -281,6 +491,8 @@ private actor WarmServerCoordinator {
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private let pipeline: ZImagePipeline
+  /// Lazy-initialized ControlNet pipeline — only created when first ControlNet request arrives.
+  private var controlPipeline: ZImageControlPipeline?
   private let startTime = Date()
   private var activeLoRAs: [LoRAConfiguration]
   private var pending: [QueuedOperation] = []
@@ -312,7 +524,10 @@ private actor WarmServerCoordinator {
     logger.info("Warm server pipeline ready")
   }
 
-  func enqueueGenerate(_ payload: GeneratePayload) async throws -> GenerateResponse {
+  func enqueueGenerate(
+    _ payload: GeneratePayload,
+    progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil
+  ) async throws -> GenerateResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -321,7 +536,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.generate(payload, ContinuationBox(continuation)))
+      pending.append(.generate(payload, ContinuationBox(continuation), progressHandler))
       startProcessingIfNeeded()
     }
   }
@@ -336,6 +551,20 @@ private actor WarmServerCoordinator {
 
     return try await withCheckedThrowingContinuation { continuation in
       pending.append(.swap(payload, ContinuationBox(continuation)))
+      startProcessingIfNeeded()
+    }
+  }
+
+  func enqueueControlGenerate(_ request: ZImageControlGenerationRequest) async throws -> GenerateResponse {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(.controlGenerate(request, ContinuationBox(continuation)))
       startProcessingIfNeeded()
     }
   }
@@ -393,8 +622,10 @@ private actor WarmServerCoordinator {
 
       let operation = pending.removeFirst()
       switch operation {
-      case .generate(let payload, let continuation):
-        await runGenerate(payload, continuation: continuation)
+      case .generate(let payload, let continuation, let progressHandler):
+        await runGenerate(payload, continuation: continuation, progressHandler: progressHandler)
+      case .controlGenerate(let request, let continuation):
+        await runControlGenerate(request, continuation: continuation)
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
       case .shutdown(let continuation):
@@ -408,7 +639,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+  private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -417,7 +648,40 @@ private actor WarmServerCoordinator {
         configuration: configuration,
         activeLoRAs: activeLoRAs
       )
-      let outputURL = try await pipeline.generateFromRequest(request)
+      let outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      successfulRenderCount += 1
+      lastRenderDurationMs = durationMs
+      lastError = nil
+      activeRenderStartedAt = nil
+
+      continuation.resume(
+        returning: GenerateResponse(
+          success: true,
+          outputPath: outputURL.path,
+          durationMs: durationMs
+        )
+      )
+    } catch {
+      failedRenderCount += 1
+      lastError = error.localizedDescription
+      activeRenderStartedAt = nil
+      continuation.resume(throwing: error)
+    }
+  }
+
+  private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
+    activeRenderStartedAt = Date()
+    let start = Date()
+
+    do {
+      // Lazy-init the control pipeline on first ControlNet request
+      if controlPipeline == nil {
+        logger.info("Initializing ControlNet pipeline (first use)...")
+        controlPipeline = ZImageControlPipeline(logger: logger)
+      }
+
+      let outputURL = try await controlPipeline!.generate(request)
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
@@ -462,7 +726,8 @@ private actor WarmServerCoordinator {
 
 private final class ConnectionHandler {
   private static let headerDelimiter = Data("\r\n\r\n".utf8)
-  private static let maximumRequestBytes = 1_048_576
+  /// 10 MB — raised from 1 MB to support ComfyUI image uploads via PUT /api/etn/image/.
+  private static let maximumRequestBytes = 10_485_760
 
   private let connection: NWConnection
   private let queue: DispatchQueue
@@ -564,12 +829,15 @@ private final class ConnectionHandler {
 
     let body = buffer.subdata(in: bodyStart..<totalLength)
     let rawPath = String(requestParts[1])
-    let path = rawPath.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? rawPath
+    let pathAndQuery = rawPath.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+    let path = pathAndQuery.first.map(String.init) ?? rawPath
+    let queryString: String? = pathAndQuery.count > 1 ? String(pathAndQuery[1]) : nil
 
     return .request(
       HTTPRequest(
         method: String(requestParts[0]).uppercased(),
         path: path,
+        queryString: queryString,
         headers: headers,
         body: body
       )
@@ -582,6 +850,31 @@ private final class ConnectionHandler {
       return
     }
 
+    // Check for WebSocket upgrade before entering the async router.
+    if request.path == "/ws", request.method == "GET" {
+      if let wsResponse = server.comfyBridge.handleWebSocketUpgrade(request: request, connection: connection, queue: queue) {
+        // Send the upgrade response, then keep the connection alive for WebSocket framing.
+        guard !responseSent else { return }
+        responseSent = true
+        connection.send(content: wsResponse, completion: .contentProcessed { [weak self] _ in
+          guard let self, let server = self.server else { return }
+          let clientId = request.queryParameters["clientId"] ?? UUID().uuidString
+          server.comfyBridge.wsManager.registerConnection(
+            clientId: clientId,
+            connection: self.connection,
+            queue: self.queue
+          )
+          // Release the ConnectionHandler — the WS manager now owns the NWConnection.
+          // Do NOT cancel the connection; only release our retain cycle.
+          self.retainSelf = nil
+        })
+      } else {
+        // Invalid WebSocket upgrade request — send 400 and close.
+        finish(with: .error(status: 400, message: "Invalid WebSocket upgrade request"))
+      }
+      return
+    }
+
     Task {
       let routed = await server.respond(to: request)
       switch routed {
@@ -591,6 +884,9 @@ private final class ConnectionHandler {
         self.finish(with: response)
       case .shutdown(let response):
         self.finish(with: response, shutdownAfterSend: true)
+      case .websocketUpgrade:
+        // Should not reach here — /ws is handled above before async dispatch.
+        self.finish(with: .error(status: 400, message: "Invalid WebSocket upgrade request"))
       }
     }
   }
@@ -610,29 +906,56 @@ private final class ConnectionHandler {
   }
 }
 
-private struct HTTPRequest {
+struct HTTPRequest {
   let method: String
   let path: String
+  let queryString: String?
   let headers: [String: String]
   let body: Data
+
+  /// Parse query parameters from the query string.
+  var queryParameters: [String: String] {
+    guard let qs = queryString, !qs.isEmpty else { return [:] }
+    var params: [String: String] = [:]
+    for pair in qs.split(separator: "&") {
+      let parts = pair.split(separator: "=", maxSplits: 1)
+      if parts.count == 2 {
+        params[String(parts[0])] = String(parts[1])
+      } else if parts.count == 1 {
+        params[String(parts[0])] = ""
+      }
+    }
+    return params
+  }
 }
 
-private enum HTTPParseResult {
+enum HTTPParseResult {
   case incomplete
   case request(HTTPRequest)
   case error(HTTPResponse)
 }
 
-private struct HTTPResponse {
+struct HTTPResponse {
   let status: Int
   let reasonPhrase: String
+  let contentType: String
   let body: Data
 
   static func json<T: Encodable>(status: Int, payload: T) -> HTTPResponse {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
     let body = (try? encoder.encode(payload)) ?? Data("{\"success\":false,\"error\":\"encoding failure\"}".utf8)
-    return HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), body: body)
+    return HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: "application/json", body: body)
+  }
+
+  /// Create a JSON response from pre-encoded Data (no snake_case conversion).
+  static func rawJSON(status: Int, data: Data) -> HTTPResponse {
+    HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: "application/json", body: data)
+  }
+
+  /// Create a binary response with a specified content type.
+  static func binary(status: Int, contentType: String, data: Data) -> HTTPResponse {
+    HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: contentType, body: data)
   }
 
   static func error(status: Int, message: String) -> HTTPResponse {
@@ -643,7 +966,7 @@ private struct HTTPResponse {
     var data = Data()
     let header = [
       "HTTP/1.1 \(status) \(reasonPhrase)",
-      "Content-Type: application/json",
+      "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
       "Connection: close",
       "",
@@ -654,7 +977,7 @@ private struct HTTPResponse {
     return data
   }
 
-  private static func reasonPhrase(for status: Int) -> String {
+  static func reasonPhrase(for status: Int) -> String {
     switch status {
     case 200: return "OK"
     case 400: return "Bad Request"
@@ -669,10 +992,12 @@ private struct HTTPResponse {
   }
 }
 
-private enum RoutedResponse {
+enum RoutedResponse {
   case json(HTTPResponse)
   case shutdown(HTTPResponse)
   case error(HTTPResponse)
+  /// WebSocket upgrade — the bridge takes ownership of the connection.
+  case websocketUpgrade
 
   static func json<T: Encodable>(status: Int, payload: T) -> RoutedResponse {
     .json(.json(status: status, payload: payload))
@@ -683,7 +1008,7 @@ private enum RoutedResponse {
   }
 }
 
-private struct GeneratePayload: Decodable, Sendable {
+private struct GeneratePayload: Sendable {
   let prompt: String
   let negativePrompt: String?
   let width: Int?
@@ -696,6 +1021,65 @@ private struct GeneratePayload: Decodable, Sendable {
   let sigmaSchedule: String?
   let eta: Float?
   let dype: String?
+  // Phase 3: Inpainting data (set by bridge, not by HTTP API)
+  let inpaintImageData: Data?
+  let maskData: Data?
+  let denoise: Float?
+  let maskGrow: Int?
+  let maskFeather: Int?
+  let maskCropX: Int?
+  let maskCropY: Int?
+
+  /// Default memberwise init for bridge-created payloads.
+  init(
+    prompt: String, negativePrompt: String? = nil,
+    width: Int? = nil, height: Int? = nil, steps: Int? = nil,
+    guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
+    scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
+    dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
+    denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
+    maskCropX: Int? = nil, maskCropY: Int? = nil
+  ) {
+    self.prompt = prompt; self.negativePrompt = negativePrompt
+    self.width = width; self.height = height; self.steps = steps
+    self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
+    self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
+    self.eta = eta; self.dype = dype
+    self.inpaintImageData = inpaintImageData; self.maskData = maskData
+    self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
+    self.maskCropX = maskCropX; self.maskCropY = maskCropY
+  }
+}
+
+extension GeneratePayload: Decodable {
+  private enum CodingKeys: String, CodingKey {
+    case prompt, negativePrompt, width, height, steps, guidance, seed
+    case outputPath, scheduler, sigmaSchedule, eta, dype
+    // inpaintImageData, maskData, denoise are excluded from JSON decoding
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    prompt = try c.decode(String.self, forKey: .prompt)
+    negativePrompt = try c.decodeIfPresent(String.self, forKey: .negativePrompt)
+    width = try c.decodeIfPresent(Int.self, forKey: .width)
+    height = try c.decodeIfPresent(Int.self, forKey: .height)
+    steps = try c.decodeIfPresent(Int.self, forKey: .steps)
+    guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
+    seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
+    outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
+    eta = try c.decodeIfPresent(Float.self, forKey: .eta)
+    dype = try c.decodeIfPresent(String.self, forKey: .dype)
+    inpaintImageData = nil
+    maskData = nil
+    denoise = nil
+    maskGrow = nil
+    maskFeather = nil
+    maskCropX = nil
+    maskCropY = nil
+  }
 
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
@@ -748,7 +1132,14 @@ private struct GeneratePayload: Decodable, Sendable {
       schedulerKind: schedulerKind,
       sigmaSchedule: sigmaScheduleKind,
       eta: eta,
-      dyPE: dyPEConfig
+      dyPE: dyPEConfig,
+      inpaintImageData: inpaintImageData,
+      maskData: maskData,
+      denoise: denoise ?? 1.0,
+      maskGrow: maskGrow ?? 0,
+      maskFeather: maskFeather ?? 0,
+      maskCropX: maskCropX ?? 0,
+      maskCropY: maskCropY ?? 0
     )
   }
 }
@@ -825,13 +1216,14 @@ private struct LoRAState: Encodable, Sendable {
   }
 }
 
-private struct ErrorPayload: Encodable {
+struct ErrorPayload: Encodable {
   let success: Bool
   let error: String
 }
 
 private enum QueuedOperation: Sendable {
-  case generate(GeneratePayload, ContinuationBox<GenerateResponse>)
+  case generate(GeneratePayload, ContinuationBox<GenerateResponse>, (@Sendable (ZImagePipeline.GenerationProgress) -> Void)?)
+  case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
