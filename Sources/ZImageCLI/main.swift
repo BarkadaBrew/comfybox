@@ -49,7 +49,7 @@ struct ZImageCLI {
     var height = ZImageModelMetadata.recommendedHeight
     var steps = ZImageModelMetadata.recommendedInferenceSteps
     var guidance = ZImageModelMetadata.recommendedGuidanceScale
-    var seed: UInt64?
+    var seeds: [UInt64] = []
     var outputPath = "z-image.png"
     var model: String?
     var textEncoderPath: String?
@@ -71,6 +71,9 @@ struct ZImageCLI {
     var dyPEDisabled = false
     var writeMetadata = false
     var configFromMetadata: String?
+    var autoSeeds: Int?
+    var resumeBatchPath: String?
+    var promptFilePath: String?
 
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
@@ -90,7 +93,9 @@ struct ZImageCLI {
       case "--guidance", "-g":
         guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
       case "--seed":
-        seed = UInt64(nextValue(for: arg, iterator: &iterator))
+        if let s = UInt64(nextValue(for: arg, iterator: &iterator)) {
+          seeds.append(s)
+        }
       case "--output", "-o":
         outputPath = nextValue(for: arg, iterator: &iterator)
       case "--model", "-m":
@@ -154,6 +159,12 @@ struct ZImageCLI {
         writeMetadata = true
       case "--config-from-metadata":
         configFromMetadata = nextValue(for: arg, iterator: &iterator)
+      case "--auto-seeds":
+        autoSeeds = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 1)
+      case "--resume-batch":
+        resumeBatchPath = nextValue(for: arg, iterator: &iterator)
+      case "--prompt-file":
+        promptFilePath = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printUsage()
         return
@@ -216,7 +227,7 @@ struct ZImageCLI {
       }
       if prompt == nil { prompt = loaded.parameters.prompt }
       if negativePrompt == nil { negativePrompt = loaded.parameters.negativePrompt }
-      if seed == nil { seed = loaded.parameters.seed }
+      if seeds.isEmpty { seeds.append(loaded.parameters.seed) }
       if width == ZImageModelMetadata.recommendedWidth { width = loaded.parameters.width }
       if height == ZImageModelMetadata.recommendedHeight { height = loaded.parameters.height }
       if steps == ZImageModelMetadata.recommendedInferenceSteps { steps = loaded.parameters.steps }
@@ -252,10 +263,14 @@ struct ZImageCLI {
       logger.info("Using \(loraConfigs.count) LoRA(s)")
     }
 
-    // Pin seed before request so metadata always records the actual seed used
-    if seed == nil {
-      seed = UInt64.random(in: 0...UInt64.max)
+    // Determine if this is a batch run
+    let isBatchRun = (autoSeeds != nil && autoSeeds! > 0) || seeds.count > 1
+
+    // Pin seed for single-image flow (batch runner handles its own seeds)
+    if !isBatchRun && seeds.isEmpty {
+      seeds.append(UInt64.random(in: 0...UInt64.max))
     }
+    let seed: UInt64? = isBatchRun ? nil : seeds.first
 
     // Build DyPE config — auto-enable when resolution exceeds base training size
     let dyPEConfig: DyPEConfig
@@ -272,6 +287,126 @@ struct ZImageCLI {
       dyPEConfig = .disabled
     }
 
+    // === BATCH EXECUTION PATH ===
+    if isBatchRun {
+      let batchOutputPattern = BatchRunner.outputPattern(from: outputPath)
+      let checkpointPath = resumeBatchPath ?? {
+        let dir = URL(fileURLWithPath: outputPath).deletingLastPathComponent().path
+        return (dir as NSString).appendingPathComponent(".batch-progress.jsonl")
+      }()
+      let batchConfig = BatchConfig(
+        seeds: seeds,
+        autoSeedCount: autoSeeds,
+        outputPattern: batchOutputPattern,
+        continueOnError: true,
+        metadataEnabled: writeMetadata,
+        promptFilePath: promptFilePath,
+        checkpointPath: checkpointPath
+      )
+
+      let capturedNegativePrompt = negativePrompt
+      let capturedModel = model
+      let capturedTextEncoderPath = textEncoderPath
+      let capturedLoraConfigs = loraConfigs
+      let capturedWriteMetadata = writeMetadata
+
+      let pipeline = ZImagePipeline(logger: logger)
+      nonisolated(unsafe) let batchSemaphore = DispatchSemaphore(value: 0)
+      let resultBox = Box<BatchResult?>(nil)
+
+      Task {
+        do {
+          let result = try await BatchRunner.run(config: batchConfig) { batchSeed, batchPrompt in
+            let effectivePrompt = batchPrompt ?? prompt
+            let batchOutputPath = BatchRunner.resolveOutputPath(
+              pattern: batchOutputPattern, seed: batchSeed, index: 0
+            )
+            let batchRequest = ZImageGenerationRequest(
+              prompt: effectivePrompt,
+              negativePrompt: capturedNegativePrompt,
+              width: width,
+              height: height,
+              steps: steps,
+              guidanceScale: guidance,
+              seed: batchSeed,
+              outputPath: URL(fileURLWithPath: batchOutputPath),
+              model: capturedModel,
+              textEncoderPath: capturedTextEncoderPath,
+              maxSequenceLength: maxSequenceLength,
+              loras: capturedLoraConfigs,
+              enhancePrompt: enhancePrompt,
+              enhanceMaxTokens: enhanceMaxTokens,
+              forceTransformerOverrideOnly: forceTransformerOverrideOnly,
+              schedulerKind: schedulerKind,
+              sigmaSchedule: sigmaSchedule,
+              eta: eta,
+              dyPE: dyPEConfig
+            )
+            let startTime = Date()
+            _ = try await pipeline.generate(batchRequest, progressHandler: nil)
+
+            // Write metadata sidecar if enabled
+            if capturedWriteMetadata {
+              let loraInfos = capturedLoraConfigs.map { lora -> LoRAInfo in
+                let path: String
+                switch lora.source {
+                case .local(let url): path = url.path
+                case .huggingFace(let id, _): path = id
+                }
+                return LoRAInfo(path: path, scale: lora.scale)
+              }
+              let metadata = GenerationMetadata(
+                pipeline: .txt2img,
+                model: ModelInfo(
+                  family: "zimage",
+                  variant: "turbo",
+                  path: capturedModel ?? ZImageRepository.id
+                ),
+                parameters: GenerationParameters(
+                  prompt: effectivePrompt,
+                  negativePrompt: capturedNegativePrompt,
+                  seed: batchSeed,
+                  steps: steps,
+                  guidance: guidance,
+                  width: width,
+                  height: height,
+                  scheduler: schedulerKind.rawValue,
+                  sigmaSchedule: sigmaSchedule == .flow ? nil : sigmaSchedule.rawValue
+                ),
+                loras: loraInfos,
+                output: OutputInfo(
+                  path: batchOutputPath,
+                  width: width,
+                  height: height,
+                  renderTimeSeconds: Date().timeIntervalSince(startTime)
+                )
+              )
+              MetadataWriter.write(metadata, for: batchOutputPath)
+            }
+
+            return batchOutputPath
+          }
+          resultBox.value = result
+        } catch {
+          logger.error("Batch failed: \(error)")
+        }
+        batchSemaphore.signal()
+      }
+      batchSemaphore.wait()
+
+      // Print batch summary
+      if let result = resultBox.value {
+        let duration = String(format: "%.1f", result.totalDuration)
+        print("\nBatch complete: \(result.completed)/\(result.totalSeeds) succeeded, \(result.failed) failed, \(result.skipped) skipped (resumed)")
+        print("Total time: \(duration)s")
+        if let checkpoint = batchConfig.checkpointPath {
+          print("Checkpoint: \(checkpoint)")
+        }
+      }
+      return
+    }
+
+    // === SINGLE IMAGE PATH ===
     let request = ZImageGenerationRequest(
       prompt: prompt,
       negativePrompt: negativePrompt,
@@ -470,6 +605,10 @@ struct ZImageCLI {
       --svg-preset           SVG preset: default, logo, detailed, simplified, bw
       --metadata             Write generation metadata JSON sidecar alongside output image
       --config-from-metadata Load generation parameters from a metadata JSON sidecar (CLI flags override)
+      --auto-seeds <N>       Generate N random seeds for batch run
+      --seed                 Random seed (repeatable for batch: --seed 42 --seed 99)
+      --resume-batch <path>  Resume batch from checkpoint file
+      --prompt-file <path>   Re-read prompt from file before each batch iteration
       --help, -h             Show help
 
     Subcommands:
@@ -521,6 +660,9 @@ struct ZImageCLI {
       ZImageCLI -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
       ZImageCLI -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
       ZImageCLI serve -m ./models/z-image-turbo --port 7862
+      ZImageCLI -p "portrait" --auto-seeds 5 -o portraits.png  # Generate 5 random variations
+      ZImageCLI -p "cat" --seed 42 --seed 99 --seed 123 -o cats.png  # 3 specific seeds
+      ZImageCLI -p "scene" --auto-seeds 10 --resume-batch progress.jsonl  # Resume interrupted batch
       ZImageCLI upscale -i photo.jpg -w ./models/seedvr2 -r 2048
     """)
   }
