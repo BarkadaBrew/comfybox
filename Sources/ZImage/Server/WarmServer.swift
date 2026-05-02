@@ -644,11 +644,20 @@ private actor WarmServerCoordinator {
     let start = Date()
 
     do {
-      let request = try payload.makePipelineRequest(
-        configuration: configuration,
-        activeLoRAs: activeLoRAs
-      )
-      let outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
+      let outputURL: URL
+      if payload.imagePath != nil {
+        let img2imgRequest = try payload.makeImg2ImgRequest(
+          configuration: configuration,
+          activeLoRAs: activeLoRAs
+        )
+        outputURL = try await pipeline.generateImg2Img(img2imgRequest, progressHandler: progressHandler)
+      } else {
+        let request = try payload.makePipelineRequest(
+          configuration: configuration,
+          activeLoRAs: activeLoRAs
+        )
+        outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
+      }
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
@@ -1030,6 +1039,11 @@ private struct GeneratePayload: Sendable {
   let maskCropX: Int?
   let maskCropY: Int?
 
+  // Phase 4: Img2img (set via HTTP API)
+  let imagePath: String?
+  let imageStrength: Float?
+  let creativity: Float?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -1038,7 +1052,8 @@ private struct GeneratePayload: Sendable {
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
-    maskCropX: Int? = nil, maskCropY: Int? = nil
+    maskCropX: Int? = nil, maskCropY: Int? = nil,
+    imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil
   ) {
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -1048,6 +1063,7 @@ private struct GeneratePayload: Sendable {
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
     self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
+    self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
   }
 }
 
@@ -1055,7 +1071,7 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, scheduler, sigmaSchedule, eta, dype
-    // inpaintImageData, maskData, denoise are excluded from JSON decoding
+    case imagePath, imageStrength, creativity
   }
 
   init(from decoder: Decoder) throws {
@@ -1079,6 +1095,9 @@ extension GeneratePayload: Decodable {
     maskFeather = nil
     maskCropX = nil
     maskCropY = nil
+    imagePath = try c.decodeIfPresent(String.self, forKey: .imagePath)
+    imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
+    creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
   }
 
   func makePipelineRequest(
@@ -1141,6 +1160,87 @@ extension GeneratePayload: Decodable {
       maskCropX: maskCropX ?? 0,
       maskCropY: maskCropY ?? 0
     )
+  }
+
+  func makeImg2ImgRequest(
+    configuration: WarmServerConfiguration,
+    activeLoRAs: [LoRAConfiguration]
+  ) throws -> Img2ImgRequest {
+    guard let imagePath else {
+      fatalError("makeImg2ImgRequest called without imagePath")
+    }
+
+    if imageStrength != nil && creativity != nil {
+      throw Img2ImgValidationError.mutuallyExclusive("imageStrength and creativity cannot both be specified")
+    }
+
+    let resolvedStrength: Float
+    let specifiedAs: Img2ImgRequest.Img2ImgSpecifier
+    if let creativity {
+      resolvedStrength = 1.0 - max(0.01, min(0.99, creativity))
+      specifiedAs = .creativity
+    } else {
+      resolvedStrength = imageStrength ?? 0.3
+      specifiedAs = .strength
+    }
+
+    let schedulerKind = scheduler.flatMap { SchedulerKind(rawValue: $0) } ?? .euler
+    let sigmaScheduleKind = sigmaSchedule.flatMap { SigmaScheduleKind(rawValue: $0) } ?? .flow
+
+    let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
+    let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
+    let dyPEConfig: DyPEConfig
+    if let dypeRaw = dype?.lowercased() {
+      switch dypeRaw {
+      case "ntk": dyPEConfig = .ntk
+      case "yarn": dyPEConfig = .yarn
+      default: dyPEConfig = .disabled
+      }
+    } else if max(resolvedWidth, resolvedHeight) > 1024 {
+      dyPEConfig = .ntk
+    } else {
+      dyPEConfig = .disabled
+    }
+
+    let outputURL: URL
+    if let outputPath, !outputPath.isEmpty {
+      outputURL = URL(fileURLWithPath: outputPath)
+    } else {
+      outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("zimage-img2img-\(UUID().uuidString).png")
+    }
+
+    return Img2ImgRequest(
+      prompt: prompt,
+      negativePrompt: negativePrompt,
+      width: width,
+      height: height,
+      steps: steps ?? ZImageModelMetadata.recommendedInferenceSteps,
+      guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
+      seed: seed,
+      outputPath: outputURL,
+      model: configuration.modelSpec,
+      textEncoderPath: configuration.textEncoderPath,
+      maxSequenceLength: configuration.maxSequenceLength,
+      loras: activeLoRAs,
+      forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly,
+      schedulerKind: schedulerKind,
+      sigmaSchedule: sigmaScheduleKind,
+      eta: eta,
+      dyPE: dyPEConfig,
+      sourceImagePath: imagePath,
+      strength: resolvedStrength,
+      specifiedAs: specifiedAs
+    )
+  }
+
+  enum Img2ImgValidationError: Error, LocalizedError {
+    case mutuallyExclusive(String)
+    var errorDescription: String? {
+      switch self {
+      case .mutuallyExclusive(let msg): return msg
+      }
+    }
   }
 }
 
