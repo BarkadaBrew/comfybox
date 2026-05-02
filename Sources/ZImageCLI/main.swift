@@ -69,6 +69,8 @@ struct ZImageCLI {
     var eta: Float?
     var dyPEMethod: DyPEMethod = .none
     var dyPEDisabled = false
+    var writeMetadata = false
+    var configFromMetadata: String?
 
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
@@ -148,6 +150,10 @@ struct ZImageCLI {
         generateSVG = true
       case "--svg-preset":
         svgPreset = nextValue(for: arg, iterator: &iterator)
+      case "--metadata":
+        writeMetadata = true
+      case "--config-from-metadata":
+        configFromMetadata = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printUsage()
         return
@@ -199,6 +205,39 @@ struct ZImageCLI {
       return
     }
 
+    // --config-from-metadata: load saved generation params (CLI flags take precedence)
+    if let metadataPath = configFromMetadata {
+      let loaded: GenerationMetadata
+      do {
+        loaded = try MetadataReader.read(from: metadataPath)
+      } catch {
+        fputs("Error loading metadata: \(error)\n", stderr)
+        exit(1)
+      }
+      if prompt == nil { prompt = loaded.parameters.prompt }
+      if negativePrompt == nil { negativePrompt = loaded.parameters.negativePrompt }
+      if seed == nil { seed = loaded.parameters.seed }
+      if width == ZImageModelMetadata.recommendedWidth { width = loaded.parameters.width }
+      if height == ZImageModelMetadata.recommendedHeight { height = loaded.parameters.height }
+      if steps == ZImageModelMetadata.recommendedInferenceSteps { steps = loaded.parameters.steps }
+      if guidance == ZImageModelMetadata.recommendedGuidanceScale { guidance = loaded.parameters.guidance }
+      if model == nil { model = loaded.model.path }
+      if let loadedSched = SchedulerKind(rawValue: loaded.parameters.scheduler), schedulerKind == .euler {
+        schedulerKind = loadedSched
+      }
+      if let sig = loaded.parameters.sigmaSchedule,
+         let sigKind = SigmaScheduleKind(rawValue: sig), sigmaSchedule == .flow {
+        sigmaSchedule = sigKind
+      }
+      if loraEntries.isEmpty {
+        for lora in loaded.loras {
+          loraEntries.append(lora.path)
+          loraScaleOverrides.append(lora.scale)
+        }
+      }
+      logger.info("Loaded generation config from: \(metadataPath)")
+    }
+
     guard let prompt else {
       printUsage()
       return
@@ -211,6 +250,11 @@ struct ZImageCLI {
     let loraConfigs = buildLoRAConfigurations(entries: loraEntries, scaleOverrides: loraScaleOverrides)
     if !loraConfigs.isEmpty {
       logger.info("Using \(loraConfigs.count) LoRA(s)")
+    }
+
+    // Pin seed before request so metadata always records the actual seed used
+    if seed == nil {
+      seed = UInt64.random(in: 0...UInt64.max)
     }
 
     // Build DyPE config — auto-enable when resolution exceeds base training size
@@ -252,6 +296,20 @@ struct ZImageCLI {
 
     let pipeline = ZImagePipeline(logger: logger)
     nonisolated(unsafe) let semaphore = DispatchSemaphore(value: 0)
+    // Capture values for metadata (before Task to avoid Sendable issues)
+    let shouldWriteMetadata = writeMetadata
+    let capturedSeed = seed
+    let capturedPrompt = prompt
+    let capturedNegativePrompt = negativePrompt
+    let capturedSteps = steps
+    let capturedGuidance = guidance
+    let capturedWidth = width
+    let capturedHeight = height
+    let capturedScheduler = schedulerKind.rawValue
+    let capturedSigmaSchedule: String? = sigmaSchedule == .flow ? nil : sigmaSchedule.rawValue
+    let capturedModel = model
+    let capturedLoraConfigs = loraConfigs
+    let capturedStartTime = Date()
     let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
     let bar = useBar ? ProgressBar(total: steps) : nil
     let finalOutputPath = URL(fileURLWithPath: outputPath)
@@ -274,6 +332,45 @@ struct ZImageCLI {
           }
         })
         if let bar { bar.finish(forceNewline: true) }
+        if shouldWriteMetadata {
+          let loraInfos = capturedLoraConfigs.map { lora -> LoRAInfo in
+            let path: String
+            switch lora.source {
+            case .local(let url): path = url.path
+            case .huggingFace(let id, _): path = id
+            }
+            return LoRAInfo(path: path, scale: lora.scale)
+          }
+          let metadata = GenerationMetadata(
+            pipeline: .txt2img,
+            model: ModelInfo(
+              family: "zimage",
+              variant: "turbo",
+              path: capturedModel ?? ZImageRepository.id
+            ),
+            parameters: GenerationParameters(
+              prompt: capturedPrompt,
+              negativePrompt: capturedNegativePrompt,
+              seed: capturedSeed ?? 0,
+              steps: capturedSteps,
+              guidance: capturedGuidance,
+              width: capturedWidth,
+              height: capturedHeight,
+              scheduler: capturedScheduler,
+              sigmaSchedule: capturedSigmaSchedule
+            ),
+            loras: loraInfos,
+            output: OutputInfo(
+              path: finalOutputPath.path,
+              width: capturedWidth,
+              height: capturedHeight,
+              renderTimeSeconds: Date().timeIntervalSince(capturedStartTime)
+            )
+          )
+          if let written = MetadataWriter.write(metadata, for: finalOutputPath.path) {
+            logger.info("Metadata written: \(written)")
+          }
+        }
         if shouldGenerateSVG {
           let svgOutputPath = finalOutputPath.deletingPathExtension().appendingPathExtension("svg")
           logger.info("Converting to SVG: \(svgOutputPath.path)")
@@ -371,6 +468,8 @@ struct ZImageCLI {
       --audit-weights        Audit transformer/text encoder/VAE weight coverage and exit
       --svg                  Also generate SVG vector output (requires vtracer)
       --svg-preset           SVG preset: default, logo, detailed, simplified, bw
+      --metadata             Write generation metadata JSON sidecar alongside output image
+      --config-from-metadata Load generation parameters from a metadata JSON sidecar (CLI flags override)
       --help, -h             Show help
 
     Subcommands:
