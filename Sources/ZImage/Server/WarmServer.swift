@@ -3,6 +3,7 @@ import Dispatch
 import Logging
 import Network
 import Darwin
+import MLX
 
 public struct WarmServerConfiguration: Sendable {
   public var port: UInt16
@@ -30,6 +31,12 @@ public struct WarmServerConfiguration: Sendable {
     self.maxSequenceLength = maxSequenceLength
     self.maxPendingRequests = max(1, maxPendingRequests)
   }
+}
+
+/// Model family used by the warm server to route generation to the correct pipeline.
+enum WarmModelFamily: String, Sendable {
+  case flux1
+  case flux2
 }
 
 public final class WarmServer {
@@ -221,20 +228,25 @@ public final class WarmServer {
     // --- Phase 4: Dynamic LoRA swap ---
     // If the workflow contains LoraLoader nodes, swap LoRAs before generating.
     // The coordinator serializes operations, so swap completes before generate starts.
+    // LoRA swap is not supported for Flux 2 models.
     if !request.loras.isEmpty {
-      let loraEntries = request.loras.map { lora -> LoRAEntry in
-        // Resolve bare filenames to full paths in the LoRA directory.
-        let resolvedPath: String
-        if lora.name.contains("/") || lora.name.hasPrefix("~") {
-          resolvedPath = lora.name
-        } else {
-          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+      if await coordinator.modelFamily == .flux2 {
+        logger.warning("WarmServer: ignoring LoRA swap for Flux 2 model (not supported)")
+      } else {
+        let loraEntries = request.loras.map { lora -> LoRAEntry in
+          // Resolve bare filenames to full paths in the LoRA directory.
+          let resolvedPath: String
+          if lora.name.contains("/") || lora.name.hasPrefix("~") {
+            resolvedPath = lora.name
+          } else {
+            resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+          }
+          return LoRAEntry(path: resolvedPath, scale: lora.scale)
         }
-        return LoRAEntry(path: resolvedPath, scale: lora.scale)
+        let swapPayload = LoRASwapPayload(loras: loraEntries)
+        let swapResult = try await coordinator.enqueueSwap(swapPayload)
+        logger.info("WarmServer: bridge LoRA swap complete — \(swapResult.loraCount) LoRA(s) active")
       }
-      let swapPayload = LoRASwapPayload(loras: loraEntries)
-      let swapResult = try await coordinator.enqueueSwap(swapPayload)
-      logger.info("WarmServer: bridge LoRA swap complete — \(swapResult.loraCount) LoRA(s) active")
     }
 
     // Derive dimensions from inpaint image if parser returned 0x0
@@ -256,7 +268,11 @@ public final class WarmServer {
     // --- Phase 4: ControlNet routing ---
     // If the workflow contains ControlNet nodes, route to ZImageControlPipeline
     // instead of the standard ZImagePipeline.
+    // ControlNet is not supported for Flux 2 models.
     if request.isControlNet, let controlnetModel = request.controlnetModel {
+      if await coordinator.modelFamily == .flux2 {
+        throw WarmServerError.controlNetNotSupported
+      }
       logger.info("WarmServer: routing to ControlNet pipeline — model=\(controlnetModel), strength=\(request.controlnetStrength)")
 
       // Resolve controlnet model name to a path or HuggingFace ID
@@ -361,13 +377,30 @@ public final class WarmServer {
       )
     }
 
+    // Family-aware defaults for step clamping, guidance, and negative prompts.
+    let family = await coordinator.modelFamily
+    let resolvedSteps: Int
+    let resolvedGuidance: Float
+    let resolvedNegativePrompt: String?
+
+    switch family {
+    case .flux1:
+      resolvedSteps = min(request.steps, 9)        // Z-Image Turbo: optimal at 9 steps
+      resolvedGuidance = 0.0                        // Z-Image Turbo: designed for cfg=0
+      resolvedNegativePrompt = nil                  // Negative prompts crash broadcast_shapes
+    case .flux2:
+      resolvedSteps = request.steps                 // Klein: no step clamp
+      resolvedGuidance = 1.0                        // Klein: default guidance 1.0
+      resolvedNegativePrompt = nil                  // Klein: CFG only when guidance > 1.0
+    }
+
     let payload = GeneratePayload(
       prompt: request.prompt,
-      negativePrompt: nil,  // Z-Image Turbo: negative prompts cause broadcast_shapes crash
+      negativePrompt: resolvedNegativePrompt,
       width: genWidth,
       height: genHeight,
-      steps: min(request.steps, 9),  // Z-Image Turbo: optimal at 9 steps, clamp plugin defaults
-      guidance: 0.0,  // Z-Image Turbo: designed for cfg=0
+      steps: resolvedSteps,
+      guidance: resolvedGuidance,
       seed: request.seed,
       outputPath: nil,
       inpaintImageData: request.inpaintImageData,
@@ -446,6 +479,24 @@ public final class WarmServer {
     case let error as LoRAError:
       return .error(status: 400, message: error.localizedDescription)
 
+    case let error as WarmServerError:
+      switch error {
+      case .loraSwapNotSupported, .controlNetNotSupported:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      case .flux2NotLoaded, .flux2DetectionFailed:
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      case .invalidPort:
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      }
+
+    case let error as Flux2Pipeline.Flux2PipelineError:
+      switch error {
+      case .invalidDimensions:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      default:
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      }
+
     case let error as DecodingError:
       return .error(status: 400, message: "Invalid JSON body: \(describe(decodingError: error))")
 
@@ -491,6 +542,12 @@ private actor WarmServerCoordinator {
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private let pipeline: ZImagePipeline
+  /// Flux 2 pipeline — created when the model is detected as Flux 2 Klein.
+  private var flux2Pipeline: Flux2Pipeline?
+  /// Which model family is loaded — determines generation routing.
+  private var currentModelFamily: WarmModelFamily = .flux1
+  /// Detected Flux 2 model info (variant, configs) — nil when running Flux 1.
+  private var detectedFlux2Model: Flux2DetectedModel?
   /// Lazy-initialized ControlNet pipeline — only created when first ControlNet request arrives.
   private var controlPipeline: ZImageControlPipeline?
   private let startTime = Date()
@@ -513,15 +570,75 @@ private actor WarmServerCoordinator {
   }
 
   func prepare() async throws {
-    logger.info("Preloading warm server pipeline")
-    try await pipeline.prepare(
-      modelSpec: configuration.modelSpec,
-      textEncoderPath: configuration.textEncoderPath,
-      loras: activeLoRAs,
-      forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly
-    )
-    pipelinePrepared = true
-    logger.info("Warm server pipeline ready")
+    // Resolve model snapshot path for family detection
+    let modelSpec = configuration.modelSpec
+    var isFlux2 = false
+    var snapshotURL: URL?
+
+    if let spec = modelSpec {
+      // Check by known model ID first
+      if Flux2ModelDetection.isKnownFlux2Model(spec) {
+        isFlux2 = true
+      }
+
+      // Resolve snapshot — needed for both detection and loading
+      let resolved = try await ModelResolution.resolveOrDefault(
+        modelSpec: spec,
+        filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
+      )
+      snapshotURL = resolved
+
+      // If not already detected by name, check the snapshot directory
+      if !isFlux2 {
+        isFlux2 = Flux2ModelDetection.detectFamily(at: resolved) == .flux2
+      }
+    }
+
+    if isFlux2, let snapshot = snapshotURL {
+      // --- Flux 2 Klein path ---
+      currentModelFamily = .flux2
+
+      guard let detected = Flux2ModelDetection.detect(at: snapshot) else {
+        throw WarmServerError.flux2DetectionFailed(modelSpec ?? "unknown")
+      }
+      detectedFlux2Model = detected
+
+      // Log memory estimate
+      let estimatedGB: String
+      switch detected.variant {
+      case "klein-4b": estimatedGB = "~15GB"
+      case "klein-9b": estimatedGB = "~25GB"
+      default: estimatedGB = "unknown"
+      }
+      logger.info("Detected Flux 2 Klein \(detected.variant) — estimated GPU memory: \(estimatedGB)")
+
+      let f2 = Flux2Pipeline(logger: logger)
+      try f2.loadModel(
+        from: snapshot,
+        config: detected.transformerConfig,
+        textEncoderConfig: detected.textEncoderConfig
+      )
+      flux2Pipeline = f2
+      pipelinePrepared = true
+      logger.info("Warm server pipeline ready (Flux 2 Klein \(detected.variant))")
+    } else {
+      // --- Flux 1 / Z-Image-Turbo path (existing behavior) ---
+      currentModelFamily = .flux1
+      logger.info("Preloading warm server pipeline (Flux 1)")
+      try await pipeline.prepare(
+        modelSpec: modelSpec,
+        textEncoderPath: configuration.textEncoderPath,
+        loras: activeLoRAs,
+        forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly
+      )
+      pipelinePrepared = true
+      logger.info("Warm server pipeline ready (Flux 1)")
+    }
+  }
+
+  /// Expose the current model family for routing decisions outside the actor.
+  var modelFamily: WarmModelFamily {
+    currentModelFamily
   }
 
   func enqueueGenerate(
@@ -588,6 +705,8 @@ private actor WarmServerCoordinator {
     return HealthResponse(
       status: shuttingDown ? "shutting_down" : "ok",
       model: configuration.modelSpec ?? ZImageRepository.id,
+      modelFamily: currentModelFamily.rawValue,
+      modelVariant: detectedFlux2Model?.variant,
       textEncoderPath: configuration.textEncoderPath,
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),
@@ -640,6 +759,15 @@ private actor WarmServerCoordinator {
   }
 
   private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
+    switch currentModelFamily {
+    case .flux2:
+      await runFlux2Generate(payload, continuation: continuation)
+    case .flux1:
+      await runFlux1Generate(payload, continuation: continuation, progressHandler: progressHandler)
+    }
+  }
+
+  private func runFlux1Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -679,7 +807,69 @@ private actor WarmServerCoordinator {
     }
   }
 
+  private func runFlux2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+    activeRenderStartedAt = Date()
+    let start = Date()
+
+    do {
+      guard let f2 = flux2Pipeline else {
+        throw WarmServerError.flux2NotLoaded
+      }
+
+      let outputURL: URL
+      if let outputPath = payload.outputPath, !outputPath.isEmpty {
+        outputURL = URL(fileURLWithPath: outputPath)
+      } else {
+        outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+          .appendingPathComponent("zimage-flux2-\(UUID().uuidString).png")
+      }
+
+      // Map GeneratePayload fields to Flux2GenerationRequest.
+      // Klein defaults: 4 steps, guidance 1.0.
+      let flux2Request = Flux2GenerationRequest(
+        prompt: payload.prompt,
+        negativePrompt: payload.negativePrompt,
+        width: payload.width ?? 1024,
+        height: payload.height ?? 1024,
+        steps: payload.steps ?? 4,
+        guidanceScale: payload.guidance ?? 1.0,
+        seed: payload.seed,
+        outputPath: outputURL,
+        maxSequenceLength: configuration.maxSequenceLength
+      )
+
+      let result = try await f2.generate(flux2Request, progressHandler: { progress in
+        // Flux2Pipeline progress — not routed to ZImagePipeline progress handler
+        // since the types differ. Logged internally by the pipeline.
+      })
+
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      successfulRenderCount += 1
+      lastRenderDurationMs = durationMs
+      lastError = nil
+      activeRenderStartedAt = nil
+
+      continuation.resume(
+        returning: GenerateResponse(
+          success: true,
+          outputPath: result.path,
+          durationMs: durationMs
+        )
+      )
+    } catch {
+      failedRenderCount += 1
+      lastError = error.localizedDescription
+      activeRenderStartedAt = nil
+      continuation.resume(throwing: error)
+    }
+  }
+
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
+    if currentModelFamily == .flux2 {
+      continuation.resume(throwing: WarmServerError.controlNetNotSupported)
+      return
+    }
+
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -713,6 +903,11 @@ private actor WarmServerCoordinator {
   }
 
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
+    if currentModelFamily == .flux2 {
+      continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
+      return
+    }
+
     do {
       let newLoRAs = try payload.makeConfigurations()
       try await pipeline.swapLoRAs(newLoRAs)
@@ -1285,6 +1480,8 @@ private struct ShutdownResponse: Encodable, Sendable {
 private struct HealthResponse: Encodable, Sendable {
   let status: String
   let model: String
+  let modelFamily: String
+  let modelVariant: String?
   let textEncoderPath: String?
   let loaded: Bool
   let loras: [LoRAState]
@@ -1375,11 +1572,23 @@ private final class SyncResult<Value> {
 
 public enum WarmServerError: Error, LocalizedError {
   case invalidPort(UInt16)
+  case flux2DetectionFailed(String)
+  case flux2NotLoaded
+  case loraSwapNotSupported
+  case controlNetNotSupported
 
   public var errorDescription: String? {
     switch self {
     case .invalidPort(let port):
       return "Invalid server port: \(port)"
+    case .flux2DetectionFailed(let model):
+      return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"
+    case .flux2NotLoaded:
+      return "Flux 2 pipeline is not loaded"
+    case .loraSwapNotSupported:
+      return "LoRA swap is not supported for Flux 2 models"
+    case .controlNetNotSupported:
+      return "ControlNet is not supported for Flux 2 models"
     }
   }
 }
