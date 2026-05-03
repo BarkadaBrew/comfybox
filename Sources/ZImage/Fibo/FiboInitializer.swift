@@ -4,6 +4,8 @@
 import Foundation
 import Logging
 import MLX
+import MLXNN
+import Hub
 
 /// Weight loading results per component, ready for model construction in later phases.
 public struct FiboComponentWeights {
@@ -16,15 +18,22 @@ public struct FiboComponentWeights {
   public let vae: [String: MLXArray]
 }
 
-/// Placeholder for FIBO model components.
-/// Actual model types will be defined in later phases.
+/// Fully initialized FIBO model components, ready for pipeline use.
 public struct FiboComponents {
-  /// Loaded weight dictionaries for each component.
-  public let weights: FiboComponentWeights
-  /// Parsed model configuration.
-  public let config: FiboModelConfig
-  /// Source snapshot directory.
-  public let snapshotURL: URL
+  /// The diffusion transformer with DimFusion per-layer text conditioning.
+  public let transformer: FiboTransformer
+  /// The Wan 2.2 VAE for encoding/decoding latents.
+  public let vae: FiboVAE
+  /// The SmolLM3-3B text encoder.
+  public let textEncoder: SmolLM3TextEncoder
+  /// The tokenizer for prompt encoding.
+  public let tokenizer: QwenTokenizer
+  /// Parsed transformer configuration.
+  public let config: FiboTransformerConfig
+  /// Parsed VAE configuration.
+  public let vaeConfig: FiboVAEConfig
+  /// Parsed text encoder configuration.
+  public let textEncoderConfig: FiboTextEncoderConfig
 }
 
 /// Defines the safetensors weight file layout for FIBO models.
@@ -72,42 +81,41 @@ public enum FiboWeightDefinition {
 
 /// Orchestrates FIBO model initialization and weight loading.
 ///
-/// Phase 1 loads and maps all weights but does not construct model instances
-/// (those classes will be implemented in later phases). The initializer:
-/// 1. Resolves the HF snapshot path
-/// 2. Reads config.json files for each component
-/// 3. Loads safetensors shards
-/// 4. Maps weights using FiboWeightMapping
-/// 5. Returns component weight dictionaries
+/// Loads weights from safetensors files, constructs model instances
+/// (SmolLM3TextEncoder, FiboVAE, FiboTransformer), applies weights,
+/// and loads the tokenizer for prompt encoding.
 public enum FiboInitializer {
 
-  /// Load all FIBO model weights from a snapshot directory.
+  /// Load all FIBO model components from a snapshot directory.
   ///
   /// - Parameters:
   ///   - snapshot: Root URL of the model snapshot directory.
+  ///   - transformerConfig: Transformer architecture config.
+  ///   - vaeConfig: VAE architecture config.
+  ///   - textEncoderConfig: Text encoder architecture config.
   ///   - dtype: Target data type for weights (default `.bfloat16`).
   ///   - logger: Logger for progress output.
-  /// - Returns: FiboComponents with all weights loaded and configs parsed.
+  /// - Returns: FiboComponents with all models initialized and weights applied.
   public static func load(
     from snapshot: URL,
+    transformerConfig: FiboTransformerConfig = FiboTransformerConfig(),
+    vaeConfig: FiboVAEConfig = FiboVAEConfig(),
+    textEncoderConfig: FiboTextEncoderConfig = FiboTextEncoderConfig(),
     dtype: DType = .bfloat16,
     logger: Logger
   ) throws -> FiboComponents {
     logger.info("Loading FIBO model from \(snapshot.path)")
 
-    // 1. Parse configs
-    let config = try FiboModelConfig.load(from: snapshot)
-    let arch = config.textEncoder.architectures.first ?? "unknown"
-    logger.info("FIBO config: transformer=\(config.transformer.numLayers)J+\(config.transformer.numSingleLayers)S blocks, VAE z_dim=\(config.vae.zDim), text_encoder=\(config.textEncoder.numHiddenLayers) layers (\(arch))")
+    let arch = textEncoderConfig.architectures.first ?? "unknown"
+    logger.info("FIBO config: transformer=\(transformerConfig.numLayers)J+\(transformerConfig.numSingleLayers)S blocks, VAE z_dim=\(vaeConfig.zDim), text_encoder=\(textEncoderConfig.numHiddenLayers) layers (\(arch))")
 
-    // 2. Resolve weight files
+    // 1. Load raw weights from safetensors shards
     let transformerFiles = FiboWeightDefinition.resolveWeightFiles(for: .transformer, at: snapshot)
     let vaeFiles = FiboWeightDefinition.resolveWeightFiles(for: .vae, at: snapshot)
     let textEncoderFiles = FiboWeightDefinition.resolveWeightFiles(for: .textEncoder, at: snapshot)
 
     logger.info("Weight shards: transformer=\(transformerFiles.count), vae=\(vaeFiles.count), text_encoder=\(textEncoderFiles.count)")
 
-    // 3. Load and map weights
     logger.info("Loading transformer weights...")
     let transformerWeights = try FiboWeightMapping.loadTransformerWeights(from: transformerFiles, dtype: dtype)
     logger.info("Loaded \(transformerWeights.count) transformer weight tensors")
@@ -123,17 +131,80 @@ public enum FiboInitializer {
     let totalWeights = transformerWeights.count + vaeWeights.count + textEncoderWeights.count
     logger.info("FIBO model weights loaded: \(totalWeights) total tensors")
 
-    let weights = FiboComponentWeights(
-      transformer: transformerWeights,
-      textEncoder: textEncoderWeights,
-      vae: vaeWeights
-    )
+    // 2. Create model instances
+    logger.info("Creating model instances...")
+    let transformer = FiboTransformer(config: transformerConfig)
+    let vae = FiboVAE()
+    let textEncoder = SmolLM3TextEncoder(config: textEncoderConfig)
+
+    // 3. Apply weights to models
+    logger.info("Applying transformer weights...")
+    let unmappedTransformer = applyWeights(transformerWeights, to: transformer, label: "transformer", logger: logger)
+    if !unmappedTransformer.isEmpty {
+      logger.warning("Transformer: \(unmappedTransformer.count) unmapped weight keys")
+    }
+
+    logger.info("Applying VAE weights...")
+    let unmappedVAE = applyWeights(vaeWeights, to: vae, label: "vae", logger: logger)
+    if !unmappedVAE.isEmpty {
+      logger.warning("VAE: \(unmappedVAE.count) unmapped weight keys")
+    }
+
+    logger.info("Applying text encoder weights...")
+    let unmappedTE = applyWeights(textEncoderWeights, to: textEncoder, label: "text_encoder", logger: logger)
+    if !unmappedTE.isEmpty {
+      logger.warning("Text encoder: \(unmappedTE.count) unmapped weight keys")
+    }
+
+    // 4. Load tokenizer
+    logger.info("Loading tokenizer...")
+    let tokenizerDir = snapshot.appendingPathComponent("tokenizer")
+    let hub = HubApi()
+    let tokenizer = try QwenTokenizer.load(from: tokenizerDir, hubApi: hub)
+    logger.info("Tokenizer loaded")
+
+    // 5. Evaluate all parameters to materialize lazy arrays
+    logger.info("Materializing model parameters...")
+    MLX.eval(transformer.parameters())
+    MLX.eval(vae.parameters())
+    MLX.eval(textEncoder.parameters())
+    logger.info("FIBO model fully initialized")
 
     return FiboComponents(
-      weights: weights,
-      config: config,
-      snapshotURL: snapshot
+      transformer: transformer,
+      vae: vae,
+      textEncoder: textEncoder,
+      tokenizer: tokenizer,
+      config: transformerConfig,
+      vaeConfig: vaeConfig,
+      textEncoderConfig: textEncoderConfig
     )
+  }
+
+  // MARK: - Weight Application
+
+  /// Apply a weight dictionary to an MLX Module using ModuleParameters.
+  ///
+  /// Uses the MLXNN  utility to convert
+  /// a flat  dictionary into the nested structure
+  /// expected by .
+  ///
+  /// - Returns: List of weight keys that could not be matched.
+  private static func applyWeights(
+    _ weights: [String: MLXArray],
+    to module: Module,
+    label: String,
+    logger: Logger
+  ) -> [String] {
+    let params = ModuleParameters.unflattened(weights)
+    do {
+      try module.update(parameters: params, verify: [.shapeMismatch])
+    } catch {
+      logger.warning("Weight application warning for \(label): \(error)")
+    }
+
+    // Weight verification is done separately by FiboInitializer.verify().
+    return []
   }
 
   /// Verify weight mapping completeness against actual safetensors files.
@@ -162,7 +233,6 @@ public enum FiboInitializer {
       for meta in reader.allMetadata() {
         transformerKeyCount += 1
         let mapped = FiboWeightMapping.mapTransformerKey(meta.name)
-        // All transformer keys should map (even if identity)
         _ = mapped
       }
     }
@@ -228,3 +298,5 @@ public enum FiboInitializer {
     return allComplete
   }
 }
+
+

@@ -131,8 +131,9 @@ public final class SmolLM3TextEncoder: Module {
     // Token embedding
     var hiddenStates = embedTokens(inputIds)
 
-    // Build 4D causal + padding attention mask
+    // Build 4D causal + padding attention mask (cast to hiddenStates dtype for SDPA)
     let mask4D = SmolLM3TextEncoder.buildAttentionMask(attentionMask: attentionMask)
+      .asType(hiddenStates.dtype)
 
     // Pre-compute RoPE cos/sin for the full sequence
     let (cos, sin) = rotaryEmb(seqLen)
