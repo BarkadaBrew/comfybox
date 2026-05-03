@@ -17,6 +17,13 @@ public enum ZImageModelMetadata {
   public static let recommendedInferenceSteps = 9 // gives 8 DiT forwards
   public static let recommendedGuidanceScale: Float = 0.0 // Turbo is distilled for zero CFG
 
+  /// Z-Image Base (non-distilled) defaults — supports full CFG guidance.
+  public enum Base {
+    public static let repository = "Tongyi-MAI/Z-Image"
+    public static let recommendedInferenceSteps = 50
+    public static let recommendedGuidanceScale: Float = 4.0
+  }
+
   public enum VAE {
     public static let latentChannels = 16
     public static let scalingFactor: Float = 0.3611
