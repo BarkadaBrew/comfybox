@@ -8,6 +8,11 @@ import MLXNN
 import MLXRandom
 import Hub
 
+#if canImport(CoreGraphics)
+import CoreGraphics
+import ImageIO
+#endif
+
 /// Configuration for a Flux 2 Klein generation request.
 public struct Flux2GenerationRequest: Sendable {
   public var prompt: String
@@ -20,6 +25,15 @@ public struct Flux2GenerationRequest: Sendable {
   public var outputPath: URL
   public var maxSequenceLength: Int
 
+  /// Path to a source image for img2img. When set with denoise < 1.0,
+  /// the pipeline encodes this image as a starting point instead of pure noise.
+  public var inputImagePath: URL?
+
+  /// Denoise strength (0.0-1.0). 1.0 = full txt2img (all steps from noise).
+  /// 0.5 = start halfway through the schedule, preserving composition.
+  /// Only used when `inputImagePath` is set.
+  public var denoise: Float
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -29,7 +43,9 @@ public struct Flux2GenerationRequest: Sendable {
     guidanceScale: Float = 1.0,
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "flux2-output.png"),
-    maxSequenceLength: Int = 512
+    maxSequenceLength: Int = 512,
+    inputImagePath: URL? = nil,
+    denoise: Float = 1.0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -40,6 +56,8 @@ public struct Flux2GenerationRequest: Sendable {
     self.seed = seed
     self.outputPath = outputPath
     self.maxSequenceLength = maxSequenceLength
+    self.inputImagePath = inputImagePath
+    self.denoise = denoise
   }
 }
 
@@ -66,6 +84,7 @@ public final class Flux2Pipeline {
     case tokenizerNotLoaded
     case invalidDimensions(String)
     case generationFailed(String)
+    case img2imgFailed(String)
 
     public var errorDescription: String? {
       switch self {
@@ -73,6 +92,7 @@ public final class Flux2Pipeline {
       case .tokenizerNotLoaded: return "Tokenizer not loaded"
       case .invalidDimensions(let msg): return "Invalid dimensions: \(msg)"
       case .generationFailed(let msg): return "Generation failed: \(msg)"
+      case .img2imgFailed(let msg): return "Img2img failed: \(msg)"
       }
     }
   }
@@ -221,6 +241,117 @@ public final class Flux2Pipeline {
     return imageData
   }
 
+  // MARK: - Img2Img Helpers
+
+  #if canImport(CoreGraphics)
+  /// Load a CGImage from a file URL.
+  private func loadImage(from url: URL) throws -> CGImage {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+      throw Flux2PipelineError.img2imgFailed("Failed to load image from \(url.path)")
+    }
+    return cgImage
+  }
+
+  /// Load, resize, and convert an image to an MLXArray in [-1, 1] NCHW format
+  /// suitable for VAE encoding.
+  ///
+  /// - Parameters:
+  ///   - cgImage: Source image.
+  ///   - width: Target width in pixels.
+  ///   - height: Target height in pixels.
+  /// - Returns: MLXArray in NCHW layout `(1, 3, H, W)` with values in [-1, 1].
+  private func prepareImageForVAE(
+    _ cgImage: CGImage,
+    width: Int,
+    height: Int
+  ) throws -> MLXArray {
+    // Resize to target dimensions and get [0, 1] NCHW array
+    let pixelArray = try QwenImageIO.resizedPixelArray(
+      from: cgImage,
+      width: width,
+      height: height,
+      addBatchDimension: true,
+      dtype: .float32
+    )
+    // Normalize from [0, 1] to [-1, 1]
+    return QwenImageIO.normalizeForEncoder(pixelArray)
+  }
+  #endif
+
+  /// Match encoded latent spatial dimensions to the target grid size via center-crop or pad.
+  ///
+  /// After VAE encoding, the spatial dimensions may not exactly match the noise
+  /// grid computed from the target resolution. This method center-crops (if larger)
+  /// or center-pads (if smaller) to match.
+  ///
+  /// Ported from mflux `Flux2Klein._match_latent_spatial_size`.
+  ///
+  /// - Parameters:
+  ///   - encoded: VAE-encoded latents in NCHW `(B, C, H, W)`.
+  ///   - targetHeight: Expected spatial height (latentHeight * 2).
+  ///   - targetWidth: Expected spatial width (latentWidth * 2).
+  /// - Returns: Latents with spatial dims matching `(targetHeight, targetWidth)`.
+  private func matchLatentSpatialSize(
+    _ encoded: MLXArray,
+    targetHeight: Int,
+    targetWidth: Int
+  ) -> MLXArray {
+    var result = encoded
+    let height = result.shape[2]
+    let width = result.shape[3]
+
+    if height != targetHeight {
+      if height > targetHeight {
+        // Center-crop height
+        let offset = (height - targetHeight) / 2
+        result = result[0..., 0..., offset..<(offset + targetHeight), 0...]
+      } else {
+        // Center-pad height
+        let padTotal = targetHeight - height
+        let padBefore = padTotal / 2
+        let padAfter = padTotal - padBefore
+        result = MLX.padded(result, widths: [
+          IntOrPair(0), IntOrPair(0), IntOrPair((padBefore, padAfter)), IntOrPair(0)
+        ])
+      }
+    }
+
+    if width != targetWidth {
+      if width > targetWidth {
+        // Center-crop width
+        let offset = (width - targetWidth) / 2
+        result = result[0..., 0..., 0..., offset..<(offset + targetWidth)]
+      } else {
+        // Center-pad width
+        let padTotal = targetWidth - width
+        let padBefore = padTotal / 2
+        let padAfter = padTotal - padBefore
+        result = MLX.padded(result, widths: [
+          IntOrPair(0), IntOrPair(0), IntOrPair(0), IntOrPair((padBefore, padAfter))
+        ])
+      }
+    }
+
+    return result
+  }
+
+  /// Apply batch norm normalization using the VAE's running statistics.
+  ///
+  /// The Flux 2 transformer operates in BN-normalized space. Without this
+  /// normalization, img2img produces garbage. The decode path applies
+  /// the inverse (x * std + mean).
+  ///
+  /// - Parameters:
+  ///   - latents: Patchified latents in NCHW `(B, 4*C, H/2, W/2)`.
+  ///   - vae: Flux2VAE instance with loaded batch norm stats.
+  /// - Returns: BN-normalized latents.
+  private func bnNormalize(_ latents: MLXArray, vae: Flux2VAE) -> MLXArray {
+    let mean = vae.bn.runningMean.reshaped(1, -1, 1, 1).asType(latents.dtype)
+    let std = sqrt(vae.bn.runningVar.reshaped(1, -1, 1, 1) + vae.bn.eps).asType(latents.dtype)
+    return (latents - mean) / std
+  }
+
   // MARK: - Core Generation
 
   private func generateCore(
@@ -307,11 +438,64 @@ public final class Flux2Pipeline {
 
     let sigmas = MLXArray(sigmaValues)
 
-    // 4. Denoising loop
-    logger.info("Running \(request.steps) denoising steps...")
-    for stepIndex in 0..<request.steps {
+    // 3a. Img2img: encode source image and blend with noise
+    var startStep = 0
+
+    #if canImport(CoreGraphics)
+    if let imagePath = request.inputImagePath, request.denoise < 1.0 {
+      logger.info("Img2img: encoding source image from \(imagePath.path) (denoise=\(request.denoise))...")
+
+      // 1. Load and resize image to target dimensions
+      let cgImage = try loadImage(from: imagePath)
+      let imageArray = try prepareImageForVAE(cgImage, width: request.width, height: request.height)
+
+      // 2. VAE encode -> (B, 32, H/8, W/8) in NCHW
+      var encoded = components.vae.encode(imageArray)
+
+      // 3. Ensure 4D (remove temporal dim if present)
+      if encoded.ndim == 5 && encoded.shape[2] == 1 {
+        encoded = encoded.squeezed(axis: 2)
+      }
+
+      // 4. Ensure even spatial dims (patchify needs H,W divisible by 2)
+      let h = encoded.shape[2]
+      let w = encoded.shape[3]
+      if h % 2 != 0 {
+        encoded = encoded[0..., 0..., 0..<(h - 1), 0...]
+      }
+      if w % 2 != 0 {
+        encoded = encoded[0..., 0..., 0..., 0..<(w - 1)]
+      }
+
+      // 5. Match spatial size to noise grid
+      encoded = matchLatentSpatialSize(encoded, targetHeight: latentHeight * 2, targetWidth: latentWidth * 2)
+
+      // 6. Patchify: (B, 32, H, W) -> (B, 128, H/2, W/2)
+      encoded = Flux2LatentCreator.patchifyLatents(encoded)
+
+      // 7. BN normalize (MANDATORY for Flux 2)
+      encoded = bnNormalize(encoded, vae: components.vae)
+
+      // 8. Pack to sequence: (B, 128, H/2, W/2) -> (B, H/2*W/2, 128)
+      let cleanLatents = Flux2LatentCreator.packLatents(encoded)
+
+      // 9. Compute start step and blend noise with clean latents
+      startStep = max(0, request.steps - Int(ceil(Float(request.steps) * request.denoise)))
+      let sigma = sigmaValues[startStep]
+      // mflux convention: (1 - sigma) * clean + sigma * noise
+      latents = MLXArray(sigma) * latents + MLXArray(1.0 - sigma) * cleanLatents
+      MLX.eval(latents)
+
+      logger.info("Img2img: starting at step \(startStep)/\(request.steps), sigma=\(sigma)")
+    }
+    #endif
+
+    // 4. Denoising loop (starts from startStep for img2img)
+    let effectiveSteps = request.steps - startStep
+    logger.info("Running \(effectiveSteps) denoising steps\(startStep > 0 ? " (from step \(startStep))" : "")...")
+    for stepIndex in startStep..<request.steps {
       try Task.checkCancellation()
-      progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepIndex, totalSteps: request.steps))
+      progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepIndex - startStep, totalSteps: effectiveSteps))
 
       let timestep = sigmas[stepIndex]
 
@@ -355,11 +539,11 @@ public final class Flux2Pipeline {
       MLX.eval(latents)
     }
 
-    progressHandler?(GenerationProgress(stage: .denoising, stepIndex: request.steps, totalSteps: request.steps))
+    progressHandler?(GenerationProgress(stage: .denoising, stepIndex: effectiveSteps, totalSteps: effectiveSteps))
     logger.info("Denoising complete")
 
     // 5. Decode latents
-    progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
+    progressHandler?(GenerationProgress(stage: .decoding, stepIndex: effectiveSteps, totalSteps: effectiveSteps))
     logger.info("Decoding with VAE...")
 
     // Reshape packed latents back to spatial for VAE decode
