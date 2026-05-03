@@ -90,7 +90,7 @@ public enum Flux2WeightMapping {
       for meta in reader.allMetadata() {
         var tensor = try reader.tensor(named: meta.name)
         // Transpose conv2d weights: PyTorch NCHW -> MLX NHWC
-        if meta.name.contains(".conv") && meta.name.hasSuffix(".weight") && tensor.ndim == 4 {
+        if meta.name.hasSuffix(".weight") && tensor.ndim == 4 && (meta.name.contains(".conv") || meta.name.contains("quant_conv") || meta.name.contains("post_quant_conv")) {
           tensor = tensor.transposed(0, 2, 3, 1)
         }
         if tensor.dtype != dtype {
