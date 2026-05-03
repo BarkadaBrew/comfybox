@@ -389,8 +389,11 @@ public final class WarmServer {
       resolvedGuidance = 0.0                        // Z-Image Turbo: designed for cfg=0
       resolvedNegativePrompt = nil                  // Negative prompts crash broadcast_shapes
     case .flux2:
+      // Base (non-distilled) models support guidance > 1.0 and default to 50 steps;
+      // distilled models default to 4 steps and guidance 1.0.
+      let isBaseModel = await coordinator.isFlux2BaseModel
       resolvedSteps = request.steps                 // Klein: no step clamp
-      resolvedGuidance = 1.0                        // Klein: default guidance 1.0
+      resolvedGuidance = isBaseModel ? request.guidance : 1.0
       resolvedNegativePrompt = nil                  // Klein: CFG only when guidance > 1.0
     }
 
@@ -606,17 +609,19 @@ private actor WarmServerCoordinator {
       // Log memory estimate
       let estimatedGB: String
       switch detected.variant {
-      case "klein-4b": estimatedGB = "~15GB"
-      case "klein-9b": estimatedGB = "~25GB"
+      case "klein-4b", "klein-base-4b": estimatedGB = "~15GB"
+      case "klein-9b", "klein-base-9b": estimatedGB = "~25GB"
       default: estimatedGB = "unknown"
       }
-      logger.info("Detected Flux 2 Klein \(detected.variant) — estimated GPU memory: \(estimatedGB)")
+      let modelType = detected.isBaseModel ? "base (non-distilled)" : "distilled"
+      logger.info("Detected Flux 2 Klein \(detected.variant) [\(modelType)] — estimated GPU memory: \(estimatedGB)")
 
       let f2 = Flux2Pipeline(logger: logger)
       try f2.loadModel(
         from: snapshot,
         config: detected.transformerConfig,
-        textEncoderConfig: detected.textEncoderConfig
+        textEncoderConfig: detected.textEncoderConfig,
+        isBase: detected.isBaseModel
       )
       flux2Pipeline = f2
       pipelinePrepared = true
@@ -639,6 +644,11 @@ private actor WarmServerCoordinator {
   /// Expose the current model family for routing decisions outside the actor.
   var modelFamily: WarmModelFamily {
     currentModelFamily
+  }
+
+  /// Whether the loaded Flux 2 model is a base (non-distilled) variant.
+  var isFlux2BaseModel: Bool {
+    detectedFlux2Model?.isBaseModel ?? false
   }
 
   func enqueueGenerate(
@@ -825,14 +835,17 @@ private actor WarmServerCoordinator {
       }
 
       // Map GeneratePayload fields to Flux2GenerationRequest.
-      // Klein defaults: 4 steps, guidance 1.0.
+      // Base models: 50 steps, guidance configurable.
+      // Distilled models: 4 steps, guidance 1.0.
+      let defaultSteps = f2.defaultSteps
+      let defaultGuidance: Float = f2.isDistilled ? 1.0 : 3.5
       let flux2Request = Flux2GenerationRequest(
         prompt: payload.prompt,
         negativePrompt: payload.negativePrompt,
         width: payload.width ?? 1024,
         height: payload.height ?? 1024,
-        steps: payload.steps ?? 4,
-        guidanceScale: payload.guidance ?? 1.0,
+        steps: payload.steps ?? defaultSteps,
+        guidanceScale: payload.guidance ?? defaultGuidance,
         seed: payload.seed,
         outputPath: outputURL,
         maxSequenceLength: configuration.maxSequenceLength

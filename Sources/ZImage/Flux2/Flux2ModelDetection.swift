@@ -10,8 +10,10 @@ public enum ZImageModelFamily: String, Sendable {
 
 /// Detected Flux 2 Klein model variant with its configuration.
 public struct Flux2DetectedModel {
-  /// The model variant (e.g., "klein-4b", "klein-9b").
+  /// The model variant (e.g., "klein-4b", "klein-base-4b").
   public let variant: String
+  /// Whether this is a base (non-distilled) model that supports guidance > 1.0.
+  public let isBaseModel: Bool
   /// Transformer config parsed from the model directory.
   public let transformerConfig: Flux2TransformerConfig
   /// Text encoder config inferred from the model directory.
@@ -81,16 +83,21 @@ public enum Flux2ModelDetection {
     // Parse text encoder config if available
     let textEncoderConfig = parseTextEncoderConfig(at: snapshot) ?? Qwen3TextEncoderConfiguration()
 
-    // Determine variant from model dimensions
+    // Determine variant from model dimensions and whether it's a base model.
+    // Base (non-distilled) models are detected by "base" in the directory path,
+    // matching mflux behavior (is_distilled = "base" not in model_name.lower()).
+    // The config.json guidance_embeds field is false for both distilled and base.
+    let isBase = snapshot.path.lowercased().contains("base")
     let variant: String
     if numLayers == 8 && numSingleLayers == 24 && numAttentionHeads == 32 {
-      variant = "klein-9b"
+      variant = isBase ? "klein-base-9b" : "klein-9b"
     } else {
-      variant = "klein-4b"
+      variant = isBase ? "klein-base-4b" : "klein-4b"
     }
 
     return Flux2DetectedModel(
       variant: variant,
+      isBaseModel: isBase,
       transformerConfig: transformerConfig,
       textEncoderConfig: textEncoderConfig
     )
