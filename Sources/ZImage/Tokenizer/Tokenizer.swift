@@ -427,6 +427,11 @@ public final class QwenTokenizer {
   /// read-only snapshot mount or a model whose chat_template must not be
   /// augmented).
   ///
+  /// Handles HuggingFace cache symlinks: snapshot files are typically symlinks
+  /// to content-addressed blobs. Writing through a symlink mutates the shared
+  /// blob and corrupts the backup. This function resolves symlinks first,
+  /// removes the symlink, and writes a real file in its place.
+  ///
   /// Errors are swallowed by the caller — a failure here degrades to the
   /// pre-existing `missingChatTemplate` error at `applyChatTemplate` time,
   /// which is strictly no worse than the status quo.
@@ -442,44 +447,101 @@ public final class QwenTokenizer {
     let jinjaURL = tokenizerDirectory.appending(path: "chat_template.jinja")
     let fm = FileManager.default
 
-    guard fm.fileExists(atPath: configURL.path),
-          fm.fileExists(atPath: jinjaURL.path) else {
-      // Nothing to do — either the config is missing (caller will surface a
-      // clearer error) or there is no sidecar to merge.
+    // Clean up orphaned .tmp files from previous failed patch attempts.
+    if let contents = try? fm.contentsOfDirectory(
+      at: tokenizerDirectory,
+      includingPropertiesForKeys: nil
+    ) {
+      for url in contents where url.lastPathComponent.contains(".patch.") && url.pathExtension == "tmp" {
+        try? fm.removeItem(at: url)
+      }
+    }
+
+    guard fm.fileExists(atPath: configURL.path) else {
+      // Config missing — caller will surface a clearer error downstream.
       return
     }
 
-    let configData = try Data(contentsOf: configURL)
-    guard var configJSON = try JSONSerialization.jsonObject(with: configData, options: []) as? [String: Any] else {
+    // Read the config, resolving through symlinks so we get actual content.
+    let resolvedConfigURL = configURL.resolvingSymlinksInPath()
+    let configData = try Data(contentsOf: resolvedConfigURL)
+    guard var configJSON = try JSONSerialization.jsonObject(
+      with: configData, options: []
+    ) as? [String: Any] else {
       return
     }
 
-    // Already inlined — no-op. We treat any non-empty string as "inlined",
+    // Already inlined — no-op.  Any non-empty string counts as "present",
     // matching what swift-transformers will accept downstream.
     if let existing = configJSON["chat_template"] as? String, !existing.isEmpty {
       return
     }
 
-    let jinjaTemplate = try String(contentsOf: jinjaURL, encoding: .utf8)
-    guard !jinjaTemplate.isEmpty else { return }
+    // No inline chat_template.  Try the jinja sidecar.
+    guard fm.fileExists(atPath: jinjaURL.path) else {
+      FileHandle.standardError.write(Data(
+        "[zimage] warning: tokenizer_config.json has no chat_template and no chat_template.jinja sidecar found in \(tokenizerDirectory.path) — applyChatTemplate will fail\n".utf8
+      ))
+      return
+    }
+
+    let resolvedJinjaURL = jinjaURL.resolvingSymlinksInPath()
+    let jinjaTemplate = try String(contentsOf: resolvedJinjaURL, encoding: .utf8)
+    guard !jinjaTemplate.isEmpty else {
+      FileHandle.standardError.write(Data(
+        "[zimage] warning: chat_template.jinja is empty in \(tokenizerDirectory.path)\n".utf8
+      ))
+      return
+    }
 
     configJSON["chat_template"] = jinjaTemplate
 
-    // Write backup on first patch (never overwrite an existing .bak).
+    // Back up the original config (actual content, not the symlink).
+    // Never overwrite an existing backup that contains real content.
     let backupURL = configURL.appendingPathExtension("bak")
-    if !fm.fileExists(atPath: backupURL.path) {
-      try? fm.copyItem(at: configURL, to: backupURL)
+    let backupExists = fm.fileExists(atPath: backupURL.path)
+    if backupExists {
+      // If the backup is a symlink (from a previous broken run that copied
+      // the symlink instead of the content), replace it with real content.
+      let backupAttrs = try? fm.attributesOfItem(atPath: backupURL.path)
+      if backupAttrs?[.type] as? FileAttributeType == .typeSymbolicLink {
+        try? fm.removeItem(at: backupURL)
+        try? configData.write(to: backupURL, options: .atomic)
+      }
+    } else {
+      try? configData.write(to: backupURL, options: .atomic)
     }
 
-    // Atomic write via temp sibling + rename, so readers never see a
-    // torn file. .sortedKeys for stable diffs on subsequent patches.
-    let tmpURL = configURL.appendingPathExtension("patch.\(UUID().uuidString).tmp")
+    // Serialize the patched config.
     let patchedData = try JSONSerialization.data(
       withJSONObject: configJSON,
       options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     )
-    try patchedData.write(to: tmpURL, options: [.atomic])
-    _ = try fm.replaceItemAt(configURL, withItemAt: tmpURL)
+
+    // If tokenizer_config.json is a symlink, remove it first.  Writing
+    // through a symlink would mutate the shared content-addressed blob in
+    // the HuggingFace cache, which is both destructive and makes the .bak
+    // backup point at the already-modified blob (useless).
+    let configAttrs = try fm.attributesOfItem(atPath: configURL.path)
+    if configAttrs[.type] as? FileAttributeType == .typeSymbolicLink {
+      try fm.removeItem(at: configURL)
+    }
+
+    // Atomic write via temp sibling + rename, so readers never see a
+    // torn file.  .sortedKeys for stable diffs on subsequent patches.
+    let tmpURL = configURL.appendingPathExtension("patch.\(UUID().uuidString).tmp")
+    do {
+      try patchedData.write(to: tmpURL, options: .atomic)
+      if fm.fileExists(atPath: configURL.path) {
+        _ = try fm.replaceItemAt(configURL, withItemAt: tmpURL)
+      } else {
+        try fm.moveItem(at: tmpURL, to: configURL)
+      }
+    } catch {
+      // Clean up temp file on failure.
+      try? fm.removeItem(at: tmpURL)
+      throw error
+    }
 
     FileHandle.standardError.write(Data(
       "[zimage] inlined chat_template.jinja (\(jinjaTemplate.count) chars) into \(configURL.path); backup at \(backupURL.lastPathComponent)\n".utf8
