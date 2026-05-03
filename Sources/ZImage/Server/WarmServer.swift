@@ -37,6 +37,7 @@ public struct WarmServerConfiguration: Sendable {
 enum WarmModelFamily: String, Sendable {
   case flux1
   case flux2
+  case fibo
 }
 
 public final class WarmServer {
@@ -384,6 +385,11 @@ public final class WarmServer {
     let resolvedNegativePrompt: String?
 
     switch family {
+    case .fibo:
+      // FIBO: use model defaults, no step clamping
+      resolvedSteps = request.steps
+      resolvedGuidance = request.guidance > 0 ? request.guidance : 4.0
+      resolvedNegativePrompt = request.negativePrompt
     case .flux1:
       let zimageVariant = await coordinator.currentZImageVariant
       if zimageVariant == .base {
@@ -495,13 +501,21 @@ public final class WarmServer {
       switch error {
       case .loraSwapNotSupported, .controlNetNotSupported:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
-      case .flux2NotLoaded, .flux2DetectionFailed:
+      case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       }
 
     case let error as Flux2Pipeline.Flux2PipelineError:
+      switch error {
+      case .invalidDimensions:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      default:
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      }
+
+    case let error as FiboPipeline.FiboPipelineError:
       switch error {
       case .invalidDimensions:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
@@ -556,10 +570,14 @@ private actor WarmServerCoordinator {
   private let pipeline: ZImagePipeline
   /// Flux 2 pipeline — created when the model is detected as Flux 2 Klein.
   private var flux2Pipeline: Flux2Pipeline?
+  /// FIBO pipeline — created when the model is detected as FIBO.
+  private var fiboPipeline: FiboPipeline?
   /// Which model family is loaded — determines generation routing.
   private var currentModelFamily: WarmModelFamily = .flux1
   /// Detected Flux 2 model info (variant, configs) — nil when running Flux 1.
   private var detectedFlux2Model: Flux2DetectedModel?
+  /// Detected FIBO model info — nil when running Flux 1/2.
+  private var detectedFiboModel: FiboDetectedModel?
   /// Detected Z-Image variant (Base vs Turbo) — only set when running Flux 1 (Z-Image).
   private var zimageVariant: ZImageVariant = .turbo
   /// Lazy-initialized ControlNet pipeline — only created when first ControlNet request arrives.
@@ -589,9 +607,13 @@ private actor WarmServerCoordinator {
     var isFlux2 = false
     var snapshotURL: URL?
 
+    var isFibo = false
+
     if let spec = modelSpec {
       // Check by known model ID first
-      if Flux2ModelDetection.isKnownFlux2Model(spec) {
+      if FiboModelDetection.isKnownFiboModel(spec) {
+        isFibo = true
+      } else if Flux2ModelDetection.isKnownFlux2Model(spec) {
         isFlux2 = true
       }
 
@@ -603,12 +625,36 @@ private actor WarmServerCoordinator {
       snapshotURL = resolved
 
       // If not already detected by name, check the snapshot directory
-      if !isFlux2 {
-        isFlux2 = Flux2ModelDetection.detectFamily(at: resolved) == .flux2
+      if !isFibo && !isFlux2 {
+        if FiboModelDetection.detect(at: resolved) != nil {
+          isFibo = true
+        } else if Flux2ModelDetection.detectFamily(at: resolved) == .flux2 {
+          isFlux2 = true
+        }
       }
     }
 
-    if isFlux2, let snapshot = snapshotURL {
+    if isFibo, let snapshot = snapshotURL {
+      // --- FIBO path ---
+      currentModelFamily = .fibo
+
+      guard let detected = FiboModelDetection.detect(at: snapshot) else {
+        throw WarmServerError.fiboDetectionFailed(modelSpec ?? "unknown")
+      }
+      detectedFiboModel = detected
+      logger.info("Detected FIBO model — estimated GPU memory: ~16GB")
+
+      let fp = FiboPipeline(logger: logger)
+      try fp.loadModel(
+        from: snapshot,
+        transformerConfig: detected.transformerConfig,
+        vaeConfig: detected.vaeConfig,
+        textEncoderConfig: detected.textEncoderConfig
+      )
+      fiboPipeline = fp
+      pipelinePrepared = true
+      logger.info("Warm server pipeline ready (FIBO)")
+    } else if isFlux2, let snapshot = snapshotURL {
       // --- Flux 2 Klein path ---
       currentModelFamily = .flux2
 
@@ -748,7 +794,7 @@ private actor WarmServerCoordinator {
       status: shuttingDown ? "shutting_down" : "ok",
       model: configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
-      modelVariant: currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant,
+      modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
       textEncoderPath: configuration.textEncoderPath,
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),
@@ -802,6 +848,8 @@ private actor WarmServerCoordinator {
 
   private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
     switch currentModelFamily {
+    case .fibo:
+      await runFiboGenerate(payload, continuation: continuation)
     case .flux2:
       await runFlux2Generate(payload, continuation: continuation)
     case .flux1:
@@ -930,8 +978,59 @@ private actor WarmServerCoordinator {
     }
   }
 
+  private func runFiboGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+    activeRenderStartedAt = Date()
+    let start = Date()
+
+    do {
+      guard let fp = fiboPipeline else {
+        throw WarmServerError.fiboNotLoaded
+      }
+
+      let outputURL: URL
+      if let outputPath = payload.outputPath, !outputPath.isEmpty {
+        outputURL = URL(fileURLWithPath: outputPath)
+      } else {
+        outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+          .appendingPathComponent("zimage-fibo-\(UUID().uuidString).png")
+      }
+
+      let fiboRequest = FiboGenerationRequest(
+        prompt: payload.prompt,
+        negativePrompt: payload.negativePrompt,
+        width: payload.width ?? 1024,
+        height: payload.height ?? 1024,
+        steps: payload.steps ?? 30,
+        guidanceScale: payload.guidance ?? 4.0,
+        seed: payload.seed,
+        outputPath: outputURL
+      )
+
+      let result = try await fp.generate(fiboRequest, progressHandler: nil)
+
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      successfulRenderCount += 1
+      lastRenderDurationMs = durationMs
+      lastError = nil
+      activeRenderStartedAt = nil
+
+      continuation.resume(
+        returning: GenerateResponse(
+          success: true,
+          outputPath: result.path,
+          durationMs: durationMs
+        )
+      )
+    } catch {
+      failedRenderCount += 1
+      lastError = error.localizedDescription
+      activeRenderStartedAt = nil
+      continuation.resume(throwing: error)
+    }
+  }
+
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
-    if currentModelFamily == .flux2 {
+    if currentModelFamily == .flux2 || currentModelFamily == .fibo {
       continuation.resume(throwing: WarmServerError.controlNetNotSupported)
       return
     }
@@ -969,7 +1068,7 @@ private actor WarmServerCoordinator {
   }
 
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
-    if currentModelFamily == .flux2 {
+    if currentModelFamily == .flux2 || currentModelFamily == .fibo {
       continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
       return
     }
@@ -1640,6 +1739,8 @@ public enum WarmServerError: Error, LocalizedError {
   case invalidPort(UInt16)
   case flux2DetectionFailed(String)
   case flux2NotLoaded
+  case fiboDetectionFailed(String)
+  case fiboNotLoaded
   case loraSwapNotSupported
   case controlNetNotSupported
 
@@ -1651,10 +1752,14 @@ public enum WarmServerError: Error, LocalizedError {
       return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"
     case .flux2NotLoaded:
       return "Flux 2 pipeline is not loaded"
+    case .fiboDetectionFailed(let model):
+      return "Model '\(model)' was identified as FIBO but detection failed at the snapshot directory"
+    case .fiboNotLoaded:
+      return "FIBO pipeline is not loaded"
     case .loraSwapNotSupported:
-      return "LoRA swap is not supported for Flux 2 models"
+      return "LoRA swap is not supported for this model family"
     case .controlNetNotSupported:
-      return "ControlNet is not supported for Flux 2 models"
+      return "ControlNet is not supported for this model family"
     }
   }
 }

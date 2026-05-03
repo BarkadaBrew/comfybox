@@ -38,37 +38,22 @@ final class FiboGELU: Module {
 /// Weight key paths:
 /// - `transformer_blocks.{i}.ff.net.0.proj.{weight,bias}`
 /// - `transformer_blocks.{i}.ff.net.2.{weight,bias}`
+///
+/// The Python reference uses a sequential list 
+/// with numeric indices as keys (0, 1, 2). MLXNN's ModuleParameters treats
+/// numeric string keys as array indices, which does not match our module
+/// structure. To work around this, we use a custom weight loading approach:
+/// the weight keys are remapped from  -> 
+/// and  ->  in FiboWeightMapping.
 final class FiboFeedForward: Module {
-  // The Python reference uses a list: [FiboGELU, Dropout, Linear]
-  // We flatten this to match the weight key structure: net.0.proj.* and net.2.*
-  @ModuleInfo(key: "net") var net: FiboFeedForwardNet
+  @ModuleInfo(key: "gelu") var gelu: FiboGELU
+  @ModuleInfo(key: "linear_out") var linearOut: Linear
 
   init(dim: Int, dimOut: Int? = nil, mult: Int = 4) {
     let innerDim = dim * mult
     let outDim = dimOut ?? dim
-    self._net.wrappedValue = FiboFeedForwardNet(dimIn: dim, innerDim: innerDim, dimOut: outDim)
-    super.init()
-  }
-
-  func callAsFunction(_ x: MLXArray) -> MLXArray {
-    net(x)
-  }
-}
-
-/// Internal net structure matching the `ff.net.{0,2}` weight key hierarchy.
-///
-/// The Python list `[FiboGELU, Dropout, Linear]` maps to:
-/// - `net.0.proj.{weight,bias}` (FiboGELU at index 0)
-/// - `net.2.{weight,bias}` (Linear at index 2, skipping Dropout at index 1)
-final class FiboFeedForwardNet: Module {
-  // Index 0: GELU gate projection
-  @ModuleInfo(key: "0") var gelu: FiboGELU
-  // Index 2: output projection (index 1 is Dropout, no parameters)
-  @ModuleInfo(key: "2") var linearOut: Linear
-
-  init(dimIn: Int, innerDim: Int, dimOut: Int) {
-    self._gelu.wrappedValue = FiboGELU(dimIn: dimIn, dimOut: innerDim)
-    self._linearOut.wrappedValue = Linear(innerDim, dimOut)
+    self._gelu.wrappedValue = FiboGELU(dimIn: dim, dimOut: innerDim)
+    self._linearOut.wrappedValue = Linear(innerDim, outDim)
     super.init()
   }
 

@@ -69,6 +69,9 @@ public enum FiboWeightMapping {
   static func mapTransformerKey(_ hfKey: String) -> String {
     var key = hfKey
     key = key.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
+    // Remap feed-forward net sequential indices to named keys
+    key = key.replacingOccurrences(of: ".net.0.proj.", with: ".gelu.proj.")
+    key = key.replacingOccurrences(of: ".net.2.", with: ".linear_out.")
     return key
   }
 

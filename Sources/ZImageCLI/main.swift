@@ -277,6 +277,8 @@ struct ZImageCLI {
     // Resolve model aliases to HuggingFace IDs
     if let m = model {
       switch m.lowercased() {
+      case "fibo", "briaai/fibo":
+        model = "briaai/FIBO"
       case "z-image-base", "zimage-base":
         model = ZImageRepository.baseId
       case "z-image-turbo", "zimage-turbo", "z-image":
@@ -600,6 +602,92 @@ struct ZImageCLI {
       return
     }
 
+    // === FIBO PATH ===
+    // Auto-detect or explicitly route to FIBO pipeline
+    let isFiboModel: Bool
+    if let family = modelFamily {
+      isFiboModel = (family.lowercased() == "fibo")
+    } else if let modelSpec = model {
+      if FiboModelDetection.isKnownFiboModel(modelSpec) {
+        isFiboModel = true
+      } else {
+        let localURL = URL(fileURLWithPath: modelSpec)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+          isFiboModel = FiboModelDetection.detect(at: localURL) != nil
+        } else {
+          isFiboModel = false
+        }
+      }
+    } else {
+      isFiboModel = false
+    }
+
+    if isFiboModel {
+      nonisolated(unsafe) let fiboSemaphore = DispatchSemaphore(value: 0)
+      let capturedModel = model
+      let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
+      let bar = useBar ? ProgressBar(total: steps) : nil
+      Task {
+        do {
+          // Resolve model snapshot
+          let modelSpec = capturedModel ?? "briaai/FIBO"
+          let snapshot = try await ModelResolution.resolve(modelSpec: modelSpec)
+
+          // Detect model config from snapshot
+          guard let detected = FiboModelDetection.detect(at: snapshot) else {
+            logger.error("Model at \(snapshot.path) is not a FIBO model")
+            fiboSemaphore.signal()
+            return
+          }
+          logger.info("Detected FIBO model")
+
+          let fiboPipeline = FiboPipeline(logger: logger)
+          try fiboPipeline.loadModel(
+            from: snapshot,
+            transformerConfig: detected.transformerConfig,
+            vaeConfig: detected.vaeConfig,
+            textEncoderConfig: detected.textEncoderConfig
+          )
+
+          // FIBO defaults: 30 steps, guidance 4.0
+          let fiboSteps = steps == ZImageModelMetadata.recommendedInferenceSteps ? 30 : steps
+          let fiboGuidance = guidance == ZImageModelMetadata.recommendedGuidanceScale ? Float(4.0) : guidance
+
+          let fiboRequest = FiboGenerationRequest(
+            prompt: prompt,
+            negativePrompt: negativePrompt,
+            width: width,
+            height: height,
+            steps: fiboSteps,
+            guidanceScale: fiboGuidance,
+            seed: seed,
+            outputPath: URL(fileURLWithPath: outputPath)
+          )
+
+          _ = try await fiboPipeline.generate(fiboRequest, progressHandler: { progress in
+            guard !noProgress else { return }
+            guard progress.stage == .denoising else { return }
+            let completed = min(progress.totalSteps, max(0, progress.stepIndex))
+            if let bar {
+              bar.update(completed: completed)
+              if completed == progress.totalSteps {
+                bar.finish(forceNewline: true)
+              }
+            } else {
+              PlainProgress.shared.report(completed: completed, total: progress.totalSteps)
+            }
+          })
+          if let bar { bar.finish(forceNewline: true) }
+        } catch {
+          logger.error("FIBO generation failed: \(error)")
+          if let bar { bar.finish(forceNewline: true) }
+        }
+        fiboSemaphore.signal()
+      }
+      fiboSemaphore.wait()
+      return
+    }
+
     // === FLUX 2 KLEIN PATH ===
     // Auto-detect or explicitly route to Flux 2 pipeline
     let isFlux2: Bool
@@ -884,7 +972,7 @@ struct ZImageCLI {
       --output, -o           Output path (default z-image.png)
       --model, -m            Model path or HuggingFace ID (default: \(ZImageRepository.id))
                              Aliases: z-image-base (Base, CFG-guided), z-image-turbo (Turbo, distilled)
-      --model-family         Model family: flux1 or flux2 (default: auto-detect from model config)
+      --model-family         Model family: flux1, flux2, or fibo (default: auto-detect from model config)
       --text-encoder-path    Override text encoder directory (CLI > ZIMAGE_ENCODER_PATH > auto-detect > default)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override (disable AIO auto-detect)
       --cache-limit          GPU memory cache limit in MB (default: unlimited)
