@@ -6,6 +6,7 @@ import Foundation
 public enum ZImageModelFamily: String, Sendable {
   case flux1 = "flux1"
   case flux2 = "flux2"
+  case fibo = "fibo"
 }
 
 /// Detected Flux 2 Klein model variant with its configuration.
@@ -108,6 +109,9 @@ public enum Flux2ModelDetection {
   /// - Parameter snapshot: Root URL of the model snapshot directory.
   /// - Returns: `.flux2` if a Flux2 model is detected, `.flux1` otherwise.
   public static func detectFamily(at snapshot: URL) -> ZImageModelFamily {
+    if FiboModelDetection.detect(at: snapshot) != nil {
+      return .fibo
+    }
     if detect(at: snapshot) != nil {
       return .flux2
     }
