@@ -131,15 +131,12 @@ public enum ComfyBoxModelRegistry {
 
   /// All registered models, keyed by ID.
   public static let models: [String: ComfyBoxModel] = {
-    var dict: [String: CombxModel] = [:]
+    var dict: [String: ComfyBoxModel] = [:]
     for model in allModels {
       dict[model.id] = model
     }
     return dict
   }()
-
-  // For the compiler — fix the typo in the computed property above
-  private typealias CombxModel = ComfyBoxModel
 
   /// All registered models as an array.
   public static let allModels: [ComfyBoxModel] = [
