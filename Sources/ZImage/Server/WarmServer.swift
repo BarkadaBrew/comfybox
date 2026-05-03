@@ -385,9 +385,18 @@ public final class WarmServer {
 
     switch family {
     case .flux1:
-      resolvedSteps = min(request.steps, 9)        // Z-Image Turbo: optimal at 9 steps
-      resolvedGuidance = 0.0                        // Z-Image Turbo: designed for cfg=0
-      resolvedNegativePrompt = nil                  // Negative prompts crash broadcast_shapes
+      let zimageVariant = await coordinator.currentZImageVariant
+      if zimageVariant == .base {
+        // Z-Image Base: non-distilled, supports CFG guidance and negative prompts
+        resolvedSteps = request.steps
+        resolvedGuidance = request.guidance > 0 ? request.guidance : ZImageModelMetadata.Base.recommendedGuidanceScale
+        resolvedNegativePrompt = request.negativePrompt
+      } else {
+        // Z-Image Turbo: distilled, optimal at 9 steps, no CFG, no negative prompts
+        resolvedSteps = min(request.steps, 9)
+        resolvedGuidance = 0.0
+        resolvedNegativePrompt = nil
+      }
     case .flux2:
       // Base (non-distilled) models support guidance > 1.0 and default to 50 steps;
       // distilled models default to 4 steps and guidance 1.0.
@@ -551,6 +560,8 @@ private actor WarmServerCoordinator {
   private var currentModelFamily: WarmModelFamily = .flux1
   /// Detected Flux 2 model info (variant, configs) — nil when running Flux 1.
   private var detectedFlux2Model: Flux2DetectedModel?
+  /// Detected Z-Image variant (Base vs Turbo) — only set when running Flux 1 (Z-Image).
+  private var zimageVariant: ZImageVariant = .turbo
   /// Lazy-initialized ControlNet pipeline — only created when first ControlNet request arrives.
   private var controlPipeline: ZImageControlPipeline?
   private let startTime = Date()
@@ -627,9 +638,25 @@ private actor WarmServerCoordinator {
       pipelinePrepared = true
       logger.info("Warm server pipeline ready (Flux 2 Klein \(detected.variant))")
     } else {
-      // --- Flux 1 / Z-Image-Turbo path (existing behavior) ---
+      // --- Flux 1 / Z-Image path ---
       currentModelFamily = .flux1
-      logger.info("Preloading warm server pipeline (Flux 1)")
+
+      // Detect Z-Image variant (Base vs Turbo)
+      if let spec = modelSpec, let variant = ZImageVariant.fromModelSpec(spec) {
+        zimageVariant = variant
+      } else if let resolvedSnapshot = snapshotURL {
+        zimageVariant = ZImageVariant.fromSnapshot(at: resolvedSnapshot)
+      } else if let spec = modelSpec {
+        // Resolve and detect from snapshot if not already resolved
+        if let resolved = try? await ModelResolution.resolveOrDefault(
+          modelSpec: spec,
+          filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
+        ) {
+          zimageVariant = ZImageVariant.fromSnapshot(at: resolved)
+        }
+      }
+      let variantLabel = zimageVariant == .base ? "Base (non-distilled)" : "Turbo (distilled)"
+      logger.info("Preloading warm server pipeline (Flux 1 / Z-Image \(variantLabel))")
       try await pipeline.prepare(
         modelSpec: modelSpec,
         textEncoderPath: configuration.textEncoderPath,
@@ -637,7 +664,7 @@ private actor WarmServerCoordinator {
         forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly
       )
       pipelinePrepared = true
-      logger.info("Warm server pipeline ready (Flux 1)")
+      logger.info("Warm server pipeline ready (Flux 1 / Z-Image \(zimageVariant.rawValue))")
     }
   }
 
@@ -649,6 +676,11 @@ private actor WarmServerCoordinator {
   /// Whether the loaded Flux 2 model is a base (non-distilled) variant.
   var isFlux2BaseModel: Bool {
     detectedFlux2Model?.isBaseModel ?? false
+  }
+
+  /// The detected Z-Image variant (Base vs Turbo) for Flux 1 models.
+  var currentZImageVariant: ZImageVariant {
+    zimageVariant
   }
 
   func enqueueGenerate(
@@ -716,7 +748,7 @@ private actor WarmServerCoordinator {
       status: shuttingDown ? "shutting_down" : "ok",
       model: configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
-      modelVariant: detectedFlux2Model?.variant,
+      modelVariant: currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant,
       textEncoderPath: configuration.textEncoderPath,
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),

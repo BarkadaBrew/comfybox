@@ -266,6 +266,31 @@ struct ZImageCLI {
       logger.info("Loaded generation config from: \(metadataPath)")
     }
 
+    // Resolve model aliases to HuggingFace IDs
+    if let m = model {
+      switch m.lowercased() {
+      case "z-image-base", "zimage-base":
+        model = ZImageRepository.baseId
+      case "z-image-turbo", "zimage-turbo", "z-image":
+        // "z-image" without qualifier defaults to Turbo for backwards compat
+        if m.lowercased() == "z-image" || m.lowercased() == "zimage-turbo" || m.lowercased() == "z-image-turbo" {
+          model = ZImageRepository.id
+        }
+      default:
+        break
+      }
+    }
+
+    // When Z-Image Base is selected, override defaults if user didn't specify them
+    if let m = model, ZImageRepository.isBaseModel(m) {
+      if steps == ZImageModelMetadata.recommendedInferenceSteps {
+        steps = ZImageModelMetadata.Base.recommendedInferenceSteps
+      }
+      if guidance == ZImageModelMetadata.recommendedGuidanceScale {
+        guidance = ZImageModelMetadata.Base.recommendedGuidanceScale
+      }
+    }
+
     guard let prompt else {
       printUsage()
       return
@@ -389,7 +414,7 @@ struct ZImageCLI {
                 pipeline: .txt2img,
                 model: ModelInfo(
                   family: "zimage",
-                  variant: "turbo",
+                  variant: (capturedModel.map { ZImageRepository.isBaseModel($0) ? "base" : "turbo" }) ?? "turbo",
                   path: capturedModel ?? ZImageRepository.id
                 ),
                 parameters: GenerationParameters(
@@ -835,6 +860,7 @@ struct ZImageCLI {
       --seed                 Random seed
       --output, -o           Output path (default z-image.png)
       --model, -m            Model path or HuggingFace ID (default: \(ZImageRepository.id))
+                             Aliases: z-image-base (Base, CFG-guided), z-image-turbo (Turbo, distilled)
       --model-family         Model family: flux1 or flux2 (default: auto-detect from model config)
       --text-encoder-path    Override text encoder directory (CLI > ZIMAGE_ENCODER_PATH > auto-detect > default)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override (disable AIO auto-detect)
@@ -1730,6 +1756,7 @@ struct ZImageCLI {
       ModelFamily(family: "flux2", variant: "klein-9b", directoryName: "flux2-klein-9b", huggingFaceId: "black-forest-labs/FLUX.2-klein-9B"),
       ModelFamily(family: "flux2", variant: "klein-base-4b", directoryName: "flux2-klein-base-4b", huggingFaceId: "black-forest-labs/FLUX.2-klein-base-4B"),
       ModelFamily(family: "flux2", variant: "klein-base-9b", directoryName: "flux2-klein-base-9b", huggingFaceId: "black-forest-labs/FLUX.2-klein-base-9B"),
+      ModelFamily(family: "z-image", variant: "base", directoryName: "z-image-base", huggingFaceId: "Tongyi-MAI/Z-Image"),
       ModelFamily(family: "qwen", variant: "default", directoryName: "qwen", huggingFaceId: nil),
     ]
   }

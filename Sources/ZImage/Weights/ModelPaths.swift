@@ -4,10 +4,79 @@ import Foundation
 /// so the rest of the pipeline can assemble download/caching steps.
 public enum ZImageRepository {
   public static let id = "Tongyi-MAI/Z-Image-Turbo"
+  public static let baseId = "Tongyi-MAI/Z-Image"
   public static let revision = "main"
 
   public static func defaultCacheDirectory(base: URL = URL(fileURLWithPath: "models")) -> URL {
     base.appendingPathComponent("z-image-turbo")
+  }
+
+  /// Known Z-Image HuggingFace model IDs (both Turbo and Base).
+  public static let knownModelIds: [String] = [
+    "Tongyi-MAI/Z-Image-Turbo",
+    "Tongyi-MAI/Z-Image",
+  ]
+
+  /// Check whether a model spec refers to the Z-Image Base (non-distilled) model.
+  public static func isBaseModel(_ modelSpec: String) -> Bool {
+    let normalized = modelSpec.lowercased()
+    // Match "Tongyi-MAI/Z-Image" but NOT "Tongyi-MAI/Z-Image-Turbo"
+    return normalized == "tongyi-mai/z-image"
+      || (normalized.hasSuffix("/z-image") && !normalized.contains("turbo"))
+  }
+}
+
+/// Z-Image model variant: Turbo (distilled, zero CFG) or Base (non-distilled, CFG-guided).
+public enum ZImageVariant: String, Sendable {
+  case turbo  // Distilled, guidance=0.0, 9 steps, no negative prompts
+  case base   // Non-distilled, guidance=4.0, 50 steps, supports negative prompts
+
+  /// Whether this variant supports classifier-free guidance (guidance > 1.0).
+  public var supportsGuidance: Bool {
+    switch self {
+    case .turbo: return false
+    case .base: return true
+    }
+  }
+
+  /// Default inference steps for this variant.
+  public var defaultSteps: Int {
+    switch self {
+    case .turbo: return ZImageModelMetadata.recommendedInferenceSteps
+    case .base: return ZImageModelMetadata.Base.recommendedInferenceSteps
+    }
+  }
+
+  /// Default guidance scale for this variant.
+  public var defaultGuidance: Float {
+    switch self {
+    case .turbo: return ZImageModelMetadata.recommendedGuidanceScale
+    case .base: return ZImageModelMetadata.Base.recommendedGuidanceScale
+    }
+  }
+
+  /// Detect variant from a model spec string (HuggingFace ID or path).
+  /// Returns nil if the spec doesn't clearly indicate a variant.
+  public static func fromModelSpec(_ modelSpec: String) -> ZImageVariant? {
+    if ZImageRepository.isBaseModel(modelSpec) {
+      return .base
+    }
+    let normalized = modelSpec.lowercased()
+    if normalized.contains("z-image-turbo") || normalized.contains("z_image_turbo") {
+      return .turbo
+    }
+    return nil
+  }
+
+  /// Detect variant from a snapshot directory.
+  /// Base model has no `scheduler/scheduler_config.json`.
+  /// Turbo model has `scheduler/scheduler_config.json`.
+  public static func fromSnapshot(at snapshot: URL) -> ZImageVariant {
+    let schedulerConfig = snapshot.appendingPathComponent(ZImageFiles.schedulerConfig)
+    if FileManager.default.fileExists(atPath: schedulerConfig.path) {
+      return .turbo
+    }
+    return .base
   }
 }
 
