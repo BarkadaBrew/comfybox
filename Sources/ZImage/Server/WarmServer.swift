@@ -871,6 +871,25 @@ private actor WarmServerCoordinator {
       // Distilled models: 4 steps, guidance 1.0.
       let defaultSteps = f2.defaultSteps
       let defaultGuidance: Float = f2.isDistilled ? 1.0 : 3.5
+      // Resolve img2img parameters from payload.
+      // imagePath takes priority; denoise defaults to 1.0 (txt2img).
+      // imageStrength maps to denoise as (1.0 - strength), creativity maps directly.
+      let inputImageURL: URL? = payload.imagePath.map { URL(fileURLWithPath: $0) }
+      let resolvedDenoise: Float
+      if inputImageURL != nil {
+        if let creativity = payload.creativity {
+          resolvedDenoise = max(0.01, min(1.0, creativity))
+        } else if let strength = payload.imageStrength {
+          resolvedDenoise = max(0.01, min(1.0, 1.0 - strength))
+        } else if let d = payload.denoise {
+          resolvedDenoise = max(0.01, min(1.0, d))
+        } else {
+          resolvedDenoise = 0.7  // sensible default for img2img
+        }
+      } else {
+        resolvedDenoise = 1.0
+      }
+
       let flux2Request = Flux2GenerationRequest(
         prompt: payload.prompt,
         negativePrompt: payload.negativePrompt,
@@ -880,7 +899,9 @@ private actor WarmServerCoordinator {
         guidanceScale: payload.guidance ?? defaultGuidance,
         seed: payload.seed,
         outputPath: outputURL,
-        maxSequenceLength: configuration.maxSequenceLength
+        maxSequenceLength: configuration.maxSequenceLength,
+        inputImagePath: inputImageURL,
+        denoise: resolvedDenoise
       )
 
       let result = try await f2.generate(flux2Request, progressHandler: { progress in
