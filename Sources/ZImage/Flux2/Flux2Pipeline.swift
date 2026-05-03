@@ -233,7 +233,7 @@ public final class Flux2Pipeline {
 
     let doCFG = request.guidanceScale > 1.0
 
-    let (promptEmbeds, textIds) = Flux2PromptEncoder.encodePrompt(
+    let (promptEmbeds, textIds) = try Flux2PromptEncoder.encodePrompt(
       prompt: request.prompt,
       tokenizer: tokenizer,
       textEncoder: components.textEncoder,
@@ -246,7 +246,7 @@ public final class Flux2Pipeline {
     var negativeTextIds: MLXArray?
     if doCFG {
       let negPrompt = request.negativePrompt ?? " "
-      let (ne, nti) = Flux2PromptEncoder.encodePrompt(
+      let (ne, nti) = try Flux2PromptEncoder.encodePrompt(
         prompt: negPrompt,
         tokenizer: tokenizer,
         textEncoder: components.textEncoder,

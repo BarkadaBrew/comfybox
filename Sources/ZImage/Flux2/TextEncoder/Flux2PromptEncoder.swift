@@ -31,8 +31,8 @@ public enum Flux2PromptEncoder {
     numImagesPerPrompt: Int = 1,
     maxSequenceLength: Int = 512,
     textEncoderOutLayers: [Int] = defaultOutputLayers
-  ) -> (promptEmbeds: MLXArray, textIds: MLXArray) {
-    var promptEmbeds = getQwen3PromptEmbeds(
+  ) throws -> (promptEmbeds: MLXArray, textIds: MLXArray) {
+    var promptEmbeds = try getQwen3PromptEmbeds(
       prompt: prompt,
       tokenizer: tokenizer,
       textEncoder: textEncoder,
@@ -55,8 +55,8 @@ public enum Flux2PromptEncoder {
     textEncoder: Qwen3TextEncoder,
     maxSequenceLength: Int,
     hiddenStateLayers: [Int]
-  ) -> MLXArray {
-    let tokens = tokenizer.encodePlain(
+  ) throws -> MLXArray {
+    let tokens = try tokenizer.encodeChat(
       prompts: [prompt],
       maxLength: maxSequenceLength
     )
