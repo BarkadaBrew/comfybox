@@ -81,6 +81,10 @@ struct ZImageCLI {
     var imageCreativity: Float?
     var modelFamily: String?
 
+    // --- Flux 2 img2img ---
+    var initImagePath: String?
+    var flux2Denoise: Float?
+
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
 
@@ -179,6 +183,10 @@ struct ZImageCLI {
         imageCreativity = floatValue(for: arg, iterator: &iterator, fallback: 0.7)
       case "--model-family":
         modelFamily = nextValue(for: arg, iterator: &iterator)
+      case "--init-image":
+        initImagePath = nextValue(for: arg, iterator: &iterator)
+      case "--denoise":
+        flux2Denoise = floatValue(for: arg, iterator: &iterator, fallback: 0.7)
       case "--help", "-h":
         printUsage()
         return
@@ -645,6 +653,19 @@ struct ZImageCLI {
             logger.warning("Guidance scale \(guidance) has no effect on distilled Klein models (forcing 1.0)")
           }
 
+          // Resolve img2img for Flux 2
+          let flux2InputImage: URL? = initImagePath.map { URL(fileURLWithPath: $0) }
+          let flux2DenoiseValue: Float = flux2InputImage != nil ? (flux2Denoise ?? 0.7) : 1.0
+
+          if let img = flux2InputImage {
+            guard FileManager.default.fileExists(atPath: img.path) else {
+              logger.error("Init image not found: \(img.path)")
+              flux2Semaphore.signal()
+              return
+            }
+            logger.info("Flux 2 img2img: source=\(img.path), denoise=\(flux2DenoiseValue)")
+          }
+
           // Override request defaults based on detected model type
           let flux2Request = Flux2GenerationRequest(
             prompt: prompt,
@@ -655,7 +676,9 @@ struct ZImageCLI {
             guidanceScale: flux2Pipeline.isDistilled ? 1.0 : guidance,
             seed: seed,
             outputPath: URL(fileURLWithPath: outputPath),
-            maxSequenceLength: maxSequenceLength
+            maxSequenceLength: maxSequenceLength,
+            inputImagePath: flux2InputImage,
+            denoise: flux2DenoiseValue
           )
 
           _ = try await flux2Pipeline.generate(flux2Request, progressHandler: { progress in
@@ -888,11 +911,15 @@ struct ZImageCLI {
       --resume-batch <path>  Resume batch from checkpoint file
       --prompt-file <path>   Re-read prompt from file before each batch iteration
 
-    Img2img:
+    Img2img (Flux 1 / Z-Image):
       --image-path, --image  Source image for img2img transformation
       --image-strength       Strength (0.0-1.0): 0.3=heavy rework (default), 0.7=light touch
       --creativity           Creativity (0.0-1.0): 0.7=heavy rework, 0.3=light touch (inverse of strength)
                              Cannot be used with --image-strength
+
+    Img2img (Flux 2 Klein):
+      --init-image           Source image for Flux 2 img2img (VAE encode + BN normalize)
+      --denoise              Denoise strength (0.0-1.0, default 0.7): 1.0=full txt2img, 0.5=preserve composition
       --help, -h             Show help
 
     Subcommands:
