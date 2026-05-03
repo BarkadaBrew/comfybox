@@ -589,18 +589,6 @@ struct ZImageCLI {
     }
 
     if isFlux2 {
-      let flux2Request = Flux2GenerationRequest(
-        prompt: prompt,
-        negativePrompt: negativePrompt,
-        width: width,
-        height: height,
-        steps: steps,
-        guidanceScale: guidance,
-        seed: seed,
-        outputPath: URL(fileURLWithPath: outputPath),
-        maxSequenceLength: maxSequenceLength
-      )
-
       nonisolated(unsafe) let flux2Semaphore = DispatchSemaphore(value: 0)
       let capturedModel = model
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
@@ -623,7 +611,26 @@ struct ZImageCLI {
           try flux2Pipeline.loadModel(
             from: snapshot,
             config: detected.transformerConfig,
-            textEncoderConfig: detected.textEncoderConfig
+            textEncoderConfig: detected.textEncoderConfig,
+            isBase: detected.isBaseModel
+          )
+
+          // Validate guidance for distilled models
+          if flux2Pipeline.isDistilled && guidance != 1.0 && guidance != ZImageModelMetadata.recommendedGuidanceScale {
+            logger.warning("Guidance scale \(guidance) has no effect on distilled Klein models (forcing 1.0)")
+          }
+
+          // Override request defaults based on detected model type
+          let flux2Request = Flux2GenerationRequest(
+            prompt: prompt,
+            negativePrompt: negativePrompt,
+            width: width,
+            height: height,
+            steps: steps == ZImageModelMetadata.recommendedInferenceSteps ? flux2Pipeline.defaultSteps : steps,
+            guidanceScale: flux2Pipeline.isDistilled ? 1.0 : guidance,
+            seed: seed,
+            outputPath: URL(fileURLWithPath: outputPath),
+            maxSequenceLength: maxSequenceLength
           )
 
           _ = try await flux2Pipeline.generate(flux2Request, progressHandler: { progress in
@@ -1720,6 +1727,9 @@ struct ZImageCLI {
       ModelFamily(family: "redux", variant: "encoder", directoryName: "redux-encoder", huggingFaceId: "DiffSynth-Studio/General-Image-Encoders"),
       ModelFamily(family: "kontext", variant: "default", directoryName: "kontext", huggingFaceId: nil),
       ModelFamily(family: "flux2", variant: "klein-4b", directoryName: "flux2-klein-4b", huggingFaceId: "black-forest-labs/FLUX.2-klein-4B"),
+      ModelFamily(family: "flux2", variant: "klein-9b", directoryName: "flux2-klein-9b", huggingFaceId: "black-forest-labs/FLUX.2-klein-9B"),
+      ModelFamily(family: "flux2", variant: "klein-base-4b", directoryName: "flux2-klein-base-4b", huggingFaceId: "black-forest-labs/FLUX.2-klein-base-4B"),
+      ModelFamily(family: "flux2", variant: "klein-base-9b", directoryName: "flux2-klein-base-9b", huggingFaceId: "black-forest-labs/FLUX.2-klein-base-9B"),
       ModelFamily(family: "qwen", variant: "default", directoryName: "qwen", huggingFaceId: nil),
     ]
   }
