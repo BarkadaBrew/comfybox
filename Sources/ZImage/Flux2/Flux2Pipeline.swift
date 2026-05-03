@@ -108,6 +108,20 @@ public final class Flux2Pipeline {
   // Model configs for current loaded model
   private var transformerConfig: Flux2TransformerConfig?
   private var textEncoderConfig: Qwen3TextEncoderConfiguration?
+  private var _isBaseModel: Bool = false
+
+  /// Whether the loaded model is a base (non-distilled) variant.
+  /// Base models support guidance > 1.0 and default to 50 steps.
+  public var isBaseModel: Bool { _isBaseModel }
+
+  /// Whether the loaded model is a distilled (few-step) variant.
+  public var isDistilled: Bool { !_isBaseModel }
+
+  /// Default inference steps for the loaded model.
+  /// Base models default to 50 steps; distilled models default to 4.
+  public var defaultSteps: Int {
+    _isBaseModel ? 50 : 4
+  }
 
   public init(logger: Logger = Logger(label: "z-image.flux2-pipeline")) {
     self.logger = logger
@@ -123,6 +137,7 @@ public final class Flux2Pipeline {
     modelSnapshot = nil
     transformerConfig = nil
     textEncoderConfig = nil
+    _isBaseModel = false
     isLoaded = false
     GPU.clearCache()
     logger.info("Flux 2 model unloaded")
@@ -134,11 +149,14 @@ public final class Flux2Pipeline {
   ///   - snapshot: Root URL of the model snapshot directory.
   ///   - config: Transformer config for this model variant. Defaults to Klein 4B.
   ///   - textEncoderConfig: Text encoder config. Defaults to Klein 4B Qwen3 config.
+  ///   - isBase: Whether this is a base (non-distilled) model. Base models support
+  ///     guidance > 1.0 and default to 50 inference steps.
   ///   - progressHandler: Optional progress callback.
   public func loadModel(
     from snapshot: URL,
     config: Flux2TransformerConfig = Flux2TransformerConfig(),
     textEncoderConfig: Qwen3TextEncoderConfiguration = Qwen3TextEncoderConfiguration(),
+    isBase: Bool = false,
     progressHandler: ProgressHandler? = nil
   ) throws {
     if isLoaded && modelSnapshot == snapshot { return }
@@ -162,10 +180,12 @@ public final class Flux2Pipeline {
     self.modelSnapshot = snapshot
     self.transformerConfig = config
     self.textEncoderConfig = textEncoderConfig
+    self._isBaseModel = isBase
     self.isLoaded = true
 
     progressHandler?(GenerationProgress(stage: .loadingModel, stepIndex: 1, totalSteps: 1))
-    logger.info("Flux 2 Klein model loaded from \(snapshot.path)")
+    let modelKind = isBase ? "base (non-distilled)" : "distilled"
+    logger.info("Flux 2 Klein model loaded from \(snapshot.path) [\(modelKind)]")
   }
 
   /// Generate an image and save it to disk.
@@ -295,6 +315,13 @@ public final class Flux2Pipeline {
 
       let timestep = sigmas[stepIndex]
 
+      // Guidance embedding: pass the guidance scale to the transformer when the
+      // model is a base (non-distilled) variant.
+      // For distilled models, pass nil (guidance embeddings are unused).
+      let guidanceForTransformer: MLXArray? = _isBaseModel
+        ? MLXArray(request.guidanceScale)
+        : nil
+
       // Forward pass through transformer
       let noisePred = components.transformer(
         hiddenStates: latents,
@@ -302,7 +329,7 @@ public final class Flux2Pipeline {
         timestep: timestep,
         imgIds: latentIds,
         txtIds: textIds,
-        guidance: nil
+        guidance: guidanceForTransformer
       )
 
       // Apply CFG if guidance > 1.0
@@ -314,7 +341,7 @@ public final class Flux2Pipeline {
           timestep: timestep,
           imgIds: latentIds,
           txtIds: nti,
-          guidance: nil
+          guidance: guidanceForTransformer
         )
         guidedNoise = negativeNoisePred + request.guidanceScale * (noisePred - negativeNoisePred)
       } else {
