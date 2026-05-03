@@ -130,8 +130,8 @@ public enum FiboPromptEncoder {
     tokenizer: QwenTokenizer,
     textEncoder: SmolLM3TextEncoder
   ) -> (MLXArray, [MLXArray], MLXArray) {
-    // Tokenize — use encodePlain for direct BPE tokenization (no chat template)
-    let tokenBatch = tokenizer.encodePlain(
+    // Tokenize — use encodeDynamic for natural-length tokenization (no padding, no chat template)
+    let tokenBatch = tokenizer.encodeDynamic(
       prompts: [prompt],
       maxLength: maxSequenceLength
     )

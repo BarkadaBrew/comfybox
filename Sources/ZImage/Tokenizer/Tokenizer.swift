@@ -323,6 +323,62 @@ public final class QwenTokenizer {
     return QwenTokenBatch(inputIds: inputIds, attentionMask: attentionMask)
   }
 
+
+  /// Dynamic-length tokenization matching Python's `padding="longest"`.
+  ///
+  /// Unlike `encodePlain` (which pads to `maxLength`), this method pads
+  /// only to the longest sequence in the batch. For a single prompt this
+  /// means NO padding — the output length equals the actual token count.
+  ///
+  /// This is critical for FIBO: its transformer creates an all-ones
+  /// attention mask for the text portion, so any padding tokens are treated
+  /// as real content and corrupt the denoising via DimFusion.
+  public func encodeDynamic(
+    prompts: [String],
+    maxLength: Int? = nil
+  ) -> QwenTokenBatch {
+    precondition(!prompts.isEmpty, "At least one prompt must be provided.")
+
+    let targetLength = min(maxLength ?? self.maxLength, self.maxLength)
+    precondition(targetLength > 0, "Maximum sequence length must be positive.")
+
+    // Tokenize all prompts to get natural lengths
+    var tokenizedPrompts: [[Int]] = []
+    tokenizedPrompts.reserveCapacity(prompts.count)
+
+    for prompt in prompts {
+      let tokens = encodeFunction(prompt)
+      let trimmed = Self.trim(tokens, maxLength: targetLength, prefixCount: 0, suffixCount: 0)
+      tokenizedPrompts.append(trimmed)
+    }
+
+    // Pad to longest in batch (not to maxLength)
+    let longestLength = tokenizedPrompts.map(\.count).max() ?? 0
+
+    var inputSequences: [[Int]] = []
+    var attentionSequences: [[Int]] = []
+    inputSequences.reserveCapacity(prompts.count)
+    attentionSequences.reserveCapacity(prompts.count)
+
+    for tokens in tokenizedPrompts {
+      let (ids, mask) = Self.prepareSequence(
+        tokens: tokens,
+        padTokenId: padTokenId,
+        maxLength: longestLength
+      )
+      inputSequences.append(ids)
+      attentionSequences.append(mask)
+    }
+
+    let flatIds = inputSequences.flatMap { $0 }
+    let flatMask = attentionSequences.flatMap { $0 }
+    let shape = [prompts.count, longestLength]
+
+    let inputIds = MLXArray(flatIds.map { Float32($0) }, shape).asType(.int32)
+    let attentionMask = MLXArray(flatMask.map { Float32($0) }, shape).asType(.int32)
+    return QwenTokenBatch(inputIds: inputIds, attentionMask: attentionMask)
+  }
+
   private func assembleTokens(for prompt: String) -> [Int] {
     let contentTokens = encodeFunction(prompt)
     return prefixTokens + contentTokens + suffixTokens
