@@ -195,6 +195,43 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    case ("GET", "/v1/models"):
+      let models = ComfyBoxModelRegistry.allModels.map { model -> [String: Any] in
+        [
+          "id": model.id,
+          "family": model.family.rawValue,
+          "variant": model.variant.rawValue,
+          "quantization": model.quantization.rawValue,
+          "display_name": model.displayName,
+          "description": model.description,
+          "parameters_b": model.parametersBillions,
+          "default_steps": model.defaultSteps,
+          "default_guidance": model.defaultGuidance,
+          "supports_guidance": model.supportsGuidance,
+          "supports_lora": model.supportsLoRA,
+          "supports_controlnet": model.supportsControlNet,
+          "supports_img2img": model.supportsImg2Img,
+          "default_resolution": "\(model.defaultWidth)x\(model.defaultHeight)",
+          "estimated_vram_gb": model.estimatedVRAM_GB,
+          "huggingface_id": model.huggingFaceId,
+        ] as [String: Any]
+      }
+      if let data = try? JSONSerialization.data(
+        withJSONObject: ["models": models, "count": models.count]
+      ) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize models"))
+
+    case ("GET", "/v1/styles"):
+      let styles = ComfyBoxStylePresets.toJSON()
+      if let data = try? JSONSerialization.data(
+        withJSONObject: ["styles": styles, "count": styles.count]
+      ) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize styles"))
+
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health"].contains(request.path) {
         return .error(.error(status: 405, message: "Method not allowed"))
