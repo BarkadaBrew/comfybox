@@ -4,7 +4,7 @@
 // FIBO generation flow:
 // 1. Encode prompts via FiboPromptEncoder (SmolLM3-3B, all 37 hidden states)
 // 2. Create noise latents: (B, 48, H/16, W/16), pack to (B, H/16*W/16, 48)
-// 3. Compute linear sigma schedule (no shift, unlike Flux)
+// 3. Compute FlowMatchEulerDiscrete sigma schedule (mu=1.0 exponential shift + stretch-to-terminal)
 // 4. Denoise loop: transformer predict + CFG + Euler step
 // 5. Unpack latents to (B, 48, H/16, W/16)
 // 6. VAE decode to image
@@ -65,14 +65,14 @@ public struct FiboGenerationRequest: Sendable {
 /// 1. Load model components via `FiboInitializer`
 /// 2. Encode prompt via `FiboPromptEncoder` (SmolLM3-3B, all 37 hidden states)
 /// 3. Create noise latents in FIBO format: (B, 48, H/16, W/16), packed to (B, seqLen, 48)
-/// 4. Run linear flow-matching denoising loop with CFG
+/// 4. Run FlowMatchEulerDiscrete denoising loop with CFG
 /// 5. Unpack latents, denormalize, and decode via `FiboVAE`
 /// 6. Save output image
 ///
 /// Key differences from Flux2Pipeline:
 /// - 48 latent channels (not 128 packed)
 /// - DimFusion: per-layer text encoder hidden states fed to transformer blocks
-/// - Linear sigma schedule (no empirical mu shift)
+/// - FlowMatchEulerDiscrete schedule: mu=1.0 exponential time-shift + stretch-to-terminal
 /// - CFG with negative prompts (guidance > 1.0 always applies)
 /// - No batch norm normalization
 public final class FiboPipeline {
@@ -263,12 +263,13 @@ public final class FiboPipeline {
     MLX.eval(latents)
     logger.info("Created noise latents: \(latents.shape) (seed: \(seed))")
 
-    // 3. Compute linear sigma schedule
+    // 3. Compute FlowMatchEulerDiscrete sigma schedule (matching Python mflux FMED scheduler)
     let numSteps = request.steps
-    let sigmas = FiboPipeline.computeLinearSigmas(numSteps: numSteps)
-    let timesteps = (0..<numSteps).map { Float($0) }
+    let schedule = FiboPipeline.computeFMEDSchedule(numSteps: numSteps)
+    let sigmas = schedule.sigmas
+    let timesteps = schedule.timesteps
 
-    logger.info("Sigma schedule: \(numSteps) steps, range [\(sigmas.first ?? 0)...\(sigmas.last ?? 0)]")
+    logger.info("FMED schedule: \(numSteps) steps, timestep range [\(timesteps.first ?? 0)...\(timesteps.last ?? 0)], sigma range [\(sigmas.first ?? 0)...\(sigmas[numSteps])]")
 
     // 4. Denoising loop
     logger.info("Running \(numSteps) denoising steps...")
@@ -330,29 +331,77 @@ public final class FiboPipeline {
     return image
   }
 
-  // MARK: - Sigma Schedule
+  // MARK: - Sigma Schedule (FlowMatchEulerDiscrete)
 
-  /// Compute the FIBO linear sigma schedule.
+  /// Result of FMED schedule computation.
+  public struct FMEDSchedule {
+    /// `numSteps + 1` sigma values (trailing zero appended).
+    public let sigmas: [Float]
+    /// `numSteps` timestep values (sigma × numTrainTimesteps).
+    public let timesteps: [Float]
+  }
+
+  /// Compute the FIBO FlowMatchEulerDiscrete sigma schedule.
   ///
-  /// Ported from mflux `LinearScheduler._get_sigmas` without the
-  /// sigma shift (FIBO's ModelConfig does not set `requires_sigma_shift`).
+  /// Exact port of mflux `FlowMatchEulerDiscreteScheduler._compute_timesteps_and_sigmas()`:
+  /// 1. Linear sigma spacing from 1.0 down to 1/numTrainTimesteps (0.001)
+  /// 2. Exponential time-shift with mu=1.0: sigma = e^mu / (e^mu + (1/t - 1))
+  /// 3. Stretch-to-terminal with terminal=0.02
+  /// 4. Timestep values = sigma × numTrainTimesteps (1000)
   ///
-  /// Produces `numSteps + 1` values: linearly spaced from 1.0 to 1/numSteps,
-  /// with a trailing zero.
+  /// FIBO's ModelConfig has `requires_sigma_shift=False`, so the dynamic mu
+  /// computation (`set_image_seq_len`) is NOT used. The instance-level schedule
+  /// with hardcoded mu=1.0 applies.
   ///
   /// - Parameter numSteps: Number of denoising steps.
-  /// - Returns: Array of `numSteps + 1` sigma values.
-  public static func computeLinearSigmas(numSteps: Int) -> [Float] {
-    guard numSteps > 0 else { return [0.0] }
-
-    var sigmas: [Float] = []
-    for i in 0..<numSteps {
-      let t = Float(i) / Float(numSteps)
-      let sigma = 1.0 - t * (1.0 - 1.0 / Float(numSteps))
-      sigmas.append(sigma)
+  /// - Returns: `FMEDSchedule` with sigmas and timesteps.
+  public static func computeFMEDSchedule(numSteps: Int) -> FMEDSchedule {
+    guard numSteps > 1 else {
+      // Degenerate: single step from sigma=1.0 to 0.0
+      return FMEDSchedule(sigmas: [1.0, 0.0], timesteps: [1000.0])
     }
-    sigmas.append(0.0)  // Trailing zero
-    return sigmas
+
+    let numTrainTimesteps: Float = 1000.0
+    let mu: Float = 1.0          // Hardcoded in FMED __init__ for FIBO
+    let shiftTerminal: Float = 0.02  // Hardcoded in FMED __init__
+    let expMu = exp(mu)          // e^1.0 ≈ 2.71828
+
+    let sigmaMin: Float = 1.0 / numTrainTimesteps  // 0.001
+    let sigmaMax: Float = 1.0
+
+    // Step 1: Linear timesteps from sigmaMax*1000 down to sigmaMin*1000
+    //   timesteps_linear[i] = sigmaMax * 1000 - i * (sigmaMax - sigmaMin) * 1000 / (N-1)
+    var sigmasLinear: [Float] = []
+    for i in 0..<numSteps {
+      let t = sigmaMax * numTrainTimesteps
+        - Float(i) * (sigmaMax - sigmaMin) * numTrainTimesteps / Float(numSteps - 1)
+      sigmasLinear.append(t / numTrainTimesteps)
+    }
+    // sigmasLinear = [1.0, 0.9655..., ..., 0.001]
+
+    // Step 2: Exponential time-shift with mu=1.0, sigma_power=1.0
+    //   shifted = exp(mu) / (exp(mu) + (1/t - 1))
+    let sigmasShifted = sigmasLinear.map { t -> Float in
+      guard t > 0 else { return 0 }
+      return expMu / (expMu + (1.0 / t - 1.0))
+    }
+
+    // Step 3: Stretch to terminal (0.02)
+    //   one_minus = [1-s for s in shifted]
+    //   scale = one_minus[-1] / (1 - terminal)
+    //   final = [1 - (oms / scale) for oms in one_minus]
+    let oneMinusSigmas = sigmasShifted.map { 1.0 - $0 }
+    let scaleFactor = oneMinusSigmas.last! / (1.0 - shiftTerminal)
+    let sigmasFinal = oneMinusSigmas.map { 1.0 - ($0 / scaleFactor) }
+
+    // Step 4: Timesteps = sigma × numTrainTimesteps
+    let timesteps = sigmasFinal.map { $0 * numTrainTimesteps }
+
+    // Append trailing zero to sigmas
+    var sigmasWithZero = sigmasFinal
+    sigmasWithZero.append(0.0)
+
+    return FMEDSchedule(sigmas: sigmasWithZero, timesteps: timesteps)
   }
 
   // MARK: - Classifier-Free Guidance
