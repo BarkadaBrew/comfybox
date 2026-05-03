@@ -3,7 +3,7 @@
 // Returns model classification data that the Krita AI Diffusion plugin uses
 // to determine which architectures (workloads) are available.
 //
-// Delegates to ComfyBridgeModelRegistry for the actual model definitions.
+// Delegates to ComfyBoxModelRegistry for the actual model definitions.
 
 import Foundation
 
@@ -11,8 +11,8 @@ import Foundation
 enum ComfyBridgeModelInfo {
 
   /// Return model metadata for the given folder name.
-  /// Delegates to `ComfyBridgeModelRegistry.bridgeModelInfo(for:)`.
+  /// Delegates to `ComfyBoxModelRegistry.bridgeModelInfo(for:)`.
   static func models(for folder: String) -> [String: Any] {
-    ComfyBridgeModelRegistry.bridgeModelInfo(for: folder)
+    ComfyBoxModelRegistry.bridgeModelInfo(for: folder)
   }
 }
