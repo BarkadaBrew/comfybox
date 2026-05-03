@@ -79,6 +79,7 @@ struct ZImageCLI {
     var imagePath: String?
     var imageStrength: Float?
     var imageCreativity: Float?
+    var modelFamily: String?
 
     let args = Array(CommandLine.arguments.dropFirst())
     var iterator = args.makeIterator()
@@ -176,6 +177,8 @@ struct ZImageCLI {
         imageStrength = floatValue(for: arg, iterator: &iterator, fallback: 0.3)
       case "--creativity":
         imageCreativity = floatValue(for: arg, iterator: &iterator, fallback: 0.7)
+      case "--model-family":
+        modelFamily = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printUsage()
         return
@@ -564,6 +567,89 @@ struct ZImageCLI {
       return
     }
 
+    // === FLUX 2 KLEIN PATH ===
+    // Auto-detect or explicitly route to Flux 2 pipeline
+    let isFlux2: Bool
+    if let family = modelFamily {
+      isFlux2 = (family.lowercased() == "flux2")
+    } else if let modelSpec = model {
+      // Check HF model ID first, then check local directory
+      if Flux2ModelDetection.isKnownFlux2Model(modelSpec) {
+        isFlux2 = true
+      } else {
+        let localURL = URL(fileURLWithPath: modelSpec)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+          isFlux2 = Flux2ModelDetection.detect(at: localURL) != nil
+        } else {
+          isFlux2 = false
+        }
+      }
+    } else {
+      isFlux2 = false
+    }
+
+    if isFlux2 {
+      let flux2Request = Flux2GenerationRequest(
+        prompt: prompt,
+        negativePrompt: negativePrompt,
+        width: width,
+        height: height,
+        steps: steps,
+        guidanceScale: guidance,
+        seed: seed,
+        outputPath: URL(fileURLWithPath: outputPath),
+        maxSequenceLength: maxSequenceLength
+      )
+
+      nonisolated(unsafe) let flux2Semaphore = DispatchSemaphore(value: 0)
+      let capturedModel = model
+      let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
+      let bar = useBar ? ProgressBar(total: steps) : nil
+      Task {
+        do {
+          // Resolve model snapshot
+          let modelSpec = capturedModel ?? "black-forest-labs/FLUX.2-klein-4B"
+          let snapshot = try await ModelResolution.resolve(modelSpec: modelSpec)
+
+          // Detect model config from snapshot
+          guard let detected = Flux2ModelDetection.detect(at: snapshot) else {
+            logger.error("Model at \(snapshot.path) is not a Flux 2 Klein model")
+            flux2Semaphore.signal()
+            return
+          }
+          logger.info("Detected Flux 2 Klein \(detected.variant)")
+
+          let flux2Pipeline = Flux2Pipeline(logger: logger)
+          try flux2Pipeline.loadModel(
+            from: snapshot,
+            config: detected.transformerConfig,
+            textEncoderConfig: detected.textEncoderConfig
+          )
+
+          _ = try await flux2Pipeline.generate(flux2Request, progressHandler: { progress in
+            guard !noProgress else { return }
+            guard progress.stage == .denoising else { return }
+            let completed = min(progress.totalSteps, max(0, progress.stepIndex))
+            if let bar {
+              bar.update(completed: completed)
+              if completed == progress.totalSteps {
+                bar.finish(forceNewline: true)
+              }
+            } else {
+              PlainProgress.shared.report(completed: completed, total: progress.totalSteps)
+            }
+          })
+          if let bar { bar.finish(forceNewline: true) }
+        } catch {
+          logger.error("Flux 2 generation failed: \(error)")
+          if let bar { bar.finish(forceNewline: true) }
+        }
+        flux2Semaphore.signal()
+      }
+      flux2Semaphore.wait()
+      return
+    }
+
     // === SINGLE IMAGE PATH ===
     let request = ZImageGenerationRequest(
       prompt: prompt,
@@ -742,6 +828,7 @@ struct ZImageCLI {
       --seed                 Random seed
       --output, -o           Output path (default z-image.png)
       --model, -m            Model path or HuggingFace ID (default: \(ZImageRepository.id))
+      --model-family         Model family: flux1 or flux2 (default: auto-detect from model config)
       --text-encoder-path    Override text encoder directory (CLI > ZIMAGE_ENCODER_PATH > auto-detect > default)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override (disable AIO auto-detect)
       --cache-limit          GPU memory cache limit in MB (default: unlimited)
