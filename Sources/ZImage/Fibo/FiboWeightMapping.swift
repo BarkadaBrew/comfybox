@@ -161,11 +161,15 @@ public enum FiboWeightMapping {
 
   /// Map a HuggingFace VAE key to the model parameter path.
   ///
-  /// VAE keys pass through directly -- the model hierarchy matches the
-  /// safetensors naming. The `.gamma` norm naming is preserved.
+  /// Remappings:
+  /// - `.resample.1.` -> `.resample_conv.` (unwrap diffusers Sequential wrapper)
+  /// - All other keys pass through directly
+  /// - `.gamma` norm naming is preserved (model uses @ModuleInfo(key: "gamma"))
   static func mapVAEKey(_ hfKey: String) -> String {
-    // VAE keys map directly (no prefix stripping, no sequential unwrapping)
-    return hfKey
+    var key = hfKey
+    // Unwrap diffusers Sequential: resample.1.weight -> resample_conv.weight
+    key = key.replacingOccurrences(of: ".resample.1.", with: ".resample_conv.")
+    return key
   }
 
   // MARK: - Weight Verification
