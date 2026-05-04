@@ -513,6 +513,7 @@ enum ComfyBridgeObjectInfo {
       "OmniSR_X3_DIV2K.safetensors",
       "OmniSR_X4_DIV2K.safetensors",
       "4x_NMKD-Superscale-SP_178000_G.pth",
+      "seedvr2-3b",
     ]
   }
 

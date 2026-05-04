@@ -77,6 +77,28 @@ struct ComfyBridgeGenerateResult: Sendable {
   let durationMs: Int
 }
 
+/// Parameters extracted from a ComfyUI workflow graph for Z-Image upscaling.
+struct ComfyBridgeUpscaleRequest: Sendable {
+  let promptId: String
+  let clientId: String
+  /// The node ID of the ETN_LoadImageCache node providing the input image.
+  let inputImageNodeId: String
+  /// The upscale model name (e.g. "seedvr2-3b").
+  let upscaleModelName: String
+  /// The node ID of the output node (ETN_SaveImageCache or PreviewImage).
+  let outputNodeId: String
+
+  // Populated by executor before passing to upscale handler.
+  // Not set by parser — must be filled from image cache.
+  var inputImageData: Data?
+}
+
+/// Discriminated result of parsing a ComfyUI workflow.
+enum ComfyBridgeParsedWorkflow: Sendable {
+  case generate(ComfyBridgeGenerateRequest)
+  case upscale(ComfyBridgeUpscaleRequest)
+}
+
 /// Parses ComfyUI workflow JSON into generation parameters.
 enum ComfyBridgeWorkflowParser {
 
@@ -328,6 +350,142 @@ enum ComfyBridgeWorkflowParser {
       controlnetStart: controlnetStart,
       controlnetEnd: controlnetEnd,
       controlImageId: controlImageId
+    )
+  }
+
+  // MARK: - Workflow Type Detection
+
+  /// Parse a /prompt request body, detecting whether it is a generate or upscale workflow.
+  static func parseWorkflow(_ json: [String: Any]) throws -> ComfyBridgeParsedWorkflow {
+    // Peek at the workflow nodes to detect upscale workflows before falling back
+    // to the standard generation parser.
+    guard let workflow = json["prompt"] as? [String: Any] else {
+      throw ParseError("Missing 'prompt' workflow object")
+    }
+
+    // Build a lightweight class_type set for detection.
+    var hasUpscaleModelLoader = false
+    var hasImageUpscaleWithModel = false
+    var hasGuider = false
+
+    for (_, value) in workflow {
+      guard let dict = value as? [String: Any],
+            let classType = dict["class_type"] as? String else { continue }
+      switch classType {
+      case "UpscaleModelLoader":
+        hasUpscaleModelLoader = true
+      case "ImageUpscaleWithModel":
+        hasImageUpscaleWithModel = true
+      case "CFGGuider", "BasicGuider":
+        hasGuider = true
+      default:
+        break
+      }
+    }
+
+    // Upscale workflows have UpscaleModelLoader + ImageUpscaleWithModel but no guider
+    // (no sampler/denoiser — pure model-based upscale).
+    if hasUpscaleModelLoader && hasImageUpscaleWithModel && !hasGuider {
+      return .upscale(try parseUpscale(json))
+    }
+
+    return .generate(try parse(json))
+  }
+
+  /// Parse a /prompt request body into upscale parameters.
+  ///
+  /// Expects a workflow containing:
+  /// - `UpscaleModelLoader` — provides `inputs.model_name` (the upscale model)
+  /// - `ImageUpscaleWithModel` — connects upscale model to input image
+  /// - `ETN_LoadImageCache` — input image source
+  /// - `ETN_SaveImageCache` or `PreviewImage` — output node
+  static func parseUpscale(_ json: [String: Any]) throws -> ComfyBridgeUpscaleRequest {
+    guard let promptId = json["prompt_id"] as? String else {
+      throw ParseError("Missing prompt_id")
+    }
+    let clientId = json["client_id"] as? String ?? "unknown"
+
+    guard let workflow = json["prompt"] as? [String: Any] else {
+      throw ParseError("Missing 'prompt' workflow object")
+    }
+
+    // Build typed node map.
+    var nodes: [String: WorkflowNode] = [:]
+    for (id, value) in workflow {
+      guard let dict = value as? [String: Any],
+            let classType = dict["class_type"] as? String,
+            let inputs = dict["inputs"] as? [String: Any] else {
+        continue
+      }
+      nodes[id] = WorkflowNode(id: id, classType: classType, inputs: inputs)
+    }
+
+    // --- Upscale model name ---
+    guard let upscaleLoaderNode = nodes.values.first(where: { $0.classType == "UpscaleModelLoader" }),
+          let modelName = upscaleLoaderNode.inputs["model_name"] as? String else {
+      throw ParseError("Could not find UpscaleModelLoader with model_name")
+    }
+
+    // --- Input image ---
+    // Find the ETN_LoadImageCache that feeds into ImageUpscaleWithModel (directly or
+    // through intermediate nodes). The simplest case: ImageUpscaleWithModel.inputs.image
+    // references an ETN_LoadImageCache node.
+    let upscaleNode = nodes.values.first { $0.classType == "ImageUpscaleWithModel" }
+
+    var inputImageNodeId: String?
+    if let upscaleN = upscaleNode,
+       let imageRef = upscaleN.inputs["image"] as? [Any],
+       let sourceNodeId = imageRef.first as? String {
+      // Direct reference to an image source node.
+      if let sourceNode = nodes[sourceNodeId], sourceNode.classType == "ETN_LoadImageCache" {
+        inputImageNodeId = sourceNode.id
+      } else {
+        // The image might pass through intermediate nodes (e.g. ImageScale).
+        // Walk one level deeper.
+        if let intermediateNode = nodes[sourceNodeId] {
+          for (_, value) in intermediateNode.inputs {
+            if let ref = value as? [Any],
+               let refNodeId = ref.first as? String,
+               let refNode = nodes[refNodeId],
+               refNode.classType == "ETN_LoadImageCache" {
+              inputImageNodeId = refNode.id
+              break
+            }
+          }
+        }
+      }
+    }
+
+    // Fallback: use any ETN_LoadImageCache in the workflow.
+    if inputImageNodeId == nil {
+      if let loadCache = nodes.values.first(where: { $0.classType == "ETN_LoadImageCache" }) {
+        inputImageNodeId = loadCache.id
+      }
+    }
+
+    guard let resolvedInputNodeId = inputImageNodeId else {
+      throw ParseError("Could not find input image node (ETN_LoadImageCache) for upscale workflow")
+    }
+
+    // --- Output node ---
+    let outputNodeId: String
+    if let saveNode = nodes.values.first(where: { $0.classType == "ETN_SaveImageCache" }) {
+      outputNodeId = saveNode.id
+    } else if let previewNode = nodes.values.first(where: { $0.classType == "PreviewImage" }) {
+      outputNodeId = previewNode.id
+    } else {
+      outputNodeId = nodes.keys.sorted { $0.localizedStandardCompare($1) == .orderedDescending }.first ?? "1"
+    }
+
+    let nodeTypes = nodes.values.map { $0.classType }.sorted()
+    print("[ComfyBridge] upscale workflow nodes: \(nodeTypes.joined(separator: ", ")), model=\(modelName)")
+
+    return ComfyBridgeUpscaleRequest(
+      promptId: promptId,
+      clientId: clientId,
+      inputImageNodeId: resolvedInputNodeId,
+      upscaleModelName: modelName,
+      outputNodeId: outputNodeId
     )
   }
 
