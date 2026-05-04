@@ -36,16 +36,21 @@ final class ComfyBridge {
     self.imageCache = ComfyImageCache(logger: logger)
   }
 
-  /// Configure the executor with a generation handler.
+  /// Configure the executor with generation and upscale handlers.
   /// Called by WarmServer after init to wire in the coordinator.
-  func configureExecutor(generateHandler: @escaping ComfyBridgeGenerateHandler) {
+  func configureExecutor(
+    generateHandler: @escaping ComfyBridgeGenerateHandler,
+    upscaleHandler: ComfyBridgeUpscaleHandler? = nil
+  ) {
     self.executor = ComfyBridgeExecutor(
       logger: logger,
       wsManager: wsManager,
       imageCache: imageCache,
-      generateHandler: generateHandler
+      generateHandler: generateHandler,
+      upscaleHandler: upscaleHandler
     )
-    logger.info("ComfyBridge: executor configured — Phase 2 generation enabled")
+    let upscaleStatus = upscaleHandler != nil ? "upscale enabled" : "upscale not configured"
+    logger.info("ComfyBridge: executor configured — Phase 2 generation enabled, \(upscaleStatus)")
   }
 
   // MARK: - Route Dispatch
@@ -240,6 +245,9 @@ final class ComfyBridge {
     }
 
     // Parse the workflow into generation parameters.
+    // TODO(seedvr2-merge): After PR 1 (parser) merges, change this to use
+    // ComfyBridgeWorkflowParser.parseWorkflow(json) which returns
+    // ComfyBridgeParsedWorkflow (.generate or .upscale) and route accordingly.
     let generateRequest: ComfyBridgeGenerateRequest
     do {
       generateRequest = try ComfyBridgeWorkflowParser.parse(json)

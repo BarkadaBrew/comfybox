@@ -13,6 +13,10 @@ public struct WarmServerConfiguration: Sendable {
   public var forceTransformerOverrideOnly: Bool
   public var maxSequenceLength: Int
   public var maxPendingRequests: Int
+  /// Path to SeedVR2 upscale model weights directory.
+  /// When set, enables upscale via the ComfyUI bridge. The pipeline is lazy-loaded
+  /// on first upscale request to avoid the ~6GB memory cost until needed.
+  public var seedvr2WeightsPath: String?
 
   public init(
     port: UInt16 = 7862,
@@ -21,7 +25,8 @@ public struct WarmServerConfiguration: Sendable {
     initialLoRAs: [LoRAConfiguration] = [],
     forceTransformerOverrideOnly: Bool = false,
     maxSequenceLength: Int = 512,
-    maxPendingRequests: Int = 10
+    maxPendingRequests: Int = 10,
+    seedvr2WeightsPath: String? = nil
   ) {
     self.port = port
     self.modelSpec = modelSpec
@@ -30,6 +35,7 @@ public struct WarmServerConfiguration: Sendable {
     self.forceTransformerOverrideOnly = forceTransformerOverrideOnly
     self.maxSequenceLength = maxSequenceLength
     self.maxPendingRequests = max(1, maxPendingRequests)
+    self.seedvr2WeightsPath = seedvr2WeightsPath
   }
 }
 
@@ -50,14 +56,33 @@ public final class WarmServer {
   private var listener: NWListener?
   private var shutdownSignalled = false
 
+  /// Lazy-loaded SeedVR2 upscale pipeline. Created on first upscale request
+  /// to avoid the ~6GB memory cost until actually needed.
+  private var seedvr2Pipeline: SeedVR2Pipeline?
+  /// Resolved path to SeedVR2 weights directory.
+  private let seedvr2WeightsPath: String?
+
   public init(configuration: WarmServerConfiguration, logger: Logger = Logger(label: "z-image.warm-server")) {
     self.configuration = configuration
     self.logger = logger
     self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
+    self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
+
     self.comfyBridge = ComfyBridge(logger: logger)
-    self.comfyBridge.configureExecutor(generateHandler: { [unowned self] request, progressCallback in
-      try await self.bridgeGenerate(request, progressCallback: progressCallback)
-    })
+
+    // Wire up the upscale handler if a SeedVR2 weights path is configured.
+    let upscaleHandler: ComfyBridgeUpscaleHandler? = configuration.seedvr2WeightsPath != nil
+      ? { [unowned self] imageData, modelName, progressCallback in
+          try await self.bridgeUpscale(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
+        }
+      : nil
+
+    self.comfyBridge.configureExecutor(
+      generateHandler: { [unowned self] request, progressCallback in
+        try await self.bridgeGenerate(request, progressCallback: progressCallback)
+      },
+      upscaleHandler: upscaleHandler
+    )
   }
 
   public func run() throws {
@@ -481,6 +506,67 @@ public final class WarmServer {
       outputPath: result.outputPath,
       durationMs: result.durationMs
     )
+  }
+
+  /// Bridge a ComfyUI upscale workflow request to the SeedVR2 pipeline.
+  /// Called by ComfyBridgeExecutor via the upscale handler closure set in init.
+  ///
+  /// The SeedVR2Pipeline is lazy-loaded on first use to avoid the ~6GB memory cost
+  /// until an upscale request actually arrives.
+  private func bridgeUpscale(
+    imageData: Data,
+    modelName: String,
+    progressCallback: ComfyBridgeProgressHandler?
+  ) async throws -> ComfyBridgeGenerateResult {
+    guard let weightsPath = seedvr2WeightsPath else {
+      throw SeedVR2Pipeline.PipelineError.weightsDirectoryNotFound("No SeedVR2 weights path configured")
+    }
+
+    // Lazy-load the SeedVR2 pipeline on first upscale request.
+    if seedvr2Pipeline == nil {
+      logger.info("WarmServer: lazy-loading SeedVR2 pipeline from \(weightsPath)...")
+      let pipeline = try SeedVR2Pipeline(weightsPath: weightsPath, logger: logger)
+      seedvr2Pipeline = pipeline
+      logger.info("WarmServer: SeedVR2 pipeline ready (\(pipeline.modelConfig == .preset7B ? "7B" : "3B"))")
+    }
+
+    guard let pipeline = seedvr2Pipeline else {
+      throw SeedVR2Pipeline.PipelineError.weightsDirectoryNotFound(weightsPath)
+    }
+
+    // Write input image data to a temp file — SeedVR2Pipeline.upscale() takes a file path.
+    let inputTempPath = NSTemporaryDirectory() + "zimage-upscale-input-\(UUID().uuidString).png"
+    try imageData.write(to: URL(fileURLWithPath: inputTempPath))
+    logger.info("WarmServer: wrote upscale input to \(inputTempPath) (\(imageData.count) bytes)")
+
+    let outputTempPath = NSTemporaryDirectory() + "zimage-upscale-output-\(UUID().uuidString).png"
+
+    let start = Date()
+
+    do {
+      let outputPath = try pipeline.upscaleAndSave(
+        imagePath: inputTempPath,
+        outputPath: outputTempPath,
+        progressHandler: progressCallback
+      )
+
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+
+      // Clean up input temp file.
+      try? FileManager.default.removeItem(atPath: inputTempPath)
+
+      logger.info("WarmServer: upscale complete — \(durationMs)ms, output=\(outputPath)")
+
+      return ComfyBridgeGenerateResult(
+        outputPath: outputPath,
+        durationMs: durationMs
+      )
+    } catch {
+      // Clean up temp files on failure.
+      try? FileManager.default.removeItem(atPath: inputTempPath)
+      try? FileManager.default.removeItem(atPath: outputTempPath)
+      throw error
+    }
   }
 
   fileprivate func requestShutdownAfterResponse() {
