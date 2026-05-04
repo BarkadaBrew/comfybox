@@ -71,11 +71,14 @@ public final class WarmServer {
     self.comfyBridge = ComfyBridge(logger: logger)
 
     // Wire up the upscale handler if a SeedVR2 weights path is configured.
-    let upscaleHandler: ComfyBridgeUpscaleHandler? = configuration.seedvr2WeightsPath != nil
-      ? { [unowned self] imageData, modelName, progressCallback in
-          try await self.bridgeUpscale(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
-        }
-      : nil
+    let upscaleHandler: ComfyBridgeUpscaleHandler?
+    if configuration.seedvr2WeightsPath != nil {
+      upscaleHandler = { [unowned self] (imageData: Data, modelName: String, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult in
+        try await self.bridgeUpscale(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
+      }
+    } else {
+      upscaleHandler = nil
+    }
 
     self.comfyBridge.configureExecutor(
       generateHandler: { [unowned self] request, progressCallback in
