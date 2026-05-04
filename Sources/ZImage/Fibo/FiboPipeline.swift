@@ -4,7 +4,7 @@
 // FIBO generation flow:
 // 1. Encode prompts via FiboPromptEncoder (SmolLM3-3B, all 37 hidden states)
 // 2. Create noise latents: (B, 48, H/16, W/16), pack to (B, H/16*W/16, 48)
-// 3. Compute FlowMatchEulerDiscrete sigma schedule (mu=1.0 exponential shift + stretch-to-terminal)
+// 3. Compute linear sigma schedule (no shift, unlike Flux)
 // 4. Denoise loop: transformer predict + CFG + Euler step
 // 5. Unpack latents to (B, 48, H/16, W/16)
 // 6. VAE decode to image
@@ -65,14 +65,14 @@ public struct FiboGenerationRequest: Sendable {
 /// 1. Load model components via `FiboInitializer`
 /// 2. Encode prompt via `FiboPromptEncoder` (SmolLM3-3B, all 37 hidden states)
 /// 3. Create noise latents in FIBO format: (B, 48, H/16, W/16), packed to (B, seqLen, 48)
-/// 4. Run FlowMatchEulerDiscrete denoising loop with CFG
+/// 4. Run linear flow-matching denoising loop with CFG
 /// 5. Unpack latents, denormalize, and decode via `FiboVAE`
 /// 6. Save output image
 ///
 /// Key differences from Flux2Pipeline:
 /// - 48 latent channels (not 128 packed)
 /// - DimFusion: per-layer text encoder hidden states fed to transformer blocks
-/// - FlowMatchEulerDiscrete schedule: mu=1.0 exponential time-shift + stretch-to-terminal
+/// - Linear sigma schedule (no empirical mu shift)
 /// - CFG with negative prompts (guidance > 1.0 always applies)
 /// - No batch norm normalization
 public final class FiboPipeline {
@@ -251,8 +251,8 @@ public final class FiboPipeline {
     let latentWidth = request.width / vaeScale
 
     // Create noise in spatial format: (B, 48, H/16, W/16)
-    MLXRandom.seed(seed)
-    let noiseLatents = MLXRandom.normal([1, 48, latentHeight, latentWidth])
+    // Use explicit key (not global seed) to match Python mflux's mx.random.key(seed)
+    let noiseLatents = MLXRandom.normal([1, 48, latentHeight, latentWidth], key: MLXRandom.key(seed))
 
     // Pack to sequence format: (B, H/16*W/16, 48)
     // Transpose from (B, C, H, W) to (B, H, W, C) then reshape
@@ -263,13 +263,14 @@ public final class FiboPipeline {
     MLX.eval(latents)
     logger.info("Created noise latents: \(latents.shape) (seed: \(seed))")
 
-    // 3. Compute FlowMatchEulerDiscrete sigma schedule (matching Python mflux FMED scheduler)
+    // 3. Compute linear sigma schedule (matching Python mflux LinearScheduler for FIBO)
+    // FIBO uses requires_sigma_shift=False → simple linear spacing, NOT FMED
     let numSteps = request.steps
-    let schedule = FiboPipeline.computeFMEDSchedule(numSteps: numSteps)
-    let sigmas = schedule.sigmas
-    let timesteps = schedule.timesteps
+    let sigmas = FiboPipeline.computeLinearSigmas(numSteps: numSteps)
+    // Timesteps are integer indices [0, 1, ..., N-1] for LinearScheduler
+    let timesteps = (0..<numSteps).map { Float($0) }
 
-    logger.info("FMED schedule: \(numSteps) steps, timestep range [\(timesteps.first ?? 0)...\(timesteps.last ?? 0)], sigma range [\(sigmas.first ?? 0)...\(sigmas[numSteps])]")
+    logger.info("Linear schedule: \(numSteps) steps, sigma range [\(sigmas.first ?? 0)...\(sigmas.last ?? 0)]")
 
     // 4. Denoising loop
     logger.info("Running \(numSteps) denoising steps...")
@@ -333,7 +334,22 @@ public final class FiboPipeline {
 
   // MARK: - Sigma Schedule (FlowMatchEulerDiscrete)
 
-  /// Result of FMED schedule computation.
+  /// Compute linear sigma schedule for FIBO (matching Python mflux LinearScheduler).
+  ///
+  /// FIBO uses `requires_sigma_shift=False`, so the schedule is simple:
+  /// sigmas linearly spaced from 1.0 to 0.0, with N+1 values.
+  /// Python: `sigmas = [1.0 - i/N for i in range(N+1)]`
+  ///
+  /// - Parameter numSteps: Number of denoising steps.
+  /// - Returns: Array of N+1 sigma values from 1.0 to 0.0.
+  public static func computeLinearSigmas(numSteps: Int) -> [Float] {
+    guard numSteps > 0 else { return [1.0, 0.0] }
+    return (0...numSteps).map { i in
+      1.0 - Float(i) / Float(numSteps)
+    }
+  }
+
+    /// Result of FMED schedule computation.
   public struct FMEDSchedule {
     /// `numSteps + 1` sigma values (trailing zero appended).
     public let sigmas: [Float]
