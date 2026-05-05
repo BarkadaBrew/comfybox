@@ -100,26 +100,37 @@ public enum ChromaInitializer {
     logger.info("T5-XXL weights applied")
 
     // 4. Load and apply VAE weights
-    //    Conv2d: PyTorch NCHW -> MLX NHWC transpose (same as Flux2)
+    //    Chroma's ae.safetensors uses original SD/LDKM key format while the Swift
+    //    AutoencoderKL uses diffusers format. Requires comprehensive key remapping
+    //    and 1x1 conv weight squeezing for attention Linear layers.
     logger.info("Loading VAE weights from \(resolvedPaths.vaePath.lastPathComponent)...")
     let rawVaeWeights = try MLX.loadArrays(url: resolvedPaths.vaePath)
     var vaeWeights: [String: MLXArray] = [:]
+    var remappedCount = 0
     for (key, var tensor) in rawVaeWeights {
-      // Transpose conv2d weights for MLX layout
-      if key.hasSuffix(".weight") && tensor.ndim == 4
-        && (key.contains(".conv") || key.contains("quant_conv") || key.contains("post_quant_conv"))
-      {
-        tensor = tensor.transposed(0, 2, 3, 1)
+      // Remap key from original format to diffusers format
+      let mappedKey = mapChromaVAEKey(key)
+      if mappedKey != key { remappedCount += 1 }
+
+      // Handle 4D weight tensor transformations
+      if tensor.ndim == 4 {
+        let isAttention = mappedKey.contains(".to_q.") || mappedKey.contains(".to_k.")
+          || mappedKey.contains(".to_v.") || mappedKey.contains(".to_out.")
+        if isAttention {
+          // 1x1 conv weights for attention Linear layers: squeeze [out, in, 1, 1] -> [out, in]
+          tensor = tensor.squeezed(axis: 3).squeezed(axis: 2)
+        } else {
+          // Regular conv weights: transpose NCHW -> NHWC for MLX Conv2d
+          tensor = tensor.transposed(0, 2, 3, 1)
+        }
       }
+
       if tensor.dtype != dtype {
         tensor = tensor.asType(dtype)
       }
-      // Same key mapping as Flux2 VAE: .to_out.0. -> .to_out.
-      var mappedKey = key
-      mappedKey = mappedKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
       vaeWeights[mappedKey] = tensor
     }
-    logger.info("Loaded \(vaeWeights.count) VAE weight tensors")
+    logger.info("Loaded \(vaeWeights.count) VAE weight tensors (\(remappedCount) keys remapped)")
 
     let vaeParams = ModuleParameters.unflattened(vaeWeights)
     try vae.update(parameters: vaeParams, verify: [.shapeMismatch])
@@ -129,6 +140,73 @@ public enum ChromaInitializer {
     logger.info("\(msg)")
 
     return Components(transformer: transformer, t5: t5, vae: vae)
+  }
+
+  /// Map original-format VAE weight keys (from ae.safetensors) to diffusers-format
+  /// module paths expected by the Swift AutoencoderKL.
+  ///
+  /// The Chroma ae.safetensors uses original SD/LDKM naming convention while
+  /// the Swift AutoencoderKL uses diffusers naming. Key differences:
+  ///
+  /// | Original | Diffusers |
+  /// |----------|-----------|
+  /// | `.mid.attn_1.{q,k,v}` | `.mid_block.attentions.0.to_{q,k,v}` |
+  /// | `.mid.attn_1.proj_out` | `.mid_block.attentions.0.to_out.0` |
+  /// | `.mid.attn_1.norm` | `.mid_block.attentions.0.group_norm` |
+  /// | `.mid.block_{1,2}` | `.mid_block.resnets.{0,1}` |
+  /// | `decoder.up.N` | `decoder.up_blocks.(3-N)` *(reversed)* |
+  /// | `encoder.down.N` | `encoder.down_blocks.N` *(same order)* |
+  /// | `.block.M` | `.resnets.M` |
+  /// | `.nin_shortcut` | `.conv_shortcut` |
+  /// | `.upsample.` | `.upsamplers.0.` |
+  /// | `.downsample.` | `.downsamplers.0.` |
+  /// | `.norm_out.` | `.conv_norm_out.` |
+  private static func mapChromaVAEKey(_ key: String) -> String {
+    var k = key
+
+    // --- Mid block (decoder and encoder share the same pattern) ---
+
+    // Attention projections: .mid.attn_1.X -> .mid_block.attentions.0.to_X
+    // proj_out must come before q/k/v to avoid partial match on "proj_out" containing no overlap,
+    // but ordering is safe since patterns are distinct — kept for clarity.
+    k = k.replacingOccurrences(of: ".mid.attn_1.proj_out.", with: ".mid_block.attentions.0.to_out.0.")
+    k = k.replacingOccurrences(of: ".mid.attn_1.q.", with: ".mid_block.attentions.0.to_q.")
+    k = k.replacingOccurrences(of: ".mid.attn_1.k.", with: ".mid_block.attentions.0.to_k.")
+    k = k.replacingOccurrences(of: ".mid.attn_1.v.", with: ".mid_block.attentions.0.to_v.")
+    k = k.replacingOccurrences(of: ".mid.attn_1.norm.", with: ".mid_block.attentions.0.group_norm.")
+
+    // Resnets: .mid.block_1 -> .mid_block.resnets.0, .mid.block_2 -> .mid_block.resnets.1
+    k = k.replacingOccurrences(of: ".mid.block_1.", with: ".mid_block.resnets.0.")
+    k = k.replacingOccurrences(of: ".mid.block_2.", with: ".mid_block.resnets.1.")
+
+    // --- Decoder up blocks (REVERSED ordering) ---
+    // Original up.0 = highest resolution = diffusers up_blocks.3
+    // Original up.3 = lowest resolution  = diffusers up_blocks.0
+    for origIdx in 0...3 {
+      let diffIdx = 3 - origIdx
+      k = k.replacingOccurrences(
+        of: "decoder.up.\(origIdx).block.",
+        with: "decoder.up_blocks.\(diffIdx).resnets.")
+      k = k.replacingOccurrences(
+        of: "decoder.up.\(origIdx).upsample.",
+        with: "decoder.up_blocks.\(diffIdx).upsamplers.0.")
+    }
+
+    // --- Encoder down blocks (SAME ordering) ---
+    for idx in 0...3 {
+      k = k.replacingOccurrences(
+        of: "encoder.down.\(idx).block.",
+        with: "encoder.down_blocks.\(idx).resnets.")
+      k = k.replacingOccurrences(
+        of: "encoder.down.\(idx).downsample.",
+        with: "encoder.down_blocks.\(idx).downsamplers.0.")
+    }
+
+    // --- Shared mappings ---
+    k = k.replacingOccurrences(of: ".nin_shortcut.", with: ".conv_shortcut.")
+    k = k.replacingOccurrences(of: ".norm_out.", with: ".conv_norm_out.")
+
+    return k
   }
 }
 

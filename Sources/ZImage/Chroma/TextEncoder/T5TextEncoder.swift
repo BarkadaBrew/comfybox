@@ -53,7 +53,7 @@ final class T5RelativePositionBias: Module {
 
     var buckets = MLX.where(isSmall, absPos, bucketsLarge)
     if bidirectional {
-      buckets = buckets + (rpos .> MLXArray(Int32(0))).asType(.int32) * MLXArray(Int32(numBuckets))
+      buckets = buckets + (rpos .> MLXArray(Int32(0))).asType(.int32) * MLXArray(Int32(effectiveBuckets))  // Must use halved value (16), not original numBuckets (32)
     }
     return buckets
   }

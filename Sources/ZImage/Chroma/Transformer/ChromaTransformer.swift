@@ -203,11 +203,7 @@ public final class ChromaTransformer: Module {
     let ids = MLX.concatenated([txtIds, imgIds], axis: 1)
     let idsFlat = ids.ndim == 3 ? ids[0] : ids
     let rawPE = posEmbed(idsFlat)
-    // Chroma uses opposite rotation convention from Flux2:
-    //   Python: (x*cos + y*sin, -x*sin + y*cos) — R(-θ)
-    //   Swift Flux2: (x*cos - y*sin, x*sin + y*cos) — R(+θ)
-    // Negating sin flips Swift to match Python’s rotation direction.
-    let pe = (rawPE.0, -rawPE.1)
+    let pe = rawPE  // Both Python and Swift use R(+θ) convention — no negation needed
 
     // Double-stream blocks
     for i in 0..<doubleBlocks.count {

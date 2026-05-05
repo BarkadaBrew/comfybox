@@ -214,7 +214,6 @@ public final class ChromaPipeline {
     // T5 encode positive prompt
     let txt = t5(tokenIds)
     eval(txt)
-    
 
     // Prepare positive conditioning
     let (txtEmb, txtIds) = prepareConditioning(txt: txt, nImages: 1)
