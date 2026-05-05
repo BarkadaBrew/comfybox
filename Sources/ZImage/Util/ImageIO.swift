@@ -175,7 +175,7 @@ public enum QwenImageIO {
     (image + 1) / 2
   }
 
-  static func saveImage(array: MLXArray, to url: URL) throws {
+  public static func saveImage(array: MLXArray, to url: URL) throws {
     let cg = try image(from: array)
     guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
       throw QwenImageIOError.writeFailed

@@ -279,6 +279,8 @@ struct ZImageCLI {
       switch m.lowercased() {
       case "fibo", "briaai/fibo":
         model = "briaai/FIBO"
+      case "chroma", "lodestones/chroma", "jack813liu/mlx-chroma":
+        model = "jack813liu/mlx-chroma"
       case "z-image-base", "zimage-base":
         model = ZImageRepository.baseId
       case "z-image-turbo", "zimage-turbo", "z-image":
@@ -599,6 +601,109 @@ struct ZImageCLI {
         semaphore.signal()
       }
       semaphore.wait()
+      return
+    }
+
+    // === CHROMA PATH ===
+    // Auto-detect or explicitly route to Chroma pipeline
+    let isChromaModel: Bool
+    if let family = modelFamily {
+      isChromaModel = (family.lowercased() == "chroma")
+    } else if let modelSpec = model {
+      if ChromaModelDetection.isKnownChromaModel(modelSpec) {
+        isChromaModel = true
+      } else {
+        let localURL = URL(fileURLWithPath: modelSpec)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+          isChromaModel = ChromaModelDetection.detect(at: localURL) != nil
+        } else {
+          isChromaModel = false
+        }
+      }
+    } else {
+      isChromaModel = false
+    }
+
+    if isChromaModel {
+      nonisolated(unsafe) let chromaSemaphore = DispatchSemaphore(value: 0)
+      let capturedModel = model
+      let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
+      // Chroma defaults: 20 steps
+      let chromaSteps = steps == ZImageModelMetadata.recommendedInferenceSteps ? 20 : steps
+      let bar = useBar ? ProgressBar(total: chromaSteps) : nil
+      Task {
+        do {
+          // Resolve model snapshot
+          let modelSpec = capturedModel ?? "jack813liu/mlx-chroma"
+          let snapshot = try await ModelResolution.resolve(modelSpec: modelSpec)
+
+          // Detect model config from snapshot
+          guard let detected = ChromaModelDetection.detect(at: snapshot) else {
+            logger.error("Model at \(snapshot.path) is not a Chroma model")
+            chromaSemaphore.signal()
+            return
+          }
+          logger.info("Detected Chroma model")
+
+          // Load all components (transformer, T5, VAE)
+          let components = try ChromaInitializer.load(
+            from: snapshot,
+            paths: detected.componentPaths,
+            config: detected.config,
+            logger: logger
+          )
+
+          // Load T5 tokenizer
+          let tokenizer = try ChromaTokenizer.load(from: detected.componentPaths.tokenizerPath)
+
+          // Build pipeline
+          let pipeline = ChromaPipeline(
+            transformer: components.transformer,
+            t5: components.t5,
+            vae: components.vae,
+            config: detected.config
+          )
+
+          // Tokenize prompt
+          let tokenIds = tokenizer.encode(prompt: prompt)
+
+          // Chroma defaults: 20 steps, guidance 0.0 (distilled)
+          let chromaGuidance = guidance == ZImageModelMetadata.recommendedGuidanceScale ? Float(0.0) : guidance
+
+          // Generate image (returns MLXArray of pixel data)
+          let pixels = pipeline.generate(
+            tokenIds: tokenIds,
+            width: width,
+            height: height,
+            numSteps: chromaSteps,
+            guidance: chromaGuidance,
+            seed: seed,
+            progressCallback: noProgress ? nil : { step, total in
+              let completed = min(total, max(0, step))
+              if let bar {
+                bar.update(completed: completed)
+                if completed == total {
+                  bar.finish(forceNewline: true)
+                }
+              } else {
+                PlainProgress.shared.report(completed: completed, total: total)
+              }
+            }
+          )
+          if let bar { bar.finish(forceNewline: true) }
+
+          // Save image — pipeline returns NHWC [1, H, W, 3], saveImage expects CHW [3, H, W]
+          let chromaOutputURL = URL(fileURLWithPath: outputPath)
+          let chromaCHW = pixels.squeezed(axis: 0).transposed(2, 0, 1)
+          try QwenImageIO.saveImage(array: chromaCHW, to: chromaOutputURL)
+          logger.info("Chroma image saved to \(chromaOutputURL.path)")
+        } catch {
+          logger.error("Chroma generation failed: \(error)")
+          if let bar { bar.finish(forceNewline: true) }
+        }
+        chromaSemaphore.signal()
+      }
+      chromaSemaphore.wait()
       return
     }
 
@@ -972,7 +1077,7 @@ struct ZImageCLI {
       --output, -o           Output path (default z-image.png)
       --model, -m            Model path or HuggingFace ID (default: \(ZImageRepository.id))
                              Aliases: z-image-base (Base, CFG-guided), z-image-turbo (Turbo, distilled)
-      --model-family         Model family: flux1, flux2, or fibo (default: auto-detect from model config)
+      --model-family         Model family: flux1, flux2, fibo, or chroma (default: auto-detect from model config)
       --text-encoder-path    Override text encoder directory (CLI > ZIMAGE_ENCODER_PATH > auto-detect > default)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override (disable AIO auto-detect)
       --cache-limit          GPU memory cache limit in MB (default: unlimited)
@@ -1861,6 +1966,7 @@ struct ZImageCLI {
       ModelFamily(family: "flux", variant: "schnell", directoryName: "flux-schnell-4bit", huggingFaceId: "black-forest-labs/FLUX.1-schnell"),
       ModelFamily(family: "flux", variant: "dev", directoryName: "flux-dev-4bit", huggingFaceId: "black-forest-labs/FLUX.1-dev"),
       ModelFamily(family: "flux", variant: "coffeeshop-8bit", directoryName: "coffeeshop-8bit", huggingFaceId: "carsenk/z-image-turbo-mflux-8bit"),
+      ModelFamily(family: "chroma", variant: "default", directoryName: "chroma", huggingFaceId: "jack813liu/mlx-chroma"),
       ModelFamily(family: "fibo", variant: "8b", directoryName: "fibo-8b-4bit", huggingFaceId: "briaai/FIBO"),
       ModelFamily(family: "fibo", variant: "vlm", directoryName: "fibo-vlm", huggingFaceId: "briaai/FIBO-vlm"),
       ModelFamily(family: "seedvr2", variant: "3b", directoryName: "seedvr2-3b", huggingFaceId: "numz/SeedVR2_comfyUI"),
