@@ -429,8 +429,8 @@ public final class WarmServer {
       resolvedGuidance = request.guidance > 0 ? request.guidance : 4.0
       resolvedNegativePrompt = request.negativePrompt
     case .chroma:
-      // Chroma: 20 steps default, guidance 0.0 (unconditioned)
-      resolvedSteps = request.steps > 0 ? request.steps : 20
+      // Chroma: 28 steps default, guidance 0.0 (unconditioned)
+      resolvedSteps = request.steps > 0 ? request.steps : 28
       resolvedGuidance = request.guidance
       resolvedNegativePrompt = nil
     case .flux1:
@@ -1136,20 +1136,30 @@ private actor WarmServerCoordinator {
 
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
-      let steps = payload.steps ?? 20
+      let steps = payload.steps ?? 28
       let guidance = payload.guidance ?? 0.0
       let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
 
-      // Tokenize prompt
-      let tokenIds = tokenizer.encode(prompt: payload.prompt)
+      // Tokenize prompt (unpadded — matches Python behavior)
+      let tokenIds = tokenizer.encodeUnpadded(prompt: payload.prompt)
+
+      // Tokenize negative prompt for CFG (empty string = unconditional)
+      let negTokenIds = tokenizer.encodeUnpadded(prompt: payload.negativePrompt ?? "")
+
+      // CFG parameters (default: cfg=4.0, no warmup steps)
+      let cfgScale = payload.cfg ?? 4.0
+      let cfgWarmup = payload.firstNStepsWithoutCFG ?? 0
 
       // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
       let result = pipeline.generate(
         tokenIds: tokenIds,
+        negativeTokenIds: negTokenIds,
         width: width,
         height: height,
         numSteps: steps,
         guidance: guidance,
+        cfg: cfgScale,
+        firstNStepsWithoutCFG: cfgWarmup,
         seed: seed,
         progressCallback: { step, total in
           // Progress logging
@@ -1553,6 +1563,10 @@ private struct GeneratePayload: Sendable {
   let maskCropX: Int?
   let maskCropY: Int?
 
+  // Chroma CFG parameters
+  let cfg: Float?
+  let firstNStepsWithoutCFG: Int?
+
   // Phase 4: Img2img (set via HTTP API)
   let imagePath: String?
   let imageStrength: Float?
@@ -1567,6 +1581,7 @@ private struct GeneratePayload: Sendable {
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
     maskCropX: Int? = nil, maskCropY: Int? = nil,
+    cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil
   ) {
     self.prompt = prompt; self.negativePrompt = negativePrompt
@@ -1577,6 +1592,7 @@ private struct GeneratePayload: Sendable {
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
     self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
+    self.cfg = cfg; self.firstNStepsWithoutCFG = firstNStepsWithoutCFG
     self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
   }
 }
@@ -1585,6 +1601,7 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, scheduler, sigmaSchedule, eta, dype
+    case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
   }
 
@@ -1609,6 +1626,8 @@ extension GeneratePayload: Decodable {
     maskFeather = nil
     maskCropX = nil
     maskCropY = nil
+    cfg = try c.decodeIfPresent(Float.self, forKey: .cfg)
+    firstNStepsWithoutCFG = try c.decodeIfPresent(Int.self, forKey: .firstNStepsWithoutCFG)
     imagePath = try c.decodeIfPresent(String.self, forKey: .imagePath)
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)

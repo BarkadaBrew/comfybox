@@ -84,6 +84,35 @@ public final class ChromaTokenizer {
     return MLXArray(ids.map { Int32($0) }).reshaped(1, maxLength)
   }
 
+  /// Encode without padding — returns variable-length token sequence like Python.
+  ///
+  /// Python tokenizer returns only: [token1, token2, ..., EOS]
+  /// This avoids polluting T5 attention with 500+ padding positions
+  /// and keeps the Chroma transformer's cross-attention focused on real tokens.
+  public func encodeUnpadded(prompt: String) -> MLXArray {
+    // Prepend space to match SentencePiece T5 behavior:
+    // SentencePiece always adds a "▁" (lower one eighth block) prefix
+    // to the first word. HuggingFace tokenizer.json doesn't do this by default,
+    // so we add a leading space which gets the same treatment.
+    var ids = tokenizer.encode(text: " " + prompt)
+
+    // Ensure EOS at end (matching Python SentencePiece behavior)
+    if ids.last != eosTokenId {
+      ids.append(eosTokenId)
+    }
+
+    // Add trailing pad to match Python tokenizer output
+    // Python produces: [tokens..., EOS, PAD] — the extra PAD is part of the T5 input
+    ids.append(padTokenId)
+
+    // Truncate if too long (but don't pad)
+    if ids.count > maxLength {
+      ids = Array(ids.prefix(maxLength - 1)) + [eosTokenId, padTokenId]
+    }
+
+    return MLXArray(ids.map { Int32($0) }).reshaped(1, ids.count)
+  }
+
   /// Decode token IDs back to text (for debugging).
   public func decode(tokens: [Int]) -> String {
     tokenizer.decode(tokens: tokens)

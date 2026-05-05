@@ -67,14 +67,29 @@ public final class ChromaPipeline {
 
   // MARK: - Denoising
 
-  /// Run the denoising loop.
+  /// Run the denoising loop with optional Classifier-Free Guidance (CFG).
+  ///
+  /// When  is provided and , runs the transformer twice per step
+  /// (positive + negative prompt) after  warmup steps, combining
+  /// predictions: .
+  ///
+  /// - Parameters:
+  ///   - negTxt: Negative prompt T5 embeddings. Pass nil to disable CFG.
+  ///   - negTxtIds: Position IDs for negative text.
+  ///   - cfg: Classifier-free guidance scale. Higher = more prompt adherence. Default 4.0.
+  ///   - firstNStepsWithoutCFG: Number of initial steps to run without CFG warmup. Default 0.
+  ///     Set to -1 to disable CFG entirely (even if negTxt is provided).
   public func denoise(
     xT: MLXArray,
     xIds: MLXArray,
     txt: MLXArray,
     txtIds: MLXArray,
-    numSteps: Int = 20,
+    negTxt: MLXArray? = nil,
+    negTxtIds: MLXArray? = nil,
+    numSteps: Int = 28,
     guidance: Float = 0.0,
+    cfg: Float = 4.0,
+    firstNStepsWithoutCFG: Int = 0,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> MLXArray {
     let batch = xT.dim(0)
@@ -86,6 +101,8 @@ public final class ChromaPipeline {
       numSteps: numSteps,
       imageSequenceLength: imageSeqLen
     )
+
+    let useCFG = negTxt != nil && firstNStepsWithoutCFG != -1
 
     var x = xT
     for i in 0..<numSteps {
@@ -103,7 +120,26 @@ public final class ChromaPipeline {
         guidance: guidanceArr
       )
 
-      x = sampler.step(pred: pred, xT: x, t: t, tPrev: tPrev)
+      if useCFG && i >= firstNStepsWithoutCFG {
+        // CFG: run transformer again with negative prompt
+        let predNeg = transformer(
+          img: x,
+          imgIds: xIds,
+          txt: negTxt!,
+          txtIds: negTxtIds!,
+          timesteps: tArr,
+          guidance: guidanceArr
+        )
+
+        // Combine: pred_cfg = pred_neg + (pred - pred_neg) * cfg
+        let predCFG = predNeg + (pred - predNeg) * MLXArray(cfg)
+
+        x = sampler.step(pred: predCFG, xT: x, t: t, tPrev: tPrev)
+      } else {
+        // No CFG: simple Euler step
+        x = x.asType(pred.dtype) + MLXArray(tPrev - t) * pred
+      }
+
       eval(x)
 
       progressCallback?(i + 1, numSteps)
@@ -119,6 +155,7 @@ public final class ChromaPipeline {
   /// Unpack and decode latents to pixel space.
   ///
   /// Returns NHWC `[B, H, W, 3]` with values in `[0, 1]`.
+  /// VAE decoding runs in float32 for precision (Python reference requirement).
   public func decode(_ x: MLXArray, latentSize: (Int, Int)) -> MLXArray {
     let (h, w) = latentSize
     let b = x.dim(0)
@@ -129,9 +166,16 @@ public final class ChromaPipeline {
       .transposed(0, 1, 4, 2, 5, 3)
       .reshaped(b, h, w, -1)
 
+    // Cast to float32 for VAE precision — Python reference does this:
+    //   z = z.astype(mx.float32)
+    //   z = z / self.scale_factor + self.shift_factor
+    //   return self.decoder(z)
+    // Running VAE in bfloat16 produces broken/garbled output.
+    let fp32 = unpacked.asType(.float32)
+
     // Transpose NHWC → NCHW for AutoencoderKL.decode()
     // AutoencoderKL handles scaling (0.3611 / 0.1159) internally.
-    let nchw = unpacked.transposed(0, 3, 1, 2)
+    let nchw = fp32.transposed(0, 3, 1, 2)
     let (decoded, _) = vae.decode(nchw)
 
     // decoded is NCHW [B, C, H, W] — transpose back to NHWC [B, H, W, C]
@@ -144,12 +188,21 @@ public final class ChromaPipeline {
   // MARK: - Full Generation
 
   /// Generate an image from pre-tokenized T5 input.
+  ///
+  /// - Parameters:
+  ///   - negativeTokenIds: Optional negative prompt token IDs for CFG. If nil, tokenizes
+  ///     an empty string internally. Pass  to disable CFG.
+  ///   - cfg: Classifier-free guidance scale (default 4.0).
+  ///   - firstNStepsWithoutCFG: Steps to run without CFG before enabling it (default 0).
   public func generate(
     tokenIds: MLXArray,
+    negativeTokenIds: MLXArray? = nil,
     width: Int = 512,
     height: Int = 512,
-    numSteps: Int = 20,
+    numSteps: Int = 28,
     guidance: Float = 0.0,
+    cfg: Float = 4.0,
+    firstNStepsWithoutCFG: Int = 0,
     seed: UInt64? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> MLXArray {
@@ -158,25 +211,43 @@ public final class ChromaPipeline {
     let latentH = height / 8
     let latentW = width / 8
 
-    // T5 encode
+    // T5 encode positive prompt
     let txt = t5(tokenIds)
     eval(txt)
+    
 
-    // Prepare conditioning
+    // Prepare positive conditioning
     let (txtEmb, txtIds) = prepareConditioning(txt: txt, nImages: 1)
+
+    // T5 encode negative prompt for CFG
+    // Caller must provide negativeTokenIds from the tokenizer (e.g. tokenizer.encode(prompt: ""))
+    // If not provided, CFG is disabled.
+    var negTxt: MLXArray? = nil
+    var negTxtIds: MLXArray? = nil
+    if let negativeTokenIds, firstNStepsWithoutCFG != -1 {
+      let negTxtRaw = t5(negativeTokenIds)
+      eval(negTxtRaw)
+      let (negTxtEmb, negTxtIdsPrepared) = prepareConditioning(txt: negTxtRaw, nImages: 1)
+      negTxt = negTxtEmb
+      negTxtIds = negTxtIdsPrepared
+    }
 
     // Sample noise
     let noise = sampler.samplePrior(shape: [1, latentH, latentW, 16], seed: seed)
     let (packed, imgIds) = prepareLatentImages(noise)
 
-    // Denoise
+    // Denoise with CFG
     let denoised = denoise(
       xT: packed,
       xIds: imgIds,
       txt: txtEmb,
       txtIds: txtIds,
+      negTxt: negTxt,
+      negTxtIds: negTxtIds,
       numSteps: numSteps,
       guidance: guidance,
+      cfg: cfg,
+      firstNStepsWithoutCFG: firstNStepsWithoutCFG,
       progressCallback: progressCallback
     )
 

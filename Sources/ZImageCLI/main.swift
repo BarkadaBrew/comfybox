@@ -628,8 +628,8 @@ struct ZImageCLI {
       nonisolated(unsafe) let chromaSemaphore = DispatchSemaphore(value: 0)
       let capturedModel = model
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
-      // Chroma defaults: 20 steps
-      let chromaSteps = steps == ZImageModelMetadata.recommendedInferenceSteps ? 20 : steps
+      // Chroma defaults: 28 steps
+      let chromaSteps = steps == ZImageModelMetadata.recommendedInferenceSteps ? 28 : steps
       let bar = useBar ? ProgressBar(total: chromaSteps) : nil
       Task {
         do {
@@ -664,19 +664,25 @@ struct ZImageCLI {
             config: detected.config
           )
 
-          // Tokenize prompt
-          let tokenIds = tokenizer.encode(prompt: prompt)
+          // Tokenize prompt (unpadded — matches Python behavior)
+          let tokenIds = tokenizer.encodeUnpadded(prompt: prompt)
 
-          // Chroma defaults: 20 steps, guidance 0.0 (distilled)
+          // Tokenize negative prompt for CFG (empty string = unconditional)
+          let negTokenIds = tokenizer.encodeUnpadded(prompt: "")
+
+          // Chroma defaults: 28 steps, guidance 0.0 (distilled), cfg 4.0
           let chromaGuidance = guidance == ZImageModelMetadata.recommendedGuidanceScale ? Float(0.0) : guidance
 
-          // Generate image (returns MLXArray of pixel data)
+          // Generate image with CFG (returns MLXArray of pixel data)
           let pixels = pipeline.generate(
             tokenIds: tokenIds,
+            negativeTokenIds: negTokenIds,
             width: width,
             height: height,
             numSteps: chromaSteps,
             guidance: chromaGuidance,
+            cfg: 4.0,
+            firstNStepsWithoutCFG: 0,
             seed: seed,
             progressCallback: noProgress ? nil : { step, total in
               let completed = min(total, max(0, step))
