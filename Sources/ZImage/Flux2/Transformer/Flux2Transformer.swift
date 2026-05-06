@@ -92,6 +92,13 @@ public final class Flux2Transformer: Module {
   public let config: Flux2TransformerConfig
   let innerDim: Int
 
+  /// DyPE configuration — set before generation to enable high-res RoPE scaling.
+  /// When enabled, spatial axes (h, w) use NTK-aware interpolation while
+  /// temporal and layer axes remain vanilla.
+  public var dyPEConfig: DyPEConfig = .disabled {
+    didSet { posEmbed.dyPE = dyPEConfig }
+  }
+
   @ModuleInfo(key: "pos_embed") var posEmbed: Flux2PosEmbed
   @ModuleInfo(key: "time_guidance_embed") var timeGuidanceEmbed: Flux2TimestepEmbedding
   @ModuleInfo(key: "double_stream_modulation_img") var doubleStreamModulationImg: Flux2Modulation
@@ -211,8 +218,26 @@ public final class Flux2Transformer: Module {
     let imgIdsFlat = imgIds.ndim == 3 ? imgIds[0] : imgIds
     let txtIdsFlat = txtIds.ndim == 3 ? txtIds[0] : txtIds
 
-    // Compute RoPE
-    let imageRotaryEmb = posEmbed(imgIdsFlat)
+    // Compute DyPE scale factors for spatial axes when resolution exceeds training base.
+    // Flux 2 has 4 RoPE axes: [t, h, w, layer]. Only h (axis 1) and w (axis 2) get scaled.
+    let ropeScales: [Float]?
+    if dyPEConfig.enabled {
+      // imgIds columns: [t, h, w, layer]. Max h/w position = number of patches on that axis.
+      // Base patch count = baseResolution / 16 (VAE=8x downscale, patchSize=2 for Klein is 1
+      // but Flux2 packs 2x2 patches into channels, so effective spatial tokens = pixels/16).
+      let basePatches = Float(dyPEConfig.baseResolution) / 16.0
+      let hMax = Float(imgIdsFlat[0..., 1].max().item(Int.self)) + 1.0
+      let wMax = Float(imgIdsFlat[0..., 2].max().item(Int.self)) + 1.0
+      let hScale = hMax / basePatches
+      let wScale = wMax / basePatches
+      // [t=1.0, h=hScale, w=wScale, layer=1.0] — only scale spatial axes
+      ropeScales = [1.0, hScale, wScale, 1.0]
+    } else {
+      ropeScales = nil
+    }
+
+    // Compute RoPE (with DyPE scales when enabled)
+    let imageRotaryEmb = posEmbed(imgIdsFlat, scales: ropeScales)
     let textRotaryEmb = posEmbed(txtIdsFlat)
     let concatRotaryEmb = (
       MLX.concatenated([textRotaryEmb.0, imageRotaryEmb.0], axis: 0),

@@ -966,7 +966,8 @@ struct ZImageCLI {
             outputPath: URL(fileURLWithPath: outputPath),
             maxSequenceLength: maxSequenceLength,
             inputImagePath: flux2InputImage,
-            denoise: flux2DenoiseValue
+            denoise: flux2DenoiseValue,
+            dyPE: dyPEConfig
           )
 
           _ = try await flux2Pipeline.generate(flux2Request, progressHandler: { progress in

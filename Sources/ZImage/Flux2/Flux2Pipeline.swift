@@ -34,6 +34,11 @@ public struct Flux2GenerationRequest: Sendable {
   /// Only used when `inputImagePath` is set.
   public var denoise: Float
 
+  /// DyPE (Dynamic Positional Encoding) config for native high-resolution generation.
+  /// When enabled, RoPE frequencies are NTK-scaled on spatial axes to support
+  /// resolutions beyond the 1024px training base.
+  public var dyPE: DyPEConfig
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -45,7 +50,8 @@ public struct Flux2GenerationRequest: Sendable {
     outputPath: URL = URL(fileURLWithPath: "flux2-output.png"),
     maxSequenceLength: Int = 512,
     inputImagePath: URL? = nil,
-    denoise: Float = 1.0
+    denoise: Float = 1.0,
+    dyPE: DyPEConfig = .disabled
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -58,6 +64,7 @@ public struct Flux2GenerationRequest: Sendable {
     self.maxSequenceLength = maxSequenceLength
     self.inputImagePath = inputImagePath
     self.denoise = denoise
+    self.dyPE = dyPE
   }
 }
 
@@ -511,6 +518,12 @@ public final class Flux2Pipeline {
       logger.info("Img2img: starting at step \(startStep)/\(request.steps), sigma=\(sigma)")
     }
     #endif
+
+    // Configure DyPE for high-resolution generation
+    components.transformer.dyPEConfig = request.dyPE
+    if request.dyPE.enabled {
+      logger.info("DyPE enabled: \(request.dyPE.method.rawValue) (base \(request.dyPE.baseResolution)px \u{2192} \(request.width)x\(request.height))")
+    }
 
     // 4. Denoising loop (starts from startStep for img2img)
     let effectiveSteps = request.steps - startStep
