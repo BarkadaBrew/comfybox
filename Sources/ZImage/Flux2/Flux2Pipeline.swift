@@ -208,6 +208,28 @@ public final class Flux2Pipeline {
     logger.info("Flux 2 Klein model loaded from \(snapshot.path) [\(modelKind)]")
   }
 
+  /// Apply a LoRA/LoKR file to the loaded transformer.
+  ///
+  /// Handles native Flux key naming (fused QKV) and diffusers key naming
+  /// (separate Q/K/V) transparently via `Flux2LoRALoader`.
+  ///
+  /// - Parameters:
+  ///   - path: Path to the LoRA safetensors file.
+  ///   - scale: LoRA scale factor (default 1.0).
+  /// - Returns: Number of layers modified.
+  @discardableResult
+  public func applyLoRA(path: String, scale: Float = 1.0) throws -> Int {
+    guard let components = components else {
+      throw Flux2PipelineError.modelNotLoaded
+    }
+    return try Flux2LoRALoader.loadAndApply(
+      path: path,
+      to: components.transformer,
+      scale: scale,
+      logger: logger
+    )
+  }
+
   /// Generate an image and save it to disk.
   ///
   /// - Parameters:
