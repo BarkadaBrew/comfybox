@@ -107,12 +107,32 @@ enum ZImageVAEWeightAliases {
       in: &normalized
     )
 
-    // Fix: Force OIHW→OHWI transpose for encoder.conv_in.weight
-    // Shape [128, 3, 3, 3] is ambiguous — in_channels(3) == kernel_size(3)
-    // alignTensorShape skips transpose when shapes match, but data layout is wrong
+    // Fix: Handle ambiguous encoder.conv_in.weight [128, 3, 3, 3] layout.
+    //
+    // The shape is identical in both OIHW (PyTorch) and OHWI (MLX) conventions
+    // because in_channels(3) == kernel_size(3). alignTensorShape skips these
+    // because shapes already match, but the data layout may be wrong.
+    //
+    // Detection: check encoder.conv_out.weight which has asymmetric channels:
+    //   OIHW (PyTorch/standard): [32, 512, 3, 3] — dim[1] > dim[3]
+    //   OHWI (MLX/pre-converted): [32, 3, 3, 512] — dim[1] < dim[3]
+    //
+    // Only transpose conv_in for OIHW models; pre-converted models are already correct.
     if let w = normalized["encoder.conv_in.weight"], w.ndim == 4 {
-      normalized["encoder.conv_in.weight"] = w.transposed(0, 2, 3, 1)
+      let needsTranspose: Bool
+      if let convOut = normalized["encoder.conv_out.weight"], convOut.ndim == 4 {
+        // Asymmetric shape reveals layout: OIHW has large dim[1], OHWI has large dim[3]
+        needsTranspose = convOut.dim(1) > convOut.dim(3)
+      } else {
+        // Fallback: assume OIHW (standard HuggingFace format)
+        needsTranspose = true
+      }
+
+      if needsTranspose {
+        normalized["encoder.conv_in.weight"] = w.transposed(0, 2, 3, 1)
+      }
     }
+
     return normalized
   }
 
