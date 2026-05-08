@@ -1,18 +1,40 @@
 # ComfyBox
 
-Swift port of [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) using [mlx-swift](https://github.com/ml-explore/mlx-swift) for Apple Silicon.
+> ComfyUI performance. Apple silicon native. Zero Python.
 
-This fork adds **SVG vector output** and **multi-LoRA support**.
+ComfyBox is a native Swift image generation engine for Apple Silicon. It runs diffusion models via MLX — no Python runtime, no node graphs, no ComfyUI dependency. Text-to-image, img2img, ControlNet, inpainting, LoRA, batch generation, and AI upscaling in a single binary.
 
-Reviewer handoff for the Barkada fork work lives at [`docs/review-handoff-barkada-fork-2026-03-28.md`](docs/review-handoff-barkada-fork-2026-03-28.md).
+An LLM orchestrator manages models, LoRAs, and generation parameters via the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), enabling AI assistants to generate images without manual configuration.
 
-**Try it with an easy UI:** [Lingdong Desktop App](https://lingdong.app/en)
+## Documentation
 
-## What's New in This Fork
+| Doc | Description |
+|-----|-------------|
+| [User Guide](docs/user-guide.md) | CLI usage, generation modes, LoRA, batch mode |
+| [Architecture](docs/architecture.md) | Engine, orchestrator, and protocol layers |
+| [MCP Tool Reference](docs/mcp-reference.md) | 18 MCP tools for AI assistant integration |
+| [Deployment](docs/deployment.md) | Serve mode, keepalive, remote SSH bridge |
+| [ComfyUI Bridge Spec](docs/comfyui-bridge-protocol-spec.md) | ComfyUI protocol emulation details |
+| [SeedVR2 Porting Guide](docs/seedvr2-porting-guide.md) | SeedVR2 upscaler implementation notes |
 
-- **SVG Export** - Convert generated images to vector SVG format
-- **Multi-LoRA** - Apply multiple LoRA weights simultaneously
-- **Progress Control** - Disable progress output for scripting
+## Quick Start
+
+```bash
+# Generate an image
+ComfyBox -p "A mountain landscape at sunset" -o landscape.png
+
+# Img2img transformation
+ComfyBox -p "oil painting style" --image photo.jpg --creativity 0.7 -o painting.png
+
+# Batch generation (10 random seeds)
+ComfyBox -p "portrait" --auto-seeds 10 -o batch/portrait.png
+
+# Run as warm server
+ComfyBox serve -m Tongyi-MAI/Z-Image-Turbo --port 7862
+
+# Start MCP server for AI assistants
+ComfyBox mcp --port 7862
+```
 
 ## System Requirements
 
@@ -20,15 +42,13 @@ Reviewer handoff for the Barkada fork work lives at [`docs/review-handoff-barkad
 |-------------|---------|
 | **macOS** | 14.0+ (Sonoma or later) |
 | **Chip** | Apple Silicon (M1, M2, M3, M4) |
-| **Disk Space** | ~6GB for model files |
-| **Internet** | Required for first-run model download |
-| **Swift** | 5.9+ (only if building from source) |
+| **VRAM** | 4-21 GB depending on model and precision |
+| **Disk** | ~6 GB for base model files |
+| **Swift** | 5.9+ (building from source only) |
 
 ## Installation
 
-### Pre-built Binary (Recommended)
-
-Download and install the latest Barkada release:
+### Pre-built Binary
 
 ```bash
 curl -LO https://github.com/BarkadaBrew/comfybox/releases/download/0.2.3/ComfyBox-0.2.3-macos-arm64.tar.gz
@@ -37,289 +57,111 @@ cd ComfyBox-0.2.3
 sudo ./install.sh
 ```
 
-This installs:
-- Binary to `/usr/local/lib/comfybox/ComfyBox`
-- Metal library to `/usr/local/lib/comfybox/mlx.metallib`
-- Wrapper script to `/usr/local/bin/ComfyBox`
-
 ### Building from Source
 
 ```bash
 git clone https://github.com/BarkadaBrew/comfybox.git
 cd comfybox
-xcodebuild -scheme ComfyBox -configuration Release -destination 'platform=macOS' -derivedDataPath .build/xcode
+xcodebuild -scheme ComfyBox -configuration Release \
+  -destination 'platform=macOS' -derivedDataPath .build/xcode
 ```
 
-The CLI binary and required Metal libraries will be in `.build/xcode/Build/Products/Release/`.
+## Supported Models
 
-> **Note**: SwiftPM builds (`swift build`) may have issues finding the Metal library on some systems. Xcode builds are recommended for production use.
+| Family | Steps | VRAM (BF16) | Notes |
+|--------|-------|-------------|-------|
+| Z-Image Turbo | 4-9 | ~7 GB | Default, fastest |
+| Z-Image Base | 20-50 | ~7 GB | CFG-guided, higher quality |
+| Flux 2 Klein 9B | 20-50 | ~21 GB | High quality, 8-bit available (~12 GB) |
+| FIBO 8B | 20+ | ~21 GB | JSON prompts, CC-BY-NC-4.0 |
+| Chroma 8.9B | 20+ | ~21 GB | Guidance-free |
+| SeedVR2 3B/7B | 1 | 7/16 GB | AI upscaling only |
 
-### Optional: Install vtracer for SVG Export
+## Features
 
-SVG conversion requires [vtracer](https://github.com/visioncortex/vtracer):
+### Generation
+- **Text-to-image** — prompt to pixels via Diffusion Transformer
+- **Image-to-image** — transform existing images with controllable strength
+- **ControlNet** — Canny, HED, Depth, Pose, MLSD conditioning
+- **Inpainting** — mask-guided region replacement
+- **Batch mode** — multi-seed/multi-prompt with checkpoint resume
 
-```bash
-# Install Rust if needed
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
+### Models & LoRA
+- **Multi-model** — Z-Image, Flux 2 Klein, FIBO, Chroma families
+- **Quantization** — 4-bit and 8-bit weight compression
+- **Multi-LoRA** — stack multiple style adapters with per-LoRA scaling
+- **Hot swap** — change LoRAs without model reload (~2s)
+- **LoRA library** — scan, search, quarantine, compatibility checking
 
-# Install vtracer
-cargo install vtracer
-```
+### Upscaling
+- **SeedVR2** — AI-powered 2x upscale with tiled VAE for large images
+- **ESRGAN** — traditional deterministic upscale with tile support
 
-## Usage
+### Server
+- **WarmServer** — HTTP API with warm model pool, hot LoRA swap
+- **Model Pool** — multiple models loaded simultaneously, instant switching
+- **MCP Server** — 18 tools for AI assistant integration via JSON-RPC 2.0
+- **ComfyUI Bridge** — protocol-compatible API for Krita AI Diffusion
 
-```bash
-ComfyBox -p "A beautiful mountain landscape at sunset" -o output.png
-```
+### Post-Processing
+- **SVG export** — vector conversion via vtracer with style presets
+- **Metadata sidecars** — reproducible generation with JSON parameter files
+- **Levels adjustment** — post-decode contrast correction
+- **Prompt enhancement** — built-in LLM prompt expansion
 
-For all available options:
+## Samplers
 
-```bash
-ComfyBox -h
-```
+| Sampler | Speed | Quality | Best For |
+|---------|-------|---------|----------|
+| `euler` | Fastest | Good | Default, distilled models |
+| `heun` | 2x slower | Higher | Fine detail |
+| `dpmpp-2m` | Medium | High | Base models with many steps |
+| `dpmpp-2s-a` | Medium | High | Stochastic variation |
+| `res_2s` | Medium | High | Balanced |
+| `deis` | Medium | High | Smooth outputs |
+| `ddim` | Medium | Good | Animation, deterministic |
 
-### Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-p, --prompt` | Text prompt (required) | - |
-| `--negative-prompt` | Negative prompt | - |
-| `-W, --width` | Output width | 1024 |
-| `-H, --height` | Output height | 1024 |
-| `-s, --steps` | Inference steps | 9 |
-| `-g, --guidance` | Guidance scale | 0.0 |
-| `--seed` | Random seed | random |
-| `-o, --output` | Output path | z-image.png |
-| `-m, --model` | Model path (dir or .safetensors) or HuggingFace ID | Tongyi-MAI/Z-Image-Turbo |
-| `--force-transformer-override-only` | Treat local .safetensors as transformer-only (disable AIO detection) | false |
-| `--cache-limit` | GPU memory cache limit in MB | unlimited |
-| `-l, --lora` | LoRA weights path or HuggingFace ID (single) | - |
-| `--lora-scale` | LoRA scale factor | 1.0 |
-| `--lora-paths` | Multiple LoRA paths (comma-separated) | - |
-| `--lora-scales` | Multiple LoRA scales (comma-separated) | 1.0 each |
-| `-e, --enhance` | Enhance prompt using LLM | false |
-| `--enhance-max-tokens` | Max tokens for prompt enhancement | 512 |
-| `--no-progress` | Disable progress output | false |
-| `--svg` | Generate SVG vector output (requires vtracer) | false |
-| `--svg-preset` | SVG conversion preset | default |
-
-Z-Image-Turbo defaults to guidance `0.0`. Other model families use different recommended guidance defaults.
-
-### SVG Presets
-
-| Preset | Use Case | Output Size |
-|--------|----------|-------------|
-| `default` | Balanced quality and file size | Medium |
-| `logo` | Logos, icons, flat graphics | Smallest |
-| `detailed` | Complex images, preserve detail | Largest |
-| `simplified` | Clean, minimal output | Small |
-| `bw` | Black and white conversion | Varies |
-
-## AIO Checkpoint Usage
-
-You can load a single `.safetensors` file containing the Transformer, Text Encoder, and VAE (AIO) directly:
-
-```bash
-ComfyBox -p "a cozy cabin" -m path/to/z_image_turbo_aio.safetensors
-```
-
-If the file is detected as an AIO checkpoint, it will skip loading base model weights and use the components from the file. To force it to be treated as a transformer-only override (overlaying base weights), use `--force-transformer-override-only`.
+**Sigma schedules:** `flow` (default), `karras`, `exponential`, `beta`, `beta57`
 
 ## Examples
 
 ```bash
-# Basic generation
-ComfyBox -p "a cute cat sitting on a windowsill" -o cat.png
+# Basic generation with seed
+ComfyBox -p "a cute cat sitting on a windowsill" --seed 42 -o cat.png
 
-# Portrait image with custom size
+# Portrait with specific resolution
 ComfyBox -p "portrait of a woman in renaissance style" -W 768 -H 1152 -o portrait.png
 
-# Using quantized model for lower memory usage
+# Quantized model (low VRAM)
 ComfyBox -p "a futuristic city at night" -m mzbac/Z-Image-Turbo-8bit -o city.png
 
-# With memory limit
-ComfyBox -p "abstract art" --cache-limit 2048 -o art.png
-
-# With single LoRA
-ComfyBox -p "a lion" --lora ostris/z_image_turbo_childrens_drawings -o lion.png
-
-# With multiple LoRAs (new in this fork)
-ComfyBox -p "a beautiful portrait" \
-  --lora style1.safetensors=0.8 \
-  --lora style2.safetensors=0.5 \
-  -o portrait.png
-
-# Generate with SVG output (new in this fork)
-ComfyBox -p "minimalist mountain logo" --svg --svg-preset logo -o logo.png
-# Creates: logo.png and logo.svg
-
-# SVG with detailed preset for complex images
-ComfyBox -p "intricate mandala pattern" --svg --svg-preset detailed -o mandala.png
-
-# Scripting without progress bars
-ComfyBox -p "batch image" --no-progress -o batch.png
-```
-
-## LoRA
-
-Apply LoRA weights for style customization.
-
-### Single LoRA
-
-```bash
-ComfyBox -p "a lion" --lora ostris/z_image_turbo_childrens_drawings --lora-scale 1.0 -o lion.png
-```
-
-### Multiple LoRAs (New in This Fork)
-
-Combine multiple LoRA styles:
-
-```bash
+# Multiple LoRAs stacked
 ComfyBox -p "a fantasy portrait" \
-  --lora ~/loras/style.safetensors=0.8 \
-  --lora ~/loras/detail.safetensors=0.6 \
+  --lora style.safetensors=0.8 \
+  --lora detail.safetensors=0.6 \
   -o combined.png
+
+# SVG logo
+ComfyBox -p "minimalist coffee cup logo, flat design" --svg --svg-preset logo -o logo.png
+
+# ControlNet with pose
+ComfyBox control -p "a woman on a beach" -c pose.jpg \
+  --cw alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \
+  --cf Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors \
+  -o beach.png
+
+# SeedVR2 upscale
+ComfyBox upscale -i photo.jpg -w ~/Models/seedvr2-3b -r 2048 -o photo-2x.png
+
+# Heun sampler with Karras schedule
+ComfyBox -p "detailed landscape" --scheduler heun --sigma-schedule karras -s 20 -o landscape.png
 ```
-
-- `--lora`: Repeatable. Prefer `path=scale` to bind a scale to a specific entry.
-- `--lora-paths`: Comma-separated list of LoRA file paths or HuggingFace IDs
-- `--lora-scales`: Corresponding scale factors (defaults to 1.0 if not specified)
-- `path:scale` is still accepted for backward compatibility when unambiguous
-- Quoted commas are not supported in comma-separated forms
-
-### LoRA Example
-
-<table width="100%">
-<tr>
-<th>Prompt</th>
-<th>LoRA</th>
-<th>Output</th>
-</tr>
-<tr>
-<td>a lion</td>
-<td><a href="https://huggingface.co/ostris/z_image_turbo_childrens_drawings">ostris/z_image_turbo_childrens_drawings</a></td>
-<td><img src="examples/lora_lion.png" height="256"></td>
-</tr>
-</table>
-
-## SVG Export (New in This Fork)
-
-Convert generated images to scalable vector graphics using [vtracer](https://github.com/visioncortex/vtracer).
-
-### Installation
-
-```bash
-# Requires Rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-cargo install vtracer
-```
-
-### Usage
-
-```bash
-# Basic SVG generation
-ComfyBox -p "geometric pattern" --svg -o pattern.png
-# Creates: pattern.png and pattern.svg
-
-# Logo preset (best for icons, logos, flat graphics)
-ComfyBox -p "minimalist coffee cup logo, flat design, white background" \
-  --svg --svg-preset logo -o coffee_logo.png
-
-# Detailed preset (preserves complex details)
-ComfyBox -p "intricate celtic knot pattern" \
-  --svg --svg-preset detailed -o celtic.png
-```
-
-### Preset Comparison
-
-| Preset | Best For | Colors | Detail Level |
-|--------|----------|--------|--------------|
-| `default` | General purpose | Full color | Medium |
-| `logo` | Logos, icons, UI elements | Simplified | Low (clean edges) |
-| `detailed` | Illustrations, complex art | Full color | High |
-| `simplified` | Clean graphics, web icons | Reduced | Low |
-| `bw` | Silhouettes, line art | Black & white | Medium |
-
-### Tips for Best SVG Results
-
-1. **Use high contrast prompts**: Add "HIGH CONTRAST, bold colors, white background"
-2. **Avoid gradients**: Add "flat design, no gradients" to prompts
-3. **Simple shapes work best**: Vector conversion excels with clean geometric forms
-4. **Logo preset for icons**: Produces the smallest, cleanest SVG files
-
-## ControlNet
-
-Generate images with ControlNet conditioning using Canny, HED, Depth, Pose, or MLSD control images:
-
-```bash
-ComfyBox control \
-  --prompt "A hyper-realistic close-up portrait of a leopard" \
-  --control-image canny_edges.jpg \
-  --controlnet-weights alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \
-  --control-file Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors \
-  --control-scale 0.75 \
-  --output leopard.png
-```
-
-### ControlNet Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-p, --prompt` | Text prompt (required) | - |
-| `-c, --control-image` | Control image path (Canny/HED/Pose/Depth/MLSD) | - |
-| `-i, --inpaint-image` | Source image for inpainting | - |
-| `--mask, --mask-image` | Mask image for inpainting | - |
-| `--cw, --controlnet-weights` | ControlNet weights path or HuggingFace ID (required) | - |
-| `--cf, --control-file` | Specific .safetensors file within weights directory | - |
-| `--cs, --control-scale` | Control context scale | 0.75 |
-| `-W, --width` | Output width | 1024 |
-| `-H, --height` | Output height | 1024 |
-| `-s, --steps` | Inference steps | 9 |
-| `-g, --guidance` | Guidance scale | 0.0 |
-| `--seed` | Random seed | random |
-| `-o, --output` | Output path | z-image-control.png |
-| `-m, --model` | Model path or HuggingFace ID | Tongyi-MAI/Z-Image-Turbo |
-| `--cache-limit` | GPU memory cache limit in MB | unlimited |
-
-### ControlNet Examples
-
-| Control Type | Prompt | Control Image | Output |
-|--------------|--------|---------------|--------|
-| Canny | A hyper-realistic close-up portrait of a leopard face hiding behind dense green jungle leaves, camouflaged, direct eye contact, intricate fur detail, bright yellow eyes, cinematic lighting, soft shadows, National Geographic photography, 8k, sharp focus, depth of field | ![Canny](images/canny.jpg) | ![Canny Output](examples/canny.png) |
-| HED | A photorealistic film still of a man in a dark shirt sitting at a dining table in a modern kitchen at night, looking down at a bowl of soup. A glass bottle and a glass of white wine are in the foreground. Warm, low, cinematic lighting, soft shadows, shallow depth of field, contemplative atmosphere, highly detailed. | ![HED](images/hed.jpg) | ![HED Output](examples/hed.png) |
-| Depth | A hyperrealistic architectural photograph of a spacious, minimalist modern hallway interior. Large floor-to-ceiling windows on the right wall fill the space with bright natural daylight. A light gray sectional sofa and a low, modern coffee table are placed in the foreground on a light wood floor. A large potted plant is visible further down the hallway. White walls, clean lines, serene atmosphere, highly detailed, 8k resolution, cinematic lighting | ![Depth](images/depth.jpg) | ![Depth Output](examples/depth.png) |
-| Pose | 一位年轻女子站在阳光明媚的海岸线上，白裙在轻拂的海风中微微飘动。她拥有一头鲜艳的紫色长发，在风中轻盈舞动... | ![Pose](images/pose.jpg) | ![Pose Output](examples/pose.png) |
-
-## Example Text To Image Output
-
-| Prompt | Output |
-|--------|--------|
-| A dramatic, cinematic japanese-action scene in a edo era Kyoto city. A woman named Harley Quinn from the movie "Birds of Prey" in colorful, punk-inspired comic-villain attire walks confidently while holding the arm of a serious-looking man named John Wick played by Keanu Reeves from the fantastic film John Wick 2 in a black suit, her t-shirt says "Birds of Prey", the characters are capture in a postcard held by a hand in front of a beautiful realistic city at sunset and there is cursive writing that says "ZImage, Now in MLX" | ![Output](examples/z-image.png) |
-
-## Quantization
-
-Quantize the model to reduce memory usage:
-
-```bash
-ComfyBox quantize -i models/z-image-turbo -o models/z-image-turbo-q8 --bits 8 --group-size 32 --verbose
-```
-
-### Performance
-
-| Model | Memory | Time (1024x1024) |
-|-------|--------|------------------|
-| BF16 | ~21 GB | ~46s |
-| 8-bit quantized | ~7.5 GB | ~44s |
-
-*Tested on Apple M2 Ultra*
 
 ## Dependencies
 
-- [mlx-swift](https://github.com/ml-explore/mlx-swift) - Apple's ML framework for Apple Silicon
-- [swift-transformers](https://github.com/huggingface/swift-transformers) - Tokenizer support
-- [swift-argument-parser](https://github.com/apple/swift-argument-parser) - CLI argument parsing
+- [mlx-swift](https://github.com/ml-explore/mlx-swift) — Apple's ML framework for Apple Silicon
+- [swift-transformers](https://github.com/huggingface/swift-transformers) — Tokenizer support
+- [swift-argument-parser](https://github.com/apple/swift-argument-parser) — CLI argument parsing
 
 ## License
 
