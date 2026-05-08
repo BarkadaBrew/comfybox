@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 
-/// End-to-end tests for ZImageCLI command line interface.
+/// End-to-end tests for ComfyBox command line interface.
 /// These tests build and run the actual CLI executable.
 /// Run with: xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -only-testing:ZImageE2ETests -parallel-testing-enabled NO
 final class CLIEndToEndTests: XCTestCase {
@@ -279,8 +279,8 @@ final class CLIEndToEndTests: XCTestCase {
     let buildDir = Self.projectRoot.appendingPathComponent(".build")
 
     // Check if CLI already exists in local build folder
-    let releasePath = buildDir.appendingPathComponent("Build/Products/Release/ZImageCLI")
-    let debugPath = buildDir.appendingPathComponent("Build/Products/Debug/ZImageCLI")
+    let releasePath = buildDir.appendingPathComponent("Build/Products/Release/ComfyBox")
+    let debugPath = buildDir.appendingPathComponent("Build/Products/Debug/ComfyBox")
     if let existing = [releasePath, debugPath].first(where: { FileManager.default.fileExists(atPath: $0.path) }),
        Self.isCLIBinaryUpToDate(existing) {
       return existing.path
@@ -291,7 +291,7 @@ final class CLIEndToEndTests: XCTestCase {
     buildProcess.executableURL = URL(fileURLWithPath: "/usr/bin/xcodebuild")
     buildProcess.arguments = [
       "build",
-      "-scheme", "ZImageCLI",
+      "-scheme", "ComfyBox",
       "-configuration", "Release",
       "-destination", "platform=macOS",
       "-derivedDataPath", buildDir.path
@@ -358,7 +358,7 @@ final class CLIEndToEndTests: XCTestCase {
 
   private func skipIfNoCLI() throws {
     guard let path = cliPath, !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
-      throw XCTSkip("CLI not built. Run 'swift build -c release --product ZImageCLI' first.")
+      throw XCTSkip("CLI not built. Run 'swift build -c release --product ComfyBox' first.")
     }
   }
 
