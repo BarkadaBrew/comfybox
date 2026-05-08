@@ -29,10 +29,10 @@ jobs:
 
       - name: Type check
         run: |
-          xcodebuild build -scheme ZImageCLI -configuration Debug -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1
+          xcodebuild build -scheme ComfyBox -configuration Debug -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1
 
       - name: Run unit tests
-        run: xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
+        run: xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
 
   release-build:
     if: github.ref == 'refs/heads/main'
@@ -53,14 +53,14 @@ jobs:
 
       - name: Release build
         run: |
-          xcodebuild build -scheme ZImageCLI -configuration Release -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO
+          xcodebuild build -scheme ComfyBox -configuration Release -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO
 
       - name: Prepare Artifacts
         run: |
           cd ./dist/Build/Products/Release
-          chmod +x ZImageCLI
+          chmod +x ComfyBox
           cp mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib .
-          zip -r zimage.macos.arm64.zip ZImageCLI default.metallib
+          zip -r comfybox.macos.arm64.zip ComfyBox default.metallib
 
       - name: Get current date
         run: echo "CURRENT_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
@@ -75,5 +75,5 @@ jobs:
           draft: false
           prerelease: true
           allowUpdates: true
-          artifacts: ./dist/Build/Products/Release/zimage.macos.arm64.zip
+          artifacts: ./dist/Build/Products/Release/comfybox.macos.arm64.zip
           token: ${{ secrets.GITHUB_TOKEN }}

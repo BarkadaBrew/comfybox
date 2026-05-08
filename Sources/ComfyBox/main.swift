@@ -1201,7 +1201,7 @@ struct ZImageCLI {
     print("""
     Z-Image-Turbo Swift port
 
-    Usage: ZImageCLI --prompt "text" [options]
+    Usage: ComfyBox --prompt "text" [options]
       --prompt, -p           Text prompt (required)
       --negative-prompt      Negative prompt
       --width, -W            Output width (default \(ZImageModelMetadata.recommendedWidth))
@@ -1272,14 +1272,14 @@ struct ZImageCLI {
         --control-image, -c  Control image path (required)
         --controlnet-weights Path to controlnet weights dir or HF ID (required)
         --control-scale      Control scale (default: 0.75)
-        Use 'ZImageCLI control --help' for full options
+        Use 'ComfyBox control --help' for full options
 
       serve                  Start warm HTTP server
         --model, -m          Model path or HuggingFace ID
         --text-encoder-path  Override text encoder directory
         --port               HTTP port (default 7862)
         --lora, -l           Initial LoRA(s)
-        Use 'ZImageCLI serve --help' for full options
+        Use 'ComfyBox serve --help' for full options
 
       upscale                Upscale image via SeedVR2 or ESRGAN
         --input, -i          Input image path (required)
@@ -1296,21 +1296,21 @@ struct ZImageCLI {
         --paths, -v          Show filesystem paths for installed models
 
     Examples:
-      ZImageCLI -p "a cute cat" -o cat.png
-      ZImageCLI -p "a sunset" -m models/z-image-turbo-q8
-      ZImageCLI -p "a forest" -m Tongyi-MAI/Z-Image-Turbo
-      ZImageCLI -p "a cut a cat" --lora ostris/z_image_turbo_childrens_drawings
-      ZImageCLI -p "portrait" --lora mood.safetensors=0.8 --lora detail.safetensors --lora-scale 0.3
-      ZImageCLI -p "cat" --enhance  # Enhanced prompt generation
-      ZImageCLI -p "portrait" --scheduler dpmpp-2m --sigma-schedule beta  # Best photorealism combo
-      ZImageCLI -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
-      ZImageCLI -p "refiner pass" --scheduler res_2s --sigma-schedule beta57  # RES 2s + beta57
-      ZImageCLI -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
-      ZImageCLI serve -m ./models/z-image-turbo --port 7862
-      ZImageCLI -p "portrait" --auto-seeds 5 -o portraits.png  # Generate 5 random variations
-      ZImageCLI -p "cat" --seed 42 --seed 99 --seed 123 -o cats.png  # 3 specific seeds
-      ZImageCLI -p "scene" --auto-seeds 10 --resume-batch progress.jsonl  # Resume interrupted batch
-      ZImageCLI upscale -i photo.jpg -w ./models/seedvr2 -r 2048
+      ComfyBox -p "a cute cat" -o cat.png
+      ComfyBox -p "a sunset" -m models/z-image-turbo-q8
+      ComfyBox -p "a forest" -m Tongyi-MAI/Z-Image-Turbo
+      ComfyBox -p "a cut a cat" --lora ostris/z_image_turbo_childrens_drawings
+      ComfyBox -p "portrait" --lora mood.safetensors=0.8 --lora detail.safetensors --lora-scale 0.3
+      ComfyBox -p "cat" --enhance  # Enhanced prompt generation
+      ComfyBox -p "portrait" --scheduler dpmpp-2m --sigma-schedule beta  # Best photorealism combo
+      ComfyBox -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
+      ComfyBox -p "refiner pass" --scheduler res_2s --sigma-schedule beta57  # RES 2s + beta57
+      ComfyBox -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
+      ComfyBox serve -m ./models/z-image-turbo --port 7862
+      ComfyBox -p "portrait" --auto-seeds 5 -o portraits.png  # Generate 5 random variations
+      ComfyBox -p "cat" --seed 42 --seed 99 --seed 123 -o cats.png  # 3 specific seeds
+      ComfyBox -p "scene" --auto-seeds 10 --resume-batch progress.jsonl  # Resume interrupted batch
+      ComfyBox upscale -i photo.jpg -w ./models/seedvr2 -r 2048
     """)
   }
 
@@ -1391,7 +1391,7 @@ struct ZImageCLI {
     print("""
     Quantize model weights.
 
-    Usage: ZImageCLI quantize -i <input> -o <output> [options]
+    Usage: ComfyBox quantize -i <input> -o <output> [options]
       --input, -i          Input model directory (required)
       --output, -o         Output directory (required)
       --bits               Bit width: 4 or 8 (default: 8)
@@ -1400,7 +1400,7 @@ struct ZImageCLI {
       --help, -h           Show help
 
     Example:
-      ZImageCLI quantize -i models/z-image-turbo -o models/z-image-turbo-q8 --verbose
+      ComfyBox quantize -i models/z-image-turbo -o models/z-image-turbo-q8 --verbose
     """)
   }
 
@@ -1518,7 +1518,7 @@ struct ZImageCLI {
     print("""
     Quantize ControlNet weights.
 
-    Usage: ZImageCLI quantize-controlnet -i <input> -o <output> [options]
+    Usage: ComfyBox quantize-controlnet -i <input> -o <output> [options]
       --input, -i          Input ControlNet path or HuggingFace ID (required)
       --output, -o         Output directory (required)
       --file, -f           Specific .safetensors file to quantize (optional)
@@ -1529,11 +1529,11 @@ struct ZImageCLI {
 
     Examples:
       # From HuggingFace
-      ZImageCLI quantize-controlnet -i alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \\
+      ComfyBox quantize-controlnet -i alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \\
         --file Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors -o controlnet-2.1-q8 --verbose
 
       # From local directory
-      ZImageCLI quantize-controlnet -i ./controlnet-union -o ./controlnet-union-q8 --verbose
+      ComfyBox quantize-controlnet -i ./controlnet-union -o ./controlnet-union-q8 --verbose
     """)
   }
 
@@ -1618,7 +1618,7 @@ struct ZImageCLI {
     print("""
     Start warm HTTP server mode.
 
-    Usage: ZImageCLI serve [options]
+    Usage: ComfyBox serve [options]
       --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
       --text-encoder-path       Override text encoder directory
       --port                    HTTP port (default: 7862)
@@ -1640,7 +1640,7 @@ struct ZImageCLI {
       POST /v1/shutdown         Gracefully stop the server
 
     Example:
-      ZImageCLI serve -m /path/to/model --text-encoder-path /path/to/encoder --port 7862 \\
+      ComfyBox serve -m /path/to/model --text-encoder-path /path/to/encoder --port 7862 \\
         --lora /path/to/lora.safetensors=0.8
     """)
   }
@@ -1877,7 +1877,7 @@ struct ZImageCLI {
     print("""
     Generate images with ControlNet conditioning (supports v2.0/v2.1 with inpainting).
 
-    Usage: ZImageCLI control --prompt "text" --controlnet-weights <path> [options]
+    Usage: ComfyBox control --prompt "text" --controlnet-weights <path> [options]
       --prompt, -p              Text prompt (required)
       --negative-prompt, --np   Negative prompt
       --control-image, -c       Control image path - Canny, HED, Depth, Pose, or MLSD
@@ -1920,26 +1920,26 @@ struct ZImageCLI {
 
     Examples:
       # T2I with pose control using v2.1 weights (recommended)
-      ZImageCLI control -p "a woman on a beach" -c pose.jpg \\
+      ComfyBox control -p "a woman on a beach" -c pose.jpg \\
         --cw alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \\
         --cf Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors
 
       # I2I inpainting with pose control
-      ZImageCLI control -p "a dancer" -c pose.jpg -i photo.jpg --mask mask.png \\
+      ComfyBox control -p "a dancer" -c pose.jpg -i photo.jpg --mask mask.png \\
         --cw alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \\
         --cf Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors --cs 0.75 -s 25
 
       # Inpainting without control guidance
-      ZImageCLI control -p "a cat sitting" -i photo.jpg --mask mask.png \\
+      ComfyBox control -p "a cat sitting" -i photo.jpg --mask mask.png \\
         --cw alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \\
         --cf Z-Image-Turbo-Fun-Controlnet-Union-2.1-8steps.safetensors
 
       # Using local controlnet weights
-      ZImageCLI control -p "a forest path" -c depth.jpg --cs 0.7 \\
+      ComfyBox control -p "a forest path" -c depth.jpg --cs 0.7 \\
         --cw ./controlnet-q8 -o forest.png
 
       # Custom encoder with stacked LoRAs
-      ZImageCLI control -p "portrait" -c pose.png --cw ./controlnet-q8 \\
+      ComfyBox control -p "portrait" -c pose.png --cw ./controlnet-q8 \\
         -m /path/to/z-image-turbo-bf16 --text-encoder-path "/path/to/z-image-turbo-bf16/text_encoder QWen Large" \\
         --lora mood.safetensors=0.8 --lora detail.safetensors --lora-scale 0.3
     """)
@@ -2111,7 +2111,7 @@ struct ZImageCLI {
         print("""
         SeedVR2 / ESRGAN Image Upscaler
 
-        Usage: ZImageCLI upscale --input <path> (--weights <path> | --esrgan-weights <path>) [options]
+        Usage: ComfyBox upscale --input <path> (--weights <path> | --esrgan-weights <path>) [options]
 
           --input, -i          Input image path (required)
           --output, -o         Output image path (default: input-upscaled.png)
@@ -2125,10 +2125,10 @@ struct ZImageCLI {
           --help, -h           Show this help
 
         Examples:
-          ZImageCLI upscale -i photo.jpg -w ./models/seedvr2
-          ZImageCLI upscale -i photo.jpg -w ./models/seedvr2 -r 4096 --seed 42
-          ZImageCLI upscale -i photo.jpg --esrgan-weights ./models/4x-ultrasharp --tile-size 512
-          ZImageCLI upscale -i low-res.png -w ./models/seedvr2 --softness 0.3 -o high-res.png
+          ComfyBox upscale -i photo.jpg -w ./models/seedvr2
+          ComfyBox upscale -i photo.jpg -w ./models/seedvr2 -r 4096 --seed 42
+          ComfyBox upscale -i photo.jpg --esrgan-weights ./models/4x-ultrasharp --tile-size 512
+          ComfyBox upscale -i low-res.png -w ./models/seedvr2 --softness 0.3 -o high-res.png
         """)
         return
       default:
@@ -2460,7 +2460,7 @@ struct ZImageCLI {
     print("""
     List known model families with installation status.
 
-    Usage: ZImageCLI models [options]
+    Usage: ComfyBox models [options]
       --paths, -v   Show filesystem paths for installed models
       --help, -h    Show help
 
@@ -2470,8 +2470,8 @@ struct ZImageCLI {
       3. ./models
 
     Example:
-      ZImageCLI models
-      ZImageCLI models --paths
+      ComfyBox models
+      ComfyBox models --paths
     """)
   }
 

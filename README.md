@@ -1,4 +1,4 @@
-# Z-Image.swift (twalderman fork)
+# ComfyBox
 
 Swift port of [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) using [mlx-swift](https://github.com/ml-explore/mlx-swift) for Apple Silicon.
 
@@ -31,23 +31,23 @@ Reviewer handoff for the Barkada fork work lives at [`docs/review-handoff-barkad
 Download and install the latest Barkada release:
 
 ```bash
-curl -LO https://github.com/BarkadaBrew/zimage.swift/releases/download/0.2.3/ZImageCLI-0.2.3-macos-arm64.tar.gz
-tar -xzf ZImageCLI-0.2.3-macos-arm64.tar.gz
-cd ZImageCLI-0.2.3
+curl -LO https://github.com/BarkadaBrew/comfybox/releases/download/0.2.3/ComfyBox-0.2.3-macos-arm64.tar.gz
+tar -xzf ComfyBox-0.2.3-macos-arm64.tar.gz
+cd ComfyBox-0.2.3
 sudo ./install.sh
 ```
 
 This installs:
-- Binary to `/usr/local/lib/zimage/ZImageCLI`
-- Metal library to `/usr/local/lib/zimage/mlx.metallib`
-- Wrapper script to `/usr/local/bin/ZImageCLI`
+- Binary to `/usr/local/lib/comfybox/ComfyBox`
+- Metal library to `/usr/local/lib/comfybox/mlx.metallib`
+- Wrapper script to `/usr/local/bin/ComfyBox`
 
 ### Building from Source
 
 ```bash
-git clone https://github.com/twalderman/zimage.swift.git
-cd zimage.swift
-xcodebuild -scheme ZImageCLI -configuration Release -destination 'platform=macOS' -derivedDataPath .build/xcode
+git clone https://github.com/BarkadaBrew/comfybox.git
+cd comfybox
+xcodebuild -scheme ComfyBox -configuration Release -destination 'platform=macOS' -derivedDataPath .build/xcode
 ```
 
 The CLI binary and required Metal libraries will be in `.build/xcode/Build/Products/Release/`.
@@ -70,13 +70,13 @@ cargo install vtracer
 ## Usage
 
 ```bash
-ZImageCLI -p "A beautiful mountain landscape at sunset" -o output.png
+ComfyBox -p "A beautiful mountain landscape at sunset" -o output.png
 ```
 
 For all available options:
 
 ```bash
-ZImageCLI -h
+ComfyBox -h
 ```
 
 ### Options
@@ -121,7 +121,7 @@ Z-Image-Turbo defaults to guidance `0.0`. Other model families use different rec
 You can load a single `.safetensors` file containing the Transformer, Text Encoder, and VAE (AIO) directly:
 
 ```bash
-ZImageCLI -p "a cozy cabin" -m path/to/z_image_turbo_aio.safetensors
+ComfyBox -p "a cozy cabin" -m path/to/z_image_turbo_aio.safetensors
 ```
 
 If the file is detected as an AIO checkpoint, it will skip loading base model weights and use the components from the file. To force it to be treated as a transformer-only override (overlaying base weights), use `--force-transformer-override-only`.
@@ -130,35 +130,35 @@ If the file is detected as an AIO checkpoint, it will skip loading base model we
 
 ```bash
 # Basic generation
-ZImageCLI -p "a cute cat sitting on a windowsill" -o cat.png
+ComfyBox -p "a cute cat sitting on a windowsill" -o cat.png
 
 # Portrait image with custom size
-ZImageCLI -p "portrait of a woman in renaissance style" -W 768 -H 1152 -o portrait.png
+ComfyBox -p "portrait of a woman in renaissance style" -W 768 -H 1152 -o portrait.png
 
 # Using quantized model for lower memory usage
-ZImageCLI -p "a futuristic city at night" -m mzbac/Z-Image-Turbo-8bit -o city.png
+ComfyBox -p "a futuristic city at night" -m mzbac/Z-Image-Turbo-8bit -o city.png
 
 # With memory limit
-ZImageCLI -p "abstract art" --cache-limit 2048 -o art.png
+ComfyBox -p "abstract art" --cache-limit 2048 -o art.png
 
 # With single LoRA
-ZImageCLI -p "a lion" --lora ostris/z_image_turbo_childrens_drawings -o lion.png
+ComfyBox -p "a lion" --lora ostris/z_image_turbo_childrens_drawings -o lion.png
 
 # With multiple LoRAs (new in this fork)
-ZImageCLI -p "a beautiful portrait" \
+ComfyBox -p "a beautiful portrait" \
   --lora style1.safetensors=0.8 \
   --lora style2.safetensors=0.5 \
   -o portrait.png
 
 # Generate with SVG output (new in this fork)
-ZImageCLI -p "minimalist mountain logo" --svg --svg-preset logo -o logo.png
+ComfyBox -p "minimalist mountain logo" --svg --svg-preset logo -o logo.png
 # Creates: logo.png and logo.svg
 
 # SVG with detailed preset for complex images
-ZImageCLI -p "intricate mandala pattern" --svg --svg-preset detailed -o mandala.png
+ComfyBox -p "intricate mandala pattern" --svg --svg-preset detailed -o mandala.png
 
 # Scripting without progress bars
-ZImageCLI -p "batch image" --no-progress -o batch.png
+ComfyBox -p "batch image" --no-progress -o batch.png
 ```
 
 ## LoRA
@@ -168,7 +168,7 @@ Apply LoRA weights for style customization.
 ### Single LoRA
 
 ```bash
-ZImageCLI -p "a lion" --lora ostris/z_image_turbo_childrens_drawings --lora-scale 1.0 -o lion.png
+ComfyBox -p "a lion" --lora ostris/z_image_turbo_childrens_drawings --lora-scale 1.0 -o lion.png
 ```
 
 ### Multiple LoRAs (New in This Fork)
@@ -176,7 +176,7 @@ ZImageCLI -p "a lion" --lora ostris/z_image_turbo_childrens_drawings --lora-scal
 Combine multiple LoRA styles:
 
 ```bash
-ZImageCLI -p "a fantasy portrait" \
+ComfyBox -p "a fantasy portrait" \
   --lora ~/loras/style.safetensors=0.8 \
   --lora ~/loras/detail.safetensors=0.6 \
   -o combined.png
@@ -220,15 +220,15 @@ cargo install vtracer
 
 ```bash
 # Basic SVG generation
-ZImageCLI -p "geometric pattern" --svg -o pattern.png
+ComfyBox -p "geometric pattern" --svg -o pattern.png
 # Creates: pattern.png and pattern.svg
 
 # Logo preset (best for icons, logos, flat graphics)
-ZImageCLI -p "minimalist coffee cup logo, flat design, white background" \
+ComfyBox -p "minimalist coffee cup logo, flat design, white background" \
   --svg --svg-preset logo -o coffee_logo.png
 
 # Detailed preset (preserves complex details)
-ZImageCLI -p "intricate celtic knot pattern" \
+ComfyBox -p "intricate celtic knot pattern" \
   --svg --svg-preset detailed -o celtic.png
 ```
 
@@ -254,7 +254,7 @@ ZImageCLI -p "intricate celtic knot pattern" \
 Generate images with ControlNet conditioning using Canny, HED, Depth, Pose, or MLSD control images:
 
 ```bash
-ZImageCLI control \
+ComfyBox control \
   --prompt "A hyper-realistic close-up portrait of a leopard" \
   --control-image canny_edges.jpg \
   --controlnet-weights alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1 \
@@ -303,7 +303,7 @@ ZImageCLI control \
 Quantize the model to reduce memory usage:
 
 ```bash
-ZImageCLI quantize -i models/z-image-turbo -o models/z-image-turbo-q8 --bits 8 --group-size 32 --verbose
+ComfyBox quantize -i models/z-image-turbo -o models/z-image-turbo-q8 --bits 8 --group-size 32 --verbose
 ```
 
 ### Performance

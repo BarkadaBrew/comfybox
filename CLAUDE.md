@@ -1,36 +1,38 @@
 # CLAUDE.md
 
+> Repo renamed from zimage.swift to comfybox on 2026-05-08. Package and executable are now "ComfyBox"; the ZImage Swift module name is unchanged.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Z-Image.swift is a Swift port of [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) using mlx-swift for Apple Silicon. It provides a CLI tool and library for text-to-image generation with support for LoRA and ControlNet.
+ComfyBox (formerly Z-Image.swift) is a Swift port of [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) using mlx-swift for Apple Silicon. It provides a CLI tool and library for text-to-image generation with support for LoRA and ControlNet.
 
 ## Build Commands
 
 ```bash
 # Build release CLI binary
-xcodebuild -scheme ZImageCLI -configuration Release -destination 'platform=macOS' -derivedDataPath .build/xcode
+xcodebuild -scheme ComfyBox -configuration Release -destination 'platform=macOS' -derivedDataPath .build/xcode
 
 # Run all tests (use -enableCodeCoverage NO to avoid creating default.profraw)
-xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enableCodeCoverage NO
+xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO
 
 # Run specific test target
-xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
+xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
 
 # Run a single test class
-xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests/FlowMatchSchedulerTests
+xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests/FlowMatchSchedulerTests
 
 # Run a single test method
-xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests/FlowMatchSchedulerTests/testTimestepsDecreasing
+xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests/FlowMatchSchedulerTests/testTimestepsDecreasing
 ```
 
 ## Architecture
 
 ### Core Components
 
-**Application Layer** (`Sources/ZImageCLI`):
-- `ZImageCLI`: Entry point for generation, controlnet, and quantization commands. Handles argument parsing and global GPU settings.
+**Application Layer** (`Sources/ComfyBox`):
+- `ComfyBox`: Entry point for generation, controlnet, and quantization commands. Handles argument parsing and global GPU settings.
 
 **Pipeline Layer** (`Sources/ZImage/Pipeline`):
 - `ZImagePipeline`: Orchestrates Text-to-Image generation. Manages dynamic model loading/unloading (phase-scoped lifetimes), LoRA application, and the denoising loop.
@@ -51,13 +53,13 @@ xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enab
 
 ### Key Data Flow
 
-1. **Enhancement (Optional)**: Text prompt → QwenTextEncoder (LLM Mode) → Enhanced Prompt.
-2. **Encoding**: Enhanced Prompt → QwenTokenizer → QwenTextEncoder → Text Embeddings.
+1. **Enhancement (Optional)**: Text prompt -> QwenTextEncoder (LLM Mode) -> Enhanced Prompt.
+2. **Encoding**: Enhanced Prompt -> QwenTokenizer -> QwenTextEncoder -> Text Embeddings.
 3. **Initialization**: Random Gaussian Latents generated.
 4. **Denoising Loop**:
-   - Latents + Timestep + Text Embeddings → `ZImageTransformer2D` (Refiners → Joint Blocks) → Noise Prediction.
+   - Latents + Timestep + Text Embeddings -> `ZImageTransformer2D` (Refiners -> Joint Blocks) -> Noise Prediction.
    - `FlowMatchEulerScheduler` updates latents based on prediction.
-5. **Decoding**: Refined Latents → `AutoencoderKL` (Decoder) → RGB Image.
+5. **Decoding**: Refined Latents -> `AutoencoderKL` (Decoder) -> RGB Image.
 
 ### Test Structure
 
