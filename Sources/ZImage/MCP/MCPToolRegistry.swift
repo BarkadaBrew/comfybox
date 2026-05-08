@@ -25,6 +25,9 @@ public enum MCPToolRegistry {
     loraLibrary,
     loraScan,
     loraQuarantine,
+    loadModel,
+    switchModel,
+    modelPool,
   ]
 
   // MARK: - Tool Definitions
@@ -271,6 +274,58 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["id", "quarantine"] as [String],
+    ] as [String: Any]
+  )
+
+
+  static let loadModel = MCPToolDefinition(
+    name: "load_model",
+    description: "Load a model into the pool. Optionally activate it and wait for completion. Supports all model families: Z-Image, Klein, FIBO, Chroma, SeedVR2.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "model": [
+          "type": "string",
+          "description": "Model spec to load (e.g. \"z-image-turbo-bf16\", \"klein-9b-q8\", \"briaai/FIBO\", \"chroma-8.9b\").",
+        ] as [String: Any],
+        "quantization": [
+          "type": "string",
+          "description": "Quantization level (e.g. \"4bit\", \"8bit\"). Omit for default (typically bf16).",
+        ] as [String: Any],
+        "activate": [
+          "type": "boolean",
+          "description": "Activate the model after loading. Default: true.",
+        ] as [String: Any],
+        "wait": [
+          "type": "boolean",
+          "description": "Wait for load to complete before returning. Default: true. Set false for background loading.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["model"] as [String],
+    ] as [String: Any]
+  )
+
+  static let switchModel = MCPToolDefinition(
+    name: "switch_model",
+    description: "Switch the active model to one already loaded in the pool. Instant — no loading required.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "model": [
+          "type": "string",
+          "description": "Pool model ID to activate (from model_pool results).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["model"] as [String],
+    ] as [String: Any]
+  )
+
+  static let modelPool = MCPToolDefinition(
+    name: "model_pool",
+    description: "List all models currently loaded in the pool with VRAM usage, active status, and last-used timestamps.",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
     ] as [String: Any]
   )
 
