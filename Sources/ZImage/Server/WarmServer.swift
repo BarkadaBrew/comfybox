@@ -167,6 +167,15 @@ public final class WarmServer {
       },
       upscaleHandler: upscaleHandler
     )
+
+    // Wire queue status provider and clear handler for ComfyUI /queue endpoint.
+    self.comfyBridge.queueStatusProvider = { [unowned self] in
+      await self.coordinator.queueStatus()
+    }
+    self.comfyBridge.queueClearHandler = { [unowned self] in
+      let cleared = await self.coordinator.clearPending()
+      self.logger.info("ComfyBridge: cleared \(cleared) pending job(s) from queue")
+    }
   }
 
   public func run() throws {
@@ -1136,6 +1145,39 @@ private actor WarmServerCoordinator {
       lastRenderDurationMs: lastRenderDurationMs,
       lastError: lastError
     )
+  }
+
+  /// Queue status for the ComfyUI bridge /queue endpoint.
+  func queueStatus() -> ComfyBridgeQueueStatus {
+    return ComfyBridgeQueueStatus(
+      pendingCount: pending.count,
+      maxPending: configuration.maxPendingRequests,
+      isRendering: activeRenderStartedAt != nil,
+      currentJobId: nil,
+      progressPercent: nil,
+      renderCount: successfulRenderCount,
+      failedCount: failedRenderCount
+    )
+  }
+
+  /// Clear all pending jobs from the queue. Active job continues.
+  func clearPending() -> Int {
+    let count = pending.count
+    // Cancel all pending continuations with an error.
+    for op in pending {
+      switch op {
+      case .generate(_, let cont, _):
+        cont.resume(throwing: ServerError.shuttingDown)
+      case .controlGenerate(_, let cont):
+        cont.resume(throwing: ServerError.shuttingDown)
+      case .swap(_, let cont):
+        cont.resume(throwing: ServerError.shuttingDown)
+      case .shutdown(let cont):
+        cont.resume(throwing: ServerError.shuttingDown)
+      }
+    }
+    pending.removeAll()
+    return count
   }
 
   private func startProcessingIfNeeded() {

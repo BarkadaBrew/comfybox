@@ -444,6 +444,55 @@ enum ComfyBridgeObjectInfo {
       outputs: []
     )
 
+    // --- ComfyBox style preset node ---
+    // Exposes style presets as a custom node that Krita can discover via /object_info.
+    // When the plugin sees this node, it knows style presets are available.
+    // The dropdown lists all preset IDs; selecting one applies prompt engineering +
+    // tuned generation parameters from ComfyBridgeStylePresets.
+    let presetNames = ComfyBoxStylePresets.allPresets.map { $0.id }
+    info["ComfyBoxStylePreset"] = nodeDefinition(
+      required: [
+        "preset_name": optionInput(presetNames),
+        "model": modelInput(),
+        "clip": clipInput(),
+      ],
+      optional: [
+        "override_steps": intInput(default: 0),
+        "override_guidance": floatInput(default: 0.0),
+      ],
+      outputs: ["MODEL", "CLIP", "STYLE_CONFIG"]
+    )
+
+    // Also expose the full preset metadata via a companion info node
+    // that Krita can query to display descriptions and categories.
+    var presetMetadata: [String: Any] = [:]
+    for preset in ComfyBoxStylePresets.allPresets {
+      var meta: [String: Any] = [
+        "name": preset.name,
+        "category": preset.category.rawValue,
+        "description": preset.description,
+        "prompt_prefix": preset.promptPrefix,
+        "prompt_suffix": preset.promptSuffix,
+        "negative_prompt": preset.negativePrompt,
+        "recommended_model": preset.recommendedModel,
+      ]
+      if let s = preset.steps { meta["steps"] = s }
+      if let g = preset.guidance { meta["guidance"] = g }
+      if let w = preset.width { meta["width"] = w }
+      if let h = preset.height { meta["height"] = h }
+      if let str = preset.img2imgStrength { meta["img2img_strength"] = str }
+      presetMetadata[preset.id] = meta
+    }
+    info["ComfyBoxStylePresetInfo"] = [
+      "input": [
+        "required": [
+          "preset_name": optionInput(presetNames),
+        ] as [String: Any],
+      ] as [String: Any],
+      "output_name": ["STYLE_INFO"],
+      "preset_metadata": presetMetadata,
+    ] as [String: Any]
+
     return info
   }
 

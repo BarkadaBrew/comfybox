@@ -290,6 +290,40 @@ enum ComfyBridgeWorkflowParser {
       loras.append((name: loraName, scale: strengthModel))
     }
 
+    // --- Style preset application ---
+    // If the workflow contains a ComfyBoxStylePreset node, apply its prompt engineering
+    // and parameter overrides. The preset modifies the prompt and may override steps/guidance.
+    var finalPrompt = prompt
+    var finalNegativePrompt = negativePrompt
+    var finalSteps = steps
+    var finalGuidance = cfg
+    var finalWidth = width
+    var finalHeight = height
+
+    if let presetNode = nodes.values.first(where: { $0.classType == "ComfyBoxStylePreset" }),
+       let presetName = presetNode.inputs["preset_name"] as? String,
+       let preset = ComfyBoxStylePresets.presets[presetName] {
+      let (enhancedPrompt, enhancedNegative) = preset.apply(prompt: prompt, negativePrompt: negativePrompt)
+      finalPrompt = enhancedPrompt
+      finalNegativePrompt = enhancedNegative
+      // Apply parameter overrides from preset (unless user explicitly overrode in the node).
+      let overrideSteps = intValue(presetNode.inputs["override_steps"]) ?? 0
+      let overrideGuidance = floatValue(presetNode.inputs["override_guidance"]) ?? 0.0
+      if overrideSteps > 0 {
+        finalSteps = overrideSteps
+      } else if let presetSteps = preset.steps {
+        finalSteps = presetSteps
+      }
+      if overrideGuidance > 0.0 {
+        finalGuidance = overrideGuidance
+      } else if let presetGuidance = preset.guidance {
+        finalGuidance = presetGuidance
+      }
+      if let presetWidth = preset.width { finalWidth = presetWidth }
+      if let presetHeight = preset.height { finalHeight = presetHeight }
+      print("[ComfyBridge] applied style preset: \(presetName)")
+    }
+
     // --- Phase 4: ControlNet extraction ---
     // Krita sends ZImageFunControlnet nodes for Z-Image native controlnet workflows,
     // or ControlNetLoader nodes for standard ComfyUI controlnet workflows.
@@ -344,12 +378,12 @@ enum ComfyBridgeWorkflowParser {
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
       clientId: clientId,
-      prompt: prompt,
-      negativePrompt: negativePrompt,
-      width: width,
-      height: height,
-      steps: steps,
-      guidance: cfg,
+      prompt: finalPrompt,
+      negativePrompt: finalNegativePrompt,
+      width: finalWidth,
+      height: finalHeight,
+      steps: finalSteps,
+      guidance: finalGuidance,
       seed: seed,
       batchSize: max(batchSize, 1),
       outputNodeId: outputNodeId,
