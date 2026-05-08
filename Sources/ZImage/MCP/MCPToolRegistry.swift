@@ -22,6 +22,9 @@ public enum MCPToolRegistry {
     shutdownServer,
     systemStats,
     applyStyle,
+    loraLibrary,
+    loraScan,
+    loraQuarantine,
   ]
 
   // MARK: - Tool Definitions
@@ -212,6 +215,62 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["style_id", "prompt"] as [String],
+    ] as [String: Any]
+  )
+
+
+  static let loraLibrary = MCPToolDefinition(
+    name: "lora_library",
+    description: "List all LoRAs in the library with compatibility info. Filter by model family.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "model": [
+          "type": "string",
+          "description": "Filter by model family (e.g. \"z-image\", \"klein-9b\").",
+        ] as [String: Any],
+        "include_quarantined": [
+          "type": "boolean",
+          "description": "Include quarantined LoRAs in results. Default: false.",
+        ] as [String: Any],
+      ] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let loraScan = MCPToolDefinition(
+    name: "lora_scan",
+    description: "Scan the LoRA directory for new or changed files and update the library index.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "force": [
+          "type": "boolean",
+          "description": "Force full rescan of all LoRA files. Default: false.",
+        ] as [String: Any],
+      ] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let loraQuarantine = MCPToolDefinition(
+    name: "lora_quarantine",
+    description: "Quarantine or un-quarantine a LoRA. Quarantined LoRAs are hidden from model loading.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": [
+          "type": "string",
+          "description": "LoRA identifier from the library.",
+        ] as [String: Any],
+        "quarantine": [
+          "type": "boolean",
+          "description": "True to quarantine, false to un-quarantine.",
+        ] as [String: Any],
+        "reason": [
+          "type": "string",
+          "description": "Reason for quarantine action.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "quarantine"] as [String],
     ] as [String: Any]
   )
 

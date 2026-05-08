@@ -54,6 +54,19 @@ public final class WarmServerClient: @unchecked Sendable {
     return (response.statusCode, data)
   }
 
+  /// Perform a DELETE request. Returns (HTTP status code, response body).
+  public func delete(_ path: String) async throws -> (Int, Data) {
+    guard let url = URL(string: baseURL + path) else {
+      throw WarmServerClientError.invalidURL(path)
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "DELETE"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+    let (data, response) = try await perform(request)
+    return (response.statusCode, data)
+  }
+
   // MARK: - Private
 
   private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {

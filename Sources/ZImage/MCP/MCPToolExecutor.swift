@@ -40,6 +40,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeGet("/system_stats")
       case "apply_style":
         return executeApplyStyle(arguments)
+      case "lora_library":
+        return try await executeLoraLibrary(arguments)
+      case "lora_scan":
+        return try await executeLoraScan(arguments)
+      case "lora_quarantine":
+        return try await executeLoraQuarantine(arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -213,6 +219,62 @@ public final class MCPToolExecutor: @unchecked Sendable {
       return MCPToolResult(error: "Error: Failed to serialize style result")
     }
     return MCPToolResult(text: text)
+  }
+
+
+  /// lora_library -> GET /v1/loras (with optional query params)
+  private func executeLoraLibrary(_ params: MCPParams?) async throws -> MCPToolResult {
+    var path = "/v1/loras"
+    var queryItems: [String] = []
+
+    if let model = params?.string("model") {
+      queryItems.append("model=\(model)")
+    }
+    if params?.bool("include_quarantined") == true {
+      queryItems.append("include_quarantined=true")
+    }
+    if !queryItems.isEmpty {
+      path += "?" + queryItems.joined(separator: "&")
+    }
+
+    let (status, data) = try await client.get(path)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// lora_scan -> POST /v1/loras/scan
+  private func executeLoraScan(_ params: MCPParams?) async throws -> MCPToolResult {
+    var body: [String: Any] = [:]
+    if params?.bool("force") == true {
+      body["force"] = true
+    }
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/loras/scan", body: jsonData)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// lora_quarantine -> POST /v1/loras/{id}/quarantine or DELETE /v1/loras/{id}/quarantine
+  private func executeLoraQuarantine(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard let quarantine = params?.bool("quarantine") else {
+      return MCPToolResult(error: "Error: 'quarantine' (boolean) is required")
+    }
+
+    let path = "/v1/loras/\(id)/quarantine"
+
+    if quarantine {
+      var body: [String: Any] = [:]
+      if let reason = params?.string("reason") {
+        body["reason"] = reason
+      }
+      let jsonData = try JSONSerialization.data(withJSONObject: body)
+      let (status, data) = try await client.post(path, body: jsonData)
+      return mapHTTPResponse(status: status, data: data)
+    } else {
+      let (status, data) = try await client.delete(path)
+      return mapHTTPResponse(status: status, data: data)
+    }
   }
 
   // MARK: - Helpers
