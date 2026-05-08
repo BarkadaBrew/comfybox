@@ -111,6 +111,8 @@ private extension URL {
 }
 
 public final class WarmServer {
+  private static let pngSignature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
+
   private let configuration: WarmServerConfiguration
   private let host: String
   private let logger: Logger
@@ -325,7 +327,7 @@ public final class WarmServer {
   /// Called by ComfyBridgeExecutor via the closure set in init.
   /// Read PNG dimensions from IHDR chunk (bytes 16-23 of a valid PNG).
   private func pngDimensions(from data: Data) -> (width: Int, height: Int)? {
-    guard data.count >= 24 else { return nil }
+    guard data.count >= 24, data.prefix(Self.pngSignature.count).elementsEqual(Self.pngSignature) else { return nil }
     let w = Int(data[16]) << 24 | Int(data[17]) << 16 | Int(data[18]) << 8 | Int(data[19])
     let h = Int(data[20]) << 24 | Int(data[21]) << 16 | Int(data[22]) << 8 | Int(data[23])
     return (w, h)
