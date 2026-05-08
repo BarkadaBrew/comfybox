@@ -283,7 +283,7 @@ enum ComfyBridgeObjectInfo {
     )
     info["KSamplerSelect"] = nodeDefinition(
       required: [
-        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc"]),
+        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
       ],
       outputs: ["SAMPLER"]
     )
@@ -377,6 +377,32 @@ enum ComfyBridgeObjectInfo {
         "unet_name": optionInput([]),
       ],
       outputs: ["MODEL"]
+    )
+
+
+    // --- Nodes referenced by ComfyBridge parser ---
+    info["ImageCrop"] = nodeDefinition(
+      required: [
+        "image": imageInput(),
+        "width": intInput(default: 512),
+        "height": intInput(default: 512),
+        "x": intInput(default: 0),
+        "y": intInput(default: 0),
+      ],
+      outputs: ["IMAGE"]
+    )
+    info["SplitSigmas"] = nodeDefinition(
+      required: [
+        "sigmas": sigmasInput(),
+        "step": intInput(default: 0),
+      ],
+      outputs: ["SIGMAS", "SIGMAS"]
+    )
+    info["PreviewImage"] = nodeDefinition(
+      required: [
+        "images": imageInput(),
+      ],
+      outputs: []
     )
 
     return info
