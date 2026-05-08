@@ -211,6 +211,9 @@ struct ZImageCLI {
       case "upscale":
         try runUpscale(args: Array(args.dropFirst()))
         return
+      case "lora":
+        try runLoRA(args: Array(args.dropFirst()))
+        return
       case "models":
         runModels(args: Array(args.dropFirst()))
         return
@@ -2472,6 +2475,421 @@ struct ZImageCLI {
     Example:
       ComfyBox models
       ComfyBox models --paths
+    """)
+  }
+
+
+  // MARK: - LoRA Library Subcommand
+
+  private static func runLoRA(args: [String]) throws {
+    guard let subcommand = args.first else {
+      printLoRAUsage()
+      return
+    }
+
+    let subArgs = Array(args.dropFirst())
+
+    switch subcommand {
+    case "list":
+      try runLoRAList(args: subArgs)
+    case "info":
+      try runLoRAInfo(args: subArgs)
+    case "scan":
+      try runLoRAScan(args: subArgs)
+    case "check":
+      try runLoRACheck(args: subArgs)
+    case "quarantine":
+      try runLoRAQuarantine(args: subArgs)
+    case "search":
+      try runLoRASearch(args: subArgs)
+    case "--help", "-h":
+      printLoRAUsage()
+    default:
+      fputs("Unknown lora subcommand: \(subcommand)\n", stderr)
+      printLoRAUsage()
+      _exit(1)
+    }
+
+    fflush(stdout)
+    _exit(0)
+  }
+
+  // MARK: - LoRA List
+
+  private static func runLoRAList(args: [String]) throws {
+    var modelFilter: String?
+    var tagFilter: String?
+    var showQuarantined = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model", "-m":
+        modelFilter = nextValue(for: arg, iterator: &iterator)
+      case "--tag", "-t":
+        tagFilter = nextValue(for: arg, iterator: &iterator)
+      case "--quarantined", "-q":
+        showQuarantined = true
+      case "--help", "-h":
+        print("""
+        List LoRAs in the library.
+
+        Usage: ZImageCLI lora list [options]
+          --model, -m <family>   Filter by model compatibility (e.g. z-image, klein-9b)
+          --tag, -t <tag>        Filter by tag
+          --quarantined, -q      Include quarantined entries
+          --help, -h             Show help
+        """)
+        return
+      default:
+        fputs("Unknown argument: \(arg)\n", stderr)
+      }
+    }
+
+    let library = try LoRALibrary()
+    let entries: [LoRALibraryEntry]
+
+    if let modelFilter {
+      if let family = LoRACompatibility.familyMapping(modelFilter) {
+        entries = library.compatible(with: family)
+      } else {
+        entries = library.list(compatibility: modelFilter, includeQuarantined: showQuarantined)
+      }
+    } else if let tagFilter {
+      entries = library.list(tags: [tagFilter], includeQuarantined: showQuarantined)
+    } else {
+      entries = library.list(includeQuarantined: showQuarantined)
+    }
+
+    if entries.isEmpty {
+      print("No LoRAs found. Run 'zimage lora scan' to build the library index.")
+      return
+    }
+
+    // Table header
+    print("")
+    let header = padRight("ID", 32) + " " +
+                 padRight("Model", 12) + " " +
+                 padRight("Format", 8) + " " +
+                 padLeft("Size", 10) + " " +
+                 padLeft("Scale", 6) + "  " +
+                 "Tags"
+    print(header)
+    print(String(repeating: "-", count: 90))
+
+    var activeCount = 0
+    var quarantinedCount = 0
+
+    for entry in entries {
+      let qMark = entry.quarantined ? " [Q]" : ""
+      if entry.quarantined { quarantinedCount += 1 } else { activeCount += 1 }
+
+      let tagsStr = entry.tags.joined(separator: ", ") + qMark
+      let row = padRight(entry.id, 32) + " " +
+                padRight(entry.primaryCompatibility, 12) + " " +
+                padRight(entry.format.rawValue, 8) + " " +
+                padLeft(entry.sizeFormatted, 10) + " " +
+                padLeft(String(format: "%.1f", entry.recommendedScale), 6) + "  " +
+                tagsStr
+      print(row)
+    }
+
+    print(String(repeating: "-", count: 90))
+    if showQuarantined {
+      print("\(entries.count) LoRAs (\(activeCount) active, \(quarantinedCount) quarantined)")
+    } else {
+      print("\(entries.count) active LoRAs")
+    }
+    print("")
+  }
+
+  // MARK: - LoRA Info
+
+  private static func runLoRAInfo(args: [String]) throws {
+    guard let identifier = args.first else {
+      fputs("Usage: ZImageCLI lora info <id>\n", stderr)
+      _exit(1)
+      return
+    }
+
+    let library = try LoRALibrary()
+    guard let entry = library.entry(for: identifier) else {
+      fputs("LoRA not found: \(identifier)\n", stderr)
+      fputs("Run 'zimage lora list --quarantined' to see all entries.\n", stderr)
+      _exit(1)
+      return
+    }
+
+    print("")
+    print("ID:                  \(entry.id)")
+    print("Filename:            \(entry.filename)")
+    print("Path:                \(entry.relativePath)")
+    print("Size:                \(entry.sizeFormatted) (\(entry.sizeBytes) bytes)")
+    if let hash = entry.sha256 {
+      print("SHA-256:             \(hash)")
+    }
+    print("Model Compatibility: \(entry.modelCompatibility.joined(separator: ", "))")
+    print("Format:              \(entry.format.rawValue)")
+    print("Rank:                \(entry.rank)")
+    if let alpha = entry.alpha {
+      print("Alpha:               \(alpha)")
+    }
+    print("Key Count:           \(entry.keyCount)")
+    print("Layer Targets:       \(entry.layerTargets.joined(separator: ", "))")
+    print("Trigger Words:       \(entry.triggerwords.isEmpty ? "(none)" : entry.triggerwords.joined(separator: ", "))")
+    print("Recommended Scale:   \(entry.recommendedScale)")
+    print("Scale Range:         [\(entry.scaleRange.map { String(format: "%.1f", $0) }.joined(separator: ", "))]")
+    print("Tags:                \(entry.tags.isEmpty ? "(none)" : entry.tags.joined(separator: ", "))")
+    print("Category:            \(entry.category)")
+    if !entry.notes.isEmpty {
+      print("Notes:               \(entry.notes)")
+    }
+    if let url = entry.sourceURL {
+      print("Source URL:           \(url)")
+    }
+    if let civitaiId = entry.civitaiModelId {
+      print("CivitAI Model ID:    \(civitaiId)")
+    }
+    print("Date Added:          \(entry.dateAdded)")
+    print("Quarantined:         \(entry.quarantined)")
+    if let reason = entry.quarantineReason {
+      print("Quarantine Reason:   \(reason)")
+    }
+
+    if let metadata = entry.safetensorsMetadata, !metadata.isEmpty {
+      print("")
+      print("Safetensors Metadata:")
+      for (key, value) in metadata.sorted(by: { $0.key < $1.key }) {
+        let displayValue = value.count > 80 ? String(value.prefix(77)) + "..." : value
+        print("  \(key): \(displayValue)")
+      }
+    }
+    print("")
+  }
+
+  // MARK: - LoRA Scan
+
+  private static func runLoRAScan(args: [String]) throws {
+    var force = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--force", "-f":
+        force = true
+      case "--help", "-h":
+        print("""
+        Scan filesystem and rebuild/update the library index.
+
+        Usage: ZImageCLI lora scan [options]
+          --force, -f   Re-analyze all files even if unchanged
+          --help, -h    Show help
+        """)
+        return
+      default:
+        fputs("Unknown argument: \(arg)\n", stderr)
+      }
+    }
+
+    let library = try LoRALibrary()
+    let result = try library.scan(force: force)
+
+    print("")
+    print("Scan Results:")
+    print("  Added:     \(result.added)")
+    print("  Updated:   \(result.updated)")
+    print("  Removed:   \(result.removed)")
+    print("  Unchanged: \(result.unchanged)")
+    print("  Total:     \(result.total)")
+
+    if !result.errors.isEmpty {
+      print("")
+      print("Errors:")
+      for (file, error) in result.errors {
+        print("  \(file): \(error)")
+      }
+    }
+    print("")
+  }
+
+  // MARK: - LoRA Check
+
+  private static func runLoRACheck(args: [String]) throws {
+    var identifier: String?
+    var modelFamilyStr: String?
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model", "-m":
+        modelFamilyStr = nextValue(for: arg, iterator: &iterator)
+      case "--help", "-h":
+        print("""
+        Check LoRA compatibility with a model family.
+
+        Usage: ZImageCLI lora check <id> --model <family>
+          --model, -m <family>   Target model family (z-image, klein-9b, chroma)
+          --help, -h             Show help
+        """)
+        return
+      default:
+        if identifier == nil && !arg.hasPrefix("-") {
+          identifier = arg
+        } else {
+          fputs("Unknown argument: \(arg)\n", stderr)
+        }
+      }
+    }
+
+    guard let identifier else {
+      fputs("Usage: ZImageCLI lora check <id> --model <family>\n", stderr)
+      _exit(1)
+      return
+    }
+
+    guard let familyStr = modelFamilyStr,
+          let family = LoRACompatibility.familyMapping(familyStr) else {
+      fputs("Error: --model is required. Valid: z-image, klein-9b, klein-4b, chroma\n", stderr)
+      _exit(1)
+      return
+    }
+
+    let library = try LoRALibrary()
+    guard let entry = library.entry(for: identifier) else {
+      fputs("LoRA not found: \(identifier)\n", stderr)
+      _exit(1)
+      return
+    }
+
+    // Perform live file check
+    let fileURL = try library.resolve(identifier)
+    let result = try LoRACompatibility.checkFile(fileURL, modelFamily: family)
+
+    print("")
+    print("Compatibility Check: \(entry.id) vs \(family.displayName)")
+    print(String(repeating: "-", count: 50))
+    print("Compatible:    \(result.isCompatible ? "YES" : "NO")")
+    print("Matched Keys:  \(result.matchedKeys)/\(result.totalKeys)")
+    print("Match Ratio:   \(String(format: "%.1f%%", result.matchRatio * 100))")
+
+    if !result.warnings.isEmpty {
+      print("")
+      print("Warnings:")
+      for warning in result.warnings {
+        print("  - \(warning)")
+      }
+    }
+    print("")
+  }
+
+  // MARK: - LoRA Quarantine
+
+  private static func runLoRAQuarantine(args: [String]) throws {
+    var identifier: String?
+    var reason: String?
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--reason", "-r":
+        reason = nextValue(for: arg, iterator: &iterator)
+      case "--help", "-h":
+        print("""
+        Quarantine a LoRA (mark as incompatible).
+
+        Usage: ZImageCLI lora quarantine <id> --reason <text>
+          --reason, -r <text>   Reason for quarantine
+          --help, -h            Show help
+        """)
+        return
+      default:
+        if identifier == nil && !arg.hasPrefix("-") {
+          identifier = arg
+        } else {
+          fputs("Unknown argument: \(arg)\n", stderr)
+        }
+      }
+    }
+
+    guard let identifier else {
+      fputs("Usage: ZImageCLI lora quarantine <id> --reason <text>\n", stderr)
+      _exit(1)
+      return
+    }
+
+    let reasonText = reason ?? "Manually quarantined"
+    let library = try LoRALibrary()
+    try library.quarantine(identifier, reason: reasonText)
+    print("Quarantined: \(identifier) - \(reasonText)")
+  }
+
+  // MARK: - LoRA Search
+
+  private static func runLoRASearch(args: [String]) throws {
+    let query = args.joined(separator: " ")
+    guard !query.isEmpty else {
+      fputs("Usage: ZImageCLI lora search <query>\n", stderr)
+      _exit(1)
+      return
+    }
+
+    let library = try LoRALibrary()
+    let results = library.search(query)
+
+    if results.isEmpty {
+      print("No results for: \(query)")
+      return
+    }
+
+    print("")
+    print("\(results.count) result(s) for \"\(query)\":")
+    print("")
+    let header = padRight("ID", 32) + " " +
+                 padRight("Model", 12) + " " +
+                 padRight("Format", 8) + " " +
+                 padLeft("Size", 10)
+    print(header)
+    print(String(repeating: "-", count: 65))
+
+    for entry in results {
+      let qMark = entry.quarantined ? " [Q]" : ""
+      let row = padRight(entry.id + qMark, 32) + " " +
+                padRight(entry.primaryCompatibility, 12) + " " +
+                padRight(entry.format.rawValue, 8) + " " +
+                padLeft(entry.sizeFormatted, 10)
+      print(row)
+    }
+    print("")
+  }
+
+  // MARK: - LoRA Usage
+
+  private static func printLoRAUsage() {
+    print("""
+
+    Manage the LoRA library.
+
+    Usage: ZImageCLI lora <subcommand> [options]
+
+    SUBCOMMANDS:
+      list          List available LoRAs
+      info          Show detailed info for a LoRA
+      scan          Scan filesystem and rebuild library index
+      check         Check LoRA compatibility with a model
+      quarantine    Quarantine an incompatible LoRA
+      search        Search LoRAs by text
+
+    EXAMPLES:
+      zimage lora list                                  List all active LoRAs
+      zimage lora list --model z-image                  Filter by model compatibility
+      zimage lora list --tag nsfw --quarantined          Filter by tag, include quarantined
+      zimage lora info zit-fdpo-v1                       Detailed metadata
+      zimage lora scan                                   Build/rebuild library index
+      zimage lora scan --force                           Re-analyze all files
+      zimage lora check KLEIN-Unchained-V2 --model z-image   Compatibility test
+      zimage lora quarantine bad-lora --reason "Wrong arch"   Mark incompatible
+      zimage lora search distill                         Text search
+
     """)
   }
 
