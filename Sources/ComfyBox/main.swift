@@ -217,6 +217,9 @@ struct ZImageCLI {
       case "models":
         runModels(args: Array(args.dropFirst()))
         return
+      case "mcp":
+        try runMCP(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -1297,6 +1300,12 @@ struct ZImageCLI {
 
       models                 List known model families with installation status
         --paths, -v          Show filesystem paths for installed models
+
+
+      mcp                    Start MCP server (stdio JSON-RPC bridge to WarmServer)
+        --port               WarmServer port (default: 7862)
+        --host               WarmServer host (default: 127.0.0.1)
+        Use 'ComfyBox mcp --help' for full options
 
     Examples:
       ComfyBox -p "a cute cat" -o cat.png
@@ -2475,6 +2484,73 @@ struct ZImageCLI {
     Example:
       ComfyBox models
       ComfyBox models --paths
+    """)
+  }
+
+
+
+  // MARK: - MCP Server Subcommand
+
+  private static func runMCP(args: [String]) throws {
+    var port: UInt16 = 7862
+    var host = "127.0.0.1"
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--port":
+        let rawPort = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: Int(port))
+        guard rawPort <= Int(UInt16.max) else {
+          logger.error("Invalid port: \(rawPort)")
+          return
+        }
+        port = UInt16(rawPort)
+      case "--host":
+        host = nextValue(for: arg, iterator: &iterator)
+      case "--help", "-h":
+        printMCPUsage()
+        return
+      default:
+        logger.warning("Unknown mcp argument: \(arg)")
+      }
+    }
+
+    // Print server info to stderr (stdout is reserved for JSON-RPC)
+    fputs("ComfyBox MCP server v\(MCPServer.version)\n", stderr)
+    fputs("Bridging to WarmServer at \(host):\(port)\n", stderr)
+
+    let server = MCPServer(host: host, port: port)
+    server.run()
+  }
+
+  private static func printMCPUsage() {
+    print("""
+    Start MCP (Model Context Protocol) server mode.
+    Bridges stdio JSON-RPC 2.0 to WarmServer HTTP API.
+
+    Usage: ComfyBox mcp [options]
+      --port                    WarmServer port to connect to (default: 7862)
+      --host                    WarmServer host to connect to (default: 127.0.0.1)
+      --help, -h                Show help
+
+    The MCP server reads JSON-RPC requests from stdin and writes responses
+    to stdout. All logging goes to stderr. Runs until stdin closes.
+
+    Registration:
+      claude mcp add comfybox -- comfybox mcp --port 7862
+
+    Tools:
+      generate_image    Text-to-image / img2img generation
+      swap_loras        Hot-swap active LoRA weights
+      list_models       List supported model families
+      list_styles       List style presets
+      server_health     Server health and loaded model info
+      queue_status      Generation queue status
+      clear_queue       Cancel pending generation jobs
+      list_loras        List available LoRA files
+      shutdown_server   Graceful server shutdown
+      system_stats      Hardware and system info
+      apply_style       Apply style preset to prompt
     """)
   }
 
