@@ -51,6 +51,8 @@ struct ZImageCLI {
     var guidance = ZImageModelMetadata.recommendedGuidanceScale
     var seeds: [UInt64] = []
     var outputPath = "z-image.png"
+    var levelsMin: Float = 0.0
+    var levelsMax: Float = 1.0
     var model: String?
     var textEncoderPath: String?
     var cacheLimit: Int?
@@ -103,11 +105,15 @@ struct ZImageCLI {
       case "--guidance", "-g":
         guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
       case "--seed":
-        if let s = UInt64(nextValue(for: arg, iterator: &iterator)) {
+        if let s = uint64Value(for: arg, iterator: &iterator) {
           seeds.append(s)
         }
       case "--output", "-o":
         outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--levels-min":
+        levelsMin = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
+      case "--levels-max":
+        levelsMax = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
       case "--model", "-m":
         model = nextValue(for: arg, iterator: &iterator)
       case "--text-encoder-path":
@@ -125,7 +131,7 @@ struct ZImageCLI {
       case "--lora-paths":
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
-        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+        loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--enhance", "-e":
         enhancePrompt = true
       case "--enhance-max-tokens":
@@ -138,14 +144,14 @@ struct ZImageCLI {
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SchedulerKind(rawValue: raw) else {
           let valid = SchedulerKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown scheduler '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown scheduler '\(raw)'. Valid: \(valid)")
         }
         schedulerKind = kind
       case "--sigma-schedule":
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SigmaScheduleKind(rawValue: raw) else {
           let valid = SigmaScheduleKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
         }
         sigmaSchedule = kind
       case "--eta":
@@ -157,7 +163,7 @@ struct ZImageCLI {
         case "yarn": dyPEMethod = .yarn
         case "none", "off": dyPEMethod = .none
         default:
-          fatalError("Unknown DyPE method '\(raw)'. Valid: ntk, yarn, none")
+          failArgumentParsing("Unknown DyPE method '\(raw)'. Valid: ntk, yarn, none")
         }
       case "--no-dype":
         dyPEDisabled = true
@@ -380,6 +386,7 @@ struct ZImageCLI {
       let pipeline = ZImagePipeline(logger: logger)
       nonisolated(unsafe) let batchSemaphore = DispatchSemaphore(value: 0)
       let resultBox = Box<BatchResult?>(nil)
+      var capturedError: (any Error)? = nil
 
       Task {
         do {
@@ -397,6 +404,8 @@ struct ZImageCLI {
               guidanceScale: guidance,
               seed: batchSeed,
               outputPath: URL(fileURLWithPath: batchOutputPath),
+              levelsMin: levelsMin,
+              levelsMax: levelsMax,
               model: capturedModel,
               textEncoderPath: capturedTextEncoderPath,
               maxSequenceLength: maxSequenceLength,
@@ -456,10 +465,15 @@ struct ZImageCLI {
           resultBox.value = result
         } catch {
           logger.error("Batch failed: \(error)")
+          capturedError = error
         }
         batchSemaphore.signal()
       }
       batchSemaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
 
       // Print batch summary
       if let result = resultBox.value {
@@ -495,6 +509,8 @@ struct ZImageCLI {
         guidanceScale: guidance,
         seed: seed,
         outputPath: URL(fileURLWithPath: outputPath),
+        levelsMin: levelsMin,
+        levelsMax: levelsMax,
         model: model,
         textEncoderPath: textEncoderPath,
         maxSequenceLength: maxSequenceLength,
@@ -527,6 +543,7 @@ struct ZImageCLI {
       let capturedStrength = resolvedStrength
       let capturedSpecifiedAs = specifiedAs.rawValue
       let capturedSpecifiedValue = specifiedValue
+      var capturedError: (any Error)? = nil
       Task {
         do {
           _ = try await pipeline.generateImg2Img(img2imgRequest, progressHandler: { progress in
@@ -596,11 +613,16 @@ struct ZImageCLI {
           }
         } catch {
           logger.error("Img2img generation failed: \(error)")
+          capturedError = error
           if let bar { bar.finish(forceNewline: true) }
         }
         semaphore.signal()
       }
       semaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
       return
     }
 
@@ -772,7 +794,9 @@ struct ZImageCLI {
             steps: fiboSteps,
             guidanceScale: fiboGuidance,
             seed: seed,
-            outputPath: URL(fileURLWithPath: outputPath)
+            outputPath: URL(fileURLWithPath: outputPath),
+            levelsMin: levelsMin,
+            levelsMax: levelsMax
           )
 
           _ = try await fiboPipeline.generate(fiboRequest, progressHandler: { progress in
@@ -875,6 +899,8 @@ struct ZImageCLI {
             guidanceScale: flux2Pipeline.isDistilled ? 1.0 : guidance,
             seed: seed,
             outputPath: URL(fileURLWithPath: outputPath),
+            levelsMin: levelsMin,
+            levelsMax: levelsMax,
             maxSequenceLength: maxSequenceLength,
             inputImagePath: flux2InputImage,
             denoise: flux2DenoiseValue
@@ -914,6 +940,8 @@ struct ZImageCLI {
       guidanceScale: guidance,
       seed: seed,
       outputPath: URL(fileURLWithPath: outputPath),
+      levelsMin: levelsMin,
+      levelsMax: levelsMax,
       model: model,
       textEncoderPath: textEncoderPath,
       maxSequenceLength: maxSequenceLength,
@@ -948,6 +976,7 @@ struct ZImageCLI {
     let finalOutputPath = URL(fileURLWithPath: outputPath)
     let shouldGenerateSVG = generateSVG
     let svgPresetCopy = svgPreset
+    var capturedError: (any Error)? = nil
     Task {
       do {
         _ = try await pipeline.generate(request, progressHandler: { progress in
@@ -1012,11 +1041,16 @@ struct ZImageCLI {
         }
       } catch {
         logger.error("Generation failed: \(error)")
+        capturedError = error
         if let bar { bar.finish(forceNewline: true) }
       }
       semaphore.signal()
     }
     semaphore.wait()
+    if let err = capturedError {
+      fputs("Error: \(err)\n", stderr)
+      exit(1)
+    }
   }
 
   private static func convertToSVG(input: URL, output: URL, preset: String) throws {
@@ -1081,6 +1115,8 @@ struct ZImageCLI {
       --guidance, -g         Guidance scale (default \(ZImageModelMetadata.recommendedGuidanceScale))
       --seed                 Random seed
       --output, -o           Output path (default z-image.png)
+      --levels-min           Levels lower bound for post-decode contrast adjustment (default: 0.0)
+      --levels-max           Levels upper bound for post-decode contrast adjustment (default: 1.0)
       --model, -m            Model path or HuggingFace ID (default: \(ZImageRepository.id))
                              Aliases: z-image-base (Base, CFG-guided), z-image-turbo (Turbo, distilled)
       --model-family         Model family: flux1, flux2, fibo, or chroma (default: auto-detect from model config)
@@ -1412,6 +1448,8 @@ struct ZImageCLI {
     var loraEntries: [String] = []
     var loraScaleOverrides: [Float] = []
     var forceTransformerOverrideOnly = false
+    var host = "127.0.0.1"
+    var allowedOutputDirectory = FileManager.default.currentDirectoryPath
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1427,6 +1465,10 @@ struct ZImageCLI {
           return
         }
         port = UInt16(rawPort)
+      case "--host":
+        host = nextValue(for: arg, iterator: &iterator)
+      case "--allowed-output-directory":
+        allowedOutputDirectory = nextValue(for: arg, iterator: &iterator)
       case "--cache-limit":
         cacheLimit = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 2048)
       case "--max-sequence-length":
@@ -1440,7 +1482,7 @@ struct ZImageCLI {
       case "--lora-paths":
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
-        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+        loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--help", "-h":
         printServeUsage()
         return
@@ -1466,10 +1508,11 @@ struct ZImageCLI {
       initialLoRAs: loraConfigs,
       forceTransformerOverrideOnly: forceTransformerOverrideOnly,
       maxSequenceLength: maxSequenceLength,
-      maxPendingRequests: 10
+      maxPendingRequests: 10,
+      allowedOutputDirectory: allowedOutputDirectory
     )
 
-    let server = WarmServer(configuration: configuration, logger: logger)
+    let server = WarmServer(configuration: configuration, host: host, logger: logger)
     try server.run()
   }
 
@@ -1481,6 +1524,8 @@ struct ZImageCLI {
       --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
       --text-encoder-path       Override text encoder directory
       --port                    HTTP port (default: 7862)
+      --host                    HTTP host/interface to bind (default: 127.0.0.1)
+      --allowed-output-directory  Directory where request outputPath values may write (default: current directory)
       --cache-limit             GPU memory cache limit in MB (default: unlimited)
       --max-sequence-length     Maximum sequence length for text encoding (default: 512)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override
@@ -1517,6 +1562,8 @@ struct ZImageCLI {
     var guidance = ZImageModelMetadata.recommendedGuidanceScale
     var seed: UInt64?
     var outputPath = "z-image-control.png"
+    var levelsMin: Float = 0.0
+    var levelsMax: Float = 1.0
     var model: String?
     var textEncoderPath: String?
     var cacheLimit: Int?
@@ -1556,9 +1603,13 @@ struct ZImageCLI {
       case "--guidance", "-g":
         guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
       case "--seed":
-        seed = UInt64(nextValue(for: arg, iterator: &iterator))
+        seed = uint64Value(for: arg, iterator: &iterator)
       case "--output", "-o":
         outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--levels-min":
+        levelsMin = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
+      case "--levels-max":
+        levelsMax = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
       case "--model", "-m":
         model = nextValue(for: arg, iterator: &iterator)
       case "--text-encoder-path":
@@ -1574,21 +1625,21 @@ struct ZImageCLI {
       case "--lora-paths":
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
-        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+        loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--no-progress":
         noProgress = true
       case "--scheduler", "--sampler":
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SchedulerKind(rawValue: raw) else {
           let valid = SchedulerKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown scheduler '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown scheduler '\(raw)'. Valid: \(valid)")
         }
         schedulerKind = kind
       case "--sigma-schedule":
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SigmaScheduleKind(rawValue: raw) else {
           let valid = SigmaScheduleKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
         }
         sigmaSchedule = kind
       case "--eta":
@@ -1687,6 +1738,8 @@ struct ZImageCLI {
       guidanceScale: guidance,
       seed: seed,
       outputPath: URL(fileURLWithPath: outputPath),
+      levelsMin: levelsMin,
+      levelsMax: levelsMax,
       model: model,
       textEncoderPath: textEncoderPath,
       controlnetWeights: controlnetWeights,
@@ -1702,6 +1755,7 @@ struct ZImageCLI {
     let pipeline = ZImageControlPipeline(logger: logger)
     nonisolated(unsafe) let semaphore = DispatchSemaphore(value: 0)
     let finalOutputPath = outputPath
+    var capturedError: (any Error)? = nil
     Task {
       do {
         _ = try await pipeline.generate(request)
@@ -1709,11 +1763,16 @@ struct ZImageCLI {
         logger.info("Output saved to: \(finalOutputPath)")
       } catch {
         logger.error("Control generation failed: \(error)")
+        capturedError = error
         if let bar = barBox.value { bar.finish(forceNewline: true) }
       }
       semaphore.signal()
     }
     semaphore.wait()
+    if let err = capturedError {
+      fputs("Error: \(err)\n", stderr)
+      exit(1)
+    }
   }
 
   private static func printControlUsage() {
@@ -1735,6 +1794,8 @@ struct ZImageCLI {
       --guidance, -g            Guidance scale (default \(ZImageModelMetadata.recommendedGuidanceScale))
       --seed                    Random seed
       --output, -o              Output path (default z-image-control.png)
+      --levels-min              Levels lower bound for post-decode contrast adjustment (default: 0.0)
+      --levels-max              Levels upper bound for post-decode contrast adjustment (default: 1.0)
       --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
       --text-encoder-path       Override text encoder directory (CLI > ZIMAGE_ENCODER_PATH > auto-detect > default)
       --cache-limit             GPU memory cache limit in MB (default: unlimited)
@@ -1788,9 +1849,18 @@ struct ZImageCLI {
 
   private static func nextValue(for arg: String, iterator: inout IndexingIterator<[String]>) -> String {
     guard let value = iterator.next() else {
-      fatalError("Expected value after \(arg)")
+      failArgumentParsing("Expected value after \(arg)")
     }
     return value
+  }
+
+  private static func failArgumentParsing(_ message: String) -> Never {
+    fputs("Error: \(message)\n", stderr)
+    exit(1)
+  }
+
+  private static func warnArgumentParsing(_ message: String) {
+    fputs("Warning: \(message)\n", stderr)
   }
 
   private static func splitCommaSeparated(_ value: String) -> [String] {
@@ -1853,12 +1923,53 @@ struct ZImageCLI {
   }
 
   private static func intValue(for arg: String, iterator: inout IndexingIterator<[String]>, minimum: Int, fallback: Int) -> Int {
-    guard let value = Int(nextValue(for: arg, iterator: &iterator)) else { return fallback }
-    return max(minimum, value)
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = Int(raw) else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); using \(fallback).")
+      return fallback
+    }
+    if value < minimum {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); using minimum \(minimum).")
+      return minimum
+    }
+    return value
   }
 
   private static func floatValue(for arg: String, iterator: inout IndexingIterator<[String]>, fallback: Float) -> Float {
-    Float(nextValue(for: arg, iterator: &iterator)) ?? fallback
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = Float(raw), value.isFinite else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); using \(fallback).")
+      return fallback
+    }
+    return value
+  }
+
+  private static func floatListValue(for arg: String, iterator: inout IndexingIterator<[String]>, fallback: Float) -> [Float] {
+    splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).map { raw in
+      guard let value = Float(raw), value.isFinite else {
+        warnArgumentParsing("Invalid value '\(raw)' for \(arg); using \(fallback).")
+        return fallback
+      }
+      return value
+    }
+  }
+
+  private static func uint64Value(for arg: String, iterator: inout IndexingIterator<[String]>) -> UInt64? {
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = UInt64(raw) else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); ignoring it.")
+      return nil
+    }
+    return value
+  }
+
+  private static func optionalIntValue(for arg: String, iterator: inout IndexingIterator<[String]>) -> Int? {
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = Int(raw) else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); ignoring it.")
+      return nil
+    }
+    return value
   }
 
   // MARK: - Upscale Subcommand
@@ -1885,7 +1996,7 @@ struct ZImageCLI {
       case "--steps":
         steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
       case "--seed":
-        if let s = Int(nextValue(for: arg, iterator: &iterator)) {
+        if let s = optionalIntValue(for: arg, iterator: &iterator) {
           seed = s
         }
       case "--weights", "-w":

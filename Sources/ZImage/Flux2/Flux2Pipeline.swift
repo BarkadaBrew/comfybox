@@ -23,6 +23,8 @@ public struct Flux2GenerationRequest: Sendable {
   public var guidanceScale: Float
   public var seed: UInt64?
   public var outputPath: URL
+  public var levelsMin: Float
+  public var levelsMax: Float
   public var maxSequenceLength: Int
 
   /// Path to a source image for img2img. When set with denoise < 1.0,
@@ -43,6 +45,8 @@ public struct Flux2GenerationRequest: Sendable {
     guidanceScale: Float = 1.0,
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "flux2-output.png"),
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0,
     maxSequenceLength: Int = 512,
     inputImagePath: URL? = nil,
     denoise: Float = 1.0
@@ -55,6 +59,8 @@ public struct Flux2GenerationRequest: Sendable {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
     self.maxSequenceLength = maxSequenceLength
     self.inputImagePath = inputImagePath
     self.denoise = denoise
@@ -556,7 +562,10 @@ public final class Flux2Pipeline {
 
     // Denormalize from [-1, 1] to [0, 1]
     let image = QwenImageIO.denormalizeFromDecoder(decoded)
-    let clipped = MLX.clip(image, min: 0, max: 1)
+    var clipped = MLX.clip(image, min: 0, max: 1)
+    if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
+      clipped = ImageLevels.apply(image: clipped, min: request.levelsMin, max: request.levelsMax)
+    }
     MLX.eval(clipped)
 
     GPU.clearCache()

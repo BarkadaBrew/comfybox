@@ -207,6 +207,110 @@ final class SafeTensorsReaderTests: XCTestCase {
     }
   }
 
+  func testHeaderLengthAtCapThrowsInvalidHeaderLength() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+    let fileURL = tempDir.appendingPathComponent("large_header_\(UUID().uuidString).safetensors")
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    var data = Data()
+    var headerLength = UInt64(100_000_000).littleEndian
+    withUnsafeBytes(of: &headerLength) { data.append(contentsOf: $0) }
+    try data.write(to: fileURL)
+
+    XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+      if case SafeTensorsReaderError.invalidHeaderLength = error {
+        // Expected
+      } else {
+        XCTFail("Expected invalidHeaderLength error, got \(error)")
+      }
+    }
+  }
+
+  func testTensorOffsetsCannotExceedFileSize() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "weight": [
+          "dtype": "U8",
+          "shape": [4],
+          "data_offsets": [0, 4]
+        ]
+      ],
+      payload: Data([1, 2])
+    )
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+      if case SafeTensorsReaderError.invalidOffsets(let name) = error {
+        XCTAssertEqual(name, "weight")
+      } else {
+        XCTFail("Expected invalidOffsets error, got \(error)")
+      }
+    }
+  }
+
+  func testNegativeTensorOffsetThrowsInvalidOffsets() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "weight": [
+          "dtype": "U8",
+          "shape": [0],
+          "data_offsets": [-1, 0]
+        ]
+      ]
+    )
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+      if case SafeTensorsReaderError.invalidOffsets(let name) = error {
+        XCTAssertEqual(name, "weight")
+      } else {
+        XCTFail("Expected invalidOffsets error, got \(error)")
+      }
+    }
+  }
+
+  func testShapeProductOverflowThrowsInvalidShape() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "weight": [
+          "dtype": "U8",
+          "shape": [Int.max, 2],
+          "data_offsets": [0, 0]
+        ]
+      ]
+    )
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+      if case SafeTensorsReaderError.invalidShape(let name) = error {
+        XCTAssertEqual(name, "weight")
+      } else {
+        XCTFail("Expected invalidShape error, got \(error)")
+      }
+    }
+  }
+
+  func testNegativeShapeDimensionThrowsInvalidShape() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "weight": [
+          "dtype": "U8",
+          "shape": [-1],
+          "data_offsets": [0, 0]
+        ]
+      ]
+    )
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+      if case SafeTensorsReaderError.invalidShape(let name) = error {
+        XCTAssertEqual(name, "weight")
+      } else {
+        XCTFail("Expected invalidShape error, got \(error)")
+      }
+    }
+  }
+
   // MARK: - Integration Test with Real SafeTensors File
 
   func testCreateAndReadSafeTensors() throws {
@@ -374,5 +478,19 @@ final class SafeTensorsReaderTests: XCTestCase {
 
     // 4 floats * 4 bytes = 16 bytes
     XCTAssertEqual(data.count, 16)
+  }
+
+  private func writeSyntheticSafeTensors(header: [String: Any], payload: Data = Data()) throws -> URL {
+    let tempDir = FileManager.default.temporaryDirectory
+    let fileURL = tempDir.appendingPathComponent("synthetic_\(UUID().uuidString).safetensors")
+    let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+
+    var data = Data()
+    var headerLength = UInt64(headerData.count).littleEndian
+    withUnsafeBytes(of: &headerLength) { data.append(contentsOf: $0) }
+    data.append(headerData)
+    data.append(payload)
+    try data.write(to: fileURL)
+    return fileURL
   }
 }

@@ -16,6 +16,8 @@ public struct ZImageGenerationRequest: Sendable {
   public var guidanceScale: Float
   public var seed: UInt64?
   public var outputPath: URL
+  public var levelsMin: Float
+  public var levelsMax: Float
   public var model: String?
   public var textEncoderPath: String?
   public var maxSequenceLength: Int
@@ -71,6 +73,8 @@ public struct ZImageGenerationRequest: Sendable {
     guidanceScale: Float = ZImageModelMetadata.recommendedGuidanceScale,
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "z-image.png"),
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0,
     model: String? = nil,
     textEncoderPath: String? = nil,
     maxSequenceLength: Int = 512,
@@ -99,6 +103,8 @@ public struct ZImageGenerationRequest: Sendable {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
     self.model = model
     self.textEncoderPath = textEncoderPath
     self.maxSequenceLength = maxSequenceLength
@@ -1094,7 +1100,11 @@ public final class ZImagePipeline {
     logger.info("Denoising complete, decoding with VAE...")
     progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
 
-    let decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    var decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
+      decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
+      MLX.eval(decoded)
+    }
     MLX.eval(MLXArray([]))
     GPU.clearCache()
 
