@@ -51,6 +51,13 @@ public protocol ZImageScheduler {
     sample: MLXArray
   ) -> MLXArray?
 
+  /// Sigma value for the intermediate model evaluation.
+  ///
+  /// Multi-evaluation schedulers may evaluate the second stage at a
+  /// substep between the current and next sigma. The default matches
+  /// Heun's existing next-sigma intermediate point.
+  func intermediateSigma(timestepIndex: Int) -> Float?
+
   /// Finalize a multi-evaluation step using predictions at both
   /// the original and intermediate points.
   ///
@@ -79,6 +86,14 @@ public extension ZImageScheduler {
     sample: MLXArray
   ) -> MLXArray? {
     nil
+  }
+
+  func intermediateSigma(timestepIndex: Int) -> Float? {
+    precondition(
+      timestepIndex >= 0 && timestepIndex + 1 < sigmas.dim(0),
+      "invalid timestep index"
+    )
+    return sigmas[timestepIndex + 1].item(Float.self)
   }
 
   mutating func finalizeStep(

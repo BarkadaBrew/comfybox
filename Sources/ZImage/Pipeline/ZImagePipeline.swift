@@ -1034,9 +1034,10 @@ public final class ZImagePipeline {
            let intermediateSample = scheduler.intermediateStep(
              modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
            ) {
-          // Derive timestep at the intermediate point (sigma[stepIndex+1])
-          let nextSigma = scheduler.sigmas[stepIndex + 1].item(Float.self)
-          let intermediateTimestepValue = nextSigma * numTrainTimestepsF
+          // Derive timestep at the scheduler's intermediate point.
+          let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
+            ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
+          let intermediateTimestepValue = intermediateSigma * numTrainTimestepsF
           let intermediateNormalized = (1000.0 - intermediateTimestepValue) / 1000.0
           let intermediateTimestepArray = MLXArray([intermediateNormalized], [1])
 

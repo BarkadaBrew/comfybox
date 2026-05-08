@@ -139,6 +139,7 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(SchedulerKind(rawValue: "dpmpp-2s-a"), .dpmplusplus2sa)
     XCTAssertEqual(SchedulerKind(rawValue: "deis"), .deis)
     XCTAssertEqual(SchedulerKind(rawValue: "ddim"), .ddim)
+    XCTAssertEqual(SchedulerKind(rawValue: "res_2s"), .res2s)
   }
 
   func testUnknownSigmaScheduleKindFromString() {
@@ -151,6 +152,7 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(SigmaScheduleKind(rawValue: "karras"), .karras)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "exponential"), .exponential)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "beta"), .beta)
+    XCTAssertEqual(SigmaScheduleKind(rawValue: "beta57"), .beta57)
   }
 
   // MARK: - All Kinds
@@ -266,10 +268,53 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertTrue(scheduler.requiresIntermediateEvaluation)
   }
 
+  func testRES2sCreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .res2s,
+      numInferenceSteps: 9,
+      config: config
+    )
+
+    XCTAssertEqual(scheduler.numInferenceSteps, 9)
+    XCTAssertEqual(scheduler.sigmas.dim(0), 10)
+    XCTAssertTrue(scheduler.requiresIntermediateEvaluation)
+  }
+
+  func testBeta57ScheduleCreation() {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = SchedulerFactory.create(
+      kind: .euler,
+      sigmaSchedule: .beta57,
+      numInferenceSteps: 9,
+      config: config
+    )
+    let defaultBeta = SchedulerFactory.create(
+      kind: .euler,
+      sigmaSchedule: .beta,
+      numInferenceSteps: 9,
+      config: config
+    )
+
+    let beta57Sigmas = scheduler.sigmas.asArray(Float.self)
+    let defaultBetaSigmas = defaultBeta.sigmas.asArray(Float.self)
+    XCTAssertEqual(beta57Sigmas.count, 10)
+    XCTAssertEqual(beta57Sigmas.last!, 0.0, accuracy: 1e-10)
+
+    var differs = false
+    for i in 0..<beta57Sigmas.count {
+      if abs(beta57Sigmas[i] - defaultBetaSigmas[i]) > 1e-6 {
+        differs = true
+        break
+      }
+    }
+    XCTAssertTrue(differs, "Factory beta57 should differ from default beta")
+  }
+
   func testPhase2SamplersWithKarrasSchedule() {
     let config = FlowMatchSchedulerTests.makeConfig()
     let phase2Kinds: [SchedulerKind] = [
-      .dpmplusplus2m, .ddim, .deis, .dpmplusplus2sa, .heun
+      .dpmplusplus2m, .ddim, .deis, .dpmplusplus2sa, .heun, .res2s
     ]
 
     for kind in phase2Kinds {

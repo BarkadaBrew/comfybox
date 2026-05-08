@@ -6,6 +6,7 @@ public enum SigmaScheduleKind: String, CaseIterable, Sendable {
   case karras = "karras"
   case exponential = "exponential"
   case beta = "beta"
+  case beta57 = "beta57"
 }
 
 /// Pure-function sigma schedule generators.

@@ -1833,8 +1833,8 @@ extension GeneratePayload: Decodable {
       defaultFilename: "zimage-\(UUID().uuidString).png"
     )
 
-    let schedulerKind = scheduler.flatMap { SchedulerKind(rawValue: $0) } ?? .euler
-    let sigmaScheduleKind = sigmaSchedule.flatMap { SigmaScheduleKind(rawValue: $0) } ?? .flow
+    let schedulerKind = Self.parseSchedulerKind(scheduler)
+    let sigmaScheduleKind = Self.parseSigmaScheduleKind(sigmaSchedule)
 
     // Build DyPE config — auto-enable for high-res requests
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
@@ -1907,8 +1907,8 @@ extension GeneratePayload: Decodable {
       specifiedAs = .strength
     }
 
-    let schedulerKind = scheduler.flatMap { SchedulerKind(rawValue: $0) } ?? .euler
-    let sigmaScheduleKind = sigmaSchedule.flatMap { SigmaScheduleKind(rawValue: $0) } ?? .flow
+    let schedulerKind = Self.parseSchedulerKind(scheduler)
+    let sigmaScheduleKind = Self.parseSigmaScheduleKind(sigmaSchedule)
 
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
@@ -1962,6 +1962,26 @@ extension GeneratePayload: Decodable {
       switch self {
       case .mutuallyExclusive(let msg): return msg
       }
+    }
+  }
+
+  private static func parseSchedulerKind(_ rawValue: String?) -> SchedulerKind {
+    guard let rawValue else { return .euler }
+    switch rawValue {
+    case "res_2s":
+      return .res2s
+    default:
+      return SchedulerKind(rawValue: rawValue) ?? .euler
+    }
+  }
+
+  private static func parseSigmaScheduleKind(_ rawValue: String?) -> SigmaScheduleKind {
+    guard let rawValue else { return .flow }
+    switch rawValue {
+    case "beta57":
+      return .beta57
+    default:
+      return SigmaScheduleKind(rawValue: rawValue) ?? .flow
     }
   }
 

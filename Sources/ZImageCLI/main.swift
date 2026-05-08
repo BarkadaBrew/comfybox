@@ -1223,8 +1223,8 @@ struct ZImageCLI {
       --lora-scale           LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths           Comma-separated LoRA paths or HuggingFace IDs (quoted commas unsupported)
       --lora-scales          Comma-separated LoRA scale overrides (default: 1.0)
-      --scheduler, --sampler  Sampler algorithm: euler, heun, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
-      --sigma-schedule       Sigma schedule: flow, karras, exponential, beta (default: flow)
+      --scheduler, --sampler  Sampler algorithm: euler, heun, res_2s, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
+      --sigma-schedule       Sigma schedule: flow, karras, exponential, beta, beta57 (default: flow)
       --eta                  Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
       --dype <method>        DyPE high-res mode: ntk, yarn, none (auto-enables for >1024px)
       --no-dype              Disable DyPE even for high-res generation
@@ -1302,6 +1302,7 @@ struct ZImageCLI {
       ZImageCLI -p "cat" --enhance  # Enhanced prompt generation
       ZImageCLI -p "portrait" --scheduler dpmpp-2m --sigma-schedule beta  # Best photorealism combo
       ZImageCLI -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
+      ZImageCLI -p "refiner pass" --scheduler res_2s --sigma-schedule beta57  # RES 2s + beta57
       ZImageCLI -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
       ZImageCLI serve -m ./models/z-image-turbo --port 7862
       ZImageCLI -p "portrait" --auto-seeds 5 -o portraits.png  # Generate 5 random variations
@@ -1899,8 +1900,8 @@ struct ZImageCLI {
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs (quoted commas unsupported)
       --lora-scales             Comma-separated LoRA scale overrides (default: 1.0)
-      --scheduler, --sampler    Sampler algorithm: euler, heun, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
-      --sigma-schedule          Sigma schedule: flow, karras, exponential, beta (default: flow)
+      --scheduler, --sampler    Sampler algorithm: euler, heun, res_2s, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
+      --sigma-schedule          Sigma schedule: flow, karras, exponential, beta, beta57 (default: flow)
       --eta                     Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
       --no-progress             Disable progress output
       --help, -h                Show help

@@ -1116,8 +1116,9 @@ public class ZImageControlPipeline {
            let intermediateSample = scheduler.intermediateStep(
              modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
            ) {
-          let nextSigma = scheduler.sigmas[stepIndex + 1].item(Float.self)
-          let intermediateTimestepValue = nextSigma * numTrainTimestepsF
+          let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
+            ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
+          let intermediateTimestepValue = intermediateSigma * numTrainTimestepsF
           let intermediateNormalized = (1000.0 - intermediateTimestepValue) / 1000.0
           let intermediateTimestepArray = MLXArray([intermediateNormalized], [1])
           var intermediateModelLatents = intermediateSample
@@ -1406,8 +1407,9 @@ public class ZImageControlPipeline {
            let intermediateSample = scheduler.intermediateStep(
              modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
            ) {
-          let nextSigma = scheduler.sigmas[stepIndex + 1].item(Float.self)
-          let intermediateTimestepValue = nextSigma * numTrainTimestepsF
+          let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
+            ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
+          let intermediateTimestepValue = intermediateSigma * numTrainTimestepsF
           let intermediateNormalized = (1000.0 - intermediateTimestepValue) / 1000.0
           let intermediateTimestepArray = MLXArray([intermediateNormalized], [1])
           var intermediateModelLatents = intermediateSample
