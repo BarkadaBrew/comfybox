@@ -81,12 +81,11 @@ final class DDIMSchedulerTests: XCTestCase {
     let seed: UInt64 = 42
     var ddimDet = Self.makeScheduler(steps: 9, eta: 0.0)
     var ddimStoch = Self.makeScheduler(steps: 9, eta: 1.0, seed: seed)
-
     let resultDet = ddimDet.step(
-      modelOutput: modelOutput, timestepIndex: 0, sample: sample
+      modelOutput: modelOutput, timestepIndex: 4, sample: sample
     )
     let resultStoch = ddimStoch.step(
-      modelOutput: modelOutput, timestepIndex: 0, sample: sample
+      modelOutput: modelOutput, timestepIndex: 4, sample: sample
     )
 
     let detF32 = resultDet.asType(.float32)
@@ -115,10 +114,10 @@ final class DDIMSchedulerTests: XCTestCase {
     var ddim2 = Self.makeScheduler(steps: 9, eta: 1.0, seed: seed)
 
     let result1 = ddim1.step(
-      modelOutput: modelOutput, timestepIndex: 0, sample: sample
+      modelOutput: modelOutput, timestepIndex: 4, sample: sample
     )
     let result2 = ddim2.step(
-      modelOutput: modelOutput, timestepIndex: 0, sample: sample
+      modelOutput: modelOutput, timestepIndex: 4, sample: sample
     )
 
     let r1 = result1.asType(.float32)

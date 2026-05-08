@@ -13,6 +13,7 @@ public struct WarmServerConfiguration: Sendable {
   public var forceTransformerOverrideOnly: Bool
   public var maxSequenceLength: Int
   public var maxPendingRequests: Int
+  public var allowedOutputDirectory: String
   /// Path to SeedVR2 upscale model weights directory.
   /// When set, enables upscale via the ComfyUI bridge. The pipeline is lazy-loaded
   /// on first upscale request to avoid the ~6GB memory cost until needed.
@@ -26,6 +27,7 @@ public struct WarmServerConfiguration: Sendable {
     forceTransformerOverrideOnly: Bool = false,
     maxSequenceLength: Int = 512,
     maxPendingRequests: Int = 10,
+    allowedOutputDirectory: String = FileManager.default.currentDirectoryPath,
     seedvr2WeightsPath: String? = nil
   ) {
     self.port = port
@@ -35,6 +37,7 @@ public struct WarmServerConfiguration: Sendable {
     self.forceTransformerOverrideOnly = forceTransformerOverrideOnly
     self.maxSequenceLength = maxSequenceLength
     self.maxPendingRequests = max(1, maxPendingRequests)
+    self.allowedOutputDirectory = allowedOutputDirectory
     self.seedvr2WeightsPath = seedvr2WeightsPath
   }
 }
@@ -46,8 +49,78 @@ enum WarmModelFamily: String, Sendable {
   case fibo
 }
 
+enum WarmServerOutputPathValidator {
+  static func resolveOutputPath(_ outputPath: String, allowedOutputDirectory: String) throws -> URL {
+    let allowedURL = canonicalFileURL(for: allowedOutputDirectory)
+    let outputURL = canonicalFileURL(for: outputPath)
+
+    guard outputURL.isContained(in: allowedURL) else {
+      throw WarmServerError.invalidOutputPath(path: outputURL.path, allowedDirectory: allowedURL.path)
+    }
+
+    return outputURL
+  }
+
+  private static func canonicalFileURL(for path: String) -> URL {
+    let expandedPath = (path as NSString).expandingTildeInPath
+    let absolutePath: String
+    if expandedPath.hasPrefix("/") {
+      absolutePath = expandedPath
+    } else {
+      absolutePath = (FileManager.default.currentDirectoryPath as NSString)
+        .appendingPathComponent(expandedPath)
+    }
+
+    return resolvePathComponents(in: absolutePath)
+  }
+
+  private static func resolvePathComponents(in path: String, symlinkDepth: Int = 0) -> URL {
+    let fileManager = FileManager.default
+    var currentURL = URL(fileURLWithPath: "/")
+
+    for component in (path as NSString).pathComponents.dropFirst() {
+      switch component {
+      case "", ".":
+        continue
+      case "..":
+        currentURL = currentURL.deletingLastPathComponent()
+      default:
+        let nextURL = currentURL.appendingPathComponent(component)
+        if let destination = try? fileManager.destinationOfSymbolicLink(atPath: nextURL.path),
+           symlinkDepth < 32 {
+          let destinationPath: String
+          if destination.hasPrefix("/") {
+            destinationPath = destination
+          } else {
+            destinationPath = (currentURL.path as NSString).appendingPathComponent(destination)
+          }
+          currentURL = resolvePathComponents(in: destinationPath, symlinkDepth: symlinkDepth + 1)
+        } else if fileManager.fileExists(atPath: nextURL.path) {
+          currentURL = nextURL.resolvingSymlinksInPath()
+        } else {
+          currentURL = nextURL
+        }
+      }
+    }
+
+    return currentURL
+  }
+}
+
+private extension URL {
+  func isContained(in directory: URL) -> Bool {
+    let pathComponents = standardizedFileURL.pathComponents
+    let directoryComponents = directory.standardizedFileURL.pathComponents
+    guard pathComponents.count >= directoryComponents.count else { return false }
+    return Array(pathComponents.prefix(directoryComponents.count)) == directoryComponents
+  }
+}
+
 public final class WarmServer {
+  private static let pngSignature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
+
   private let configuration: WarmServerConfiguration
+  private let host: String
   private let logger: Logger
   private let coordinator: WarmServerCoordinator
   let comfyBridge: ComfyBridge
@@ -62,8 +135,13 @@ public final class WarmServer {
   /// Resolved path to SeedVR2 weights directory.
   private let seedvr2WeightsPath: String?
 
-  public init(configuration: WarmServerConfiguration, logger: Logger = Logger(label: "z-image.warm-server")) {
+  public init(
+    configuration: WarmServerConfiguration,
+    host: String = "127.0.0.1",
+    logger: Logger = Logger(label: "z-image.warm-server")
+  ) {
     self.configuration = configuration
+    self.host = host
     self.logger = logger
     self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
@@ -117,7 +195,10 @@ public final class WarmServer {
     }
     sigIntSource.resume()
 
-    let listener = try NWListener(using: .tcp, on: port)
+    let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = endpoint
+    let listener = try NWListener(using: parameters)
     self.listener = listener
 
     listener.stateUpdateHandler = { [weak self] state in
@@ -153,7 +234,7 @@ public final class WarmServer {
   private func handleListenerState(_ state: NWListener.State) {
     switch state {
     case .ready:
-      logger.info("Warm server listening on http://127.0.0.1:\(self.configuration.port)")
+      logger.info("Warm server listening on http://\(self.host):\(self.configuration.port)")
     case .failed(let error):
       logger.error("Warm server listener failed: \(error.localizedDescription)")
       initiateShutdown(exitCode: 1)
@@ -200,6 +281,7 @@ public final class WarmServer {
     case ("POST", "/v1/generate"):
       do {
         let payload = try decode(GeneratePayload.self, from: request.body)
+        try payload.validateOutputPath(configuration: configuration)
         let result = try await coordinator.enqueueGenerate(payload)
         return .json(status: 200, payload: result)
       } catch {
@@ -273,7 +355,7 @@ public final class WarmServer {
   /// Called by ComfyBridgeExecutor via the closure set in init.
   /// Read PNG dimensions from IHDR chunk (bytes 16-23 of a valid PNG).
   private func pngDimensions(from data: Data) -> (width: Int, height: Int)? {
-    guard data.count >= 24 else { return nil }
+    guard data.count >= 24, data.prefix(Self.pngSignature.count).elementsEqual(Self.pngSignature) else { return nil }
     let w = Int(data[16]) << 24 | Int(data[17]) << 16 | Int(data[18]) << 8 | Int(data[19])
     let h = Int(data[20]) << 24 | Int(data[21]) << 16 | Int(data[22]) << 8 | Int(data[23])
     return (w, h)
@@ -626,6 +708,8 @@ public final class WarmServer {
     case let error as WarmServerError:
       switch error {
       case .loraSwapNotSupported, .controlNetNotSupported:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      case .invalidOutputPath:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
@@ -1033,12 +1117,10 @@ private actor WarmServerCoordinator {
       }
 
       let outputURL: URL
-      if let outputPath = payload.outputPath, !outputPath.isEmpty {
-        outputURL = URL(fileURLWithPath: outputPath)
-      } else {
-        outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
-          .appendingPathComponent("zimage-flux2-\(UUID().uuidString).png")
-      }
+      outputURL = try payload.resolvedOutputURL(
+        configuration: configuration,
+        defaultFilename: "zimage-flux2-\(UUID().uuidString).png"
+      )
 
       // Map GeneratePayload fields to Flux2GenerationRequest.
       // Base models: 50 steps, guidance configurable.
@@ -1073,6 +1155,8 @@ private actor WarmServerCoordinator {
         guidanceScale: payload.guidance ?? defaultGuidance,
         seed: payload.seed,
         outputPath: outputURL,
+        levelsMin: payload.levelsMin ?? 0.0,
+        levelsMax: payload.levelsMax ?? 1.0,
         maxSequenceLength: configuration.maxSequenceLength,
         inputImagePath: inputImageURL,
         denoise: resolvedDenoise
@@ -1114,12 +1198,10 @@ private actor WarmServerCoordinator {
       }
 
       let outputURL: URL
-      if let outputPath = payload.outputPath, !outputPath.isEmpty {
-        outputURL = URL(fileURLWithPath: outputPath)
-      } else {
-        outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
-          .appendingPathComponent("zimage-fibo-\(UUID().uuidString).png")
-      }
+      outputURL = try payload.resolvedOutputURL(
+        configuration: configuration,
+        defaultFilename: "zimage-fibo-\(UUID().uuidString).png"
+      )
 
       let fiboRequest = FiboGenerationRequest(
         prompt: payload.prompt,
@@ -1129,7 +1211,9 @@ private actor WarmServerCoordinator {
         steps: payload.steps ?? 30,
         guidanceScale: payload.guidance ?? 4.0,
         seed: payload.seed,
-        outputPath: outputURL
+        outputPath: outputURL,
+        levelsMin: payload.levelsMin ?? 0.0,
+        levelsMax: payload.levelsMax ?? 1.0
       )
 
       let result = try await fp.generate(fiboRequest, progressHandler: nil)
@@ -1512,6 +1596,8 @@ private struct GeneratePayload: Sendable {
   let guidance: Float?
   let seed: UInt64?
   let outputPath: String?
+  let levelsMin: Float?
+  let levelsMax: Float?
   let scheduler: String?
   let sigmaSchedule: String?
   let eta: Float?
@@ -1535,6 +1621,7 @@ private struct GeneratePayload: Sendable {
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
     guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
+    levelsMin: Float? = nil, levelsMax: Float? = nil,
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
@@ -1544,6 +1631,7 @@ private struct GeneratePayload: Sendable {
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
+    self.levelsMin = levelsMin; self.levelsMax = levelsMax
     self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
     self.eta = eta; self.dype = dype
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
@@ -1556,7 +1644,7 @@ private struct GeneratePayload: Sendable {
 extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
-    case outputPath, scheduler, sigmaSchedule, eta, dype
+    case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
     case imagePath, imageStrength, creativity
   }
 
@@ -1570,6 +1658,8 @@ extension GeneratePayload: Decodable {
     guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
+    levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
     scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
@@ -1590,13 +1680,10 @@ extension GeneratePayload: Decodable {
     configuration: WarmServerConfiguration,
     activeLoRAs: [LoRAConfiguration]
   ) throws -> ZImageGenerationRequest {
-    let outputURL: URL
-    if let outputPath, !outputPath.isEmpty {
-      outputURL = URL(fileURLWithPath: outputPath)
-    } else {
-      outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("zimage-\(UUID().uuidString).png")
-    }
+    let outputURL = try resolvedOutputURL(
+      configuration: configuration,
+      defaultFilename: "zimage-\(UUID().uuidString).png"
+    )
 
     let schedulerKind = scheduler.flatMap { SchedulerKind(rawValue: $0) } ?? .euler
     let sigmaScheduleKind = sigmaSchedule.flatMap { SigmaScheduleKind(rawValue: $0) } ?? .flow
@@ -1627,6 +1714,8 @@ extension GeneratePayload: Decodable {
       guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
+      levelsMin: levelsMin ?? 0.0,
+      levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
@@ -1688,13 +1777,10 @@ extension GeneratePayload: Decodable {
       dyPEConfig = .disabled
     }
 
-    let outputURL: URL
-    if let outputPath, !outputPath.isEmpty {
-      outputURL = URL(fileURLWithPath: outputPath)
-    } else {
-      outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("zimage-img2img-\(UUID().uuidString).png")
-    }
+    let outputURL = try resolvedOutputURL(
+      configuration: configuration,
+      defaultFilename: "zimage-img2img-\(UUID().uuidString).png"
+    )
 
     return Img2ImgRequest(
       prompt: prompt,
@@ -1705,6 +1791,8 @@ extension GeneratePayload: Decodable {
       guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
+      levelsMin: levelsMin ?? 0.0,
+      levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
@@ -1727,6 +1815,29 @@ extension GeneratePayload: Decodable {
       case .mutuallyExclusive(let msg): return msg
       }
     }
+  }
+
+  func validateOutputPath(configuration: WarmServerConfiguration) throws {
+    guard let outputPath, !outputPath.isEmpty else { return }
+    _ = try WarmServerOutputPathValidator.resolveOutputPath(
+      outputPath,
+      allowedOutputDirectory: configuration.allowedOutputDirectory
+    )
+  }
+
+  func resolvedOutputURL(
+    configuration: WarmServerConfiguration,
+    defaultFilename: String
+  ) throws -> URL {
+    guard let outputPath, !outputPath.isEmpty else {
+      return URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent(defaultFilename)
+    }
+
+    return try WarmServerOutputPathValidator.resolveOutputPath(
+      outputPath,
+      allowedOutputDirectory: configuration.allowedOutputDirectory
+    )
   }
 }
 
@@ -1863,6 +1974,7 @@ private final class SyncResult<Value> {
 
 public enum WarmServerError: Error, LocalizedError {
   case invalidPort(UInt16)
+  case invalidOutputPath(path: String, allowedDirectory: String)
   case flux2DetectionFailed(String)
   case flux2NotLoaded
   case fiboDetectionFailed(String)
@@ -1874,6 +1986,8 @@ public enum WarmServerError: Error, LocalizedError {
     switch self {
     case .invalidPort(let port):
       return "Invalid server port: \(port)"
+    case .invalidOutputPath(let path, let allowedDirectory):
+      return "Output path '\(path)' must be under allowed output directory '\(allowedDirectory)'"
     case .flux2DetectionFailed(let model):
       return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"
     case .flux2NotLoaded:
