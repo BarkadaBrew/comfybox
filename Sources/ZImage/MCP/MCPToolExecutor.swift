@@ -52,6 +52,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeSwitchModel(arguments)
       case "model_pool":
         return try await executeGet("/v1/model/pool")
+      case "unload_model":
+        return try await executeUnloadModel(arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -317,6 +319,18 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["model": model]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/model/activate", body: jsonData)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+
+  /// unload_model -> POST /v1/model/unload
+  private func executeUnloadModel(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let model = params?.string("model"), !model.isEmpty else {
+      return MCPToolResult(error: "Error: 'model' is required")
+    }
+    let body: [String: Any] = ["model": model]
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/model/unload", body: jsonData)
     return mapHTTPResponse(status: status, data: data)
   }
 
