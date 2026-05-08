@@ -46,6 +46,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeLoraScan(arguments)
       case "lora_quarantine":
         return try await executeLoraQuarantine(arguments)
+      case "load_model":
+        return try await executeLoadModel(arguments)
+      case "switch_model":
+        return try await executeSwitchModel(arguments)
+      case "model_pool":
+        return try await executeGet("/v1/model/pool")
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -275,6 +281,43 @@ public final class MCPToolExecutor: @unchecked Sendable {
       let (status, data) = try await client.delete(path)
       return mapHTTPResponse(status: status, data: data)
     }
+  }
+
+
+  /// load_model -> POST /v1/model/load
+  private func executeLoadModel(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let model = params?.string("model"), !model.isEmpty else {
+      return MCPToolResult(error: "Error: 'model' is required")
+    }
+    var body: [String: Any] = ["model": model]
+    if let quantization = params?.string("quantization") {
+      body["quantization"] = quantization
+    }
+    if let activate = params?.bool("activate") {
+      body["activate"] = activate
+    }
+    if let wait = params?.bool("wait") {
+      body["wait"] = wait
+    }
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/model/load", body: jsonData)
+    // 202 is valid (async load in progress)
+    if status == 200 || status == 202 {
+      let text = String(data: data, encoding: .utf8) ?? "{}"
+      return MCPToolResult(text: text)
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// switch_model -> POST /v1/model/activate
+  private func executeSwitchModel(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let model = params?.string("model"), !model.isEmpty else {
+      return MCPToolResult(error: "Error: 'model' is required")
+    }
+    let body: [String: Any] = ["model": model]
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/model/activate", body: jsonData)
+    return mapHTTPResponse(status: status, data: data)
   }
 
   // MARK: - Helpers
