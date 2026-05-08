@@ -27,6 +27,8 @@ public struct Img2ImgRequest: Sendable {
   public var guidanceScale: Float
   public var seed: UInt64?
   public var outputPath: URL
+  public var levelsMin: Float
+  public var levelsMax: Float
   public var model: String?
   public var textEncoderPath: String?
   public var maxSequenceLength: Int
@@ -64,6 +66,8 @@ public struct Img2ImgRequest: Sendable {
     guidanceScale: Float = ZImageModelMetadata.recommendedGuidanceScale,
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "z-image-img2img.png"),
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0,
     model: String? = nil,
     textEncoderPath: String? = nil,
     maxSequenceLength: Int = 512,
@@ -87,6 +91,8 @@ public struct Img2ImgRequest: Sendable {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
     self.model = model
     self.textEncoderPath = textEncoderPath
     self.maxSequenceLength = maxSequenceLength
@@ -273,6 +279,8 @@ extension ZImagePipeline {
       guidanceScale: request.guidanceScale,
       seed: request.seed,
       outputPath: request.outputPath,
+      levelsMin: request.levelsMin,
+      levelsMax: request.levelsMax,
       model: request.model,
       textEncoderPath: request.textEncoderPath,
       maxSequenceLength: request.maxSequenceLength,
