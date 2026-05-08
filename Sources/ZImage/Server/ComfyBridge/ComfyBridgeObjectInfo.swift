@@ -14,7 +14,7 @@ import Foundation
 enum ComfyBridgeObjectInfo {
 
   /// Build the full object_info dictionary. All keys are node class_type names.
-  static func build() -> [String: Any] {
+  static func build(loraLibrary: LoRALibrary? = nil) -> [String: Any] {
     var info: [String: Any] = [:]
 
     // --- comfyui-tooling-nodes (required) ---
@@ -363,7 +363,7 @@ enum ComfyBridgeObjectInfo {
       required: [
         "model": modelInput(),
         "clip": clipInput(),
-        "lora_name": optionInput(zimageLoraModels()),
+        "lora_name": optionInput(zimageLoraModels(library: loraLibrary)),
         "strength_model": floatInput(default: 1.0),
         "strength_clip": floatInput(default: 1.0),
       ],
@@ -691,12 +691,19 @@ enum ComfyBridgeObjectInfo {
   /// Default LoRA directory path. Matches the wrapper script's --lora location.
   private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
 
-  private static func zimageLoraModels() -> [String] {
-    // Dynamically scan LoRA directory for .safetensors files.
+  private static func zimageLoraModels(library: LoRALibrary? = nil) -> [String] {
+    // When a LoRA Library is available, return non-quarantined entries.
+    // This provides richer discovery than filesystem scanning alone:
+    // entries include all subdirectories, and quarantined LoRAs are excluded.
+    if let library {
+      let entries = library.list(includeQuarantined: false)
+      return entries.map { $0.filename }.sorted()
+    }
+
+    // Fallback: dynamically scan the flat LoRA directory for .safetensors files.
     let loraDir = loraDirectoryPath
     let fm = FileManager.default
     guard let entries = try? fm.contentsOfDirectory(atPath: loraDir) else {
-      // Fallback: return empty if directory is inaccessible.
       return []
     }
     return entries

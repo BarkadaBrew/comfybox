@@ -513,6 +513,28 @@ public final class LoRALibrary: @unchecked Sendable {
     logger.info("Quarantined: \(entry.filename) — \(reason)")
   }
 
+  /// Un-quarantine a LoRA entry.
+  ///
+  /// Clears the quarantine flag and reason. Does not move the file on disk.
+  ///
+  /// - Parameter id: The entry ID.
+  /// - Throws: `LoRALibraryError.entryNotFound` if the ID doesn't exist.
+  public func unquarantine(_ id: String) throws {
+    lock.lock()
+    defer { lock.unlock() }
+
+    guard var entry = entries[id] else {
+      throw LoRALibraryError.entryNotFound(id)
+    }
+
+    entry.quarantined = false
+    entry.quarantineReason = nil
+    entries[id] = entry
+    try saveIndex()
+
+    logger.info("Un-quarantined: \(entry.filename)")
+  }
+
   // MARK: - SHA-256
 
   /// Compute and cache the SHA-256 hash for an entry.
