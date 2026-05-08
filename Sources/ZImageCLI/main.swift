@@ -378,6 +378,7 @@ struct ZImageCLI {
       let pipeline = ZImagePipeline(logger: logger)
       nonisolated(unsafe) let batchSemaphore = DispatchSemaphore(value: 0)
       let resultBox = Box<BatchResult?>(nil)
+      var capturedError: (any Error)? = nil
 
       Task {
         do {
@@ -454,10 +455,15 @@ struct ZImageCLI {
           resultBox.value = result
         } catch {
           logger.error("Batch failed: \(error)")
+          capturedError = error
         }
         batchSemaphore.signal()
       }
       batchSemaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
 
       // Print batch summary
       if let result = resultBox.value {
@@ -525,6 +531,7 @@ struct ZImageCLI {
       let capturedStrength = resolvedStrength
       let capturedSpecifiedAs = specifiedAs.rawValue
       let capturedSpecifiedValue = specifiedValue
+      var capturedError: (any Error)? = nil
       Task {
         do {
           _ = try await pipeline.generateImg2Img(img2imgRequest, progressHandler: { progress in
@@ -594,11 +601,16 @@ struct ZImageCLI {
           }
         } catch {
           logger.error("Img2img generation failed: \(error)")
+          capturedError = error
           if let bar { bar.finish(forceNewline: true) }
         }
         semaphore.signal()
       }
       semaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
       return
     }
 
@@ -837,6 +849,7 @@ struct ZImageCLI {
     let finalOutputPath = URL(fileURLWithPath: outputPath)
     let shouldGenerateSVG = generateSVG
     let svgPresetCopy = svgPreset
+    var capturedError: (any Error)? = nil
     Task {
       do {
         _ = try await pipeline.generate(request, progressHandler: { progress in
@@ -901,11 +914,16 @@ struct ZImageCLI {
         }
       } catch {
         logger.error("Generation failed: \(error)")
+        capturedError = error
         if let bar { bar.finish(forceNewline: true) }
       }
       semaphore.signal()
     }
     semaphore.wait()
+    if let err = capturedError {
+      fputs("Error: \(err)\n", stderr)
+      exit(1)
+    }
   }
 
   private static func convertToSVG(input: URL, output: URL, preset: String) throws {
@@ -1591,6 +1609,7 @@ struct ZImageCLI {
     let pipeline = ZImageControlPipeline(logger: logger)
     nonisolated(unsafe) let semaphore = DispatchSemaphore(value: 0)
     let finalOutputPath = outputPath
+    var capturedError: (any Error)? = nil
     Task {
       do {
         _ = try await pipeline.generate(request)
@@ -1598,11 +1617,16 @@ struct ZImageCLI {
         logger.info("Output saved to: \(finalOutputPath)")
       } catch {
         logger.error("Control generation failed: \(error)")
+        capturedError = error
         if let bar = barBox.value { bar.finish(forceNewline: true) }
       }
       semaphore.signal()
     }
     semaphore.wait()
+    if let err = capturedError {
+      fputs("Error: \(err)\n", stderr)
+      exit(1)
+    }
   }
 
   private static func printControlUsage() {
