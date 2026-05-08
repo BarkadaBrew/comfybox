@@ -569,6 +569,7 @@ public final class WarmServer {
       guidance: resolvedGuidance,
       seed: request.seed,
       outputPath: nil,
+      scheduler: request.sampler,
       inpaintImageData: request.inpaintImageData,
       maskData: request.maskImageData,
       denoise: request.denoise,

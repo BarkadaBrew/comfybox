@@ -22,6 +22,8 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let batchSize: Int
   /// The node ID of the output node (ETN_SaveImageCache or PreviewImage).
   let outputNodeId: String
+  /// Sampler name extracted from KSamplerSelect node (e.g. "euler", "res_2s").
+  let sampler: String?
 
   // --- Phase 3: Inpainting fields ---
 
@@ -234,6 +236,10 @@ enum ComfyBridgeWorkflowParser {
     let noiseNode = nodes.values.first { $0.classType == "RandomNoise" }
     let seed = uint64Value(noiseNode?.inputs["noise_seed"])
 
+    // --- Sampler name ---
+    let samplerSelectNode = nodes.values.first { $0.classType == "KSamplerSelect" }
+    let samplerName = samplerSelectNode?.inputs["sampler_name"] as? String
+
     // --- Output node ---
     let outputNodeId: String
     if let saveNode = nodes.values.first(where: { $0.classType == "ETN_SaveImageCache" }) {
@@ -337,6 +343,7 @@ enum ComfyBridgeWorkflowParser {
       seed: seed,
       batchSize: max(batchSize, 1),
       outputNodeId: outputNodeId,
+      sampler: samplerName,
       inpaintImageId: inpaintImageId,
       maskImageId: maskImageId,
       denoise: denoise,
