@@ -136,6 +136,12 @@ public final class WarmServer {
   /// Resolved path to SeedVR2 weights directory.
   private let seedvr2WeightsPath: String?
 
+  /// Lazy-loaded ESRGAN upscale pipeline. Created on first ESRGAN upscale request.
+  private var esrganPipeline: ESRGANPipeline?
+
+  /// Default upscale models directory path — ESRGAN weights are stored here.
+  private static let upscaleModelsDirectoryPath = ("~/bin/zimage/upscale_models" as NSString).expandingTildeInPath
+
   public init(
     configuration: WarmServerConfiguration,
     host: String = "127.0.0.1",
@@ -149,14 +155,10 @@ public final class WarmServer {
 
     self.comfyBridge = ComfyBridge(logger: logger)
 
-    // Wire up the upscale handler if a SeedVR2 weights path is configured.
-    let upscaleHandler: ComfyBridgeUpscaleHandler?
-    if configuration.seedvr2WeightsPath != nil {
-      upscaleHandler = { [unowned self] (imageData: Data, modelName: String, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult in
-        try await self.bridgeUpscale(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
-      }
-    } else {
-      upscaleHandler = nil
+    // Wire up the upscale handler. ESRGAN models are always available (lazy-loaded from
+    // ~/bin/zimage/upscale_models/); SeedVR2 additionally requires a configured weights path.
+    let upscaleHandler: ComfyBridgeUpscaleHandler? = { [unowned self] (imageData: Data, modelName: String, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult in
+      try await self.bridgeUpscale(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
     }
 
     self.comfyBridge.configureExecutor(
@@ -569,7 +571,10 @@ public final class WarmServer {
       guidance: resolvedGuidance,
       seed: request.seed,
       outputPath: nil,
+      levelsMin: request.levelsMin,
+      levelsMax: request.levelsMax,
       scheduler: request.sampler,
+      sigmaSchedule: request.sigmaSchedule,
       inpaintImageData: request.inpaintImageData,
       maskData: request.maskImageData,
       denoise: request.denoise,
@@ -595,12 +600,91 @@ public final class WarmServer {
     )
   }
 
-  /// Bridge a ComfyUI upscale workflow request to the SeedVR2 pipeline.
-  /// Called by ComfyBridgeExecutor via the upscale handler closure set in init.
-  ///
-  /// The SeedVR2Pipeline is lazy-loaded on first use to avoid the ~6GB memory cost
-  /// until an upscale request actually arrives.
+  /// Known ESRGAN model name patterns.
+  /// If the upscale model name matches any of these, route to ESRGANPipeline.
+  private static let esrganModelPatterns: [String] = [
+    "RealESRGAN_x4",
+    "4x-UltraSharp",
+    "4xNomos8k",
+    "4x_NMKD-Superscale",
+    "OmniSR_",
+  ]
+
+  /// Whether the given upscale model name should be routed to ESRGAN.
+  private static func isESRGANModel(_ modelName: String) -> Bool {
+    esrganModelPatterns.contains { modelName.hasPrefix($0) || modelName.contains($0) }
+  }
+
+  /// Bridge a ComfyUI upscale workflow request to the appropriate upscale pipeline.
+  /// Routes to ESRGANPipeline for ESRGAN-family models, SeedVR2Pipeline for SeedVR2.
+  /// Both pipelines are lazy-loaded on first use to avoid startup memory costs.
   private func bridgeUpscale(
+    imageData: Data,
+    modelName: String,
+    progressCallback: ComfyBridgeProgressHandler?
+  ) async throws -> ComfyBridgeGenerateResult {
+    if Self.isESRGANModel(modelName) {
+      return try await bridgeUpscaleESRGAN(imageData: imageData, modelName: modelName)
+    } else {
+      return try await bridgeUpscaleSeedVR2(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
+    }
+  }
+
+  /// ESRGAN upscale path. Lazy-loads the ESRGANPipeline on first use.
+  /// Weights are resolved from ~/bin/zimage/upscale_models/<modelName>/.
+  private func bridgeUpscaleESRGAN(
+    imageData: Data,
+    modelName: String
+  ) async throws -> ComfyBridgeGenerateResult {
+    // Resolve weights directory: ~/bin/zimage/upscale_models/<modelName>/
+    // Strip file extension if present (e.g. "4x-UltraSharp.pth" -> "4x-UltraSharp")
+    let baseName: String
+    if let dotIndex = modelName.lastIndex(of: ".") {
+      baseName = String(modelName[modelName.startIndex..<dotIndex])
+    } else {
+      baseName = modelName
+    }
+    let weightsDir = URL(fileURLWithPath: Self.upscaleModelsDirectoryPath)
+      .appendingPathComponent(baseName)
+
+    // Lazy-load ESRGAN pipeline (re-create if model changed)
+    if esrganPipeline == nil || esrganPipeline!.weightsDirectory.path != weightsDir.path {
+      logger.info("WarmServer: lazy-loading ESRGAN pipeline from \(weightsDir.path)...")
+      let pipeline = try ESRGANPipeline(weightsDirectory: weightsDir, logger: logger)
+      esrganPipeline = pipeline
+      logger.info("WarmServer: ESRGAN pipeline ready (scale=\(pipeline.config.scale)x, blocks=\(pipeline.config.numBlock))")
+    }
+
+    guard let pipeline = esrganPipeline else {
+      throw ESRGANPipeline.PipelineError.weightsDirectoryNotFound(weightsDir.path)
+    }
+
+    // Write input image data to a temp file.
+    let inputTempPath = NSTemporaryDirectory() + "zimage-esrgan-input-\(UUID().uuidString).png"
+    try imageData.write(to: URL(fileURLWithPath: inputTempPath))
+    logger.info("WarmServer: wrote ESRGAN input to \(inputTempPath) (\(imageData.count) bytes)")
+
+    let outputTempPath = NSTemporaryDirectory() + "zimage-esrgan-output-\(UUID().uuidString).png"
+
+    let start = Date()
+    do {
+      let outputPath = try pipeline.upscaleAndSave(
+        imagePath: inputTempPath,
+        outputPath: outputTempPath
+      )
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      try? FileManager.default.removeItem(atPath: inputTempPath)
+      logger.info("WarmServer: ESRGAN upscale complete — \(durationMs)ms, output=\(outputPath)")
+      return ComfyBridgeGenerateResult(outputPath: outputPath, durationMs: durationMs)
+    } catch {
+      try? FileManager.default.removeItem(atPath: inputTempPath)
+      try? FileManager.default.removeItem(atPath: outputTempPath)
+      throw error
+    }
+  }
+
+  /// SeedVR2 upscale path. Lazy-loads on first use.
+  private func bridgeUpscaleSeedVR2(
     imageData: Data,
     modelName: String,
     progressCallback: ComfyBridgeProgressHandler?
@@ -621,7 +705,7 @@ public final class WarmServer {
       throw SeedVR2Pipeline.PipelineError.weightsDirectoryNotFound(weightsPath)
     }
 
-    // Write input image data to a temp file — SeedVR2Pipeline.upscale() takes a file path.
+    // Write input image data to a temp file.
     let inputTempPath = NSTemporaryDirectory() + "zimage-upscale-input-\(UUID().uuidString).png"
     try imageData.write(to: URL(fileURLWithPath: inputTempPath))
     logger.info("WarmServer: wrote upscale input to \(inputTempPath) (\(imageData.count) bytes)")
@@ -629,27 +713,17 @@ public final class WarmServer {
     let outputTempPath = NSTemporaryDirectory() + "zimage-upscale-output-\(UUID().uuidString).png"
 
     let start = Date()
-
     do {
       let outputPath = try pipeline.upscaleAndSave(
         imagePath: inputTempPath,
         outputPath: outputTempPath,
         progressHandler: progressCallback
       )
-
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
-
-      // Clean up input temp file.
       try? FileManager.default.removeItem(atPath: inputTempPath)
-
       logger.info("WarmServer: upscale complete — \(durationMs)ms, output=\(outputPath)")
-
-      return ComfyBridgeGenerateResult(
-        outputPath: outputPath,
-        durationMs: durationMs
-      )
+      return ComfyBridgeGenerateResult(outputPath: outputPath, durationMs: durationMs)
     } catch {
-      // Clean up temp files on failure.
       try? FileManager.default.removeItem(atPath: inputTempPath)
       try? FileManager.default.removeItem(atPath: outputTempPath)
       throw error

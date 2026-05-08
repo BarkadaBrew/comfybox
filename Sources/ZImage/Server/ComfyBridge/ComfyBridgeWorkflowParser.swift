@@ -24,6 +24,12 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let outputNodeId: String
   /// Sampler name extracted from KSamplerSelect node (e.g. "euler", "res_2s").
   let sampler: String?
+  /// Sigma schedule extracted from BasicScheduler node (e.g. "normal", "karras", "exponential").
+  let sigmaSchedule: String?
+  /// Levels min (black point) for contrast adjustment. Default 0.0.
+  let levelsMin: Float?
+  /// Levels max (white point) for contrast adjustment. Default 1.0.
+  let levelsMax: Float?
 
   // --- Phase 3: Inpainting fields ---
 
@@ -240,6 +246,10 @@ enum ComfyBridgeWorkflowParser {
     let samplerSelectNode = nodes.values.first { $0.classType == "KSamplerSelect" }
     let samplerName = samplerSelectNode?.inputs["sampler_name"] as? String
 
+    // --- Sigma schedule ---
+    // Extract the scheduler field from BasicScheduler (normal, karras, exponential, beta, sgm_uniform).
+    let sigmaScheduleName = schedulerNode?.inputs["scheduler"] as? String
+
     // --- Output node ---
     let outputNodeId: String
     if let saveNode = nodes.values.first(where: { $0.classType == "ETN_SaveImageCache" }) {
@@ -344,6 +354,9 @@ enum ComfyBridgeWorkflowParser {
       batchSize: max(batchSize, 1),
       outputNodeId: outputNodeId,
       sampler: samplerName,
+      sigmaSchedule: sigmaScheduleName,
+      levelsMin: nil,
+      levelsMax: nil,
       inpaintImageId: inpaintImageId,
       maskImageId: maskImageId,
       denoise: denoise,
