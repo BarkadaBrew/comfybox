@@ -77,7 +77,7 @@ final class FiboSingleTransformerBlock: Module {
     )
 
     // 3. Parallel MLP + projection
-    let mlpHiddenStates = gelu(projMLP(normHiddenStates))
+    let mlpHiddenStates = geluApproximate(projMLP(normHiddenStates))
     let combined = MLX.concatenated([attnOutput, mlpHiddenStates], axis: 2)
     let gateExpanded = gate.expandedDimensions(axis: 1)
     let projected = gateExpanded * projOut(combined)
