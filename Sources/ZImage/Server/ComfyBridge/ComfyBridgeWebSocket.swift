@@ -58,6 +58,15 @@ final class ComfyWebSocketManager {
     ws?.sendText(text)
   }
 
+  /// Send a binary message to a specific client.
+  func sendBinary(to clientId: String, data: Data) {
+    lock.lock()
+    let ws = connections[clientId]
+    lock.unlock()
+
+    ws?.sendBinary(data)
+  }
+
   /// Send a text message to all connected clients.
   func broadcast(text: String) {
     lock.lock()

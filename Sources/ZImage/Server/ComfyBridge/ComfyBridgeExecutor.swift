@@ -5,9 +5,13 @@
 //
 // Phase 2: txt2img execution with WebSocket event dispatch.
 // Phase 5: SeedVR2 upscale execution with WebSocket progress.
+// Phase 6: Binary WebSocket preview images for Krita live denoising.
 
 import Foundation
 import Logging
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 /// Callback type for generating images via the warm server pipeline.
 /// Accepts a ComfyBridgeGenerateRequest and returns the output path + timing.
@@ -31,6 +35,18 @@ final class ComfyBridgeExecutor {
   let generateHandler: ComfyBridgeGenerateHandler?
   let upscaleHandler: ComfyBridgeUpscaleHandler?
 
+  /// Whether to send binary WebSocket preview frames during generation.
+  /// When enabled, sends a downscaled JPEG preview as a ComfyUI binary frame
+  /// after generation completes (before the text "executed" event).
+  /// Has a small performance cost for image encoding.
+  var previewsEnabled: Bool = true
+
+  /// Maximum preview dimension (longest edge in pixels).
+  var previewMaxDimension: Int = 256
+
+  /// JPEG compression quality for preview images (0.0-1.0).
+  var previewJPEGQuality: Double = 0.6
+
   /// Active prompt being executed, if any.
   private let lock = NSLock()
   private var activePromptId: String?
@@ -40,13 +56,15 @@ final class ComfyBridgeExecutor {
     wsManager: ComfyWebSocketManager,
     imageCache: ComfyImageCache,
     generateHandler: ComfyBridgeGenerateHandler?,
-    upscaleHandler: ComfyBridgeUpscaleHandler? = nil
+    upscaleHandler: ComfyBridgeUpscaleHandler? = nil,
+    previewsEnabled: Bool = true
   ) {
     self.logger = logger
     self.wsManager = wsManager
     self.imageCache = imageCache
     self.generateHandler = generateHandler
     self.upscaleHandler = upscaleHandler
+    self.previewsEnabled = previewsEnabled
   }
 
   /// Whether a generation is currently in progress.
@@ -178,6 +196,18 @@ final class ComfyBridgeExecutor {
 
       // --- Phase 4: send output events ---
 
+      // Send binary preview frame before text events (Krita expects this for live preview).
+      #if canImport(CoreGraphics)
+      if previewsEnabled {
+        sendBinaryPreview(
+          imageData: imageData,
+          clientId: request.clientId,
+          eventType: .preview,
+          label: "generation"
+        )
+      }
+      #endif
+
       // Mark the output node as executing.
       sendEvent(to: request.clientId, type: "executing", data: [
         "prompt_id": request.promptId,
@@ -297,6 +327,18 @@ final class ComfyBridgeExecutor {
 
       // --- Phase 4: send output events ---
 
+      // Send binary preview frame before text events (Krita expects this for live preview).
+      #if canImport(CoreGraphics)
+      if previewsEnabled {
+        sendBinaryPreview(
+          imageData: imageData,
+          clientId: request.clientId,
+          eventType: .preview,
+          label: "upscale"
+        )
+      }
+      #endif
+
       // Mark the output node as executing.
       sendEvent(to: request.clientId, type: "executing", data: [
         "prompt_id": request.promptId,
@@ -403,4 +445,34 @@ final class ComfyBridgeExecutor {
     }
     return str
   }
+
+  // MARK: - Binary Preview Helpers
+
+  #if canImport(CoreGraphics)
+  /// Encode and send a binary WebSocket preview frame from PNG image data.
+  ///
+  /// Decodes the PNG, downscales to preview size, re-encodes as JPEG with
+  /// the ComfyUI 8-byte binary header, and sends via WebSocket.
+  ///
+  /// Failures are logged but do not interrupt the generation flow —
+  /// binary previews are best-effort and non-critical.
+  private func sendBinaryPreview(
+    imageData: Data,
+    clientId: String,
+    eventType: ComfyBridgePreviewEncoder.EventType,
+    label: String
+  ) {
+    guard let frame = ComfyBridgePreviewEncoder.encodePreviewFrame(
+      fromPNG: imageData,
+      maxDimension: previewMaxDimension,
+      jpegQuality: CGFloat(previewJPEGQuality),
+      eventType: eventType
+    ) else {
+      logger.warning("ComfyBridge: failed to encode \(label) preview — skipping binary frame")
+      return
+    }
+    wsManager.sendBinary(to: clientId, data: frame)
+    logger.info("ComfyBridge: sent binary \(label) preview (\(frame.count) bytes, \(previewMaxDimension)px max)")
+  }
+  #endif
 }
