@@ -107,6 +107,12 @@ enum ZImageVAEWeightAliases {
       in: &normalized
     )
 
+    // Fix: Force OIHW→OHWI transpose for encoder.conv_in.weight
+    // Shape [128, 3, 3, 3] is ambiguous — in_channels(3) == kernel_size(3)
+    // alignTensorShape skips transpose when shapes match, but data layout is wrong
+    if let w = normalized["encoder.conv_in.weight"], w.ndim == 4 {
+      normalized["encoder.conv_in.weight"] = w.transposed(0, 2, 3, 1)
+    }
     return normalized
   }
 
