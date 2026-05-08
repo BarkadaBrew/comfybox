@@ -142,6 +142,9 @@ public struct LoRAApplicator {
         }
 
         logger?.info("LoRA merge complete: applied=\(appliedCount), skipped=\(skippedCount)")
+        if appliedCount == 0 {
+            logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
+        }
         return merged
     }
 
@@ -235,6 +238,9 @@ public struct LoRAApplicator {
             logger?.info("LoRA applied to transformer: \(appliedCount) layers modified (\(quantizedCount) quantized)")
         } else {
             logger?.info("LoRA applied to transformer: \(appliedCount) layers modified")
+        }
+        if appliedCount == 0 {
+            logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
         }
     }
 
@@ -392,6 +398,8 @@ public struct LoRAApplicator {
             } else {
                 logger?.info("LoKr applied to \(appliedCount) layers")
             }
+        } else if !loraWeights.lokrWeights.isEmpty {
+            logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
         }
     }
 
@@ -504,6 +512,9 @@ public struct LoRAApplicator {
             logger?.info("Dynamic LoRA applied to \(appliedCount) layers (\(quantizedCount) quantized)")
         } else {
             logger?.info("Dynamic LoRA applied to \(appliedCount) layers")
+        }
+        if appliedCount == 0 {
+            logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
         }
     }
 
