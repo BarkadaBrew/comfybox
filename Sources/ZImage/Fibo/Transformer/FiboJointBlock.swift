@@ -26,7 +26,7 @@ final class FiboGELU: Module {
   }
 
   func callAsFunction(_ x: MLXArray) -> MLXArray {
-    gelu(proj(x))
+    geluApproximate(proj(x))
   }
 }
 
