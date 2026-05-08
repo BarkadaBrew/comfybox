@@ -419,6 +419,45 @@ enum ComfyBridgeObjectInfo {
     )
 
 
+    // --- NSFW filter node (pass-through — we do not filter) ---
+    info["NSFWFilter"] = nodeDefinition(
+      required: [
+        "images": imageInput(),
+      ],
+      outputs: ["IMAGE"]
+    )
+
+    // --- Tiled VAE nodes (ComfyBox handles tiling internally) ---
+    info["VAEEncodeTiled"] = nodeDefinition(
+      required: [
+        "pixels": imageInput(),
+        "vae": vaeInput(),
+      ],
+      optional: [
+        "tile_size": intInput(default: 512),
+      ],
+      outputs: ["LATENT"]
+    )
+    info["VAEDecodeTiled"] = nodeDefinition(
+      required: [
+        "samples": latentInput(),
+        "vae": vaeInput(),
+      ],
+      optional: [
+        "tile_size": intInput(default: 512),
+      ],
+      outputs: ["IMAGE"]
+    )
+
+    // --- Batch generation node ---
+    info["RepeatLatentBatch"] = nodeDefinition(
+      required: [
+        "samples": latentInput(),
+        "amount": intInput(default: 1),
+      ],
+      outputs: ["LATENT"]
+    )
+
     // --- Nodes referenced by ComfyBridge parser ---
     info["ImageCrop"] = nodeDefinition(
       required: [

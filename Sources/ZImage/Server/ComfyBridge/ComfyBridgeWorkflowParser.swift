@@ -260,6 +260,12 @@ enum ComfyBridgeWorkflowParser {
       outputNodeId = nodes.keys.sorted { $0.localizedStandardCompare($1) == .orderedDescending }.first ?? "1"
     }
 
+    // --- RepeatLatentBatch node ---
+    // If a RepeatLatentBatch node is present, its amount field overrides the batch size.
+    let repeatBatchNode = nodes.values.first { $0.classType == "RepeatLatentBatch" }
+    let repeatAmount = intValue(repeatBatchNode?.inputs["amount"]) ?? 1
+    let finalBatchSize = repeatAmount > 1 ? repeatAmount : batchSize
+
     // --- Phase 3: Inpainting detection ---
     // Detect inpaint workflows by finding ETN_LoadImageCache nodes.
     // The first one is typically the input image, the second is the mask.
@@ -385,7 +391,7 @@ enum ComfyBridgeWorkflowParser {
       steps: finalSteps,
       guidance: finalGuidance,
       seed: seed,
-      batchSize: max(batchSize, 1),
+      batchSize: max(finalBatchSize, 1),
       outputNodeId: outputNodeId,
       sampler: samplerName,
       sigmaSchedule: sigmaScheduleName,

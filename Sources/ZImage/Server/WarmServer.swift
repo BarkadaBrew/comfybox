@@ -602,6 +602,44 @@ public final class WarmServer {
       }
     }
 
+    // Batch generation: if batchSize > 1 (from RepeatLatentBatch), loop and return last result.
+    if request.batchSize > 1 {
+      logger.info("WarmServer: batch generation — \(request.batchSize) images")
+      var lastResult: ComfyBridgeGenerateResult?
+      var totalDurationMs = 0
+      for i in 0..<request.batchSize {
+        // Vary seed per batch item for unique outputs.
+        var batchPayload = payload
+        if let baseSeed = request.seed {
+          batchPayload = GeneratePayload(
+            prompt: payload.prompt,
+            negativePrompt: payload.negativePrompt,
+            width: payload.width,
+            height: payload.height,
+            steps: payload.steps,
+            guidance: payload.guidance,
+            seed: baseSeed + UInt64(i),
+            outputPath: payload.outputPath,
+            levelsMin: payload.levelsMin,
+            levelsMax: payload.levelsMax,
+            scheduler: payload.scheduler,
+            sigmaSchedule: payload.sigmaSchedule,
+            inpaintImageData: payload.inpaintImageData,
+            maskData: payload.maskData,
+            denoise: payload.denoise,
+            maskGrow: payload.maskGrow,
+            maskFeather: payload.maskFeather,
+            maskCropX: payload.maskCropX,
+            maskCropY: payload.maskCropY
+          )
+        }
+        let result = try await coordinator.enqueueGenerate(batchPayload, progressHandler: pipelineProgress)
+        totalDurationMs += result.durationMs
+        lastResult = ComfyBridgeGenerateResult(outputPath: result.outputPath, durationMs: totalDurationMs)
+      }
+      return lastResult!
+    }
+
     let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress)
     return ComfyBridgeGenerateResult(
       outputPath: result.outputPath,
