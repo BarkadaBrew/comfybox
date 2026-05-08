@@ -599,10 +599,18 @@ enum ComfyBridgeObjectInfo {
 
   private static func zimageUnetModels() -> [String] {
     [
+      // Z-Image (Flux 1) family
       "z-image-turbo",
       "z-image-turbo-bf16",
       "z-image-turbo-q8",
       "z-image-turbo-q4",
+      // Klein (Flux 2) family
+      "klein-4b-q8",
+      "klein-9b-q8",
+      // FIBO family
+      "briaai/FIBO",
+      // Chroma family
+      "chroma-8.9b",
     ]
   }
 
