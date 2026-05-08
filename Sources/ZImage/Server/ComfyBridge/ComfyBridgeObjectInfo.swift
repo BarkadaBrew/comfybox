@@ -307,6 +307,45 @@ enum ComfyBridgeObjectInfo {
       outputs: ["MODEL"]
     )
 
+    // --- KSampler nodes (used by some Krita workflows instead of SamplerCustomAdvanced) ---
+    info["KSampler"] = nodeDefinition(
+      required: [
+        "model": modelInput(),
+        "seed": intInput(default: 0),
+        "steps": intInput(default: 20),
+        "cfg": floatInput(default: 8.0),
+        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
+        "scheduler": optionInput(["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"]),
+        "positive": conditioningInput(),
+        "negative": conditioningInput(),
+        "latent_image": latentInput(),
+      ],
+      optional: [
+        "denoise": floatInput(default: 1.0),
+      ],
+      outputs: ["LATENT"]
+    )
+    info["KSamplerAdvanced"] = nodeDefinition(
+      required: [
+        "model": modelInput(),
+        "add_noise": optionInput(["enable", "disable"]),
+        "noise_seed": intInput(default: 0),
+        "steps": intInput(default: 20),
+        "cfg": floatInput(default: 8.0),
+        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
+        "scheduler": optionInput(["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"]),
+        "positive": conditioningInput(),
+        "negative": conditioningInput(),
+        "latent_image": latentInput(),
+      ],
+      optional: [
+        "start_at_step": intInput(default: 0),
+        "end_at_step": intInput(default: 10000),
+        "return_with_leftover_noise": optionInput(["disable", "enable"]),
+      ],
+      outputs: ["LATENT"]
+    )
+
     // --- Additional loader nodes (probed by Krita during connect/resource discovery) ---
     info["CLIPVisionLoader"] = nodeDefinition(
       required: [

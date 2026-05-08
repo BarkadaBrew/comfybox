@@ -18,6 +18,8 @@ public enum ComfyBoxModelFamily: String, Codable, CaseIterable, Sendable {
   case flux2Klein = "flux2-klein"
   case fibo = "fibo"
   case seedvr2 = "seedvr2"
+  case chroma = "chroma"
+  case esrgan = "esrgan"
 
   /// Human-readable display name.
   public var displayName: String {
@@ -26,6 +28,8 @@ public enum ComfyBoxModelFamily: String, Codable, CaseIterable, Sendable {
     case .flux2Klein: return "Flux 2 Klein"
     case .fibo: return "FIBO"
     case .seedvr2: return "SeedVR2"
+    case .chroma: return "Chroma"
+    case .esrgan: return "ESRGAN"
     }
   }
 
@@ -36,6 +40,8 @@ public enum ComfyBoxModelFamily: String, Codable, CaseIterable, Sendable {
     case .flux2Klein: return "4B/9B DiT, Qwen3 text encoder, Flux 2 architecture"
     case .fibo: return "8B DiT, SmolLM3-3B text encoder, Wan 2.2 VAE, DimFusion"
     case .seedvr2: return "3B upscaler, 2× resolution enhancement"
+    case .chroma: return "8.9B DiT, T5-XXL text encoder, FLUX.1 VAE, Approximator"
+    case .esrgan: return "RRDBNet 4× image upscaler"
     }
   }
 }
@@ -294,6 +300,68 @@ public enum ComfyBoxModelRegistry {
       displayName: "SeedVR2 Upscaler",
       description: "2× resolution upscaler. Feed a generated image, get 2× detail."
     ),
+
+    // ─── Chroma Family ───────────────────────────────────────────────
+    // 8.9B DiT with T5-XXL text encoder, FLUX.1 VAE, Approximator block.
+
+    ComfyBoxModel(
+      id: "chroma-8.9b-bf16",
+      family: .chroma, variant: .base, quantization: .none,
+      huggingFaceId: "lodestone-horizon/chroma",
+      parametersBillions: 8.9, latentChannels: 128,
+      defaultSteps: 28, defaultGuidance: 0.0,
+      supportsGuidance: false, supportsLoRA: false,
+      supportsControlNet: false, supportsImg2Img: false,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 17.0,
+      displayName: "Chroma 8.9B",
+      description: "Lodestone Horizon's Chroma model. T5-XXL encoder, CFG via Approximator. No guidance needed."
+    ),
+
+    // ─── ESRGAN Family ───────────────────────────────────────────────
+    // RRDBNet-based 4× upscalers. Various community weights.
+
+    ComfyBoxModel(
+      id: "esrgan-4x-ultrasharp",
+      family: .esrgan, variant: .upscaler, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 0.017, latentChannels: 3,
+      defaultSteps: 1, defaultGuidance: 0.0,
+      supportsGuidance: false, supportsLoRA: false,
+      supportsControlNet: false, supportsImg2Img: true,
+      defaultWidth: 4096, defaultHeight: 4096,
+      estimatedVRAM_GB: 1.0,
+      displayName: "4x-UltraSharp",
+      description: "4× ESRGAN upscaler. Sharp detail enhancement, popular community model."
+    ),
+
+    ComfyBoxModel(
+      id: "esrgan-realesrgan-x4",
+      family: .esrgan, variant: .upscaler, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 0.017, latentChannels: 3,
+      defaultSteps: 1, defaultGuidance: 0.0,
+      supportsGuidance: false, supportsLoRA: false,
+      supportsControlNet: false, supportsImg2Img: true,
+      defaultWidth: 4096, defaultHeight: 4096,
+      estimatedVRAM_GB: 1.0,
+      displayName: "RealESRGAN x4",
+      description: "4× Real-ESRGAN upscaler. General-purpose, good for photos and illustrations."
+    ),
+
+    ComfyBoxModel(
+      id: "esrgan-4xnomos8k",
+      family: .esrgan, variant: .upscaler, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 0.017, latentChannels: 3,
+      defaultSteps: 1, defaultGuidance: 0.0,
+      supportsGuidance: false, supportsLoRA: false,
+      supportsControlNet: false, supportsImg2Img: true,
+      defaultWidth: 4096, defaultHeight: 4096,
+      estimatedVRAM_GB: 1.0,
+      displayName: "4xNomos8k",
+      description: "4× ESRGAN upscaler trained on 8K images. Best for photorealistic content."
+    ),
   ]
 
   // MARK: - Lookups
@@ -351,10 +419,11 @@ public enum ComfyBoxModelRegistry {
     case "upscale_models":
       var result: [String: Any] = [:]
       for model in allModels where model.variant == .upscaler {
+        let scaleFactor: Int = model.family == .esrgan ? 4 : 2
         result[model.id] = [
           "base_model": model.family.rawValue,
           "type": "upscaler",
-          "scale_factor": 2,
+          "scale_factor": scaleFactor,
           "display_name": model.displayName,
           "description": model.description,
         ] as [String: Any]
