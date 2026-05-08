@@ -421,9 +421,13 @@ public enum ComfyBoxModelRegistry {
       for model in allModels where model.variant == .upscaler {
         let scaleFactor: Int = model.family == .esrgan ? 4 : 2
         result[model.id] = [
+          "name": model.id,
           "base_model": model.family.rawValue,
           "type": "upscaler",
+          "architecture": model.family.architecture,
           "scale_factor": scaleFactor,
+          "params_b": model.parametersBillions,
+          "estimated_vram_gb": model.estimatedVRAM_GB,
           "display_name": model.displayName,
           "description": model.description,
         ] as [String: Any]

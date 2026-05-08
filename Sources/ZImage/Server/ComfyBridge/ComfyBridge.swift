@@ -25,6 +25,12 @@ final class ComfyBridge {
   /// Configured after init via `configureExecutor()`.
   private(set) var executor: ComfyBridgeExecutor?
 
+  /// Queue status provider — set by WarmServer to expose coordinator queue state.
+  var queueStatusProvider: (() async -> ComfyBridgeQueueStatus)?
+
+  /// Queue clear handler — set by WarmServer to clear pending coordinator jobs.
+  var queueClearHandler: (() async -> Void)?
+
   // Lazily built and cached on first request. Guarded by cacheLock.
   private let cacheLock = NSLock()
   private var cachedSystemStats: Data?
@@ -187,6 +193,38 @@ final class ComfyBridge {
   // MARK: - GET /queue
 
   private func handleGetQueue() -> RoutedResponse {
+    // Fetch rich queue status from the coordinator if available.
+    // Use a semaphore to bridge async → sync since route() is synchronous.
+    if let provider = queueStatusProvider {
+      let semaphore = DispatchSemaphore(value: 0)
+      var status: ComfyBridgeQueueStatus?
+      Task {
+        status = await provider()
+        semaphore.signal()
+      }
+      semaphore.wait()
+
+      if let s = status {
+        let queue: [String: Any] = [
+          "queue_running": s.isRendering ? [["active_job"]] as [Any] : [] as [Any],
+          "queue_pending": Array(repeating: ["pending_job"] as [Any], count: s.pendingCount),
+          "queue_status": [
+            "pending_count": s.pendingCount,
+            "max_pending": s.maxPending,
+            "is_rendering": s.isRendering,
+            "current_job_id": s.currentJobId as Any,
+            "progress_percent": s.progressPercent as Any,
+            "render_count": s.renderCount,
+            "failed_count": s.failedCount,
+          ] as [String: Any],
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: queue) {
+          return .json(.rawJSON(status: 200, data: data))
+        }
+      }
+    }
+
+    // Fallback: basic status from executor.
     let isRunning = executor?.isExecuting ?? false
     let queue: [String: Any] = [
       "queue_running": isRunning ? [["placeholder"]] as [Any] : [] as [Any],
@@ -201,6 +239,39 @@ final class ComfyBridge {
   // MARK: - POST /queue (delete queued jobs)
 
   private func handlePostQueue() -> RoutedResponse {
+    // POST /queue with {"clear": true} cancels all pending jobs.
+    // This is a no-op if there are no pending jobs or no queue provider.
+    if let provider = queueStatusProvider {
+      let semaphore = DispatchSemaphore(value: 0)
+      var status: ComfyBridgeQueueStatus?
+      Task {
+        status = await provider()
+        semaphore.signal()
+      }
+      semaphore.wait()
+
+      let cleared = status?.pendingCount ?? 0
+      logger.info("ComfyBridge: POST /queue — clearing \(cleared) pending job(s)")
+
+      // Signal the coordinator to clear pending jobs.
+      if let clearFn = queueClearHandler {
+        let sem2 = DispatchSemaphore(value: 0)
+        Task {
+          await clearFn()
+          sem2.signal()
+        }
+        sem2.wait()
+      }
+
+      let response: [String: Any] = [
+        "success": true,
+        "cleared_count": cleared,
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: response) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+    }
+
     return .json(status: 200, payload: EmptyObject())
   }
 
@@ -376,6 +447,19 @@ final class ComfyBridge {
     logger.info("ComfyBridge: WebSocket upgrade for clientId=\(request.queryParameters["clientId"] ?? "unknown")")
     return Data(response.utf8)
   }
+}
+
+// MARK: - Queue Status
+
+/// Queue status returned by the coordinator, bridged to ComfyUI /queue format.
+struct ComfyBridgeQueueStatus: Sendable {
+  let pendingCount: Int
+  let maxPending: Int
+  let isRendering: Bool
+  let currentJobId: String?
+  let progressPercent: Int?
+  let renderCount: Int
+  let failedCount: Int
 }
 
 // MARK: - Helpers
