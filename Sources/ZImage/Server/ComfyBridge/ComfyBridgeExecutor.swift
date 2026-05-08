@@ -1,9 +1,10 @@
 // ComfyBridgeExecutor.swift — Async generation lifecycle for ComfyUI bridge
 //
-// Manages the full lifecycle of a generation request:
+// Manages the full lifecycle of a generation or upscale request:
 // parse workflow → enqueue via warm server → send WebSocket progress events → store output.
 //
 // Phase 2: txt2img execution with WebSocket event dispatch.
+// Phase 5: SeedVR2 upscale execution with WebSocket progress.
 
 import Foundation
 import Logging
@@ -17,12 +18,18 @@ typealias ComfyBridgeProgressHandler = @Sendable (Int, Int) -> Void  // (stepInd
 /// Accepts a request and optional progress callback, returns output path + timing.
 typealias ComfyBridgeGenerateHandler = @Sendable (ComfyBridgeGenerateRequest, ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult
 
+/// Callback type for upscaling images via the SeedVR2 pipeline.
+/// Accepts input image data, upscale model name, and optional progress callback.
+/// Returns the output path + timing.
+typealias ComfyBridgeUpscaleHandler = @Sendable (Data, String, ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult
+
 /// Manages async generation execution and WebSocket event dispatch.
 final class ComfyBridgeExecutor {
   private let logger: Logger
   private let wsManager: ComfyWebSocketManager
   private let imageCache: ComfyImageCache
   let generateHandler: ComfyBridgeGenerateHandler?
+  let upscaleHandler: ComfyBridgeUpscaleHandler?
 
   /// Active prompt being executed, if any.
   private let lock = NSLock()
@@ -32,12 +39,14 @@ final class ComfyBridgeExecutor {
     logger: Logger,
     wsManager: ComfyWebSocketManager,
     imageCache: ComfyImageCache,
-    generateHandler: ComfyBridgeGenerateHandler?
+    generateHandler: ComfyBridgeGenerateHandler?,
+    upscaleHandler: ComfyBridgeUpscaleHandler? = nil
   ) {
     self.logger = logger
     self.wsManager = wsManager
     self.imageCache = imageCache
     self.generateHandler = generateHandler
+    self.upscaleHandler = upscaleHandler
   }
 
   /// Whether a generation is currently in progress.
@@ -193,6 +202,125 @@ final class ComfyBridgeExecutor {
 
     } catch {
       logger.error("ComfyBridge: generation failed — prompt_id=\(request.promptId): \(error)")
+      sendError(promptId: request.promptId, clientId: request.clientId,
+                message: error.localizedDescription)
+    }
+  }
+
+  /// Execute a parsed upscale request asynchronously.
+  /// Sends the full sequence of ComfyUI WebSocket events during upscale.
+  func executeUpscale(_ request: ComfyBridgeUpscaleRequest) async {
+    guard let handler = upscaleHandler else {
+      logger.error("ComfyBridge: no upscale handler configured — upscale disabled")
+      sendError(promptId: request.promptId, clientId: request.clientId,
+                message: "Upscale not configured on this server")
+      return
+    }
+
+    lock.lock()
+    activePromptId = request.promptId
+    lock.unlock()
+
+    defer {
+      lock.lock()
+      activePromptId = nil
+      lock.unlock()
+    }
+
+    // --- Load input image from cache ---
+    var mutableRequest = request
+    guard let inputImageData = imageCache.retrieve(id: request.inputImageNodeId) else {
+      logger.error("ComfyBridge: upscale input image not found in cache: \(request.inputImageNodeId)")
+      sendError(promptId: request.promptId, clientId: request.clientId,
+                message: "Upscale input image not found: \(request.inputImageNodeId)")
+      return
+    }
+    mutableRequest.inputImageData = inputImageData
+
+    logger.info("ComfyBridge: executing upscale prompt_id=\(mutableRequest.promptId) — model=\(mutableRequest.upscaleModelName), input=\(inputImageData.count) bytes")
+
+    // --- Phase 1: execution_start ---
+    sendEvent(to: request.clientId, type: "execution_start", data: [
+      "prompt_id": request.promptId
+    ])
+
+    // --- Phase 2: simulate cached loader nodes ---
+    // Upscale workflows have fewer nodes — just mark the upscale model loader as cached.
+    sendEvent(to: request.clientId, type: "execution_cached", data: [
+      "prompt_id": request.promptId,
+      "nodes": ["1", "2"]
+    ])
+
+    // The upscale node is where actual work happens.
+    sendEvent(to: request.clientId, type: "executing", data: [
+      "prompt_id": request.promptId,
+      "node": "3"  // Upscale processing node
+    ])
+
+    // --- Phase 3: run actual upscale ---
+    do {
+      // Create a progress callback that sends WebSocket events.
+      let progressCallback: ComfyBridgeProgressHandler = { [wsManager, clientId = request.clientId, promptId = request.promptId] step, total in
+        let event: [String: Any] = [
+          "type": "progress",
+          "data": [
+            "prompt_id": promptId,
+            "value": step,
+            "max": total
+          ] as [String: Any]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: event),
+           let text = String(data: data, encoding: .utf8) {
+          wsManager.send(to: clientId, text: text)
+        }
+      }
+
+      let result = try await handler(inputImageData, mutableRequest.upscaleModelName, progressCallback)
+
+      // Read the output image.
+      let outputURL = URL(fileURLWithPath: result.outputPath)
+      guard let imageData = try? Data(contentsOf: outputURL) else {
+        logger.error("ComfyBridge: failed to read upscale output at \(result.outputPath)")
+        sendError(promptId: request.promptId, clientId: request.clientId,
+                  message: "Failed to read upscaled image")
+        return
+      }
+
+      // Store in the image cache.
+      let imageId = UUID().uuidString
+      guard imageCache.store(id: imageId, data: imageData) else {
+        logger.error("ComfyBridge: failed to cache upscale output image \(imageId)")
+        sendError(promptId: request.promptId, clientId: request.clientId,
+                  message: "Failed to cache upscaled image")
+        return
+      }
+
+      // --- Phase 4: send output events ---
+
+      // Mark the output node as executing.
+      sendEvent(to: request.clientId, type: "executing", data: [
+        "prompt_id": request.promptId,
+        "node": request.outputNodeId
+      ])
+
+      // Send the executed event with the image reference.
+      sendExecutedEvent(
+        to: request.clientId,
+        promptId: request.promptId,
+        nodeId: request.outputNodeId,
+        imageId: imageId
+      )
+
+      // Workflow complete — node=null signals done.
+      sendExecutingDone(to: request.clientId, promptId: request.promptId)
+
+      logger.info("ComfyBridge: upscale complete — prompt_id=\(request.promptId), \(result.durationMs)ms, image=\(imageId) (\(imageData.count) bytes)")
+
+      // Clean up the temp file — the image is now in the cache.
+      try? FileManager.default.removeItem(at: outputURL)
+
+    } catch {
+      logger.error("ComfyBridge: upscale failed — prompt_id=\(request.promptId): \(error)")
       sendError(promptId: request.promptId, clientId: request.clientId,
                 message: error.localizedDescription)
     }
