@@ -760,6 +760,12 @@ struct ZImageCLI {
             isBase: detected.isBaseModel
           )
 
+          // Load LoRAs for Flux 2
+          if !loraConfigs.isEmpty {
+            logger.info("Loading \(loraConfigs.count) LoRA(s) for Flux 2...")
+            try await flux2Pipeline.loadLoRAs(loraConfigs)
+          }
+
           // Validate guidance for distilled models
           if flux2Pipeline.isDistilled && guidance != 1.0 && guidance != ZImageModelMetadata.recommendedGuidanceScale {
             logger.warning("Guidance scale \(guidance) has no effect on distilled Klein models (forcing 1.0)")

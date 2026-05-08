@@ -376,25 +376,20 @@ public final class WarmServer {
     // --- Phase 4: Dynamic LoRA swap ---
     // If the workflow contains LoraLoader nodes, swap LoRAs before generating.
     // The coordinator serializes operations, so swap completes before generate starts.
-    // LoRA swap is not supported for Flux 2 models.
     if !request.loras.isEmpty {
-      if await coordinator.modelFamily == .flux2 {
-        logger.warning("WarmServer: ignoring LoRA swap for Flux 2 model (not supported)")
-      } else {
-        let loraEntries = request.loras.map { lora -> LoRAEntry in
-          // Resolve bare filenames to full paths in the LoRA directory.
-          let resolvedPath: String
-          if lora.name.contains("/") || lora.name.hasPrefix("~") {
-            resolvedPath = lora.name
-          } else {
-            resolvedPath = Self.loraDirectoryPath + "/" + lora.name
-          }
-          return LoRAEntry(path: resolvedPath, scale: lora.scale)
+      let loraEntries = request.loras.map { lora -> LoRAEntry in
+        // Resolve bare filenames to full paths in the LoRA directory.
+        let resolvedPath: String
+        if lora.name.contains("/") || lora.name.hasPrefix("~") {
+          resolvedPath = lora.name
+        } else {
+          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
         }
-        let swapPayload = LoRASwapPayload(loras: loraEntries)
-        let swapResult = try await coordinator.enqueueSwap(swapPayload)
-        logger.info("WarmServer: bridge LoRA swap complete — \(swapResult.loraCount) LoRA(s) active")
+        return LoRAEntry(path: resolvedPath, scale: lora.scale)
       }
+      let swapPayload = LoRASwapPayload(loras: loraEntries)
+      let swapResult = try await coordinator.enqueueSwap(swapPayload)
+      logger.info("WarmServer: bridge LoRA swap complete — \(swapResult.loraCount) LoRA(s) active")
     }
 
     // Derive dimensions from inpaint image if parser returned 0x0
@@ -1278,15 +1273,28 @@ private actor WarmServerCoordinator {
   }
 
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
-    if currentModelFamily == .flux2 || currentModelFamily == .fibo {
+    if currentModelFamily == .fibo {
       continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
       return
     }
 
     do {
       let newLoRAs = try payload.makeConfigurations()
-      try await pipeline.swapLoRAs(newLoRAs)
-      activeLoRAs = newLoRAs
+
+      if currentModelFamily == .flux2 {
+        // Flux 2 LoRA swap via Flux2Pipeline.loadLoRAs()
+        guard let f2 = flux2Pipeline else {
+          continuation.resume(throwing: WarmServerError.flux2NotLoaded)
+          return
+        }
+        try await f2.loadLoRAs(newLoRAs)
+        activeLoRAs = newLoRAs
+      } else {
+        // Flux 1 LoRA swap via ZImagePipeline.swapLoRAs()
+        try await pipeline.swapLoRAs(newLoRAs)
+        activeLoRAs = newLoRAs
+      }
+
       lastError = nil
       continuation.resume(
         returning: LoRASwapResponse(
@@ -1296,7 +1304,11 @@ private actor WarmServerCoordinator {
         )
       )
     } catch {
-      activeLoRAs = pipeline.loadedLoRAConfigs
+      if currentModelFamily == .flux2 {
+        activeLoRAs = flux2Pipeline?.loadedLoRAConfigs ?? []
+      } else {
+        activeLoRAs = pipeline.loadedLoRAConfigs
+      }
       lastError = error.localizedDescription
       continuation.resume(throwing: error)
     }
