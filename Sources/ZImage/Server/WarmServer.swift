@@ -231,15 +231,15 @@ public final class WarmServer {
   }
 
   public func run() throws {
+    // Ignore SIGHUP before model loading — prevents SSH disconnect from
+    // killing the daemon during the ~40s pipeline initialization phase.
+    signal(SIGHUP, SIG_IGN)
+
     try preparePipeline()
 
     guard let port = NWEndpoint.Port(rawValue: configuration.port) else {
       throw WarmServerError.invalidPort(configuration.port)
     }
-
-    // Ignore SIGHUP — prevents session loss from killing the daemon
-    // when run under launchd, nohup, or after SSH disconnect.
-    signal(SIGHUP, SIG_IGN)
 
     // Handle SIGTERM for clean launchd stop/restart.
     let sigTermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: listenerQueue)
