@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   typecheck:
@@ -31,8 +31,13 @@ jobs:
         run: |
           xcodebuild build -scheme ZImageCLI -configuration Debug -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1
 
+      - name: Run unit tests
+        run: xcodebuild test -scheme zimage.swift-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
+
   release-build:
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     runs-on: macos-latest
     steps:
       - name: Checkout

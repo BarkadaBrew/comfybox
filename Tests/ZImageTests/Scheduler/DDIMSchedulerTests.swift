@@ -81,7 +81,6 @@ final class DDIMSchedulerTests: XCTestCase {
     let seed: UInt64 = 42
     var ddimDet = Self.makeScheduler(steps: 9, eta: 0.0)
     var ddimStoch = Self.makeScheduler(steps: 9, eta: 1.0, seed: seed)
-
     let resultDet = ddimDet.step(
       modelOutput: modelOutput, timestepIndex: 4, sample: sample
     )

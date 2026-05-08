@@ -1319,6 +1319,8 @@ struct ZImageCLI {
     var loraEntries: [String] = []
     var loraScaleOverrides: [Float] = []
     var forceTransformerOverrideOnly = false
+    var host = "127.0.0.1"
+    var allowedOutputDirectory = FileManager.default.currentDirectoryPath
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1334,6 +1336,10 @@ struct ZImageCLI {
           return
         }
         port = UInt16(rawPort)
+      case "--host":
+        host = nextValue(for: arg, iterator: &iterator)
+      case "--allowed-output-directory":
+        allowedOutputDirectory = nextValue(for: arg, iterator: &iterator)
       case "--cache-limit":
         cacheLimit = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 2048)
       case "--max-sequence-length":
@@ -1373,10 +1379,11 @@ struct ZImageCLI {
       initialLoRAs: loraConfigs,
       forceTransformerOverrideOnly: forceTransformerOverrideOnly,
       maxSequenceLength: maxSequenceLength,
-      maxPendingRequests: 10
+      maxPendingRequests: 10,
+      allowedOutputDirectory: allowedOutputDirectory
     )
 
-    let server = WarmServer(configuration: configuration, logger: logger)
+    let server = WarmServer(configuration: configuration, host: host, logger: logger)
     try server.run()
   }
 
@@ -1388,6 +1395,8 @@ struct ZImageCLI {
       --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
       --text-encoder-path       Override text encoder directory
       --port                    HTTP port (default: 7862)
+      --host                    HTTP host/interface to bind (default: 127.0.0.1)
+      --allowed-output-directory  Directory where request outputPath values may write (default: current directory)
       --cache-limit             GPU memory cache limit in MB (default: unlimited)
       --max-sequence-length     Maximum sequence length for text encoding (default: 512)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override
