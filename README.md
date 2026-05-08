@@ -88,7 +88,7 @@ ZImageCLI -h
 | `-W, --width` | Output width | 1024 |
 | `-H, --height` | Output height | 1024 |
 | `-s, --steps` | Inference steps | 9 |
-| `-g, --guidance` | Guidance scale | 3.0 |
+| `-g, --guidance` | Guidance scale | 0.0 |
 | `--seed` | Random seed | random |
 | `-o, --output` | Output path | z-image.png |
 | `-m, --model` | Model path (dir or .safetensors) or HuggingFace ID | Tongyi-MAI/Z-Image-Turbo |
@@ -103,6 +103,8 @@ ZImageCLI -h
 | `--no-progress` | Disable progress output | false |
 | `--svg` | Generate SVG vector output (requires vtracer) | false |
 | `--svg-preset` | SVG conversion preset | default |
+
+Z-Image-Turbo defaults to guidance `0.0`. Other model families use different recommended guidance defaults.
 
 ### SVG Presets
 
@@ -275,7 +277,7 @@ ZImageCLI control \
 | `-W, --width` | Output width | 1024 |
 | `-H, --height` | Output height | 1024 |
 | `-s, --steps` | Inference steps | 9 |
-| `-g, --guidance` | Guidance scale | 3.0 |
+| `-g, --guidance` | Guidance scale | 0.0 |
 | `--seed` | Random seed | random |
 | `-o, --output` | Output path | z-image-control.png |
 | `-m, --model` | Model path or HuggingFace ID | Tongyi-MAI/Z-Image-Turbo |

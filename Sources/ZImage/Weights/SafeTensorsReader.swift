@@ -25,6 +25,8 @@ public enum SafeTensorsReaderError: Error {
 }
 
 public final class SafeTensorsReader {
+  private static let maxHeaderLength = 100_000_000
+
   public let fileURL: URL
   private let mappedData: Data
   private let tensors: [String: SafeTensorMetadata]
@@ -38,16 +40,21 @@ public final class SafeTensorsReader {
       throw SafeTensorsReaderError.fileTooSmall(fileURL)
     }
 
-    let headerLength = mappedData.prefix(8).withUnsafeBytes { rawBuffer -> Int in
+    let rawHeaderLength = mappedData.prefix(8).withUnsafeBytes { rawBuffer -> UInt64 in
       let value = rawBuffer.load(as: UInt64.self)
-      return Int(UInt64(littleEndian: value))
+      return UInt64(littleEndian: value)
     }
 
-    let headerStart = 8
-    let headerEnd = headerStart + headerLength
-    guard headerEnd <= mappedData.count else {
+    guard rawHeaderLength < UInt64(Self.maxHeaderLength) else {
       throw SafeTensorsReaderError.invalidHeaderLength(fileURL)
     }
+
+    let headerLength = Int(rawHeaderLength)
+    let headerStart = 8
+    guard headerLength <= mappedData.count - headerStart else {
+      throw SafeTensorsReaderError.invalidHeaderLength(fileURL)
+    }
+    let headerEnd = headerStart + headerLength
 
     let headerData = mappedData.subdata(in: headerStart..<headerEnd)
     let headerJSON = try JSONSerialization.jsonObject(with: headerData, options: [])
@@ -60,6 +67,7 @@ public final class SafeTensorsReader {
     var metadataValues: [String: String] = [:]
 
     let dataStartOffset = headerEnd
+    let dataSectionByteCount = mappedData.count - dataStartOffset
 
     for (key, value) in headerDict {
       if key == "__metadata__" {
@@ -90,13 +98,7 @@ public final class SafeTensorsReader {
       }
 
       let shape: [Int] = try shapeAny.map { element in
-        if let number = element as? NSNumber {
-          return number.intValue
-        } else if let string = element as? String, let intValue = Int(string) {
-          return intValue
-        } else {
-          throw SafeTensorsReaderError.invalidShape(name: key)
-        }
+        try SafeTensorsReader.parseDimension(element, tensorName: key)
       }
 
       guard let offsetsAny = tensorInfo["data_offsets"] as? [Any], offsetsAny.count == 2 else {
@@ -106,18 +108,25 @@ public final class SafeTensorsReader {
       let startOffset = try SafeTensorsReader.parseOffset(offsetsAny[0], tensorName: key)
       let endOffset = try SafeTensorsReader.parseOffset(offsetsAny[1], tensorName: key)
 
-      guard endOffset >= startOffset else {
+      guard startOffset <= dataSectionByteCount,
+            endOffset >= startOffset,
+            endOffset <= dataSectionByteCount else {
         throw SafeTensorsReaderError.invalidOffsets(name: key)
       }
 
       let byteCount = endOffset - startOffset
-      let expectedBytes = SafeTensorsReader.expectedByteCount(shape: shape, dtype: dtype)
+      let expectedBytes = try SafeTensorsReader.expectedByteCount(shape: shape, dtype: dtype, tensorName: key)
       guard byteCount == expectedBytes else {
         throw SafeTensorsReaderError.invalidShape(name: key)
       }
 
-      let absoluteOffset = dataStartOffset + startOffset
-      guard absoluteOffset + byteCount <= mappedData.count else {
+      let absoluteOffsetResult = dataStartOffset.addingReportingOverflow(startOffset)
+      guard !absoluteOffsetResult.overflow else {
+        throw SafeTensorsReaderError.invalidOffsets(name: key)
+      }
+      let absoluteOffset = absoluteOffsetResult.partialValue
+      let absoluteEndResult = absoluteOffset.addingReportingOverflow(byteCount)
+      guard !absoluteEndResult.overflow, absoluteEndResult.partialValue <= mappedData.count else {
         throw SafeTensorsReaderError.invalidOffsets(name: key)
       }
 
@@ -195,18 +204,57 @@ public final class SafeTensorsReader {
   }
 
   private static func parseOffset(_ value: Any, tensorName: String) throws -> Int {
-    if let number = value as? NSNumber {
-      return number.intValue
+    guard let parsed = parseNonNegativeInteger(value) else {
+      throw SafeTensorsReaderError.invalidOffsets(name: tensorName)
     }
-    if let string = value as? String, let intValue = Int(string) {
-      return intValue
-    }
-    throw SafeTensorsReaderError.invalidOffsets(name: tensorName)
+    return parsed
   }
 
-  private static func expectedByteCount(shape: [Int], dtype: DType) -> Int {
-    let elements = shape.reduce(1, *)
-    return elements * dtype.size
+  private static func parseDimension(_ value: Any, tensorName: String) throws -> Int {
+    guard let parsed = parseNonNegativeInteger(value) else {
+      throw SafeTensorsReaderError.invalidShape(name: tensorName)
+    }
+    return parsed
+  }
+
+  private static func parseNonNegativeInteger(_ value: Any) -> Int? {
+    if let number = value as? NSNumber {
+      if CFGetTypeID(number) == CFBooleanGetTypeID() {
+        return nil
+      }
+      if let intValue = Int(number.stringValue), intValue >= 0 {
+        return intValue
+      }
+      let doubleValue = number.doubleValue
+      guard doubleValue.isFinite,
+            doubleValue >= 0,
+            doubleValue.rounded(.towardZero) == doubleValue,
+            doubleValue < Double(Int.max) else {
+        return nil
+      }
+      return Int(doubleValue)
+    }
+    if let string = value as? String, let intValue = Int(string), intValue >= 0 {
+      return intValue
+    }
+    return nil
+  }
+
+  private static func expectedByteCount(shape: [Int], dtype: DType, tensorName: String) throws -> Int {
+    var elements = 1
+    for dimension in shape {
+      let result = elements.multipliedReportingOverflow(by: dimension)
+      guard !result.overflow else {
+        throw SafeTensorsReaderError.invalidShape(name: tensorName)
+      }
+      elements = result.partialValue
+    }
+
+    let byteCount = elements.multipliedReportingOverflow(by: dtype.size)
+    guard !byteCount.overflow else {
+      throw SafeTensorsReaderError.invalidShape(name: tensorName)
+    }
+    return byteCount.partialValue
   }
 
   private static func mapDType(_ value: String) throws -> DType {
