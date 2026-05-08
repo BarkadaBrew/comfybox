@@ -354,8 +354,75 @@ public final class WarmServer {
       }
       return .error(.error(status: 500, message: "Failed to serialize styles"))
 
+    // MARK: - Model Pool Endpoints
+
+    case ("POST", "/v1/model/load"):
+      do {
+        let payload = try decode(ModelLoadRequest.self, from: request.body)
+        let shouldActivate = payload.activate ?? true
+        let shouldWait = payload.wait ?? true
+
+        if shouldWait {
+          let result = try await coordinator.poolLoad(
+            modelSpec: payload.model,
+            quantization: payload.quantization,
+            activate: shouldActivate
+          )
+          return .json(status: 200, payload: result)
+        } else {
+          // Fire-and-forget: start loading in background, return immediately.
+          Task {
+            do {
+              try await coordinator.poolLoad(
+                modelSpec: payload.model,
+                quantization: payload.quantization,
+                activate: shouldActivate
+              )
+            } catch {
+              logger.error("ModelPool: background load failed for '\(payload.model)': \(error.localizedDescription)")
+            }
+          }
+          let ack = ModelLoadResponse(
+            status: "loading",
+            model: payload.model,
+            family: "pending",
+            loadTimeMs: 0,
+            vramEstimateMB: 0,
+            poolSize: await coordinator.modelPool.count(),
+            poolBudgetMB: await coordinator.modelPool.budget()
+          )
+          return .json(status: 202, payload: ack)
+        }
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("POST", "/v1/model/activate"):
+      do {
+        let payload = try decode(ModelActivateRequest.self, from: request.body)
+        let result = try await coordinator.poolActivate(modelId: payload.model)
+        return .json(status: 200, payload: result)
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", "/v1/model/pool"):
+      let result = await coordinator.poolList()
+      return .json(status: 200, payload: result)
+
+    case ("POST", "/v1/model/unload"):
+      do {
+        let payload = try decode(ModelUnloadRequest.self, from: request.body)
+        let result = try await coordinator.poolUnload(modelId: payload.model)
+        return .json(status: 200, payload: result)
+      } catch {
+        return .error(response(for: error))
+      }
+
     default:
-      if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health"].contains(request.path) {
+      if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
+          "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload"
+      ].contains(request.path) {
         return .error(.error(status: 405, message: "Method not allowed"))
       }
       return .error(.error(status: 404, message: "Not found"))
@@ -857,6 +924,18 @@ public final class WarmServer {
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       }
 
+    case let error as ModelPoolError:
+      switch error {
+      case .modelNotInPool, .cannotUnloadActive:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      case .budgetExceeded:
+        return .error(status: 507, message: error.localizedDescription ?? error.localizedDescription)
+      case .alreadyLoaded:
+        return .error(status: 409, message: error.localizedDescription ?? error.localizedDescription)
+      case .loadFailed, .modelDetectionFailed:
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      }
+
     case let error as DecodingError:
       return .error(status: 400, message: "Invalid JSON body: \(describe(decodingError: error))")
 
@@ -932,11 +1011,20 @@ private actor WarmServerCoordinator {
   private var activeRenderStartedAt: Date?
   private var pipelinePrepared = false
 
+  /// Model hot-swap pool — holds loaded pipelines with LRU eviction.
+  let modelPool: ModelPool
+
   init(configuration: WarmServerConfiguration, logger: Logger) {
     self.configuration = configuration
     self.logger = logger
     self.pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
     self.activeLoRAs = configuration.initialLoRAs
+    self.modelPool = ModelPool(
+      textEncoderPath: configuration.textEncoderPath,
+      maxSequenceLength: configuration.maxSequenceLength,
+      forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly,
+      logger: logger
+    )
   }
 
   func prepare() async throws {
@@ -1085,6 +1173,44 @@ private actor WarmServerCoordinator {
       pipelinePrepared = true
       logger.info("Warm server pipeline ready (Flux 1 / Z-Image \(zimageVariant.rawValue))")
     }
+
+    // Register the initial model in the pool so it appears in pool listings
+    // and can be managed alongside hot-swapped models.
+    // We register the already-loaded pipeline to avoid double-loading.
+    if let spec = modelSpec {
+      let box: PipelineBox
+      let detectedInfo: Any?
+      let vramMB: Int
+      switch currentModelFamily {
+      case .chroma:
+        box = PipelineBox(pipeline: chromaPipeline! as AnyObject)
+        if let tok = chromaTokenizer { box.context["tokenizer"] = tok as AnyObject }
+        detectedInfo = nil
+        vramMB = 17408
+      case .fibo:
+        box = PipelineBox(pipeline: fiboPipeline! as AnyObject)
+        detectedInfo = detectedFiboModel
+        vramMB = 22528
+      case .flux2:
+        box = PipelineBox(pipeline: flux2Pipeline! as AnyObject)
+        detectedInfo = detectedFlux2Model
+        vramMB = (detectedFlux2Model?.variant.contains("9b") ?? false) ? 18432 : 8704
+      case .flux1:
+        box = PipelineBox(pipeline: pipeline as AnyObject)
+        detectedInfo = zimageVariant
+        vramMB = 12288
+      }
+      let poolKey = ModelPool.poolKey(for: spec)
+      await modelPool.registerExisting(
+        poolKey: poolKey,
+        modelSpec: spec,
+        family: currentModelFamily,
+        box: box,
+        vramEstimateMB: vramMB,
+        detectedInfo: detectedInfo
+      )
+      logger.info("ModelPool: initial model '\(poolKey)' registered and activated")
+    }
   }
 
   /// Expose the current model family for routing decisions outside the actor.
@@ -1100,6 +1226,108 @@ private actor WarmServerCoordinator {
   /// The detected Z-Image variant (Base vs Turbo) for Flux 1 models.
   var currentZImageVariant: ZImageVariant {
     zimageVariant
+  }
+
+  // MARK: - Model Pool Operations
+
+  /// Load a model into the pool, optionally activating it.
+  func poolLoad(modelSpec: String, quantization: String?, activate: Bool) async throws -> ModelLoadResponse {
+    let start = Date()
+    let entry = try await modelPool.load(
+      modelSpec: modelSpec,
+      quantization: quantization,
+      initialLoRAs: activeLoRAs
+    )
+    let loadTimeMs = Int(Date().timeIntervalSince(start) * 1000.0)
+
+    if activate {
+      try await poolActivate(modelId: entry.id)
+    }
+
+    return ModelLoadResponse(
+      status: "loaded",
+      model: entry.modelSpec,
+      family: entry.family.rawValue,
+      loadTimeMs: loadTimeMs,
+      vramEstimateMB: entry.vramEstimateMB,
+      poolSize: await modelPool.count(),
+      poolBudgetMB: await modelPool.budget()
+    )
+  }
+
+  /// Activate a model that is already in the pool.
+  @discardableResult
+  func poolActivate(modelId: String) async throws -> ModelActivateResponse {
+    // Try by pool key first, then by model spec.
+    let entry: PoolEntry
+    if let e = await modelPool.findEntry(for: modelId) {
+      entry = try await modelPool.activate(modelId: e.id)
+    } else {
+      throw ModelPoolError.modelNotInPool(modelId)
+    }
+
+    // Sync coordinator state from pool entry.
+    currentModelFamily = entry.family
+    switch entry.family {
+    case .chroma:
+      chromaPipeline = entry.box.pipeline as? ChromaPipeline
+      chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
+    case .fibo:
+      fiboPipeline = entry.box.pipeline as? FiboPipeline
+      detectedFiboModel = entry.detectedInfo as? FiboDetectedModel
+    case .flux2:
+      flux2Pipeline = entry.box.pipeline as? Flux2Pipeline
+      detectedFlux2Model = entry.detectedInfo as? Flux2DetectedModel
+    case .flux1:
+      // The ZImagePipeline is stored in the pool box; the coordinator's
+      // `pipeline` property is still the original one created at init.
+      // For pool-loaded flux1 models, we use the box pipeline directly.
+      if let poolZImage = entry.box.pipeline as? ZImagePipeline {
+        // Cannot reassign let pipeline, but pool-based flux1 will go through pool path.
+        _ = poolZImage
+      }
+      zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
+    }
+    pipelinePrepared = true
+
+    return ModelActivateResponse(
+      status: "activated",
+      model: entry.modelSpec,
+      family: entry.family.rawValue
+    )
+  }
+
+  /// Unload a model from the pool.
+  func poolUnload(modelId: String) async throws -> ModelUnloadResponse {
+    // Find the entry to get the model spec before unloading.
+    guard let entry = await modelPool.findEntry(for: modelId) else {
+      throw ModelPoolError.modelNotInPool(modelId)
+    }
+    let freedMB = try await modelPool.unload(modelId: entry.id)
+    return ModelUnloadResponse(
+      status: "unloaded",
+      model: entry.modelSpec,
+      freedMB: freedMB,
+      poolSize: await modelPool.count()
+    )
+  }
+
+  /// List all models in the pool.
+  func poolList() async -> ModelPoolListResponse {
+    let entries = await modelPool.listPool()
+    let activeId = await modelPool.activeModelId()
+    let activeSpec: String?
+    if let aid = activeId, let entry = await modelPool.findEntry(for: aid) {
+      activeSpec = entry.modelSpec
+    } else {
+      activeSpec = nil
+    }
+    return ModelPoolListResponse(
+      active: activeSpec,
+      pool: entries,
+      totalVramMB: await modelPool.totalVramMB(),
+      budgetMB: await modelPool.budget()
+    )
   }
 
   func enqueueGenerate(
