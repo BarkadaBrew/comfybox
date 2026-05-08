@@ -10,6 +10,7 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   case dpmplusplus2sa = "dpmpp-2s-a"
   case deis = "deis"
   case ddim = "ddim"
+  case res2s = "res_2s"
 }
 
 /// Creates scheduler instances by kind.
@@ -27,6 +28,7 @@ public enum SchedulerFactory {
   ///   - mu: Dynamic shifting parameter (pass non-nil when `config.useDynamicShifting`).
   ///   - seed: Random seed for stochastic samplers (DPM++ 2S-A, DDIM with eta > 0).
   ///   - eta: DDIM stochasticity parameter (0 = deterministic, 1 = full DDPM).
+  ///   - c2: RES 2s second-stage substep location in log-sigma space.
   /// - Returns: A type-erased ``ZImageScheduler``.
   public static func create(
     kind: SchedulerKind,
@@ -35,7 +37,8 @@ public enum SchedulerFactory {
     config: ZImageSchedulerConfig,
     mu: Float? = nil,
     seed: UInt64? = nil,
-    eta: Float? = nil
+    eta: Float? = nil,
+    c2: Float = 0.5
   ) -> any ZImageScheduler {
     let sigmaValues = resolveSigmas(
       schedule: sigmaSchedule,
@@ -100,6 +103,14 @@ public enum SchedulerFactory {
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps
       )
+
+    case .res2s:
+      return RES2sScheduler(
+        numInferenceSteps: numInferenceSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps,
+        c2: c2
+      )
     }
   }
 
@@ -123,6 +134,15 @@ public enum SchedulerFactory {
     case .beta:
       let (lo, hi) = flowMatchingSigmaBounds(config: config)
       return SigmaSchedule.beta(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
+    case .beta57:
+      let (lo, hi) = flowMatchingSigmaBounds(config: config)
+      return SigmaSchedule.beta(
+        numSteps: numSteps,
+        sigmaMin: lo,
+        sigmaMax: hi,
+        alpha: 0.5,
+        betaParam: 0.7
+      )
     }
   }
 

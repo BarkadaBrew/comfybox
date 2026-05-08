@@ -215,6 +215,54 @@ final class SigmaScheduleTests: XCTestCase {
     }
   }
 
+  func testBeta57DiffersFromDefaultBeta() {
+    let steps = 9
+    let beta = SigmaSchedule.beta(
+      numSteps: steps,
+      sigmaMin: 0.001,
+      sigmaMax: 1.0
+    )
+    let beta57 = SigmaSchedule.beta(
+      numSteps: steps,
+      sigmaMin: 0.001,
+      sigmaMax: 1.0,
+      alpha: 0.5,
+      betaParam: 0.7
+    )
+
+    XCTAssertEqual(beta57.count, steps + 1)
+    XCTAssertEqual(beta57.last!, 0.0, accuracy: 1e-10)
+
+    var differs = false
+    for i in 0..<beta57.count {
+      if abs(beta57[i] - beta[i]) > 1e-6 {
+        differs = true
+        break
+      }
+    }
+    XCTAssertTrue(differs, "beta57 should differ from default beta")
+  }
+
+  func testBeta57MonotonicallyDecreasing() {
+    let sigmas = SigmaSchedule.beta(
+      numSteps: 20,
+      sigmaMin: 0.001,
+      sigmaMax: 1.0,
+      alpha: 0.5,
+      betaParam: 0.7
+    )
+
+    XCTAssertEqual(sigmas.count, 21)
+    for i in 1..<sigmas.count {
+      XCTAssertLessThanOrEqual(
+        sigmas[i],
+        sigmas[i - 1],
+        "beta57 sigmas should decrease monotonically at index \(i)"
+      )
+    }
+    XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)
+  }
+
   // MARK: - Linspace Helper
 
   func testLinspaceTwoElements() {
