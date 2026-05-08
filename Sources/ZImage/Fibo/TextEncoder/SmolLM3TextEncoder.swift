@@ -100,13 +100,11 @@ public final class SmolLM3TextEncoder: Module {
       base: config.ropeTheta
     )
 
-    // Parse no_rope_layers: array of 0/1 where 1 = skip RoPE
-    if let noRopeLayers = config.noRopeLayers, noRopeLayers.count == config.numHiddenLayers {
-      self.noRopeFlags = noRopeLayers.map { $0 == 1 }
-    } else {
-      // Default: all layers use RoPE (matching mflux behavior)
-      self.noRopeFlags = Array(repeating: false, count: config.numHiddenLayers)
-    }
+    // PARITY: Python mflux ignores the model config's no_rope_layers and applies
+    // RoPE to ALL layers. The config says to skip RoPE on 27/36 layers, but the
+    // Python reference doesn't implement this — so we match Python's behavior.
+    // TODO: Once parity is achieved, test respecting no_rope_layers for correctness.
+    self.noRopeFlags = Array(repeating: false, count: config.numHiddenLayers)
   }
 
   /// Forward pass through the full encoder.

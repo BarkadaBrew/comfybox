@@ -291,6 +291,83 @@ public final class LoRAWeightLoader {
         return results.sorted(by: { $0.path < $1.path })
     }
 
+    // MARK: - Flux 2 LoRA Loading
+
+    /// Load a safetensors LoRA file and map keys for the Flux2Transformer.
+    ///
+    /// Uses ``Flux2LoRAMapping`` instead of ``LoRAKeyMapper`` to map adapter keys
+    /// to Flux2Transformer module paths. For fused QKV keys, lora_B is split into
+    /// 3 equal parts along dim 0, creating separate Q/K/V entries.
+    ///
+    /// - Parameter url: Path to a `.safetensors` file.
+    /// - Returns: LoRAWeights with keys matching Flux2Transformer module paths.
+    public static func loadForFlux2(from url: URL) throws -> LoRAWeights {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw LoRAError.fileNotFound(url.path)
+        }
+
+        let reader = try SafeTensorsReader(fileURL: url)
+        let keys = reader.tensorNames
+
+        var processedKeys = Set<String>()
+        var loraPairs: [String: (down: MLXArray, up: MLXArray)] = [:]
+
+        for key in keys {
+            if processedKeys.contains(key) { continue }
+
+            // Find lora_A/lora_B or lora_down/lora_up pair
+            guard let (downKey, upKey, baseKey) = resolveKeyPair(key) else { continue }
+            guard reader.contains(downKey), reader.contains(upKey) else { continue }
+
+            let downWeight = try reader.tensor(named: downKey)  // lora_A
+            let upWeight = try reader.tensor(named: upKey)      // lora_B
+
+            processedKeys.insert(downKey)
+            processedKeys.insert(upKey)
+
+            // Map using Flux2LoRAMapping instead of LoRAKeyMapper
+            let mapping = Flux2LoRAMapping.map(baseKey)
+
+            switch mapping {
+            case .direct(let targetPath):
+                loraPairs[targetPath] = (down: downWeight, up: upWeight)
+
+            case .qkvSplit(let target):
+                // Split lora_B (up) into 3 parts along dim 0
+                guard upWeight.ndim == 2 else { continue }
+                let totalOut = upWeight.dim(0)
+                guard totalOut % 3 == 0 else { continue }
+                let splitSize = totalOut / 3
+
+                let qUp = upWeight[0..<splitSize, 0...]
+                let kUp = upWeight[splitSize..<(2 * splitSize), 0...]
+                let vUp = upWeight[(2 * splitSize)..<(3 * splitSize), 0...]
+
+                // lora_A (down): use the full tensor for all 3 projections.
+                // The rank dimension is shared across Q/K/V.
+                loraPairs[target.qPath] = (down: downWeight, up: qUp)
+                loraPairs[target.kPath] = (down: downWeight, up: kUp)
+                loraPairs[target.vPath] = (down: downWeight, up: vUp)
+
+            case .unmapped:
+                // Skip keys we don't recognize
+                continue
+            }
+        }
+
+        guard !loraPairs.isEmpty else {
+            throw LoRAError.invalidFormat(
+                "No valid Flux 2 LoRA weight pairs found in \(url.lastPathComponent). " +
+                "Expected keys matching double_blocks/single_blocks patterns."
+            )
+        }
+
+        let rank = inferRank(from: loraPairs)
+        let alpha = loadAlpha(from: url.deletingLastPathComponent())
+
+        return LoRAWeights(weights: loraPairs, rank: rank, alpha: alpha)
+    }
+
     private static func mapLoKrModuleKey(_ key: String) -> (moduleKey: String, suffix: LoKrSuffix)? {
         let suffix: LoKrSuffix
         if key.hasSuffix(LoKrSuffix.w1.rawValue) {

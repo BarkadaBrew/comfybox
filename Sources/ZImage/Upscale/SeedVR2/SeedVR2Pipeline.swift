@@ -105,12 +105,17 @@ public final class SeedVR2Pipeline {
     logger.info("SeedVR2 pipeline ready (\(config == .preset7B ? "7B" : "3B"))")
   }
 
+  /// Progress callback for upscale operations.
+  /// Called after each denoising step with (currentStep, totalSteps).
+  public typealias UpscaleProgressHandler = @Sendable (Int, Int) -> Void
+
   /// Upscales an image to the target resolution.
   public func upscale(
     imagePath: String,
     targetResolution: Int = 2048,
     seed: Int? = nil,
-    softness: Float = 0.0
+    softness: Float = 0.0,
+    progressHandler: UpscaleProgressHandler? = nil
   ) throws -> CGImage {
     let actualSeed = seed ?? Int.random(in: 0..<Int(Int32.max))
     logger.info("Upscaling \(imagePath) to \(targetResolution)px, seed=\(actualSeed), softness=\(softness)")
@@ -174,6 +179,7 @@ public final class SeedVR2Pipeline {
       latents = scheduler.step(modelOutput: noise, timestepIndex: t, sample: latents)
       MLX.eval(latents)
       logger.info("  Step \(t + 1)/\(numSteps) complete")
+      progressHandler?(t + 1, numSteps)
     }
 
     // 7. VAE decode
@@ -217,13 +223,15 @@ public final class SeedVR2Pipeline {
     outputPath: String? = nil,
     targetResolution: Int = 2048,
     seed: Int? = nil,
-    softness: Float = 0.0
+    softness: Float = 0.0,
+    progressHandler: UpscaleProgressHandler? = nil
   ) throws -> String {
     let result = try upscale(
       imagePath: imagePath,
       targetResolution: targetResolution,
       seed: seed,
-      softness: softness
+      softness: softness,
+      progressHandler: progressHandler
     )
 
     let outPath: String

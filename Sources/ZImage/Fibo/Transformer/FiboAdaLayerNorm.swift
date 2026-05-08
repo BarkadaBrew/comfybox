@@ -124,7 +124,7 @@ final class FiboAdaLayerNormContinuous: Module {
 
   init(embeddingDim: Int = 3072, conditioningEmbeddingDim: Int = 3072) {
     self.embeddingDim = embeddingDim
-    self._linear.wrappedValue = Linear(conditioningEmbeddingDim, embeddingDim * 2)
+    self._linear.wrappedValue = Linear(conditioningEmbeddingDim, embeddingDim * 2, bias: false)
     self._norm.wrappedValue = LayerNorm(dimensions: embeddingDim, eps: 1e-6, affine: false)
     super.init()
   }

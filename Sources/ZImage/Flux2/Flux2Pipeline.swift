@@ -131,6 +131,12 @@ public final class Flux2Pipeline {
   private var modelSnapshot: URL?
   private var isLoaded: Bool = false
 
+  /// Currently applied LoRA configurations (for hot-swap tracking).
+  private var appliedLoRAs: [LoRAConfiguration] = []
+
+  /// Public accessor for currently loaded LoRA configurations.
+  public var loadedLoRAConfigs: [LoRAConfiguration] { appliedLoRAs }
+
   // Model configs for current loaded model
   private var transformerConfig: Flux2TransformerConfig?
   private var textEncoderConfig: Qwen3TextEncoderConfiguration?
@@ -165,6 +171,7 @@ public final class Flux2Pipeline {
     textEncoderConfig = nil
     _isBaseModel = false
     isLoaded = false
+    appliedLoRAs = []
     GPU.clearCache()
     logger.info("Flux 2 model unloaded")
   }
@@ -234,6 +241,50 @@ public final class Flux2Pipeline {
       scale: scale,
       logger: logger
     )
+  }
+
+  // MARK: - LoRA Support
+
+  /// Load and apply LoRAs to the Flux 2 transformer.
+  ///
+  /// Clears any previously applied LoRAs before applying the new set.
+  /// Uses ``LoRAWeightLoader/loadForFlux2(from:)`` which handles the
+  /// Flux 2 key mapping (including fused QKV splitting).
+  ///
+  /// - Parameter configs: LoRA configurations to apply. Pass an empty array to clear all LoRAs.
+  public func loadLoRAs(_ configs: [LoRAConfiguration]) async throws {
+    guard let components = components else {
+      throw Flux2PipelineError.modelNotLoaded
+    }
+
+    // Clear existing dynamic LoRAs
+    if !appliedLoRAs.isEmpty {
+      LoRAApplicator.clearDynamicLoRA(from: components.transformer, logger: logger)
+      appliedLoRAs = []
+      logger.info("Cleared existing LoRAs from Flux 2 transformer")
+    }
+
+    guard !configs.isEmpty else {
+      return
+    }
+
+    // Load and apply each LoRA
+    for config in configs {
+      let url = try await LoRAWeightLoader.resolveSource(config.source)
+      let weights = try LoRAWeightLoader.loadForFlux2(from: url)
+
+      logger.info("Applying Flux 2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), scale=\(config.scale))")
+
+      LoRAApplicator.applyDynamically(
+        to: components.transformer,
+        loraWeights: weights,
+        scale: config.scale,
+        logger: logger
+      )
+    }
+
+    appliedLoRAs = configs
+    logger.info("Flux 2 LoRA loading complete: \(configs.count) LoRA(s) applied")
   }
 
   /// Generate an image and save it to disk.
