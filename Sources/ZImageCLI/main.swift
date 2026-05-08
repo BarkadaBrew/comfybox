@@ -649,10 +649,27 @@ struct ZImageCLI {
     if isChromaModel {
       nonisolated(unsafe) let chromaSemaphore = DispatchSemaphore(value: 0)
       let capturedModel = model
+      let capturedLoraEntries = loraEntries
+      let capturedLoraScales = loraScaleOverrides
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
-      // Chroma defaults: 28 steps
+      // Chroma defaults: 28 steps (8 for flash-heun)
       let chromaSteps = steps == ZImageModelMetadata.recommendedInferenceSteps ? 28 : steps
       let bar = useBar ? ProgressBar(total: chromaSteps) : nil
+
+      // Map scheduler: heun/beta → Chroma scheduler types
+      let chromaScheduler: ChromaSchedulerType
+      switch schedulerKind {
+      case .heun:
+        chromaScheduler = .heun
+      default:
+        // Check sigma schedule for beta
+        if sigmaSchedule == .beta {
+          chromaScheduler = .beta
+        } else {
+          chromaScheduler = .euler
+        }
+      }
+
       Task {
         do {
           // Resolve model snapshot
@@ -675,6 +692,41 @@ struct ZImageCLI {
             logger: logger
           )
 
+          // Apply LoRAs to transformer
+          if !capturedLoraEntries.isEmpty {
+            logger.info("Loading \(capturedLoraEntries.count) LoRA(s) for Chroma")
+            for (idx, loraEntry) in capturedLoraEntries.enumerated() {
+              let scale = idx < capturedLoraScales.count ? capturedLoraScales[idx] : 1.0
+
+              // Resolve LoRA path (local file or HuggingFace)
+              let loraURL: URL
+              if FileManager.default.fileExists(atPath: loraEntry) {
+                loraURL = URL(fileURLWithPath: loraEntry)
+              } else {
+                // Try as HuggingFace model ID
+                let resolved = try await ModelResolution.resolve(
+                  modelSpec: loraEntry,
+                  filePatterns: ["*.safetensors"]
+                )
+                let contents = try FileManager.default.contentsOfDirectory(
+                  at: resolved, includingPropertiesForKeys: nil
+                )
+                guard let safetensors = contents.first(where: { $0.pathExtension == "safetensors" }) else {
+                  logger.error("No safetensors found in LoRA: \(loraEntry)")
+                  continue
+                }
+                loraURL = safetensors
+              }
+
+              try ChromaLoRALoader.loadAndApply(
+                path: loraURL.path,
+                to: components.transformer,
+                scale: scale,
+                logger: logger
+              )
+            }
+          }
+
           // Load T5 tokenizer
           let tokenizer = try ChromaTokenizer.load(from: detected.componentPaths.tokenizerPath)
 
@@ -693,9 +745,13 @@ struct ZImageCLI {
           let negTokenIds = tokenizer.encodeUnpadded(prompt: "")
 
           // Chroma defaults: 28 steps, guidance 0.0 (distilled), cfg 4.0
+          // Flash-heun: 8 steps, heun/beta scheduler, CFG 1.0
           let chromaGuidance = guidance == ZImageModelMetadata.recommendedGuidanceScale ? Float(0.0) : guidance
+          let chromaCFG: Float = chromaScheduler == .euler ? 4.0 : 1.0
 
-          // Generate image with CFG (returns MLXArray of pixel data)
+          logger.info("Chroma: \(chromaSteps) steps, scheduler=\(chromaScheduler.rawValue), guidance=\(chromaGuidance), cfg=\(chromaCFG)")
+
+          // Generate image
           let pixels = pipeline.generate(
             tokenIds: tokenIds,
             negativeTokenIds: negTokenIds,
@@ -703,8 +759,9 @@ struct ZImageCLI {
             height: height,
             numSteps: chromaSteps,
             guidance: chromaGuidance,
-            cfg: 4.0,
-            firstNStepsWithoutCFG: 0,
+            cfg: chromaCFG,
+            firstNStepsWithoutCFG: chromaScheduler == .euler ? 0 : -1,
+            schedulerType: chromaScheduler,
             seed: seed,
             progressCallback: noProgress ? nil : { step, total in
               let completed = min(total, max(0, step))
@@ -847,6 +904,8 @@ struct ZImageCLI {
     if isFlux2 {
       nonisolated(unsafe) let flux2Semaphore = DispatchSemaphore(value: 0)
       let capturedModel = model
+      let capturedLoraEntries2 = loraEntries
+      let capturedLoraScales2 = loraScaleOverrides
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
       let bar = useBar ? ProgressBar(total: steps) : nil
       Task {
@@ -880,6 +939,36 @@ struct ZImageCLI {
           // Validate guidance for distilled models
           if flux2Pipeline.isDistilled && guidance != 1.0 && guidance != ZImageModelMetadata.recommendedGuidanceScale {
             logger.warning("Guidance scale \(guidance) has no effect on distilled Klein models (forcing 1.0)")
+          }
+
+          // Apply LoRAs to Flux 2 transformer
+          if !capturedLoraEntries2.isEmpty {
+            logger.info("Loading \(capturedLoraEntries2.count) LoRA(s) for Flux 2")
+            for (idx, loraEntry) in capturedLoraEntries2.enumerated() {
+              let loraScale = idx < capturedLoraScales2.count ? capturedLoraScales2[idx] : 1.0
+
+              // Resolve LoRA path (local file or HuggingFace)
+              let loraPath: String
+              if FileManager.default.fileExists(atPath: loraEntry) {
+                loraPath = loraEntry
+              } else {
+                // Try as HuggingFace model ID
+                let resolved = try await ModelResolution.resolve(
+                  modelSpec: loraEntry,
+                  filePatterns: ["*.safetensors"]
+                )
+                let contents = try FileManager.default.contentsOfDirectory(
+                  at: resolved, includingPropertiesForKeys: nil
+                )
+                guard let safetensors = contents.first(where: { $0.pathExtension == "safetensors" }) else {
+                  logger.error("No safetensors found in LoRA: \(loraEntry)")
+                  continue
+                }
+                loraPath = safetensors.path
+              }
+
+              try flux2Pipeline.applyLoRA(path: loraPath, scale: loraScale)
+            }
           }
 
           // Resolve img2img for Flux 2

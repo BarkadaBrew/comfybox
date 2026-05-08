@@ -67,18 +67,7 @@ public final class ChromaPipeline {
 
   // MARK: - Denoising
 
-  /// Run the denoising loop with optional Classifier-Free Guidance (CFG).
-  ///
-  /// When  is provided and , runs the transformer twice per step
-  /// (positive + negative prompt) after  warmup steps, combining
-  /// predictions: .
-  ///
-  /// - Parameters:
-  ///   - negTxt: Negative prompt T5 embeddings. Pass nil to disable CFG.
-  ///   - negTxtIds: Position IDs for negative text.
-  ///   - cfg: Classifier-free guidance scale. Higher = more prompt adherence. Default 4.0.
-  ///   - firstNStepsWithoutCFG: Number of initial steps to run without CFG warmup. Default 0.
-  ///     Set to -1 to disable CFG entirely (even if negTxt is provided).
+  /// Run the denoising loop with Euler stepping and optional CFG.
   public func denoise(
     xT: MLXArray,
     xIds: MLXArray,
@@ -90,6 +79,7 @@ public final class ChromaPipeline {
     guidance: Float = 0.0,
     cfg: Float = 4.0,
     firstNStepsWithoutCFG: Int = 0,
+    schedulerType: ChromaSchedulerType = .euler,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> MLXArray {
     let batch = xT.dim(0)
@@ -97,12 +87,17 @@ public final class ChromaPipeline {
 
     let guidanceArr = MLX.full([batch], values: MLXArray(guidance), dtype: .bfloat16)
 
-    let timesteps = sampler.timesteps(
-      numSteps: numSteps,
-      imageSequenceLength: imageSeqLen
-    )
+    // Select timestep schedule
+    let timesteps: [Float]
+    switch schedulerType {
+    case .euler, .heun:
+      timesteps = sampler.timesteps(numSteps: numSteps, imageSequenceLength: imageSeqLen)
+    case .beta:
+      timesteps = sampler.betaTimesteps(numSteps: numSteps, imageSequenceLength: imageSeqLen)
+    }
 
     let useCFG = negTxt != nil && firstNStepsWithoutCFG != -1
+    let useHeun = (schedulerType == .heun || schedulerType == .beta)
 
     var x = xT
     for i in 0..<numSteps {
@@ -111,7 +106,8 @@ public final class ChromaPipeline {
 
       let tArr = MLX.full([batch], values: MLXArray(t), dtype: .bfloat16)
 
-      let pred = transformer(
+      // First model evaluation
+      var pred = transformer(
         img: x,
         imgIds: xIds,
         txt: txt,
@@ -120,8 +116,8 @@ public final class ChromaPipeline {
         guidance: guidanceArr
       )
 
+      // Apply CFG if active
       if useCFG && i >= firstNStepsWithoutCFG {
-        // CFG: run transformer again with negative prompt
         let predNeg = transformer(
           img: x,
           imgIds: xIds,
@@ -130,18 +126,47 @@ public final class ChromaPipeline {
           timesteps: tArr,
           guidance: guidanceArr
         )
+        pred = predNeg + (pred - predNeg) * MLXArray(cfg)
+      }
 
-        // Combine: pred_cfg = pred_neg + (pred - pred_neg) * cfg
-        let predCFG = predNeg + (pred - predNeg) * MLXArray(cfg)
+      if useHeun && i < numSteps - 1 {
+        // Heun: second-order step
+        // 1. Euler step to intermediate
+        let xMid = sampler.eulerIntermediate(pred: pred, xT: x, t: t, tPrev: tPrev)
+        eval(xMid)
 
-        x = sampler.step(pred: predCFG, xT: x, t: t, tPrev: tPrev)
+        // 2. Evaluate at intermediate point
+        let tPrevArr = MLX.full([batch], values: MLXArray(tPrev), dtype: .bfloat16)
+        var pred2 = transformer(
+          img: xMid,
+          imgIds: xIds,
+          txt: txt,
+          txtIds: txtIds,
+          timesteps: tPrevArr,
+          guidance: guidanceArr
+        )
+
+        // Apply CFG to second prediction too
+        if useCFG && i >= firstNStepsWithoutCFG {
+          let predNeg2 = transformer(
+            img: xMid,
+            imgIds: xIds,
+            txt: negTxt!,
+            txtIds: negTxtIds!,
+            timesteps: tPrevArr,
+            guidance: guidanceArr
+          )
+          pred2 = predNeg2 + (pred2 - predNeg2) * MLXArray(cfg)
+        }
+
+        // 3. Trapezoidal combination
+        x = sampler.heunStep(pred1: pred, pred2: pred2, xT: x, t: t, tPrev: tPrev)
       } else {
-        // No CFG: simple Euler step
-        x = x.asType(pred.dtype) + MLXArray(tPrev - t) * pred
+        // Euler step (first order) — also used for last Heun step
+        x = sampler.step(pred: pred, xT: x, t: t, tPrev: tPrev)
       }
 
       eval(x)
-
       progressCallback?(i + 1, numSteps)
     }
 
@@ -149,8 +174,6 @@ public final class ChromaPipeline {
   }
 
   // MARK: - VAE Decoding
-
-
 
   /// Unpack and decode latents to pixel space.
   ///
@@ -166,15 +189,10 @@ public final class ChromaPipeline {
       .transposed(0, 1, 4, 2, 5, 3)
       .reshaped(b, h, w, -1)
 
-    // Cast to float32 for VAE precision — Python reference does this:
-    //   z = z.astype(mx.float32)
-    //   z = z / self.scale_factor + self.shift_factor
-    //   return self.decoder(z)
-    // Running VAE in bfloat16 produces broken/garbled output.
+    // Cast to float32 for VAE precision
     let fp32 = unpacked.asType(.float32)
 
     // Transpose NHWC → NCHW for AutoencoderKL.decode()
-    // AutoencoderKL handles scaling (0.3611 / 0.1159) internally.
     let nchw = fp32.transposed(0, 3, 1, 2)
     let (decoded, _) = vae.decode(nchw)
 
@@ -190,8 +208,8 @@ public final class ChromaPipeline {
   /// Generate an image from pre-tokenized T5 input.
   ///
   /// - Parameters:
-  ///   - negativeTokenIds: Optional negative prompt token IDs for CFG. If nil, tokenizes
-  ///     an empty string internally. Pass  to disable CFG.
+  ///   - schedulerType: Denoising schedule (`.euler`, `.heun`, `.beta`). Default `.euler`.
+  ///   - negativeTokenIds: Optional negative prompt token IDs for CFG.
   ///   - cfg: Classifier-free guidance scale (default 4.0).
   ///   - firstNStepsWithoutCFG: Steps to run without CFG before enabling it (default 0).
   public func generate(
@@ -203,6 +221,7 @@ public final class ChromaPipeline {
     guidance: Float = 0.0,
     cfg: Float = 4.0,
     firstNStepsWithoutCFG: Int = 0,
+    schedulerType: ChromaSchedulerType = .euler,
     seed: UInt64? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> MLXArray {
@@ -219,8 +238,6 @@ public final class ChromaPipeline {
     let (txtEmb, txtIds) = prepareConditioning(txt: txt, nImages: 1)
 
     // T5 encode negative prompt for CFG
-    // Caller must provide negativeTokenIds from the tokenizer (e.g. tokenizer.encode(prompt: ""))
-    // If not provided, CFG is disabled.
     var negTxt: MLXArray? = nil
     var negTxtIds: MLXArray? = nil
     if let negativeTokenIds, firstNStepsWithoutCFG != -1 {
@@ -235,7 +252,7 @@ public final class ChromaPipeline {
     let noise = sampler.samplePrior(shape: [1, latentH, latentW, 16], seed: seed)
     let (packed, imgIds) = prepareLatentImages(noise)
 
-    // Denoise with CFG
+    // Denoise
     let denoised = denoise(
       xT: packed,
       xIds: imgIds,
@@ -247,6 +264,7 @@ public final class ChromaPipeline {
       guidance: guidance,
       cfg: cfg,
       firstNStepsWithoutCFG: firstNStepsWithoutCFG,
+      schedulerType: schedulerType,
       progressCallback: progressCallback
     )
 
