@@ -202,6 +202,32 @@ public final class WarmServer {
       let cleared = await self.coordinator.clearPending()
       self.logger.info("ComfyBridge: cleared \(cleared) pending job(s) from queue")
     }
+
+    // Wire model switch handler for Krita checkpoint auto-detection.
+    // When Krita sends a workflow with a different checkpoint, this handler
+    // checks if the model is already in the pool (activate) or needs loading.
+    self.comfyBridge.modelSwitchHandler = { [unowned self] (modelId: String) async throws -> Bool in
+      // Check if this model is already active — no switch needed.
+      let currentActive = await self.coordinator.modelPool.activeModelId()
+      let requestedKey = ModelPool.poolKey(for: modelId)
+      if currentActive == requestedKey {
+        return false
+      }
+
+      // Check if the model is already in the pool — just activate it (instant).
+      if let existing = await self.coordinator.modelPool.findEntry(for: modelId) {
+        try await self.coordinator.poolActivate(modelId: existing.id)
+        self.logger.info("ComfyBridge: activated pool model '\(existing.id)' for Krita checkpoint switch")
+        return true
+      }
+
+      // Model not in pool — load and activate it.
+      let quantization = Self.parseQuantization(from: modelId)
+      let modelSpec = Self.parseModelSpec(from: modelId)
+      let result = try await self.coordinator.poolLoad(modelSpec: modelSpec, quantization: quantization, activate: true)
+      self.logger.info("ComfyBridge: loaded + activated '\(result.model)' (\(result.loadTimeMs)ms) for Krita checkpoint switch")
+      return true
+    }
   }
 
   public func run() throws {
@@ -1154,6 +1180,40 @@ public final class WarmServer {
     }
     guard result == KERN_SUCCESS else { return 0 }
     return info.phys_footprint
+  }
+
+  // MARK: - Krita Model Detection Helpers
+
+  /// Parse quantization suffix from a model ID string.
+  /// e.g. "z-image-turbo-q8" -> "q8", "klein-4b-q8" -> "q8", "briaai/FIBO" -> nil
+  static func parseQuantization(from modelId: String) -> String? {
+    let lowered = modelId.lowercased()
+    if lowered.hasSuffix("-q4") { return "q4" }
+    if lowered.hasSuffix("-q8") { return "q8" }
+    if lowered.hasSuffix("-bf16") { return "bf16" }
+    return nil
+  }
+
+  /// Parse the model spec from a pool-style model ID.
+  /// Strips quantization suffixes since poolLoad takes them separately.
+  /// e.g. "z-image-turbo-q8" -> "z-image-turbo", "briaai/FIBO" -> "briaai/FIBO"
+  static func parseModelSpec(from modelId: String) -> String {
+    let knownSpecs = [
+      "briaai/FIBO",
+      "chroma-8.9b",
+      "z-image-turbo",
+      "z-image-turbo-bf16",
+      "klein-4b",
+      "klein-9b",
+    ]
+    if knownSpecs.contains(modelId) { return modelId }
+    let suffixes = ["-q4", "-q8", "-bf16"]
+    for suffix in suffixes {
+      if modelId.lowercased().hasSuffix(suffix) {
+        return String(modelId.dropLast(suffix.count))
+      }
+    }
+    return modelId
   }
 }
 
