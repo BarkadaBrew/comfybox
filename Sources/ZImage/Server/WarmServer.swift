@@ -1066,6 +1066,8 @@ private actor WarmServerCoordinator {
         guidanceScale: payload.guidance ?? defaultGuidance,
         seed: payload.seed,
         outputPath: outputURL,
+        levelsMin: payload.levelsMin ?? 0.0,
+        levelsMax: payload.levelsMax ?? 1.0,
         maxSequenceLength: configuration.maxSequenceLength,
         inputImagePath: inputImageURL,
         denoise: resolvedDenoise
@@ -1120,7 +1122,9 @@ private actor WarmServerCoordinator {
         steps: payload.steps ?? 30,
         guidanceScale: payload.guidance ?? 4.0,
         seed: payload.seed,
-        outputPath: outputURL
+        outputPath: outputURL,
+        levelsMin: payload.levelsMin ?? 0.0,
+        levelsMax: payload.levelsMax ?? 1.0
       )
 
       let result = try await fp.generate(fiboRequest, progressHandler: nil)
@@ -1503,6 +1507,8 @@ private struct GeneratePayload: Sendable {
   let guidance: Float?
   let seed: UInt64?
   let outputPath: String?
+  let levelsMin: Float?
+  let levelsMax: Float?
   let scheduler: String?
   let sigmaSchedule: String?
   let eta: Float?
@@ -1526,6 +1532,7 @@ private struct GeneratePayload: Sendable {
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
     guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
+    levelsMin: Float? = nil, levelsMax: Float? = nil,
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
@@ -1535,6 +1542,7 @@ private struct GeneratePayload: Sendable {
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
+    self.levelsMin = levelsMin; self.levelsMax = levelsMax
     self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
     self.eta = eta; self.dype = dype
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
@@ -1547,7 +1555,7 @@ private struct GeneratePayload: Sendable {
 extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
-    case outputPath, scheduler, sigmaSchedule, eta, dype
+    case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
     case imagePath, imageStrength, creativity
   }
 
@@ -1561,6 +1569,8 @@ extension GeneratePayload: Decodable {
     guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
+    levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
     scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
@@ -1615,6 +1625,8 @@ extension GeneratePayload: Decodable {
       guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
+      levelsMin: levelsMin ?? 0.0,
+      levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
@@ -1690,6 +1702,8 @@ extension GeneratePayload: Decodable {
       guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
+      levelsMin: levelsMin ?? 0.0,
+      levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,

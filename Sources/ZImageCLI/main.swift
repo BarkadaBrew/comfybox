@@ -51,6 +51,8 @@ struct ZImageCLI {
     var guidance = ZImageModelMetadata.recommendedGuidanceScale
     var seeds: [UInt64] = []
     var outputPath = "z-image.png"
+    var levelsMin: Float = 0.0
+    var levelsMax: Float = 1.0
     var model: String?
     var textEncoderPath: String?
     var cacheLimit: Int?
@@ -108,6 +110,10 @@ struct ZImageCLI {
         }
       case "--output", "-o":
         outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--levels-min":
+        levelsMin = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
+      case "--levels-max":
+        levelsMax = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
       case "--model", "-m":
         model = nextValue(for: arg, iterator: &iterator)
       case "--text-encoder-path":
@@ -396,6 +402,8 @@ struct ZImageCLI {
               guidanceScale: guidance,
               seed: batchSeed,
               outputPath: URL(fileURLWithPath: batchOutputPath),
+              levelsMin: levelsMin,
+              levelsMax: levelsMax,
               model: capturedModel,
               textEncoderPath: capturedTextEncoderPath,
               maxSequenceLength: maxSequenceLength,
@@ -499,6 +507,8 @@ struct ZImageCLI {
         guidanceScale: guidance,
         seed: seed,
         outputPath: URL(fileURLWithPath: outputPath),
+        levelsMin: levelsMin,
+        levelsMax: levelsMax,
         model: model,
         textEncoderPath: textEncoderPath,
         maxSequenceLength: maxSequenceLength,
@@ -673,7 +683,9 @@ struct ZImageCLI {
             steps: fiboSteps,
             guidanceScale: fiboGuidance,
             seed: seed,
-            outputPath: URL(fileURLWithPath: outputPath)
+            outputPath: URL(fileURLWithPath: outputPath),
+            levelsMin: levelsMin,
+            levelsMax: levelsMax
           )
 
           _ = try await fiboPipeline.generate(fiboRequest, progressHandler: { progress in
@@ -776,6 +788,8 @@ struct ZImageCLI {
             guidanceScale: flux2Pipeline.isDistilled ? 1.0 : guidance,
             seed: seed,
             outputPath: URL(fileURLWithPath: outputPath),
+            levelsMin: levelsMin,
+            levelsMax: levelsMax,
             maxSequenceLength: maxSequenceLength,
             inputImagePath: flux2InputImage,
             denoise: flux2DenoiseValue
@@ -815,6 +829,8 @@ struct ZImageCLI {
       guidanceScale: guidance,
       seed: seed,
       outputPath: URL(fileURLWithPath: outputPath),
+      levelsMin: levelsMin,
+      levelsMax: levelsMax,
       model: model,
       textEncoderPath: textEncoderPath,
       maxSequenceLength: maxSequenceLength,
@@ -988,6 +1004,8 @@ struct ZImageCLI {
       --guidance, -g         Guidance scale (default \(ZImageModelMetadata.recommendedGuidanceScale))
       --seed                 Random seed
       --output, -o           Output path (default z-image.png)
+      --levels-min           Levels lower bound for post-decode contrast adjustment (default: 0.0)
+      --levels-max           Levels upper bound for post-decode contrast adjustment (default: 1.0)
       --model, -m            Model path or HuggingFace ID (default: \(ZImageRepository.id))
                              Aliases: z-image-base (Base, CFG-guided), z-image-turbo (Turbo, distilled)
       --model-family         Model family: flux1, flux2, or fibo (default: auto-detect from model config)
@@ -1433,6 +1451,8 @@ struct ZImageCLI {
     var guidance = ZImageModelMetadata.recommendedGuidanceScale
     var seed: UInt64?
     var outputPath = "z-image-control.png"
+    var levelsMin: Float = 0.0
+    var levelsMax: Float = 1.0
     var model: String?
     var textEncoderPath: String?
     var cacheLimit: Int?
@@ -1475,6 +1495,10 @@ struct ZImageCLI {
         seed = uint64Value(for: arg, iterator: &iterator)
       case "--output", "-o":
         outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--levels-min":
+        levelsMin = floatValue(for: arg, iterator: &iterator, fallback: 0.0)
+      case "--levels-max":
+        levelsMax = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
       case "--model", "-m":
         model = nextValue(for: arg, iterator: &iterator)
       case "--text-encoder-path":
@@ -1603,6 +1627,8 @@ struct ZImageCLI {
       guidanceScale: guidance,
       seed: seed,
       outputPath: URL(fileURLWithPath: outputPath),
+      levelsMin: levelsMin,
+      levelsMax: levelsMax,
       model: model,
       textEncoderPath: textEncoderPath,
       controlnetWeights: controlnetWeights,
@@ -1657,6 +1683,8 @@ struct ZImageCLI {
       --guidance, -g            Guidance scale (default \(ZImageModelMetadata.recommendedGuidanceScale))
       --seed                    Random seed
       --output, -o              Output path (default z-image-control.png)
+      --levels-min              Levels lower bound for post-decode contrast adjustment (default: 0.0)
+      --levels-max              Levels upper bound for post-decode contrast adjustment (default: 1.0)
       --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
       --text-encoder-path       Override text encoder directory (CLI > ZIMAGE_ENCODER_PATH > auto-detect > default)
       --cache-limit             GPU memory cache limit in MB (default: unlimited)

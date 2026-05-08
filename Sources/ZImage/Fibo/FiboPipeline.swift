@@ -34,6 +34,8 @@ public struct FiboGenerationRequest: Sendable {
   public var guidanceScale: Float
   public var seed: UInt64?
   public var outputPath: URL
+  public var levelsMin: Float
+  public var levelsMax: Float
 
   public init(
     prompt: String,
@@ -43,7 +45,9 @@ public struct FiboGenerationRequest: Sendable {
     steps: Int = 30,
     guidanceScale: Float = 4.0,
     seed: UInt64? = nil,
-    outputPath: URL = URL(fileURLWithPath: "fibo-output.png")
+    outputPath: URL = URL(fileURLWithPath: "fibo-output.png"),
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -53,6 +57,8 @@ public struct FiboGenerationRequest: Sendable {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
   }
 }
 
@@ -325,6 +331,9 @@ public final class FiboPipeline {
     // VAE output is in ~[-1, 1] range, denormalize to [0, 1]
     image = QwenImageIO.denormalizeFromDecoder(image)
     image = MLX.clip(image, min: 0, max: 1)
+    if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
+      image = ImageLevels.apply(image: image, min: request.levelsMin, max: request.levelsMax)
+    }
     MLX.eval(image)
 
     GPU.clearCache()
