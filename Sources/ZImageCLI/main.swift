@@ -1281,13 +1281,15 @@ struct ZImageCLI {
         --lora, -l           Initial LoRA(s)
         Use 'ZImageCLI serve --help' for full options
 
-      upscale                Upscale image via SeedVR2
+      upscale                Upscale image via SeedVR2 or ESRGAN
         --input, -i          Input image path (required)
         --output, -o         Output image path (default: input-upscaled.png)
         --resolution, -r     Target resolution (default: 2048)
         --steps              Inference steps (default: 1)
         --seed               Random seed
         --weights, -w        Path to SeedVR2 model weights directory
+        --esrgan-weights     Path to ESRGAN safetensors directory
+        --tile-size          ESRGAN tile size (default: 512)
         --softness           Preprocessing softness 0.0-1.0 (default: 0.0)
 
       models                 List known model families with installation status
@@ -2078,6 +2080,8 @@ struct ZImageCLI {
     var steps = 1
     var seed: Int?
     var weightsPath: String?
+    var esrganWeightsPath: String?
+    var tileSize = 512
     var softness: Float = 0.0
 
     var iterator = args.makeIterator()
@@ -2097,26 +2101,33 @@ struct ZImageCLI {
         }
       case "--weights", "-w":
         weightsPath = nextValue(for: arg, iterator: &iterator)
+      case "--esrgan-weights":
+        esrganWeightsPath = nextValue(for: arg, iterator: &iterator)
+      case "--tile-size":
+        tileSize = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: tileSize)
       case "--softness":
         softness = floatValue(for: arg, iterator: &iterator, fallback: softness)
       case "--help", "-h":
         print("""
-        SeedVR2 Image Upscaler
+        SeedVR2 / ESRGAN Image Upscaler
 
-        Usage: ZImageCLI upscale --input <path> --weights <path> [options]
+        Usage: ZImageCLI upscale --input <path> (--weights <path> | --esrgan-weights <path>) [options]
 
           --input, -i          Input image path (required)
           --output, -o         Output image path (default: input-upscaled.png)
           --resolution, -r     Target resolution for shortest side (default: 2048)
           --steps              Inference steps (default: 1)
           --seed               Random seed for reproducibility
-          --weights, -w        Path to SeedVR2 model weights directory (required)
+          --weights, -w        Path to SeedVR2 model weights directory
+          --esrgan-weights     Path to ESRGAN safetensors directory
+          --tile-size          ESRGAN tile size for large images (default: 512)
           --softness           Preprocessing softness 0.0-1.0 (default: 0.0)
           --help, -h           Show this help
 
         Examples:
           ZImageCLI upscale -i photo.jpg -w ./models/seedvr2
           ZImageCLI upscale -i photo.jpg -w ./models/seedvr2 -r 4096 --seed 42
+          ZImageCLI upscale -i photo.jpg --esrgan-weights ./models/4x-ultrasharp --tile-size 512
           ZImageCLI upscale -i low-res.png -w ./models/seedvr2 --softness 0.3 -o high-res.png
         """)
         return
@@ -2130,8 +2141,8 @@ struct ZImageCLI {
       exit(1)
     }
 
-    guard let weights = weightsPath else {
-      fputs("Error: --weights is required for upscale\n", stderr)
+    guard weightsPath != nil || esrganWeightsPath != nil else {
+      fputs("Error: --weights or --esrgan-weights is required for upscale\n", stderr)
       exit(1)
     }
 
@@ -2141,6 +2152,29 @@ struct ZImageCLI {
     }
 
     let startTime = CFAbsoluteTimeGetCurrent()
+
+    if let esrganWeights = esrganWeightsPath {
+      let pipeline = try ESRGANPipeline(
+        weightsDirectory: URL(fileURLWithPath: esrganWeights),
+        config: nil,
+        logger: logger
+      )
+
+      let savedPath = try pipeline.upscaleAndSave(
+        imagePath: input,
+        outputPath: outputPath,
+        tileSize: tileSize
+      )
+
+      let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+      logger.info("ESRGAN upscale complete in \(String(format: "%.1f", elapsed))s -> \(savedPath)")
+      return
+    }
+
+    guard let weights = weightsPath else {
+      fputs("Error: --weights is required for SeedVR2 upscale\n", stderr)
+      exit(1)
+    }
 
     let pipeline = try SeedVR2Pipeline(
       weightsPath: weights,
@@ -2161,7 +2195,7 @@ struct ZImageCLI {
   }
   #else
   private static func runUpscale(args: [String]) throws {
-    fputs("Error: SeedVR2 upscale requires CoreGraphics (macOS)\n", stderr)
+    fputs("Error: upscale requires CoreGraphics (macOS)\n", stderr)
     exit(1)
   }
   #endif
