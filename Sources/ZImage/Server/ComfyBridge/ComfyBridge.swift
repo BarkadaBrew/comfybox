@@ -31,6 +31,17 @@ final class ComfyBridge {
   /// Queue clear handler — set by WarmServer to clear pending coordinator jobs.
   var queueClearHandler: (() async -> Void)?
 
+  /// LoRA Library reference — set by WarmServer for library-aware LoRA discovery.
+  /// When set, invalidates the cached object_info so the next request picks up
+  /// library-sourced LoRA listings filtered by model compatibility.
+  var loraLibrary: LoRALibrary? {
+    didSet {
+      cacheLock.lock()
+      cachedObjectInfo = nil
+      cacheLock.unlock()
+    }
+  }
+
   // Lazily built and cached on first request. Guarded by cacheLock.
   private let cacheLock = NSLock()
   private var cachedSystemStats: Data?
@@ -177,7 +188,7 @@ final class ComfyBridge {
       return .json(.rawJSON(status: 200, data: cached))
     }
 
-    let info = ComfyBridgeObjectInfo.build()
+    let info = ComfyBridgeObjectInfo.build(loraLibrary: loraLibrary)
 
     if let data = try? JSONSerialization.data(withJSONObject: info) {
       cacheLock.lock()

@@ -139,6 +139,10 @@ public final class WarmServer {
   /// Lazy-loaded ESRGAN upscale pipeline. Created on first ESRGAN upscale request.
   private var esrganPipeline: ESRGANPipeline?
 
+  /// LoRA Library — indexes, queries, and manages LoRA adapter files.
+  /// Initialized at startup; auto-scans if no library.json exists.
+  private var loraLibrary: LoRALibrary?
+
   /// Default upscale models directory path — ESRGAN weights are stored here.
   private static let upscaleModelsDirectoryPath = ("~/bin/zimage/upscale_models" as NSString).expandingTildeInPath
 
@@ -154,6 +158,28 @@ public final class WarmServer {
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
+
+    // Initialize the LoRA Library. The library root defaults to ~/Models/loras/
+    // (via COMFYBOX_MODELS env or LoRALibrary default). If no library.json exists,
+    // the first API call to /v1/loras/scan will create it.
+    do {
+      let library = try LoRALibrary(logger: logger)
+      self.loraLibrary = library
+
+      // Auto-scan if no library.json exists yet (first run).
+      if library.count == 0 {
+        logger.info("LoRA Library: no index found, running initial scan...")
+        let result = try library.scan()
+        logger.info("LoRA Library: initial scan complete — \(result.added) LoRAs indexed")
+      } else {
+        logger.info("LoRA Library: loaded \(library.count) entries from index")
+      }
+
+      // Wire the library into the ComfyBridge for LoRA discovery.
+      comfyBridge.loraLibrary = library
+    } catch {
+      logger.warning("LoRA Library: failed to initialize — \(error.localizedDescription). LoRA API endpoints will return 503.")
+    }
 
     // Wire up the upscale handler. ESRGAN models are always available (lazy-loaded from
     // ~/bin/zimage/upscale_models/); SeedVR2 additionally requires a configured weights path.
@@ -419,10 +445,169 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    // MARK: - LoRA Library Endpoints
+
+    case ("GET", "/v1/loras"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      let allEntries = library.list(includeQuarantined: true)
+      let activeLoRANames = await coordinator.activeLoRAIdentifiers
+      let quarantinedCount = allEntries.filter { $0.quarantined }.count
+
+      var loraList: [[String: Any]] = []
+      for entry in allEntries {
+        var dict: [String: Any] = [
+          "id": entry.id,
+          "filename": entry.filename,
+          "model_compatibility": entry.modelCompatibility,
+          "format": entry.format.rawValue,
+          "rank": entry.rank,
+          "size_bytes": entry.sizeBytes,
+          "quarantined": entry.quarantined,
+          "tags": entry.tags,
+          "category": entry.category,
+          "triggerwords": entry.triggerwords,
+          "recommended_scale": entry.recommendedScale,
+          "date_added": entry.dateAdded,
+        ]
+        if let reason = entry.quarantineReason { dict["quarantine_reason"] = reason }
+        if !entry.notes.isEmpty { dict["notes"] = entry.notes }
+        loraList.append(dict)
+      }
+
+      let responseDict: [String: Any] = [
+        "loras": loraList,
+        "active_loras": activeLoRANames,
+        "total": allEntries.count,
+        "quarantined": quarantinedCount,
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize LoRA list"))
+
+    case ("GET", _) where request.path.hasPrefix("/v1/loras/"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      let id = String(request.path.dropFirst("/v1/loras/".count))
+      guard !id.isEmpty, !id.contains("/") else {
+        return .error(.error(status: 400, message: "Invalid LoRA ID"))
+      }
+      guard let entry = library.entry(for: id) else {
+        return .error(.error(status: 404, message: "LoRA not found: \(id)"))
+      }
+
+      var dict: [String: Any] = [
+        "id": entry.id,
+        "filename": entry.filename,
+        "relative_path": entry.relativePath,
+        "size_bytes": entry.sizeBytes,
+        "size_formatted": entry.sizeFormatted,
+        "model_compatibility": entry.modelCompatibility,
+        "format": entry.format.rawValue,
+        "rank": entry.rank,
+        "key_count": entry.keyCount,
+        "layer_targets": entry.layerTargets,
+        "triggerwords": entry.triggerwords,
+        "recommended_scale": entry.recommendedScale,
+        "scale_range": entry.scaleRange,
+        "tags": entry.tags,
+        "category": entry.category,
+        "notes": entry.notes,
+        "date_added": entry.dateAdded,
+        "quarantined": entry.quarantined,
+      ]
+      if let sha = entry.sha256 { dict["sha256"] = sha }
+      if let alpha = entry.alpha { dict["alpha"] = alpha }
+      if let reason = entry.quarantineReason { dict["quarantine_reason"] = reason }
+      if let url = entry.sourceURL { dict["source_url"] = url }
+      if let civitaiId = entry.civitaiModelId { dict["civitai_model_id"] = civitaiId }
+      if let meta = entry.safetensorsMetadata { dict["safetensors_metadata"] = meta }
+
+      if let data = try? JSONSerialization.data(withJSONObject: dict) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize LoRA entry"))
+
+    case ("POST", "/v1/loras/scan"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      do {
+        let force: Bool
+        if !request.body.isEmpty,
+           let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+           let f = json["force"] as? Bool {
+          force = f
+        } else {
+          force = false
+        }
+        let result = try library.scan(force: force)
+        let responseDict: [String: Any] = [
+          "added": result.added,
+          "updated": result.updated,
+          "removed": result.removed,
+          "unchanged": result.unchanged,
+          "total": result.total,
+          "errors": result.errors.map { ["file": $0.0, "error": $0.1] },
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
+          return .json(.rawJSON(status: 200, data: data))
+        }
+        return .error(.error(status: 500, message: "Failed to serialize scan result"))
+      } catch {
+        return .error(.error(status: 500, message: "Scan failed: \(error.localizedDescription)"))
+      }
+
+    case ("POST", _) where request.path.hasSuffix("/quarantine") && request.path.hasPrefix("/v1/loras/"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      let pathBody = String(request.path.dropFirst("/v1/loras/".count).dropLast("/quarantine".count))
+      guard !pathBody.isEmpty, !pathBody.contains("/") else {
+        return .error(.error(status: 400, message: "Invalid LoRA ID"))
+      }
+      do {
+        let reason: String
+        if !request.body.isEmpty,
+           let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+           let r = json["reason"] as? String {
+          reason = r
+        } else {
+          reason = "Quarantined via API"
+        }
+        try library.quarantine(pathBody, reason: reason)
+        return .json(.rawJSON(status: 200, data: Data("{\"success\":true,\"id\":\"\(pathBody)\",\"quarantined\":true}".utf8)))
+      } catch let error as LoRALibraryError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: error.localizedDescription))
+      }
+
+    case ("DELETE", _) where request.path.hasSuffix("/quarantine") && request.path.hasPrefix("/v1/loras/"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      let pathBody = String(request.path.dropFirst("/v1/loras/".count).dropLast("/quarantine".count))
+      guard !pathBody.isEmpty, !pathBody.contains("/") else {
+        return .error(.error(status: 400, message: "Invalid LoRA ID"))
+      }
+      do {
+        try library.unquarantine(pathBody)
+        return .json(.rawJSON(status: 200, data: Data("{\"success\":true,\"id\":\"\(pathBody)\",\"quarantined\":false}".utf8)))
+      } catch let error as LoRALibraryError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: error.localizedDescription))
+      }
+
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
-          "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload"
-      ].contains(request.path) {
+          "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
+          "/v1/loras", "/v1/loras/scan"
+      ].contains(request.path) || request.path.hasPrefix("/v1/loras/") {
         return .error(.error(status: 405, message: "Method not allowed"))
       }
       return .error(.error(status: 404, message: "Not found"))
@@ -1216,6 +1401,21 @@ private actor WarmServerCoordinator {
   /// Expose the current model family for routing decisions outside the actor.
   var modelFamily: WarmModelFamily {
     currentModelFamily
+  }
+
+  /// Active LoRA identifiers (bare filenames without path or extension) for the library API.
+  var activeLoRAIdentifiers: [String] {
+    activeLoRAs.map { config in
+      switch config.source {
+      case .local(let url):
+        return (url.lastPathComponent as NSString).deletingPathExtension
+      case .huggingFace(let modelId, let filename):
+        if let filename {
+          return (filename as NSString).deletingPathExtension
+        }
+        return modelId.components(separatedBy: "/").last ?? modelId
+      }
+    }
   }
 
   /// Whether the loaded Flux 2 model is a base (non-distilled) variant.
