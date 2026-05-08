@@ -139,14 +139,15 @@ public final class SmolLM3TextEncoder: Module {
     // Collect hidden states: index 0 = embedding output
     var hiddenStatesList: [MLXArray] = outputHiddenStates ? [hiddenStates] : []
 
-    for (layerIdx, layer) in layers.enumerated() {
-      // Determine if this layer should apply RoPE
-      let cosSin: (cos: MLXArray, sin: MLXArray)? = noRopeFlags[layerIdx] ? nil : (cos, sin)
-
+    for (_, layer) in layers.enumerated() {
+      // Always pass RoPE to every layer — matching Python mflux behavior.
+      // The model config has a `no_rope_layers` field that suggests skipping
+      // RoPE on 27/36 layers, but mflux ignores it and applies RoPE to ALL
+      // layers. Skipping RoPE produces mosaic artifacts via corrupted DimFusion.
       hiddenStates = layer(
         hiddenStates: hiddenStates,
         attentionMask: mask4D,
-        cosSin: cosSin
+        cosSin: (cos, sin)
       )
 
       if outputHiddenStates {
