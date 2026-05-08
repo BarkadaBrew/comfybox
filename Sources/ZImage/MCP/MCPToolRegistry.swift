@@ -28,6 +28,7 @@ public enum MCPToolRegistry {
     loadModel,
     switchModel,
     modelPool,
+    unloadModel,
   ]
 
   // MARK: - Tool Definitions
@@ -326,6 +327,21 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let unloadModel = MCPToolDefinition(
+    name: "unload_model",
+    description: "Unload a model from the pool to free VRAM. Cannot unload the currently active model — switch to another model first.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "model": [
+          "type": "string",
+          "description": "Pool model ID to unload (from model_pool results).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["model"] as [String],
     ] as [String: Any]
   )
 

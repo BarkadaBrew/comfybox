@@ -331,38 +331,45 @@ final class ComfyBridge {
       }
     }
 
-    // Parse the workflow into generation parameters.
-    // TODO(seedvr2-merge): After PR 1 (parser) merges, change this to use
-    // ComfyBridgeWorkflowParser.parseWorkflow(json) which returns
-    // ComfyBridgeParsedWorkflow (.generate or .upscale) and route accordingly.
-    let generateRequest: ComfyBridgeGenerateRequest
+    // Parse the workflow — detects generate vs upscale from node types.
+    let parsedWorkflow: ComfyBridgeParsedWorkflow
     do {
-      generateRequest = try ComfyBridgeWorkflowParser.parse(json)
+      parsedWorkflow = try ComfyBridgeWorkflowParser.parseWorkflow(json)
     } catch {
       logger.error("ComfyBridge: workflow parse failed — \(error)")
       return .error(.error(status: 400, message: "Workflow parse error: \(error)"))
     }
 
-    logger.info("ComfyBridge: /prompt — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, cfg=\(generateRequest.guidance), seed=\(generateRequest.seed.map(String.init) ?? "random")")
+    // Route to the correct executor based on workflow type.
+    switch parsedWorkflow {
+    case .generate(let generateRequest):
+      logger.info("ComfyBridge: /prompt [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, cfg=\(generateRequest.guidance), seed=\(generateRequest.seed.map(String.init) ?? "random")")
 
-    // Acknowledge immediately — generation runs async via WebSocket events.
-    // Model switch (if detected) happens inside the async Task before generation starts.
-    let detectedModel = generateRequest.detectedModel
-    let switchHandler = modelSwitchHandler
-    Task {
-      // Auto-switch model if the workflow specifies a different checkpoint.
-      if let modelId = detectedModel, let handler = switchHandler {
-        do {
-          let switched = try await handler(modelId)
-          if switched {
-            self.logger.info("ComfyBridge: auto-switched to model '\(modelId)' for this render")
+      // Acknowledge immediately — generation runs async via WebSocket events.
+      // Model switch (if detected) happens inside the async Task before generation starts.
+      let detectedModel = generateRequest.detectedModel
+      let switchHandler = modelSwitchHandler
+      Task {
+        // Auto-switch model if the workflow specifies a different checkpoint.
+        if let modelId = detectedModel, let handler = switchHandler {
+          do {
+            let switched = try await handler(modelId)
+            if switched {
+              self.logger.info("ComfyBridge: auto-switched to model '\(modelId)' for this render")
+            }
+          } catch {
+            self.logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
+            // Continue with current model rather than failing the entire render.
           }
-        } catch {
-          self.logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
-          // Continue with current model rather than failing the entire render.
         }
+        await executor.execute(generateRequest)
       }
-      await executor.execute(generateRequest)
+
+    case .upscale(let upscaleRequest):
+      logger.info("ComfyBridge: /prompt [upscale] — model=\(upscaleRequest.upscaleModelName), input=\(upscaleRequest.inputImageNodeId)")
+      Task {
+        await executor.executeUpscale(upscaleRequest)
+      }
     }
 
     let response: [String: Any] = ["prompt_id": promptId]
