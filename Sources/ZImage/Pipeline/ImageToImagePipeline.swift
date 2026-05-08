@@ -27,6 +27,8 @@ public struct Img2ImgRequest: Sendable {
   public var guidanceScale: Float
   public var seed: UInt64?
   public var outputPath: URL
+  public var levelsMin: Float
+  public var levelsMax: Float
   public var model: String?
   public var textEncoderPath: String?
   public var maxSequenceLength: Int
@@ -64,6 +66,8 @@ public struct Img2ImgRequest: Sendable {
     guidanceScale: Float = ZImageModelMetadata.recommendedGuidanceScale,
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "z-image-img2img.png"),
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0,
     model: String? = nil,
     textEncoderPath: String? = nil,
     maxSequenceLength: Int = 512,
@@ -87,6 +91,8 @@ public struct Img2ImgRequest: Sendable {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
     self.model = model
     self.textEncoderPath = textEncoderPath
     self.maxSequenceLength = maxSequenceLength
@@ -122,6 +128,8 @@ public struct Img2ImgRequest: Sendable {
 // MARK: - White Mask Generation
 
 private enum Img2ImgUtilities {
+  private static let pngSignature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
+
   enum Img2ImgError: Error, CustomStringConvertible {
     case sourceImageNotFound(String)
     case sourceImageLoadFailed(String)
@@ -177,7 +185,7 @@ private enum Img2ImgUtilities {
 
   /// Read the dimensions of a PNG file from its IHDR chunk.
   static func pngDimensions(from data: Data) -> (width: Int, height: Int)? {
-    guard data.count >= 24 else { return nil }
+    guard data.count >= 24, data.prefix(pngSignature.count).elementsEqual(pngSignature) else { return nil }
     let w = Int(data[16]) << 24 | Int(data[17]) << 16 | Int(data[18]) << 8 | Int(data[19])
     let h = Int(data[20]) << 24 | Int(data[21]) << 16 | Int(data[22]) << 8 | Int(data[23])
     guard w > 0 && h > 0 && w < 65536 && h < 65536 else { return nil }
@@ -273,6 +281,8 @@ extension ZImagePipeline {
       guidanceScale: request.guidanceScale,
       seed: request.seed,
       outputPath: request.outputPath,
+      levelsMin: request.levelsMin,
+      levelsMax: request.levelsMax,
       model: request.model,
       textEncoderPath: request.textEncoderPath,
       maxSequenceLength: request.maxSequenceLength,

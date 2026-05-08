@@ -47,6 +47,8 @@ public struct ZImageControlGenerationRequest {
   public var guidanceScale: Float
   public var seed: UInt64?
   public var outputPath: URL?
+  public var levelsMin: Float
+  public var levelsMax: Float
   public var model: String?
   public var textEncoderPath: String?
   public var controlnetWeights: String?
@@ -79,6 +81,8 @@ public struct ZImageControlGenerationRequest {
     guidanceScale: Float = ZImageModelMetadata.recommendedGuidanceScale,
     seed: UInt64? = nil,
     outputPath: URL? = nil,
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0,
     model: String? = nil,
     textEncoderPath: String? = nil,
     controlnetWeights: String? = nil,
@@ -105,6 +109,8 @@ public struct ZImageControlGenerationRequest {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
     self.model = model
     self.textEncoderPath = textEncoderPath
     self.controlnetWeights = controlnetWeights
@@ -132,6 +138,8 @@ public struct ZImageControlGenerationRequest {
     guidanceScale: Float = ZImageModelMetadata.recommendedGuidanceScale,
     seed: UInt64? = nil,
     outputPath: URL? = nil,
+    levelsMin: Float = 0.0,
+    levelsMax: Float = 1.0,
     model: String? = nil,
     textEncoderPath: String? = nil,
     controlnetWeights: String? = nil,
@@ -161,6 +169,8 @@ public struct ZImageControlGenerationRequest {
     self.guidanceScale = guidanceScale
     self.seed = seed
     self.outputPath = outputPath
+    self.levelsMin = levelsMin
+    self.levelsMax = levelsMax
     self.model = model
     self.textEncoderPath = textEncoderPath
     self.controlnetWeights = controlnetWeights
@@ -1164,7 +1174,11 @@ public class ZImageControlPipeline {
     guard let outputPath = request.outputPath else {
       throw PipelineError.outputPathRequired
     }
-    let decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    var decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
+      decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
+      MLX.eval(decoded)
+    }
     try QwenImageIO.saveImage(array: decoded, to: outputPath)
     logger.info("Wrote image to \(outputPath.path)")
     return outputPath
@@ -1447,7 +1461,11 @@ public class ZImageControlPipeline {
       fractionCompleted: 1.0
     ))
     logger.info("Denoising complete, decoding latents...")
-    let decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    var decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
+      decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
+      MLX.eval(decoded)
+    }
     let imageData = try QwenImageIO.imageData(from: decoded)
     logger.info("Generated image data (\(imageData.count) bytes)")
     return imageData
