@@ -47,6 +47,7 @@ enum WarmModelFamily: String, Sendable {
   case flux1
   case flux2
   case fibo
+  case chroma
 }
 
 enum WarmServerOutputPathValidator {
@@ -532,6 +533,11 @@ public final class WarmServer {
       resolvedSteps = request.steps
       resolvedGuidance = request.guidance > 0 ? request.guidance : 4.0
       resolvedNegativePrompt = request.negativePrompt
+    case .chroma:
+      // Chroma: 28 steps default, guidance 0.0 (unconditioned)
+      resolvedSteps = request.steps > 0 ? request.steps : 28
+      resolvedGuidance = request.guidance
+      resolvedNegativePrompt = nil
     case .flux1:
       let zimageVariant = await coordinator.currentZImageVariant
       if zimageVariant == .base {
@@ -706,7 +712,8 @@ public final class WarmServer {
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
-      case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed:
+      case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
+           .chromaNotLoaded, .chromaDetectionFailed:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
@@ -777,6 +784,10 @@ private actor WarmServerCoordinator {
   private var flux2Pipeline: Flux2Pipeline?
   /// FIBO pipeline — created when the model is detected as FIBO.
   private var fiboPipeline: FiboPipeline?
+  /// Chroma pipeline — created when the model is detected as Chroma.
+  private var chromaPipeline: ChromaPipeline?
+  /// Chroma tokenizer — loaded alongside the Chroma pipeline.
+  private var chromaTokenizer: ChromaTokenizer?
   /// Which model family is loaded — determines generation routing.
   private var currentModelFamily: WarmModelFamily = .flux1
   /// Detected Flux 2 model info (variant, configs) — nil when running Flux 1.
@@ -813,10 +824,13 @@ private actor WarmServerCoordinator {
     var snapshotURL: URL?
 
     var isFibo = false
+    var isChroma = false
 
     if let spec = modelSpec {
       // Check by known model ID first
-      if FiboModelDetection.isKnownFiboModel(spec) {
+      if ChromaModelDetection.isKnownChromaModel(spec) {
+        isChroma = true
+      } else if FiboModelDetection.isKnownFiboModel(spec) {
         isFibo = true
       } else if Flux2ModelDetection.isKnownFlux2Model(spec) {
         isFlux2 = true
@@ -830,8 +844,10 @@ private actor WarmServerCoordinator {
       snapshotURL = resolved
 
       // If not already detected by name, check the snapshot directory
-      if !isFibo && !isFlux2 {
-        if FiboModelDetection.detect(at: resolved) != nil {
+      if !isFibo && !isFlux2 && !isChroma {
+        if ChromaModelDetection.detect(at: resolved) != nil {
+          isChroma = true
+        } else if FiboModelDetection.detect(at: resolved) != nil {
           isFibo = true
         } else if Flux2ModelDetection.detectFamily(at: resolved) == .flux2 {
           isFlux2 = true
@@ -839,7 +855,37 @@ private actor WarmServerCoordinator {
       }
     }
 
-    if isFibo, let snapshot = snapshotURL {
+    if isChroma, let snapshot = snapshotURL {
+      // --- Chroma path ---
+      currentModelFamily = .chroma
+
+      guard let detected = ChromaModelDetection.detect(at: snapshot) else {
+        throw WarmServerError.chromaDetectionFailed(modelSpec ?? "unknown")
+      }
+
+      logger.info("Detected Chroma model — estimated GPU memory: ~17GB")
+
+      let components = try ChromaInitializer.load(
+        from: snapshot,
+        paths: detected.componentPaths,
+        config: detected.config,
+        dtype: .bfloat16,
+        logger: logger
+      )
+
+      // Load tokenizer
+      let tokenizer = try ChromaTokenizer.load(from: detected.componentPaths.tokenizerPath)
+
+      chromaPipeline = ChromaPipeline(
+        transformer: components.transformer,
+        t5: components.t5,
+        vae: components.vae,
+        config: detected.config
+      )
+      chromaTokenizer = tokenizer
+      pipelinePrepared = true
+      logger.info("Warm server pipeline ready (Chroma)")
+    } else if isFibo, let snapshot = snapshotURL {
       // --- FIBO path ---
       currentModelFamily = .fibo
 
@@ -1053,6 +1099,8 @@ private actor WarmServerCoordinator {
 
   private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
     switch currentModelFamily {
+    case .chroma:
+      await runChromaGenerate(payload, continuation: continuation)
     case .fibo:
       await runFiboGenerate(payload, continuation: continuation)
     case .flux2:
@@ -1234,8 +1282,87 @@ private actor WarmServerCoordinator {
     }
   }
 
+  private func runChromaGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+    activeRenderStartedAt = Date()
+    let start = Date()
+
+    do {
+      guard let pipeline = chromaPipeline else {
+        throw WarmServerError.chromaNotLoaded
+      }
+      guard let tokenizer = chromaTokenizer else {
+        throw WarmServerError.chromaNotLoaded
+      }
+
+      let outputURL: URL
+      if let outputPath = payload.outputPath, !outputPath.isEmpty {
+        outputURL = URL(fileURLWithPath: outputPath)
+      } else {
+        outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+          .appendingPathComponent("zimage-chroma-\(UUID().uuidString).png")
+      }
+
+      let width = payload.width ?? 1024
+      let height = payload.height ?? 1024
+      let steps = payload.steps ?? 28
+      let guidance = payload.guidance ?? 0.0
+      let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
+
+      // Tokenize prompt (unpadded — matches Python behavior)
+      let tokenIds = tokenizer.encodeUnpadded(prompt: payload.prompt)
+
+      // Tokenize negative prompt for CFG (empty string = unconditional)
+      let negTokenIds = tokenizer.encodeUnpadded(prompt: payload.negativePrompt ?? "")
+
+      // CFG parameters (default: cfg=4.0, no warmup steps)
+      let cfgScale = payload.cfg ?? 4.0
+      let cfgWarmup = payload.firstNStepsWithoutCFG ?? 0
+
+      // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
+      let result = pipeline.generate(
+        tokenIds: tokenIds,
+        negativeTokenIds: negTokenIds,
+        width: width,
+        height: height,
+        numSteps: steps,
+        guidance: guidance,
+        cfg: cfgScale,
+        firstNStepsWithoutCFG: cfgWarmup,
+        seed: seed,
+        progressCallback: { step, total in
+          // Progress logging
+        }
+      )
+
+      // Transpose from NHWC [1, H, W, 3] to CHW [3, H, W] for QwenImageIO
+      let imageArray = result.squeezed(axis: 0).transposed(2, 0, 1)
+
+      // Save image
+      try QwenImageIO.saveImage(array: imageArray, to: outputURL)
+
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      successfulRenderCount += 1
+      lastRenderDurationMs = durationMs
+      lastError = nil
+      activeRenderStartedAt = nil
+
+      continuation.resume(
+        returning: GenerateResponse(
+          success: true,
+          outputPath: outputURL.path,
+          durationMs: durationMs
+        )
+      )
+    } catch {
+      failedRenderCount += 1
+      lastError = error.localizedDescription
+      activeRenderStartedAt = nil
+      continuation.resume(throwing: error)
+    }
+  }
+
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
-    if currentModelFamily == .flux2 || currentModelFamily == .fibo {
+    if currentModelFamily == .flux2 || currentModelFamily == .fibo || currentModelFamily == .chroma {
       continuation.resume(throwing: WarmServerError.controlNetNotSupported)
       return
     }
@@ -1273,7 +1400,7 @@ private actor WarmServerCoordinator {
   }
 
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
-    if currentModelFamily == .fibo {
+    if currentModelFamily == .fibo || currentModelFamily == .chroma {
       continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
       return
     }
@@ -1623,6 +1750,10 @@ private struct GeneratePayload: Sendable {
   let maskCropX: Int?
   let maskCropY: Int?
 
+  // Chroma CFG parameters
+  let cfg: Float?
+  let firstNStepsWithoutCFG: Int?
+
   // Phase 4: Img2img (set via HTTP API)
   let imagePath: String?
   let imageStrength: Float?
@@ -1638,6 +1769,7 @@ private struct GeneratePayload: Sendable {
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
     maskCropX: Int? = nil, maskCropY: Int? = nil,
+    cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil
   ) {
     self.prompt = prompt; self.negativePrompt = negativePrompt
@@ -1649,6 +1781,7 @@ private struct GeneratePayload: Sendable {
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
     self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
+    self.cfg = cfg; self.firstNStepsWithoutCFG = firstNStepsWithoutCFG
     self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
   }
 }
@@ -1657,6 +1790,7 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
+    case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
   }
 
@@ -1683,6 +1817,8 @@ extension GeneratePayload: Decodable {
     maskFeather = nil
     maskCropX = nil
     maskCropY = nil
+    cfg = try c.decodeIfPresent(Float.self, forKey: .cfg)
+    firstNStepsWithoutCFG = try c.decodeIfPresent(Int.self, forKey: .firstNStepsWithoutCFG)
     imagePath = try c.decodeIfPresent(String.self, forKey: .imagePath)
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
@@ -1991,6 +2127,8 @@ public enum WarmServerError: Error, LocalizedError {
   case flux2NotLoaded
   case fiboDetectionFailed(String)
   case fiboNotLoaded
+  case chromaDetectionFailed(String)
+  case chromaNotLoaded
   case loraSwapNotSupported
   case controlNetNotSupported
 
@@ -2008,6 +2146,10 @@ public enum WarmServerError: Error, LocalizedError {
       return "Model '\(model)' was identified as FIBO but detection failed at the snapshot directory"
     case .fiboNotLoaded:
       return "FIBO pipeline is not loaded"
+    case .chromaDetectionFailed(let model):
+      return "Model '\(model)' was identified as Chroma but detection failed at the snapshot directory"
+    case .chromaNotLoaded:
+      return "Chroma pipeline is not loaded"
     case .loraSwapNotSupported:
       return "LoRA swap is not supported for this model family"
     case .controlNetNotSupported:
