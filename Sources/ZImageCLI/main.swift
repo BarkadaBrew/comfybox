@@ -103,7 +103,7 @@ struct ZImageCLI {
       case "--guidance", "-g":
         guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
       case "--seed":
-        if let s = UInt64(nextValue(for: arg, iterator: &iterator)) {
+        if let s = uint64Value(for: arg, iterator: &iterator) {
           seeds.append(s)
         }
       case "--output", "-o":
@@ -125,7 +125,7 @@ struct ZImageCLI {
       case "--lora-paths":
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
-        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+        loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--enhance", "-e":
         enhancePrompt = true
       case "--enhance-max-tokens":
@@ -138,14 +138,14 @@ struct ZImageCLI {
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SchedulerKind(rawValue: raw) else {
           let valid = SchedulerKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown scheduler '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown scheduler '\(raw)'. Valid: \(valid)")
         }
         schedulerKind = kind
       case "--sigma-schedule":
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SigmaScheduleKind(rawValue: raw) else {
           let valid = SigmaScheduleKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
         }
         sigmaSchedule = kind
       case "--eta":
@@ -157,7 +157,7 @@ struct ZImageCLI {
         case "yarn": dyPEMethod = .yarn
         case "none", "off": dyPEMethod = .none
         default:
-          fatalError("Unknown DyPE method '\(raw)'. Valid: ntk, yarn, none")
+          failArgumentParsing("Unknown DyPE method '\(raw)'. Valid: ntk, yarn, none")
         }
       case "--no-dype":
         dyPEDisabled = true
@@ -1329,7 +1329,7 @@ struct ZImageCLI {
       case "--lora-paths":
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
-        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+        loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--help", "-h":
         printServeUsage()
         return
@@ -1445,7 +1445,7 @@ struct ZImageCLI {
       case "--guidance", "-g":
         guidance = floatValue(for: arg, iterator: &iterator, fallback: guidance)
       case "--seed":
-        seed = UInt64(nextValue(for: arg, iterator: &iterator))
+        seed = uint64Value(for: arg, iterator: &iterator)
       case "--output", "-o":
         outputPath = nextValue(for: arg, iterator: &iterator)
       case "--model", "-m":
@@ -1463,21 +1463,21 @@ struct ZImageCLI {
       case "--lora-paths":
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
-        loraScaleOverrides.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).compactMap(Float.init))
+        loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--no-progress":
         noProgress = true
       case "--scheduler", "--sampler":
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SchedulerKind(rawValue: raw) else {
           let valid = SchedulerKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown scheduler '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown scheduler '\(raw)'. Valid: \(valid)")
         }
         schedulerKind = kind
       case "--sigma-schedule":
         let raw = nextValue(for: arg, iterator: &iterator)
         guard let kind = SigmaScheduleKind(rawValue: raw) else {
           let valid = SigmaScheduleKind.allCases.map(\.rawValue).joined(separator: ", ")
-          fatalError("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
+          failArgumentParsing("Unknown sigma schedule '\(raw)'. Valid: \(valid)")
         }
         sigmaSchedule = kind
       case "--eta":
@@ -1677,9 +1677,18 @@ struct ZImageCLI {
 
   private static func nextValue(for arg: String, iterator: inout IndexingIterator<[String]>) -> String {
     guard let value = iterator.next() else {
-      fatalError("Expected value after \(arg)")
+      failArgumentParsing("Expected value after \(arg)")
     }
     return value
+  }
+
+  private static func failArgumentParsing(_ message: String) -> Never {
+    fputs("Error: \(message)\n", stderr)
+    exit(1)
+  }
+
+  private static func warnArgumentParsing(_ message: String) {
+    fputs("Warning: \(message)\n", stderr)
   }
 
   private static func splitCommaSeparated(_ value: String) -> [String] {
@@ -1742,12 +1751,53 @@ struct ZImageCLI {
   }
 
   private static func intValue(for arg: String, iterator: inout IndexingIterator<[String]>, minimum: Int, fallback: Int) -> Int {
-    guard let value = Int(nextValue(for: arg, iterator: &iterator)) else { return fallback }
-    return max(minimum, value)
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = Int(raw) else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); using \(fallback).")
+      return fallback
+    }
+    if value < minimum {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); using minimum \(minimum).")
+      return minimum
+    }
+    return value
   }
 
   private static func floatValue(for arg: String, iterator: inout IndexingIterator<[String]>, fallback: Float) -> Float {
-    Float(nextValue(for: arg, iterator: &iterator)) ?? fallback
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = Float(raw), value.isFinite else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); using \(fallback).")
+      return fallback
+    }
+    return value
+  }
+
+  private static func floatListValue(for arg: String, iterator: inout IndexingIterator<[String]>, fallback: Float) -> [Float] {
+    splitCommaSeparated(nextValue(for: arg, iterator: &iterator)).map { raw in
+      guard let value = Float(raw), value.isFinite else {
+        warnArgumentParsing("Invalid value '\(raw)' for \(arg); using \(fallback).")
+        return fallback
+      }
+      return value
+    }
+  }
+
+  private static func uint64Value(for arg: String, iterator: inout IndexingIterator<[String]>) -> UInt64? {
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = UInt64(raw) else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); ignoring it.")
+      return nil
+    }
+    return value
+  }
+
+  private static func optionalIntValue(for arg: String, iterator: inout IndexingIterator<[String]>) -> Int? {
+    let raw = nextValue(for: arg, iterator: &iterator)
+    guard let value = Int(raw) else {
+      warnArgumentParsing("Invalid value '\(raw)' for \(arg); ignoring it.")
+      return nil
+    }
+    return value
   }
 
   // MARK: - Upscale Subcommand
@@ -1774,7 +1824,7 @@ struct ZImageCLI {
       case "--steps":
         steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
       case "--seed":
-        if let s = Int(nextValue(for: arg, iterator: &iterator)) {
+        if let s = optionalIntValue(for: arg, iterator: &iterator) {
           seed = s
         }
       case "--weights", "-w":
