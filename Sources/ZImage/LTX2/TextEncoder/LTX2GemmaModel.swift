@@ -6,12 +6,15 @@
 // ALL 49 hidden states (1 embedding + 48 transformer layers) must be extracted,
 // not just the final output.
 //
-// Architecture (Gemma 3 12B):
-//   - Embedding: vocab 262144 -> 3840
+// Architecture (Gemma 3 12B from unsloth/gemma-3-12b-it):
+//   - Embedding: vocab 262208 -> 3840
 //   - 48 transformer layers with sliding window attention
 //   - Sliding window pattern of 6 (every 6th layer is global attention)
 //   - GQA: 16 query heads, 8 KV heads, head_dim 256
-//   - MLP: SiLU-gated (gate_proj + up_proj -> down_proj), intermediate 21504
+//   - QK normalization: per-head RMSNorm on Q and K after projection
+//   - MLP: gelu_pytorch_tanh-gated (gate_proj + up_proj -> down_proj), intermediate 15360
+//   - Pre-norm: input_layernorm, post_attention_layernorm
+//   - Extra norms: pre_feedforward_layernorm, post_feedforward_layernorm
 //   - RMSNorm with eps=1e-6
 //   - RoPE with theta=1,000,000
 //   - Embedding scaling: h *= sqrt(hidden_size)
@@ -29,8 +32,9 @@ import MLXNN
 
 /// RMSNorm for Gemma 3, matching the Gemma normalization convention.
 ///
-/// Casts to float32 for variance computation, applies learned weight,
+/// Casts to float32 for variance computation, applies learned weight (+1),
 /// then casts back to input dtype for numerical stability.
+/// Gemma uses weight + 1 convention (like LLaMA).
 public final class Gemma3RMSNorm: Module {
   @ModuleInfo(key: "weight") var weight: MLXArray
   let eps: Float
@@ -41,11 +45,8 @@ public final class Gemma3RMSNorm: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    let inputDtype = x.dtype
-    let h = x.asType(.float32)
-    let variance = MLX.mean(h * h, axis: -1, keepDims: true)
-    let normed = h * MLX.rsqrt(variance + MLXArray(eps))
-    return (weight.asType(.float32) * normed).asType(inputDtype)
+    // Use MLXFast.rmsNorm with weight+1 to match Gemma convention
+    return MLXFast.rmsNorm(x, weight: 1.0 + weight, eps: eps)
   }
 }
 
@@ -91,6 +92,7 @@ public final class Gemma3RoPE: Module {
 /// - 16 query heads, 8 KV heads (2x GQA ratio)
 /// - Head dimension 256
 /// - No bias on projections
+/// - QK normalization: per-head RMSNorm (dim=head_dim) on Q and K
 /// - RoPE applied via rotate-half method
 ///
 /// Weight key mapping:
@@ -98,6 +100,8 @@ public final class Gemma3RoPE: Module {
 /// - `model.layers.N.self_attn.k_proj.weight`
 /// - `model.layers.N.self_attn.v_proj.weight`
 /// - `model.layers.N.self_attn.o_proj.weight`
+/// - `model.layers.N.self_attn.q_norm.weight`
+/// - `model.layers.N.self_attn.k_norm.weight`
 public final class Gemma3Attention: Module {
   let numHeads: Int
   let numKVHeads: Int
@@ -109,12 +113,15 @@ public final class Gemma3Attention: Module {
   @ModuleInfo(key: "k_proj") var kProj: Linear
   @ModuleInfo(key: "v_proj") var vProj: Linear
   @ModuleInfo(key: "o_proj") var oProj: Linear
+  @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
+  @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
   public init(config: LTX2GemmaConfig) {
     self.numHeads = config.numAttentionHeads
     self.numKVHeads = config.numKeyValueHeads
     self.headDim = config.headDim
     self.numKVGroups = config.numAttentionHeads / config.numKeyValueHeads
+    // Gemma 3 uses query_pre_attn_scalar = head_dim for scaling
     self.scale = 1.0 / Float(config.headDim).squareRoot()
 
     let hiddenSize = config.hiddenSize
@@ -122,6 +129,9 @@ public final class Gemma3Attention: Module {
     self._kProj.wrappedValue = Linear(hiddenSize, numKVHeads * headDim, bias: false)
     self._vProj.wrappedValue = Linear(hiddenSize, numKVHeads * headDim, bias: false)
     self._oProj.wrappedValue = Linear(numHeads * headDim, hiddenSize, bias: false)
+    // Per-head QK normalization (dim = head_dim = 256)
+    self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
+    self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
   }
 
   /// Forward pass through self-attention.
@@ -138,22 +148,24 @@ public final class Gemma3Attention: Module {
   ) -> MLXArray {
     let batchSize = hiddenStates.dim(0)
     let seqLen = hiddenStates.dim(1)
-    let inputDtype = hiddenStates.dtype
 
     var q = qProj(hiddenStates)
     var k = kProj(hiddenStates)
     var v = vProj(hiddenStates)
 
-    if q.dtype != inputDtype {
-      q = q.asType(inputDtype)
-      k = k.asType(inputDtype)
-      v = v.asType(inputDtype)
-    }
+    // Reshape to [B, S, heads, headDim] for per-head QK norm
+    q = q.reshaped(batchSize, seqLen, numHeads, headDim)
+    k = k.reshaped(batchSize, seqLen, numKVHeads, headDim)
+    v = v.reshaped(batchSize, seqLen, numKVHeads, headDim)
 
-    // Reshape to [B, heads, S, headDim]
-    q = q.reshaped(batchSize, seqLen, numHeads, headDim).transposed(0, 2, 1, 3)
-    k = k.reshaped(batchSize, seqLen, numKVHeads, headDim).transposed(0, 2, 1, 3)
-    v = v.reshaped(batchSize, seqLen, numKVHeads, headDim).transposed(0, 2, 1, 3)
+    // Apply per-head QK normalization
+    q = qNorm(q)
+    k = kNorm(k)
+
+    // Transpose to [B, heads, S, headDim]
+    q = q.transposed(0, 2, 1, 3)
+    k = k.transposed(0, 2, 1, 3)
+    v = v.transposed(0, 2, 1, 3)
 
     // Apply RoPE
     (q, k) = Gemma3Attention.applyRoPE(q: q, k: k, cos: cosSin.cos, sin: cosSin.sin)
@@ -218,9 +230,9 @@ public final class Gemma3Attention: Module {
 
 // MARK: - Gemma 3 MLP
 
-/// Gated MLP for Gemma 3 12B using GELU activation.
+/// Gated MLP for Gemma 3 12B using approximate GELU (gelu_pytorch_tanh).
 ///
-/// Implements: output = down_proj(GELU(gate_proj(x)) * up_proj(x))
+/// Implements: output = down_proj(GELU_approx(gate_proj(x)) * up_proj(x))
 ///
 /// Weight key mapping:
 /// - `model.layers.N.mlp.gate_proj.weight`
@@ -238,7 +250,8 @@ public final class Gemma3MLP: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    downProj(gelu(gateProj(x)) * upProj(x))
+    // Gemma 3 uses gelu_pytorch_tanh (approximate GELU)
+    downProj(geluApproximate(gateProj(x)) * upProj(x))
   }
 }
 
@@ -246,19 +259,30 @@ public final class Gemma3MLP: Module {
 
 /// Single pre-norm transformer layer for Gemma 3 12B.
 ///
-/// Architecture:
-///   x -> RMSNorm -> GQA Attention (+ RoPE) -> residual add
-///   x -> RMSNorm -> Gated MLP -> residual add
+/// Architecture (matches unsloth/gemma-3-12b-it weights):
+///   x -> input_layernorm -> GQA Attention (+ QK norm + RoPE) -> residual add
+///   x -> post_attention_layernorm (not used in forward, kept for weight compat)
+///   x -> pre_feedforward_layernorm -> Gated MLP -> post_feedforward_layernorm -> residual add
+///
+/// Note: Gemma 3 has a 4-norm architecture per layer. The naming from HuggingFace:
+///   - input_layernorm: pre-attention norm
+///   - post_attention_layernorm: post-attention pre-residual norm
+///   - pre_feedforward_layernorm: pre-MLP norm
+///   - post_feedforward_layernorm: post-MLP pre-residual norm
 ///
 /// Weight key mapping:
 /// - `model.layers.N.input_layernorm.weight`
 /// - `model.layers.N.self_attn.*`
 /// - `model.layers.N.post_attention_layernorm.weight`
+/// - `model.layers.N.pre_feedforward_layernorm.weight`
+/// - `model.layers.N.post_feedforward_layernorm.weight`
 /// - `model.layers.N.mlp.*`
 public final class Gemma3Layer: Module {
   @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma3RMSNorm
   @ModuleInfo(key: "self_attn") var selfAttn: Gemma3Attention
   @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: Gemma3RMSNorm
+  @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm: Gemma3RMSNorm
+  @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm: Gemma3RMSNorm
   let mlp: Gemma3MLP
 
   public init(config: LTX2GemmaConfig) {
@@ -267,11 +291,19 @@ public final class Gemma3Layer: Module {
     self._selfAttn.wrappedValue = Gemma3Attention(config: config)
     self._postAttentionLayerNorm.wrappedValue = Gemma3RMSNorm(
       hiddenSize: config.hiddenSize, eps: config.rmsNormEps)
+    self._preFeedforwardLayerNorm.wrappedValue = Gemma3RMSNorm(
+      hiddenSize: config.hiddenSize, eps: config.rmsNormEps)
+    self._postFeedforwardLayerNorm.wrappedValue = Gemma3RMSNorm(
+      hiddenSize: config.hiddenSize, eps: config.rmsNormEps)
     self.mlp = Gemma3MLP(
       hiddenSize: config.hiddenSize, intermediateSize: config.intermediateSize)
   }
 
   /// Forward pass through the transformer layer.
+  ///
+  /// Gemma 3 uses a 4-norm architecture:
+  ///   residual -> input_layernorm -> attention -> post_attention_layernorm -> + residual
+  ///   residual -> pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm -> + residual
   ///
   /// - Parameters:
   ///   - hiddenStates: Input `[B, S, hiddenSize]`.
@@ -283,16 +315,18 @@ public final class Gemma3Layer: Module {
     attentionMask: MLXArray?,
     cosSin: (cos: MLXArray, sin: MLXArray)
   ) -> MLXArray {
-    // Self-attention with pre-norm residual
+    // Self-attention block: pre-norm -> attn -> post-norm -> residual
     let residual1 = hiddenStates
     var h = inputLayerNorm(hiddenStates)
     h = selfAttn(hiddenStates: h, attentionMask: attentionMask, cosSin: cosSin)
+    h = postAttentionLayerNorm(h)
     h = residual1 + h
 
-    // Feed-forward with pre-norm residual
+    // Feed-forward block: pre-norm -> MLP -> post-norm -> residual
     let residual2 = h
-    h = postAttentionLayerNorm(h)
+    h = preFeedforwardLayerNorm(h)
     h = mlp(h)
+    h = postFeedforwardLayerNorm(h)
     h = residual2 + h
 
     return h
@@ -388,11 +422,9 @@ public final class LTX2GemmaModel: Module {
       // Gemma 3 sliding window: every Nth layer is global (N = slidingWindowPattern)
       // For layer index i, global when (i % pattern == pattern - 1)
       // Other layers use sliding window mask
-      let isGlobal = (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
-      let layerMask = isGlobal ? fullCausalMask : fullCausalMask  // Both use full mask for simplicity
-      // NOTE: Proper sliding window masking would limit attention to `slidingWindow` tokens
-      // for non-global layers. Using full causal mask is correct but slightly less efficient.
+      // NOTE: Using full causal mask for all layers (correct but slightly less efficient).
       // This matches the Python reference which also uses the full mask for both.
+      let layerMask = fullCausalMask
 
       h = layer(
         hiddenStates: h,
@@ -469,17 +501,37 @@ public final class LTX2GemmaModel: Module {
 
   /// Sanitize weight keys from safetensors format.
   ///
-  /// Strips `language_model.` prefix and converts float32 to bfloat16.
+  /// Handles two common prefix patterns:
+  /// - `language_model.model.` -> `model.` (MLX community 4bit)
+  /// - `language_model.` -> `` (kept as model.* after strip)
+  /// - `model.language_model.` -> `model.` (full VLM from transformers)
+  ///
+  /// Strips the language_model prefix and keeps the model.* structure that
+  /// matches our Module hierarchy (model.embed_tokens, model.layers, model.norm).
   public static func sanitizeWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
-    let prefix = "language_model."
     var sanitized: [String: MLXArray] = [:]
     for (key, value) in weights {
-      guard key.hasPrefix(prefix) else { continue }
-      let newKey = String(key.dropFirst(prefix.count))
+      var newKey: String? = nil
+      if key.hasPrefix("language_model.model.") {
+        // MLX community format: language_model.model.layers.0.* -> model.layers.0.*
+        newKey = String(key.dropFirst("language_model.".count))
+      } else if key.hasPrefix("model.language_model.") {
+        // Full VLM format: model.language_model.layers.0.* -> model.layers.0.*
+        newKey = String(key.dropFirst("model.language_model.".count))
+      } else if key.hasPrefix("language_model.") {
+        // Generic: language_model.* -> *
+        newKey = String(key.dropFirst("language_model.".count))
+      }
+
+      guard let finalKey = newKey else { continue }
+
+      // Skip vision tower weights
+      guard !finalKey.hasPrefix("vision_tower.") else { continue }
+
       if value.dtype == .float32 {
-        sanitized[newKey] = value.asType(.bfloat16)
+        sanitized[finalKey] = value.asType(.bfloat16)
       } else {
-        sanitized[newKey] = value
+        sanitized[finalKey] = value
       }
     }
     return sanitized

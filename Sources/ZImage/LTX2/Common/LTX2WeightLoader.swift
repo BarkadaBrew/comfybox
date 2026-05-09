@@ -159,8 +159,16 @@ public enum LTX2WeightLoader {
     logger.info("Applied LTX-2 VAE weights (best-effort)")
   }
 
-  /// Apply weights to a module, handling dict-typed sub-modules by loading
-  /// each top-level group separately.
+  /// Apply weights to a module by recursively navigating [String: Module] dicts.
+  ///
+  /// MLX-Swift's `ModuleParameters.unflattened()` treats numeric string keys
+  /// (like "0", "1") as array indices, creating `.array(...)` structures.
+  /// But our modules use `[String: Module]` dicts which produce `.dictionary(...)`
+  /// structures. These are incompatible, causing a crash in `update(parameters:)`.
+  ///
+  /// This method avoids `unflattened` for numeric-keyed paths by recursively
+  /// descending through `items()` / `children()` to find each block module,
+  /// then applying only the leaf (non-numeric) weights via `update(parameters:)`.
   private static func applyBlockWeights(
     to module: Module,
     weights: [(String, MLXArray)],
@@ -177,62 +185,90 @@ public enum LTX2WeightLoader {
     }
 
     var loadedCount = 0
+    let moduleItems = module.items()
 
     for (topKey, subWeights) in groups {
-      // Try to find the child module
-      let children = module.children()
-
-      if let childItems = children[topKey] {
-        // Handle dict-typed children like down_blocks/up_blocks
-        if let dictChildren = childItems as? [Int: Module] {
-          // Group sub-weights by block index
-          var blockGroups: [Int: [(String, MLXArray)]] = [:]
-          for (subKey, value) in subWeights {
-            let parts = subKey.split(separator: ".", maxSplits: 1)
-            if let idx = Int(parts[0]) {
-              let remainder = parts.count > 1 ? String(parts[1]) : ""
-              blockGroups[idx, default: []].append((remainder, value))
-            }
-          }
-
-          for (idx, blockWeights) in blockGroups {
-            if let blockModule = dictChildren[idx] {
-              let weightList = blockWeights.filter { !$0.0.isEmpty }
-              if !weightList.isEmpty {
-                do {
-                  let params = ModuleParameters.unflattened(weightList)
-                  try blockModule.update(parameters: params, verify: [])
-                  loadedCount += weightList.count
-                } catch {
-                  logger.warning("\(label).\(topKey).\(idx) weight load failed: \(error)")
-                }
-              }
-            }
-          }
-        } else {
-          // Regular module child -- load all sub-weights
-          let weightList = subWeights.filter { !$0.0.isEmpty }
-          if !weightList.isEmpty {
-            do {
-              if let childModule = childItems as? Module {
-                let params = ModuleParameters.unflattened(weightList)
-                try childModule.update(parameters: params, verify: [])
-                loadedCount += weightList.count
-              }
-            } catch {
-              logger.warning("\(label).\(topKey) weight load failed: \(error)")
-            }
-          }
-        }
-      } else {
-        // Top-level parameter (e.g., standalone weight/bias)
+      guard let topItem = moduleItems[topKey] else {
+        // Not found in module items -- try as top-level parameters
         let allTopLevel = subWeights.map { ($0.0.isEmpty ? topKey : topKey + "." + $0.0, $0.1) }
         do {
           let params = ModuleParameters.unflattened(allTopLevel)
           try module.update(parameters: params, verify: [])
           loadedCount += allTopLevel.count
         } catch {
-          // Silently skip if can't apply
+          // Silently skip params that don't exist in the model (e.g., timestep)
+        }
+        continue
+      }
+
+      // Check if sub-keys start with numeric indices (block dict pattern)
+      let hasNumericSubKeys = subWeights.contains { subKey, _ in
+        let first = subKey.split(separator: ".").first
+        return first != nil && Int(first!) != nil
+      }
+
+      if hasNumericSubKeys, case .dictionary(let dictEntries) = topItem {
+        // [String: Module] dict property (up_blocks, down_blocks, res_blocks)
+        var blockGroups: [String: [(String, MLXArray)]] = [:]
+        for (subKey, value) in subWeights {
+          let parts = subKey.split(separator: ".", maxSplits: 1)
+          let idxStr = String(parts[0])
+          let remainder = parts.count > 1 ? String(parts[1]) : ""
+          blockGroups[idxStr, default: []].append((remainder, value))
+        }
+
+        for (idxStr, blockWeights) in blockGroups {
+          guard let blockEntry = dictEntries[idxStr],
+                case .value(.module(let blockModule)) = blockEntry else {
+            logger.warning("\(label).\(topKey).\(idxStr): no module found in items()")
+            continue
+          }
+
+          let weightList = blockWeights.filter { !$0.0.isEmpty }
+          if !weightList.isEmpty {
+            // Recurse into the block module -- it may also have [String: Module] dicts
+            applyBlockWeights(
+              to: blockModule, weights: weightList,
+              label: "\(label).\(topKey).\(idxStr)", logger: logger
+            )
+            loadedCount += weightList.count
+          }
+        }
+      } else if case .value(.module(let childModule)) = topItem {
+        // Regular module child (conv_in, conv_out, per_channel_statistics, etc.)
+        let weightList = subWeights.filter { !$0.0.isEmpty }
+        if !weightList.isEmpty {
+          // Check if child also has numeric sub-keys that need recursive handling
+          let childHasNumericKeys = weightList.contains { subKey, _ in
+            let first = subKey.split(separator: ".").first
+            return first != nil && Int(first!) != nil
+          }
+
+          if childHasNumericKeys {
+            applyBlockWeights(
+              to: childModule, weights: weightList,
+              label: "\(label).\(topKey)", logger: logger
+            )
+            loadedCount += weightList.count
+          } else {
+            do {
+              let params = ModuleParameters.unflattened(weightList)
+              try childModule.update(parameters: params, verify: [])
+              loadedCount += weightList.count
+            } catch {
+              logger.warning("\(label).\(topKey) weight load failed: \(error)")
+            }
+          }
+        }
+      } else {
+        // Try as module-level parameter update
+        let allTopLevel = subWeights.map { ($0.0.isEmpty ? topKey : topKey + "." + $0.0, $0.1) }
+        do {
+          let params = ModuleParameters.unflattened(allTopLevel)
+          try module.update(parameters: params, verify: [])
+          loadedCount += allTopLevel.count
+        } catch {
+          // Silently skip
         }
       }
     }
@@ -268,9 +304,15 @@ public enum LTX2WeightLoader {
         continue
       }
 
-      // Conv3d weight transpose: PyTorch (O, I, D, H, W) -> MLX (O, D, H, W, I)
+      // Conv3d weight transpose: only if in PyTorch (O, I, D, H, W) format.
+      // Detect format: if dim[1] > kernel_size (not 1,2,3), it's PyTorch format.
+      // If dim[4] > kernel_size, it's already MLX (O, D, H, W, I) format.
       if isConvWeightKey(newKey) && newValue.ndim == 5 {
-        newValue = newValue.transposed(0, 2, 3, 4, 1)
+        let isPyTorchFormat = newValue.dim(1) > 3 && newValue.dim(4) <= 3
+        if isPyTorchFormat {
+          newValue = newValue.transposed(0, 2, 3, 4, 1)
+        }
+        // else: already in MLX format, no transpose needed
       }
 
       result.append((newKey, newValue))
@@ -294,11 +336,14 @@ public enum LTX2WeightLoader {
       var newKey = key
       var newValue = value
 
-      // Per-channel statistics
+      // Per-channel statistics: prefer vae.decoder.per_channel_statistics over
+      // vae.per_channel_statistics.mean-of-means to avoid duplicates.
       if key == "vae.per_channel_statistics.mean-of-means" {
-        newKey = "per_channel_statistics.mean"
+        // Skip -- decoder has its own per_channel_statistics from vae.decoder. path
+        // Including both would create duplicate keys that crash unflattened().
+        continue
       } else if key == "vae.per_channel_statistics.std-of-means" {
-        newKey = "per_channel_statistics.std"
+        continue
       } else if key.hasPrefix("vae.per_channel_statistics.") {
         continue
       } else if key.hasPrefix("vae.decoder.") {
@@ -307,14 +352,13 @@ public enum LTX2WeightLoader {
         continue
       }
 
-      // Conv3d weight transpose: PyTorch (O, I, D, H, W) -> MLX (O, D, H, W, I)
+      // Conv3d weight transpose: only if in PyTorch (O, I, D, H, W) format.
       if isConvWeightKey(newKey) && newValue.ndim == 5 {
-        newValue = newValue.transposed(0, 2, 3, 4, 1)
+        let isPyTorchFormat = newValue.dim(1) > 3 && newValue.dim(4) <= 3
+        if isPyTorchFormat {
+          newValue = newValue.transposed(0, 2, 3, 4, 1)
+        }
       }
-
-      // Ensure conv_in/conv_out have nested .conv. path for decoder
-      // PyTorch: conv_in.conv.weight -> already has .conv.
-      // The decoder wrapper structure expects this nesting
 
       result.append((newKey, newValue))
     }

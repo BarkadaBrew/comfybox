@@ -38,7 +38,7 @@ public final class LTX2Decoder3D: Module {
   @ModuleInfo(key: "conv_in") var convIn: LTX2ConvWrapper
 
   /// Decoder blocks: res_x groups and depth-to-space upsamplers.
-  @ModuleInfo(key: "up_blocks") var upBlocks: [Int: Module]
+  @ModuleInfo(key: "up_blocks") var upBlocks: [String: Module]
 
   /// Output convolution wrapper. Has a nested `conv` to match PyTorch weight naming.
   @ModuleInfo(key: "conv_out") var convOut: LTX2ConvWrapper
@@ -89,28 +89,55 @@ public final class LTX2Decoder3D: Module {
     var featureChannels = config.latentChannels
     // Walk the decoder blocks in reverse to compute initial (highest) channels
     for blockDef in config.decoderBlocks.reversed() {
-      if case .compressAll(let multiplier, _) = blockDef {
+      switch blockDef {
+      case .compressAll(let multiplier, _):
         featureChannels = featureChannels * multiplier
+      case .compressSpace(let multiplier):
+        featureChannels = featureChannels * multiplier
+      case .compressTime(let multiplier):
+        featureChannels = featureChannels * multiplier
+      default:
+        break
       }
     }
 
     let firstChannels = featureChannels
 
     // Build decoder blocks (reversed order matches Python decoder logic)
-    var blocks: [Int: Module] = [:]
+    var blocks: [String: Module] = [:]
     var idx = 0
     for blockDef in config.decoderBlocks.reversed() {
       switch blockDef {
       case .resX(let numLayers):
-        blocks[idx] = LTX2DecoderResBlockGroup(
+        blocks[String(idx)] = LTX2DecoderResBlockGroup(
           channels: featureChannels,
           numLayers: numLayers,
           timestepConditioning: config.timestepConditioning
         )
 
+      case .compressSpace(let multiplier):
+        let outChannels = featureChannels / multiplier
+        blocks[String(idx)] = LTX2DepthToSpaceUpsample(
+          inChannels: featureChannels,
+          stride: (1, 2, 2),
+          residual: true,
+          outChannelsReductionFactor: multiplier
+        )
+        featureChannels = outChannels
+
+      case .compressTime(let multiplier):
+        let outChannels = featureChannels / multiplier
+        blocks[String(idx)] = LTX2DepthToSpaceUpsample(
+          inChannels: featureChannels,
+          stride: (2, 1, 1),
+          residual: true,
+          outChannelsReductionFactor: multiplier
+        )
+        featureChannels = outChannels
+
       case .compressAll(let multiplier, let residual):
         let outChannels = featureChannels / multiplier
-        blocks[idx] = LTX2DepthToSpaceUpsample(
+        blocks[String(idx)] = LTX2DepthToSpaceUpsample(
           inChannels: featureChannels,
           stride: (2, 2, 2),
           residual: residual,
@@ -181,7 +208,7 @@ public final class LTX2Decoder3D: Module {
     x = convIn(x)
 
     // Process through decoder blocks
-    let sortedKeys = upBlocks.keys.sorted()
+    let sortedKeys = upBlocks.keys.sorted { Int($0)! < Int($1)! }
     for key in sortedKeys {
       let block = upBlocks[key]!
       if let resGroup = block as? LTX2DecoderResBlockGroup {
@@ -419,7 +446,7 @@ public final class LTX2DecoderResBlockGroup: Module {
   @ModuleInfo(key: "time_embedder") var timeEmbedder: LTX2PixArtTimestepEmbedder?
 
   /// Residual blocks.
-  @ModuleInfo(key: "res_blocks") var resBlocks: [Int: LTX2DecoderResBlock]
+  @ModuleInfo(key: "res_blocks") var resBlocks: [String: LTX2DecoderResBlock]
 
   /// Whether timestep conditioning is active.
   public let timestepConditioning: Bool
@@ -437,9 +464,9 @@ public final class LTX2DecoderResBlockGroup: Module {
       )
     }
 
-    var blocks: [Int: LTX2DecoderResBlock] = [:]
+    var blocks: [String: LTX2DecoderResBlock] = [:]
     for i in 0..<numLayers {
-      blocks[i] = LTX2DecoderResBlock(
+      blocks[String(i)] = LTX2DecoderResBlock(
         channels: channels,
         timestepConditioning: timestepConditioning
       )
@@ -458,7 +485,7 @@ public final class LTX2DecoderResBlockGroup: Module {
     }
 
     var hidden = x
-    let sortedKeys = resBlocks.keys.sorted()
+    let sortedKeys = resBlocks.keys.sorted { Int($0)! < Int($1)! }
     for key in sortedKeys {
       hidden = resBlocks[key]!(hidden, timestepEmbed: timestepEmbed)
     }

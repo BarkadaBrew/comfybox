@@ -310,24 +310,55 @@ public final class LTX2Transformer: Module {
   /// - Parameter weights: Raw weight dictionary.
   /// - Returns: Sanitized weight dictionary.
   public static func sanitizeWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
-    let hasRawPrefix = weights.keys.contains { $0.hasPrefix("model.diffusion_model.") }
-    guard hasRawPrefix else { return weights }
+    // Detect which prefix format the checkpoint uses.
+    // LTX-2.3 distilled/dev weights use "transformer." prefix.
+    // Older checkpoints use "model.diffusion_model." prefix.
+    let hasTransformerPrefix = weights.keys.contains { $0.hasPrefix("transformer.") }
+    let hasModelPrefix = weights.keys.contains { $0.hasPrefix("model.diffusion_model.") }
+
+    guard hasTransformerPrefix || hasModelPrefix else { return weights }
 
     var sanitized: [String: MLXArray] = [:]
 
     for (key, value) in weights {
-      guard key.hasPrefix("model.diffusion_model.") else { continue }
-      // Skip audio/video embedding connectors (handled in text encoder)
-      if key.contains("audio_embeddings_connector") || key.contains("video_embeddings_connector") {
+      var newKey: String
+
+      if hasTransformerPrefix && key.hasPrefix("transformer.") {
+        // Skip audio-only modules — our Swift transformer is video-only.
+        // Audio blocks have keys under audio_* or av_ca_* top-level names.
+        let stripped = String(key.dropFirst("transformer.".count))
+        let isAudioOnly = stripped.hasPrefix("audio_")
+          || stripped.hasPrefix("av_ca_")
+          || stripped.contains(".audio_attn")
+          || stripped.contains(".audio_ff")
+          || stripped.contains(".audio_prompt_scale_shift_table")
+          || stripped.contains(".audio_scale_shift_table")
+          || stripped.contains(".audio_to_video_attn")
+          || stripped.contains(".video_to_audio_attn")
+          || stripped.contains(".scale_shift_table_a2v")
+        if isAudioOnly { continue }
+
+        newKey = stripped
+
+        // Rename norm_out -> norm_out (already correct in weights)
+        // No renames needed for transformer. prefix format.
+
+      } else if hasModelPrefix && key.hasPrefix("model.diffusion_model.") {
+        // Skip audio/video embedding connectors (handled in text encoder)
+        if key.contains("audio_embeddings_connector") || key.contains("video_embeddings_connector") {
+          continue
+        }
+
+        newKey = key.replacingOccurrences(of: "model.diffusion_model.", with: "")
+        newKey = newKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
+        newKey = newKey.replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj_in.")
+        newKey = newKey.replacingOccurrences(of: ".ff.net.2.", with: ".ff.proj_out.")
+        newKey = newKey.replacingOccurrences(of: ".linear_1.", with: ".linear1.")
+        newKey = newKey.replacingOccurrences(of: ".linear_2.", with: ".linear2.")
+
+      } else {
         continue
       }
-
-      var newKey = key.replacingOccurrences(of: "model.diffusion_model.", with: "")
-      newKey = newKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
-      newKey = newKey.replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj_in.")
-      newKey = newKey.replacingOccurrences(of: ".ff.net.2.", with: ".ff.proj_out.")
-      newKey = newKey.replacingOccurrences(of: ".linear_1.", with: ".linear1.")
-      newKey = newKey.replacingOccurrences(of: ".linear_2.", with: ".linear2.")
 
       sanitized[newKey] = value
     }

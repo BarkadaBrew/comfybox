@@ -63,6 +63,10 @@ public struct LTX2VideoVAEConfig: Equatable {
   public enum DecoderBlockDef: Equatable {
     /// Stack of residual blocks.
     case resX(numLayers: Int)
+    /// DepthToSpace upsample: spatial only (1, 2, 2).
+    case compressSpace(multiplier: Int)
+    /// DepthToSpace upsample: temporal only (2, 1, 1).
+    case compressTime(multiplier: Int)
     /// DepthToSpace upsample: all dimensions with residual.
     case compressAll(multiplier: Int, residual: Bool)
   }
@@ -97,6 +101,44 @@ public struct LTX2VideoVAEConfig: Equatable {
       .resX(numLayers: 5),
     ]
   )
+
+  /// LTX-2 v2.3 Video VAE configuration.
+  ///
+  /// v2.3 uses separate spatial and temporal upsample blocks in the decoder
+  /// instead of the default all-dimension blocks. Timestep conditioning is
+  /// disabled in the VAE.
+  public static let v23 = LTX2VideoVAEConfig(
+    inChannels: 3,
+    latentChannels: 128,
+    patchSize: 4,
+    timestepConditioning: false,
+    decodeNoiseScale: 0.025,
+    decodeTimestep: 0.05,
+    timestepScaleMultiplier: 1000.0,
+    encoderBlocks: [
+      .resX(numLayers: 4),
+      .compressSpaceRes(multiplier: 2),
+      .resX(numLayers: 6),
+      .compressTimeRes(multiplier: 2),
+      .resX(numLayers: 4),
+      .compressAllRes(multiplier: 2),
+      .resX(numLayers: 2),
+      .compressAllRes(multiplier: 1),
+      .resX(numLayers: 2),
+    ],
+    decoderBlocks: [
+      .resX(numLayers: 4),
+      .compressSpace(multiplier: 2),
+      .resX(numLayers: 6),
+      .compressTime(multiplier: 2),
+      .resX(numLayers: 4),
+      .compressAll(multiplier: 1, residual: true),
+      .resX(numLayers: 2),
+      .compressAll(multiplier: 2, residual: true),
+      .resX(numLayers: 2),
+    ]
+  )
+
 
   /// Spatial compression factor: patchSize (4) * 2^(number of spatial downsamples).
   /// Default: 4 * 8 = 32.
