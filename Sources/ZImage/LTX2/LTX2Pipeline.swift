@@ -242,6 +242,131 @@ public final class LTX2Pipeline {
     )
   }
 
+  // MARK: - Text-to-Video with Pre-computed Embeddings
+
+  /// Generate a video from pre-computed text embeddings, bypassing the text encoder.
+  ///
+  /// Use this when you want to supply your own embeddings (e.g. from a cached
+  /// encoder run, or dummy embeddings for pipeline testing) without loading
+  /// the Gemma 3 text encoder weights.
+  ///
+  /// - Parameters:
+  ///   - videoEmbeddings: Pre-computed text embeddings `[B, S, 4096]`.
+  ///   - negativeEmbeddings: Optional negative embeddings for CFG.
+  ///   - width: Output width in pixels (must be divisible by 32).
+  ///   - height: Output height in pixels (must be divisible by 32).
+  ///   - numFrames: Number of output frames. Must be `1 + 8k`.
+  ///   - steps: Number of denoising steps.
+  ///   - seed: Optional random seed for reproducibility.
+  ///   - guidance: CFG guidance scale. Overrides config if provided.
+  ///   - progressCallback: Called after each denoising step with `(currentStep, totalSteps)`.
+  /// - Returns: Pipeline output with decoded frames.
+  public func generateT2VWithEmbeddings(
+    videoEmbeddings: MLXArray,
+    negativeEmbeddings: MLXArray? = nil,
+    width: Int,
+    height: Int,
+    numFrames: Int,
+    steps: Int,
+    seed: UInt64? = nil,
+    guidance: Float? = nil,
+    progressCallback: ((Int, Int) -> Void)? = nil
+  ) -> LTX2PipelineOutput {
+    let startTime = CFAbsoluteTimeGetCurrent()
+    let cfgScale = guidance ?? config.guidance
+
+    // Validate frame count
+    precondition((numFrames - 1) % 8 == 0, "numFrames must be 1 + 8k (got \(numFrames))")
+    precondition(width % spatialCompression == 0, "width must be divisible by \(spatialCompression)")
+    precondition(height % spatialCompression == 0, "height must be divisible by \(spatialCompression)")
+
+    logger.info("T2V (embeddings) generation: \(width)x\(height), \(numFrames) frames, \(steps) steps")
+
+    // Use embeddings directly -- skip text encoder
+    eval(videoEmbeddings)
+
+    var negEmb: MLXArray? = nil
+    if cfgScale > 1.0, let neg = negativeEmbeddings {
+      negEmb = neg
+      eval(negEmb!)
+    }
+
+    // Compute latent dimensions
+    let latH = height / spatialCompression
+    let latW = width / spatialCompression
+    let latF = (numFrames - 1) / temporalCompression + 1
+
+    logger.info("Latent dimensions: \(latF) frames x \(latH) x \(latW)")
+
+    // Create initial noise
+    if let seed = seed {
+      MLXRandom.seed(seed)
+    }
+
+    let sigmas = getSigmaSchedule(steps: steps, latF: latF, latH: latH, latW: latW)
+
+    // Scale initial noise by sigma_max
+    let noise = MLXRandom.normal([1, 128, latF, latH, latW], dtype: .float32)
+    var latents = noise * MLXArray(sigmas[0])
+    eval(latents)
+
+    // Build position grid for RoPE
+    let positions = createPositionGrid(
+      batchSize: 1, latF: latF, latH: latH, latW: latW
+    )
+
+    // Precompute RoPE
+    let precomputedPE = ltx2PrecomputeFreqsCIS(
+      indicesGrid: positions,
+      dim: innerDim,
+      theta: transformer.positionalEmbeddingTheta,
+      maxPos: transformer.positionalEmbeddingMaxPos,
+      useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
+      numAttentionHeads: transformer.numHeads,
+      ropeMode: transformer.ropeMode
+    )
+    eval(precomputedPE.cos, precomputedPE.sin)
+
+    // Denoising loop
+    logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
+    latents = denoisingLoop(
+      latents: latents,
+      positions: positions,
+      precomputedPE: precomputedPE,
+      textEmbeddings: videoEmbeddings,
+      negativeEmbeddings: negEmb,
+      sigmas: sigmas,
+      cfgScale: cfgScale,
+      state: nil,
+      progressCallback: progressCallback
+    )
+
+    // Decode latents via VAE
+    logger.info("Decoding latents via VAE...")
+    let decoded: MLXArray
+    if config.tiledDecode {
+      decoded = vae.decodeTiled(latents.asType(.bfloat16))
+    } else {
+      decoded = vae.decode(latents.asType(.bfloat16))
+    }
+    eval(decoded)
+
+    // Clamp to [0, 1]
+    let clamped = MLX.clip(decoded.asType(.float32), min: 0, max: 1)
+    eval(clamped)
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+    logger.info("Generation complete in \(String(format: "%.1f", elapsed))s")
+
+    return LTX2PipelineOutput(
+      decoded: clamped,
+      numFrames: numFrames,
+      width: width,
+      height: height,
+      elapsedSeconds: elapsed
+    )
+  }
+
   // MARK: - Image-to-Video
 
   /// Generate a video from a text prompt and input image.

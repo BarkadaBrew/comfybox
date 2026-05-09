@@ -3,6 +3,8 @@ import Dispatch
 import Logging
 import Metal
 import MLX
+import MLXRandom
+import MLXNN
 import ZImage
 import Darwin
 
@@ -219,6 +221,9 @@ struct ZImageCLI {
         return
       case "mcp":
         try runMCP(args: Array(args.dropFirst()))
+        return
+      case "ltx2-demo":
+        try runLTX2Demo(args: Array(args.dropFirst()))
         return
       default:
         logger.warning("Unknown argument: \(arg)")
@@ -2970,6 +2975,224 @@ struct ZImageCLI {
   }
 
 
+
+  // MARK: - LTX2 Demo
+
+  private static func runLTX2Demo(args: [String]) throws {
+    var modelDir = "/Volumes/Bolt/Models/ltx2-distilled"
+    var outputPath = "/tmp/ltx2-demo.mp4"
+    var width = 512
+    var height = 320
+    var frames = 9
+    var steps = 4
+    var seed = 42
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model-dir":
+        modelDir = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--width", "-W":
+        width = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: width)
+      case "--height", "-H":
+        height = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: height)
+      case "--frames":
+        frames = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: frames)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed":
+        seed = intValue(for: arg, iterator: &iterator, minimum: 0, fallback: seed)
+      case "--help", "-h":
+        printLTX2DemoUsage()
+        return
+      default:
+        logger.warning("Unknown ltx2-demo argument: \(arg)")
+      }
+    }
+
+    print("=== LTX2 Demo ===")
+    print("Model dir:  \(modelDir)")
+    print("Output:     \(outputPath)")
+    print("Resolution: \(width)x\(height)")
+    print("Frames:     \(frames)")
+    print("Steps:      \(steps)")
+    print("Seed:       \(seed)")
+    print()
+
+    // --- Create transformer ---
+    print("[1/6] Creating transformer (48-layer, 32 heads)...")
+    let transformer = LTX2Transformer(
+      numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
+      numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
+      normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+      positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+      useMiddleIndicesGrid: true, ropeMode: .split
+    )
+
+    // --- Load transformer weights ---
+    print("[2/6] Loading transformer weights (this takes 1-3 minutes for 35GB)...")
+    let transformerPath = URL(fileURLWithPath: modelDir + "/transformer-distilled.safetensors")
+    guard FileManager.default.fileExists(atPath: transformerPath.path) else {
+      throw NSError(domain: "LTX2Demo", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Transformer weights not found at \(transformerPath.path)"])
+    }
+    let startLoad = CFAbsoluteTimeGetCurrent()
+    let rawWeights = try MLX.loadArrays(url: transformerPath)
+    let sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+    let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
+    try transformer.update(parameters: params, verify: [.shapeMismatch])
+    MLX.eval(transformer.parameters())
+    let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
+    print("  Loaded \(rawWeights.count) tensors in \(String(format: "%.1f", loadTime))s")
+
+    // --- Create and load VAE ---
+    print("[3/6] Creating and loading VAE...")
+    let vae = LTX2VAE()
+
+    // Load VAE weights from separate files.
+    // The files use "vae_decoder.X"/"vae_encoder.X" prefix.
+    // We rewrite to "vae.decoder.X"/"vae.encoder.X" so LTX2WeightLoader's
+    // remapping logic handles the heterogeneous block arrays correctly.
+    let vaeDecoderPath = URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors")
+    let vaeEncoderPath = URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors")
+    guard FileManager.default.fileExists(atPath: vaeDecoderPath.path) else {
+      throw NSError(domain: "LTX2Demo", code: 2,
+        userInfo: [NSLocalizedDescriptionKey: "VAE decoder weights not found at \(vaeDecoderPath.path)"])
+    }
+    guard FileManager.default.fileExists(atPath: vaeEncoderPath.path) else {
+      throw NSError(domain: "LTX2Demo", code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "VAE encoder weights not found at \(vaeEncoderPath.path)"])
+    }
+
+    // Load and rewrite key prefixes
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecoderWeights = try MLX.loadArrays(url: vaeDecoderPath)
+    for (key, value) in rawDecoderWeights {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncoderWeights = try MLX.loadArrays(url: vaeEncoderPath)
+    for (key, value) in rawEncoderWeights {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    // Add per_channel_statistics in the format the weight loader expects
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+    print("  Combined \(combinedVAEWeights.count) VAE weights")
+
+    var vaeLogger = Logger(label: "ltx2.demo.vae")
+    vaeLogger.logLevel = .info
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(
+      into: vae,
+      tensors: combinedVAEWeights,
+      logger: vaeLogger
+    )
+    MLX.eval(vae.parameters())
+    print("  VAE weights loaded successfully")
+
+    // --- Create pipeline ---
+    print("[4/6] Creating pipeline...")
+    let pipelineConfig = LTX2PipelineConfig(
+      modelPath: modelDir,
+      pipelineType: .distilled,
+      hasPromptAdaLN: true
+    )
+
+    // Dummy text encoder (we bypass it via embeddings)
+    let textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig())
+
+    let pipeline = LTX2Pipeline(
+      vae: vae,
+      textEncoder: textEncoder,
+      transformer: transformer,
+      config: pipelineConfig
+    )
+
+    // --- Generate ---
+    print("[5/6] Generating video with dummy embeddings...")
+    print("  Using random embeddings (no text encoder) -- output will be abstract noise")
+    MLXRandom.seed(UInt64(seed))
+    let dummyEmbeddings = MLXRandom.normal([1, 32, 4096]) * Float(0.01)
+    MLX.eval(dummyEmbeddings)
+
+    let output = pipeline.generateT2VWithEmbeddings(
+      videoEmbeddings: dummyEmbeddings,
+      width: width, height: height, numFrames: frames,
+      steps: steps, seed: UInt64(seed),
+      progressCallback: { step, total in
+        print("  Step \(step)/\(total)")
+      }
+    )
+
+    print("  Generation complete in \(String(format: "%.1f", output.elapsedSeconds))s")
+    print("  Output shape: \(output.decoded.shape)")
+
+    // --- Write MP4 ---
+    print("[6/6] Writing MP4 to \(outputPath)...")
+    #if canImport(AVFoundation) && canImport(CoreGraphics)
+    let cgFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+    print("  Extracted \(cgFrames.count) CGImage frames")
+    try LTX2PostProcess.writeMP4(
+      frames: cgFrames,
+      outputPath: outputPath,
+      fps: 24,
+      width: width,
+      height: height
+    )
+    #else
+    // Fallback: write PPM frames
+    let ppmDir = outputPath.replacingOccurrences(of: ".mp4", with: "-frames")
+    try LTX2PostProcess.writeFramesPPM(from: output.decoded, outputDir: ppmDir)
+    print("  Wrote PPM frames to \(ppmDir) (AVFoundation not available)")
+    #endif
+
+    // Report
+    let fm = FileManager.default
+    if let attrs = try? fm.attributesOfItem(atPath: outputPath),
+       let size = attrs[.size] as? Int {
+      let kb = Double(size) / 1024.0
+      print()
+      print("=== Done ===")
+      print("Output: \(outputPath)")
+      print("Size:   \(String(format: "%.1f", kb)) KB")
+      print("Frames: \(output.numFrames)")
+      print("Time:   \(String(format: "%.1f", output.elapsedSeconds))s")
+    } else {
+      print()
+      print("=== Done ===")
+      print("Output: \(outputPath)")
+    }
+  }
+
+  private static func printLTX2DemoUsage() {
+    print("""
+    Run LTX-2 video generation demo with dummy embeddings.
+    Proves the full pipeline works: weight loading -> transformer -> VAE decode -> MP4.
+
+    Usage: ComfyBox ltx2-demo [options]
+      --model-dir <path>        Model weights directory (default: /Volumes/Bolt/Models/ltx2-distilled)
+      --output, -o <path>       Output MP4 path (default: /tmp/ltx2-demo.mp4)
+      --width, -W <int>         Video width in pixels (default: 512)
+      --height, -H <int>        Video height in pixels (default: 320)
+      --frames <int>            Number of frames, must be 1+8k (default: 9)
+      --steps <int>             Denoising steps (default: 4)
+      --seed <int>              Random seed (default: 42)
+      --help, -h                Show help
+
+    The demo uses random embeddings instead of a real text encoder,
+    so output will be abstract noise. This proves the pipeline works
+    end-to-end without requiring Gemma 3 weights.
+    """)
+  }
 }
 
 // MARK: - Progress Helpers
@@ -3061,6 +3284,7 @@ private final class ProgressBar {
     if m > 0 { return String(format: "%dm%02ds", m, s) }
     return String(format: "%ds", s)
   }
+
 
 
 }

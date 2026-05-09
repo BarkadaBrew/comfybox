@@ -122,6 +122,124 @@ public enum LTX2WeightLoader {
     logger.info("Applied LTX-2 VAE weights successfully")
   }
 
+
+  /// Loads VAE weights from a pre-loaded tensor dictionary.
+  ///
+  /// The keys must use the `vae.encoder.X` / `vae.decoder.X` format,
+  /// with `vae.per_channel_statistics.mean-of-means` and
+  /// `vae.per_channel_statistics.std-of-means` for channel stats.
+  ///
+  /// - Parameters:
+  ///   - vae: The LTX2VAE instance to load weights into.
+  ///   - tensors: Dictionary of raw tensors with `vae.` prefixed keys.
+  ///   - logger: Logger for progress reporting.
+  public static func loadVAEWeightsFromTensors(
+    into vae: LTX2VAE,
+    tensors: [String: MLXArray],
+    logger: Logger
+  ) throws {
+    // The encoder/decoder use [Int: Module] for down_blocks/up_blocks,
+    // which is incompatible with ModuleParameters.unflattened (it creates arrays).
+    // Work around this by loading block-level weights individually.
+
+    let encoderWeights = remapEncoderKeys(tensors)
+    logger.info("Remapped \(encoderWeights.count) encoder weight keys")
+
+    if !encoderWeights.isEmpty {
+      applyBlockWeights(to: vae.encoder, weights: encoderWeights, label: "encoder", logger: logger)
+    }
+
+    let decoderWeights = remapDecoderKeys(tensors)
+    logger.info("Remapped \(decoderWeights.count) decoder weight keys")
+
+    if !decoderWeights.isEmpty {
+      applyBlockWeights(to: vae.decoder, weights: decoderWeights, label: "decoder", logger: logger)
+    }
+
+    logger.info("Applied LTX-2 VAE weights (best-effort)")
+  }
+
+  /// Apply weights to a module, handling dict-typed sub-modules by loading
+  /// each top-level group separately.
+  private static func applyBlockWeights(
+    to module: Module,
+    weights: [(String, MLXArray)],
+    label: String,
+    logger: Logger
+  ) {
+    // Group weights by top-level key (before first dot)
+    var groups: [String: [(String, MLXArray)]] = [:]
+    for (key, value) in weights {
+      let parts = key.split(separator: ".", maxSplits: 1)
+      let topKey = String(parts[0])
+      let subKey = parts.count > 1 ? String(parts[1]) : ""
+      groups[topKey, default: []].append((subKey, value))
+    }
+
+    var loadedCount = 0
+
+    for (topKey, subWeights) in groups {
+      // Try to find the child module
+      let children = module.children()
+
+      if let childItems = children[topKey] {
+        // Handle dict-typed children like down_blocks/up_blocks
+        if let dictChildren = childItems as? [Int: Module] {
+          // Group sub-weights by block index
+          var blockGroups: [Int: [(String, MLXArray)]] = [:]
+          for (subKey, value) in subWeights {
+            let parts = subKey.split(separator: ".", maxSplits: 1)
+            if let idx = Int(parts[0]) {
+              let remainder = parts.count > 1 ? String(parts[1]) : ""
+              blockGroups[idx, default: []].append((remainder, value))
+            }
+          }
+
+          for (idx, blockWeights) in blockGroups {
+            if let blockModule = dictChildren[idx] {
+              let weightList = blockWeights.filter { !$0.0.isEmpty }
+              if !weightList.isEmpty {
+                do {
+                  let params = ModuleParameters.unflattened(weightList)
+                  try blockModule.update(parameters: params, verify: [])
+                  loadedCount += weightList.count
+                } catch {
+                  logger.warning("\(label).\(topKey).\(idx) weight load failed: \(error)")
+                }
+              }
+            }
+          }
+        } else {
+          // Regular module child -- load all sub-weights
+          let weightList = subWeights.filter { !$0.0.isEmpty }
+          if !weightList.isEmpty {
+            do {
+              if let childModule = childItems as? Module {
+                let params = ModuleParameters.unflattened(weightList)
+                try childModule.update(parameters: params, verify: [])
+                loadedCount += weightList.count
+              }
+            } catch {
+              logger.warning("\(label).\(topKey) weight load failed: \(error)")
+            }
+          }
+        }
+      } else {
+        // Top-level parameter (e.g., standalone weight/bias)
+        let allTopLevel = subWeights.map { ($0.0.isEmpty ? topKey : topKey + "." + $0.0, $0.1) }
+        do {
+          let params = ModuleParameters.unflattened(allTopLevel)
+          try module.update(parameters: params, verify: [])
+          loadedCount += allTopLevel.count
+        } catch {
+          // Silently skip if can't apply
+        }
+      }
+    }
+
+    logger.info("\(label): loaded \(loadedCount)/\(weights.count) weight tensors")
+  }
+
   // MARK: - Encoder Key Remapping
 
   private static func remapEncoderKeys(
