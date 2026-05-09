@@ -444,7 +444,7 @@ public final class LTX2GemmaModel: Module {
     for (key, value) in weights {
       var newKey: String? = nil
       if key.hasPrefix("language_model.model.") {
-        newKey = String(key.dropFirst("language_model.".count))
+        newKey = String(key.dropFirst("language_model.model.".count))
       } else if key.hasPrefix("model.language_model.") {
         newKey = String(key.dropFirst("model.language_model.".count))
       } else if key.hasPrefix("language_model.") {
