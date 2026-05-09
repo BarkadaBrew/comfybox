@@ -7,21 +7,18 @@
 // not just the final output.
 //
 // Architecture (Gemma 3 12B from unsloth/gemma-3-12b-it):
-//   - Embedding: vocab 262208 -> 3840
-//   - 48 transformer layers with sliding window attention
-//   - Sliding window pattern of 6 (every 6th layer is global attention)
+//   - Embedding: vocab 262208 -> 3840, with sqrt(3840) scaling built into embed
+//   - 48 transformer layers with sliding window attention pattern
+//   - Dual RoPE: global (base=10000, linear scale 8x) and local (base=10000)
+//   - Every 6th layer (5, 11, 17, ...) uses full attention with global RoPE
+//   - All other layers use sliding window attention with local RoPE
 //   - GQA: 16 query heads, 8 KV heads, head_dim 256
 //   - QK normalization: per-head RMSNorm on Q and K after projection
-//   - MLP: gelu_pytorch_tanh-gated (gate_proj + up_proj -> down_proj), intermediate 15360
-//   - Pre-norm: input_layernorm, post_attention_layernorm
-//   - Extra norms: pre_feedforward_layernorm, post_feedforward_layernorm
-//   - RMSNorm with eps=1e-6
-//   - RoPE with theta=1,000,000
-//   - Embedding scaling: h *= sqrt(hidden_size)
+//   - MLP: gelu_pytorch_tanh-gated, intermediate 15360
+//   - 4-norm layers: input/post_attention/pre_feedforward/post_feedforward
+//   - RMSNorm uses (1 + weight) convention
 //
 // Q4 quantization support keeps memory at ~6 GB instead of ~24 GB.
-//
-// Reference: text_encoder.py class LanguageModel, wrapping mlx_vlm Gemma3Model
 
 import Foundation
 import MLX
@@ -30,11 +27,10 @@ import MLXNN
 
 // MARK: - Gemma 3 RMS Norm
 
-/// RMSNorm for Gemma 3, matching the Gemma normalization convention.
+/// RMSNorm for Gemma 3, using the (1 + weight) convention.
 ///
-/// Casts to float32 for variance computation, applies learned weight (+1),
-/// then casts back to input dtype for numerical stability.
-/// Gemma uses weight + 1 convention (like LLaMA).
+/// Gemma uses `output = rms_norm(x) * (1 + weight)` rather than just `* weight`.
+/// This matches the HuggingFace Gemma3RMSNorm implementation.
 public final class Gemma3RMSNorm: Module {
   @ModuleInfo(key: "weight") var weight: MLXArray
   let eps: Float
@@ -45,7 +41,6 @@ public final class Gemma3RMSNorm: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    // Use MLXFast.rmsNorm with weight+1 to match Gemma convention
     return MLXFast.rmsNorm(x, weight: 1.0 + weight, eps: eps)
   }
 }
@@ -54,26 +49,37 @@ public final class Gemma3RMSNorm: Module {
 
 /// Rotary position embeddings for Gemma 3 12B.
 ///
-/// Uses theta=1,000,000 for extended context support.
+/// Supports two modes used by Gemma 3:
+/// - **Local** (sliding window layers): base=10000, no scaling
+/// - **Global** (full attention layers): base=10000, linear scaling factor 8
+///   (positions are divided by 8, equivalent to dividing inv_freq by 8)
+///
 /// Output: (cos, sin) each `[1, 1, seqLen, headDim]`.
 public final class Gemma3RoPE: Module {
   let dim: Int
   let base: Float
+  let scaleFactor: Float
   let invFreq: MLXArray
 
-  public init(dim: Int, base: Float = 1_000_000.0) {
+  public init(dim: Int, base: Float = 10_000.0, scaleFactor: Float = 1.0) {
     self.dim = dim
     self.base = base
+    self.scaleFactor = scaleFactor
 
     // inv_freq = 1.0 / (base ** (arange(0, dim, 2) / dim))
     let indices = MLXArray(stride(from: 0, to: dim, by: 2).map { Float($0) })
-    self.invFreq = 1.0 / MLX.pow(MLXArray(base), indices / Float(dim))
+    var freq = 1.0 / MLX.pow(MLXArray(base), indices / Float(dim))
+
+    // Linear scaling: divide frequencies by scale factor
+    // This makes positions evolve slower (wider context window)
+    if scaleFactor > 1.0 {
+      freq = freq / MLXArray(scaleFactor)
+    }
+
+    self.invFreq = freq
   }
 
   /// Compute cos/sin tables for the given sequence length.
-  ///
-  /// - Parameter seqLen: Sequence length.
-  /// - Returns: `(cos, sin)` each `[1, 1, seqLen, headDim]`.
   public func callAsFunction(_ seqLen: Int) -> (cos: MLXArray, sin: MLXArray) {
     let positions = MLXArray(0..<seqLen).asType(.float32)
     let freqs = MLX.outer(positions, invFreq)
@@ -88,20 +94,11 @@ public final class Gemma3RoPE: Module {
 
 /// Multi-head attention with GQA for Gemma 3 12B.
 ///
-/// Architecture:
-/// - 16 query heads, 8 KV heads (2x GQA ratio)
-/// - Head dimension 256
-/// - No bias on projections
-/// - QK normalization: per-head RMSNorm (dim=head_dim) on Q and K
+/// Features:
+/// - 16 query heads, 8 KV heads (2x GQA ratio), head_dim 256
+/// - Per-head QK normalization (RMSNorm on dim=head_dim)
 /// - RoPE applied via rotate-half method
-///
-/// Weight key mapping:
-/// - `model.layers.N.self_attn.q_proj.weight`
-/// - `model.layers.N.self_attn.k_proj.weight`
-/// - `model.layers.N.self_attn.v_proj.weight`
-/// - `model.layers.N.self_attn.o_proj.weight`
-/// - `model.layers.N.self_attn.q_norm.weight`
-/// - `model.layers.N.self_attn.k_norm.weight`
+/// - No bias on projections
 public final class Gemma3Attention: Module {
   let numHeads: Int
   let numKVHeads: Int
@@ -113,15 +110,14 @@ public final class Gemma3Attention: Module {
   @ModuleInfo(key: "k_proj") var kProj: Linear
   @ModuleInfo(key: "v_proj") var vProj: Linear
   @ModuleInfo(key: "o_proj") var oProj: Linear
-  @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-  @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+  @ModuleInfo(key: "q_norm") var qNorm: Gemma3RMSNorm
+  @ModuleInfo(key: "k_norm") var kNorm: Gemma3RMSNorm
 
   public init(config: LTX2GemmaConfig) {
     self.numHeads = config.numAttentionHeads
     self.numKVHeads = config.numKeyValueHeads
     self.headDim = config.headDim
     self.numKVGroups = config.numAttentionHeads / config.numKeyValueHeads
-    // Gemma 3 uses query_pre_attn_scalar = head_dim for scaling
     self.scale = 1.0 / Float(config.headDim).squareRoot()
 
     let hiddenSize = config.hiddenSize
@@ -129,18 +125,10 @@ public final class Gemma3Attention: Module {
     self._kProj.wrappedValue = Linear(hiddenSize, numKVHeads * headDim, bias: false)
     self._vProj.wrappedValue = Linear(hiddenSize, numKVHeads * headDim, bias: false)
     self._oProj.wrappedValue = Linear(numHeads * headDim, hiddenSize, bias: false)
-    // Per-head QK normalization (dim = head_dim = 256)
-    self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-    self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
+    self._qNorm.wrappedValue = Gemma3RMSNorm(hiddenSize: headDim, eps: config.rmsNormEps)
+    self._kNorm.wrappedValue = Gemma3RMSNorm(hiddenSize: headDim, eps: config.rmsNormEps)
   }
 
-  /// Forward pass through self-attention.
-  ///
-  /// - Parameters:
-  ///   - hiddenStates: Input `[B, S, hiddenSize]`.
-  ///   - attentionMask: 4D additive mask `[B, 1, S, S]`.
-  ///   - cosSin: `(cos, sin)` from `Gemma3RoPE`, each `[1, 1, S, headDim]`.
-  /// - Returns: Output `[B, S, hiddenSize]`.
   public func callAsFunction(
     hiddenStates: MLXArray,
     attentionMask: MLXArray?,
@@ -158,7 +146,7 @@ public final class Gemma3Attention: Module {
     k = k.reshaped(batchSize, seqLen, numKVHeads, headDim)
     v = v.reshaped(batchSize, seqLen, numKVHeads, headDim)
 
-    // Apply per-head QK normalization
+    // Per-head QK normalization
     q = qNorm(q)
     k = kNorm(k)
 
@@ -176,11 +164,8 @@ public final class Gemma3Attention: Module {
       v = Gemma3Attention.repeatKV(v, nRep: numKVGroups)
     }
 
-    // Scaled dot-product attention
     var attnOutput = MLXFast.scaledDotProductAttention(
-      queries: q,
-      keys: k,
-      values: v,
+      queries: q, keys: k, values: v,
       scale: scale,
       mask: attentionMask.map { .array($0) } ?? .none
     )
@@ -190,9 +175,6 @@ public final class Gemma3Attention: Module {
     return oProj(attnOutput)
   }
 
-  // MARK: - RoPE Application
-
-  /// Apply rotary position embeddings using rotate-half method.
   static func applyRoPE(
     q: MLXArray, k: MLXArray,
     cos: MLXArray, sin: MLXArray
@@ -210,7 +192,6 @@ public final class Gemma3Attention: Module {
     return (qEmbed.asType(qDtype), kEmbed.asType(kDtype))
   }
 
-  /// Rotate the second half: [-x2, x1]
   static func rotateHalf(_ x: MLXArray) -> MLXArray {
     let halfDim = x.dim(-1) / 2
     let x1 = x[.ellipsis, ..<halfDim]
@@ -218,7 +199,6 @@ public final class Gemma3Attention: Module {
     return MLX.concatenated([-x2, x1], axis: -1)
   }
 
-  /// Expand KV heads for GQA.
   static func repeatKV(_ x: MLXArray, nRep: Int) -> MLXArray {
     guard nRep > 1 else { return x }
     let shape = x.shape
@@ -231,13 +211,6 @@ public final class Gemma3Attention: Module {
 // MARK: - Gemma 3 MLP
 
 /// Gated MLP for Gemma 3 12B using approximate GELU (gelu_pytorch_tanh).
-///
-/// Implements: output = down_proj(GELU_approx(gate_proj(x)) * up_proj(x))
-///
-/// Weight key mapping:
-/// - `model.layers.N.mlp.gate_proj.weight`
-/// - `model.layers.N.mlp.up_proj.weight`
-/// - `model.layers.N.mlp.down_proj.weight`
 public final class Gemma3MLP: Module {
   @ModuleInfo(key: "gate_proj") var gateProj: Linear
   @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -250,33 +223,17 @@ public final class Gemma3MLP: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    // Gemma 3 uses gelu_pytorch_tanh (approximate GELU)
     downProj(geluApproximate(gateProj(x)) * upProj(x))
   }
 }
 
 // MARK: - Gemma 3 Transformer Layer
 
-/// Single pre-norm transformer layer for Gemma 3 12B.
+/// Single transformer layer for Gemma 3 12B with 4-norm architecture.
 ///
-/// Architecture (matches unsloth/gemma-3-12b-it weights):
-///   x -> input_layernorm -> GQA Attention (+ QK norm + RoPE) -> residual add
-///   x -> post_attention_layernorm (not used in forward, kept for weight compat)
-///   x -> pre_feedforward_layernorm -> Gated MLP -> post_feedforward_layernorm -> residual add
-///
-/// Note: Gemma 3 has a 4-norm architecture per layer. The naming from HuggingFace:
-///   - input_layernorm: pre-attention norm
-///   - post_attention_layernorm: post-attention pre-residual norm
-///   - pre_feedforward_layernorm: pre-MLP norm
-///   - post_feedforward_layernorm: post-MLP pre-residual norm
-///
-/// Weight key mapping:
-/// - `model.layers.N.input_layernorm.weight`
-/// - `model.layers.N.self_attn.*`
-/// - `model.layers.N.post_attention_layernorm.weight`
-/// - `model.layers.N.pre_feedforward_layernorm.weight`
-/// - `model.layers.N.post_feedforward_layernorm.weight`
-/// - `model.layers.N.mlp.*`
+/// Architecture:
+///   residual -> input_layernorm -> attention -> post_attention_layernorm -> + residual
+///   residual -> pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm -> + residual
 public final class Gemma3Layer: Module {
   @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma3RMSNorm
   @ModuleInfo(key: "self_attn") var selfAttn: Gemma3Attention
@@ -299,23 +256,12 @@ public final class Gemma3Layer: Module {
       hiddenSize: config.hiddenSize, intermediateSize: config.intermediateSize)
   }
 
-  /// Forward pass through the transformer layer.
-  ///
-  /// Gemma 3 uses a 4-norm architecture:
-  ///   residual -> input_layernorm -> attention -> post_attention_layernorm -> + residual
-  ///   residual -> pre_feedforward_layernorm -> MLP -> post_feedforward_layernorm -> + residual
-  ///
-  /// - Parameters:
-  ///   - hiddenStates: Input `[B, S, hiddenSize]`.
-  ///   - attentionMask: 4D additive mask `[B, 1, S, S]`.
-  ///   - cosSin: `(cos, sin)` from `Gemma3RoPE`.
-  /// - Returns: Output `[B, S, hiddenSize]`.
   public func callAsFunction(
     hiddenStates: MLXArray,
     attentionMask: MLXArray?,
     cosSin: (cos: MLXArray, sin: MLXArray)
   ) -> MLXArray {
-    // Self-attention block: pre-norm -> attn -> post-norm -> residual
+    // Attention block: pre-norm -> attn -> post-norm -> residual
     let residual1 = hiddenStates
     var h = inputLayerNorm(hiddenStates)
     h = selfAttn(hiddenStates: h, attentionMask: attentionMask, cosSin: cosSin)
@@ -341,14 +287,8 @@ public final class Gemma3Layer: Module {
 /// `outputHiddenStates: true` mode that extracts ALL 49 hidden states
 /// (1 embedding + 48 layer outputs) needed by LTX-2's feature extractor.
 ///
-/// Gemma 3 uses a sliding window attention pattern where every 6th layer
-/// (i.e., layers 5, 11, 17, ...) uses full global attention, and all other
-/// layers use sliding window attention of 1024 tokens.
-///
-/// Weight key mapping (after `language_model.` prefix strip):
-/// - `model.embed_tokens.weight`
-/// - `model.layers.N.*`
-/// - `model.norm.weight`
+/// Uses dual RoPE: global (for full attention layers) and local (for sliding
+/// window layers), matching the HuggingFace Gemma 3 implementation.
 public final class LTX2GemmaModel: Module {
   public let config: LTX2GemmaConfig
 
@@ -356,7 +296,13 @@ public final class LTX2GemmaModel: Module {
   @ModuleInfo(key: "layers") var layers: [Gemma3Layer]
   @ModuleInfo(key: "norm") var norm: Gemma3RMSNorm
 
-  let rotaryEmb: Gemma3RoPE
+  /// Global RoPE: used by full attention layers (every 6th layer)
+  /// base=10000, linear scaling factor=8 (theta=1M equiv)
+  let rotaryEmbGlobal: Gemma3RoPE
+
+  /// Local RoPE: used by sliding window attention layers
+  /// base=10000, no scaling
+  let rotaryEmbLocal: Gemma3RoPE
 
   public init(config: LTX2GemmaConfig = LTX2GemmaConfig()) {
     self.config = config
@@ -375,9 +321,18 @@ public final class LTX2GemmaModel: Module {
       eps: config.rmsNormEps
     )
 
-    self.rotaryEmb = Gemma3RoPE(
+    // Dual RoPE matching HuggingFace Gemma 3:
+    // Local: standard base=10000 (rope_local_base_freq)
+    // Global: base=10000 with linear scaling factor 8 (rope_scaling.factor)
+    self.rotaryEmbLocal = Gemma3RoPE(
       dim: config.headDim,
-      base: config.ropeTheta
+      base: 10_000.0,
+      scaleFactor: 1.0
+    )
+    self.rotaryEmbGlobal = Gemma3RoPE(
+      dim: config.headDim,
+      base: 10_000.0,
+      scaleFactor: 8.0  // rope_scaling.factor from config
     )
   }
 
@@ -389,8 +344,6 @@ public final class LTX2GemmaModel: Module {
   ///   - outputHiddenStates: When true, returns all 49 hidden states.
   /// - Returns: Array of hidden states `[embedding, layer0, ..., layer47]` where
   ///   the final entry has the final RMSNorm applied. Each tensor is `[B, S, 3840]`.
-  ///
-  ///   When `outputHiddenStates` is false, returns `[finalNormedOutput]`.
   public func callAsFunction(
     inputIds: MLXArray,
     attentionMask: MLXArray,
@@ -398,38 +351,38 @@ public final class LTX2GemmaModel: Module {
   ) -> [MLXArray] {
     let seqLen = inputIds.dim(1)
 
-    // Token embedding with Gemma scaling
+    // Token embedding with Gemma scaling (sqrt(hidden_size))
     var h = embedTokens(inputIds)
     let scaleFactor = MLXArray(Float(config.hiddenSize).squareRoot()).asType(h.dtype)
     h = h * scaleFactor
     eval(h)
 
-    // Build causal + padding attention masks
+    // Build causal + padding attention mask
     let fullCausalMask = LTX2GemmaModel.buildCausalMask(
       seqLen: seqLen,
       attentionMask: attentionMask,
       dtype: h.dtype
     )
 
-    // Pre-compute RoPE
-    let (cos, sin) = rotaryEmb(seqLen)
+    // Pre-compute both RoPE variants
+    let globalCosSin = rotaryEmbGlobal(seqLen)
+    let localCosSin = rotaryEmbLocal(seqLen)
 
     // Collect hidden states
     var hiddenStatesList: [MLXArray] = outputHiddenStates ? [h] : []
 
     let numLayers = layers.count
     for (i, layer) in layers.enumerated() {
-      // Gemma 3 sliding window: every Nth layer is global (N = slidingWindowPattern)
-      // For layer index i, global when (i % pattern == pattern - 1)
-      // Other layers use sliding window mask
-      // NOTE: Using full causal mask for all layers (correct but slightly less efficient).
-      // This matches the Python reference which also uses the full mask for both.
-      let layerMask = fullCausalMask
+      // Gemma 3 sliding window pattern:
+      // Every 6th layer (indices 5, 11, 17, ...) uses full attention + global RoPE
+      // All other layers use sliding window attention + local RoPE
+      let isGlobal = (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
+      let cosSin = isGlobal ? globalCosSin : localCosSin
 
       h = layer(
         hiddenStates: h,
-        attentionMask: layerMask,
-        cosSin: (cos, sin)
+        attentionMask: fullCausalMask,
+        cosSin: cosSin
       )
       eval(h)
 
@@ -453,17 +406,6 @@ public final class LTX2GemmaModel: Module {
   // MARK: - Attention Mask
 
   /// Build a 4D causal + padding attention mask.
-  ///
-  /// Matches the Python `_create_causal_mask_with_padding` function:
-  /// - Lower triangular causal mask
-  /// - Combined with padding mask from attention_mask
-  /// - 0 where attend, large negative where masked
-  ///
-  /// - Parameters:
-  ///   - seqLen: Sequence length.
-  ///   - attentionMask: `[B, S]` with 1 = attend, 0 = pad.
-  ///   - dtype: Output dtype.
-  /// - Returns: `[B, 1, S, S]` additive mask.
   public static func buildCausalMask(
     seqLen: Int,
     attentionMask: MLXArray,
@@ -473,59 +415,43 @@ public final class LTX2GemmaModel: Module {
     let minVal: Float = (dtype == .float16 || dtype == .bfloat16) ? -65504.0 : -1e9
     let maskDtype: DType = .float32
 
-    // Padding mask: 0 where attend, minVal where pad -> [B, 1, 1, S]
+    // Padding mask
     let keepMask = attentionMask .== MLXArray(1).asType(attentionMask.dtype)
     let padOnes = MLX.zeros(attentionMask.shape, dtype: maskDtype)
     let padNegInf = MLX.full(attentionMask.shape, values: MLXArray(minVal), dtype: maskDtype)
     var paddingMask = MLX.where(keepMask, padOnes, padNegInf)
-    // [B, S] -> [B, 1, 1, S]
     paddingMask = paddingMask.expandedDimensions(axis: 1).expandedDimensions(axis: 1)
 
-    // Causal mask: upper triangle = minVal -> [1, 1, S, S]
+    // Causal mask
     let idx = MLXArray(0..<seqLen).asType(.int32)
-    let j = idx.expandedDimensions(axis: 0)  // (1, S)
-    let i = idx.expandedDimensions(axis: 1)  // (S, 1)
-    let triBool = j .> i  // upper triangular = true
+    let j = idx.expandedDimensions(axis: 0)
+    let i = idx.expandedDimensions(axis: 1)
+    let triBool = j .> i
     let zeros2D = MLX.zeros([seqLen, seqLen], dtype: maskDtype)
     let negInf2D = MLX.full([seqLen, seqLen], values: MLXArray(minVal), dtype: maskDtype)
     var causalMask = MLX.where(triBool, negInf2D, zeros2D)
-    // [S, S] -> [1, 1, S, S] -> [B, 1, S, S]
     causalMask = causalMask.expandedDimensions(axis: 0).expandedDimensions(axis: 0)
     causalMask = MLX.broadcast(causalMask, to: [batchSize, 1, seqLen, seqLen])
 
-    // Combined: causal + padding (additive masks, broadcasts [B, 1, 1, S] + [B, 1, S, S])
     return (causalMask + paddingMask).asType(dtype)
   }
 
   // MARK: - Weight Loading
 
   /// Sanitize weight keys from safetensors format.
-  ///
-  /// Handles two common prefix patterns:
-  /// - `language_model.model.` -> `model.` (MLX community 4bit)
-  /// - `language_model.` -> `` (kept as model.* after strip)
-  /// - `model.language_model.` -> `model.` (full VLM from transformers)
-  ///
-  /// Strips the language_model prefix and keeps the model.* structure that
-  /// matches our Module hierarchy (model.embed_tokens, model.layers, model.norm).
   public static func sanitizeWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     var sanitized: [String: MLXArray] = [:]
     for (key, value) in weights {
       var newKey: String? = nil
       if key.hasPrefix("language_model.model.") {
-        // MLX community format: language_model.model.layers.0.* -> model.layers.0.*
         newKey = String(key.dropFirst("language_model.".count))
       } else if key.hasPrefix("model.language_model.") {
-        // Full VLM format: model.language_model.layers.0.* -> model.layers.0.*
         newKey = String(key.dropFirst("model.language_model.".count))
       } else if key.hasPrefix("language_model.") {
-        // Generic: language_model.* -> *
         newKey = String(key.dropFirst("language_model.".count))
       }
 
       guard let finalKey = newKey else { continue }
-
-      // Skip vision tower weights
       guard !finalKey.hasPrefix("vision_tower.") else { continue }
 
       if value.dtype == .float32 {
