@@ -59,14 +59,11 @@ public enum LTX2PostProcess {
       let hwc = scaled.transposed(1, 2, 0)  // (H, W, 3)
       eval(hwc)
 
-      // Get flat pixel data as RGB
+      // Bulk copy pixel data as RGB (avoids per-pixel GPU-to-CPU transfers)
       let rgbData: [UInt8]
       let flatArray = hwc.reshaped(-1)
       eval(flatArray)
-      let count = height * width * 3
-      rgbData = (0..<count).map { i in
-        UInt8(flatArray[i].item(Int32.self))
-      }
+      rgbData = flatArray.asArray(UInt8.self)
 
       // Convert RGB to RGBA (add alpha = 255)
       var rgbaData = [UInt8](repeating: 255, count: height * width * 4)

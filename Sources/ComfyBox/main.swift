@@ -2988,7 +2988,7 @@ struct ZImageCLI {
   /// pre-computed ground truth embeddings.
   private static func runLTX2TextEncoderTest(args: [String]) throws {
     var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-4bit/snapshots/86cc6a8dedbc456dd0e4af01a9d09f396f77e558"
-    var connectorPath = "/Volumes/Bolt/Models/ltx2-distilled"
+    var connectorPath = "/Users/toddwalderman/Models/ltx2-distilled"
     var groundTruthPath = "/tmp/kira-text-embeddings.safetensors"
 
     var iterator = args.makeIterator()
@@ -3181,10 +3181,11 @@ struct ZImageCLI {
   // MARK: - LTX2 Demo
 
   private static func runLTX2Demo(args: [String]) throws {
-    var modelDir = "/Volumes/Bolt/Models/ltx2-distilled"
+    var modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
     var outputPath = "/tmp/ltx2-demo.mp4"
     var embeddingsPath: String? = nil
     var prompt: String? = nil
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-4bit/snapshots/86cc6a8dedbc456dd0e4af01a9d09f396f77e558"
     var width = 512
     var height = 320
     var frames = 9
@@ -3212,6 +3213,8 @@ struct ZImageCLI {
         embeddingsPath = nextValue(for: arg, iterator: &iterator)
       case "--prompt", "-p":
         prompt = nextValue(for: arg, iterator: &iterator)
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printLTX2DemoUsage()
         return
@@ -3220,19 +3223,30 @@ struct ZImageCLI {
       }
     }
 
-    print("=== LTX2 Demo ===")
+    // Determine if we should use the real text encoder
+    let useRealEncoder = prompt != nil && embeddingsPath == nil
+    let totalSteps = useRealEncoder ? 9 : 7
+
+    print("=== LTX2 End-to-End Demo ===")
     print("Model dir:  \(modelDir)")
     print("Output:     \(outputPath)")
     print("Prompt:     \(prompt ?? "(none)")")
-    print("Embeddings: \(embeddingsPath ?? "random (dummy)")")
+    if useRealEncoder {
+      print("Encoder:    Gemma 3 12B Q4 (live)")
+      print("Gemma path: \(gemmaPath)")
+    } else {
+      print("Embeddings: \(embeddingsPath ?? "random (dummy)")")
+    }
     print("Resolution: \(width)x\(height)")
     print("Frames:     \(frames)")
     print("Steps:      \(steps)")
     print("Seed:       \(seed)")
     print()
 
+    var stepNum = 1
+
     // --- Create transformer ---
-    print("[1/7] Creating transformer (48-layer, 32 heads)...")
+    print("[\(stepNum)/\(totalSteps)] Creating transformer (48-layer, 32 heads)...")
     let transformer = LTX2Transformer(
       numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
       numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
@@ -3240,9 +3254,10 @@ struct ZImageCLI {
       positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
       useMiddleIndicesGrid: true, ropeMode: .split
     )
+    stepNum += 1
 
     // --- Load transformer weights ---
-    print("[2/7] Loading transformer weights (this takes 1-3 minutes for 35GB)...")
+    print("[\(stepNum)/\(totalSteps)] Loading transformer weights (this takes 1-3 minutes for 35GB)...")
     let transformerPath = URL(fileURLWithPath: modelDir + "/transformer-distilled.safetensors")
     guard FileManager.default.fileExists(atPath: transformerPath.path) else {
       throw NSError(domain: "LTX2Demo", code: 1,
@@ -3256,15 +3271,12 @@ struct ZImageCLI {
     MLX.eval(transformer.parameters())
     let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
     print("  Loaded \(rawWeights.count) tensors in \(String(format: "%.1f", loadTime))s")
+    stepNum += 1
 
     // --- Create and load VAE ---
-    print("[3/7] Creating and loading VAE...")
+    print("[\(stepNum)/\(totalSteps)] Creating and loading VAE...")
     let vae = LTX2VAE(config: .v23)
 
-    // Load VAE weights from separate files.
-    // The files use "vae_decoder.X"/"vae_encoder.X" prefix.
-    // We rewrite to "vae.decoder.X"/"vae.encoder.X" so LTX2WeightLoader's
-    // remapping logic handles the heterogeneous block arrays correctly.
     let vaeDecoderPath = URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors")
     let vaeEncoderPath = URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors")
     guard FileManager.default.fileExists(atPath: vaeDecoderPath.path) else {
@@ -3276,7 +3288,6 @@ struct ZImageCLI {
         userInfo: [NSLocalizedDescriptionKey: "VAE encoder weights not found at \(vaeEncoderPath.path)"])
     }
 
-    // Load and rewrite key prefixes
     var combinedVAEWeights: [String: MLXArray] = [:]
     let rawDecoderWeights = try MLX.loadArrays(url: vaeDecoderPath)
     for (key, value) in rawDecoderWeights {
@@ -3290,9 +3301,6 @@ struct ZImageCLI {
         combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
       }
     }
-    // Per-channel statistics are already in the decoder weights as
-    // vae.decoder.per_channel_statistics.mean/std (after prefix rewrite).
-    // Also add them with the mean-of-means format for the encoder path.
     if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
       combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
     }
@@ -3311,17 +3319,57 @@ struct ZImageCLI {
     print("  VAE weight loading completed, evaluating parameters...")
     MLX.eval(vae.parameters())
     print("  VAE weights loaded and evaluated successfully")
+    stepNum += 1
+
+    // --- Create text encoder (real or dummy) ---
+    let textEncoder: LTX2TextEncoder
+    if useRealEncoder {
+      print("[\(stepNum)/\(totalSteps)] Creating text encoder (Gemma 3 12B Q4 + connectors)...")
+      let gemmaConfig = LTX2GemmaConfig(
+        vocabSize: 262208,
+        hiddenSize: 3840,
+        numHiddenLayers: 48,
+        numAttentionHeads: 16,
+        numKeyValueHeads: 8,
+        headDim: 256,
+        intermediateSize: 15360,
+        rmsNormEps: 1e-6,
+        ropeTheta: 1_000_000.0,
+        slidingWindow: 1024,
+        slidingWindowPattern: 6,
+        quantization: LTX2GemmaQuantizationConfig(bits: 4, groupSize: 64)
+      )
+      let encoderConfig = LTX2TextEncoderConfig(
+        gemma: gemmaConfig,
+        hasPromptAdaLN: true
+      )
+      textEncoder = LTX2TextEncoder(config: encoderConfig)
+      stepNum += 1
+
+      print("[\(stepNum)/\(totalSteps)] Loading text encoder weights...")
+      print("  Gemma path: \(gemmaPath)")
+      print("  Connector path: \(modelDir)")
+      let teLoadStart = CFAbsoluteTimeGetCurrent()
+      try textEncoder.loadWeights(
+        modelPath: URL(fileURLWithPath: modelDir),
+        textEncoderPath: URL(fileURLWithPath: gemmaPath)
+      )
+      MLX.eval(textEncoder.parameters())
+      let teLoadTime = CFAbsoluteTimeGetCurrent() - teLoadStart
+      print("  Text encoder weights loaded in \(String(format: "%.1f", teLoadTime))s")
+      stepNum += 1
+    } else {
+      // Dummy text encoder (bypassed via embeddings)
+      textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig())
+    }
 
     // --- Create pipeline ---
-    print("[4/7] Creating pipeline...")
+    print("[\(stepNum)/\(totalSteps)] Creating pipeline...")
     let pipelineConfig = LTX2PipelineConfig(
       modelPath: modelDir,
       pipelineType: .distilled,
       hasPromptAdaLN: true
     )
-
-    // Dummy text encoder (we bypass it via embeddings)
-    let textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig())
 
     let pipeline = LTX2Pipeline(
       vae: vae,
@@ -3329,11 +3377,41 @@ struct ZImageCLI {
       transformer: transformer,
       config: pipelineConfig
     )
+    stepNum += 1
 
-    // --- Generate ---
+    // --- Generate embeddings or load them ---
     let videoEmbeddings: MLXArray
-    if let embPath = embeddingsPath {
-      print("[5/7] Loading pre-computed embeddings from \(embPath)...")
+    if useRealEncoder, let promptText = prompt {
+      // End-to-end: tokenize prompt -> Gemma 3 -> connector -> video embeddings
+      print("[\(stepNum)/\(totalSteps)] Tokenizing and encoding prompt...")
+      let tokenizerDir = URL(fileURLWithPath: gemmaPath)
+      let tokenizer = try LTX2GemmaTokenizer.load(from: tokenizerDir, maxLength: 128)
+      let batch = tokenizer.encode(prompt: promptText, maxLength: 128)
+      MLX.eval(batch.inputIds, batch.attentionMask)
+      let maskSum = MLX.sum(batch.attentionMask).item(Int.self)
+      print("  Tokenized: \(maskSum) tokens")
+
+      let encodeStart = CFAbsoluteTimeGetCurrent()
+      let textOutput = textEncoder.encode(
+        inputIds: batch.inputIds,
+        attentionMask: batch.attentionMask,
+        returnAudioEmbeddings: false
+      )
+      MLX.eval(textOutput.videoEmbeddings)
+      let encodeTime = CFAbsoluteTimeGetCurrent() - encodeStart
+      print("  Video embeddings shape: \(textOutput.videoEmbeddings.shape)")
+      print("  Encoding time: \(String(format: "%.1f", encodeTime))s")
+
+      // Embedding statistics for diagnostics
+      let embF32 = textOutput.videoEmbeddings.asType(.float32)
+      let embMin = MLX.min(embF32).item(Float.self)
+      let embMax = MLX.max(embF32).item(Float.self)
+      let embMean = MLX.mean(embF32).item(Float.self)
+      print(String(format: "  Embedding stats: min=%.4f  max=%.4f  mean=%.6f", embMin, embMax, embMean))
+
+      videoEmbeddings = textOutput.videoEmbeddings
+    } else if let embPath = embeddingsPath {
+      print("[\(stepNum)/\(totalSteps)] Loading pre-computed embeddings from \(embPath)...")
       let embURL = URL(fileURLWithPath: embPath)
       guard FileManager.default.fileExists(atPath: embPath) else {
         throw NSError(domain: "LTX2Demo", code: 4,
@@ -3347,14 +3425,15 @@ struct ZImageCLI {
       videoEmbeddings = emb
       print("  Loaded embeddings shape: \(videoEmbeddings.shape) dtype: \(videoEmbeddings.dtype)")
     } else {
-      print("[5/7] Generating video with dummy embeddings...")
+      print("[\(stepNum)/\(totalSteps)] Generating video with dummy embeddings...")
       print("  Using random embeddings (no text encoder) -- output will be abstract noise")
       MLXRandom.seed(UInt64(seed))
       videoEmbeddings = MLXRandom.normal([1, 32, 4096]) * Float(0.01)
     }
     MLX.eval(videoEmbeddings)
+    stepNum += 1
 
-    print("[6/7] Running denoising loop (\(steps) steps)...")
+    print("[\(stepNum)/\(totalSteps)] Running denoising loop (\(steps) steps)...")
     let genStart = CFAbsoluteTimeGetCurrent()
     let output = pipeline.generateT2VWithEmbeddings(
       videoEmbeddings: videoEmbeddings,
@@ -3371,7 +3450,6 @@ struct ZImageCLI {
 
     print("  Generation complete in \(String(format: "%.1f", output.elapsedSeconds))s")
     print("  Output shape: \(output.decoded.shape)")
-    // Pixel value diagnostics (crucial for detecting dark/muted output)
     let decodedF32 = output.decoded.asType(.float32)
     let pixMin = MLX.min(decodedF32).item(Float.self)
     let pixMax = MLX.max(decodedF32).item(Float.self)
@@ -3385,9 +3463,10 @@ struct ZImageCLI {
     } else {
       print("  Pixel values look reasonable")
     }
+    stepNum += 1
 
     // --- Write MP4 ---
-    print("[7/7] Writing MP4 to \(outputPath)...")
+    print("[\(stepNum)/\(totalSteps)] Writing MP4 to \(outputPath)...")
     #if canImport(AVFoundation) && canImport(CoreGraphics)
     let cgFrames = LTX2PostProcess.framesToImages(from: output.decoded)
     print("  Extracted \(cgFrames.count) CGImage frames")
@@ -3399,7 +3478,6 @@ struct ZImageCLI {
       height: height
     )
     #else
-    // Fallback: write PPM frames
     let ppmDir = outputPath.replacingOccurrences(of: ".mp4", with: "-frames")
     try LTX2PostProcess.writeFramesPPM(from: output.decoded, outputDir: ppmDir)
     print("  Wrote PPM frames to \(ppmDir) (AVFoundation not available)")
@@ -3425,13 +3503,15 @@ struct ZImageCLI {
 
   private static func printLTX2DemoUsage() {
     print("""
-    LTX-2.3 distilled text-to-video pipeline (T2V with pre-computed embeddings).
-    Loads transformer + VAE weights, runs 8-step distilled denoising, writes MP4.
+    LTX-2.3 distilled text-to-video pipeline.
+    Supports end-to-end generation from text prompt (Gemma 3 12B Q4 text encoder)
+    or pre-computed embeddings.
 
     Usage: ComfyBox ltx2-demo [options]
-      --model-dir <path>        Model weights directory (default: /Volumes/Bolt/Models/ltx2-distilled)
+      --model-dir <path>        Model weights directory (default: ~/Models/ltx2-distilled)
       --output, -o <path>       Output MP4 path (default: /tmp/ltx2-demo.mp4)
-      --prompt, -p <text>       Text prompt (accepted, ignored -- uses embeddings)
+      --prompt, -p <text>       Text prompt (triggers end-to-end text encoding)
+      --gemma-path <path>       Path to Gemma 3 weights directory (default: HF cache)
       --embeddings <path>       Pre-computed embeddings (.safetensors, key: video_embeddings)
       --width, -W <int>         Video width in pixels, div by 32 (default: 512)
       --height, -H <int>        Video height in pixels, div by 32 (default: 320)
@@ -3441,7 +3521,7 @@ struct ZImageCLI {
       --help, -h                Show help
 
     The distilled pipeline uses 8 fixed sigma steps, guidance=1.0, no CFG.
-    Without --embeddings, random dummy embeddings are used (abstract output).
+    Priority: --embeddings > --prompt > random dummy embeddings.
     """)
   }
 }
