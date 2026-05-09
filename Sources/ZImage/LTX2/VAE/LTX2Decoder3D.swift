@@ -120,7 +120,7 @@ public final class LTX2Decoder3D: Module {
         blocks[String(idx)] = LTX2DepthToSpaceUpsample(
           inChannels: featureChannels,
           stride: (1, 2, 2),
-          residual: true,
+          residual: false,
           outChannelsReductionFactor: multiplier
         )
         featureChannels = outChannels
@@ -130,7 +130,7 @@ public final class LTX2Decoder3D: Module {
         blocks[String(idx)] = LTX2DepthToSpaceUpsample(
           inChannels: featureChannels,
           stride: (2, 1, 1),
-          residual: true,
+          residual: false,
           outChannelsReductionFactor: multiplier
         )
         featureChannels = outChannels

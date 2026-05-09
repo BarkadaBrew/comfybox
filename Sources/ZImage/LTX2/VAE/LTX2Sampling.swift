@@ -23,7 +23,8 @@ import MLXNN
 public final class LTX2SpaceToDepthDownsample: Module {
 
   /// 3x3 causal convolution before space-to-depth rearrangement.
-  @ModuleInfo(key: "conv") var conv: CausalConv3d
+  /// Wrapped in LTX2ConvWrapper to match checkpoint key path (conv.conv.weight).
+  @ModuleInfo(key: "conv") var conv: LTX2ConvWrapper
 
   /// Stride as `(temporal, height, width)`.
   public let stride: (Int, Int, Int)
@@ -52,9 +53,8 @@ public final class LTX2SpaceToDepthDownsample: Module {
     self.groupSize = inChannels * multiplier / outChannels
     let convOutChannels = outChannels / multiplier
 
-    self._conv.wrappedValue = CausalConv3d(
-      inChannels: inChannels, outChannels: convOutChannels,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+    self._conv.wrappedValue = LTX2ConvWrapper(
+      inChannels: inChannels, outChannels: convOutChannels
     )
 
     super.init()
@@ -155,7 +155,8 @@ public final class LTX2SpaceToDepthDownsample: Module {
 public final class LTX2DepthToSpaceUpsample: Module {
 
   /// 3x3 causal convolution to expand channels for depth-to-space.
-  @ModuleInfo(key: "conv") var conv: CausalConv3d
+  /// Wrapped in LTX2ConvWrapper to match checkpoint key path (conv.conv.weight).
+  @ModuleInfo(key: "conv") var conv: LTX2ConvWrapper
 
   /// Stride as `(temporal, height, width)`.
   public let stride: (Int, Int, Int)
@@ -189,9 +190,8 @@ public final class LTX2DepthToSpaceUpsample: Module {
     let multiplier = stride.0 * stride.1 * stride.2
     self.outChannels = inChannels / outChannelsReductionFactor
 
-    self._conv.wrappedValue = CausalConv3d(
-      inChannels: inChannels, outChannels: outChannels * multiplier,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+    self._conv.wrappedValue = LTX2ConvWrapper(
+      inChannels: inChannels, outChannels: outChannels * multiplier
     )
 
     super.init()

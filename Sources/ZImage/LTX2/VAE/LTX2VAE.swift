@@ -49,7 +49,7 @@ public final class LTX2VAE: Module {
   @ModuleInfo(key: "encoder") var encoder: LTX2Encoder3D
 
   /// The 3D decoder.
-  @ModuleInfo(key: "decoder") var decoder: LTX2Decoder3D
+  @ModuleInfo(key: "decoder") public var decoder: LTX2Decoder3D
 
   /// Configuration.
   public let config: LTX2VideoVAEConfig

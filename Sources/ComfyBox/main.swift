@@ -225,6 +225,9 @@ struct ZImageCLI {
       case "ltx2-demo":
         try runLTX2Demo(args: Array(args.dropFirst()))
         return
+      case "ltx2-vae-test":
+        try runLTX2VAETest(args: Array(args.dropFirst()))
+        return
       case "ltx2-text-encoder-test":
         try runLTX2TextEncoderTest(args: Array(args.dropFirst()))
         return
@@ -3524,6 +3527,85 @@ struct ZImageCLI {
     Priority: --embeddings > --prompt > random dummy embeddings.
     """)
   }
+
+  // MARK: - LTX2 VAE Decoder Test
+  private static func runLTX2VAETest(args: [String]) throws {
+    print("=== LTX2 VAE Decoder Test ===")
+    let modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
+    var vaeLogger = Logger(label: "ltx2.vae.test")
+    vaeLogger.logLevel = .info
+
+    let vae = LTX2VAE(config: .v23)
+
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecW = try MLX.loadArrays(url: URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors"))
+    for (key, value) in rawDecW {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncW = try MLX.loadArrays(url: URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors"))
+    for (key, value) in rawEncW {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: vaeLogger)
+    MLX.eval(vae.parameters())
+    print("VAE weights loaded")
+
+    let latTensors = try MLX.loadArrays(url: URL(fileURLWithPath: "/tmp/test_latent.safetensors"))
+    guard let lat = latTensors["latent"] else { print("ERROR: No latent"); return }
+    let latF32 = lat.asType(.float32)
+    print("Latent: \(latF32.shape)")
+
+    let decoded = vae.decode(latF32)
+    MLX.eval(decoded)
+    let df = decoded.asType(.float32)
+    print(String(format: "Output: %@ min=%.4f max=%.4f mean=%.4f",
+      "\(decoded.shape)",
+      MLX.min(df).item(Float.self),
+      MLX.max(df).item(Float.self),
+      MLX.mean(df).item(Float.self)))
+
+    let frame = df[0, 0, 0]
+    MLX.eval(frame)
+    print("\nR channel pixel grid (first 8x8):")
+    for row in 0..<8 {
+      var vals = [String]()
+      for col in 0..<8 {
+        vals.append(String(format: "%7.3f", frame[row, col].item(Float.self)))
+      }
+      print("  row \(row): \(vals.joined(separator: " "))")
+    }
+
+    print("\nPython ref (first 4x4):")
+    print("  row 0: -0.269 -0.259 -0.259 -0.272")
+    print("  row 1: -0.275 -0.270 -0.258 -0.262")
+    print("  row 2: -0.282 -0.272 -0.273 -0.265")
+    print("  row 3: -0.291 -0.267 -0.280 -0.276")
+
+    print("\nGrid analysis:")
+    for startRow in stride(from: 0, to: 12, by: 4) {
+      var subs = [Float]()
+      for q in 0..<4 {
+        var sum: Float = 0
+        for col in 0..<min(16, Int(decoded.dim(4))) { sum += frame[startRow + q, col].item(Float.self) }
+        subs.append(sum / 16.0)
+      }
+      print(String(format: "  Block row %d: q0=%.4f q1=%.4f q2=%.4f q3=%.4f spread=%.4f",
+        startRow, subs[0], subs[1], subs[2], subs[3], subs.max()! - subs.min()!))
+    }
+    print("=== Done ===")
+  }
+
 }
 
 // MARK: - Progress Helpers
@@ -3615,7 +3697,6 @@ private final class ProgressBar {
     if m > 0 { return String(format: "%dm%02ds", m, s) }
     return String(format: "%ds", s)
   }
-
 
 
 }

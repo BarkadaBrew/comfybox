@@ -55,11 +55,11 @@ public enum LTX2PostProcess {
       let scaled = (clamped * 255.0).asType(.uint8)
       eval(scaled)
 
-      // Rearrange to (H, W, 3) for image construction
-      let hwc = scaled.transposed(1, 2, 0)  // (H, W, 3)
+      // Use contiguous() before transposing to ensure correct memory layout
+      let hwc = scaled.transposed(1, 2, 0).contiguous()  // (H, W, 3) contiguous
       eval(hwc)
 
-      // Bulk copy pixel data as RGB (avoids per-pixel GPU-to-CPU transfers)
+      // Bulk copy pixel data as RGB
       let rgbData: [UInt8]
       let flatArray = hwc.reshaped(-1)
       eval(flatArray)

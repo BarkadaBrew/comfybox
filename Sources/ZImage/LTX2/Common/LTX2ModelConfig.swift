@@ -132,9 +132,9 @@ public struct LTX2VideoVAEConfig: Equatable {
       .resX(numLayers: 6),
       .compressTime(multiplier: 2),
       .resX(numLayers: 4),
-      .compressAll(multiplier: 1, residual: true),
+      .compressAll(multiplier: 1, residual: false),
       .resX(numLayers: 2),
-      .compressAll(multiplier: 2, residual: true),
+      .compressAll(multiplier: 2, residual: false),
       .resX(numLayers: 2),
     ]
   )
