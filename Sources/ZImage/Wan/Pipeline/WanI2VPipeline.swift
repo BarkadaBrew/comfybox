@@ -87,7 +87,25 @@ public final class WanI2VPipeline {
     logger.info("Loading Wan 2.1 VAE...")
     self.vae = WanVAE()
     let vaePath = modelDir.appendingPathComponent("Wan2.1_VAE.safetensors")
-    let vaeWeights = try MLX.loadArrays(url: vaePath)
+    var vaeWeights = try MLX.loadArrays(url: vaePath)
+
+    // Transpose convolution weights from PyTorch layout to MLX layout.
+    // PyTorch Conv3d: [outCh, inCh, kT, kH, kW] -> MLX: [outCh, kT, kH, kW, inCh]
+    // PyTorch Conv2d: [outCh, inCh, kH, kW]      -> MLX: [outCh, kH, kW, inCh]
+    // Only .weight keys with ndim >= 4 are convolutions. Bias (1D), norm gamma
+    // (.gamma suffix, not .weight), and 2D linear weights are left untouched.
+    for (key, tensor) in vaeWeights {
+      if key.hasSuffix(".weight") {
+        if tensor.ndim == 5 {
+          // Conv3d weight: axes [0,1,2,3,4] -> [0,2,3,4,1]
+          vaeWeights[key] = tensor.transposed(0, 2, 3, 4, 1)
+        } else if tensor.ndim == 4 {
+          // Conv2d weight (incl. 1x1 attention convs): axes [0,1,2,3] -> [0,2,3,1]
+          vaeWeights[key] = tensor.transposed(0, 2, 3, 1)
+        }
+      }
+    }
+
     let vaeParams = ModuleParameters.unflattened(vaeWeights.map { ($0.key, $0.value) })
     try vae.update(parameters: vaeParams, verify: [.shapeMismatch])
     eval(vae.parameters())
