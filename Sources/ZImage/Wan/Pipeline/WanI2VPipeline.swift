@@ -106,6 +106,15 @@ public final class WanI2VPipeline {
       }
     }
 
+    // Remap safetensors keys to match the MLX module hierarchy.
+    // Wrapper classes (WanSequentialLayers, WanMiddleLayers, WanResidualPath,
+    // WanEncoderHead, WanDecoderHead, WanResampleSeq) store sub-modules in
+    // `public let layers: [Module]`, injecting "layers" into the weight path.
+    // Safetensors keys lack this segment, so we insert it. Example:
+    //   encoder.downsamples.0.residual.0.gamma
+    //     -> encoder.downsamples.layers.0.residual.layers.0.gamma
+    vaeWeights = Self.remapVAEKeys(vaeWeights)
+
     let vaeParams = ModuleParameters.unflattened(vaeWeights.map { ($0.key, $0.value) })
     try vae.update(parameters: vaeParams, verify: [.shapeMismatch])
     eval(vae.parameters())
@@ -342,6 +351,48 @@ public final class WanI2VPipeline {
       steps: steps,
       progressCallback: progressCallback
     )
+  }
+  // MARK: - VAE Key Remapping
+
+  /// Remaps safetensors VAE keys to match the MLX module hierarchy.
+  ///
+  /// The VAE uses wrapper classes whose `layers: [Module]` property injects
+  /// a `layers` segment into the parameter path. Safetensors keys don't have
+  /// this segment, so we insert it.
+  ///
+  /// Containers that inject `layers`:
+  /// - `WanSequentialLayers` at `encoder.downsamples`, `decoder.upsamples`
+  /// - `WanMiddleLayers` at `encoder.middle`, `decoder.middle`
+  /// - `WanResidualPath` at `*.residual`
+  /// - `WanEncoderHead` at `encoder.head`
+  /// - `WanDecoderHead` at `decoder.head`
+  /// - `WanResampleSeq` at `*.resample`
+  static func remapVAEKeys(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+    let containers: Set<String> = [
+      "downsamples", "upsamples", "middle", "head", "residual", "resample",
+    ]
+
+    var result = [String: MLXArray]()
+    result.reserveCapacity(weights.count)
+
+    for (key, value) in weights {
+      let parts = key.split(separator: ".")
+      var remapped: [String] = []
+
+      for (i, part) in parts.enumerated() {
+        remapped.append(String(part))
+        // If this part is a container name and the next part is a digit,
+        // insert "layers" between them.
+        if containers.contains(String(part)),
+           i + 1 < parts.count,
+           parts[i + 1].allSatisfy({ $0.isNumber }) {
+          remapped.append("layers")
+        }
+      }
+
+      result[remapped.joined(separator: ".")] = value
+    }
+    return result
   }
 }
 
