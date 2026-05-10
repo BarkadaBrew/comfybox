@@ -3194,6 +3194,8 @@ struct ZImageCLI {
     var frames = 9
     var steps = 8
     var seed = 42
+    var loraPath: String? = nil
+    var loraStrength: Float = 1.0
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -3218,6 +3220,10 @@ struct ZImageCLI {
         prompt = nextValue(for: arg, iterator: &iterator)
       case "--gemma-path":
         gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-path":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
       case "--help", "-h":
         printLTX2DemoUsage()
         return
@@ -3244,6 +3250,10 @@ struct ZImageCLI {
     print("Frames:     \(frames)")
     print("Steps:      \(steps)")
     print("Seed:       \(seed)")
+    if let lp = loraPath {
+      print("LoRA:       \(lp)")
+      print("LoRA str:   \(loraStrength)")
+    }
     print()
 
     var stepNum = 1
@@ -3269,7 +3279,63 @@ struct ZImageCLI {
     }
     let startLoad = CFAbsoluteTimeGetCurrent()
     let rawWeights = try MLX.loadArrays(url: transformerPath)
-    let sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+    var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+
+    // --- Merge LoRA weights if specified ---
+    if let loraFile = loraPath {
+      print("  Merging LoRA: \(loraFile) (strength=\(loraStrength))")
+      guard FileManager.default.fileExists(atPath: loraFile) else {
+        throw NSError(domain: "LTX2Demo", code: 10,
+          userInfo: [NSLocalizedDescriptionKey: "LoRA file not found at \(loraFile)"])
+      }
+      let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraFile))
+      var mergedCount = 0
+      var skippedCount = 0
+
+      for (key, loraA) in loraWeights {
+        guard key.hasSuffix(".lora_A.weight") else { continue }
+
+        // Strip lora_A.weight suffix to get base key
+        var baseKey = String(key.dropLast(".lora_A.weight".count))
+
+        // Strip diffusion_model. prefix (ComfyUI convention)
+        if baseKey.hasPrefix("diffusion_model.") {
+          baseKey = String(baseKey.dropFirst("diffusion_model.".count))
+        }
+
+        // Skip audio-related LoRA keys
+        if baseKey.contains("video_to_audio_attn") ||
+           baseKey.contains("audio_to_video_attn") ||
+           baseKey.contains("audio_attn") ||
+           baseKey.contains("audio_ff") ||
+           baseKey.contains("audio_") ||
+           baseKey.contains("av_ca_") {
+          skippedCount += 1
+          continue
+        }
+
+        // Find matching lora_B tensor
+        let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
+        guard let loraB = loraWeights[bKey] else {
+          skippedCount += 1
+          continue
+        }
+
+        // Target key in sanitized weights dict
+        let targetKey = baseKey + ".weight"
+        guard sanitized[targetKey] != nil else {
+          skippedCount += 1
+          continue
+        }
+
+        // delta = B @ A * strength (float32 for precision)
+        let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+        sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+        mergedCount += 1
+      }
+      print("  Merged \(mergedCount) LoRA weight pairs (skipped \(skippedCount))")
+    }
+
     let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
     try transformer.update(parameters: params, verify: [.shapeMismatch])
     MLX.eval(transformer.parameters())
@@ -3522,6 +3588,8 @@ struct ZImageCLI {
       --frames <int>            Number of frames, must be 1+8k (default: 9)
       --steps <int>             Denoising steps (default: 8)
       --seed <int>              Random seed (default: 42)
+      --lora-path <path>        Path to LoRA safetensors file (merge-on-load)
+      --lora-strength <float>   LoRA merge strength (default: 1.0)
       --help, -h                Show help
 
     The distilled pipeline uses 8 fixed sigma steps, guidance=1.0, no CFG.
