@@ -4,21 +4,31 @@ import MLXRandom
 import MLXNN
 @testable import ZImage
 
-// MARK: - S1.1: CausalConv3d Tests
+// MARK: - CausalConv3d Tests
 
 final class WanCausalConv3dTests: XCTestCase {
 
   func testModuleConstruction() {
     let conv = WanCausalConv3d(inChannels: 8, outChannels: 16, kernelSize: 3, padding: 1)
-    XCTAssertEqual(conv.padding, 1)
-    XCTAssertEqual(conv.kernelSize, 3)
-    XCTAssertEqual(conv.stride, 1)
+    XCTAssertEqual(conv.paddingT, 1)
+    XCTAssertEqual(conv.outChannels, 16)
+    XCTAssertEqual(conv.strideT, 1)
   }
 
   func testKernel1Construction() {
     let conv = WanCausalConv3d(inChannels: 4, outChannels: 8, kernelSize: 1, padding: 0)
-    XCTAssertEqual(conv.padding, 0)
-    XCTAssertEqual(conv.kernelSize, 1)
+    XCTAssertEqual(conv.paddingT, 0)
+    XCTAssertEqual(conv.outChannels, 8)
+  }
+
+  func testAnisotropicConstruction() {
+    let conv = WanCausalConv3d(
+      inChannels: 4, outChannels: 8,
+      kernelSize: (3, 1, 1), stride: (2, 1, 1), padding: (0, 0, 0)
+    )
+    XCTAssertEqual(conv.strideT, 2)
+    XCTAssertEqual(conv.strideH, 1)
+    XCTAssertEqual(conv.paddingT, 0)
   }
 
   func testOutputShapePreserved() throws {
@@ -45,12 +55,19 @@ final class WanCausalConv3dTests: XCTestCase {
     XCTAssertEqual(out.shape, [1, 2, 3, 6, 6])
   }
 
-  func testChannelExpansionShape() throws {
-    let conv = WanCausalConv3d(inChannels: 16, outChannels: 48, kernelSize: 3, padding: 1)
-    let x = MLXArray.zeros([1, 16, 2, 4, 4], type: Float.self)
+  func testTemporalDownsampleStride() throws {
+    let conv = WanCausalConv3d(
+      inChannels: 4, outChannels: 4,
+      kernelSize: (3, 1, 1), stride: (2, 1, 1), padding: (0, 0, 0)
+    )
+    // kernel=3, stride=2, no padding: output_t = floor((T-3)/2) + 1
+    // T=5 -> output_t = floor(2/2) + 1 = 2
+    let x = MLXArray.zeros([1, 4, 5, 4, 4], type: Float.self)
     let out = conv(x)
     eval(out)
-    XCTAssertEqual(out.shape, [1, 48, 2, 4, 4])
+    XCTAssertEqual(out.shape[2], 2)
+    XCTAssertEqual(out.shape[3], 4)
+    XCTAssertEqual(out.shape[4], 4)
   }
 
   func testBatchDimPreservedShape() throws {
@@ -62,52 +79,58 @@ final class WanCausalConv3dTests: XCTestCase {
   }
 }
 
-// MARK: - S1.2: Normalization Tests
+// MARK: - WanVAENorm Tests
 
-final class WanNormTests: XCTestCase {
+final class WanVAENormTests: XCTestCase {
 
-  func testRMSNormVideoConstruction() {
-    let norm = WanRMSNorm(dim: 16, images: false)
+  func testNormVideoConstruction() {
+    let norm = WanVAENorm(dim: 16, images: false)
     XCTAssertEqual(norm.scale, 4.0)  // sqrt(16)
     XCTAssertFalse(norm.images)
+    XCTAssertEqual(norm.gamma.shape, [16, 1, 1, 1])
   }
 
-  func testRMSNormImageConstruction() {
-    let norm = WanRMSNorm(dim: 32, images: true)
+  func testNormImageConstruction() {
+    let norm = WanVAENorm(dim: 32, images: true)
     XCTAssertTrue(norm.images)
+    XCTAssertEqual(norm.gamma.shape, [32, 1, 1])
   }
 
-  func testGroupNorm32Construction() {
-    let norm = WanGroupNorm32(channels: 128)
-    XCTAssertEqual(norm.channels, 128)
-  }
-
-  func testRMSNormOutputShapeVideo() throws {
-    let norm = WanRMSNorm(dim: 16, images: false)
+  func testNormOutputShapeVideo() throws {
+    let norm = WanVAENorm(dim: 16, images: false)
     let x = MLXArray.zeros([1, 16, 2, 4, 4], type: Float.self)
     let out = norm(x)
     eval(out)
     XCTAssertEqual(out.shape, [1, 16, 2, 4, 4])
   }
 
-  func testRMSNormOutputShapeImages() throws {
-    let norm = WanRMSNorm(dim: 32, images: true)
+  func testNormOutputShapeImages() throws {
+    let norm = WanVAENorm(dim: 32, images: true)
     let x = MLXArray.zeros([2, 32, 8, 8], type: Float.self)
     let out = norm(x)
     eval(out)
     XCTAssertEqual(out.shape, [2, 32, 8, 8])
   }
 
-  func testGroupNorm32OutputShape() throws {
-    let norm = WanGroupNorm32(channels: 128)
-    let x = MLXArray.zeros([1, 128, 2, 4, 4], type: Float.self)
+  func testNormL2Behavior() throws {
+    // After normalization, each spatial position should have unit L2 norm
+    // (before scaling by sqrt(dim) * gamma)
+    let norm = WanVAENorm(dim: 4, images: false)
+    let x = MLXRandom.normal([1, 4, 1, 2, 2]).asType(.float32)
     let out = norm(x)
     eval(out)
-    XCTAssertEqual(out.shape, [1, 128, 2, 4, 4])
+    // The output should be scaled by sqrt(4) * 1.0 = 2.0
+    // Check that magnitude is roughly sqrt(dim) = 2.0
+    let normSq = MLX.sum(out * out, axis: 1)
+    eval(normSq)
+    // Each spatial position should have norm^2 = dim (since gamma=1)
+    let expected = Float(4.0)  // dim
+    let actual = normSq[0, 0, 0, 0].item(Float.self)
+    XCTAssertEqual(actual, expected, accuracy: 0.01)
   }
 }
 
-// MARK: - S1.3: ResidualBlock + AttentionBlock Tests
+// MARK: - ResidualBlock + AttentionBlock Tests
 
 final class WanResidualBlockTests: XCTestCase {
 
@@ -136,6 +159,15 @@ final class WanResidualBlockTests: XCTestCase {
     eval(out)
     XCTAssertEqual(out.shape, [1, 32, 2, 4, 4])
   }
+
+  func testWan21Channels() throws {
+    // Test with actual Wan 2.1 channel dims: 96->192
+    let block = WanResidualBlock(inDim: 96, outDim: 192)
+    let x = MLXArray.zeros([1, 96, 1, 4, 4], type: Float.self)
+    let out = block(x)
+    eval(out)
+    XCTAssertEqual(out.shape, [1, 192, 1, 4, 4])
+  }
 }
 
 final class WanAttentionBlockTests: XCTestCase {
@@ -152,115 +184,74 @@ final class WanAttentionBlockTests: XCTestCase {
     eval(out)
     XCTAssertEqual(out.shape, [1, 32, 2, 4, 4])
   }
+
+  func testWan21ChannelDim() throws {
+    // Wan 2.1 uses dim=384 for attention in the middle block
+    let block = WanAttentionBlock(dim: 384)
+    let x = MLXArray.zeros([1, 384, 1, 2, 2], type: Float.self)
+    let out = block(x)
+    eval(out)
+    XCTAssertEqual(out.shape, [1, 384, 1, 2, 2])
+  }
 }
 
-// MARK: - S1.4: DownBlock, UpBlock, MidBlock Tests
+// MARK: - Resample Tests
 
-final class WanBlockTests: XCTestCase {
+final class WanResampleTests: XCTestCase {
 
-  func testMidBlockConstruction() {
-    let _ = WanMidBlock(dim: 64)
+  func testDownsample2dShape() throws {
+    let ds = WanResample(dim: 96, mode: .downsample2d)
+    let x = MLXArray.zeros([1, 96, 2, 8, 8], type: Float.self)
+    let out = ds(x)
+    eval(out)
+    // Spatial /2, temporal preserved, channels preserved
+    XCTAssertEqual(out.shape, [1, 96, 2, 4, 4])
   }
 
-  func testDownBlockConstruction() {
-    let _ = WanDownBlock(
-      inDim: 32, outDim: 64, numResBlocks: 2,
-      temporalDownsample: false, isLast: false
-    )
+  func testDownsample3dShape() throws {
+    let ds = WanResample(dim: 192, mode: .downsample3d)
+    // time_conv: kernel=3, stride=2, pad=0 -> output_t = floor((T-3)/2) + 1
+    // T=5 -> output_t = floor(2/2) + 1 = 2
+    let x = MLXArray.zeros([1, 192, 5, 8, 8], type: Float.self)
+    let out = ds(x)
+    eval(out)
+    // Spatial /2, temporal -> 2, channels preserved
+    XCTAssertEqual(out.shape, [1, 192, 2, 4, 4])
   }
 
-  func testUpBlockConstruction() {
-    let _ = WanResidualUpBlock(
-      inDim: 64, outDim: 32, numResBlocks: 2,
-      temporalUpsample: false, upFlag: true
-    )
+  func testUpsample2dShape() throws {
+    let us = WanResample(dim: 192, mode: .upsample2d)
+    let x = MLXArray.zeros([1, 192, 2, 4, 4], type: Float.self)
+    let out = us(x)
+    eval(out)
+    // Spatial *2, temporal preserved, channels halved
+    XCTAssertEqual(out.shape, [1, 96, 2, 8, 8])
   }
 
-  func testMidBlockPreservesShape() throws {
-    let mid = WanMidBlock(dim: 64)
-    let x = MLXArray.zeros([1, 64, 2, 4, 4], type: Float.self)
+  func testUpsample3dShape() throws {
+    let us = WanResample(dim: 384, mode: .upsample3d)
+    let x = MLXArray.zeros([1, 384, 2, 4, 4], type: Float.self)
+    let out = us(x)
+    eval(out)
+    // Spatial *2, temporal *2, channels halved
+    XCTAssertEqual(out.shape, [1, 192, 4, 8, 8])
+  }
+}
+
+// MARK: - Middle Block Tests
+
+final class WanMiddleLayersTests: XCTestCase {
+
+  func testPreservesShape() throws {
+    let mid = WanMiddleLayers(dim: 384)
+    let x = MLXArray.zeros([1, 384, 1, 2, 2], type: Float.self)
     let out = mid(x)
     eval(out)
-    XCTAssertEqual(out.shape, [1, 64, 2, 4, 4])
-  }
-
-  func testDownBlockSpatialDownsample() throws {
-    // No temporal downsample — main path and shortcut both do spatial-only
-    let down = WanDownBlock(
-      inDim: 32, outDim: 64, numResBlocks: 2,
-      temporalDownsample: false, isLast: false
-    )
-    let x = MLXArray.zeros([1, 32, 1, 8, 8], type: Float.self)
-    let out = down(x)
-    eval(out)
-    // Spatial downsample 2x: H/2, W/2, T preserved
-    XCTAssertEqual(out.shape, [1, 64, 1, 4, 4])
-  }
-
-  func testDownBlockLastNoDownsample() throws {
-    let down = WanDownBlock(
-      inDim: 64, outDim: 64, numResBlocks: 2,
-      temporalDownsample: false, isLast: true
-    )
-    let x = MLXArray.zeros([1, 64, 1, 4, 4], type: Float.self)
-    let out = down(x)
-    eval(out)
-    XCTAssertEqual(out.shape, [1, 64, 1, 4, 4])
-  }
-
-  func testResidualUpBlockSpatialUpsample() throws {
-    let up = WanResidualUpBlock(
-      inDim: 64, outDim: 32, numResBlocks: 2,
-      temporalUpsample: false, upFlag: true
-    )
-    let x = MLXArray.zeros([1, 64, 1, 4, 4], type: Float.self)
-    let out = up(x, firstChunk: true)
-    eval(out)
-    // Spatial upsample 2x: H*2, W*2
-    XCTAssertEqual(out.shape, [1, 32, 1, 8, 8])
-  }
-
-  func testResidualUpBlockNoUpsample() throws {
-    let up = WanResidualUpBlock(
-      inDim: 64, outDim: 32, numResBlocks: 2,
-      temporalUpsample: false, upFlag: false
-    )
-    let x = MLXArray.zeros([1, 64, 1, 4, 4], type: Float.self)
-    let out = up(x, firstChunk: true)
-    eval(out)
-    XCTAssertEqual(out.shape, [1, 32, 1, 4, 4])
+    XCTAssertEqual(out.shape, [1, 384, 1, 2, 2])
   }
 }
 
-// MARK: - S1.5: Encoder, Decoder, Patchify, WanVAE Tests
-
-final class WanPatchifyTests: XCTestCase {
-
-  func testPatchifyShape() throws {
-    let x = MLXArray.zeros([1, 3, 4, 16, 16], type: Float.self)
-    let patched = WanVAE.patchify(x, patchSize: 2)
-    eval(patched)
-    XCTAssertEqual(patched.shape, [1, 12, 4, 8, 8])
-  }
-
-  func testUnpatchifyShape() throws {
-    let x = MLXArray.zeros([1, 12, 4, 8, 8], type: Float.self)
-    let unpatched = WanVAE.unpatchify(x, patchSize: 2)
-    eval(unpatched)
-    XCTAssertEqual(unpatched.shape, [1, 3, 4, 16, 16])
-  }
-
-  func testPatchifyRoundtrip() throws {
-    let x = MLXRandom.normal([1, 3, 2, 4, 4]).asType(.float32)
-    let patched = WanVAE.patchify(x, patchSize: 2)
-    let restored = WanVAE.unpatchify(patched, patchSize: 2)
-    eval(x, restored)
-    let diff = MLX.abs(x - restored)
-    eval(diff)
-    let maxDiff = MLX.max(diff).item(Float.self)
-    XCTAssertLessThan(maxDiff, 1e-5)
-  }
-}
+// MARK: - Encoder, Decoder, VAE Tests
 
 final class WanEncoder3dTests: XCTestCase {
 
@@ -269,15 +260,17 @@ final class WanEncoder3dTests: XCTestCase {
   }
 
   func testEncoderOutputShape() throws {
-    // Use T=1 (single image), spatial dimensions that survive 3 levels of 2x downsample
-    // Input: [1, 12, 1, 16, 16] -> after 3x spatial /2 = [16/8=2, 16/8=2]
+    // Input: [1, 3, 1, 16, 16]
+    // After 3x spatial /2 = [16/8=2, 16/8=2]
+    // No temporal downsample for T=1 (first stage is spatial-only)
+    // Output channels: z_dim*2 = 32
     let encoder = WanEncoder3d()
-    let x = MLXArray.zeros([1, 12, 1, 16, 16], type: Float.self)
+    let x = MLXArray.zeros([1, 3, 1, 16, 16], type: Float.self)
     let out = encoder(x)
     eval(out)
     XCTAssertEqual(out.shape[0], 1)
-    XCTAssertEqual(out.shape[1], 96) // z_dim * 2
-    XCTAssertEqual(out.shape[2], 1)  // T preserved (no temporal downsample for T=1)
+    XCTAssertEqual(out.shape[1], 32) // z_dim * 2 = 16 * 2
+    XCTAssertEqual(out.shape[2], 1)  // T preserved
     XCTAssertEqual(out.shape[3], 2)  // 16 / 8
     XCTAssertEqual(out.shape[4], 2)  // 16 / 8
   }
@@ -290,21 +283,17 @@ final class WanDecoder3dTests: XCTestCase {
   }
 
   func testDecoderOutputShape() throws {
-    // Decoder: [1, 48, 1, 2, 2] -> 3 levels of 2x upsample = 2*8=16
-    // But decoder has 4 blocks with dimMult=[1,2,4,4]:
-    //   up_blocks[0]: 1024->1024, no upsample (last block reversed)
-    //   up_blocks[1]: 1024->640, upsample 2x: 2->4
-    //   up_blocks[2]: 640->320, upsample 2x: 4->8
-    //   up_blocks[3]: 320->256, upsample 2x: 8->16
-    // So output spatial is 2*8 = 16
+    // Input: [1, 16, 1, 2, 2]
+    // After 3x spatial *2 = [2*8=16, 2*8=16]
+    // Output channels: 3 (RGB)
     let decoder = WanDecoder3d()
-    let x = MLXArray.zeros([1, 48, 1, 2, 2], type: Float.self)
+    let x = MLXArray.zeros([1, 16, 1, 2, 2], type: Float.self)
     let out = decoder(x)
     eval(out)
     XCTAssertEqual(out.shape[0], 1)
-    XCTAssertEqual(out.shape[1], 12) // out_channels
+    XCTAssertEqual(out.shape[1], 3)  // RGB
     XCTAssertEqual(out.shape[2], 1)  // T
-    XCTAssertEqual(out.shape[3], 16) // 2 * 8 (3 levels of 2x upsample)
+    XCTAssertEqual(out.shape[3], 16) // 2 * 8
     XCTAssertEqual(out.shape[4], 16) // 2 * 8
   }
 }
@@ -315,44 +304,52 @@ final class WanVAETests: XCTestCase {
     let _ = WanVAE()
   }
 
-  func testLatentsMeanCount() {
-    XCTAssertEqual(WanVAE.latentsMean.count, 48)
-  }
-
-  func testLatentsStdCount() {
-    XCTAssertEqual(WanVAE.latentsStd.count, 48)
+  func testConstants() {
+    XCTAssertEqual(WanVAE.zDim, 16)
+    XCTAssertEqual(WanVAE.spatialScale, 8)
+    XCTAssertEqual(WanVAE.temporalScale, 4)
+    XCTAssertEqual(WanVAE.latentMean.count, 16)
+    XCTAssertEqual(WanVAE.latentStd.count, 16)
   }
 
   func testEncodeOutputShape() throws {
-    // Full encode: [1, 3, 1, 32, 32]
-    //   patchify(p=2): [1, 12, 1, 16, 16]
-    //   encoder 3x spatial/2: [1, 96, 1, 2, 2]
-    //   quant_conv: [1, 96, 1, 2, 2]
-    //   take first 48 channels: [1, 48, 1, 2, 2]
+    // Input: [1, 3, 1, 16, 16]
+    // Encoder: 8x spatial compression -> [1, 32, 1, 2, 2]
+    // conv1: [1, 32, 1, 2, 2]
+    // Take first 16 channels: [1, 16, 1, 2, 2]
     let vae = WanVAE()
-    let x = MLXArray.zeros([1, 3, 1, 32, 32], type: Float.self)
+    let x = MLXArray.zeros([1, 3, 1, 16, 16], type: Float.self)
     let latent = vae.encode(x)
     eval(latent)
     XCTAssertEqual(latent.shape[0], 1)
-    XCTAssertEqual(latent.shape[1], 48)
+    XCTAssertEqual(latent.shape[1], 16)
     XCTAssertEqual(latent.shape[2], 1)
     XCTAssertEqual(latent.shape[3], 2)
     XCTAssertEqual(latent.shape[4], 2)
   }
 
   func testDecodeOutputShape() throws {
-    // Full decode: [1, 48, 1, 2, 2]
-    //   post_quant_conv: [1, 48, 1, 2, 2]
-    //   decoder 3x spatial*2: [1, 12, 1, 16, 16]
-    //   unpatchify(p=2): [1, 3, 1, 32, 32]
+    // Input: [1, 16, 1, 2, 2]
+    // conv2: [1, 16, 1, 2, 2]
+    // Decoder: 8x spatial decompression -> [1, 3, 1, 16, 16]
     let vae = WanVAE()
-    let z = MLXArray.zeros([1, 48, 1, 2, 2], type: Float.self)
+    let z = MLXArray.zeros([1, 16, 1, 2, 2], type: Float.self)
     let decoded = vae.decode(z)
     eval(decoded)
     XCTAssertEqual(decoded.shape[0], 1)
     XCTAssertEqual(decoded.shape[1], 3)
     XCTAssertEqual(decoded.shape[2], 1)
-    XCTAssertEqual(decoded.shape[3], 32)
-    XCTAssertEqual(decoded.shape[4], 32)
+    XCTAssertEqual(decoded.shape[3], 16)
+    XCTAssertEqual(decoded.shape[4], 16)
+  }
+
+  func testEncodeSingleImage4D() throws {
+    // 4D input should auto-add temporal dim
+    let vae = WanVAE()
+    let x = MLXArray.zeros([1, 3, 16, 16], type: Float.self)
+    let latent = vae.encode(x)
+    eval(latent)
+    XCTAssertEqual(latent.ndim, 5)
+    XCTAssertEqual(latent.shape[1], 16)
   }
 }

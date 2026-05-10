@@ -2,77 +2,68 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Residual block for the Wan 2.2 VAE.
+/// Residual block for the Wan 2.1 VAE.
 ///
-/// Uses RMSNorm (video mode) and SiLU activation with two CausalConv3d layers.
-/// Includes a 1x1 shortcut convolution when input and output channel counts differ.
-///
-/// ## Architecture
-///
-/// ```
-/// Input (B, C_in, T, H, W)
-///   ├─ Shortcut: identity or CausalConv3d(1x1, C_in → C_out)
-///   ├─ Main: RMSNorm → SiLU → CausalConv3d(3x3, C_in → C_out)
-///   │        → RMSNorm → SiLU → CausalConv3d(3x3, C_out → C_out)
-///   ├─ + shortcut
-///   └─ Output (B, C_out, T, H, W)
-/// ```
+/// Weight keys: residual.0.gamma, residual.2.weight/bias,
+/// residual.3.gamma, residual.6.weight/bias,
+/// optionally shortcut.weight/bias.
 public final class WanResidualBlock: Module {
 
-  /// First normalization layer.
-  @ModuleInfo(key: "norm1") var norm1: WanRMSNorm
+  @ModuleInfo(key: "residual") var residual: WanResidualPath
+  @ModuleInfo(key: "shortcut") var shortcut: WanCausalConv3d?
 
-  /// First convolution (C_in → C_out).
-  @ModuleInfo(key: "conv1") var conv1: WanCausalConv3d
-
-  /// Second normalization layer.
-  @ModuleInfo(key: "norm2") var norm2: WanRMSNorm
-
-  /// Second convolution (C_out → C_out).
-  @ModuleInfo(key: "conv2") var conv2: WanCausalConv3d
-
-  /// Optional 1x1 shortcut convolution when channels differ.
-  @ModuleInfo(key: "conv_shortcut") var convShortcut: WanCausalConv3d?
-
-  /// Whether the shortcut uses a convolution.
   public let hasShortcut: Bool
 
-  /// Creates a Wan residual block.
-  ///
-  /// - Parameters:
-  ///   - inDim: Number of input channels.
-  ///   - outDim: Number of output channels.
   public init(inDim: Int, outDim: Int) {
     self.hasShortcut = (inDim != outDim)
-
-    self._norm1.wrappedValue = WanRMSNorm(dim: inDim, images: false)
-    self._conv1.wrappedValue = WanCausalConv3d(inChannels: inDim, outChannels: outDim, kernelSize: 3, padding: 1)
-    self._norm2.wrappedValue = WanRMSNorm(dim: outDim, images: false)
-    self._conv2.wrappedValue = WanCausalConv3d(inChannels: outDim, outChannels: outDim, kernelSize: 3, padding: 1)
-
+    self._residual.wrappedValue = WanResidualPath(inDim: inDim, outDim: outDim)
     if inDim != outDim {
-      self._convShortcut.wrappedValue = WanCausalConv3d(inChannels: inDim, outChannels: outDim, kernelSize: 1, padding: 0)
+      self._shortcut.wrappedValue = WanCausalConv3d(
+        inChannels: inDim, outChannels: outDim, kernelSize: 1, padding: 0
+      )
     }
-
     super.init()
   }
 
-  /// Applies the residual block.
-  ///
-  /// - Parameter x: Input tensor of shape `(B, C_in, T, H, W)`.
-  /// - Returns: Output tensor of shape `(B, C_out, T, H, W)`.
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    // Shortcut path
-    let h = hasShortcut ? convShortcut!(x) : x
-
-    // Main path
-    var out = norm1(x)
-    out = silu(out)
-    out = conv1(out)
-    out = norm2(out)
-    out = silu(out)
-    out = conv2(out)
-
+    let h: MLXArray
+    if let sc = shortcut {
+      h = sc(x)
+    } else {
+      h = x
+    }
+    let out = residual(x)
     return out + h
+  }
+}
+
+/// The residual path matching PyTorch Sequential index-based weight keys.
+/// Uses [Module] array so indices 0-6 map to weight keys.
+/// Index 0: norm1, 1: SiLU, 2: conv1, 3: norm2, 4: SiLU, 5: Dropout, 6: conv2
+public final class WanResidualPath: Module {
+
+  public let layers: [Module]
+
+  public init(inDim: Int, outDim: Int) {
+    self.layers = [
+      WanVAENorm(dim: inDim, images: false),     // 0
+      SiLUPlaceholder(),                          // 1
+      WanCausalConv3d(inChannels: inDim, outChannels: outDim, kernelSize: 3, padding: 1),  // 2
+      WanVAENorm(dim: outDim, images: false),     // 3
+      SiLUPlaceholder(),                          // 4
+      SiLUPlaceholder(),                          // 5 (dropout)
+      WanCausalConv3d(inChannels: outDim, outChannels: outDim, kernelSize: 3, padding: 1), // 6
+    ]
+    super.init()
+  }
+
+  public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    var h = (layers[0] as! WanVAENorm)(x)
+    h = silu(h)
+    h = (layers[2] as! WanCausalConv3d)(h)
+    h = (layers[3] as! WanVAENorm)(h)
+    h = silu(h)
+    h = (layers[6] as! WanCausalConv3d)(h)
+    return h
   }
 }
