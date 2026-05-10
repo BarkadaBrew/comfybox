@@ -17,18 +17,24 @@ import MLXNN
 ///
 /// ## Weight Mapping (Wan naming)
 ///
-/// | Wan Key | Role | Shape |
-/// |---------|------|-------|
-/// | `ffn.gate.0.weight` | Gate (wi0) | [10240, 4096] |
-/// | `ffn.fc1.weight` | Up (wi1) | [10240, 4096] |
-/// | `ffn.fc2.weight` | Down (wo) | [4096, 10240] |
+/// The Wan checkpoint stores the gate linear as `ffn.gate.0.weight` (with a
+/// numeric `.0.` segment). Because MLX-Swift's unflatten logic treats numeric
+/// path components as array indices (incompatible with Module.update), the
+/// loading code remaps `ffn.gate.0.weight` → `ffn.gate.weight` before
+/// unflattening. This allows a plain Linear property keyed as `gate`.
+///
+/// | Wan Key | Remapped Key | Role | Shape |
+/// |---------|-------------|------|-------|
+/// | `ffn.gate.0.weight` | `ffn.gate.weight` | Gate (wi0) | [10240, 4096] |
+/// | `ffn.fc1.weight` | `ffn.fc1.weight` | Up (wi1) | [10240, 4096] |
+/// | `ffn.fc2.weight` | `ffn.fc2.weight` | Down (wo) | [4096, 10240] |
 ///
 /// All projections have no bias.
 public final class WanT5FFN: Module {
 
   /// Gate projection: Linear(hiddenSize, ffnHiddenSize, bias: false).
-  /// Wan weight key: `ffn.gate.0.weight`
-  @ModuleInfo(key: "gate") var gateProj: WanT5FFNGate
+  /// Wan weight key: `ffn.gate.0.weight` (remapped to `ffn.gate.weight` at load time).
+  @ModuleInfo(key: "gate") var gateProj: Linear
 
   /// Up projection: Linear(hiddenSize, ffnHiddenSize, bias: false).
   /// Wan weight key: `ffn.fc1.weight`
@@ -44,7 +50,7 @@ public final class WanT5FFN: Module {
   ///   - hiddenSize: Model hidden dimension. Default 4096.
   ///   - ffnHiddenSize: FFN intermediate dimension. Default 10240.
   public init(hiddenSize: Int = 4096, ffnHiddenSize: Int = 10240) {
-    self._gateProj.wrappedValue = WanT5FFNGate(inputSize: hiddenSize, outputSize: ffnHiddenSize)
+    self._gateProj.wrappedValue = Linear(hiddenSize, ffnHiddenSize, bias: false)
     self._upProj.wrappedValue = Linear(hiddenSize, ffnHiddenSize, bias: false)
     self._downProj.wrappedValue = Linear(ffnHiddenSize, hiddenSize, bias: false)
     super.init()
@@ -55,29 +61,8 @@ public final class WanT5FFN: Module {
   /// - Parameter x: Input tensor of shape `[B, seqLen, hiddenSize]`.
   /// - Returns: Output tensor of shape `[B, seqLen, hiddenSize]`.
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    let gate = gateProj(x)   // gelu(wi0(x))
-    let up = upProj(x)       // wi1(x)
+    let gate = gelu(gateProj(x))  // gelu(wi0(x))
+    let up = upProj(x)            // wi1(x)
     return downProj(gate * up)
-  }
-}
-
-/// Wrapper for the gate projection to match Wan's weight key `ffn.gate.0.weight`.
-///
-/// The Wan checkpoint stores the gate linear as `ffn.gate.0.weight`, where
-/// `gate` is a container and `0` is the first (only) element. This wrapper
-/// creates that nesting so Module.update can find the weight.
-public final class WanT5FFNGate: Module {
-
-  /// The gate linear projection, stored at key "0" to match `gate.0.weight`.
-  @ModuleInfo(key: "0") var linear: Linear
-
-  public init(inputSize: Int, outputSize: Int) {
-    self._linear.wrappedValue = Linear(inputSize, outputSize, bias: false)
-    super.init()
-  }
-
-  /// Applies the gate projection with GELU activation.
-  public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    gelu(linear(x))
   }
 }

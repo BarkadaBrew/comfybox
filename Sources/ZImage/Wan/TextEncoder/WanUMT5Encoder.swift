@@ -11,10 +11,10 @@ import MLXNN
 ///
 /// ```
 /// Input: [B, seqLen] (token IDs)
-///   → Embedding(256384, 4096)
-///   → 24 × WanT5EncoderLayer (pre-norm attention + gated GELU FFN)
-///   → RMSNorm(4096)
-///   → Output: [B, seqLen, 4096]
+///   -> Embedding(256384, 4096)
+///   -> 24 x WanT5EncoderLayer (pre-norm attention + gated GELU FFN)
+///   -> RMSNorm(4096)
+///   -> Output: [B, seqLen, 4096]
 /// ```
 ///
 /// ## Weight File
@@ -27,6 +27,10 @@ import MLXNN
 /// | `token_embedding.weight` | embedding |
 /// | `blocks.{i}.*` | layers[i] |
 /// | `norm.weight` | finalNorm |
+///
+/// Note: `blocks.{i}.ffn.gate.0.weight` is remapped to `blocks.{i}.ffn.gate.weight`
+/// at load time because MLX-Swift unflatten treats numeric path segments as
+/// array indices, which is incompatible with Module.update.
 public final class WanUMT5Encoder: Module {
 
   /// Token embedding: [vocabSize, hiddenSize].
@@ -61,35 +65,26 @@ public final class WanUMT5Encoder: Module {
   ///   - attentionMask: Attention mask of shape `[B, seqLen]`. 1 = attend, 0 = mask.
   /// - Returns: Encoded representations of shape `[B, seqLen, hiddenSize]`.
   public func callAsFunction(tokenIds: MLXArray, attentionMask: MLXArray? = nil) -> MLXArray {
-    // Embed tokens: [B, seqLen] -> [B, seqLen, hiddenSize]
     var hidden = embedding(tokenIds)
 
-    // Build causal-compatible mask from attention mask if provided
-    // Convert from [B, seqLen] with 1/0 to [B, 1, 1, seqLen] with 0/-inf
     let mask: MLXArray?
     if let attentionMask = attentionMask {
-      // (1 - mask) * -1e9 gives 0 for attend positions, large negative for masked
       let expandedMask = attentionMask.reshaped(attentionMask.dim(0), 1, 1, attentionMask.dim(1))
       mask = (1.0 - expandedMask.asType(.float32)) * MLXArray(Float(-1e9))
     } else {
       mask = nil
     }
 
-    // Apply encoder layers
     for layer in layers {
       hidden = layer(hidden, mask: mask)
     }
 
-    // Final normalization
     hidden = finalNorm(hidden)
 
     return hidden
   }
 
   /// Loads weights from a safetensors file.
-  ///
-  /// The safetensors file should contain keys matching the Wan naming convention
-  /// (e.g., `blocks.0.attn.q.weight`, `token_embedding.weight`, `norm.weight`).
   ///
   /// - Parameter url: Path to the safetensors file.
   /// - Throws: If the file cannot be read or weights cannot be applied.
@@ -100,12 +95,42 @@ public final class WanUMT5Encoder: Module {
 
   /// Loads weights from a pre-loaded dictionary.
   ///
+  /// Remaps Wan checkpoint keys before unflattening:
+  /// - `ffn.gate.0.weight` -> `ffn.gate.weight` (numeric segment breaks MLX-Swift unflatten)
+  /// - `ffn.gate.0.bias` -> `ffn.gate.bias` (if present)
+  ///
   /// - Parameter weights: Dictionary mapping weight keys to MLXArrays.
   /// - Throws: If weights cannot be applied.
   public func loadWeights(_ weights: [String: MLXArray]) throws {
-    // Build nested parameter dictionary for Module.update
-    let params = ModuleParameters.unflattened(weights.map { ($0.key, $0.value) })
+    let remapped = Self.remapGateKeys(weights)
+    let params = ModuleParameters.unflattened(remapped.map { ($0.key, $0.value) })
     try self.update(parameters: params, verify: [.shapeMismatch])
     eval(self.parameters())
+  }
+
+  /// Remaps `ffn.gate.0.{suffix}` -> `ffn.gate.{suffix}` in weight keys.
+  ///
+  /// The Wan checkpoint stores the gate projection under PyTorch nn.ModuleList
+  /// naming convention (`gate.0.weight`). MLX-Swift unflattenedRecurse() treats
+  /// the numeric `0` segment as an array index, creating an `.array` structure that
+  /// `Module.update()` cannot merge (it only handles `.module + .dictionary`).
+  ///
+  /// By stripping the `.0.` segment, the key becomes `gate.weight` which unflattens
+  /// into a `.dictionary` structure compatible with the plain `Linear` property.
+  ///
+  /// - Parameter weights: Original weight dictionary from safetensors.
+  /// - Returns: Dictionary with gate keys remapped.
+  static func remapGateKeys(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+    var result = [String: MLXArray]()
+    result.reserveCapacity(weights.count)
+    for (key, value) in weights {
+      if key.contains(".ffn.gate.0.") {
+        let remapped = key.replacingOccurrences(of: ".ffn.gate.0.", with: ".ffn.gate.")
+        result[remapped] = value
+      } else {
+        result[key] = value
+      }
+    }
+    return result
   }
 }

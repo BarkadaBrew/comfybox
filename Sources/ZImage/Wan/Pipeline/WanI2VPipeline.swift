@@ -77,7 +77,7 @@ public final class WanI2VPipeline {
     // Load text encoder
     logger.info("Loading UMT5-XXL text encoder...")
     self.textEncoder = WanUMT5Encoder()
-    let t5Path = modelDir.appendingPathComponent("models_t5_umt5-xxl-enc-bf16.pth")
+    let t5Path = modelDir.appendingPathComponent("models_t5_umt5-xxl-enc-bf16.safetensors")
     // The T5 weights are in a single safetensors-like file
     let t5Weights = try MLX.loadArrays(url: t5Path)
     try textEncoder.loadWeights(t5Weights)
@@ -86,7 +86,7 @@ public final class WanI2VPipeline {
     // Load VAE
     logger.info("Loading Wan 2.1 VAE...")
     self.vae = WanVAE()
-    let vaePath = modelDir.appendingPathComponent("Wan2.1_VAE.pth")
+    let vaePath = modelDir.appendingPathComponent("Wan2.1_VAE.safetensors")
     let vaeWeights = try MLX.loadArrays(url: vaePath)
     let vaeParams = ModuleParameters.unflattened(vaeWeights.map { ($0.key, $0.value) })
     try vae.update(parameters: vaeParams, verify: [.shapeMismatch])

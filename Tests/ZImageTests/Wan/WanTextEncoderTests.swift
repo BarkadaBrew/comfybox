@@ -334,14 +334,16 @@ final class WanT5FFNTests: XCTestCase {
   }
 
   func testWeightKeyStructure() {
-    // Verify the module tree produces the right key hierarchy
-    // to match Wan weight keys: ffn.gate.0.weight, ffn.fc1.weight, ffn.fc2.weight
+    // Verify the module tree produces the right key hierarchy.
+    // After the gate fix, the module key is gate.weight (not gate.0.weight).
+    // The Wan safetensors key ffn.gate.0.weight is remapped to ffn.gate.weight
+    // at load time by WanUMT5Encoder.remapGateKeys().
     let ffn = WanT5FFN(hiddenSize: 16, ffnHiddenSize: 32)
     let params = ffn.parameters().flattened()
     let keys = Set(params.map(\.0))
 
-    XCTAssertTrue(keys.contains("gate.0.weight"),
-                  "Should have gate.0.weight key")
+    XCTAssertTrue(keys.contains("gate.weight"),
+                  "Should have gate.weight key")
     XCTAssertTrue(keys.contains("fc1.weight"),
                   "Should have fc1.weight key")
     XCTAssertTrue(keys.contains("fc2.weight"),
@@ -551,7 +553,11 @@ final class WanUMT5WeightMappingTests: XCTestCase {
 
   func testModuleParameterKeysMatchExpected() {
     // Verify the Swift module hierarchy produces the same keys
-    // as the weight mapping expects.
+    // as the weight mapping expects (after remapping).
+    //
+    // The weight mapping returns safetensors file keys (with gate.0.weight).
+    // The module keys use gate.weight (no .0. nesting).
+    // WanUMT5Encoder.remapGateKeys() bridges the difference at load time.
     let config = WanUMT5Config(
       numLayers: 2, hiddenSize: 32, ffnHiddenSize: 64,
       numHeads: 2, headDim: 16, vocabSize: 128,
@@ -562,11 +568,14 @@ final class WanUMT5WeightMappingTests: XCTestCase {
     let params = encoder.parameters().flattened()
     let moduleKeys = Set(params.map(\.0))
 
-    // Check that the module parameter keys match expected pattern
-    let expectedKeys = Set(WanUMT5WeightMapping.expectedKeys(config: config))
-    XCTAssertEqual(moduleKeys, expectedKeys,
-                   "Module parameter keys should exactly match expected weight keys. " +
-                   "Missing: \(expectedKeys.subtracting(moduleKeys)). " +
-                   "Extra: \(moduleKeys.subtracting(expectedKeys))")
+    // Simulate the remap that happens at load time
+    let safetensorsKeys = WanUMT5WeightMapping.expectedKeys(config: config)
+    let remappedKeys = Set(safetensorsKeys.map { key in
+      key.replacingOccurrences(of: ".ffn.gate.0.", with: ".ffn.gate.")
+    })
+    XCTAssertEqual(moduleKeys, remappedKeys,
+                   "Module parameter keys should match remapped weight keys. " +
+                   "Missing: \(remappedKeys.subtracting(moduleKeys)). " +
+                   "Extra: \(moduleKeys.subtracting(remappedKeys))")
   }
 }
