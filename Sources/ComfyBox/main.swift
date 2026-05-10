@@ -220,6 +220,9 @@ struct ZImageCLI {
       case "mcp":
         try runMCP(args: Array(args.dropFirst()))
         return
+      case "wan-i2v":
+        try runWanI2V(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -2967,6 +2970,232 @@ struct ZImageCLI {
       zimage lora search distill                         Text search
 
     """)
+  }
+
+
+  // MARK: - Wan I2V
+
+  private static func runWanI2V(args: [String]) throws {
+    var prompt: String?
+    var negativePrompt: String?
+    var initImagePath: String?
+    var outputPath = "wan-i2v-output.mp4"
+    var modelDir = "/Volumes/Bolt/Models/wan22-i2v"
+    var width: Int?
+    var height: Int?
+    var maxArea = 720 * 1280
+    var frameNum = 81
+    var steps = 40
+    var seed: UInt64?
+    var shift: Float = 5.0
+    var guideScale: Float = 3.5
+    var loraPath: String?
+    var loraStrength: Float = 1.0
+    var extendTo: Float?
+    var lazyMoE = true
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--prompt", "-p":
+        prompt = nextValue(for: arg, iterator: &iterator)
+      case "--negative-prompt", "--np":
+        negativePrompt = nextValue(for: arg, iterator: &iterator)
+      case "--init-image":
+        initImagePath = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--model-dir":
+        modelDir = nextValue(for: arg, iterator: &iterator)
+      case "--width", "-W":
+        width = intValue(for: arg, iterator: &iterator, minimum: 64, fallback: 0)
+        if width == 0 { width = nil }
+      case "--height", "-H":
+        height = intValue(for: arg, iterator: &iterator, minimum: 64, fallback: 0)
+        if height == 0 { height = nil }
+      case "--max-area":
+        maxArea = intValue(for: arg, iterator: &iterator, minimum: 1024, fallback: maxArea)
+      case "--frames":
+        frameNum = intValue(for: arg, iterator: &iterator, minimum: 5, fallback: frameNum)
+      case "--steps", "-s":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed":
+        let seedStr = nextValue(for: arg, iterator: &iterator)
+        seed = UInt64(seedStr)
+      case "--shift":
+        shift = floatValue(for: arg, iterator: &iterator, fallback: shift)
+      case "--guide-scale", "-g":
+        guideScale = floatValue(for: arg, iterator: &iterator, fallback: guideScale)
+      case "--lora-path":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: loraStrength)
+      case "--extend-to":
+        extendTo = floatValue(for: arg, iterator: &iterator, fallback: 10.0)
+      case "--lazy-moe":
+        lazyMoE = true
+      case "--no-lazy-moe":
+        lazyMoE = false
+      case "--help", "-h":
+        printWanI2VUsage()
+        return
+      default:
+        logger.warning("Unknown wan-i2v argument: \(arg)")
+      }
+    }
+
+    guard let prompt = prompt else {
+      logger.error("--prompt is required")
+      printWanI2VUsage()
+      return
+    }
+    guard let initImagePath = initImagePath else {
+      logger.error("--init-image is required")
+      printWanI2VUsage()
+      return
+    }
+
+    // Validate frame count
+    guard (frameNum - 1) % 4 == 0 else {
+      logger.error("--frames must be 4n+1 (e.g., 81, 85, 89). Got \(frameNum)")
+      return
+    }
+
+    // Load init image
+    logger.info("Loading init image: \(initImagePath)")
+    #if canImport(CoreGraphics)
+    guard let imageSource = CGImageSourceCreateWithURL(
+      URL(fileURLWithPath: initImagePath) as CFURL, nil
+    ), let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
+      logger.error("Failed to load image: \(initImagePath)")
+      return
+    }
+
+    let imageArray = try QwenImageIO.resizedPixelArray(
+      from: cgImage, width: cgImage.width, height: cgImage.height,
+      addBatchDimension: false
+    )
+    #else
+    logger.error("CoreGraphics not available — cannot load images")
+    return
+    #endif
+
+    // Build config
+    let config = WanI2VConfig(
+      modelDir: modelDir,
+      shift: shift,
+      steps: steps,
+      boundary: 0.9,
+      guideScale: (guideScale, guideScale),
+      fps: 16,
+      maxArea: maxArea,
+      frameNum: frameNum,
+      negativePrompt: negativePrompt ?? WanI2VConfig.defaultNegativePrompt,
+      numTrainTimesteps: 1000,
+      lazyMoE: lazyMoE
+    )
+
+    logger.info("Wan I2V Configuration:")
+    logger.info("  Model: \(modelDir)")
+    logger.info("  Steps: \(steps), Shift: \(shift), Guide: \(guideScale)")
+    logger.info("  Frames: \(frameNum) (\(Float(frameNum) / 16.0)s at 16fps)")
+    if let extendTo = extendTo {
+      logger.info("  Extend to: \(extendTo)s")
+    }
+    if let loraPath = loraPath {
+      logger.info("  LoRA: \(loraPath) (strength=\(loraStrength))")
+    }
+
+    // Initialize pipeline
+    logger.info("Initializing pipeline...")
+    let pipeline = try WanI2VPipeline(config: config, logger: logger)
+
+    // Register LoRA if specified
+    if let loraPath = loraPath {
+      pipeline.moeManager.registerLoRA(path: loraPath, strength: loraStrength)
+    }
+
+    // Progress bar
+    let bar = ProgressBar(total: steps)
+
+    // Generate
+    let video: MLXArray
+    if let extendTo = extendTo {
+      logger.info("Generating extended video (\(extendTo)s)...")
+      video = try WanExtend.generateExtended(
+        pipeline: pipeline,
+        prompt: prompt,
+        negativePrompt: negativePrompt,
+        image: imageArray,
+        targetSeconds: extendTo,
+        seed: seed,
+        width: width,
+        height: height,
+        logger: logger,
+        progressCallback: { chunk, totalChunks, step, totalSteps in
+          let overallStep = (chunk - 1) * totalSteps + step
+          let overallTotal = totalChunks * totalSteps
+          bar.update(completed: min(overallTotal, overallStep))
+          if overallStep >= overallTotal {
+            bar.finish(forceNewline: true)
+          }
+        }
+      )
+    } else {
+      logger.info("Generating video...")
+      video = try pipeline.generate(
+        prompt: prompt,
+        negativePrompt: negativePrompt,
+        image: imageArray,
+        seed: seed,
+        width: width,
+        height: height,
+        progressCallback: { step, total in
+          bar.update(completed: step)
+          if step >= total {
+            bar.finish(forceNewline: true)
+          }
+        }
+      )
+    }
+
+    // Write MP4
+    logger.info("Writing MP4: \(outputPath)")
+    #if canImport(AVFoundation)
+    try WanMP4Writer.write(video: video, to: outputPath, fps: config.fps)
+    logger.info("Video saved: \(outputPath) (\(video.dim(1)) frames, \(Float(video.dim(1)) / 16.0)s)")
+    #else
+    logger.error("AVFoundation not available — cannot write MP4")
+    #endif
+  }
+
+  private static func printWanI2VUsage() {
+    let usage = """
+    Usage: ComfyBox wan-i2v --init-image <path> --prompt <text> [options]
+
+    Required:
+      --init-image <path>      Input image file
+      --prompt, -p <text>      Text prompt
+
+    Options:
+      --model-dir <path>       Model directory (default: /Volumes/Bolt/Models/wan22-i2v)
+      --output, -o <path>      Output MP4 path (default: wan-i2v-output.mp4)
+      --width, -W <int>        Width (auto-computed from max-area if omitted)
+      --height, -H <int>       Height (auto-computed from max-area if omitted)
+      --max-area <int>         Maximum pixel area (default: 921600 = 720*1280)
+      --frames <int>           Frames per chunk (default: 81, must be 4n+1)
+      --steps, -s <int>        Sampling steps (default: 40)
+      --seed <int>             Random seed
+      --shift <float>          Noise schedule shift (default: 5.0)
+      --guide-scale, -g <float> CFG scale (default: 3.5)
+      --lora-path <path>       LoRA safetensors path
+      --lora-strength <float>  LoRA merge strength (default: 1.0)
+      --extend-to <seconds>    Target duration for multi-chunk extend
+      --lazy-moe               Lazy expert loading (default: on)
+      --no-lazy-moe            Load both experts at once
+      --negative-prompt <text> Negative prompt (default: Chinese text from config)
+    """
+    print(usage)
   }
 
 

@@ -381,7 +381,6 @@ enum ComfyBridgeWorkflowParser {
       controlnetModel = nil
     }
 
-
     // --- Model detection from CheckpointLoaderSimple ---
     // Krita sends a CheckpointLoaderSimple node with ckpt_name indicating the user's
     // selected model. We extract this and map it to a ComfyBox pool model ID.
@@ -391,8 +390,7 @@ enum ComfyBridgeWorkflowParser {
     let _nodeTypes = nodes.values.map { $0.classType }.sorted()
     let _loraDesc = loras.isEmpty ? "none" : loras.map { "\($0.name)@\($0.scale)" }.joined(separator: ", ")
     let _cnDesc = controlnetModel ?? "none"
-    let _modelDesc = detectedModel ?? "none"
-    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc) controlnet=\(_cnDesc) model=\(_modelDesc)")
+    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc) controlnet=\(_cnDesc)")
 
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
@@ -684,7 +682,27 @@ enum ComfyBridgeWorkflowParser {
 
   // MARK: - Model Detection
 
-  /// Known exact model name to pool ID mappings.
+  /// Known model name mappings from Krita checkpoint names to ComfyBox pool model IDs.
+  /// Krita sends the ckpt_name from the CheckpointLoaderSimple dropdown; we map it
+  /// to the model spec string used by ModelPool.
+  private static let knownModelMappings: [(pattern: String, poolId: String)] = [
+    // Exact matches (checked first via dictionary lookup)
+    // are handled in extractDetectedModel. These are partial/prefix matches.
+    ("z-image-turbo-bf16", "z-image-turbo-bf16"),
+    ("z-image-turbo-q8", "z-image-turbo-q8"),
+    ("z-image-turbo-q4", "z-image-turbo-q4"),
+    ("z-image-turbo", "z-image-turbo-bf16"),   // default to bf16
+    ("z-image", "z-image-turbo-bf16"),          // partial match
+    ("klein-9b", "klein-9b-q8"),
+    ("klein-4b", "klein-4b-q8"),
+    ("klein", "klein-4b-q8"),                   // default to 4b
+    ("briaai/FIBO", "briaai/FIBO"),
+    ("FIBO", "briaai/FIBO"),
+    ("fibo", "briaai/FIBO"),
+    ("chroma", "chroma-8.9b"),
+  ]
+
+  /// Exact model name → pool ID lookup (no partial matching needed).
   private static let exactModelMap: [String: String] = [
     "z-image-turbo-bf16": "z-image-turbo-bf16",
     "z-image-turbo-q8": "z-image-turbo-q8",
@@ -696,23 +714,10 @@ enum ComfyBridgeWorkflowParser {
     "chroma-8.9b": "chroma-8.9b",
   ]
 
-  /// Partial model name patterns for fuzzy matching (checked in order).
-  private static let partialModelPatterns: [(pattern: String, poolId: String)] = [
-    ("z-image-turbo-bf16", "z-image-turbo-bf16"),
-    ("z-image-turbo-q8", "z-image-turbo-q8"),
-    ("z-image-turbo-q4", "z-image-turbo-q4"),
-    ("z-image-turbo", "z-image-turbo-bf16"),
-    ("z-image", "z-image-turbo-bf16"),
-    ("klein-9b", "klein-9b-q8"),
-    ("klein-4b", "klein-4b-q8"),
-    ("klein", "klein-4b-q8"),
-    ("fibo", "briaai/FIBO"),
-    ("chroma", "chroma-8.9b"),
-  ]
-
   /// Extract the detected model ID from a CheckpointLoaderSimple node.
   /// Returns nil if no checkpoint node is found or the model name is unrecognized.
   private static func extractDetectedModel(from nodes: [String: WorkflowNode]) -> String? {
+    // Look for CheckpointLoaderSimple node with ckpt_name input.
     guard let checkpointNode = nodes.values.first(where: { $0.classType == "CheckpointLoaderSimple" }),
           let ckptName = checkpointNode.inputs["ckpt_name"] as? String,
           !ckptName.isEmpty else {
@@ -726,7 +731,7 @@ enum ComfyBridgeWorkflowParser {
 
     // Try partial/prefix matching (case-insensitive).
     let lowered = ckptName.lowercased()
-    for (pattern, poolId) in partialModelPatterns {
+    for (pattern, poolId) in knownModelMappings {
       if lowered.contains(pattern.lowercased()) {
         return poolId
       }
