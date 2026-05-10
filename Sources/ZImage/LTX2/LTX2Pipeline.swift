@@ -511,7 +511,8 @@ public final class LTX2Pipeline {
     }
     eval(decoded)
 
-    let clamped = MLX.clip(decoded.asType(.float32), min: 0, max: 1)
+    let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
+    let clamped = MLX.clip(rescaled, min: 0, max: 1)
     eval(clamped)
 
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime

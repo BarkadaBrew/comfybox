@@ -225,6 +225,9 @@ struct ZImageCLI {
       case "ltx2-demo":
         try runLTX2Demo(args: Array(args.dropFirst()))
         return
+      case "ltx2-i2v":
+        try runLTX2I2V(args: Array(args.dropFirst()))
+        return
       case "ltx2-vae-test":
         try runLTX2VAETest(args: Array(args.dropFirst()))
         return
@@ -3673,6 +3676,311 @@ struct ZImageCLI {
         startRow, subs[0], subs[1], subs[2], subs[3], subs.max()! - subs.min()!))
     }
     print("=== Done ===")
+  }
+
+
+  // MARK: - LTX2 Image-to-Video + Extend
+
+  private static func runLTX2I2V(args: [String]) throws {
+    var modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
+    var outputPath = "/tmp/ltx2-i2v.mp4"
+    var prompt: String? = nil
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
+    var width = 704
+    var height = 448
+    var framesPerChunk = 97
+    var steps = 8
+    var seed = 42
+    var loraPath: String? = nil
+    var loraStrength: Float = 1.0
+    var initImagePath: String = ""
+    var extendToSeconds: Float = 0
+    var strength: Float = 1.0
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model-dir":
+        modelDir = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--width", "-W":
+        width = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: width)
+      case "--height", "-H":
+        height = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: height)
+      case "--frames":
+        framesPerChunk = intValue(for: arg, iterator: &iterator, minimum: 9, fallback: framesPerChunk)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed":
+        seed = intValue(for: arg, iterator: &iterator, minimum: 0, fallback: seed)
+      case "--prompt", "-p":
+        prompt = nextValue(for: arg, iterator: &iterator)
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-path":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      case "--init-image":
+        initImagePath = nextValue(for: arg, iterator: &iterator)
+      case "--extend-to":
+        extendToSeconds = floatValue(for: arg, iterator: &iterator, fallback: 0)
+      case "--strength":
+        strength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      default:
+        logger.warning("Unknown ltx2-i2v argument: \(arg)")
+      }
+    }
+
+    guard !initImagePath.isEmpty else {
+      print("ERROR: --init-image is required for ltx2-i2v")
+      print("Usage: ComfyBox ltx2-i2v --init-image <path> --prompt <text> [options]")
+      print("  --extend-to <seconds>   Target duration (generates multiple chunks)")
+      print("  --frames <N>            Frames per chunk (default 97, must be 1+8k)")
+      print("  --strength <0-1>        I2V conditioning strength (default 1.0)")
+      return
+    }
+
+    guard let promptText = prompt else {
+      print("ERROR: --prompt is required for ltx2-i2v")
+      return
+    }
+
+    guard (framesPerChunk - 1) % 8 == 0 else {
+      print("ERROR: --frames must be 1 + 8k (e.g. 9, 17, 25, 33, 97)")
+      return
+    }
+
+    let fps = 24
+    let totalChunks: Int
+    if extendToSeconds > 0 {
+      let targetFrames = Int(extendToSeconds * Float(fps))
+      let continuations = max(0, Int(ceil(Float(targetFrames - framesPerChunk) / Float(framesPerChunk - 1))))
+      totalChunks = 1 + continuations
+    } else {
+      totalChunks = 1
+    }
+
+    let totalFrames = framesPerChunk + (framesPerChunk - 1) * (totalChunks - 1)
+    let totalDuration = Float(totalFrames) / Float(fps)
+
+    print("=== LTX2 Image-to-Video" + (totalChunks > 1 ? " + Extend" : "") + " ===")
+    print("Model dir:    \(modelDir)")
+    print("Output:       \(outputPath)")
+    print("Init image:   \(initImagePath)")
+    print("Prompt:       \(promptText)")
+    print("Resolution:   \(width)x\(height)")
+    print("Frames/chunk: \(framesPerChunk)")
+    print("Chunks:       \(totalChunks)")
+    print("Total frames: \(totalFrames) (\(String(format: "%.1f", totalDuration))s)")
+    print("Steps:        \(steps)")
+    print("Seed:         \(seed)")
+    print("Strength:     \(strength)")
+    if let lp = loraPath {
+      print("LoRA:         \(lp)")
+      print("LoRA str:     \(loraStrength)")
+    }
+    print()
+
+    print("[1] Creating transformer...")
+    let transformer = LTX2Transformer(
+      numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
+      numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
+      normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+      positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+      useMiddleIndicesGrid: true, ropeMode: .split,
+      doublePrecisionRoPE: true
+    )
+
+    print("[2] Loading transformer weights...")
+    let transformerPath = URL(fileURLWithPath: modelDir + "/transformer-distilled.safetensors")
+    let startLoad = CFAbsoluteTimeGetCurrent()
+    let rawWeights = try MLX.loadArrays(url: transformerPath)
+    var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+
+    if let loraFile = loraPath {
+      print("  Merging LoRA: \(loraFile) (strength=\(loraStrength))")
+      let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraFile))
+      var mergedCount = 0
+      var skippedCount = 0
+      for (key, loraA) in loraWeights {
+        guard key.hasSuffix(".lora_A.weight") else { continue }
+        var baseKey = String(key.dropLast(".lora_A.weight".count))
+        if baseKey.hasPrefix("diffusion_model.") {
+          baseKey = String(baseKey.dropFirst("diffusion_model.".count))
+        }
+        if baseKey.contains("audio_") || baseKey.contains("av_ca_") ||
+           baseKey.contains("video_to_audio_attn") || baseKey.contains("audio_to_video_attn") {
+          skippedCount += 1; continue
+        }
+        let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
+        guard let loraB = loraWeights[bKey] else { skippedCount += 1; continue }
+        let targetKey = baseKey + ".weight"
+        guard sanitized[targetKey] != nil else { skippedCount += 1; continue }
+        let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+        sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+        mergedCount += 1
+      }
+      print("  Merged \(mergedCount) LoRA pairs (skipped \(skippedCount))")
+    }
+
+    let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
+    try transformer.update(parameters: params, verify: [.shapeMismatch])
+    MLX.eval(transformer.parameters())
+    let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
+    print("  Loaded in \(String(format: "%.1f", loadTime))s")
+
+    print("[3] Loading VAE...")
+    let vae = LTX2VAE(config: .v23)
+    let vaeDecoderPath = URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors")
+    let vaeEncoderPath = URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors")
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecoderWeights = try MLX.loadArrays(url: vaeDecoderPath)
+    for (key, value) in rawDecoderWeights {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncoderWeights = try MLX.loadArrays(url: vaeEncoderPath)
+    for (key, value) in rawEncoderWeights {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+    var vaeLogger = Logger(label: "ltx2.i2v.vae")
+    vaeLogger.logLevel = .info
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: vaeLogger)
+    MLX.eval(vae.parameters())
+
+    print("[4] Loading text encoder (Gemma 3 12B BF16)...")
+    let gemmaConfig = LTX2GemmaConfig(
+      vocabSize: 262208, hiddenSize: 3840,
+      numHiddenLayers: 48, numAttentionHeads: 16,
+      numKeyValueHeads: 8, headDim: 256,
+      intermediateSize: 15360,
+      rmsNormEps: 1e-6, ropeTheta: 1_000_000.0,
+      slidingWindow: 1024, slidingWindowPattern: 6,
+      quantization: nil
+    )
+    let encoderConfig = LTX2TextEncoderConfig(
+      gemma: gemmaConfig,
+      hasPromptAdaLN: true
+    )
+    let textEncoder = LTX2TextEncoder(config: encoderConfig)
+    try textEncoder.loadWeights(
+      modelPath: URL(fileURLWithPath: modelDir),
+      textEncoderPath: URL(fileURLWithPath: gemmaPath)
+    )
+    MLX.eval(textEncoder.parameters())
+
+    print("[5] Creating pipeline...")
+    let pipelineConfig = LTX2PipelineConfig(
+      modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true
+    )
+    let pipeline = LTX2Pipeline(
+      vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig
+    )
+
+    print("[6] Tokenizing prompt...")
+    let tokenizerDir = URL(fileURLWithPath: gemmaPath)
+    let tokenizer = try LTX2GemmaTokenizer.load(from: tokenizerDir, maxLength: 128)
+    let batch = tokenizer.encode(prompt: promptText, maxLength: 128)
+    MLX.eval(batch.inputIds, batch.attentionMask)
+    print("  Tokens: \(MLX.sum(batch.attentionMask).item(Int.self))")
+
+    #if canImport(CoreGraphics) && canImport(ImageIO)
+    print("[7] Loading init image: \(initImagePath)")
+    let imgURL = URL(fileURLWithPath: initImagePath)
+    guard let imgSource = CGImageSourceCreateWithURL(imgURL as CFURL, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(imgSource, 0, nil) else {
+      throw NSError(domain: "LTX2I2V", code: 20,
+        userInfo: [NSLocalizedDescriptionKey: "Failed to load image from \(initImagePath)"])
+    }
+    let pixelArray = try QwenImageIO.resizedPixelArray(
+      from: cgImage, width: width, height: height,
+      addBatchDimension: true, dtype: .float32
+    )
+    var currentImage = QwenImageIO.normalizeForEncoder(pixelArray)
+    print("  Image loaded: \(currentImage.shape)")
+
+    var allFrames: [CGImage] = []
+    let overallStart = CFAbsoluteTimeGetCurrent()
+
+    for chunk in 0..<totalChunks {
+      let chunkSeed = UInt64(seed + chunk)
+      print()
+      print("--- Chunk \(chunk + 1)/\(totalChunks) (seed \(chunkSeed)) ---")
+
+      let genStart = CFAbsoluteTimeGetCurrent()
+      let output = pipeline.generateI2V(
+        inputIds: batch.inputIds,
+        attentionMask: batch.attentionMask,
+        image: currentImage,
+        strength: strength,
+        width: width, height: height,
+        numFrames: framesPerChunk,
+        steps: steps, seed: chunkSeed,
+        progressCallback: { step, total in
+          let elapsed = CFAbsoluteTimeGetCurrent() - genStart
+          let rate = step > 0 ? elapsed / Double(step) : 0
+          let remaining = rate > 0 ? rate * Double(total - step) : 0
+          print(String(format: "  [step %d/%d]  %.1fs elapsed  ~%.0fs remaining",
+            step, total, elapsed, remaining))
+        }
+      )
+      print("  Chunk generated in \(String(format: "%.1f", output.elapsedSeconds))s")
+
+      let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+      print("  Extracted \(chunkFrames.count) frames")
+
+      if chunk == 0 {
+        allFrames.append(contentsOf: chunkFrames)
+      } else {
+        allFrames.append(contentsOf: chunkFrames.dropFirst())
+      }
+      print("  Total frames so far: \(allFrames.count)")
+
+      if chunk < totalChunks - 1 {
+        let t = output.decoded.dim(2)
+        let lastFramePixels = output.decoded[0..., 0..., (t-1)..<t, 0..., 0...]
+        let lastFrame4D = lastFramePixels.squeezed(axis: 2)
+        currentImage = lastFrame4D * 2.0 - 1.0
+        MLX.eval(currentImage)
+        print("  Last frame extracted for next chunk")
+      }
+    }
+
+    let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
+    print()
+    print("=== All chunks complete ===")
+    print("Total frames: \(allFrames.count) (\(String(format: "%.1f", Float(allFrames.count) / Float(fps)))s at \(fps)fps)")
+    print("Total time:   \(String(format: "%.1f", overallTime))s")
+
+    print("Writing MP4 to \(outputPath)...")
+    try LTX2PostProcess.writeMP4(
+      frames: allFrames,
+      outputPath: outputPath,
+      fps: fps,
+      width: width,
+      height: height
+    )
+
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: outputPath),
+       let size = attrs[FileAttributeKey.size] as? Int {
+      let mb = Double(size) / (1024.0 * 1024.0)
+      print("Output: \(outputPath) (\(String(format: "%.1f", mb)) MB)")
+    }
+    print("Done!")
+    #else
+    print("ERROR: CoreGraphics/ImageIO required for i2v (macOS only)")
+    #endif
   }
 
 }
