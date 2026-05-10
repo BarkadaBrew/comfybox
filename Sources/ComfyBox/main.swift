@@ -2986,11 +2986,11 @@ struct ZImageCLI {
 
   /// Validate the Gemma 3 text encoder pipeline against Python ground truth.
   ///
-  /// Loads the Gemma 3 12B model (Q4), tokenizes the reference prompt,
+  /// Loads the Gemma 3 12B model (BF16), tokenizes the reference prompt,
   /// runs the full text encoding pipeline, and compares against the
   /// pre-computed ground truth embeddings.
   private static func runLTX2TextEncoderTest(args: [String]) throws {
-    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-4bit/snapshots/86cc6a8dedbc456dd0e4af01a9d09f396f77e558"
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
     var connectorPath = "/Users/toddwalderman/Models/ltx2-distilled"
     var groundTruthPath = "/tmp/kira-text-embeddings.safetensors"
 
@@ -3007,7 +3007,7 @@ struct ZImageCLI {
         print("""
         LTX-2.3 Text Encoder Validation Test
 
-        Loads Gemma 3 12B (Q4) + connector weights, encodes the reference prompt,
+        Loads Gemma 3 12B (live) + connector weights, encodes the reference prompt,
         and compares output against Python ground truth embeddings.
 
         Usage: ComfyBox ltx2-text-encoder-test [options]
@@ -3065,7 +3065,7 @@ struct ZImageCLI {
       ropeTheta: 1_000_000.0,
       slidingWindow: 1024,
       slidingWindowPattern: 6,
-      quantization: LTX2GemmaQuantizationConfig(bits: 4, groupSize: 64)
+      quantization: nil
     )
     let encoderConfig = LTX2TextEncoderConfig(
       gemma: gemmaConfig,
@@ -3167,8 +3167,8 @@ struct ZImageCLI {
     if cosineSim > 0.95 {
       print("  PASS: Cosine similarity > 0.95 -- embeddings are functionally equivalent")
     } else if cosineSim > 0.85 {
-      print("  PASS (Q4): Cosine similarity > 0.85 -- within expected Q4 quantization tolerance")
-      print("  Note: Q4 quantization across 48 layers + connector introduces ~15% divergence")
+      print("  PASS (BF16): Cosine similarity > 0.85 -- within expected tolerance")
+      print("  Note: BF16 precision across 48 layers + connector may introduce minor divergence")
     } else if cosineSim > 0.70 {
       print("  WARN: Cosine similarity > 0.70 -- larger than expected quantization error")
       print("  Check weight loading, architecture, or consider bf16 weights")
@@ -3188,7 +3188,7 @@ struct ZImageCLI {
     var outputPath = "/tmp/ltx2-demo.mp4"
     var embeddingsPath: String? = nil
     var prompt: String? = nil
-    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--mlx-community--gemma-3-12b-it-4bit/snapshots/86cc6a8dedbc456dd0e4af01a9d09f396f77e558"
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
     var width = 512
     var height = 320
     var frames = 9
@@ -3235,7 +3235,7 @@ struct ZImageCLI {
     print("Output:     \(outputPath)")
     print("Prompt:     \(prompt ?? "(none)")")
     if useRealEncoder {
-      print("Encoder:    Gemma 3 12B Q4 (live)")
+      print("Encoder:    Gemma 3 12B BF16 (live)")
       print("Gemma path: \(gemmaPath)")
     } else {
       print("Embeddings: \(embeddingsPath ?? "random (dummy)")")
@@ -3328,7 +3328,7 @@ struct ZImageCLI {
     // --- Create text encoder (real or dummy) ---
     let textEncoder: LTX2TextEncoder
     if useRealEncoder {
-      print("[\(stepNum)/\(totalSteps)] Creating text encoder (Gemma 3 12B Q4 + connectors)...")
+      print("[\(stepNum)/\(totalSteps)] Creating text encoder (Gemma 3 12B BF16 + connectors)...")
       let gemmaConfig = LTX2GemmaConfig(
         vocabSize: 262208,
         hiddenSize: 3840,
@@ -3341,7 +3341,7 @@ struct ZImageCLI {
         ropeTheta: 1_000_000.0,
         slidingWindow: 1024,
         slidingWindowPattern: 6,
-        quantization: LTX2GemmaQuantizationConfig(bits: 4, groupSize: 64)
+        quantization: nil
       )
       let encoderConfig = LTX2TextEncoderConfig(
         gemma: gemmaConfig,
@@ -3508,7 +3508,7 @@ struct ZImageCLI {
   private static func printLTX2DemoUsage() {
     print("""
     LTX-2.3 distilled text-to-video pipeline.
-    Supports end-to-end generation from text prompt (Gemma 3 12B Q4 text encoder)
+    Supports end-to-end generation from text prompt (Gemma 3 12B BF16 text encoder)
     or pre-computed embeddings.
 
     Usage: ComfyBox ltx2-demo [options]
