@@ -216,8 +216,15 @@ public enum WanTransformerWeightLoader {
       throw LoadError.missingKeys(missing)
     }
 
+    // Remap keys: wrapper classes (WanTextEmbeddingMLP, WanTimeEmbeddingMLP,
+    // WanTimeProjection, WanFFN) use `public let layers: [Module]`, injecting
+    // "layers" into the weight path. Safetensors keys lack this segment.
+    // Example: text_embedding.0.weight -> text_embedding.layers.0.weight
+    //          blocks.0.ffn.0.weight   -> blocks.0.ffn.layers.0.weight
+    let remapped = remapTransformerKeys(weights)
+
     // Build flat key-value pairs for ModuleParameters
-    let flat: [(String, MLXArray)] = weights.map { ($0.key, $0.value) }
+    let flat: [(String, MLXArray)] = remapped.map { ($0.key, $0.value) }
 
     // Apply to model
     do {
@@ -230,6 +237,45 @@ public enum WanTransformerWeightLoader {
     let totalParams = weights.values.reduce(0) { $0 + $1.size }
     let paramGB = Double(totalParams * 2) / (1024 * 1024 * 1024)  // BF16 = 2 bytes
     logger.info("Wan transformer weights applied: \(weights.count) tensors, \(String(format: "%.1f", paramGB)) GB (BF16)")
+  }
+
+  // MARK: - Key Remapping
+
+  /// Remaps safetensors transformer keys to match the MLX module hierarchy.
+  ///
+  /// Wrapper classes that use `public let layers: [Module]`:
+  /// - `WanTextEmbeddingMLP` at `text_embedding`
+  /// - `WanTimeEmbeddingMLP` at `time_embedding`
+  /// - `WanTimeProjection` at `time_projection`
+  /// - `WanFFN` at `blocks.{i}.ffn`
+  ///
+  /// Inserts `layers.` before numeric indices following these container names.
+  private static func remapTransformerKeys(
+    _ weights: [String: MLXArray]
+  ) -> [String: MLXArray] {
+    let containers: Set<String> = [
+      "text_embedding", "time_embedding", "time_projection", "ffn",
+    ]
+
+    var result = [String: MLXArray]()
+    result.reserveCapacity(weights.count)
+
+    for (key, value) in weights {
+      let parts = key.split(separator: ".")
+      var remapped: [String] = []
+
+      for (i, part) in parts.enumerated() {
+        remapped.append(String(part))
+        if containers.contains(String(part)),
+           i + 1 < parts.count,
+           parts[i + 1].allSatisfy({ $0.isNumber }) {
+          remapped.append("layers")
+        }
+      }
+
+      result[remapped.joined(separator: ".")] = value
+    }
+    return result
   }
 
   // MARK: - Convenience
