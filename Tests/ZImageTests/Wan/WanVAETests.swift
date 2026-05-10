@@ -260,17 +260,17 @@ final class WanEncoder3dTests: XCTestCase {
   }
 
   func testEncoderOutputShape() throws {
-    // Input: [1, 3, 1, 16, 16]
-    // After 3x spatial /2 = [16/8=2, 16/8=2]
-    // No temporal downsample for T=1 (first stage is spatial-only)
+    // Input: [1, 3, 7, 16, 16]
+    // Spatial: 3x downsample /2 -> 16/8 = 2
+    // Temporal: 2x downsample (k=3,s=2,p=0): 7 -> 3 -> 1
     // Output channels: z_dim*2 = 32
     let encoder = WanEncoder3d()
-    let x = MLXArray.zeros([1, 3, 1, 16, 16], type: Float.self)
+    let x = MLXArray.zeros([1, 3, 7, 16, 16], type: Float.self)
     let out = encoder(x)
     eval(out)
     XCTAssertEqual(out.shape[0], 1)
     XCTAssertEqual(out.shape[1], 32) // z_dim * 2 = 16 * 2
-    XCTAssertEqual(out.shape[2], 1)  // T preserved
+    XCTAssertEqual(out.shape[2], 1)  // 7 -> 3 -> 1
     XCTAssertEqual(out.shape[3], 2)  // 16 / 8
     XCTAssertEqual(out.shape[4], 2)  // 16 / 8
   }
@@ -284,7 +284,8 @@ final class WanDecoder3dTests: XCTestCase {
 
   func testDecoderOutputShape() throws {
     // Input: [1, 16, 1, 2, 2]
-    // After 3x spatial *2 = [2*8=16, 2*8=16]
+    // Spatial: 3x upsample *2 -> 2*8 = 16
+    // Temporal: 2x upsample *2 -> 1*4 = 4
     // Output channels: 3 (RGB)
     let decoder = WanDecoder3d()
     let x = MLXArray.zeros([1, 16, 1, 2, 2], type: Float.self)
@@ -292,7 +293,7 @@ final class WanDecoder3dTests: XCTestCase {
     eval(out)
     XCTAssertEqual(out.shape[0], 1)
     XCTAssertEqual(out.shape[1], 3)  // RGB
-    XCTAssertEqual(out.shape[2], 1)  // T
+    XCTAssertEqual(out.shape[2], 4)  // T: 1 -> 2 -> 4
     XCTAssertEqual(out.shape[3], 16) // 2 * 8
     XCTAssertEqual(out.shape[4], 16) // 2 * 8
   }
@@ -313,12 +314,12 @@ final class WanVAETests: XCTestCase {
   }
 
   func testEncodeOutputShape() throws {
-    // Input: [1, 3, 1, 16, 16]
-    // Encoder: 8x spatial compression -> [1, 32, 1, 2, 2]
+    // Input: [1, 3, 7, 16, 16]
+    // Encoder: 8x spatial (16->2), temporal 7->3->1
     // conv1: [1, 32, 1, 2, 2]
     // Take first 16 channels: [1, 16, 1, 2, 2]
     let vae = WanVAE()
-    let x = MLXArray.zeros([1, 3, 1, 16, 16], type: Float.self)
+    let x = MLXArray.zeros([1, 3, 7, 16, 16], type: Float.self)
     let latent = vae.encode(x)
     eval(latent)
     XCTAssertEqual(latent.shape[0], 1)
@@ -331,25 +332,32 @@ final class WanVAETests: XCTestCase {
   func testDecodeOutputShape() throws {
     // Input: [1, 16, 1, 2, 2]
     // conv2: [1, 16, 1, 2, 2]
-    // Decoder: 8x spatial decompression -> [1, 3, 1, 16, 16]
+    // Decoder: 8x spatial (2->16), temporal 1->2->4
     let vae = WanVAE()
     let z = MLXArray.zeros([1, 16, 1, 2, 2], type: Float.self)
     let decoded = vae.decode(z)
     eval(decoded)
     XCTAssertEqual(decoded.shape[0], 1)
     XCTAssertEqual(decoded.shape[1], 3)
-    XCTAssertEqual(decoded.shape[2], 1)
+    XCTAssertEqual(decoded.shape[2], 4)  // T: 1 -> 2 -> 4
     XCTAssertEqual(decoded.shape[3], 16)
     XCTAssertEqual(decoded.shape[4], 16)
   }
 
-  func testEncodeSingleImage4D() throws {
-    // 4D input should auto-add temporal dim
+  func testRoundTripShapes() throws {
+    // Verify encode -> decode produces correct output dimensions
+    // T=7 encodes to T=1, which decodes to T=4
     let vae = WanVAE()
-    let x = MLXArray.zeros([1, 3, 16, 16], type: Float.self)
+    let x = MLXArray.zeros([1, 3, 7, 16, 16], type: Float.self)
     let latent = vae.encode(x)
     eval(latent)
-    XCTAssertEqual(latent.ndim, 5)
-    XCTAssertEqual(latent.shape[1], 16)
+    XCTAssertEqual(latent.shape, [1, 16, 1, 2, 2])
+    let decoded = vae.decode(latent)
+    eval(decoded)
+    XCTAssertEqual(decoded.shape[0], 1)
+    XCTAssertEqual(decoded.shape[1], 3)
+    XCTAssertEqual(decoded.shape[2], 4)  // temporal upsample 1->2->4
+    XCTAssertEqual(decoded.shape[3], 16)
+    XCTAssertEqual(decoded.shape[4], 16)
   }
 }
