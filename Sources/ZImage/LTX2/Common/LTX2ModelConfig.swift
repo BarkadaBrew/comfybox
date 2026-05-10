@@ -39,6 +39,10 @@ public struct LTX2VideoVAEConfig: Equatable {
   /// Timestep scale multiplier.
   public let timestepScaleMultiplier: Float
 
+  /// Whether the decoder uses causal temporal padding (true) or symmetric padding (false).
+  /// v2.3 uses non-causal decoder (false), default uses causal (true).
+  public let causalDecoder: Bool
+
   /// Encoder block definitions.
   /// Each entry is a `(blockType, config)` pair.
   public let encoderBlocks: [EncoderBlockDef]
@@ -80,6 +84,7 @@ public struct LTX2VideoVAEConfig: Equatable {
     decodeNoiseScale: 0.025,
     decodeTimestep: 0.05,
     timestepScaleMultiplier: 1000.0,
+    causalDecoder: true,
     encoderBlocks: [
       .resX(numLayers: 4),
       .compressSpaceRes(multiplier: 2),
@@ -115,6 +120,7 @@ public struct LTX2VideoVAEConfig: Equatable {
     decodeNoiseScale: 0.025,
     decodeTimestep: 0.05,
     timestepScaleMultiplier: 1000.0,
+    causalDecoder: false,
     encoderBlocks: [
       .resX(numLayers: 4),
       .compressSpaceRes(multiplier: 2),

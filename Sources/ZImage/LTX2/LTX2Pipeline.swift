@@ -198,7 +198,8 @@ public final class LTX2Pipeline {
       maxPos: transformer.positionalEmbeddingMaxPos,
       useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
       numAttentionHeads: transformer.numHeads,
-      ropeMode: transformer.ropeMode
+      ropeMode: transformer.ropeMode,
+      doublePrecision: transformer.doublePrecisionRoPE
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
@@ -323,7 +324,8 @@ public final class LTX2Pipeline {
       maxPos: transformer.positionalEmbeddingMaxPos,
       useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
       numAttentionHeads: transformer.numHeads,
-      ropeMode: transformer.ropeMode
+      ropeMode: transformer.ropeMode,
+      doublePrecision: transformer.doublePrecisionRoPE
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
@@ -478,7 +480,8 @@ public final class LTX2Pipeline {
       maxPos: transformer.positionalEmbeddingMaxPos,
       useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
       numAttentionHeads: transformer.numHeads,
-      ropeMode: transformer.ropeMode
+      ropeMode: transformer.ropeMode,
+      doublePrecision: transformer.doublePrecisionRoPE
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 

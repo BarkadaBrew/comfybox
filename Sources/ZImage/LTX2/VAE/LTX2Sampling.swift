@@ -181,7 +181,8 @@ public final class LTX2DepthToSpaceUpsample: Module {
     inChannels: Int,
     stride: (Int, Int, Int),
     residual: Bool = false,
-    outChannelsReductionFactor: Int = 1
+    outChannelsReductionFactor: Int = 1,
+    causalTemporal: Bool = true
   ) {
     self.stride = stride
     self.residual = residual
@@ -191,7 +192,8 @@ public final class LTX2DepthToSpaceUpsample: Module {
     self.outChannels = inChannels / outChannelsReductionFactor
 
     self._conv.wrappedValue = LTX2ConvWrapper(
-      inChannels: inChannels, outChannels: outChannels * multiplier
+      inChannels: inChannels, outChannels: outChannels * multiplier,
+      causalTemporal: causalTemporal
     )
 
     super.init()

@@ -53,6 +53,7 @@ public final class LTX2Transformer: Module {
   let positionalEmbeddingMaxPos: [Int]
   let useMiddleIndicesGrid: Bool
   let ropeMode: LTX2RoPEMode
+  let doublePrecisionRoPE: Bool
 
   // Patchify projection
   @ModuleInfo(key: "patchify_proj") var patchifyProj: Linear
@@ -105,7 +106,8 @@ public final class LTX2Transformer: Module {
     positionalEmbeddingTheta: Float = 10000,
     positionalEmbeddingMaxPos: [Int] = [20, 2048, 2048],
     useMiddleIndicesGrid: Bool = true,
-    ropeMode: LTX2RoPEMode = .split
+    ropeMode: LTX2RoPEMode = .split,
+    doublePrecisionRoPE: Bool = false
   ) {
     self.innerDim = numHeads * headDim
     self.numHeads = numHeads
@@ -120,6 +122,7 @@ public final class LTX2Transformer: Module {
     self.positionalEmbeddingMaxPos = positionalEmbeddingMaxPos
     self.useMiddleIndicesGrid = useMiddleIndicesGrid
     self.ropeMode = ropeMode
+    self.doublePrecisionRoPE = doublePrecisionRoPE
 
     // Patchify projection: latent channels -> inner dim
     self._patchifyProj.wrappedValue = Linear(inChannels, innerDim, bias: true)

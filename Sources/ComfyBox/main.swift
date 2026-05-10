@@ -3255,7 +3255,8 @@ struct ZImageCLI {
       numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
       normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
       positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
-      useMiddleIndicesGrid: true, ropeMode: .split
+      useMiddleIndicesGrid: true, ropeMode: .split,
+      doublePrecisionRoPE: true
     )
     stepNum += 1
 

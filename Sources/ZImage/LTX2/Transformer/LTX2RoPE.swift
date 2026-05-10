@@ -168,7 +168,8 @@ public func ltx2PrecomputeFreqsCIS(
   maxPos: [Int] = [20, 2048, 2048],
   useMiddleIndicesGrid: Bool = true,
   numAttentionHeads: Int = 32,
-  ropeMode: LTX2RoPEMode = .split
+  ropeMode: LTX2RoPEMode = .split,
+  doublePrecision: Bool = false
 ) -> (cos: MLXArray, sin: MLXArray) {
   // Keep positions in float32 for precision
   let gridF32 = indicesGrid.asType(.float32)
@@ -183,7 +184,8 @@ public func ltx2PrecomputeFreqsCIS(
   let freqIndices = ltx2GenerateFreqGrid(
     theta: theta,
     maxPosCount: nPosDims,
-    innerDim: dim
+    innerDim: dim,
+    doublePrecision: doublePrecision
   )
 
   // Generate frequencies from positions
@@ -222,20 +224,40 @@ public func ltx2PrecomputeFreqsCIS(
 func ltx2GenerateFreqGrid(
   theta: Float,
   maxPosCount: Int,
-  innerDim: Int
+  innerDim: Int,
+  doublePrecision: Bool = false
 ) -> MLXArray {
   let nElem = 2 * maxPosCount
   var numIndices = innerDim / nElem
   if numIndices == 0 { numIndices = 1 }
 
-  // Log-spaced from 1.0 to theta
-  let logStart = Foundation.log(1.0) / Foundation.log(theta)
-  let logEnd = Foundation.log(theta) / Foundation.log(theta)  // = 1.0
+  if doublePrecision {
+    // LTX-2.3 uses float64 for the critical frequency grid computation.
+    // This matches PyTorch's generate_freq_grid_np which uses numpy float64
+    // for the log-spaced values before converting to float32. The high
+    // frequencies (up to ~15708) need the extra precision to avoid sign
+    // flips in cos/sin that destroy temporal coherence.
+    let thetaD = Double(theta)
+    let logStart = Foundation.log(1.0) / Foundation.log(thetaD)
+    let logEnd = 1.0  // log(theta)/log(theta) = 1.0
 
-  let linSpace = MLXArray.linspace(Float(logStart), Float(logEnd), count: numIndices)
-  let powIndices = MLXArray(theta).pow(linSpace)
+    var powValues = [Float](repeating: 0, count: numIndices)
+    for i in 0..<numIndices {
+      let t = logStart + (logEnd - logStart) * Double(i) / Double(max(numIndices - 1, 1))
+      let powVal = Foundation.pow(thetaD, t)
+      powValues[i] = Float(powVal * (Double.pi / 2.0))
+    }
+    return MLXArray(powValues)
+  } else {
+    // Standard float32 path
+    let logStart = Foundation.log(1.0) / Foundation.log(theta)
+    let logEnd = Foundation.log(theta) / Foundation.log(theta)  // = 1.0
 
-  return powIndices * Float(Float.pi / 2.0)
+    let linSpace = MLXArray.linspace(Float(logStart), Float(logEnd), count: numIndices)
+    let powIndices = MLXArray(theta).pow(linSpace)
+
+    return powIndices * Float(Float.pi / 2.0)
+  }
 }
 
 /// Generate frequencies from position indices and frequency grid.

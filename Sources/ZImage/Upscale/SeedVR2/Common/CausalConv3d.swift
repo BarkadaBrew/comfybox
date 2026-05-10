@@ -110,6 +110,19 @@ public final class CausalConv3d: Module {
         input = MLX.concatenated([padFrames, input], axis: 2)
       }
       temporalPadding = 0
+    } else if kt > 1 {
+      // Non-causal: symmetric temporal padding by replicating boundary frames.
+      // Matches Python: pad_left = x[:,:,:1].repeat(1,1,(kt-1)//2,1,1)
+      //                 pad_right = x[:,:,-1:].repeat(1,1,(kt-1)//2,1,1)
+      let halfPad = (kt - 1) / 2
+      if halfPad > 0 {
+        let firstFrame = input[0..., 0..., ..<1, 0..., 0...]
+        let lastFrame = input[0..., 0..., (input.dim(2) - 1)..., 0..., 0...]
+        let padLeft = MLX.repeated(firstFrame, count: halfPad, axis: 2)
+        let padRight = MLX.repeated(lastFrame, count: halfPad, axis: 2)
+        input = MLX.concatenated([padLeft, input, padRight], axis: 2)
+      }
+      temporalPadding = 0
     } else {
       temporalPadding = pt
     }
