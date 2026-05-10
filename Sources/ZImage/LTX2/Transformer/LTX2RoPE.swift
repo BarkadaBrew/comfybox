@@ -36,7 +36,6 @@ public func ltx2ApplySplitRoPE(
   cos cosFreqs: MLXArray,
   sin sinFreqs: MLXArray
 ) -> MLXArray {
-  let inputDtype = input.dtype
   var x = input
   var needsReshape = false
 
@@ -49,16 +48,12 @@ public func ltx2ApplySplitRoPE(
     needsReshape = true
   }
 
-  let xF = x.asType(.float32)
-  let cosF = cosFreqs.asType(.float32)
-  let sinF = sinFreqs.asType(.float32)
-
   let halfDim = x.dim(-1) / 2
-  let x1 = xF[.ellipsis, ..<halfDim]
-  let x2 = xF[.ellipsis, halfDim...]
+  let x1 = x[.ellipsis, ..<halfDim]
+  let x2 = x[.ellipsis, halfDim...]
 
-  let out1 = x1 * cosF - x2 * sinF
-  let out2 = x2 * cosF + x1 * sinF
+  let out1 = x1 * cosFreqs - x2 * sinFreqs
+  let out2 = x2 * cosFreqs + x1 * sinFreqs
 
   var output = MLX.concatenated([out1, out2], axis: -1)
 
@@ -70,7 +65,7 @@ public func ltx2ApplySplitRoPE(
     output = output.transposed(0, 2, 1, 3).reshaped(b, t, h * output.dim(3))
   }
 
-  return output.asType(inputDtype)
+  return output
 }
 
 /// Apply INTERLEAVED rotary position embeddings to an input tensor.
@@ -87,17 +82,12 @@ public func ltx2ApplyInterleavedRoPE(
   cos cosFreqs: MLXArray,
   sin sinFreqs: MLXArray
 ) -> MLXArray {
-  let inputDtype = input.dtype
-  let xF = input.asType(.float32)
-  let cosF = cosFreqs.asType(.float32)
-  let sinF = sinFreqs.asType(.float32)
-
   // Reshape to pairs: (..., dim) -> (..., dim/2, 2)
-  let shape = xF.shape
+  let shape = input.shape
   let lastDim = shape[shape.count - 1]
   var pairedShape = Array(shape.dropLast())
   pairedShape.append(contentsOf: [lastDim / 2, 2])
-  let paired = xF.reshaped(pairedShape)
+  let paired = input.reshaped(pairedShape)
 
   // Extract even (index 0) and odd (index 1) from the pair axis
   // Use split to get the two halves of the pair dimension
@@ -110,8 +100,7 @@ public func ltx2ApplyInterleavedRoPE(
   let rotatedPairs = MLX.stacked([negT2, t1], axis: -1)  // (..., dim/2, 2)
   let rotated = rotatedPairs.reshaped(shape)
 
-  let output = xF * cosF + rotated * sinF
-  return output.asType(inputDtype)
+  return input * cosFreqs + rotated * sinFreqs
 }
 
 /// Dispatch RoPE application based on mode.

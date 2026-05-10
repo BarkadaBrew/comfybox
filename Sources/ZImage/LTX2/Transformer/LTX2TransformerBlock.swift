@@ -34,6 +34,7 @@ public final class LTX2TransformerBlock: Module {
   let normEps: Float
   let hasPromptAdaLN: Bool
   let numAdaParams: Int
+  private let rmsNormOnes: MLXArray
 
   // Self-attention
   @ModuleInfo(key: "attn1") var attn1: LTX2Attention
@@ -74,6 +75,7 @@ public final class LTX2TransformerBlock: Module {
     self.normEps = normEps
     self.hasPromptAdaLN = hasPromptAdaLN
     self.numAdaParams = hasPromptAdaLN ? 9 : 6
+    self.rmsNormOnes = MLXArray.ones([dim]).asType(.bfloat16)
 
     // Self-attention (no context_dim = self-attention)
     self._attn1.wrappedValue = LTX2Attention(
@@ -253,8 +255,6 @@ public final class LTX2TransformerBlock: Module {
   ///
   /// Matches Python's `rms_norm(x, eps)` utility which uses `mx.ones` as weight.
   private func weightFreeRMSNorm(_ x: MLXArray) -> MLXArray {
-    let dim = x.dim(-1)
-    let ones = MLXArray.ones([dim]).asType(x.dtype)
-    return MLXFast.rmsNorm(x, weight: ones, eps: normEps)
+    return MLXFast.rmsNorm(x, weight: rmsNormOnes, eps: normEps)
   }
 }

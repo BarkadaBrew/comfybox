@@ -575,10 +575,7 @@ public final class LTX2Pipeline {
         let maskFlat = maskBroadcast.reshaped(b, numTokens)
         timesteps = MLXArray(sigma).asType(dtype) * maskFlat.asType(dtype)
       } else {
-        timesteps = MLXArray(
-          [Float](repeating: sigma, count: numTokens),
-          [1, numTokens]
-        ).asType(dtype)
+        timesteps = MLXArray(sigma).reshaped(1, 1).asType(dtype)
       }
 
       let sigmaArray = MLXArray([sigma]).asType(dtype)
@@ -592,7 +589,6 @@ public final class LTX2Pipeline {
         sigma: sigmaArray,
         precomputedPE: precomputedPE
       )
-      eval(velocityPos)
 
       // Compute x0 (denoised) from velocity using per-token timesteps
       let latentsFlatF32 = currentLatents
