@@ -103,14 +103,15 @@ public struct FlowUniPCScheduler: ZImageScheduler {
       shift * s / (1.0 + (shift - 1.0) * s)
     }
 
-    // Compute timesteps
-    let timestepValues = sigmaValues.map { $0 * Float(numTrainTimesteps) }
+    // Compute timesteps — truncate to integer to match Python's int64 conversion.
+    // Python: self.timesteps = torch.from_numpy(timesteps).to(dtype=torch.int64)
+    let timestepValues = sigmaValues.map { Float(Int32($0 * Float(numTrainTimesteps))) }
 
     // Append trailing zero sentinel
     sigmaValues.append(0.0)
 
-    self.sigmas = MLXArray(sigmaValues)
-    self.timesteps = MLXArray(timestepValues)
+    self.sigmas = MLXArray(sigmaValues, [sigmaValues.count])
+    self.timesteps = MLXArray(timestepValues, [timestepValues.count])
 
     // Initialize mutable state
     self.modelOutputs = Array(repeating: nil, count: solverOrder)

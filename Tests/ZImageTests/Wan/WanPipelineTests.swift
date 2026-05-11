@@ -47,9 +47,9 @@ final class WanPipelineTests: XCTestCase {
     let trailingSigma = scheduler.sigmas[40].item(Float.self)
     XCTAssertEqual(trailingSigma, 0.0, accuracy: 1e-6, "Trailing sigma should be 0")
 
-    // First timestep should be sigmas[0] * 1000
+    // First timestep should be floor(sigmas[0] * 1000) — truncated to int like Python
     let firstTimestep = scheduler.timesteps[0].item(Float.self)
-    XCTAssertEqual(firstTimestep, firstSigma * 1000, accuracy: 0.1, "First timestep = sigma * numTrainTimesteps")
+    XCTAssertEqual(firstTimestep, Float(Int32(firstSigma * 1000)), accuracy: 0.01, "First timestep = int(sigma * numTrainTimesteps)")
 
     // Sigmas should be monotonically decreasing
     for i in 0..<40 {

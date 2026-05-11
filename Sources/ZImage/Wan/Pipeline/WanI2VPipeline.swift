@@ -272,8 +272,12 @@ public final class WanI2VPipeline {
       let model = try moeManager.model(forTimestep: t)
       let guideScale = moeManager.guideScale(forTimestep: t, scales: config.guideScale)
 
-      // Prepare timestep tensor
-      let timestep = MLXArray([t])
+      // Prepare timestep tensor — truncate to integer to match Python's int64 dtype.
+      // The sinusoidal position embedding is sensitive to fractional differences;
+      // passing 999.8 instead of 999 shifts high-frequency components enough to
+      // bias the noise prediction, which the multi-step UniPC solver then amplifies
+      // into divergent latent growth.
+      let timestep = MLXArray([Float(Int32(t))])
 
       // CFG: conditional forward pass
       let noisePredCond = model.forward(
