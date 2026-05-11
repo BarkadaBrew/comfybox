@@ -2976,7 +2976,6 @@ struct ZImageCLI {
   // MARK: - Wan I2V
 
   private static func runWanI2V(args: [String]) throws {
-    setlinebuf(stderr)
     var prompt: String?
     var negativePrompt: String?
     var initImagePath: String?
