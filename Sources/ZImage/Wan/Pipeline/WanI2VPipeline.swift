@@ -245,31 +245,31 @@ public final class WanI2VPipeline {
     eval(noise)
 
     // DEBUG: Dump pipeline stage values for bisection
-    print("[BISECT] === STAGE 0: SCHEDULER ===")
-    print("[BISECT] sigmas = \(scheduler.sigmas)")
-    print("[BISECT] timesteps = \(scheduler.timesteps)")
+    logger.info("[BISECT] === STAGE 0: SCHEDULER ===")
+    logger.info("[BISECT] sigmas = \(scheduler.sigmas)")
+    logger.info("[BISECT] timesteps = \(scheduler.timesteps)")
 
-    print("[BISECT] === STAGE 1: TEXT ENCODING ===")
-    print("[BISECT] context shape = \(context.shape)")
-    print("[BISECT] context mean = \(context.mean().item(Float.self))")
-    print("[BISECT] context std = \(MLX.sqrt(context.variance()).item(Float.self))")
-    print("[BISECT] contextNull shape = \(contextNull.shape)")
-    print("[BISECT] contextNull mean = \(contextNull.mean().item(Float.self))")
+    logger.info("[BISECT] === STAGE 1: TEXT ENCODING ===")
+    logger.info("[BISECT] context shape = \(context.shape)")
+    logger.info("[BISECT] context mean = \(context.mean().item(Float.self))")
+    logger.info("[BISECT] context std = \(MLX.sqrt(context.variance()).item(Float.self))")
+    logger.info("[BISECT] contextNull shape = \(contextNull.shape)")
+    logger.info("[BISECT] contextNull mean = \(contextNull.mean().item(Float.self))")
 
-    print("[BISECT] === STAGE 2: VAE ENCODE ===")
-    print("[BISECT] vaeEncoded shape = \(vaeEncoded.shape)")
-    print("[BISECT] vaeEncoded mean = \(vaeEncoded.mean().item(Float.self))")
-    print("[BISECT] vaeEncoded std = \(MLX.sqrt(vaeEncoded.variance()).item(Float.self))")
+    logger.info("[BISECT] === STAGE 2: VAE ENCODE ===")
+    logger.info("[BISECT] vaeEncoded shape = \(vaeEncoded.shape)")
+    logger.info("[BISECT] vaeEncoded mean = \(vaeEncoded.mean().item(Float.self))")
+    logger.info("[BISECT] vaeEncoded std = \(MLX.sqrt(vaeEncoded.variance()).item(Float.self))")
 
-    print("[BISECT] === STAGE 3: CONDITIONING ===")
-    print("[BISECT] conditioning shape = \(conditioning.shape)")
-    print("[BISECT] conditioning mean = \(conditioning.mean().item(Float.self))")
+    logger.info("[BISECT] === STAGE 3: CONDITIONING ===")
+    logger.info("[BISECT] conditioning shape = \(conditioning.shape)")
+    logger.info("[BISECT] conditioning mean = \(conditioning.mean().item(Float.self))")
 
-    print("[BISECT] === STAGE 4: NOISE ===")
-    print("[BISECT] noise shape = \(noise.shape)")
-    print("[BISECT] noise mean = \(noise.mean().item(Float.self))")
-    print("[BISECT] noise std = \(MLX.sqrt(noise.variance()).item(Float.self))")
-    print("[BISECT] noise[0,0,0,0:5] = [\(noise[0,0,0,0].item(Float.self)), \(noise[0,0,0,1].item(Float.self)), \(noise[0,0,0,2].item(Float.self)), \(noise[0,0,0,3].item(Float.self)), \(noise[0,0,0,4].item(Float.self))]")
+    logger.info("[BISECT] === STAGE 4: NOISE ===")
+    logger.info("[BISECT] noise shape = \(noise.shape)")
+    logger.info("[BISECT] noise mean = \(noise.mean().item(Float.self))")
+    logger.info("[BISECT] noise std = \(MLX.sqrt(noise.variance()).item(Float.self))")
+    logger.info("[BISECT] noise[0,0,0,0:5] = [\(noise[0,0,0,0].item(Float.self)), \(noise[0,0,0,1].item(Float.self)), \(noise[0,0,0,2].item(Float.self)), \(noise[0,0,0,3].item(Float.self)), \(noise[0,0,0,4].item(Float.self))]")
 
     // 5. Compute sequence length
     let seqLen = WanI2VConditioner.computeSeqLen(
@@ -331,14 +331,14 @@ public final class WanI2VPipeline {
       let noisePred = noisePredUncond + cfgScaled
 
       // DEBUG: Dump step values for bisection
-      print("[BISECT] === STEP \(stepIdx) (t=\(t)) ===")
-      print("[BISECT] timestep tensor = \(timestep)")
-      print("[BISECT] noisePredCond mean = \(noisePredCond.mean().item(Float.self))")
-      print("[BISECT] noisePredCond std = \(MLX.sqrt(noisePredCond.variance()).item(Float.self))")
-      print("[BISECT] noisePredUncond mean = \(noisePredUncond.mean().item(Float.self))")
-      print("[BISECT] noisePredUncond std = \(MLX.sqrt(noisePredUncond.variance()).item(Float.self))")
-      print("[BISECT] noisePred (CFG) mean = \(noisePred.mean().item(Float.self))")
-      print("[BISECT] noisePred (CFG) std = \(MLX.sqrt(noisePred.variance()).item(Float.self))")
+      logger.info("[BISECT] === STEP \(stepIdx) (t=\(t)) ===")
+      logger.info("[BISECT] timestep tensor = \(timestep)")
+      logger.info("[BISECT] noisePredCond mean = \(noisePredCond.mean().item(Float.self))")
+      logger.info("[BISECT] noisePredCond std = \(MLX.sqrt(noisePredCond.variance()).item(Float.self))")
+      logger.info("[BISECT] noisePredUncond mean = \(noisePredUncond.mean().item(Float.self))")
+      logger.info("[BISECT] noisePredUncond std = \(MLX.sqrt(noisePredUncond.variance()).item(Float.self))")
+      logger.info("[BISECT] noisePred (CFG) mean = \(noisePred.mean().item(Float.self))")
+      logger.info("[BISECT] noisePred (CFG) std = \(MLX.sqrt(noisePred.variance()).item(Float.self))")
 
       // Scheduler step
       latent = scheduler.step(
@@ -348,12 +348,12 @@ public final class WanI2VPipeline {
       )
       eval(latent)
 
-      print("[BISECT] latent after step mean = \(latent.mean().item(Float.self))")
-      print("[BISECT] latent after step std = \(MLX.sqrt(latent.variance()).item(Float.self))")
-      print("[BISECT] latent after step min = \(latent.min().item(Float.self))")
-      print("[BISECT] latent after step max = \(latent.max().item(Float.self))")
+      logger.info("[BISECT] latent after step mean = \(latent.mean().item(Float.self))")
+      logger.info("[BISECT] latent after step std = \(MLX.sqrt(latent.variance()).item(Float.self))")
+      logger.info("[BISECT] latent after step min = \(latent.min().item(Float.self))")
+      logger.info("[BISECT] latent after step max = \(latent.max().item(Float.self))")
       if stepIdx < 2 {
-        print("[BISECT] latent[0,0,0,0:5] = [\(latent[0,0,0,0].item(Float.self)), \(latent[0,0,0,1].item(Float.self)), \(latent[0,0,0,2].item(Float.self)), \(latent[0,0,0,3].item(Float.self)), \(latent[0,0,0,4].item(Float.self))]")
+        logger.info("[BISECT] latent[0,0,0,0:5] = [\(latent[0,0,0,0].item(Float.self)), \(latent[0,0,0,1].item(Float.self)), \(latent[0,0,0,2].item(Float.self)), \(latent[0,0,0,3].item(Float.self)), \(latent[0,0,0,4].item(Float.self))]")
       }
 
       progressCallback?(stepIdx + 1, numSteps)
