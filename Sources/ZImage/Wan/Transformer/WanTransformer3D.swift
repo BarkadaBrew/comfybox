@@ -248,8 +248,8 @@ public final class WanTransformer3D: Module {
       // Reshape to [F, H, W, pT, pH, pW, outDim]
       let reshaped = patches.reshaped(f, h, w, pT, pH, pW, outDim)
 
-      // Permute: fhwpqrc -> cfphqwr (0123456 -> 6304152)
-      let permuted = reshaped.transposed(6, 3, 0, 4, 1, 5, 2)
+      // Permute: fhwpqrc -> cfphqwr (0123456 -> 6031425)
+      let permuted = reshaped.transposed(6, 0, 3, 1, 4, 2, 5)
 
       // Flatten to [outDim, F*pT, H*pH, W*pW]
       let output = permuted.reshaped(outDim, f * pT, h * pH, w * pW)
