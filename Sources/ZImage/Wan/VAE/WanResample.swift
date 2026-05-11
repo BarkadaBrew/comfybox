@@ -39,7 +39,7 @@ public final class WanResample: Module {
       )
       self._timeConv.wrappedValue = WanCausalConv3d(
         inChannels: dim, outChannels: dim,
-        kernelSize: (3, 1, 1), stride: (2, 1, 1), padding: (1, 0, 0)
+        kernelSize: (3, 1, 1), stride: (2, 1, 1), padding: (0, 0, 0)
       )
 
     case .upsample2d:

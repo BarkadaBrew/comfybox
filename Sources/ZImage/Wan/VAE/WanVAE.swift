@@ -100,6 +100,6 @@ public final class WanVAE: Module {
 
     z = conv2(z)
     let decoded = decoder(z)
-    return decoded
+    return MLX.clip(decoded, min: -1.0, max: 1.0)
   }
 }
