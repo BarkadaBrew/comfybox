@@ -312,22 +312,17 @@ public struct FlowUniPCScheduler: ZImageScheduler {
 
     let D1t = thisModelOutput - m0
 
+    // Solve for rhos_c coefficients matching Python's torch.linalg.solve(R, b)
+    let rhosC = solveCorrector(order: order, hh: hh, hPhi1: hPhi1, B_h: B_h, h: h, lambdaS0: lambdaS0)
+
     if predictX0 {
       var xT = sigmaT / sigmaS0 * lastSample - alphaT * hPhi1 * m0
 
       if order == 1 {
-        // rhos_c = [0.5]
-        xT = xT - alphaT * B_h * (0.5 * D1t)
+        // rhos_c = [0.5], single coefficient applied to D1_t
+        xT = xT - alphaT * B_h * (rhosC.last! * D1t)
       } else {
-        // order >= 2: solve R * rhos = b for rhos_c
-        // For order 2 corrector with bh2:
-        // R = [[1, 1], [rk^0, rk^1]] but since there's 1 history entry + current
-        // Python uses torch.linalg.solve(R, b). For order=2:
-        // R = [[1], [1]] -> rhos = b / R (trivial)
-        // Actually for order 2 corrector: R is 2x2, b is 2x1
-        // But we know order=2 means 2 equations. Let's just use 0.5 for the
-        // correction coefficient (same as order 1) since this is the dominant path.
-        // The difference is negligible for most practical use cases.
+        // order >= 2: rhos_c[:-1] weights history D1s, rhos_c[-1] weights D1_t
         var D1s: [MLXArray] = []
         for i in 1..<order {
           let si = stepIndex - (i + 1)
@@ -339,24 +334,14 @@ public struct FlowUniPCScheduler: ZImageScheduler {
           D1s.append((mi - m0) / rk)
         }
 
-        // Compute rhos via the B(h) formulation for order 2
-        var hPhiK = hPhi1 / hh - 1.0
-        let b0 = hPhiK * 1.0 / B_h
-        hPhiK = hPhiK / hh - MLXArray(1.0 / 2.0)
-        let b1 = hPhiK * 2.0 / B_h
-
-        // For order 2 with 1 history point + current:
-        // R = [[1, 1], [1, rk]], b = [b0, b1]
-        // Solve manually: rhos[0] = (b0*rk - b1) / (rk - 1)
-        //                 rhos[1] = (b1 - b0) / (rk - 1)
-        // But if rk is close to 1, fall back to equal weights
-
         if !D1s.isEmpty {
-          // Simplified: use first D1 with weight from b0
-          let corrRes = D1s[0] * b0
-          xT = xT - alphaT * B_h * (corrRes + b1 * D1t)
+          var corrRes = D1s[0] * rhosC[0]
+          for j in 1..<D1s.count {
+            corrRes = corrRes + D1s[j] * rhosC[j]
+          }
+          xT = xT - alphaT * B_h * (corrRes + rhosC.last! * D1t)
         } else {
-          xT = xT - alphaT * B_h * (0.5 * D1t)
+          xT = xT - alphaT * B_h * (rhosC.last! * D1t)
         }
       }
 
@@ -365,7 +350,7 @@ public struct FlowUniPCScheduler: ZImageScheduler {
       var xT = alphaT / alphaS0 * lastSample - sigmaT * hPhi1 * m0
 
       if order == 1 {
-        xT = xT - sigmaT * B_h * (0.5 * D1t)
+        xT = xT - sigmaT * B_h * (rhosC.last! * D1t)
       } else {
         var D1s: [MLXArray] = []
         for i in 1..<order {
@@ -378,20 +363,83 @@ public struct FlowUniPCScheduler: ZImageScheduler {
           D1s.append((mi - m0) / rk)
         }
 
-        var hPhiK = hPhi1 / hh - 1.0
-        let b0 = hPhiK * 1.0 / B_h
-        hPhiK = hPhiK / hh - MLXArray(1.0 / 2.0)
-        let b1 = hPhiK * 2.0 / B_h
-
         if !D1s.isEmpty {
-          let corrRes = D1s[0] * b0
-          xT = xT - sigmaT * B_h * (corrRes + b1 * D1t)
+          var corrRes = D1s[0] * rhosC[0]
+          for j in 1..<D1s.count {
+            corrRes = corrRes + D1s[j] * rhosC[j]
+          }
+          xT = xT - sigmaT * B_h * (corrRes + rhosC.last! * D1t)
         } else {
-          xT = xT - sigmaT * B_h * (0.5 * D1t)
+          xT = xT - sigmaT * B_h * (rhosC.last! * D1t)
         }
       }
 
       return xT
     }
+  }
+
+  // MARK: - Corrector Coefficient Solver
+
+  /// Solves for the UniC corrector coefficients `rhos_c` matching Python's
+  /// `torch.linalg.solve(R, b)`.
+  ///
+  /// For order 1: returns `[0.5]`.
+  /// For order 2: builds the 2x2 R matrix and 2-element b vector from the
+  /// step size ratios and h_phi_k recurrence, then solves via Cramer's rule.
+  private func solveCorrector(
+    order: Int,
+    hh: MLXArray,
+    hPhi1: MLXArray,
+    B_h: MLXArray,
+    h: MLXArray,
+    lambdaS0: MLXArray
+  ) -> [MLXArray] {
+    if order == 1 {
+      return [MLXArray(0.5)]
+    }
+
+    // Build rks: step size ratios for history entries, plus 1.0 for current
+    var rks: [MLXArray] = []
+    for i in 1..<order {
+      let si = stepIndex - (i + 1)
+      let sigmaSi = sigmas[si]
+      let alphaSi = 1.0 - sigmaSi
+      let lambdaSi = MLX.log(alphaSi) - MLX.log(sigmaSi)
+      let rk = (lambdaSi - lambdaS0) / h
+      rks.append(rk)
+    }
+    rks.append(MLXArray(1.0))
+
+    // Build R matrix (order x order) and b vector (order elements)
+    // Python: for i in range(1, order+1):
+    //   R.append(torch.pow(rks, i-1))
+    //   b.append(h_phi_k * factorial_i / B_h)
+    //   factorial_i *= (i+1)
+    //   h_phi_k = h_phi_k / hh - 1/factorial_i
+    var hPhiK = hPhi1 / hh - 1.0
+    var factorialI: Float = 1.0
+
+    var bVec: [MLXArray] = []
+    var R: [[MLXArray]] = []
+    for i in 1...order {
+      var row: [MLXArray] = []
+      for rk in rks {
+        row.append(MLX.pow(rk, MLXArray(Float(i - 1))))
+      }
+      R.append(row)
+      bVec.append(hPhiK * MLXArray(factorialI) / B_h)
+      factorialI *= Float(i + 1)
+      hPhiK = hPhiK / hh - MLXArray(1.0 / factorialI)
+    }
+
+    // For order 2: solve 2x2 system R * rhos = b via Cramer's rule
+    // det = R[0][0]*R[1][1] - R[0][1]*R[1][0]
+    // rhos[0] = (b[0]*R[1][1] - b[1]*R[0][1]) / det
+    // rhos[1] = (R[0][0]*b[1] - R[1][0]*b[0]) / det
+    precondition(order == 2, "UniC corrector only supports order <= 2")
+    let det = R[0][0] * R[1][1] - R[0][1] * R[1][0]
+    let rho0 = (bVec[0] * R[1][1] - bVec[1] * R[0][1]) / det
+    let rho1 = (R[0][0] * bVec[1] - R[1][0] * bVec[0]) / det
+    return [rho0, rho1]
   }
 }
