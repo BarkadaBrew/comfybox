@@ -3159,6 +3159,25 @@ struct ZImageCLI {
       )
     }
 
+    // Diagnostic: save individual frames as PNG before MP4 encoding.
+    // Uses the same QwenImageIO.saveImage() that works correctly for still images.
+    // If PNGs are purple → VAE decoder issue. If PNGs look correct → MP4 writer issue.
+    #if canImport(CoreGraphics)
+    do {
+      let numDiagFrames = min(video.dim(1), 5)  // Save first 5 frames
+      logger.info("[BISECT] Saving \(numDiagFrames) diagnostic frames as PNG...")
+      for f in 0..<numDiagFrames {
+        let singleFrame = video[0..., f, 0..., 0...]  // [3, H, W]
+        let frameURL = URL(fileURLWithPath: outputPath.replacingOccurrences(of: ".mp4", with: "_frame\(f).png"))
+        try QwenImageIO.saveImage(array: singleFrame, to: frameURL)
+        logger.info("[BISECT] Saved frame \(f): \(frameURL.path)")
+      }
+      logger.info("[BISECT] Diagnostic frames saved. Check PNGs to isolate VAE vs MP4 writer.")
+    } catch {
+      logger.warning("[BISECT] Failed to save diagnostic frames: \(error)")
+    }
+    #endif
+
     // Write MP4
     logger.info("Writing MP4: \(outputPath)")
     #if canImport(AVFoundation)

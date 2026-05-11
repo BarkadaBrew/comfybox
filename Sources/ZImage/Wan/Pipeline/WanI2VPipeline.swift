@@ -378,6 +378,18 @@ public final class WanI2VPipeline {
     logger.info("[BISECT] decoded std = \(MLX.sqrt(decoded.variance()).item(Float.self))")
     logger.info("[BISECT] decoded range = [\(decoded.min().item(Float.self)), \(decoded.max().item(Float.self))]")
 
+    // Per-channel decode stats — diagnose purple cast / channel imbalance
+    do {
+      let decodedSqueezed = decoded.squeezed(axis: 0)  // [3, T, H, W]
+      let decoded0 = decodedSqueezed[0]  // channel 0 (R)
+      let decoded1 = decodedSqueezed[1]  // channel 1 (G)
+      let decoded2 = decodedSqueezed[2]  // channel 2 (B)
+      eval(decoded0, decoded1, decoded2)
+      logger.info("[BISECT] decoded ch0 (R) mean=\(decoded0.mean().item(Float.self)) range=[\(decoded0.min().item(Float.self)), \(decoded0.max().item(Float.self))]")
+      logger.info("[BISECT] decoded ch1 (G) mean=\(decoded1.mean().item(Float.self)) range=[\(decoded1.min().item(Float.self)), \(decoded1.max().item(Float.self))]")
+      logger.info("[BISECT] decoded ch2 (B) mean=\(decoded2.mean().item(Float.self)) range=[\(decoded2.min().item(Float.self)), \(decoded2.max().item(Float.self))]")
+    }
+
     // Post-process: [-1, 1] -> [0, 1]
     var frames = decoded.squeezed(axis: 0)  // Remove batch dim: [3, T_out, H, W]
 
