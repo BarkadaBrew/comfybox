@@ -2,6 +2,12 @@ import Foundation
 import MLX
 import MLXNN
 
+private func debugLog(_ message: String) {
+    #if DEBUG
+    print(message)
+    #endif
+}
+
 /// Wan 2.2 I2V-A14B video diffusion transformer.
 ///
 /// Full model wiring: embeddings -> 40 transformer blocks -> head -> unpatchify.
