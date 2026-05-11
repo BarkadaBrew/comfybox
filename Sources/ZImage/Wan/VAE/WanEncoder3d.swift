@@ -48,11 +48,37 @@ public final class WanEncoder3d: Module {
     super.init()
   }
 
+  /// Standard forward (no cache).
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     var h = conv1(x)
     h = downsamples(h)
     h = middle(h)
     h = head(h)
     return h
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    var h = conv1.forward(x, cache: cache)
+    h = downsamples.forward(h, cache: cache)
+    h = middle.forward(h, cache: cache)
+    h = head.forward(h, cache: cache)
+    return h
+  }
+
+  /// Counts the number of cache layers needed for this encoder.
+  ///
+  /// Each CausalConv3d uses 1 slot. Each downsample3d Resample uses 1 slot.
+  /// Uses the Module.modules() recursive traversal.
+  public func countCacheLayers() -> Int {
+    var count = 0
+    for m in modules() {
+      if m is WanCausalConv3d {
+        count += 1
+      } else if let resample = m as? WanResample, resample.mode == .downsample3d {
+        count += 1
+      }
+    }
+    return count
   }
 }

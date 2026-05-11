@@ -62,6 +62,7 @@ public final class WanResample: Module {
     super.init()
   }
 
+  /// Standard forward (no cache) -- used by decoder.
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     let b = x.dim(0)
     let c = x.dim(1)
@@ -122,10 +123,85 @@ public final class WanResample: Module {
       input = input.reshaped(b, t, newC2, newH2, newW2)
       input = input.transposed(0, 2, 1, 3, 4)
 
-      if mode == .downsample3d, let tConv = timeConv {
-        input = tConv(input)
-      }
+      // In non-cached mode, skip time_conv for downsample3d.
+      // The Python code only applies time_conv in the cached path.
+      // For the decoder, downsample3d is not used anyway.
       return input
+    }
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  ///
+  /// Matches Python's Resample.forward() for downsample3d with feat_cache:
+  /// - First chunk: cache the spatially-downsampled result, do NOT apply time_conv
+  /// - Later chunks: concatenate cached last frame, apply time_conv for temporal downsample
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    let b = x.dim(0)
+    let c = x.dim(1)
+    let t = x.dim(2)
+    let h = x.dim(3)
+    let w = x.dim(4)
+    var input = x
+
+    switch mode {
+    case .downsample2d:
+      // Spatial-only downsample, no cache needed (just pass through)
+      return callAsFunction(x)
+
+    case .downsample3d:
+      // Step 1: Spatial downsample (same as non-cached)
+      input = input.transposed(0, 2, 1, 3, 4)
+      input = input.reshaped(b * t, c, h, w)
+      input = input.transposed(0, 2, 3, 1)
+
+      input = MLX.padded(input, widths: [
+        IntOrPair((0, 0)),
+        IntOrPair((0, 1)),
+        IntOrPair((0, 1)),
+        IntOrPair((0, 0)),
+      ])
+
+      input = resample(input)
+      input = input.transposed(0, 3, 1, 2)
+
+      let newC = input.dim(1)
+      let newH = input.dim(2)
+      let newW = input.dim(3)
+
+      input = input.reshaped(b, t, newC, newH, newW)
+      input = input.transposed(0, 2, 1, 3, 4)
+
+      // Step 2: Temporal downsample with cache
+      let slotIdx = cache.advance()
+      guard let tConv = timeConv else { return input }
+
+      if cache.slots[slotIdx] == nil {
+        // First chunk: cache the spatially-downsampled result, skip time_conv
+        cache.slots[slotIdx] = input
+        return input
+      } else {
+        // Later chunks: concat cached last frame + current, apply time_conv
+        let cached = cache.slots[slotIdx]!
+        let cachedLast = cached[0..., 0..., (cached.dim(2) - 1)...(cached.dim(2) - 1), 0..., 0...]
+        let newCacheX = input[0..., 0..., (input.dim(2) - 1)...(input.dim(2) - 1), 0..., 0...]
+
+        // Concatenate: [cached_last_frame, current_frames]
+        let combined = MLX.concatenated([cachedLast, input], axis: 2)
+
+        // Apply time_conv (Conv3d kernel=3, stride=2, padding=0)
+        // This is a raw conv, NOT the cached CausalConv3d path.
+        // The Python time_conv has CausalConv3d with padding=(0,0,0),
+        // which means _padding = 2*0 = 0, so no causal padding at all.
+        input = tConv(combined)
+
+        // Update cache with last frame of the spatial output
+        cache.slots[slotIdx] = newCacheX
+        return input
+      }
+
+    case .upsample2d, .upsample3d:
+      // Upsample modes don't need encoding cache
+      return callAsFunction(x)
     }
   }
 }

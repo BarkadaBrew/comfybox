@@ -17,6 +17,7 @@ public final class WanSequentialLayers: Module {
     super.init()
   }
 
+  /// Standard forward (no cache).
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     var h = x
     for layer in layers {
@@ -24,6 +25,19 @@ public final class WanSequentialLayers: Module {
         h = resBlock(h)
       } else if let resample = layer as? WanResample {
         h = resample(h)
+      }
+    }
+    return h
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    var h = x
+    for layer in layers {
+      if let resBlock = layer as? WanResidualBlock {
+        h = resBlock.forward(h, cache: cache)
+      } else if let resample = layer as? WanResample {
+        h = resample.forward(h, cache: cache)
       }
     }
     return h
@@ -47,10 +61,19 @@ public final class WanMiddleLayers: Module {
     super.init()
   }
 
+  /// Standard forward (no cache).
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     var h = (layers[0] as! WanResidualBlock)(x)
     h = (layers[1] as! WanAttentionBlock)(h)
     h = (layers[2] as! WanResidualBlock)(h)
+    return h
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    var h = (layers[0] as! WanResidualBlock).forward(x, cache: cache)
+    h = (layers[1] as! WanAttentionBlock)(h)
+    h = (layers[2] as! WanResidualBlock).forward(h, cache: cache)
     return h
   }
 }
@@ -73,10 +96,19 @@ public final class WanEncoderHead: Module {
     super.init()
   }
 
+  /// Standard forward (no cache).
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     var h = (layers[0] as! WanVAENorm)(x)
     h = silu(h)
     h = (layers[2] as! WanCausalConv3d)(h)
+    return h
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    var h = (layers[0] as! WanVAENorm)(x)
+    h = silu(h)
+    h = (layers[2] as! WanCausalConv3d).forward(h, cache: cache)
     return h
   }
 }

@@ -25,6 +25,7 @@ public final class WanResidualBlock: Module {
     super.init()
   }
 
+  /// Standard forward (no cache).
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     let h: MLXArray
     if let sc = shortcut {
@@ -33,6 +34,13 @@ public final class WanResidualBlock: Module {
       h = x
     }
     let out = residual(x)
+    return out + h
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    let h = shortcut != nil ? shortcut!.callAsFunction(x) : x
+    let out = residual.forward(x, cache: cache)
     return out + h
   }
 }
@@ -57,6 +65,7 @@ public final class WanResidualPath: Module {
     super.init()
   }
 
+  /// Standard forward (no cache).
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     var h = (layers[0] as! WanVAENorm)(x)
     h = silu(h)
@@ -64,6 +73,17 @@ public final class WanResidualPath: Module {
     h = (layers[3] as! WanVAENorm)(h)
     h = silu(h)
     h = (layers[6] as! WanCausalConv3d)(h)
+    return h
+  }
+
+  /// Cached forward for chunk-by-chunk encoding.
+  public func forward(_ x: MLXArray, cache: WanEncoderCache) -> MLXArray {
+    var h = (layers[0] as! WanVAENorm)(x)
+    h = silu(h)
+    h = (layers[2] as! WanCausalConv3d).forward(h, cache: cache)
+    h = (layers[3] as! WanVAENorm)(h)
+    h = silu(h)
+    h = (layers[6] as! WanCausalConv3d).forward(h, cache: cache)
     return h
   }
 }
