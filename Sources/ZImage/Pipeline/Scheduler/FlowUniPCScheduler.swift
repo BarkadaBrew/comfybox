@@ -135,9 +135,13 @@ public struct FlowUniPCScheduler: ZImageScheduler {
     // 1. Convert model output (flow prediction -> x0)
     let convertedOutput = convertModelOutput(modelOutput: modelOutput, sample: sample)
 
+    // DEBUG
+    print("[SCHED] step \(timestepIndex): convertedOutput mean=\(convertedOutput.mean().item(Float.self))")
+
     // 2. Apply corrector if we have a previous sample and output
     var correctedSample = sample
     let useCorrector = stepIndex > 0 && lastSample != nil
+    print("[SCHED] step \(timestepIndex): useCorrector=\(useCorrector), thisOrder=\(thisOrder)")
     if useCorrector {
       correctedSample = multistepUniCBhUpdate(
         thisModelOutput: convertedOutput,
@@ -145,6 +149,7 @@ public struct FlowUniPCScheduler: ZImageScheduler {
         thisSample: sample,
         order: thisOrder
       )
+      print("[SCHED] step \(timestepIndex): corrected mean=\(correctedSample.mean().item(Float.self))")
     }
 
     // 3. Shift model output buffer (FIFO ring)
@@ -174,6 +179,8 @@ public struct FlowUniPCScheduler: ZImageScheduler {
       sample: correctedSample,
       order: order
     )
+
+    print("[SCHED] step \(timestepIndex): predictor order=\(order), result mean=\(prevSample.mean().item(Float.self))")
 
     // 7. Update warmup counter
     if lowerOrderNums < solverOrder {
