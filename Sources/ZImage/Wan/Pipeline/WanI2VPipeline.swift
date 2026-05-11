@@ -245,10 +245,6 @@ public final class WanI2VPipeline {
     eval(noise)
 
     // DEBUG: Dump pipeline stage values for bisection
-    logger.info("[BISECT] === STAGE 0: SCHEDULER ===")
-    logger.info("[BISECT] sigmas = \(scheduler.sigmas)")
-    logger.info("[BISECT] timesteps = \(scheduler.timesteps)")
-
     logger.info("[BISECT] === STAGE 1: TEXT ENCODING ===")
     logger.info("[BISECT] context shape = \(context.shape)")
     logger.info("[BISECT] context mean = \(context.mean().item(Float.self))")
@@ -284,6 +280,11 @@ public final class WanI2VPipeline {
       shift: config.shift,
       numTrainTimesteps: config.numTrainTimesteps
     )
+
+    // DEBUG: Scheduler values
+    logger.info("[BISECT] === STAGE 0: SCHEDULER ===")
+    logger.info("[BISECT] sigmas = \(scheduler.sigmas)")
+    logger.info("[BISECT] timesteps = \(scheduler.timesteps)")
 
     // 7. Denoising loop
     logger.info("Starting denoising: \(numSteps) steps")
