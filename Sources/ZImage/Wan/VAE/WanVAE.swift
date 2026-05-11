@@ -147,8 +147,8 @@ public final class WanVAE: Module {
     }
 
     let latMean = MLXArray(Self.latentMean).reshaped(1, Self.zDim, 1, 1, 1)
-    let latInvStd = MLXArray(Self.latentStd.map { 1.0 / $0 }).reshaped(1, Self.zDim, 1, 1, 1)
-    z = z / latInvStd + latMean
+    let latStd = MLXArray(Self.latentStd).reshaped(1, Self.zDim, 1, 1, 1)
+    z = z * latStd + latMean
 
     z = conv2(z)
     let decoded = decoder(z)

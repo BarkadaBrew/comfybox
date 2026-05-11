@@ -362,15 +362,40 @@ public final class WanI2VPipeline {
     }
 
     // 8. VAE decode
+    logger.info("[BISECT] === STAGE 5: VAE DECODE ===")
+    logger.info("[BISECT] latent shape = \(latent.shape)")
+    logger.info("[BISECT] latent mean = \(latent.mean().item(Float.self))")
+    logger.info("[BISECT] latent std = \(MLX.sqrt(latent.variance()).item(Float.self))")
+    logger.info("[BISECT] latent range = [\(latent.min().item(Float.self)), \(latent.max().item(Float.self))]")
+
     logger.info("Decoding latents...")
     let decodedLatent = latent.expandedDimensions(axis: 0)  // Add batch dim
     let decoded = vae.decode(decodedLatent)
     eval(decoded)
 
-    // Post-process: clamp to [0, 1]
-    var frames = decoded.squeezed(axis: 0)  // Remove batch dim
+    logger.info("[BISECT] decoded shape = \(decoded.shape)")
+    logger.info("[BISECT] decoded mean = \(decoded.mean().item(Float.self))")
+    logger.info("[BISECT] decoded std = \(MLX.sqrt(decoded.variance()).item(Float.self))")
+    logger.info("[BISECT] decoded range = [\(decoded.min().item(Float.self)), \(decoded.max().item(Float.self))]")
+
+    // Post-process: [-1, 1] -> [0, 1]
+    var frames = decoded.squeezed(axis: 0)  // Remove batch dim: [3, T_out, H, W]
+
+    // Trim temporal dimension to match requested frame count.
+    // The VAE decoder produces 4 * latent_t frames due to 2x temporal upsampling
+    // in each of two upsample3d layers. For frameNum=81 this gives 84 frames.
+    // The first frameNum frames are the valid output.
+    let decodedT = frames.dim(1)
+    if decodedT > config.frameNum {
+      logger.info("Trimming decoded frames: \(decodedT) -> \(config.frameNum)")
+      frames = frames[0..., 0..<config.frameNum, 0..., 0...]
+    }
+
     frames = MLX.clip(frames * 0.5 + 0.5, min: 0.0, max: 1.0)
 
+    logger.info("[BISECT] output frames shape = \(frames.shape)")
+    logger.info("[BISECT] output frames mean = \(frames.mean().item(Float.self))")
+    logger.info("[BISECT] output frames range = [\(frames.min().item(Float.self)), \(frames.max().item(Float.self))]")
     logger.info("Generation complete: \(frames.shape)")
     return frames
   }
