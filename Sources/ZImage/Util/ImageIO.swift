@@ -60,7 +60,7 @@ public enum QwenImageIO {
     let bytesPerRow = width * bytesPerPixel
 
     var buffer = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
 
     let succeeded = buffer.withUnsafeMutableBytes { ptr -> Bool in
@@ -146,7 +146,7 @@ public enum QwenImageIO {
       throw QwenImageIOError.unsupportedPixelFormat
     }
 
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
     guard let image = CGImage(
       width: width,

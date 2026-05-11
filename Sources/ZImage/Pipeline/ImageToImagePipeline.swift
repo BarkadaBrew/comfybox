@@ -147,7 +147,7 @@ private enum Img2ImgUtilities {
   /// Generate a solid white PNG image of the given dimensions.
   static func generateWhiteMaskPNG(width: Int, height: Int) throws -> Data {
     #if canImport(CoreGraphics)
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
     guard let context = CGContext(
       data: nil,

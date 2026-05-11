@@ -333,7 +333,7 @@ enum InpaintUtilities {
   private static func convertToRGBA(_ image: CGImage) -> CGImage? {
     let width = image.width
     let height = image.height
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
 
     guard let context = CGContext(
