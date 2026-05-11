@@ -136,6 +136,57 @@ public final class WanMoEManager {
     activeModel = transformer
     activeExpert = expert
     logger.info("\(expert.rawValue) loaded successfully")
+
+    // Diagnostic: verify critical weights after loading
+    dumpWeightDiagnostics(transformer)
+  }
+
+  /// Dumps mean/std of critical weights to verify correct loading.
+  ///
+  /// Expected values (from Python model, high_noise_model):
+  /// - patch_embedding.weight mean ≈ small, std ≈ 0.01-0.03
+  /// - blocks.0.modulation mean ≈ 0, std ≈ 0.01
+  /// - blocks.0.self_attn.q.weight std ≈ 0.01-0.02
+  /// - head.head.weight should be near-zero (initialized to zeros in Python)
+  private func dumpWeightDiagnostics(_ model: WanTransformer3D) {
+    let params = model.parameters().flattened()
+    var paramDict: [String: MLXArray] = [:]
+    for (key, value) in params {
+      paramDict[key] = value
+    }
+
+    let diagnosticKeys = [
+      "patch_embedding.weight",
+      "patch_embedding.bias",
+      "blocks.0.modulation",
+      "blocks.0.self_attn.q.weight",
+      "blocks.0.self_attn.q.bias",
+      "blocks.0.cross_attn.q.weight",
+      "blocks.0.ffn.layers.0.weight",
+      "blocks.19.modulation",
+      "blocks.39.modulation",
+      "head.head.weight",
+      "head.head.bias",
+      "head.modulation",
+      "text_embedding.layers.0.weight",
+      "time_embedding.layers.0.weight",
+      "time_projection.layers.1.weight",
+    ]
+
+    logger.info("[WEIGHT-DIAG] === Weight Diagnostics ===")
+    for key in diagnosticKeys {
+      if let w = paramDict[key] {
+        let wf = w.asType(.float32)
+        let mean = wf.mean().item(Float.self)
+        let std = MLX.sqrt(wf.variance()).item(Float.self)
+        let minVal = wf.min().item(Float.self)
+        let maxVal = wf.max().item(Float.self)
+        logger.info("[WEIGHT-DIAG] \(key): shape=\(w.shape), dtype=\(w.dtype), mean=\(mean), std=\(std), min=\(minVal), max=\(maxVal)")
+      } else {
+        logger.warning("[WEIGHT-DIAG] \(key): NOT FOUND in model parameters")
+      }
+    }
+    logger.info("[WEIGHT-DIAG] Total parameters: \(paramDict.count)")
   }
 
   /// Unloads the current expert to free memory.

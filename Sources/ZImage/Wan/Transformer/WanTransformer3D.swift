@@ -166,6 +166,12 @@ public final class WanTransformer3D: Module {
     let timeProj = timeProjection(timeEmb)  // [B, maxSeq, 6*dim]
     let e0 = timeProj.reshaped(b, maxSeq, 6, config.dim)  // [B, maxSeq, 6, dim]
 
+    // Trace embedding pipeline values
+    debugLog("[EMBED] sinEmb[0,0,0:8] = [\((0..<min(8, config.freqDim)).map { sinEmb[0, 0, $0].item(Float.self).description }.joined(separator: ", "))]")
+    debugLog("[EMBED] timeEmb mean=\(timeEmb.mean().item(Float.self)), std=\(MLX.sqrt(timeEmb.variance()).item(Float.self))")
+    debugLog("[EMBED] e0 mean=\(e0.mean().item(Float.self)), std=\(MLX.sqrt(e0.variance()).item(Float.self))")
+    debugLog("[EMBED] h (after patch) mean=\(h.mean().item(Float.self)), std=\(MLX.sqrt(h.variance()).item(Float.self))")
+
     // Text embedding
     var contextPadded: [MLXArray] = []
     for ctx in context {
@@ -181,11 +187,16 @@ public final class WanTransformer3D: Module {
     let contextEmb = textEmbedding(contextStacked)  // [B, textLen, dim]
 
     // Run through blocks
-    for block in blocks {
+    for (blockIdx, block) in blocks.enumerated() {
       h = block(
         h, e: e0, seqLens: seqLens, gridSizes: gridSizesList,
         freqs: freqs, context: contextEmb, contextLens: nil
       )
+      // Trace first and last few blocks to find divergence point
+      if blockIdx < 3 || blockIdx >= blocks.count - 2 {
+        let hf = h.asType(.float32)
+        debugLog("[BLOCK] block \(blockIdx): mean=\(hf.mean().item(Float.self)), std=\(MLX.sqrt(hf.variance()).item(Float.self)), min=\(hf.min().item(Float.self)), max=\(hf.max().item(Float.self))")
+      }
     }
 
     // Head
