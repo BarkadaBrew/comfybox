@@ -64,8 +64,8 @@ public enum CivitAICheckpoint {
         diagnostics: ["has text_encoder or VAE keys — use AIO path"], keyCount: diffusionKeys.count)
     }
 
-    // Must have diffusion model keys (real checkpoints have ~453)
-    guard diffusionKeys.count >= 400 else {
+    // Must have diffusion model keys (Base ~453, Turbo ~201)
+    guard diffusionKeys.count >= 150 else {
       return Inspection(isCivitAI: false, variant: nil,
         diagnostics: ["only \(diffusionKeys.count) diffusion keys (expected >= 400)"], keyCount: diffusionKeys.count)
     }
@@ -87,21 +87,38 @@ public enum CivitAICheckpoint {
 
   /// Detect whether a CivitAI checkpoint is Base or Turbo.
   ///
-  /// Most reliable signal: check if `model.diffusion_model.guidance_in.mlp.0.weight` exists.
-  /// Base Z-Image has a guidance embedding module; Turbo does not.
+  /// Base Z-Image uses `t_embedder` (time embedder) and has `noise_refiner`,
+  /// `context_refiner`, `cap_embedder` modules (~453 keys total).
+  /// Turbo Z-Image uses `time_in` and has a smaller architecture (~201 keys).
+  ///
+  /// The raw CivitAI keys retain the `model.diffusion_model.` prefix.
   static func detectVariant(names: Set<String>) -> ZImageVariant {
-    // Primary signal: guidance embedding layer exists only in Base
-    let guidanceKeys = [
-      "model.diffusion_model.guidance_in.mlp.0.weight",
-      "model.diffusion_model.guidance_in.mlp.2.weight",
-      "model.diffusion_model.g_embedder.mlp.0.weight",
-      "model.diffusion_model.g_embedder.mlp.2.weight",
+    // Primary signal: Base has t_embedder and noise_refiner; Turbo does not
+    let baseSignalKeys = [
+      "model.diffusion_model.t_embedder.mlp.0.weight",
+      "model.diffusion_model.noise_refiner.0.attention.qkv.weight",
+      "model.diffusion_model.context_refiner.0.attention.qkv.weight",
+      "model.diffusion_model.cap_embedder.0.weight",
     ]
-    if guidanceKeys.contains(where: { names.contains($0) }) {
+    if baseSignalKeys.contains(where: { names.contains($0) }) {
       return .base
     }
 
-    // No guidance embedder found — assume Turbo (majority of community checkpoints)
+    // Secondary signal: Turbo has time_in (not t_embedder)
+    let turboSignalKeys = [
+      "model.diffusion_model.time_in.in_layer.weight",
+      "model.diffusion_model.time_in.out_layer.weight",
+    ]
+    if turboSignalKeys.contains(where: { names.contains($0) }) {
+      return .turbo
+    }
+
+    // Tertiary signal: key count — Base has ~453, Turbo has ~201
+    if names.count >= 400 {
+      return .base
+    }
+
+    // Default to Turbo for unrecognized small checkpoints
     return .turbo
   }
 
