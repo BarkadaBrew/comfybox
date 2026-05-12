@@ -1396,6 +1396,15 @@ private actor WarmServerCoordinator {
       // Detect Z-Image variant (Base vs Turbo)
       if let spec = modelSpec, let variant = ZImageVariant.fromModelSpec(spec) {
         zimageVariant = variant
+      } else if let spec = modelSpec, spec.hasSuffix(".safetensors") {
+        // Detect from CivitAI checkpoint inspection
+        let localURL = URL(fileURLWithPath: spec)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+          let inspection = CivitAICheckpoint.inspect(fileURL: localURL)
+          if let variant = inspection.variant {
+            zimageVariant = variant
+          }
+        }
       } else if let resolvedSnapshot = snapshotURL {
         zimageVariant = ZImageVariant.fromSnapshot(at: resolvedSnapshot)
       } else if let spec = modelSpec {

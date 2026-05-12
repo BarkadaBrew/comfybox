@@ -105,7 +105,8 @@ final class SafeTensorsReaderTests: XCTestCase {
       dtype: .float32,
       shape: [10, 20, 30],
       dataOffset: 0,
-      byteCount: 10 * 20 * 30 * 4
+      byteCount: 10 * 20 * 30 * 4,
+      rawDType: "F32"
     )
 
     XCTAssertEqual(metadata.elementCount, 6000) // 10 * 20 * 30
@@ -117,7 +118,8 @@ final class SafeTensorsReaderTests: XCTestCase {
       dtype: .float32,
       shape: [],
       dataOffset: 0,
-      byteCount: 4
+      byteCount: 4,
+      rawDType: "F32"
     )
 
     XCTAssertEqual(metadata.elementCount, 1) // Empty product is 1
@@ -129,7 +131,8 @@ final class SafeTensorsReaderTests: XCTestCase {
       dtype: .float16,
       shape: [256],
       dataOffset: 100,
-      byteCount: 256 * 2
+      byteCount: 256 * 2,
+      rawDType: "F16"
     )
 
     XCTAssertEqual(metadata.name, "vector")

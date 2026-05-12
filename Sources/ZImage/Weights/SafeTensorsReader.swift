@@ -7,6 +7,9 @@ public struct SafeTensorMetadata: Sendable {
   public let shape: [Int]
   public let dataOffset: Int
   public let byteCount: Int
+  /// Original dtype string from the safetensors header (e.g. "BF16", "F8_E4M3FN").
+  /// Useful for detecting FP8 tensors that are mapped to .uint8.
+  public let rawDType: String
 
   public var elementCount: Int {
     shape.reduce(1, *)
@@ -135,7 +138,8 @@ public final class SafeTensorsReader {
         dtype: dtype,
         shape: shape,
         dataOffset: absoluteOffset,
-        byteCount: byteCount
+        byteCount: byteCount,
+        rawDType: dtypeString
       )
     }
 
@@ -286,6 +290,10 @@ public final class SafeTensorsReader {
       return .uint8
     case "BOOL":
       return .bool
+    case "F8_E4M3", "F8_E4M3FN":
+      return .uint8  // Store as uint8; caller decodes via CivitAICheckpoint.decodeFP8()
+    case "F8_E5M2":
+      return .uint8  // Store as uint8; rarely used but handle gracefully
     default:
       throw SafeTensorsReaderError.unsupportedDType(value)
     }

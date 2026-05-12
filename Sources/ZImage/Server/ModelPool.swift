@@ -422,6 +422,20 @@ actor ModelPool {
       return .flux2
     }
 
+    // Check if modelSpec points to a single safetensors file
+    let localURL = URL(fileURLWithPath: modelSpec)
+    if localURL.pathExtension == "safetensors" && FileManager.default.fileExists(atPath: localURL.path) {
+      // Single-file checkpoint — check if CivitAI or AIO
+      let aio = ZImageAIOCheckpoint.inspect(fileURL: localURL)
+      if aio.isAIO { return .flux1 }
+
+      let civitai = CivitAICheckpoint.inspect(fileURL: localURL)
+      if civitai.isCivitAI { return .flux1 }
+
+      // Could also be a single-file transformer override for flux1
+      return .flux1
+    }
+
     // Not detected by name — try resolving and inspecting the snapshot.
     let resolved = try await ModelResolution.resolveOrDefault(
       modelSpec: modelSpec,
