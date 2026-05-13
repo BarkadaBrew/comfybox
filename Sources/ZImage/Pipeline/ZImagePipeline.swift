@@ -362,6 +362,19 @@ public final class ZImagePipeline {
     return v
   }
 
+
+  /// Pre-load the full VAE with encoder so that the first img2img request
+  /// does not need to perform synchronous weight loading mid-render.
+  ///
+  /// Call this during warm server startup (after prepare) to avoid
+  /// a potential deadlock when ensureFullVAE runs inside the actor-
+  /// isolated render path. The deadlock occurs because synchronous weight
+  /// loading inside an async actor method can starve the cooperative
+  /// thread pool, preventing MLX.eval completion handlers from running.
+  public func prepareFullVAE() throws {
+    _ = try ensureFullVAE()
+  }
+
   private func encodePrompt(_ prompt: String, tokenizer: QwenTokenizer, textEncoder: QwenTextEncoder, maxLength: Int) throws -> (MLXArray, MLXArray) {
     do {
       let promptEncodingMode = ZImageFiles.resolvePromptEncodingMode(

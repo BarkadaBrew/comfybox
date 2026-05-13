@@ -1426,6 +1426,17 @@ private actor WarmServerCoordinator {
       )
       pipelinePrepared = true
       logger.info("Warm server pipeline ready (Flux 1 / Z-Image \(zimageVariant.rawValue))")
+
+      // Pre-load the full VAE encoder for img2img support.
+      // Without this, the first img2img request triggers synchronous weight
+      // loading inside the actor-isolated render path, which can deadlock
+      // the cooperative thread pool (issue #141).
+      do {
+        try pipeline.prepareFullVAE()
+        logger.info("Full VAE encoder pre-loaded for img2img")
+      } catch {
+        logger.warning("Failed to pre-load full VAE encoder: \(error). First img2img request will attempt lazy load.")
+      }
     }
 
     // Register the initial model in the pool so it appears in pool listings
@@ -1654,12 +1665,17 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Maximum render age before the health endpoint reports the render as stale.
+  /// After this threshold, the health status changes to "render_stale" to signal
+  /// that the render is likely deadlocked (issue #141).
+  private static let renderStaleThresholdMs = 300_000 // 5 minutes
+
   func health(memoryBytes: UInt64) -> HealthResponse {
     let uptimeSeconds = Int(Date().timeIntervalSince(startTime))
     let activeAgeMs = activeRenderStartedAt.map { Int(Date().timeIntervalSince($0) * 1000.0) }
 
     return HealthResponse(
-      status: shuttingDown ? "shutting_down" : "ok",
+      status: shuttingDown ? "shutting_down" : (activeAgeMs.map { $0 > Self.renderStaleThresholdMs } ?? false ? "render_stale" : "ok"),
       model: configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
       modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
