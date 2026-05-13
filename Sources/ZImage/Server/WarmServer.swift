@@ -2482,6 +2482,7 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
+    case denoise
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
   }
@@ -2504,7 +2505,7 @@ extension GeneratePayload: Decodable {
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
     inpaintImageData = nil
     maskData = nil
-    denoise = nil
+    denoise = try c.decodeIfPresent(Float.self, forKey: .denoise)
     maskGrow = nil
     maskFeather = nil
     maskCropX = nil
@@ -2594,8 +2595,14 @@ extension GeneratePayload: Decodable {
     if let creativity {
       resolvedStrength = 1.0 - max(0.01, min(0.99, creativity))
       specifiedAs = .creativity
+    } else if let imageStrength {
+      resolvedStrength = imageStrength
+      specifiedAs = .strength
+    } else if let denoise {
+      resolvedStrength = 1.0 - max(0.01, min(0.99, denoise))
+      specifiedAs = .denoise
     } else {
-      resolvedStrength = imageStrength ?? 0.3
+      resolvedStrength = 0.3
       specifiedAs = .strength
     }
 

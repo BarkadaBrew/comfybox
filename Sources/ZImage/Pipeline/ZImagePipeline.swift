@@ -354,7 +354,7 @@ public final class ZImagePipeline {
 
     // Load ALL VAE weights (encoder + decoder)
     let weightsMapper = ZImageWeightsMapper(snapshot: snapshot, logger: logger)
-    let allVAEWeights = try weightsMapper.loadVAE()
+    let allVAEWeights = try weightsMapper.loadVAE(dtype: .float32)
     try ZImageWeightsMapping.applyVAE(weights: allVAEWeights, to: v, manifest: quantManifest, logger: logger)
 
     fullVAE = v
@@ -1044,8 +1044,12 @@ public final class ZImagePipeline {
     let randomKey: RandomStateOrKey? = request.seed.map { MLXRandom.key($0) }
     var latents = MLXRandom.normal(shape, loc: 0, scale: 1, key: randomKey)
 
+    let imageSeqLen = PipelineUtilities.zImagePackedImageSeqLen(
+      latentHeight: latentH,
+      latentWidth: latentW
+    )
     let mu = calculateShift(
-      imageSeqLen: latentH * latentW,
+      imageSeqLen: imageSeqLen,
       baseSeqLen: modelConfigs.scheduler.baseImageSeqLen ?? 256,
       maxSeqLen: modelConfigs.scheduler.maxImageSeqLen ?? 4096,
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
@@ -1224,7 +1228,25 @@ public final class ZImagePipeline {
     logger.info("Denoising complete, decoding with VAE...")
     progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
 
-    var decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    let decodeVAE: VAEImageDecoding
+    let decodeDType: DType
+    if originalLatents == nil {
+      decodeVAE = vae
+      decodeDType = .bfloat16
+    } else if let fullVAE {
+      decodeVAE = fullVAE
+      decodeDType = .float32
+    } else {
+      decodeVAE = vae
+      decodeDType = .bfloat16
+    }
+    var decoded = decodeLatents(
+      latents,
+      vae: decodeVAE,
+      height: request.height,
+      width: request.width,
+      dtype: decodeDType
+    )
     if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
       decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
       MLX.eval(decoded)
@@ -1235,8 +1257,14 @@ public final class ZImagePipeline {
     return decoded
   }
 
-  private func decodeLatents(_ latents: MLXArray, vae: VAEImageDecoding, height: Int, width: Int) -> MLXArray {
-    PipelineUtilities.decodeLatents(latents, vae: vae, height: height, width: width)
+  private func decodeLatents(
+    _ latents: MLXArray,
+    vae: VAEImageDecoding,
+    height: Int,
+    width: Int,
+    dtype: DType = .bfloat16
+  ) -> MLXArray {
+    PipelineUtilities.decodeLatents(latents, vae: vae, height: height, width: width, dtype: dtype)
   }
 
   private func calculateShift(

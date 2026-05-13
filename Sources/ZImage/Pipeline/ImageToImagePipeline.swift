@@ -55,6 +55,7 @@ public struct Img2ImgRequest: Sendable {
   public enum Img2ImgSpecifier: String, Sendable {
     case strength
     case creativity
+    case denoise
   }
 
   public init(
