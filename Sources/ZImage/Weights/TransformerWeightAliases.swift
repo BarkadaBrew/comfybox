@@ -25,6 +25,26 @@ enum ZImageTransformerWeightAliases {
       to: "t_embedder.mlp.2.bias",
       in: &normalized
     )
+    addAlias(
+      from: "time_in.in_layer.weight",
+      to: "t_embedder.mlp.0.weight",
+      in: &normalized
+    )
+    addAlias(
+      from: "time_in.in_layer.bias",
+      to: "t_embedder.mlp.0.bias",
+      in: &normalized
+    )
+    addAlias(
+      from: "time_in.out_layer.weight",
+      to: "t_embedder.mlp.2.weight",
+      in: &normalized
+    )
+    addAlias(
+      from: "time_in.out_layer.bias",
+      to: "t_embedder.mlp.2.bias",
+      in: &normalized
+    )
 
     addFinalLayerAdaLNAliases(in: &normalized)
 
