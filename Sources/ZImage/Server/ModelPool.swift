@@ -431,6 +431,10 @@ actor ModelPool {
 
       let civitai = CivitAICheckpoint.inspect(fileURL: localURL)
       if civitai.isCivitAI { return .flux1 }
+      if let variant = civitai.variant {
+        logger.info("ModelPool: checkpoint inspection detected Z-Image variant=\(variant.rawValue) for \(localURL.lastPathComponent)")
+        return .flux1
+      }
 
       // Could also be a single-file transformer override for flux1
       return .flux1
@@ -521,7 +525,7 @@ actor ModelPool {
     case .flux1:
       let pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
       // Detect variant (base vs turbo).
-      // Priority: filename heuristic > CivitAI checkpoint inspection > snapshot heuristic.
+      // Priority: filename heuristic > checkpoint key inspection > snapshot heuristic.
       let variant: ZImageVariant
       if let v = ZImageVariant.fromModelSpec(modelSpec) {
         variant = v
@@ -530,9 +534,9 @@ actor ModelPool {
         // For local .safetensors files, use CivitAI inspection which reads
         // actual key signatures instead of the less reliable snapshot heuristic.
         let inspection = CivitAICheckpoint.inspect(fileURL: fileURL)
-        if inspection.isCivitAI, let v = inspection.variant {
+        if let v = inspection.variant {
           variant = v
-          logger.info("ModelPool: CivitAI inspection detected variant=\(v.rawValue) for \(fileURL.lastPathComponent)")
+          logger.info("ModelPool: checkpoint inspection detected variant=\(v.rawValue) for \(fileURL.lastPathComponent)")
         } else {
           variant = ZImageVariant.fromSnapshot(at: resolved)
         }
