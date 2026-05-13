@@ -44,6 +44,31 @@ final class AIOCheckpointTests: XCTestCase {
     XCTAssertTrue(inspection.diagnostics.contains(where: { $0.contains("text encoder") }))
   }
 
+  func testLoadComponentsCanKeepVAEInFloat32() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+    let fileURL = tempDir.appendingPathComponent("aio_dtype_\(UUID().uuidString).safetensors")
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    let arrays: [String: MLXArray] = [
+      "model.diffusion_model.cap_embedder.0.weight": MLXArray([Float(0.0)], [1]).asType(.bfloat16),
+      "text_encoders.qwen3_4b.transformer.model.embed_tokens.weight": MLXArray([Float(0.0)], [1, 1]).asType(.bfloat16),
+      "vae.decoder.conv_in.weight": MLXArray([Float(0.0)], [1, 1, 1, 1]).asType(.bfloat16),
+    ]
+    try MLX.save(arrays: arrays, metadata: [:], url: fileURL)
+
+    let components = try ZImageAIOCheckpoint.loadComponents(
+      from: fileURL,
+      textEncoderPrefix: "text_encoders.qwen3_4b.transformer.",
+      dtype: .bfloat16,
+      vaeDType: .float32,
+      logger: nil
+    )
+
+    XCTAssertEqual(components.transformer["model.diffusion_model.cap_embedder.0.weight"]?.dtype, .bfloat16)
+    XCTAssertEqual(components.textEncoder["model.embed_tokens.weight"]?.dtype, .bfloat16)
+    XCTAssertEqual(components.vae["decoder.conv_in.weight"]?.dtype, .float32)
+  }
+
   func testResolveModelSelectionUsesAIOByDefaultUnlessForced() throws {
     let tempDir = FileManager.default.temporaryDirectory
     let fileURL = tempDir.appendingPathComponent("aio_select_\(UUID().uuidString).safetensors")

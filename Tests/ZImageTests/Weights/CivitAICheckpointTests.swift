@@ -261,6 +261,58 @@ final class CivitAICheckpointTests: XCTestCase {
     XCTAssertEqual(values[1], 2.0, accuracy: 0.001)
   }
 
+  func testLoadTransformerWeightsDecodesFP8E4M3FNBitPatterns() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "model.diffusion_model.time_in.in_layer.weight": [
+          "dtype": "F8_E4M3FN",
+          "shape": [6],
+          "data_offsets": [0, 6]
+        ]
+      ],
+      payload: Data([0x00, 0x01, 0x38, 0x40, 0x7E, 0xC0])
+    )
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    let weights = try CivitAICheckpoint.loadTransformerWeights(from: fileURL, dtype: .float32)
+    let tensor = try XCTUnwrap(weights["model.diffusion_model.time_in.in_layer.weight"])
+    MLX.eval(tensor)
+
+    let values = tensor.asArray(Float.self)
+    XCTAssertEqual(values[0], 0.0, accuracy: 0.000001)
+    XCTAssertEqual(values[1], 1.0 / 512.0, accuracy: 0.000001)
+    XCTAssertEqual(values[2], 1.0, accuracy: 0.000001)
+    XCTAssertEqual(values[3], 2.0, accuracy: 0.000001)
+    XCTAssertEqual(values[4], 448.0, accuracy: 0.000001)
+    XCTAssertEqual(values[5], -2.0, accuracy: 0.000001)
+  }
+
+  func testLoadTransformerWeightsDecodesFP8E5M2BitPatterns() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "model.diffusion_model.time_in.in_layer.weight": [
+          "dtype": "F8_E5M2",
+          "shape": [6],
+          "data_offsets": [0, 6]
+        ]
+      ],
+      payload: Data([0x00, 0x01, 0x3C, 0x40, 0x7B, 0xC0])
+    )
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    let weights = try CivitAICheckpoint.loadTransformerWeights(from: fileURL, dtype: .float32)
+    let tensor = try XCTUnwrap(weights["model.diffusion_model.time_in.in_layer.weight"])
+    MLX.eval(tensor)
+
+    let values = tensor.asArray(Float.self)
+    XCTAssertEqual(values[0], 0.0, accuracy: 0.000001)
+    XCTAssertEqual(values[1], 1.0 / 65536.0, accuracy: 0.000001)
+    XCTAssertEqual(values[2], 1.0, accuracy: 0.000001)
+    XCTAssertEqual(values[3], 2.0, accuracy: 0.000001)
+    XCTAssertEqual(values[4], 57344.0, accuracy: 0.000001)
+    XCTAssertEqual(values[5], -2.0, accuracy: 0.000001)
+  }
+
   // MARK: - ModelPaths Variant Heuristic Tests
 
   func testFromModelSpecDetectsDPOAsTurbo() {
