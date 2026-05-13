@@ -57,7 +57,7 @@ final class CivitAICheckpointTests: XCTestCase {
 
     let inspection = CivitAICheckpoint.inspect(fileURL: fileURL)
     XCTAssertTrue(inspection.isCivitAI, "Should detect as CivitAI: \(inspection.diagnostics)")
-    XCTAssertEqual(inspection.variant, .turbo, "No guidance embedder should mean Turbo")
+    XCTAssertEqual(inspection.variant, .base, "Fixture has Base signal keys (t_embedder, noise_refiner, etc.)")
     XCTAssertTrue(inspection.diagnostics.isEmpty)
     XCTAssertGreaterThanOrEqual(inspection.keyCount, 400)
   }
@@ -186,6 +186,7 @@ final class CivitAICheckpointTests: XCTestCase {
     let w2d = MLXArray([Float(0.0), Float(0.0)], [1, 2]).asType(.bfloat16)
     var arrays: [String: MLXArray] = [:]
 
+    // Turbo architecture: uses time_in instead of t_embedder, no noise/context refiners
     for i in 0..<30 {
       arrays["model.diffusion_model.layers.\(i).attention.qkv.weight"] = MLXArray(Array(repeating: Float(0.0), count: 6 * 2), [6, 2]).asType(.bfloat16)
       arrays["model.diffusion_model.layers.\(i).attention.out.weight"] = w2d
@@ -201,23 +202,18 @@ final class CivitAICheckpointTests: XCTestCase {
       arrays["model.diffusion_model.layers.\(i).adaLN_modulation.1.weight"] = w2d
       arrays["model.diffusion_model.layers.\(i).adaLN_modulation.1.bias"] = w1d
     }
-    for prefix in ["noise_refiner", "context_refiner"] {
-      for i in 0..<2 {
-        arrays["model.diffusion_model.\(prefix).\(i).attention.qkv.weight"] = MLXArray(Array(repeating: Float(0.0), count: 6 * 2), [6, 2]).asType(.bfloat16)
-        arrays["model.diffusion_model.\(prefix).\(i).attention.out.weight"] = w2d
-      }
-    }
-    arrays["model.diffusion_model.t_embedder.mlp.0.weight"] = w2d
-    arrays["model.diffusion_model.cap_embedder.0.weight"] = w1d
+    // Turbo signal keys: time_in instead of t_embedder
+    arrays["model.diffusion_model.time_in.in_layer.weight"] = w2d
+    arrays["model.diffusion_model.time_in.out_layer.weight"] = w2d
     arrays["model.diffusion_model.x_embedder.weight"] = w2d
     arrays["model.diffusion_model.final_layer.adaLN_modulation.1.weight"] = w2d
-    // NO guidance_in keys
+    // NO guidance_in, NO t_embedder, NO noise_refiner, NO context_refiner
 
     try MLX.save(arrays: arrays, metadata: [:], url: fileURL)
 
     let inspection = CivitAICheckpoint.inspect(fileURL: fileURL)
     XCTAssertTrue(inspection.isCivitAI)
-    XCTAssertEqual(inspection.variant, .turbo, "No guidance embedder should mean Turbo variant")
+    XCTAssertEqual(inspection.variant, .turbo, "Turbo signal keys (time_in) and no Base signal keys should mean Turbo variant")
   }
 
   // MARK: - SafeTensorsReader FP8 Dtype Tests
