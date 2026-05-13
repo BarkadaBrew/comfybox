@@ -483,6 +483,30 @@ final class SafeTensorsReaderTests: XCTestCase {
     XCTAssertEqual(data.count, 16)
   }
 
+  func testFP8DTypesThrowUnsupportedDType() throws {
+    for dtype in ["F8_E4M3", "F8_E4M3FN", "F8_E5M2"] {
+      let fileURL = try writeSyntheticSafeTensors(
+        header: [
+          "weight": [
+            "dtype": dtype,
+            "shape": [1],
+            "data_offsets": [0, 1]
+          ]
+        ],
+        payload: Data([0x38])
+      )
+      defer { try? FileManager.default.removeItem(at: fileURL) }
+
+      XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+        if case SafeTensorsReaderError.unsupportedDType(let unsupported) = error {
+          XCTAssertEqual(unsupported, dtype)
+        } else {
+          XCTFail("Expected unsupportedDType for \(dtype), got \(error)")
+        }
+      }
+    }
+  }
+
   private func writeSyntheticSafeTensors(header: [String: Any], payload: Data = Data()) throws -> URL {
     let tempDir = FileManager.default.temporaryDirectory
     let fileURL = tempDir.appendingPathComponent("synthetic_\(UUID().uuidString).safetensors")

@@ -8,7 +8,7 @@ public struct SafeTensorMetadata: Sendable {
   public let dataOffset: Int
   public let byteCount: Int
   /// Original dtype string from the safetensors header (e.g. "BF16", "F8_E4M3FN").
-  /// Useful for detecting FP8 tensors that are mapped to .uint8.
+  /// Useful for diagnostics and loaders that need format-specific handling.
   public let rawDType: String
 
   public var elementCount: Int {
@@ -35,7 +35,11 @@ public final class SafeTensorsReader {
   private let tensors: [String: SafeTensorMetadata]
   public let fileMetadata: [String: String]
 
-  public init(fileURL: URL) throws {
+  public convenience init(fileURL: URL) throws {
+    try self.init(fileURL: fileURL, dtypeMapper: Self.mapDType)
+  }
+
+  init(fileURL: URL, dtypeMapper: (String) throws -> DType) throws {
     self.fileURL = fileURL
     self.mappedData = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
 
@@ -94,7 +98,7 @@ public final class SafeTensorsReader {
         throw SafeTensorsReaderError.tensorMetadataMissing(key)
       }
 
-      let dtype = try SafeTensorsReader.mapDType(dtypeString)
+      let dtype = try dtypeMapper(dtypeString)
 
       guard let shapeAny = tensorInfo["shape"] as? [Any] else {
         throw SafeTensorsReaderError.tensorMetadataMissing(key)
@@ -261,7 +265,7 @@ public final class SafeTensorsReader {
     return byteCount.partialValue
   }
 
-  private static func mapDType(_ value: String) throws -> DType {
+  static func mapDType(_ value: String) throws -> DType {
     let key = value.uppercased()
     switch key {
     case "F32":
@@ -290,10 +294,8 @@ public final class SafeTensorsReader {
       return .uint8
     case "BOOL":
       return .bool
-    case "F8_E4M3", "F8_E4M3FN":
-      return .uint8  // Store as uint8; caller decodes via CivitAICheckpoint.decodeFP8()
-    case "F8_E5M2":
-      return .uint8  // Store as uint8; rarely used but handle gracefully
+    case "F8_E4M3", "F8_E4M3FN", "F8_E5M2":
+      throw SafeTensorsReaderError.unsupportedDType(value)
     default:
       throw SafeTensorsReaderError.unsupportedDType(value)
     }

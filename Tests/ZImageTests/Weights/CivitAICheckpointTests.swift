@@ -108,6 +108,25 @@ final class CivitAICheckpointTests: XCTestCase {
     XCTAssertFalse(inspection.isCivitAI, "Should reject internal format (no prefix)")
   }
 
+  func testInspectReportsVariantForNonCivitAITurboTransformerFile() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+    let fileURL = tempDir.appendingPathComponent("internal_turbo_\(UUID().uuidString).safetensors")
+    defer { try? FileManager.default.removeItem(at: fileURL) }
+
+    let w = MLXArray([Float(0.0)]).asType(.bfloat16)
+    let arrays: [String: MLXArray] = [
+      "time_in.in_layer.weight": w,
+      "time_in.out_layer.weight": w,
+      "layers.0.attention.to_q.weight": w,
+    ]
+
+    try MLX.save(arrays: arrays, metadata: [:], url: fileURL)
+
+    let inspection = CivitAICheckpoint.inspect(fileURL: fileURL)
+    XCTAssertFalse(inspection.isCivitAI)
+    XCTAssertEqual(inspection.variant, .turbo)
+  }
+
   func testInspectRejectsTooFewKeys() throws {
     let tempDir = FileManager.default.temporaryDirectory
     let fileURL = tempDir.appendingPathComponent("fewkeys_\(UUID().uuidString).safetensors")
@@ -125,7 +144,7 @@ final class CivitAICheckpointTests: XCTestCase {
 
     let inspection = CivitAICheckpoint.inspect(fileURL: fileURL)
     XCTAssertFalse(inspection.isCivitAI, "Should reject too few keys")
-    XCTAssertTrue(inspection.diagnostics.contains(where: { $0.contains("diffusion keys") }))
+    XCTAssertTrue(inspection.diagnostics.contains(where: { $0.contains("expected >= 150") }))
   }
 
   // MARK: - Variant Detection Tests
@@ -216,25 +235,30 @@ final class CivitAICheckpointTests: XCTestCase {
     XCTAssertEqual(inspection.variant, .turbo, "Turbo signal keys (time_in) and no Base signal keys should mean Turbo variant")
   }
 
-  // MARK: - SafeTensorsReader FP8 Dtype Tests
+  // MARK: - CivitAI FP8 Dtype Tests
 
-  func testMapDTypeF8E4M3ReturnsUInt8() throws {
-    // Verify FP8 dtype strings are handled (don't throw unsupportedDType)
-    // We test by creating a safetensors file with BF16 and checking rawDType
-    let tempDir = FileManager.default.temporaryDirectory
-    let fileURL = tempDir.appendingPathComponent("dtype_\(UUID().uuidString).safetensors")
+  func testLoadTransformerWeightsDecodesFP8InsideCivitAICheckpoint() throws {
+    let fileURL = try writeSyntheticSafeTensors(
+      header: [
+        "model.diffusion_model.time_in.in_layer.weight": [
+          "dtype": "F8_E4M3FN",
+          "shape": [2],
+          "data_offsets": [0, 2]
+        ]
+      ],
+      payload: Data([0x38, 0x40])
+    )
     defer { try? FileManager.default.removeItem(at: fileURL) }
 
-    let arrays: [String: MLXArray] = [
-      "test.weight": MLXArray([Float(1.0)]).asType(.bfloat16)
-    ]
-    try MLX.save(arrays: arrays, metadata: [:], url: fileURL)
+    let weights = try CivitAICheckpoint.loadTransformerWeights(from: fileURL, dtype: .float32)
+    let tensor = try XCTUnwrap(weights["model.diffusion_model.time_in.in_layer.weight"])
+    MLX.eval(tensor)
 
-    let reader = try SafeTensorsReader(fileURL: fileURL)
-    let meta = reader.metadata(for: "test.weight")
-    XCTAssertNotNil(meta)
-    XCTAssertEqual(meta?.rawDType, "BF16")
-    XCTAssertEqual(meta?.dtype, .bfloat16)
+    XCTAssertEqual(tensor.dtype, .float32)
+    XCTAssertEqual(tensor.shape, [2])
+    let values = tensor.asArray(Float.self)
+    XCTAssertEqual(values[0], 1.0, accuracy: 0.001)
+    XCTAssertEqual(values[1], 2.0, accuracy: 0.001)
   }
 
   // MARK: - ModelPaths Variant Heuristic Tests
@@ -257,5 +281,19 @@ final class CivitAICheckpointTests: XCTestCase {
   func testFromModelSpecStillDetectsHuggingFaceModels() {
     XCTAssertEqual(ZImageVariant.fromModelSpec("Tongyi-MAI/Z-Image"), .base)
     XCTAssertEqual(ZImageVariant.fromModelSpec("Tongyi-MAI/Z-Image-Turbo"), .turbo)
+  }
+
+  private func writeSyntheticSafeTensors(header: [String: Any], payload: Data = Data()) throws -> URL {
+    let tempDir = FileManager.default.temporaryDirectory
+    let fileURL = tempDir.appendingPathComponent("synthetic_\(UUID().uuidString).safetensors")
+    let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+
+    var data = Data()
+    var headerLength = UInt64(headerData.count).littleEndian
+    withUnsafeBytes(of: &headerLength) { data.append(contentsOf: $0) }
+    data.append(headerData)
+    data.append(payload)
+    try data.write(to: fileURL)
+    return fileURL
   }
 }

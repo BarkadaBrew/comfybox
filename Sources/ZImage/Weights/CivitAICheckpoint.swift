@@ -42,7 +42,7 @@ public enum CivitAICheckpoint {
   /// - Transformer-only overrides (no prefix, already in internal format)
   public static func inspect(fileURL: URL) -> Inspection {
     do {
-      let reader = try SafeTensorsReader(fileURL: fileURL)
+      let reader = try SafeTensorsReader(fileURL: fileURL, dtypeMapper: mapCivitAIDType)
       return inspect(reader: reader)
     } catch {
       return Inspection(isCivitAI: false, variant: nil, diagnostics: ["failed to read: \(error)"], keyCount: 0)
@@ -57,6 +57,7 @@ public enum CivitAICheckpoint {
     let diffusionKeys = names.filter { $0.hasPrefix("model.diffusion_model.") }
     let hasTextEncoder = names.contains { $0.hasPrefix("text_encoders.") }
     let hasVAE = names.contains { $0.hasPrefix("vae.") }
+    let variantSignal = detectVariantSignal(names: nameSet)
 
     // If it has text encoder or VAE, it is an AIO checkpoint, not CivitAI-transformer-only
     if hasTextEncoder || hasVAE {
@@ -66,14 +67,14 @@ public enum CivitAICheckpoint {
 
     // Must have diffusion model keys (Base ~453, Turbo ~201)
     guard diffusionKeys.count >= 150 else {
-      return Inspection(isCivitAI: false, variant: nil,
-        diagnostics: ["only \(diffusionKeys.count) diffusion keys (expected >= 400)"], keyCount: diffusionKeys.count)
+      return Inspection(isCivitAI: false, variant: variantSignal,
+        diagnostics: ["only \(diffusionKeys.count) diffusion keys (expected >= 150)"], keyCount: diffusionKeys.count)
     }
 
     // Must have fused QKV (the signature of CivitAI format vs already-canonicalized)
     let hasFusedQKV = nameSet.contains("model.diffusion_model.layers.0.attention.qkv.weight")
     guard hasFusedQKV else {
-      return Inspection(isCivitAI: false, variant: nil,
+      return Inspection(isCivitAI: false, variant: variantSignal,
         diagnostics: ["no fused QKV keys found"], keyCount: diffusionKeys.count)
     }
 
@@ -94,22 +95,12 @@ public enum CivitAICheckpoint {
   /// The raw CivitAI keys retain the `model.diffusion_model.` prefix.
   static func detectVariant(names: Set<String>) -> ZImageVariant {
     // Primary signal: Base has t_embedder and noise_refiner; Turbo does not
-    let baseSignalKeys = [
-      "model.diffusion_model.t_embedder.mlp.0.weight",
-      "model.diffusion_model.noise_refiner.0.attention.qkv.weight",
-      "model.diffusion_model.context_refiner.0.attention.qkv.weight",
-      "model.diffusion_model.cap_embedder.0.weight",
-    ]
-    if baseSignalKeys.contains(where: { names.contains($0) }) {
+    if hasBaseVariantSignal(names: names) {
       return .base
     }
 
     // Secondary signal: Turbo has time_in (not t_embedder)
-    let turboSignalKeys = [
-      "model.diffusion_model.time_in.in_layer.weight",
-      "model.diffusion_model.time_in.out_layer.weight",
-    ]
-    if turboSignalKeys.contains(where: { names.contains($0) }) {
+    if hasTurboVariantSignal(names: names) {
       return .turbo
     }
 
@@ -120,6 +111,48 @@ public enum CivitAICheckpoint {
 
     // Default to Turbo for unrecognized small checkpoints
     return .turbo
+  }
+
+  private static func detectVariantSignal(names: Set<String>) -> ZImageVariant? {
+    if hasBaseVariantSignal(names: names) {
+      return .base
+    }
+    if hasTurboVariantSignal(names: names) {
+      return .turbo
+    }
+    return nil
+  }
+
+  private static func hasBaseVariantSignal(names: Set<String>) -> Bool {
+    containsAnyVariantKey(
+      [
+        "t_embedder.mlp.0.weight",
+        "noise_refiner.0.attention.qkv.weight",
+        "context_refiner.0.attention.qkv.weight",
+        "cap_embedder.0.weight",
+      ],
+      in: names
+    )
+  }
+
+  private static func hasTurboVariantSignal(names: Set<String>) -> Bool {
+    containsAnyVariantKey(
+      [
+        "time_in.in_layer.weight",
+        "time_in.out_layer.weight",
+      ],
+      in: names
+    )
+  }
+
+  private static func containsAnyVariantKey(_ suffixes: [String], in names: Set<String>) -> Bool {
+    let prefixes = ["", "model.diffusion_model.", "diffusion_model.", "model."]
+    for suffix in suffixes {
+      for prefix in prefixes where names.contains("\(prefix)\(suffix)") {
+        return true
+      }
+    }
+    return false
   }
 
   // MARK: - Loading
@@ -138,7 +171,7 @@ public enum CivitAICheckpoint {
     dtype: DType = .bfloat16,
     logger: Logger? = nil
   ) throws -> [String: MLXArray] {
-    let reader = try SafeTensorsReader(fileURL: fileURL)
+    let reader = try SafeTensorsReader(fileURL: fileURL, dtypeMapper: mapCivitAIDType)
     var weights: [String: MLXArray] = [:]
     weights.reserveCapacity(reader.tensorNames.count)
 
@@ -150,7 +183,7 @@ public enum CivitAICheckpoint {
 
       var tensor = try reader.tensor(named: meta.name)
 
-      // Handle FP8 (float8_e4m3fn / float8_e5m2) — SafeTensorsReader maps to .uint8
+      // Handle FP8 (float8_e4m3fn / float8_e5m2) from CivitAI checkpoints.
       if let format = fp8Format(meta) {
         tensor = decodeFP8(tensor, format: format)
         fp8Count += 1
@@ -179,8 +212,8 @@ public enum CivitAICheckpoint {
   /// Check if a tensor metadata entry represents FP8 data, and which format.
   ///
   /// CivitAI FP8 checkpoints use dtype "F8_E4M3" or "F8_E4M3FN" or "F8_E5M2"
-  /// in the safetensors header. SafeTensorsReader maps these to .uint8 and
-  /// preserves the original dtype string in rawDType.
+  /// in the safetensors header. This loader reads them as raw uint8 bytes and
+  /// preserves the original dtype string in rawDType for explicit decoding here.
   private static func fp8Format(_ meta: SafeTensorMetadata) -> FP8Format? {
     let raw = meta.rawDType.uppercased()
     switch raw {
@@ -192,6 +225,16 @@ public enum CivitAICheckpoint {
 
   private static func isFP8Tensor(_ meta: SafeTensorMetadata) -> Bool {
     return fp8Format(meta) != nil
+  }
+
+  private static func mapCivitAIDType(_ value: String) throws -> DType {
+    let raw = value.uppercased()
+    switch raw {
+    case "F8_E4M3", "F8_E4M3FN", "F8_E5M2":
+      return .uint8
+    default:
+      return try SafeTensorsReader.mapDType(value)
+    }
   }
 
   /// Decode FP8 E4M3FN tensor to float32.
