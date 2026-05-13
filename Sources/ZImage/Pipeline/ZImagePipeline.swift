@@ -559,11 +559,14 @@ public final class ZImagePipeline {
     }
     let normalizedAIOPath = aioCheckpointURL?.standardizedFileURL.path
     let currentAIOPath = activeAIOCheckpointURL?.standardizedFileURL.path
+    let normalizedCivitAIPath = civitaiCheckpointURL?.standardizedFileURL.path
+    let currentCivitAIPath = activeCivitAICheckpointURL?.standardizedFileURL.path
     let hasLoadedComponents = tokenizer != nil && textEncoder != nil && transformer != nil && vae != nil && modelConfigs != nil && modelSnapshot != nil
 
     if isModelLoaded,
       loadedModelId == modelId,
       normalizedAIOPath == currentAIOPath,
+      normalizedCivitAIPath == currentCivitAIPath,
       hasLoadedComponents,
       let cachedSnapshot = modelSnapshot
     {
@@ -579,7 +582,11 @@ public final class ZImagePipeline {
 
     progressHandler?(GenerationProgress(stage: .loadingModel, stepIndex: 0, totalSteps: 1))
     let snapshotFilePatterns: [String]? = aioCheckpointURL == nil ? nil : PipelineSnapshot.configAndTokenizerFilePatterns
-    let snapshot = try await PipelineSnapshot.prepare(model: modelSpec, filePatterns: snapshotFilePatterns, logger: logger)
+    // Use modelId (which accounts for CivitAI variant) instead of raw
+    // modelSpec so that Base CivitAI checkpoints resolve the Base snapshot
+    // (with nRefinerLayers > 0) rather than falling through to Turbo.
+    let snapshotModelId = modelSpec ?? (modelId != ZImageRepository.id ? modelId : nil)
+    let snapshot = try await PipelineSnapshot.prepare(model: snapshotModelId, filePatterns: snapshotFilePatterns, logger: logger)
     let textEncoderSelection = PipelineUtilities.resolveTextEncoderSelection(
       for: snapshot,
       overridePath: textEncoderPath,
@@ -590,6 +597,7 @@ public final class ZImagePipeline {
     if isModelLoaded
       && loadedModelId == modelId
       && normalizedAIOPath == currentAIOPath
+      && normalizedCivitAIPath == currentCivitAIPath
       && loadedTextEncoderPath == selectedTextEncoderPath
       && hasLoadedComponents
     {
@@ -601,7 +609,7 @@ public final class ZImagePipeline {
       && currentAIOPath == nil
       && normalizedAIOPath == nil
       && areZImageVariants(loadedModelId ?? "", modelId)
-    if isModelLoaded && (loadedModelId != modelId || normalizedAIOPath != currentAIOPath) {
+    if isModelLoaded && (loadedModelId != modelId || normalizedAIOPath != currentAIOPath || normalizedCivitAIPath != currentCivitAIPath) {
       if canPreserveSharedComponents {
         logger.info("Switching Z-Image variant, preserving VAE and tokenizer")
 
@@ -944,6 +952,8 @@ public final class ZImagePipeline {
       textEncoderPath: request.textEncoderPath,
       aioCheckpointURL: selection.aioCheckpointURL,
       aioTextEncoderPrefix: selection.aioTextEncoderPrefix,
+      civitaiCheckpointURL: selection.civitaiCheckpointURL,
+      civitaiVariant: selection.civitaiVariant,
       progressHandler: progressHandler
     )
 
