@@ -581,7 +581,14 @@ public final class ZImagePipeline {
     }
 
     progressHandler?(GenerationProgress(stage: .loadingModel, stepIndex: 0, totalSteps: 1))
-    let snapshotFilePatterns: [String]? = aioCheckpointURL == nil ? nil : PipelineSnapshot.configAndTokenizerFilePatterns
+    let snapshotFilePatterns: [String]?
+    if aioCheckpointURL != nil {
+      snapshotFilePatterns = PipelineSnapshot.configAndTokenizerFilePatterns
+    } else if civitaiCheckpointURL != nil {
+      snapshotFilePatterns = PipelineSnapshot.configTokenizerTextEncoderAndVAEFilePatterns
+    } else {
+      snapshotFilePatterns = nil
+    }
     // Use modelId (which accounts for CivitAI variant) instead of raw
     // modelSpec so that Base CivitAI checkpoints resolve the Base snapshot
     // (with nRefinerLayers > 0) rather than falling through to Turbo.
