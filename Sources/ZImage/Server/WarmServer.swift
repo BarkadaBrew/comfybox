@@ -1255,6 +1255,11 @@ private actor WarmServerCoordinator {
   private var lastError: String?
   private var activeRenderStartedAt: Date?
   private var pipelinePrepared = false
+  /// When a pool model is activated, this holds its modelSpec so that
+  /// generation requests use the pool model instead of the startup
+  /// configuration.modelSpec. Reset to nil when the startup model is
+  /// re-activated or the pool model is unloaded.
+  private var activePoolModelSpec: String?
 
   /// Model hot-swap pool — holds loaded pipelines with LRU eviction.
   let modelPool: ModelPool
@@ -1548,6 +1553,9 @@ private actor WarmServerCoordinator {
 
     // Sync coordinator state from pool entry.
     currentModelFamily = entry.family
+    // Track the activated pool model's spec so generation requests use
+    // the correct model instead of the startup configuration.modelSpec.
+    activePoolModelSpec = entry.modelSpec
     switch entry.family {
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
@@ -1563,6 +1571,13 @@ private actor WarmServerCoordinator {
       // operate on the pool-loaded pipeline, not the original one (#138).
       if let poolZImage = entry.box.pipeline as? ZImagePipeline {
         pipeline = poolZImage
+        // Pre-load full VAE for the pool-activated pipeline to avoid
+        // deadlock on first img2img request (same issue as #141).
+        do {
+          try poolZImage.prepareFullVAE()
+        } catch {
+          logger.warning("Failed to pre-load full VAE for pool model '\(entry.modelSpec)': \(error)")
+        }
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }
@@ -1780,17 +1795,28 @@ private actor WarmServerCoordinator {
     activeRenderStartedAt = Date()
     let start = Date()
 
+    // When a pool model is active, override configuration.modelSpec so
+    // that generateCore loads/validates the pool model, not the startup model.
+    let effectiveConfig: WarmServerConfiguration
+    if let poolSpec = activePoolModelSpec, poolSpec != configuration.modelSpec {
+      var cfg = configuration
+      cfg.modelSpec = poolSpec
+      effectiveConfig = cfg
+    } else {
+      effectiveConfig = configuration
+    }
+
     do {
       let outputURL: URL
       if payload.imagePath != nil {
         let img2imgRequest = try payload.makeImg2ImgRequest(
-          configuration: configuration,
+          configuration: effectiveConfig,
           activeLoRAs: activeLoRAs
         )
         outputURL = try await pipeline.generateImg2Img(img2imgRequest, progressHandler: progressHandler)
       } else {
         let request = try payload.makePipelineRequest(
-          configuration: configuration,
+          configuration: effectiveConfig,
           activeLoRAs: activeLoRAs
         )
         outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
