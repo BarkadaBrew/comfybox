@@ -772,7 +772,7 @@ public class ZImageControlPipeline {
       self.tokenizer = try loadTokenizer(snapshot: resolvedSnapshot)
       logger.info("Loading VAE...")
       let vae = try loadVAE(snapshot: resolvedSnapshot, config: modelConfigs.vae)
-      let vaeWeights = try weightsMapper.loadVAE()
+      let vaeWeights = try weightsMapper.loadVAE(dtype: .float32)
       try ZImageWeightsMapping.applyVAE(weights: vaeWeights, to: vae, manifest: quantManifest, logger: logger)
       self.vae = vae
       logger.info("Loading control transformer...")

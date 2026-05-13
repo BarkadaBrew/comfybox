@@ -94,7 +94,7 @@ public enum PipelineUtilities {
         vae: VAEImageDecoding,
         height: Int,
         width: Int,
-        dtype: DType = .bfloat16
+        dtype: DType = .float32
     ) -> MLXArray {
         let input: MLXArray
         if latents.dtype == dtype {

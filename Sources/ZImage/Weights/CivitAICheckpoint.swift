@@ -161,7 +161,7 @@ public enum CivitAICheckpoint {
   ///
   /// Steps:
   /// 1. Read all tensors with `model.diffusion_model.` prefix
-  /// 2. Handle FP8/FP16/FP32 -> BF16 conversion
+  /// 2. Handle FP8/FP16/FP32 -> target dtype conversion
   /// 3. Return raw dict (caller applies canonicalizeTransformerOverride)
   ///
   /// The returned keys still have the `model.diffusion_model.` prefix.
@@ -185,6 +185,9 @@ public enum CivitAICheckpoint {
 
       // Handle FP8 (float8_e4m3fn / float8_e5m2) from CivitAI checkpoints.
       if let format = fp8Format(meta) {
+        // Decode through float32 to apply the FP8 exponent/mantissa rules.
+        // Casting that result to BF16 is exact for FP8 source values because
+        // BF16 has more mantissa bits than either supported FP8 format.
         tensor = decodeFP8(tensor, format: format)
         fp8Count += 1
       }

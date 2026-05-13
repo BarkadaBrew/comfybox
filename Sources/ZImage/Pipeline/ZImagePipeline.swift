@@ -654,7 +654,13 @@ public final class ZImagePipeline {
       }
 
       logger.info("Loading AIO checkpoint weights from \(aioCheckpointURL.lastPathComponent)")
-      let aio = try ZImageAIOCheckpoint.loadComponents(from: aioCheckpointURL, textEncoderPrefix: textEncoderPrefix, dtype: .bfloat16, logger: logger)
+      let aio = try ZImageAIOCheckpoint.loadComponents(
+        from: aioCheckpointURL,
+        textEncoderPrefix: textEncoderPrefix,
+        dtype: .bfloat16,
+        vaeDType: .float32,
+        logger: logger
+      )
 
       logger.info("Loading text encoder...")
       let te = try loadTextEncoder(snapshot: snapshot, config: configs.textEncoder)
@@ -716,7 +722,7 @@ public final class ZImagePipeline {
             logger: logger
           )
           let weightsMapper = ZImageWeightsMapper(snapshot: baseVAESnapshot, logger: logger)
-          let baseVAEWeights = try weightsMapper.loadVAE()
+          let baseVAEWeights = try weightsMapper.loadVAE(dtype: .float32)
           let baseDecoderWeights = baseVAEWeights.filter { $0.key.hasPrefix("decoder.") }
           try ZImageWeightsMapping.applyVAE(weights: baseDecoderWeights, to: v, manifest: nil, logger: logger)
         }
@@ -772,7 +778,7 @@ public final class ZImagePipeline {
         progressHandler?(GenerationProgress(stage: .loadingVAE, stepIndex: 0, totalSteps: 1))
         logger.info("Loading VAE from HuggingFace snapshot...")
         let v = try loadVAEDecoder(snapshot: snapshot, config: configs.vae)
-        let vaeWeights = try weightsMapper.loadVAE()
+        let vaeWeights = try weightsMapper.loadVAE(dtype: .float32)
         let decoderWeights = vaeWeights.filter { $0.key.hasPrefix("decoder.") }
         try ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: manifest, logger: logger)
         vae = v
@@ -809,7 +815,7 @@ public final class ZImagePipeline {
         progressHandler?(GenerationProgress(stage: .loadingVAE, stepIndex: 0, totalSteps: 1))
         logger.info("Loading VAE...")
         let v = try loadVAEDecoder(snapshot: snapshot, config: configs.vae)
-        let vaeWeights = try weightsMapper.loadVAE()
+        let vaeWeights = try weightsMapper.loadVAE(dtype: .float32)
         let decoderWeights = vaeWeights.filter { $0.key.hasPrefix("decoder.") }
         try ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: manifest, logger: logger)
         vae = v
@@ -1229,23 +1235,19 @@ public final class ZImagePipeline {
     progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
 
     let decodeVAE: VAEImageDecoding
-    let decodeDType: DType
     if originalLatents == nil {
       decodeVAE = vae
-      decodeDType = .bfloat16
     } else if let fullVAE {
       decodeVAE = fullVAE
-      decodeDType = .float32
     } else {
       decodeVAE = vae
-      decodeDType = .bfloat16
     }
     var decoded = decodeLatents(
       latents,
       vae: decodeVAE,
       height: request.height,
       width: request.width,
-      dtype: decodeDType
+      dtype: .float32
     )
     if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
       decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
@@ -1262,7 +1264,7 @@ public final class ZImagePipeline {
     vae: VAEImageDecoding,
     height: Int,
     width: Int,
-    dtype: DType = .bfloat16
+    dtype: DType = .float32
   ) -> MLXArray {
     PipelineUtilities.decodeLatents(latents, vae: vae, height: height, width: width, dtype: dtype)
   }
