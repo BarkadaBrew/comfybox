@@ -150,9 +150,9 @@ public enum CivitAICheckpoint {
 
       var tensor = try reader.tensor(named: meta.name)
 
-      // Handle FP8 (float8_e4m3fn) — SafeTensorsReader maps to .uint8
-      if isFP8Tensor(meta) {
-        tensor = decodeFP8(tensor)
+      // Handle FP8 (float8_e4m3fn / float8_e5m2) — SafeTensorsReader maps to .uint8
+      if let format = fp8Format(meta) {
+        tensor = decodeFP8(tensor, format: format)
         fp8Count += 1
       }
 
@@ -171,43 +171,49 @@ public enum CivitAICheckpoint {
 
   // MARK: - FP8 Support
 
-  /// Check if a tensor metadata entry represents FP8 data.
-  ///
-  /// CivitAI FP8 checkpoints use dtype "F8_E4M3" or "F8_E4M3FN" in the safetensors header.
-  /// SafeTensorsReader maps these to .uint8 and preserves the original dtype string in rawDType.
-  private static func isFP8Tensor(_ meta: SafeTensorMetadata) -> Bool {
-    let raw = meta.rawDType.uppercased()
-    return raw == "F8_E4M3" || raw == "F8_E4M3FN" || raw == "F8_E5M2"
+  private enum FP8Format {
+    case e4m3fn  // 4 exponent bits, 3 mantissa bits, bias 7
+    case e5m2    // 5 exponent bits, 2 mantissa bits, bias 15
   }
 
-  /// Decode FP8 (float8_e4m3fn) tensor to float32, then let caller cast to target dtype.
+  /// Check if a tensor metadata entry represents FP8 data, and which format.
+  ///
+  /// CivitAI FP8 checkpoints use dtype "F8_E4M3" or "F8_E4M3FN" or "F8_E5M2"
+  /// in the safetensors header. SafeTensorsReader maps these to .uint8 and
+  /// preserves the original dtype string in rawDType.
+  private static func fp8Format(_ meta: SafeTensorMetadata) -> FP8Format? {
+    let raw = meta.rawDType.uppercased()
+    switch raw {
+    case "F8_E4M3", "F8_E4M3FN": return .e4m3fn
+    case "F8_E5M2": return .e5m2
+    default: return nil
+    }
+  }
+
+  private static func isFP8Tensor(_ meta: SafeTensorMetadata) -> Bool {
+    return fp8Format(meta) != nil
+  }
+
+  /// Decode FP8 E4M3FN tensor to float32.
   ///
   /// FP8 E4M3FN: 1 sign bit, 4 exponent bits, 3 mantissa bits.
   /// Bias = 7, no infinity representation, NaN = 0x7F.
   ///
-  /// The decode is done via integer arithmetic on the uint8 raw bytes:
   ///   value = (-1)^sign * 2^(exponent - 7) * (1 + mantissa/8)   [normal]
   ///   value = (-1)^sign * 2^(-6) * (mantissa/8)                  [subnormal, exp=0]
   ///   value = NaN                                                 [exp=15, mantissa=7]
-  private static func decodeFP8(_ tensor: MLXArray) -> MLXArray {
-    // Promote to int32 for bit manipulation
+  private static func decodeFP8E4M3(_ tensor: MLXArray) -> MLXArray {
     let u = tensor.asType(.int32)
 
     let sign = (u >> 7) & 1
     let exponent = (u >> 3) & 0xF
     let mantissa = u & 0x7
 
-    // Build float32 values
     let signF = MLX.where(sign .== 0, MLXArray(Float(1.0)), MLXArray(Float(-1.0)))
-
-    // Normal: exp > 0 => value = sign * 2^(exp-7) * (1 + mantissa/8)
-    // Subnormal: exp == 0 => value = sign * 2^(-6) * (mantissa/8)
-    // NaN: exp==15 && mantissa==7 => 0 (treat as zero for practical use)
 
     let mantissaF = mantissa.asType(.float32) / MLXArray(Float(8.0))
     let expF = exponent.asType(.float32)
 
-    // 2^(exp - 7) for normal, 2^(-6) for subnormal
     let isSubnormal = exponent .== 0
     let isNaN = (exponent .== 15) & (mantissa .== 7)
 
@@ -220,5 +226,47 @@ public enum CivitAICheckpoint {
     result = MLX.where(isNaN, MLXArray(Float(0.0)), result)
 
     return result
+  }
+
+  /// Decode FP8 E5M2 tensor to float32.
+  ///
+  /// FP8 E5M2: 1 sign bit, 5 exponent bits, 2 mantissa bits.
+  /// Bias = 15, has infinity (exp=31, mantissa=0), NaN (exp=31, mantissa!=0).
+  ///
+  ///   value = (-1)^sign * 2^(exponent - 15) * (1 + mantissa/4)  [normal]
+  ///   value = (-1)^sign * 2^(-14) * (mantissa/4)                 [subnormal, exp=0]
+  ///   value = Inf / NaN                                           [exp=31]
+  private static func decodeFP8E5M2(_ tensor: MLXArray) -> MLXArray {
+    let u = tensor.asType(.int32)
+
+    let sign = (u >> 7) & 1
+    let exponent = (u >> 2) & 0x1F  // 5 exponent bits
+    let mantissa = u & 0x3          // 2 mantissa bits
+
+    let signF = MLX.where(sign .== 0, MLXArray(Float(1.0)), MLXArray(Float(-1.0)))
+
+    let mantissaF = mantissa.asType(.float32) / MLXArray(Float(4.0))
+    let expF = exponent.asType(.float32)
+
+    let isSubnormal = exponent .== 0
+    let isSpecial = exponent .== 31  // Inf or NaN — treat both as zero for weights
+
+    let normalPow = MLX.pow(MLXArray(Float(2.0)), expF - MLXArray(Float(15.0)))
+    let normalVal = signF * normalPow * (MLXArray(Float(1.0)) + mantissaF)
+
+    let subnormalVal = signF * MLXArray(Float(1.0 / 16384.0)) * mantissaF  // 2^(-14)
+
+    var result = MLX.where(isSubnormal, subnormalVal, normalVal)
+    result = MLX.where(isSpecial, MLXArray(Float(0.0)), result)
+
+    return result
+  }
+
+  /// Decode FP8 tensor to float32 using the appropriate format rules.
+  private static func decodeFP8(_ tensor: MLXArray, format: FP8Format = .e4m3fn) -> MLXArray {
+    switch format {
+    case .e4m3fn: return decodeFP8E4M3(tensor)
+    case .e5m2: return decodeFP8E5M2(tensor)
+    }
   }
 }
