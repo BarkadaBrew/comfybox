@@ -422,6 +422,24 @@ actor ModelPool {
       return .flux2
     }
 
+    // Check if modelSpec points to a single safetensors file
+    let localURL = URL(fileURLWithPath: modelSpec)
+    if localURL.pathExtension == "safetensors" && FileManager.default.fileExists(atPath: localURL.path) {
+      // Single-file checkpoint — check if CivitAI or AIO
+      let aio = ZImageAIOCheckpoint.inspect(fileURL: localURL)
+      if aio.isAIO { return .flux1 }
+
+      let civitai = CivitAICheckpoint.inspect(fileURL: localURL)
+      if civitai.isCivitAI { return .flux1 }
+      if let variant = civitai.variant {
+        logger.info("ModelPool: checkpoint inspection detected Z-Image variant=\(variant.rawValue) for \(localURL.lastPathComponent)")
+        return .flux1
+      }
+
+      // Could also be a single-file transformer override for flux1
+      return .flux1
+    }
+
     // Not detected by name — try resolving and inspecting the snapshot.
     let resolved = try await ModelResolution.resolveOrDefault(
       modelSpec: modelSpec,
@@ -507,9 +525,21 @@ actor ModelPool {
     case .flux1:
       let pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
       // Detect variant (base vs turbo).
+      // Priority: filename heuristic > checkpoint key inspection > snapshot heuristic.
       let variant: ZImageVariant
       if let v = ZImageVariant.fromModelSpec(modelSpec) {
         variant = v
+      } else if modelSpec.hasSuffix(".safetensors"),
+                let fileURL = URL(string: modelSpec) ?? (FileManager.default.fileExists(atPath: modelSpec) ? URL(fileURLWithPath: modelSpec) : nil) {
+        // For local .safetensors files, use CivitAI inspection which reads
+        // actual key signatures instead of the less reliable snapshot heuristic.
+        let inspection = CivitAICheckpoint.inspect(fileURL: fileURL)
+        if let v = inspection.variant {
+          variant = v
+          logger.info("ModelPool: checkpoint inspection detected variant=\(v.rawValue) for \(fileURL.lastPathComponent)")
+        } else {
+          variant = ZImageVariant.fromSnapshot(at: resolved)
+        }
       } else {
         variant = ZImageVariant.fromSnapshot(at: resolved)
       }

@@ -93,13 +93,14 @@ public enum PipelineUtilities {
         _ latents: MLXArray,
         vae: VAEImageDecoding,
         height: Int,
-        width: Int
+        width: Int,
+        dtype: DType = .float32
     ) -> MLXArray {
         let input: MLXArray
-        if latents.dtype == .bfloat16 {
+        if latents.dtype == dtype {
             input = latents
         } else {
-            input = latents.asType(.bfloat16)
+            input = latents.asType(dtype)
         }
 
         let (decoded, _) = vae.decode(input, return_dict: false)
@@ -126,6 +127,18 @@ public enum PipelineUtilities {
         let m = (maxShift - baseShift) / Float(maxSeqLen - baseSeqLen)
         let b = baseShift - m * Float(baseSeqLen)
         return Float(imageSeqLen) * m + b
+    }
+
+    /// Z-Image schedules are parameterized by packed 2x2 latent patch tokens,
+    /// not raw VAE latent cells.
+    static func zImagePackedImageSeqLen(
+        latentHeight: Int,
+        latentWidth: Int,
+        patchSize: Int = 2
+    ) -> Int {
+        let hTokens = max(1, latentHeight / patchSize)
+        let wTokens = max(1, latentWidth / patchSize)
+        return hTokens * wTokens
     }
 
     public static func prepareSnapshot(

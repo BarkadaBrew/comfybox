@@ -12,6 +12,13 @@ enum PipelineSnapshot {
     "tokenizer/*",
   ]
 
+  static let configTokenizerTextEncoderAndVAEFilePatterns: [String] = configAndTokenizerFilePatterns + [
+    "text_encoder/*.safetensors",
+    "text_encoder/*.safetensors.index.json",
+    "vae/*.safetensors",
+    "vae/*.safetensors.index.json",
+  ]
+
   static let vaeOnlyFilePatterns: [String] = [
     ZImageFiles.modelIndex,
     ZImageFiles.vaeConfig,

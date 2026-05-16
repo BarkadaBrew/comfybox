@@ -58,6 +58,7 @@ enum ZImageAIOCheckpoint {
     from fileURL: URL,
     textEncoderPrefix: String,
     dtype: DType? = .bfloat16,
+    vaeDType: DType? = nil,
     logger: Logger?
   ) throws -> Components {
     let reader = try SafeTensorsReader(fileURL: fileURL)
@@ -86,7 +87,8 @@ enum ZImageAIOCheckpoint {
       if name.hasPrefix("vae.") {
         let stripped = String(name.dropFirst("vae.".count))
         var tensor = try reader.tensor(named: name)
-        if let dtype, tensor.dtype != dtype { tensor = tensor.asType(dtype) }
+        let targetDType = vaeDType ?? dtype
+        if let targetDType, tensor.dtype != targetDType { tensor = tensor.asType(targetDType) }
         vae[stripped] = tensor
         continue
       }

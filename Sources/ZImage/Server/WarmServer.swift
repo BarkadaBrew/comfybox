@@ -1444,7 +1444,7 @@ private actor WarmServerCoordinator {
 
   private let configuration: WarmServerConfiguration
   private let logger: Logger
-  private let pipeline: ZImagePipeline
+  private var pipeline: ZImagePipeline
   /// Flux 2 pipeline — created when the model is detected as Flux 2 Klein.
   private var flux2Pipeline: Flux2Pipeline?
   /// FIBO pipeline — created when the model is detected as FIBO.
@@ -1474,6 +1474,11 @@ private actor WarmServerCoordinator {
   private var lastError: String?
   private var activeRenderStartedAt: Date?
   private var pipelinePrepared = false
+  /// When a pool model is activated, this holds its modelSpec so that
+  /// generation requests use the pool model instead of the startup
+  /// configuration.modelSpec. Reset to nil when the startup model is
+  /// re-activated or the pool model is unloaded.
+  private var activePoolModelSpec: String?
 
   /// Model hot-swap pool — holds loaded pipelines with LRU eviction.
   let modelPool: ModelPool
@@ -1615,6 +1620,15 @@ private actor WarmServerCoordinator {
       // Detect Z-Image variant (Base vs Turbo)
       if let spec = modelSpec, let variant = ZImageVariant.fromModelSpec(spec) {
         zimageVariant = variant
+      } else if let spec = modelSpec, spec.hasSuffix(".safetensors") {
+        // Detect from CivitAI checkpoint inspection
+        let localURL = URL(fileURLWithPath: spec)
+        if FileManager.default.fileExists(atPath: localURL.path) {
+          let inspection = CivitAICheckpoint.inspect(fileURL: localURL)
+          if let variant = inspection.variant {
+            zimageVariant = variant
+          }
+        }
       } else if let resolvedSnapshot = snapshotURL {
         zimageVariant = ZImageVariant.fromSnapshot(at: resolvedSnapshot)
       } else if let spec = modelSpec {
@@ -1636,6 +1650,17 @@ private actor WarmServerCoordinator {
       )
       pipelinePrepared = true
       logger.info("Warm server pipeline ready (Flux 1 / Z-Image \(zimageVariant.rawValue))")
+
+      // Pre-load the full VAE encoder for img2img support.
+      // Without this, the first img2img request triggers synchronous weight
+      // loading inside the actor-isolated render path, which can deadlock
+      // the cooperative thread pool (issue #141).
+      do {
+        try pipeline.prepareFullVAE()
+        logger.info("Full VAE encoder pre-loaded for img2img")
+      } catch {
+        logger.warning("Failed to pre-load full VAE encoder: \(error). First img2img request will attempt lazy load.")
+      }
     }
 
     // Register the initial model in the pool so it appears in pool listings
@@ -1747,6 +1772,9 @@ private actor WarmServerCoordinator {
 
     // Sync coordinator state from pool entry.
     currentModelFamily = entry.family
+    // Track the activated pool model's spec so generation requests use
+    // the correct model instead of the startup configuration.modelSpec.
+    activePoolModelSpec = entry.modelSpec
     switch entry.family {
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
@@ -1758,12 +1786,17 @@ private actor WarmServerCoordinator {
       flux2Pipeline = entry.box.pipeline as? Flux2Pipeline
       detectedFlux2Model = entry.detectedInfo as? Flux2DetectedModel
     case .flux1:
-      // The ZImagePipeline is stored in the pool box; the coordinator's
-      // `pipeline` property is still the original one created at init.
-      // For pool-loaded flux1 models, we use the box pipeline directly.
+      // Reassign the pipeline so that runSwap and runFlux1Generate
+      // operate on the pool-loaded pipeline, not the original one (#138).
       if let poolZImage = entry.box.pipeline as? ZImagePipeline {
-        // Cannot reassign let pipeline, but pool-based flux1 will go through pool path.
-        _ = poolZImage
+        pipeline = poolZImage
+        // Pre-load full VAE for the pool-activated pipeline to avoid
+        // deadlock on first img2img request (same issue as #141).
+        do {
+          try poolZImage.prepareFullVAE()
+        } catch {
+          logger.warning("Failed to pre-load full VAE for pool model '\(entry.modelSpec)': \(error)")
+        }
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }
@@ -1866,12 +1899,17 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Maximum render age before the health endpoint reports the render as stale.
+  /// After this threshold, the health status changes to "render_stale" to signal
+  /// that the render is likely deadlocked (issue #141).
+  private static let renderStaleThresholdMs = 300_000 // 5 minutes
+
   func health(memoryBytes: UInt64) -> HealthResponse {
     let uptimeSeconds = Int(Date().timeIntervalSince(startTime))
     let activeAgeMs = activeRenderStartedAt.map { Int(Date().timeIntervalSince($0) * 1000.0) }
 
     return HealthResponse(
-      status: shuttingDown ? "shutting_down" : "ok",
+      status: shuttingDown ? "shutting_down" : (activeAgeMs.map { $0 > Self.renderStaleThresholdMs } ?? false ? "render_stale" : "ok"),
       model: configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
       modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
@@ -1976,17 +2014,28 @@ private actor WarmServerCoordinator {
     activeRenderStartedAt = Date()
     let start = Date()
 
+    // When a pool model is active, override configuration.modelSpec so
+    // that generateCore loads/validates the pool model, not the startup model.
+    let effectiveConfig: WarmServerConfiguration
+    if let poolSpec = activePoolModelSpec, poolSpec != configuration.modelSpec {
+      var cfg = configuration
+      cfg.modelSpec = poolSpec
+      effectiveConfig = cfg
+    } else {
+      effectiveConfig = configuration
+    }
+
     do {
       let outputURL: URL
       if payload.imagePath != nil {
         let img2imgRequest = try payload.makeImg2ImgRequest(
-          configuration: configuration,
+          configuration: effectiveConfig,
           activeLoRAs: activeLoRAs
         )
         outputURL = try await pipeline.generateImg2Img(img2imgRequest, progressHandler: progressHandler)
       } else {
         let request = try payload.makePipelineRequest(
-          configuration: configuration,
+          configuration: effectiveConfig,
           activeLoRAs: activeLoRAs
         )
         outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
@@ -2652,6 +2701,7 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
+    case denoise
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
   }
@@ -2674,7 +2724,7 @@ extension GeneratePayload: Decodable {
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
     inpaintImageData = nil
     maskData = nil
-    denoise = nil
+    denoise = try c.decodeIfPresent(Float.self, forKey: .denoise)
     maskGrow = nil
     maskFeather = nil
     maskCropX = nil
@@ -2764,8 +2814,14 @@ extension GeneratePayload: Decodable {
     if let creativity {
       resolvedStrength = 1.0 - max(0.01, min(0.99, creativity))
       specifiedAs = .creativity
+    } else if let imageStrength {
+      resolvedStrength = imageStrength
+      specifiedAs = .strength
+    } else if let denoise {
+      resolvedStrength = 1.0 - max(0.01, min(0.99, denoise))
+      specifiedAs = .denoise
     } else {
-      resolvedStrength = imageStrength ?? 0.3
+      resolvedStrength = 0.3
       specifiedAs = .strength
     }
 

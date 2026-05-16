@@ -772,7 +772,7 @@ public class ZImageControlPipeline {
       self.tokenizer = try loadTokenizer(snapshot: resolvedSnapshot)
       logger.info("Loading VAE...")
       let vae = try loadVAE(snapshot: resolvedSnapshot, config: modelConfigs.vae)
-      let vaeWeights = try weightsMapper.loadVAE()
+      let vaeWeights = try weightsMapper.loadVAE(dtype: .float32)
       try ZImageWeightsMapping.applyVAE(weights: vaeWeights, to: vae, manifest: quantManifest, logger: logger)
       self.vae = vae
       logger.info("Loading control transformer...")
@@ -1023,8 +1023,12 @@ public class ZImageControlPipeline {
     let randomKey: RandomStateOrKey? = request.seed.map { MLXRandom.key($0) }
     let initialNoise = MLXRandom.normal(shape, loc: 0, scale: 1, key: randomKey)
     var latents = initialNoise
+    let imageSeqLen = PipelineUtilities.zImagePackedImageSeqLen(
+      latentHeight: latentH,
+      latentWidth: latentW
+    )
     let mu = calculateShift(
-      imageSeqLen: latentH * latentW,
+      imageSeqLen: imageSeqLen,
       baseSeqLen: modelConfigs.scheduler.baseImageSeqLen ?? 256,
       maxSeqLen: modelConfigs.scheduler.maxImageSeqLen ?? 4096,
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
@@ -1314,8 +1318,12 @@ public class ZImageControlPipeline {
     let randomKey: RandomStateOrKey? = request.seed.map { MLXRandom.key($0) }
     let initialNoise = MLXRandom.normal(shape, loc: 0, scale: 1, key: randomKey)
     var latents = initialNoise
+    let imageSeqLen = PipelineUtilities.zImagePackedImageSeqLen(
+      latentHeight: latentH,
+      latentWidth: latentW
+    )
     let mu = calculateShift(
-      imageSeqLen: latentH * latentW,
+      imageSeqLen: imageSeqLen,
       baseSeqLen: modelConfigs.scheduler.baseImageSeqLen ?? 256,
       maxSeqLen: modelConfigs.scheduler.maxImageSeqLen ?? 4096,
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,

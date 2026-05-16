@@ -46,6 +46,21 @@ final class TransformerWeightNormalizationTests: XCTestCase {
     XCTAssertNotNil(normalized["all_final_layer.custom-key.adaLN_modulation.1.bias"])
   }
 
+  func testTimeInAliasesRemapToTimestepEmbedderMLPSlots() {
+    let value = MLXArray([Float(0.0)])
+    let normalized = ZImageTransformerWeightAliases.normalized([
+      "time_in.in_layer.weight": value,
+      "time_in.in_layer.bias": value,
+      "time_in.out_layer.weight": value,
+      "time_in.out_layer.bias": value,
+    ])
+
+    XCTAssertNotNil(normalized["t_embedder.mlp.0.weight"])
+    XCTAssertNotNil(normalized["t_embedder.mlp.0.bias"])
+    XCTAssertNotNil(normalized["t_embedder.mlp.2.weight"])
+    XCTAssertNotNil(normalized["t_embedder.mlp.2.bias"])
+  }
+
   private func makeTempDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     try makeDirectory(directory)

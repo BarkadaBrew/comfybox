@@ -105,7 +105,8 @@ final class SafeTensorsReaderTests: XCTestCase {
       dtype: .float32,
       shape: [10, 20, 30],
       dataOffset: 0,
-      byteCount: 10 * 20 * 30 * 4
+      byteCount: 10 * 20 * 30 * 4,
+      rawDType: "F32"
     )
 
     XCTAssertEqual(metadata.elementCount, 6000) // 10 * 20 * 30
@@ -117,7 +118,8 @@ final class SafeTensorsReaderTests: XCTestCase {
       dtype: .float32,
       shape: [],
       dataOffset: 0,
-      byteCount: 4
+      byteCount: 4,
+      rawDType: "F32"
     )
 
     XCTAssertEqual(metadata.elementCount, 1) // Empty product is 1
@@ -129,7 +131,8 @@ final class SafeTensorsReaderTests: XCTestCase {
       dtype: .float16,
       shape: [256],
       dataOffset: 100,
-      byteCount: 256 * 2
+      byteCount: 256 * 2,
+      rawDType: "F16"
     )
 
     XCTAssertEqual(metadata.name, "vector")
@@ -478,6 +481,30 @@ final class SafeTensorsReaderTests: XCTestCase {
 
     // 4 floats * 4 bytes = 16 bytes
     XCTAssertEqual(data.count, 16)
+  }
+
+  func testFP8DTypesThrowUnsupportedDType() throws {
+    for dtype in ["F8_E4M3", "F8_E4M3FN", "F8_E5M2"] {
+      let fileURL = try writeSyntheticSafeTensors(
+        header: [
+          "weight": [
+            "dtype": dtype,
+            "shape": [1],
+            "data_offsets": [0, 1]
+          ]
+        ],
+        payload: Data([0x38])
+      )
+      defer { try? FileManager.default.removeItem(at: fileURL) }
+
+      XCTAssertThrowsError(try SafeTensorsReader(fileURL: fileURL)) { error in
+        if case SafeTensorsReaderError.unsupportedDType(let unsupported) = error {
+          XCTAssertEqual(unsupported, dtype)
+        } else {
+          XCTFail("Expected unsupportedDType for \(dtype), got \(error)")
+        }
+      }
+    }
   }
 
   private func writeSyntheticSafeTensors(header: [String: Any], payload: Data = Data()) throws -> URL {

@@ -163,6 +163,8 @@ public final class ZImagePipeline {
   private var useDynamicLoRA: Bool = false
   private var activeTransformerOverrideURL: URL?
   private var activeAIOCheckpointURL: URL?
+  private var activeCivitAICheckpointURL: URL?
+  private var activeCivitAIVariant: ZImageVariant?
   private var loadedTextEncoderSelection: TextEncoderSelection?
 
   // Stored behind pipeline-local serialized access only. LoRAWeights contains MLXArray.
@@ -201,6 +203,8 @@ public final class ZImagePipeline {
     useDynamicLoRA = false
     activeTransformerOverrideURL = nil
     activeAIOCheckpointURL = nil
+    activeCivitAICheckpointURL = nil
+    activeCivitAIVariant = nil
     loadedTextEncoderSelection = nil
     GPU.clearCache()
     logger.info("Model unloaded from memory")
@@ -350,12 +354,25 @@ public final class ZImagePipeline {
 
     // Load ALL VAE weights (encoder + decoder)
     let weightsMapper = ZImageWeightsMapper(snapshot: snapshot, logger: logger)
-    let allVAEWeights = try weightsMapper.loadVAE()
+    let allVAEWeights = try weightsMapper.loadVAE(dtype: .float32)
     try ZImageWeightsMapping.applyVAE(weights: allVAEWeights, to: v, manifest: quantManifest, logger: logger)
 
     fullVAE = v
     logger.info("Full VAE loaded (encoder + decoder)")
     return v
+  }
+
+
+  /// Pre-load the full VAE with encoder so that the first img2img request
+  /// does not need to perform synchronous weight loading mid-render.
+  ///
+  /// Call this during warm server startup (after prepare) to avoid
+  /// a potential deadlock when ensureFullVAE runs inside the actor-
+  /// isolated render path. The deadlock occurs because synchronous weight
+  /// loading inside an async actor method can starve the cooperative
+  /// thread pool, preventing MLX.eval completion handlers from running.
+  public func prepareFullVAE() throws {
+    _ = try ensureFullVAE()
   }
 
   private func encodePrompt(_ prompt: String, tokenizer: QwenTokenizer, textEncoder: QwenTextEncoder, maxLength: Int) throws -> (MLXArray, MLXArray) {
@@ -383,6 +400,8 @@ public final class ZImagePipeline {
     var transformerOverrideURL: URL?
     var aioCheckpointURL: URL?
     var aioTextEncoderPrefix: String?
+    var civitaiCheckpointURL: URL?
+    var civitaiVariant: ZImageVariant?
   }
 
   func resolveModelSelection(_ modelSpec: String?, forceTransformerOverrideOnly: Bool) -> ModelSelection {
@@ -442,6 +461,23 @@ public final class ZImagePipeline {
       }
     }
 
+    // CivitAI transformer-only detection
+    if !forceTransformerOverrideOnly {
+      let civitaiInspection = CivitAICheckpoint.inspect(fileURL: url)
+      if civitaiInspection.isCivitAI {
+        let variant = civitaiInspection.variant ?? .turbo
+        logger.info("Detected CivitAI checkpoint: \(url.lastPathComponent) (variant=\(variant.rawValue), keys=\(civitaiInspection.keyCount))")
+        // Use the correct base model for the detected variant so that the
+        // transformer config (nRefinerLayers, etc.) matches the checkpoint
+        // architecture.  Without this, a Base CivitAI checkpoint defaults
+        // to the Turbo snapshot config, creating a transformer without
+        // noise_refiner / context_refiner blocks.  That mismatch causes
+        // crashes during subsequent LoRA swap operations (#138).
+        let baseSpec = variant == .base ? ZImageRepository.baseId : ZImageRepository.id
+        return .init(baseModelSpec: baseSpec, transformerOverrideURL: nil, aioCheckpointURL: nil, aioTextEncoderPrefix: nil, civitaiCheckpointURL: url, civitaiVariant: variant)
+      }
+    }
+
     if sourceDirectory != nil {
       logger.info("Using transformer override file from directory: \(url.lastPathComponent)")
     } else {
@@ -452,7 +488,7 @@ public final class ZImagePipeline {
 
   private func applyTransformerOverrideIfNeeded(_ overrideURL: URL?) throws {
     guard overrideURL != activeTransformerOverrideURL else { return }
-    guard activeAIOCheckpointURL == nil else { return }
+    guard activeAIOCheckpointURL == nil && activeCivitAICheckpointURL == nil else { return }
     guard let transformer, let snapshot = modelSnapshot, let configs = modelConfigs else { throw PipelineError.modelNotLoaded }
 
     let weightsMapper = ZImageWeightsMapper(snapshot: snapshot, logger: logger)
@@ -507,16 +543,30 @@ public final class ZImagePipeline {
     textEncoderPath: String? = nil,
     aioCheckpointURL: URL? = nil,
     aioTextEncoderPrefix: String? = nil,
+    civitaiCheckpointURL: URL? = nil,
+    civitaiVariant: ZImageVariant? = nil,
     progressHandler: ProgressHandler? = nil
   ) async throws {
-    let modelId = modelSpec ?? ZImageRepository.id
+    // When loading a CivitAI Base checkpoint, ensure the snapshot comes from
+    // the Base model repo so the transformer config has nRefinerLayers > 0.
+    let modelId: String
+    if let modelSpec {
+      modelId = modelSpec
+    } else if civitaiCheckpointURL != nil, civitaiVariant == .base {
+      modelId = ZImageRepository.baseId
+    } else {
+      modelId = ZImageRepository.id
+    }
     let normalizedAIOPath = aioCheckpointURL?.standardizedFileURL.path
     let currentAIOPath = activeAIOCheckpointURL?.standardizedFileURL.path
+    let normalizedCivitAIPath = civitaiCheckpointURL?.standardizedFileURL.path
+    let currentCivitAIPath = activeCivitAICheckpointURL?.standardizedFileURL.path
     let hasLoadedComponents = tokenizer != nil && textEncoder != nil && transformer != nil && vae != nil && modelConfigs != nil && modelSnapshot != nil
 
     if isModelLoaded,
       loadedModelId == modelId,
       normalizedAIOPath == currentAIOPath,
+      normalizedCivitAIPath == currentCivitAIPath,
       hasLoadedComponents,
       let cachedSnapshot = modelSnapshot
     {
@@ -531,8 +581,19 @@ public final class ZImagePipeline {
     }
 
     progressHandler?(GenerationProgress(stage: .loadingModel, stepIndex: 0, totalSteps: 1))
-    let snapshotFilePatterns: [String]? = aioCheckpointURL == nil ? nil : PipelineSnapshot.configAndTokenizerFilePatterns
-    let snapshot = try await PipelineSnapshot.prepare(model: modelSpec, filePatterns: snapshotFilePatterns, logger: logger)
+    let snapshotFilePatterns: [String]?
+    if aioCheckpointURL != nil {
+      snapshotFilePatterns = PipelineSnapshot.configAndTokenizerFilePatterns
+    } else if civitaiCheckpointURL != nil {
+      snapshotFilePatterns = PipelineSnapshot.configTokenizerTextEncoderAndVAEFilePatterns
+    } else {
+      snapshotFilePatterns = nil
+    }
+    // Use modelId (which accounts for CivitAI variant) instead of raw
+    // modelSpec so that Base CivitAI checkpoints resolve the Base snapshot
+    // (with nRefinerLayers > 0) rather than falling through to Turbo.
+    let snapshotModelId = modelSpec ?? (modelId != ZImageRepository.id ? modelId : nil)
+    let snapshot = try await PipelineSnapshot.prepare(model: snapshotModelId, filePatterns: snapshotFilePatterns, logger: logger)
     let textEncoderSelection = PipelineUtilities.resolveTextEncoderSelection(
       for: snapshot,
       overridePath: textEncoderPath,
@@ -543,6 +604,7 @@ public final class ZImagePipeline {
     if isModelLoaded
       && loadedModelId == modelId
       && normalizedAIOPath == currentAIOPath
+      && normalizedCivitAIPath == currentCivitAIPath
       && loadedTextEncoderPath == selectedTextEncoderPath
       && hasLoadedComponents
     {
@@ -554,7 +616,7 @@ public final class ZImagePipeline {
       && currentAIOPath == nil
       && normalizedAIOPath == nil
       && areZImageVariants(loadedModelId ?? "", modelId)
-    if isModelLoaded && (loadedModelId != modelId || normalizedAIOPath != currentAIOPath) {
+    if isModelLoaded && (loadedModelId != modelId || normalizedAIOPath != currentAIOPath || normalizedCivitAIPath != currentCivitAIPath) {
       if canPreserveSharedComponents {
         logger.info("Switching Z-Image variant, preserving VAE and tokenizer")
 
@@ -592,7 +654,13 @@ public final class ZImagePipeline {
       }
 
       logger.info("Loading AIO checkpoint weights from \(aioCheckpointURL.lastPathComponent)")
-      let aio = try ZImageAIOCheckpoint.loadComponents(from: aioCheckpointURL, textEncoderPrefix: textEncoderPrefix, dtype: .bfloat16, logger: logger)
+      let aio = try ZImageAIOCheckpoint.loadComponents(
+        from: aioCheckpointURL,
+        textEncoderPrefix: textEncoderPrefix,
+        dtype: .bfloat16,
+        vaeDType: .float32,
+        logger: logger
+      )
 
       logger.info("Loading text encoder...")
       let te = try loadTextEncoder(snapshot: snapshot, config: configs.textEncoder)
@@ -654,10 +722,65 @@ public final class ZImagePipeline {
             logger: logger
           )
           let weightsMapper = ZImageWeightsMapper(snapshot: baseVAESnapshot, logger: logger)
-          let baseVAEWeights = try weightsMapper.loadVAE()
+          let baseVAEWeights = try weightsMapper.loadVAE(dtype: .float32)
           let baseDecoderWeights = baseVAEWeights.filter { $0.key.hasPrefix("decoder.") }
           try ZImageWeightsMapping.applyVAE(weights: baseDecoderWeights, to: v, manifest: nil, logger: logger)
         }
+        vae = v
+      } else {
+        logger.info("Reusing cached VAE")
+      }
+    } else if let civitaiCheckpointURL {
+      let variant = civitaiVariant ?? .turbo
+      logger.info("Loading CivitAI checkpoint: \(civitaiCheckpointURL.lastPathComponent) (variant=\(variant.rawValue))")
+
+      // Load transformer weights (raw, with model.diffusion_model. prefix)
+      let rawWeights = try CivitAICheckpoint.loadTransformerWeights(
+        from: civitaiCheckpointURL, dtype: .bfloat16, logger: logger)
+
+      // Canonicalize keys (strip prefix, split QKV, remap names)
+      let transformerWeights = canonicalizeTransformerOverride(rawWeights, dim: configs.transformer.dim, logger: logger)
+
+      // Validate
+      if let inferredDim = inferTransformerDim(from: transformerWeights), inferredDim != configs.transformer.dim {
+        throw PipelineError.weightsMissing("CivitAI transformer dim \(inferredDim) mismatches model dim \(configs.transformer.dim)")
+      }
+      try validateStrictAIOTransformerWeights(transformerWeights, config: configs.transformer)
+
+      progressHandler?(GenerationProgress(stage: .loadingTransformer, stepIndex: 0, totalSteps: 1))
+      logger.info("Loading transformer architecture...")
+      let trans = try loadTransformer(snapshot: snapshot, config: configs.transformer)
+      try validateAIOTransformerCoverage(transformerWeights, transformer: trans)
+      try ZImageWeightsMapping.applyTransformer(weights: transformerWeights, to: trans, manifest: nil, logger: logger)
+      transformer = trans
+
+      activeTransformerOverrideURL = nil
+      activeAIOCheckpointURL = nil
+      activeCivitAICheckpointURL = civitaiCheckpointURL
+      activeCivitAIVariant = variant
+      quantManifest = nil
+
+      // Text encoder loaded from HuggingFace snapshot (standard path)
+      let weightsMapper = ZImageWeightsMapper(
+        snapshot: snapshot,
+        logger: logger,
+        textEncoderDirectory: textEncoderSelection.directory
+      )
+      let manifest = weightsMapper.loadQuantizationManifest()
+      logger.info("Loading text encoder from HuggingFace snapshot...")
+      let te = try loadTextEncoder(snapshot: snapshot, config: configs.textEncoder)
+      let textEncoderWeights = try weightsMapper.loadTextEncoder()
+      try ZImageWeightsMapping.applyTextEncoder(weights: textEncoderWeights, to: te, manifest: manifest, logger: logger)
+      textEncoder = te
+
+      // VAE loaded from HuggingFace snapshot (standard path)
+      if vae == nil {
+        progressHandler?(GenerationProgress(stage: .loadingVAE, stepIndex: 0, totalSteps: 1))
+        logger.info("Loading VAE from HuggingFace snapshot...")
+        let v = try loadVAEDecoder(snapshot: snapshot, config: configs.vae)
+        let vaeWeights = try weightsMapper.loadVAE(dtype: .float32)
+        let decoderWeights = vaeWeights.filter { $0.key.hasPrefix("decoder.") }
+        try ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: manifest, logger: logger)
         vae = v
       } else {
         logger.info("Reusing cached VAE")
@@ -686,11 +809,13 @@ public final class ZImagePipeline {
       transformer = trans
       activeTransformerOverrideURL = nil
       activeAIOCheckpointURL = nil
+      activeCivitAICheckpointURL = nil
+      activeCivitAIVariant = nil
       if vae == nil {
         progressHandler?(GenerationProgress(stage: .loadingVAE, stepIndex: 0, totalSteps: 1))
         logger.info("Loading VAE...")
         let v = try loadVAEDecoder(snapshot: snapshot, config: configs.vae)
-        let vaeWeights = try weightsMapper.loadVAE()
+        let vaeWeights = try weightsMapper.loadVAE(dtype: .float32)
         let decoderWeights = vaeWeights.filter { $0.key.hasPrefix("decoder.") }
         try ZImageWeightsMapping.applyVAE(weights: decoderWeights, to: v, manifest: manifest, logger: logger)
         vae = v
@@ -726,10 +851,12 @@ public final class ZImagePipeline {
       textEncoderPath: textEncoderPath,
       aioCheckpointURL: selection.aioCheckpointURL,
       aioTextEncoderPrefix: selection.aioTextEncoderPrefix,
+      civitaiCheckpointURL: selection.civitaiCheckpointURL,
+      civitaiVariant: selection.civitaiVariant,
       progressHandler: progressHandler
     )
 
-    if selection.aioCheckpointURL == nil {
+    if selection.aioCheckpointURL == nil && selection.civitaiCheckpointURL == nil {
       try applyTransformerOverrideIfNeeded(selection.transformerOverrideURL)
     }
 
@@ -838,6 +965,8 @@ public final class ZImagePipeline {
       textEncoderPath: request.textEncoderPath,
       aioCheckpointURL: selection.aioCheckpointURL,
       aioTextEncoderPrefix: selection.aioTextEncoderPrefix,
+      civitaiCheckpointURL: selection.civitaiCheckpointURL,
+      civitaiVariant: selection.civitaiVariant,
       progressHandler: progressHandler
     )
 
@@ -921,8 +1050,12 @@ public final class ZImagePipeline {
     let randomKey: RandomStateOrKey? = request.seed.map { MLXRandom.key($0) }
     var latents = MLXRandom.normal(shape, loc: 0, scale: 1, key: randomKey)
 
+    let imageSeqLen = PipelineUtilities.zImagePackedImageSeqLen(
+      latentHeight: latentH,
+      latentWidth: latentW
+    )
     let mu = calculateShift(
-      imageSeqLen: latentH * latentW,
+      imageSeqLen: imageSeqLen,
       baseSeqLen: modelConfigs.scheduler.baseImageSeqLen ?? 256,
       maxSeqLen: modelConfigs.scheduler.maxImageSeqLen ?? 4096,
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
@@ -1101,7 +1234,21 @@ public final class ZImagePipeline {
     logger.info("Denoising complete, decoding with VAE...")
     progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
 
-    var decoded = decodeLatents(latents, vae: vae, height: request.height, width: request.width)
+    let decodeVAE: VAEImageDecoding
+    if originalLatents == nil {
+      decodeVAE = vae
+    } else if let fullVAE {
+      decodeVAE = fullVAE
+    } else {
+      decodeVAE = vae
+    }
+    var decoded = decodeLatents(
+      latents,
+      vae: decodeVAE,
+      height: request.height,
+      width: request.width,
+      dtype: .float32
+    )
     if ImageLevels.shouldApply(min: request.levelsMin, max: request.levelsMax) {
       decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
       MLX.eval(decoded)
@@ -1112,8 +1259,14 @@ public final class ZImagePipeline {
     return decoded
   }
 
-  private func decodeLatents(_ latents: MLXArray, vae: VAEImageDecoding, height: Int, width: Int) -> MLXArray {
-    PipelineUtilities.decodeLatents(latents, vae: vae, height: height, width: width)
+  private func decodeLatents(
+    _ latents: MLXArray,
+    vae: VAEImageDecoding,
+    height: Int,
+    width: Int,
+    dtype: DType = .float32
+  ) -> MLXArray {
+    PipelineUtilities.decodeLatents(latents, vae: vae, height: height, width: width, dtype: dtype)
   }
 
   private func calculateShift(

@@ -65,6 +65,20 @@ public enum ZImageVariant: String, Sendable {
     if normalized.contains("z-image-turbo") || normalized.contains("z_image_turbo") {
       return .turbo
     }
+
+    // CivitAI checkpoint filename heuristics
+    if normalized.hasSuffix(".safetensors") {
+      let filename = (normalized as NSString).lastPathComponent
+      // Known Turbo-derived checkpoints contain "dpo" or "turbo" in the filename
+      if filename.contains("dpo") || filename.contains("turbo") {
+        return .turbo
+      }
+      // "wild" is a known Base-derived model family
+      if filename.contains("wild") {
+        return .base
+      }
+    }
+
     return nil
   }
 
