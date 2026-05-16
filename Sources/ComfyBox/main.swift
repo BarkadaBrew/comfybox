@@ -1560,6 +1560,7 @@ struct ZImageCLI {
     var forceTransformerOverrideOnly = false
     var host = "127.0.0.1"
     var allowedOutputDirectory = FileManager.default.currentDirectoryPath
+    var seedvr2Weights: String? = nil
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1593,6 +1594,8 @@ struct ZImageCLI {
         loraEntries.append(contentsOf: splitCommaSeparated(nextValue(for: arg, iterator: &iterator)))
       case "--lora-scales":
         loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
+      case "--seedvr2-weights":
+        seedvr2Weights = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printServeUsage()
         return
@@ -1619,7 +1622,8 @@ struct ZImageCLI {
       forceTransformerOverrideOnly: forceTransformerOverrideOnly,
       maxSequenceLength: maxSequenceLength,
       maxPendingRequests: 10,
-      allowedOutputDirectory: allowedOutputDirectory
+      allowedOutputDirectory: allowedOutputDirectory,
+      seedvr2WeightsPath: seedvr2Weights
     )
 
     let server = WarmServer(configuration: configuration, host: host, logger: logger)
@@ -1639,6 +1643,7 @@ struct ZImageCLI {
       --cache-limit             GPU memory cache limit in MB (default: unlimited)
       --max-sequence-length     Maximum sequence length for text encoding (default: 512)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override
+      --seedvr2-weights            Path to SeedVR2 upscale model weights directory
       --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs
