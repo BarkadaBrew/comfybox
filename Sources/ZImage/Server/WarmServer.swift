@@ -1225,7 +1225,7 @@ private actor WarmServerCoordinator {
 
   private let configuration: WarmServerConfiguration
   private let logger: Logger
-  private let pipeline: ZImagePipeline
+  private var pipeline: ZImagePipeline
   /// Flux 2 pipeline — created when the model is detected as Flux 2 Klein.
   private var flux2Pipeline: Flux2Pipeline?
   /// FIBO pipeline — created when the model is detected as FIBO.
@@ -1548,12 +1548,10 @@ private actor WarmServerCoordinator {
       flux2Pipeline = entry.box.pipeline as? Flux2Pipeline
       detectedFlux2Model = entry.detectedInfo as? Flux2DetectedModel
     case .flux1:
-      // The ZImagePipeline is stored in the pool box; the coordinator's
-      // `pipeline` property is still the original one created at init.
-      // For pool-loaded flux1 models, we use the box pipeline directly.
+      // Reassign the pipeline so that runSwap and runFlux1Generate
+      // operate on the pool-loaded pipeline, not the original one (#138).
       if let poolZImage = entry.box.pipeline as? ZImagePipeline {
-        // Cannot reassign let pipeline, but pool-based flux1 will go through pool path.
-        _ = poolZImage
+        pipeline = poolZImage
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }

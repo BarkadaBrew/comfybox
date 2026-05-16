@@ -454,7 +454,14 @@ public final class ZImagePipeline {
       if civitaiInspection.isCivitAI {
         let variant = civitaiInspection.variant ?? .turbo
         logger.info("Detected CivitAI checkpoint: \(url.lastPathComponent) (variant=\(variant.rawValue), keys=\(civitaiInspection.keyCount))")
-        return .init(baseModelSpec: nil, transformerOverrideURL: nil, aioCheckpointURL: nil, aioTextEncoderPrefix: nil, civitaiCheckpointURL: url, civitaiVariant: variant)
+        // Use the correct base model for the detected variant so that the
+        // transformer config (nRefinerLayers, etc.) matches the checkpoint
+        // architecture.  Without this, a Base CivitAI checkpoint defaults
+        // to the Turbo snapshot config, creating a transformer without
+        // noise_refiner / context_refiner blocks.  That mismatch causes
+        // crashes during subsequent LoRA swap operations (#138).
+        let baseSpec = variant == .base ? ZImageRepository.baseId : ZImageRepository.id
+        return .init(baseModelSpec: baseSpec, transformerOverrideURL: nil, aioCheckpointURL: nil, aioTextEncoderPrefix: nil, civitaiCheckpointURL: url, civitaiVariant: variant)
       }
     }
 
@@ -527,7 +534,16 @@ public final class ZImagePipeline {
     civitaiVariant: ZImageVariant? = nil,
     progressHandler: ProgressHandler? = nil
   ) async throws {
-    let modelId = modelSpec ?? ZImageRepository.id
+    // When loading a CivitAI Base checkpoint, ensure the snapshot comes from
+    // the Base model repo so the transformer config has nRefinerLayers > 0.
+    let modelId: String
+    if let modelSpec {
+      modelId = modelSpec
+    } else if civitaiCheckpointURL != nil, civitaiVariant == .base {
+      modelId = ZImageRepository.baseId
+    } else {
+      modelId = ZImageRepository.id
+    }
     let normalizedAIOPath = aioCheckpointURL?.standardizedFileURL.path
     let currentAIOPath = activeAIOCheckpointURL?.standardizedFileURL.path
     let hasLoadedComponents = tokenizer != nil && textEncoder != nil && transformer != nil && vae != nil && modelConfigs != nil && modelSnapshot != nil
