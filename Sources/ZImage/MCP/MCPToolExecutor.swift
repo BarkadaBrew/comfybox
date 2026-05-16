@@ -334,6 +334,54 @@ public final class MCPToolExecutor: @unchecked Sendable {
     return mapHTTPResponse(status: status, data: data)
   }
 
+
+  /// generate_video -> POST /v1/video/generate
+  private func executeGenerateVideo(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
+      return MCPToolResult(error: "Error: 'prompt' is required")
+    }
+
+    var body: [String: Any] = ["prompt": prompt]
+
+    if let imagePath = params?.string("image_path") {
+      body["image_path"] = imagePath
+    }
+    if let duration = params?.integer("duration") {
+      body["duration"] = duration
+    }
+    if let resolution = params?.string("resolution") {
+      body["resolution"] = resolution
+    }
+    if let aspectRatio = params?.string("aspect_ratio") {
+      body["aspect_ratio"] = aspectRatio
+    }
+    if let seed = params?.integer("seed") {
+      body["seed"] = seed
+    }
+    if let outputPath = params?.string("output_path") {
+      body["output_path"] = outputPath
+    }
+
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/video/generate", body: jsonData)
+    // 202 is the expected status for async job submission
+    if status == 200 || status == 202 {
+      let text = String(data: data, encoding: .utf8) ?? "{}"
+      return MCPToolResult(text: text)
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// video_status -> GET /v1/video/status/{job_id}
+  private func executeVideoStatus(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let jobId = params?.string("job_id"), !jobId.isEmpty else {
+      return MCPToolResult(error: "Error: 'job_id' is required")
+    }
+
+    let (status, data) = try await client.get("/v1/video/status/\(jobId)")
+    return mapHTTPResponse(status: status, data: data)
+  }
+
   // MARK: - Helpers
 
   /// Generic GET endpoint handler.
