@@ -31,6 +31,7 @@ public enum MCPToolRegistry {
     unloadModel,
     generateVideo,
     videoStatus,
+    upscale,
   ]
 
   // MARK: - Tool Definitions
@@ -348,6 +349,7 @@ public enum MCPToolRegistry {
   )
 
 
+
   // MARK: - Video Tools
 
   static let generateVideo = MCPToolDefinition(
@@ -401,6 +403,44 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["job_id"] as [String],
+    ] as [String: Any]
+  )
+
+  // MARK: - Upscale Tool
+
+  static let upscale = MCPToolDefinition(
+    name: "upscale",
+    description: "Upscale an image using the SeedVR2 super-resolution pipeline. Accepts a file path and returns the upscaled output file path. Default target resolution is 1024px (safe). 2048px is experimental and may OOM.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "image_path": [
+          "type": "string",
+          "description": "Absolute path to the input image file to upscale.",
+        ] as [String: Any],
+        "target_resolution": [
+          "type": "integer",
+          "description": "Target resolution in pixels for the long edge. Default: 1024. Values above 1024 are experimental and may cause OOM errors.",
+        ] as [String: Any],
+        "seed": [
+          "type": "integer",
+          "description": "Random seed for reproducibility. Omit for random.",
+        ] as [String: Any],
+        "softness": [
+          "type": "number",
+          "description": "Softness factor (0.0-1.0). Higher values produce softer results. Default: 0.0.",
+        ] as [String: Any],
+        "output_path": [
+          "type": "string",
+          "description": "Output file path. Omit to auto-generate from input filename with '-upscaled' suffix.",
+        ] as [String: Any],
+        "model": [
+          "type": "string",
+          "description": "SeedVR2 variant: 'seedvr2-3b' (default, ~7GB) or 'seedvr2-7b' (~16GB). Auto-detected from available weights.",
+          "enum": ["seedvr2-3b", "seedvr2-7b"],
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["image_path"] as [String],
     ] as [String: Any]
   )
 
