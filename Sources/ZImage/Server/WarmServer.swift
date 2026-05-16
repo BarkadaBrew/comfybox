@@ -4,6 +4,8 @@ import Logging
 import Network
 import Darwin
 import MLX
+import CoreGraphics
+import ImageIO
 
 public struct WarmServerConfiguration: Sendable {
   public var port: UInt16
@@ -718,10 +720,21 @@ public final class WarmServer {
         return .error(.error(status: 500, message: "Failed to encode job status"))
       }
 
+    // MARK: - Upscale Endpoint
+
+    case ("POST", "/v1/upscale"):
+      do {
+        let payload = try decode(UpscalePayload.self, from: request.body)
+        let result = try await handleUpscale(payload)
+        return .json(status: 200, payload: result)
+      } catch {
+        return .error(response(for: error))
+      }
+
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
-          "/v1/loras", "/v1/loras/scan", "/v1/video/generate"
+          "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/upscale"
       ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
          || request.path.hasPrefix("/v1/video/status/") {
         return .error(.error(status: 405, message: "Method not allowed"))
@@ -1145,6 +1158,122 @@ public final class WarmServer {
     }
   }
 
+  // MARK: - Upscale Handler
+
+  /// Handle a direct upscale request via the REST API.
+  /// Lazy-loads the SeedVR2 pipeline on first call.
+  private func handleUpscale(_ payload: UpscalePayload) async throws -> UpscaleResponse {
+    guard let weightsPath = seedvr2WeightsPath else {
+      throw WarmServerError.invalidRequest(
+        message: "SeedVR2 upscale not available: no weights path configured"
+      )
+    }
+
+    // Validate input file exists
+    guard FileManager.default.fileExists(atPath: payload.imagePath) else {
+      throw WarmServerError.invalidRequest(
+        message: "Input image not found: \(payload.imagePath)"
+      )
+    }
+
+    let targetResolution = payload.targetResolution ?? 1024
+    let softness = payload.softness ?? 0.0
+
+    // Resolution guard
+    if let error = UpscalePayload.validateResolution(targetResolution) {
+      throw WarmServerError.invalidRequest(message: error)
+    }
+
+    // Validate softness range
+    if let error = UpscalePayload.validateSoftness(softness) {
+      throw WarmServerError.invalidRequest(message: error)
+    }
+
+    // Model variant validation
+    if let error = UpscalePayload.validateModel(payload.model) {
+      throw WarmServerError.invalidRequest(message: error)
+    }
+
+    // Lazy-load pipeline
+    if seedvr2Pipeline == nil {
+      logger.info("WarmServer: lazy-loading SeedVR2 pipeline from \(weightsPath)...")
+      let pipeline = try SeedVR2Pipeline(weightsPath: weightsPath, logger: logger)
+      seedvr2Pipeline = pipeline
+      logger.info("WarmServer: SeedVR2 pipeline ready (\(pipeline.modelConfig == .preset7B ? "7B" : "3B"))")
+    }
+
+    guard let pipeline = seedvr2Pipeline else {
+      throw WarmServerError.invalidRequest(
+        message: "SeedVR2 pipeline failed to initialize"
+      )
+    }
+
+    // Check model variant matches request
+    if let requestedModel = payload.model {
+      let is7B = pipeline.modelConfig == .preset7B
+      let requested7B = requestedModel == "seedvr2-7b"
+      if is7B != requested7B {
+        let loaded = is7B ? "seedvr2-7b" : "seedvr2-3b"
+        throw WarmServerError.invalidRequest(
+          message: "Requested \(requestedModel) but loaded weights are \(loaded)"
+        )
+      }
+    }
+
+    // Build warning for experimental resolutions
+    let warning = UpscalePayload.resolutionWarning(for: targetResolution)
+
+    let start = Date()
+
+    // Resolve output path
+    let resolvedOutputPath: String?
+    if let op = payload.outputPath {
+      resolvedOutputPath = try WarmServerOutputPathValidator
+        .resolveOutputPath(op, allowedOutputDirectory: configuration.allowedOutputDirectory)
+        .path
+    } else {
+      resolvedOutputPath = nil
+    }
+
+    let outputPath = try pipeline.upscaleAndSave(
+      imagePath: payload.imagePath,
+      outputPath: resolvedOutputPath,
+      targetResolution: targetResolution,
+      seed: payload.seed,
+      softness: softness
+    )
+
+    let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+    let modelName = pipeline.modelConfig == .preset7B ? "seedvr2-7b" : "seedvr2-3b"
+
+    // Read output image dimensions for the response
+    let outputResolution = readImageDimensions(at: outputPath)
+    let inputResolution = readImageDimensions(at: payload.imagePath)
+
+    return UpscaleResponse(
+      success: true,
+      outputPath: outputPath,
+      durationMs: durationMs,
+      inputResolution: inputResolution,
+      outputResolution: outputResolution,
+      model: modelName,
+      warning: warning
+    )
+  }
+
+  /// Read image dimensions as "WxH" string. Returns "unknown" on failure.
+  private func readImageDimensions(at path: String) -> String {
+    guard let source = CGImageSourceCreateWithURL(
+      URL(fileURLWithPath: path) as CFURL, nil
+    ),
+    let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+    let width = properties[kCGImagePropertyPixelWidth] as? Int,
+    let height = properties[kCGImagePropertyPixelHeight] as? Int else {
+      return "unknown"
+    }
+    return "\(width)x\(height)"
+  }
+
   fileprivate func requestShutdownAfterResponse() {
     initiateShutdown()
   }
@@ -1200,7 +1329,7 @@ public final class WarmServer {
       switch error {
       case .loraSwapNotSupported, .controlNetNotSupported:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
-      case .invalidOutputPath:
+      case .invalidOutputPath, .invalidRequest:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed:
@@ -2748,6 +2877,59 @@ private struct GenerateResponse: Encodable, Sendable {
   let durationMs: Int
 }
 
+// MARK: - Upscale Payload & Response
+
+struct UpscalePayload: Decodable, Sendable {
+  let imagePath: String
+  let targetResolution: Int?
+  let seed: Int?
+  let softness: Float?
+  let outputPath: String?
+  let model: String?   // "seedvr2-3b" or "seedvr2-7b"
+
+  /// Validate target resolution. Returns an error message if invalid, nil if valid.
+  static func validateResolution(_ resolution: Int) -> String? {
+    guard resolution >= 256 && resolution <= 2048 else {
+      return "target_resolution must be between 256 and 2048"
+    }
+    return nil
+  }
+
+  /// Validate softness. Returns an error message if invalid, nil if valid.
+  static func validateSoftness(_ softness: Float) -> String? {
+    guard softness >= 0.0 && softness <= 1.0 else {
+      return "softness must be between 0.0 and 1.0"
+    }
+    return nil
+  }
+
+  /// Validate model variant. Returns an error message if invalid, nil if valid.
+  static func validateModel(_ model: String?) -> String? {
+    guard let model = model else { return nil }
+    guard model == "seedvr2-3b" || model == "seedvr2-7b" else {
+      return "Invalid model: '\(model)'. Must be 'seedvr2-3b' or 'seedvr2-7b'."
+    }
+    return nil
+  }
+
+  /// Return a warning string if resolution is experimental (>1024), nil otherwise.
+  static func resolutionWarning(for resolution: Int) -> String? {
+    resolution > 1024
+      ? "target_resolution \(resolution) is experimental and may cause OOM errors. Safe maximum is 1024."
+      : nil
+  }
+}
+
+struct UpscaleResponse: Encodable, Sendable {
+  let success: Bool
+  let outputPath: String
+  let durationMs: Int
+  let inputResolution: String     // e.g. "512x512"
+  let outputResolution: String    // e.g. "1024x1024"
+  let model: String               // "seedvr2-3b" or "seedvr2-7b"
+  let warning: String?            // non-nil if target_resolution > 1024
+}
+
 private struct LoRASwapPayload: Decodable, Sendable {
   let loras: [LoRAEntry]
 
@@ -2876,6 +3058,7 @@ private final class SyncResult<Value> {
 public enum WarmServerError: Error, LocalizedError {
   case invalidPort(UInt16)
   case invalidOutputPath(path: String, allowedDirectory: String)
+  case invalidRequest(message: String)
   case flux2DetectionFailed(String)
   case flux2NotLoaded
   case fiboDetectionFailed(String)
@@ -2891,6 +3074,8 @@ public enum WarmServerError: Error, LocalizedError {
       return "Invalid server port: \(port)"
     case .invalidOutputPath(let path, let allowedDirectory):
       return "Output path '\(path)' must be under allowed output directory '\(allowedDirectory)'"
+    case .invalidRequest(let message):
+      return message
     case .flux2DetectionFailed(let model):
       return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"
     case .flux2NotLoaded:

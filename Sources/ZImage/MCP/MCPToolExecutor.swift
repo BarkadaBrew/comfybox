@@ -54,6 +54,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeGet("/v1/model/pool")
       case "unload_model":
         return try await executeUnloadModel(arguments)
+      case "generate_video":
+        return try await executeGenerateVideo(arguments)
+      case "video_status":
+        return try await executeVideoStatus(arguments)
+      case "upscale":
+        return try await executeUpscale(arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -379,6 +385,35 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
 
     let (status, data) = try await client.get("/v1/video/status/\(jobId)")
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// upscale -> POST /v1/upscale
+  private func executeUpscale(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let imagePath = params?.string("image_path"), !imagePath.isEmpty else {
+      return MCPToolResult(error: "Error: 'image_path' is required")
+    }
+
+    var body: [String: Any] = ["image_path": imagePath]
+
+    if let targetResolution = params?.integer("target_resolution") {
+      body["target_resolution"] = targetResolution
+    }
+    if let seed = params?.integer("seed") {
+      body["seed"] = seed
+    }
+    if let softness = params?.number("softness") {
+      body["softness"] = softness
+    }
+    if let outputPath = params?.string("output_path") {
+      body["output_path"] = outputPath
+    }
+    if let model = params?.string("model") {
+      body["model"] = model
+    }
+
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/upscale", body: jsonData)
     return mapHTTPResponse(status: status, data: data)
   }
 
