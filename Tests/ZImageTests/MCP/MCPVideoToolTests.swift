@@ -230,8 +230,8 @@ final class MCPVideoToolTests: XCTestCase {
       jobId: "vid_789_ghi",
       status: .failed,
       backend: "replicate",
-      error: "NSFW content detected",
-      durationMs: 12000
+      durationMs: 12000,
+      error: "NSFW content detected"
     )
 
     let encoder = JSONEncoder()
