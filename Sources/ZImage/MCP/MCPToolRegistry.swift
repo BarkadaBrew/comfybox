@@ -29,6 +29,8 @@ public enum MCPToolRegistry {
     switchModel,
     modelPool,
     unloadModel,
+    generateVideo,
+    videoStatus,
   ]
 
   // MARK: - Tool Definitions
@@ -342,6 +344,63 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
+    ] as [String: Any]
+  )
+
+
+  // MARK: - Video Tools
+
+  static let generateVideo = MCPToolDefinition(
+    name: "generate_video",
+    description: "Generate a video clip. Supports text-to-video (T2V) and image-to-video (I2V). T2V uses LTX 2.3; I2V uses Wan 2.2. Returns a job_id for async polling via video_status. In proxy mode, generation runs on Replicate; in native mode, it runs locally on the Mac GPU.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "prompt": [
+          "type": "string",
+          "description": "For T2V: detailed cinematic scene description (longer is better). For I2V: motion description only (camera + subject + atmosphere, 80-120 words). The source image provides the scene for I2V.",
+        ] as [String: Any],
+        "image_path": [
+          "type": "string",
+          "description": "Absolute path to source image for I2V mode. Must be on the Mac filesystem. Omit for T2V mode.",
+        ] as [String: Any],
+        "duration": [
+          "type": "number",
+          "description": "Video duration in seconds. I2V: fixed ~5s (ignored). T2V: 6, 8, 10, 12, 14, 16, 18, or 20 (default: 6).",
+        ] as [String: Any],
+        "resolution": [
+          "type": "string",
+          "description": "Output resolution. I2V: '480p' or '720p' (default: '480p'). T2V: '720p' or '1080p' (default: '720p').",
+        ] as [String: Any],
+        "aspect_ratio": [
+          "type": "string",
+          "description": "Aspect ratio: '16:9' or '9:16' (default: '16:9').",
+        ] as [String: Any],
+        "seed": [
+          "type": "integer",
+          "description": "Random seed for reproducibility. Omit for random.",
+        ] as [String: Any],
+        "output_path": [
+          "type": "string",
+          "description": "Output file path for the .mp4. Must be within the allowed output directory. Omit to auto-generate.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["prompt"] as [String],
+    ] as [String: Any]
+  )
+
+  static let videoStatus = MCPToolDefinition(
+    name: "video_status",
+    description: "Check the status of a video generation job. Returns status ('queued', 'processing', 'succeeded', 'failed'), and on success, the output file path and render duration.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "job_id": [
+          "type": "string",
+          "description": "Job ID returned by generate_video.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["job_id"] as [String],
     ] as [String: Any]
   )
 

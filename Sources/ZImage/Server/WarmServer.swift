@@ -139,6 +139,10 @@ public final class WarmServer {
   /// Lazy-loaded ESRGAN upscale pipeline. Created on first ESRGAN upscale request.
   private var esrganPipeline: ESRGANPipeline?
 
+  /// Replicate video proxy — handles video generation via Replicate API.
+  /// Initialized at startup if REPLICATE_API_TOKEN is available; nil otherwise.
+  private var replicateVideoProxy: ReplicateVideoProxy?
+
   /// LoRA Library — indexes, queries, and manages LoRA adapter files.
   /// Initialized at startup; auto-scans if no library.json exists.
   private var loraLibrary: LoRALibrary?
@@ -179,6 +183,19 @@ public final class WarmServer {
       comfyBridge.loraLibrary = library
     } catch {
       logger.warning("LoRA Library: failed to initialize — \(error.localizedDescription). LoRA API endpoints will return 503.")
+    }
+
+    // Initialize Replicate video proxy if API key is available.
+    if let replicateKey = ProcessInfo.processInfo.environment["REPLICATE_API_TOKEN"], !replicateKey.isEmpty {
+      self.replicateVideoProxy = ReplicateVideoProxy(
+        apiKey: replicateKey,
+        allowedOutputDirectory: configuration.allowedOutputDirectory,
+        logger: logger
+      )
+      logger.info("Video proxy: enabled (Replicate)")
+    } else {
+      self.replicateVideoProxy = nil
+      logger.info("Video proxy: disabled (no API key)")
     }
 
     // Wire up the upscale handler. ESRGAN models are always available (lazy-loaded from
@@ -272,6 +289,16 @@ public final class WarmServer {
       self?.accept(connection: connection)
     }
 
+    // Video job pruning timer — clean up completed jobs older than 1 hour.
+    if replicateVideoProxy != nil {
+      let pruneTimer = DispatchSource.makeTimerSource(queue: listenerQueue)
+      pruneTimer.schedule(deadline: .now() + 600, repeating: 600)  // Every 10 minutes
+      pruneTimer.setEventHandler { [weak self] in
+        self?.replicateVideoProxy?.pruneCompletedJobs()
+      }
+      pruneTimer.resume()
+    }
+
     listener.start(queue: listenerQueue)
 
     // Use dispatchMain() instead of semaphore.wait() for daemon reliability.
@@ -340,6 +367,22 @@ public final class WarmServer {
     case ("GET", "/health"):
       let memoryBytes = Self.currentMemoryFootprintBytes()
       let health = await coordinator.health(memoryBytes: memoryBytes)
+      // Encode base health, then inject video section
+      let encoder = JSONEncoder()
+      encoder.keyEncodingStrategy = .convertToSnakeCase
+      if var healthJSON = try? JSONSerialization.jsonObject(
+        with: encoder.encode(health)
+      ) as? [String: Any] {
+        let videoAvailable = replicateVideoProxy != nil
+        healthJSON["video"] = [
+          "available": videoAvailable,
+          "backend": videoAvailable ? "replicate" : "none",
+          "active_jobs": replicateVideoProxy?.activeJobCount ?? 0,
+        ] as [String: Any]
+        if let data = try? JSONSerialization.data(withJSONObject: healthJSON, options: [.sortedKeys]) {
+          return .json(.rawJSON(status: 200, data: data))
+        }
+      }
       return .json(status: 200, payload: health)
 
     case ("POST", "/v1/generate"):
@@ -629,11 +672,58 @@ public final class WarmServer {
         return .error(.error(status: 500, message: error.localizedDescription))
       }
 
+    // MARK: - Video Endpoints
+
+    case ("POST", "/v1/video/generate"):
+      guard let proxy = replicateVideoProxy else {
+        return .error(.error(status: 503, message: "Video generation not available: Replicate API key not configured"))
+      }
+      do {
+        let videoRequest = try decode(VideoGenerateRequest.self, from: request.body)
+        if let validationError = videoRequest.validate() {
+          return .error(.error(status: 400, message: validationError))
+        }
+        // I2V: verify image_path exists on filesystem
+        if let imagePath = videoRequest.imagePath {
+          guard FileManager.default.fileExists(atPath: imagePath) else {
+            return .error(.error(status: 400, message: "image_path file not found: \(imagePath)"))
+          }
+        }
+        let jobStatus = await proxy.submit(videoRequest)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(jobStatus)
+        return .json(.rawJSON(status: 202, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", _) where request.path.hasPrefix("/v1/video/status/"):
+      let jobId = String(request.path.dropFirst("/v1/video/status/".count))
+      guard !jobId.isEmpty else {
+        return .error(.error(status: 400, message: "Missing job_id in path"))
+      }
+      guard let proxy = replicateVideoProxy else {
+        return .error(.error(status: 503, message: "Video generation not available: Replicate API key not configured"))
+      }
+      guard let jobStatus = proxy.status(jobId: jobId) else {
+        return .error(.error(status: 404, message: "Video job not found: \(jobId)"))
+      }
+      do {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(jobStatus)
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(.error(status: 500, message: "Failed to encode job status"))
+      }
+
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
-          "/v1/loras", "/v1/loras/scan"
-      ].contains(request.path) || request.path.hasPrefix("/v1/loras/") {
+          "/v1/loras", "/v1/loras/scan", "/v1/video/generate"
+      ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
+         || request.path.hasPrefix("/v1/video/status/") {
         return .error(.error(status: 405, message: "Method not allowed"))
       }
       return .error(.error(status: 404, message: "Not found"))
