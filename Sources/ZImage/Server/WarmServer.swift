@@ -2888,6 +2888,10 @@ extension GeneratePayload: Decodable {
     switch rawValue {
     case "res_2s":
       return .res2s
+    case "dpmpp_2m":
+      return .dpmplusplus2m
+    case "dpmpp_2s_ancestral":
+      return .dpmplusplus2sa
     default:
       return SchedulerKind(rawValue: rawValue) ?? .euler
     }
@@ -2898,6 +2902,9 @@ extension GeneratePayload: Decodable {
     switch rawValue {
     case "beta57":
       return .beta57
+    case "normal", "simple", "sgm_uniform", "ddim_uniform":
+      // ComfyUI schedule names that map to the model's native flow-matching schedule.
+      return .flow
     default:
       return SigmaScheduleKind(rawValue: rawValue) ?? .flow
     }
