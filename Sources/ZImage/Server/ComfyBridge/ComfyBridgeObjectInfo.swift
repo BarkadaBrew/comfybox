@@ -230,6 +230,14 @@ enum ComfyBridgeObjectInfo {
       ],
       outputs: ["LATENT"]
     )
+    info["EmptyLatentImage"] = nodeDefinition(
+      required: [
+        "width": intInput(default: 1024),
+        "height": intInput(default: 1024),
+        "batch_size": intInput(default: 1),
+      ],
+      outputs: ["LATENT"]
+    )
     info["SamplerCustomAdvanced"] = nodeDefinition(
       required: [
         "noise": noiseInput(),
