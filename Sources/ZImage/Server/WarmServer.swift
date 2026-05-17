@@ -207,8 +207,8 @@ public final class WarmServer {
     }
 
     self.comfyBridge.configureExecutor(
-      generateHandler: { [unowned self] request, progressCallback in
-        try await self.bridgeGenerate(request, progressCallback: progressCallback)
+      generateHandler: { [unowned self] request, progressCallback, latentPreviewCallback in
+        try await self.bridgeGenerate(request, progressCallback: progressCallback, latentPreviewCallback: latentPreviewCallback)
       },
       upscaleHandler: upscaleHandler
     )
@@ -765,7 +765,7 @@ public final class WarmServer {
   /// Default ControlNet directory path — matches ComfyBridgeObjectInfo discovery path.
   private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
 
-  private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult {
+  private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?, latentPreviewCallback: ComfyBridgeLatentPreviewHandler? = nil) async throws -> ComfyBridgeGenerateResult {
     // --- Phase 4: Dynamic LoRA swap ---
     // If the workflow contains LoraLoader nodes, swap LoRAs before generating.
     // The coordinator serializes operations, so swap completes before generate starts.
@@ -983,6 +983,10 @@ public final class WarmServer {
       }
     }
 
+    // Forward the latent preview callback directly — it uses the same
+    // (MLXArray, Int, Int, Int, Int) signature as the pipeline handler.
+    let pipelineLatentPreview: ZImagePipeline.LatentPreviewHandler? = latentPreviewCallback
+
     // Batch generation: if batchSize > 1 (from RepeatLatentBatch), loop and return last result.
     if request.batchSize > 1 {
       logger.info("WarmServer: batch generation — \(request.batchSize) images")
@@ -1014,14 +1018,14 @@ public final class WarmServer {
             maskCropY: payload.maskCropY
           )
         }
-        let result = try await coordinator.enqueueGenerate(batchPayload, progressHandler: pipelineProgress)
+        let result = try await coordinator.enqueueGenerate(batchPayload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview)
         totalDurationMs += result.durationMs
         lastResult = ComfyBridgeGenerateResult(outputPath: result.outputPath, durationMs: totalDurationMs)
       }
       return lastResult!
     }
 
-    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress)
+    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview)
     return ComfyBridgeGenerateResult(
       outputPath: result.outputPath,
       durationMs: result.durationMs
@@ -1844,7 +1848,8 @@ private actor WarmServerCoordinator {
 
   func enqueueGenerate(
     _ payload: GeneratePayload,
-    progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil
+    progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil,
+    latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil
   ) async throws -> GenerateResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -1854,7 +1859,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.generate(payload, ContinuationBox(continuation), progressHandler))
+      pending.append(.generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler))
       startProcessingIfNeeded()
     }
   }
@@ -1980,8 +1985,8 @@ private actor WarmServerCoordinator {
 
       let operation = pending.removeFirst()
       switch operation {
-      case .generate(let payload, let continuation, let progressHandler):
-        await runGenerate(payload, continuation: continuation, progressHandler: progressHandler)
+      case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
+        await runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
       case .controlGenerate(let request, let continuation):
         await runControlGenerate(request, continuation: continuation)
       case .swap(let payload, let continuation):
@@ -1997,7 +2002,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
+  private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
     switch currentModelFamily {
     case .chroma:
       await runChromaGenerate(payload, continuation: continuation)
@@ -2006,11 +2011,11 @@ private actor WarmServerCoordinator {
     case .flux2:
       await runFlux2Generate(payload, continuation: continuation)
     case .flux1:
-      await runFlux1Generate(payload, continuation: continuation, progressHandler: progressHandler)
+      await runFlux1Generate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
     }
   }
 
-  private func runFlux1Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil) async {
+  private func runFlux1Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -2038,7 +2043,7 @@ private actor WarmServerCoordinator {
           configuration: effectiveConfig,
           activeLoRAs: activeLoRAs
         )
-        outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler)
+        outputURL = try await pipeline.generateFromRequest(request, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
       }
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
@@ -3067,7 +3072,7 @@ struct ErrorPayload: Encodable {
 }
 
 private enum QueuedOperation: Sendable {
-  case generate(GeneratePayload, ContinuationBox<GenerateResponse>, (@Sendable (ZImagePipeline.GenerationProgress) -> Void)?)
+  case generate(GeneratePayload, ContinuationBox<GenerateResponse>, (@Sendable (ZImagePipeline.GenerationProgress) -> Void)?, ZImagePipeline.LatentPreviewHandler?)
   case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case shutdown(ContinuationBox<ShutdownResponse>)

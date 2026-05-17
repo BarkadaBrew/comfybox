@@ -6,21 +6,28 @@
 // Phase 2: txt2img execution with WebSocket event dispatch.
 // Phase 5: SeedVR2 upscale execution with WebSocket progress.
 // Phase 6: Binary WebSocket preview images for Krita live denoising.
+// Phase 7: Live denoising preview via latent-to-RGB approximation.
 
 import Foundation
 import Logging
+import MLX
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
 
-/// Callback type for generating images via the warm server pipeline.
-/// Accepts a ComfyBridgeGenerateRequest and returns the output path + timing.
 /// Progress callback sent during generation — maps to WebSocket progress events.
-typealias ComfyBridgeProgressHandler = @Sendable (Int, Int) -> Void  // (stepIndex, totalSteps)
+/// Parameters: (stepIndex, totalSteps)
+typealias ComfyBridgeProgressHandler = @Sendable (Int, Int) -> Void
+
+/// Latent preview callback — receives the current latent state during denoising.
+/// Called every N steps so the executor can generate binary preview frames.
+/// Parameters: (latents: MLXArray [1,C,H,W], stepIndex, totalSteps, latentHeight, latentWidth)
+typealias ComfyBridgeLatentPreviewHandler = @Sendable (MLXArray, Int, Int, Int, Int) -> Void
 
 /// Callback type for generating images via the warm server pipeline.
-/// Accepts a request and optional progress callback, returns output path + timing.
-typealias ComfyBridgeGenerateHandler = @Sendable (ComfyBridgeGenerateRequest, ComfyBridgeProgressHandler?) async throws -> ComfyBridgeGenerateResult
+/// Accepts a request, optional progress callback, and optional latent preview callback.
+/// Returns output path + timing.
+typealias ComfyBridgeGenerateHandler = @Sendable (ComfyBridgeGenerateRequest, ComfyBridgeProgressHandler?, ComfyBridgeLatentPreviewHandler?) async throws -> ComfyBridgeGenerateResult
 
 /// Callback type for upscaling images via the SeedVR2 pipeline.
 /// Accepts input image data, upscale model name, and optional progress callback.
@@ -36,9 +43,8 @@ final class ComfyBridgeExecutor {
   let upscaleHandler: ComfyBridgeUpscaleHandler?
 
   /// Whether to send binary WebSocket preview frames during generation.
-  /// When enabled, sends a downscaled JPEG preview as a ComfyUI binary frame
-  /// after generation completes (before the text "executed" event).
-  /// Has a small performance cost for image encoding.
+  /// When enabled, sends live denoising previews every `previewStepInterval` steps
+  /// and a final preview after generation completes (before the text "executed" event).
   var previewsEnabled: Bool = true
 
   /// Maximum preview dimension (longest edge in pixels).
@@ -46,6 +52,11 @@ final class ComfyBridgeExecutor {
 
   /// JPEG compression quality for preview images (0.0-1.0).
   var previewJPEGQuality: Double = 0.6
+
+  /// How often to send a live preview during denoising, in steps.
+  /// For example, 2 means send a preview every 2 steps (steps 2, 4, 6, ...).
+  /// Set to 0 to disable live previews (only send final preview).
+  var previewStepInterval: Int = 2
 
   /// Active prompt being executed, if any.
   private let lock = NSLock()
@@ -174,7 +185,51 @@ final class ComfyBridgeExecutor {
         }
       }
 
-      let result = try await handler(mutableRequest, progressCallback)
+      // Create a latent preview callback for live denoising previews.
+      // Sends a binary WebSocket frame with an approximate RGB preview
+      // of the current latent state every `previewStepInterval` steps.
+      let latentPreviewCallback: ComfyBridgeLatentPreviewHandler?
+      #if canImport(CoreGraphics)
+      if previewsEnabled && previewStepInterval > 0 {
+        let interval = previewStepInterval
+        let maxDim = previewMaxDimension
+        let quality = previewJPEGQuality
+        let clientId = request.clientId
+        let wsRef = wsManager
+        let loggerRef = logger
+        latentPreviewCallback = { latents, step, total, latentH, latentW in
+          // Only send previews at the configured interval (skip step 0).
+          guard step > 0, step % interval == 0 else { return }
+          // Skip the last step — the final preview from the completed image is better.
+          guard step < total else { return }
+
+          guard let (rgbaData, pixelW, pixelH) = LatentPreviewApproximator.latentsToRGBA(
+            latents, latentHeight: latentH, latentWidth: latentW
+          ) else {
+            return
+          }
+
+          guard let frame = ComfyBridgePreviewEncoder.encodePreviewFrame(
+            fromRGBA: rgbaData,
+            width: pixelW,
+            height: pixelH,
+            maxDimension: maxDim,
+            jpegQuality: CGFloat(quality)
+          ) else {
+            return
+          }
+
+          wsRef.sendBinary(to: clientId, data: frame)
+          loggerRef.debug("ComfyBridge: sent live preview step \(step)/\(total) (\(frame.count) bytes)")
+        }
+      } else {
+        latentPreviewCallback = nil
+      }
+      #else
+      latentPreviewCallback = nil
+      #endif
+
+      let result = try await handler(mutableRequest, progressCallback, latentPreviewCallback)
 
       // Read the output image.
       let outputURL = URL(fileURLWithPath: result.outputPath)
@@ -202,7 +257,6 @@ final class ComfyBridgeExecutor {
         sendBinaryPreview(
           imageData: imageData,
           clientId: request.clientId,
-          eventType: .preview,
           label: "generation"
         )
       }
@@ -333,7 +387,6 @@ final class ComfyBridgeExecutor {
         sendBinaryPreview(
           imageData: imageData,
           clientId: request.clientId,
-          eventType: .preview,
           label: "upscale"
         )
       }
@@ -459,14 +512,12 @@ final class ComfyBridgeExecutor {
   private func sendBinaryPreview(
     imageData: Data,
     clientId: String,
-    eventType: ComfyBridgePreviewEncoder.EventType,
     label: String
   ) {
     guard let frame = ComfyBridgePreviewEncoder.encodePreviewFrame(
       fromPNG: imageData,
       maxDimension: previewMaxDimension,
-      jpegQuality: CGFloat(previewJPEGQuality),
-      eventType: eventType
+      jpegQuality: CGFloat(previewJPEGQuality)
     ) else {
       logger.warning("ComfyBridge: failed to encode \(label) preview — skipping binary frame")
       return
