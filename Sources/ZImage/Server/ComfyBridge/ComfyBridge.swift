@@ -129,7 +129,7 @@ final class ComfyBridge {
       return handleView(request)
 
     case ("GET", "/history"):
-      return handleHistory()
+      return handleHistory(request)
 
     case ("POST", "/upload/image"):
       return handleUploadImage(request)
@@ -503,8 +503,10 @@ final class ComfyBridge {
 
   // MARK: - History
 
-  private func handleHistory() -> RoutedResponse {
-    let payload = history.allJSON()
+  private func handleHistory(_ request: HTTPRequest) -> RoutedResponse {
+    let maxItems = intQueryParameter("max_items", in: request) ?? intQueryParameter("maxItems", in: request) ?? 200
+    let offset = intQueryParameter("offset", in: request) ?? 0
+    let payload = history.toJSON(maxItems: maxItems, offset: offset)
     if let data = try? JSONSerialization.data(withJSONObject: payload) {
       return .json(.rawJSON(status: 200, data: data))
     }
@@ -524,50 +526,33 @@ final class ComfyBridge {
 
   private func handleUploadImage(_ request: HTTPRequest) -> RoutedResponse {
     do {
-      let form = try ComfyBridgeMultipart.parse(
+      let fields = try ComfyBridgeMultipart.parse(
         body: request.body,
         contentType: request.headers["content-type"]
       )
-      guard let file = form.file(named: "image") ?? form.files.first else {
+      guard let imageData = fields["image"] else {
         return .error(.error(status: 400, message: "Missing image upload field"))
       }
 
-      let filename = sanitizedUploadFilename(file.filename)
-      let imageId = cacheId(forUploadedFilename: filename)
-      guard imageCache.store(id: imageId, data: file.data) else {
+      let imageId = UUID().uuidString
+      let filename = "\(imageId).png"
+      guard imageCache.store(id: imageId, data: imageData) else {
         return .error(.error(status: 500, message: "Failed to cache uploaded image"))
       }
 
       let response: [String: Any] = [
         "name": filename,
-        "subfolder": form.field(named: "subfolder") ?? "",
-        "type": form.field(named: "type") ?? "input"
+        "subfolder": "",
+        "type": "input"
       ]
       if let data = try? JSONSerialization.data(withJSONObject: response) {
-        logger.info("ComfyBridge: uploaded image \(filename) as cache id \(imageId) (\(file.data.count) bytes)")
+        logger.info("ComfyBridge: uploaded image \(filename) as cache id \(imageId) (\(imageData.count) bytes)")
         return .json(.rawJSON(status: 200, data: data))
       }
       return .error(.error(status: 500, message: "Failed to serialize upload response"))
     } catch {
       return .error(.error(status: 400, message: "Invalid multipart upload: \(error)"))
     }
-  }
-
-  private func sanitizedUploadFilename(_ filename: String?) -> String {
-    let fallback = "upload-\(UUID().uuidString).png"
-    guard let filename, !filename.isEmpty else {
-      return fallback
-    }
-    let normalized = filename.replacingOccurrences(of: "\\", with: "/")
-    let lastComponent = URL(fileURLWithPath: normalized).lastPathComponent
-    return lastComponent.isEmpty ? fallback : lastComponent
-  }
-
-  private func cacheId(forUploadedFilename filename: String) -> String {
-    if filename.lowercased().hasSuffix(".png") {
-      return String(filename.dropLast(4))
-    }
-    return filename
   }
 
   // MARK: - Model Info
@@ -621,6 +606,11 @@ final class ComfyBridge {
     return nil
   }
 
+  private func intQueryParameter(_ name: String, in request: HTTPRequest) -> Int? {
+    guard let value = decodedQueryParameter(name, in: request) else { return nil }
+    return Int(value)
+  }
+
   // MARK: - WebSocket Upgrade
 
   /// Build the HTTP 101 WebSocket upgrade response for a validated request.
@@ -650,6 +640,9 @@ final class ComfyBridge {
       "Upgrade: websocket",
       "Connection: Upgrade",
       "Sec-WebSocket-Accept: \(acceptKey)",
+      "Access-Control-Allow-Origin: *",
+      "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers: Content-Type",
       "",
       ""
     ].joined(separator: "\r\n")
