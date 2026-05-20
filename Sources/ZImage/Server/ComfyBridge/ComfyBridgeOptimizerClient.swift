@@ -16,6 +16,14 @@ struct ComfyBridgeOptimizerRequest: Sendable {
   let characterDescription: String?
 }
 
+struct ComfyBridgeOptimizerResponse: Sendable {
+  let optimizedPrompt: String
+  let contextBlock: String
+  let photoBlock: String
+  let enhanced: Bool
+  let note: String?
+}
+
 final class ComfyBridgeOptimizerClient {
   private let endpoint: URL
   private let session: URLSession
@@ -31,20 +39,16 @@ final class ComfyBridgeOptimizerClient {
     self.session = session
   }
 
-  func optimize(_ optimizerRequest: ComfyBridgeOptimizerRequest) async throws -> String {
-    var payload: [String: Any] = [
+  func optimize(_ optimizerRequest: ComfyBridgeOptimizerRequest) async throws -> ComfyBridgeOptimizerResponse {
+    let payload: [String: Any] = [
       "raw_prompt": optimizerRequest.rawPrompt,
       "preset": optimizerRequest.preset,
       "content_mode": optimizerRequest.contentMode,
       "scene_hint": optimizerRequest.sceneHint,
-      "aspect_ratio": optimizerRequest.aspectRatio
+      "aspect_ratio": optimizerRequest.aspectRatio,
+      "character": optimizerRequest.character ?? "",
+      "character_description": optimizerRequest.characterDescription ?? "",
     ]
-    if let character = optimizerRequest.character, !character.isEmpty {
-      payload["character"] = character
-    }
-    if let characterDescription = optimizerRequest.characterDescription, !characterDescription.isEmpty {
-      payload["character_description"] = characterDescription
-    }
 
     var request = URLRequest(url: endpoint)
     request.httpMethod = "POST"
@@ -59,39 +63,21 @@ final class ComfyBridgeOptimizerClient {
       throw OptimizerError.requestFailed(message)
     }
 
-    if let object = try? JSONSerialization.jsonObject(with: data),
-       let optimized = Self.extractOptimizedPrompt(from: object) {
-      return optimized
+    guard let object = try? JSONSerialization.jsonObject(with: data),
+          let dict = object as? [String: Any],
+          let optimizedPrompt = dict["optimized_prompt"] as? String,
+          let contextBlock = dict["context_block"] as? String,
+          let photoBlock = dict["photo_block"] as? String else {
+      throw OptimizerError.invalidResponse
     }
 
-    if let text = String(data: data, encoding: .utf8), !text.isEmpty {
-      return text
-    }
-
-    throw OptimizerError.invalidResponse
-  }
-
-  private static func extractOptimizedPrompt(from object: Any) -> String? {
-    if let dict = object as? [String: Any] {
-      for key in ["optimized_prompt", "prompt", "result", "text", "optimized"] {
-        if let value = dict[key] as? String, !value.isEmpty {
-          return value
-        }
-      }
-      for key in ["data", "output"] {
-        if let nested = dict[key], let value = extractOptimizedPrompt(from: nested) {
-          return value
-        }
-      }
-    }
-    if let array = object as? [Any] {
-      for value in array {
-        if let value = extractOptimizedPrompt(from: value) {
-          return value
-        }
-      }
-    }
-    return nil
+    return ComfyBridgeOptimizerResponse(
+      optimizedPrompt: optimizedPrompt,
+      contextBlock: contextBlock,
+      photoBlock: photoBlock,
+      enhanced: (dict["enhanced"] as? Bool) ?? false,
+      note: dict["note"] as? String
+    )
   }
 
   enum OptimizerError: Error, CustomStringConvertible {

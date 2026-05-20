@@ -156,13 +156,13 @@ final class ComfyBridgeExecutor {
       ])
 
       do {
-        let optimizedPrompt = try await optimizerClient.optimize(optimizer)
-        mutableRequest.prompt = optimizedPrompt
+        let optimized = try await optimizerClient.optimize(optimizer)
+        mutableRequest.prompt = optimized.optimizedPrompt
         sendOptimizerExecutedEvent(
           to: request.clientId,
           promptId: request.promptId,
           nodeId: optimizer.nodeId,
-          optimizedPrompt: optimizedPrompt
+          response: optimized
         )
         logger.info("ComfyBridge: CoffeeShop optimizer resolved node \(optimizer.nodeId)")
       } catch {
@@ -452,22 +452,34 @@ final class ComfyBridgeExecutor {
       "type": "execution_success",
       "data": [
         "prompt_id": promptId,
-        "timestamp": Date().timeIntervalSince1970
+        "timestamp": Int(Date().timeIntervalSince1970)
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))
   }
 
-  private func sendOptimizerExecutedEvent(to clientId: String, promptId: String, nodeId: String, optimizedPrompt: String) {
+  private func sendOptimizerExecutedEvent(
+    to clientId: String,
+    promptId: String,
+    nodeId: String,
+    response: ComfyBridgeOptimizerResponse
+  ) {
+    var output: [String: Any] = [
+      "optimized_prompt": [response.optimizedPrompt],
+      "context_block": [response.contextBlock],
+      "photo_block": [response.photoBlock],
+      "enhanced": response.enhanced,
+    ]
+    if let note = response.note {
+      output["note"] = note
+    }
+
     let event: [String: Any] = [
       "type": "executed",
       "data": [
         "prompt_id": promptId,
         "node": nodeId,
-        "output": [
-          "text": [optimizedPrompt],
-          "STRING": [optimizedPrompt]
-        ]
+        "output": output
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))
