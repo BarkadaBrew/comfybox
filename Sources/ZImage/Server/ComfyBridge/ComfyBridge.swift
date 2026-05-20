@@ -176,7 +176,9 @@ final class ComfyBridge {
       }
 
       if originalPath == "/api" || originalPath.hasPrefix("/api/") {
-        logger.warning("ComfyBridge: unknown frontend API route \(request.method) \(originalPath) — returning empty object")
+        let warning = "ComfyBridge: unknown frontend API route \(request.method) \(originalPath) — returning empty object"
+        logger.warning("\(warning)")
+        FileHandle.standardError.write(Data("warning: \(warning)\n".utf8))
         return rawJSON("{}")
       }
 
