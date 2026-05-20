@@ -146,7 +146,17 @@ private final class WebSocketConnection {
   func start() {
     retainSelf = self
     // Send the initial status message that triggers Krita's "connected" event.
-    let statusMsg = #"{"type":"status"}"#
+    let statusMsg = jsonString([
+      "type": "status",
+      "data": [
+        "sid": clientId,
+        "status": [
+          "exec_info": [
+            "queue_remaining": 0
+          ]
+        ]
+      ] as [String: Any]
+    ])
     sendText(statusMsg)
     receiveLoop()
   }
@@ -362,6 +372,14 @@ private final class WebSocketConnection {
   private func sendPong(payload: Data) {
     let frame = encodeFrame(opcode: .pong, payload: payload)
     connection.send(content: frame, completion: .contentProcessed { _ in })
+  }
+
+  private func jsonString(_ dict: [String: Any]) -> String {
+    guard let data = try? JSONSerialization.data(withJSONObject: dict),
+          let str = String(data: data, encoding: .utf8) else {
+      return "{}"
+    }
+    return str
   }
 
   // MARK: - Frame Encoding (Server → Client)

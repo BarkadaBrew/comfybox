@@ -20,6 +20,7 @@ final class ComfyBridge {
   private let logger: Logger
   let wsManager: ComfyWebSocketManager
   let imageCache: ComfyImageCache
+  let history: ComfyBridgeHistory
 
   /// The executor handles async generation and WebSocket event dispatch.
   /// Configured after init via `configureExecutor()`.
@@ -56,6 +57,7 @@ final class ComfyBridge {
     self.logger = logger
     self.wsManager = ComfyWebSocketManager(logger: logger)
     self.imageCache = ComfyImageCache(logger: logger)
+    self.history = ComfyBridgeHistory()
   }
 
   /// Configure the executor with generation and upscale handlers.
@@ -68,6 +70,7 @@ final class ComfyBridge {
       logger: logger,
       wsManager: wsManager,
       imageCache: imageCache,
+      history: history,
       generateHandler: generateHandler,
       upscaleHandler: upscaleHandler
     )
@@ -80,7 +83,14 @@ final class ComfyBridge {
   /// Attempt to route a request through the ComfyUI bridge.
   /// Returns nil if this request is not a ComfyUI endpoint (falls through to WarmServer routes).
   func route(_ request: HTTPRequest) -> RoutedResponse? {
-    switch (request.method, request.path) {
+    let originalPath = request.path
+    let path = Self.strippingAPIPrefix(from: originalPath)
+
+    if request.method == "OPTIONS" {
+      return .json(.empty(status: 204))
+    }
+
+    switch (request.method, path) {
 
     case ("GET", "/system_stats"):
       return handleSystemStats()
@@ -88,17 +98,41 @@ final class ComfyBridge {
     case ("GET", "/object_info"):
       return handleObjectInfo()
 
+    case ("GET", "/embeddings"):
+      return rawJSON("[]")
+
+    case ("GET", "/settings"):
+      return rawJSON("{}")
+
+    case ("GET", "/extensions"):
+      return rawJSON("[]")
+
+    case ("GET", "/users"):
+      return rawJSON(#"{"storage":"server","migrated":true,"users":{"":"default"}}"#)
+
     case ("GET", "/queue"):
       return handleGetQueue()
 
     case ("POST", "/queue"):
       return handlePostQueue()
 
+    case ("GET", "/prompt"):
+      return handleGetPrompt()
+
     case ("POST", "/prompt"):
       return handlePrompt(request)
 
     case ("POST", "/interrupt"):
       return handleInterrupt()
+
+    case ("GET", "/view"):
+      return handleView(request)
+
+    case ("GET", "/history"):
+      return handleHistory(request)
+
+    case ("POST", "/upload/image"):
+      return handleUploadImage(request)
 
     case ("GET", "/ws"):
       // WebSocket upgrade is handled separately in ConnectionHandler.
@@ -107,8 +141,13 @@ final class ComfyBridge {
 
     default:
       // Image cache endpoints use path-prefix matching.
-      if request.path.hasPrefix("/api/etn/image/") {
-        let id = String(request.path.dropFirst("/api/etn/image/".count))
+      if request.method == "GET", path.hasPrefix("/history/") {
+        let promptId = String(path.dropFirst("/history/".count))
+        return handleHistory(promptId: promptId)
+      }
+
+      if path.hasPrefix("/etn/image/") {
+        let id = String(path.dropFirst("/etn/image/".count))
         guard !id.isEmpty else {
           return .error(.error(status: 400, message: "Missing image ID"))
         }
@@ -123,21 +162,42 @@ final class ComfyBridge {
       }
 
       // Model info endpoint with pagination.
-      if request.path.hasPrefix("/api/etn/model_info/") {
-        let folder = String(request.path.dropFirst("/api/etn/model_info/".count))
+      if path.hasPrefix("/etn/model_info/") {
+        let folder = String(path.dropFirst("/etn/model_info/".count))
         return handleModelInfo(folder: folder, queryString: request.queryString)
       }
 
       // Languages endpoint.
-      if request.path == "/api/etn/languages" {
+      if path == "/etn/languages" {
         if let data = try? JSONSerialization.data(withJSONObject: [] as [Any]) {
           return .json(.rawJSON(status: 200, data: data))
         }
         return .json(status: 200, payload: EmptyObject())
       }
 
+      if originalPath == "/api" || originalPath.hasPrefix("/api/") {
+        let warning = "ComfyBridge: unknown frontend API route \(request.method) \(originalPath) — returning empty object"
+        logger.warning("\(warning)")
+        FileHandle.standardError.write(Data("warning: \(warning)\n".utf8))
+        return rawJSON("{}")
+      }
+
       return nil
     }
+  }
+
+  private static func strippingAPIPrefix(from path: String) -> String {
+    if path == "/api" {
+      return "/"
+    }
+    if path.hasPrefix("/api/") {
+      return String(path.dropFirst("/api".count))
+    }
+    return path
+  }
+
+  private func rawJSON(_ json: String, status: Int = 200) -> RoutedResponse {
+    .json(.rawJSON(status: status, data: Data(json.utf8)))
   }
 
   // MARK: - GET /system_stats
@@ -250,6 +310,20 @@ final class ComfyBridge {
       return .json(.rawJSON(status: 200, data: data))
     }
     return .error(.error(status: 500, message: "Failed to serialize queue"))
+  }
+
+  // MARK: - GET /prompt
+
+  private func handleGetPrompt() -> RoutedResponse {
+    let response: [String: Any] = [
+      "exec_info": [
+        "queue_remaining": 0
+      ]
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: response) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize prompt status"))
   }
 
   // MARK: - POST /queue (delete queued jobs)
@@ -412,6 +486,77 @@ final class ComfyBridge {
     return .json(.binary(status: 200, contentType: "image/png", data: data))
   }
 
+  private func handleView(_ request: HTTPRequest) -> RoutedResponse {
+    guard var filename = decodedQueryParameter("filename", in: request), !filename.isEmpty else {
+      return .error(.error(status: 400, message: "Missing filename"))
+    }
+
+    filename = URL(fileURLWithPath: filename).lastPathComponent
+    if filename.lowercased().hasSuffix(".png") {
+      filename.removeLast(4)
+    }
+
+    guard let data = imageCache.retrieve(id: filename) else {
+      return .error(.error(status: 404, message: "Image not found: \(filename)"))
+    }
+
+    return .json(.binary(status: 200, contentType: "image/png", data: data))
+  }
+
+  // MARK: - History
+
+  private func handleHistory(_ request: HTTPRequest) -> RoutedResponse {
+    let maxItems = intQueryParameter("max_items", in: request) ?? intQueryParameter("maxItems", in: request) ?? 200
+    let offset = intQueryParameter("offset", in: request) ?? 0
+    let payload = history.toJSON(maxItems: maxItems, offset: offset)
+    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize history"))
+  }
+
+  private func handleHistory(promptId: String) -> RoutedResponse {
+    let decodedPromptId = promptId.removingPercentEncoding ?? promptId
+    let payload = history.entry(for: decodedPromptId) ?? [:]
+    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize history item"))
+  }
+
+  // MARK: - POST /upload/image
+
+  private func handleUploadImage(_ request: HTTPRequest) -> RoutedResponse {
+    do {
+      let fields = try ComfyBridgeMultipart.parse(
+        body: request.body,
+        contentType: request.headers["content-type"]
+      )
+      guard let imageData = fields["image"] else {
+        return .error(.error(status: 400, message: "Missing image upload field"))
+      }
+
+      let imageId = UUID().uuidString
+      let filename = "\(imageId).png"
+      guard imageCache.store(id: imageId, data: imageData) else {
+        return .error(.error(status: 500, message: "Failed to cache uploaded image"))
+      }
+
+      let response: [String: Any] = [
+        "name": filename,
+        "subfolder": "",
+        "type": "input"
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: response) {
+        logger.info("ComfyBridge: uploaded image \(filename) as cache id \(imageId) (\(imageData.count) bytes)")
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize upload response"))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid multipart upload: \(error)"))
+    }
+  }
+
   // MARK: - Model Info
 
   private func handleModelInfo(folder: String, queryString: String?) -> RoutedResponse {
@@ -449,6 +594,25 @@ final class ComfyBridge {
     return .error(.error(status: 500, message: "Failed to serialize model_info"))
   }
 
+  private func decodedQueryParameter(_ name: String, in request: HTTPRequest) -> String? {
+    guard let queryString = request.queryString else { return nil }
+    for pair in queryString.split(separator: "&", omittingEmptySubsequences: false) {
+      let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+      guard let rawKey = parts.first else { continue }
+      let key = String(rawKey).replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? String(rawKey)
+      guard key == name else { continue }
+      if parts.count == 1 { return "" }
+      let rawValue = String(parts[1]).replacingOccurrences(of: "+", with: " ")
+      return rawValue.removingPercentEncoding ?? rawValue
+    }
+    return nil
+  }
+
+  private func intQueryParameter(_ name: String, in request: HTTPRequest) -> Int? {
+    guard let value = decodedQueryParameter(name, in: request) else { return nil }
+    return Int(value)
+  }
+
   // MARK: - WebSocket Upgrade
 
   /// Build the HTTP 101 WebSocket upgrade response for a validated request.
@@ -478,6 +642,9 @@ final class ComfyBridge {
       "Upgrade: websocket",
       "Connection: Upgrade",
       "Sec-WebSocket-Accept: \(acceptKey)",
+      "Access-Control-Allow-Origin: *",
+      "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers: Content-Type",
       "",
       ""
     ].joined(separator: "\r\n")

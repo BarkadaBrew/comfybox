@@ -12,7 +12,7 @@ import Foundation
 struct ComfyBridgeGenerateRequest: Sendable {
   let promptId: String
   let clientId: String
-  let prompt: String
+  var prompt: String
   let negativePrompt: String?
   let width: Int
   let height: Int
@@ -71,6 +71,9 @@ struct ComfyBridgeGenerateRequest: Sendable {
   /// Model ID detected from CheckpointLoaderSimple node in the workflow.
   /// Used for automatic model switching when Krita selects a different checkpoint.
   let detectedModel: String?
+
+  /// Optional CoffeeShop optimizer node extracted from the workflow.
+  let optimizer: ComfyBridgeOptimizerRequest?
 
   /// Whether this is an inpainting request.
   var isInpaint: Bool { inpaintImageId != nil }
@@ -165,11 +168,16 @@ enum ComfyBridgeWorkflowParser {
         .filter { $0.classType == "CLIPTextEncode" }
         .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
       if let first = textNodes.first {
-        positivePrompt = first.inputs["text"] as? String
+        positivePrompt = resolveText(from: first, nodes: nodes)
       }
       if textNodes.count > 1 {
-        negativePrompt = textNodes[1].inputs["text"] as? String
+        negativePrompt = resolveText(from: textNodes[1], nodes: nodes)
       }
+    }
+
+    let detectedOptimizer = Self.extractOptimizer(from: nodes)
+    if positivePrompt == nil {
+      positivePrompt = detectedOptimizer?.rawPrompt
     }
 
     guard let prompt = positivePrompt, !prompt.isEmpty else {
@@ -387,6 +395,9 @@ enum ComfyBridgeWorkflowParser {
     // selected model. We extract this and map it to a ComfyBox pool model ID.
     let detectedModel = Self.extractDetectedModel(from: nodes)
 
+    // --- CoffeeShop optimizer detection ---
+    let optimizer = detectedOptimizer
+
     // Debug: log workflow structure
     let _nodeTypes = nodes.values.map { $0.classType }.sorted()
     let _loraDesc = loras.isEmpty ? "none" : loras.map { "\($0.name)@\($0.scale)" }.joined(separator: ", ")
@@ -423,7 +434,8 @@ enum ComfyBridgeWorkflowParser {
       controlnetStart: controlnetStart,
       controlnetEnd: controlnetEnd,
       controlImageId: controlImageId,
-      detectedModel: detectedModel
+      detectedModel: detectedModel,
+      optimizer: optimizer
     )
   }
 
@@ -652,7 +664,23 @@ enum ComfyBridgeWorkflowParser {
           let textNode = nodes[refNodeId] else {
       return nil
     }
-    return textNode.inputs["text"] as? String
+    return resolveText(from: textNode, nodes: nodes)
+  }
+
+  private static func resolveText(from node: WorkflowNode, nodes: [String: WorkflowNode]) -> String? {
+    if let text = node.inputs["text"] as? String {
+      return text
+    }
+    if let ref = node.inputs["text"] as? [Any],
+       let refNodeId = ref.first as? String,
+       let sourceNode = nodes[refNodeId],
+       sourceNode.classType == "CoffeeShopOptimizer" {
+      return sourceNode.inputs["raw_prompt"] as? String
+    }
+    if node.classType == "CoffeeShopOptimizer" {
+      return node.inputs["raw_prompt"] as? String
+    }
+    return nil
   }
 
   // MARK: - Value Extraction Helpers
@@ -734,6 +762,28 @@ enum ComfyBridgeWorkflowParser {
 
     // Unrecognized model — return the raw name so the caller can attempt pool lookup.
     return ckptName
+  }
+
+  private static func extractOptimizer(from nodes: [String: WorkflowNode]) -> ComfyBridgeOptimizerRequest? {
+    guard let node = nodes.values.first(where: { $0.classType == "CoffeeShopOptimizer" }) else {
+      return nil
+    }
+
+    return ComfyBridgeOptimizerRequest(
+      nodeId: node.id,
+      rawPrompt: node.inputs["raw_prompt"] as? String ?? "",
+      preset: node.inputs["preset"] as? String ?? "photorealistic",
+      contentMode: node.inputs["content_mode"] as? String ?? "neutral",
+      sceneHint: node.inputs["scene_hint"] as? String ?? "auto",
+      aspectRatio: node.inputs["aspect_ratio"] as? String ?? "1:1",
+      character: optionalString(node.inputs["character"]),
+      characterDescription: optionalString(node.inputs["character_description"])
+    )
+  }
+
+  private static func optionalString(_ value: Any?) -> String? {
+    guard let value = value as? String else { return nil }
+    return value.isEmpty ? nil : value
   }
 }
 

@@ -32,6 +32,8 @@ final class ComfyBridgeExecutor {
   private let logger: Logger
   private let wsManager: ComfyWebSocketManager
   private let imageCache: ComfyImageCache
+  private let history: ComfyBridgeHistory
+  private let optimizerClient: ComfyBridgeOptimizerClient
   let generateHandler: ComfyBridgeGenerateHandler?
   let upscaleHandler: ComfyBridgeUpscaleHandler?
 
@@ -55,6 +57,8 @@ final class ComfyBridgeExecutor {
     logger: Logger,
     wsManager: ComfyWebSocketManager,
     imageCache: ComfyImageCache,
+    history: ComfyBridgeHistory,
+    optimizerClient: ComfyBridgeOptimizerClient = ComfyBridgeOptimizerClient(),
     generateHandler: ComfyBridgeGenerateHandler?,
     upscaleHandler: ComfyBridgeUpscaleHandler? = nil,
     previewsEnabled: Bool = true
@@ -62,6 +66,8 @@ final class ComfyBridgeExecutor {
     self.logger = logger
     self.wsManager = wsManager
     self.imageCache = imageCache
+    self.history = history
+    self.optimizerClient = optimizerClient
     self.generateHandler = generateHandler
     self.upscaleHandler = upscaleHandler
     self.previewsEnabled = previewsEnabled
@@ -127,13 +133,6 @@ final class ComfyBridgeExecutor {
       logger.info("ComfyBridge: loaded control image \(controlImageId) (\(controlData.count) bytes)")
     }
 
-    let promptPreview = mutableRequest.prompt.count > 80
-      ? String(mutableRequest.prompt.prefix(77)) + "..."
-      : mutableRequest.prompt
-    let modeLabel = mutableRequest.isControlNet ? "controlnet" : (mutableRequest.isInpaint ? "inpaint" : "txt2img")
-    logger.info("ComfyBridge: executing \(modeLabel) prompt_id=\(mutableRequest.promptId) — \(mutableRequest.width)x\(mutableRequest.height), \(mutableRequest.steps) steps, denoise=\(mutableRequest.denoise)")
-    logger.info("ComfyBridge: prompt — \"\(promptPreview)\"")
-
     // --- Phase 1: execution_start ---
     sendEvent(to: request.clientId, type: "execution_start", data: [
       "prompt_id": request.promptId
@@ -149,6 +148,36 @@ final class ComfyBridgeExecutor {
         "nodes": [nodeId]
       ])
     }
+
+    if let optimizer = mutableRequest.optimizer {
+      sendEvent(to: request.clientId, type: "executing", data: [
+        "prompt_id": request.promptId,
+        "node": optimizer.nodeId
+      ])
+
+      do {
+        let optimized = try await optimizerClient.optimize(optimizer)
+        mutableRequest.prompt = optimized.optimizedPrompt
+        sendOptimizerExecutedEvent(
+          to: request.clientId,
+          promptId: request.promptId,
+          nodeId: optimizer.nodeId,
+          response: optimized
+        )
+        logger.info("ComfyBridge: CoffeeShop optimizer resolved node \(optimizer.nodeId)")
+      } catch {
+        logger.error("ComfyBridge: CoffeeShop optimizer failed — prompt_id=\(request.promptId): \(error)")
+        sendError(promptId: request.promptId, clientId: request.clientId, message: "\(error)")
+        return
+      }
+    }
+
+    let promptPreview = mutableRequest.prompt.count > 80
+      ? String(mutableRequest.prompt.prefix(77)) + "..."
+      : mutableRequest.prompt
+    let modeLabel = mutableRequest.isControlNet ? "controlnet" : (mutableRequest.isInpaint ? "inpaint" : "txt2img")
+    logger.info("ComfyBridge: executing \(modeLabel) prompt_id=\(mutableRequest.promptId) — \(mutableRequest.width)x\(mutableRequest.height), \(mutableRequest.steps) steps, denoise=\(mutableRequest.denoise)")
+    logger.info("ComfyBridge: prompt — \"\(promptPreview)\"")
 
     // The sampler node is where actual work happens.
     sendEvent(to: request.clientId, type: "executing", data: [
@@ -221,6 +250,10 @@ final class ComfyBridgeExecutor {
         nodeId: request.outputNodeId,
         imageId: imageId
       )
+
+      history.recordGeneration(request: mutableRequest, imageId: imageId, durationMs: result.durationMs)
+
+      sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
 
       // Workflow complete — node=null signals done.
       sendExecutingDone(to: request.clientId, promptId: request.promptId)
@@ -353,6 +386,10 @@ final class ComfyBridgeExecutor {
         imageId: imageId
       )
 
+      history.recordUpscale(request: mutableRequest, imageId: imageId, durationMs: result.durationMs)
+
+      sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
+
       // Workflow complete — node=null signals done.
       sendExecutingDone(to: request.clientId, promptId: request.promptId)
 
@@ -402,12 +439,60 @@ final class ComfyBridgeExecutor {
         "node": nodeId,
         "output": [
           "images": [
-            ["source": "http", "id": imageId]
+            imageReference(for: imageId)
           ]
         ]
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func sendExecutionSuccess(to clientId: String, promptId: String) {
+    let event: [String: Any] = [
+      "type": "execution_success",
+      "data": [
+        "prompt_id": promptId,
+        "timestamp": Int(Date().timeIntervalSince1970)
+      ] as [String: Any]
+    ]
+    wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func sendOptimizerExecutedEvent(
+    to clientId: String,
+    promptId: String,
+    nodeId: String,
+    response: ComfyBridgeOptimizerResponse
+  ) {
+    var output: [String: Any] = [
+      "optimized_prompt": [response.optimizedPrompt],
+      "context_block": [response.contextBlock],
+      "photo_block": [response.photoBlock],
+      "enhanced": response.enhanced,
+    ]
+    if let note = response.note {
+      output["note"] = note
+    }
+
+    let event: [String: Any] = [
+      "type": "executed",
+      "data": [
+        "prompt_id": promptId,
+        "node": nodeId,
+        "output": output
+      ] as [String: Any]
+    ]
+    wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func imageReference(for imageId: String) -> [String: Any] {
+    [
+      "source": "http",
+      "id": imageId,
+      "filename": "\(imageId).png",
+      "subfolder": "",
+      "type": "output"
+    ]
   }
 
   private func sendExecutingDone(to clientId: String, promptId: String) {

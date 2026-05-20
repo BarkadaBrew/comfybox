@@ -2480,7 +2480,7 @@ private final class ConnectionHandler {
     }
 
     // Check for WebSocket upgrade before entering the async router.
-    if request.path == "/ws", request.method == "GET" {
+    if (request.path == "/ws" || request.path == "/api/ws"), request.method == "GET" {
       if let wsResponse = server.comfyBridge.handleWebSocketUpgrade(request: request, connection: connection, queue: queue) {
         // Send the upgrade response, then keep the connection alive for WebSocket framing.
         guard !responseSent else { return }
@@ -2587,6 +2587,10 @@ struct HTTPResponse {
     HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: contentType, body: data)
   }
 
+  static func empty(status: Int) -> HTTPResponse {
+    HTTPResponse(status: status, reasonPhrase: reasonPhrase(for: status), contentType: "application/json", body: Data())
+  }
+
   static func error(status: Int, message: String) -> HTTPResponse {
     json(status: status, payload: ErrorPayload(success: false, error: message))
   }
@@ -2597,6 +2601,10 @@ struct HTTPResponse {
       "HTTP/1.1 \(status) \(reasonPhrase)",
       "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
+      "Access-Control-Allow-Origin: *",
+      "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers: Content-Type, Authorization, Accept, Origin, X-Requested-With",
+      "Access-Control-Max-Age: 86400",
       "Connection: close",
       "",
       ""
@@ -2608,6 +2616,7 @@ struct HTTPResponse {
 
   static func reasonPhrase(for status: Int) -> String {
     switch status {
+    case 204: return "No Content"
     case 200: return "OK"
     case 400: return "Bad Request"
     case 404: return "Not Found"
