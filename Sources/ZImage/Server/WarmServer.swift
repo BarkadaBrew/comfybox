@@ -2603,7 +2603,8 @@ struct HTTPResponse {
       "Content-Length: \(body.count)",
       "Access-Control-Allow-Origin: *",
       "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers: Content-Type",
+      "Access-Control-Allow-Headers: Content-Type, Authorization, Accept, Origin, X-Requested-With",
+      "Access-Control-Max-Age: 86400",
       "Connection: close",
       "",
       ""
