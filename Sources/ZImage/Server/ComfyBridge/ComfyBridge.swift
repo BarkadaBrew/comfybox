@@ -87,7 +87,7 @@ final class ComfyBridge {
     let path = Self.strippingAPIPrefix(from: originalPath)
 
     if request.method == "OPTIONS" {
-      return rawJSON("{}")
+      return .json(.empty(status: 204))
     }
 
     switch (request.method, path) {
@@ -106,6 +106,9 @@ final class ComfyBridge {
 
     case ("GET", "/extensions"):
       return rawJSON("[]")
+
+    case ("GET", "/users"):
+      return rawJSON(#"{"storage":"server","migrated":true,"users":{"":"default"}}"#)
 
     case ("GET", "/queue"):
       return handleGetQueue()

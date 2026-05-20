@@ -33,6 +33,7 @@ final class ComfyBridgeExecutor {
   private let wsManager: ComfyWebSocketManager
   private let imageCache: ComfyImageCache
   private let history: ComfyBridgeHistory
+  private let optimizerClient: ComfyBridgeOptimizerClient
   let generateHandler: ComfyBridgeGenerateHandler?
   let upscaleHandler: ComfyBridgeUpscaleHandler?
 
@@ -57,6 +58,7 @@ final class ComfyBridgeExecutor {
     wsManager: ComfyWebSocketManager,
     imageCache: ComfyImageCache,
     history: ComfyBridgeHistory,
+    optimizerClient: ComfyBridgeOptimizerClient = ComfyBridgeOptimizerClient(),
     generateHandler: ComfyBridgeGenerateHandler?,
     upscaleHandler: ComfyBridgeUpscaleHandler? = nil,
     previewsEnabled: Bool = true
@@ -65,6 +67,7 @@ final class ComfyBridgeExecutor {
     self.wsManager = wsManager
     self.imageCache = imageCache
     self.history = history
+    self.optimizerClient = optimizerClient
     self.generateHandler = generateHandler
     self.upscaleHandler = upscaleHandler
     self.previewsEnabled = previewsEnabled
@@ -130,13 +133,6 @@ final class ComfyBridgeExecutor {
       logger.info("ComfyBridge: loaded control image \(controlImageId) (\(controlData.count) bytes)")
     }
 
-    let promptPreview = mutableRequest.prompt.count > 80
-      ? String(mutableRequest.prompt.prefix(77)) + "..."
-      : mutableRequest.prompt
-    let modeLabel = mutableRequest.isControlNet ? "controlnet" : (mutableRequest.isInpaint ? "inpaint" : "txt2img")
-    logger.info("ComfyBridge: executing \(modeLabel) prompt_id=\(mutableRequest.promptId) — \(mutableRequest.width)x\(mutableRequest.height), \(mutableRequest.steps) steps, denoise=\(mutableRequest.denoise)")
-    logger.info("ComfyBridge: prompt — \"\(promptPreview)\"")
-
     // --- Phase 1: execution_start ---
     sendEvent(to: request.clientId, type: "execution_start", data: [
       "prompt_id": request.promptId
@@ -152,6 +148,36 @@ final class ComfyBridgeExecutor {
         "nodes": [nodeId]
       ])
     }
+
+    if let optimizer = mutableRequest.optimizer {
+      sendEvent(to: request.clientId, type: "executing", data: [
+        "prompt_id": request.promptId,
+        "node": optimizer.nodeId
+      ])
+
+      do {
+        let optimizedPrompt = try await optimizerClient.optimize(optimizer)
+        mutableRequest.prompt = optimizedPrompt
+        sendOptimizerExecutedEvent(
+          to: request.clientId,
+          promptId: request.promptId,
+          nodeId: optimizer.nodeId,
+          optimizedPrompt: optimizedPrompt
+        )
+        logger.info("ComfyBridge: CoffeeShop optimizer resolved node \(optimizer.nodeId)")
+      } catch {
+        logger.error("ComfyBridge: CoffeeShop optimizer failed — prompt_id=\(request.promptId): \(error)")
+        sendError(promptId: request.promptId, clientId: request.clientId, message: "\(error)")
+        return
+      }
+    }
+
+    let promptPreview = mutableRequest.prompt.count > 80
+      ? String(mutableRequest.prompt.prefix(77)) + "..."
+      : mutableRequest.prompt
+    let modeLabel = mutableRequest.isControlNet ? "controlnet" : (mutableRequest.isInpaint ? "inpaint" : "txt2img")
+    logger.info("ComfyBridge: executing \(modeLabel) prompt_id=\(mutableRequest.promptId) — \(mutableRequest.width)x\(mutableRequest.height), \(mutableRequest.steps) steps, denoise=\(mutableRequest.denoise)")
+    logger.info("ComfyBridge: prompt — \"\(promptPreview)\"")
 
     // The sampler node is where actual work happens.
     sendEvent(to: request.clientId, type: "executing", data: [
@@ -427,6 +453,21 @@ final class ComfyBridgeExecutor {
       "data": [
         "prompt_id": promptId,
         "timestamp": Date().timeIntervalSince1970
+      ] as [String: Any]
+    ]
+    wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func sendOptimizerExecutedEvent(to clientId: String, promptId: String, nodeId: String, optimizedPrompt: String) {
+    let event: [String: Any] = [
+      "type": "executed",
+      "data": [
+        "prompt_id": promptId,
+        "node": nodeId,
+        "output": [
+          "text": [optimizedPrompt],
+          "STRING": [optimizedPrompt]
+        ]
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))

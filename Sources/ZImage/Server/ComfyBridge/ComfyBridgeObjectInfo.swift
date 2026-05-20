@@ -540,6 +540,26 @@ enum ComfyBridgeObjectInfo {
       "preset_metadata": presetMetadata,
     ] as [String: Any]
 
+    // --- CoffeeShop prompt optimizer node ---
+    info["CoffeeShopOptimizer"] = nodeDefinition(
+      required: [
+        "raw_prompt": stringInput(multiline: true),
+        "preset": optionInput([
+          "photorealistic", "cinematic", "glamour", "editorial", "intimate",
+          "medium_format", "analog", "candid", "noir", "neon", "macro", "pov", "phone",
+        ]),
+        "content_mode": optionInput(["neutral", "banana", "avocado"]),
+        "scene_hint": optionInput(["auto", "portrait", "full_body", "environmental", "action", "intimate", "pov", "macro"]),
+        "aspect_ratio": optionInput(["1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9"]),
+      ],
+      optional: [
+        "character": stringInput(),
+        "character_description": stringInput(multiline: true),
+      ],
+      outputs: ["STRING", "STRING", "STRING"],
+      outputNames: ["optimized_prompt", "context_block", "photo_block"]
+    )
+
     return finalizedObjectInfo(info)
   }
 
@@ -549,19 +569,25 @@ enum ComfyBridgeObjectInfo {
   private static func nodeDefinition(
     required: [String: Any],
     optional: [String: Any] = [:],
-    outputs: [String]
+    outputs: [String],
+    outputNames: [String]? = nil
   ) -> [String: Any] {
     var input: [String: Any] = ["required": required]
     if !optional.isEmpty {
       input["optional"] = optional
     }
+    let names = outputNames ?? outputs
     return [
+      "name": "",
+      "display_name": "",
+      "description": "",
+      "category": "_for_testing",
+      "output_node": false,
+      "python_module": "nodes",
       "input": input,
       "output": outputs,
-      "output_name": outputs,
+      "output_name": names,
       "output_is_list": outputs.map { _ in false },
-      "output_node": false,
-      "python_module": "ComfyBox.ComfyBridge"
     ]
   }
 
@@ -570,21 +596,27 @@ enum ComfyBridgeObjectInfo {
     for (nodeName, value) in info {
       guard var definition = value as? [String: Any] else { continue }
 
-      definition["name"] = definition["name"] ?? nodeName
-      definition["display_name"] = definition["display_name"] ?? displayName(for: nodeName)
-      definition["description"] = definition["description"] ?? "ComfyBox bridge declaration for \(displayName(for: nodeName))."
-      definition["category"] = definition["category"] ?? category(for: nodeName)
+      definition["name"] = nonEmptyString(definition["name"]) ?? nodeName
+      definition["display_name"] = nonEmptyString(definition["display_name"]) ?? displayName(for: nodeName)
+      definition["description"] = nonEmptyString(definition["description"]) ?? ""
+      definition["category"] = category(for: nodeName)
       definition["output_node"] = outputNodeTypes.contains(nodeName) || ((definition["output_node"] as? Bool) ?? false)
-      definition["python_module"] = definition["python_module"] ?? "ComfyBox.ComfyBridge"
+      definition["python_module"] = "nodes"
 
-      let output = outputTypes(from: definition)
-      definition["output"] = definition["output"] ?? output
-      definition["output_name"] = definition["output_name"] ?? output
-      definition["output_is_list"] = definition["output_is_list"] ?? output.map { _ in false }
+      let output = stringArray(definition["output"]) ?? stringArray(definition["output_name"]) ?? []
+      let outputNames = stringArray(definition["output_name"]) ?? output
+      definition["output"] = output
+      definition["output_name"] = outputNames
+      definition["output_is_list"] = output.map { _ in false }
 
       finalized[nodeName] = definition
     }
     return finalized
+  }
+
+  private static func nonEmptyString(_ value: Any?) -> String? {
+    guard let string = value as? String, !string.isEmpty else { return nil }
+    return string
   }
 
   private static let outputNodeTypes: Set<String> = [
@@ -592,20 +624,14 @@ enum ComfyBridgeObjectInfo {
     "PreviewImage"
   ]
 
-  private static func outputTypes(from definition: [String: Any]) -> [String] {
-    if let output = definition["output"] as? [String] {
-      return output
+  private static func stringArray(_ value: Any?) -> [String]? {
+    if let strings = value as? [String] {
+      return strings
     }
-    if let output = definition["output_name"] as? [String] {
-      return output
+    if let values = value as? [Any] {
+      return values.compactMap { $0 as? String }
     }
-    if let output = definition["output"] as? [Any] {
-      return output.compactMap { $0 as? String }
-    }
-    if let output = definition["output_name"] as? [Any] {
-      return output.compactMap { $0 as? String }
-    }
-    return []
+    return nil
   }
 
   private static func displayName(for nodeName: String) -> String {
@@ -619,38 +645,48 @@ enum ComfyBridgeObjectInfo {
   }
 
   private static func category(for nodeName: String) -> String {
-    if nodeName.hasPrefix("ETN_") {
-      return "ComfyBox/Krita ETN"
-    }
-    if nodeName.hasPrefix("INPAINT_") || nodeName.contains("Inpaint") {
-      return "ComfyBox/Inpaint"
-    }
-    if nodeName.contains("Control") || nodeName.contains("Preprocessor") || nodeName == "ModelPatchLoader" {
-      return "ComfyBox/ControlNet"
-    }
-    if nodeName.contains("Loader") || nodeName == "CheckpointLoaderSimple" {
-      return "ComfyBox/Loaders"
-    }
-    if nodeName.contains("Sampler") || nodeName.contains("Scheduler") || nodeName.contains("Guider") || nodeName == "RandomNoise" || nodeName == "SplitSigmas" {
-      return "ComfyBox/Sampling"
-    }
-    if nodeName.contains("Image") || nodeName.contains("VAE") || nodeName.contains("Mask") {
-      return "ComfyBox/Image"
-    }
-    if nodeName.hasPrefix("ComfyBox") {
-      return "ComfyBox/Presets"
-    }
-    if nodeName.hasPrefix("CoffeeShop") {
+    switch nodeName {
+    case "ComfyBoxStylePreset", "ComfyBoxStylePresetInfo", "CoffeeShopOptimizer":
       return "CoffeeShop"
+
+    case "UNETLoader", "CLIPLoader", "DualCLIPLoader", "DualCLIPLoaderGGUF",
+         "VAELoader", "ControlNetLoader", "UpscaleModelLoader",
+         "NunchakuZImageDiTLoader", "ModelPatchLoader", "IPAdapterModelLoader",
+         "CLIPVisionLoader", "StyleModelLoader", "LoraLoader",
+         "INPAINT_LoadInpaintModel", "INPAINT_LoadFooocusInpaint",
+         "CheckpointLoaderSimple", "UnetLoaderGGUF":
+      return "loaders"
+
+    case "CLIPTextEncode", "BasicGuider", "CFGGuider", "ZImageFunControlnet",
+         "IPAdapter", "ETN_Translate":
+      return "conditioning"
+
+    case "EmptySD3LatentImage", "EmptyLatentImage", "VAEEncode", "VAEEncodeTiled",
+         "INPAINT_VAEEncodeInpaintConditioning", "SetLatentNoiseMask",
+         "RepeatLatentBatch":
+      return "latent"
+
+    case "SamplerCustomAdvanced", "BasicScheduler", "KSamplerSelect", "RandomNoise",
+         "DifferentialDiffusion", "KSampler", "KSamplerAdvanced", "SplitSigmas":
+      return "sampling"
+
+    case "ETN_LoadImageCache", "ETN_SaveImageCache", "INPAINT_ShrinkMask",
+         "INPAINT_StabilizeMask", "INPAINT_ColorMatch", "INPAINT_ExpandMask",
+         "INPAINT_MaskedBlur", "InpaintPreprocessor", "DepthAnythingV2Preprocessor",
+         "VAEDecode", "VAEDecodeTiled", "ETN_ApplyMaskToImage", "ImageScale",
+         "ImageUpscaleWithModel", "NSFWFilter", "ImageCrop", "PreviewImage":
+      return "image"
+
+    default:
+      return "_for_testing"
     }
-    return "ComfyBox"
   }
 
   // MARK: - Input Type Helpers
 
-  /// String input: ["STRING", {}]
-  private static func stringInput() -> [Any] {
-    return ["STRING", [:] as [String: Any]]
+  /// String input: ["STRING", {"multiline": Bool}]
+  private static func stringInput(multiline: Bool = false) -> [Any] {
+    return ["STRING", ["multiline": multiline] as [String: Any]]
   }
 
   /// Integer input with default: ["INT", {"default": N}]
