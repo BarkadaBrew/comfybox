@@ -372,9 +372,8 @@ final class ComfyBridge {
       return .error(.error(status: 400, message: "Invalid JSON body"))
     }
 
-    guard let promptId = json["prompt_id"] as? String else {
-      return .error(.error(status: 400, message: "Missing prompt_id"))
-    }
+    // ComfyUI frontend doesn't send prompt_id — generate one server-side.
+    let promptId = (json["prompt_id"] as? String) ?? UUID().uuidString
 
     guard json["prompt"] is [String: Any] else {
       return .error(.error(status: 400, message: "Missing or invalid 'prompt' object"))
