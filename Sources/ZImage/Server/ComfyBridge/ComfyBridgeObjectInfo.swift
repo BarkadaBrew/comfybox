@@ -540,7 +540,7 @@ enum ComfyBridgeObjectInfo {
       "preset_metadata": presetMetadata,
     ] as [String: Any]
 
-    return info
+    return finalizedObjectInfo(info)
   }
 
   // MARK: - Node Definition Helpers
@@ -557,8 +557,93 @@ enum ComfyBridgeObjectInfo {
     }
     return [
       "input": input,
-      "output_name": outputs
+      "output": outputs,
+      "output_name": outputs,
+      "output_is_list": outputs.map { _ in false },
+      "output_node": false,
+      "python_module": "ComfyBox.ComfyBridge"
     ]
+  }
+
+  private static func finalizedObjectInfo(_ info: [String: Any]) -> [String: Any] {
+    var finalized = info
+    for (nodeName, value) in info {
+      guard var definition = value as? [String: Any] else { continue }
+
+      definition["name"] = definition["name"] ?? nodeName
+      definition["display_name"] = definition["display_name"] ?? displayName(for: nodeName)
+      definition["description"] = definition["description"] ?? "ComfyBox bridge declaration for \(displayName(for: nodeName))."
+      definition["category"] = definition["category"] ?? category(for: nodeName)
+      definition["output_node"] = outputNodeTypes.contains(nodeName) || ((definition["output_node"] as? Bool) ?? false)
+      definition["python_module"] = definition["python_module"] ?? "ComfyBox.ComfyBridge"
+
+      let output = outputTypes(from: definition)
+      definition["output"] = definition["output"] ?? output
+      definition["output_name"] = definition["output_name"] ?? output
+      definition["output_is_list"] = definition["output_is_list"] ?? output.map { _ in false }
+
+      finalized[nodeName] = definition
+    }
+    return finalized
+  }
+
+  private static let outputNodeTypes: Set<String> = [
+    "ETN_SaveImageCache",
+    "PreviewImage"
+  ]
+
+  private static func outputTypes(from definition: [String: Any]) -> [String] {
+    if let output = definition["output"] as? [String] {
+      return output
+    }
+    if let output = definition["output_name"] as? [String] {
+      return output
+    }
+    if let output = definition["output"] as? [Any] {
+      return output.compactMap { $0 as? String }
+    }
+    if let output = definition["output_name"] as? [Any] {
+      return output.compactMap { $0 as? String }
+    }
+    return []
+  }
+
+  private static func displayName(for nodeName: String) -> String {
+    nodeName
+      .replacingOccurrences(of: "_", with: " ")
+      .replacingOccurrences(
+        of: "([a-z0-9])([A-Z])",
+        with: "$1 $2",
+        options: .regularExpression
+      )
+  }
+
+  private static func category(for nodeName: String) -> String {
+    if nodeName.hasPrefix("ETN_") {
+      return "ComfyBox/Krita ETN"
+    }
+    if nodeName.hasPrefix("INPAINT_") || nodeName.contains("Inpaint") {
+      return "ComfyBox/Inpaint"
+    }
+    if nodeName.contains("Control") || nodeName.contains("Preprocessor") || nodeName == "ModelPatchLoader" {
+      return "ComfyBox/ControlNet"
+    }
+    if nodeName.contains("Loader") || nodeName == "CheckpointLoaderSimple" {
+      return "ComfyBox/Loaders"
+    }
+    if nodeName.contains("Sampler") || nodeName.contains("Scheduler") || nodeName.contains("Guider") || nodeName == "RandomNoise" || nodeName == "SplitSigmas" {
+      return "ComfyBox/Sampling"
+    }
+    if nodeName.contains("Image") || nodeName.contains("VAE") || nodeName.contains("Mask") {
+      return "ComfyBox/Image"
+    }
+    if nodeName.hasPrefix("ComfyBox") {
+      return "ComfyBox/Presets"
+    }
+    if nodeName.hasPrefix("CoffeeShop") {
+      return "CoffeeShop"
+    }
+    return "ComfyBox"
   }
 
   // MARK: - Input Type Helpers

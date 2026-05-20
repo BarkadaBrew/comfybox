@@ -222,6 +222,8 @@ final class ComfyBridgeExecutor {
         imageId: imageId
       )
 
+      sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
+
       // Workflow complete — node=null signals done.
       sendExecutingDone(to: request.clientId, promptId: request.promptId)
 
@@ -353,6 +355,8 @@ final class ComfyBridgeExecutor {
         imageId: imageId
       )
 
+      sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
+
       // Workflow complete — node=null signals done.
       sendExecutingDone(to: request.clientId, promptId: request.promptId)
 
@@ -402,12 +406,33 @@ final class ComfyBridgeExecutor {
         "node": nodeId,
         "output": [
           "images": [
-            ["source": "http", "id": imageId]
+            imageReference(for: imageId)
           ]
         ]
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func sendExecutionSuccess(to clientId: String, promptId: String) {
+    let event: [String: Any] = [
+      "type": "execution_success",
+      "data": [
+        "prompt_id": promptId,
+        "timestamp": Date().timeIntervalSince1970
+      ] as [String: Any]
+    ]
+    wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func imageReference(for imageId: String) -> [String: Any] {
+    [
+      "source": "http",
+      "id": imageId,
+      "filename": "\(imageId).png",
+      "subfolder": "",
+      "type": "output"
+    ]
   }
 
   private func sendExecutingDone(to clientId: String, promptId: String) {
