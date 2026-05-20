@@ -20,6 +20,7 @@ final class ComfyBridge {
   private let logger: Logger
   let wsManager: ComfyWebSocketManager
   let imageCache: ComfyImageCache
+  let history: ComfyBridgeHistory
 
   /// The executor handles async generation and WebSocket event dispatch.
   /// Configured after init via `configureExecutor()`.
@@ -56,6 +57,7 @@ final class ComfyBridge {
     self.logger = logger
     self.wsManager = ComfyWebSocketManager(logger: logger)
     self.imageCache = ComfyImageCache(logger: logger)
+    self.history = ComfyBridgeHistory()
   }
 
   /// Configure the executor with generation and upscale handlers.
@@ -68,6 +70,7 @@ final class ComfyBridge {
       logger: logger,
       wsManager: wsManager,
       imageCache: imageCache,
+      history: history,
       generateHandler: generateHandler,
       upscaleHandler: upscaleHandler
     )
@@ -122,6 +125,12 @@ final class ComfyBridge {
     case ("GET", "/view"):
       return handleView(request)
 
+    case ("GET", "/history"):
+      return handleHistory()
+
+    case ("POST", "/upload/image"):
+      return handleUploadImage(request)
+
     case ("GET", "/ws"):
       // WebSocket upgrade is handled separately in ConnectionHandler.
       // Return websocketUpgrade to signal the router that this path is claimed.
@@ -129,6 +138,11 @@ final class ComfyBridge {
 
     default:
       // Image cache endpoints use path-prefix matching.
+      if request.method == "GET", path.hasPrefix("/history/") {
+        let promptId = String(path.dropFirst("/history/".count))
+        return handleHistory(promptId: promptId)
+      }
+
       if path.hasPrefix("/etn/image/") {
         let id = String(path.dropFirst("/etn/image/".count))
         guard !id.isEmpty else {
@@ -482,6 +496,75 @@ final class ComfyBridge {
     }
 
     return .json(.binary(status: 200, contentType: "image/png", data: data))
+  }
+
+  // MARK: - History
+
+  private func handleHistory() -> RoutedResponse {
+    let payload = history.allJSON()
+    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize history"))
+  }
+
+  private func handleHistory(promptId: String) -> RoutedResponse {
+    let decodedPromptId = promptId.removingPercentEncoding ?? promptId
+    let payload = history.json(for: decodedPromptId) ?? [:]
+    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize history item"))
+  }
+
+  // MARK: - POST /upload/image
+
+  private func handleUploadImage(_ request: HTTPRequest) -> RoutedResponse {
+    do {
+      let form = try ComfyBridgeMultipart.parse(
+        body: request.body,
+        contentType: request.headers["content-type"]
+      )
+      guard let file = form.file(named: "image") ?? form.files.first else {
+        return .error(.error(status: 400, message: "Missing image upload field"))
+      }
+
+      let filename = sanitizedUploadFilename(file.filename)
+      let imageId = cacheId(forUploadedFilename: filename)
+      guard imageCache.store(id: imageId, data: file.data) else {
+        return .error(.error(status: 500, message: "Failed to cache uploaded image"))
+      }
+
+      let response: [String: Any] = [
+        "name": filename,
+        "subfolder": form.field(named: "subfolder") ?? "",
+        "type": form.field(named: "type") ?? "input"
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: response) {
+        logger.info("ComfyBridge: uploaded image \(filename) as cache id \(imageId) (\(file.data.count) bytes)")
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize upload response"))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid multipart upload: \(error)"))
+    }
+  }
+
+  private func sanitizedUploadFilename(_ filename: String?) -> String {
+    let fallback = "upload-\(UUID().uuidString).png"
+    guard let filename, !filename.isEmpty else {
+      return fallback
+    }
+    let normalized = filename.replacingOccurrences(of: "\\", with: "/")
+    let lastComponent = URL(fileURLWithPath: normalized).lastPathComponent
+    return lastComponent.isEmpty ? fallback : lastComponent
+  }
+
+  private func cacheId(forUploadedFilename filename: String) -> String {
+    if filename.lowercased().hasSuffix(".png") {
+      return String(filename.dropLast(4))
+    }
+    return filename
   }
 
   // MARK: - Model Info

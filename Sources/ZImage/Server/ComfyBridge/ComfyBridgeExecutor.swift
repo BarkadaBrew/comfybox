@@ -32,6 +32,7 @@ final class ComfyBridgeExecutor {
   private let logger: Logger
   private let wsManager: ComfyWebSocketManager
   private let imageCache: ComfyImageCache
+  private let history: ComfyBridgeHistory
   let generateHandler: ComfyBridgeGenerateHandler?
   let upscaleHandler: ComfyBridgeUpscaleHandler?
 
@@ -55,6 +56,7 @@ final class ComfyBridgeExecutor {
     logger: Logger,
     wsManager: ComfyWebSocketManager,
     imageCache: ComfyImageCache,
+    history: ComfyBridgeHistory,
     generateHandler: ComfyBridgeGenerateHandler?,
     upscaleHandler: ComfyBridgeUpscaleHandler? = nil,
     previewsEnabled: Bool = true
@@ -62,6 +64,7 @@ final class ComfyBridgeExecutor {
     self.logger = logger
     self.wsManager = wsManager
     self.imageCache = imageCache
+    self.history = history
     self.generateHandler = generateHandler
     self.upscaleHandler = upscaleHandler
     self.previewsEnabled = previewsEnabled
@@ -222,6 +225,8 @@ final class ComfyBridgeExecutor {
         imageId: imageId
       )
 
+      history.recordGeneration(request: mutableRequest, imageId: imageId, durationMs: result.durationMs)
+
       sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
 
       // Workflow complete — node=null signals done.
@@ -354,6 +359,8 @@ final class ComfyBridgeExecutor {
         nodeId: request.outputNodeId,
         imageId: imageId
       )
+
+      history.recordUpscale(request: mutableRequest, imageId: imageId, durationMs: result.durationMs)
 
       sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
 

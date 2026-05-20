@@ -149,7 +149,6 @@ private final class WebSocketConnection {
     let statusMsg = jsonString([
       "type": "status",
       "data": [
-        "sid": clientId,
         "status": [
           "exec_info": [
             "queue_remaining": 0
