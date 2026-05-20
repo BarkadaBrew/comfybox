@@ -517,7 +517,7 @@ final class ComfyBridge {
 
   private func handleHistory(promptId: String) -> RoutedResponse {
     let decodedPromptId = promptId.removingPercentEncoding ?? promptId
-    let payload = history.json(for: decodedPromptId) ?? [:]
+    let payload = history.entry(for: decodedPromptId) ?? [:]
     if let data = try? JSONSerialization.data(withJSONObject: payload) {
       return .json(.rawJSON(status: 200, data: data))
     }
