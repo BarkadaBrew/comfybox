@@ -913,10 +913,11 @@ public final class WarmServer {
       )
     }
 
-    // Family-aware defaults for step clamping, guidance, and negative prompts.
+    // Family-aware defaults for step clamping, guidance, sampler, and negative prompts.
     let family = await coordinator.modelFamily
     let resolvedSteps: Int
     let resolvedGuidance: Float
+    let resolvedSampler: String
     let resolvedNegativePrompt: String?
 
     switch family {
@@ -924,23 +925,33 @@ public final class WarmServer {
       // FIBO: use model defaults, no step clamping
       resolvedSteps = request.steps
       resolvedGuidance = request.guidance > 0 ? request.guidance : 4.0
+      resolvedSampler = request.sampler ?? "euler"
       resolvedNegativePrompt = request.negativePrompt
     case .chroma:
       // Chroma: 28 steps default, guidance 0.0 (unconditioned)
       resolvedSteps = request.steps > 0 ? request.steps : 28
       resolvedGuidance = request.guidance
+      resolvedSampler = request.sampler ?? "euler"
       resolvedNegativePrompt = nil
     case .flux1:
       let zimageVariant = await coordinator.currentZImageVariant
       if zimageVariant == .base {
-        // Z-Image Base: non-distilled, supports CFG guidance and negative prompts
-        resolvedSteps = request.steps
+        // Z-Image Base / undistilled CivitAI checkpoints (Moody, etc.)
+        // The ComfyUI frontend KSampler defaults are for Turbo (9 steps, 0 CFG, euler).
+        // When an undistilled model is loaded, those defaults produce blurry noise.
+        // If steps <= 9 (turbo default), override to 40 (undistilled recommended).
+        // If sampler is euler, switch to dpmpp_2m_sde (better for undistilled).
+        resolvedSteps = request.steps <= 9 ? 40 : request.steps
         resolvedGuidance = request.guidance > 0 ? request.guidance : ZImageModelMetadata.Base.recommendedGuidanceScale
+        resolvedSampler = (request.sampler ?? "euler") == "euler" ? "dpmpp_2m" : (request.sampler ?? "dpmpp_2m")
         resolvedNegativePrompt = request.negativePrompt
+        let origSampler = request.sampler ?? "nil"
+        logger.info("[WarmServer] Base variant override: steps=\(resolvedSteps) (was \(request.steps)), cfg=\(resolvedGuidance), sampler=\(resolvedSampler) (was \(origSampler))")
       } else {
         // Z-Image Turbo: distilled, optimal at 9 steps, no CFG, no negative prompts
         resolvedSteps = min(request.steps, 9)
         resolvedGuidance = 0.0
+        resolvedSampler = "euler"
         resolvedNegativePrompt = nil
       }
     case .flux2:
@@ -949,6 +960,7 @@ public final class WarmServer {
       let isBaseModel = await coordinator.isFlux2BaseModel
       resolvedSteps = request.steps                 // Klein: no step clamp
       resolvedGuidance = isBaseModel ? request.guidance : 1.0
+      resolvedSampler = request.sampler ?? "euler"
       resolvedNegativePrompt = nil                  // Klein: CFG only when guidance > 1.0
     }
 
@@ -963,7 +975,7 @@ public final class WarmServer {
       outputPath: nil,
       levelsMin: request.levelsMin,
       levelsMax: request.levelsMax,
-      scheduler: request.sampler,
+      scheduler: resolvedSampler,
       sigmaSchedule: request.sigmaSchedule,
       inpaintImageData: request.inpaintImageData,
       maskData: request.maskImageData,

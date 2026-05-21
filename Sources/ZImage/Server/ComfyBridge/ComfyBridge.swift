@@ -439,32 +439,11 @@ final class ComfyBridge {
       let detectedModel = generateRequest.detectedModel
       let switchHandler = modelSwitchHandler
 
-      // --- Model-aware parameter defaults ---
-      // The /object_info KSampler declares defaults for Z-Image Turbo (steps=9, cfg=0.0,
-      // sampler=euler). When the user loads a different model via the ComfyUI frontend,
-      // the KSampler widget values stay at those defaults. Undistilled models like
-      // Moody Wild V4 need different parameters (40 steps, CFG 4.0, dpmpp_2m_sde).
-      //
-      // Detection: if both steps and cfg match the /object_info KSampler defaults exactly,
-      // the user has not intentionally changed them -- apply the model recommended defaults.
-      // If either was changed, the user is experimenting -- respect their values.
-      if let modelId = detectedModel {
-        let objectInfoDefaultSteps = 9
-        let objectInfoDefaultCFG: Float = 0.0
-        let userKeptDefaults = generateRequest.steps == objectInfoDefaultSteps
-          && generateRequest.guidance == objectInfoDefaultCFG
-
-        if userKeptDefaults,
-           let registryModel = ComfyBoxModelRegistry.allModels.first(where: { $0.id == modelId }) {
-          generateRequest.steps = registryModel.defaultSteps
-          generateRequest.guidance = registryModel.defaultGuidance
-          // Set sampler based on variant: undistilled models need dpmpp_2m_sde,
-          // distilled/turbo models use euler.
-          let recommendedSampler = registryModel.variant == .base ? "dpmpp_2m_sde" : "euler"
-          generateRequest.sampler = recommendedSampler
-          self.logger.info("[ComfyBridge] Applying model defaults for \(registryModel.displayName): steps=\(registryModel.defaultSteps), cfg=\(registryModel.defaultGuidance), sampler=\(recommendedSampler)")
-        }
-      }
+      // NOTE: Model-aware parameter defaults are handled in WarmServer.bridgeGenerate(),
+      // not here. The bridge detects the model from the WORKFLOW checkpoint node, which
+      // may not match the actually loaded model (e.g., user loaded Moody V4 externally
+      // but the default workflow still references z-image-turbo-bf16). WarmServer knows
+      // the actual loaded model family/variant and applies correct defaults.
 
       Task {
         // Auto-switch model if the workflow specifies a different checkpoint.
