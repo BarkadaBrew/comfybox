@@ -114,6 +114,7 @@ struct ComfyBridgeUpscaleRequest: Sendable {
 enum ComfyBridgeParsedWorkflow: Sendable {
   case generate(ComfyBridgeGenerateRequest)
   case upscale(ComfyBridgeUpscaleRequest)
+  case multiStage(ComfyBridgeMultiStageRequest)
 }
 
 /// Parses ComfyUI workflow JSON into generation parameters.
@@ -474,6 +475,12 @@ enum ComfyBridgeWorkflowParser {
       return .upscale(try parseUpscale(json))
     }
 
+    // Multi-stage workflows have 2+ KSampler nodes linked via LATENT connections.
+    // Detect before falling back to single-pass parser.
+    if let multiStage = parseMultiStage(json) {
+      return .multiStage(multiStage)
+    }
+
     return .generate(try parse(json))
   }
 
@@ -779,14 +786,353 @@ enum ComfyBridgeWorkflowParser {
     )
   }
 
+
+  // MARK: - Multi-Stage Workflow Parsing
+
+  /// Detect whether a workflow contains multiple KSampler stages linked by LATENT connections.
+  /// Returns nil if this is a single-sampler workflow (handled by the existing parser).
+  static func parseMultiStage(_ json: [String: Any]) -> ComfyBridgeMultiStageRequest? {
+    let promptId = (json["prompt_id"] as? String) ?? UUID().uuidString
+    let clientId = json["client_id"] as? String ?? "unknown"
+
+    guard let workflow = json["prompt"] as? [String: Any] else { return nil }
+
+    // Build typed node map.
+    var nodes: [String: WorkflowNode] = [:]
+    for (id, value) in workflow {
+      guard let dict = value as? [String: Any],
+            let classType = dict["class_type"] as? String,
+            let inputs = dict["inputs"] as? [String: Any] else {
+        continue
+      }
+      nodes[id] = WorkflowNode(id: id, classType: classType, inputs: inputs)
+    }
+
+    // Find all KSampler nodes.
+    let kSamplerNodes = nodes.values.filter {
+      $0.classType == "KSampler" || $0.classType == "KSamplerAdvanced"
+    }
+
+    // Only multi-stage if we have 2+ KSamplers.
+    guard kSamplerNodes.count >= 2 else { return nil }
+
+    var kSamplerById: [String: WorkflowNode] = [:]
+    for node in kSamplerNodes {
+      kSamplerById[node.id] = node
+    }
+
+    // Find the root KSampler (one whose latent_image comes from EmptyLatentImage).
+    var rootNode: WorkflowNode?
+    for node in kSamplerNodes {
+      if let latentRef = node.inputs["latent_image"] as? [Any],
+         let sourceId = latentRef.first as? String,
+         let sourceNode = nodes[sourceId] {
+        if sourceNode.classType == "EmptyLatentImage" || sourceNode.classType == "EmptySD3LatentImage" {
+          rootNode = node
+          break
+        }
+      }
+    }
+
+    guard let root = rootNode else { return nil }
+
+    // Build the chain starting from root.
+    var chainOrder: [WorkflowNode] = [root]
+    var visited: Set<String> = [root.id]
+
+    // Build map: parentKSamplerId -> childKSamplerNode (child takes parent's latent output)
+    var childOf: [String: WorkflowNode] = [:]
+    for node in kSamplerNodes {
+      if let latentRef = node.inputs["latent_image"] as? [Any],
+         let sourceId = latentRef.first as? String,
+         kSamplerById[sourceId] != nil {
+        childOf[sourceId] = node
+      }
+    }
+
+    // Walk the chain.
+    var current = root
+    while let next = childOf[current.id], !visited.contains(next.id) {
+      chainOrder.append(next)
+      visited.insert(next.id)
+      current = next
+    }
+
+    // Must have at least 2 stages in the chain.
+    guard chainOrder.count >= 2 else { return nil }
+
+    // --- Extract prompt text ---
+    var positivePrompt: String?
+    var negativePrompt: String?
+
+    let firstKSampler = chainOrder[0]
+    if let posRef = firstKSampler.inputs["positive"] as? [Any],
+       let posNodeId = posRef.first as? String,
+       let posNode = nodes[posNodeId] {
+      positivePrompt = resolveText(from: posNode, nodes: nodes)
+    }
+    if let negRef = firstKSampler.inputs["negative"] as? [Any],
+       let negNodeId = negRef.first as? String,
+       let negNode = nodes[negNodeId] {
+      negativePrompt = resolveText(from: negNode, nodes: nodes)
+    }
+
+    if positivePrompt == nil {
+      let textNodes = nodes.values
+        .filter { $0.classType == "CLIPTextEncode" }
+        .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+      if let first = textNodes.first {
+        positivePrompt = resolveText(from: first, nodes: nodes)
+      }
+      if textNodes.count > 1 {
+        negativePrompt = resolveText(from: textNodes[1], nodes: nodes)
+      }
+    }
+
+    let detectedOptimizer = Self.extractOptimizer(from: nodes)
+    if positivePrompt == nil {
+      positivePrompt = detectedOptimizer?.rawPrompt
+    }
+
+    guard let prompt = positivePrompt, !prompt.isEmpty else { return nil }
+
+    // --- Extract dimensions ---
+    let latentNode = nodes.values.first {
+      $0.classType == "EmptySD3LatentImage" || $0.classType == "EmptyLatentImage"
+    }
+    let width = roundTo16(intValue(latentNode?.inputs["width"]) ?? 1024)
+    let height = roundTo16(intValue(latentNode?.inputs["height"]) ?? 1024)
+
+    // --- Extract output node ---
+    // For multi-stage, find the output node connected to the LAST stage's output chain.
+    let outputNodeId = resolveOutputNodeId(from: chainOrder.last!, nodes: nodes)
+
+    // --- Build stages ---
+    var stages: [ComfyBridgeStage] = []
+    for (index, kNode) in chainOrder.enumerated() {
+      let isFirst = (index == 0)
+      let modelId = resolveModelForKSampler(kNode, nodes: nodes)
+      let steps = intValue(kNode.inputs["steps"]) ?? 9
+      let cfg = floatValue(kNode.inputs["cfg"]) ?? 0.0
+      let samplerName = kNode.inputs["sampler_name"] as? String ?? "euler"
+      let scheduler = kNode.inputs["scheduler"] as? String ?? "normal"
+      let denoise = floatValue(kNode.inputs["denoise"]) ?? (isFirst ? 1.0 : 0.5)
+      let seed: UInt64?
+      if kNode.classType == "KSamplerAdvanced" {
+        seed = uint64Value(kNode.inputs["noise_seed"])
+      } else {
+        seed = uint64Value(kNode.inputs["seed"])
+      }
+      let loras = resolveLoRAsForKSampler(kNode, nodes: nodes)
+
+      stages.append(ComfyBridgeStage(
+        nodeId: kNode.id,
+        modelId: modelId,
+        steps: steps,
+        cfg: cfg,
+        sampler: samplerName,
+        scheduler: scheduler,
+        denoise: denoise,
+        seed: seed,
+        loras: loras,
+        isFirstStage: isFirst
+      ))
+    }
+
+    let stageDesc = stages.enumerated().map { (i, s) in
+      "stage\(i+1): \(s.steps) steps, cfg=\(s.cfg), sampler=\(s.sampler), denoise=\(s.denoise), model=\(s.modelId ?? "inherit")"
+    }.joined(separator: " | ")
+    print("[ComfyBridge] multi-stage workflow detected: \(stages.count) stages: \(stageDesc)")
+
+    return ComfyBridgeMultiStageRequest(
+      promptId: promptId,
+      clientId: clientId,
+      prompt: prompt,
+      negativePrompt: negativePrompt,
+      width: width,
+      height: height,
+      stages: stages,
+      outputNodeId: outputNodeId,
+      optimizer: detectedOptimizer
+    )
+  }
+
+  // MARK: - Multi-Stage Helper Methods
+
+  /// Trace the model input chain from a KSampler back to a CheckpointLoaderSimple.
+  /// The chain may go through LoraLoader nodes (which pass through MODEL).
+  private static func resolveModelForKSampler(_ kNode: WorkflowNode, nodes: [String: WorkflowNode]) -> String? {
+    var currentNode = kNode
+    var maxDepth = 10
+
+    while maxDepth > 0 {
+      maxDepth -= 1
+
+      guard let modelRef = currentNode.inputs["model"] as? [Any],
+            let sourceId = modelRef.first as? String,
+            let sourceNode = nodes[sourceId] else {
+        return nil
+      }
+
+      if sourceNode.classType == "CheckpointLoaderSimple" {
+        guard let ckptName = sourceNode.inputs["ckpt_name"] as? String, !ckptName.isEmpty else {
+          return nil
+        }
+        // Try exact match first.
+        if let exactMatch = exactModelMap[ckptName] {
+          return exactMatch
+        }
+        // Try partial matching.
+        let lowered = ckptName.lowercased()
+        for (pattern, poolId) in partialModelPatterns {
+          if lowered.contains(pattern.lowercased()) {
+            return poolId
+          }
+        }
+        return ckptName
+      }
+
+      // LoraLoader, ModelMerge, etc. pass through the model input.
+      currentNode = sourceNode
+    }
+    return nil
+  }
+
+  /// Resolve LoRAs from the model chain feeding into a specific KSampler.
+  private static func resolveLoRAsForKSampler(_ kNode: WorkflowNode, nodes: [String: WorkflowNode]) -> [(name: String, scale: Float)] {
+    var loras: [(name: String, scale: Float)] = []
+    var currentNode = kNode
+    var maxDepth = 10
+
+    while maxDepth > 0 {
+      maxDepth -= 1
+
+      guard let modelRef = currentNode.inputs["model"] as? [Any],
+            let sourceId = modelRef.first as? String,
+            let sourceNode = nodes[sourceId] else {
+        break
+      }
+
+      if sourceNode.classType == "LoraLoader" {
+        if let loraName = sourceNode.inputs["lora_name"] as? String, !loraName.isEmpty {
+          let strengthModel = floatValue(sourceNode.inputs["strength_model"]) ?? 1.0
+          loras.append((name: loraName, scale: strengthModel))
+        }
+      }
+
+      if sourceNode.classType == "CheckpointLoaderSimple" {
+        break
+      }
+
+      currentNode = sourceNode
+    }
+
+    return loras
+  }
+
+  /// Find the output node connected to a KSampler's output chain.
+  /// Walks: KSampler -> VAEDecode -> PreviewImage/ETN_SaveImageCache.
+  private static func resolveOutputNodeId(from kNode: WorkflowNode, nodes: [String: WorkflowNode]) -> String {
+    // Build forward link map: which nodes consume each node's output?
+    var consumers: [String: [WorkflowNode]] = [:]
+    for (_, node) in nodes {
+      for (_, value) in node.inputs {
+        if let ref = value as? [Any],
+           let refNodeId = ref.first as? String {
+          consumers[refNodeId, default: []].append(node)
+        }
+      }
+    }
+
+    // Walk forward from the last KSampler: KSampler -> VAEDecode -> PreviewImage/Save
+    var candidates = consumers[kNode.id] ?? []
+    var visited: Set<String> = [kNode.id]
+    var maxDepth = 5
+
+    while maxDepth > 0 && !candidates.isEmpty {
+      maxDepth -= 1
+      for candidate in candidates {
+        if candidate.classType == "ETN_SaveImageCache" || candidate.classType == "PreviewImage" {
+          return candidate.id
+        }
+      }
+      // Go one level deeper
+      var nextCandidates: [WorkflowNode] = []
+      for candidate in candidates {
+        if !visited.contains(candidate.id) {
+          visited.insert(candidate.id)
+          nextCandidates.append(contentsOf: consumers[candidate.id] ?? [])
+        }
+      }
+      candidates = nextCandidates
+    }
+
+    // Fallback: any output node in the workflow
+    if let saveNode = nodes.values.first(where: { $0.classType == "ETN_SaveImageCache" }) {
+      return saveNode.id
+    }
+    if let previewNode = nodes.values.first(where: { $0.classType == "PreviewImage" }) {
+      return previewNode.id
+    }
+    return nodes.keys.sorted { $0.localizedStandardCompare($1) == .orderedDescending }.first ?? "1"
+  }
+
   private static func optionalString(_ value: Any?) -> String? {
     guard let value = value as? String else { return nil }
     return value.isEmpty ? nil : value
   }
 }
 
+
+// MARK: - Multi-Stage Data Types
+
+/// A single stage in a multi-stage workflow.
+/// Each stage corresponds to one KSampler node in the ComfyUI graph.
+struct ComfyBridgeStage: Sendable {
+  /// The KSampler node ID in the workflow graph.
+  let nodeId: String
+  /// Model identifier from the CheckpointLoaderSimple feeding this KSampler.
+  /// nil means reuse the model from the previous stage.
+  let modelId: String?
+  /// Number of denoising steps.
+  let steps: Int
+  /// CFG guidance scale.
+  let cfg: Float
+  /// Sampler algorithm name (e.g. "euler", "dpmpp_2m").
+  let sampler: String
+  /// Scheduler name (e.g. "normal", "karras").
+  let scheduler: String
+  /// Denoising strength (1.0 = full txt2img, <1.0 = img2img).
+  let denoise: Float
+  /// Random seed. nil = random.
+  let seed: UInt64?
+  /// LoRAs to apply for this stage.
+  let loras: [(name: String, scale: Float)]
+  /// Whether this is the first stage (txt2img from empty latent).
+  let isFirstStage: Bool
+}
+
+/// A multi-stage generation request parsed from a ComfyUI workflow.
+struct ComfyBridgeMultiStageRequest: Sendable {
+  let promptId: String
+  let clientId: String
+  /// The positive prompt text.
+  var prompt: String
+  /// The negative prompt text.
+  let negativePrompt: String?
+  /// Image dimensions (from EmptyLatentImage).
+  let width: Int
+  let height: Int
+  /// The ordered list of stages to execute.
+  let stages: [ComfyBridgeStage]
+  /// The output node ID (PreviewImage/ETN_SaveImageCache).
+  let outputNodeId: String
+  /// Optional CoffeeShop optimizer.
+  let optimizer: ComfyBridgeOptimizerRequest?
+}
+
 /// A node in the ComfyUI workflow graph.
-private struct WorkflowNode {
+struct WorkflowNode {
   let id: String
   let classType: String
   let inputs: [String: Any]

@@ -206,11 +206,16 @@ public final class WarmServer {
       try await self.bridgeUpscale(imageData: imageData, modelName: modelName, progressCallback: progressCallback)
     }
 
+    let multiStageHandler: ComfyBridgeMultiStageHandler = { [unowned self] (request: ComfyBridgeMultiStageRequest, stage: ComfyBridgeStage, stageIndex: Int, totalStages: Int, previousOutput: Data?, progressCallback: ComfyBridgeProgressHandler?, latentPreviewCallback: ComfyBridgeLatentPreviewHandler?) async throws -> ComfyBridgeGenerateResult in
+      try await self.bridgeMultiStageGenerate(request: request, stage: stage, stageIndex: stageIndex, totalStages: totalStages, previousStageOutput: previousOutput, progressCallback: progressCallback, latentPreviewCallback: latentPreviewCallback)
+    }
+
     self.comfyBridge.configureExecutor(
       generateHandler: { [unowned self] request, progressCallback, latentPreviewCallback in
         try await self.bridgeGenerate(request, progressCallback: progressCallback, latentPreviewCallback: latentPreviewCallback)
       },
-      upscaleHandler: upscaleHandler
+      upscaleHandler: upscaleHandler,
+      multiStageHandler: multiStageHandler
     )
 
     // Wire queue status provider and clear handler for ComfyUI /queue endpoint.
@@ -1036,6 +1041,153 @@ public final class WarmServer {
       }
       return lastResult!
     }
+
+    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview)
+    return ComfyBridgeGenerateResult(
+      outputPath: result.outputPath,
+      durationMs: result.durationMs
+    )
+  }
+
+
+  // MARK: - Multi-Stage Bridge Generation
+
+  /// Execute a single stage of a multi-stage workflow.
+  /// Handles model switching, LoRA swaps, and img2img for non-first stages.
+  private func bridgeMultiStageGenerate(
+    request: ComfyBridgeMultiStageRequest,
+    stage: ComfyBridgeStage,
+    stageIndex: Int,
+    totalStages: Int,
+    previousStageOutput: Data?,
+    progressCallback: ComfyBridgeProgressHandler?,
+    latentPreviewCallback: ComfyBridgeLatentPreviewHandler?
+  ) async throws -> ComfyBridgeGenerateResult {
+    let stageNum = stageIndex + 1
+    logger.info("WarmServer: multi-stage \(stageNum)/\(totalStages) — model=\(stage.modelId ?? "current"), steps=\(stage.steps), cfg=\(stage.cfg), sampler=\(stage.sampler), denoise=\(stage.denoise)")
+
+    // --- Model switch if needed ---
+    if let modelId = stage.modelId {
+      let currentActive = await coordinator.modelPool.activeModelId()
+      let requestedKey = ModelPool.poolKey(for: modelId)
+
+      if currentActive != requestedKey {
+        // Try to activate from pool first (instant), then load if needed.
+        if let existing = await coordinator.modelPool.findEntry(for: modelId) {
+          try await coordinator.poolActivate(modelId: existing.id)
+          logger.info("WarmServer: multi-stage model switch — activated pool model '\(existing.id)' for stage \(stageNum)")
+        } else {
+          let quantization = Self.parseQuantization(from: modelId)
+          let modelSpec = Self.parseModelSpec(from: modelId)
+          let result = try await coordinator.poolLoad(modelSpec: modelSpec, quantization: quantization, activate: true)
+          logger.info("WarmServer: multi-stage model switch — loaded '\(result.model)' (\(result.loadTimeMs)ms) for stage \(stageNum)")
+        }
+      }
+    }
+
+    // --- LoRA swap if needed ---
+    if !stage.loras.isEmpty {
+      let loraEntries = stage.loras.map { lora -> LoRAEntry in
+        let resolvedPath: String
+        if lora.name.contains("/") || lora.name.hasPrefix("~") {
+          resolvedPath = lora.name
+        } else {
+          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+        }
+        return LoRAEntry(path: resolvedPath, scale: lora.scale)
+      }
+      let swapPayload = LoRASwapPayload(loras: loraEntries)
+      let swapResult = try await coordinator.enqueueSwap(swapPayload)
+      logger.info("WarmServer: multi-stage LoRA swap for stage \(stageNum) — \(swapResult.loraCount) LoRA(s) active")
+    }
+
+    // --- Family-aware defaults ---
+    let family = await coordinator.modelFamily
+    let resolvedSteps: Int
+    let resolvedGuidance: Float
+    let resolvedSampler: String
+    let resolvedNegativePrompt: String?
+
+    switch family {
+    case .fibo:
+      resolvedSteps = stage.steps
+      resolvedGuidance = stage.cfg > 0 ? stage.cfg : 4.0
+      resolvedSampler = stage.sampler
+      resolvedNegativePrompt = request.negativePrompt
+    case .chroma:
+      resolvedSteps = stage.steps > 0 ? stage.steps : 28
+      resolvedGuidance = stage.cfg
+      resolvedSampler = stage.sampler
+      resolvedNegativePrompt = nil
+    case .flux1:
+      let zimageVariant = await coordinator.currentZImageVariant
+      if zimageVariant == .base {
+        // For base (undistilled) models, use the stage's own parameters.
+        // The workflow author set these intentionally for multi-stage.
+        resolvedSteps = stage.steps
+        resolvedGuidance = stage.cfg > 0 ? stage.cfg : 4.0
+        resolvedSampler = stage.sampler
+        resolvedNegativePrompt = request.negativePrompt
+      } else {
+        resolvedSteps = min(stage.steps, 9)
+        resolvedGuidance = 0.0
+        resolvedSampler = "euler"
+        resolvedNegativePrompt = nil
+      }
+    case .flux2:
+      let isBaseModel = await coordinator.isFlux2BaseModel
+      resolvedSteps = stage.steps
+      resolvedGuidance = isBaseModel ? stage.cfg : 1.0
+      resolvedSampler = stage.sampler
+      resolvedNegativePrompt = nil
+    }
+
+    // --- Build payload ---
+    // For the first stage: txt2img (empty latent).
+    // For subsequent stages: img2img (previous stage output as inpaint image with denoise < 1.0).
+    let payload: GeneratePayload
+    if stage.isFirstStage || previousStageOutput == nil {
+      // First stage: standard txt2img
+      payload = GeneratePayload(
+        prompt: request.prompt,
+        negativePrompt: resolvedNegativePrompt,
+        width: request.width,
+        height: request.height,
+        steps: resolvedSteps,
+        guidance: resolvedGuidance,
+        seed: stage.seed,
+        scheduler: resolvedSampler,
+        sigmaSchedule: stage.scheduler == "normal" ? nil : stage.scheduler,
+        denoise: stage.denoise
+      )
+    } else {
+      // Subsequent stages: img2img using previous stage's output.
+      // Pass the previous output as inpaint image data with the stage's denoise value.
+      payload = GeneratePayload(
+        prompt: request.prompt,
+        negativePrompt: resolvedNegativePrompt,
+        width: request.width,
+        height: request.height,
+        steps: resolvedSteps,
+        guidance: resolvedGuidance,
+        seed: stage.seed,
+        scheduler: resolvedSampler,
+        sigmaSchedule: stage.scheduler == "normal" ? nil : stage.scheduler,
+        inpaintImageData: previousStageOutput,
+        denoise: stage.denoise
+      )
+    }
+
+    // Convert progress callback.
+    let pipelineProgress: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = progressCallback.map { callback in
+      return { progress in
+        if progress.stage == .denoising {
+          callback(progress.stepIndex, progress.totalSteps)
+        }
+      }
+    }
+
+    let pipelineLatentPreview: ZImagePipeline.LatentPreviewHandler? = latentPreviewCallback
 
     let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview)
     return ComfyBridgeGenerateResult(

@@ -29,6 +29,12 @@ typealias ComfyBridgeLatentPreviewHandler = @Sendable (MLXArray, Int, Int, Int, 
 /// Returns output path + timing.
 typealias ComfyBridgeGenerateHandler = @Sendable (ComfyBridgeGenerateRequest, ComfyBridgeProgressHandler?, ComfyBridgeLatentPreviewHandler?) async throws -> ComfyBridgeGenerateResult
 
+/// Callback type for executing a single stage of a multi-stage workflow.
+/// Accepts the stage request, stage index, total stages, optional output from previous stage,
+/// progress callback, and latent preview callback.
+/// Returns output path + timing.
+typealias ComfyBridgeMultiStageHandler = @Sendable (ComfyBridgeMultiStageRequest, ComfyBridgeStage, Int, Int, Data?, ComfyBridgeProgressHandler?, ComfyBridgeLatentPreviewHandler?) async throws -> ComfyBridgeGenerateResult
+
 /// Callback type for upscaling images via the SeedVR2 pipeline.
 /// Accepts input image data, upscale model name, and optional progress callback.
 /// Returns the output path + timing.
@@ -43,6 +49,7 @@ final class ComfyBridgeExecutor {
   private let optimizerClient: ComfyBridgeOptimizerClient
   let generateHandler: ComfyBridgeGenerateHandler?
   let upscaleHandler: ComfyBridgeUpscaleHandler?
+  let multiStageHandler: ComfyBridgeMultiStageHandler?
 
   /// Whether to send binary WebSocket preview frames during generation.
   /// When enabled, sends live denoising previews every `previewStepInterval` steps
@@ -72,6 +79,7 @@ final class ComfyBridgeExecutor {
     optimizerClient: ComfyBridgeOptimizerClient = ComfyBridgeOptimizerClient(),
     generateHandler: ComfyBridgeGenerateHandler?,
     upscaleHandler: ComfyBridgeUpscaleHandler? = nil,
+    multiStageHandler: ComfyBridgeMultiStageHandler? = nil,
     previewsEnabled: Bool = true
   ) {
     self.logger = logger
@@ -81,6 +89,7 @@ final class ComfyBridgeExecutor {
     self.optimizerClient = optimizerClient
     self.generateHandler = generateHandler
     self.upscaleHandler = upscaleHandler
+    self.multiStageHandler = multiStageHandler
     self.previewsEnabled = previewsEnabled
   }
 
@@ -455,6 +464,234 @@ final class ComfyBridgeExecutor {
       logger.error("ComfyBridge: upscale failed — prompt_id=\(request.promptId): \(error)")
       sendError(promptId: request.promptId, clientId: request.clientId,
                 message: error.localizedDescription)
+    }
+  }
+
+
+  /// Execute a parsed multi-stage request asynchronously.
+  /// Runs each stage sequentially, passing the output image from one stage
+  /// as the input latent for the next. Model swaps happen between stages.
+  func executeMultiStage(_ request: ComfyBridgeMultiStageRequest) async {
+    guard let handler = multiStageHandler else {
+      logger.error("ComfyBridge: no multi-stage handler configured")
+      sendError(promptId: request.promptId, clientId: request.clientId,
+                message: "Multi-stage generation not configured on this server")
+      return
+    }
+
+    lock.lock()
+    activePromptId = request.promptId
+    lock.unlock()
+
+    defer {
+      lock.lock()
+      activePromptId = nil
+      lock.unlock()
+    }
+
+    // --- execution_start ---
+    sendEvent(to: request.clientId, type: "execution_start", data: [
+      "prompt_id": request.promptId
+    ])
+
+    // Simulate cached loader nodes.
+    sendEvent(to: request.clientId, type: "execution_cached", data: [
+      "prompt_id": request.promptId,
+      "nodes": ["1", "2", "3", "4", "5", "6"]
+    ])
+
+    // --- Handle optimizer if present ---
+    var mutableRequest = request
+    if let optimizer = mutableRequest.optimizer {
+      sendEvent(to: request.clientId, type: "executing", data: [
+        "prompt_id": request.promptId,
+        "node": optimizer.nodeId
+      ])
+
+      do {
+        let optimized = try await optimizerClient.optimize(optimizer)
+        mutableRequest.prompt = optimized.optimizedPrompt
+        sendOptimizerExecutedEvent(
+          to: request.clientId,
+          promptId: request.promptId,
+          nodeId: optimizer.nodeId,
+          response: optimized
+        )
+        logger.info("ComfyBridge: multi-stage optimizer resolved node \(optimizer.nodeId)")
+      } catch {
+        logger.error("ComfyBridge: multi-stage optimizer failed: \(error)")
+        sendError(promptId: request.promptId, clientId: request.clientId, message: "\(error)")
+        return
+      }
+    }
+
+    let totalStages = mutableRequest.stages.count
+    logger.info("ComfyBridge: executing multi-stage workflow \(mutableRequest.promptId) — \(totalStages) stages, \(mutableRequest.width)x\(mutableRequest.height)")
+
+    var previousStageOutputData: Data? = nil
+
+    for (stageIndex, stage) in mutableRequest.stages.enumerated() {
+      let stageNum = stageIndex + 1
+      logger.info("ComfyBridge: stage \(stageNum)/\(totalStages) — node=\(stage.nodeId), \(stage.steps) steps, cfg=\(stage.cfg), sampler=\(stage.sampler), denoise=\(stage.denoise), model=\(stage.modelId ?? "inherit")")
+
+      // Signal which node is executing.
+      sendEvent(to: request.clientId, type: "executing", data: [
+        "prompt_id": request.promptId,
+        "node": stage.nodeId
+      ])
+
+      // Create per-stage progress callback that offsets step numbers for cumulative progress.
+      let totalStepsAllStages = mutableRequest.stages.reduce(0) { $0 + $1.steps }
+      let stepsBeforeThisStage = mutableRequest.stages.prefix(stageIndex).reduce(0) { $0 + $1.steps }
+
+      let progressCallback: ComfyBridgeProgressHandler = { [wsManager, clientId = request.clientId, promptId = request.promptId] step, total in
+        let cumulativeStep = stepsBeforeThisStage + step
+        let event: [String: Any] = [
+          "type": "progress",
+          "data": [
+            "prompt_id": promptId,
+            "value": cumulativeStep,
+            "max": totalStepsAllStages
+          ] as [String: Any]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: event),
+           let text = String(data: data, encoding: .utf8) {
+          wsManager.send(to: clientId, text: text)
+        }
+      }
+
+      // Latent preview callback (only for CoreGraphics platforms).
+      let latentPreviewCallback: ComfyBridgeLatentPreviewHandler?
+      #if canImport(CoreGraphics)
+      if previewsEnabled && previewStepInterval > 0 {
+        let interval = previewStepInterval
+        let maxDim = previewMaxDimension
+        let quality = previewJPEGQuality
+        let clientId = request.clientId
+        let wsRef = wsManager
+        latentPreviewCallback = { latents, step, total, latentH, latentW in
+          guard step > 0, step % interval == 0 else { return }
+          guard step < total else { return }
+          guard let (rgbaData, pixelW, pixelH) = LatentPreviewApproximator.latentsToRGBA(
+            latents, latentHeight: latentH, latentWidth: latentW
+          ) else { return }
+          guard let frame = ComfyBridgePreviewEncoder.encodePreviewFrame(
+            fromRGBA: rgbaData, width: pixelW, height: pixelH,
+            maxDimension: maxDim, jpegQuality: CGFloat(quality)
+          ) else { return }
+          wsRef.sendBinary(to: clientId, data: frame)
+        }
+      } else {
+        latentPreviewCallback = nil
+      }
+      #else
+      latentPreviewCallback = nil
+      #endif
+
+      do {
+        let result = try await handler(mutableRequest, stage, stageIndex, totalStages, previousStageOutputData, progressCallback, latentPreviewCallback)
+
+        // Read stage output image.
+        let outputURL = URL(fileURLWithPath: result.outputPath)
+        guard let imageData = try? Data(contentsOf: outputURL) else {
+          logger.error("ComfyBridge: failed to read stage \(stageNum) output at \(result.outputPath)")
+          sendError(promptId: request.promptId, clientId: request.clientId,
+                    message: "Failed to read stage \(stageNum) output image")
+          return
+        }
+
+        logger.info("ComfyBridge: stage \(stageNum)/\(totalStages) complete — \(result.durationMs)ms, \(imageData.count) bytes")
+
+        // For the last stage, store the final output and send completion events.
+        if stageIndex == totalStages - 1 {
+          let imageId = UUID().uuidString
+          guard imageCache.store(id: imageId, data: imageData) else {
+            logger.error("ComfyBridge: failed to cache multi-stage output \(imageId)")
+            sendError(promptId: request.promptId, clientId: request.clientId,
+                      message: "Failed to cache final output image")
+            return
+          }
+
+          // Send binary preview.
+          #if canImport(CoreGraphics)
+          if previewsEnabled {
+            sendBinaryPreview(imageData: imageData, clientId: request.clientId, label: "multi-stage")
+          }
+          #endif
+
+          sendEvent(to: request.clientId, type: "executing", data: [
+            "prompt_id": request.promptId,
+            "node": request.outputNodeId
+          ])
+
+          sendExecutedEvent(
+            to: request.clientId,
+            promptId: request.promptId,
+            nodeId: request.outputNodeId,
+            imageId: imageId
+          )
+
+          // Record history with total duration across all stages.
+          let totalDuration = mutableRequest.stages.count > 0 ? result.durationMs : 0
+          // Create a synthetic single-stage request for history recording.
+          let historyRequest = ComfyBridgeGenerateRequest(
+            promptId: mutableRequest.promptId,
+            clientId: mutableRequest.clientId,
+            prompt: mutableRequest.prompt,
+            negativePrompt: mutableRequest.negativePrompt,
+            width: mutableRequest.width,
+            height: mutableRequest.height,
+            steps: mutableRequest.stages.reduce(0) { $0 + $1.steps },
+            guidance: mutableRequest.stages.first?.cfg ?? 0.0,
+            seed: mutableRequest.stages.first?.seed,
+            batchSize: 1,
+            outputNodeId: mutableRequest.outputNodeId,
+            sampler: mutableRequest.stages.first?.sampler,
+            sigmaSchedule: nil,
+            levelsMin: nil,
+            levelsMax: nil,
+            inpaintImageId: nil,
+            maskImageId: nil,
+            denoise: 1.0,
+            maskGrow: 0,
+            maskFeather: 0,
+            maskCropX: 0,
+            maskCropY: 0,
+            loras: mutableRequest.stages.first?.loras ?? [],
+            controlnetModel: nil,
+            controlnetStrength: 0.5,
+            controlnetStart: 0.0,
+            controlnetEnd: 1.0,
+            controlImageId: nil,
+            detectedModel: mutableRequest.stages.first?.modelId,
+            optimizer: nil
+          )
+          history.recordGeneration(request: historyRequest, imageId: imageId, durationMs: result.durationMs)
+
+          sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
+          sendExecutingDone(to: request.clientId, promptId: request.promptId)
+
+          logger.info("ComfyBridge: multi-stage workflow complete — \(totalStages) stages, prompt_id=\(request.promptId), image=\(imageId)")
+        } else {
+          // Intermediate stage: save output for next stage's input.
+          previousStageOutputData = imageData
+          // Send intermediate preview.
+          #if canImport(CoreGraphics)
+          if previewsEnabled {
+            sendBinaryPreview(imageData: imageData, clientId: request.clientId, label: "stage-\(stageNum)")
+          }
+          #endif
+        }
+
+        // Clean up temp file.
+        try? FileManager.default.removeItem(at: outputURL)
+
+      } catch {
+        logger.error("ComfyBridge: multi-stage failed at stage \(stageNum)/\(totalStages): \(error)")
+        sendError(promptId: request.promptId, clientId: request.clientId,
+                  message: "Stage \(stageNum) failed: \(error.localizedDescription)")
+        return
+      }
     }
   }
 

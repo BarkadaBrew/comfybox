@@ -60,11 +60,12 @@ final class ComfyBridge {
     self.history = ComfyBridgeHistory()
   }
 
-  /// Configure the executor with generation and upscale handlers.
+  /// Configure the executor with generation, upscale, and multi-stage handlers.
   /// Called by WarmServer after init to wire in the coordinator.
   func configureExecutor(
     generateHandler: @escaping ComfyBridgeGenerateHandler,
-    upscaleHandler: ComfyBridgeUpscaleHandler? = nil
+    upscaleHandler: ComfyBridgeUpscaleHandler? = nil,
+    multiStageHandler: ComfyBridgeMultiStageHandler? = nil
   ) {
     self.executor = ComfyBridgeExecutor(
       logger: logger,
@@ -72,10 +73,12 @@ final class ComfyBridge {
       imageCache: imageCache,
       history: history,
       generateHandler: generateHandler,
-      upscaleHandler: upscaleHandler
+      upscaleHandler: upscaleHandler,
+      multiStageHandler: multiStageHandler
     )
     let upscaleStatus = upscaleHandler != nil ? "upscale enabled" : "upscale not configured"
-    logger.info("ComfyBridge: executor configured — Phase 2 generation enabled, \(upscaleStatus)")
+    let multiStageStatus = multiStageHandler != nil ? "multi-stage enabled" : "multi-stage not configured"
+    logger.info("ComfyBridge: executor configured — Phase 2 generation enabled, \(upscaleStatus), \(multiStageStatus)")
   }
 
   // MARK: - Route Dispatch
@@ -465,6 +468,15 @@ final class ComfyBridge {
       logger.info("ComfyBridge: /prompt [upscale] — model=\(upscaleRequest.upscaleModelName), input=\(upscaleRequest.inputImageNodeId)")
       Task {
         await executor.executeUpscale(upscaleRequest)
+      }
+
+    case .multiStage(var multiStageRequest):
+      let stageCount = multiStageRequest.stages.count
+      let stageModels = multiStageRequest.stages.compactMap { $0.modelId }.joined(separator: " -> ")
+      logger.info("ComfyBridge: /prompt [multi-stage] — \(stageCount) stages, models: \(stageModels), \(multiStageRequest.width)x\(multiStageRequest.height)")
+
+      Task {
+        await executor.executeMultiStage(multiStageRequest)
       }
     }
 
