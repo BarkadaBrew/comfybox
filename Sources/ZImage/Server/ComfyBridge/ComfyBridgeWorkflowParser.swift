@@ -126,9 +126,8 @@ enum ComfyBridgeWorkflowParser {
 
   /// Parse a /prompt request body into generation parameters.
   static func parse(_ json: [String: Any]) throws -> ComfyBridgeGenerateRequest {
-    guard let promptId = json["prompt_id"] as? String else {
-      throw ParseError("Missing prompt_id")
-    }
+    // ComfyUI frontend doesn't send prompt_id — generate one server-side.
+    let promptId = (json["prompt_id"] as? String) ?? UUID().uuidString
     let clientId = json["client_id"] as? String ?? "unknown"
 
     guard let workflow = json["prompt"] as? [String: Any] else {
@@ -486,9 +485,8 @@ enum ComfyBridgeWorkflowParser {
   /// - `ETN_LoadImageCache` — input image source
   /// - `ETN_SaveImageCache` or `PreviewImage` — output node
   static func parseUpscale(_ json: [String: Any]) throws -> ComfyBridgeUpscaleRequest {
-    guard let promptId = json["prompt_id"] as? String else {
-      throw ParseError("Missing prompt_id")
-    }
+    // ComfyUI frontend doesn't send prompt_id — generate one server-side.
+    let promptId = (json["prompt_id"] as? String) ?? UUID().uuidString
     let clientId = json["client_id"] as? String ?? "unknown"
 
     guard let workflow = json["prompt"] as? [String: Any] else {

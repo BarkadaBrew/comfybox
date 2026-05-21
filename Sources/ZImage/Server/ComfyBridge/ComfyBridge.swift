@@ -102,9 +102,15 @@ final class ComfyBridge {
       return rawJSON("[]")
 
     case ("GET", "/settings"):
-      return rawJSON("{}")
+      return rawJSON(#"{"Comfy.TutorialCompleted":true,"Comfy.Workflow.Persist":false}"#)
 
     case ("GET", "/extensions"):
+      return rawJSON("[]")
+
+    case ("GET", "/experiment/models"):
+      return rawJSON("[]")
+
+    case _ where request.method == "GET" && path.hasPrefix("/userdata"):
       return rawJSON("[]")
 
     case ("GET", "/users"):
@@ -165,6 +171,11 @@ final class ComfyBridge {
       if path.hasPrefix("/etn/model_info/") {
         let folder = String(path.dropFirst("/etn/model_info/".count))
         return handleModelInfo(folder: folder, queryString: request.queryString)
+      }
+
+      // Experiment models sub-path (e.g. /experiment/models/checkpoints).
+      if path.hasPrefix("/experiment/models/") {
+        return rawJSON("[]")
       }
 
       // Languages endpoint.
@@ -255,7 +266,12 @@ final class ComfyBridge {
 
     let info = ComfyBridgeObjectInfo.build(loraLibrary: loraLibrary)
 
-    if let data = try? JSONSerialization.data(withJSONObject: info) {
+    // Use orderedJSONData instead of JSONSerialization to preserve
+    // input key order. ComfyUI frontend maps widgets_values positionally
+    // based on the key order in /object_info — scrambled keys cause
+    // width/height/batch_size to swap, resulting in wrong dimensions
+    // and runaway batch renders.
+    if let data = orderedJSONData(info) {
       cacheLock.lock()
       cachedObjectInfo = data
       cacheLock.unlock()
@@ -372,9 +388,8 @@ final class ComfyBridge {
       return .error(.error(status: 400, message: "Invalid JSON body"))
     }
 
-    guard let promptId = json["prompt_id"] as? String else {
-      return .error(.error(status: 400, message: "Missing prompt_id"))
-    }
+    // ComfyUI frontend doesn't send prompt_id — generate one server-side.
+    let promptId = (json["prompt_id"] as? String) ?? UUID().uuidString
 
     guard json["prompt"] is [String: Any] else {
       return .error(.error(status: 400, message: "Missing or invalid 'prompt' object"))

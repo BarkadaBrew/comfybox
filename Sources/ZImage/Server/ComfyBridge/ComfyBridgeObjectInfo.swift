@@ -136,6 +136,7 @@ enum ComfyBridgeObjectInfo {
         "unet_name": optionInput(zimageUnetModels()),
         "weight_dtype": optionInput(["default", "fp8_e4m3fn", "fp8_e5m2"]),
       ],
+      requiredOrder: ["unet_name", "weight_dtype"],
       outputs: ["MODEL"]
     )
     info["CLIPLoader"] = nodeDefinition(
@@ -143,6 +144,7 @@ enum ComfyBridgeObjectInfo {
         "clip_name": optionInput(zimageClipModels()),
         "type": optionInput(["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "lumina2"]),
       ],
+      requiredOrder: ["clip_name", "type"],
       outputs: ["CLIP"]
     )
     info["DualCLIPLoader"] = nodeDefinition(
@@ -151,6 +153,7 @@ enum ComfyBridgeObjectInfo {
         "clip_name2": optionInput(zimageClipModels()),
         "type": optionInput(["sdxl", "sd3", "flux", "hunyuan_video"]),
       ],
+      requiredOrder: ["clip_name1", "clip_name2", "type"],
       outputs: ["CLIP"]
     )
     info["DualCLIPLoaderGGUF"] = nodeDefinition(
@@ -159,6 +162,7 @@ enum ComfyBridgeObjectInfo {
         "clip_name2": optionInput(zimageClipModels()),
         "type": optionInput(["sdxl", "sd3", "flux", "hunyuan_video"]),
       ],
+      requiredOrder: ["clip_name1", "clip_name2", "type"],
       outputs: ["CLIP"]
     )
     info["VAELoader"] = nodeDefinition(
@@ -220,6 +224,7 @@ enum ComfyBridgeObjectInfo {
         "text": stringInput(),
         "clip": clipInput(),
       ],
+      requiredOrder: ["clip", "text"],
       outputs: ["CONDITIONING"]
     )
     info["EmptySD3LatentImage"] = nodeDefinition(
@@ -228,6 +233,7 @@ enum ComfyBridgeObjectInfo {
         "height": intInput(default: 1024),
         "batch_size": intInput(default: 1),
       ],
+      requiredOrder: ["width", "height", "batch_size"],
       outputs: ["LATENT"]
     )
     info["EmptyLatentImage"] = nodeDefinition(
@@ -236,6 +242,7 @@ enum ComfyBridgeObjectInfo {
         "height": intInput(default: 1024),
         "batch_size": intInput(default: 1),
       ],
+      requiredOrder: ["width", "height", "batch_size"],
       outputs: ["LATENT"]
     )
     info["SamplerCustomAdvanced"] = nodeDefinition(
@@ -287,6 +294,7 @@ enum ComfyBridgeObjectInfo {
         "steps": intInput(default: 9),
         "denoise": floatInput(default: 1.0),
       ],
+      requiredOrder: ["model", "scheduler", "steps", "denoise"],
       outputs: ["SIGMAS"]
     )
     info["KSamplerSelect"] = nodeDefinition(
@@ -320,17 +328,19 @@ enum ComfyBridgeObjectInfo {
       required: [
         "model": modelInput(),
         "seed": intInput(default: 0),
-        "steps": intInput(default: 20),
-        "cfg": floatInput(default: 8.0),
-        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
+        "steps": intInput(default: 9),
+        "cfg": floatInput(default: 0.0),
+        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
         "scheduler": optionInput(["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"]),
         "positive": conditioningInput(),
         "negative": conditioningInput(),
         "latent_image": latentInput(),
       ],
+      requiredOrder: ["model", "seed", "steps", "cfg", "sampler_name", "scheduler", "positive", "negative", "latent_image"],
       optional: [
         "denoise": floatInput(default: 1.0),
       ],
+      optionalOrder: ["denoise"],
       outputs: ["LATENT"]
     )
     info["KSamplerAdvanced"] = nodeDefinition(
@@ -346,11 +356,13 @@ enum ComfyBridgeObjectInfo {
         "negative": conditioningInput(),
         "latent_image": latentInput(),
       ],
+      requiredOrder: ["model", "add_noise", "noise_seed", "steps", "cfg", "sampler_name", "scheduler", "positive", "negative", "latent_image"],
       optional: [
         "start_at_step": intInput(default: 0),
         "end_at_step": intInput(default: 10000),
         "return_with_leftover_noise": optionInput(["disable", "enable"]),
       ],
+      optionalOrder: ["start_at_step", "end_at_step", "return_with_leftover_noise"],
       outputs: ["LATENT"]
     )
 
@@ -375,6 +387,7 @@ enum ComfyBridgeObjectInfo {
         "strength_model": floatInput(default: 1.0),
         "strength_clip": floatInput(default: 1.0),
       ],
+      requiredOrder: ["model", "clip", "lora_name", "strength_model", "strength_clip"],
       outputs: ["MODEL", "CLIP"]
     )
     info["INPAINT_LoadInpaintModel"] = nodeDefinition(
@@ -400,6 +413,7 @@ enum ComfyBridgeObjectInfo {
         "height": intInput(default: 1024),
         "crop": optionInput(["disabled", "center"]),
       ],
+      requiredOrder: ["image", "upscale_method", "width", "height", "crop"],
       outputs: ["IMAGE"]
     )
     info["ImageUpscaleWithModel"] = nodeDefinition(
@@ -475,6 +489,7 @@ enum ComfyBridgeObjectInfo {
         "x": intInput(default: 0),
         "y": intInput(default: 0),
       ],
+      requiredOrder: ["image", "width", "height", "x", "y"],
       outputs: ["IMAGE"]
     )
     info["SplitSigmas"] = nodeDefinition(
@@ -552,10 +567,7 @@ enum ComfyBridgeObjectInfo {
         "scene_hint": optionInput(["auto", "portrait", "full_body", "environmental", "action", "intimate", "pov", "macro"]),
         "aspect_ratio": optionInput(["1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9"]),
       ],
-      optional: [
-        "character": stringInput(),
-        "character_description": stringInput(multiline: true),
-      ],
+      requiredOrder: ["raw_prompt", "preset", "content_mode", "scene_hint", "aspect_ratio"],
       outputs: ["STRING", "STRING", "STRING"],
       outputNames: ["optimized_prompt", "context_block", "photo_block"]
     )
@@ -568,14 +580,9 @@ enum ComfyBridgeObjectInfo {
   /// Build a standard node definition dict matching ComfyUI's schema.
   private static func nodeDefinition(
     required: [String: Any],
+    requiredOrder: [String]? = nil,
     optional: [String: Any] = [:],
-    outputs: [String],
-    outputNames: [String]? = nil
-  ) -> [String: Any] {
-    var input: [String: Any] = ["required": required]
-    if !optional.isEmpty {
-      input["optional"] = optional
-    }
+    optionalOrder: [String]? = nil,
     let names = outputNames ?? outputs
     return [
       "name": "",
@@ -740,6 +747,11 @@ enum ComfyBridgeObjectInfo {
       "briaai/FIBO",
       // Chroma family
       "chroma-8.9b",
+      // Moody (CivitAI Z-Image checkpoints)
+      "moody-wild-v4",
+      "moody-wild-v4-distilled",
+      "moody-wild-v4-fp8",
+      "moody-real-v6",
     ]
   }
 
