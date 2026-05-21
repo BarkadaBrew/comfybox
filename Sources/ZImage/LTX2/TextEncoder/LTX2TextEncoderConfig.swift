@@ -39,19 +39,20 @@ public struct LTX2GemmaQuantizationConfig: Codable, Sendable {
 
 /// Configuration for the Gemma 3 12B language model used as LTX-2's text encoder backbone.
 ///
-/// Architecture (Gemma 3 12B):
-///   vocab_size: 262144
+/// Architecture (Gemma 3 12B from unsloth/gemma-3-12b-it):
+///   vocab_size: 262208 (expanded for image tokens in VLM wrapper)
 ///   hidden_size: 3840
 ///   num_hidden_layers: 48 (+ 1 embedding = 49 total hidden states)
 ///   num_attention_heads: 16
 ///   num_key_value_heads: 8 (GQA)
 ///   head_dim: 256
-///   intermediate_size: 21504
+///   intermediate_size: 15360 (VLM text model uses 15360, not 21504)
 ///   rms_norm_eps: 1e-6
 ///   rope_theta: 1000000.0
 ///   sliding_window: 1024
 ///   sliding_window_pattern: 6
-///   activation: GELU (for MLP)
+///   activation: gelu_pytorch_tanh (approximate GELU)
+///   extra norms: q_norm, k_norm (per head_dim), pre/post feedforward layernorm
 public struct LTX2GemmaConfig: Codable, Sendable {
   public let vocabSize: Int
   public let hiddenSize: Int
@@ -87,15 +88,15 @@ public struct LTX2GemmaConfig: Codable, Sendable {
   /// Total number of hidden states produced (embedding + all layers)
   public var totalHiddenStates: Int { numHiddenLayers + 1 }
 
-  /// Default configuration matching Gemma 3 12B
+  /// Default configuration matching Gemma 3 12B (from unsloth/gemma-3-12b-it)
   public init(
-    vocabSize: Int = 262144,
+    vocabSize: Int = 262208,
     hiddenSize: Int = 3840,
     numHiddenLayers: Int = 48,
     numAttentionHeads: Int = 16,
     numKeyValueHeads: Int = 8,
     headDim: Int = 256,
-    intermediateSize: Int = 21504,
+    intermediateSize: Int = 15360,
     rmsNormEps: Float = 1e-6,
     ropeTheta: Float = 1_000_000.0,
     slidingWindow: Int = 1024,

@@ -7,7 +7,6 @@
 // Output:
 //   - videoEmbeddings: (B, seqLen, 4096) — for cross-attention in the video transformer
 //   - audioEmbeddings: (B, seqLen, 2048) — for cross-attention in the audio transformer
-//   - captionProjection: (B, innerDim) — for AdaLN conditioning (via text projection)
 //
 // Supports both LTX-2 (original) and LTX-2.3 (prompt adaln) variants.
 //
@@ -17,28 +16,6 @@ import Foundation
 import MLX
 import MLXFast
 import MLXNN
-
-// MARK: - Audio Embeddings Connector (V1 only)
-
-/// Simple linear projection from shared feature space to audio cross-attention dimension.
-///
-/// Only used in LTX-2 original (V1) where video and audio share the same feature
-/// extractor output and a simple projection maps to the audio dimension.
-///
-/// Weight key mapping:
-/// - `audio_embeddings_connector_projection.linear.weight`
-/// - `audio_embeddings_connector_projection.linear.bias`
-public final class LTX2AudioEmbeddingsProjection: Module {
-  @ModuleInfo(key: "linear") var linear: Linear
-
-  public init(inputDim: Int = 3840, outputDim: Int = 2048) {
-    self._linear.wrappedValue = Linear(inputDim, outputDim, bias: true)
-  }
-
-  public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    linear(x)
-  }
-}
 
 // MARK: - Text Encoder Output
 
@@ -219,14 +196,15 @@ public final class LTX2TextEncoder: Module {
   /// Load weights for the complete text encoder.
   ///
   /// Handles two weight layout formats:
-  /// 1. Reformatted (text_projections/ subdirectory): pre-sanitized keys
-  /// 2. Monolithic (single safetensors at root): raw PyTorch key names
+  /// 1. Split model: `connector.safetensors` for projection weights
+  /// 2. Monolithic: single safetensors at root
   ///
-  /// Gemma 3 weights are loaded separately from a text_encoder subdirectory
-  /// or from a pre-trained model path.
+  /// Gemma 3 weights are loaded separately from either:
+  /// - MLX community quantized model (e.g. mlx-community/gemma-3-12b-it-4bit)
+  /// - Full precision model from HuggingFace cache
   ///
   /// - Parameters:
-  ///   - modelPath: Path to the LTX-2 model directory.
+  ///   - modelPath: Path to the LTX-2 model directory (contains connector.safetensors).
   ///   - textEncoderPath: Path to the Gemma 3 weights directory.
   ///     If nil, looks for `text_encoder/` subdirectory under modelPath.
   public func loadWeights(
@@ -275,22 +253,27 @@ public final class LTX2TextEncoder: Module {
       }
     }
 
-    // Sanitize: strip language_model. prefix, convert float32 -> bfloat16
+    // Sanitize: strip language_model prefix, filter vision tower, convert dtype
     let sanitized = LTX2GemmaModel.sanitizeWeights(allWeights)
+
+    print("  Gemma weights: \(allWeights.count) raw -> \(sanitized.count) sanitized")
 
     // Check for quantization config
     let configFile = path.appendingPathComponent("config.json")
-    var quantization: [String: Any]? = nil
+    var quantBits: Int? = nil
+    var quantGroupSize: Int? = nil
     if let configData = try? Data(contentsOf: configFile),
-       let configDict = try? JSONSerialization.jsonObject(with: configData) as? [String: Any] {
-      quantization = configDict["quantization"] as? [String: Any]
+      let configDict = try? JSONSerialization.jsonObject(with: configData) as? [String: Any]
+    {
+      if let quant = configDict["quantization"] as? [String: Any] {
+        quantBits = quant["bits"] as? Int
+        quantGroupSize = quant["group_size"] as? Int
+      }
     }
 
     // Apply quantization if configured
-    if let quant = quantization,
-       let bits = quant["bits"] as? Int,
-       let groupSize = quant["group_size"] as? Int {
-      // Quantize the language model layers
+    if let bits = quantBits, let groupSize = quantGroupSize {
+      print("  Quantization: \(bits)-bit, group_size=\(groupSize)")
       let availableKeys = Set(sanitized.keys)
       MLXNN.quantize(model: languageModel) { path, _ in
         let scalesKey = "\(path).scales"
@@ -309,17 +292,22 @@ public final class LTX2TextEncoder: Module {
   private func loadProjectionWeights(from modelPath: URL) throws {
     let fm = FileManager.default
     var weights: [String: MLXArray] = [:]
-    var isReformatted = false
 
-    // Try reformatted layout: text_projections/ subdirectory
-    let textProjDir = modelPath.appendingPathComponent("text_projections")
-    if fm.fileExists(atPath: textProjDir.path) {
-      isReformatted = true
-      let contents = try fm.contentsOfDirectory(at: textProjDir, includingPropertiesForKeys: nil)
-      for file in contents where file.pathExtension == "safetensors" {
-        let w = try MLX.loadArrays(url: file)
-        for (key, value) in w {
-          weights[key] = value
+    // Try connector.safetensors (split model format)
+    let connectorFile = modelPath.appendingPathComponent("connector.safetensors")
+    if fm.fileExists(atPath: connectorFile.path) {
+      weights = try MLX.loadArrays(url: connectorFile)
+      print("  Loaded connector.safetensors: \(weights.count) keys")
+    }
+
+    // Try text_projections/ subdirectory (reformatted layout)
+    if weights.isEmpty {
+      let textProjDir = modelPath.appendingPathComponent("text_projections")
+      if fm.fileExists(atPath: textProjDir.path) {
+        let contents = try fm.contentsOfDirectory(at: textProjDir, includingPropertiesForKeys: nil)
+        for file in contents where file.pathExtension == "safetensors" {
+          let w = try MLX.loadArrays(url: file)
+          for (key, value) in w { weights[key] = value }
         }
       }
     }
@@ -336,53 +324,64 @@ public final class LTX2TextEncoder: Module {
     }
 
     guard !weights.isEmpty else {
-      print("WARNING: No transformer weights found for text projection connectors.")
+      print("WARNING: No connector weights found for text projection.")
       print("  Text conditioning will use uninitialized weights!")
       return
     }
 
+    // Detect format from key prefixes
+    let hasConnectorPrefix = weights.keys.contains { $0.hasPrefix("connector.") }
+
     // Load feature extractor weights
-    loadFeatureExtractorWeights(weights, isReformatted: isReformatted)
+    loadFeatureExtractorWeights(weights, hasConnectorPrefix: hasConnectorPrefix)
 
     // Load connector weights
-    loadConnectorWeights(name: "video_embeddings_connector",
-                         connector: videoConnector,
-                         weights: weights,
-                         isReformatted: isReformatted)
-    loadConnectorWeights(name: "audio_embeddings_connector",
-                         connector: audioConnector,
-                         weights: weights,
-                         isReformatted: isReformatted)
+    loadConnectorWeights(
+      name: "video_embeddings_connector",
+      connector: videoConnector,
+      weights: weights,
+      hasConnectorPrefix: hasConnectorPrefix
+    )
+    loadConnectorWeights(
+      name: "audio_embeddings_connector",
+      connector: audioConnector,
+      weights: weights,
+      hasConnectorPrefix: hasConnectorPrefix
+    )
   }
 
   /// Load feature extractor weights.
   private func loadFeatureExtractorWeights(
     _ weights: [String: MLXArray],
-    isReformatted: Bool
+    hasConnectorPrefix: Bool
   ) {
     if config.hasPromptAdaLN {
       // V2: separate video/audio aggregate embeds
       guard let extractor = featureExtractorV2 else { return }
 
       var feWeights: [(String, MLXArray)] = []
-      for prefix in ["video_aggregate_embed", "audio_aggregate_embed"] {
-        if let w = weights["\(prefix).weight"] {
-          feWeights.append(("\(prefix).weight", w))
+      let prefix = hasConnectorPrefix ? "connector.text_embedding_projection." : ""
+
+      for tag in ["video_aggregate_embed", "audio_aggregate_embed"] {
+        if let w = weights["\(prefix)\(tag).weight"] {
+          feWeights.append(("\(tag).weight", w))
         }
-        if let b = weights["\(prefix).bias"] {
-          feWeights.append(("\(prefix).bias", b))
+        if let b = weights["\(prefix)\(tag).bias"] {
+          feWeights.append(("\(tag).bias", b))
         }
       }
+
       if !feWeights.isEmpty {
+        print("  Feature extractor V2: \(feWeights.count) weights")
         let params = ModuleParameters.unflattened(feWeights)
         try? extractor.update(parameters: params, verify: [.shapeMismatch])
       }
     } else {
       // V1: single aggregate_embed
       guard let extractor = featureExtractorV1 else { return }
-      let key = isReformatted
-        ? "aggregate_embed.weight"
-        : "text_embedding_projection.aggregate_embed.weight"
+      let key = hasConnectorPrefix
+        ? "connector.text_embedding_projection.aggregate_embed.weight"
+        : "aggregate_embed.weight"
       if let w = weights[key] {
         let params = ModuleParameters.unflattened([("aggregate_embed.weight", w)])
         try? extractor.update(parameters: params, verify: [.shapeMismatch])
@@ -391,19 +390,26 @@ public final class LTX2TextEncoder: Module {
   }
 
   /// Load connector weights with key sanitization.
+  ///
+  /// Handles the connector.safetensors key format:
+  /// - `connector.video_embeddings_connector.transformer_1d_blocks.0.attn1.to_out.0.weight`
+  /// - `connector.video_embeddings_connector.learnable_registers`
+  ///
+  /// Maps `.to_out.0.` -> `.to_out.` and `.ff.net.0.proj.` -> `.ff.proj_in.`
+  /// to match the Swift module hierarchy.
   private func loadConnectorWeights(
     name: String,
     connector: LTX2Connector1D,
     weights: [String: MLXArray],
-    isReformatted: Bool
+    hasConnectorPrefix: Bool
   ) {
     // Extract connector-specific weights
     var connectorWeights: [String: MLXArray] = [:]
     let prefix: String
-    if isReformatted {
-      prefix = "\(name)."
+    if hasConnectorPrefix {
+      prefix = "connector.\(name)."
     } else {
-      prefix = "model.diffusion_model.\(name)."
+      prefix = "\(name)."
     }
 
     for (key, value) in weights {
@@ -411,21 +417,29 @@ public final class LTX2TextEncoder: Module {
       connectorWeights[String(key.dropFirst(prefix.count))] = value
     }
 
-    guard !connectorWeights.isEmpty else { return }
+    guard !connectorWeights.isEmpty else {
+      print("  WARNING: No weights found for connector '\(name)'")
+      return
+    }
 
-    // Sanitize key names (only for monolithic/raw PyTorch keys)
+    // Sanitize key names to match Swift module hierarchy
     var mapped: [String: MLXArray] = [:]
     for (key, value) in connectorWeights {
+      if key == "learnable_registers" { continue }  // Handle separately
+
       var newKey = key
-      if !isReformatted {
-        newKey = newKey.replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj_in.")
-        newKey = newKey.replacingOccurrences(of: ".ff.net.2.", with: ".ff.proj_out.")
-        newKey = newKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
-      }
+      // PyTorch: .to_out.0. -> Swift: .to_out.
+      newKey = newKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
+      // PyTorch: .ff.net.0.proj. -> Swift: .ff.proj_in.
+      newKey = newKey.replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj_in.")
+      // PyTorch: .ff.net.2. -> Swift: .ff.proj_out.
+      newKey = newKey.replacingOccurrences(of: ".ff.net.2.", with: ".ff.proj_out.")
       mapped[newKey] = value
     }
 
-    // Load weights into the connector (non-strict for optional gate_logits)
+    print("  Connector '\(name)': \(mapped.count) weights")
+
+    // Load weights into the connector
     let weightList = mapped.map { ($0.key, $0.value) }
     let params = ModuleParameters.unflattened(weightList)
     try? connector.update(parameters: params, verify: [])
@@ -433,6 +447,7 @@ public final class LTX2TextEncoder: Module {
     // Manually load learnable_registers (plain array, not a Module parameter)
     if let registers = connectorWeights["learnable_registers"] {
       connector.learnableRegisters = registers
+      print("  Connector '\(name)': loaded learnable_registers \(registers.shape)")
     }
   }
 }

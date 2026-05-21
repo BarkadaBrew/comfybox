@@ -37,7 +37,7 @@ public final class LTX2Encoder3D: Module {
 
   /// Encoder blocks: residual groups and downsamplers.
   /// Uses a dictionary (not array) because MLX-Swift only tracks dict-keyed modules.
-  @ModuleInfo(key: "down_blocks") var downBlocks: [Int: Module]
+  @ModuleInfo(key: "down_blocks") var downBlocks: [String: Module]
 
   /// Output convolution producing latent channels (+1 for uniform logvar).
   @ModuleInfo(key: "conv_out") var convOut: CausalConv3d
@@ -68,15 +68,15 @@ public final class LTX2Encoder3D: Module {
     )
 
     // Build encoder blocks
-    var blocks: [Int: Module] = [:]
+    var blocks: [String: Module] = [:]
     for (idx, blockDef) in config.encoderBlocks.enumerated() {
       switch blockDef {
       case .resX(let numLayers):
-        blocks[idx] = LTX2UNetMidBlock3D(inChannels: featureChannels, numLayers: numLayers)
+        blocks[String(idx)] = LTX2UNetMidBlock3D(inChannels: featureChannels, numLayers: numLayers)
 
       case .compressSpaceRes(let multiplier):
         let outChannels = featureChannels * multiplier
-        blocks[idx] = LTX2SpaceToDepthDownsample(
+        blocks[String(idx)] = LTX2SpaceToDepthDownsample(
           inChannels: featureChannels, outChannels: outChannels,
           stride: (1, 2, 2)
         )
@@ -84,7 +84,7 @@ public final class LTX2Encoder3D: Module {
 
       case .compressTimeRes(let multiplier):
         let outChannels = featureChannels * multiplier
-        blocks[idx] = LTX2SpaceToDepthDownsample(
+        blocks[String(idx)] = LTX2SpaceToDepthDownsample(
           inChannels: featureChannels, outChannels: outChannels,
           stride: (2, 1, 1)
         )
@@ -92,7 +92,7 @@ public final class LTX2Encoder3D: Module {
 
       case .compressAllRes(let multiplier):
         let outChannels = featureChannels * multiplier
-        blocks[idx] = LTX2SpaceToDepthDownsample(
+        blocks[String(idx)] = LTX2SpaceToDepthDownsample(
           inChannels: featureChannels, outChannels: outChannels,
           stride: (2, 2, 2)
         )
@@ -128,7 +128,7 @@ public final class LTX2Encoder3D: Module {
     hidden = convIn(hidden)
 
     // Process through encoder blocks
-    let sortedKeys = downBlocks.keys.sorted()
+    let sortedKeys = downBlocks.keys.sorted { Int($0)! < Int($1)! }
     for key in sortedKeys {
       let block = downBlocks[key]!
       if let resBlock = block as? LTX2UNetMidBlock3D {

@@ -3,6 +3,8 @@ import Dispatch
 import Logging
 import Metal
 import MLX
+import MLXRandom
+import MLXNN
 import ZImage
 import Darwin
 
@@ -219,6 +221,18 @@ struct ZImageCLI {
         return
       case "mcp":
         try runMCP(args: Array(args.dropFirst()))
+        return
+      case "ltx2-demo":
+        try runLTX2Demo(args: Array(args.dropFirst()))
+        return
+      case "ltx2-i2v":
+        try runLTX2I2V(args: Array(args.dropFirst()))
+        return
+      case "ltx2-vae-test":
+        try runLTX2VAETest(args: Array(args.dropFirst()))
+        return
+      case "ltx2-text-encoder-test":
+        try runLTX2TextEncoderTest(args: Array(args.dropFirst()))
         return
       default:
         logger.warning("Unknown argument: \(arg)")
@@ -2974,6 +2988,1005 @@ struct ZImageCLI {
     """)
   }
 
+
+
+  // MARK: - LTX2 Text Encoder Test
+
+  /// Validate the Gemma 3 text encoder pipeline against Python ground truth.
+  ///
+  /// Loads the Gemma 3 12B model (BF16), tokenizes the reference prompt,
+  /// runs the full text encoding pipeline, and compares against the
+  /// pre-computed ground truth embeddings.
+  private static func runLTX2TextEncoderTest(args: [String]) throws {
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
+    var connectorPath = "/Users/toddwalderman/Models/ltx2-distilled"
+    var groundTruthPath = "/tmp/kira-text-embeddings.safetensors"
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--connector-path":
+        connectorPath = nextValue(for: arg, iterator: &iterator)
+      case "--ground-truth":
+        groundTruthPath = nextValue(for: arg, iterator: &iterator)
+      case "--help", "-h":
+        print("""
+        LTX-2.3 Text Encoder Validation Test
+
+        Loads Gemma 3 12B (live) + connector weights, encodes the reference prompt,
+        and compares output against Python ground truth embeddings.
+
+        Usage: ComfyBox ltx2-text-encoder-test [options]
+          --gemma-path <path>      Path to Gemma 3 weights directory
+          --connector-path <path>  Path to LTX-2 model directory (contains connector.safetensors)
+          --ground-truth <path>    Path to ground truth embeddings (.safetensors)
+          --help, -h               Show help
+        """)
+        return
+      default:
+        logger.warning("Unknown argument: \(arg)")
+      }
+    }
+
+    let prompt = "A young petite Filipina woman with dark brown skin and long black hair, wearing a simple white sundress, walking along a tropical beach at golden hour. Ocean waves gently lapping at her feet. Cinematic, warm lighting."
+
+    print(String(repeating: "=", count: 60))
+    print("LTX-2.3 Text Encoder Validation Test")
+    print(String(repeating: "=", count: 60))
+    print()
+
+    // Step 1: Load tokenizer
+    print("[1/5] Loading Gemma 3 tokenizer...")
+    let tokenizerDir = URL(fileURLWithPath: gemmaPath)
+    let tokenizer = try LTX2GemmaTokenizer.load(from: tokenizerDir, maxLength: 128)
+    let batch = tokenizer.encode(prompt: prompt, maxLength: 128)
+    print("  Token IDs shape: \(batch.inputIds.shape)")
+    print("  Attention mask shape: \(batch.attentionMask.shape)")
+
+    // Print first/last few tokens for verification
+    MLX.eval(batch.inputIds, batch.attentionMask)
+    let maskSum = MLX.sum(batch.attentionMask).item(Int.self)
+    print("  Valid tokens: \(maskSum) / 128")
+
+    // Verify against known Python output
+    let expectedValidTokens = 46
+    if maskSum == expectedValidTokens {
+      print("  PASS: Token count matches Python reference (\(expectedValidTokens))")
+    } else {
+      print("  WARN: Token count \(maskSum) != expected \(expectedValidTokens)")
+    }
+
+    // Step 2: Create text encoder
+    print()
+    print("[2/5] Creating text encoder (Gemma 3 12B + connectors)...")
+    let gemmaConfig = LTX2GemmaConfig(
+      vocabSize: 262208,
+      hiddenSize: 3840,
+      numHiddenLayers: 48,
+      numAttentionHeads: 16,
+      numKeyValueHeads: 8,
+      headDim: 256,
+      intermediateSize: 15360,
+      rmsNormEps: 1e-6,
+      ropeTheta: 1_000_000.0,
+      slidingWindow: 1024,
+      slidingWindowPattern: 6,
+      quantization: nil
+    )
+    let encoderConfig = LTX2TextEncoderConfig(
+      gemma: gemmaConfig,
+      hasPromptAdaLN: true
+    )
+    let textEncoder = LTX2TextEncoder(config: encoderConfig)
+
+    // Step 3: Load weights
+    print()
+    print("[3/5] Loading weights...")
+    print("  Gemma path: \(gemmaPath)")
+    print("  Connector path: \(connectorPath)")
+    let startLoad = CFAbsoluteTimeGetCurrent()
+    try textEncoder.loadWeights(
+      modelPath: URL(fileURLWithPath: connectorPath),
+      textEncoderPath: URL(fileURLWithPath: gemmaPath)
+    )
+    MLX.eval(textEncoder.parameters())
+    let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
+    print("  Weights loaded in \(String(format: "%.1f", loadTime))s")
+
+    // Step 4: Encode
+    print()
+    print("[4/5] Running text encoder pipeline...")
+    let startEncode = CFAbsoluteTimeGetCurrent()
+    let output = textEncoder.encode(
+      inputIds: batch.inputIds,
+      attentionMask: batch.attentionMask,
+      returnAudioEmbeddings: false
+    )
+    MLX.eval(output.videoEmbeddings)
+    let encodeTime = CFAbsoluteTimeGetCurrent() - startEncode
+    print("  Video embeddings shape: \(output.videoEmbeddings.shape)")
+    print("  Encoding time: \(String(format: "%.1f", encodeTime))s")
+
+    // Step 5: Compare against ground truth
+    print()
+    print("[5/5] Comparing against ground truth...")
+    let gtURL = URL(fileURLWithPath: groundTruthPath)
+    guard FileManager.default.fileExists(atPath: groundTruthPath) else {
+      print("  SKIP: Ground truth file not found at \(groundTruthPath)")
+      print("  Run the Python reference script first to generate it.")
+      return
+    }
+
+    let gtTensors = try MLX.loadArrays(url: gtURL)
+    guard let gtEmbeddings = gtTensors["video_embeddings"] else {
+      print("  ERROR: No video_embeddings key in ground truth file")
+      return
+    }
+
+    print("  Ground truth shape: \(gtEmbeddings.shape)")
+
+    // Convert both to float32 for comparison
+    let swiftEmb = output.videoEmbeddings.asType(.float32)
+    let pyEmb = gtEmbeddings.asType(.float32)
+    MLX.eval(swiftEmb, pyEmb)
+
+    // Statistics
+    let swiftMin = MLX.min(swiftEmb).item(Float.self)
+    let swiftMax = MLX.max(swiftEmb).item(Float.self)
+    let swiftMean = MLX.mean(swiftEmb).item(Float.self)
+
+    let pyMin = MLX.min(pyEmb).item(Float.self)
+    let pyMax = MLX.max(pyEmb).item(Float.self)
+    let pyMean = MLX.mean(pyEmb).item(Float.self)
+
+    print()
+    print("  Statistics:")
+    print("                  Swift          Python")
+    print(String(format: "  min:     %12.4f    %12.4f", swiftMin, pyMin))
+    print(String(format: "  max:     %12.4f    %12.4f", swiftMax, pyMax))
+    print(String(format: "  mean:    %12.6f    %12.6f", swiftMean, pyMean))
+
+    // Compute differences
+    let diff = swiftEmb - pyEmb
+    MLX.eval(diff)
+    let maxAbsDiff = MLX.max(MLX.abs(diff)).item(Float.self)
+    let meanAbsDiff = MLX.mean(MLX.abs(diff)).item(Float.self)
+    let mse = MLX.mean(diff * diff).item(Float.self)
+
+    // Cosine similarity (flatten then compute)
+    let swiftFlat = swiftEmb.reshaped(-1)
+    let pyFlat = pyEmb.reshaped(-1)
+    let dotProduct = MLX.sum(swiftFlat * pyFlat).item(Float.self)
+    let swiftNorm = MLX.sqrt(MLX.sum(swiftFlat * swiftFlat)).item(Float.self)
+    let pyNorm = MLX.sqrt(MLX.sum(pyFlat * pyFlat)).item(Float.self)
+    let cosineSim = dotProduct / (swiftNorm * pyNorm + 1e-8)
+
+    print()
+    print("  Comparison:")
+    print(String(format: "  Max absolute diff:  %.6f", maxAbsDiff))
+    print(String(format: "  Mean absolute diff: %.6f", meanAbsDiff))
+    print(String(format: "  MSE:                %.6f", mse))
+    print(String(format: "  Cosine similarity:  %.6f", cosineSim))
+
+    // Verdict
+    print()
+    if cosineSim > 0.95 {
+      print("  PASS: Cosine similarity > 0.95 -- embeddings are functionally equivalent")
+    } else if cosineSim > 0.85 {
+      print("  PASS (BF16): Cosine similarity > 0.85 -- within expected tolerance")
+      print("  Note: BF16 precision across 48 layers + connector may introduce minor divergence")
+    } else if cosineSim > 0.70 {
+      print("  WARN: Cosine similarity > 0.70 -- larger than expected quantization error")
+      print("  Check weight loading, architecture, or consider bf16 weights")
+    } else {
+      print("  FAIL: Cosine similarity < 0.70 -- embeddings do not match")
+      print("  Architecture or weight loading bug likely")
+    }
+
+    print()
+    print(String(repeating: "=", count: 60))
+  }
+
+  // MARK: - LTX2 Demo
+
+  private static func runLTX2Demo(args: [String]) throws {
+    var modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
+    var outputPath = "/tmp/ltx2-demo.mp4"
+    var embeddingsPath: String? = nil
+    var prompt: String? = nil
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
+    var width = 512
+    var height = 320
+    var frames = 9
+    var steps = 8
+    var seed = 42
+    var loraPath: String? = nil
+    var loraStrength: Float = 1.0
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model-dir":
+        modelDir = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--width", "-W":
+        width = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: width)
+      case "--height", "-H":
+        height = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: height)
+      case "--frames":
+        frames = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: frames)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed":
+        seed = intValue(for: arg, iterator: &iterator, minimum: 0, fallback: seed)
+      case "--embeddings":
+        embeddingsPath = nextValue(for: arg, iterator: &iterator)
+      case "--prompt", "-p":
+        prompt = nextValue(for: arg, iterator: &iterator)
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-path":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      case "--help", "-h":
+        printLTX2DemoUsage()
+        return
+      default:
+        logger.warning("Unknown ltx2-demo argument: \(arg)")
+      }
+    }
+
+    // Determine if we should use the real text encoder
+    let useRealEncoder = prompt != nil && embeddingsPath == nil
+    let totalSteps = useRealEncoder ? 9 : 7
+
+    print("=== LTX2 End-to-End Demo ===")
+    print("Model dir:  \(modelDir)")
+    print("Output:     \(outputPath)")
+    print("Prompt:     \(prompt ?? "(none)")")
+    if useRealEncoder {
+      print("Encoder:    Gemma 3 12B BF16 (live)")
+      print("Gemma path: \(gemmaPath)")
+    } else {
+      print("Embeddings: \(embeddingsPath ?? "random (dummy)")")
+    }
+    print("Resolution: \(width)x\(height)")
+    print("Frames:     \(frames)")
+    print("Steps:      \(steps)")
+    print("Seed:       \(seed)")
+    if let lp = loraPath {
+      print("LoRA:       \(lp)")
+      print("LoRA str:   \(loraStrength)")
+    }
+    print()
+
+    var stepNum = 1
+
+    // --- Create transformer ---
+    print("[\(stepNum)/\(totalSteps)] Creating transformer (48-layer, 32 heads)...")
+    let transformer = LTX2Transformer(
+      numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
+      numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
+      normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+      positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+      useMiddleIndicesGrid: true, ropeMode: .split,
+      doublePrecisionRoPE: true
+    )
+    stepNum += 1
+
+    // --- Load transformer weights ---
+    print("[\(stepNum)/\(totalSteps)] Loading transformer weights (this takes 1-3 minutes for 35GB)...")
+    let transformerPath = URL(fileURLWithPath: modelDir + "/transformer-distilled.safetensors")
+    guard FileManager.default.fileExists(atPath: transformerPath.path) else {
+      throw NSError(domain: "LTX2Demo", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Transformer weights not found at \(transformerPath.path)"])
+    }
+    let startLoad = CFAbsoluteTimeGetCurrent()
+    let rawWeights = try MLX.loadArrays(url: transformerPath)
+    var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+
+    // --- Merge LoRA weights if specified ---
+    if let loraFile = loraPath {
+      print("  Merging LoRA: \(loraFile) (strength=\(loraStrength))")
+      guard FileManager.default.fileExists(atPath: loraFile) else {
+        throw NSError(domain: "LTX2Demo", code: 10,
+          userInfo: [NSLocalizedDescriptionKey: "LoRA file not found at \(loraFile)"])
+      }
+      let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraFile))
+      var mergedCount = 0
+      var skippedCount = 0
+
+      for (key, loraA) in loraWeights {
+        guard key.hasSuffix(".lora_A.weight") else { continue }
+
+        // Strip lora_A.weight suffix to get base key
+        var baseKey = String(key.dropLast(".lora_A.weight".count))
+
+        // Strip diffusion_model. prefix (ComfyUI convention)
+        if baseKey.hasPrefix("diffusion_model.") {
+          baseKey = String(baseKey.dropFirst("diffusion_model.".count))
+        }
+
+        // Skip audio-related LoRA keys
+        if baseKey.contains("video_to_audio_attn") ||
+           baseKey.contains("audio_to_video_attn") ||
+           baseKey.contains("audio_attn") ||
+           baseKey.contains("audio_ff") ||
+           baseKey.contains("audio_") ||
+           baseKey.contains("av_ca_") {
+          skippedCount += 1
+          continue
+        }
+
+        // Find matching lora_B tensor
+        let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
+        guard let loraB = loraWeights[bKey] else {
+          skippedCount += 1
+          continue
+        }
+
+        // Target key in sanitized weights dict
+        let targetKey = baseKey + ".weight"
+        guard sanitized[targetKey] != nil else {
+          skippedCount += 1
+          continue
+        }
+
+        // delta = B @ A * strength (float32 for precision)
+        let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+        sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+        mergedCount += 1
+      }
+      print("  Merged \(mergedCount) LoRA weight pairs (skipped \(skippedCount))")
+    }
+
+    let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
+    try transformer.update(parameters: params, verify: [.shapeMismatch])
+    MLX.eval(transformer.parameters())
+    let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
+    print("  Loaded \(rawWeights.count) tensors in \(String(format: "%.1f", loadTime))s")
+    stepNum += 1
+
+    // --- Create and load VAE ---
+    print("[\(stepNum)/\(totalSteps)] Creating and loading VAE...")
+    let vae = LTX2VAE(config: .v23)
+
+    let vaeDecoderPath = URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors")
+    let vaeEncoderPath = URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors")
+    guard FileManager.default.fileExists(atPath: vaeDecoderPath.path) else {
+      throw NSError(domain: "LTX2Demo", code: 2,
+        userInfo: [NSLocalizedDescriptionKey: "VAE decoder weights not found at \(vaeDecoderPath.path)"])
+    }
+    guard FileManager.default.fileExists(atPath: vaeEncoderPath.path) else {
+      throw NSError(domain: "LTX2Demo", code: 3,
+        userInfo: [NSLocalizedDescriptionKey: "VAE encoder weights not found at \(vaeEncoderPath.path)"])
+    }
+
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecoderWeights = try MLX.loadArrays(url: vaeDecoderPath)
+    for (key, value) in rawDecoderWeights {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncoderWeights = try MLX.loadArrays(url: vaeEncoderPath)
+    for (key, value) in rawEncoderWeights {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+    print("  Combined \(combinedVAEWeights.count) VAE weights")
+
+    var vaeLogger = Logger(label: "ltx2.demo.vae")
+    vaeLogger.logLevel = .info
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(
+      into: vae,
+      tensors: combinedVAEWeights,
+      logger: vaeLogger
+    )
+    print("  VAE weight loading completed, evaluating parameters...")
+    MLX.eval(vae.parameters())
+    print("  VAE weights loaded and evaluated successfully")
+    stepNum += 1
+
+    // --- Create text encoder (real or dummy) ---
+    let textEncoder: LTX2TextEncoder
+    if useRealEncoder {
+      print("[\(stepNum)/\(totalSteps)] Creating text encoder (Gemma 3 12B BF16 + connectors)...")
+      let gemmaConfig = LTX2GemmaConfig(
+        vocabSize: 262208,
+        hiddenSize: 3840,
+        numHiddenLayers: 48,
+        numAttentionHeads: 16,
+        numKeyValueHeads: 8,
+        headDim: 256,
+        intermediateSize: 15360,
+        rmsNormEps: 1e-6,
+        ropeTheta: 1_000_000.0,
+        slidingWindow: 1024,
+        slidingWindowPattern: 6,
+        quantization: nil
+      )
+      let encoderConfig = LTX2TextEncoderConfig(
+        gemma: gemmaConfig,
+        hasPromptAdaLN: true
+      )
+      textEncoder = LTX2TextEncoder(config: encoderConfig)
+      stepNum += 1
+
+      print("[\(stepNum)/\(totalSteps)] Loading text encoder weights...")
+      print("  Gemma path: \(gemmaPath)")
+      print("  Connector path: \(modelDir)")
+      let teLoadStart = CFAbsoluteTimeGetCurrent()
+      try textEncoder.loadWeights(
+        modelPath: URL(fileURLWithPath: modelDir),
+        textEncoderPath: URL(fileURLWithPath: gemmaPath)
+      )
+      MLX.eval(textEncoder.parameters())
+      let teLoadTime = CFAbsoluteTimeGetCurrent() - teLoadStart
+      print("  Text encoder weights loaded in \(String(format: "%.1f", teLoadTime))s")
+      stepNum += 1
+    } else {
+      // Dummy text encoder (bypassed via embeddings)
+      textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig())
+    }
+
+    // --- Create pipeline ---
+    print("[\(stepNum)/\(totalSteps)] Creating pipeline...")
+    let pipelineConfig = LTX2PipelineConfig(
+      modelPath: modelDir,
+      pipelineType: .distilled,
+      hasPromptAdaLN: true
+    )
+
+    let pipeline = LTX2Pipeline(
+      vae: vae,
+      textEncoder: textEncoder,
+      transformer: transformer,
+      config: pipelineConfig
+    )
+    stepNum += 1
+
+    // --- Generate embeddings or load them ---
+    let videoEmbeddings: MLXArray
+    if useRealEncoder, let promptText = prompt {
+      // End-to-end: tokenize prompt -> Gemma 3 -> connector -> video embeddings
+      print("[\(stepNum)/\(totalSteps)] Tokenizing and encoding prompt...")
+      let tokenizerDir = URL(fileURLWithPath: gemmaPath)
+      let tokenizer = try LTX2GemmaTokenizer.load(from: tokenizerDir, maxLength: 128)
+      let batch = tokenizer.encode(prompt: promptText, maxLength: 128)
+      MLX.eval(batch.inputIds, batch.attentionMask)
+      let maskSum = MLX.sum(batch.attentionMask).item(Int.self)
+      print("  Tokenized: \(maskSum) tokens")
+
+      let encodeStart = CFAbsoluteTimeGetCurrent()
+      let textOutput = textEncoder.encode(
+        inputIds: batch.inputIds,
+        attentionMask: batch.attentionMask,
+        returnAudioEmbeddings: false
+      )
+      MLX.eval(textOutput.videoEmbeddings)
+      let encodeTime = CFAbsoluteTimeGetCurrent() - encodeStart
+      print("  Video embeddings shape: \(textOutput.videoEmbeddings.shape)")
+      print("  Encoding time: \(String(format: "%.1f", encodeTime))s")
+
+      // Embedding statistics for diagnostics
+      let embF32 = textOutput.videoEmbeddings.asType(.float32)
+      let embMin = MLX.min(embF32).item(Float.self)
+      let embMax = MLX.max(embF32).item(Float.self)
+      let embMean = MLX.mean(embF32).item(Float.self)
+      print(String(format: "  Embedding stats: min=%.4f  max=%.4f  mean=%.6f", embMin, embMax, embMean))
+
+      videoEmbeddings = textOutput.videoEmbeddings
+    } else if let embPath = embeddingsPath {
+      print("[\(stepNum)/\(totalSteps)] Loading pre-computed embeddings from \(embPath)...")
+      let embURL = URL(fileURLWithPath: embPath)
+      guard FileManager.default.fileExists(atPath: embPath) else {
+        throw NSError(domain: "LTX2Demo", code: 4,
+          userInfo: [NSLocalizedDescriptionKey: "Embeddings file not found at \(embPath)"])
+      }
+      let embTensors = try MLX.loadArrays(url: embURL)
+      guard let emb = embTensors["video_embeddings"] else {
+        throw NSError(domain: "LTX2Demo", code: 5,
+          userInfo: [NSLocalizedDescriptionKey: "No video_embeddings tensor in \(embPath). Keys: \(Array(embTensors.keys))"])
+      }
+      videoEmbeddings = emb
+      print("  Loaded embeddings shape: \(videoEmbeddings.shape) dtype: \(videoEmbeddings.dtype)")
+    } else {
+      print("[\(stepNum)/\(totalSteps)] Generating video with dummy embeddings...")
+      print("  Using random embeddings (no text encoder) -- output will be abstract noise")
+      MLXRandom.seed(UInt64(seed))
+      videoEmbeddings = MLXRandom.normal([1, 32, 4096]) * Float(0.01)
+    }
+    MLX.eval(videoEmbeddings)
+    stepNum += 1
+
+    print("[\(stepNum)/\(totalSteps)] Running denoising loop (\(steps) steps)...")
+    let genStart = CFAbsoluteTimeGetCurrent()
+    let output = pipeline.generateT2VWithEmbeddings(
+      videoEmbeddings: videoEmbeddings,
+      width: width, height: height, numFrames: frames,
+      steps: steps, seed: UInt64(seed),
+      progressCallback: { step, total in
+        let elapsed = CFAbsoluteTimeGetCurrent() - genStart
+        let rate = step > 0 ? elapsed / Double(step) : 0
+        let remaining = rate > 0 ? rate * Double(total - step) : 0
+        print(String(format: "  [step %d/%d]  %.1fs elapsed  ~%.0fs remaining",
+          step, total, elapsed, remaining))
+      }
+    )
+
+    print("  Generation complete in \(String(format: "%.1f", output.elapsedSeconds))s")
+    print("  Output shape: \(output.decoded.shape)")
+    let decodedF32 = output.decoded.asType(.float32)
+    let pixMin = MLX.min(decodedF32).item(Float.self)
+    let pixMax = MLX.max(decodedF32).item(Float.self)
+    let pixMean = MLX.mean(decodedF32).item(Float.self)
+    eval(decodedF32)
+    print(String(format: "  Pixel range: min=%.4f  max=%.4f  mean=%.4f", pixMin, pixMax, pixMean))
+    if pixMax < 0.1 {
+      print("  WARNING: output is very dark (pixMax < 0.1) -- transformer may not be loading weights correctly")
+    } else if pixMean < 0.05 || pixMean > 0.95 {
+      print("  WARNING: output mean is extreme -- possible normalization issue")
+    } else {
+      print("  Pixel values look reasonable")
+    }
+    stepNum += 1
+
+    // --- Write MP4 ---
+    print("[\(stepNum)/\(totalSteps)] Writing MP4 to \(outputPath)...")
+    #if canImport(AVFoundation) && canImport(CoreGraphics)
+    let cgFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+    print("  Extracted \(cgFrames.count) CGImage frames")
+    try LTX2PostProcess.writeMP4(
+      frames: cgFrames,
+      outputPath: outputPath,
+      fps: 24,
+      width: width,
+      height: height
+    )
+    #else
+    let ppmDir = outputPath.replacingOccurrences(of: ".mp4", with: "-frames")
+    try LTX2PostProcess.writeFramesPPM(from: output.decoded, outputDir: ppmDir)
+    print("  Wrote PPM frames to \(ppmDir) (AVFoundation not available)")
+    #endif
+
+    // Report
+    let fm = FileManager.default
+    if let attrs = try? fm.attributesOfItem(atPath: outputPath),
+       let size = attrs[.size] as? Int {
+      let kb = Double(size) / 1024.0
+      print()
+      print("=== Done ===")
+      print("Output: \(outputPath)")
+      print("Size:   \(String(format: "%.1f", kb)) KB")
+      print("Frames: \(output.numFrames)")
+      print("Time:   \(String(format: "%.1f", output.elapsedSeconds))s")
+    } else {
+      print()
+      print("=== Done ===")
+      print("Output: \(outputPath)")
+    }
+  }
+
+  private static func printLTX2DemoUsage() {
+    print("""
+    LTX-2.3 distilled text-to-video pipeline.
+    Supports end-to-end generation from text prompt (Gemma 3 12B BF16 text encoder)
+    or pre-computed embeddings.
+
+    Usage: ComfyBox ltx2-demo [options]
+      --model-dir <path>        Model weights directory (default: ~/Models/ltx2-distilled)
+      --output, -o <path>       Output MP4 path (default: /tmp/ltx2-demo.mp4)
+      --prompt, -p <text>       Text prompt (triggers end-to-end text encoding)
+      --gemma-path <path>       Path to Gemma 3 weights directory (default: HF cache)
+      --embeddings <path>       Pre-computed embeddings (.safetensors, key: video_embeddings)
+      --width, -W <int>         Video width in pixels, div by 32 (default: 512)
+      --height, -H <int>        Video height in pixels, div by 32 (default: 320)
+      --frames <int>            Number of frames, must be 1+8k (default: 9)
+      --steps <int>             Denoising steps (default: 8)
+      --seed <int>              Random seed (default: 42)
+      --lora-path <path>        Path to LoRA safetensors file (merge-on-load)
+      --lora-strength <float>   LoRA merge strength (default: 1.0)
+      --help, -h                Show help
+
+    The distilled pipeline uses 8 fixed sigma steps, guidance=1.0, no CFG.
+    Priority: --embeddings > --prompt > random dummy embeddings.
+    """)
+  }
+
+  // MARK: - LTX2 VAE Decoder Test
+  private static func runLTX2VAETest(args: [String]) throws {
+    print("=== LTX2 VAE Decoder Test ===")
+    let modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
+    var vaeLogger = Logger(label: "ltx2.vae.test")
+    vaeLogger.logLevel = .info
+
+    let vae = LTX2VAE(config: .v23)
+
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecW = try MLX.loadArrays(url: URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors"))
+    for (key, value) in rawDecW {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncW = try MLX.loadArrays(url: URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors"))
+    for (key, value) in rawEncW {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: vaeLogger)
+    MLX.eval(vae.parameters())
+    print("VAE weights loaded")
+
+    let latTensors = try MLX.loadArrays(url: URL(fileURLWithPath: "/tmp/test_latent.safetensors"))
+    guard let lat = latTensors["latent"] else { print("ERROR: No latent"); return }
+    let latF32 = lat.asType(.float32)
+    print("Latent: \(latF32.shape)")
+
+    let decoded = vae.decode(latF32)
+    MLX.eval(decoded)
+    let df = decoded.asType(.float32)
+    print(String(format: "Output: %@ min=%.4f max=%.4f mean=%.4f",
+      "\(decoded.shape)",
+      MLX.min(df).item(Float.self),
+      MLX.max(df).item(Float.self),
+      MLX.mean(df).item(Float.self)))
+
+    let frame = df[0, 0, 0]
+    MLX.eval(frame)
+    print("\nR channel pixel grid (first 8x8):")
+    for row in 0..<8 {
+      var vals = [String]()
+      for col in 0..<8 {
+        vals.append(String(format: "%7.3f", frame[row, col].item(Float.self)))
+      }
+      print("  row \(row): \(vals.joined(separator: " "))")
+    }
+
+    print("\nPython ref (first 4x4):")
+    print("  row 0: -0.269 -0.259 -0.259 -0.272")
+    print("  row 1: -0.275 -0.270 -0.258 -0.262")
+    print("  row 2: -0.282 -0.272 -0.273 -0.265")
+    print("  row 3: -0.291 -0.267 -0.280 -0.276")
+
+    print("\nGrid analysis:")
+    for startRow in stride(from: 0, to: 12, by: 4) {
+      var subs = [Float]()
+      for q in 0..<4 {
+        var sum: Float = 0
+        for col in 0..<min(16, Int(decoded.dim(4))) { sum += frame[startRow + q, col].item(Float.self) }
+        subs.append(sum / 16.0)
+      }
+      print(String(format: "  Block row %d: q0=%.4f q1=%.4f q2=%.4f q3=%.4f spread=%.4f",
+        startRow, subs[0], subs[1], subs[2], subs[3], subs.max()! - subs.min()!))
+    }
+    print("=== Done ===")
+  }
+
+
+  // MARK: - LTX2 Image-to-Video + Extend
+
+  private static func runLTX2I2V(args: [String]) throws {
+    var modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
+    var outputPath = "/tmp/ltx2-i2v.mp4"
+    var prompt: String? = nil
+    var gemmaPath = "/Users/toddwalderman/.cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
+    var width = 704
+    var height = 448
+    var framesPerChunk = 97
+    var steps = 8
+    var seed = 42
+    var loraPath: String? = nil
+    var loraStrength: Float = 1.0
+    var initImagePath: String = ""
+    var extendToSeconds: Float = 0
+    var strength: Float = 1.0
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--model-dir":
+        modelDir = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--width", "-W":
+        width = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: width)
+      case "--height", "-H":
+        height = intValue(for: arg, iterator: &iterator, minimum: 32, fallback: height)
+      case "--frames":
+        framesPerChunk = intValue(for: arg, iterator: &iterator, minimum: 9, fallback: framesPerChunk)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed":
+        seed = intValue(for: arg, iterator: &iterator, minimum: 0, fallback: seed)
+      case "--prompt", "-p":
+        prompt = nextValue(for: arg, iterator: &iterator)
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-path":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      case "--init-image":
+        initImagePath = nextValue(for: arg, iterator: &iterator)
+      case "--extend-to":
+        extendToSeconds = floatValue(for: arg, iterator: &iterator, fallback: 0)
+      case "--strength":
+        strength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      default:
+        logger.warning("Unknown ltx2-i2v argument: \(arg)")
+      }
+    }
+
+    guard !initImagePath.isEmpty else {
+      print("ERROR: --init-image is required for ltx2-i2v")
+      print("Usage: ComfyBox ltx2-i2v --init-image <path> --prompt <text> [options]")
+      print("  --extend-to <seconds>   Target duration (generates multiple chunks)")
+      print("  --frames <N>            Frames per chunk (default 97, must be 1+8k)")
+      print("  --strength <0-1>        I2V conditioning strength (default 1.0)")
+      return
+    }
+
+    guard let promptText = prompt else {
+      print("ERROR: --prompt is required for ltx2-i2v")
+      return
+    }
+
+    guard (framesPerChunk - 1) % 8 == 0 else {
+      print("ERROR: --frames must be 1 + 8k (e.g. 9, 17, 25, 33, 97)")
+      return
+    }
+
+    let fps = 24
+    let totalChunks: Int
+    if extendToSeconds > 0 {
+      let targetFrames = Int(extendToSeconds * Float(fps))
+      let continuations = max(0, Int(ceil(Float(targetFrames - framesPerChunk) / Float(framesPerChunk - 1))))
+      totalChunks = 1 + continuations
+    } else {
+      totalChunks = 1
+    }
+
+    let totalFrames = framesPerChunk + (framesPerChunk - 1) * (totalChunks - 1)
+    let totalDuration = Float(totalFrames) / Float(fps)
+
+    print("=== LTX2 Image-to-Video" + (totalChunks > 1 ? " + Extend" : "") + " ===")
+    print("Model dir:    \(modelDir)")
+    print("Output:       \(outputPath)")
+    print("Init image:   \(initImagePath)")
+    print("Prompt:       \(promptText)")
+    print("Resolution:   \(width)x\(height)")
+    print("Frames/chunk: \(framesPerChunk)")
+    print("Chunks:       \(totalChunks)")
+    print("Total frames: \(totalFrames) (\(String(format: "%.1f", totalDuration))s)")
+    print("Steps:        \(steps)")
+    print("Seed:         \(seed)")
+    print("Strength:     \(strength)")
+    if let lp = loraPath {
+      print("LoRA:         \(lp)")
+      print("LoRA str:     \(loraStrength)")
+    }
+    print()
+
+    print("[1] Creating transformer...")
+    let transformer = LTX2Transformer(
+      numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
+      numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
+      normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+      positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+      useMiddleIndicesGrid: true, ropeMode: .split,
+      doublePrecisionRoPE: true
+    )
+
+    print("[2] Loading transformer weights...")
+    let transformerPath = URL(fileURLWithPath: modelDir + "/transformer-distilled.safetensors")
+    let startLoad = CFAbsoluteTimeGetCurrent()
+    let rawWeights = try MLX.loadArrays(url: transformerPath)
+    var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+
+    if let loraFile = loraPath {
+      print("  Merging LoRA: \(loraFile) (strength=\(loraStrength))")
+      let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraFile))
+      var mergedCount = 0
+      var skippedCount = 0
+      for (key, loraA) in loraWeights {
+        guard key.hasSuffix(".lora_A.weight") else { continue }
+        var baseKey = String(key.dropLast(".lora_A.weight".count))
+        if baseKey.hasPrefix("diffusion_model.") {
+          baseKey = String(baseKey.dropFirst("diffusion_model.".count))
+        }
+        if baseKey.contains("audio_") || baseKey.contains("av_ca_") ||
+           baseKey.contains("video_to_audio_attn") || baseKey.contains("audio_to_video_attn") {
+          skippedCount += 1; continue
+        }
+        let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
+        guard let loraB = loraWeights[bKey] else { skippedCount += 1; continue }
+        let targetKey = baseKey + ".weight"
+        guard sanitized[targetKey] != nil else { skippedCount += 1; continue }
+        let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+        sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+        mergedCount += 1
+      }
+      print("  Merged \(mergedCount) LoRA pairs (skipped \(skippedCount))")
+    }
+
+    let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
+    try transformer.update(parameters: params, verify: [.shapeMismatch])
+    MLX.eval(transformer.parameters())
+    let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
+    print("  Loaded in \(String(format: "%.1f", loadTime))s")
+
+    print("[3] Loading VAE...")
+    let vae = LTX2VAE(config: .v23)
+    let vaeDecoderPath = URL(fileURLWithPath: modelDir + "/vae_decoder.safetensors")
+    let vaeEncoderPath = URL(fileURLWithPath: modelDir + "/vae_encoder.safetensors")
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecoderWeights = try MLX.loadArrays(url: vaeDecoderPath)
+    for (key, value) in rawDecoderWeights {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncoderWeights = try MLX.loadArrays(url: vaeEncoderPath)
+    for (key, value) in rawEncoderWeights {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+    var vaeLogger = Logger(label: "ltx2.i2v.vae")
+    vaeLogger.logLevel = .info
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: vaeLogger)
+    MLX.eval(vae.parameters())
+
+    print("[4] Loading text encoder (Gemma 3 12B BF16)...")
+    let gemmaConfig = LTX2GemmaConfig(
+      vocabSize: 262208, hiddenSize: 3840,
+      numHiddenLayers: 48, numAttentionHeads: 16,
+      numKeyValueHeads: 8, headDim: 256,
+      intermediateSize: 15360,
+      rmsNormEps: 1e-6, ropeTheta: 1_000_000.0,
+      slidingWindow: 1024, slidingWindowPattern: 6,
+      quantization: nil
+    )
+    let encoderConfig = LTX2TextEncoderConfig(
+      gemma: gemmaConfig,
+      hasPromptAdaLN: true
+    )
+    let textEncoder = LTX2TextEncoder(config: encoderConfig)
+    try textEncoder.loadWeights(
+      modelPath: URL(fileURLWithPath: modelDir),
+      textEncoderPath: URL(fileURLWithPath: gemmaPath)
+    )
+    MLX.eval(textEncoder.parameters())
+
+    print("[5] Creating pipeline...")
+    let pipelineConfig = LTX2PipelineConfig(
+      modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true
+    )
+    let pipeline = LTX2Pipeline(
+      vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig
+    )
+
+    print("[6] Tokenizing prompt...")
+    let tokenizerDir = URL(fileURLWithPath: gemmaPath)
+    let tokenizer = try LTX2GemmaTokenizer.load(from: tokenizerDir, maxLength: 128)
+    let batch = tokenizer.encode(prompt: promptText, maxLength: 128)
+    MLX.eval(batch.inputIds, batch.attentionMask)
+    print("  Tokens: \(MLX.sum(batch.attentionMask).item(Int.self))")
+
+    #if canImport(CoreGraphics) && canImport(ImageIO)
+    print("[7] Loading init image: \(initImagePath)")
+    let imgURL = URL(fileURLWithPath: initImagePath)
+    guard let imgSource = CGImageSourceCreateWithURL(imgURL as CFURL, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(imgSource, 0, nil) else {
+      throw NSError(domain: "LTX2I2V", code: 20,
+        userInfo: [NSLocalizedDescriptionKey: "Failed to load image from \(initImagePath)"])
+    }
+    let pixelArray = try QwenImageIO.resizedPixelArray(
+      from: cgImage, width: width, height: height,
+      addBatchDimension: true, dtype: .float32
+    )
+    var currentImage = QwenImageIO.normalizeForEncoder(pixelArray)
+    print("  Image loaded: \(currentImage.shape)")
+
+    var allFrames: [CGImage] = []
+    let overallStart = CFAbsoluteTimeGetCurrent()
+
+    for chunk in 0..<totalChunks {
+      let chunkSeed = UInt64(seed + chunk)
+      print()
+      print("--- Chunk \(chunk + 1)/\(totalChunks) (seed \(chunkSeed)) ---")
+
+      let genStart = CFAbsoluteTimeGetCurrent()
+      let output = pipeline.generateI2V(
+        inputIds: batch.inputIds,
+        attentionMask: batch.attentionMask,
+        image: currentImage,
+        strength: strength,
+        width: width, height: height,
+        numFrames: framesPerChunk,
+        steps: steps, seed: chunkSeed,
+        progressCallback: { step, total in
+          let elapsed = CFAbsoluteTimeGetCurrent() - genStart
+          let rate = step > 0 ? elapsed / Double(step) : 0
+          let remaining = rate > 0 ? rate * Double(total - step) : 0
+          print(String(format: "  [step %d/%d]  %.1fs elapsed  ~%.0fs remaining",
+            step, total, elapsed, remaining))
+        }
+      )
+      print("  Chunk generated in \(String(format: "%.1f", output.elapsedSeconds))s")
+
+      let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+      print("  Extracted \(chunkFrames.count) frames")
+
+      if chunk == 0 {
+        allFrames.append(contentsOf: chunkFrames)
+      } else {
+        allFrames.append(contentsOf: chunkFrames.dropFirst())
+      }
+      print("  Total frames so far: \(allFrames.count)")
+
+      if chunk < totalChunks - 1 {
+        let t = output.decoded.dim(2)
+        let lastFramePixels = output.decoded[0..., 0..., (t-1)..<t, 0..., 0...]
+        let lastFrame4D = lastFramePixels.squeezed(axis: 2)
+        currentImage = lastFrame4D * 2.0 - 1.0
+        MLX.eval(currentImage)
+        print("  Last frame extracted for next chunk")
+      }
+    }
+
+    let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
+    print()
+    print("=== All chunks complete ===")
+    print("Total frames: \(allFrames.count) (\(String(format: "%.1f", Float(allFrames.count) / Float(fps)))s at \(fps)fps)")
+    print("Total time:   \(String(format: "%.1f", overallTime))s")
+
+    print("Writing MP4 to \(outputPath)...")
+    try LTX2PostProcess.writeMP4(
+      frames: allFrames,
+      outputPath: outputPath,
+      fps: fps,
+      width: width,
+      height: height
+    )
+
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: outputPath),
+       let size = attrs[FileAttributeKey.size] as? Int {
+      let mb = Double(size) / (1024.0 * 1024.0)
+      print("Output: \(outputPath) (\(String(format: "%.1f", mb)) MB)")
+    }
+    print("Done!")
+    #else
+    print("ERROR: CoreGraphics/ImageIO required for i2v (macOS only)")
+    #endif
+  }
 
 }
 

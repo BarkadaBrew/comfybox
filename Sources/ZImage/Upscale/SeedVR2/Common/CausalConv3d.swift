@@ -110,6 +110,17 @@ public final class CausalConv3d: Module {
         input = MLX.concatenated([padFrames, input], axis: 2)
       }
       temporalPadding = 0
+    } else if kt > 1 {
+      // Non-causal: symmetric temporal padding by replicating boundary frames.
+      let halfPad = (kt - 1) / 2
+      if halfPad > 0 {
+        let firstFrame = input[0..., 0..., ..<1, 0..., 0...]
+        let lastFrame = input[0..., 0..., (input.dim(2) - 1)..., 0..., 0...]
+        let padLeft = MLX.repeated(firstFrame, count: halfPad, axis: 2)
+        let padRight = MLX.repeated(lastFrame, count: halfPad, axis: 2)
+        input = MLX.concatenated([padLeft, input, padRight], axis: 2)
+      }
+      temporalPadding = 0
     } else {
       temporalPadding = pt
     }
@@ -117,12 +128,71 @@ public final class CausalConv3d: Module {
     // --- Transpose BCTHW -> BTHWC for convGeneral ---
     input = input.transposed(0, 2, 3, 4, 1)
 
-    // --- 3D convolution ---
-    var out = convGeneral(
-      input, weight,
-      strides: IntOrArray([stride.0, stride.1, stride.2]),
-      padding: IntOrArray([temporalPadding, ph, pw])
-    )
+    // --- 3D convolution with temporal chunking ---
+    // MLX convGeneral produces incorrect results for 5D tensors when the
+    // temporal dimension (after padding) exceeds ~64 frames at large spatial
+    // resolution. Work around by processing overlapping temporal chunks.
+    //
+    // After temporal padding and BTHWC transpose, input is [B, T_padded, H, W, C].
+    // With kernel_t=kt and stride_t=1, each output frame i depends on input
+    // frames [i, i+1, ..., i+kt-1].  So chunks need (kt-1) frames of overlap
+    // and each chunk of size S produces S-(kt-1) valid output frames.
+    let temporalFrames = input.dim(1)
+    let maxTemporalChunk = 64  // Safe limit for MLX Metal conv kernels
+
+    var out: MLXArray
+    if temporalFrames > maxTemporalChunk && stride.0 == 1 && kt > 1 {
+      let overlap = kt - 1
+      let validPerChunk = maxTemporalChunk - overlap  // Net new output frames per chunk
+      var chunks: [MLXArray] = []
+      var tStart = 0
+
+      while tStart < temporalFrames {
+        var tEnd = min(tStart + maxTemporalChunk, temporalFrames)
+
+        // If the leftover after this chunk is too small for a valid conv,
+        // extend this chunk to consume the rest.
+        let remaining = temporalFrames - tEnd
+        if remaining > 0 && remaining < kt {
+          tEnd = temporalFrames
+        }
+
+        let chunkSize = tEnd - tStart
+        // Skip if chunk is smaller than the kernel (shouldn't happen with the guard above)
+        guard chunkSize >= kt else { break }
+
+        let chunk = input[0..., tStart..<tEnd, 0..., 0..., 0...]
+
+        var chunkOut = convGeneral(
+          chunk, weight,
+          strides: IntOrArray([stride.0, stride.1, stride.2]),
+          padding: IntOrArray([temporalPadding, ph, pw])
+        )
+        eval(chunkOut)
+
+        // No output trimming needed: the input overlap provides convolution
+        // context but doesn't produce duplicate output frames. Chunk 1's
+        // last output frame covers input position (chunkEnd - kt), and
+        // chunk 2's first output frame starts at input position chunkStart,
+        // which is exactly (chunkEnd - overlap) = next valid position.
+
+        if chunkOut.dim(1) > 0 {
+          chunks.append(chunkOut)
+        }
+
+        // Advance by validPerChunk so the next chunk starts with `overlap`
+        // frames of context from this chunk.
+        tStart += validPerChunk
+      }
+
+      out = MLX.concatenated(chunks, axis: 1)
+    } else {
+      out = convGeneral(
+        input, weight,
+        strides: IntOrArray([stride.0, stride.1, stride.2]),
+        padding: IntOrArray([temporalPadding, ph, pw])
+      )
+    }
 
     // --- Add bias ---
     out = out + bias

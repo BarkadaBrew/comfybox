@@ -38,7 +38,7 @@ public final class LTX2Decoder3D: Module {
   @ModuleInfo(key: "conv_in") var convIn: LTX2ConvWrapper
 
   /// Decoder blocks: res_x groups and depth-to-space upsamplers.
-  @ModuleInfo(key: "up_blocks") var upBlocks: [Int: Module]
+  @ModuleInfo(key: "up_blocks") var upBlocks: [String: Module]
 
   /// Output convolution wrapper. Has a nested `conv` to match PyTorch weight naming.
   @ModuleInfo(key: "conv_out") var convOut: LTX2ConvWrapper
@@ -73,6 +73,9 @@ public final class LTX2Decoder3D: Module {
   /// Last block channel count (needed for final modulation).
   public let lastChannels: Int
 
+  /// Whether convolutions use causal temporal padding.
+  public let causalDecoder: Bool
+
   /// Creates an LTX-2 3D decoder with the default architecture.
   ///
   /// - Parameter config: Video VAE configuration. Defaults to `.default`.
@@ -89,32 +92,64 @@ public final class LTX2Decoder3D: Module {
     var featureChannels = config.latentChannels
     // Walk the decoder blocks in reverse to compute initial (highest) channels
     for blockDef in config.decoderBlocks.reversed() {
-      if case .compressAll(let multiplier, _) = blockDef {
+      switch blockDef {
+      case .compressAll(let multiplier, _):
         featureChannels = featureChannels * multiplier
+      case .compressSpace(let multiplier):
+        featureChannels = featureChannels * multiplier
+      case .compressTime(let multiplier):
+        featureChannels = featureChannels * multiplier
+      default:
+        break
       }
     }
 
     let firstChannels = featureChannels
+    let isCausal = config.causalDecoder
 
     // Build decoder blocks (reversed order matches Python decoder logic)
-    var blocks: [Int: Module] = [:]
+    var blocks: [String: Module] = [:]
     var idx = 0
     for blockDef in config.decoderBlocks.reversed() {
       switch blockDef {
       case .resX(let numLayers):
-        blocks[idx] = LTX2DecoderResBlockGroup(
+        blocks[String(idx)] = LTX2DecoderResBlockGroup(
           channels: featureChannels,
           numLayers: numLayers,
-          timestepConditioning: config.timestepConditioning
+          timestepConditioning: config.timestepConditioning,
+          causalTemporal: isCausal
         )
+
+      case .compressSpace(let multiplier):
+        let outChannels = featureChannels / multiplier
+        blocks[String(idx)] = LTX2DepthToSpaceUpsample(
+          inChannels: featureChannels,
+          stride: (1, 2, 2),
+          residual: false,
+          outChannelsReductionFactor: multiplier,
+          causalTemporal: isCausal
+        )
+        featureChannels = outChannels
+
+      case .compressTime(let multiplier):
+        let outChannels = featureChannels / multiplier
+        blocks[String(idx)] = LTX2DepthToSpaceUpsample(
+          inChannels: featureChannels,
+          stride: (2, 1, 1),
+          residual: false,
+          outChannelsReductionFactor: multiplier,
+          causalTemporal: isCausal
+        )
+        featureChannels = outChannels
 
       case .compressAll(let multiplier, let residual):
         let outChannels = featureChannels / multiplier
-        blocks[idx] = LTX2DepthToSpaceUpsample(
+        blocks[String(idx)] = LTX2DepthToSpaceUpsample(
           inChannels: featureChannels,
           stride: (2, 2, 2),
           residual: residual,
-          outChannelsReductionFactor: multiplier
+          outChannelsReductionFactor: multiplier,
+          causalTemporal: isCausal
         )
         featureChannels = outChannels
       }
@@ -122,16 +157,19 @@ public final class LTX2Decoder3D: Module {
     }
     self._upBlocks.wrappedValue = blocks
     self.lastChannels = featureChannels
+    self.causalDecoder = config.causalDecoder
 
     // Conv in: latent_channels → first_channels
     self._convIn.wrappedValue = LTX2ConvWrapper(
-      inChannels: config.latentChannels, outChannels: firstChannels
+      inChannels: config.latentChannels, outChannels: firstChannels,
+      causalTemporal: isCausal
     )
 
     // Conv out: last_channels → output_channels * patch_size^2
     let finalOutChannels = config.inChannels * config.patchSize * config.patchSize
     self._convOut.wrappedValue = LTX2ConvWrapper(
-      inChannels: featureChannels, outChannels: finalOutChannels
+      inChannels: featureChannels, outChannels: finalOutChannels,
+      causalTemporal: isCausal
     )
 
     // Per-channel statistics
@@ -181,7 +219,7 @@ public final class LTX2Decoder3D: Module {
     x = convIn(x)
 
     // Process through decoder blocks
-    let sortedKeys = upBlocks.keys.sorted()
+    let sortedKeys = upBlocks.keys.sorted { Int($0)! < Int($1)! }
     for key in sortedKeys {
       let block = upBlocks[key]!
       if let resGroup = block as? LTX2DecoderResBlockGroup {
@@ -239,10 +277,11 @@ public final class LTX2ConvWrapper: Module {
 
   @ModuleInfo(key: "conv") var conv: CausalConv3d
 
-  public init(inChannels: Int, outChannels: Int) {
+  public init(inChannels: Int, outChannels: Int, causalTemporal: Bool = true) {
     self._conv.wrappedValue = CausalConv3d(
       inChannels: inChannels, outChannels: outChannels,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1),
+      causalTemporal: causalTemporal
     )
     super.init()
   }
@@ -350,12 +389,12 @@ public final class LTX2DecoderResBlock: Module {
   /// Number of channels.
   public let channels: Int
 
-  public init(channels: Int, timestepConditioning: Bool = false) {
+  public init(channels: Int, timestepConditioning: Bool = false, causalTemporal: Bool = true) {
     self.channels = channels
     self.timestepConditioning = timestepConditioning
 
-    self._conv1.wrappedValue = LTX2ConvWrapper(inChannels: channels, outChannels: channels)
-    self._conv2.wrappedValue = LTX2ConvWrapper(inChannels: channels, outChannels: channels)
+    self._conv1.wrappedValue = LTX2ConvWrapper(inChannels: channels, outChannels: channels, causalTemporal: causalTemporal)
+    self._conv2.wrappedValue = LTX2ConvWrapper(inChannels: channels, outChannels: channels, causalTemporal: causalTemporal)
 
     self.scaleShiftTable = timestepConditioning
       ? MLXArray.zeros([4, channels])
@@ -419,7 +458,7 @@ public final class LTX2DecoderResBlockGroup: Module {
   @ModuleInfo(key: "time_embedder") var timeEmbedder: LTX2PixArtTimestepEmbedder?
 
   /// Residual blocks.
-  @ModuleInfo(key: "res_blocks") var resBlocks: [Int: LTX2DecoderResBlock]
+  @ModuleInfo(key: "res_blocks") var resBlocks: [String: LTX2DecoderResBlock]
 
   /// Whether timestep conditioning is active.
   public let timestepConditioning: Bool
@@ -427,7 +466,8 @@ public final class LTX2DecoderResBlockGroup: Module {
   public init(
     channels: Int,
     numLayers: Int,
-    timestepConditioning: Bool
+    timestepConditioning: Bool,
+    causalTemporal: Bool = true
   ) {
     self.timestepConditioning = timestepConditioning
 
@@ -437,11 +477,12 @@ public final class LTX2DecoderResBlockGroup: Module {
       )
     }
 
-    var blocks: [Int: LTX2DecoderResBlock] = [:]
+    var blocks: [String: LTX2DecoderResBlock] = [:]
     for i in 0..<numLayers {
-      blocks[i] = LTX2DecoderResBlock(
+      blocks[String(i)] = LTX2DecoderResBlock(
         channels: channels,
-        timestepConditioning: timestepConditioning
+        timestepConditioning: timestepConditioning,
+        causalTemporal: causalTemporal
       )
     }
     self._resBlocks.wrappedValue = blocks
@@ -458,7 +499,7 @@ public final class LTX2DecoderResBlockGroup: Module {
     }
 
     var hidden = x
-    let sortedKeys = resBlocks.keys.sorted()
+    let sortedKeys = resBlocks.keys.sorted { Int($0)! < Int($1)! }
     for key in sortedKeys {
       hidden = resBlocks[key]!(hidden, timestepEmbed: timestepEmbed)
     }
