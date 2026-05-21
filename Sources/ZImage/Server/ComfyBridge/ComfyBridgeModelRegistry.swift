@@ -284,6 +284,66 @@ public enum ComfyBoxModelRegistry {
       description: "Bria AI's 8B model. Unique DimFusion architecture, Wan 2.2 VAE. Commercial-licensed."
     ),
 
+    // ─── Moody Family (CivitAI Z-Image Checkpoints) ────────────────
+    // Community Z-Image checkpoints. Same architecture (6B DiT, Qwen3-Coder).
+    // Moody Wild Mix V4: enhanced NSFW, better anatomy. Undistilled = 40 steps, CFG 4.0.
+
+    ComfyBoxModel(
+      id: "moody-wild-v4",
+      family: .zImage, variant: .base, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 6.0, latentChannels: 128,
+      defaultSteps: 40, defaultGuidance: 4.0,
+      supportsGuidance: true, supportsLoRA: true,
+      supportsControlNet: true, supportsImg2Img: true,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 12.5,
+      displayName: "Moody Wild Mix V4",
+      description: "CivitAI Z-Image checkpoint. Undistilled, 40 steps, CFG 4.0, dpmpp_2m_sde. Enhanced NSFW and anatomy."
+    ),
+
+    ComfyBoxModel(
+      id: "moody-wild-v4-distilled",
+      family: .zImage, variant: .turbo, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 6.0, latentChannels: 128,
+      defaultSteps: 10, defaultGuidance: 1.0,
+      supportsGuidance: false, supportsLoRA: true,
+      supportsControlNet: true, supportsImg2Img: true,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 12.5,
+      displayName: "Moody Wild Mix V4 (Distilled)",
+      description: "Distilled variant. 10 steps, CFG 1.0. Faster but less control than undistilled."
+    ),
+
+    ComfyBoxModel(
+      id: "moody-wild-v4-fp8",
+      family: .zImage, variant: .base, quantization: .q8,
+      huggingFaceId: "",
+      parametersBillions: 6.0, latentChannels: 128,
+      defaultSteps: 40, defaultGuidance: 4.0,
+      supportsGuidance: true, supportsLoRA: true,
+      supportsControlNet: true, supportsImg2Img: true,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 7.0,
+      displayName: "Moody Wild Mix V4 (FP8)",
+      description: "FP8 quantized undistilled. Lower VRAM, same settings as full."
+    ),
+
+    ComfyBoxModel(
+      id: "moody-real-v6",
+      family: .zImage, variant: .base, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 6.0, latentChannels: 128,
+      defaultSteps: 40, defaultGuidance: 4.0,
+      supportsGuidance: true, supportsLoRA: true,
+      supportsControlNet: true, supportsImg2Img: true,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 12.5,
+      displayName: "Moody Real V6",
+      description: "CivitAI Z-Image checkpoint. Realistic style, undistilled. 40 steps, CFG 4.0."
+    ),
+
     // ─── SeedVR2 Family ──────────────────────────────────────────────
     // 3B upscaler — 2× resolution enhancement.
 

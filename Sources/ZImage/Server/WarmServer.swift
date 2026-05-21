@@ -1426,6 +1426,18 @@ public final class WarmServer {
       "klein-9b",
     ]
     if knownSpecs.contains(modelId) { return modelId }
+
+    // CivitAI checkpoint path mappings (Moody family)
+    let civitaiPaths: [String: String] = [
+      "moody-wild-v4": "~/Models-working/moody-wild-mix/moody-wild-v4-fp16-full.safetensors",
+      "moody-wild-v4-distilled": "~/Models-working/moody-wild-mix/moody-wild-v4-distilled-10step-fp16.safetensors",
+      "moody-wild-v4-fp8": "~/Models-working/moody-wild-mix/moody-wild-v4-fp8.safetensors",
+      "moody-real-v6": "~/Models-working/moody-real-v6/moody-real-v6.safetensors",
+    ]
+    if let path = civitaiPaths[modelId] {
+      return NSString(string: path).expandingTildeInPath
+    }
+
     let suffixes = ["-q4", "-q8", "-bf16"]
     for suffix in suffixes {
       if modelId.lowercased().hasSuffix(suffix) {
