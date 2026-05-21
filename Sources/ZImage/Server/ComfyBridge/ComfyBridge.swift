@@ -431,13 +431,41 @@ final class ComfyBridge {
 
     // Route to the correct executor based on workflow type.
     switch parsedWorkflow {
-    case .generate(let generateRequest):
+    case .generate(var generateRequest):
       logger.info("ComfyBridge: /prompt [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, cfg=\(generateRequest.guidance), seed=\(generateRequest.seed.map(String.init) ?? "random")")
 
       // Acknowledge immediately — generation runs async via WebSocket events.
       // Model switch (if detected) happens inside the async Task before generation starts.
       let detectedModel = generateRequest.detectedModel
       let switchHandler = modelSwitchHandler
+
+      // --- Model-aware parameter defaults ---
+      // The /object_info KSampler declares defaults for Z-Image Turbo (steps=9, cfg=0.0,
+      // sampler=euler). When the user loads a different model via the ComfyUI frontend,
+      // the KSampler widget values stay at those defaults. Undistilled models like
+      // Moody Wild V4 need different parameters (40 steps, CFG 4.0, dpmpp_2m_sde).
+      //
+      // Detection: if both steps and cfg match the /object_info KSampler defaults exactly,
+      // the user has not intentionally changed them -- apply the model recommended defaults.
+      // If either was changed, the user is experimenting -- respect their values.
+      if let modelId = detectedModel {
+        let objectInfoDefaultSteps = 9
+        let objectInfoDefaultCFG: Float = 0.0
+        let userKeptDefaults = generateRequest.steps == objectInfoDefaultSteps
+          && generateRequest.guidance == objectInfoDefaultCFG
+
+        if userKeptDefaults,
+           let registryModel = ComfyBoxModelRegistry.allModels.first(where: { $0.id == modelId }) {
+          generateRequest.steps = registryModel.defaultSteps
+          generateRequest.guidance = registryModel.defaultGuidance
+          // Set sampler based on variant: undistilled models need dpmpp_2m_sde,
+          // distilled/turbo models use euler.
+          let recommendedSampler = registryModel.variant == .base ? "dpmpp_2m_sde" : "euler"
+          generateRequest.sampler = recommendedSampler
+          self.logger.info("[ComfyBridge] Applying model defaults for \(registryModel.displayName): steps=\(registryModel.defaultSteps), cfg=\(registryModel.defaultGuidance), sampler=\(recommendedSampler)")
+        }
+      }
+
       Task {
         // Auto-switch model if the workflow specifies a different checkpoint.
         if let modelId = detectedModel, let handler = switchHandler {

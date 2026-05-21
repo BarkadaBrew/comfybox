@@ -16,14 +16,14 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let negativePrompt: String?
   let width: Int
   let height: Int
-  let steps: Int
-  let guidance: Float
+  var steps: Int
+  var guidance: Float
   let seed: UInt64?
   let batchSize: Int
   /// The node ID of the output node (ETN_SaveImageCache or PreviewImage).
   let outputNodeId: String
   /// Sampler name extracted from KSamplerSelect node (e.g. "euler", "res_2s").
-  let sampler: String?
+  var sampler: String?
   /// Sigma schedule extracted from BasicScheduler node (e.g. "normal", "karras", "exponential").
   let sigmaSchedule: String?
   /// Levels min (black point) for contrast adjustment. Default 0.0.
