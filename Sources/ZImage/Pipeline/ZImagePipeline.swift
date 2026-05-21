@@ -538,6 +538,12 @@ public final class ZImagePipeline {
   }
 
   public typealias ProgressHandler = (GenerationProgress) -> Void
+
+  /// Optional callback for live denoising previews.
+  /// Receives the current latent tensor, step index, total steps, and latent dimensions.
+  /// Called from the denoising loop — implementations must not block.
+  public typealias LatentPreviewHandler = @Sendable (MLXArray, Int, Int, Int, Int) -> Void
+
   public func loadModel(
     modelSpec: String? = nil,
     textEncoderPath: String? = nil,
@@ -876,8 +882,8 @@ public final class ZImagePipeline {
     try await loadLoRAs(configs, progressHandler: progressHandler)
   }
 
-  public func generateFromRequest(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil) async throws -> URL {
-    try await generate(request, progressHandler: progressHandler)
+  public func generateFromRequest(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil, latentPreviewHandler: LatentPreviewHandler? = nil) async throws -> URL {
+    try await generate(request, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
   }
 
   public func loadLoRAs(_ configs: [LoRAConfiguration], progressHandler: ProgressHandler? = nil) async throws {
@@ -928,10 +934,10 @@ public final class ZImagePipeline {
     currentLoRAs.map(\.configuration)
   }
 
-  public func generate(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil) async throws -> URL {
+  public func generate(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil, latentPreviewHandler: LatentPreviewHandler? = nil) async throws -> URL {
     logger.info("Requested Z-Image generation")
 
-    let decoded = try await generateCore(request, progressHandler: progressHandler)
+    let decoded = try await generateCore(request, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
 
     progressHandler?(GenerationProgress(stage: .saving, stepIndex: request.steps, totalSteps: request.steps))
     try QwenImageIO.saveImage(array: decoded, to: request.outputPath)
@@ -939,10 +945,10 @@ public final class ZImagePipeline {
 
     return request.outputPath
   }
-  public func generateToMemory(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil) async throws -> Data {
+  public func generateToMemory(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil, latentPreviewHandler: LatentPreviewHandler? = nil) async throws -> Data {
     logger.info("Requested Z-Image generation (to memory)")
 
-    let decoded = try await generateCore(request, progressHandler: progressHandler)
+    let decoded = try await generateCore(request, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
 
     progressHandler?(GenerationProgress(stage: .saving, stepIndex: request.steps, totalSteps: request.steps))
     let imageData = try QwenImageIO.imageData(from: decoded)
@@ -950,7 +956,7 @@ public final class ZImagePipeline {
 
     return imageData
   }
-  private func generateCore(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil) async throws -> MLXArray {
+  private func generateCore(_ request: ZImageGenerationRequest, progressHandler: ProgressHandler? = nil, latentPreviewHandler: LatentPreviewHandler? = nil) async throws -> MLXArray {
 
     let vaeScale = 16
     if request.width % vaeScale != 0 {
@@ -1220,6 +1226,11 @@ public final class ZImagePipeline {
           }
         }
         MLX.eval(latents)
+
+        // Live denoising preview — send current latent state to preview handler.
+        // The handler decides whether to emit a preview frame (based on step interval).
+        // Non-blocking: if encoding is slow, frames are simply skipped.
+        latentPreviewHandler?(latents, stepIndex + 1, request.steps, latentH, latentW)
       }
       transformer.clearCache()
     }

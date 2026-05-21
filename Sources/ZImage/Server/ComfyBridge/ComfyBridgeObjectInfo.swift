@@ -568,11 +568,6 @@ enum ComfyBridgeObjectInfo {
         "aspect_ratio": optionInput(["1:1", "3:4", "4:3", "2:3", "3:2", "9:16", "16:9"]),
       ],
       requiredOrder: ["raw_prompt", "preset", "content_mode", "scene_hint", "aspect_ratio"],
-      optional: [
-        "character": stringInput(),
-        "character_description": stringInput(multiline: true),
-      ],
-      optionalOrder: ["character", "character_description"],
       outputs: ["STRING", "STRING", "STRING"],
       outputNames: ["optimized_prompt", "context_block", "photo_block"]
     )
@@ -588,38 +583,6 @@ enum ComfyBridgeObjectInfo {
     requiredOrder: [String]? = nil,
     optional: [String: Any] = [:],
     optionalOrder: [String]? = nil,
-    outputs: [String],
-    outputNames: [String]? = nil
-  ) -> [String: Any] {
-    // When requiredOrder is provided, wrap in OrderedDict to preserve
-    // key order during JSON serialization. ComfyUI frontend maps
-    // widgets_values positionally based on this key order.
-    let orderedRequired: Any
-    if let order = requiredOrder {
-      orderedRequired = OrderedDict(order.compactMap { key in
-        required[key].map { (key, $0) }
-      })
-    } else {
-      orderedRequired = required
-    }
-
-    let orderedOptional: Any?
-    if !optional.isEmpty {
-      if let order = optionalOrder {
-        orderedOptional = OrderedDict(order.compactMap { key in
-          optional[key].map { (key, $0) }
-        })
-      } else {
-        orderedOptional = optional
-      }
-    } else {
-      orderedOptional = nil
-    }
-
-    var input: [String: Any] = ["required": orderedRequired]
-    if let opt = orderedOptional {
-      input["optional"] = opt
-    }
     let names = outputNames ?? outputs
     return [
       "name": "",
