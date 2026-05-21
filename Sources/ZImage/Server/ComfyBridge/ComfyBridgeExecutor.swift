@@ -675,12 +675,44 @@ final class ComfyBridgeExecutor {
         } else {
           // Intermediate stage: save output for next stage's input.
           previousStageOutputData = imageData
-          // Send intermediate preview.
-          #if canImport(CoreGraphics)
-          if previewsEnabled {
-            sendBinaryPreview(imageData: imageData, clientId: request.clientId, label: "stage-\(stageNum)")
+
+          // Cache intermediate output so the frontend can fetch it via /view.
+          let intermediateImageId = UUID().uuidString
+          if imageCache.store(id: intermediateImageId, data: imageData) {
+            logger.info("ComfyBridge: cached intermediate stage \(stageNum) output as \(intermediateImageId)")
+
+            // Send binary preview frame for intermediate stage.
+            #if canImport(CoreGraphics)
+            if previewsEnabled {
+              sendBinaryPreview(imageData: imageData, clientId: request.clientId, label: "stage-\(stageNum)")
+            }
+            #endif
+
+            // If this stage has a PreviewImage node, send executing/executed events
+            // so the ComfyUI frontend renders the intermediate result.
+            if let previewNodeId = stage.previewNodeId {
+              sendEvent(to: request.clientId, type: "executing", data: [
+                "prompt_id": request.promptId,
+                "node": previewNodeId
+              ])
+
+              sendExecutedEvent(
+                to: request.clientId,
+                promptId: request.promptId,
+                nodeId: previewNodeId,
+                imageId: intermediateImageId
+              )
+              logger.info("ComfyBridge: sent intermediate preview events for stage \(stageNum) node \(previewNodeId)")
+            }
+          } else {
+            logger.warning("ComfyBridge: failed to cache intermediate stage \(stageNum) output — preview will be skipped")
+            // Still send binary preview even if cache fails.
+            #if canImport(CoreGraphics)
+            if previewsEnabled {
+              sendBinaryPreview(imageData: imageData, clientId: request.clientId, label: "stage-\(stageNum)")
+            }
+            #endif
           }
-          #endif
         }
 
         // Clean up temp file.

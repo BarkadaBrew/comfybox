@@ -925,6 +925,9 @@ enum ComfyBridgeWorkflowParser {
       }
       let loras = resolveLoRAsForKSampler(kNode, nodes: nodes)
 
+      // Resolve per-stage preview node by tracing KSampler -> VAEDecode -> PreviewImage.
+      let stagePreviewNodeId = resolvePreviewNodeId(from: kNode, nodes: nodes)
+
       stages.append(ComfyBridgeStage(
         nodeId: kNode.id,
         modelId: modelId,
@@ -935,7 +938,8 @@ enum ComfyBridgeWorkflowParser {
         denoise: denoise,
         seed: seed,
         loras: loras,
-        isFirstStage: isFirst
+        isFirstStage: isFirst,
+        previewNodeId: stagePreviewNodeId
       ))
     }
 
@@ -1077,6 +1081,44 @@ enum ComfyBridgeWorkflowParser {
     return nodes.keys.sorted { $0.localizedStandardCompare($1) == .orderedDescending }.first ?? "1"
   }
 
+  /// Find the PreviewImage node connected to a KSampler's output chain (for intermediate previews).
+  /// Returns nil if no PreviewImage is found in the output chain.
+  private static func resolvePreviewNodeId(from kNode: WorkflowNode, nodes: [String: WorkflowNode]) -> String? {
+    // Build forward link map: which nodes consume each node's output?
+    var consumers: [String: [WorkflowNode]] = [:]
+    for (_, node) in nodes {
+      for (_, value) in node.inputs {
+        if let ref = value as? [Any],
+           let refNodeId = ref.first as? String {
+          consumers[refNodeId, default: []].append(node)
+        }
+      }
+    }
+
+    // Walk forward from KSampler: KSampler -> VAEDecode -> PreviewImage
+    var candidates = consumers[kNode.id] ?? []
+    var visited: Set<String> = [kNode.id]
+    var maxDepth = 5
+
+    while maxDepth > 0 && !candidates.isEmpty {
+      maxDepth -= 1
+      for candidate in candidates {
+        if candidate.classType == "PreviewImage" {
+          return candidate.id
+        }
+      }
+      var nextCandidates: [WorkflowNode] = []
+      for candidate in candidates {
+        if !visited.contains(candidate.id) {
+          visited.insert(candidate.id)
+          nextCandidates.append(contentsOf: consumers[candidate.id] ?? [])
+        }
+      }
+      candidates = nextCandidates
+    }
+    return nil
+  }
+
   private static func optionalString(_ value: Any?) -> String? {
     guard let value = value as? String else { return nil }
     return value.isEmpty ? nil : value
@@ -1110,6 +1152,9 @@ struct ComfyBridgeStage: Sendable {
   let loras: [(name: String, scale: Float)]
   /// Whether this is the first stage (txt2img from empty latent).
   let isFirstStage: Bool
+  /// The PreviewImage node ID for this stage (traced from KSampler output chain).
+  /// Used by the executor to send intermediate preview events to the frontend.
+  let previewNodeId: String?
 }
 
 /// A multi-stage generation request parsed from a ComfyUI workflow.
