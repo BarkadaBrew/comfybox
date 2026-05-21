@@ -3,11 +3,10 @@
 // Encodes preview images with the ComfyUI binary header format for Krita
 // AI Diffusion plugin live denoising previews.
 //
-// Binary frame format (ComfyUI protocol):
-//   Bytes 0-3: event type as UInt32 big-endian (1 = preview, 2 = final)
-//   Bytes 4-5: output_id as UInt16 big-endian (which output, usually 0)
-//   Bytes 6-7: image format as UInt16 big-endian (1 = JPEG, 2 = PNG)
-//   Bytes 8+:  JPEG or PNG encoded image data
+// Binary frame format (ComfyUI protocol — struct.pack(">II", type, format)):
+//   Bytes 0-3: event type as UInt32 big-endian (1 = PREVIEW_IMAGE)
+//   Bytes 4-7: image format as UInt32 big-endian (1 = JPEG, 2 = PNG)
+//   Bytes 8+:  encoded image data
 
 import Foundation
 
@@ -21,12 +20,11 @@ enum ComfyBridgePreviewEncoder {
 
   /// ComfyUI binary frame event types.
   enum EventType: UInt32 {
-    case preview = 1
-    case finalImage = 2
+    case previewImage = 1
   }
 
   /// ComfyUI binary frame image formats.
-  enum ImageFormat: UInt16 {
+  enum ImageFormat: UInt32 {
     case jpeg = 1
     case png = 2
   }
@@ -46,15 +44,13 @@ enum ComfyBridgePreviewEncoder {
   ///   - pngData: Full-resolution PNG image data.
   ///   - maxDimension: Maximum preview dimension (longest edge). Default 256.
   ///   - jpegQuality: JPEG compression quality (0.0-1.0). Default 0.6.
-  ///   - eventType: Binary frame event type. Default `.preview`.
-  ///   - outputId: Output node ID. Default 0.
+  ///   - imageFormat: Output format for the preview. Default `.jpeg`.
   /// - Returns: Binary frame data ready to send via WebSocket, or nil on failure.
   static func encodePreviewFrame(
     fromPNG pngData: Data,
     maxDimension: Int = defaultPreviewSize,
     jpegQuality: CGFloat = defaultJPEGQuality,
-    eventType: EventType = .preview,
-    outputId: UInt16 = 0
+    imageFormat: ImageFormat = .jpeg
   ) -> Data? {
     // Decode the PNG to a CGImage.
     guard let imageSource = CGImageSourceCreateWithData(pngData as CFData, nil),
@@ -66,8 +62,7 @@ enum ComfyBridgePreviewEncoder {
       fromCGImage: cgImage,
       maxDimension: maxDimension,
       jpegQuality: jpegQuality,
-      eventType: eventType,
-      outputId: outputId
+      imageFormat: imageFormat
     )
   }
 
@@ -80,15 +75,13 @@ enum ComfyBridgePreviewEncoder {
   ///   - cgImage: Source image.
   ///   - maxDimension: Maximum preview dimension (longest edge). Default 256.
   ///   - jpegQuality: JPEG compression quality (0.0-1.0). Default 0.6.
-  ///   - eventType: Binary frame event type. Default `.preview`.
-  ///   - outputId: Output node ID. Default 0.
+  ///   - imageFormat: Output format for the preview. Default `.jpeg`.
   /// - Returns: Binary frame data ready to send via WebSocket, or nil on failure.
   static func encodePreviewFrame(
     fromCGImage cgImage: CGImage,
     maxDimension: Int = defaultPreviewSize,
     jpegQuality: CGFloat = defaultJPEGQuality,
-    eventType: EventType = .preview,
-    outputId: UInt16 = 0
+    imageFormat: ImageFormat = .jpeg
   ) -> Data? {
     // Calculate preview dimensions preserving aspect ratio.
     let srcWidth = cgImage.width
@@ -109,10 +102,56 @@ enum ComfyBridgePreviewEncoder {
 
     // Build the binary frame: 8-byte header + JPEG data.
     return buildBinaryFrame(
-      eventType: eventType,
-      outputId: outputId,
-      imageFormat: .jpeg,
+      imageFormat: imageFormat,
       imageData: jpegData
+    )
+  }
+
+  /// Build a ComfyUI binary preview frame from raw RGBA pixel data.
+  ///
+  /// Used for latent-to-RGB approximations where we already have pixel data
+  /// and just need to encode + frame it. Skips CGImage decode step.
+  ///
+  /// - Parameters:
+  ///   - rgbaData: Raw RGBA pixel bytes (width * height * 4 bytes).
+  ///   - width: Image width in pixels.
+  ///   - height: Image height in pixels.
+  ///   - maxDimension: Maximum preview dimension (longest edge). Default 256.
+  ///   - jpegQuality: JPEG compression quality (0.0-1.0). Default 0.6.
+  /// - Returns: Binary frame data ready to send via WebSocket, or nil on failure.
+  static func encodePreviewFrame(
+    fromRGBA rgbaData: Data,
+    width: Int,
+    height: Int,
+    maxDimension: Int = defaultPreviewSize,
+    jpegQuality: CGFloat = defaultJPEGQuality
+  ) -> Data? {
+    guard width > 0, height > 0, rgbaData.count >= width * height * 4 else { return nil }
+
+    // Create CGImage from raw RGBA.
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+    guard let provider = CGDataProvider(data: rgbaData as CFData),
+          let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+          ) else {
+      return nil
+    }
+
+    return encodePreviewFrame(
+      fromCGImage: cgImage,
+      maxDimension: maxDimension,
+      jpegQuality: jpegQuality
     )
   }
 
@@ -181,13 +220,13 @@ enum ComfyBridgePreviewEncoder {
 
   /// Build the ComfyUI binary frame with 8-byte header + image data.
   ///
+  /// Matches ComfyUI's Python: `struct.pack(">II", event_type, format)`
+  ///
   /// Header layout (big-endian):
-  ///   [0..3] UInt32 event type (1=preview, 2=final)
-  ///   [4..5] UInt16 output_id
-  ///   [6..7] UInt16 image format (1=JPEG, 2=PNG)
+  ///   [0..3] UInt32 event type (1 = PREVIEW_IMAGE)
+  ///   [4..7] UInt32 image format (1 = JPEG, 2 = PNG)
   static func buildBinaryFrame(
-    eventType: EventType,
-    outputId: UInt16,
+    eventType: EventType = .previewImage,
     imageFormat: ImageFormat,
     imageData: Data
   ) -> Data {
@@ -197,13 +236,9 @@ enum ComfyBridgePreviewEncoder {
     var eventTypeValue = eventType.rawValue.bigEndian
     frame.append(Data(bytes: &eventTypeValue, count: 4))
 
-    // Output ID — UInt16 big-endian.
-    var outputIdValue = outputId.bigEndian
-    frame.append(Data(bytes: &outputIdValue, count: 2))
-
-    // Image format — UInt16 big-endian.
+    // Image format — UInt32 big-endian.
     var formatValue = imageFormat.rawValue.bigEndian
-    frame.append(Data(bytes: &formatValue, count: 2))
+    frame.append(Data(bytes: &formatValue, count: 4))
 
     // Image data.
     frame.append(imageData)
