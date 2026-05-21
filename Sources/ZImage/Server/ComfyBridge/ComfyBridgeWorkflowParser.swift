@@ -75,6 +75,10 @@ struct ComfyBridgeGenerateRequest: Sendable {
   /// Optional CoffeeShop optimizer node extracted from the workflow.
   let optimizer: ComfyBridgeOptimizerRequest?
 
+  /// ShowText nodes wired to optimizer outputs. Each entry carries the ShowText node ID
+  /// and the optimizer output index (0=optimized_prompt, 1=context_block, 2=photo_block).
+  let showTextNodes: [ShowTextNodeInfo]
+
   /// Whether this is an inpainting request.
   var isInpaint: Bool { inpaintImageId != nil }
 
@@ -405,6 +409,9 @@ enum ComfyBridgeWorkflowParser {
     let _modelDesc = detectedModel ?? "none"
     print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc) controlnet=\(_cnDesc) model=\(_modelDesc)")
 
+    // --- ShowText node detection ---
+    let showTextNodes = Self.extractShowTextNodes(from: nodes)
+
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
       clientId: clientId,
@@ -435,7 +442,8 @@ enum ComfyBridgeWorkflowParser {
       controlnetEnd: controlnetEnd,
       controlImageId: controlImageId,
       detectedModel: detectedModel,
-      optimizer: optimizer
+      optimizer: optimizer,
+      showTextNodes: showTextNodes
     )
   }
 
@@ -678,12 +686,29 @@ enum ComfyBridgeWorkflowParser {
     }
     if let ref = node.inputs["text"] as? [Any],
        let refNodeId = ref.first as? String,
-       let sourceNode = nodes[refNodeId],
-       sourceNode.classType == "CoffeeShopOptimizer" {
-      return sourceNode.inputs["raw_prompt"] as? String
+       let sourceNode = nodes[refNodeId] {
+      // Direct link to CoffeeShopOptimizer
+      if sourceNode.classType == "CoffeeShopOptimizer" {
+        return sourceNode.inputs["raw_prompt"] as? String
+      }
+      // Link through ShowText pass-through
+      if sourceNode.classType == "ShowText" {
+        return resolveText(from: sourceNode, nodes: nodes)
+      }
     }
     if node.classType == "CoffeeShopOptimizer" {
       return node.inputs["raw_prompt"] as? String
+    }
+    if node.classType == "ShowText" {
+      // ShowText is a pass-through -- follow its text input
+      if let ref = node.inputs["text"] as? [Any],
+         let refNodeId = ref.first as? String,
+         let sourceNode = nodes[refNodeId] {
+        if sourceNode.classType == "CoffeeShopOptimizer" {
+          return sourceNode.inputs["raw_prompt"] as? String
+        }
+      }
+      return node.inputs["text"] as? String
     }
     return nil
   }
@@ -948,6 +973,9 @@ enum ComfyBridgeWorkflowParser {
     }.joined(separator: " | ")
     print("[ComfyBridge] multi-stage workflow detected: \(stages.count) stages: \(stageDesc)")
 
+    // --- ShowText node detection ---
+    let showTextNodes = Self.extractShowTextNodes(from: nodes)
+
     return ComfyBridgeMultiStageRequest(
       promptId: promptId,
       clientId: clientId,
@@ -957,7 +985,8 @@ enum ComfyBridgeWorkflowParser {
       height: height,
       stages: stages,
       outputNodeId: outputNodeId,
-      optimizer: detectedOptimizer
+      optimizer: detectedOptimizer,
+      showTextNodes: showTextNodes
     )
   }
 
@@ -1119,6 +1148,27 @@ enum ComfyBridgeWorkflowParser {
     return nil
   }
 
+  /// Find ShowText nodes wired to a CoffeeShopOptimizer node's outputs.
+  private static func extractShowTextNodes(from nodes: [String: WorkflowNode]) -> [ShowTextNodeInfo] {
+    // Find the optimizer node ID first.
+    guard let optimizerNode = nodes.values.first(where: { $0.classType == "CoffeeShopOptimizer" }) else {
+      return []
+    }
+
+    var result: [ShowTextNodeInfo] = []
+    for (_, node) in nodes {
+      guard node.classType == "ShowText" else { continue }
+      // Check if text input is wired to the optimizer: ["<optimizer_id>", <output_index>]
+      if let ref = node.inputs["text"] as? [Any],
+         let sourceNodeId = ref.first as? String,
+         sourceNodeId == optimizerNode.id {
+        let outputIndex = (ref.count > 1) ? (ref[1] as? Int ?? 0) : 0
+        result.append(ShowTextNodeInfo(nodeId: node.id, optimizerOutputIndex: outputIndex))
+      }
+    }
+    return result
+  }
+
   private static func optionalString(_ value: Any?) -> String? {
     guard let value = value as? String else { return nil }
     return value.isEmpty ? nil : value
@@ -1174,6 +1224,16 @@ struct ComfyBridgeMultiStageRequest: Sendable {
   let outputNodeId: String
   /// Optional CoffeeShop optimizer.
   let optimizer: ComfyBridgeOptimizerRequest?
+  /// ShowText nodes wired to optimizer outputs.
+  let showTextNodes: [ShowTextNodeInfo]
+}
+
+/// Info about a ShowText node wired to an optimizer output.
+struct ShowTextNodeInfo: Sendable {
+  /// The ShowText node ID in the workflow graph.
+  let nodeId: String
+  /// Which optimizer output this ShowText reads (0=optimized_prompt, 1=context_block, 2=photo_block).
+  let optimizerOutputIndex: Int
 }
 
 /// A node in the ComfyUI workflow graph.

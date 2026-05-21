@@ -184,6 +184,17 @@ final class ComfyBridgeExecutor {
           nodeId: optimizer.nodeId,
           response: optimized
         )
+
+        // Send ShowText events for any ShowText nodes wired to optimizer outputs
+        if !mutableRequest.showTextNodes.isEmpty {
+          sendShowTextExecutedEvents(
+            to: request.clientId,
+            promptId: request.promptId,
+            showTextNodes: mutableRequest.showTextNodes,
+            response: optimized
+          )
+        }
+
         logger.info("ComfyBridge: CoffeeShop optimizer resolved node \(optimizer.nodeId)")
       } catch {
         logger.error("ComfyBridge: CoffeeShop optimizer failed — prompt_id=\(request.promptId): \(error)")
@@ -517,6 +528,17 @@ final class ComfyBridgeExecutor {
           nodeId: optimizer.nodeId,
           response: optimized
         )
+
+        // Send ShowText events for any ShowText nodes wired to optimizer outputs
+        if !mutableRequest.showTextNodes.isEmpty {
+          sendShowTextExecutedEvents(
+            to: request.clientId,
+            promptId: request.promptId,
+            showTextNodes: mutableRequest.showTextNodes,
+            response: optimized
+          )
+        }
+
         logger.info("ComfyBridge: multi-stage optimizer resolved node \(optimizer.nodeId)")
       } catch {
         logger.error("ComfyBridge: multi-stage optimizer failed: \(error)")
@@ -664,7 +686,8 @@ final class ComfyBridgeExecutor {
             controlnetEnd: 1.0,
             controlImageId: nil,
             detectedModel: mutableRequest.stages.first?.modelId,
-            optimizer: nil
+            optimizer: nil,
+            showTextNodes: []
           )
           history.recordGeneration(request: historyRequest, imageId: imageId, durationMs: result.durationMs)
 
@@ -805,6 +828,46 @@ final class ComfyBridgeExecutor {
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  /// Send "executing" + "executed" events for ShowText nodes wired to an optimizer.
+  /// Maps optimizer output index to the corresponding text value from the response.
+  private func sendShowTextExecutedEvents(
+    to clientId: String,
+    promptId: String,
+    showTextNodes: [ShowTextNodeInfo],
+    response: ComfyBridgeOptimizerResponse
+  ) {
+    for showText in showTextNodes {
+      // Map optimizer output index to text value
+      let textValue: String
+      switch showText.optimizerOutputIndex {
+      case 0: textValue = response.optimizedPrompt
+      case 1: textValue = response.contextBlock
+      case 2: textValue = response.photoBlock
+      default: textValue = response.optimizedPrompt
+      }
+
+      // Send "executing" event for this ShowText node
+      sendEvent(to: clientId, type: "executing", data: [
+        "prompt_id": promptId,
+        "node": showText.nodeId
+      ])
+
+      // Send "executed" event with text content
+      let event: [String: Any] = [
+        "type": "executed",
+        "data": [
+          "prompt_id": promptId,
+          "node": showText.nodeId,
+          "output": [
+            "text": [textValue]
+          ]
+        ] as [String: Any]
+      ]
+      wsManager.send(to: clientId, text: jsonString(event))
+      logger.info("ComfyBridge: sent ShowText executed event for node \(showText.nodeId)")
+    }
   }
 
   private func imageReference(for imageId: String) -> [String: Any] {

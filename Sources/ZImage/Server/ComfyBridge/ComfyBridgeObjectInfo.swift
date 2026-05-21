@@ -572,6 +572,18 @@ enum ComfyBridgeObjectInfo {
       outputNames: ["optimized_prompt", "context_block", "photo_block"]
     )
 
+    // --- ShowText display node ---
+    // Displays STRING output from other nodes (e.g. CoffeeShopOptimizer) in the frontend.
+    // Works as both an output node (displays text) and a pass-through (STRING output chains to other nodes).
+    info["ShowText"] = nodeDefinition(
+      required: [
+        "text": stringInput(multiline: true),
+      ],
+      requiredOrder: ["text"],
+      outputs: ["STRING"],
+      outputNames: ["text"]
+    )
+
     return finalizedObjectInfo(info)
   }
 
@@ -660,7 +672,8 @@ enum ComfyBridgeObjectInfo {
 
   private static let outputNodeTypes: Set<String> = [
     "ETN_SaveImageCache",
-    "PreviewImage"
+    "PreviewImage",
+    "ShowText"
   ]
 
   private static func stringArray(_ value: Any?) -> [String]? {
@@ -685,7 +698,7 @@ enum ComfyBridgeObjectInfo {
 
   private static func category(for nodeName: String) -> String {
     switch nodeName {
-    case "ComfyBoxStylePreset", "ComfyBoxStylePresetInfo", "CoffeeShopOptimizer":
+    case "ComfyBoxStylePreset", "ComfyBoxStylePresetInfo", "CoffeeShopOptimizer", "ShowText":
       return "CoffeeShop"
 
     case "UNETLoader", "CLIPLoader", "DualCLIPLoader", "DualCLIPLoaderGGUF",
