@@ -764,8 +764,21 @@ public final class WarmServer {
     return ((n + 15) / 16) * 16
   }
 
-  /// Default LoRA directory path — matches ComfyBridgeObjectInfo discovery path.
+  /// Default LoRA directory path — fallback when library lookup fails.
   private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
+
+  /// Resolve a LoRA filename to its full path.
+  /// Prefers the LoRA library (which knows about subdirectories and symlinks),
+  /// falls back to the legacy flat directory path.
+  private func resolveLoRAPath(_ name: String) -> String {
+    if name.contains("/") || name.hasPrefix("~") {
+      return name
+    }
+    if let library = loraLibrary, let url = try? library.resolve(name) {
+      return url.path
+    }
+    return Self.loraDirectoryPath + "/" + name
+  }
 
   /// Default ControlNet directory path — matches ComfyBridgeObjectInfo discovery path.
   private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
@@ -777,12 +790,7 @@ public final class WarmServer {
     if !request.loras.isEmpty {
       let loraEntries = request.loras.map { lora -> LoRAEntry in
         // Resolve bare filenames to full paths in the LoRA directory.
-        let resolvedPath: String
-        if lora.name.contains("/") || lora.name.hasPrefix("~") {
-          resolvedPath = lora.name
-        } else {
-          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
-        }
+        let resolvedPath = resolveLoRAPath(lora.name)
         return LoRAEntry(path: resolvedPath, scale: lora.scale)
       }
       let swapPayload = LoRASwapPayload(loras: loraEntries)
@@ -862,12 +870,7 @@ public final class WarmServer {
 
       // Build LoRA configurations for the control pipeline
       let controlLoRAs: [LoRAConfiguration] = request.loras.map { lora in
-        let resolvedPath: String
-        if lora.name.contains("/") || lora.name.hasPrefix("~") {
-          resolvedPath = lora.name
-        } else {
-          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
-        }
+        let resolvedPath = resolveLoRAPath(lora.name)
         return .local(resolvedPath, scale: lora.scale)
       }
 
@@ -1088,12 +1091,7 @@ public final class WarmServer {
     // --- LoRA swap if needed ---
     if !stage.loras.isEmpty {
       let loraEntries = stage.loras.map { lora -> LoRAEntry in
-        let resolvedPath: String
-        if lora.name.contains("/") || lora.name.hasPrefix("~") {
-          resolvedPath = lora.name
-        } else {
-          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
-        }
+        let resolvedPath = resolveLoRAPath(lora.name)
         return LoRAEntry(path: resolvedPath, scale: lora.scale)
       }
       let swapPayload = LoRASwapPayload(loras: loraEntries)

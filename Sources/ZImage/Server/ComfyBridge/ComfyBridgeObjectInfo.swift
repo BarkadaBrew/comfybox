@@ -384,8 +384,8 @@ enum ComfyBridgeObjectInfo {
         "model": modelInput(),
         "clip": clipInput(),
         "lora_name": optionInput(zimageLoraModels(library: loraLibrary)),
-        "strength_model": floatInput(default: 1.0),
-        "strength_clip": floatInput(default: 1.0),
+        "strength_model": floatInput(default: 1.0, min: -20.0, max: 20.0, step: 0.01),
+        "strength_clip": floatInput(default: 1.0, min: -20.0, max: 20.0, step: 0.01),
       ],
       requiredOrder: ["model", "clip", "lora_name", "strength_model", "strength_clip"],
       outputs: ["MODEL", "CLIP"]
@@ -734,6 +734,11 @@ enum ComfyBridgeObjectInfo {
   }
 
   /// Float input with default: ["FLOAT", {"default": N}]
+  private static func floatInput(default value: Float, min: Float, max: Float, step: Float) -> [Any] {
+    return ["FLOAT", ["default": value, "min": min, "max": max, "step": step] as [String: Any]]
+  }
+
+  /// Float input with default only (no range constraints): ["FLOAT", {"default": N}]
   private static func floatInput(default value: Float) -> [Any] {
     return ["FLOAT", ["default": value] as [String: Any]]
   }
