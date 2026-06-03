@@ -1966,7 +1966,7 @@ private actor WarmServerCoordinator {
     // Cancel all pending continuations with an error.
     for op in pending {
       switch op {
-      case .generate(_, let cont, _):
+      case .generate(_, let cont, _, _):
         cont.resume(throwing: ServerError.shuttingDown)
       case .controlGenerate(_, let cont):
         cont.resume(throwing: ServerError.shuttingDown)

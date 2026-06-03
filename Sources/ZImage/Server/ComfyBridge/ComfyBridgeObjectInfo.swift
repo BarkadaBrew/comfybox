@@ -583,6 +583,35 @@ enum ComfyBridgeObjectInfo {
     requiredOrder: [String]? = nil,
     optional: [String: Any] = [:],
     optionalOrder: [String]? = nil,
+    outputs: [String],
+    outputNames: [String]? = nil
+  ) -> [String: Any] {
+    let orderedRequired: Any
+    if let order = requiredOrder {
+      orderedRequired = OrderedDict(order.compactMap { key in
+        required[key].map { (key, $0) }
+      })
+    } else {
+      orderedRequired = required
+    }
+
+    let orderedOptional: Any?
+    if !optional.isEmpty {
+      if let order = optionalOrder {
+        orderedOptional = OrderedDict(order.compactMap { key in
+          optional[key].map { (key, $0) }
+        })
+      } else {
+        orderedOptional = optional
+      }
+    } else {
+      orderedOptional = nil
+    }
+
+    var input: [String: Any] = ["required": orderedRequired]
+    if let opt = orderedOptional {
+      input["optional"] = opt
+    }
     let names = outputNames ?? outputs
     return [
       "name": "",
