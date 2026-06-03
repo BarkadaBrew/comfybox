@@ -459,10 +459,14 @@ public final class WarmServer {
         let shouldActivate = payload.activate ?? true
         let shouldWait = payload.wait ?? true
 
+        // Resolve CivitAI model IDs (e.g. 'cyberrealistic-v5') to file paths
+        let resolvedSpec = Self.parseModelSpec(from: payload.model)
+        let resolvedQuantization = payload.quantization ?? Self.parseQuantization(from: payload.model)
+
         if shouldWait {
           let result = try await coordinator.poolLoad(
-            modelSpec: payload.model,
-            quantization: payload.quantization,
+            modelSpec: resolvedSpec,
+            quantization: resolvedQuantization,
             activate: shouldActivate
           )
           return .json(status: 200, payload: result)
@@ -471,8 +475,8 @@ public final class WarmServer {
           Task {
             do {
               try await coordinator.poolLoad(
-                modelSpec: payload.model,
-                quantization: payload.quantization,
+                modelSpec: resolvedSpec,
+                quantization: resolvedQuantization,
                 activate: shouldActivate
               )
             } catch {
