@@ -1437,6 +1437,7 @@ public final class WarmServer {
       "moody-wild-v4-distilled": "~/Models-working/moody-wild-mix/moody-wild-v4-distilled-10step-fp16.safetensors",
       "moody-wild-v4-fp8": "~/Models-working/moody-wild-mix/moody-wild-v4-fp8.safetensors",
       "moody-real-v6": "~/Models-working/moody-real-v6/moody-real-v6.safetensors",
+      "cyberrealistic-v5": "~/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors",
     ]
     if let path = civitaiPaths[modelId] {
       return NSString(string: path).expandingTildeInPath

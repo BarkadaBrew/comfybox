@@ -781,6 +781,7 @@ enum ComfyBridgeObjectInfo {
       "moody-wild-v4-distilled",
       "moody-wild-v4-fp8",
       "moody-real-v6",
+      "cyberrealistic-v5",
     ]
   }
 
