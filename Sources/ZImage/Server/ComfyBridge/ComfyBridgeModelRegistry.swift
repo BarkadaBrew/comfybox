@@ -344,6 +344,21 @@ public enum ComfyBoxModelRegistry {
       description: "CivitAI Z-Image checkpoint. Realistic style, undistilled. 40 steps, CFG 4.0."
     ),
 
+    ComfyBoxModel(
+      id: "cyberrealistic-v5",
+      family: .zImage, variant: .base, quantization: .none,
+      huggingFaceId: "",
+      parametersBillions: 6.0, latentChannels: 128,
+      defaultSteps: 8, defaultGuidance: 1.0,
+      supportsGuidance: false, supportsLoRA: true,
+      supportsControlNet: true, supportsImg2Img: true,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 12.5,
+      displayName: "CyberRealistic V5",
+      description: "CivitAI Z-Image Turbo fine-tune. Enhanced photorealism and NSFW. Apache 2.0 license."
+    ),
+
+
     // ─── SeedVR2 Family ──────────────────────────────────────────────
     // 3B upscaler — 2× resolution enhancement.
 

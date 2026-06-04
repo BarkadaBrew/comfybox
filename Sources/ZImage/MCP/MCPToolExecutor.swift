@@ -171,7 +171,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let result: [String: Any] = [
       "loras": options,
       "count": options.count,
-      "directory": "~/bin/zimage/loras",
+      "directory": "~/Models/loras",
     ]
     let resultData = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
     return MCPToolResult(text: String(data: resultData, encoding: .utf8) ?? "{}")
