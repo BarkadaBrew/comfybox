@@ -25,7 +25,14 @@ public final class LoRAWeightLoader {
 
     public static func load(from config: LoRAConfiguration) async throws -> LoRAWeights {
         let url = try await resolveSource(config.source)
-        return try load(from: url)
+        // Use a detached task to avoid Swift concurrency deadlock:
+        // When called from an actor-isolated method, the synchronous
+        // load(from: url) can block the cooperative pool and prevent
+        // the actor from resuming. A detached task runs independently.
+        let weights = try await Task.detached(priority: .userInitiated) {
+            try load(from: url)
+        }.value
+        return weights
     }
 
     public static func load(from url: URL) throws -> LoRAWeights {
