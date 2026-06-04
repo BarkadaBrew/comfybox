@@ -1932,7 +1932,7 @@ private actor WarmServerCoordinator {
 
     return HealthResponse(
       status: shuttingDown ? "shutting_down" : (activeAgeMs.map { $0 > Self.renderStaleThresholdMs } ?? false ? "render_stale" : "ok"),
-      model: configuration.modelSpec ?? ZImageRepository.id,
+      model: activePoolModelSpec ?? configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
       modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
       textEncoderPath: configuration.textEncoderPath,
@@ -2036,6 +2036,18 @@ private actor WarmServerCoordinator {
     activeRenderStartedAt = Date()
     let start = Date()
 
+    var resumed = false
+
+    defer {
+      if !resumed {
+        logger.error("runFlux1Generate: continuation was not resumed — resuming with error.")
+        failedRenderCount += 1
+        lastError = "Flux1 generation failed unexpectedly (continuation not resumed)"
+        activeRenderStartedAt = nil
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "Flux1 generation failed unexpectedly"))
+      }
+    }
+
     // When a pool model is active, override configuration.modelSpec so
     // that generateCore loads/validates the pool model, not the startup model.
     let effectiveConfig: WarmServerConfiguration
@@ -2068,6 +2080,7 @@ private actor WarmServerCoordinator {
       lastError = nil
       activeRenderStartedAt = nil
 
+      resumed = true
       continuation.resume(
         returning: GenerateResponse(
           success: true,
@@ -2079,6 +2092,7 @@ private actor WarmServerCoordinator {
       failedRenderCount += 1
       lastError = error.localizedDescription
       activeRenderStartedAt = nil
+      resumed = true
       continuation.resume(throwing: error)
     }
   }
@@ -2086,6 +2100,18 @@ private actor WarmServerCoordinator {
   private func runFlux2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
     activeRenderStartedAt = Date()
     let start = Date()
+
+    var resumed = false
+
+    defer {
+      if !resumed {
+        logger.error("runFlux2Generate: continuation was not resumed — resuming with error.")
+        failedRenderCount += 1
+        lastError = "Flux2 generation failed unexpectedly (continuation not resumed)"
+        activeRenderStartedAt = nil
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "Flux2 generation failed unexpectedly"))
+      }
+    }
 
     do {
       guard let f2 = flux2Pipeline else {
@@ -2149,6 +2175,7 @@ private actor WarmServerCoordinator {
       lastError = nil
       activeRenderStartedAt = nil
 
+      resumed = true
       continuation.resume(
         returning: GenerateResponse(
           success: true,
@@ -2160,6 +2187,7 @@ private actor WarmServerCoordinator {
       failedRenderCount += 1
       lastError = error.localizedDescription
       activeRenderStartedAt = nil
+      resumed = true
       continuation.resume(throwing: error)
     }
   }
@@ -2167,6 +2195,18 @@ private actor WarmServerCoordinator {
   private func runFiboGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
     activeRenderStartedAt = Date()
     let start = Date()
+
+    var resumed = false
+
+    defer {
+      if !resumed {
+        logger.error("runFiboGenerate: continuation was not resumed — resuming with error.")
+        failedRenderCount += 1
+        lastError = "FIBO generation failed unexpectedly (continuation not resumed)"
+        activeRenderStartedAt = nil
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "FIBO generation failed unexpectedly"))
+      }
+    }
 
     do {
       guard let fp = fiboPipeline else {
@@ -2200,6 +2240,7 @@ private actor WarmServerCoordinator {
       lastError = nil
       activeRenderStartedAt = nil
 
+      resumed = true
       continuation.resume(
         returning: GenerateResponse(
           success: true,
@@ -2211,6 +2252,7 @@ private actor WarmServerCoordinator {
       failedRenderCount += 1
       lastError = error.localizedDescription
       activeRenderStartedAt = nil
+      resumed = true
       continuation.resume(throwing: error)
     }
   }
@@ -2218,6 +2260,18 @@ private actor WarmServerCoordinator {
   private func runChromaGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
     activeRenderStartedAt = Date()
     let start = Date()
+
+    var resumed = false
+
+    defer {
+      if !resumed {
+        logger.error("runChromaGenerate: continuation was not resumed — resuming with error.")
+        failedRenderCount += 1
+        lastError = "Chroma generation failed unexpectedly (continuation not resumed)"
+        activeRenderStartedAt = nil
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "Chroma generation failed unexpectedly"))
+      }
+    }
 
     do {
       guard let pipeline = chromaPipeline else {
@@ -2279,6 +2333,7 @@ private actor WarmServerCoordinator {
       lastError = nil
       activeRenderStartedAt = nil
 
+      resumed = true
       continuation.resume(
         returning: GenerateResponse(
           success: true,
@@ -2290,6 +2345,7 @@ private actor WarmServerCoordinator {
       failedRenderCount += 1
       lastError = error.localizedDescription
       activeRenderStartedAt = nil
+      resumed = true
       continuation.resume(throwing: error)
     }
   }
@@ -2302,6 +2358,18 @@ private actor WarmServerCoordinator {
 
     activeRenderStartedAt = Date()
     let start = Date()
+
+    var resumed = false
+
+    defer {
+      if !resumed {
+        logger.error("runControlGenerate: continuation was not resumed — resuming with error.")
+        failedRenderCount += 1
+        lastError = "ControlNet generation failed unexpectedly (continuation not resumed)"
+        activeRenderStartedAt = nil
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "ControlNet generation failed unexpectedly"))
+      }
+    }
 
     do {
       // Lazy-init the control pipeline on first ControlNet request
@@ -2317,6 +2385,7 @@ private actor WarmServerCoordinator {
       lastError = nil
       activeRenderStartedAt = nil
 
+      resumed = true
       continuation.resume(
         returning: GenerateResponse(
           success: true,
@@ -2328,6 +2397,7 @@ private actor WarmServerCoordinator {
       failedRenderCount += 1
       lastError = error.localizedDescription
       activeRenderStartedAt = nil
+      resumed = true
       continuation.resume(throwing: error)
     }
   }
@@ -2338,12 +2408,28 @@ private actor WarmServerCoordinator {
       return
     }
 
+    var resumed = false
+
+    defer {
+      if !resumed {
+        logger.error("runSwap: continuation was not resumed — likely a crash in LoRA application. Resuming with error.")
+        if currentModelFamily == .flux2 {
+          activeLoRAs = flux2Pipeline?.loadedLoRAConfigs ?? []
+        } else {
+          activeLoRAs = pipeline.loadedLoRAConfigs
+        }
+        lastError = "LoRA swap failed unexpectedly (continuation not resumed)"
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "LoRA swap failed unexpectedly"))
+      }
+    }
+
     do {
       let newLoRAs = try payload.makeConfigurations()
 
       if currentModelFamily == .flux2 {
         // Flux 2 LoRA swap via Flux2Pipeline.loadLoRAs()
         guard let f2 = flux2Pipeline else {
+          resumed = true
           continuation.resume(throwing: WarmServerError.flux2NotLoaded)
           return
         }
@@ -2356,6 +2442,7 @@ private actor WarmServerCoordinator {
       }
 
       lastError = nil
+      resumed = true
       continuation.resume(
         returning: LoRASwapResponse(
           success: true,
@@ -2370,6 +2457,7 @@ private actor WarmServerCoordinator {
         activeLoRAs = pipeline.loadedLoRAConfigs
       }
       lastError = error.localizedDescription
+      resumed = true
       continuation.resume(throwing: error)
     }
   }
@@ -3044,9 +3132,26 @@ private struct LoRAEntry: Codable, Sendable {
 
   func makeConfiguration() throws -> LoRAConfiguration {
     let expanded = (path as NSString).expandingTildeInPath
-    if path.hasPrefix("/") || path.hasPrefix("./") || path.hasPrefix("../") || path.hasPrefix("~") || FileManager.default.fileExists(atPath: expanded) {
+
+    // Direct path (absolute, relative, tilde-expanded)
+    if path.hasPrefix("/") || path.hasPrefix("./") || path.hasPrefix("../") || path.hasPrefix("~")
+       || FileManager.default.fileExists(atPath: expanded) {
       return .local(expanded, scale: scale ?? 1.0)
     }
+
+    // Library resolution: search the LoRA library root for the filename
+    let libraryRoot = ("~/Models/loras" as NSString).expandingTildeInPath
+    let fm = FileManager.default
+    if let enumerator = fm.enumerator(at: URL(fileURLWithPath: libraryRoot),
+                                       includingPropertiesForKeys: [.isRegularFileKey]) {
+      for case let fileURL as URL in enumerator {
+        if fileURL.lastPathComponent == path {
+          return .local(fileURL.path, scale: scale ?? 1.0)
+        }
+      }
+    }
+
+    // HuggingFace fallback
     return .huggingFace(path, scale: scale ?? 1.0)
   }
 }

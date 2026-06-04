@@ -346,7 +346,7 @@ public enum ComfyBoxModelRegistry {
 
     ComfyBoxModel(
       id: "cyberrealistic-v5",
-      family: .zImage, variant: .turbo, quantization: .none,
+      family: .zImage, variant: .base, quantization: .none,
       huggingFaceId: "",
       parametersBillions: 6.0, latentChannels: 128,
       defaultSteps: 8, defaultGuidance: 1.0,

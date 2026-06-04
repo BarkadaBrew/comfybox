@@ -109,7 +109,7 @@ public enum MCPToolRegistry {
             "properties": [
               "path": [
                 "type": "string",
-                "description": "Path to .safetensors file, or HuggingFace model ID. Bare filenames resolve to ~/bin/zimage/loras/.",
+                "description": "Path to .safetensors file, or HuggingFace model ID. Bare filenames resolve to ~/Models/loras/.",
               ] as [String: Any],
               "scale": [
                 "type": "number",
@@ -171,7 +171,7 @@ public enum MCPToolRegistry {
 
   static let listLoras = MCPToolDefinition(
     name: "list_loras",
-    description: "List LoRA files available in the LoRA directory (~/bin/zimage/loras/). Returns filenames that can be passed to swap_loras.",
+    description: "List LoRA files available in the LoRA directory (~/Models/loras/). Returns filenames that can be passed to swap_loras.",
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
