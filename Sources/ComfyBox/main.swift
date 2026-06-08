@@ -4006,6 +4006,7 @@ struct ZImageCLI {
     var configPath: String? = nil
     var warmServerPort: UInt16 = 7862
     var warmServerHost: String = "127.0.0.1"
+    var enhanceOverride: Bool? = nil
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -4019,6 +4020,21 @@ struct ZImageCLI {
         warmServerPort = UInt16(min(raw, Int(UInt16.max)))
       case "--host":
         warmServerHost = nextValue(for: arg, iterator: &iterator)
+      case "--enhance":
+        let next = iterator.next()
+        if let next = next?.lowercased() {
+          switch next {
+          case "on", "true", "yes": enhanceOverride = true
+          case "off", "false", "no": enhanceOverride = false
+          default:
+            logger.warning("Unknown --enhance value: \(next), expected on/off")
+            enhanceOverride = true
+          }
+        } else {
+          enhanceOverride = true  // --enhance with no value means on
+        }
+      case "--no-enhance":
+        enhanceOverride = false
       case "--help", "-h":
         printTelegramUsage()
         return
@@ -4032,7 +4048,8 @@ struct ZImageCLI {
       botToken: botToken,
       configPath: configPath,
       warmServerHost: warmServerHost,
-      warmServerPort: warmServerPort
+      warmServerPort: warmServerPort,
+      enhanceOverride: enhanceOverride
     )
 
     let coordinator = ImageBotCoordinator(configuration: config, logger: logger)
@@ -4072,7 +4089,8 @@ struct ZImageCLI {
     botToken: String?,
     configPath: String?,
     warmServerHost: String,
-    warmServerPort: UInt16
+    warmServerPort: UInt16,
+    enhanceOverride: Bool?
   ) throws -> ImageBotCoordinator.Configuration {
     // Resolution: CLI > env > config file > defaults
     var token = botToken
@@ -4080,6 +4098,16 @@ struct ZImageCLI {
     var host = warmServerHost
     var port = warmServerPort
     var outputDir = ("~/Pictures/ComfyBox/Telegram" as NSString).expandingTildeInPath
+    var galleryDir: String? = nil
+    var characterConfigPath: String? = nil
+    var contentModeConfigPath: String? = nil
+
+    // Optimizer config (defaults)
+    var optimizerEnabled = true
+    var ollamaBaseURL = "http://localhost:11434"
+    var lmStudioBaseURL: String? = "http://localhost:1234"
+    var optimizerModel = "qwen3:8b"
+    var optimizerTimeout = 15
 
     // Check environment variable
     if token == nil {
@@ -4110,6 +4138,36 @@ struct ZImageCLI {
       if let dir = json["outputDirectory"] as? String {
         outputDir = (dir as NSString).expandingTildeInPath
       }
+      if let dir = json["galleryDirectory"] as? String {
+        galleryDir = (dir as NSString).expandingTildeInPath
+      }
+      if let charPath = json["characterConfigPath"] as? String {
+        characterConfigPath = (charPath as NSString).expandingTildeInPath
+      }
+
+      // Optimizer config from file
+      if let opt = json["optimizer"] as? [String: Any] {
+        if let enabled = opt["enabled"] as? Bool {
+          optimizerEnabled = enabled
+        }
+        if let url = opt["ollamaBaseURL"] as? String {
+          ollamaBaseURL = url
+        }
+        if let url = opt["lmStudioBaseURL"] as? String {
+          lmStudioBaseURL = url
+        }
+        if let model = opt["model"] as? String {
+          optimizerModel = model
+        }
+        if let timeout = opt["timeoutSeconds"] as? Int {
+          optimizerTimeout = timeout
+        }
+      }
+    }
+
+    // CLI --enhance/--no-enhance overrides config file
+    if let enhanceOverride = enhanceOverride {
+      optimizerEnabled = enhanceOverride
     }
 
     guard let finalToken = token, !finalToken.isEmpty else {
@@ -4126,11 +4184,23 @@ struct ZImageCLI {
       allowedUserIds: allowedUserIds
     )
 
+    let optimizerConfig = PromptOptimizer.Configuration(
+      ollamaBaseURL: ollamaBaseURL,
+      lmStudioBaseURL: lmStudioBaseURL,
+      model: optimizerModel,
+      timeoutSeconds: optimizerTimeout,
+      enabled: optimizerEnabled
+    )
+
     return ImageBotCoordinator.Configuration(
       telegram: telegramConfig,
       warmServerHost: host,
       warmServerPort: port,
-      outputDirectory: outputDir
+      outputDirectory: outputDir,
+      galleryDirectory: galleryDir,
+      optimizer: optimizerConfig,
+      characterConfigPath: characterConfigPath,
+      contentModeConfigPath: contentModeConfigPath
     )
   }
 
@@ -4146,13 +4216,28 @@ struct ZImageCLI {
       --config <path>         Config file (default: ~/.comfybox/telegram.json)
       --port <port>           WarmServer port (default: 7862)
       --host <host>           WarmServer host (default: 127.0.0.1)
+      --enhance [on|off]      Enable/disable prompt optimization (default: on)
+      --no-enhance            Disable prompt optimization
       --help, -h              Show help
+
+    Content Modes (in-bot commands):
+      /neutral or /apple      SFW mode
+      /banana                 Suggestive mode
+      /avocado                Explicit mode
 
     Config file (~/.comfybox/telegram.json):
       {
         "botToken": "123456:ABC...",
         "allowedUserIds": [8754779862],
         "warmServer": { "host": "127.0.0.1", "port": 7862 },
+        "optimizer": {
+          "enabled": true,
+          "ollamaBaseURL": "http://localhost:11434",
+          "lmStudioBaseURL": "http://localhost:1234",
+          "model": "qwen3:8b",
+          "timeoutSeconds": 15
+        },
+        "characterConfigPath": "~/.comfybox/characters.json",
         "outputDirectory": "~/Pictures/ComfyBox/Telegram"
       }
 
@@ -4161,6 +4246,7 @@ struct ZImageCLI {
     Requires a running WarmServer: ComfyBox serve --port 7862
     """)
   }
+
 
 
 
