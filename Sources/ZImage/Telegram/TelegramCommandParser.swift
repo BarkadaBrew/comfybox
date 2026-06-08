@@ -2,6 +2,7 @@
 //
 // Phase 1: /help, /status, and bare text (render). All other commands defined
 // in the enum but parsed as render with the raw text for forward compatibility.
+// Phase 4: Discuss mode ship-cue detection, reply-to-image intent parsing.
 
 import Foundation
 
@@ -47,8 +48,19 @@ public enum BotCommand: Sendable {
   case status
   case help
   case reset
-  case look
+  case look(id: String?)
   case queue(subcommand: String?)
+}
+
+// MARK: - Reply Intent
+
+/// Describes what the user intends when replying to a bot-sent photo.
+public enum ReplyIntent: Sendable {
+  case rerender                         // "rerender", "again"
+  case hq                               // "hq"
+  case upscaleReply                     // "upscale"
+  case video(motion: String?)           // "video" or "video <desc>"
+  case newPrompt(text: String)          // any other text → img2img
 }
 
 // MARK: - Parsed Prompt
@@ -166,7 +178,7 @@ public enum TelegramCommandParser {
       case "/reset":
         return .reset
       case "/look":
-        return .look
+        return .look(id: args)
 
       // Phase 4 commands
       case "/chat", "/discuss":
@@ -191,6 +203,38 @@ public enum TelegramCommandParser {
     }
 
     return .render(prompt: trimmed)
+  }
+
+  /// Determine the intent of a reply to a bot-sent photo.
+  /// Returns nil if the text is empty or can't be classified.
+  public static func parseReplyIntent(_ text: String) -> ReplyIntent? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    let lowered = trimmed.lowercased()
+
+    // Exact match keywords
+    switch lowered {
+    case "rerender", "again", "redo":
+      return .rerender
+    case "hq":
+      return .hq
+    case "upscale":
+      return .upscaleReply
+    case "video":
+      return .video(motion: nil)
+    default:
+      break
+    }
+
+    // "video <motion description>"
+    if lowered.hasPrefix("video ") {
+      let motion = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+      return .video(motion: motion.isEmpty ? nil : motion)
+    }
+
+    // Anything else is a new prompt for img2img
+    return .newPrompt(text: trimmed)
   }
 
   /// Extract character name and inline mode overrides from a prompt string.
