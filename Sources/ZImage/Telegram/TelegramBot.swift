@@ -2,6 +2,7 @@
 //
 // Long-polling bot using URLSession. No external dependencies.
 // Handles getUpdates, sendMessage, sendPhoto, sendDocument.
+// Phase 4: Added answerCallbackQuery, editMessageReplyMarkup, downloadFile.
 
 import Foundation
 import Logging
@@ -283,6 +284,37 @@ public final class TelegramBot: @unchecked Sendable {
       body["reply_markup"] = ["inline_keyboard": markup.toJSON()]
     }
     let _ = try await callMethod("editMessageReplyMarkup", body: body)
+  }
+
+  /// Download a file from Telegram by fileId.
+  /// Returns the file data, or nil if the download failed.
+  public func downloadFile(fileId: String) async throws -> Data? {
+    // Step 1: getFile to obtain the file_path
+    let fileInfo = try await callMethod("getFile", body: ["file_id": fileId])
+    // fileInfo response doesn't have messageId, we need to re-parse for file_path
+    // Use a separate raw call for getFile
+    guard let url = URL(string: "\(baseURL)/getFile") else { return nil }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: ["file_id": fileId])
+
+    let (data, _) = try await session.data(for: request)
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let ok = json["ok"] as? Bool, ok,
+          let result = json["result"] as? [String: Any],
+          let filePath = result["file_path"] as? String else {
+      return nil
+    }
+
+    // Step 2: Download the file from Telegram's file server
+    let fileURL = "https://api.telegram.org/file/bot\(config.botToken)/\(filePath)"
+    guard let downloadURL = URL(string: fileURL) else { return nil }
+    let (fileData, response) = try await session.data(from: downloadURL)
+    guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+      return nil
+    }
+    return fileData
   }
 
   // MARK: - Private
