@@ -207,7 +207,7 @@ public final class EngineService {
     // MARK: - Configuration
 
     public var serverHost: String = "127.0.0.1"
-    public var serverPort: UInt16 = 7862
+    public var serverPort: UInt16 = 7870
     public var outputDirectory: String = NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath
 
     // MARK: - Private
@@ -215,7 +215,12 @@ public final class EngineService {
     private var client: WarmServerClient?
     private var healthPollTask: Task<Void, Never>?
 
-    public init() {}
+    public init() {
+        let config = AppConfig.load()
+        self.serverHost = config.serverHost
+        self.serverPort = config.serverPort
+        self.outputDirectory = NSString(string: config.outputDirectory).expandingTildeInPath
+    }
 
     deinit {
         healthPollTask?.cancel()

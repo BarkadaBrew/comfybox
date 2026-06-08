@@ -23,7 +23,7 @@ struct DesktopSettings: Codable {
 
     static let defaultSettings = DesktopSettings(
         serverHost: "127.0.0.1",
-        serverPort: 7862,
+        serverPort: 7870,
         autoConnect: true,
         outputDirectory: NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath,
         defaultSteps: 9,
