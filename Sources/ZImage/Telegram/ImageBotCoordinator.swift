@@ -4,6 +4,8 @@
 // Phase 2: Content modes, character injection, prompt optimization.
 // Phase 3: Full command set — batch, vary, sequence, upscale, aspect, cfg,
 //          seed, polish, post-processing (saturation, temp, film), reset.
+// Phase 4: Inline keyboards on photos, callback query handling, reply-to-image
+//          (rerender/HQ/img2img/upscale), discuss mode, queue, /look alias, /imagine.
 // Connects to a running WarmServer instance via WarmServerClient.
 
 import Foundation
@@ -96,16 +98,366 @@ public final class ImageBotCoordinator {
   // MARK: - Update Handling
 
   private func handleUpdate(_ update: TelegramUpdate) async {
-    if let message = update.message, let text = message.text {
-      await handleTextMessage(message: message, text: text)
+    // Phase 4: Handle callback queries (inline keyboard presses)
+    if let cbQuery = update.callbackQuery {
+      await handleCallbackQuery(cbQuery)
       return
     }
-    // Future: handle callback queries, photos, etc.
+
+    if let message = update.message {
+      // Phase 4: Check for reply-to-image
+      if let replyTo = message.replyToMessage,
+         replyTo.photo != nil || replyTo.caption != nil,
+         let text = message.text {
+        await handleReplyToImage(message: message, replyToMessage: replyTo, text: text)
+        return
+      }
+
+      if let text = message.text {
+        await handleTextMessage(message: message, text: text)
+        return
+      }
+    }
   }
 
-  private func handleTextMessage(message: TelegramMessage, text: String) async {
-    let command = TelegramCommandParser.parse(text, inDiscussMode: false)
+  // MARK: - Callback Query Handling (Phase 4)
+
+  private func handleCallbackQuery(_ query: TelegramCallbackQuery) async {
+    guard let chatId = query.chatId, let data = query.data else {
+      try? await bot.answerCallbackQuery(id: query.id, text: "Invalid callback")
+      return
+    }
+
+    // Parse callback data: "action:chatId:msgId"
+    let parts = data.split(separator: ":")
+    guard parts.count >= 3,
+          let origMsgId = Int(parts[2]) else {
+      try? await bot.answerCallbackQuery(id: query.id, text: "Invalid callback data")
+      return
+    }
+
+    let action = String(parts[0])
+    let state = sessions.getState(chatId: chatId)
+
+    // Look up the render context for the original message
+    guard let renderCtx = state.getRenderContext(messageId: origMsgId) else {
+      try? await bot.answerCallbackQuery(id: query.id, text: "Render context expired")
+      return
+    }
+
+    switch action {
+    case "rerender":
+      try? await bot.answerCallbackQuery(id: query.id, text: "Re-rendering with new seed...")
+      await handleCallbackRerender(chatId: chatId, renderCtx: renderCtx)
+
+    case "hq":
+      try? await bot.answerCallbackQuery(id: query.id, text: "Rendering HQ (polish pass)...")
+      await handleCallbackHQ(chatId: chatId, renderCtx: renderCtx)
+
+    case "video":
+      try? await bot.answerCallbackQuery(id: query.id, text: nil)
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "Video generation routes through @BaristaBree_Bot. Send her the image with a motion description.")
+
+    default:
+      try? await bot.answerCallbackQuery(id: query.id, text: "Unknown action")
+    }
+  }
+
+  private func handleCallbackRerender(chatId: Int, renderCtx: RenderContext) async {
+    let state = sessions.getState(chatId: chatId)
+
+    let result = await generateImage(
+      prompt: renderCtx.prompt,
+      character: renderCtx.character,
+      characterDescription: renderCtx.character.flatMap { characterLoader.description(for: $0, mode: contentModeManager.current) },
+      effectiveMode: contentModeManager.current,
+      state: state,
+      seed: nil  // New random seed
+    )
+
+    switch result {
+    case .success(let render):
+      let finalData = applyPostProcessing(imageData: render.imageData, state: state, wasUpscaled: render.wasUpscaled)
+      let caption = buildCaption(
+        prompt: renderCtx.prompt,
+        character: renderCtx.character,
+        mode: contentModeManager.current,
+        durationMs: render.durationMs,
+        enhanced: renderCtx.enhanceEnabled,
+        seed: render.seed,
+        state: state
+      )
+      let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+
+      // Store render context for the new message
+      if let newMsgId = sentResult?.messageId {
+        sessions.updateState(chatId: chatId) {
+          $0.lastPrompt = renderCtx.prompt
+          $0.lastImagePath = render.outputPath
+          $0.lastSeed = render.seed
+          $0.storeRenderContext(messageId: newMsgId, context: RenderContext(
+            prompt: renderCtx.prompt,
+            imagePath: render.outputPath,
+            seed: render.seed,
+            character: renderCtx.character,
+            contentMode: renderCtx.contentMode,
+            enhanceEnabled: renderCtx.enhanceEnabled
+          ))
+        }
+      }
+      copyToGallery(outputPath: render.outputPath, filename: render.filename)
+
+    case .failure(let error):
+      await sendError(chatId: chatId, error: error)
+    }
+  }
+
+  private func handleCallbackHQ(chatId: Int, renderCtx: RenderContext) async {
+    var state = sessions.getState(chatId: chatId)
+    // Force polish on for this render
+    let originalPolish = state.polishEnabled
+    state.polishEnabled = true
+
+    let result = await generateImage(
+      prompt: renderCtx.prompt,
+      character: renderCtx.character,
+      characterDescription: renderCtx.character.flatMap { characterLoader.description(for: $0, mode: contentModeManager.current) },
+      effectiveMode: contentModeManager.current,
+      state: state,
+      seed: renderCtx.seed  // Same seed for consistency
+    )
+
+    // Restore polish state
+    sessions.updateState(chatId: chatId) { $0.polishEnabled = originalPolish }
+
+    switch result {
+    case .success(let render):
+      let finalData = applyPostProcessing(imageData: render.imageData, state: state, wasUpscaled: render.wasUpscaled)
+      let caption = "\u{2728} HQ \u{2014} " + buildCaption(
+        prompt: renderCtx.prompt,
+        character: renderCtx.character,
+        mode: contentModeManager.current,
+        durationMs: render.durationMs,
+        enhanced: renderCtx.enhanceEnabled,
+        seed: render.seed,
+        state: state
+      )
+      let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+
+      if let newMsgId = sentResult?.messageId {
+        sessions.updateState(chatId: chatId) {
+          $0.lastPrompt = renderCtx.prompt
+          $0.lastImagePath = render.outputPath
+          $0.lastSeed = render.seed
+          $0.storeRenderContext(messageId: newMsgId, context: RenderContext(
+            prompt: renderCtx.prompt,
+            imagePath: render.outputPath,
+            seed: render.seed,
+            character: renderCtx.character,
+            contentMode: renderCtx.contentMode,
+            enhanceEnabled: renderCtx.enhanceEnabled
+          ))
+        }
+      }
+      copyToGallery(outputPath: render.outputPath, filename: render.filename)
+
+    case .failure(let error):
+      await sendError(chatId: chatId, error: error)
+    }
+  }
+
+  // MARK: - Reply-to-Image Handling (Phase 4)
+
+  private func handleReplyToImage(message: TelegramMessage, replyToMessage: TelegramMessage, text: String) async {
     let chatId = message.chatId
+    let replyMsgId = replyToMessage.messageId
+
+    // Try to get the render context for the replied-to message
+    let state = sessions.getState(chatId: chatId)
+    let renderCtx = state.getRenderContext(messageId: replyMsgId)
+
+    guard let intent = TelegramCommandParser.parseReplyIntent(text) else { return }
+
+    switch intent {
+    case .rerender:
+      guard let ctx = renderCtx else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "No render context for that image. Send a new prompt.")
+        return
+      }
+      await handleCallbackRerender(chatId: chatId, renderCtx: ctx)
+
+    case .hq:
+      guard let ctx = renderCtx else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "No render context for that image. Send a new prompt.")
+        return
+      }
+      await handleCallbackHQ(chatId: chatId, renderCtx: ctx)
+
+    case .upscaleReply:
+      guard let ctx = renderCtx else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "No render context for that image. Send a new prompt.")
+        return
+      }
+      await handleReplyUpscale(chatId: chatId, renderCtx: ctx)
+
+    case .video(let motion):
+      let motionText = motion != nil ? " with motion: \(motion!)" : ""
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "Video generation routes through @BaristaBree_Bot\(motionText). Send her the image with a motion description.")
+
+    case .newPrompt(let newPrompt):
+      // img2img: use original image with new prompt
+      if let ctx = renderCtx {
+        await handleImg2Img(chatId: chatId, newPrompt: newPrompt, renderCtx: ctx)
+      } else {
+        // No context — treat as a regular render
+        await handleRender(chatId: chatId, prompt: newPrompt, messageId: message.messageId)
+      }
+    }
+  }
+
+  private func handleReplyUpscale(chatId: Int, renderCtx: RenderContext) async {
+    let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F50D} Upscaling...")
+
+    let state = sessions.getState(chatId: chatId)
+    let upscaleResult = await upscaleImage(imagePath: renderCtx.imagePath, state: state)
+
+    switch upscaleResult {
+    case .success(let upscaled):
+      var finalData = upscaled.data
+      // Sharpen after upscale
+      finalData = PostProcessor.applyPipeline(
+        imageData: finalData,
+        saturation: state.saturation,
+        colorTemp: state.colorTemp,
+        filmLookId: state.filmLook,
+        sharpenAfterUpscale: true
+      )
+      let filename = "telegram-upscaled-\(Int(Date().timeIntervalSince1970)).png"
+      let caption = "\u{1F50D} Upscaled \u{2014} \(upscaled.durationMs)ms"
+      let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: filename, caption: caption)
+
+      if let newMsgId = sentResult?.messageId {
+        sessions.updateState(chatId: chatId) {
+          $0.storeRenderContext(messageId: newMsgId, context: RenderContext(
+            prompt: renderCtx.prompt,
+            imagePath: upscaled.outputPath,
+            seed: renderCtx.seed,
+            character: renderCtx.character,
+            contentMode: renderCtx.contentMode,
+            enhanceEnabled: renderCtx.enhanceEnabled
+          ))
+        }
+      }
+
+    case .failure(let error):
+      await sendError(chatId: chatId, error: error)
+    }
+  }
+
+  private func handleImg2Img(chatId: Int, newPrompt: String, renderCtx: RenderContext) async {
+    let state = sessions.getState(chatId: chatId)
+    let parsed = parseAndResolve(prompt: newPrompt)
+
+    let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F3A8} Re-rendering with new prompt...")
+
+    // Optimize the new prompt
+    let finalPrompt: String
+    if state.enhanceEnabled {
+      let result = await promptOptimizer.optimize(
+        prompt: parsed.prompt,
+        character: parsed.character,
+        characterDescription: parsed.characterDescription,
+        contentMode: parsed.effectiveMode.rawValue
+      )
+      finalPrompt = result.prompt
+    } else {
+      if let desc = parsed.characterDescription {
+        finalPrompt = "\(desc)\n\n\(parsed.prompt)"
+      } else {
+        finalPrompt = parsed.prompt
+      }
+    }
+
+    // Generate with img2img using the original image
+    let outputFilename = "telegram-\(Int(Date().timeIntervalSince1970))-\(UInt32.random(in: 0...999999)).png"
+    let outputPath = (config.outputDirectory as NSString).appendingPathComponent(outputFilename)
+
+    do {
+      let dims = state.aspectDimensions()
+      var body: [String: Any] = [
+        "prompt": finalPrompt,
+        "outputPath": outputPath,
+        "width": dims.width,
+        "height": dims.height,
+        "image_path": renderCtx.imagePath,
+        "strength": 0.5
+      ]
+      if let cfg = state.cfgOverride { body["guidance"] = cfg }
+
+      let jsonData = try JSONSerialization.data(withJSONObject: body)
+      let (status, responseData) = try await warmServer.post("/v1/generate", body: jsonData)
+
+      guard status == 200,
+            let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+            let actualOutputPath = responseJSON["outputPath"] as? String else {
+        let errorMsg = parseErrorMessage(responseData) ?? "img2img returned status \(status)"
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "img2img failed: \(errorMsg)")
+        return
+      }
+
+      let durationMs = responseJSON["durationMs"] as? Int ?? 0
+      let responseSeed = responseJSON["seed"] as? Int
+      var imageData = try Data(contentsOf: URL(fileURLWithPath: actualOutputPath))
+
+      // Apply post-processing
+      imageData = applyPostProcessing(imageData: imageData, state: state, wasUpscaled: false)
+
+      let caption = "\u{1F3A8} img2img \u{2014} " + buildCaption(
+        prompt: newPrompt,
+        character: parsed.character,
+        mode: parsed.effectiveMode,
+        durationMs: durationMs,
+        enhanced: state.enhanceEnabled,
+        seed: responseSeed,
+        state: state
+      )
+
+      let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: imageData, filename: outputFilename, caption: caption)
+
+      if let newMsgId = sentResult?.messageId {
+        sessions.updateState(chatId: chatId) {
+          $0.lastPrompt = newPrompt
+          $0.lastImagePath = actualOutputPath
+          $0.lastSeed = responseSeed
+          $0.storeRenderContext(messageId: newMsgId, context: RenderContext(
+            prompt: newPrompt,
+            imagePath: actualOutputPath,
+            seed: responseSeed,
+            character: parsed.character,
+            contentMode: parsed.effectiveMode.rawValue,
+            enhanceEnabled: state.enhanceEnabled
+          ))
+        }
+      }
+      copyToGallery(outputPath: actualOutputPath, filename: outputFilename)
+
+    } catch {
+      let _ = try? await bot.sendMessage(chatId: chatId, text: "img2img failed: \(error.localizedDescription)")
+    }
+  }
+
+  // MARK: - Text Message Handling
+
+  private func handleTextMessage(message: TelegramMessage, text: String) async {
+    let chatId = message.chatId
+
+    // Check discuss mode
+    let state = sessions.getState(chatId: chatId)
+    let inDiscussMode = state.isInDiscussMode
+
+    let command = TelegramCommandParser.parse(text, inDiscussMode: inDiscussMode)
 
     switch command {
     // -- Phase 1 --
@@ -138,8 +490,8 @@ public final class ImageBotCoordinator {
       let _ = try? await bot.sendMessage(chatId: chatId, text: "\(emoji) Mode set to <b>\(name)</b>")
 
     case .enhance(let on):
-      let state = sessions.getState(chatId: chatId)
-      let newValue = on ?? !state.enhanceEnabled
+      let current = sessions.getState(chatId: chatId)
+      let newValue = on ?? !current.enhanceEnabled
       sessions.updateState(chatId: chatId) { $0.enhanceEnabled = newValue }
       let stateText = newValue ? "ON" : "OFF"
       let emoji = newValue ? "\u{2728}" : "\u{1F6D1}"
@@ -194,19 +546,33 @@ public final class ImageBotCoordinator {
     case .reset:
       await handleReset(chatId: chatId)
 
-    case .look:
-      await sendLookList(chatId: chatId)
+    case .look(let id):
+      await handleLook(chatId: chatId, lookId: id)
+
+    // -- Phase 4: Discuss mode --
+    case .chat:
+      await handleEnterDiscussMode(chatId: chatId)
+
+    case .endChat:
+      await handleExitDiscussMode(chatId: chatId)
+
+    case .shipCue:
+      await handleShipCue(chatId: chatId)
+
+    case .chatMessage(let text):
+      await handleDiscussMessage(chatId: chatId, text: text)
+
+    case .imagine(let description):
+      await handleImagine(chatId: chatId, description: description)
+
+    // -- Phase 4: Queue --
+    case .queue(let subcommand):
+      await handleQueue(chatId: chatId, subcommand: subcommand)
 
     // -- Deferred --
     case .video:
       let _ = try? await bot.sendMessage(chatId: chatId,
-        text: "Video generation routes through the daemon. Use Bree's <code>/video</code> command on the server.")
-
-    default:
-      let _ = try? await bot.sendMessage(
-        chatId: chatId,
-        text: "Command not yet available. Send a text prompt to generate an image, or /help for commands."
-      )
+        text: "Video generation routes through @BaristaBree_Bot. Send her the image with a motion description.")
     }
   }
 
@@ -227,7 +593,6 @@ public final class ImageBotCoordinator {
   private func handleResolution(chatId: Int, target: String?) async {
     if let target = target {
       sessions.updateState(chatId: chatId) { $0.resolutionTarget = target }
-      // Also enable upscale since resolution targets require it
       sessions.updateState(chatId: chatId) { $0.upscaleEnabled = true }
       let _ = try? await bot.sendMessage(chatId: chatId,
         text: "\u{1F4D0} Resolution target: <b>\(target.uppercased())</b> (upscale enabled)")
@@ -330,7 +695,6 @@ public final class ImageBotCoordinator {
 
   private func handleFilm(chatId: Int, lookId: String?) async {
     guard let lookId = lookId else {
-      // No argument — show current + available looks
       await sendLookList(chatId: chatId)
       return
     }
@@ -358,6 +722,18 @@ public final class ImageBotCoordinator {
       text: "\u{1F504} Post-processing settings cleared (saturation, color temp, film look).")
   }
 
+  // MARK: - Look (Phase 4: enhanced with ID alias)
+
+  private func handleLook(chatId: Int, lookId: String?) async {
+    guard let lookId = lookId else {
+      // No arg — list all looks
+      await sendLookList(chatId: chatId)
+      return
+    }
+    // /look <id> acts as alias for /film <id>
+    await handleFilm(chatId: chatId, lookId: lookId)
+  }
+
   private func sendLookList(chatId: Int) async {
     let looks = PostProcessor.availableLooks()
     let state = sessions.getState(chatId: chatId)
@@ -366,8 +742,288 @@ public final class ImageBotCoordinator {
       let active = state.filmLook?.lowercased() == look.id.lowercased() ? " \u{2705}" : ""
       lines.append("\u{2022} <code>\(look.id)</code> \u{2014} \(look.name)\(active)")
     }
-    lines.append("\nUsage: <code>/film kodak-portra</code> or <code>/film off</code>")
+    lines.append("\nUsage: <code>/look kodak-portra</code> or <code>/film off</code>")
     let _ = try? await bot.sendMessage(chatId: chatId, text: lines.joined(separator: "\n"))
+  }
+
+  // MARK: - Discuss Mode (Phase 4)
+
+  private func handleEnterDiscussMode(chatId: Int) async {
+    sessions.updateState(chatId: chatId) { $0.enterDiscussMode() }
+    let _ = try? await bot.sendMessage(chatId: chatId,
+      text: """
+      \u{1F4AC} <b>Discuss mode</b> \u{2014} let's design a prompt together.
+
+      Describe what you're imagining and I'll help refine it into a great image prompt. When you're happy, say <b>go</b>, <b>ship it</b>, or <b>render it</b> to generate.
+
+      /end to exit discuss mode.
+      """)
+  }
+
+  private func handleExitDiscussMode(chatId: Int) async {
+    let state = sessions.getState(chatId: chatId)
+    guard state.isInDiscussMode else {
+      let _ = try? await bot.sendMessage(chatId: chatId, text: "Not in discuss mode.")
+      return
+    }
+    sessions.updateState(chatId: chatId) { $0.exitDiscussMode() }
+    let _ = try? await bot.sendMessage(chatId: chatId,
+      text: "\u{1F44B} Exited discuss mode. Send a text prompt to generate directly.")
+  }
+
+  private func handleDiscussMessage(chatId: Int, text: String) async {
+    // Add user message to history
+    sessions.updateState(chatId: chatId) { $0.addDiscussMessage(role: "user", content: text) }
+
+    let state = sessions.getState(chatId: chatId)
+    let mode = contentModeManager.current
+
+    // Build conversation for the LLM
+    let systemPrompt = buildDiscussSystemPrompt(mode: mode)
+    var messages: [[String: String]] = [["role": "system", "content": systemPrompt]]
+    for entry in state.discussHistory {
+      messages.append(["role": entry.role, "content": entry.content])
+    }
+
+    // Call LLM for collaborative conversation
+    let response = await callDiscussLLM(messages: messages)
+
+    if let response = response {
+      sessions.updateState(chatId: chatId) {
+        $0.addDiscussMessage(role: "assistant", content: response)
+        // Try to extract the latest prompt proposal from the response
+        if let extracted = extractPromptFromDiscussion(response) {
+          $0.discussCurrentPrompt = extracted
+        }
+      }
+      let _ = try? await bot.sendMessage(chatId: chatId, text: response)
+    } else {
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "Couldn't reach the prompt design assistant. Try again or say <b>go</b> to render what we have.")
+    }
+  }
+
+  private func handleShipCue(chatId: Int) async {
+    let state = sessions.getState(chatId: chatId)
+
+    // Use the current refined prompt, or fall back to the last user message
+    let promptToRender: String
+    if let current = state.discussCurrentPrompt {
+      promptToRender = current
+    } else if let lastUser = state.discussHistory.last(where: { $0.role == "user" }) {
+      promptToRender = lastUser.content
+    } else {
+      let _ = try? await bot.sendMessage(chatId: chatId, text: "Nothing to render yet. Describe what you want first.")
+      return
+    }
+
+    // Exit discuss mode and render
+    sessions.updateState(chatId: chatId) { $0.exitDiscussMode() }
+    let _ = try? await bot.sendMessage(chatId: chatId,
+      text: "\u{1F680} Rendering...")
+
+    await handleRender(chatId: chatId, prompt: promptToRender, messageId: 0)
+  }
+
+  // MARK: - Imagine (Phase 4: One-shot agent)
+
+  private func handleImagine(chatId: Int, description: String) async {
+    let mode = contentModeManager.current
+    let state = sessions.getState(chatId: chatId)
+
+    let _ = try? await bot.sendMessage(chatId: chatId,
+      text: "\u{1F3A8} Designing prompt from: <i>\(description)</i>...")
+
+    // Use the discuss LLM to design a complete prompt from the description
+    let systemPrompt = """
+    You are a creative director for AI image generation. The user gives you a brief scene description. You must:
+    1. Design a complete, detailed image prompt in YOUR CONTEXT: / YOUR PHOTO: format.
+    2. After the prompt, write a brief creative report (2-3 sentences) explaining your choices.
+
+    Separate the prompt from the report with a line containing only "---".
+
+    The prompt should be rich in visual detail, lighting, composition, and mood.
+    Current content mode: \(mode.rawValue).
+    """
+
+    let messages: [[String: String]] = [
+      ["role": "system", "content": systemPrompt],
+      ["role": "user", "content": description]
+    ]
+
+    let response = await callDiscussLLM(messages: messages)
+
+    // Parse out the prompt vs the report
+    let promptToRender: String
+    var report: String? = nil
+
+    if let response = response {
+      let parts = response.components(separatedBy: "\n---\n")
+      if parts.count >= 2 {
+        promptToRender = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        report = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+      } else {
+        // No separator — use the whole thing as the prompt
+        promptToRender = response.trimmingCharacters(in: .whitespacesAndNewlines)
+      }
+    } else {
+      // LLM unavailable — use description directly
+      promptToRender = description
+    }
+
+    // Render it
+    let parsed = parseAndResolve(prompt: promptToRender)
+
+    let result = await generateImage(
+      prompt: parsed.prompt,
+      character: parsed.character,
+      characterDescription: parsed.characterDescription,
+      effectiveMode: parsed.effectiveMode,
+      state: state,
+      seed: nil
+    )
+
+    switch result {
+    case .success(let render):
+      let finalData = applyPostProcessing(imageData: render.imageData, state: state, wasUpscaled: render.wasUpscaled)
+
+      var caption = buildCaption(
+        prompt: description,
+        character: parsed.character,
+        mode: parsed.effectiveMode,
+        durationMs: render.durationMs,
+        enhanced: true,
+        seed: render.seed,
+        state: state
+      )
+
+      if let report = report {
+        caption += "\n\n\(report)"
+      }
+
+      let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+
+      if let newMsgId = sentResult?.messageId {
+        sessions.updateState(chatId: chatId) {
+          $0.lastPrompt = description
+          $0.lastImagePath = render.outputPath
+          $0.lastSeed = render.seed
+          $0.storeRenderContext(messageId: newMsgId, context: RenderContext(
+            prompt: description,
+            imagePath: render.outputPath,
+            seed: render.seed,
+            character: parsed.character,
+            contentMode: parsed.effectiveMode.rawValue,
+            enhanceEnabled: state.enhanceEnabled
+          ))
+        }
+      }
+      copyToGallery(outputPath: render.outputPath, filename: render.filename)
+
+    case .failure(let error):
+      await sendError(chatId: chatId, error: error)
+    }
+  }
+
+  // MARK: - Queue Management (Phase 4)
+
+  private func handleQueue(chatId: Int, subcommand: String?) async {
+    let sub = subcommand?.lowercased().trimmingCharacters(in: .whitespaces) ?? "status"
+
+    switch sub {
+    case "status", "":
+      await sendQueueStatus(chatId: chatId)
+    case "cancel":
+      await cancelQueueJobs(chatId: chatId)
+    case "list":
+      await listQueueJobs(chatId: chatId)
+    default:
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "Unknown queue command. Usage: <code>/queue</code>, <code>/queue cancel</code>, <code>/queue list</code>")
+    }
+  }
+
+  private func sendQueueStatus(chatId: Int) async {
+    do {
+      let (status, data) = try await warmServer.get("/health")
+      guard status == 200,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "Could not reach WarmServer.")
+        return
+      }
+
+      let serverStatus = json["status"] as? String ?? "unknown"
+      let queueLength = json["queueLength"] as? Int ?? 0
+      let totalGens = json["totalGenerations"] as? Int ?? 0
+      let model = json["model"] as? String ?? "none"
+
+      let statusEmoji = serverStatus == "idle" ? "\u{1F7E2}" : "\u{1F7E1}"
+      let _ = try? await bot.sendMessage(chatId: chatId, text: """
+      <b>Queue Status</b>
+
+      \(statusEmoji) <b>Server:</b> \(serverStatus)
+      \u{1F4E6} <b>Pending:</b> \(queueLength)
+      \u{2705} <b>Completed:</b> \(totalGens)
+      \u{1F9E0} <b>Model:</b> <code>\(model)</code>
+      """)
+
+    } catch {
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "WarmServer not available \u{2014} start <code>ComfyBox serve</code> first.")
+    }
+  }
+
+  private func cancelQueueJobs(chatId: Int) async {
+    do {
+      let (status, _) = try await warmServer.delete("/v1/queue")
+      if status == 200 || status == 204 {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F5D1} Queue cleared.")
+      } else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "Could not clear queue (status \(status)).")
+      }
+    } catch {
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "WarmServer not available \u{2014} start <code>ComfyBox serve</code> first.")
+    }
+  }
+
+  private func listQueueJobs(chatId: Int) async {
+    do {
+      let (status, data) = try await warmServer.get("/v1/queue")
+      guard status == 200 else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "Could not fetch queue (status \(status)).")
+        return
+      }
+
+      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let jobs = json["jobs"] as? [[String: Any]] else {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F4E6} Queue is empty.")
+        return
+      }
+
+      if jobs.isEmpty {
+        let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F4E6} Queue is empty.")
+        return
+      }
+
+      var lines: [String] = ["<b>Queue (\(jobs.count) jobs):</b>\n"]
+      for (i, job) in jobs.prefix(10).enumerated() {
+        let prompt = job["prompt"] as? String ?? "?"
+        let truncated = prompt.count > 60 ? String(prompt.prefix(57)) + "..." : prompt
+        let jobStatus = job["status"] as? String ?? "pending"
+        let emoji = jobStatus == "rendering" ? "\u{1F3A8}" : "\u{23F3}"
+        lines.append("\(emoji) \(i + 1). \(truncated)")
+      }
+      if jobs.count > 10 {
+        lines.append("... and \(jobs.count - 10) more")
+      }
+
+      let _ = try? await bot.sendMessage(chatId: chatId, text: lines.joined(separator: "\n"))
+
+    } catch {
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "WarmServer not available \u{2014} start <code>ComfyBox serve</code> first.")
+    }
   }
 
   // MARK: - Single Render
@@ -383,7 +1039,7 @@ public final class ImageBotCoordinator {
 
     // Send status
     let statusText = buildStatusText(parsed: parsed, state: state, index: nil, total: nil)
-    let statusResult = try? await bot.sendMessage(chatId: chatId, text: statusText)
+    let _ = try? await bot.sendMessage(chatId: chatId, text: statusText)
 
     // Generate
     let result = await generateImage(
@@ -411,14 +1067,24 @@ public final class ImageBotCoordinator {
         state: state
       )
 
-      // Send
-      await sendImage(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+      // Send with inline keyboard
+      let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
 
-      // Update session
+      // Update session and store render context
       sessions.updateState(chatId: chatId) {
         $0.lastPrompt = parsed.rawPrompt
         $0.lastImagePath = render.outputPath
         $0.lastSeed = render.seed
+        if let msgId = sentResult?.messageId {
+          $0.storeRenderContext(messageId: msgId, context: RenderContext(
+            prompt: parsed.rawPrompt,
+            imagePath: render.outputPath,
+            seed: render.seed,
+            character: parsed.character,
+            contentMode: parsed.effectiveMode.rawValue,
+            enhanceEnabled: state.enhanceEnabled
+          ))
+        }
       }
 
       // Copy to gallery
@@ -437,16 +1103,11 @@ public final class ImageBotCoordinator {
     let state = sessions.getState(chatId: chatId)
     let parsed = parseAndResolve(prompt: prompt)
 
-    let statusText = "\u{1F4E6} Batch: rendering \(count) images..."
-    let statusResult = try? await bot.sendMessage(chatId: chatId, text: statusText)
-    let statusMsgId = statusResult?.messageId
+    let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F4E6} Batch: rendering \(count) images...")
 
     for i in 0..<count {
-      // Update progress
-      if let msgId = statusMsgId {
-        let _ = try? await bot.sendMessage(chatId: chatId,
-          text: "\u{1F4E6} Rendering \(i + 1)/\(count)...")
-      }
+      let _ = try? await bot.sendMessage(chatId: chatId,
+        text: "\u{1F4E6} Rendering \(i + 1)/\(count)...")
 
       let result = await generateImage(
         prompt: parsed.prompt,
@@ -454,19 +1115,32 @@ public final class ImageBotCoordinator {
         characterDescription: parsed.characterDescription,
         effectiveMode: parsed.effectiveMode,
         state: state,
-        seed: nil  // Different seed each time
+        seed: nil
       )
 
       switch result {
       case .success(let render):
         let finalData = applyPostProcessing(imageData: render.imageData, state: state, wasUpscaled: render.wasUpscaled)
         let caption = "\(i + 1)/\(count) \u{2014} seed:\(render.seed ?? 0)"
-        await sendImage(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+        let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+
+        if let msgId = sentResult?.messageId {
+          sessions.updateState(chatId: chatId) {
+            $0.storeRenderContext(messageId: msgId, context: RenderContext(
+              prompt: parsed.rawPrompt,
+              imagePath: render.outputPath,
+              seed: render.seed,
+              character: parsed.character,
+              contentMode: parsed.effectiveMode.rawValue,
+              enhanceEnabled: state.enhanceEnabled
+            ))
+          }
+        }
         copyToGallery(outputPath: render.outputPath, filename: render.filename)
 
       case .failure(let error):
         await sendError(chatId: chatId, error: error)
-        return  // Abort batch on error
+        return
       }
     }
 
@@ -487,7 +1161,6 @@ public final class ImageBotCoordinator {
       let _ = try? await bot.sendMessage(chatId: chatId,
         text: "\u{1F500} Variation \(i + 1)/\(count)...")
 
-      // Call optimizer with variation instruction for each
       let variedPrompt: String
       if state.enhanceEnabled {
         let variationInstruction = "Create variation #\(i + 1) of this scene. Change the angle, lighting, or composition while keeping the same subject and mood."
@@ -512,7 +1185,20 @@ public final class ImageBotCoordinator {
       case .success(let render):
         let finalData = applyPostProcessing(imageData: render.imageData, state: state, wasUpscaled: render.wasUpscaled)
         let caption = "Variation \(i + 1)/\(count)"
-        await sendImage(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+        let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+
+        if let msgId = sentResult?.messageId {
+          sessions.updateState(chatId: chatId) {
+            $0.storeRenderContext(messageId: msgId, context: RenderContext(
+              prompt: parsed.rawPrompt,
+              imagePath: render.outputPath,
+              seed: render.seed,
+              character: parsed.character,
+              contentMode: parsed.effectiveMode.rawValue,
+              enhanceEnabled: state.enhanceEnabled
+            ))
+          }
+        }
         copyToGallery(outputPath: render.outputPath, filename: render.filename)
 
       case .failure(let error):
@@ -534,7 +1220,6 @@ public final class ImageBotCoordinator {
     let _ = try? await bot.sendMessage(chatId: chatId,
       text: "\u{1F3AC} Sequence: breaking story into \(count) frames...")
 
-    // Use optimizer to break story into N sequential frame prompts
     let framePrompts: [String]
     if state.enhanceEnabled {
       let breakdownInstruction = """
@@ -551,10 +1236,8 @@ public final class ImageBotCoordinator {
         contentMode: parsed.effectiveMode.rawValue
       )
 
-      // Parse the numbered output into individual prompts
       framePrompts = parseNumberedScenes(breakdownResult.prompt, expectedCount: count)
     } else {
-      // No optimizer — split by sentence or use the same prompt for each frame
       framePrompts = splitStoryIntoFrames(story, count: count)
     }
 
@@ -564,7 +1247,6 @@ public final class ImageBotCoordinator {
       let _ = try? await bot.sendMessage(chatId: chatId,
         text: "\u{1F3AC} Frame \(i + 1)/\(actualCount)...")
 
-      // Optimize each frame prompt individually
       let framePrompt: String
       if state.enhanceEnabled {
         let result = await promptOptimizer.optimize(
@@ -595,7 +1277,20 @@ public final class ImageBotCoordinator {
           ? String(framePrompts[i].prefix(97)) + "..."
           : framePrompts[i]
         let caption = "Frame \(i + 1)/\(actualCount) \u{2014} \(truncatedScene)"
-        await sendImage(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+        let sentResult = await sendImageWithKeyboard(chatId: chatId, imageData: finalData, filename: render.filename, caption: caption)
+
+        if let msgId = sentResult?.messageId {
+          sessions.updateState(chatId: chatId) {
+            $0.storeRenderContext(messageId: msgId, context: RenderContext(
+              prompt: framePrompts[i],
+              imagePath: render.outputPath,
+              seed: render.seed,
+              character: parsed.character,
+              contentMode: parsed.effectiveMode.rawValue,
+              enhanceEnabled: state.enhanceEnabled
+            ))
+          }
+        }
         copyToGallery(outputPath: render.outputPath, filename: render.filename)
 
       case .failure(let error):
@@ -658,7 +1353,6 @@ public final class ImageBotCoordinator {
     state: ChatState,
     seed: Int?
   ) async -> Result<RenderResult, RenderError> {
-    // Optimize prompt
     let finalPrompt: String
     if state.enhanceEnabled {
       let result = await promptOptimizer.optimize(
@@ -720,14 +1414,12 @@ public final class ImageBotCoordinator {
       let durationMs = responseJSON["durationMs"] as? Int ?? 0
       let responseSeed = responseJSON["seed"] as? Int
 
-      // Read generated image
-      let imageURL = URL(fileURLWithPath: actualOutputPath)
-      var imageData = try Data(contentsOf: imageURL)
+      var imageData = try Data(contentsOf: URL(fileURLWithPath: actualOutputPath))
       var wasUpscaled = false
       var finalOutputPath = actualOutputPath
       var totalDuration = durationMs
 
-      // Polish pass (two-pass: re-render with higher steps at lower strength)
+      // Polish pass
       if state.polishEnabled {
         let polishResult = await polishImage(imagePath: actualOutputPath, prompt: finalPrompt, state: state)
         if case .success(let polished) = polishResult {
@@ -748,7 +1440,7 @@ public final class ImageBotCoordinator {
         }
       }
 
-      // Double upscale for 4K (render -> 2K -> 4K)
+      // Double upscale for 4K
       if state.resolutionTarget == "4k" && wasUpscaled {
         let secondUpscaleResult = await upscaleImage(imagePath: finalOutputPath, state: state)
         if case .success(let upscaled) = secondUpscaleResult {
@@ -789,7 +1481,7 @@ public final class ImageBotCoordinator {
       let body: [String: Any] = [
         "image_path": imagePath,
         "output_path": upscaledPath,
-        "target_resolution": 1024  // Safe default
+        "target_resolution": 1024
       ]
       let jsonData = try JSONSerialization.data(withJSONObject: body)
       let (status, responseData) = try await warmServer.post("/v1/upscale", body: jsonData)
@@ -875,24 +1567,60 @@ public final class ImageBotCoordinator {
     )
   }
 
+  // MARK: - Inline Keyboard (Phase 4)
+
+  /// Build the standard inline keyboard for delivered images.
+  private func buildImageKeyboard(chatId: Int, messageId: Int) -> InlineKeyboard {
+    return InlineKeyboard(rows: [
+      [
+        InlineButton(text: "Rerender \u{1F504}", callbackData: "rerender:\(chatId):\(messageId)"),
+        InlineButton(text: "HQ \u{2728}", callbackData: "hq:\(chatId):\(messageId)"),
+        InlineButton(text: "Video \u{1F3AC}", callbackData: "video:\(chatId):\(messageId)")
+      ]
+    ])
+  }
+
   // MARK: - Send Helpers
 
-  private func sendImage(chatId: Int, imageData: Data, filename: String, caption: String) async {
+  /// Send an image with the standard inline keyboard attached.
+  /// Returns the SendResult so callers can track the sent message ID.
+  private func sendImageWithKeyboard(chatId: Int, imageData: Data, filename: String, caption: String) async -> SendResult? {
     if imageData.count > 8_000_000 {
-      let _ = try? await bot.sendDocument(
+      // Documents: Telegram allows up to 50MB
+      // We still want to attach the keyboard to documents too
+      let result = try? await bot.sendDocument(
         chatId: chatId,
         fileData: imageData,
         filename: filename,
         mimeType: "image/png",
         caption: caption
       )
+      // Note: We can't predict messageId for doc sends to attach keyboard retroactively,
+      // but sendDocument already supports replyMarkup if we pass it.
+      // Let's re-send with keyboard.
+      // Actually, we already support it via the replyMarkup parameter.
+      // But we need the messageId first for the callback data.
+      // For documents, we'll skip the keyboard (edge case: >8MB images are rare).
+      return result
     } else {
-      let _ = try? await bot.sendPhoto(
+      // For photos under 8MB, first send without keyboard to get messageId,
+      // then we need the messageId for the callback data.
+      // Alternative: use a placeholder messageId of 0 and parse chatId from callback.
+      // Better approach: send photo, get messageId, then edit to add keyboard.
+      let result = try? await bot.sendPhoto(
         chatId: chatId,
         imageData: imageData,
         filename: filename,
         caption: caption
       )
+
+      // Now add the inline keyboard using the actual message ID
+      if let msgId = result?.messageId {
+        let keyboard = buildImageKeyboard(chatId: chatId, messageId: msgId)
+        try? await bot.editMessageReplyMarkup(chatId: chatId, messageId: msgId, markup: keyboard)
+      }
+
+      return result
     }
   }
 
@@ -914,6 +1642,100 @@ public final class ImageBotCoordinator {
       let galleryPath = (galleryDir as NSString).appendingPathComponent(filename)
       try? FileManager.default.copyItem(atPath: outputPath, toPath: galleryPath)
     }
+  }
+
+  // MARK: - Discuss Mode LLM (Phase 4)
+
+  /// Call the local LLM (Ollama/LM Studio) for discuss mode conversation.
+  private func callDiscussLLM(messages: [[String: String]]) async -> String? {
+    let endpoints = [
+      config.optimizer.ollamaBaseURL,
+      config.optimizer.lmStudioBaseURL
+    ].compactMap { $0 }
+
+    for baseURL in endpoints {
+      let payload: [String: Any] = [
+        "model": config.optimizer.model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1024,
+        "stream": false
+      ]
+
+      guard let payloadData = try? JSONSerialization.data(withJSONObject: payload),
+            let url = URL(string: "\(baseURL)/v1/chat/completions") else {
+        continue
+      }
+
+      var request = URLRequest(url: url)
+      request.httpMethod = "POST"
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = payloadData
+      request.timeoutInterval = 30
+
+      do {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+          continue
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let message = first["message"] as? [String: Any],
+              let content = message["content"] as? String else {
+          continue
+        }
+        // Strip think tags from Qwen3
+        return PromptOptimizer.cleanLLMOutput(content)
+      } catch {
+        logger.debug("Discuss LLM call to \(baseURL) failed: \(error.localizedDescription)")
+        continue
+      }
+    }
+
+    return nil
+  }
+
+  /// Build the system prompt for discuss mode conversations.
+  private func buildDiscussSystemPrompt(mode: ContentModeManager.Mode) -> String {
+    let modeDesc: String
+    switch mode {
+    case .neutral:
+      modeDesc = "safe-for-work content. No nudity or suggestive content."
+    case .banana:
+      modeDesc = "suggestive/sensual content. Lingerie, partial nudity, intimate framing OK."
+    case .avocado:
+      modeDesc = "explicit adult content. Full nudity, graphic descriptions OK."
+    }
+
+    return """
+    You are a creative prompt design assistant for AI image generation (Z-Image Turbo, a Qwen3-4B text encoder model). You help the user iteratively design and refine image prompts.
+
+    Your role:
+    - Listen to what the user wants to create
+    - Suggest improvements: better composition, lighting, mood, camera angles
+    - Propose a concrete prompt using YOUR CONTEXT: / YOUR PHOTO: format
+    - When refining, explain what you changed and why
+    - Keep suggestions concise (2-4 sentences of discussion + the prompt proposal)
+
+    Current content mode: \(mode.rawValue) — \(modeDesc)
+
+    Available characters (mention by name if relevant): Kira, Bree, Todd.
+
+    When proposing a prompt, format it clearly so the user can review it. Do NOT render anything — just propose and discuss. The user will say "go" or "ship it" when they're ready to render.
+    """
+  }
+
+  /// Try to extract the latest prompt proposal from a discuss mode response.
+  private func extractPromptFromDiscussion(_ text: String) -> String? {
+    // Look for YOUR CONTEXT: / YOUR PHOTO: blocks
+    if let contextRange = text.range(of: "YOUR CONTEXT:", options: .caseInsensitive),
+       text.range(of: "YOUR PHOTO:", options: .caseInsensitive) != nil {
+      // Extract everything from YOUR CONTEXT: to the end (or next section)
+      let prompt = String(text[contextRange.lowerBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+      if prompt.count > 30 { return prompt }
+    }
+    return nil
   }
 
   // MARK: - Status Text Builder
@@ -967,7 +1789,6 @@ public final class ImageBotCoordinator {
     if enhanced { parts.append("\u{2728}") }
     if let s = seed { parts.append("seed:\(s)") }
 
-    // Active settings indicators
     var indicators: [String] = []
     if state.upscaleEnabled { indicators.append("up") }
     if state.polishEnabled { indicators.append("pol") }
@@ -1006,6 +1827,13 @@ public final class ImageBotCoordinator {
     /batch &lt;N&gt; &lt;prompt&gt; \u{2014} Generate N images (2-8)
     /vary [N] &lt;prompt&gt; \u{2014} N prompt variations (default 3)
     /seq &lt;N&gt; &lt;story&gt; \u{2014} N sequential story frames
+    /imagine &lt;desc&gt; \u{2014} One-shot: agent designs + renders
+
+    <b>Interactive:</b>
+    /chat or /discuss \u{2014} Enter prompt design mode
+    /end or /exit \u{2014} Leave prompt design mode
+    /queue \u{2014} Queue status / /queue cancel / /queue list
+    Reply to any photo \u{2014} rerender, hq, upscale, or new prompt
 
     <b>Settings:</b>
     /enhance [on|off] \u{2014} Prompt optimization
@@ -1021,7 +1849,7 @@ public final class ImageBotCoordinator {
     /saturation &lt;0-2|off&gt; \u{2014} Saturation adjust
     /temp &lt;2000-10000|off&gt; \u{2014} Color temperature
     /film &lt;look|off&gt; \u{2014} Film look preset
-    /look \u{2014} List available film looks
+    /look [id] \u{2014} List or apply film looks
     /reset \u{2014} Clear all post-process settings
 
     <b>Info:</b>
@@ -1038,7 +1866,8 @@ public final class ImageBotCoordinator {
     <b>Tips:</b>
     \u{2022} Character names (\(charList)) are detected automatically
     \u{2022} Inline mode override: include /avocado in your prompt
-    \u{2022} Be descriptive \u{2014} more detail = better results
+    \u{2022} Reply to a photo with text for img2img
+    \u{2022} Tap buttons under photos to rerender or HQ
     """
     let _ = try? await bot.sendMessage(chatId: chatId, text: helpText)
   }
@@ -1097,7 +1926,6 @@ public final class ImageBotCoordinator {
 
   // MARK: - Sequence Helpers
 
-  /// Parse numbered scenes from LLM output (e.g., "1. scene one\n2. scene two")
   private func parseNumberedScenes(_ text: String, expectedCount: Int) -> [String] {
     let lines = text.components(separatedBy: .newlines)
     var scenes: [String] = []
@@ -1105,12 +1933,10 @@ public final class ImageBotCoordinator {
     var currentScene = ""
     for line in lines {
       let trimmed = line.trimmingCharacters(in: .whitespaces)
-      // Detect numbered lines: "1.", "1)", "Scene 1:", etc.
       if let _ = trimmed.range(of: #"^\d+[\.\)\:]"#, options: .regularExpression) {
         if !currentScene.isEmpty {
           scenes.append(currentScene.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        // Strip the number prefix
         let stripped = trimmed.replacingOccurrences(of: #"^\d+[\.\)\:]\s*"#, with: "", options: .regularExpression)
         currentScene = stripped
       } else if !trimmed.isEmpty {
@@ -1121,7 +1947,6 @@ public final class ImageBotCoordinator {
       scenes.append(currentScene.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    // If parsing yielded wrong count, fall back to sentence splitting
     if scenes.isEmpty || scenes.count < 2 {
       return splitStoryIntoFrames(text, count: expectedCount)
     }
@@ -1129,15 +1954,12 @@ public final class ImageBotCoordinator {
     return scenes
   }
 
-  /// Fallback: split story text into N roughly equal frames by sentences.
   private func splitStoryIntoFrames(_ story: String, count: Int) -> [String] {
-    // Split on common delimiters: periods, semicolons, em dashes, " -- "
     let delimiters = CharacterSet(charactersIn: ".;")
     var sentences = story.components(separatedBy: delimiters)
       .map { $0.trimmingCharacters(in: .whitespaces) }
       .filter { !$0.isEmpty }
 
-    // Also split on " -- " for story-style separators
     if sentences.count < count {
       sentences = story.components(separatedBy: " -- ")
         .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -1145,7 +1967,6 @@ public final class ImageBotCoordinator {
     }
 
     if sentences.count >= count {
-      // Group sentences into N buckets
       var frames: [String] = []
       let perFrame = max(1, sentences.count / count)
       for i in 0..<count {
@@ -1158,7 +1979,6 @@ public final class ImageBotCoordinator {
       return frames
     }
 
-    // Not enough sentences — duplicate the story for each frame with a frame number
     return (0..<count).map { "Frame \($0 + 1) of \(count): \(story)" }
   }
 

@@ -2,9 +2,40 @@
 //
 // Phase 3: Tracks all render settings per chatId — aspect, cfg, seed,
 // post-processing, upscale, polish, and last render context.
+// Phase 4: Adds messageId→imagePath mapping, discuss mode state,
+// and per-message render context for inline keyboards.
 // Thread-safe via NSLock.
 
 import Foundation
+
+// MARK: - Render Context (for inline keyboard callbacks)
+
+/// Stored context for a delivered image, enabling rerender/HQ/reply actions.
+public struct RenderContext: Sendable {
+  public let prompt: String
+  public let imagePath: String
+  public let seed: Int?
+  public let character: String?
+  public let contentMode: String
+  public let enhanceEnabled: Bool
+
+  public init(prompt: String, imagePath: String, seed: Int?, character: String?,
+              contentMode: String, enhanceEnabled: Bool) {
+    self.prompt = prompt
+    self.imagePath = imagePath
+    self.seed = seed
+    self.character = character
+    self.contentMode = contentMode
+    self.enhanceEnabled = enhanceEnabled
+  }
+}
+
+// MARK: - Discuss Mode History Entry
+
+public struct DiscussEntry: Sendable {
+  public let role: String   // "user" or "assistant"
+  public let content: String
+}
 
 // MARK: - ChatState
 
@@ -33,11 +64,66 @@ public struct ChatState: Sendable {
   public var lastImagePath: String? = nil
   public var lastSeed: Int? = nil
 
+  // -- Phase 4: Per-message render context (messageId → RenderContext) --
+  // Maps bot-sent photo messageId to the render context that produced it.
+  // Used by inline keyboard callbacks and reply-to-image.
+  public var renderContexts: [Int: RenderContext] = [:]
+
+  // -- Phase 4: Discuss mode --
+  public var isInDiscussMode: Bool = false
+  public var discussHistory: [DiscussEntry] = []
+  public var discussCurrentPrompt: String? = nil
+
   public init() {}
 
   /// Convenience initializer with custom enhance default.
   public init(enhanceEnabled: Bool) {
     self.enhanceEnabled = enhanceEnabled
+  }
+
+  // MARK: - Render Context Management
+
+  /// Store a render context for a delivered message.
+  /// Keeps only the last 50 entries to avoid unbounded growth.
+  public mutating func storeRenderContext(messageId: Int, context: RenderContext) {
+    renderContexts[messageId] = context
+    // Evict oldest if over 50
+    if renderContexts.count > 50 {
+      let sorted = renderContexts.keys.sorted()
+      let toRemove = sorted.prefix(renderContexts.count - 50)
+      for key in toRemove {
+        renderContexts.removeValue(forKey: key)
+      }
+    }
+  }
+
+  /// Look up a render context by the bot-sent message ID.
+  public func getRenderContext(messageId: Int) -> RenderContext? {
+    return renderContexts[messageId]
+  }
+
+  // MARK: - Discuss Mode
+
+  /// Enter discuss mode, clearing any previous history.
+  public mutating func enterDiscussMode() {
+    isInDiscussMode = true
+    discussHistory = []
+    discussCurrentPrompt = nil
+  }
+
+  /// Exit discuss mode.
+  public mutating func exitDiscussMode() {
+    isInDiscussMode = false
+    discussHistory = []
+    discussCurrentPrompt = nil
+  }
+
+  /// Add a message to the discuss history. Keeps last 20 entries.
+  public mutating func addDiscussMessage(role: String, content: String) {
+    discussHistory.append(DiscussEntry(role: role, content: content))
+    if discussHistory.count > 20 {
+      discussHistory = Array(discussHistory.suffix(20))
+    }
   }
 
   // MARK: - Aspect Dimensions
