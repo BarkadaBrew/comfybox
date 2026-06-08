@@ -531,7 +531,7 @@ struct GalleryCellView: View {
     private func loadThumbnail() async {
         let path = thumbnailPath
         let fullPath = asset.absolutePath
-        let image = await Task.detached {
+        let image: NSImage? = await Task.detached {
             NSImage(contentsOfFile: path) ?? NSImage(contentsOfFile: fullPath)
         }.value
         await MainActor.run {
