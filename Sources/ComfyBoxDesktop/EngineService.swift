@@ -588,6 +588,63 @@ public final class EngineService {
         }
     }
 
+    // MARK: - Prompt Enhancement
+
+    /// Send a prompt to the server's LLM enhancement endpoint.
+    /// Returns the enhanced prompt string on success.
+    public func enhancePrompt(_ prompt: String) async throws -> String {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+
+        let payloadDict: [String: Any] = ["prompt": prompt]
+        let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
+        let (status, responseData) = try await client.post("/v1/enhance", body: bodyData)
+
+        guard status == 200 else {
+            let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
+            throw EngineServiceError.serverError(status, errorMessage)
+        }
+
+        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let enhanced = json["prompt"] as? String else {
+            throw EngineServiceError.generationFailed("Invalid enhance response")
+        }
+
+        return enhanced
+    }
+
+    // MARK: - Character Registry
+
+    /// Fetch registered characters from the server.
+    public func fetchCharacters() async -> [CharacterEntry] {
+        guard let client = client, connectionState.isConnected else { return [] }
+
+        do {
+            let (status, data) = try await client.get("/v1/characters")
+            guard status == 200 else { return [] }
+
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let chars = json["characters"] as? [[String: Any]] else { return [] }
+
+            return chars.compactMap { dict -> CharacterEntry? in
+                guard let id = dict["id"] as? String,
+                      let name = dict["name"] as? String else { return nil }
+
+                return CharacterEntry(
+                    id: id,
+                    name: name,
+                    description: (dict["description"] as? String) ?? "",
+                    defaultLoras: (dict["default_loras"] as? [String]) ?? [],
+                    promptSnippet: (dict["prompt_snippet"] as? String) ?? "",
+                    tags: (dict["tags"] as? [String]) ?? []
+                )
+            }
+        } catch {
+            return []
+        }
+    }
+
     // MARK: - Helpers
 
     private func parseErrorMessage(from data: Data) -> String? {

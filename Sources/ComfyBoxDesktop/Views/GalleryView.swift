@@ -3,9 +3,11 @@
 // Displays DAMStore assets as a grid of thumbnails with sorting,
 // filtering by favorite/content mode/character, and FTS5 search.
 // Clicking a cell opens the AssetDetailView for full metadata
-// display and editing.
+// display and editing. Phase 4: Added drag-and-drop, comparison
+// selection, Quick Look via Space bar.
 
 import SwiftUI
+import AppKit
 
 /// Sort options for the gallery.
 enum GallerySortOrder: String, CaseIterable {
@@ -17,6 +19,7 @@ enum GallerySortOrder: String, CaseIterable {
 struct GalleryView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
+    var onCompare: (([DAMAsset]) -> Void)?
 
     @State private var assets: [DAMAsset] = []
     @State private var searchText: String = ""
@@ -29,9 +32,16 @@ struct GalleryView: View {
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
 
+    // Comparison selection
+    @State private var comparisonSelection: Set<String> = []
+    @State private var isComparisonMode: Bool = false
+
     // Available filter values extracted from assets.
     @State private var contentModes: [String] = []
     @State private var characters: [String] = []
+
+    // Search field focus
+    @FocusState private var searchFieldFocused: Bool
 
     private let columns = [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 12)]
 
@@ -79,6 +89,12 @@ struct GalleryView: View {
         .onChange(of: ingestor.ingestedCount) { _, _ in
             Task { await loadAssets() }
         }
+        .onKeyPress(.space) {
+            if let asset = selectedAsset {
+                quickLookAsset(asset)
+            }
+            return .handled
+        }
     }
 
     // MARK: - Toolbar
@@ -91,6 +107,7 @@ struct GalleryView: View {
                     .foregroundStyle(.secondary)
                 TextField("Search prompts...", text: $searchText)
                     .textFieldStyle(.plain)
+                    .focused($searchFieldFocused)
                 if !searchText.isEmpty {
                     Button(action: { searchText = "" }) {
                         Image(systemName: "xmark.circle.fill")
@@ -105,6 +122,31 @@ struct GalleryView: View {
             .frame(maxWidth: 300)
 
             Spacer()
+
+            // Comparison mode toggle
+            Toggle(isOn: $isComparisonMode) {
+                HStack(spacing: 4) {
+                    Image(systemName: "square.grid.2x2")
+                    if isComparisonMode && !comparisonSelection.isEmpty {
+                        Text("\(comparisonSelection.count)")
+                            .font(.caption2)
+                    }
+                }
+            }
+            .toggleStyle(.button)
+            .help("Toggle comparison selection mode")
+            .onChange(of: isComparisonMode) { _, newValue in
+                if !newValue { comparisonSelection.removeAll() }
+            }
+
+            // Compare button (visible when 2+ selected)
+            if isComparisonMode && comparisonSelection.count >= 2 {
+                Button(action: { sendToComparison() }) {
+                    Label("Compare \(comparisonSelection.count)", systemImage: "arrow.right.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
 
             // Favorite filter
             Toggle(isOn: $filterFavorites) {
@@ -169,13 +211,19 @@ struct GalleryView: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(filteredAssets) { asset in
+                    let isCompSelected = comparisonSelection.contains(asset.id)
                     GalleryCellView(
                         asset: asset,
-                        thumbnailPath: ingestor.thumbnailPath(for: asset.id)
+                        thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+                        isComparisonSelected: isComparisonMode ? isCompSelected : nil
                     )
                     .onTapGesture {
-                        selectedAsset = asset
-                        showingDetail = true
+                        if isComparisonMode {
+                            toggleComparisonSelection(asset)
+                        } else {
+                            selectedAsset = asset
+                            showingDetail = true
+                        }
                     }
                     .contextMenu {
                         Button("Reveal in Finder") {
@@ -184,7 +232,17 @@ struct GalleryView: View {
                         Button(asset.favorite ? "Unfavorite" : "Favorite") {
                             Task { await toggleFavorite(asset) }
                         }
+                        if !isComparisonMode {
+                            Divider()
+                            Button("Add to Comparison") {
+                                if comparisonSelection.count < 4 {
+                                    comparisonSelection.insert(asset.id)
+                                    isComparisonMode = true
+                                }
+                            }
+                        }
                     }
+                    .draggable(DraggableAsset(path: asset.absolutePath))
                 }
             }
             .padding(12)
@@ -295,6 +353,11 @@ struct GalleryView: View {
 
     // MARK: - Actions
 
+    /// Focus the search field (called by Cmd+F keyboard shortcut).
+    func focusSearch() {
+        searchFieldFocused = true
+    }
+
     private func updateAsset(_ asset: DAMAsset) async {
         do {
             try await store.insertAsset(asset)
@@ -338,6 +401,37 @@ struct GalleryView: View {
             inFileViewerRootedAtPath: ""
         )
     }
+
+    private func toggleComparisonSelection(_ asset: DAMAsset) {
+        if comparisonSelection.contains(asset.id) {
+            comparisonSelection.remove(asset.id)
+        } else if comparisonSelection.count < 4 {
+            comparisonSelection.insert(asset.id)
+        }
+    }
+
+    private func sendToComparison() {
+        let selected = assets.filter { comparisonSelection.contains($0.id) }
+        onCompare?(selected)
+    }
+
+    /// Open Quick Look for an asset using macOS native preview.
+    private func quickLookAsset(_ asset: DAMAsset) {
+        let url = URL(fileURLWithPath: asset.absolutePath)
+        NSWorkspace.shared.open(url)
+    }
+}
+
+// MARK: - Draggable Asset (for drag-and-drop to Finder)
+
+struct DraggableAsset: Transferable {
+    let path: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .png) { asset in
+            SentTransferredFile(URL(fileURLWithPath: asset.path))
+        }
+    }
 }
 
 // MARK: - Gallery Cell
@@ -345,72 +439,90 @@ struct GalleryView: View {
 struct GalleryCellView: View {
     let asset: DAMAsset
     let thumbnailPath: String
+    var isComparisonSelected: Bool?
 
     @State private var thumbnail: NSImage?
 
     var body: some View {
-        VStack(spacing: 4) {
-            // Thumbnail
-            ZStack {
-                Color(nsColor: .controlBackgroundColor)
+        ZStack(alignment: .topTrailing) {
+            VStack(spacing: 4) {
+                // Thumbnail
+                ZStack {
+                    Color(nsColor: .controlBackgroundColor)
 
-                if let thumb = thumbnail {
-                    Image(nsImage: thumb)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    Image(systemName: "photo")
-                        .font(.title)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .frame(height: 160)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-
-            // Prompt preview
-            if let prompt = asset.prompt {
-                Text(prompt)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            // Rating + favorite
-            HStack(spacing: 4) {
-                if asset.favorite {
-                    Image(systemName: "heart.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                }
-
-                if asset.rating > 0 {
-                    HStack(spacing: 1) {
-                        ForEach(1...5, id: \.self) { star in
-                            Image(systemName: star <= asset.rating ? "star.fill" : "star")
-                                .font(.system(size: 8))
-                                .foregroundStyle(star <= asset.rating ? .yellow : .gray.opacity(0.3))
-                        }
+                    if let thumb = thumbnail {
+                        Image(nsImage: thumb)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    } else {
+                        Image(systemName: "photo")
+                            .font(.title)
+                            .foregroundStyle(.tertiary)
                     }
                 }
+                .frame(height: 160)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                Spacer()
-
-                if let mode = asset.contentMode {
-                    Text(mode)
-                        .font(.system(size: 9))
+                // Prompt preview
+                if let prompt = asset.prompt {
+                    Text(prompt)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.secondary.opacity(0.15))
-                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+
+                // Rating + favorite
+                HStack(spacing: 4) {
+                    if asset.favorite {
+                        Image(systemName: "heart.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    }
+
+                    if asset.rating > 0 {
+                        HStack(spacing: 1) {
+                            ForEach(1...5, id: \.self) { star in
+                                Image(systemName: star <= asset.rating ? "star.fill" : "star")
+                                    .font(.system(size: 8))
+                                    .foregroundStyle(star <= asset.rating ? .yellow : .gray.opacity(0.3))
+                            }
+                        }
+                    }
+
+                    Spacer()
+
+                    if let mode = asset.contentMode {
+                        Text(mode)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15))
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+            }
+
+            // Comparison selection overlay
+            if let isSelected = isComparisonSelected {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isSelected ? .white : .secondary, isSelected ? Color.accentColor : Color.clear)
+                    .font(.title3)
+                    .padding(6)
             }
         }
         .padding(6)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
         .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(
+                    isComparisonSelected == true ? Color.accentColor : Color.clear,
+                    lineWidth: 2
+                )
+        )
         .task {
             await loadThumbnail()
         }
@@ -418,7 +530,6 @@ struct GalleryCellView: View {
 
     private func loadThumbnail() async {
         let path = thumbnailPath
-        // Also try loading the full image as fallback if no thumbnail.
         let fullPath = asset.absolutePath
         let image = await Task.detached {
             NSImage(contentsOfFile: path) ?? NSImage(contentsOfFile: fullPath)
