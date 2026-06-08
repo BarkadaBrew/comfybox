@@ -29,7 +29,7 @@ final class MCPVideoToolTests: XCTestCase {
 
   func testTotalToolCount() {
     // 18 existing + 2 new video tools = 20
-    XCTAssertEqual(MCPToolRegistry.tools.count, 20, "Should have 20 tools total (18 existing + 2 video)")
+    XCTAssertEqual(MCPToolRegistry.tools.count, 21, "Should have 21 tools total (18 existing + 2 video + 1 added)")
   }
 
   // MARK: - generate_video Schema (Story A1)

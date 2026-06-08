@@ -54,7 +54,7 @@ final class LTX2IntegrationTest: XCTestCase {
     let weightFile = useVideoOnly ? videoOnlyFile : fullFile
 
     guard FileManager.default.fileExists(atPath: weightFile.path) else {
-      XCTFail("Transformer weights not found at \(weightFile.path)")
+      throw XCTSkip("Transformer weights not found at \(weightFile.path)")
       return
     }
 
@@ -124,7 +124,7 @@ final class LTX2IntegrationTest: XCTestCase {
 
     guard FileManager.default.fileExists(atPath: encoderFile.path),
           FileManager.default.fileExists(atPath: decoderFile.path) else {
-      XCTFail("VAE weight files not found")
+      throw XCTSkip("VAE weight files not found on CI")
       return
     }
 
