@@ -2,7 +2,8 @@
 //
 // Provides prompt entry, parameter controls, generation button,
 // and image preview. Communicates with the WarmServer through
-// EngineService.
+// EngineService. On successful generation, calls onGenerated
+// to trigger DAM ingestion.
 
 import SwiftUI
 
@@ -23,6 +24,7 @@ struct ResolutionPreset: Identifiable, Hashable {
 
 struct GenerationView: View {
     @Bindable var engine: EngineService
+    var onGenerated: ((String, GenerationRequest) -> Void)?
 
     // Generation parameters
     @State private var prompt: String = ""
@@ -299,6 +301,8 @@ struct GenerationView: View {
                         displayedImage = image
                     }
                 }
+                // Notify app to ingest the generated file into DAM.
+                onGenerated?(outputPath, request)
             } catch {
                 // Error is already stored in engine.lastError
             }

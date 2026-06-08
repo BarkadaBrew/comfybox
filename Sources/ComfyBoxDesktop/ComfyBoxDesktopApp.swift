@@ -1,15 +1,19 @@
 // ComfyBoxDesktopApp.swift — SwiftUI app entry point
 //
-// Main application for ComfyBox Desktop. Creates the EngineService
-// on launch and provides the primary window with a tabbed interface
-// for generation and gallery views.
+// Main application for ComfyBox Desktop. Creates the EngineService,
+// DAMStore, and AssetIngestor on launch. Provides a tabbed interface
+// for generation and gallery views. Generation output is automatically
+// ingested into the DAM.
 
 import SwiftUI
 
 @main
 struct ComfyBoxDesktopApp: App {
     @State private var engine = EngineService()
+    @State private var store: DAMStore?
+    @State private var ingestor: AssetIngestor?
     @State private var selectedTab: AppTab = .generate
+    @State private var initError: String?
 
     enum AppTab: String, CaseIterable {
         case generate = "Generate"
@@ -33,9 +37,26 @@ struct ComfyBoxDesktopApp: App {
             } detail: {
                 switch selectedTab {
                 case .generate:
-                    GenerationView(engine: engine)
+                    GenerationView(engine: engine, onGenerated: handleGenerated)
                 case .gallery:
-                    GalleryView()
+                    if let store = store, let ingestor = ingestor {
+                        GalleryView(store: store, ingestor: ingestor)
+                    } else if let error = initError {
+                        VStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 48))
+                                .foregroundStyle(.orange)
+                            Text("Database Error")
+                                .font(.title2)
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ProgressView("Initializing database...")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
             }
             .navigationTitle("ComfyBox Desktop")
@@ -44,6 +65,15 @@ struct ComfyBoxDesktopApp: App {
                 ToolbarItem(placement: .automatic) {
                     connectionButton
                 }
+
+                if let ingestor = ingestor {
+                    ToolbarItem(placement: .automatic) {
+                        ingestorStatus(ingestor)
+                    }
+                }
+            }
+            .task {
+                await initializeDAM()
             }
         }
         .defaultSize(width: 1200, height: 800)
@@ -67,6 +97,50 @@ struct ComfyBoxDesktopApp: App {
                     .frame(width: 8, height: 8)
                 Text(engine.connectionState.isConnected ? "Connected" : "Connect")
                     .font(.caption)
+            }
+        }
+    }
+
+    private func ingestorStatus(_ ingestor: AssetIngestor) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(ingestor.isWatching ? .blue : .gray)
+                .frame(width: 6, height: 6)
+            Text("\(ingestor.ingestedCount) ingested")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Initialization
+
+    private func initializeDAM() async {
+        do {
+            let damStore = try await DAMStore.open()
+            let assetIngestor = AssetIngestor(
+                store: damStore,
+                watchDirectory: engine.outputDirectory
+            )
+            store = damStore
+            ingestor = assetIngestor
+            await assetIngestor.startWatching()
+        } catch {
+            initError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Generation → Ingestion Bridge
+
+    /// Called when GenerationView successfully generates an image.
+    /// Ingests the output into DAMStore so it appears in the gallery.
+    private func handleGenerated(_ path: String, _ request: GenerationRequest) {
+        guard let ingestor = ingestor else { return }
+        Task {
+            do {
+                try await ingestor.ingestFile(at: path)
+            } catch {
+                // Ingestion failure is non-fatal; the file is still on disk.
+                print("[ComfyBoxDesktop] Auto-ingest failed for \(path): \(error)")
             }
         }
     }
