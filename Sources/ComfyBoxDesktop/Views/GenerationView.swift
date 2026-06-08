@@ -1,9 +1,9 @@
 // GenerationView.swift — Main image generation interface
 //
-// Provides prompt entry, parameter controls, generation button,
-// and image preview. Communicates with the WarmServer through
-// EngineService. On successful generation, calls onGenerated
-// to trigger DAM ingestion.
+// Provides prompt entry, parameter controls, model selection,
+// LoRA picker, queue status, and image preview. Communicates
+// with the WarmServer through EngineService. On successful
+// generation, calls onGenerated to trigger DAM ingestion.
 
 import SwiftUI
 
@@ -34,11 +34,19 @@ struct GenerationView: View {
     @State private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
+    // LoRA selections
+    @State private var selectedLoras: [LoRASelection] = []
+
+    // Sidebar sections
+    @State private var showModelSelector: Bool = true
+    @State private var showLoraPicker: Bool = false
+    @State private var showQueuePanel: Bool = false
+
     var body: some View {
         HSplitView {
             // Left panel: Controls
             controlPanel
-                .frame(minWidth: 320, maxWidth: 400)
+                .frame(minWidth: 340, maxWidth: 420)
 
             // Right panel: Image preview
             previewPanel
@@ -56,6 +64,17 @@ struct GenerationView: View {
 
                 Divider()
 
+                // Model selector (collapsible)
+                DisclosureGroup(isExpanded: $showModelSelector) {
+                    ModelSelector(engine: engine)
+                        .padding(.top, 4)
+                } label: {
+                    Label("Model", systemImage: "cpu")
+                        .font(.headline)
+                }
+
+                Divider()
+
                 // Prompt
                 promptSection
 
@@ -63,6 +82,49 @@ struct GenerationView: View {
 
                 // Parameters
                 parameterSection
+
+                Divider()
+
+                // LoRA picker (collapsible)
+                DisclosureGroup(isExpanded: $showLoraPicker) {
+                    LoRAPicker(engine: engine, selectedLoras: $selectedLoras)
+                        .padding(.top, 4)
+                } label: {
+                    HStack {
+                        Label("LoRA Adapters", systemImage: "slider.horizontal.3")
+                            .font(.headline)
+                        if !selectedLoras.isEmpty {
+                            Text("\(selectedLoras.count)")
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.2))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Queue panel (collapsible)
+                DisclosureGroup(isExpanded: $showQueuePanel) {
+                    QueuePanel(engine: engine)
+                        .padding(.top, 4)
+                } label: {
+                    HStack {
+                        Label("Queue", systemImage: "list.bullet.rectangle")
+                            .font(.headline)
+                        if engine.queueCount > 0 {
+                            Text("\(engine.queueCount)")
+                                .font(.caption2)
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(.orange)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                }
 
                 Divider()
 
@@ -289,10 +351,21 @@ struct GenerationView: View {
             height: selectedResolution.height,
             steps: Int(steps),
             guidance: Float(guidance),
-            seed: seed
+            seed: seed,
+            loras: selectedLoras
         )
 
         Task {
+            // Swap LoRAs if any selected (before generation).
+            if !selectedLoras.isEmpty {
+                do {
+                    try await engine.swapLoras(selectedLoras)
+                } catch {
+                    // LoRA swap failure — still attempt generation with
+                    // whatever LoRAs are currently loaded.
+                }
+            }
+
             do {
                 let outputPath = try await engine.generate(request)
                 // Load the generated image for display.

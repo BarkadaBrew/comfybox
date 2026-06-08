@@ -3,7 +3,7 @@
 // Main application for ComfyBox Desktop. Creates the EngineService,
 // DAMStore, and AssetIngestor on launch. Provides a tabbed interface
 // for generation and gallery views. Generation output is automatically
-// ingested into the DAM.
+// ingested into the DAM. Settings persist via DesktopSettings.
 
 import SwiftUI
 
@@ -73,6 +73,7 @@ struct ComfyBoxDesktopApp: App {
                 }
             }
             .task {
+                applySettings()
                 await initializeDAM()
             }
         }
@@ -112,6 +113,20 @@ struct ComfyBoxDesktopApp: App {
         }
     }
 
+    // MARK: - Settings
+
+    /// Apply persisted settings to the engine on launch.
+    private func applySettings() {
+        let settings = DesktopSettings.load()
+        engine.serverHost = settings.serverHost
+        engine.serverPort = settings.serverPort
+        engine.outputDirectory = settings.outputDirectory
+
+        if settings.autoConnect {
+            engine.connect()
+        }
+    }
+
     // MARK: - Initialization
 
     private func initializeDAM() async {
@@ -143,26 +158,5 @@ struct ComfyBoxDesktopApp: App {
                 print("[ComfyBoxDesktop] Auto-ingest failed for \(path): \(error)")
             }
         }
-    }
-}
-
-// MARK: - Settings View
-
-struct SettingsView: View {
-    @Bindable var engine: EngineService
-
-    var body: some View {
-        Form {
-            Section("Server Connection") {
-                TextField("Host", text: $engine.serverHost)
-                TextField("Port", value: $engine.serverPort, format: .number)
-            }
-
-            Section("Output") {
-                TextField("Output Directory", text: $engine.outputDirectory)
-            }
-        }
-        .formStyle(.grouped)
-        .frame(width: 400, height: 200)
     }
 }
