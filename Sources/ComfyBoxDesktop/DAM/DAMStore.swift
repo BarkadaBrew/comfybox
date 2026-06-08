@@ -144,6 +144,25 @@ public actor DAMStore {
         return results
     }
 
+    /// Return all known absolute_path values from the database.
+    /// Used by AssetIngestor to avoid re-ingesting existing assets.
+    public func allAssetPaths() throws -> [String] {
+        let sql = "SELECT absolute_path FROM assets"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var paths: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let path = columnText(stmt, 0) {
+                paths.append(path)
+            }
+        }
+        return paths
+    }
+
     /// Total number of assets in the database.
     public func assetCount() throws -> Int {
         let sql = "SELECT COUNT(*) FROM assets"
