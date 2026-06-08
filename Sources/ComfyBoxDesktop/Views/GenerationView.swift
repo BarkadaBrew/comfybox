@@ -1,9 +1,10 @@
 // GenerationView.swift — Main image generation interface
 //
-// Provides prompt entry, parameter controls, generation button,
-// and image preview. Communicates with the WarmServer through
-// EngineService. On successful generation, calls onGenerated
-// to trigger DAM ingestion.
+// Provides prompt entry, parameter controls, model selection,
+// LoRA picker, queue status, and image preview. Communicates
+// with the WarmServer through EngineService. On successful
+// generation, calls onGenerated to trigger DAM ingestion.
+// Phase 4: Added preset save, prompt enhancement, keyboard shortcuts.
 
 import SwiftUI
 
@@ -24,6 +25,8 @@ struct ResolutionPreset: Identifiable, Hashable {
 
 struct GenerationView: View {
     @Bindable var engine: EngineService
+    var presetManager: PresetManager?
+    var characters: [CharacterEntry]
     var onGenerated: ((String, GenerationRequest) -> Void)?
 
     // Generation parameters
@@ -34,15 +37,58 @@ struct GenerationView: View {
     @State private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
+    // LoRA selections
+    @State private var selectedLoras: [LoRASelection] = []
+
+    // Sidebar sections
+    @State private var showModelSelector: Bool = true
+    @State private var showLoraPicker: Bool = false
+    @State private var showQueuePanel: Bool = false
+    @State private var showCharacters: Bool = false
+
+    // Preset save sheet
+    @State private var showingSavePreset: Bool = false
+
+    // Prompt enhancement
+    @State private var isEnhancing: Bool = false
+    @State private var enhanceAvailable: Bool = true
+
     var body: some View {
         HSplitView {
             // Left panel: Controls
             controlPanel
-                .frame(minWidth: 320, maxWidth: 400)
+                .frame(minWidth: 340, maxWidth: 420)
 
             // Right panel: Image preview
             previewPanel
                 .frame(minWidth: 400)
+        }
+        .sheet(isPresented: $showingSavePreset) {
+            if let pm = presetManager {
+                SavePresetSheet(
+                    promptTemplate: prompt,
+                    modelId: engine.currentModel,
+                    loras: selectedLoras,
+                    steps: Int(steps),
+                    guidance: Float(guidance),
+                    width: selectedResolution.width,
+                    height: selectedResolution.height,
+                    onSave: { name in
+                        _ = pm.create(
+                            name: name,
+                            promptTemplate: prompt,
+                            modelId: engine.currentModel,
+                            loras: selectedLoras,
+                            steps: Int(steps),
+                            guidance: Float(guidance),
+                            width: selectedResolution.width,
+                            height: selectedResolution.height
+                        )
+                        showingSavePreset = false
+                    },
+                    onCancel: { showingSavePreset = false }
+                )
+            }
         }
     }
 
@@ -56,6 +102,17 @@ struct GenerationView: View {
 
                 Divider()
 
+                // Model selector (collapsible)
+                DisclosureGroup(isExpanded: $showModelSelector) {
+                    ModelSelector(engine: engine)
+                        .padding(.top, 4)
+                } label: {
+                    Label("Model", systemImage: "cpu")
+                        .font(.headline)
+                }
+
+                Divider()
+
                 // Prompt
                 promptSection
 
@@ -66,8 +123,69 @@ struct GenerationView: View {
 
                 Divider()
 
-                // Generate button
-                generateButton
+                // LoRA picker (collapsible)
+                DisclosureGroup(isExpanded: $showLoraPicker) {
+                    LoRAPicker(engine: engine, selectedLoras: $selectedLoras)
+                        .padding(.top, 4)
+                } label: {
+                    HStack {
+                        Label("LoRA Adapters", systemImage: "slider.horizontal.3")
+                            .font(.headline)
+                        if !selectedLoras.isEmpty {
+                            Text("\(selectedLoras.count)")
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.2))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                }
+
+                // Characters (collapsible)
+                if !characters.isEmpty {
+                    Divider()
+                    DisclosureGroup(isExpanded: $showCharacters) {
+                        CharacterLibraryView(
+                            characters: characters,
+                            onInsert: { entry in
+                                insertCharacterPrompt(entry)
+                            }
+                        )
+                        .frame(maxHeight: 300)
+                        .padding(.top, 4)
+                    } label: {
+                        Label("Characters", systemImage: "person.2")
+                            .font(.headline)
+                    }
+                }
+
+                Divider()
+
+                // Queue panel (collapsible)
+                DisclosureGroup(isExpanded: $showQueuePanel) {
+                    QueuePanel(engine: engine)
+                        .padding(.top, 4)
+                } label: {
+                    HStack {
+                        Label("Queue", systemImage: "list.bullet.rectangle")
+                            .font(.headline)
+                        if engine.queueCount > 0 {
+                            Text("\(engine.queueCount)")
+                                .font(.caption2)
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(.orange)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Action buttons
+                actionButtons
 
                 // Error display
                 if let error = engine.lastError {
@@ -126,8 +244,27 @@ struct GenerationView: View {
 
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Prompt")
-                .font(.headline)
+            HStack {
+                Text("Prompt")
+                    .font(.headline)
+                Spacer()
+                // Enhance button
+                Button(action: { enhancePrompt() }) {
+                    HStack(spacing: 4) {
+                        if isEnhancing {
+                            ProgressView()
+                                .controlSize(.mini)
+                        } else {
+                            Image(systemName: "sparkles")
+                        }
+                        Text("Enhance")
+                    }
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+                .disabled(!canEnhance)
+                .help("Send prompt to LLM for enhancement")
+            }
 
             TextEditor(text: $prompt)
                 .font(.body)
@@ -205,31 +342,65 @@ struct GenerationView: View {
         }
     }
 
-    private var generateButton: some View {
-        Button(action: { submitGeneration() }) {
-            HStack {
-                if engine.isGenerating {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.trailing, 4)
-                    Text("Generating...")
-                } else {
-                    Image(systemName: "wand.and.stars")
-                    Text("Generate")
+    private var actionButtons: some View {
+        VStack(spacing: 8) {
+            // Generate button
+            Button(action: { submitGeneration() }) {
+                HStack {
+                    if engine.isGenerating {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.trailing, 4)
+                        Text("Generating...")
+                    } else {
+                        Image(systemName: "wand.and.stars")
+                        Text("Generate")
+                    }
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
+            .buttonStyle(.borderedProminent)
+            .disabled(!canGenerate)
+            .keyboardShortcut(.return, modifiers: .command)
+
+            // Save / Clear row
+            HStack(spacing: 8) {
+                Button(action: { showingSavePreset = true }) {
+                    HStack {
+                        Image(systemName: "square.and.arrow.down")
+                        Text("Save Preset")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(presetManager == nil)
+                .keyboardShortcut("s", modifiers: .command)
+
+                Button(action: { clearPrompt() }) {
+                    HStack {
+                        Image(systemName: "doc")
+                        Text("New")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .keyboardShortcut("n", modifiers: .command)
+            }
         }
-        .buttonStyle(.borderedProminent)
-        .disabled(!canGenerate)
-        .keyboardShortcut(.return, modifiers: .command)
     }
 
     private var canGenerate: Bool {
         engine.connectionState.isConnected
             && !engine.isGenerating
             && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canEnhance: Bool {
+        engine.connectionState.isConnected
+            && !isEnhancing
+            && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && enhanceAvailable
     }
 
     // MARK: - Preview Panel
@@ -289,10 +460,21 @@ struct GenerationView: View {
             height: selectedResolution.height,
             steps: Int(steps),
             guidance: Float(guidance),
-            seed: seed
+            seed: seed,
+            loras: selectedLoras
         )
 
         Task {
+            // Swap LoRAs if any selected (before generation).
+            if !selectedLoras.isEmpty {
+                do {
+                    try await engine.swapLoras(selectedLoras)
+                } catch {
+                    // LoRA swap failure — still attempt generation with
+                    // whatever LoRAs are currently loaded.
+                }
+            }
+
             do {
                 let outputPath = try await engine.generate(request)
                 // Load the generated image for display.
@@ -305,6 +487,65 @@ struct GenerationView: View {
                 onGenerated?(outputPath, request)
             } catch {
                 // Error is already stored in engine.lastError
+            }
+        }
+    }
+
+    private func clearPrompt() {
+        prompt = ""
+        seedText = ""
+        displayedImage = nil
+        engine.lastError = nil
+    }
+
+    /// Apply a preset to the current generation parameters.
+    func applyPreset(_ preset: GenerationPreset) {
+        prompt = preset.promptTemplate
+        steps = Double(preset.steps)
+        guidance = Double(preset.guidance)
+
+        // Find matching resolution preset, or keep current
+        if let match = ResolutionPreset.presets.first(where: {
+            $0.width == preset.width && $0.height == preset.height
+        }) {
+            selectedResolution = match
+        }
+
+        // Convert preset LoRAs to LoRASelections
+        selectedLoras = preset.loras.map {
+            LoRASelection(id: $0.id, filename: $0.filename, scale: $0.scale)
+        }
+    }
+
+    /// Insert a character's prompt snippet into the current prompt.
+    private func insertCharacterPrompt(_ entry: CharacterEntry) {
+        if prompt.isEmpty {
+            prompt = entry.promptSnippet
+        } else {
+            prompt += ", \(entry.promptSnippet)"
+        }
+    }
+
+    /// Send the current prompt to the LLM enhancement endpoint.
+    private func enhancePrompt() {
+        guard canEnhance else { return }
+        isEnhancing = true
+
+        Task {
+            do {
+                let enhanced = try await engine.enhancePrompt(prompt)
+                await MainActor.run {
+                    prompt = enhanced
+                    isEnhancing = false
+                }
+            } catch {
+                await MainActor.run {
+                    isEnhancing = false
+                    // If endpoint not found, disable the button.
+                    if case EngineServiceError.serverError(404, _) = error {
+                        enhanceAvailable = false
+                    }
+                }
             }
         }
     }
