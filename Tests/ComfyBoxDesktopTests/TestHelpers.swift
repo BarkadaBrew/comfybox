@@ -1,0 +1,174 @@
+// TestHelpers.swift — Shared test utilities and data factories
+
+import Foundation
+@testable import ComfyBoxDesktop
+
+// MARK: - Sample Data Factories
+
+enum TestData {
+    static func makeAsset(
+        id: String = "test-asset-1",
+        filename: String = "test-image.png",
+        prompt: String? = "a beautiful landscape",
+        seed: Int? = 42,
+        steps: Int? = 9,
+        guidance: Double? = 3.5,
+        modelFamily: String? = "flux",
+        rating: Int = 0,
+        favorite: Bool = false,
+        contentMode: String? = nil,
+        characterName: String? = nil,
+        width: Int? = 1024,
+        height: Int? = 1024
+    ) -> DAMAsset {
+        DAMAsset(
+            id: id,
+            kind: "image",
+            filename: filename,
+            absolutePath: "/tmp/test-images/\(filename)",
+            fileSize: 1_234_567,
+            sha256: nil,
+            width: width,
+            height: height,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            modifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            ingestedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            orphaned: false,
+            prompt: prompt,
+            negativePrompt: nil,
+            seed: seed,
+            steps: steps,
+            guidance: guidance,
+            modelFamily: modelFamily,
+            rating: rating,
+            favorite: favorite,
+            contentMode: contentMode,
+            characterName: characterName
+        )
+    }
+
+    static func makePreset(
+        id: String = "preset-1",
+        name: String = "Test Preset",
+        promptTemplate: String = "a test prompt",
+        steps: Int = 9,
+        guidance: Float = 3.5,
+        width: Int = 1024,
+        height: Int = 1024
+    ) -> GenerationPreset {
+        GenerationPreset(
+            id: id,
+            name: name,
+            promptTemplate: promptTemplate,
+            modelId: "test-model",
+            loras: [],
+            steps: steps,
+            guidance: guidance,
+            width: width,
+            height: height,
+            sampler: nil,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            modifiedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+    }
+
+    static func makeCharacter(
+        id: String = "char-1",
+        name: String = "Test Character",
+        description: String = "A test character",
+        promptSnippet: String = "test character prompt"
+    ) -> CharacterEntry {
+        CharacterEntry(
+            id: id,
+            name: name,
+            description: description,
+            defaultLoras: ["test-lora"],
+            promptSnippet: promptSnippet,
+            tags: ["test", "sample"]
+        )
+    }
+
+    static func makeLoRAInfo(
+        id: String = "lora-1",
+        filename: String = "test-lora.safetensors",
+        isActive: Bool = false,
+        quarantined: Bool = false
+    ) -> LoRAInfo {
+        LoRAInfo(
+            id: id,
+            filename: filename,
+            modelCompatibility: "flux",
+            format: "safetensors",
+            rank: 16,
+            sizeBytes: 50_000_000,
+            quarantined: quarantined,
+            tags: ["test"],
+            category: "style",
+            triggerwords: ["testtrigger"],
+            recommendedScale: 0.8,
+            isActive: isActive
+        )
+    }
+
+    static func makeModelInfo(
+        id: String = "model-1",
+        family: String = "flux",
+        displayName: String = "Test Model"
+    ) -> ModelInfo {
+        ModelInfo(
+            id: id,
+            family: family,
+            variant: "dev",
+            quantization: "q8",
+            displayName: displayName,
+            description: "A test model",
+            parametersBillions: 12.0,
+            defaultSteps: 9,
+            defaultGuidance: 3.5,
+            supportsGuidance: true,
+            supportsLoRA: true,
+            defaultResolution: "1024x1024",
+            estimatedVRAM_GB: 24.0,
+            huggingFaceId: "test-org/test-model"
+        )
+    }
+
+    static func makePoolModel(
+        id: String = "pool-1",
+        model: String = "test-org/test-model",
+        active: Bool = true
+    ) -> PoolModelInfo {
+        PoolModelInfo(
+            id: id,
+            model: model,
+            family: "flux",
+            vramMB: 24576,
+            active: active,
+            lastUsed: "2025-01-01T00:00:00Z"
+        )
+    }
+
+    static func makeQueueInfo(
+        isRendering: Bool = false,
+        pendingCount: Int = 0,
+        renderCount: Int = 42
+    ) -> QueueInfo {
+        QueueInfo(
+            isRendering: isRendering,
+            pendingCount: pendingCount,
+            renderCount: renderCount,
+            uptimeSeconds: 3600,
+            lastRenderDurationMs: 15000,
+            lastError: nil,
+            memoryUsageMB: 8192
+        )
+    }
+
+    static func makeLoRASelection(
+        id: String = "lora-1",
+        filename: String = "test-lora.safetensors",
+        scale: Float = 1.0
+    ) -> LoRASelection {
+        LoRASelection(id: id, filename: filename, scale: scale)
+    }
+}

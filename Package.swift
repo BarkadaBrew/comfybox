@@ -15,7 +15,8 @@ let package = Package(
       url: "https://github.com/huggingface/swift-transformers",
       from: "1.1.6"
     ),
-    .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4")
+    .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
+    .package(url: "https://github.com/nalexn/ViewInspector.git", from: "0.10.0")
   ],
   targets: [
     .target(
@@ -65,6 +66,14 @@ let package = Package(
       name: "ZImageE2ETests",
       dependencies: ["ZImage"],
       path: "Tests/ZImageE2ETests"
+    ),
+    .testTarget(
+      name: "ComfyBoxDesktopTests",
+      dependencies: [
+        "ComfyBoxDesktop",
+        .product(name: "ViewInspector", package: "ViewInspector")
+      ],
+      path: "Tests/ComfyBoxDesktopTests"
     )
   ]
 )
