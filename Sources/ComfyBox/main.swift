@@ -234,6 +234,9 @@ struct ZImageCLI {
       case "ltx2-text-encoder-test":
         try runLTX2TextEncoderTest(args: Array(args.dropFirst()))
         return
+      case "telegram":
+        try runTelegram(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -1320,6 +1323,13 @@ struct ZImageCLI {
         --port               WarmServer port (default: 7862)
         --host               WarmServer host (default: 127.0.0.1)
         Use 'ComfyBox mcp --help' for full options
+
+      telegram               Start Telegram bot (receives prompts, renders via WarmServer)
+        --bot-token          Telegram Bot API token
+        --config             Config file path (default: ~/.comfybox/telegram.json)
+        --port               WarmServer port (default: 7862)
+        --host               WarmServer host (default: 127.0.0.1)
+        Use 'ComfyBox telegram --help' for full options
 
     Examples:
       ComfyBox -p "a cute cat" -o cat.png
@@ -3988,6 +3998,172 @@ struct ZImageCLI {
     #endif
   }
 
+
+  // MARK: - Telegram Bot Subcommand
+
+  private static func runTelegram(args: [String]) throws {
+    var botToken: String? = nil
+    var configPath: String? = nil
+    var warmServerPort: UInt16 = 7862
+    var warmServerHost: String = "127.0.0.1"
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--bot-token":
+        botToken = nextValue(for: arg, iterator: &iterator)
+      case "--config":
+        configPath = nextValue(for: arg, iterator: &iterator)
+      case "--port":
+        let raw = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 7862)
+        warmServerPort = UInt16(min(raw, Int(UInt16.max)))
+      case "--host":
+        warmServerHost = nextValue(for: arg, iterator: &iterator)
+      case "--help", "-h":
+        printTelegramUsage()
+        return
+      default:
+        logger.warning("Unknown telegram argument: \(arg)")
+      }
+    }
+
+    // Load config
+    let config = try loadTelegramConfig(
+      botToken: botToken,
+      configPath: configPath,
+      warmServerHost: warmServerHost,
+      warmServerPort: warmServerPort
+    )
+
+    let coordinator = ImageBotCoordinator(configuration: config, logger: logger)
+
+    // Signal handling (SIGINT/SIGTERM)
+    let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    signalSource.setEventHandler { coordinator.shutdown() }
+    signalSource.resume()
+    signal(SIGINT, SIG_IGN)
+
+    let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    termSource.setEventHandler { coordinator.shutdown() }
+    termSource.resume()
+    signal(SIGTERM, SIG_IGN)
+
+    // Keep Mac awake while bot is running
+    let caffeinate = Process()
+    caffeinate.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+    caffeinate.arguments = ["-s", "-w", "\(ProcessInfo.processInfo.processIdentifier)"]
+    try? caffeinate.run()
+
+    logger.info("ComfyBox Telegram bot starting...")
+
+    Task {
+      do {
+        try await coordinator.run()
+      } catch {
+        fputs("Telegram bot error: \(error.localizedDescription)\n", stderr)
+      }
+      Darwin.exit(0)
+    }
+
+    dispatchMain()
+  }
+
+  private static func loadTelegramConfig(
+    botToken: String?,
+    configPath: String?,
+    warmServerHost: String,
+    warmServerPort: UInt16
+  ) throws -> ImageBotCoordinator.Configuration {
+    // Resolution: CLI > env > config file > defaults
+    var token = botToken
+    var allowedUserIds: Set<Int> = [8754779862]  // Todd
+    var host = warmServerHost
+    var port = warmServerPort
+    var outputDir = ("~/Pictures/ComfyBox/Telegram" as NSString).expandingTildeInPath
+
+    // Check environment variable
+    if token == nil {
+      token = ProcessInfo.processInfo.environment["COMFYBOX_TELEGRAM_TOKEN"]
+    }
+
+    // Load config file
+    let configFilePath = configPath ?? (("~/.comfybox/telegram.json" as NSString).expandingTildeInPath)
+    if FileManager.default.fileExists(atPath: configFilePath),
+       let data = FileManager.default.contents(atPath: configFilePath),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+
+      if token == nil, let fileToken = json["botToken"] as? String {
+        token = fileToken
+      }
+      if let userIds = json["allowedUserIds"] as? [Int] {
+        allowedUserIds = Set(userIds)
+      }
+      if let ws = json["warmServer"] as? [String: Any] {
+        // Only use config file values if not overridden by CLI
+        if warmServerHost == "127.0.0.1", let h = ws["host"] as? String {
+          host = h
+        }
+        if warmServerPort == 7862, let p = ws["port"] as? Int {
+          port = UInt16(min(p, Int(UInt16.max)))
+        }
+      }
+      if let dir = json["outputDirectory"] as? String {
+        outputDir = (dir as NSString).expandingTildeInPath
+      }
+    }
+
+    guard let finalToken = token, !finalToken.isEmpty else {
+      throw NSError(
+        domain: "ComfyBox.Telegram",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey:
+          "Bot token required. Use --bot-token, COMFYBOX_TELEGRAM_TOKEN env, or config file."]
+      )
+    }
+
+    let telegramConfig = TelegramBot.Configuration(
+      botToken: finalToken,
+      allowedUserIds: allowedUserIds
+    )
+
+    return ImageBotCoordinator.Configuration(
+      telegram: telegramConfig,
+      warmServerHost: host,
+      warmServerPort: port,
+      outputDirectory: outputDir
+    )
+  }
+
+  private static func printTelegramUsage() {
+    print("""
+    Start Telegram bot surface for ComfyBox.
+    Connects to a running WarmServer for image generation.
+
+    Usage: ComfyBox telegram [options]
+
+    Options:
+      --bot-token <token>     Telegram Bot API token (or COMFYBOX_TELEGRAM_TOKEN env)
+      --config <path>         Config file (default: ~/.comfybox/telegram.json)
+      --port <port>           WarmServer port (default: 7862)
+      --host <host>           WarmServer host (default: 127.0.0.1)
+      --help, -h              Show help
+
+    Config file (~/.comfybox/telegram.json):
+      {
+        "botToken": "123456:ABC...",
+        "allowedUserIds": [8754779862],
+        "warmServer": { "host": "127.0.0.1", "port": 7862 },
+        "outputDirectory": "~/Pictures/ComfyBox/Telegram"
+      }
+
+    Resolution order: CLI flags > env vars > config file > defaults
+
+    Requires a running WarmServer: ComfyBox serve --port 7862
+    """)
+  }
+
+
+
 }
 
 // MARK: - Progress Helpers
@@ -4079,6 +4255,7 @@ private final class ProgressBar {
     if m > 0 { return String(format: "%dm%02ds", m, s) }
     return String(format: "%ds", s)
   }
+
 
 
 }
