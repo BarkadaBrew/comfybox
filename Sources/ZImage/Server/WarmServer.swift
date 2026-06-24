@@ -1457,6 +1457,17 @@ public final class WarmServer {
   }
 }
 
+/// Thread-safe holder for the active render's progress percent. Written from
+/// the (off-actor, `@Sendable`) pipeline progress callback and read by the
+/// actor's `queueStatus()` — lock-protected so it can cross the actor boundary
+/// safely without an actor hop on every denoising step.
+private final class RenderProgressTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private var percent: Int?
+  func set(_ value: Int?) { lock.lock(); percent = value; lock.unlock() }
+  func get() -> Int? { lock.lock(); defer { lock.unlock() }; return percent }
+}
+
 private actor WarmServerCoordinator {
   enum ServerError: Error {
     case queueFull(maxPending: Int)
@@ -1494,6 +1505,11 @@ private actor WarmServerCoordinator {
   private var lastRenderDurationMs: Int?
   private var lastError: String?
   private var activeRenderStartedAt: Date?
+  /// Synthetic id for the currently-rendering job — surfaced as `current_job_id`.
+  private var activeJobId: String?
+  /// Live progress (0-100) of the active render; nil when idle. Updated from the
+  /// pipeline denoising callback, read by `queueStatus()`.
+  private let progressTracker = RenderProgressTracker()
   private var pipelinePrepared = false
   /// When a pool model is activated, this holds its modelSpec so that
   /// generation requests use the pool model instead of the startup
@@ -1958,8 +1974,8 @@ private actor WarmServerCoordinator {
       pendingCount: pending.count,
       maxPending: configuration.maxPendingRequests,
       isRendering: activeRenderStartedAt != nil,
-      currentJobId: nil,
-      progressPercent: nil,
+      currentJobId: activeJobId,
+      progressPercent: progressTracker.get(),
       renderCount: successfulRenderCount,
       failedCount: failedRenderCount
     )
@@ -2020,6 +2036,22 @@ private actor WarmServerCoordinator {
   }
 
   private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
+    // Queue telemetry: tag this render with a job id and stream denoising
+    // progress into the tracker that queueStatus() reads. Cleared on return
+    // (success or failure) via defer. flux1 forwards the wrapped handler so the
+    // pipeline's per-step callback updates progress; other families currently
+    // have no per-step callback, so they report only is_rendering + job id.
+    activeJobId = UUID().uuidString
+    progressTracker.set(0)
+    let tracker = progressTracker
+    let trackedHandler: @Sendable (ZImagePipeline.GenerationProgress) -> Void = { progress in
+      if progress.stage == .denoising {
+        tracker.set(Int(progress.fractionCompleted * 100))
+      }
+      progressHandler?(progress)
+    }
+    defer { activeJobId = nil; progressTracker.set(nil) }
+
     switch currentModelFamily {
     case .chroma:
       await runChromaGenerate(payload, continuation: continuation)
@@ -2028,7 +2060,7 @@ private actor WarmServerCoordinator {
     case .flux2:
       await runFlux2Generate(payload, continuation: continuation)
     case .flux1:
-      await runFlux1Generate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
+      await runFlux1Generate(payload, continuation: continuation, progressHandler: trackedHandler, latentPreviewHandler: latentPreviewHandler)
     }
   }
 
