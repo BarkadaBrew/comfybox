@@ -222,6 +222,9 @@ struct ZImageCLI {
       case "mcp":
         try runMCP(args: Array(args.dropFirst()))
         return
+      case "video":
+        try runVideo(args: Array(args.dropFirst()))
+        return
       case "ltx2-demo":
         try runLTX2Demo(args: Array(args.dropFirst()))
         return
@@ -1315,6 +1318,15 @@ struct ZImageCLI {
         --tile-size          ESRGAN tile size (default: 512)
         --softness           Preprocessing softness 0.0-1.0 (default: 0.0)
 
+      video                  Native LTX-2 video generation (T2V and I2V)
+        -p, --prompt         Text/motion prompt (required)
+        -i, --image          Source image for I2V mode
+        -o, --output         Output .mp4 path (default: z-video.mp4)
+        -d, --duration       T2V duration in seconds: 6-20 (default: 6)
+        -r, --resolution     Resolution: 480p, 720p, 1080p (default: 720p)
+        --aspect-ratio       16:9 or 9:16 (default: 16:9)
+        Use 'ComfyBox video --help' for full options
+
       models                 List known model families with installation status
         --paths, -v          Show filesystem paths for installed models
 
@@ -1347,6 +1359,9 @@ struct ZImageCLI {
       ComfyBox -p "cat" --seed 42 --seed 99 --seed 123 -o cats.png  # 3 specific seeds
       ComfyBox -p "scene" --auto-seeds 10 --resume-batch progress.jsonl  # Resume interrupted batch
       ComfyBox upscale -i photo.jpg -w ./models/seedvr2 -r 2048
+      ComfyBox video -p "a woman walks through a sunlit garden" -o garden.mp4
+      ComfyBox video -p "she turns and smiles" -i photo.png -o smile.mp4
+      ComfyBox video -p "ocean waves" -d 10 -r 1080p --seed 42
     """)
   }
 
@@ -3197,6 +3212,488 @@ struct ZImageCLI {
 
     print()
     print(String(repeating: "=", count: 60))
+  }
+
+  // MARK: - Video Subcommand (LTX-2 Native)
+
+  /// Resolve resolution label + aspect ratio to (width, height) in pixels.
+  ///
+  /// All dimensions are rounded to multiples of 32 (VAE spatial compression).
+  private static func resolveVideoResolution(
+    resolution: String, aspectRatio: String
+  ) -> (width: Int, height: Int) {
+    let landscape = aspectRatio != "9:16"
+    switch resolution {
+    case "480p":
+      return landscape ? (width: 832, height: 480) : (width: 480, height: 832)
+    case "1080p":
+      return landscape ? (width: 1920, height: 1088) : (width: 1088, height: 1920)
+    default: // 720p
+      return landscape ? (width: 1280, height: 736) : (width: 736, height: 1280)
+    }
+  }
+
+  /// Convert a T2V duration in seconds to frame count at 24 fps.
+  ///
+  /// LTX-2 requires numFrames = 1 + 8k. We round to the nearest valid count.
+  private static func durationToFrames(_ seconds: Int, fps: Int = 24) -> Int {
+    let rawFrames = seconds * fps
+    // Round to nearest valid frame count (1 + 8k)
+    let k = max(1, Int((Float(rawFrames - 1) / 8.0).rounded()))
+    return 1 + 8 * k
+  }
+
+  private static func runVideo(args: [String]) throws {
+    // --- Default values ---
+    let defaultWeightsDir = (NSHomeDirectory() as NSString).appendingPathComponent("Models/ltx2-distilled")
+    let defaultGemmaPath = (NSHomeDirectory() as NSString).appendingPathComponent(
+      ".cache/huggingface/hub/models--unsloth--gemma-3-12b-it/snapshots/9478e665381f42974aa06177b019352fb6291876"
+    )
+
+    var prompt: String?
+    var imagePath: String?
+    var outputPath = "z-video.mp4"
+    var durationSeconds = 6
+    var resolution = "720p"
+    var aspectRatio = "16:9"
+    var seed: UInt64? = nil
+    var weightsDir: String = defaultWeightsDir
+    var gemmaPath: String = defaultGemmaPath
+    var noProgress = false
+    var loraPath: String? = nil
+    var loraStrength: Float = 1.0
+    var steps: Int? = nil
+    var strength: Float = 1.0
+
+    // --- Parse arguments ---
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--prompt", "-p":
+        prompt = nextValue(for: arg, iterator: &iterator)
+      case "--image", "-i":
+        imagePath = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        outputPath = nextValue(for: arg, iterator: &iterator)
+      case "--duration", "-d":
+        durationSeconds = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: durationSeconds)
+      case "--resolution", "-r":
+        resolution = nextValue(for: arg, iterator: &iterator)
+      case "--aspect-ratio":
+        aspectRatio = nextValue(for: arg, iterator: &iterator)
+      case "--seed":
+        if let s = uint64Value(for: arg, iterator: &iterator) {
+          seed = s
+        }
+      case "--weights", "-w":
+        weightsDir = nextValue(for: arg, iterator: &iterator)
+      case "--gemma-path":
+        gemmaPath = nextValue(for: arg, iterator: &iterator)
+      case "--no-progress":
+        noProgress = true
+      case "--lora":
+        loraPath = nextValue(for: arg, iterator: &iterator)
+      case "--lora-strength":
+        loraStrength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      case "--steps":
+        steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 8)
+      case "--strength":
+        strength = floatValue(for: arg, iterator: &iterator, fallback: 1.0)
+      case "--help", "-h":
+        printVideoUsage()
+        return
+      default:
+        logger.warning("Unknown video argument: \(arg)")
+      }
+    }
+
+    // --- Validate ---
+    guard let promptText = prompt else {
+      fputs("Error: --prompt is required.\n", stderr)
+      printVideoUsage()
+      exit(1)
+    }
+
+    let isI2V = imagePath != nil
+
+    if !VideoGenerateRequest.validResolutions.contains(resolution) {
+      fputs("Error: invalid resolution '\(resolution)'. Valid: \(VideoGenerateRequest.validResolutions.joined(separator: ", "))\n", stderr)
+      exit(1)
+    }
+    if !VideoGenerateRequest.validAspectRatios.contains(aspectRatio) {
+      fputs("Error: invalid aspect ratio '\(aspectRatio)'. Valid: \(VideoGenerateRequest.validAspectRatios.joined(separator: ", "))\n", stderr)
+      exit(1)
+    }
+    if !isI2V {
+      if !VideoGenerateRequest.validT2VDurations.contains(durationSeconds) {
+        fputs("Error: invalid duration \(durationSeconds). T2V supports: \(VideoGenerateRequest.validT2VDurations.map(String.init).joined(separator: ", "))\n", stderr)
+        exit(1)
+      }
+    }
+
+    // Resolve dimensions
+    let (width, height) = resolveVideoResolution(resolution: resolution, aspectRatio: aspectRatio)
+
+    // Resolve frame count
+    let fps = 24
+    let numFrames: Int
+    if isI2V {
+      // I2V: fixed 97 frames (~4s at 24fps), matching ltx2-i2v default
+      numFrames = 97
+    } else {
+      numFrames = durationToFrames(durationSeconds, fps: fps)
+    }
+
+    // Default steps: 8 for distilled
+    let denoiseSteps = steps ?? 8
+
+    // Generate seed if not provided
+    let actualSeed = seed ?? UInt64.random(in: 0...UInt64.max)
+
+    // Ensure output ends with .mp4
+    if !outputPath.hasSuffix(".mp4") {
+      outputPath += ".mp4"
+    }
+
+    // --- Banner ---
+    let mode = isI2V ? "Image-to-Video" : "Text-to-Video"
+    let durationDesc = isI2V ? "\(numFrames) frames (\(String(format: "%.1f", Float(numFrames) / Float(fps)))s)"
+                              : "\(durationSeconds)s (\(numFrames) frames)"
+    print()
+    print("=== ComfyBox Video (\(mode)) ===")
+    print("Weights:    \(weightsDir)")
+    print("Output:     \(outputPath)")
+    print("Prompt:     \(promptText)")
+    if let img = imagePath {
+      print("Image:      \(img)")
+      print("Strength:   \(strength)")
+    }
+    print("Resolution: \(width)x\(height) (\(resolution), \(aspectRatio))")
+    print("Duration:   \(durationDesc)")
+    print("Steps:      \(denoiseSteps)")
+    print("Seed:       \(actualSeed)")
+    if let lp = loraPath {
+      print("LoRA:       \(lp)")
+      print("LoRA str:   \(loraStrength)")
+    }
+    print()
+
+    // --- Verify weight files exist ---
+    let fm = FileManager.default
+    let transformerPath = URL(fileURLWithPath: weightsDir + "/transformer-distilled.safetensors")
+    let vaeDecoderPath = URL(fileURLWithPath: weightsDir + "/vae_decoder.safetensors")
+    let vaeEncoderPath = URL(fileURLWithPath: weightsDir + "/vae_encoder.safetensors")
+
+    guard fm.fileExists(atPath: transformerPath.path) else {
+      fputs("Error: transformer weights not found at \(transformerPath.path)\n", stderr)
+      exit(1)
+    }
+    guard fm.fileExists(atPath: vaeDecoderPath.path) else {
+      fputs("Error: VAE decoder weights not found at \(vaeDecoderPath.path)\n", stderr)
+      exit(1)
+    }
+    guard fm.fileExists(atPath: vaeEncoderPath.path) else {
+      fputs("Error: VAE encoder weights not found at \(vaeEncoderPath.path)\n", stderr)
+      exit(1)
+    }
+    guard fm.fileExists(atPath: gemmaPath) else {
+      fputs("Error: Gemma text encoder weights not found at \(gemmaPath)\n", stderr)
+      exit(1)
+    }
+
+    if let img = imagePath, !fm.fileExists(atPath: img) {
+      fputs("Error: source image not found at \(img)\n", stderr)
+      exit(1)
+    }
+
+    let overallStart = CFAbsoluteTimeGetCurrent()
+    var stepNum = 1
+    let totalSteps = isI2V ? 8 : 7
+
+    // --- Step 1: Create transformer ---
+    print("[\(stepNum)/\(totalSteps)] Creating transformer (48-layer, 32 heads)...")
+    let transformer = LTX2Transformer(
+      numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
+      numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
+      normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+      positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+      useMiddleIndicesGrid: true, ropeMode: .split,
+      doublePrecisionRoPE: true
+    )
+    stepNum += 1
+
+    // --- Step 2: Load transformer weights ---
+    print("[\(stepNum)/\(totalSteps)] Loading transformer weights...")
+    let startLoad = CFAbsoluteTimeGetCurrent()
+    let rawWeights = try MLX.loadArrays(url: transformerPath)
+    var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+
+    // Merge LoRA if specified
+    if let loraFile = loraPath {
+      print("  Merging LoRA: \(loraFile) (strength=\(loraStrength))")
+      guard fm.fileExists(atPath: loraFile) else {
+        fputs("Error: LoRA file not found at \(loraFile)\n", stderr)
+        exit(1)
+      }
+      let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraFile))
+      var mergedCount = 0
+      var skippedCount = 0
+      for (key, loraA) in loraWeights {
+        guard key.hasSuffix(".lora_A.weight") else { continue }
+        var baseKey = String(key.dropLast(".lora_A.weight".count))
+        if baseKey.hasPrefix("diffusion_model.") {
+          baseKey = String(baseKey.dropFirst("diffusion_model.".count))
+        }
+        if baseKey.contains("audio_") || baseKey.contains("av_ca_") ||
+           baseKey.contains("video_to_audio_attn") || baseKey.contains("audio_to_video_attn") {
+          skippedCount += 1; continue
+        }
+        let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
+        guard let loraB = loraWeights[bKey] else { skippedCount += 1; continue }
+        let targetKey = baseKey + ".weight"
+        guard sanitized[targetKey] != nil else { skippedCount += 1; continue }
+        let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+        sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+        mergedCount += 1
+      }
+      print("  Merged \(mergedCount) LoRA pairs (skipped \(skippedCount))")
+    }
+
+    let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
+    try transformer.update(parameters: params, verify: [.shapeMismatch])
+    MLX.eval(transformer.parameters())
+    let loadTime = CFAbsoluteTimeGetCurrent() - startLoad
+    print("  Loaded \(rawWeights.count) tensors in \(String(format: "%.1f", loadTime))s")
+    stepNum += 1
+
+    // --- Step 3: Create and load VAE ---
+    print("[\(stepNum)/\(totalSteps)] Creating and loading VAE...")
+    let vae = LTX2VAE(config: .v23)
+    var combinedVAEWeights: [String: MLXArray] = [:]
+    let rawDecoderWeights = try MLX.loadArrays(url: vaeDecoderPath)
+    for (key, value) in rawDecoderWeights {
+      if key.hasPrefix("vae_decoder.") {
+        combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+      }
+    }
+    let rawEncoderWeights = try MLX.loadArrays(url: vaeEncoderPath)
+    for (key, value) in rawEncoderWeights {
+      if key.hasPrefix("vae_encoder.") {
+        combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+      }
+    }
+    if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+      combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+    }
+    if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+      combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+    }
+    var vaeLogger = Logger(label: "ltx2.video.vae")
+    vaeLogger.logLevel = .info
+    try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: vaeLogger)
+    MLX.eval(vae.parameters())
+    print("  VAE loaded (\(combinedVAEWeights.count) tensors)")
+    stepNum += 1
+
+    // --- Step 4: Create and load text encoder ---
+    print("[\(stepNum)/\(totalSteps)] Loading text encoder (Gemma 3 12B BF16)...")
+    let gemmaConfig = LTX2GemmaConfig(
+      vocabSize: 262208, hiddenSize: 3840,
+      numHiddenLayers: 48, numAttentionHeads: 16,
+      numKeyValueHeads: 8, headDim: 256,
+      intermediateSize: 15360,
+      rmsNormEps: 1e-6, ropeTheta: 1_000_000.0,
+      slidingWindow: 1024, slidingWindowPattern: 6,
+      quantization: nil
+    )
+    let encoderConfig = LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true)
+    let textEncoder = LTX2TextEncoder(config: encoderConfig)
+    let teLoadStart = CFAbsoluteTimeGetCurrent()
+    try textEncoder.loadWeights(
+      modelPath: URL(fileURLWithPath: weightsDir),
+      textEncoderPath: URL(fileURLWithPath: gemmaPath)
+    )
+    MLX.eval(textEncoder.parameters())
+    let teLoadTime = CFAbsoluteTimeGetCurrent() - teLoadStart
+    print("  Text encoder loaded in \(String(format: "%.1f", teLoadTime))s")
+    stepNum += 1
+
+    // --- Step 5: Create pipeline ---
+    print("[\(stepNum)/\(totalSteps)] Creating pipeline...")
+    let pipelineConfig = LTX2PipelineConfig(
+      modelPath: weightsDir, pipelineType: .distilled, hasPromptAdaLN: true
+    )
+    let pipeline = LTX2Pipeline(
+      vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig
+    )
+    stepNum += 1
+
+    // --- Step 6: Tokenize prompt ---
+    print("[\(stepNum)/\(totalSteps)] Tokenizing prompt...")
+    let tokenizerDir = URL(fileURLWithPath: gemmaPath)
+    let tokenizer = try LTX2GemmaTokenizer.load(from: tokenizerDir, maxLength: 128)
+    let batch = tokenizer.encode(prompt: promptText, maxLength: 128)
+    MLX.eval(batch.inputIds, batch.attentionMask)
+    let tokenCount = MLX.sum(batch.attentionMask).item(Int.self)
+    print("  Tokenized: \(tokenCount) tokens")
+    stepNum += 1
+
+    // --- Step 7: Generate ---
+    let genStart = CFAbsoluteTimeGetCurrent()
+    let progressCB: ((Int, Int) -> Void)? = noProgress ? nil : { step, total in
+      let elapsed = CFAbsoluteTimeGetCurrent() - genStart
+      let rate = step > 0 ? elapsed / Double(step) : 0
+      let remaining = rate > 0 ? rate * Double(total - step) : 0
+      print(String(format: "  [step %d/%d]  %.1fs elapsed  ~%.0fs remaining",
+        step, total, elapsed, remaining))
+    }
+
+    let output: LTX2PipelineOutput
+
+    if isI2V {
+      // --- I2V: load source image ---
+      #if canImport(CoreGraphics) && canImport(ImageIO)
+      print("[\(stepNum)/\(totalSteps)] Loading source image...")
+      let imgURL = URL(fileURLWithPath: imagePath!)
+      guard let imgSource = CGImageSourceCreateWithURL(imgURL as CFURL, nil),
+            let cgImage = CGImageSourceCreateImageAtIndex(imgSource, 0, nil) else {
+        fputs("Error: failed to load image from \(imagePath!)\n", stderr)
+        exit(1)
+      }
+      let pixelArray = try QwenImageIO.resizedPixelArray(
+        from: cgImage, width: width, height: height,
+        addBatchDimension: true, dtype: .float32
+      )
+      let imageForEncoder = QwenImageIO.normalizeForEncoder(pixelArray)
+      print("  Image loaded: \(imageForEncoder.shape)")
+      stepNum += 1
+
+      print("[\(stepNum)/\(totalSteps)] Generating I2V (\(denoiseSteps) steps, \(numFrames) frames)...")
+      output = pipeline.generateI2V(
+        inputIds: batch.inputIds,
+        attentionMask: batch.attentionMask,
+        image: imageForEncoder,
+        strength: strength,
+        width: width, height: height,
+        numFrames: numFrames,
+        steps: denoiseSteps,
+        seed: actualSeed,
+        progressCallback: progressCB
+      )
+      #else
+      fputs("Error: I2V requires CoreGraphics/ImageIO (macOS only)\n", stderr)
+      exit(1)
+      #endif
+    } else {
+      // --- T2V ---
+      print("[\(stepNum)/\(totalSteps)] Generating T2V (\(denoiseSteps) steps, \(numFrames) frames)...")
+      output = pipeline.generateT2V(
+        inputIds: batch.inputIds,
+        attentionMask: batch.attentionMask,
+        width: width, height: height,
+        numFrames: numFrames,
+        steps: denoiseSteps,
+        seed: actualSeed,
+        progressCallback: progressCB
+      )
+    }
+
+    print("  Generation complete in \(String(format: "%.1f", output.elapsedSeconds))s")
+    stepNum += 1
+
+    // --- Write MP4 ---
+    print("[\(stepNum)/\(totalSteps)] Writing MP4 to \(outputPath)...")
+    #if canImport(AVFoundation) && canImport(CoreGraphics)
+    let cgFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+    print("  Extracted \(cgFrames.count) frames")
+    try LTX2PostProcess.writeMP4(
+      frames: cgFrames,
+      outputPath: outputPath,
+      fps: fps,
+      width: width,
+      height: height
+    )
+    #else
+    // Fallback: write PPM frames and invoke ffmpeg
+    let ppmDir = outputPath.replacingOccurrences(of: ".mp4", with: "-frames")
+    try LTX2PostProcess.writeFramesPPM(from: output.decoded, outputDir: ppmDir)
+    print("  Wrote PPM frames to \(ppmDir)")
+    print("  Converting to MP4 via ffmpeg...")
+    let ffmpeg = Process()
+    ffmpeg.executableURL = URL(fileURLWithPath: "/usr/local/bin/ffmpeg")
+    ffmpeg.arguments = [
+      "-y", "-framerate", "\(fps)",
+      "-i", "\(ppmDir)/frame_%04d.ppm",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p",
+      "-crf", "18", outputPath
+    ]
+    try ffmpeg.run()
+    ffmpeg.waitUntilExit()
+    if ffmpeg.terminationStatus != 0 {
+      fputs("Warning: ffmpeg exited with status \(ffmpeg.terminationStatus)\n", stderr)
+    }
+    #endif
+
+    // --- Report ---
+    let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
+    let videoDuration = Float(output.numFrames) / Float(fps)
+    print()
+    print("=== Done ===")
+    print("Output:   \(outputPath)")
+    if let attrs = try? fm.attributesOfItem(atPath: outputPath),
+       let size = attrs[FileAttributeKey.size] as? Int {
+      let mb = Double(size) / (1024.0 * 1024.0)
+      print("Size:     \(String(format: "%.1f", mb)) MB")
+    }
+    print("Mode:     \(mode)")
+    print("Frames:   \(output.numFrames)")
+    print("Duration: \(String(format: "%.1f", videoDuration))s @ \(fps)fps")
+    print("Seed:     \(actualSeed)")
+    print("Time:     \(String(format: "%.1f", overallTime))s total (\(String(format: "%.1f", output.elapsedSeconds))s generation)")
+    print()
+  }
+
+  private static func printVideoUsage() {
+    print("""
+
+    ComfyBox video — Native LTX-2 video generation on Apple Silicon.
+
+    Usage:
+      ComfyBox video -p "prompt" [options]              # Text-to-Video
+      ComfyBox video -p "motion" -i source.png [opts]   # Image-to-Video
+
+    Required:
+      -p, --prompt <text>       Scene description (T2V) or motion description (I2V)
+
+    Options:
+      -i, --image <path>        Source image for I2V mode. Omit for T2V.
+      -o, --output <path>       Output .mp4 path (default: z-video.mp4)
+      -d, --duration <seconds>  T2V duration: 6,8,10,12,14,16,18,20 (default: 6). Ignored for I2V.
+      -r, --resolution <res>    Output resolution: 480p, 720p, 1080p (default: 720p)
+      --aspect-ratio <ratio>    Aspect ratio: 16:9 or 9:16 (default: 16:9)
+      --seed <uint64>           Random seed for reproducibility
+      -w, --weights <dir>       LTX2 model weights directory (default: ~/Models/ltx2-distilled/)
+      --gemma-path <dir>        Gemma 3 text encoder weights (default: HF cache)
+      --lora <path>             LoRA safetensors file (merge-on-load)
+      --lora-strength <float>   LoRA merge strength (default: 1.0)
+      --steps <int>             Denoising steps (default: 8 distilled)
+      --strength <float>        I2V conditioning strength 0-1 (default: 1.0)
+      --no-progress             Disable step-by-step progress output
+      -h, --help                Show this help
+
+    Examples:
+      ComfyBox video -p "a woman walks through a sunlit garden" -o garden.mp4
+      ComfyBox video -p "she turns and smiles" -i photo.png -o smile.mp4
+      ComfyBox video -p "ocean waves at sunset" -d 10 -r 1080p --seed 42
+      ComfyBox video -p "camera pans across a city" --aspect-ratio 9:16 -r 720p
+
+    Notes:
+      - Uses the LTX-2.3 distilled pipeline (8 steps, no CFG) by default.
+      - Model loading takes 1-3 minutes for the 35GB transformer. This is a cold
+        invocation — for repeated generation, use 'ComfyBox serve' instead.
+      - T2V frame counts are computed from duration at 24fps, rounded to 1+8k.
+      - I2V always generates 97 frames (~4s at 24fps).
+    """)
   }
 
   // MARK: - LTX2 Demo
