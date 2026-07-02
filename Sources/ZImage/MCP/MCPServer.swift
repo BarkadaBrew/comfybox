@@ -20,7 +20,7 @@ public final class MCPServer {
   /// Server version reported in initialize response.
   public static let version = "1.0.0"
 
-  public init(host: String = "127.0.0.1", port: UInt16 = 7862) {
+  public init(host: String = "127.0.0.1", port: UInt16 = 7870) {
     self.client = WarmServerClient(host: host, port: port)
     self.executor = MCPToolExecutor(client: client)
   }

@@ -1292,7 +1292,7 @@ struct ZImageCLI {
       serve                  Start warm HTTP server
         --model, -m          Model path or HuggingFace ID
         --text-encoder-path  Override text encoder directory
-        --port               HTTP port (default 7862)
+        --port               HTTP port (default 7870)
         --lora, -l           Initial LoRA(s)
         Use 'ComfyBox serve --help' for full options
 
@@ -1321,14 +1321,14 @@ struct ZImageCLI {
 
 
       mcp                    Start MCP server (stdio JSON-RPC bridge to WarmServer)
-        --port               WarmServer port (default: 7862)
+        --port               WarmServer port (default: 7870)
         --host               WarmServer host (default: 127.0.0.1)
         Use 'ComfyBox mcp --help' for full options
 
       telegram               Start Telegram bot (receives prompts, renders via WarmServer)
         --bot-token          Telegram Bot API token
         --config             Config file path (default: ~/.comfybox/telegram.json)
-        --port               WarmServer port (default: 7862)
+        --port               WarmServer port (default: 7870)
         --host               WarmServer host (default: 127.0.0.1)
         Use 'ComfyBox telegram --help' for full options
 
@@ -1343,7 +1343,7 @@ struct ZImageCLI {
       ComfyBox -p "landscape" --scheduler heun --sigma-schedule beta -s 5  # Heun at half steps
       ComfyBox -p "refiner pass" --scheduler res_2s --sigma-schedule beta57  # RES 2s + beta57
       ComfyBox -p "scene" --scheduler ddim --eta 0.5  # Semi-stochastic DDIM
-      ComfyBox serve -m ./models/z-image-turbo --port 7862
+      ComfyBox serve -m ./models/z-image-turbo --port 7870
       ComfyBox -p "portrait" --auto-seeds 5 -o portraits.png  # Generate 5 random variations
       ComfyBox -p "cat" --seed 42 --seed 99 --seed 123 -o cats.png  # 3 specific seeds
       ComfyBox -p "scene" --auto-seeds 10 --resume-batch progress.jsonl  # Resume interrupted batch
@@ -1578,17 +1578,21 @@ struct ZImageCLI {
   }
 
   private static func runServe(args: [String]) throws {
-    var model: String?
+    // Load ~/.comfybox/config.json, auto-migrating from ~/.coffeeshop on first launch.
+    // Config supplies defaults; explicit CLI flags below override them.
+    let config = ComfyBoxServerConfig.loadOrMigrate()
+
+    var model: String? = config.modelSpec
     var textEncoderPath: String?
-    var port: UInt16 = 7862
+    var port: UInt16 = config.port
     var cacheLimit: Int?
     var maxSequenceLength = 512
     var loraEntries: [String] = []
     var loraScaleOverrides: [Float] = []
     var forceTransformerOverrideOnly = false
-    var host = "127.0.0.1"
-    var allowedOutputDirectory = FileManager.default.currentDirectoryPath
-    var seedvr2Weights: String? = nil
+    var host = config.host
+    var allowedOutputDirectory = config.allowedOutputDirectory ?? FileManager.default.currentDirectoryPath
+    var seedvr2Weights: String? = config.seedvr2WeightsPath
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1632,6 +1636,10 @@ struct ZImageCLI {
       }
     }
 
+    if port == ComfyBoxServerConfig.deprecatedAliasPort {
+      logger.warning("Port \(port) is deprecated; ComfyBox's canonical port is \(ComfyBoxServerConfig.canonicalPort). It still works this release — update clients (Krita, warm-worker) to \(ComfyBoxServerConfig.canonicalPort).")
+    }
+
     if let limit = cacheLimit {
       GPU.set(cacheLimit: limit * 1024 * 1024)
       logger.info("GPU cache limit set to \(limit)MB")
@@ -1665,7 +1673,7 @@ struct ZImageCLI {
     Usage: ComfyBox serve [options]
       --model, -m               Model path or HuggingFace ID (default: \(ZImageRepository.id))
       --text-encoder-path       Override text encoder directory
-      --port                    HTTP port (default: 7862)
+      --port                    HTTP port (default: 7870)
       --host                    HTTP host/interface to bind (default: 127.0.0.1)
       --allowed-output-directory  Directory where request outputPath values may write (default: current directory)
       --cache-limit             GPU memory cache limit in MB (default: unlimited)
@@ -1685,7 +1693,7 @@ struct ZImageCLI {
       POST /v1/shutdown         Gracefully stop the server
 
     Example:
-      ComfyBox serve -m /path/to/model --text-encoder-path /path/to/encoder --port 7862 \\
+      ComfyBox serve -m /path/to/model --text-encoder-path /path/to/encoder --port 7870 \\
         --lora /path/to/lora.safetensors=0.8
     """)
   }
@@ -2525,7 +2533,7 @@ struct ZImageCLI {
   // MARK: - MCP Server Subcommand
 
   private static func runMCP(args: [String]) throws {
-    var port: UInt16 = 7862
+    var port: UInt16 = 7870
     var host = "127.0.0.1"
 
     var iterator = args.makeIterator()
@@ -2562,7 +2570,7 @@ struct ZImageCLI {
     Bridges stdio JSON-RPC 2.0 to WarmServer HTTP API.
 
     Usage: ComfyBox mcp [options]
-      --port                    WarmServer port to connect to (default: 7862)
+      --port                    WarmServer port to connect to (default: 7870)
       --host                    WarmServer host to connect to (default: 127.0.0.1)
       --help, -h                Show help
 
@@ -2570,7 +2578,7 @@ struct ZImageCLI {
     to stdout. All logging goes to stderr. Runs until stdin closes.
 
     Registration:
-      claude mcp add comfybox -- comfybox mcp --port 7862
+      claude mcp add comfybox -- comfybox mcp --port 7870
 
     Tools:
       generate_image    Text-to-image / img2img generation
@@ -4490,7 +4498,7 @@ struct ZImageCLI {
   private static func runTelegram(args: [String]) throws {
     var botToken: String? = nil
     var configPath: String? = nil
-    var warmServerPort: UInt16 = 7862
+    var warmServerPort: UInt16 = 7870
     var warmServerHost: String = "127.0.0.1"
     var enhanceOverride: Bool? = nil
 
@@ -4502,7 +4510,7 @@ struct ZImageCLI {
       case "--config":
         configPath = nextValue(for: arg, iterator: &iterator)
       case "--port":
-        let raw = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 7862)
+        let raw = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: 7870)
         warmServerPort = UInt16(min(raw, Int(UInt16.max)))
       case "--host":
         warmServerHost = nextValue(for: arg, iterator: &iterator)
@@ -4618,7 +4626,7 @@ struct ZImageCLI {
         if warmServerHost == "127.0.0.1", let h = ws["host"] as? String {
           host = h
         }
-        if warmServerPort == 7862, let p = ws["port"] as? Int {
+        if warmServerPort == 7870, let p = ws["port"] as? Int {
           port = UInt16(min(p, Int(UInt16.max)))
         }
       }
@@ -4701,7 +4709,7 @@ struct ZImageCLI {
     Options:
       --bot-token <token>     Telegram Bot API token (or COMFYBOX_TELEGRAM_TOKEN env)
       --config <path>         Config file (default: ~/.comfybox/telegram.json)
-      --port <port>           WarmServer port (default: 7862)
+      --port <port>           WarmServer port (default: 7870)
       --host <host>           WarmServer host (default: 127.0.0.1)
       --enhance [on|off]      Enable/disable prompt optimization (default: on)
       --no-enhance            Disable prompt optimization
@@ -4716,7 +4724,7 @@ struct ZImageCLI {
       {
         "botToken": "123456:ABC...",
         "allowedUserIds": [8754779862],
-        "warmServer": { "host": "127.0.0.1", "port": 7862 },
+        "warmServer": { "host": "127.0.0.1", "port": 7870 },
         "optimizer": {
           "enabled": true,
           "ollamaBaseURL": "http://localhost:11434",
@@ -4730,7 +4738,7 @@ struct ZImageCLI {
 
     Resolution order: CLI flags > env vars > config file > defaults
 
-    Requires a running WarmServer: ComfyBox serve --port 7862
+    Requires a running WarmServer: ComfyBox serve --port 7870
     """)
   }
 
