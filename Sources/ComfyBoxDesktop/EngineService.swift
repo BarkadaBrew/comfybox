@@ -674,6 +674,34 @@ public final class EngineService {
         }
     }
 
+    // MARK: - Server Config (/v1/config)
+
+    /// Fetch the server config document (~/.comfybox/config.json). The config document
+    /// is canonical camelCase, decoded with a plain decoder (not the snake_case API DTOs).
+    public func fetchServerConfig() async throws -> ComfyBoxServerConfig {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (status, data) = try await client.get("/v1/config")
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to load config")
+        }
+        return try JSONDecoder().decode(ComfyBoxServerConfig.self, from: data)
+    }
+
+    /// Persist the full server config document. PUT replaces the document, so callers
+    /// should fetch, mutate, and save to preserve fields they don't manage.
+    public func saveServerConfig(_ config: ComfyBoxServerConfig) async throws {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let body = try JSONEncoder().encode(config)
+        let (status, data) = try await client.put("/v1/config", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to save config")
+        }
+    }
+
     // MARK: - Helpers
 
     private func parseErrorMessage(from data: Data) -> String? {
