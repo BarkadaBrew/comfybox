@@ -157,6 +157,27 @@ public final class WarmServer {
   /// Default upscale models directory path — ESRGAN weights are stored here.
   private static let upscaleModelsDirectoryPath = ("~/bin/zimage/upscale_models" as NSString).expandingTildeInPath
 
+  // MARK: - Creative-layer stores
+  //
+  // Feature parity with the Coffee Shop image service's creative subsystems. Each persists
+  // to a JSON file under ~/.comfybox/ (characters.json, presets.json, content-modes.json,
+  // audit-log.jsonl). Constructed eagerly so the first request has warm data; they are cheap
+  // (small JSON loads) and thread-safe internally (CharacterStore is an actor; PresetStore /
+  // AuditLog guard with a lock / serial queue; ContentModeStore is a value type).
+
+  /// Character registry (~/.comfybox/characters.json).
+  let characterStore = CharacterStore()
+  /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
+  let presetStore = PresetStore()
+  /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
+  let contentModeStore = ContentModeStore.loadOrCreate()
+  /// Append-only audit trail (~/.comfybox/audit-log.jsonl).
+  let auditLog = AuditLog()
+  /// Server stats + memory-pressure sampler (pure logic; live probes isolated).
+  private let statsProvider = StatsProvider()
+  /// Server start time, for the /v1/stats uptime figure.
+  private let serverStartTime = Date()
+
   public init(
     configuration: WarmServerConfiguration,
     host: String = "127.0.0.1",
@@ -813,16 +834,249 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    // MARK: - Creative Layer: Characters
+    // Character registry parity with the image service. Path-parameter routes follow the
+    // /v1/loras/ hasPrefix pattern.
+
+    case ("GET", "/v1/characters"):
+      return await listCharactersResponse()
+
+    case ("POST", "/v1/characters"), ("PUT", "/v1/characters"):
+      return await upsertCharacterResponse(body: request.body)
+
+    case ("GET", _) where request.path.hasPrefix("/v1/characters/"):
+      return await getCharacterResponse(rawId: String(request.path.dropFirst("/v1/characters/".count)))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/characters/"):
+      return await deleteCharacterResponse(rawId: String(request.path.dropFirst("/v1/characters/".count)))
+
+    // MARK: - Creative Layer: Presets
+
+    case ("GET", "/v1/presets"):
+      return presetsListResponse()
+
+    case ("POST", "/v1/presets/resolve"):
+      // Match before the generic /v1/presets/ prefix routes below.
+      return resolvePresetResponse(body: request.body)
+
+    case ("POST", "/v1/presets"), ("PUT", "/v1/presets"):
+      return upsertPresetResponse(body: request.body)
+
+    case ("GET", _) where request.path.hasPrefix("/v1/presets/"):
+      return getPresetResponse(rawId: String(request.path.dropFirst("/v1/presets/".count)))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/presets/"):
+      return deletePresetResponse(rawId: String(request.path.dropFirst("/v1/presets/".count)))
+
+    // MARK: - Creative Layer: Content modes
+
+    case ("GET", "/v1/content-modes"):
+      return contentModesResponse()
+
+    // MARK: - Creative Layer: Stats / memory
+
+    case ("GET", "/v1/stats"):
+      return await statsResponse()
+
+    case ("GET", "/v1/memory"):
+      return memoryResponse()
+
+    // MARK: - Creative Layer: Audit log
+
+    case ("GET", "/v1/audit-log"):
+      return auditLogResponse(query: request.queryParameters)
+
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
-          "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/upscale"
+          "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/upscale",
+          "/v1/characters", "/v1/presets", "/v1/presets/resolve",
+          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log"
       ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
-         || request.path.hasPrefix("/v1/video/status/") {
+         || request.path.hasPrefix("/v1/video/status/")
+         || request.path.hasPrefix("/v1/characters/")
+         || request.path.hasPrefix("/v1/presets/") {
         return .error(.error(status: 405, message: "Method not allowed"))
       }
       return .error(.error(status: 404, message: "Not found"))
     }
+  }
+
+  // MARK: - Creative-layer route handlers
+  //
+  // These back the /v1/characters, /v1/presets, /v1/content-modes, /v1/stats, /v1/memory,
+  // and /v1/audit-log routes above. Kept as small private methods so the main route switch
+  // stays readable. Responses use the same helpers as the rest of the server:
+  // `RoutedResponse.json(status:payload:)` (snake_case JSON) and `.error(.error(...))`.
+
+  /// Small `{ success, id, deleted }` payload for DELETE responses.
+  private struct DeleteResult: Encodable {
+    let success: Bool
+    let id: String
+    let deleted: Bool
+  }
+
+  /// Validate + percent-decode a single path-parameter id (rejects empty / nested paths),
+  /// matching the guard the /v1/loras/{id} routes use.
+  private static func pathIdComponent(_ raw: String) -> String? {
+    let decoded = raw.removingPercentEncoding ?? raw
+    guard !decoded.isEmpty, !decoded.contains("/") else { return nil }
+    return decoded
+  }
+
+  // Characters ---------------------------------------------------------------
+
+  private func listCharactersResponse() async -> RoutedResponse {
+    .json(status: 200, payload: await characterStore.list())
+  }
+
+  private func getCharacterResponse(rawId: String) async -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid character id"))
+    }
+    guard let character = await characterStore.get(id) else {
+      return .error(.error(status: 404, message: "Character not found: \(id)"))
+    }
+    return .json(status: 200, payload: character)
+  }
+
+  private func upsertCharacterResponse(body: Data) async -> RoutedResponse {
+    do {
+      let character = try decode(CharacterEntry.self, from: body)
+      guard !character.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return .error(.error(status: 400, message: "Character 'name' is required"))
+      }
+      let saved = await characterStore.upsert(character)
+      auditLog.append(
+        kind: "character.upsert",
+        message: "Upserted character \(saved.id)",
+        metadata: ["id": saved.id, "name": saved.name]
+      )
+      return .json(status: 200, payload: saved)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid character payload: \(error.localizedDescription)"))
+    }
+  }
+
+  private func deleteCharacterResponse(rawId: String) async -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid character id"))
+    }
+    let deleted = await characterStore.delete(id)
+    if deleted {
+      auditLog.append(kind: "character.delete", message: "Deleted character \(id)", metadata: ["id": id])
+    }
+    return .json(status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
+  }
+
+  // Presets ------------------------------------------------------------------
+
+  private func presetsListResponse() -> RoutedResponse {
+    .json(status: 200, payload: presetStore.list())
+  }
+
+  private func getPresetResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid preset id"))
+    }
+    guard let preset = presetStore.get(id) else {
+      return .error(.error(status: 404, message: "Preset not found: \(id)"))
+    }
+    return .json(status: 200, payload: preset)
+  }
+
+  private func upsertPresetResponse(body: Data) -> RoutedResponse {
+    do {
+      let preset = try decode(ImagePreset.self, from: body)
+      let saved = try presetStore.upsert(preset)
+      auditLog.append(kind: "preset.upsert", message: "Upserted preset \(saved.id)", metadata: ["id": saved.id])
+      return .json(status: 200, payload: saved)
+    } catch let error as PresetStoreError {
+      return presetErrorResponse(error)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid preset payload: \(error.localizedDescription)"))
+    }
+  }
+
+  private func deletePresetResponse(rawId: String) -> RoutedResponse {
+    guard let id = Self.pathIdComponent(rawId) else {
+      return .error(.error(status: 400, message: "Invalid preset id"))
+    }
+    do {
+      let deleted = try presetStore.delete(id)
+      if deleted {
+        auditLog.append(kind: "preset.delete", message: "Deleted preset \(id)", metadata: ["id": id])
+      }
+      return .json(status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
+    } catch {
+      return .error(.error(status: 500, message: "Failed to delete preset: \(error.localizedDescription)"))
+    }
+  }
+
+  private func resolvePresetResponse(body: Data) -> RoutedResponse {
+    struct ResolveRequest: Decodable { let id: String }
+    do {
+      let request = try decode(ResolveRequest.self, from: body)
+      let resolved = try presetStore.resolve(request.id)
+      return .json(status: 200, payload: resolved)
+    } catch let error as PresetStoreError {
+      return presetErrorResponse(error)
+    } catch {
+      return .error(.error(status: 400, message: #"Invalid resolve request (expected {"id": ...}): \#(error.localizedDescription)"#))
+    }
+  }
+
+  /// Map a ``PresetStoreError`` to the right HTTP status: validation -> 400, notFound -> 404.
+  private func presetErrorResponse(_ error: PresetStoreError) -> RoutedResponse {
+    switch error {
+    case .validation(let message):
+      return .error(.error(status: 400, message: message))
+    case .notFound(let id):
+      return .error(.error(status: 404, message: "Preset not found: \(id)"))
+    }
+  }
+
+  // Content modes ------------------------------------------------------------
+
+  private func contentModesResponse() -> RoutedResponse {
+    .json(status: 200, payload: contentModeStore.listModes())
+  }
+
+  // Stats / memory -----------------------------------------------------------
+
+  private func statsResponse() async -> RoutedResponse {
+    let queue = await coordinator.queueStatus()
+    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let snapshot = statsProvider.snapshot(
+      memory: statsProvider.sampleMemoryStatus(),
+      uptimeSeconds: StatsProvider.uptimeSeconds(startTime: serverStartTime),
+      renderCount: queue.renderCount,
+      failedRenderCount: queue.failedCount,
+      pendingCount: queue.pendingCount,
+      config: config
+    )
+    return .json(status: 200, payload: snapshot)
+  }
+
+  private func memoryResponse() -> RoutedResponse {
+    .json(status: 200, payload: statsProvider.sampleMemoryStatus())
+  }
+
+  // Audit log ----------------------------------------------------------------
+
+  private func auditLogResponse(query: [String: String]) -> RoutedResponse {
+    let limit = query["limit"].flatMap { Int($0) } ?? 100
+    let entries = auditLog.recent(limit: max(0, limit))
+    // Custom encoder: ISO8601 timestamps (matching the on-disk JSONL). No snake_case
+    // conversion — AuditEntry keys are already flat single words, and converting would
+    // also mangle arbitrary `metadata` dictionary keys.
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(entries) else {
+      return .error(.error(status: 500, message: "Failed to serialize audit log"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
   }
 
 
