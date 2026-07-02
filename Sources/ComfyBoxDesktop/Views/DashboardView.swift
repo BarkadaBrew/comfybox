@@ -72,11 +72,11 @@ struct DashboardView: View {
                 Text("Current render")
                     .font(.subheadline).bold()
                 Spacer()
-                Text("\(Int(pct * 100))%")
+                Text("\(Int(pct))%")   // server reports progress_percent on a 0–100 scale
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            ProgressView(value: min(max(pct, 0), 1))
+            ProgressView(value: min(max(pct / 100, 0), 1))
         }
         .padding(12)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
