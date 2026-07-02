@@ -46,22 +46,52 @@ public struct LoRAWeights: @unchecked Sendable {
     public let lokrWeights: [String: LoKrWeights]
     public let rank: Int
     public let alpha: Float
+    /// Per-layer alpha values from kohya-style `<module>.alpha` tensors,
+    /// keyed the same way as `weights` (typically ending in ".weight").
+    public let layerAlphas: [String: Float]
+    /// The alpha that was explicitly provided by the adapter (PEFT
+    /// adapter_config.json, ss_network_alpha metadata, ...). When nil,
+    /// `alpha` was defaulted to `rank` (effective scale 1.0).
+    private let explicitAlpha: Float?
 
     public init(
         weights: [String: (down: MLXArray, up: MLXArray)],
         lokrWeights: [String: LoKrWeights] = [:],
         rank: Int,
-        alpha: Float? = nil
+        alpha: Float? = nil,
+        layerAlphas: [String: Float] = [:]
     ) {
         self.weights = weights
         self.lokrWeights = lokrWeights
         self.rank = rank
+        self.explicitAlpha = alpha
         self.alpha = alpha ?? Float(rank)
+        self.layerAlphas = layerAlphas
     }
 
     public var effectiveScale: Float {
         guard rank > 0 else { return 1.0 }
         return alpha / Float(rank)
+    }
+
+    /// Effective scale (alpha / rank) for a specific layer, following the
+    /// kohya/PEFT convention. Uses the layer's own rank (inner dimension of
+    /// its down/up pair) and its per-layer alpha tensor when present, falling
+    /// back to the adapter-wide alpha, then to 1.0 (alpha == rank).
+    public func effectiveScale(forLayer key: String) -> Float {
+        let weightKey = key.hasSuffix(".weight") ? key : key + ".weight"
+        let baseKey = String(weightKey.dropLast(".weight".count))
+
+        var layerRank = 0
+        if let down = (weights[weightKey] ?? weights[baseKey])?.down, down.ndim == 2 {
+            layerRank = min(down.dim(0), down.dim(1))
+        }
+
+        guard let layerAlpha = layerAlphas[weightKey] ?? layerAlphas[baseKey] ?? explicitAlpha else {
+            return 1.0
+        }
+        guard layerRank > 0 else { return effectiveScale }
+        return layerAlpha / Float(layerRank)
     }
 
     public var layerCount: Int {

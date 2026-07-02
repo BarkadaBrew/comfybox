@@ -217,6 +217,12 @@ actor ModelPool {
   private let budgetMB: Int
   private let logger: Logger
 
+  /// In-flight load tasks keyed by pool key. `load` suspends across the
+  /// pipeline load, so the actor is reentrant — without this map, concurrent
+  /// requests for the same model would each pass the duplicate check and
+  /// load the multi-GB pipeline twice, overshooting the VRAM budget.
+  private var inFlightLoads: [String: Task<Void, Error>] = [:]
+
   /// Configuration snapshot from WarmServerConfiguration, needed for pipeline loading.
   private let textEncoderPath: String?
   private let maxSequenceLength: Int
@@ -266,6 +272,44 @@ actor ModelPool {
       return existing
     }
 
+    // A load for this key is already in flight (actor reentrancy across the
+    // awaits in performLoad) — await it instead of duplicating the load.
+    if let inFlight = inFlightLoads[poolKey] {
+      logger.info("ModelPool: load of '\(poolKey)' already in flight, awaiting existing task")
+      try await inFlight.value
+    } else {
+      let task = Task {
+        try await self.performLoad(
+          poolKey: poolKey,
+          modelSpec: modelSpec,
+          quantization: quantization,
+          initialLoRAs: initialLoRAs
+        )
+      }
+      inFlightLoads[poolKey] = task
+      defer { inFlightLoads[poolKey] = nil }
+      try await task.value
+    }
+
+    guard var entry = pool[poolKey] else {
+      // Entry vanished between load completion and this resume (e.g. evicted
+      // or unloaded by a concurrent operation) — report as not in pool.
+      throw ModelPoolError.modelNotInPool(poolKey)
+    }
+    entry.lastUsed = Date()
+    pool[poolKey] = entry
+    return entry
+  }
+
+  /// Detect the family, evict if needed, load the pipeline, and insert the
+  /// entry into the pool. Factored out of `load` so concurrent callers can
+  /// await a single in-flight task instead of loading twice.
+  private func performLoad(
+    poolKey: String,
+    modelSpec: String,
+    quantization: String?,
+    initialLoRAs: [LoRAConfiguration]
+  ) async throws {
     // Detect model family.
     let family = try await detectFamily(modelSpec: modelSpec)
     let vramEstimate = VRAMEstimates.estimate(for: modelSpec, family: family, quantization: quantization)
@@ -296,7 +340,6 @@ actor ModelPool {
       detectedInfo: detectedInfo
     )
     pool[poolKey] = entry
-    return entry
   }
 
   /// Activate a model for generation. Must already be loaded.

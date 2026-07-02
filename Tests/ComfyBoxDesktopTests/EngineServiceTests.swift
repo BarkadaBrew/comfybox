@@ -4,6 +4,7 @@ import Testing
 import Foundation
 @testable import ComfyBoxDesktop
 
+@MainActor
 @Suite("EngineService")
 struct EngineServiceTests {
     @Test("initial state is disconnected")
@@ -88,6 +89,92 @@ struct EngineServiceTests {
     func queueInfoNil() {
         let engine = EngineService()
         #expect(engine.queueInfo == nil)
+    }
+}
+
+@Suite("Server response decoding")
+struct ServerResponseDecodingTests {
+    // The server encodes all /v1/* and /health responses with
+    // JSONEncoder.keyEncodingStrategy = .convertToSnakeCase, so client
+    // structs must decode snake_case keys.
+
+    @Test("generate response decodes snake_case keys")
+    func generateResponseSnakeCase() throws {
+        let json = Data("""
+            {"success": true, "output_path": "/tmp/out/comfybox-123.png", "duration_ms": 4211}
+            """.utf8)
+        let response = try JSONDecoder().decode(ServerGenerateResponse.self, from: json)
+        #expect(response.success)
+        #expect(response.outputPath == "/tmp/out/comfybox-123.png")
+        #expect(response.durationMs == 4211)
+    }
+
+    @Test("generate response fails without snake_case keys decoded")
+    func generateResponseRejectsMissingKeys() {
+        let json = Data("""
+            {"success": true}
+            """.utf8)
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder().decode(ServerGenerateResponse.self, from: json)
+        }
+    }
+
+    @Test("health response decodes snake_case keys including progress telemetry")
+    func healthResponseSnakeCase() throws {
+        let json = Data("""
+            {
+                "status": "ok",
+                "model": "tongyi/z-image-turbo",
+                "model_family": "zimage",
+                "loaded": true,
+                "is_rendering": true,
+                "pending_count": 2,
+                "render_count": 17,
+                "uptime_seconds": 360,
+                "last_render_duration_ms": 5300,
+                "last_error": null,
+                "memory_usage_mb": 8192,
+                "current_job_id": "job-42",
+                "progress_percent": 55.5,
+                "loras": [{"source": "/tmp/style.safetensors", "scale": 0.8}]
+            }
+            """.utf8)
+        let health = try JSONDecoder().decode(ServerHealthResponse.self, from: json)
+        #expect(health.status == "ok")
+        #expect(health.model == "tongyi/z-image-turbo")
+        #expect(health.modelFamily == "zimage")
+        #expect(health.isRendering == true)
+        #expect(health.pendingCount == 2)
+        #expect(health.renderCount == 17)
+        #expect(health.uptimeSeconds == 360)
+        #expect(health.lastRenderDurationMs == 5300)
+        #expect(health.lastError == nil)
+        #expect(health.memoryUsageMB == 8192)
+        #expect(health.currentJobId == "job-42")
+        #expect(health.progressPercent == 55.5)
+        #expect(health.loras?.count == 1)
+        #expect(health.loras?[0].scale == 0.8)
+    }
+
+    @Test("health response tolerates missing progress fields")
+    func healthResponseWithoutProgress() throws {
+        let json = Data("""
+            {"status": "ok", "model": "some-model"}
+            """.utf8)
+        let health = try JSONDecoder().decode(ServerHealthResponse.self, from: json)
+        #expect(health.status == "ok")
+        #expect(health.currentJobId == nil)
+        #expect(health.progressPercent == nil)
+    }
+
+    @Test("progress_percent decodes integer values")
+    func integerProgress() throws {
+        let json = Data("""
+            {"status": "ok", "progress_percent": 43, "current_job_id": null}
+            """.utf8)
+        let health = try JSONDecoder().decode(ServerHealthResponse.self, from: json)
+        #expect(health.progressPercent == 43.0)
+        #expect(health.currentJobId == nil)
     }
 }
 
@@ -308,5 +395,21 @@ struct QueueInfoTests {
         let info = TestData.makeQueueInfo(isRendering: false, pendingCount: 0)
         #expect(!info.isRendering)
         #expect(info.pendingCount == 0)
+    }
+
+    @Test("progress telemetry defaults to nil")
+    func progressDefaultsNil() {
+        let info = TestData.makeQueueInfo()
+        #expect(info.currentJobId == nil)
+        #expect(info.progressPercent == nil)
+    }
+
+    @Test("progress telemetry fields stored")
+    func progressFields() {
+        let info = TestData.makeQueueInfo(
+            isRendering: true, currentJobId: "job-1", progressPercent: 42.0
+        )
+        #expect(info.currentJobId == "job-1")
+        #expect(info.progressPercent == 42.0)
     }
 }

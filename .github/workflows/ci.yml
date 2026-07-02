@@ -34,6 +34,11 @@ jobs:
       - name: Run unit tests
         run: xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
 
+      # ComfyBoxDesktopTests is not part of the comfybox-Package scheme's test action;
+      # it must run under the ComfyBoxDesktop scheme (scoped to skip the E2E suite).
+      - name: Run desktop tests
+        run: xcodebuild test -scheme ComfyBoxDesktop -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ComfyBoxDesktopTests
+
   release-build:
     if: github.ref == 'refs/heads/main'
     permissions:

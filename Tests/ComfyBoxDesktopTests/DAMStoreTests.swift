@@ -118,6 +118,77 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    @Test("FTS index does not accumulate duplicate rows on repeated updates")
+    func ftsNoDuplicates() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let asset = TestData.makeAsset(id: "fts-dup", filename: "dup.png", prompt: "cerulean dragonfly over water")
+        try await store.insertAsset(asset)
+        // Simulate repeated rating/favorite updates via insertAsset.
+        for rating in 1...3 {
+            let updated = TestData.makeAsset(
+                id: "fts-dup", filename: "dup.png",
+                prompt: "cerulean dragonfly over water", rating: rating
+            )
+            try await store.insertAsset(updated)
+        }
+        let results = try await store.searchPrompts(query: "dragonfly")
+        #expect(results.count == 1)
+        #expect(results[0].id == "fts-dup")
+        #expect(results[0].rating == 3)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("re-ingesting a path preserves id, rating, and favorite")
+    func reingestPreservesAnnotations() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let original = TestData.makeAsset(
+            id: "original-id", filename: "keeper.png",
+            prompt: "an annotated masterpiece", rating: 4, favorite: true
+        )
+        try await store.insertAsset(original)
+
+        // Simulate a re-ingest: fresh UUID, same absolute path, no metadata.
+        let reingested = DAMAsset(
+            filename: "keeper.png",
+            absolutePath: original.absolutePath,
+            fileSize: 999
+        )
+        let stored = try await store.insertAsset(reingested)
+        #expect(stored.id == "original-id")
+
+        let fetched = try await store.fetchAssets()
+        #expect(fetched.count == 1)
+        #expect(fetched[0].id == "original-id")
+        #expect(fetched[0].rating == 4)
+        #expect(fetched[0].favorite)
+        // File metadata refreshed, generation metadata preserved.
+        #expect(fetched[0].fileSize == 999)
+        #expect(fetched[0].prompt == "an annotated masterpiece")
+        // FTS still resolves to the single surviving row.
+        let results = try await store.searchPrompts(query: "masterpiece")
+        #expect(results.count == 1)
+        #expect(results[0].id == "original-id")
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("fetchAsset(byPath:) returns tracked asset or nil")
+    func fetchByPath() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let asset = TestData.makeAsset(id: "by-path", filename: "by-path.png")
+        try await store.insertAsset(asset)
+        let found = try await store.fetchAsset(byPath: asset.absolutePath)
+        #expect(found?.id == "by-path")
+        let missing = try await store.fetchAsset(byPath: "/tmp/does-not-exist.png")
+        #expect(missing == nil)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("preserves all asset fields through insert and fetch")
     func allFields() async throws {
         let tmpDir = NSTemporaryDirectory()

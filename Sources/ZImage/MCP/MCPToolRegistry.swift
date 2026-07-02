@@ -113,7 +113,7 @@ public enum MCPToolRegistry {
               ] as [String: Any],
               "scale": [
                 "type": "number",
-                "description": "LoRA weight scale (0.0-2.0). Default: 1.0.",
+                "description": "LoRA weight scale. Default: 1.0. Negative values invert the effect (useful for slider LoRAs like breast size). Typical range: -5.0 to 5.0.",
               ] as [String: Any],
             ] as [String: Any],
             "required": ["path"] as [String],

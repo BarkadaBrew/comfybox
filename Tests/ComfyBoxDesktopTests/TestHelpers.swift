@@ -151,7 +151,9 @@ enum TestData {
     static func makeQueueInfo(
         isRendering: Bool = false,
         pendingCount: Int = 0,
-        renderCount: Int = 42
+        renderCount: Int = 42,
+        currentJobId: String? = nil,
+        progressPercent: Double? = nil
     ) -> QueueInfo {
         QueueInfo(
             isRendering: isRendering,
@@ -160,7 +162,9 @@ enum TestData {
             uptimeSeconds: 3600,
             lastRenderDurationMs: 15000,
             lastError: nil,
-            memoryUsageMB: 8192
+            memoryUsageMB: 8192,
+            currentJobId: currentJobId,
+            progressPercent: progressPercent
         )
     }
 

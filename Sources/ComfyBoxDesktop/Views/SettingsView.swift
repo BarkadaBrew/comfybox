@@ -285,10 +285,20 @@ struct SettingsView: View {
     // MARK: - Actions
 
     private func applyAndSave() {
+        let endpointChanged = engine.serverHost != settings.serverHost
+            || engine.serverPort != settings.serverPort
+        let wasConnected = engine.connectionState.isConnected
+
         // Apply to engine
         engine.serverHost = settings.serverHost
         engine.serverPort = settings.serverPort
         engine.outputDirectory = settings.outputDirectory
+
+        // Reconnect so a new host/port takes effect immediately.
+        if endpointChanged && wasConnected {
+            engine.disconnect()
+            engine.connect()
+        }
 
         // Persist to disk
         settings.save()

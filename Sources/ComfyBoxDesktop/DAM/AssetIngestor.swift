@@ -12,7 +12,10 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Watches an output directory and ingests new images into DAMStore.
+/// MainActor-isolated so its @Observable state is only mutated on the
+/// main thread; thumbnail generation runs off-main via a detached task.
 @Observable
+@MainActor
 public final class AssetIngestor {
     // MARK: - Published State
 
@@ -88,16 +91,25 @@ public final class AssetIngestor {
         isWatching = false
     }
 
-    /// Manually ingest a single file at the given path. Returns the created asset.
+    /// Manually ingest a single file at the given path. Returns the stored
+    /// asset (which keeps its original id if the path was already tracked).
     @discardableResult
     public func ingestFile(at path: String) async throws -> DAMAsset {
         let asset = try buildAsset(from: path)
-        try await store.insertAsset(asset)
-        generateThumbnail(for: path, assetId: asset.id)
+        let stored = try await store.insertAsset(asset)
+        let thumbPath = thumbnailPath(for: stored.id)
+        let maxDimension = thumbnailMaxDimension
+        let quality = thumbnailJPEGQuality
+        await Task.detached(priority: .utility) {
+            Self.generateThumbnail(
+                from: path, to: thumbPath,
+                maxDimension: maxDimension, jpegQuality: quality
+            )
+        }.value
         knownPaths.insert(path)
         ingestedCount += 1
-        lastIngestedFile = asset.filename
-        return asset
+        lastIngestedFile = stored.filename
+        return stored
     }
 
     // MARK: - Polling
@@ -218,9 +230,12 @@ public final class AssetIngestor {
 
     // MARK: - Thumbnail Generation
 
-    private func generateThumbnail(for imagePath: String, assetId: String) {
-        let thumbPath = thumbnailPath(for: assetId)
-
+    private nonisolated static func generateThumbnail(
+        from imagePath: String,
+        to thumbPath: String,
+        maxDimension: CGFloat,
+        jpegQuality: CGFloat
+    ) {
         // Skip if thumbnail already exists.
         guard !FileManager.default.fileExists(atPath: thumbPath) else { return }
 
@@ -230,7 +245,7 @@ public final class AssetIngestor {
 
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceThumbnailMaxPixelSize: Int(thumbnailMaxDimension),
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxDimension),
             kCGImageSourceCreateThumbnailWithTransform: true,
         ]
 
@@ -246,7 +261,7 @@ public final class AssetIngestor {
         ) else { return }
 
         let destOptions: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: thumbnailJPEGQuality,
+            kCGImageDestinationLossyCompressionQuality: jpegQuality,
         ]
         CGImageDestinationAddImage(dest, thumbnail, destOptions as CFDictionary)
         CGImageDestinationFinalize(dest)

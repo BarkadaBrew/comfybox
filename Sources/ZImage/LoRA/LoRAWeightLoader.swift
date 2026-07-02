@@ -55,21 +55,36 @@ public final class LoRAWeightLoader {
         var loraWeights: [String: (down: MLXArray, up: MLXArray)] = [:]
         var lokrW1: [String: MLXArray] = [:]
         var lokrW2: [String: MLXArray] = [:]
-        var lokrAlpha: [String: Float] = [:]
+        var moduleAlphas: [String: Float] = [:]
+        var networkAlpha: Float?
 
         for fileURL in safetensorFiles {
             let partial = try loadSafetensorFile(fileURL)
             for (k, v) in partial.loraPairs { loraWeights[k] = v }
             for (k, v) in partial.lokrW1 { lokrW1[k] = v }
             for (k, v) in partial.lokrW2 { lokrW2[k] = v }
-            for (k, v) in partial.lokrAlpha { lokrAlpha[k] = v }
+            for (k, v) in partial.moduleAlphas { moduleAlphas[k] = v }
+            if networkAlpha == nil { networkAlpha = partial.networkAlpha }
         }
 
         var lokrWeights: [String: LoKrWeights] = [:]
         lokrWeights.reserveCapacity(min(lokrW1.count, lokrW2.count))
         for (key, w1) in lokrW1 {
             guard let w2 = lokrW2[key] else { continue }
-            lokrWeights[key] = LoKrWeights(w1: w1, w2: w2, alpha: lokrAlpha[key])
+            lokrWeights[key] = LoKrWeights(w1: w1, w2: w2, alpha: moduleAlphas[key])
+        }
+
+        // Kohya-style `<module>.alpha` tensors also accompany standard
+        // lora_down/lora_up pairs; attach them per layer so scaling can use
+        // alpha / rank instead of the default 1.0.
+        var layerAlphas: [String: Float] = [:]
+        for (key, value) in moduleAlphas {
+            let weightKey = key + ".weight"
+            if loraWeights[weightKey] != nil {
+                layerAlphas[weightKey] = value
+            } else if loraWeights[key] != nil {
+                layerAlphas[key] = value
+            }
         }
 
         guard !loraWeights.isEmpty || !lokrWeights.isEmpty else {
@@ -77,9 +92,15 @@ public final class LoRAWeightLoader {
         }
 
         let rank = inferRank(from: loraWeights)
-        let alpha = loadAlpha(from: configDirectory)
+        let alpha = loadAlpha(from: configDirectory) ?? networkAlpha
 
-        return LoRAWeights(weights: loraWeights, lokrWeights: lokrWeights, rank: rank, alpha: alpha)
+        return LoRAWeights(
+            weights: loraWeights,
+            lokrWeights: lokrWeights,
+            rank: rank,
+            alpha: alpha,
+            layerAlphas: layerAlphas
+        )
     }
 
     public static func resolveSource(_ source: LoRASource) async throws -> URL {
@@ -171,7 +192,12 @@ public final class LoRAWeightLoader {
     }
 
     private static func inferRank(from weights: [String: (down: MLXArray, up: MLXArray)]) -> Int {
-        for (_, pair) in weights {
+        // Iterate keys in sorted order so mixed-rank adapters produce a
+        // deterministic result (dictionary order is unspecified). Per-layer
+        // ranks are still preferred at application time via
+        // LoRAWeights.effectiveScale(forLayer:).
+        for key in weights.keys.sorted() {
+            guard let pair = weights[key] else { continue }
             let downShape = pair.down.shape
             if downShape.count == 2 {
                 return min(downShape[0], downShape[1])
@@ -228,7 +254,11 @@ public final class LoRAWeightLoader {
         let loraPairs: [String: (down: MLXArray, up: MLXArray)]
         let lokrW1: [String: MLXArray]
         let lokrW2: [String: MLXArray]
-        let lokrAlpha: [String: Float]
+        /// Kohya/LyCORIS `<module>.alpha` scalars, used both for LoKr and
+        /// for per-layer scaling of standard lora_down/lora_up pairs.
+        let moduleAlphas: [String: Float]
+        /// Adapter-wide alpha from `ss_network_alpha` file metadata, if any.
+        let networkAlpha: Float?
     }
 
     private static func loadSafetensorFile(_ url: URL) throws -> PartialLoRAWeights {
@@ -239,7 +269,7 @@ public final class LoRAWeightLoader {
         var loraPairs: [String: (down: MLXArray, up: MLXArray)] = [:]
         var lokrW1: [String: MLXArray] = [:]
         var lokrW2: [String: MLXArray] = [:]
-        var lokrAlpha: [String: Float] = [:]
+        var moduleAlphas: [String: Float] = [:]
 
         for key in keys {
             if processedKeys.contains(key) { continue }
@@ -253,7 +283,7 @@ public final class LoRAWeightLoader {
                 case .alpha:
                     let tensor = try reader.tensor(named: key)
                     if let value = tensor.asArray(Float.self).first {
-                        lokrAlpha[moduleKey] = value
+                        moduleAlphas[moduleKey] = value
                     }
                 }
                 continue
@@ -276,7 +306,8 @@ public final class LoRAWeightLoader {
             loraPairs: loraPairs,
             lokrW1: lokrW1,
             lokrW2: lokrW2,
-            lokrAlpha: lokrAlpha
+            moduleAlphas: moduleAlphas,
+            networkAlpha: reader.fileMetadata["ss_network_alpha"].flatMap(Float.init)
         )
     }
 

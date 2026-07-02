@@ -15,8 +15,7 @@ let package = Package(
       url: "https://github.com/huggingface/swift-transformers",
       from: "1.1.6"
     ),
-    .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4"),
-    .package(url: "https://github.com/nalexn/ViewInspector.git", from: "0.10.0")
+    .package(url: "https://github.com/apple/swift-log.git", from: "1.6.4")
   ],
   targets: [
     .target(
@@ -25,7 +24,6 @@ let package = Package(
         .product(name: "MLX", package: "mlx-swift"),
         .product(name: "MLXFast", package: "mlx-swift"),
         .product(name: "MLXNN", package: "mlx-swift"),
-        .product(name: "MLXOptimizers", package: "mlx-swift"),
         .product(name: "MLXRandom", package: "mlx-swift"),
         .product(name: "Transformers", package: "swift-transformers"),
         .product(name: "Logging", package: "swift-log")
@@ -55,7 +53,9 @@ let package = Package(
       name: "ZImageIntegrationTests",
       dependencies: [
         "ZImage",
-        .product(name: "MLX", package: "mlx-swift")
+        .product(name: "MLX", package: "mlx-swift"),
+        .product(name: "MLXNN", package: "mlx-swift"),
+        .product(name: "MLXRandom", package: "mlx-swift")
       ],
       path: "Tests/ZImageIntegrationTests",
       resources: [
@@ -69,10 +69,7 @@ let package = Package(
     ),
     .testTarget(
       name: "ComfyBoxDesktopTests",
-      dependencies: [
-        "ComfyBoxDesktop",
-        .product(name: "ViewInspector", package: "ViewInspector")
-      ],
+      dependencies: ["ComfyBoxDesktop"],
       path: "Tests/ComfyBoxDesktopTests"
     )
   ]

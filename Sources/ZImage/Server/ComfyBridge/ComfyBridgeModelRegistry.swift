@@ -467,6 +467,27 @@ public enum ComfyBoxModelRegistry {
 
   // MARK: - Bridge Format
 
+  /// base_model string for the Krita plugin's Arch.from_string.
+  /// "flux2-klein" is not a recognized Arch — Klein maps to "flux2" with the
+  /// size variant carried in "type".
+  private static func kritaBaseModel(for model: ComfyBoxModel) -> String {
+    switch model.family {
+    case .flux2Klein: return "flux2"
+    default: return model.family.rawValue
+    }
+  }
+
+  /// type string for the Krita plugin. For Flux 2 Klein the type selects the
+  /// 4B/9B variant; for everything else it is the prediction type.
+  private static func kritaType(for model: ComfyBoxModel) -> String {
+    switch model.family {
+    case .flux2Klein:
+      return model.parametersBillions >= 9.0 ? "klein-9b" : "klein-4b"
+    default:
+      return model.supportsGuidance ? "v_prediction" : "eps"
+    }
+  }
+
   /// Convert to the format expected by /api/etn/model_info/{folder}.
   /// Returns [modelId: metadata] for the Krita AI Diffusion plugin.
   public static func bridgeModelInfo(for folder: String) -> [String: Any] {
@@ -474,9 +495,13 @@ public enum ComfyBoxModelRegistry {
     case "diffusion_models", "unet":
       var result: [String: Any] = [:]
       for model in allModels where model.variant != .upscaler {
+        // FIBO and Chroma workloads are not usable from the Krita plugin
+        // (unrecognized or unsupported Arch) — omit them until supported so
+        // they neither vanish silently nor surface as broken entries.
+        if model.family == .fibo || model.family == .chroma { continue }
         result[model.id] = [
-          "base_model": model.family.rawValue,
-          "type": model.supportsGuidance ? "v_prediction" : "eps",
+          "base_model": kritaBaseModel(for: model),
+          "type": kritaType(for: model),
           "is_inpaint": false,
           "quant": model.quantization.rawValue,
           "params_b": model.parametersBillions,

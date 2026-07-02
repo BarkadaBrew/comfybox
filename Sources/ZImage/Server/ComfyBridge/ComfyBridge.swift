@@ -35,7 +35,18 @@ final class ComfyBridge {
   /// Model switch handler — set by WarmServer to auto-switch models when Krita
   /// selects a different checkpoint. Returns true if the model was switched successfully.
   /// The handler receives the detected model ID from the workflow's CheckpointLoaderSimple node.
+  /// The WarmServer implementation runs the switch through the coordinator's FIFO
+  /// render queue so the pool load/activate cannot race an in-flight render.
   var modelSwitchHandler: ((_ modelId: String) async throws -> Bool)?
+
+  /// Interrupt handler — set by WarmServer to cancel the in-flight render task.
+  /// Returns true if a render was actually cancelled.
+  var interruptHandler: (() async -> Bool)?
+
+  /// Debug workflow dumps/logging are gated behind an env flag — they write full
+  /// prompts to a world-readable file in /tmp and to stdout.
+  static let debugWorkflowDumpEnabled =
+    ProcessInfo.processInfo.environment["COMFYBOX_DEBUG_WORKFLOW"] != nil
 
   /// LoRA Library reference — set by WarmServer for library-aware LoRA discovery.
   /// When set, invalidates the cached object_info so the next request picks up
@@ -82,7 +93,9 @@ final class ComfyBridge {
 
   /// Attempt to route a request through the ComfyUI bridge.
   /// Returns nil if this request is not a ComfyUI endpoint (falls through to WarmServer routes).
-  func route(_ request: HTTPRequest) -> RoutedResponse? {
+  /// Async so queue/interrupt handlers can await the coordinator directly instead
+  /// of blocking a cooperative-pool thread on a semaphore.
+  func route(_ request: HTTPRequest) async -> RoutedResponse? {
     let originalPath = request.path
     let path = Self.strippingAPIPrefix(from: originalPath)
 
@@ -117,10 +130,10 @@ final class ComfyBridge {
       return rawJSON(#"{"storage":"server","migrated":true,"users":{"":"default"}}"#)
 
     case ("GET", "/queue"):
-      return handleGetQueue()
+      return await handleGetQueue()
 
     case ("POST", "/queue"):
-      return handlePostQueue()
+      return await handlePostQueue(request)
 
     case ("GET", "/prompt"):
       return handleGetPrompt()
@@ -129,7 +142,7 @@ final class ComfyBridge {
       return handlePrompt(request)
 
     case ("POST", "/interrupt"):
-      return handleInterrupt()
+      return await handleInterrupt()
 
     case ("GET", "/view"):
       return handleView(request)
@@ -176,6 +189,22 @@ final class ComfyBridge {
       // Experiment models sub-path (e.g. /experiment/models/checkpoints).
       if path.hasPrefix("/experiment/models/") {
         return rawJSON("[]")
+      }
+
+      // No-op translation passthrough. The plugin expects the translated
+      // string as the JSON response body; without this route the /api
+      // catch-all returns "{}" and Krita uses "{}" as the prompt text.
+      if request.method == "GET", path.hasPrefix("/etn/translate/") {
+        return handleTranslate(path: path)
+      }
+
+      // LoRA upload: PUT /api/etn/upload/loras/{id} with raw file bytes.
+      if path.hasPrefix("/etn/upload/loras/") {
+        guard request.method == "PUT" || request.method == "POST" else {
+          return .error(.error(status: 405, message: "Method not allowed"))
+        }
+        let id = String(path.dropFirst("/etn/upload/loras/".count))
+        return handleLoRAUpload(id: id, body: request.body)
       }
 
       // Languages endpoint.
@@ -284,35 +313,25 @@ final class ComfyBridge {
 
   // MARK: - GET /queue
 
-  private func handleGetQueue() -> RoutedResponse {
+  private func handleGetQueue() async -> RoutedResponse {
     // Fetch rich queue status from the coordinator if available.
-    // Use a semaphore to bridge async → sync since route() is synchronous.
     if let provider = queueStatusProvider {
-      let semaphore = DispatchSemaphore(value: 0)
-      var status: ComfyBridgeQueueStatus?
-      Task {
-        status = await provider()
-        semaphore.signal()
-      }
-      semaphore.wait()
-
-      if let s = status {
-        let queue: [String: Any] = [
-          "queue_running": s.isRendering ? [["active_job"]] as [Any] : [] as [Any],
-          "queue_pending": Array(repeating: ["pending_job"] as [Any], count: s.pendingCount),
-          "queue_status": [
-            "pending_count": s.pendingCount,
-            "max_pending": s.maxPending,
-            "is_rendering": s.isRendering,
-            "current_job_id": s.currentJobId as Any,
-            "progress_percent": s.progressPercent as Any,
-            "render_count": s.renderCount,
-            "failed_count": s.failedCount,
-          ] as [String: Any],
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: queue) {
-          return .json(.rawJSON(status: 200, data: data))
-        }
+      let s = await provider()
+      let queue: [String: Any] = [
+        "queue_running": s.isRendering ? [["active_job"]] as [Any] : [] as [Any],
+        "queue_pending": Array(repeating: ["pending_job"] as [Any], count: s.pendingCount),
+        "queue_status": [
+          "pending_count": s.pendingCount,
+          "max_pending": s.maxPending,
+          "is_rendering": s.isRendering,
+          "current_job_id": s.currentJobId as Any,
+          "progress_percent": s.progressPercent as Any,
+          "render_count": s.renderCount,
+          "failed_count": s.failedCount,
+        ] as [String: Any],
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: queue) {
+        return .json(.rawJSON(status: 200, data: data))
       }
     }
 
@@ -344,40 +363,46 @@ final class ComfyBridge {
 
   // MARK: - POST /queue (delete queued jobs)
 
-  private func handlePostQueue() -> RoutedResponse {
-    // POST /queue with {"clear": true} cancels all pending jobs.
-    // This is a no-op if there are no pending jobs or no queue provider.
-    if let provider = queueStatusProvider {
-      let semaphore = DispatchSemaphore(value: 0)
-      var status: ComfyBridgeQueueStatus?
-      Task {
-        status = await provider()
-        semaphore.signal()
-      }
-      semaphore.wait()
+  private func handlePostQueue(_ request: HTTPRequest) async -> RoutedResponse {
+    let body = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
 
-      let cleared = status?.pendingCount ?? 0
-      logger.info("ComfyBridge: POST /queue — clearing \(cleared) pending job(s)")
-
-      // Signal the coordinator to clear pending jobs.
-      if let clearFn = queueClearHandler {
-        let sem2 = DispatchSemaphore(value: 0)
-        Task {
-          await clearFn()
-          sem2.signal()
-        }
-        sem2.wait()
-      }
-
+    // {"delete": [prompt_ids]} — cancel only the listed queued jobs.
+    // The Krita plugin uses this to cancel a single queued generation;
+    // clearing everything would silently kill its other queued jobs.
+    if let deleteList = body?["delete"] as? [Any] {
+      let promptIds = deleteList.compactMap { $0 as? String }
+      let cancelled = executor?.cancelQueued(promptIds: promptIds) ?? 0
+      logger.info("ComfyBridge: POST /queue delete — cancelled \(cancelled)/\(promptIds.count) queued job(s)")
       let response: [String: Any] = [
         "success": true,
-        "cleared_count": cleared,
+        "cancelled_count": cancelled,
       ]
       if let data = try? JSONSerialization.data(withJSONObject: response) {
         return .json(.rawJSON(status: 200, data: data))
       }
+      return .json(status: 200, payload: EmptyObject())
     }
 
+    // {"clear": true} (or a legacy/empty body) — cancel all pending jobs:
+    // the bridge's serialized queue plus the coordinator's pending queue.
+    let clearedBridge = executor?.cancelAllQueued() ?? 0
+    var clearedCoordinator = 0
+    if let provider = queueStatusProvider {
+      clearedCoordinator = await provider().pendingCount
+      // Signal the coordinator to clear pending jobs.
+      if let clearFn = queueClearHandler {
+        await clearFn()
+      }
+    }
+    logger.info("ComfyBridge: POST /queue clear — cancelled \(clearedBridge) bridge job(s), \(clearedCoordinator) coordinator job(s)")
+
+    let response: [String: Any] = [
+      "success": true,
+      "cleared_count": clearedBridge + clearedCoordinator,
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: response) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
     return .json(status: 200, payload: EmptyObject())
   }
 
@@ -408,8 +433,10 @@ final class ComfyBridge {
       return .error(.error(status: 500, message: "Failed to serialize prompt response"))
     }
 
-    // Debug: dump raw workflow JSON
-    if let dumpData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
+    // Debug: dump raw workflow JSON. Gated behind COMFYBOX_DEBUG_WORKFLOW —
+    // the dump contains full prompts and lands in world-readable /tmp.
+    if Self.debugWorkflowDumpEnabled,
+       let dumpData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]),
        let dumpStr = String(data: dumpData, encoding: .utf8) {
       try? dumpStr.write(toFile: "/tmp/zimage-debug-workflow.json", atomically: true, encoding: .utf8)
       logger.info("ComfyBridge: dumped workflow to /tmp/zimage-debug-workflow.json (\(dumpData.count) bytes)")
@@ -434,20 +461,26 @@ final class ComfyBridge {
     case .generate(let generateRequest):
       logger.info("ComfyBridge: /prompt [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, cfg=\(generateRequest.guidance), seed=\(generateRequest.seed.map(String.init) ?? "random")")
 
-      // Acknowledge immediately — generation runs async via WebSocket events.
-      // Model switch (if detected) happens inside the async Task before generation starts.
+      // Acknowledge immediately, but run the job through the executor's
+      // serialized queue: execution_start must only be emitted when the
+      // generation actually begins. The Krita plugin frees its one-job send
+      // slot on execution_start — emitting it while a previous job is still
+      // rendering makes the plugin mark that job interrupted and drop its
+      // results. The model switch (if detected) runs inside the serialized
+      // job so it cannot land in the coordinator queue ahead of a previously
+      // accepted generation.
       let detectedModel = generateRequest.detectedModel
       let switchHandler = modelSwitchHandler
-      Task {
+      executor.enqueue(promptId: generateRequest.promptId) { [logger] in
         // Auto-switch model if the workflow specifies a different checkpoint.
         if let modelId = detectedModel, let handler = switchHandler {
           do {
             let switched = try await handler(modelId)
             if switched {
-              self.logger.info("ComfyBridge: auto-switched to model '\(modelId)' for this render")
+              logger.info("ComfyBridge: auto-switched to model '\(modelId)' for this render")
             }
           } catch {
-            self.logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
+            logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
             // Continue with current model rather than failing the entire render.
           }
         }
@@ -456,7 +489,7 @@ final class ComfyBridge {
 
     case .upscale(let upscaleRequest):
       logger.info("ComfyBridge: /prompt [upscale] — model=\(upscaleRequest.upscaleModelName), input=\(upscaleRequest.inputImageNodeId)")
-      Task {
+      executor.enqueue(promptId: upscaleRequest.promptId) {
         await executor.executeUpscale(upscaleRequest)
       }
     }
@@ -470,9 +503,13 @@ final class ComfyBridge {
 
   // MARK: - POST /interrupt
 
-  private func handleInterrupt() -> RoutedResponse {
-    if let executor, executor.interrupt() {
-      logger.info("ComfyBridge: /interrupt — active generation interrupted")
+  private func handleInterrupt() async -> RoutedResponse {
+    // Broadcast execution_interrupted for the active prompt(s), then cancel the
+    // in-flight render task so the pipeline's denoise loop actually stops.
+    let hadActive = executor?.interrupt() ?? false
+    let cancelled = await interruptHandler?() ?? false
+    if hadActive || cancelled {
+      logger.info("ComfyBridge: /interrupt — active generation interrupted (render cancelled: \(cancelled))")
     } else {
       logger.info("ComfyBridge: /interrupt — no active generation")
     }
@@ -607,6 +644,72 @@ final class ComfyBridge {
       return .json(.rawJSON(status: 200, data: data))
     }
     return .error(.error(status: 500, message: "Failed to serialize model_info"))
+  }
+
+  // MARK: - Translation (no-op passthrough)
+
+  /// GET /api/etn/translate/{lang}/{text} — ComfyBox has no translation
+  /// backend (GET /etn/languages returns []), so echo the text back as a
+  /// JSON string. Prompts pass through unchanged when translation is enabled.
+  private func handleTranslate(path: String) -> RoutedResponse {
+    let remainder = String(path.dropFirst("/etn/translate/".count))
+    guard let separator = remainder.firstIndex(of: "/") else {
+      return .error(.error(status: 400, message: "Expected /etn/translate/{lang}/{text}"))
+    }
+    let rawText = String(remainder[remainder.index(after: separator)...])
+    let text = rawText.removingPercentEncoding ?? rawText
+    if let data = try? JSONSerialization.data(withJSONObject: text, options: [.fragmentsAllowed]) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize translation"))
+  }
+
+  // MARK: - LoRA Upload
+
+  /// LoRA upload destination — matches the directory the workflow parser and
+  /// WarmServer resolve bare LoraLoader names against.
+  private static let loraUploadDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
+
+  /// PUT /api/etn/upload/loras/{id} — persist the uploaded LoRA file so it
+  /// appears in LoraLoader options and resolves at generation time. Without
+  /// this, the catch-all returns 200 and the upload silently vanishes.
+  private func handleLoRAUpload(id: String, body: Data) -> RoutedResponse {
+    guard !body.isEmpty else {
+      return .error(.error(status: 400, message: "Empty LoRA upload body"))
+    }
+
+    let decoded = id.removingPercentEncoding ?? id
+    // Sanitize: allow subdirectories but reject empty ids, absolute paths,
+    // and path traversal.
+    let components = decoded.split(separator: "/").map(String.init)
+    guard !decoded.hasPrefix("/"), !components.isEmpty, !components.contains("..") else {
+      return .error(.error(status: 400, message: "Invalid LoRA id"))
+    }
+
+    var fileURL = URL(fileURLWithPath: Self.loraUploadDirectoryPath)
+    for component in components {
+      fileURL.appendPathComponent(component)
+    }
+
+    do {
+      try FileManager.default.createDirectory(
+        at: fileURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      try body.write(to: fileURL, options: .atomic)
+    } catch {
+      logger.error("ComfyBridge: failed to store uploaded LoRA \(decoded) — \(error)")
+      return .error(.error(status: 500, message: "Failed to store LoRA: \(error)"))
+    }
+
+    // Invalidate the cached object_info so the next /object_info request
+    // lists the new LoRA in LoraLoader options.
+    cacheLock.lock()
+    cachedObjectInfo = nil
+    cacheLock.unlock()
+
+    logger.info("ComfyBridge: stored uploaded LoRA \(decoded) (\(body.count) bytes)")
+    return .json(status: 200, payload: EmptyObject())
   }
 
   private func decodedQueryParameter(_ name: String, in request: HTTPRequest) -> String? {
