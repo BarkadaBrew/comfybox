@@ -5,6 +5,54 @@
 // persist to ~/.comfybox/desktop-config.json.
 
 import SwiftUI
+import ZImage
+
+// MARK: - AI Provider form models
+
+/// Editable string fields for one AI-provider endpoint, mapped to/from `AIProviderEndpoint`.
+struct EndpointForm {
+    var baseUrl: String = ""
+    var model: String = ""
+    var apiKey: String = ""
+
+    init() {}
+    init(_ endpoint: AIProviderEndpoint?) {
+        baseUrl = endpoint?.baseUrl ?? ""
+        model = endpoint?.model ?? ""
+        apiKey = endpoint?.apiKey ?? ""
+    }
+
+    /// A configured endpoint requires both a base URL and a model; otherwise it's absent.
+    func toEndpoint() -> AIProviderEndpoint? {
+        let b = baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let m = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !b.isEmpty, !m.isEmpty else { return nil }
+        let k = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return AIProviderEndpoint(baseUrl: b, model: m, apiKey: k.isEmpty ? nil : k)
+    }
+}
+
+/// The full editable provider registry for the Settings form.
+struct ProviderFormBundle {
+    var prompt = EndpointForm()
+    var vision = EndpointForm()
+    var captioning = EndpointForm()
+
+    init() {}
+    init(_ registry: AIProviderRegistry) {
+        prompt = EndpointForm(registry.promptOptimization)
+        vision = EndpointForm(registry.vision)
+        captioning = EndpointForm(registry.captioning)
+    }
+
+    func toRegistry() -> AIProviderRegistry {
+        AIProviderRegistry(
+            promptOptimization: prompt.toEndpoint(),
+            vision: vision.toEndpoint(),
+            captioning: captioning.toEndpoint()
+        )
+    }
+}
 
 // MARK: - Settings Storage
 
@@ -83,6 +131,12 @@ struct SettingsView: View {
     @State private var hasUnsavedChanges: Bool = false
     @State private var showingSaveConfirmation: Bool = false
 
+    // AI provider registry (server config, /v1/config)
+    @State private var providerForm = ProviderFormBundle()
+    @State private var loadedServerConfig: ComfyBoxServerConfig?
+    @State private var providerStatus: String?
+    @State private var providerIsError: Bool = false
+
     init(engine: EngineService) {
         self.engine = engine
         self._settings = State(initialValue: DesktopSettings.load())
@@ -104,8 +158,13 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Gallery", systemImage: "photo.on.rectangle")
                 }
+
+            providersTab
+                .tabItem {
+                    Label("AI Providers", systemImage: "brain")
+                }
         }
-        .frame(width: 480, height: 340)
+        .frame(width: 480, height: 460)
         .onDisappear {
             if hasUnsavedChanges {
                 applyAndSave()
@@ -280,6 +339,93 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    // MARK: - AI Providers Tab
+
+    private var providersTab: some View {
+        Form {
+            Section {
+                Text("Local AI endpoints (OpenAI-compatible, e.g. LM Studio). Stored server-side in ~/.comfybox/config.json.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            endpointSection("Prompt Optimization", form: $providerForm.prompt)
+            endpointSection("Vision (optional)", form: $providerForm.vision)
+            endpointSection("Captioning (optional)", form: $providerForm.captioning)
+
+            if let status = providerStatus {
+                Section {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(providerIsError ? .red : .secondary)
+                }
+            }
+
+            Section {
+                HStack {
+                    Spacer()
+                    Button("Reload") { Task { await loadProviders() } }
+                    Button("Save") { Task { await saveProviders() } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!engine.connectionState.isConnected)
+                    Spacer()
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .task { await loadProviders() }
+    }
+
+    @ViewBuilder
+    private func endpointSection(_ title: String, form: Binding<EndpointForm>) -> some View {
+        Section(title) {
+            TextField("Base URL", text: form.baseUrl)
+                .textContentType(.URL)
+                .autocorrectionDisabled()
+            TextField("Model", text: form.model)
+                .autocorrectionDisabled()
+            SecureField("API Key (optional)", text: form.apiKey)
+        }
+    }
+
+    private func loadProviders() async {
+        guard engine.connectionState.isConnected else {
+            providerStatus = "Connect to the server to edit AI providers."
+            providerIsError = true
+            return
+        }
+        do {
+            let config = try await engine.fetchServerConfig()
+            loadedServerConfig = config
+            providerForm = ProviderFormBundle(config.providers)
+            providerStatus = nil
+            providerIsError = false
+        } catch {
+            providerStatus = "Failed to load: \(error.localizedDescription)"
+            providerIsError = true
+        }
+    }
+
+    private func saveProviders() async {
+        do {
+            // Fetch-mutate-save so we preserve server-owned fields PUT would otherwise reset.
+            var config: ComfyBoxServerConfig
+            if let loaded = loadedServerConfig {
+                config = loaded
+            } else {
+                config = try await engine.fetchServerConfig()
+            }
+            config.providers = providerForm.toRegistry()
+            try await engine.saveServerConfig(config)
+            loadedServerConfig = config
+            providerStatus = "Saved to ~/.comfybox/config.json"
+            providerIsError = false
+        } catch {
+            providerStatus = "Failed to save: \(error.localizedDescription)"
+            providerIsError = true
+        }
     }
 
     // MARK: - Actions
