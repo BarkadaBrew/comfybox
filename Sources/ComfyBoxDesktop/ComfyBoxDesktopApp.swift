@@ -14,7 +14,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var store: DAMStore?
     @State private var ingestor: AssetIngestor?
     @State private var presetManager = PresetManager()
-    @State private var selectedTab: AppTab = .generate
+    @State private var selectedTab: AppTab = .dashboard
     @State private var initError: String?
     @State private var characters: [CharacterEntry] = []
     @State private var comparisonAssets: [DAMAsset]?
@@ -22,26 +22,32 @@ struct ComfyBoxDesktopApp: App {
     @State private var gallerySearchFocusRequests: Int = 0
 
     enum AppTab: String, CaseIterable {
+        case dashboard = "Dashboard"
         case generate = "Generate"
         case gallery = "Gallery"
         case compare = "Compare"
         case presets = "Presets"
+        case server = "Server"
 
         var icon: String {
             switch self {
+            case .dashboard: return "gauge.with.dots.needle.bottom.50percent"
             case .generate: return "wand.and.stars"
             case .gallery: return "photo.on.rectangle"
             case .compare: return "square.grid.2x2"
             case .presets: return "slider.horizontal.below.rectangle"
+            case .server: return "server.rack"
             }
         }
 
         var shortcutKey: KeyEquivalent {
             switch self {
-            case .generate: return "1"
-            case .gallery: return "2"
-            case .compare: return "3"
-            case .presets: return "4"
+            case .dashboard: return "1"
+            case .generate: return "2"
+            case .gallery: return "3"
+            case .compare: return "4"
+            case .presets: return "5"
+            case .server: return "6"
             }
         }
     }
@@ -109,6 +115,12 @@ struct ComfyBoxDesktopApp: App {
     @ViewBuilder
     private var detailView: some View {
         switch selectedTab {
+        case .dashboard:
+            DashboardView(engine: engine, store: store, ingestor: ingestor)
+
+        case .server:
+            ServerView(engine: engine)
+
         case .generate:
             GenerationView(
                 engine: engine,
