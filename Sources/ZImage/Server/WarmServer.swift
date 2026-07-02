@@ -1254,6 +1254,7 @@ public final class WarmServer {
     let resolvedSteps: Int
     let resolvedGuidance: Float
     let resolvedNegativePrompt: String?
+    let resolvedSampler: String?
 
     switch family {
     case .fibo:
@@ -1261,23 +1262,35 @@ public final class WarmServer {
       resolvedSteps = request.steps
       resolvedGuidance = request.guidance > 0 ? request.guidance : 4.0
       resolvedNegativePrompt = request.negativePrompt
+      resolvedSampler = request.sampler
     case .chroma:
       // Chroma: 28 steps default, guidance 0.0 (unconditioned)
       resolvedSteps = request.steps > 0 ? request.steps : 28
       resolvedGuidance = request.guidance
       resolvedNegativePrompt = nil
+      resolvedSampler = request.sampler
     case .flux1:
       let zimageVariant = await coordinator.currentZImageVariant
       if zimageVariant == .base {
-        // Z-Image Base: non-distilled, supports CFG guidance and negative prompts
-        resolvedSteps = request.steps
+        // Z-Image Base / undistilled checkpoints (Moody, etc.): the ComfyUI/Krita
+        // KSampler defaults are tuned for Turbo (9 steps, euler) and produce noise on
+        // undistilled models. When the request still carries those turbo defaults, apply
+        // the undistilled recommendations (40 steps, dpmpp_2m). If the user changed a
+        // value, respect it. (Model-aware defaults from PR #164, @bree.)
+        resolvedSteps = request.steps <= 9 ? 40 : request.steps
         resolvedGuidance = request.guidance > 0 ? request.guidance : ZImageModelMetadata.Base.recommendedGuidanceScale
         resolvedNegativePrompt = request.negativePrompt
+        let sampler = request.sampler ?? "euler"
+        resolvedSampler = sampler == "euler" ? "dpmpp_2m" : sampler
+        if resolvedSteps != request.steps || resolvedSampler != request.sampler {
+          logger.info("[WarmServer] Z-Image Base override: steps=\(resolvedSteps) (was \(request.steps)), sampler=\(resolvedSampler ?? "nil") (was \(request.sampler ?? "nil"))")
+        }
       } else {
         // Z-Image Turbo: distilled, optimal at 9 steps, no CFG, no negative prompts
         resolvedSteps = min(request.steps, 9)
         resolvedGuidance = 0.0
         resolvedNegativePrompt = nil
+        resolvedSampler = request.sampler
       }
     case .flux2:
       // Base (non-distilled) models support guidance > 1.0 and default to 50 steps;
@@ -1286,6 +1299,7 @@ public final class WarmServer {
       resolvedSteps = request.steps                 // Klein: no step clamp
       resolvedGuidance = isBaseModel ? request.guidance : 1.0
       resolvedNegativePrompt = nil                  // Klein: CFG only when guidance > 1.0
+      resolvedSampler = request.sampler
     }
 
     let payload = GeneratePayload(
@@ -1299,7 +1313,7 @@ public final class WarmServer {
       outputPath: nil,
       levelsMin: request.levelsMin,
       levelsMax: request.levelsMax,
-      scheduler: request.sampler,
+      scheduler: resolvedSampler,
       sigmaSchedule: request.sigmaSchedule,
       inpaintImageData: request.inpaintImageData,
       maskData: request.maskImageData,
