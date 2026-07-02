@@ -645,7 +645,8 @@ public final class EngineService {
 
     // MARK: - Character Registry
 
-    /// Fetch registered characters from the server.
+    /// Fetch registered characters from the server. `/v1/characters` returns a bare
+    /// JSON array (snake_case); `default_loras` are `{filename, scale}` objects.
     public func fetchCharacters() async -> [CharacterEntry] {
         guard let client = client, connectionState.isConnected else { return [] }
 
@@ -653,24 +654,58 @@ public final class EngineService {
             let (status, data) = try await client.get("/v1/characters")
             guard status == 200 else { return [] }
 
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let chars = json["characters"] as? [[String: Any]] else { return [] }
+            guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
 
-            return chars.compactMap { dict -> CharacterEntry? in
+            return arr.compactMap { dict -> CharacterEntry? in
                 guard let id = dict["id"] as? String,
                       let name = dict["name"] as? String else { return nil }
+
+                let loras: [String]
+                if let objs = dict["default_loras"] as? [[String: Any]] {
+                    loras = objs.compactMap { $0["filename"] as? String }
+                } else {
+                    loras = (dict["default_loras"] as? [String]) ?? []
+                }
 
                 return CharacterEntry(
                     id: id,
                     name: name,
                     description: (dict["description"] as? String) ?? "",
-                    defaultLoras: (dict["default_loras"] as? [String]) ?? [],
+                    defaultLoras: loras,
                     promptSnippet: (dict["prompt_snippet"] as? String) ?? "",
                     tags: (dict["tags"] as? [String]) ?? []
                 )
             }
         } catch {
             return []
+        }
+    }
+
+    /// Create or update a character. The server accepts camelCase input (tolerant decode).
+    public func saveCharacter(_ c: CharacterEntry) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let dict: [String: Any] = [
+            "id": c.id,
+            "name": c.name,
+            "description": c.description,
+            "promptSnippet": c.promptSnippet,
+            "tags": c.tags,
+            "defaultLoras": c.defaultLoras.map { ["filename": $0, "scale": 1.0] as [String: Any] }
+        ]
+        let body = try JSONSerialization.data(withJSONObject: dict)
+        let (status, data) = try await client.post("/v1/characters", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to save character")
+        }
+    }
+
+    /// Delete a character by id.
+    public func deleteCharacter(id: String) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let enc = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let (status, data) = try await client.delete("/v1/characters/\(enc)")
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to delete character")
         }
     }
 

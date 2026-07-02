@@ -27,6 +27,7 @@ struct ComfyBoxDesktopApp: App {
         case gallery = "Gallery"
         case compare = "Compare"
         case presets = "Presets"
+        case characters = "Characters"
         case server = "Server"
 
         var icon: String {
@@ -36,6 +37,7 @@ struct ComfyBoxDesktopApp: App {
             case .gallery: return "photo.on.rectangle"
             case .compare: return "square.grid.2x2"
             case .presets: return "slider.horizontal.below.rectangle"
+            case .characters: return "person.2.crop.square.stack"
             case .server: return "server.rack"
             }
         }
@@ -47,7 +49,8 @@ struct ComfyBoxDesktopApp: App {
             case .gallery: return "3"
             case .compare: return "4"
             case .presets: return "5"
-            case .server: return "6"
+            case .characters: return "6"
+            case .server: return "7"
             }
         }
     }
@@ -120,6 +123,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .server:
             ServerView(engine: engine)
+
+        case .characters:
+            CharactersView(engine: engine)
 
         case .generate:
             GenerationView(
