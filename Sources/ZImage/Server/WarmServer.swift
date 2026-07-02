@@ -22,7 +22,7 @@ public struct WarmServerConfiguration: Sendable {
   public var seedvr2WeightsPath: String?
 
   public init(
-    port: UInt16 = 7862,
+    port: UInt16 = ComfyBoxServerConfig.canonicalPort,
     modelSpec: String? = nil,
     textEncoderPath: String? = nil,
     initialLoRAs: [LoRAConfiguration] = [],
@@ -470,6 +470,55 @@ public final class WarmServer {
         return .json(.rawJSON(status: 200, data: data))
       }
       return .error(.error(status: 500, message: "Failed to serialize styles"))
+
+    // MARK: - Config
+    // The config document is served/accepted in its canonical camelCase shape (matching
+    // ~/.comfybox/config.json and the desktop's plain Codable) — not the snake_case DTO
+    // convention used by the render/status routes.
+
+    case ("GET", "/v1/config"):
+      let config = ComfyBoxServerConfig.loadOrMigrate()
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      if let data = try? encoder.encode(config) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize config"))
+
+    case ("PUT", "/v1/config"):
+      do {
+        let updated = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: request.body)
+        try updated.save()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(updated)
+        // Port/host changes take effect on next server start; the running listener is unchanged.
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(.error(status: 400, message: "Invalid config: \(error.localizedDescription)"))
+      }
+
+    case ("GET", "/v1/providers/status"):
+      let config = ComfyBoxServerConfig.loadOrMigrate()
+      func status(_ endpoint: AIProviderEndpoint?) -> [String: Any] {
+        guard let endpoint else { return ["configured": false] }
+        return [
+          "configured": true,
+          "model": endpoint.model,
+          "base_url": endpoint.baseUrl,
+          "has_api_key": !(endpoint.apiKey ?? "").isEmpty,
+        ]
+      }
+      let payload: [String: Any] = [
+        "prompt_optimization": status(config.providers.promptOptimization),
+        "vision": status(config.providers.vision),
+        "captioning": status(config.providers.captioning),
+        "replicate": ["configured": !(config.replicate?.apiKey ?? "").isEmpty],
+      ]
+      if let data = try? JSONSerialization.data(withJSONObject: payload) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize provider status"))
 
     // MARK: - Model Pool Endpoints
 

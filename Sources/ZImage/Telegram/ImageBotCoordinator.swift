@@ -25,7 +25,7 @@ public final class ImageBotCoordinator {
     public init(
       telegram: TelegramBot.Configuration,
       warmServerHost: String = "127.0.0.1",
-      warmServerPort: UInt16 = 7862,
+      warmServerPort: UInt16 = 7870,
       outputDirectory: String = ("~/Pictures/ComfyBox/Telegram" as NSString).expandingTildeInPath,
       galleryDirectory: String? = nil,
       optimizer: PromptOptimizer.Configuration = PromptOptimizer.Configuration(),
