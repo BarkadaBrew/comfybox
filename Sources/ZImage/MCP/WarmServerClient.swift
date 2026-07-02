@@ -13,7 +13,7 @@ public final class WarmServerClient: @unchecked Sendable {
   private let session: URLSession
   private let baseURL: String
 
-  public init(host: String = "127.0.0.1", port: UInt16 = 7862) {
+  public init(host: String = "127.0.0.1", port: UInt16 = 7870) {
     self.host = host
     self.port = port
     self.baseURL = "http://\(host):\(port)"
