@@ -18,8 +18,10 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let height: Int
   let steps: Int
   let guidance: Float
-  let seed: UInt64?
-  let batchSize: Int
+  /// Mutable so the executor can increment the seed per batch item.
+  var seed: UInt64?
+  /// Mutable so the executor can loop batch items as single generations.
+  var batchSize: Int
   /// The node ID of the output node (ETN_SaveImageCache or PreviewImage).
   let outputNodeId: String
   /// Sampler name extracted from KSamplerSelect node (e.g. "euler", "res_2s").
@@ -68,8 +70,9 @@ struct ComfyBridgeGenerateRequest: Sendable {
 
   // --- Model detection fields ---
 
-  /// Model ID detected from CheckpointLoaderSimple node in the workflow.
-  /// Used for automatic model switching when Krita selects a different checkpoint.
+  /// Model ID detected from the workflow's model loader node (UNETLoader,
+  /// NunchakuZImageDiTLoader, or legacy CheckpointLoaderSimple).
+  /// Used for automatic model switching when Krita selects a different model.
   let detectedModel: String?
 
   /// Optional CoffeeShop optimizer node extracted from the workflow.
@@ -223,7 +226,19 @@ enum ComfyBridgeWorkflowParser {
     }
 
     // --- Steps ---
-    let schedulerNode = nodes.values.first { $0.classType == "BasicScheduler" }
+    // Krita emits BasicScheduler for the common sigma schedules, but alternate
+    // scheduler settings produce AlignYourStepsScheduler, GITSScheduler,
+    // PolyexponentialScheduler, LaplaceScheduler, or Flux2Scheduler — all of
+    // which carry a "steps" input. Sort by node id so multi-pass workflows
+    // resolve deterministically, preferring BasicScheduler (the primary pass).
+    let schedulerClassTypes: Set<String> = [
+      "BasicScheduler", "AlignYourStepsScheduler", "GITSScheduler",
+      "PolyexponentialScheduler", "LaplaceScheduler", "Flux2Scheduler",
+    ]
+    let schedulerNodes = nodes.values
+      .filter { schedulerClassTypes.contains($0.classType) }
+      .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    let schedulerNode = schedulerNodes.first { $0.classType == "BasicScheduler" } ?? schedulerNodes.first
     // Also check KSampler for denoise (Krita may use KSampler instead of BasicScheduler)
     let kSamplerNode = nodes.values.first { $0.classType == "KSampler" || $0.classType == "KSamplerAdvanced" }
     let steps = intValue(schedulerNode?.inputs["steps"]) ?? 9
@@ -283,7 +298,9 @@ enum ComfyBridgeWorkflowParser {
     // Detect inpaint workflows by finding ETN_LoadImageCache nodes.
     // The first one is typically the input image, the second is the mask.
     // Node connections determine which is image vs mask.
-    let (inpaintImageId, maskImageId) = extractInpaintImageIds(nodes: nodes)
+    // (var: structural control workflows below may reclaim a cache image
+    // that the fallback heuristic misattributed as the inpaint source.)
+    var (inpaintImageId, maskImageId) = extractInpaintImageIds(nodes: nodes)
 
     // --- Phase 3: Mask preprocessing parameters ---
     // Extract grow and feather from INPAINT_ExpandMask node.
@@ -353,8 +370,16 @@ enum ComfyBridgeWorkflowParser {
     var controlnetEnd: Float = 1.0
     var controlImageId: String?
 
-    // Check for ZImageFunControlnet node first (our custom node)
-    if let funControlNode = nodes.values.first(where: { $0.classType == "ZImageFunControlnet" }) {
+    // Check for ZImageFunControlnet node first (our custom node).
+    // Multiple control layers chain several ZImageFunControlnet nodes —
+    // only the first (by node id) is applied; extras are ignored explicitly.
+    let funControlNodes = nodes.values
+      .filter { $0.classType == "ZImageFunControlnet" }
+      .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    if let funControlNode = funControlNodes.first {
+      if funControlNodes.count > 1 {
+        print("[ComfyBridge] warning: \(funControlNodes.count) ZImageFunControlnet nodes in workflow — only node \(funControlNode.id) is applied")
+      }
       // The model_patch input links to a ModelPatchLoader node
       if let patchRef = funControlNode.inputs["model_patch"] as? [Any],
          let patchNodeId = patchRef.first as? String,
@@ -367,13 +392,19 @@ enum ComfyBridgeWorkflowParser {
       controlnetStrength = floatValue(funControlNode.inputs["strength"]) ?? 0.5
       controlnetStart = floatValue(funControlNode.inputs["start"]) ?? 0.0
       controlnetEnd = floatValue(funControlNode.inputs["end"]) ?? 1.0
-      // The inpaint_image input links to ETN_LoadImageCache or another image source
-      if let imgRef = funControlNode.inputs["inpaint_image"] as? [Any],
-         let imgNodeId = imgRef.first as? String,
-         let imgNode = nodes[imgNodeId] {
-        if imgNode.classType == "ETN_LoadImageCache" {
-          controlImageId = imgNode.inputs["id"] as? String
-        }
+      // The control image arrives on "inpaint_image" for inpaint workflows and
+      // on "image" for structural control modes (scribble, soft edge, canny,
+      // depth, pose). Either may pass through intermediate nodes (ImageScale,
+      // HintImageEnchance, preprocessors) before the source ETN_LoadImageCache.
+      if let inpaintControlId = resolveImageCacheId(ref: funControlNode.inputs["inpaint_image"], nodes: nodes) {
+        controlImageId = inpaintControlId
+      } else if let structuralControlId = resolveImageCacheId(ref: funControlNode.inputs["image"], nodes: nodes) {
+        controlImageId = structuralControlId
+        // Structural control is not inpainting — the control layer's cache
+        // image must not double as the inpaint source image (the inpaint
+        // heuristic's fallback can misattribute it).
+        if inpaintImageId == structuralControlId { inpaintImageId = nil }
+        if maskImageId == structuralControlId { maskImageId = nil }
       }
     }
     // Fallback: standard ControlNetLoader node
@@ -389,20 +420,23 @@ enum ComfyBridgeWorkflowParser {
     }
 
 
-    // --- Model detection from CheckpointLoaderSimple ---
-    // Krita sends a CheckpointLoaderSimple node with ckpt_name indicating the user's
+    // --- Model detection from the workflow's model loader node ---
+    // Krita emits UNETLoader (or NunchakuZImageDiTLoader) with the user's
     // selected model. We extract this and map it to a ComfyBox pool model ID.
     let detectedModel = Self.extractDetectedModel(from: nodes)
 
     // --- CoffeeShop optimizer detection ---
     let optimizer = detectedOptimizer
 
-    // Debug: log workflow structure
-    let _nodeTypes = nodes.values.map { $0.classType }.sorted()
-    let _loraDesc = loras.isEmpty ? "none" : loras.map { "\($0.name)@\($0.scale)" }.joined(separator: ", ")
-    let _cnDesc = controlnetModel ?? "none"
-    let _modelDesc = detectedModel ?? "none"
-    print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc) controlnet=\(_cnDesc) model=\(_modelDesc)")
+    // Debug: log workflow structure. Gated behind COMFYBOX_DEBUG_WORKFLOW —
+    // the parsed summary includes prompt-derived details and prints per-request.
+    if ComfyBridge.debugWorkflowDumpEnabled {
+      let _nodeTypes = nodes.values.map { $0.classType }.sorted()
+      let _loraDesc = loras.isEmpty ? "none" : loras.map { "\($0.name)@\($0.scale)" }.joined(separator: ", ")
+      let _cnDesc = controlnetModel ?? "none"
+      let _modelDesc = detectedModel ?? "none"
+      print("[ComfyBridge] workflow nodes: \(_nodeTypes.joined(separator: ", ")), parsed: \(width)x\(height) denoise=\(denoise) loras=\(_loraDesc) controlnet=\(_cnDesc) model=\(_modelDesc)")
+    }
 
     return ComfyBridgeGenerateRequest(
       promptId: promptId,
@@ -655,6 +689,9 @@ enum ComfyBridgeWorkflowParser {
 
   // MARK: - Node Graph Traversal
 
+  /// Maximum reference-chain depth when walking the node graph.
+  private static let maxTraversalDepth = 8
+
   /// Follow a node reference to resolve the text value from a CLIPTextEncode node.
   private static func resolveTextInput(key: String, from node: WorkflowNode, nodes: [String: WorkflowNode]) -> String? {
     guard let ref = node.inputs[key] as? [Any],
@@ -665,18 +702,44 @@ enum ComfyBridgeWorkflowParser {
     return resolveText(from: textNode, nodes: nodes)
   }
 
-  private static func resolveText(from node: WorkflowNode, nodes: [String: WorkflowNode]) -> String? {
+  /// Resolve prompt text from a node, following "text" input references
+  /// recursively. When Krita's translation is enabled, CLIPTextEncode.text is
+  /// a reference to an ETN_Translate node whose own "text" input carries the
+  /// prompt (as a string or a further reference).
+  private static func resolveText(from node: WorkflowNode, nodes: [String: WorkflowNode], depth: Int = 0) -> String? {
+    guard depth < maxTraversalDepth else { return nil }
+    if node.classType == "CoffeeShopOptimizer" {
+      return node.inputs["raw_prompt"] as? String
+    }
     if let text = node.inputs["text"] as? String {
       return text
     }
     if let ref = node.inputs["text"] as? [Any],
        let refNodeId = ref.first as? String,
-       let sourceNode = nodes[refNodeId],
-       sourceNode.classType == "CoffeeShopOptimizer" {
-      return sourceNode.inputs["raw_prompt"] as? String
+       let sourceNode = nodes[refNodeId] {
+      return resolveText(from: sourceNode, nodes: nodes, depth: depth + 1)
     }
-    if node.classType == "CoffeeShopOptimizer" {
-      return node.inputs["raw_prompt"] as? String
+    return nil
+  }
+
+  /// Follow an image reference through intermediate nodes (ImageScale,
+  /// HintImageEnchance, preprocessor nodes, ...) to the source
+  /// ETN_LoadImageCache node's cache id.
+  private static func resolveImageCacheId(ref: Any?, nodes: [String: WorkflowNode], depth: Int = 0) -> String? {
+    guard depth < maxTraversalDepth,
+          let refArray = ref as? [Any],
+          let refNodeId = refArray.first as? String,
+          let node = nodes[refNodeId] else {
+      return nil
+    }
+    if node.classType == "ETN_LoadImageCache" {
+      return (node.inputs["id"] as? String) ?? (node.inputs["image_id"] as? String)
+    }
+    // Follow the node's own image-like input toward the source.
+    for key in ["image", "images", "pixels", "inpaint_image"] {
+      if let resolved = resolveImageCacheId(ref: node.inputs[key], nodes: nodes, depth: depth + 1) {
+        return resolved
+      }
     }
     return nil
   }
@@ -736,12 +799,28 @@ enum ComfyBridgeWorkflowParser {
     ("chroma", "chroma-8.9b"),
   ]
 
-  /// Extract the detected model ID from a CheckpointLoaderSimple node.
-  /// Returns nil if no checkpoint node is found or the model name is unrecognized.
+  /// Extract the detected model ID from the workflow's model loader node.
+  /// Krita classifies bridge models (served via /api/etn/model_info/
+  /// diffusion_models) as FileFormat.diffusion and emits UNETLoader — or
+  /// NunchakuZImageDiTLoader for svdq models. CheckpointLoaderSimple is only
+  /// a legacy fallback. Returns nil if no loader node is found.
   private static func extractDetectedModel(from nodes: [String: WorkflowNode]) -> String? {
-    guard let checkpointNode = nodes.values.first(where: { $0.classType == "CheckpointLoaderSimple" }),
-          let ckptName = checkpointNode.inputs["ckpt_name"] as? String,
-          !ckptName.isEmpty else {
+    let loaderCandidates: [(classType: String, inputKey: String)] = [
+      ("UNETLoader", "unet_name"),
+      ("NunchakuZImageDiTLoader", "model_name"),
+      ("CheckpointLoaderSimple", "ckpt_name"),
+    ]
+
+    var detectedName: String?
+    for (classType, inputKey) in loaderCandidates {
+      if let node = nodes.values.first(where: { $0.classType == classType }),
+         let name = node.inputs[inputKey] as? String,
+         !name.isEmpty {
+        detectedName = name
+        break
+      }
+    }
+    guard let ckptName = detectedName else {
       return nil
     }
 

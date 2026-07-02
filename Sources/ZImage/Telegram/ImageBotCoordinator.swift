@@ -388,11 +388,11 @@ public final class ImageBotCoordinator {
       let dims = state.aspectDimensions()
       var body: [String: Any] = [
         "prompt": finalPrompt,
-        "outputPath": outputPath,
+        "output_path": outputPath,
         "width": dims.width,
         "height": dims.height,
         "image_path": renderCtx.imagePath,
-        "strength": 0.5
+        "image_strength": 0.5
       ]
       if let cfg = state.cfgOverride { body["guidance"] = cfg }
 
@@ -401,14 +401,15 @@ public final class ImageBotCoordinator {
 
       guard status == 200,
             let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-            let actualOutputPath = responseJSON["outputPath"] as? String else {
+            let actualOutputPath = responseJSON["output_path"] as? String else {
         let errorMsg = parseErrorMessage(responseData) ?? "img2img returned status \(status)"
         let _ = try? await bot.sendMessage(chatId: chatId, text: "img2img failed: \(errorMsg)")
         return
       }
 
-      let durationMs = responseJSON["durationMs"] as? Int ?? 0
-      let responseSeed = responseJSON["seed"] as? Int
+      let durationMs = responseJSON["duration_ms"] as? Int ?? 0
+      // /v1/generate does not return a seed; no seed was sent with this request.
+      let responseSeed: Int? = nil
       var imageData = try Data(contentsOf: URL(fileURLWithPath: actualOutputPath))
 
       // Apply post-processing
@@ -953,11 +954,11 @@ public final class ImageBotCoordinator {
       }
 
       let serverStatus = json["status"] as? String ?? "unknown"
-      let queueLength = json["queueLength"] as? Int ?? 0
-      let totalGens = json["totalGenerations"] as? Int ?? 0
+      let queueLength = json["pending_count"] as? Int ?? 0
+      let totalGens = json["render_count"] as? Int ?? 0
       let model = json["model"] as? String ?? "none"
 
-      let statusEmoji = serverStatus == "idle" ? "\u{1F7E2}" : "\u{1F7E1}"
+      let statusEmoji = serverStatus == "ok" ? "\u{1F7E2}" : "\u{1F7E1}"
       let _ = try? await bot.sendMessage(chatId: chatId, text: """
       <b>Queue Status</b>
 
@@ -975,9 +976,16 @@ public final class ImageBotCoordinator {
 
   private func cancelQueueJobs(chatId: Int) async {
     do {
-      let (status, _) = try await warmServer.delete("/v1/queue")
+      // POST /queue (ComfyUI bridge endpoint) clears all pending jobs.
+      let body = try JSONSerialization.data(withJSONObject: ["clear": true])
+      let (status, data) = try await warmServer.post("/queue", body: body)
       if status == 200 || status == 204 {
-        let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F5D1} Queue cleared.")
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let cleared = json?["cleared_count"] as? Int {
+          let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F5D1} Queue cleared (\(cleared) pending job\(cleared == 1 ? "" : "s")).")
+        } else {
+          let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F5D1} Queue cleared.")
+        }
       } else {
         let _ = try? await bot.sendMessage(chatId: chatId, text: "Could not clear queue (status \(status)).")
       }
@@ -989,33 +997,34 @@ public final class ImageBotCoordinator {
 
   private func listQueueJobs(chatId: Int) async {
     do {
-      let (status, data) = try await warmServer.get("/v1/queue")
-      guard status == 200 else {
+      // GET /queue (ComfyUI bridge endpoint) returns queue_running/queue_pending
+      // placeholder arrays plus a queue_status summary — no per-job prompts.
+      let (status, data) = try await warmServer.get("/queue")
+      guard status == 200,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         let _ = try? await bot.sendMessage(chatId: chatId, text: "Could not fetch queue (status \(status)).")
         return
       }
 
-      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let jobs = json["jobs"] as? [[String: Any]] else {
+      let running = json["queue_running"] as? [Any] ?? []
+      let pending = json["queue_pending"] as? [Any] ?? []
+
+      if running.isEmpty && pending.isEmpty {
         let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F4E6} Queue is empty.")
         return
       }
 
-      if jobs.isEmpty {
-        let _ = try? await bot.sendMessage(chatId: chatId, text: "\u{1F4E6} Queue is empty.")
-        return
+      var lines: [String] = ["<b>Queue:</b>\n"]
+      if !running.isEmpty {
+        var renderLine = "\u{1F3A8} 1 job rendering"
+        if let queueStatus = json["queue_status"] as? [String: Any],
+           let progress = queueStatus["progress_percent"] as? Int {
+          renderLine += " (\(progress)%)"
+        }
+        lines.append(renderLine)
       }
-
-      var lines: [String] = ["<b>Queue (\(jobs.count) jobs):</b>\n"]
-      for (i, job) in jobs.prefix(10).enumerated() {
-        let prompt = job["prompt"] as? String ?? "?"
-        let truncated = prompt.count > 60 ? String(prompt.prefix(57)) + "..." : prompt
-        let jobStatus = job["status"] as? String ?? "pending"
-        let emoji = jobStatus == "rendering" ? "\u{1F3A8}" : "\u{23F3}"
-        lines.append("\(emoji) \(i + 1). \(truncated)")
-      }
-      if jobs.count > 10 {
-        lines.append("... and \(jobs.count - 10) more")
+      if !pending.isEmpty {
+        lines.append("\u{23F3} \(pending.count) pending")
       }
 
       let _ = try? await bot.sendMessage(chatId: chatId, text: lines.joined(separator: "\n"))
@@ -1386,7 +1395,7 @@ public final class ImageBotCoordinator {
       let dims = state.aspectDimensions()
       var body: [String: Any] = [
         "prompt": finalPrompt,
-        "outputPath": outputPath,
+        "output_path": outputPath,
         "width": dims.width,
         "height": dims.height
       ]
@@ -1407,12 +1416,13 @@ public final class ImageBotCoordinator {
       }
 
       guard let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-            let actualOutputPath = responseJSON["outputPath"] as? String else {
+            let actualOutputPath = responseJSON["output_path"] as? String else {
         return .failure(.generateFailed("Invalid response from WarmServer"))
       }
 
-      let durationMs = responseJSON["durationMs"] as? Int ?? 0
-      let responseSeed = responseJSON["seed"] as? Int
+      let durationMs = responseJSON["duration_ms"] as? Int ?? 0
+      // /v1/generate does not return a seed; echo the seed we requested (if any).
+      let responseSeed = seed ?? state.seedLock
 
       var imageData = try Data(contentsOf: URL(fileURLWithPath: actualOutputPath))
       var wasUpscaled = false
@@ -1492,11 +1502,11 @@ public final class ImageBotCoordinator {
       }
 
       guard let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-            let outputPath = responseJSON["outputPath"] as? String ?? responseJSON["output_path"] as? String else {
+            let outputPath = responseJSON["output_path"] as? String else {
         return .failure(.upscaleFailed("Invalid upscale response"))
       }
 
-      let durationMs = responseJSON["durationMs"] as? Int ?? responseJSON["duration_ms"] as? Int ?? 0
+      let durationMs = responseJSON["duration_ms"] as? Int ?? 0
       let data = try Data(contentsOf: URL(fileURLWithPath: outputPath))
 
       return .success(UpscaleOutput(data: data, outputPath: outputPath, durationMs: durationMs))
@@ -1520,11 +1530,11 @@ public final class ImageBotCoordinator {
       let dims = state.aspectDimensions()
       var body: [String: Any] = [
         "prompt": prompt,
-        "outputPath": polishedPath,
+        "output_path": polishedPath,
         "width": dims.width,
         "height": dims.height,
         "image_path": imagePath,
-        "strength": 0.35,
+        "image_strength": 0.35,
         "steps": 30
       ]
       if let cfg = state.cfgOverride {
@@ -1540,11 +1550,11 @@ public final class ImageBotCoordinator {
       }
 
       guard let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-            let outputPath = responseJSON["outputPath"] as? String else {
+            let outputPath = responseJSON["output_path"] as? String else {
         return .failure(.generateFailed("Invalid polish response"))
       }
 
-      let durationMs = responseJSON["durationMs"] as? Int ?? 0
+      let durationMs = responseJSON["duration_ms"] as? Int ?? 0
       let data = try Data(contentsOf: URL(fileURLWithPath: outputPath))
 
       return .success(PolishOutput(data: data, outputPath: outputPath, durationMs: durationMs))
@@ -1887,9 +1897,9 @@ public final class ImageBotCoordinator {
 
       let serverStatus = json["status"] as? String ?? "unknown"
       let model = json["model"] as? String ?? "none"
-      let uptime = json["uptimeSeconds"] as? Int ?? 0
-      let queueLength = json["queueLength"] as? Int ?? 0
-      let totalGens = json["totalGenerations"] as? Int ?? 0
+      let uptime = json["uptime_seconds"] as? Int ?? 0
+      let queueLength = json["pending_count"] as? Int ?? 0
+      let totalGens = json["render_count"] as? Int ?? 0
 
       let botUptime = Int(Date().timeIntervalSince(startTime))
       let charCount = characterLoader.allNames().count

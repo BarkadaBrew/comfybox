@@ -19,3 +19,9 @@ temp/
 models/
 checkpoints/
 outputs/
+
+# Test & build outputs
+default.profraw
+/comfybox-*.png
+/server/
+release-artifacts/

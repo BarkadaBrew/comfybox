@@ -55,14 +55,21 @@ public struct LoRASelection: Sendable, Identifiable, Equatable {
 }
 
 /// Decoded generation response from the server.
-private struct ServerGenerateResponse: Decodable {
+/// The server encodes all /v1/* responses with `.convertToSnakeCase`.
+struct ServerGenerateResponse: Decodable {
     let success: Bool
     let outputPath: String
     let durationMs: Int
+
+    enum CodingKeys: String, CodingKey {
+        case success
+        case outputPath = "output_path"
+        case durationMs = "duration_ms"
+    }
 }
 
 /// Decoded health response from the server.
-private struct ServerHealthResponse: Decodable {
+struct ServerHealthResponse: Decodable {
     let status: String
     let model: String?
     let modelFamily: String?
@@ -75,6 +82,8 @@ private struct ServerHealthResponse: Decodable {
     let lastError: String?
     let loras: [ServerLoRAState]?
     let memoryUsageMB: UInt64?
+    let currentJobId: String?
+    let progressPercent: Double?
 
     enum CodingKeys: String, CodingKey {
         case status, model, loaded, loras
@@ -86,11 +95,13 @@ private struct ServerHealthResponse: Decodable {
         case lastRenderDurationMs = "last_render_duration_ms"
         case lastError = "last_error"
         case memoryUsageMB = "memory_usage_mb"
+        case currentJobId = "current_job_id"
+        case progressPercent = "progress_percent"
     }
 }
 
 /// LoRA state from health endpoint.
-private struct ServerLoRAState: Decodable {
+struct ServerLoRAState: Decodable {
     let source: String
     let scale: Float
 }
@@ -176,9 +187,12 @@ public struct QueueInfo: Sendable {
     public let lastRenderDurationMs: Int?
     public let lastError: String?
     public let memoryUsageMB: UInt64
+    public let currentJobId: String?
+    public let progressPercent: Double?
 }
 
 @Observable
+@MainActor
 public final class EngineService {
     // MARK: - Published State
 
@@ -207,15 +221,22 @@ public final class EngineService {
     // MARK: - Configuration
 
     public var serverHost: String = "127.0.0.1"
-    public var serverPort: UInt16 = 7862
+    public var serverPort: UInt16 = 7870
     public var outputDirectory: String = NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath
 
     // MARK: - Private
 
     private var client: WarmServerClient?
-    private var healthPollTask: Task<Void, Never>?
+    // nonisolated(unsafe) so the nonisolated deinit can cancel it; Task.cancel()
+    // is thread-safe, and all other accesses happen on the main actor.
+    private nonisolated(unsafe) var healthPollTask: Task<Void, Never>?
 
-    public init() {}
+    public init() {
+        let config = AppConfig.load()
+        self.serverHost = config.serverHost
+        self.serverPort = config.serverPort
+        self.outputDirectory = NSString(string: config.outputDirectory).expandingTildeInPath
+    }
 
     deinit {
         healthPollTask?.cancel()
@@ -325,8 +346,14 @@ public final class EngineService {
             throw EngineServiceError.serverError(status, errorMessage)
         }
 
-        let decoder = JSONDecoder()
-        let response = try decoder.decode(ServerGenerateResponse.self, from: responseData)
+        let response: ServerGenerateResponse
+        do {
+            response = try JSONDecoder().decode(ServerGenerateResponse.self, from: responseData)
+        } catch {
+            let msg = "Failed to decode server response: \(error.localizedDescription)"
+            lastError = msg
+            throw EngineServiceError.generationFailed(msg)
+        }
 
         guard response.success else {
             let msg = "Generation reported failure"
@@ -577,7 +604,9 @@ public final class EngineService {
                 uptimeSeconds: health.uptimeSeconds ?? 0,
                 lastRenderDurationMs: health.lastRenderDurationMs,
                 lastError: health.lastError,
-                memoryUsageMB: health.memoryUsageMB ?? 0
+                memoryUsageMB: health.memoryUsageMB ?? 0,
+                currentJobId: health.currentJobId,
+                progressPercent: health.progressPercent
             )
         } catch is WarmServerClientError {
             connectionState = .disconnected

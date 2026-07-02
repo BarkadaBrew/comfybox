@@ -20,6 +20,8 @@ struct GalleryView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
     var onCompare: (([DAMAsset]) -> Void)?
+    /// Incremented by the app's Cmd+F command; consumed to focus search.
+    @Binding var searchFocusRequests: Int
 
     @State private var assets: [DAMAsset] = []
     @State private var searchText: String = ""
@@ -28,7 +30,6 @@ struct GalleryView: View {
     @State private var filterContentMode: String?
     @State private var filterCharacter: String?
     @State private var selectedAsset: DAMAsset?
-    @State private var showingDetail: Bool = false
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
 
@@ -70,25 +71,30 @@ struct GalleryView: View {
                 galleryGrid
             }
         }
-        .sheet(isPresented: $showingDetail) {
-            if let asset = selectedAsset {
-                AssetDetailView(
-                    asset: asset,
-                    thumbnailPath: ingestor.thumbnailPath(for: asset.id),
-                    onUpdate: { updated in
-                        Task { await updateAsset(updated) }
-                        showingDetail = false
-                    }
-                )
-                .frame(minWidth: 800, minHeight: 500)
-            }
+        .sheet(item: $selectedAsset) { asset in
+            AssetDetailView(
+                asset: asset,
+                thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+                onUpdate: { updated in
+                    Task { await updateAsset(updated) }
+                    selectedAsset = nil
+                }
+            )
+            .frame(minWidth: 800, minHeight: 500)
         }
-        .task {
+        .task(id: searchText) {
+            // Debounce while the user is typing, then re-run the FTS query.
+            if !searchText.isEmpty {
+                try? await Task.sleep(for: .milliseconds(250))
+                if Task.isCancelled { return }
+            }
             await loadAssets()
         }
         .onChange(of: ingestor.ingestedCount) { _, _ in
             Task { await loadAssets() }
         }
+        .onAppear { consumeSearchFocusRequest() }
+        .onChange(of: searchFocusRequests) { _, _ in consumeSearchFocusRequest() }
         .onKeyPress(.space) {
             if let asset = selectedAsset {
                 quickLookAsset(asset)
@@ -222,7 +228,6 @@ struct GalleryView: View {
                             toggleComparisonSelection(asset)
                         } else {
                             selectedAsset = asset
-                            showingDetail = true
                         }
                     }
                     .contextMenu {
@@ -356,6 +361,14 @@ struct GalleryView: View {
     /// Focus the search field (called by Cmd+F keyboard shortcut).
     func focusSearch() {
         searchFieldFocused = true
+    }
+
+    /// Consume a pending Cmd+F focus request from the app commands.
+    private func consumeSearchFocusRequest() {
+        guard searchFocusRequests > 0 else { return }
+        searchFocusRequests = 0
+        // Defer a tick so the field is in the hierarchy before focusing.
+        Task { focusSearch() }
     }
 
     private func updateAsset(_ asset: DAMAsset) async {
@@ -531,7 +544,7 @@ struct GalleryCellView: View {
     private func loadThumbnail() async {
         let path = thumbnailPath
         let fullPath = asset.absolutePath
-        let image = await Task.detached {
+        let image: NSImage? = await Task.detached {
             NSImage(contentsOfFile: path) ?? NSImage(contentsOfFile: fullPath)
         }.value
         await MainActor.run {

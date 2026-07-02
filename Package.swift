@@ -24,7 +24,6 @@ let package = Package(
         .product(name: "MLX", package: "mlx-swift"),
         .product(name: "MLXFast", package: "mlx-swift"),
         .product(name: "MLXNN", package: "mlx-swift"),
-        .product(name: "MLXOptimizers", package: "mlx-swift"),
         .product(name: "MLXRandom", package: "mlx-swift"),
         .product(name: "Transformers", package: "swift-transformers"),
         .product(name: "Logging", package: "swift-log")
@@ -54,7 +53,9 @@ let package = Package(
       name: "ZImageIntegrationTests",
       dependencies: [
         "ZImage",
-        .product(name: "MLX", package: "mlx-swift")
+        .product(name: "MLX", package: "mlx-swift"),
+        .product(name: "MLXNN", package: "mlx-swift"),
+        .product(name: "MLXRandom", package: "mlx-swift")
       ],
       path: "Tests/ZImageIntegrationTests",
       resources: [
@@ -65,6 +66,11 @@ let package = Package(
       name: "ZImageE2ETests",
       dependencies: ["ZImage"],
       path: "Tests/ZImageE2ETests"
+    ),
+    .testTarget(
+      name: "ComfyBoxDesktopTests",
+      dependencies: ["ComfyBoxDesktop"],
+      path: "Tests/ComfyBoxDesktopTests"
     )
   ]
 )

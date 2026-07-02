@@ -98,15 +98,15 @@ public struct LoRAApplicator {
         logger: Logger? = nil
     ) -> [String: MLXArray] {
         var merged = baseWeights
-        let effectiveScale = scale * loraWeights.effectiveScale
 
-        logger?.info("Merging LoRA weights with scale=\(scale), alpha=\(loraWeights.alpha), rank=\(loraWeights.rank), effective_scale=\(effectiveScale)")
+        logger?.info("Merging LoRA weights with scale=\(scale), alpha=\(loraWeights.alpha), rank=\(loraWeights.rank)")
 
         var appliedCount = 0
         var skippedCount = 0
 
         for (keyPath, (down, up)) in loraWeights.weights {
             let weightKey = keyPath.hasSuffix(".weight") ? keyPath : keyPath + ".weight"
+            let effectiveScale = scale * loraWeights.effectiveScale(forLayer: keyPath)
 
             guard let baseWeight = merged[weightKey] else {
                 logger?.debug("LoRA key '\(weightKey)' not found in base weights, skipping")
@@ -154,9 +154,7 @@ public struct LoRAApplicator {
         scale: Float,
         logger: Logger? = nil
     ) {
-        let effectiveScale = scale * loraWeights.effectiveScale
-
-        logger?.info("Applying LoRA to transformer with scale=\(scale), effective_scale=\(effectiveScale)")
+        logger?.info("Applying LoRA to transformer with scale=\(scale)")
 
         var appliedCount = 0
         var quantizedCount = 0
@@ -169,6 +167,8 @@ public struct LoRAApplicator {
             guard let (down, up) = loraWeights.weights[loraKey] ?? loraWeights.weights[loraKeyBase] else {
                 continue
             }
+
+            let effectiveScale = scale * loraWeights.effectiveScale(forLayer: loraKey)
 
             guard let dims = linearDims(for: module),
                   let normalized = normalizeLoRAPair(
@@ -251,10 +251,10 @@ public struct LoRAApplicator {
         logger: Logger? = nil
     ) -> [String: MLXArray] {
         var restored = mergedWeights
-        let effectiveScale = scale * loraWeights.effectiveScale
 
         for (keyPath, (down, up)) in loraWeights.weights {
             let weightKey = keyPath.hasSuffix(".weight") ? keyPath : keyPath + ".weight"
+            let effectiveScale = scale * loraWeights.effectiveScale(forLayer: keyPath)
 
             guard let currentWeight = restored[weightKey],
                   let normalized = normalizedLoRAPair(
@@ -300,6 +300,19 @@ public struct LoRAApplicator {
         applyLoKrInternal(to: transformer, loraWeights: loraWeights, signedScale: -scale, logger: logger)
     }
 
+    /// LyCORIS LoKr convention: the delta w1 ⊗ w2 is scaled by alpha / dim,
+    /// not by alpha as a raw multiplier. We only load full-matrix LoKr
+    /// (lokr_w1/lokr_w2 without a w2_a/w2_b factorization), so dim is taken
+    /// as the smaller dimension of w2 — the `lora_dim` a factorized w2 would
+    /// have used. LyCORIS stores alpha == dim for full-matrix modules, so
+    /// this typically evaluates to 1.0. Internal for unit testing.
+    static func lokrAlphaScale(alpha: Float?, w2Shape: [Int]) -> Float {
+        guard let alpha, w2Shape.count == 2 else { return 1.0 }
+        let dim = min(w2Shape[0], w2Shape[1])
+        guard dim > 0, alpha > 0 else { return 1.0 }
+        return alpha / Float(dim)
+    }
+
     private static func applyLoKrInternal<T: Module>(
         to transformer: T,
         loraWeights: LoRAWeights,
@@ -332,8 +345,7 @@ public struct LoRAApplicator {
                 continue
             }
 
-            let alphaScale = lokr.alpha ?? 1.0
-            let effectiveScale = signedScale * alphaScale
+            let effectiveScale = signedScale * lokrAlphaScale(alpha: lokr.alpha, w2Shape: lokr.w2.shape)
 
             if let qlin = module as? QuantizedLinear {
                 let dequantizedWeight = MLX.dequantized(
@@ -409,9 +421,7 @@ public struct LoRAApplicator {
         scale: Float,
         logger: Logger? = nil
     ) {
-        let effectiveScale = scale * loraWeights.effectiveScale
-
-        logger?.info("Applying dynamic LoRA with scale=\(scale), effective_scale=\(effectiveScale)")
+        logger?.info("Applying dynamic LoRA with scale=\(scale)")
 
         var moduleUpdates: [(String, Module)] = []
         var appliedCount = 0
@@ -422,6 +432,7 @@ public struct LoRAApplicator {
 
             let loraKey = key.hasSuffix(".weight") ? key : key + ".weight"
             var pair: (down: MLXArray, up: MLXArray)? = loraWeights.weights[loraKey] ?? loraWeights.weights[key]
+            var scaleKey = loraKey
 
             if pair == nil {
                 // Fallback: some LoRA packs store combined qkv deltas under attention.qkv.*
@@ -453,11 +464,14 @@ public struct LoRAApplicator {
                         projectionIndex: projectionIndex
                        ) {
                         pair = normalized
+                        scaleKey = qkvKey + ".weight"
                     }
                 }
             }
 
             guard let pair else { continue }
+
+            let effectiveScale = scale * loraWeights.effectiveScale(forLayer: scaleKey)
 
             guard let normalized = normalizeLoRAPair(
                 down: pair.down,

@@ -18,6 +18,8 @@ struct ComfyBoxDesktopApp: App {
     @State private var initError: String?
     @State private var characters: [CharacterEntry] = []
     @State private var comparisonAssets: [DAMAsset]?
+    @State private var pendingPreset: GenerationPreset?
+    @State private var gallerySearchFocusRequests: Int = 0
 
     enum AppTab: String, CaseIterable {
         case generate = "Generate"
@@ -89,7 +91,9 @@ struct ComfyBoxDesktopApp: App {
             CommandGroup(after: .textEditing) {
                 Button("Find in Gallery") {
                     selectedTab = .gallery
-                    // Focus is handled by GalleryView's focusSearch()
+                    // GalleryView consumes the request and focuses its
+                    // search field via focusSearch().
+                    gallerySearchFocusRequests += 1
                 }
                 .keyboardShortcut("f", modifiers: .command)
             }
@@ -110,7 +114,8 @@ struct ComfyBoxDesktopApp: App {
                 engine: engine,
                 presetManager: presetManager,
                 characters: characters,
-                onGenerated: handleGenerated
+                onGenerated: handleGenerated,
+                pendingPreset: $pendingPreset
             )
 
         case .gallery:
@@ -121,7 +126,8 @@ struct ComfyBoxDesktopApp: App {
                     onCompare: { assets in
                         comparisonAssets = assets
                         selectedTab = .compare
-                    }
+                    },
+                    searchFocusRequests: $gallerySearchFocusRequests
                 )
             } else if let error = initError {
                 errorView(error)
@@ -144,9 +150,6 @@ struct ComfyBoxDesktopApp: App {
             PresetView(
                 presetManager: presetManager,
                 onApply: { preset in
-                    selectedTab = .generate
-                    // The GenerationView reads preset values when applied
-                    // through the presetManager binding.
                     applyPresetToGeneration(preset)
                 }
             )
@@ -236,10 +239,12 @@ struct ComfyBoxDesktopApp: App {
     // MARK: - Generation -> Ingestion Bridge
 
     /// Called when GenerationView successfully generates an image.
-    /// Ingests the output into DAMStore so it appears in the gallery.
+    /// Writes a metadata sidecar and ingests the output into DAMStore
+    /// so it appears in the gallery with its generation parameters.
     private func handleGenerated(_ path: String, _ request: GenerationRequest) {
         guard let ingestor = ingestor else { return }
         Task {
+            writeSidecarIfMissing(for: path, request: request)
             do {
                 try await ingestor.ingestFile(at: path)
             } catch {
@@ -249,13 +254,39 @@ struct ComfyBoxDesktopApp: App {
         }
     }
 
+    /// Write a `{basename}.json` sidecar next to the generated image so
+    /// AssetIngestor picks up prompt/seed/steps/size at ingest. Skipped if
+    /// a sidecar already exists (e.g. written by the server).
+    private func writeSidecarIfMissing(for imagePath: String, request: GenerationRequest) {
+        let jsonPath = ((imagePath as NSString).deletingPathExtension) + ".json"
+        guard !FileManager.default.fileExists(atPath: jsonPath) else { return }
+
+        var metadata: [String: Any] = [
+            "prompt": request.prompt,
+            "steps": request.steps,
+            "guidance": Double(request.guidance),
+            "width": request.width,
+            "height": request.height,
+        ]
+        if request.seed > 0 {
+            metadata["seed"] = request.seed
+        }
+        if let model = request.modelId ?? engine.currentModel {
+            metadata["model"] = model
+        }
+
+        if let data = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]) {
+            try? data.write(to: URL(fileURLWithPath: jsonPath))
+        }
+    }
+
     // MARK: - Preset Application
 
-    /// Apply a preset by switching to generate tab. The GenerationView
-    /// will read the preset values through its applyPreset method.
+    /// Queue a preset for the GenerationView and switch to the generate tab.
+    /// GenerationView consumes `pendingPreset` onAppear/onChange and applies
+    /// it via its applyPreset method.
     private func applyPresetToGeneration(_ preset: GenerationPreset) {
-        // The tab switch triggers; actual application happens in GenerationView.
-        // We store it for the view to pick up.
+        pendingPreset = preset
         selectedTab = .generate
     }
 }

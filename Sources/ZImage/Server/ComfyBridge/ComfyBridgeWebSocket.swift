@@ -255,18 +255,21 @@ private final class WebSocketConnection {
     } else {
       // 64-bit extended payload length.
       guard buf.count >= 10 else { return nil }
-      payloadLength = 0
+      var length64: UInt64 = 0
       for i in 0..<8 {
-        payloadLength = (payloadLength << 8) | Int(buf[buf.startIndex + 2 + i])
+        length64 = (length64 << 8) | UInt64(buf[buf.startIndex + 2 + i])
       }
       headerSize = 10
 
-      // Sanity check — reject frames larger than our limit.
-      if payloadLength > Self.maxMessageSize {
-        logger.warning("ComfyWS: frame too large (\(payloadLength) bytes), closing \(clientId)")
+      // Sanity check — reject frames larger than our limit. Compare as UInt64
+      // before converting to Int: a length with the top bit set would otherwise
+      // overflow to a negative Int, bypass this check, and crash on slicing.
+      guard length64 <= UInt64(Self.maxMessageSize) else {
+        logger.warning("ComfyWS: frame too large (\(length64) bytes), closing \(clientId)")
         closeWithProtocolError()
         return nil
       }
+      payloadLength = Int(length64)
     }
 
     let maskSize = masked ? 4 : 0

@@ -337,7 +337,7 @@ struct ZImageCLI {
 
     guard let prompt else {
       printUsage()
-      return
+      exit(1)
     }
 
     // Validate img2img flags
@@ -599,7 +599,7 @@ struct ZImageCLI {
               pipeline: .img2img,
               model: ModelInfo(
                 family: "zimage",
-                variant: "turbo",
+                variant: (capturedModel.map { ZImageRepository.isBaseModel($0) ? "base" : "turbo" }) ?? "turbo",
                 path: capturedModel ?? ZImageRepository.id
               ),
               parameters: GenerationParameters(
@@ -673,8 +673,15 @@ struct ZImageCLI {
     }
 
     if isChromaModel {
+      // Chroma packs 2x2 latent patches (VAE /8, then patchify /2), so
+      // pixel dimensions must be multiples of 16 or the reshape crashes.
+      guard width % 16 == 0 && height % 16 == 0 else {
+        fputs("Error: Chroma requires width and height to be multiples of 16 (got \(width)x\(height)).\n", stderr)
+        exit(1)
+      }
       nonisolated(unsafe) let chromaSemaphore = DispatchSemaphore(value: 0)
       let capturedModel = model
+      let capturedNegativePrompt = negativePrompt
       let capturedLoraEntries = loraEntries
       let capturedLoraScales = loraScaleOverrides
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
@@ -696,6 +703,7 @@ struct ZImageCLI {
         }
       }
 
+      var capturedError: (any Error)? = nil
       Task {
         do {
           // Resolve model snapshot
@@ -704,9 +712,8 @@ struct ZImageCLI {
 
           // Detect model config from snapshot
           guard let detected = ChromaModelDetection.detect(at: snapshot) else {
-            logger.error("Model at \(snapshot.path) is not a Chroma model")
-            chromaSemaphore.signal()
-            return
+            throw NSError(domain: "ZImageCLI", code: 1,
+              userInfo: [NSLocalizedDescriptionKey: "Model at \(snapshot.path) is not a Chroma model"])
           }
           logger.info("Detected Chroma model")
 
@@ -768,7 +775,7 @@ struct ZImageCLI {
           let tokenIds = tokenizer.encodeUnpadded(prompt: prompt)
 
           // Tokenize negative prompt for CFG (empty string = unconditional)
-          let negTokenIds = tokenizer.encodeUnpadded(prompt: "")
+          let negTokenIds = tokenizer.encodeUnpadded(prompt: capturedNegativePrompt ?? "")
 
           // Chroma defaults: 28 steps, guidance 0.0 (distilled), cfg 4.0
           // Flash-heun: 8 steps, heun/beta scheduler, CFG 1.0
@@ -810,11 +817,16 @@ struct ZImageCLI {
           logger.info("Chroma image saved to \(chromaOutputURL.path)")
         } catch {
           logger.error("Chroma generation failed: \(error)")
+          capturedError = error
           if let bar { bar.finish(forceNewline: true) }
         }
         chromaSemaphore.signal()
       }
       chromaSemaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
       return
     }
 
@@ -843,6 +855,7 @@ struct ZImageCLI {
       let capturedModel = model
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
       let bar = useBar ? ProgressBar(total: steps) : nil
+      var capturedError: (any Error)? = nil
       Task {
         do {
           // Resolve model snapshot
@@ -851,9 +864,8 @@ struct ZImageCLI {
 
           // Detect model config from snapshot
           guard let detected = FiboModelDetection.detect(at: snapshot) else {
-            logger.error("Model at \(snapshot.path) is not a FIBO model")
-            fiboSemaphore.signal()
-            return
+            throw NSError(domain: "ZImageCLI", code: 1,
+              userInfo: [NSLocalizedDescriptionKey: "Model at \(snapshot.path) is not a FIBO model"])
           }
           logger.info("Detected FIBO model")
 
@@ -898,11 +910,16 @@ struct ZImageCLI {
           if let bar { bar.finish(forceNewline: true) }
         } catch {
           logger.error("FIBO generation failed: \(error)")
+          capturedError = error
           if let bar { bar.finish(forceNewline: true) }
         }
         fiboSemaphore.signal()
       }
       fiboSemaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
       return
     }
 
@@ -930,10 +947,9 @@ struct ZImageCLI {
     if isFlux2 {
       nonisolated(unsafe) let flux2Semaphore = DispatchSemaphore(value: 0)
       let capturedModel = model
-      let capturedLoraEntries2 = loraEntries
-      let capturedLoraScales2 = loraScaleOverrides
       let useBar = !noProgress && (isatty(STDERR_FILENO) != 0)
       let bar = useBar ? ProgressBar(total: steps) : nil
+      var capturedError: (any Error)? = nil
       Task {
         do {
           // Resolve model snapshot
@@ -942,9 +958,8 @@ struct ZImageCLI {
 
           // Detect model config from snapshot
           guard let detected = Flux2ModelDetection.detect(at: snapshot) else {
-            logger.error("Model at \(snapshot.path) is not a Flux 2 Klein model")
-            flux2Semaphore.signal()
-            return
+            throw NSError(domain: "ZImageCLI", code: 1,
+              userInfo: [NSLocalizedDescriptionKey: "Model at \(snapshot.path) is not a Flux 2 Klein model"])
           }
           logger.info("Detected Flux 2 Klein \(detected.variant)")
 
@@ -967,45 +982,14 @@ struct ZImageCLI {
             logger.warning("Guidance scale \(guidance) has no effect on distilled Klein models (forcing 1.0)")
           }
 
-          // Apply LoRAs to Flux 2 transformer
-          if !capturedLoraEntries2.isEmpty {
-            logger.info("Loading \(capturedLoraEntries2.count) LoRA(s) for Flux 2")
-            for (idx, loraEntry) in capturedLoraEntries2.enumerated() {
-              let loraScale = idx < capturedLoraScales2.count ? capturedLoraScales2[idx] : 1.0
-
-              // Resolve LoRA path (local file or HuggingFace)
-              let loraPath: String
-              if FileManager.default.fileExists(atPath: loraEntry) {
-                loraPath = loraEntry
-              } else {
-                // Try as HuggingFace model ID
-                let resolved = try await ModelResolution.resolve(
-                  modelSpec: loraEntry,
-                  filePatterns: ["*.safetensors"]
-                )
-                let contents = try FileManager.default.contentsOfDirectory(
-                  at: resolved, includingPropertiesForKeys: nil
-                )
-                guard let safetensors = contents.first(where: { $0.pathExtension == "safetensors" }) else {
-                  logger.error("No safetensors found in LoRA: \(loraEntry)")
-                  continue
-                }
-                loraPath = safetensors.path
-              }
-
-              try flux2Pipeline.applyLoRA(path: loraPath, scale: loraScale)
-            }
-          }
-
           // Resolve img2img for Flux 2
           let flux2InputImage: URL? = initImagePath.map { URL(fileURLWithPath: $0) }
           let flux2DenoiseValue: Float = flux2InputImage != nil ? (flux2Denoise ?? 0.7) : 1.0
 
           if let img = flux2InputImage {
             guard FileManager.default.fileExists(atPath: img.path) else {
-              logger.error("Init image not found: \(img.path)")
-              flux2Semaphore.signal()
-              return
+              throw NSError(domain: "ZImageCLI", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Init image not found: \(img.path)"])
             }
             logger.info("Flux 2 img2img: source=\(img.path), denoise=\(flux2DenoiseValue)")
           }
@@ -1043,11 +1027,16 @@ struct ZImageCLI {
           if let bar { bar.finish(forceNewline: true) }
         } catch {
           logger.error("Flux 2 generation failed: \(error)")
+          capturedError = error
           if let bar { bar.finish(forceNewline: true) }
         }
         flux2Semaphore.signal()
       }
       flux2Semaphore.wait()
+      if let err = capturedError {
+        fputs("Error: \(err)\n", stderr)
+        exit(1)
+      }
       return
     }
 
@@ -1128,7 +1117,7 @@ struct ZImageCLI {
             pipeline: .txt2img,
             model: ModelInfo(
               family: "zimage",
-              variant: "turbo",
+              variant: (capturedModel.map { ZImageRepository.isBaseModel($0) ? "base" : "turbo" }) ?? "turbo",
               path: capturedModel ?? ZImageRepository.id
             ),
             parameters: GenerationParameters(
@@ -1396,13 +1385,13 @@ struct ZImageCLI {
     guard let inputPath = input else {
       logger.error("Missing required --input argument")
       printQuantizeUsage()
-      return
+      exit(1)
     }
 
     guard let outputPath = output else {
       logger.error("Missing required --output argument")
       printQuantizeUsage()
-      return
+      exit(1)
     }
 
     let inputURL = URL(fileURLWithPath: inputPath)
@@ -1410,17 +1399,17 @@ struct ZImageCLI {
 
     guard FileManager.default.fileExists(atPath: inputURL.path) else {
       logger.error("Input directory not found: \(inputPath)")
-      return
+      exit(1)
     }
 
     guard ZImageQuantizer.supportedBits.contains(bits) else {
       logger.error("Invalid bits: \(bits). Supported: 4, 8")
-      return
+      exit(1)
     }
 
     guard ZImageQuantizer.supportedGroupSizes.contains(groupSize) else {
       logger.error("Invalid group size: \(groupSize). Supported: 32, 64, 128")
-      return
+      exit(1)
     }
 
     let spec = ZImageQuantizationSpec(groupSize: groupSize, bits: bits, mode: .affine)
@@ -1809,25 +1798,25 @@ struct ZImageCLI {
     guard let prompt else {
       logger.error("Missing required --prompt argument")
       printControlUsage()
-      return
+      exit(1)
     }
     if controlImage == nil && inpaintImage == nil && maskImage == nil {
       logger.error("At least one of --control-image, --inpaint-image, or --mask must be provided")
       printControlUsage()
-      return
+      exit(1)
     }
 
     guard let controlnetWeights else {
       logger.error("Missing required --controlnet-weights argument")
       printControlUsage()
-      return
+      exit(1)
     }
     var controlImageURL: URL? = nil
     if let controlImage {
       controlImageURL = URL(fileURLWithPath: controlImage)
       guard FileManager.default.fileExists(atPath: controlImageURL!.path) else {
         logger.error("Control image not found: \(controlImage)")
-        return
+        exit(1)
       }
     }
     var inpaintImageURL: URL? = nil
@@ -1835,7 +1824,7 @@ struct ZImageCLI {
       inpaintImageURL = URL(fileURLWithPath: inpaintImage)
       guard FileManager.default.fileExists(atPath: inpaintImageURL!.path) else {
         logger.error("Inpaint image not found: \(inpaintImage)")
-        return
+        exit(1)
       }
     }
     var maskImageURL: URL? = nil
@@ -1843,7 +1832,7 @@ struct ZImageCLI {
       maskImageURL = URL(fileURLWithPath: maskImage)
       guard FileManager.default.fileExists(atPath: maskImageURL!.path) else {
         logger.error("Mask image not found: \(maskImage)")
-        return
+        exit(1)
       }
     }
 
@@ -4573,10 +4562,11 @@ struct ZImageCLI {
     Task {
       do {
         try await coordinator.run()
+        Darwin.exit(0)
       } catch {
         fputs("Telegram bot error: \(error.localizedDescription)\n", stderr)
+        Darwin.exit(1)
       }
-      Darwin.exit(0)
     }
 
     dispatchMain()

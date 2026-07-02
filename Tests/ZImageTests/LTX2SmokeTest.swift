@@ -158,7 +158,7 @@ final class LTX2SmokeTest: XCTestCase {
     XCTAssertEqual(cfg.audioDim, 2048)
 
     // Gemma config
-    XCTAssertEqual(cfg.gemma.vocabSize, 262144)
+    XCTAssertEqual(cfg.gemma.vocabSize, 262208)
     XCTAssertEqual(cfg.gemma.hiddenSize, 3840)
     XCTAssertEqual(cfg.gemma.numHiddenLayers, 48)
     XCTAssertEqual(cfg.gemma.numAttentionHeads, 16)

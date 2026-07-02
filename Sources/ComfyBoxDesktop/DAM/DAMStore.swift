@@ -9,6 +9,11 @@
 import Foundation
 import SQLite3
 
+/// SQLite destructor telling SQLite to copy bound text immediately.
+/// Passing nil (SQLITE_STATIC) with autoreleased `NSString.utf8String`
+/// pointers risks the buffer being released before the statement runs.
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 public actor DAMStore {
     private var db: OpaquePointer?
     private let dbPath: String
@@ -61,8 +66,14 @@ public actor DAMStore {
 
     // MARK: - Public API
 
-    /// Insert a new asset into the database.
-    public func insertAsset(_ asset: DAMAsset) throws {
+    /// Insert a new asset, or update an existing one. If the asset's path is
+    /// already tracked under a different id (re-ingest), the existing id and
+    /// user annotations (rating, favorite) are preserved and generation
+    /// metadata is only overwritten when the new record provides it.
+    /// Returns the asset as stored.
+    @discardableResult
+    public func insertAsset(_ asset: DAMAsset) throws -> DAMAsset {
+        let asset = try mergedWithExisting(asset)
         let sql = """
             INSERT OR REPLACE INTO assets (
                 id, kind, filename, absolute_path, file_size, sha256,
@@ -83,10 +94,10 @@ public actor DAMStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (asset.id as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (asset.kind as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 3, (asset.filename as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 4, (asset.absolutePath as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (asset.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (asset.kind as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, (asset.filename as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 4, (asset.absolutePath as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(stmt, 5, sqlite3_int64(asset.fileSize))
         bindOptionalText(stmt, 6, asset.sha256)
         bindOptionalInt(stmt, 7, asset.width)
@@ -110,10 +121,14 @@ public actor DAMStore {
             throw DAMStoreError.insertFailed(lastError)
         }
 
-        // Update FTS index.
+        // Update FTS index. Delete first — FTS5 has no unique constraint on
+        // id, so a bare INSERT would accumulate duplicate rows on updates.
+        try deleteFTS(id: asset.id)
         if let prompt = asset.prompt {
             try insertFTS(id: asset.id, prompt: prompt, negativePrompt: asset.negativePrompt)
         }
+
+        return asset
     }
 
     /// Fetch assets ordered by creation date (newest first).
@@ -198,7 +213,7 @@ public actor DAMStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (query as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (query as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
 
         var results: [DAMAsset] = []
@@ -208,7 +223,67 @@ public actor DAMStore {
         return results
     }
 
+    /// Fetch a single asset by absolute path, or nil if not tracked.
+    public func fetchAsset(byPath path: String) throws -> DAMAsset? {
+        let sql = """
+            SELECT id, kind, filename, absolute_path, file_size, sha256,
+                   width, height, created_at, modified_at, ingested_at, orphaned,
+                   prompt, negative_prompt, seed, steps, guidance,
+                   model_family, rating, favorite, content_mode, character_name
+            FROM assets
+            WHERE absolute_path = ?1
+            LIMIT 1
+            """
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (path as NSString).utf8String, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return assetFromRow(stmt)
+    }
+
     // MARK: - Private
+
+    /// If the asset's path is already tracked under a different id, keep the
+    /// existing id and user annotations so a re-ingest does not reset them
+    /// (and does not orphan the thumbnail keyed by id). An insert with a
+    /// matching id is an intentional update and is stored as-is.
+    private func mergedWithExisting(_ asset: DAMAsset) throws -> DAMAsset {
+        guard let existing = try fetchAsset(byPath: asset.absolutePath),
+              existing.id != asset.id else {
+            return asset
+        }
+
+        return DAMAsset(
+            id: existing.id,
+            kind: asset.kind,
+            filename: asset.filename,
+            absolutePath: asset.absolutePath,
+            fileSize: asset.fileSize,
+            sha256: asset.sha256 ?? existing.sha256,
+            width: asset.width ?? existing.width,
+            height: asset.height ?? existing.height,
+            createdAt: asset.createdAt,
+            modifiedAt: asset.modifiedAt,
+            ingestedAt: existing.ingestedAt,
+            orphaned: asset.orphaned,
+            prompt: asset.prompt ?? existing.prompt,
+            negativePrompt: asset.negativePrompt ?? existing.negativePrompt,
+            seed: asset.seed ?? existing.seed,
+            steps: asset.steps ?? existing.steps,
+            guidance: asset.guidance ?? existing.guidance,
+            modelFamily: asset.modelFamily ?? existing.modelFamily,
+            rating: existing.rating,
+            favorite: existing.favorite,
+            contentMode: asset.contentMode ?? existing.contentMode,
+            characterName: asset.characterName ?? existing.characterName
+        )
+    }
 
     private var lastError: String {
         db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
@@ -264,8 +339,21 @@ public actor DAMStore {
             """)
     }
 
+    private func deleteFTS(id: String) throws {
+        let sql = "DELETE FROM assets_fts WHERE id = ?1"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            // FTS delete failure is non-fatal.
+            return
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_step(stmt)
+    }
+
     private func insertFTS(id: String, prompt: String, negativePrompt: String?) throws {
-        let sql = "INSERT OR REPLACE INTO assets_fts (id, prompt, negative_prompt) VALUES (?1, ?2, ?3)"
+        let sql = "INSERT INTO assets_fts (id, prompt, negative_prompt) VALUES (?1, ?2, ?3)"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             // FTS insert failure is non-fatal.
@@ -273,8 +361,8 @@ public actor DAMStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(stmt, 2, (prompt as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (prompt as NSString).utf8String, -1, SQLITE_TRANSIENT)
         bindOptionalText(stmt, 3, negativePrompt)
         sqlite3_step(stmt)
     }
@@ -310,7 +398,7 @@ public actor DAMStore {
 
     private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) {
         if let value = value {
-            sqlite3_bind_text(stmt, index, (value as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, index, (value as NSString).utf8String, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, index)
         }

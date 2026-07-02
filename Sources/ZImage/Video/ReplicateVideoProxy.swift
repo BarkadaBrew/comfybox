@@ -119,6 +119,28 @@ public final class ReplicateVideoProxy: @unchecked Sendable {
       return job.toStatus()
     }
 
+    // Enforce output path containment before spending anything on Replicate.
+    if let outputPath = request.outputPath, !outputPath.isEmpty {
+      do {
+        _ = try WarmServerOutputPathValidator.resolveOutputPath(
+          outputPath,
+          allowedOutputDirectory: allowedOutputDirectory
+        )
+      } catch {
+        let jobId = generateJobId()
+        let job = VideoJob(id: jobId, mode: request.mode)
+        job.state = .failed
+        job.error = error.localizedDescription
+        job.completedAt = Date()
+
+        lock.lock()
+        jobs[jobId] = job
+        lock.unlock()
+
+        return job.toStatus()
+      }
+    }
+
     let jobId = generateJobId()
     let job = VideoJob(id: jobId, mode: request.mode)
     job.model = request.mode == .i2v ? Self.i2vModel : Self.t2vModel
@@ -251,10 +273,18 @@ public final class ReplicateVideoProxy: @unchecked Sendable {
       throw ReplicateError.invalidRequest("image_path is required for I2V mode")
     }
 
+    // Sanity-check the source: must be an existing regular file with image
+    // magic bytes. Prevents arbitrary readable files from being base64-uploaded.
+    if let imageError = Self.validateSourceImage(atPath: imagePath) {
+      throw ReplicateError.invalidRequest(imageError)
+    }
+
     // Read and base64-encode the source image
     let imageURL = URL(fileURLWithPath: imagePath)
     let imageData = try Data(contentsOf: imageURL)
-    let mimeType = imagePath.lowercased().hasSuffix(".png") ? "image/png" : "image/jpeg"
+    guard let mimeType = Self.imageMimeType(for: imageData) else {
+      throw ReplicateError.invalidRequest("image_path is not a PNG or JPEG image: \(imagePath)")
+    }
     let dataURI = "data:\(mimeType);base64,\(imageData.base64EncodedString())"
 
     let resolution = request.resolution ?? "480p"
@@ -364,7 +394,16 @@ public final class ReplicateVideoProxy: @unchecked Sendable {
 
     let (data, _) = try await session.data(from: downloadURL)
 
-    let outputPath = request.outputPath ?? generateOutputPath(mode: request.mode)
+    // Resolve the output path, enforcing containment in the allowed output
+    // directory (defense in depth — also validated at submit time).
+    let outputPath: String
+    if let requestedPath = request.outputPath, !requestedPath.isEmpty {
+      outputPath = try WarmServerOutputPathValidator
+        .resolveOutputPath(requestedPath, allowedOutputDirectory: allowedOutputDirectory)
+        .path
+    } else {
+      outputPath = generateOutputPath(mode: request.mode)
+    }
 
     // Ensure parent directory exists
     let outputURL = URL(fileURLWithPath: outputPath)
@@ -387,6 +426,42 @@ public final class ReplicateVideoProxy: @unchecked Sendable {
     lock.unlock()
 
     logger.info("Video job \(jobId): succeeded — \(outputPath) (\(fileSize) bytes)")
+  }
+
+  // MARK: - Source Image Validation
+
+  /// Validate that an I2V source image path points at an existing regular file
+  /// whose contents start with PNG or JPEG magic bytes. Returns an error
+  /// message, or nil if valid. Guards against uploading arbitrary readable
+  /// files (or blocking on non-regular files) via the base64 data URI.
+  static func validateSourceImage(atPath path: String) -> String? {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+          (attributes[.type] as? FileAttributeType) == .typeRegular else {
+      return "image_path not found or not a regular file: \(path)"
+    }
+    guard let handle = FileHandle(forReadingAtPath: path) else {
+      return "image_path could not be read: \(path)"
+    }
+    defer { try? handle.close() }
+    guard let header = (try? handle.read(upToCount: 8)) ?? nil,
+          imageMimeType(for: header) != nil else {
+      return "image_path is not a PNG or JPEG image: \(path)"
+    }
+    return nil
+  }
+
+  /// Detect the MIME type from image magic bytes. PNG and JPEG only.
+  static func imageMimeType(for data: Data) -> String? {
+    let bytes = [UInt8](data.prefix(8))
+    let pngMagic: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    if bytes.count >= 8, Array(bytes[0..<8]) == pngMagic {
+      return "image/png"
+    }
+    let jpegMagic: [UInt8] = [0xFF, 0xD8, 0xFF]
+    if bytes.count >= 3, Array(bytes[0..<3]) == jpegMagic {
+      return "image/jpeg"
+    }
+    return nil
   }
 
   // MARK: - Helpers

@@ -202,8 +202,9 @@ public final class SafeTensorsReader {
         return Data()
       }
       let startPointer = base.advanced(by: metadata.dataOffset)
-      let mutablePointer = UnsafeMutableRawPointer(mutating: startPointer)
-      return Data(bytesNoCopy: mutablePointer, count: metadata.byteCount, deallocator: .none)
+      // Copy the bytes: a no-copy Data would point into the mmapped buffer
+      // and outlive both the closure and potentially the reader itself.
+      return Data(bytes: startPointer, count: metadata.byteCount)
     }
   }
 

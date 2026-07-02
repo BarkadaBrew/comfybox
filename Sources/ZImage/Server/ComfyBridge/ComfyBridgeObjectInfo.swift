@@ -425,9 +425,14 @@ enum ComfyBridgeObjectInfo {
     )
 
     // --- Checkpoint loader (fallback model discovery) ---
+    // ckpt_name options are intentionally empty: the /api/etn/model_info
+    // "checkpoints" folder returns no metadata, so any name listed here would
+    // be deduced from its filename by the Krita plugin and appear as a
+    // phantom, unusable SD1.5 checkpoint. Bridge models are served through
+    // UNETLoader + model_info/diffusion_models instead.
     info["CheckpointLoaderSimple"] = nodeDefinition(
       required: [
-        "ckpt_name": optionInput(zimageUnetModels()),
+        "ckpt_name": optionInput([]),
       ],
       outputs: ["MODEL", "CLIP", "VAE"]
     )
@@ -763,6 +768,9 @@ enum ComfyBridgeObjectInfo {
   // Phase 2+ can scan the filesystem for actually available models.
 
   private static func zimageUnetModels() -> [String] {
+    // FIBO ("briaai/FIBO") and Chroma ("chroma-8.9b") are deliberately not
+    // listed: the Krita plugin cannot build workloads for those archs, and
+    // options without model_info metadata surface as phantom entries.
     [
       // Z-Image (Flux 1) family
       "z-image-turbo",
@@ -772,10 +780,6 @@ enum ComfyBridgeObjectInfo {
       // Klein (Flux 2) family
       "klein-4b-q8",
       "klein-9b-q8",
-      // FIBO family
-      "briaai/FIBO",
-      // Chroma family
-      "chroma-8.9b",
       // Moody (CivitAI Z-Image checkpoints)
       "moody-wild-v4",
       "moody-wild-v4-distilled",
@@ -871,22 +875,26 @@ enum ComfyBridgeObjectInfo {
   private static let loraDirectoryPath = ("~/bin/zimage/loras" as NSString).expandingTildeInPath
 
   private static func zimageLoraModels(library: LoRALibrary? = nil) -> [String] {
-    // When a LoRA Library is available, return non-quarantined entries.
-    // This provides richer discovery than filesystem scanning alone:
-    // entries include all subdirectories, and quarantined LoRAs are excluded.
+    // When a LoRA Library is available, return non-quarantined entries merged
+    // with the flat LoRA directory. The flat directory is what bare LoraLoader
+    // names resolve against at generation time and where /api/etn/upload/loras
+    // stores plugin-uploaded files, so its contents must stay visible even
+    // when the library index is the primary source.
     if let library {
-      let entries = library.list(includeQuarantined: false)
-      return entries.map { $0.filename }.sorted()
+      var names = Set(library.list(includeQuarantined: false).map { $0.filename })
+      names.formUnion(flatDirectoryLoraModels())
+      return names.sorted()
     }
 
-    // Fallback: dynamically scan the flat LoRA directory for .safetensors files.
-    let loraDir = loraDirectoryPath
+    return flatDirectoryLoraModels().sorted()
+  }
+
+  /// Scan the flat LoRA directory for .safetensors files.
+  private static func flatDirectoryLoraModels() -> [String] {
     let fm = FileManager.default
-    guard let entries = try? fm.contentsOfDirectory(atPath: loraDir) else {
+    guard let entries = try? fm.contentsOfDirectory(atPath: loraDirectoryPath) else {
       return []
     }
-    return entries
-      .filter { $0.hasSuffix(".safetensors") }
-      .sorted()
+    return entries.filter { $0.hasSuffix(".safetensors") }
   }
 }

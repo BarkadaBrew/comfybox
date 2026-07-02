@@ -212,6 +212,10 @@ public class ZImageControlPipeline {
   private var loadedModelId: String?
   private var loadedTextEncoderSelection: TextEncoderSelection?
   private var loadedControlnetWeightsId: String?
+  // True when clearControlnetWeights() released the control blocks of the currently
+  // loaded transformer; the transformer must be rebuilt before controlnet weights
+  // can be applied again.
+  private var controlnetWeightsReleased = false
   // Stored behind pipeline-local serialized access only. LoRAWeights contains MLXArray.
   private struct AppliedLoRA: @unchecked Sendable {
     let weights: LoRAWeights
@@ -221,6 +225,7 @@ public class ZImageControlPipeline {
   private struct CachedPromptEmbedding {
     let prompt: String
     let negativePrompt: String?
+    let doCFG: Bool
     let maxSequenceLength: Int
     let textEncoderDirectoryPath: String
     let promptEmbeds: MLXArray
@@ -237,20 +242,26 @@ public class ZImageControlPipeline {
   private func clearControlnetWeights() {
     guard let transformer = self.transformer else { return }
     logger.info("Clearing controlnet weights to free GPU memory...")
-    for (_, linear) in transformer.controlAllXEmbedder {
-      let zeroWeight = MLXArray.zeros(like: linear.weight)
-      linear.weight._updateInternal(zeroWeight)
-      if let bias = linear.bias {
-        let zeroBias = MLXArray.zeros(like: bias)
-        linear.bias?._updateInternal(zeroBias)
+    // Replace every control parameter's storage with a 1-element placeholder so the
+    // full-size buffers are actually released. The control modules are only used when
+    // a control context is passed to forward(), which cannot happen until controlnet
+    // weights are applied again — and controlnetWeightsReleased forces a transformer
+    // rebuild before that.
+    func releaseParameters(of module: Module) {
+      for (_, param) in module.parameters().flattened() {
+        param._updateInternal(MLXArray.zeros([1], dtype: param.dtype))
       }
     }
+    for (_, linear) in transformer.controlAllXEmbedder {
+      releaseParameters(of: linear)
+    }
     for block in transformer.controlNoiseRefiner {
-      zeroOutControlTransformerBlock(block)
+      releaseParameters(of: block)
     }
     for block in transformer.controlLayers {
-      zeroOutControlTransformerBlock(block)
+      releaseParameters(of: block)
     }
+    controlnetWeightsReleased = true
     GPU.clearCache()
     logger.info("Controlnet weights cleared")
   }
@@ -283,46 +294,6 @@ public class ZImageControlPipeline {
     block.feedForward.w1.weight._updateInternal(MLXArray.zeros(like: block.feedForward.w1.weight))
     block.feedForward.w2.weight._updateInternal(MLXArray.zeros(like: block.feedForward.w2.weight))
     block.feedForward.w3.weight._updateInternal(MLXArray.zeros(like: block.feedForward.w3.weight))
-  }
-  private func zeroOutControlTransformerBlock(_ block: ZImageControlTransformerBlock) {
-    block.attention.toQ.weight._updateInternal(MLXArray.zeros(like: block.attention.toQ.weight))
-    block.attention.toK.weight._updateInternal(MLXArray.zeros(like: block.attention.toK.weight))
-    block.attention.toV.weight._updateInternal(MLXArray.zeros(like: block.attention.toV.weight))
-    if block.attention.toOut.count > 0 {
-      block.attention.toOut[0].weight._updateInternal(MLXArray.zeros(like: block.attention.toOut[0].weight))
-      if let bias = block.attention.toOut[0].bias {
-        block.attention.toOut[0].bias?._updateInternal(MLXArray.zeros(like: bias))
-      }
-    }
-    if let normQ = block.attention.normQ {
-      normQ.weight._updateInternal(MLXArray.zeros(like: normQ.weight))
-    }
-    if let normK = block.attention.normK {
-      normK.weight._updateInternal(MLXArray.zeros(like: normK.weight))
-    }
-    if let adaLN = block.adaLN, adaLN.count > 0 {
-      adaLN[0].weight._updateInternal(MLXArray.zeros(like: adaLN[0].weight))
-      if let bias = adaLN[0].bias {
-        adaLN[0].bias?._updateInternal(MLXArray.zeros(like: bias))
-      }
-    }
-    block.attentionNorm1.weight._updateInternal(MLXArray.zeros(like: block.attentionNorm1.weight))
-    block.ffnNorm1.weight._updateInternal(MLXArray.zeros(like: block.ffnNorm1.weight))
-    block.attentionNorm2.weight._updateInternal(MLXArray.zeros(like: block.attentionNorm2.weight))
-    block.ffnNorm2.weight._updateInternal(MLXArray.zeros(like: block.ffnNorm2.weight))
-    block.feedForward.w1.weight._updateInternal(MLXArray.zeros(like: block.feedForward.w1.weight))
-    block.feedForward.w2.weight._updateInternal(MLXArray.zeros(like: block.feedForward.w2.weight))
-    block.feedForward.w3.weight._updateInternal(MLXArray.zeros(like: block.feedForward.w3.weight))
-    if let beforeProj = block.beforeProj {
-      beforeProj.weight._updateInternal(MLXArray.zeros(like: beforeProj.weight))
-      if let bias = beforeProj.bias {
-        beforeProj.bias?._updateInternal(MLXArray.zeros(like: bias))
-      }
-    }
-    block.afterProj.weight._updateInternal(MLXArray.zeros(like: block.afterProj.weight))
-    if let bias = block.afterProj.bias {
-      block.afterProj.bias?._updateInternal(MLXArray.zeros(like: bias))
-    }
   }
   private func loadTokenizer(snapshot: URL) throws -> QwenTokenizer {
     let tokDir = snapshot.appending(path: "tokenizer")
@@ -694,6 +665,7 @@ public class ZImageControlPipeline {
     transformer = nil
     currentLoRAs.removeAll()
     loadedControlnetWeightsId = nil
+    controlnetWeightsReleased = false
     GPU.clearCache()
     logger.info("Transformer unloaded for memory optimization")
   }
@@ -743,6 +715,16 @@ public class ZImageControlPipeline {
       || modelConfigs == nil
     let needsControlnetReload = loadedControlnetWeightsId != requestedControlnetId
 
+    if requestedControlnetId != nil, controlnetWeightsReleased, self.transformer != nil {
+      // The control blocks were released to free memory; force a transformer rebuild
+      // so controlnet weights can be applied to freshly allocated blocks. The LoRA
+      // weights live in the discarded transformer, so they must be reapplied too.
+      logger.info("Control blocks were released; reloading transformer to restore controlnet capacity...")
+      self.transformer = nil
+      self.currentLoRAs.removeAll()
+      GPU.clearCache()
+    }
+
     if needsModelReload {
       logger.info("Loading model \(requestedModelId)...")
       self.tokenizer = nil
@@ -785,6 +767,7 @@ public class ZImageControlPipeline {
         logger: logger
       )
       self.transformer = transformer
+      self.controlnetWeightsReleased = false
       self.loadedModelId = requestedModelId
       self.loadedControlnetWeightsId = nil
     } else if self.transformer == nil {
@@ -803,6 +786,7 @@ public class ZImageControlPipeline {
         logger: logger
       )
       self.transformer = transformer
+      self.controlnetWeightsReleased = false
       self.loadedControlnetWeightsId = nil
     } else {
       logger.info("Reusing cached model \(requestedModelId)")
@@ -873,6 +857,7 @@ public class ZImageControlPipeline {
     if let cached = cachedPromptEmbedding,
        cached.prompt == request.prompt,
        cached.negativePrompt == request.negativePrompt,
+       cached.doCFG == doCFG,
        cached.maxSequenceLength == request.maxSequenceLength,
        cached.textEncoderDirectoryPath == textEncoderSelection.directory.standardizedFileURL.path,
        cached.enhancePrompt == request.enhancePrompt,
@@ -952,6 +937,7 @@ public class ZImageControlPipeline {
       cachedPromptEmbedding = CachedPromptEmbedding(
         prompt: request.prompt,
         negativePrompt: request.negativePrompt,
+        doCFG: doCFG,
         maxSequenceLength: request.maxSequenceLength,
         textEncoderDirectoryPath: textEncoderSelection.directory.standardizedFileURL.path,
         promptEmbeds: promptEmbeds,
@@ -1057,6 +1043,7 @@ public class ZImageControlPipeline {
         logger: logger
       )
       self.transformer = transformerModel
+      self.controlnetWeightsReleased = false
       self.loadedControlnetWeightsId = nil
       if let controlnetSpec = request.controlnetWeights {
         logger.info("Reloading controlnet weights...")
@@ -1203,6 +1190,7 @@ public class ZImageControlPipeline {
     if let cached = cachedPromptEmbedding,
        cached.prompt == request.prompt,
        cached.negativePrompt == request.negativePrompt,
+       cached.doCFG == doCFG,
        cached.maxSequenceLength == request.maxSequenceLength,
        cached.textEncoderDirectoryPath == textEncoderSelection.directory.standardizedFileURL.path,
        cached.enhancePrompt == request.enhancePrompt,
@@ -1282,6 +1270,7 @@ public class ZImageControlPipeline {
       cachedPromptEmbedding = CachedPromptEmbedding(
         prompt: request.prompt,
         negativePrompt: request.negativePrompt,
+        doCFG: doCFG,
         maxSequenceLength: request.maxSequenceLength,
         textEncoderDirectoryPath: textEncoderSelection.directory.standardizedFileURL.path,
         promptEmbeds: promptEmbeds,
@@ -1292,11 +1281,22 @@ public class ZImageControlPipeline {
       )
       logger.info("Text encoding complete, embeddings cached")
     }
+    // Clear GPU cache after text encoding to free memory for VAE operations
+    // The text encoder uses ~6GB and is no longer needed after prompt embedding
+    GPU.clearCache()
+    logger.info("Cleared GPU cache after text encoding")
     var controlContext: MLXArray? = nil
     let controlCG: CGImage? = request.controlImageCG ?? (request.controlImage.flatMap { loadCGImage(from: $0) })
     let inpaintCG: CGImage? = request.inpaintImageCG ?? (request.inpaintImage.flatMap { loadCGImage(from: $0) })
     let maskCG: CGImage? = request.maskImageCG ?? (request.maskImage.flatMap { loadCGImage(from: $0) })
     if controlCG != nil || inpaintCG != nil || maskCG != nil {
+      // Unload transformer before VAE encoding to free ~20GB of GPU memory
+      // The transformer will be automatically reloaded after control context building
+      if self.transformer != nil {
+        logger.info("Temporarily unloading transformer to free memory for VAE encoding...")
+        unloadTransformer()
+        GPU.clearCache()
+      }
       logger.info("Building control context (control=\(controlCG != nil), inpaint=\(inpaintCG != nil), mask=\(maskCG != nil))...")
       let result = try buildControlContext(
         controlImage: controlCG,
@@ -1311,6 +1311,8 @@ public class ZImageControlPipeline {
       logger.info("Control context built, shape: \(result.shape)")
       controlContext = result.asType(.bfloat16)
     }
+    // Clear GPU cache after control context building to free VAE intermediate memory
+    GPU.clearCache()
     let vaeDivisor = modelConfigs.vae.latentDivisor
     let latentH = max(1, request.height / vaeDivisor)
     let latentW = max(1, request.width / vaeDivisor)
@@ -1352,6 +1354,7 @@ public class ZImageControlPipeline {
         logger: logger
       )
       self.transformer = transformerModel
+      self.controlnetWeightsReleased = false
       self.loadedControlnetWeightsId = nil
       if let controlnetSpec = request.controlnetWeights {
         logger.info("Reloading controlnet weights...")
@@ -1712,6 +1715,8 @@ public enum ZImageControlWeightsMapping {
       logger.info("Applied quantization to controlnet (\(manifest.bits)-bit, group_size=\(manifest.groupSize))")
     }
     transformer.loadControlXEmbedderWeights(from: weights)
+    var matchedCount = 0
+    var missingKeys: [String] = []
     for (idx, block) in transformer.controlNoiseRefiner.enumerated() {
       if isQuantized {
         let prefix = "controlNoiseRefiner.\(idx)"
@@ -1723,7 +1728,9 @@ public enum ZImageControlWeightsMapping {
         )
       } else {
         let prefix = "control_noise_refiner.\(idx)"
-        applyControlTransformerBlockWeights(weights: weights, prefix: prefix, to: block)
+        let result = applyControlTransformerBlockWeights(weights: weights, prefix: prefix, to: block)
+        matchedCount += result.matched
+        missingKeys.append(contentsOf: result.missing)
       }
     }
     for (idx, block) in transformer.controlLayers.enumerated() {
@@ -1737,10 +1744,36 @@ public enum ZImageControlWeightsMapping {
         )
       } else {
         let prefix = "control_layers.\(idx)"
-        applyControlTransformerBlockWeights(weights: weights, prefix: prefix, to: block)
+        let result = applyControlTransformerBlockWeights(weights: weights, prefix: prefix, to: block)
+        matchedCount += result.matched
+        missingKeys.append(contentsOf: result.missing)
       }
     }
+    if !isQuantized {
+      try validateControlnetCoverage(matched: matchedCount, missing: missingKeys, logger: logger)
+    }
     logger.info("Applied controlnet weights")
+  }
+  private static func validateControlnetCoverage(
+    matched: Int,
+    missing: [String],
+    logger: Logger,
+    minimumCoverage: Double = 0.99
+  ) throws {
+    let total = matched + missing.count
+    guard total > 0 else { return }
+    let coverage = Double(matched) / Double(total)
+    if coverage < minimumCoverage {
+      let percent = Int((coverage * 100.0).rounded())
+      let missingSample = missing.prefix(10).joined(separator: ", ")
+      let suffix = missing.count > 10 ? ", ..." : ""
+      throw ZImageControlPipeline.PipelineError.weightsMissing(
+        "Controlnet weights coverage too low: matched \(matched)/\(total) tensors (\(percent)%). Missing (sample): \(missingSample)\(suffix). The checkpoint likely does not match this controlnet architecture."
+      )
+    }
+    if !missing.isEmpty {
+      logger.warning("Controlnet weights missing \(missing.count) tensor(s): \(missing.prefix(10).joined(separator: ", "))")
+    }
   }
   private static func applyTransformerBlockWeights(
     weights: [String: MLXArray],
@@ -1862,74 +1895,60 @@ public enum ZImageControlWeightsMapping {
     weights: [String: MLXArray],
     prefix: String,
     to block: ZImageControlTransformerBlock
-  ) {
+  ) -> (matched: Int, missing: [String]) {
+    var matched = 0
+    var missing: [String] = []
+    // Applies the first key present among `keys`; records the primary key as missing otherwise.
+    func apply(_ keys: String..., update: (MLXArray) -> Void) {
+      for key in keys {
+        if let w = weights[key] {
+          update(w)
+          matched += 1
+          return
+        }
+      }
+      missing.append(keys[0])
+    }
     if let beforeProj = block.beforeProj {
-      if let w = weights["\(prefix).before_proj.weight"] {
-        beforeProj.weight._updateInternal(w)
-      }
-      if let b = weights["\(prefix).before_proj.bias"] {
-        beforeProj.bias?._updateInternal(b)
+      apply("\(prefix).before_proj.weight") { beforeProj.weight._updateInternal($0) }
+      if beforeProj.bias != nil {
+        apply("\(prefix).before_proj.bias") { beforeProj.bias?._updateInternal($0) }
       }
     }
-    if let w = weights["\(prefix).after_proj.weight"] {
-      block.afterProj.weight._updateInternal(w)
+    apply("\(prefix).after_proj.weight") { block.afterProj.weight._updateInternal($0) }
+    if block.afterProj.bias != nil {
+      apply("\(prefix).after_proj.bias") { block.afterProj.bias?._updateInternal($0) }
     }
-    if let b = weights["\(prefix).after_proj.bias"] {
-      block.afterProj.bias?._updateInternal(b)
+    apply("\(prefix).attention.to_q.weight") { block.attention.toQ.weight._updateInternal($0) }
+    apply("\(prefix).attention.to_k.weight") { block.attention.toK.weight._updateInternal($0) }
+    apply("\(prefix).attention.to_v.weight") { block.attention.toV.weight._updateInternal($0) }
+    apply("\(prefix).attention.to_out.0.weight") { block.attention.toOut[0].weight._updateInternal($0) }
+    if block.attention.toOut.first?.bias != nil {
+      apply("\(prefix).attention.to_out.0.bias") { block.attention.toOut[0].bias?._updateInternal($0) }
     }
-    if let w = weights["\(prefix).attention.to_q.weight"] {
-      block.attention.toQ.weight._updateInternal(w)
+    if let normQ = block.attention.normQ {
+      apply("\(prefix).attention.norm_q.weight") { normQ.weight._updateInternal($0) }
     }
-    if let w = weights["\(prefix).attention.to_k.weight"] {
-      block.attention.toK.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).attention.to_v.weight"] {
-      block.attention.toV.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).attention.to_out.0.weight"] {
-      block.attention.toOut[0].weight._updateInternal(w)
-    }
-    if let b = weights["\(prefix).attention.to_out.0.bias"] {
-      block.attention.toOut[0].bias?._updateInternal(b)
-    }
-    if let w = weights["\(prefix).attention.norm_q.weight"] {
-      block.attention.normQ?.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).attention.norm_k.weight"] {
-      block.attention.normK?.weight._updateInternal(w)
+    if let normK = block.attention.normK {
+      apply("\(prefix).attention.norm_k.weight") { normK.weight._updateInternal($0) }
     }
     if let adaLN = block.adaLN, adaLN.count > 0 {
-      if let w = weights["\(prefix).adaLN_modulation.0.weight"] {
-        adaLN[0].weight._updateInternal(w)
-      } else if let w = weights["\(prefix).adaLN_modulation.1.weight"] {
-        adaLN[0].weight._updateInternal(w)
+      apply("\(prefix).adaLN_modulation.0.weight", "\(prefix).adaLN_modulation.1.weight") {
+        adaLN[0].weight._updateInternal($0)
       }
-      if let b = weights["\(prefix).adaLN_modulation.0.bias"] {
-        adaLN[0].bias?._updateInternal(b)
-      } else if let b = weights["\(prefix).adaLN_modulation.1.bias"] {
-        adaLN[0].bias?._updateInternal(b)
+      if adaLN[0].bias != nil {
+        apply("\(prefix).adaLN_modulation.0.bias", "\(prefix).adaLN_modulation.1.bias") {
+          adaLN[0].bias?._updateInternal($0)
+        }
       }
     }
-    if let w = weights["\(prefix).attention_norm1.weight"] {
-      block.attentionNorm1.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).ffn_norm1.weight"] {
-      block.ffnNorm1.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).attention_norm2.weight"] {
-      block.attentionNorm2.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).ffn_norm2.weight"] {
-      block.ffnNorm2.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).feed_forward.w1.weight"] {
-      block.feedForward.w1.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).feed_forward.w2.weight"] {
-      block.feedForward.w2.weight._updateInternal(w)
-    }
-    if let w = weights["\(prefix).feed_forward.w3.weight"] {
-      block.feedForward.w3.weight._updateInternal(w)
-    }
+    apply("\(prefix).attention_norm1.weight") { block.attentionNorm1.weight._updateInternal($0) }
+    apply("\(prefix).ffn_norm1.weight") { block.ffnNorm1.weight._updateInternal($0) }
+    apply("\(prefix).attention_norm2.weight") { block.attentionNorm2.weight._updateInternal($0) }
+    apply("\(prefix).ffn_norm2.weight") { block.ffnNorm2.weight._updateInternal($0) }
+    apply("\(prefix).feed_forward.w1.weight") { block.feedForward.w1.weight._updateInternal($0) }
+    apply("\(prefix).feed_forward.w2.weight") { block.feedForward.w2.weight._updateInternal($0) }
+    apply("\(prefix).feed_forward.w3.weight") { block.feedForward.w3.weight._updateInternal($0) }
+    return (matched, missing)
   }
 }

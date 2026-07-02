@@ -60,9 +60,23 @@ final class ComfyBridgeExecutor {
   /// Set to 0 to disable live previews (only send final preview).
   var previewStepInterval: Int = 2
 
-  /// Active prompt being executed, if any.
+  /// Prompts currently executing. Concurrent prompts each register here so
+  /// isExecuting/interrupt track all of them, not just the newest.
   private let lock = NSLock()
-  private var activePromptId: String?
+  private var activePromptIds: Set<String> = []
+
+  /// Tail of the serialized job queue. Jobs (generate/upscale) run strictly
+  /// one at a time: each enqueued task awaits the previous tail before running.
+  /// This ensures execution_start is only emitted when a job actually begins —
+  /// the Krita plugin frees its one-job send slot on execution_start, and
+  /// emitting it while the previous job is still rendering makes the plugin
+  /// mark that job interrupted and drop its results.
+  private var tailTask: Task<Void, Never>?
+  /// Prompt IDs accepted but not yet started, in submission order.
+  private var queuedPromptIds: [String] = []
+  /// Queued prompt IDs cancelled via POST /queue {"delete": [...]}.
+  /// Their jobs are skipped when their turn arrives.
+  private var cancelledQueuedPromptIds: Set<String> = []
 
   init(
     logger: Logger,
@@ -88,7 +102,64 @@ final class ComfyBridgeExecutor {
   var isExecuting: Bool {
     lock.lock()
     defer { lock.unlock() }
-    return activePromptId != nil
+    return !activePromptIds.isEmpty
+  }
+
+  // MARK: - Serialized Job Queue
+
+  /// Enqueue a job in the serialized execution queue. The job runs after all
+  /// previously enqueued jobs have finished, so WebSocket event sequences
+  /// (execution_start ... executing:null) never interleave between jobs.
+  /// If the prompt is cancelled while still queued (POST /queue delete),
+  /// the job is skipped.
+  func enqueue(promptId: String, _ job: @escaping @Sendable () async -> Void) {
+    lock.lock()
+    queuedPromptIds.append(promptId)
+    let previous = tailTask
+    tailTask = Task { [weak self] in
+      await previous?.value
+      guard let self else { return }
+      self.lock.lock()
+      if let index = self.queuedPromptIds.firstIndex(of: promptId) {
+        self.queuedPromptIds.remove(at: index)
+      }
+      let wasCancelled = self.cancelledQueuedPromptIds.remove(promptId) != nil
+      self.lock.unlock()
+      if wasCancelled {
+        self.logger.info("ComfyBridge: skipping cancelled queued prompt_id=\(promptId)")
+        return
+      }
+      await job()
+    }
+    lock.unlock()
+  }
+
+  /// Cancel specific queued (not yet started) prompts.
+  /// Returns the number of jobs actually cancelled.
+  func cancelQueued(promptIds: [String]) -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    var cancelled = 0
+    for promptId in promptIds where queuedPromptIds.contains(promptId) {
+      if cancelledQueuedPromptIds.insert(promptId).inserted {
+        cancelled += 1
+      }
+    }
+    return cancelled
+  }
+
+  /// Cancel all queued (not yet started) prompts.
+  /// Returns the number of jobs cancelled.
+  func cancelAllQueued() -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    var cancelled = 0
+    for promptId in queuedPromptIds {
+      if cancelledQueuedPromptIds.insert(promptId).inserted {
+        cancelled += 1
+      }
+    }
+    return cancelled
   }
 
   /// Execute a parsed generation request asynchronously.
@@ -102,12 +173,12 @@ final class ComfyBridgeExecutor {
     }
 
     lock.lock()
-    activePromptId = request.promptId
+    activePromptIds.insert(request.promptId)
     lock.unlock()
 
     defer {
       lock.lock()
-      activePromptId = nil
+      activePromptIds.remove(request.promptId)
       lock.unlock()
     }
 
@@ -198,14 +269,14 @@ final class ComfyBridgeExecutor {
 
     // --- Phase 3: run actual generation ---
     do {
-      // Create a progress callback that sends WebSocket events.
-      let progressCallback: ComfyBridgeProgressHandler = { [wsManager, clientId = request.clientId, promptId = request.promptId] step, total in
+      // Raw progress sender — emits WebSocket progress events.
+      let sendProgress: @Sendable (Int, Int) -> Void = { [wsManager, clientId = request.clientId, promptId = request.promptId] value, max in
         let event: [String: Any] = [
           "type": "progress",
           "data": [
             "prompt_id": promptId,
-            "value": step,
-            "max": total
+            "value": value,
+            "max": max
           ] as [String: Any]
         ]
         if let data = try? JSONSerialization.data(withJSONObject: event),
@@ -258,33 +329,62 @@ final class ComfyBridgeExecutor {
       latentPreviewCallback = nil
       #endif
 
-      let result = try await handler(mutableRequest, progressCallback, latentPreviewCallback)
+      // Batch generation: Krita expects batchSize result images per job.
+      // Loop the handler with incremented seeds, cache each output, and put
+      // all image references in the executed message.
+      let batchCount = max(mutableRequest.batchSize, 1)
+      var imageIds: [String] = []
+      var lastImageData: Data?
+      var totalDurationMs = 0
 
-      // Read the output image.
-      let outputURL = URL(fileURLWithPath: result.outputPath)
-      guard let imageData = try? Data(contentsOf: outputURL) else {
-        logger.error("ComfyBridge: failed to read output at \(result.outputPath)")
-        sendError(promptId: request.promptId, clientId: request.clientId,
-                  message: "Failed to read generated image")
-        return
-      }
+      for batchIndex in 0..<batchCount {
+        var itemRequest = mutableRequest
+        itemRequest.batchSize = 1
+        if let baseSeed = mutableRequest.seed {
+          itemRequest.seed = baseSeed &+ UInt64(batchIndex)
+        }
 
-      // Store in the image cache.
-      let imageId = UUID().uuidString
-      guard imageCache.store(id: imageId, data: imageData) else {
-        logger.error("ComfyBridge: failed to cache output image \(imageId)")
-        sendError(promptId: request.promptId, clientId: request.clientId,
-                  message: "Failed to cache generated image")
-        return
+        // Scale progress across the whole batch so the client sees one
+        // continuous bar instead of batchCount restarts.
+        let progressCallback: ComfyBridgeProgressHandler = { step, total in
+          sendProgress(batchIndex * total + step, batchCount * total)
+        }
+
+        let result = try await handler(itemRequest, progressCallback, latentPreviewCallback)
+
+        // Read the output image.
+        let outputURL = URL(fileURLWithPath: result.outputPath)
+        guard let imageData = try? Data(contentsOf: outputURL) else {
+          logger.error("ComfyBridge: failed to read output at \(result.outputPath)")
+          sendError(promptId: request.promptId, clientId: request.clientId,
+                    message: "Failed to read generated image")
+          return
+        }
+
+        // Store in the image cache.
+        let imageId = UUID().uuidString
+        guard imageCache.store(id: imageId, data: imageData) else {
+          logger.error("ComfyBridge: failed to cache output image \(imageId)")
+          sendError(promptId: request.promptId, clientId: request.clientId,
+                    message: "Failed to cache generated image")
+          return
+        }
+
+        imageIds.append(imageId)
+        lastImageData = imageData
+        totalDurationMs += result.durationMs
+
+        // Clean up the temp file — the image is now in the cache.
+        try? FileManager.default.removeItem(at: outputURL)
       }
 
       // --- Phase 4: send output events ---
 
       // Send binary preview frame before text events (Krita expects this for live preview).
       #if canImport(CoreGraphics)
-      if previewsEnabled {
+      if previewsEnabled, let previewData = lastImageData {
         sendBinaryPreview(
-          imageData: imageData,
+          imageData: previewData,
           clientId: request.clientId,
           label: "generation"
         )
@@ -297,26 +397,28 @@ final class ComfyBridgeExecutor {
         "node": request.outputNodeId
       ])
 
-      // Send the executed event with the image reference.
+      // Send the executed event with all image references.
       sendExecutedEvent(
         to: request.clientId,
         promptId: request.promptId,
         nodeId: request.outputNodeId,
-        imageId: imageId
+        imageIds: imageIds
       )
 
-      history.recordGeneration(request: mutableRequest, imageId: imageId, durationMs: result.durationMs)
+      history.recordGeneration(request: mutableRequest, imageId: imageIds.first ?? "", durationMs: totalDurationMs)
 
       sendExecutionSuccess(to: request.clientId, promptId: request.promptId)
 
       // Workflow complete — node=null signals done.
       sendExecutingDone(to: request.clientId, promptId: request.promptId)
 
-      logger.info("ComfyBridge: generation complete — prompt_id=\(request.promptId), \(result.durationMs)ms, image=\(imageId) (\(imageData.count) bytes)")
+      logger.info("ComfyBridge: generation complete — prompt_id=\(request.promptId), \(totalDurationMs)ms, \(imageIds.count) image(s): \(imageIds.joined(separator: ", "))")
 
-      // Clean up the temp file — the image is now in the cache.
-      try? FileManager.default.removeItem(at: outputURL)
-
+    } catch is CancellationError {
+      // /interrupt cancelled the render task — surface a clean interrupted
+      // status instead of an execution_error.
+      logger.info("ComfyBridge: generation interrupted — prompt_id=\(request.promptId)")
+      sendInterrupted(promptId: request.promptId, clientId: request.clientId)
     } catch {
       logger.error("ComfyBridge: generation failed — prompt_id=\(request.promptId): \(error)")
       sendError(promptId: request.promptId, clientId: request.clientId,
@@ -335,12 +437,12 @@ final class ComfyBridgeExecutor {
     }
 
     lock.lock()
-    activePromptId = request.promptId
+    activePromptIds.insert(request.promptId)
     lock.unlock()
 
     defer {
       lock.lock()
-      activePromptId = nil
+      activePromptIds.remove(request.promptId)
       lock.unlock()
     }
 
@@ -436,7 +538,7 @@ final class ComfyBridgeExecutor {
         to: request.clientId,
         promptId: request.promptId,
         nodeId: request.outputNodeId,
-        imageId: imageId
+        imageIds: [imageId]
       )
 
       history.recordUpscale(request: mutableRequest, imageId: imageId, durationMs: result.durationMs)
@@ -451,6 +553,9 @@ final class ComfyBridgeExecutor {
       // Clean up the temp file — the image is now in the cache.
       try? FileManager.default.removeItem(at: outputURL)
 
+    } catch is CancellationError {
+      logger.info("ComfyBridge: upscale interrupted — prompt_id=\(request.promptId)")
+      sendInterrupted(promptId: request.promptId, clientId: request.clientId)
     } catch {
       logger.error("ComfyBridge: upscale failed — prompt_id=\(request.promptId): \(error)")
       sendError(promptId: request.promptId, clientId: request.clientId,
@@ -458,21 +563,25 @@ final class ComfyBridgeExecutor {
     }
   }
 
-  /// Interrupt the active generation.
-  /// Returns true if there was an active prompt to interrupt.
+  /// Interrupt the active generation(s).
+  /// Broadcasts execution_interrupted for every active prompt. The actual
+  /// pipeline cancellation is handled by the ComfyBridge interruptHandler,
+  /// which cancels the coordinator's in-flight render task.
+  /// Returns true if there was at least one active prompt to interrupt.
   func interrupt() -> Bool {
     lock.lock()
-    let active = activePromptId
+    let active = activePromptIds
     lock.unlock()
 
-    guard let promptId = active else { return false }
+    guard !active.isEmpty else { return false }
 
-    wsManager.broadcast(text: jsonString([
-      "type": "execution_interrupted",
-      "data": ["prompt_id": promptId]
-    ]))
-
-    logger.info("ComfyBridge: interrupted prompt_id=\(promptId)")
+    for promptId in active.sorted() {
+      wsManager.broadcast(text: jsonString([
+        "type": "execution_interrupted",
+        "data": ["prompt_id": promptId]
+      ]))
+      logger.info("ComfyBridge: interrupted prompt_id=\(promptId)")
+    }
     return true
   }
 
@@ -484,16 +593,14 @@ final class ComfyBridgeExecutor {
     wsManager.send(to: clientId, text: text)
   }
 
-  private func sendExecutedEvent(to clientId: String, promptId: String, nodeId: String, imageId: String) {
+  private func sendExecutedEvent(to clientId: String, promptId: String, nodeId: String, imageIds: [String]) {
     let event: [String: Any] = [
       "type": "executed",
       "data": [
         "prompt_id": promptId,
         "node": nodeId,
         "output": [
-          "images": [
-            imageReference(for: imageId)
-          ]
+          "images": imageIds.map { imageReference(for: $0) }
         ]
       ] as [String: Any]
     ]
@@ -559,6 +666,17 @@ final class ComfyBridgeExecutor {
       ] as [String: Any]
     ]
     wsManager.send(to: clientId, text: jsonString(event))
+  }
+
+  private func sendInterrupted(promptId: String, clientId: String) {
+    let event: [String: Any] = [
+      "type": "execution_interrupted",
+      "data": ["prompt_id": promptId] as [String: Any]
+    ]
+    wsManager.send(to: clientId, text: jsonString(event))
+
+    // Also send executing-done so the plugin cleans up the prompt state.
+    sendExecutingDone(to: clientId, promptId: promptId)
   }
 
   private func sendError(promptId: String, clientId: String, message: String) {

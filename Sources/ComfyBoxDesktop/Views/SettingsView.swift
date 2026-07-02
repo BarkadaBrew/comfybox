@@ -23,7 +23,7 @@ struct DesktopSettings: Codable {
 
     static let defaultSettings = DesktopSettings(
         serverHost: "127.0.0.1",
-        serverPort: 7862,
+        serverPort: 7870,
         autoConnect: true,
         outputDirectory: NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath,
         defaultSteps: 9,
@@ -285,10 +285,20 @@ struct SettingsView: View {
     // MARK: - Actions
 
     private func applyAndSave() {
+        let endpointChanged = engine.serverHost != settings.serverHost
+            || engine.serverPort != settings.serverPort
+        let wasConnected = engine.connectionState.isConnected
+
         // Apply to engine
         engine.serverHost = settings.serverHost
         engine.serverPort = settings.serverPort
         engine.outputDirectory = settings.outputDirectory
+
+        // Reconnect so a new host/port takes effect immediately.
+        if endpointChanged && wasConnected {
+            engine.disconnect()
+            engine.connect()
+        }
 
         // Persist to disk
         settings.save()

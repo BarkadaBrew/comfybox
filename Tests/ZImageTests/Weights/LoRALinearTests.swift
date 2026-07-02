@@ -5,7 +5,14 @@ import MLX
 final class LoRALinearTests: XCTestCase {
 
   override func setUpWithError() throws {
-    throw XCTSkip("MLX metallib is unavailable in the SwiftPM test runner on this machine")
+    do {
+      try MLX.withError {
+        let probe = MLXArray([1 as Float, 2], [2]) + MLXArray([3 as Float, 4], [2])
+        MLX.eval(probe)
+      }
+    } catch {
+      throw XCTSkip("MLX evaluation is unavailable in this test runner: \(error)")
+    }
   }
 
   func testMultipleAdaptersAccumulateIncludingNegativeScales() {

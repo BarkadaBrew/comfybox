@@ -141,6 +141,11 @@ public final class WarmServer {
   /// Lazy-loaded ESRGAN upscale pipeline. Created on first ESRGAN upscale request.
   private var esrganPipeline: ESRGANPipeline?
 
+  /// Serializes lazy initialization of the upscale pipelines. WarmServer is a
+  /// plain class reached from concurrent request tasks — without this lock,
+  /// simultaneous first-use requests could double-load multi-GB pipelines.
+  private let upscalePipelineLock = NSLock()
+
   /// Replicate video proxy — handles video generation via Replicate API.
   /// Initialized at startup if REPLICATE_API_TOKEN is available; nil otherwise.
   private var replicateVideoProxy: ReplicateVideoProxy?
@@ -225,27 +230,38 @@ public final class WarmServer {
     // Wire model switch handler for Krita checkpoint auto-detection.
     // When Krita sends a workflow with a different checkpoint, this handler
     // checks if the model is already in the pool (activate) or needs loading.
+    // The switch runs through the coordinator's FIFO render queue so the pool
+    // load/activate cannot mutate the active pipeline while a queued render
+    // is mid-flight.
     self.comfyBridge.modelSwitchHandler = { [unowned self] (modelId: String) async throws -> Bool in
-      // Check if this model is already active — no switch needed.
-      let currentActive = await self.coordinator.modelPool.activeModelId()
-      let requestedKey = ModelPool.poolKey(for: modelId)
-      if currentActive == requestedKey {
-        return false
-      }
+      try await self.coordinator.enqueueModelSwitch { [unowned self] in
+        // Check if this model is already active — no switch needed.
+        let currentActive = await self.coordinator.modelPool.activeModelId()
+        let requestedKey = ModelPool.poolKey(for: modelId)
+        if currentActive == requestedKey {
+          return false
+        }
 
-      // Check if the model is already in the pool — just activate it (instant).
-      if let existing = await self.coordinator.modelPool.findEntry(for: modelId) {
-        try await self.coordinator.poolActivate(modelId: existing.id)
-        self.logger.info("ComfyBridge: activated pool model '\(existing.id)' for Krita checkpoint switch")
+        // Check if the model is already in the pool — just activate it (instant).
+        if let existing = await self.coordinator.modelPool.findEntry(for: modelId) {
+          try await self.coordinator.poolActivate(modelId: existing.id)
+          self.logger.info("ComfyBridge: activated pool model '\(existing.id)' for Krita checkpoint switch")
+          return true
+        }
+
+        // Model not in pool — load and activate it.
+        let quantization = Self.parseQuantization(from: modelId)
+        let modelSpec = Self.parseModelSpec(from: modelId)
+        let result = try await self.coordinator.poolLoad(modelSpec: modelSpec, quantization: quantization, activate: true)
+        self.logger.info("ComfyBridge: loaded + activated '\(result.model)' (\(result.loadTimeMs)ms) for Krita checkpoint switch")
         return true
       }
+    }
 
-      // Model not in pool — load and activate it.
-      let quantization = Self.parseQuantization(from: modelId)
-      let modelSpec = Self.parseModelSpec(from: modelId)
-      let result = try await self.coordinator.poolLoad(modelSpec: modelSpec, quantization: quantization, activate: true)
-      self.logger.info("ComfyBridge: loaded + activated '\(result.model)' (\(result.loadTimeMs)ms) for Krita checkpoint switch")
-      return true
+    // Wire interrupt handler so ComfyUI /interrupt cancels the in-flight render
+    // task — the pipelines observe cancellation in their denoise loops.
+    self.comfyBridge.interruptHandler = { [unowned self] in
+      await self.coordinator.cancelActiveRender()
     }
   }
 
@@ -361,7 +377,7 @@ public final class WarmServer {
 
   fileprivate func respond(to request: HTTPRequest) async -> RoutedResponse {
     // Try ComfyUI bridge routes first.
-    if let bridgeResponse = comfyBridge.route(request) {
+    if let bridgeResponse = await comfyBridge.route(request) {
       return bridgeResponse
     }
 
@@ -375,6 +391,10 @@ public final class WarmServer {
       if var healthJSON = try? JSONSerialization.jsonObject(
         with: encoder.encode(health)
       ) as? [String: Any] {
+        // Telemetry contract: always emit these keys (JSON null when idle) so
+        // clients can decode current_job_id / progress_percent unconditionally.
+        healthJSON["current_job_id"] = (health.currentJobId as Any?) ?? NSNull()
+        healthJSON["progress_percent"] = (health.progressPercent as Any?) ?? NSNull()
         let videoAvailable = replicateVideoProxy != nil
         healthJSON["video"] = [
           "available": videoAvailable,
@@ -689,10 +709,19 @@ public final class WarmServer {
         if let validationError = videoRequest.validate() {
           return .error(.error(status: 400, message: validationError))
         }
-        // I2V: verify image_path exists on filesystem
+        // Enforce output path containment within the allowed output directory
+        // (throws WarmServerError.invalidOutputPath -> 400 via response(for:)).
+        if let outputPath = videoRequest.outputPath, !outputPath.isEmpty {
+          _ = try WarmServerOutputPathValidator.resolveOutputPath(
+            outputPath,
+            allowedOutputDirectory: configuration.allowedOutputDirectory
+          )
+        }
+        // I2V: verify image_path exists, is a regular file, and has PNG/JPEG
+        // magic bytes before it gets base64-uploaded to Replicate.
         if let imagePath = videoRequest.imagePath {
-          guard FileManager.default.fileExists(atPath: imagePath) else {
-            return .error(.error(status: 400, message: "image_path file not found: \(imagePath)"))
+          if let imageError = ReplicateVideoProxy.validateSourceImage(atPath: imagePath) {
+            return .error(.error(status: 400, message: imageError))
           }
         }
         let jobStatus = await proxy.submit(videoRequest)
@@ -1084,16 +1113,7 @@ public final class WarmServer {
       .appendingPathComponent(baseName)
 
     // Lazy-load ESRGAN pipeline (re-create if model changed)
-    if esrganPipeline == nil || esrganPipeline!.weightsDirectory.path != weightsDir.path {
-      logger.info("WarmServer: lazy-loading ESRGAN pipeline from \(weightsDir.path)...")
-      let pipeline = try ESRGANPipeline(weightsDirectory: weightsDir, logger: logger)
-      esrganPipeline = pipeline
-      logger.info("WarmServer: ESRGAN pipeline ready (scale=\(pipeline.config.scale)x, blocks=\(pipeline.config.numBlock))")
-    }
-
-    guard let pipeline = esrganPipeline else {
-      throw ESRGANPipeline.PipelineError.weightsDirectoryNotFound(weightsDir.path)
-    }
+    let pipeline = try loadESRGANPipelineIfNeeded(weightsDirectory: weightsDir)
 
     // Write input image data to a temp file.
     let inputTempPath = NSTemporaryDirectory() + "zimage-esrgan-input-\(UUID().uuidString).png"
@@ -1130,16 +1150,7 @@ public final class WarmServer {
     }
 
     // Lazy-load the SeedVR2 pipeline on first upscale request.
-    if seedvr2Pipeline == nil {
-      logger.info("WarmServer: lazy-loading SeedVR2 pipeline from \(weightsPath)...")
-      let pipeline = try SeedVR2Pipeline(weightsPath: weightsPath, logger: logger)
-      seedvr2Pipeline = pipeline
-      logger.info("WarmServer: SeedVR2 pipeline ready (\(pipeline.modelConfig == .preset7B ? "7B" : "3B"))")
-    }
-
-    guard let pipeline = seedvr2Pipeline else {
-      throw SeedVR2Pipeline.PipelineError.weightsDirectoryNotFound(weightsPath)
-    }
+    let pipeline = try loadSeedVR2PipelineIfNeeded(weightsPath: weightsPath)
 
     // Write input image data to a temp file.
     let inputTempPath = NSTemporaryDirectory() + "zimage-upscale-input-\(UUID().uuidString).png"
@@ -1164,6 +1175,42 @@ public final class WarmServer {
       try? FileManager.default.removeItem(atPath: outputTempPath)
       throw error
     }
+  }
+
+  /// Get or lazily create the SeedVR2 pipeline. Double-checked under
+  /// `upscalePipelineLock` so concurrent first-use requests cannot
+  /// double-load the ~6GB weights.
+  private func loadSeedVR2PipelineIfNeeded(weightsPath: String) throws -> SeedVR2Pipeline {
+    upscalePipelineLock.lock()
+    defer { upscalePipelineLock.unlock() }
+
+    if let pipeline = seedvr2Pipeline {
+      return pipeline
+    }
+
+    logger.info("WarmServer: lazy-loading SeedVR2 pipeline from \(weightsPath)...")
+    let pipeline = try SeedVR2Pipeline(weightsPath: weightsPath, logger: logger)
+    seedvr2Pipeline = pipeline
+    logger.info("WarmServer: SeedVR2 pipeline ready (\(pipeline.modelConfig == .preset7B ? "7B" : "3B"))")
+    return pipeline
+  }
+
+  /// Get or lazily create the ESRGAN pipeline for the given weights directory,
+  /// re-creating it when the requested model changes. Serialized under
+  /// `upscalePipelineLock` like SeedVR2 to prevent concurrent double-loads.
+  private func loadESRGANPipelineIfNeeded(weightsDirectory weightsDir: URL) throws -> ESRGANPipeline {
+    upscalePipelineLock.lock()
+    defer { upscalePipelineLock.unlock() }
+
+    if let pipeline = esrganPipeline, pipeline.weightsDirectory.path == weightsDir.path {
+      return pipeline
+    }
+
+    logger.info("WarmServer: lazy-loading ESRGAN pipeline from \(weightsDir.path)...")
+    let pipeline = try ESRGANPipeline(weightsDirectory: weightsDir, logger: logger)
+    esrganPipeline = pipeline
+    logger.info("WarmServer: ESRGAN pipeline ready (scale=\(pipeline.config.scale)x, blocks=\(pipeline.config.numBlock))")
+    return pipeline
   }
 
   // MARK: - Upscale Handler
@@ -1203,18 +1250,7 @@ public final class WarmServer {
     }
 
     // Lazy-load pipeline
-    if seedvr2Pipeline == nil {
-      logger.info("WarmServer: lazy-loading SeedVR2 pipeline from \(weightsPath)...")
-      let pipeline = try SeedVR2Pipeline(weightsPath: weightsPath, logger: logger)
-      seedvr2Pipeline = pipeline
-      logger.info("WarmServer: SeedVR2 pipeline ready (\(pipeline.modelConfig == .preset7B ? "7B" : "3B"))")
-    }
-
-    guard let pipeline = seedvr2Pipeline else {
-      throw WarmServerError.invalidRequest(
-        message: "SeedVR2 pipeline failed to initialize"
-      )
-    }
+    let pipeline = try loadSeedVR2PipelineIfNeeded(weightsPath: weightsPath)
 
     // Check model variant matches request
     if let requestedModel = payload.model {
@@ -1318,6 +1354,8 @@ public final class WarmServer {
         return .error(status: 429, message: "Queue full (\(maxPending) pending max)")
       case .shuttingDown:
         return .error(status: 503, message: "Server is shutting down")
+      case .cancelled:
+        return .error(status: 409, message: "Request cancelled (queue cleared)")
       }
 
     case let error as ZImagePipeline.PipelineError:
@@ -1457,10 +1495,23 @@ public final class WarmServer {
   }
 }
 
+/// Thread-safe holder for the active render's progress percent. Written from
+/// the (off-actor, `@Sendable`) pipeline progress callback and read by the
+/// actor's `queueStatus()` — lock-protected so it can cross the actor boundary
+/// safely without an actor hop on every denoising step.
+private final class RenderProgressTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private var percent: Int?
+  func set(_ value: Int?) { lock.lock(); percent = value; lock.unlock() }
+  func get() -> Int? { lock.lock(); defer { lock.unlock() }; return percent }
+}
+
 private actor WarmServerCoordinator {
   enum ServerError: Error {
     case queueFull(maxPending: Int)
     case shuttingDown
+    /// The pending request was removed by a queue clear (not a server shutdown).
+    case cancelled
   }
 
   private let configuration: WarmServerConfiguration
@@ -1494,6 +1545,15 @@ private actor WarmServerCoordinator {
   private var lastRenderDurationMs: Int?
   private var lastError: String?
   private var activeRenderStartedAt: Date?
+  /// Synthetic id for the currently-rendering job — surfaced as `current_job_id`.
+  private var activeJobId: String?
+  /// Handle for the in-flight render — retained so /interrupt can cancel it.
+  /// The pipelines observe cancellation via Task.checkCancellation() in their
+  /// denoise loops; the render's continuation then resumes with CancellationError.
+  private var activeRenderTask: Task<Void, Never>?
+  /// Live progress (0-100) of the active render; nil when idle. Updated from the
+  /// pipeline denoising callback, read by `queueStatus()`.
+  private let progressTracker = RenderProgressTracker()
   private var pipelinePrepared = false
   /// When a pool model is activated, this holds its modelSpec so that
   /// generation requests use the pool model instead of the startup
@@ -1909,6 +1969,24 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Run a Krita model auto-switch through the FIFO render queue so the pool
+  /// load/activate executes after any in-flight render finishes instead of
+  /// mutating the active pipeline underneath it. The body performs the actual
+  /// pool operations and returns whether a switch occurred.
+  func enqueueModelSwitch(_ body: @escaping @Sendable () async throws -> Bool) async throws -> Bool {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(.modelSwitch(body, ContinuationBox(continuation)))
+      startProcessingIfNeeded()
+    }
+  }
+
   func enqueueShutdown() async throws -> ShutdownResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -1945,6 +2023,8 @@ private actor WarmServerCoordinator {
       maxPending: configuration.maxPendingRequests,
       isRendering: activeRenderStartedAt != nil,
       activeRequestAgeMs: activeAgeMs,
+      currentJobId: activeJobId,
+      progressPercent: progressTracker.get(),
       memoryUsageBytes: memoryBytes,
       memoryUsageMB: memoryBytes / (1024 * 1024),
       lastRenderDurationMs: lastRenderDurationMs,
@@ -1958,27 +2038,38 @@ private actor WarmServerCoordinator {
       pendingCount: pending.count,
       maxPending: configuration.maxPendingRequests,
       isRendering: activeRenderStartedAt != nil,
-      currentJobId: nil,
-      progressPercent: nil,
+      currentJobId: activeJobId,
+      progressPercent: progressTracker.get(),
       renderCount: successfulRenderCount,
       failedCount: failedRenderCount
     )
   }
 
+  /// Cancel the in-flight render, if any (ComfyUI /interrupt).
+  /// Returns true if a render task was cancelled. Pending jobs are unaffected.
+  func cancelActiveRender() -> Bool {
+    guard let task = activeRenderTask else { return false }
+    task.cancel()
+    return true
+  }
+
   /// Clear all pending jobs from the queue. Active job continues.
   func clearPending() -> Int {
     let count = pending.count
-    // Cancel all pending continuations with an error.
+    // Cancel all pending continuations with a queue-clear error (distinct
+    // from shuttingDown — the server keeps running after a queue clear).
     for op in pending {
       switch op {
       case .generate(_, let cont, _, _):
-        cont.resume(throwing: ServerError.shuttingDown)
+        cont.resume(throwing: ServerError.cancelled)
       case .controlGenerate(_, let cont):
-        cont.resume(throwing: ServerError.shuttingDown)
+        cont.resume(throwing: ServerError.cancelled)
       case .swap(_, let cont):
-        cont.resume(throwing: ServerError.shuttingDown)
+        cont.resume(throwing: ServerError.cancelled)
+      case .modelSwitch(_, let cont):
+        cont.resume(throwing: ServerError.cancelled)
       case .shutdown(let cont):
-        cont.resume(throwing: ServerError.shuttingDown)
+        cont.resume(throwing: ServerError.cancelled)
       }
     }
     pending.removeAll()
@@ -2003,11 +2094,29 @@ private actor WarmServerCoordinator {
       let operation = pending.removeFirst()
       switch operation {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
-        await runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
+        // Run the render in a retained child task so /interrupt can cancel it
+        // without cancelling the queue's processing loop.
+        let renderTask = Task {
+          await self.runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
+        }
+        activeRenderTask = renderTask
+        await renderTask.value
+        activeRenderTask = nil
       case .controlGenerate(let request, let continuation):
-        await runControlGenerate(request, continuation: continuation)
+        let renderTask = Task {
+          await self.runControlGenerate(request, continuation: continuation)
+        }
+        activeRenderTask = renderTask
+        await renderTask.value
+        activeRenderTask = nil
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
+      case .modelSwitch(let body, let continuation):
+        do {
+          continuation.resume(returning: try await body())
+        } catch {
+          continuation.resume(throwing: error)
+        }
       case .shutdown(let continuation):
         continuation.resume(
           returning: ShutdownResponse(
@@ -2020,6 +2129,22 @@ private actor WarmServerCoordinator {
   }
 
   private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
+    // Queue telemetry: tag this render with a job id and stream denoising
+    // progress into the tracker that queueStatus() reads. Cleared on return
+    // (success or failure) via defer. flux1 forwards the wrapped handler so the
+    // pipeline's per-step callback updates progress; other families currently
+    // have no per-step callback, so they report only is_rendering + job id.
+    activeJobId = UUID().uuidString
+    progressTracker.set(0)
+    let tracker = progressTracker
+    let trackedHandler: @Sendable (ZImagePipeline.GenerationProgress) -> Void = { progress in
+      if progress.stage == .denoising {
+        tracker.set(Int(progress.fractionCompleted * 100))
+      }
+      progressHandler?(progress)
+    }
+    defer { activeJobId = nil; progressTracker.set(nil) }
+
     switch currentModelFamily {
     case .chroma:
       await runChromaGenerate(payload, continuation: continuation)
@@ -2028,7 +2153,7 @@ private actor WarmServerCoordinator {
     case .flux2:
       await runFlux2Generate(payload, continuation: continuation)
     case .flux1:
-      await runFlux1Generate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
+      await runFlux1Generate(payload, continuation: continuation, progressHandler: trackedHandler, latentPreviewHandler: latentPreviewHandler)
     }
   }
 
@@ -2289,43 +2414,17 @@ private actor WarmServerCoordinator {
           .appendingPathComponent("zimage-chroma-\(UUID().uuidString).png")
       }
 
-      let width = payload.width ?? 1024
-      let height = payload.height ?? 1024
-      let steps = payload.steps ?? 28
-      let guidance = payload.guidance ?? 0.0
-      let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
-
-      // Tokenize prompt (unpadded — matches Python behavior)
-      let tokenIds = tokenizer.encodeUnpadded(prompt: payload.prompt)
-
-      // Tokenize negative prompt for CFG (empty string = unconditional)
-      let negTokenIds = tokenizer.encodeUnpadded(prompt: payload.negativePrompt ?? "")
-
-      // CFG parameters (default: cfg=4.0, no warmup steps)
-      let cfgScale = payload.cfg ?? 4.0
-      let cfgWarmup = payload.firstNStepsWithoutCFG ?? 0
-
-      // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
-      let result = pipeline.generate(
-        tokenIds: tokenIds,
-        negativeTokenIds: negTokenIds,
-        width: width,
-        height: height,
-        numSteps: steps,
-        guidance: guidance,
-        cfg: cfgScale,
-        firstNStepsWithoutCFG: cfgWarmup,
-        seed: seed,
-        progressCallback: { step, total in
-          // Progress logging
-        }
+      // Run the synchronous Chroma render off the actor (the static helper is
+      // nonisolated, so it executes on the global concurrent executor). This
+      // mirrors the flux2/fibo paths, which await pipeline work without
+      // blocking the actor — keeping /health, /queue, and progress telemetry
+      // responsive for the duration of the render.
+      try await Self.renderChroma(
+        pipeline: pipeline,
+        tokenizer: tokenizer,
+        payload: payload,
+        outputURL: outputURL
       )
-
-      // Transpose from NHWC [1, H, W, 3] to CHW [3, H, W] for QwenImageIO
-      let imageArray = result.squeezed(axis: 0).transposed(2, 0, 1)
-
-      // Save image
-      try QwenImageIO.saveImage(array: imageArray, to: outputURL)
 
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
@@ -2348,6 +2447,55 @@ private actor WarmServerCoordinator {
       resumed = true
       continuation.resume(throwing: error)
     }
+  }
+
+  /// Perform the synchronous Chroma pipeline render. Static (hence nonisolated)
+  /// and async, so it runs on the global concurrent executor rather than on
+  /// the coordinator actor — a Chroma render would otherwise block /health,
+  /// /queue, and progress telemetry for its full duration.
+  private static func renderChroma(
+    pipeline: ChromaPipeline,
+    tokenizer: ChromaTokenizer,
+    payload: GeneratePayload,
+    outputURL: URL
+  ) async throws {
+    let width = payload.width ?? 1024
+    let height = payload.height ?? 1024
+    let steps = payload.steps ?? 28
+    let guidance = payload.guidance ?? 0.0
+    let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
+
+    // Tokenize prompt (unpadded — matches Python behavior)
+    let tokenIds = tokenizer.encodeUnpadded(prompt: payload.prompt)
+
+    // Tokenize negative prompt for CFG (empty string = unconditional)
+    let negTokenIds = tokenizer.encodeUnpadded(prompt: payload.negativePrompt ?? "")
+
+    // CFG parameters (default: cfg=4.0, no warmup steps)
+    let cfgScale = payload.cfg ?? 4.0
+    let cfgWarmup = payload.firstNStepsWithoutCFG ?? 0
+
+    // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
+    let result = pipeline.generate(
+      tokenIds: tokenIds,
+      negativeTokenIds: negTokenIds,
+      width: width,
+      height: height,
+      numSteps: steps,
+      guidance: guidance,
+      cfg: cfgScale,
+      firstNStepsWithoutCFG: cfgWarmup,
+      seed: seed,
+      progressCallback: { step, total in
+        // Progress logging
+      }
+    )
+
+    // Transpose from NHWC [1, H, W, 3] to CHW [3, H, W] for QwenImageIO
+    let imageArray = result.squeezed(axis: 0).transposed(2, 0, 1)
+
+    // Save image
+    try QwenImageIO.saveImage(array: imageArray, to: outputURL)
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
@@ -2707,14 +2855,13 @@ struct HTTPResponse {
 
   func serialize() -> Data {
     var data = Data()
+    // No CORS headers: all known clients (desktop app, Krita plugin, Telegram
+    // bot, MCP) are native, so browser cross-origin access is intentionally
+    // not enabled.
     let header = [
       "HTTP/1.1 \(status) \(reasonPhrase)",
       "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
-      "Access-Control-Allow-Origin: *",
-      "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers: Content-Type, Authorization, Accept, Origin, X-Requested-With",
-      "Access-Control-Max-Age: 86400",
       "Connection: close",
       "",
       ""
@@ -2731,6 +2878,7 @@ struct HTTPResponse {
     case 400: return "Bad Request"
     case 404: return "Not Found"
     case 405: return "Method Not Allowed"
+    case 409: return "Conflict"
     case 413: return "Payload Too Large"
     case 429: return "Too Many Requests"
     case 500: return "Internal Server Error"
@@ -3130,13 +3278,29 @@ private struct LoRAEntry: Codable, Sendable {
   let path: String
   let scale: Float?
 
+  /// Allowed range for LoRA scales — finite values outside are clamped.
+  private static let scaleRange: ClosedRange<Float> = -10.0...10.0
+
+  /// Validate the requested scale: reject non-finite values, clamp finite
+  /// values to `scaleRange`. Defaults to 1.0 when absent.
+  private func resolvedScale() throws -> Float {
+    guard let scale else { return 1.0 }
+    guard scale.isFinite else {
+      throw WarmServerError.invalidRequest(
+        message: "Invalid LoRA scale for '\(path)': must be a finite number"
+      )
+    }
+    return min(max(scale, Self.scaleRange.lowerBound), Self.scaleRange.upperBound)
+  }
+
   func makeConfiguration() throws -> LoRAConfiguration {
+    let clampedScale = try resolvedScale()
     let expanded = (path as NSString).expandingTildeInPath
 
     // Direct path (absolute, relative, tilde-expanded)
     if path.hasPrefix("/") || path.hasPrefix("./") || path.hasPrefix("../") || path.hasPrefix("~")
        || FileManager.default.fileExists(atPath: expanded) {
-      return .local(expanded, scale: scale ?? 1.0)
+      return .local(expanded, scale: clampedScale)
     }
 
     // Library resolution: search the LoRA library root for the filename
@@ -3146,13 +3310,13 @@ private struct LoRAEntry: Codable, Sendable {
                                        includingPropertiesForKeys: [.isRegularFileKey]) {
       for case let fileURL as URL in enumerator {
         if fileURL.lastPathComponent == path {
-          return .local(fileURL.path, scale: scale ?? 1.0)
+          return .local(fileURL.path, scale: clampedScale)
         }
       }
     }
 
     // HuggingFace fallback
-    return .huggingFace(path, scale: scale ?? 1.0)
+    return .huggingFace(path, scale: clampedScale)
   }
 }
 
@@ -3176,6 +3340,10 @@ private struct HealthResponse: Encodable, Sendable {
   let maxPending: Int
   let isRendering: Bool
   let activeRequestAgeMs: Int?
+  /// Synthetic id of the currently-rendering job — `current_job_id` on the wire.
+  let currentJobId: String?
+  /// Live progress (0-100) of the active render — `progress_percent` on the wire.
+  let progressPercent: Int?
   let memoryUsageBytes: UInt64
   let memoryUsageMB: UInt64
   let lastRenderDurationMs: Int?
@@ -3206,6 +3374,7 @@ private enum QueuedOperation: Sendable {
   case generate(GeneratePayload, ContinuationBox<GenerateResponse>, (@Sendable (ZImagePipeline.GenerationProgress) -> Void)?, ZImagePipeline.LatentPreviewHandler?)
   case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
+  case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
 

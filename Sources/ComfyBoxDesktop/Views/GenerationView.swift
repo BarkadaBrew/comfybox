@@ -28,6 +28,8 @@ struct GenerationView: View {
     var presetManager: PresetManager?
     var characters: [CharacterEntry]
     var onGenerated: ((String, GenerationRequest) -> Void)?
+    /// Preset queued by the Presets tab; consumed on appear / on change.
+    @Binding var pendingPreset: GenerationPreset?
 
     // Generation parameters
     @State private var prompt: String = ""
@@ -63,6 +65,8 @@ struct GenerationView: View {
             previewPanel
                 .frame(minWidth: 400)
         }
+        .onAppear { consumePendingPreset() }
+        .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .sheet(isPresented: $showingSavePreset) {
             if let pm = presetManager {
                 SavePresetSheet(
@@ -461,6 +465,7 @@ struct GenerationView: View {
             steps: Int(steps),
             guidance: Float(guidance),
             seed: seed,
+            modelId: engine.currentModel,
             loras: selectedLoras
         )
 
@@ -486,7 +491,12 @@ struct GenerationView: View {
                 // Notify app to ingest the generated file into DAM.
                 onGenerated?(outputPath, request)
             } catch {
-                // Error is already stored in engine.lastError
+                // Surface the error to the UI. EngineService sets lastError
+                // for server errors, but not for every failure mode (e.g.
+                // connection loss), so record it here as well.
+                await MainActor.run {
+                    engine.lastError = error.localizedDescription
+                }
             }
         }
     }
@@ -496,6 +506,13 @@ struct GenerationView: View {
         seedText = ""
         displayedImage = nil
         engine.lastError = nil
+    }
+
+    /// Consume a preset queued by the Presets tab, if any.
+    private func consumePendingPreset() {
+        guard let preset = pendingPreset else { return }
+        pendingPreset = nil
+        applyPreset(preset)
     }
 
     /// Apply a preset to the current generation parameters.
@@ -514,6 +531,23 @@ struct GenerationView: View {
         // Convert preset LoRAs to LoRASelections
         selectedLoras = preset.loras.map {
             LoRASelection(id: $0.id, filename: $0.filename, scale: $0.scale)
+        }
+
+        // Activate the preset's model via the model-pool API if it differs
+        // from the currently active model.
+        if let modelId = preset.modelId, modelId != engine.currentModel {
+            Task {
+                do {
+                    try await engine.activateModel(id: modelId)
+                } catch {
+                    // Not in the pool yet — try loading (and activating) it.
+                    do {
+                        try await engine.loadModel(id: modelId)
+                    } catch {
+                        engine.lastError = "Failed to activate preset model \(modelId): \(error.localizedDescription)"
+                    }
+                }
+            }
         }
     }
 

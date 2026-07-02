@@ -97,17 +97,45 @@ struct QueuePanel: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if info.isRendering {
-                    HStack(spacing: 4) {
-                        ProgressView()
-                            .controlSize(.mini)
-                        Text("Rendering...")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                    if let percent = info.progressPercent {
+                        // Determinate progress when the server reports it.
+                        HStack(spacing: 6) {
+                            ProgressView(value: min(max(percent, 0), 100), total: 100)
+                                .controlSize(.small)
+                                .frame(width: 80)
+                            Text("\(Int(percent.rounded()))%")
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(.orange)
+                        }
+                    } else {
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Rendering...")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
                 } else {
                     Text("Ready")
                         .font(.caption)
                         .foregroundStyle(.green)
+                }
+            }
+
+            // Current job id
+            if info.isRendering, let jobId = info.currentJobId {
+                HStack {
+                    Text("Job")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(jobId)
+                        .font(.caption)
+                        .monospaced()
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
 

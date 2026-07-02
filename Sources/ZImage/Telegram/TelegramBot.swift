@@ -290,9 +290,6 @@ public final class TelegramBot: @unchecked Sendable {
   /// Returns the file data, or nil if the download failed.
   public func downloadFile(fileId: String) async throws -> Data? {
     // Step 1: getFile to obtain the file_path
-    let fileInfo = try await callMethod("getFile", body: ["file_id": fileId])
-    // fileInfo response doesn't have messageId, we need to re-parse for file_path
-    // Use a separate raw call for getFile
     guard let url = URL(string: "\(baseURL)/getFile") else { return nil }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
