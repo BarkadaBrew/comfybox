@@ -154,3 +154,113 @@ struct AgentView: View {
         Task { await agent.send(text) }
     }
 }
+
+// MARK: - Compact panel embedded in Generate
+
+/// A small assistant chat that lives inside the Generate control panel. When
+/// a reply carries a parameter action, `onApply` is invoked so the assistant
+/// can populate the generation controls (and optionally start a render).
+struct GenerateAssistantPanel: View {
+    @Bindable var agent: AgentService
+    var onApply: (AgentAction) -> Void
+
+    @State private var input: String = ""
+    /// Ids of assistant messages whose action was already applied.
+    @State private var appliedMessageIds: Set<String> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if agent.messages.isEmpty {
+                Text("Ask the assistant to set up a shot, e.g. \"portrait of Kira, 85mm, 1024×1536, 9 steps\" — it fills the controls below.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(agent.messages) { message in
+                                messageRow(message).id(message.id)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(maxHeight: 240)
+                    .onChange(of: agent.messages.count) { _, _ in
+                        withAnimation { proxy.scrollTo(agent.messages.last?.id, anchor: .bottom) }
+                    }
+                }
+            }
+
+            if agent.isThinking {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Thinking…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let error = agent.lastError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange).lineLimit(2)
+            }
+
+            HStack(spacing: 6) {
+                TextField("Ask the assistant…", text: $input, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...4)
+                    .onSubmit(send)
+                Button(action: send) { Image(systemName: "arrow.up.circle.fill").font(.title3) }
+                    .buttonStyle(.plain)
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || agent.isThinking)
+                if !agent.messages.isEmpty {
+                    Button { agent.reset() } label: { Image(systemName: "square.and.pencil") }
+                        .buttonStyle(.plain)
+                        .help("New chat")
+                }
+            }
+        }
+        // Apply an action as soon as a new assistant reply carries one.
+        .onChange(of: agent.messages.count) { _, _ in applyLatestActionIfNeeded() }
+    }
+
+    @ViewBuilder
+    private func messageRow(_ message: AgentMessage) -> some View {
+        let isUser = message.role == .user
+        VStack(alignment: .leading, spacing: 4) {
+            Text(message.text)
+                .font(.caption)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if !isUser, let action = AgentService.parseAction(from: message.text) {
+                Button {
+                    onApply(action)
+                    appliedMessageIds.insert(message.id)
+                } label: {
+                    Label("Apply: \(action.summary)", systemImage: "slider.horizontal.3")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.mini)
+            }
+        }
+        .padding(8)
+        .background(
+            isUser ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+    }
+
+    private func send() {
+        let text = input
+        input = ""
+        Task { await agent.send(text) }
+    }
+
+    /// When the newest message is an assistant reply with an unapplied action,
+    /// apply it automatically (the button remains for re-applying).
+    private func applyLatestActionIfNeeded() {
+        guard let last = agent.messages.last, last.role == .assistant,
+              !appliedMessageIds.contains(last.id),
+              let action = AgentService.parseAction(from: last.text)
+        else { return }
+        appliedMessageIds.insert(last.id)
+        onApply(action)
+    }
+}

@@ -168,7 +168,8 @@ struct ComfyBoxDesktopApp: App {
                 characters: characters,
                 onGenerated: handleGenerated,
                 pendingPreset: $pendingPreset,
-                pendingPromptInsert: $pendingPromptInsert
+                pendingPromptInsert: $pendingPromptInsert,
+                agent: agentService
             )
 
         case .prompts:

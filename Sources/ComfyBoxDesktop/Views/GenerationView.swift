@@ -55,6 +55,8 @@ struct GenerationView: View {
     @Binding var pendingPreset: GenerationPreset?
     /// Prompt queued by the Prompt Library; replaces the prompt field once.
     @Binding var pendingPromptInsert: String?
+    /// Shared image assistant (Dan's v1.3) that can drive these controls.
+    var agent: AgentService?
 
     // Generation parameters
     @State private var prompt: String = ""
@@ -83,7 +85,9 @@ struct GenerationView: View {
     @State private var showQueuePanel: Bool = false
     @State private var showCharacters: Bool = false
     @State private var showCamera: Bool = false
+    @State private var showAssistant: Bool = true
     @State private var shotTemplates = ShotTemplateStore()
+    @State private var lastAppliedActionSummary: String?
 
     // Preset save sheet
     @State private var showingSavePreset: Bool = false
@@ -161,7 +165,25 @@ struct GenerationView: View {
                         .font(.headline)
                 }
 
-                Divider()
+                // Image assistant (Dan's v1.3) — can populate the controls below.
+                if let agent {
+                    DisclosureGroup(isExpanded: $showAssistant) {
+                        GenerateAssistantPanel(
+                            agent: agent,
+                            onApply: { action in applyAgentAction(action) }
+                        )
+                        .padding(.top, 4)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Label("Assistant", systemImage: "sparkles").font(.headline)
+                            if let summary = lastAppliedActionSummary {
+                                Text("applied: \(summary)")
+                                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                            }
+                        }
+                    }
+                    Divider()
+                }
 
                 // Prompt
                 promptSection
@@ -578,6 +600,28 @@ struct GenerationView: View {
         guard let text = pendingPromptInsert, !text.isEmpty else { return }
         pendingPromptInsert = nil
         prompt = text
+    }
+
+    /// Apply an assistant action to the generation controls. Only fields the
+    /// action set are changed; a `generate` flag kicks off a render.
+    private func applyAgentAction(_ action: AgentAction) {
+        if let p = action.prompt { prompt = p }
+        if let s = action.steps { steps = Double(min(max(s, 1), 50)) }
+        if let g = action.guidance { guidance = min(max(g, 0), 20) }
+        if let w = action.width, let h = action.height {
+            if let match = ResolutionPreset.presets.first(where: { $0.width == w && $0.height == h }) {
+                selectedResolution = match
+            } else {
+                customWidth = w
+                customHeight = h
+                selectedResolution = .custom
+            }
+        }
+        if let seed = action.seed { seedText = seed > 0 ? String(seed) : "" }
+        lastAppliedActionSummary = action.summary
+        if action.generate == true, !engine.isGenerating {
+            submitGeneration()
+        }
     }
 
     /// Apply a preset to the current generation parameters.

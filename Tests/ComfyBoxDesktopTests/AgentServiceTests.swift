@@ -44,8 +44,58 @@ struct AgentServiceTests {
         #expect(AgentService.suggestedPrompt(from: "PROMPT:   ") == nil)
     }
 
-    @Test("system prompt instructs the PROMPT: convention")
+    @Test("system prompt instructs the PROMPT: convention and json action")
     func systemPrompt() {
         #expect(AgentService.systemPrompt.contains("PROMPT:"))
+        #expect(AgentService.systemPrompt.contains("json"))
+    }
+
+    @Test("parseAction reads a fenced json action block")
+    func parseActionFenced() {
+        let reply = """
+        Here's a moody setup.
+        ```json
+        {"prompt": "kira at golden hour, 85mm", "negative_prompt": "blurry", "steps": 9, "guidance": 3.5, "width": 1024, "height": 1536, "seed": 42, "loras": ["moody=0.7"], "generate": true}
+        ```
+        """
+        let action = AgentService.parseAction(from: reply)
+        #expect(action != nil)
+        #expect(action?.prompt == "kira at golden hour, 85mm")
+        #expect(action?.negativePrompt == "blurry")
+        #expect(action?.steps == 9)
+        #expect(action?.guidance == 3.5)
+        #expect(action?.width == 1024)
+        #expect(action?.height == 1536)
+        #expect(action?.seed == 42)
+        #expect(action?.loras == ["moody=0.7"])
+        #expect(action?.generate == true)
+    }
+
+    @Test("parseAction reads a bare json object and partial keys")
+    func parseActionBare() {
+        let action = AgentService.parseAction(from: #"Sure. {"steps": 12, "guidance": 4}"#)
+        #expect(action?.steps == 12)
+        #expect(action?.guidance == 4.0)
+        #expect(action?.prompt == nil)
+        #expect(action?.width == nil)
+    }
+
+    @Test("parseAction returns nil for no block or empty changes")
+    func parseActionNil() {
+        #expect(AgentService.parseAction(from: "just prose, no json") == nil)
+        #expect(AgentService.parseAction(from: "```json\n{}\n```") == nil)
+        #expect(AgentService.parseAction(from: #"{"prompt": ""}"#) == nil)
+    }
+
+    @Test("action summary describes the changes")
+    func actionSummary() {
+        var action = AgentAction()
+        action.steps = 9
+        action.width = 1024; action.height = 1536
+        action.generate = true
+        let s = action.summary
+        #expect(s.contains("steps 9"))
+        #expect(s.contains("1024×1536"))
+        #expect(s.contains("generate"))
     }
 }
