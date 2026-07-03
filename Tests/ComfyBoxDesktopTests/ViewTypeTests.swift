@@ -13,10 +13,14 @@ struct ResolutionPresetTests {
     @Test("presets contain standard resolutions")
     func standardResolutions() {
         let presets = ResolutionPreset.presets
-        #expect(presets.count >= 4)
-        let labels = presets.map { $0.label }
-        #expect(labels.contains("1024 x 1024"))
-        #expect(labels.contains("512 x 512"))
+        #expect(presets.count >= 8)
+        let sizes = presets.map { "\($0.width)x\($0.height)" }
+        #expect(sizes.contains("1024x1024"))
+        #expect(sizes.contains("512x512"))
+        // Todd's staple aspect ratios (headshot, full body, landscape).
+        #expect(sizes.contains("1280x1280"))
+        #expect(sizes.contains("1024x1536"))
+        #expect(sizes.contains("1536x1024"))
     }
 
     @Test("presets have unique IDs")
@@ -25,10 +29,12 @@ struct ResolutionPresetTests {
         #expect(Set(ids).count == ids.count)
     }
 
-    @Test("label format is width x height")
+    @Test("label format is width × height, with an optional aspect hint")
     func labelFormat() {
-        let preset = ResolutionPreset(id: "test", width: 800, height: 600)
-        #expect(preset.label == "800 x 600")
+        let plain = ResolutionPreset(id: "test", width: 800, height: 600)
+        #expect(plain.label == "800 × 600")
+        let hinted = ResolutionPreset(id: "test2", width: 800, height: 600, hint: "4:3")
+        #expect(hinted.label == "800 × 600  (4:3)")
     }
 
     @Test("hashable conformance")

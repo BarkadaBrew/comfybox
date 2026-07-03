@@ -13,13 +13,36 @@ struct ResolutionPreset: Identifiable, Hashable {
     let id: String
     let width: Int
     let height: Int
-    var label: String { "\(width) x \(height)" }
+    /// Aspect-ratio hint shown next to the pixel size in the picker.
+    let hint: String
+
+    init(id: String, width: Int, height: Int, hint: String = "") {
+        self.id = id
+        self.width = width
+        self.height = height
+        self.hint = hint
+    }
+
+    var label: String {
+        hint.isEmpty ? "\(width) × \(height)" : "\(width) × \(height)  (\(hint))"
+    }
+
+    /// Sentinel for user-entered dimensions; width/height come from the
+    /// custom fields, not this entry.
+    static let custom = ResolutionPreset(id: "custom", width: 0, height: 0, hint: "custom")
 
     static let presets: [ResolutionPreset] = [
-        ResolutionPreset(id: "512sq", width: 512, height: 512),
-        ResolutionPreset(id: "768p", width: 768, height: 1024),
-        ResolutionPreset(id: "1024sq", width: 1024, height: 1024),
-        ResolutionPreset(id: "1024l", width: 1024, height: 768),
+        ResolutionPreset(id: "512sq", width: 512, height: 512, hint: "1:1 draft"),
+        ResolutionPreset(id: "768sq", width: 768, height: 768, hint: "1:1"),
+        ResolutionPreset(id: "1024sq", width: 1024, height: 1024, hint: "1:1"),
+        ResolutionPreset(id: "1280sq", width: 1280, height: 1280, hint: "1:1 headshot"),
+        ResolutionPreset(id: "768x1024", width: 768, height: 1024, hint: "3:4 portrait"),
+        ResolutionPreset(id: "1024x768", width: 1024, height: 768, hint: "4:3 landscape"),
+        ResolutionPreset(id: "1024x1536", width: 1024, height: 1536, hint: "2:3 full body"),
+        ResolutionPreset(id: "1536x1024", width: 1536, height: 1024, hint: "3:2 landscape"),
+        ResolutionPreset(id: "768x1344", width: 768, height: 1344, hint: "9:16 tall"),
+        ResolutionPreset(id: "1344x768", width: 1344, height: 768, hint: "16:9 wide"),
+        ResolutionPreset(id: "1536sq", width: 1536, height: 1536, hint: "1:1 hi-res"),
     ]
 }
 
@@ -34,10 +57,20 @@ struct GenerationView: View {
     // Generation parameters
     @State private var prompt: String = ""
     @State private var selectedResolution: ResolutionPreset = ResolutionPreset.presets[2]
+    @State private var customWidth: Int = 1024
+    @State private var customHeight: Int = 1024
     @State private var steps: Double = 9
     @State private var guidance: Double = 3.5
     @State private var seedText: String = ""
     @State private var displayedImage: NSImage?
+
+    /// Output dimensions: the picked preset, or the custom fields.
+    private var effectiveWidth: Int {
+        selectedResolution.id == ResolutionPreset.custom.id ? customWidth : selectedResolution.width
+    }
+    private var effectiveHeight: Int {
+        selectedResolution.id == ResolutionPreset.custom.id ? customHeight : selectedResolution.height
+    }
 
     // LoRA selections
     @State private var selectedLoras: [LoRASelection] = []
@@ -75,8 +108,8 @@ struct GenerationView: View {
                     loras: selectedLoras,
                     steps: Int(steps),
                     guidance: Float(guidance),
-                    width: selectedResolution.width,
-                    height: selectedResolution.height,
+                    width: effectiveWidth,
+                    height: effectiveHeight,
                     onSave: { name in
                         _ = pm.create(
                             name: name,
@@ -85,8 +118,8 @@ struct GenerationView: View {
                             loras: selectedLoras,
                             steps: Int(steps),
                             guidance: Float(guidance),
-                            width: selectedResolution.width,
-                            height: selectedResolution.height
+                            width: effectiveWidth,
+                            height: effectiveHeight
                         )
                         showingSavePreset = false
                     },
@@ -299,40 +332,36 @@ struct GenerationView: View {
                     ForEach(ResolutionPreset.presets) { preset in
                         Text(preset.label).tag(preset)
                     }
+                    Divider()
+                    Text("Custom…").tag(ResolutionPreset.custom)
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .labelsHidden()
-            }
 
-            // Steps slider
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Steps")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text("\(Int(steps))")
-                        .font(.subheadline)
-                        .monospacedDigit()
+                if selectedResolution.id == ResolutionPreset.custom.id {
+                    HStack(spacing: 6) {
+                        TextField("Width", value: $customWidth, format: .number.grouping(.never))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.subheadline.monospacedDigit())
+                            .frame(width: 70)
+                        Text("×").foregroundStyle(.secondary)
+                        TextField("Height", value: $customHeight, format: .number.grouping(.never))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.subheadline.monospacedDigit())
+                            .frame(width: 70)
+                        Text("px")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                    }
                 }
-
-                Slider(value: $steps, in: 1...50, step: 1)
             }
 
-            // Guidance slider
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Guidance")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text(String(format: "%.1f", guidance))
-                        .font(.subheadline)
-                        .monospacedDigit()
-                }
+            // Steps
+            NumericSliderField(label: "Steps", value: $steps, range: 1...50, step: 1)
 
-                Slider(value: $guidance, in: 0...20, step: 0.5)
-            }
+            // Guidance
+            NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
 
             // Seed field
             VStack(alignment: .leading, spacing: 4) {
@@ -460,8 +489,8 @@ struct GenerationView: View {
 
         let request = GenerationRequest(
             prompt: prompt,
-            width: selectedResolution.width,
-            height: selectedResolution.height,
+            width: effectiveWidth,
+            height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
             seed: seed,
@@ -521,11 +550,16 @@ struct GenerationView: View {
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
 
-        // Find matching resolution preset, or keep current
+        // Find a matching resolution preset, else carry the preset's exact
+        // dimensions through the custom fields.
         if let match = ResolutionPreset.presets.first(where: {
             $0.width == preset.width && $0.height == preset.height
         }) {
             selectedResolution = match
+        } else if preset.width > 0, preset.height > 0 {
+            customWidth = preset.width
+            customHeight = preset.height
+            selectedResolution = .custom
         }
 
         // Convert preset LoRAs to LoRASelections

@@ -220,10 +220,18 @@ struct LoRAPicker: View {
                     )
                     .controlSize(.mini)
 
-                    Text(String(format: "%.2f", selectedLoras[safe: index]?.scale ?? 1.0))
-                        .font(.caption2)
-                        .monospacedDigit()
-                        .frame(width: 32)
+                    TextField(
+                        "",
+                        value: Binding(
+                            get: { selectedLoras[safe: index]?.scale ?? 1.0 },
+                            set: { selectedLoras[index].scale = min(max($0, 0.0), 2.0) }
+                        ),
+                        format: .number.precision(.fractionLength(0...2))
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption2.monospacedDigit())
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 44)
                 }
                 .padding(.leading, 22)
             }
