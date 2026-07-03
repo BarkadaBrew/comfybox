@@ -101,31 +101,39 @@ struct GenerationView: View {
         .onAppear { consumePendingPreset() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .sheet(isPresented: $showingSavePreset) {
-            if let pm = presetManager {
-                SavePresetSheet(
-                    promptTemplate: prompt,
-                    modelId: engine.currentModel,
-                    loras: selectedLoras,
-                    steps: Int(steps),
-                    guidance: Float(guidance),
-                    width: effectiveWidth,
-                    height: effectiveHeight,
-                    onSave: { name in
-                        _ = pm.create(
-                            name: name,
-                            promptTemplate: prompt,
-                            modelId: engine.currentModel,
-                            loras: selectedLoras,
-                            steps: Int(steps),
-                            guidance: Float(guidance),
-                            width: effectiveWidth,
-                            height: effectiveHeight
-                        )
-                        showingSavePreset = false
-                    },
-                    onCancel: { showingSavePreset = false }
-                )
-            }
+            SavePresetSheet(
+                promptTemplate: prompt,
+                modelId: engine.currentModel,
+                loras: selectedLoras,
+                steps: Int(steps),
+                guidance: Float(guidance),
+                width: effectiveWidth,
+                height: effectiveHeight,
+                onSave: { name in
+                    // Save to the canonical server preset store (shared with
+                    // Bree/Telegram), not the old device-local list.
+                    let preset = ServerPreset(
+                        name: name,
+                        prompt: prompt.isEmpty ? nil : prompt,
+                        steps: Int(steps),
+                        guidance: guidance,
+                        width: effectiveWidth,
+                        height: effectiveHeight,
+                        loras: selectedLoras.map {
+                            ServerPresetLora(filename: $0.filename, scale: Double($0.scale))
+                        }
+                    )
+                    var withModel = preset
+                    if let model = engine.currentModel {
+                        if model.hasPrefix("/") { withModel.customModelPath = model }
+                        else { withModel.model = model }
+                    }
+                    let toSave = withModel
+                    Task { try? await engine.savePreset(toSave) }
+                    showingSavePreset = false
+                },
+                onCancel: { showingSavePreset = false }
+            )
         }
     }
 

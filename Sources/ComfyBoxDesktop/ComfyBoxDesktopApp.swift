@@ -177,7 +177,7 @@ struct ComfyBoxDesktopApp: App {
 
         case .presets:
             PresetView(
-                presetManager: presetManager,
+                engine: engine,
                 onApply: { preset in
                     applyPresetToGeneration(preset)
                 }

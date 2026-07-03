@@ -1,227 +1,329 @@
-// PresetView.swift — Preset list with CRUD actions
+// PresetView.swift — Server-backed preset management
 //
-// Displays saved generation presets in a list. Supports apply,
-// edit, duplicate, and delete actions. The "Save as Preset" flow
-// is triggered from GenerationView and routes through PresetManager.
+// Full CRUD against the canonical /v1/presets store (shared with Bree and
+// the Telegram bot), replacing the old device-local preset list. Apply maps
+// a server preset onto the Generate tab; legacy image-service routing fields
+// (engine/provider/mode) are shown as chips and preserved verbatim on save.
 
 import SwiftUI
 
 struct PresetView: View {
-    @Bindable var presetManager: PresetManager
+    @Bindable var engine: EngineService
     var onApply: ((GenerationPreset) -> Void)?
 
-    @State private var editingPreset: GenerationPreset?
-    @State private var showingEditor: Bool = false
+    @State private var presets: [ServerPreset] = []
+    @State private var editing: ServerPreset?
+    @State private var isNew: Bool = false
+    @State private var isLoading = false
+    @State private var loadError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Text("Presets")
-                    .font(.headline)
-                Spacer()
-                Text("\(presetManager.presets.count) saved")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-
+            header
             Divider()
-
-            if presetManager.presets.isEmpty {
+            if let loadError {
+                Text(loadError).font(.caption).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+            }
+            if presets.isEmpty {
                 emptyState
             } else {
                 presetList
             }
         }
-        .sheet(isPresented: $showingEditor) {
-            if let preset = editingPreset {
-                PresetEditorSheet(
-                    preset: preset,
-                    onSave: { updated in
-                        presetManager.update(updated)
-                        showingEditor = false
-                        editingPreset = nil
-                    },
-                    onCancel: {
-                        showingEditor = false
-                        editingPreset = nil
-                    }
-                )
-                .frame(minWidth: 420, minHeight: 400)
+        .navigationTitle("Presets")
+        .task { await reload() }
+        .onChange(of: engine.connectionState.isConnected) { _, connected in
+            if connected { Task { await reload() } }
+        }
+        .sheet(item: $editing) { preset in
+            ServerPresetEditor(
+                original: preset,
+                isNew: isNew,
+                onSave: { updated in Task { await save(updated) } },
+                onCancel: { editing = nil }
+            )
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Text("Presets")
+                .font(.headline)
+            Text("\(presets.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Spacer()
+            if isLoading { ProgressView().controlSize(.small) }
+            Button { Task { await reload() } } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless)
+            Button {
+                isNew = true
+                editing = ServerPreset(name: "")
+            } label: { Label("New Preset", systemImage: "plus") }
+                .buttonStyle(.borderedProminent)
+                .disabled(!engine.connectionState.isConnected)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private var presetList: some View {
+        ScrollView {
+            LazyVStack(spacing: 8) {
+                ForEach(presets) { preset in
+                    ServerPresetRow(
+                        preset: preset,
+                        onApply: { onApply?(preset.toGenerationPreset()) },
+                        onEdit: { isNew = false; editing = preset },
+                        onDuplicate: { Task { await duplicate(preset) } },
+                        onDelete: { Task { await delete(preset) } }
+                    )
+                }
             }
+            .padding(12)
         }
     }
 
     private var emptyState: some View {
         VStack(spacing: 8) {
             Image(systemName: "slider.horizontal.below.rectangle")
-                .font(.system(size: 32))
-                .foregroundStyle(.tertiary)
-            Text("No presets saved")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Text("Use Cmd+S or the Save button to create one.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
-    }
-
-    private var presetList: some View {
-        List {
-            ForEach(presetManager.presets) { preset in
-                PresetRow(preset: preset)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        onApply?(preset)
-                    }
-                    .contextMenu {
-                        Button("Apply") { onApply?(preset) }
-                        Button("Edit...") {
-                            editingPreset = preset
-                            showingEditor = true
-                        }
-                        Button("Duplicate") {
-                            _ = presetManager.duplicate(preset)
-                        }
-                        Divider()
-                        Button("Delete", role: .destructive) {
-                            presetManager.delete(id: preset.id)
-                        }
-                    }
+                .font(.system(size: 32)).foregroundStyle(.tertiary)
+            Text(engine.connectionState.isConnected ? "No presets yet" : "Connect to the server to manage presets")
+                .font(.subheadline).foregroundStyle(.secondary)
+            if engine.connectionState.isConnected {
+                Text("Create one here, or use “Save as Preset” in Generate.")
+                    .font(.caption).foregroundStyle(.tertiary)
             }
         }
-        .listStyle(.inset)
+        .frame(maxWidth: .infinity, maxHeight: .infinity).padding()
+    }
+
+    // MARK: - Actions
+
+    private func reload() async {
+        guard engine.connectionState.isConnected else { return }
+        isLoading = true; defer { isLoading = false }
+        loadError = nil
+        presets = await engine.fetchPresets()
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func save(_ preset: ServerPreset) async {
+        do {
+            try await engine.savePreset(preset)
+            editing = nil
+            await reload()
+        } catch {
+            loadError = "Save failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func duplicate(_ preset: ServerPreset) async {
+        var copy = preset
+        copy.id = UUID().uuidString
+        copy.name = "\(preset.name) Copy"
+        await save(copy)
+    }
+
+    private func delete(_ preset: ServerPreset) async {
+        do {
+            try await engine.deletePreset(id: preset.id)
+            await reload()
+        } catch {
+            loadError = "Delete failed: \(error.localizedDescription)"
+        }
     }
 }
 
-// MARK: - Preset Row
+// MARK: - Row
 
-private struct PresetRow: View {
-    let preset: GenerationPreset
+private struct ServerPresetRow: View {
+    let preset: ServerPreset
+    var onApply: () -> Void
+    var onEdit: () -> Void
+    var onDuplicate: () -> Void
+    var onDelete: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(preset.name)
-                    .font(.subheadline.weight(.medium))
-                Spacer()
-                if let model = preset.modelId {
-                    Text(model)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: preset.mediaKind == "video" ? "film" : "photo")
+                .font(.title3).foregroundStyle(.secondary).frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(preset.name).font(.headline)
+                    if let engineName = preset.engine {
+                        chip(engineName)
+                    }
+                    if let provider = preset.provider, provider != "local" {
+                        chip(provider)
+                    }
                 }
+                if !preset.description.isEmpty {
+                    Text(preset.description)
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Text(summaryLine)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
             }
 
-            if !preset.promptTemplate.isEmpty {
-                Text(preset.promptTemplate)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-            }
+            Spacer()
 
-            HStack(spacing: 8) {
-                Label("\(preset.steps) steps", systemImage: "slider.horizontal.3")
-                Label(String(format: "%.1f cfg", preset.guidance), systemImage: "tuningfork")
-                Label("\(preset.width)x\(preset.height)", systemImage: "aspectratio")
-                if !preset.loras.isEmpty {
-                    Label("\(preset.loras.count) LoRA", systemImage: "link")
-                }
+            Button("Apply", action: onApply)
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+            Button { onEdit() } label: { Image(systemName: "pencil") }
+                .buttonStyle(.borderless)
+            Menu {
+                Button("Duplicate", action: onDuplicate)
+                Button("Delete", role: .destructive, action: onDelete)
+            } label: {
+                Image(systemName: "ellipsis.circle")
             }
+            .buttonStyle(.borderless)
+            .fixedSize()
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var summaryLine: String {
+        var parts: [String] = []
+        if let model = preset.model ?? preset.customModelPath {
+            parts.append((model as NSString).lastPathComponent)
+        }
+        if let w = preset.width, let h = preset.height { parts.append("\(w)×\(h)") }
+        if let steps = preset.steps { parts.append("\(steps) steps") }
+        if let guidance = preset.guidance { parts.append(String(format: "g %.1f", guidance)) }
+        if !preset.loras.isEmpty { parts.append("\(preset.loras.count) LoRA\(preset.loras.count == 1 ? "" : "s")") }
+        if let scheduler = preset.scheduler { parts.append(scheduler) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func chip(_ text: String) -> some View {
+        Text(text)
             .font(.caption2)
-            .foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 4)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(.quaternary, in: Capsule())
+            .foregroundStyle(.secondary)
     }
 }
 
-// MARK: - Preset Editor Sheet
+// MARK: - Editor
 
-struct PresetEditorSheet: View {
-    @State var preset: GenerationPreset
-    var onSave: (GenerationPreset) -> Void
-    var onCancel: () -> Void
+private struct ServerPresetEditor: View {
+    let original: ServerPreset
+    let isNew: Bool
+    let onSave: (ServerPreset) -> Void
+    let onCancel: () -> Void
+
+    @State private var name: String
+    @State private var descriptionText: String
+    @State private var prompt: String
+    @State private var negativePrompt: String
+    @State private var model: String
+    @State private var widthText: String
+    @State private var heightText: String
+    @State private var stepsText: String
+    @State private var guidanceText: String
+    @State private var lorasText: String
+    @State private var scheduler: String
+
+    init(original: ServerPreset, isNew: Bool,
+         onSave: @escaping (ServerPreset) -> Void, onCancel: @escaping () -> Void) {
+        self.original = original
+        self.isNew = isNew
+        self.onSave = onSave
+        self.onCancel = onCancel
+        _name = State(initialValue: original.name)
+        _descriptionText = State(initialValue: original.description)
+        _prompt = State(initialValue: original.prompt ?? "")
+        _negativePrompt = State(initialValue: original.negativePrompt ?? "")
+        _model = State(initialValue: original.customModelPath ?? original.model ?? "")
+        _widthText = State(initialValue: original.width.map(String.init) ?? "")
+        _heightText = State(initialValue: original.height.map(String.init) ?? "")
+        _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
+        _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
+        _lorasText = State(initialValue: original.loras
+            .map { $0.scale == 1.0 ? $0.filename : "\($0.filename)=\($0.scale)" }
+            .joined(separator: ", "))
+        _scheduler = State(initialValue: original.scheduler ?? "")
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Title bar
-            HStack {
-                Text("Edit Preset")
-                    .font(.headline)
-                Spacer()
-            }
-            .padding()
-
+        VStack(alignment: .leading, spacing: 0) {
+            Text(isNew ? "New Preset" : "Edit Preset").font(.headline).padding()
             Divider()
-
             Form {
-                Section("Basics") {
-                    TextField("Name", text: $preset.name)
-                    TextField("Model ID", text: Binding(
-                        get: { preset.modelId ?? "" },
-                        set: { preset.modelId = $0.isEmpty ? nil : $0 }
-                    ))
+                TextField("Name", text: $name)
+                TextField("Description", text: $descriptionText)
+                Section("Prompt") {
+                    TextField("Prompt template", text: $prompt, axis: .vertical).lineLimit(2...6)
+                    TextField("Negative prompt", text: $negativePrompt, axis: .vertical).lineLimit(1...3)
                 }
-
-                Section("Prompt Template") {
-                    TextEditor(text: $preset.promptTemplate)
-                        .frame(minHeight: 60)
-                        .font(.body)
-                }
-
-                Section("Parameters") {
+                Section("Model & Parameters") {
+                    TextField("Model (name or path)", text: $model)
                     HStack {
-                        Text("Steps")
+                        TextField("Width", text: $widthText).frame(width: 90)
+                        Text("×").foregroundStyle(.secondary)
+                        TextField("Height", text: $heightText).frame(width: 90)
                         Spacer()
-                        TextField("Steps", value: $preset.steps, format: .number)
-                            .frame(width: 60)
-                            .multilineTextAlignment(.trailing)
                     }
                     HStack {
-                        Text("Guidance")
-                        Spacer()
-                        TextField("Guidance", value: $preset.guidance, format: .number.precision(.fractionLength(1)))
-                            .frame(width: 60)
-                            .multilineTextAlignment(.trailing)
+                        TextField("Steps", text: $stepsText).frame(width: 90)
+                        TextField("Guidance", text: $guidanceText).frame(width: 90)
+                        TextField("Scheduler", text: $scheduler)
                     }
-                    HStack {
-                        Text("Width")
-                        Spacer()
-                        TextField("Width", value: $preset.width, format: .number)
-                            .frame(width: 80)
-                            .multilineTextAlignment(.trailing)
-                    }
-                    HStack {
-                        Text("Height")
-                        Spacer()
-                        TextField("Height", value: $preset.height, format: .number)
-                            .frame(width: 80)
-                            .multilineTextAlignment(.trailing)
-                    }
+                    TextField("LoRAs (file=scale, comma-separated)", text: $lorasText)
                 }
             }
             .formStyle(.grouped)
-
             Divider()
-
-            // Action buttons
             HStack {
-                Button("Cancel") { onCancel() }
-                    .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Save") { onSave(preset) }
-                    .keyboardShortcut(.defaultAction)
+                Button("Cancel", action: onCancel)
+                Button("Save") { onSave(buildPreset()) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(preset.name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding()
         }
+        .frame(minWidth: 540, idealWidth: 600, minHeight: 540, idealHeight: 620)
+    }
+
+    /// Apply the edited fields onto the original so unedited (legacy routing)
+    /// fields pass through untouched.
+    private func buildPreset() -> ServerPreset {
+        var p = original
+        if p.id.isEmpty { p.id = UUID().uuidString }
+        p.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        p.description = descriptionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        p.prompt = prompt.isEmpty ? nil : prompt
+        p.negativePrompt = negativePrompt.isEmpty ? nil : negativePrompt
+        let modelValue = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if modelValue.hasPrefix("/") || modelValue.hasPrefix("~") {
+            p.customModelPath = modelValue
+        } else {
+            p.model = modelValue.isEmpty ? nil : modelValue
+            p.customModelPath = nil
+        }
+        p.width = Int(widthText)
+        p.height = Int(heightText)
+        p.steps = Int(stepsText)
+        p.guidance = Double(guidanceText.replacingOccurrences(of: ",", with: "."))
+        p.scheduler = scheduler.isEmpty ? nil : scheduler
+        p.loras = lorasText.split(separator: ",").compactMap { part in
+            let token = part.trimmingCharacters(in: .whitespaces)
+            guard !token.isEmpty else { return nil }
+            let pieces = token.split(separator: "=", maxSplits: 1)
+            let filename = String(pieces[0]).trimmingCharacters(in: .whitespaces)
+            let scale = pieces.count > 1 ? (Double(pieces[1]) ?? 1.0) : 1.0
+            return ServerPresetLora(filename: filename, scale: scale)
+        }
+        return p
     }
 }
 

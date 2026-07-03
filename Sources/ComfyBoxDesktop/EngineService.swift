@@ -713,6 +713,123 @@ public final class EngineService {
         }
     }
 
+    // MARK: - Queue management (/v1/queue)
+
+    /// One pending job in the server render queue.
+    public struct QueueJob: Identifiable, Sendable, Equatable {
+        public let id: String
+        public let kind: String
+        public let summary: String
+        public let enqueuedAt: Date?
+    }
+
+    /// Snapshot of the server queue: active operation + pending jobs.
+    public struct QueueJobList: Sendable, Equatable {
+        public var isRendering: Bool = false
+        public var activeJobId: String?
+        public var activeSummary: String?
+        public var progressPercent: Int?
+        public var pending: [QueueJob] = []
+        public var renderCount: Int = 0
+        public var failedCount: Int = 0
+    }
+
+    /// Fetch the detailed queue listing.
+    public func fetchQueueJobs() async -> QueueJobList? {
+        guard let client = client, connectionState.isConnected else { return nil }
+        do {
+            let (status, data) = try await client.get("/v1/queue")
+            guard status == 200,
+                  let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return nil }
+            let iso = ISO8601DateFormatter()
+            var list = QueueJobList()
+            list.isRendering = (dict["is_rendering"] as? Bool) ?? false
+            list.activeJobId = dict["active_job_id"] as? String
+            list.activeSummary = dict["active_summary"] as? String
+            list.progressPercent = dict["progress_percent"] as? Int
+            list.renderCount = (dict["render_count"] as? Int) ?? 0
+            list.failedCount = (dict["failed_count"] as? Int) ?? 0
+            list.pending = ((dict["pending"] as? [[String: Any]]) ?? []).compactMap { job in
+                guard let id = job["id"] as? String else { return nil }
+                return QueueJob(
+                    id: id,
+                    kind: (job["kind"] as? String) ?? "job",
+                    summary: (job["summary"] as? String) ?? "",
+                    enqueuedAt: (job["enqueued_at"] as? String).flatMap { iso.date(from: $0) }
+                )
+            }
+            return list
+        } catch {
+            return nil
+        }
+    }
+
+    /// Cancel the in-flight render (pending jobs continue).
+    public func interruptRender() async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let (status, data) = try await client.post("/v1/queue/interrupt", body: Data("{}".utf8))
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Interrupt failed")
+        }
+    }
+
+    /// Cancel one pending job by id.
+    public func cancelQueueJob(id: String) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let enc = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let (status, data) = try await client.delete("/v1/queue/\(enc)")
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Cancel failed")
+        }
+    }
+
+    /// Clear every pending job (the active render continues).
+    public func clearQueue() async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let (status, data) = try await client.post("/v1/queue/clear", body: Data("{}".utf8))
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Clear failed")
+        }
+    }
+
+    // MARK: - Presets (/v1/presets — the server-side canonical store)
+
+    /// Fetch the server preset list (bare snake_case array).
+    public func fetchPresets() async -> [ServerPreset] {
+        guard let client = client, connectionState.isConnected else { return [] }
+        do {
+            let (status, data) = try await client.get("/v1/presets")
+            guard status == 200 else { return [] }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            return try decoder.decode([ServerPreset].self, from: data)
+        } catch {
+            return []
+        }
+    }
+
+    /// Create or update a server preset. Sends the full document (camelCase,
+    /// tolerated by the server) — upsert replaces the stored preset.
+    public func savePreset(_ preset: ServerPreset) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONEncoder().encode(preset)
+        let (status, data) = try await client.post("/v1/presets", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to save preset")
+        }
+    }
+
+    /// Delete a server preset by id.
+    public func deletePreset(id: String) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let enc = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let (status, data) = try await client.delete("/v1/presets/\(enc)")
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to delete preset")
+        }
+    }
+
     /// Delete a character by id.
     public func deleteCharacter(id: String) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
