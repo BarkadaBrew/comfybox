@@ -1,0 +1,455 @@
+// HealthBoardView.swift — "Datadog, but local" health board
+//
+// One pane answering "is the stack healthy right now?" without SSH
+// (coffeeshop-dashboard-prd). Shows the ComfyBox engine, user-watched
+// service endpoints, host unified memory, and a state-transition event
+// timeline fed by HealthMonitor. Status is always icon + label + color,
+// never color alone.
+
+import SwiftUI
+
+/// Trailing window for activity stats and uptime figures.
+enum HealthRange: String, CaseIterable, Identifiable {
+    case week = "7d"
+    case month = "30d"
+    case all = "All"
+    var id: String { rawValue }
+
+    /// Days in the window; `nil` = unbounded (all history).
+    var days: Int? {
+        switch self {
+        case .week: return 7
+        case .month: return 30
+        case .all: return nil
+        }
+    }
+}
+
+struct HealthBoardView: View {
+    @Bindable var engine: EngineService
+    @Bindable var monitor: HealthMonitor
+    var store: DAMStore?
+
+    @State private var newServiceName: String = ""
+    @State private var newServiceURL: String = ""
+    @State private var showAddService: Bool = false
+
+    // Render-activity data (from the DAM).
+    @State private var renderTimestamps: [Date] = []
+    @State private var range: HealthRange = .month
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                header
+                comfyBoxSection
+                activitySection
+                servicesSection
+                memorySection
+                eventsSection
+            }
+            .padding(20)
+        }
+        .navigationTitle("Health")
+        .task { await loadActivity() }
+    }
+
+    private func loadActivity() async {
+        guard let store else { return }
+        renderTimestamps = (try? await store.assetCreationTimestamps()) ?? []
+    }
+
+    // MARK: - Header
+
+    /// Overall stack state: worst of the watched services and the engine.
+    private var stackState: HealthState {
+        let engineState = engineHealthState
+        let monitorState = monitor.overallState
+        return engineState.severityRank >= monitorState.severityRank ? engineState : monitorState
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            statusBadge(stackState, font: .title3)
+            if let refreshed = monitor.lastRefresh {
+                Text("Checked \(refreshed, style: .relative) ago")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                Task { await monitor.checkNow() }
+            } label: {
+                Label("Check Now", systemImage: "arrow.clockwise")
+            }
+        }
+    }
+
+    // MARK: - ComfyBox engine
+
+    /// Engine health from live connection + queue state (no HTTP probe needed).
+    private var engineHealthState: HealthState {
+        guard engine.connectionState.isConnected else { return .down }
+        if engine.queueInfo?.lastError != nil { return .degraded }
+        return .healthy
+    }
+
+    private var comfyBoxSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("ComfyBox")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
+                let q = engine.queueInfo
+                serviceCard(
+                    name: "ComfyBox Server",
+                    state: engineHealthState,
+                    detail: engine.connectionState.isConnected
+                        ? "\(engine.serverHost):\(engine.serverPort)"
+                        : "disconnected",
+                    latencyMs: nil
+                )
+                StatTile(title: "Queue", value: "\(q?.pendingCount ?? 0)", systemImage: "tray.full")
+                StatTile(
+                    title: "Status",
+                    value: (q?.isRendering ?? false) ? "Rendering" : "Idle",
+                    systemImage: "bolt.fill",
+                    tint: (q?.isRendering ?? false) ? .orange : .green
+                )
+                if let ms = q?.lastRenderDurationMs {
+                    StatTile(title: "Last render", value: String(format: "%.1fs", Double(ms) / 1000), systemImage: "timer")
+                }
+                if let mem = q?.memoryUsageMB, mem > 0 {
+                    StatTile(title: "Server memory", value: String(format: "%.1f GB", Double(mem) / 1024), systemImage: "memorychip")
+                }
+            }
+            if let q = engine.queueInfo, q.isRendering, let pct = q.progressPercent {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(q.currentJobId.map { "Job \($0)" } ?? "Current render")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(Int(pct))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    ProgressView(value: min(max(pct / 100, 0), 1))
+                }
+            }
+            if let error = engine.queueInfo?.lastError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    // MARK: - Render activity
+
+    /// Timestamps inside the selected range.
+    private var rangedTimestamps: [Date] {
+        guard let days = range.days else { return renderTimestamps }
+        let cutoff = Calendar.current.date(byAdding: .day, value: -(days - 1), to: Calendar.current.startOfDay(for: Date())) ?? .distantPast
+        return renderTimestamps.filter { $0 >= cutoff }
+    }
+
+    /// Days shown in the heatmap: the range, or all history capped at a year.
+    private var heatmapDayCount: Int {
+        if let days = range.days { return days }
+        guard let first = renderTimestamps.first else { return 30 }
+        let span = (Calendar.current.dateComponents(
+            [.day], from: Calendar.current.startOfDay(for: first), to: Date()).day ?? 0) + 1
+        return min(max(span, 30), 366)
+    }
+
+    private var activitySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionTitle("Activity")
+                Spacer()
+                Picker("Range", selection: $range) {
+                    ForEach(HealthRange.allCases) { r in
+                        Text(r.rawValue).tag(r)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+            }
+
+            let summary = ActivityStats.summarize(timestamps: rangedTimestamps)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 12)], spacing: 12) {
+                StatTile(title: "Renders", value: "\(summary.totalCount)", systemImage: "photo.stack")
+                StatTile(title: "Active days", value: "\(summary.activeDays)", systemImage: "calendar")
+                StatTile(title: "Current streak", value: "\(summary.currentStreak)d", systemImage: "flame")
+                StatTile(title: "Longest streak", value: "\(summary.longestStreak)d", systemImage: "trophy")
+                StatTile(
+                    title: "Peak hour",
+                    value: summary.peakHour.map { hourLabel($0) } ?? "—",
+                    systemImage: "clock"
+                )
+            }
+
+            ActivityHeatmapView(
+                days: ActivityStats.dayCounts(timestamps: rangedTimestamps, days: heatmapDayCount)
+            )
+            .padding(12)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    /// "11 AM" style label for an hour of day.
+    private func hourLabel(_ hour: Int) -> String {
+        var components = DateComponents()
+        components.hour = hour
+        let date = Calendar.current.date(from: components) ?? Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h a"
+        return formatter.string(from: date)
+    }
+
+    // MARK: - Watched services
+
+    private var servicesSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionTitle("Watched Services")
+                Spacer()
+                Button {
+                    showAddService.toggle()
+                } label: {
+                    Label("Add", systemImage: "plus")
+                }
+                .controlSize(.small)
+                .popover(isPresented: $showAddService, arrowEdge: .bottom) {
+                    addServiceForm
+                }
+            }
+
+            if monitor.services.isEmpty {
+                Text("No services watched yet. Add a health endpoint (e.g. the Bree daemon or LM Studio) to see it here.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], spacing: 12) {
+                    ForEach(monitor.services) { health in
+                        serviceCard(
+                            name: health.service.name,
+                            state: health.state,
+                            detail: health.detail ?? health.service.urlString,
+                            latencyMs: health.latencyMs,
+                            uptime: monitor.uptime.stats(
+                                serviceId: health.service.id,
+                                days: range.days ?? 90
+                            )
+                        )
+                        .contextMenu {
+                            Button("Remove", role: .destructive) {
+                                removeService(health.service)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var addServiceForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Watch a service")
+                .font(.headline)
+            TextField("Name (e.g. Bree Daemon)", text: $newServiceName)
+                .textFieldStyle(.roundedBorder)
+            TextField("Health URL (e.g. http://10.0.100.232:8080/health)", text: $newServiceURL)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Add") { addService() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(newServiceName.isEmpty || URL(string: newServiceURL)?.host == nil)
+            }
+        }
+        .padding(16)
+        .frame(width: 360)
+    }
+
+    // MARK: - Host memory
+
+    private var memorySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Host")
+            HStack(spacing: 16) {
+                if let fraction = monitor.memoryUsedFraction,
+                   let used = monitor.memoryUsedGB,
+                   let total = monitor.memoryTotalGB {
+                    Gauge(value: fraction) {
+                        Text("Memory")
+                    } currentValueLabel: {
+                        Text("\(Int(fraction * 100))%")
+                            .font(.caption.monospacedDigit())
+                    }
+                    .gaugeStyle(.accessoryCircularCapacity)
+                    .tint(fraction > 0.9 ? .red : fraction > 0.75 ? .orange : .green)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Unified memory")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(String(format: "%.1f / %.0f GB in use", used, total))
+                            .font(.body.monospacedDigit())
+                    }
+                } else {
+                    Text("Memory stats unavailable")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    // MARK: - Events
+
+    private var eventsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Events")
+            if monitor.events.isEmpty {
+                Text("No events yet — state changes appear here.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(monitor.events) { event in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: severityIcon(event.severity))
+                                .foregroundStyle(severityColor(event.severity))
+                                .font(.caption)
+                            Text(event.timestamp, format: .dateTime.hour().minute().second())
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Text(event.message)
+                                .font(.callout)
+                                .lineLimit(2)
+                            Spacer()
+                        }
+                        .padding(.vertical, 5)
+                        .padding(.horizontal, 10)
+                        if event.id != monitor.events.last?.id {
+                            Divider()
+                        }
+                    }
+                }
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
+    }
+
+    // MARK: - Pieces
+
+    private func sectionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(.headline)
+    }
+
+    private func statusBadge(_ state: HealthState, font: Font = .callout) -> some View {
+        Label(state.label, systemImage: state.systemImage)
+            .font(font.weight(.semibold))
+            .foregroundStyle(stateColor(state))
+    }
+
+    private func serviceCard(
+        name: String, state: HealthState, detail: String?, latencyMs: Int?,
+        uptime: UptimeStats? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                Spacer()
+                if let latencyMs {
+                    Text("\(latencyMs) ms")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            statusBadge(state, font: .caption)
+            if let detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if let uptime, uptime.totalChecks > 0 {
+                Text(String(
+                    format: "%.1f%% up · %d interruption%@ (%@)",
+                    uptime.uptimePercent,
+                    uptime.interruptions,
+                    uptime.interruptions == 1 ? "" : "s",
+                    range.days.map { "\($0)d" } ?? "90d"
+                ))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(uptime.interruptions > 0 ? .orange : .secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
+        .padding(12)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(stateColor(state).opacity(state == .healthy ? 0 : 0.5), lineWidth: 1.5)
+        )
+    }
+
+    private func stateColor(_ state: HealthState) -> Color {
+        switch state {
+        case .healthy: return .green
+        case .degraded: return .orange
+        case .down: return .red
+        case .unknown: return .gray
+        }
+    }
+
+    private func severityIcon(_ severity: HealthEvent.Severity) -> String {
+        switch severity {
+        case .info: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .error: return "xmark.octagon.fill"
+        }
+    }
+
+    private func severityColor(_ severity: HealthEvent.Severity) -> Color {
+        switch severity {
+        case .info: return .green
+        case .warning: return .orange
+        case .error: return .red
+        }
+    }
+
+    // MARK: - Service management
+
+    private func addService() {
+        let service = WatchedService(name: newServiceName, urlString: newServiceURL)
+        monitor.watchedServices.append(service)
+        persistWatchedServices()
+        newServiceName = ""
+        newServiceURL = ""
+        showAddService = false
+        Task { await monitor.checkNow() }
+    }
+
+    private func removeService(_ service: WatchedService) {
+        monitor.watchedServices.removeAll { $0.id == service.id }
+        persistWatchedServices()
+        Task { await monitor.checkNow() }
+    }
+
+    private func persistWatchedServices() {
+        var settings = DesktopSettings.load()
+        settings.watchedServices = monitor.watchedServices
+        settings.save()
+    }
+}

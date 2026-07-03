@@ -68,6 +68,18 @@ struct DesktopSettings: Codable {
     var defaultHeight: Int
     var thumbnailSize: Int
     var gallerySortDefault: String
+    /// Health-board endpoints. Optional so configs written before the
+    /// health board still decode; nil means "use defaults".
+    var watchedServices: [WatchedService]?
+
+    /// Starter set for the health board when nothing is configured yet:
+    /// the coffeeshop stack (Bree's server web UI, the legacy image service)
+    /// plus the local LM Studio prompt-enhancement endpoint.
+    static let defaultWatchedServices: [WatchedService] = [
+        WatchedService(name: "LM Studio", urlString: "http://127.0.0.1:1234/v1/models"),
+        WatchedService(name: "Image Service", urlString: "http://127.0.0.1:7861/health"),
+        WatchedService(name: "Bree Server", urlString: "http://10.0.100.232:3000/health"),
+    ]
 
     static let defaultSettings = DesktopSettings(
         serverHost: "127.0.0.1",
@@ -79,7 +91,8 @@ struct DesktopSettings: Codable {
         defaultWidth: 1024,
         defaultHeight: 1024,
         thumbnailSize: 180,
-        gallerySortDefault: "date"
+        gallerySortDefault: "date",
+        watchedServices: nil
     )
 
     static var configPath: String {

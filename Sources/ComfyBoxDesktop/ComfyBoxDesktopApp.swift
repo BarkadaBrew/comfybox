@@ -14,7 +14,8 @@ struct ComfyBoxDesktopApp: App {
     @State private var store: DAMStore?
     @State private var ingestor: AssetIngestor?
     @State private var presetManager = PresetManager()
-    @State private var selectedTab: AppTab = .dashboard
+    @State private var healthMonitor = HealthMonitor()
+    @State private var selectedTab: AppTab = .gallery
     @State private var initError: String?
     @State private var characters: [CharacterEntry] = []
     @State private var comparisonAssets: [DAMAsset]?
@@ -23,6 +24,7 @@ struct ComfyBoxDesktopApp: App {
 
     enum AppTab: String, CaseIterable {
         case dashboard = "Dashboard"
+        case health = "Health"
         case generate = "Generate"
         case gallery = "Gallery"
         case compare = "Compare"
@@ -33,6 +35,7 @@ struct ComfyBoxDesktopApp: App {
         var icon: String {
             switch self {
             case .dashboard: return "gauge.with.dots.needle.bottom.50percent"
+            case .health: return "waveform.path.ecg"
             case .generate: return "wand.and.stars"
             case .gallery: return "photo.on.rectangle"
             case .compare: return "square.grid.2x2"
@@ -51,6 +54,7 @@ struct ComfyBoxDesktopApp: App {
             case .presets: return "5"
             case .characters: return "6"
             case .server: return "7"
+            case .health: return "8"
             }
         }
     }
@@ -121,6 +125,9 @@ struct ComfyBoxDesktopApp: App {
         case .dashboard:
             DashboardView(engine: engine, store: store, ingestor: ingestor)
 
+        case .health:
+            HealthBoardView(engine: engine, monitor: healthMonitor, store: store)
+
         case .server:
             ServerView(engine: engine)
 
@@ -156,7 +163,11 @@ struct ComfyBoxDesktopApp: App {
 
         case .compare:
             if let store = store, let ingestor = ingestor {
-                ComparisonGridView(store: store, ingestor: ingestor)
+                ComparisonGridView(
+                    store: store,
+                    ingestor: ingestor,
+                    pendingSelection: $comparisonAssets
+                )
             } else if let error = initError {
                 errorView(error)
             } else {
@@ -231,6 +242,10 @@ struct ComfyBoxDesktopApp: App {
         if settings.autoConnect {
             engine.connect()
         }
+
+        healthMonitor.watchedServices =
+            settings.watchedServices ?? DesktopSettings.defaultWatchedServices
+        healthMonitor.startMonitoring()
     }
 
     // MARK: - Initialization
