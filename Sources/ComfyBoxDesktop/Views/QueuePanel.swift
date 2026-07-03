@@ -10,6 +10,9 @@ import SwiftUI
 struct QueuePanel: View {
     @Bindable var engine: EngineService
 
+    @State private var jobs: EngineService.QueueJobList?
+    @State private var actionError: String?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Header
@@ -25,6 +28,7 @@ struct QueuePanel: View {
 
             if let info = engine.queueInfo {
                 queueContent(info)
+                pendingJobsSection
             } else if engine.connectionState.isConnected {
                 Text("Loading queue status...")
                     .font(.caption)
@@ -34,6 +38,120 @@ struct QueuePanel: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
+
+            if let actionError {
+                Text(actionError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+        }
+        // The health poll updates queueInfo every few seconds; piggyback on it
+        // to refresh the detailed job list only while something is queued or
+        // rendering (avoids constant polling when idle).
+        .task(id: pollKey) { await reloadJobs() }
+    }
+
+    /// Changes whenever the coarse queue state moves, retriggering the job fetch.
+    private var pollKey: String {
+        let info = engine.queueInfo
+        return "\(info?.pendingCount ?? 0)-\(info?.isRendering ?? false)-\(info?.currentJobId ?? "")-\(Int(info?.progressPercent ?? 0))"
+    }
+
+    private func reloadJobs() async {
+        guard engine.connectionState.isConnected else { jobs = nil; return }
+        jobs = await engine.fetchQueueJobs()
+    }
+
+    // MARK: - Pending jobs (management)
+
+    @ViewBuilder
+    private var pendingJobsSection: some View {
+        if let jobs, !jobs.pending.isEmpty || jobs.isRendering {
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Jobs")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if jobs.isRendering {
+                        Button {
+                            Task {
+                                do { try await engine.interruptRender(); await reloadJobs() }
+                                catch { actionError = error.localizedDescription }
+                            }
+                        } label: {
+                            Label("Interrupt", systemImage: "stop.circle")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.orange)
+                        .help("Cancel the in-flight render")
+                    }
+                    if !jobs.pending.isEmpty {
+                        Button {
+                            Task {
+                                do { try await engine.clearQueue(); await reloadJobs() }
+                                catch { actionError = error.localizedDescription }
+                            }
+                        } label: {
+                            Label("Clear", systemImage: "xmark.bin")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.red)
+                        .help("Cancel all pending jobs")
+                    }
+                }
+
+                if let summary = jobs.activeSummary, jobs.isRendering {
+                    HStack(spacing: 4) {
+                        Image(systemName: "play.circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                        Text(summary)
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+
+                ForEach(jobs.pending) { job in
+                    HStack(spacing: 4) {
+                        Image(systemName: jobIcon(job.kind))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(job.summary)
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer()
+                        Button {
+                            Task {
+                                do { try await engine.cancelQueueJob(id: job.id); await reloadJobs() }
+                                catch { actionError = error.localizedDescription }
+                            }
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Cancel this job")
+                    }
+                }
+            }
+        }
+    }
+
+    private func jobIcon(_ kind: String) -> String {
+        switch kind {
+        case "generate": return "photo"
+        case "controlnet": return "square.3.layers.3d"
+        case "lora_swap": return "square.stack.3d.up"
+        case "model_switch": return "arrow.triangle.2.circlepath"
+        case "shutdown": return "power"
+        default: return "clock"
         }
     }
 

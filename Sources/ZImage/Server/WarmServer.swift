@@ -853,6 +853,35 @@ public final class WarmServer {
     case ("POST", "/v1/enhance"):
       return await enhancePromptResponse(body: request.body)
 
+    // MARK: - Queue management
+
+    case ("GET", "/v1/queue"):
+      return await queueListResponse()
+
+    case ("POST", "/v1/queue/interrupt"):
+      struct InterruptResult: Encodable { let success: Bool; let interrupted: Bool }
+      let cancelled = await coordinator.cancelActiveRender()
+      auditLog.append(kind: "queue.interrupt", message: cancelled ? "Interrupted active render" : "No active render")
+      return .json(status: 200, payload: InterruptResult(success: true, interrupted: cancelled))
+
+    case ("POST", "/v1/queue/clear"):
+      struct ClearResult: Encodable { let success: Bool; let cleared: Int }
+      let cleared = await coordinator.clearPending()
+      auditLog.append(kind: "queue.clear", message: "Cleared \(cleared) pending job(s)")
+      return .json(status: 200, payload: ClearResult(success: true, cleared: cleared))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/queue/"):
+      guard let id = Self.pathIdComponent(String(request.path.dropFirst("/v1/queue/".count))) else {
+        return .error(.error(status: 400, message: "Invalid job id"))
+      }
+      let removed = await coordinator.cancelPending(id: id)
+      if removed {
+        auditLog.append(kind: "queue.cancel", message: "Cancelled pending job \(id)", metadata: ["id": id])
+      }
+      return removed
+        ? .json(status: 200, payload: DeleteResult(success: true, id: id, deleted: true))
+        : .error(.error(status: 404, message: "Job not pending: \(id)"))
+
     case ("GET", "/v1/characters"):
       return await listCharactersResponse()
 
@@ -937,6 +966,36 @@ public final class WarmServer {
     let decoded = raw.removingPercentEncoding ?? raw
     guard !decoded.isEmpty, !decoded.contains("/") else { return nil }
     return decoded
+  }
+
+  // Queue ----------------------------------------------------------------------
+
+  /// GET /v1/queue: the active operation + every pending job (cancellable by id).
+  private func queueListResponse() async -> RoutedResponse {
+    let snapshot = await coordinator.queueSnapshot()
+    let iso = ISO8601DateFormatter()
+    var payload: [String: Any] = [
+      "is_rendering": snapshot.isRendering,
+      "max_pending": snapshot.maxPending,
+      "render_count": snapshot.renderCount,
+      "failed_count": snapshot.failedCount,
+      "pending": snapshot.pending.map { job in
+        [
+          "id": job.id,
+          "kind": job.kind,
+          "summary": job.summary,
+          "enqueued_at": iso.string(from: job.enqueuedAt),
+        ] as [String: Any]
+      },
+    ]
+    if let id = snapshot.activeJobId { payload["active_job_id"] = id }
+    if let summary = snapshot.activeSummary { payload["active_summary"] = summary }
+    if let started = snapshot.activeStartedAt { payload["active_started_at"] = iso.string(from: started) }
+    if let pct = snapshot.progressPercent { payload["progress_percent"] = pct }
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+      return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
   }
 
   // Prompt enhancement --------------------------------------------------------
@@ -1944,7 +2003,17 @@ private actor WarmServerCoordinator {
   private var controlPipeline: ZImageControlPipeline?
   private let startTime = Date()
   private var activeLoRAs: [LoRAConfiguration]
-  private var pending: [QueuedOperation] = []
+  /// A queued operation tagged with identity + arrival time so the queue can
+  /// be listed and individual pending jobs cancelled.
+  private struct PendingJob {
+    let id = UUID().uuidString
+    let enqueuedAt = Date()
+    let operation: QueuedOperation
+  }
+
+  private var pending: [PendingJob] = []
+  /// Human-readable summary of the operation the loop is currently running.
+  private var activeJobSummary: String?
   private var isProcessing = false
   private var shuttingDown = false
   private var successfulRenderCount = 0
@@ -2343,7 +2412,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler))
+      pending.append(PendingJob(operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler)))
       startProcessingIfNeeded()
     }
   }
@@ -2357,7 +2426,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.swap(payload, ContinuationBox(continuation)))
+      pending.append(PendingJob(operation: .swap(payload, ContinuationBox(continuation))))
       startProcessingIfNeeded()
     }
   }
@@ -2371,7 +2440,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.controlGenerate(request, ContinuationBox(continuation)))
+      pending.append(PendingJob(operation: .controlGenerate(request, ContinuationBox(continuation))))
       startProcessingIfNeeded()
     }
   }
@@ -2389,7 +2458,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.modelSwitch(body, ContinuationBox(continuation)))
+      pending.append(PendingJob(operation: .modelSwitch(body, ContinuationBox(continuation))))
       startProcessingIfNeeded()
     }
   }
@@ -2401,7 +2470,7 @@ private actor WarmServerCoordinator {
 
     shuttingDown = true
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(.shutdown(ContinuationBox(continuation)))
+      pending.append(PendingJob(operation: .shutdown(ContinuationBox(continuation))))
       startProcessingIfNeeded()
     }
   }
@@ -2465,22 +2534,104 @@ private actor WarmServerCoordinator {
     let count = pending.count
     // Cancel all pending continuations with a queue-clear error (distinct
     // from shuttingDown — the server keeps running after a queue clear).
-    for op in pending {
-      switch op {
-      case .generate(_, let cont, _, _):
-        cont.resume(throwing: ServerError.cancelled)
-      case .controlGenerate(_, let cont):
-        cont.resume(throwing: ServerError.cancelled)
-      case .swap(_, let cont):
-        cont.resume(throwing: ServerError.cancelled)
-      case .modelSwitch(_, let cont):
-        cont.resume(throwing: ServerError.cancelled)
-      case .shutdown(let cont):
-        cont.resume(throwing: ServerError.cancelled)
-      }
+    for job in pending {
+      Self.cancel(job.operation)
     }
     pending.removeAll()
     return count
+  }
+
+  /// Cancel one pending job by id. Returns false when the id isn't queued
+  /// (already running or already finished).
+  func cancelPending(id: String) -> Bool {
+    guard let index = pending.firstIndex(where: { $0.id == id }) else { return false }
+    Self.cancel(pending[index].operation)
+    pending.remove(at: index)
+    return true
+  }
+
+  private static func cancel(_ operation: QueuedOperation) {
+    switch operation {
+    case .generate(_, let cont, _, _):
+      cont.resume(throwing: ServerError.cancelled)
+    case .controlGenerate(_, let cont):
+      cont.resume(throwing: ServerError.cancelled)
+    case .swap(_, let cont):
+      cont.resume(throwing: ServerError.cancelled)
+    case .modelSwitch(_, let cont):
+      cont.resume(throwing: ServerError.cancelled)
+    case .shutdown(let cont):
+      cont.resume(throwing: ServerError.cancelled)
+    }
+  }
+
+  /// One line describing an operation for queue listings.
+  private static func describe(_ operation: QueuedOperation) -> String {
+    switch operation {
+    case .generate(let payload, _, _, _):
+      return "Render: \(payload.prompt.prefix(100))"
+    case .controlGenerate(let request, _):
+      return "ControlNet render: \(request.prompt.prefix(100))"
+    case .swap(let payload, _):
+      return "LoRA swap (\(payload.loras.count))"
+    case .modelSwitch:
+      return "Model switch"
+    case .shutdown:
+      return "Shutdown"
+    }
+  }
+
+  private static func kind(of operation: QueuedOperation) -> String {
+    switch operation {
+    case .generate: return "generate"
+    case .controlGenerate: return "controlnet"
+    case .swap: return "lora_swap"
+    case .modelSwitch: return "model_switch"
+    case .shutdown: return "shutdown"
+    }
+  }
+
+  /// One pending entry in a /v1/queue listing.
+  struct QueueJobInfo: Sendable {
+    let id: String
+    let kind: String
+    let summary: String
+    let enqueuedAt: Date
+  }
+
+  /// Full queue listing for /v1/queue: the running operation plus every
+  /// pending job with enough identity to cancel it.
+  struct QueueSnapshot: Sendable {
+    let isRendering: Bool
+    let activeJobId: String?
+    let activeSummary: String?
+    let activeStartedAt: Date?
+    let progressPercent: Int?
+    let pending: [QueueJobInfo]
+    let maxPending: Int
+    let renderCount: Int
+    let failedCount: Int
+  }
+
+  func queueSnapshot() -> QueueSnapshot {
+    QueueSnapshot(
+      isRendering: activeRenderStartedAt != nil,
+      activeJobId: activeJobId,
+      activeSummary: activeJobSummary,
+      activeStartedAt: activeRenderStartedAt,
+      progressPercent: progressTracker.get(),
+      pending: pending.map { job in
+        QueueJobInfo(
+          id: job.id,
+          kind: Self.kind(of: job.operation),
+          summary: Self.describe(job.operation),
+          enqueuedAt: job.enqueuedAt
+        )
+      },
+      maxPending: configuration.maxPendingRequests,
+      renderCount: successfulRenderCount,
+      failedCount: failedRenderCount
+    )
   }
 
   private func startProcessingIfNeeded() {
@@ -2498,8 +2649,10 @@ private actor WarmServerCoordinator {
         return
       }
 
-      let operation = pending.removeFirst()
-      switch operation {
+      let job = pending.removeFirst()
+      activeJobSummary = Self.describe(job.operation)
+      defer { activeJobSummary = nil }
+      switch job.operation {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
         // without cancelling the queue's processing loop.
