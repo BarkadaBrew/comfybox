@@ -40,27 +40,33 @@ Server deploy: `swift build -c release --product ComfyBox`, then restart the
 - `POST /v1/presets/import-legacy`
 - CharacterEntry gained `kind`; character + preset legacy import run at startup
 
-## In progress
+## Also shipped
 
-- **#30 assistant-in-Generate** (STARTED): AgentService has `AgentAction`
-  (structured param changes) + updated systemPrompt teaching a ```json action
-  block. TODO: `AgentService.parseAction(from:)` (pure+tested), have `send()`
-  return/store the action, build a Generate-embedded assistant panel that
-  applies prompt/negative/steps/guidance/size/seed/loras and can trigger a
-  render. Keep the standalone Assistant tab.
+- Assistant embedded in Generate — AgentAction + parseAction (json action
+  block), auto-applies prompt/steps/guidance/size/seed and can trigger a
+  render; standalone Assistant tab retained (f57ad27).
+- MCP + API sync — 11 new MCP tools (enhance/characters/presets/queue/nearline)
+  + docs/api-reference.md (e71f487).
 
-## Pending / TODO
+## Pending / TODO (all explicit requests done; these are proposed/deferred)
 
-- **#31 API + MCP sync**: document the new endpoints; add matching
-  `mcp_comfybox_*` MCP tools (queue control, nearline stage/evict, enhance,
-  preset import). Verify against running server.
-- Camera tool **V2**: img2img/Klein reference for identity-preserving
-  multi-angle; captioning (deferred by user).
-- Draw Things derivations (backends already exist server-side; need desktop UI),
-  recommended order: img2img in Generate → inpaint/outpaint on Canvas →
-  ControlNet UI → Creative Upscale right-click → Moodboard.
+- Camera tool **V2** — img2img/Klein reference for identity-preserving
+  multi-angle + captioning. **Explicitly deferred by owner.**
+- Draw Things derivations (backends exist server-side; need desktop UI):
+  1. Creative Upscale right-click action — /v1/upscale exists, NOT i2i, safe to
+     build now. **← building next.**
+  2. img2img in Generate — deferred (shares the i2i plumbing owner deferred).
+  3. inpaint/outpaint on Canvas — i2i-adjacent; hold until i2i is un-deferred.
+  4. ControlNet UI — i2i-adjacent; hold.
+  5. Moodboard — reference-image conditioning; hold.
 - Canvas later phases: node connections, on-canvas generation, prompt/text
   nodes, export board.
+
+## GUI verification owed on owner's return (laptop locked, validated by tests)
+
+- Assistant-in-Generate live round-trip (Dan's model → applies controls).
+- Masonry gallery visual, canvas board interactions, camera panel, folder
+  import — all built + unit-tested but not screenshot-verified while locked.
 
 ## Operational notes
 
