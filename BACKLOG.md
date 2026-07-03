@@ -53,14 +53,22 @@ Server deploy: `swift build -c release --product ComfyBox`, then restart the
 - Camera tool **V2** — img2img/Klein reference for identity-preserving
   multi-angle + captioning. **Explicitly deferred by owner.**
 - Draw Things derivations (backends exist server-side; need desktop UI):
-  1. Creative Upscale right-click action — /v1/upscale exists, NOT i2i, safe to
-     build now. **← building next.**
+  1. Creative Upscale right-click action — DONE (d76ef0b).
   2. img2img in Generate — deferred (shares the i2i plumbing owner deferred).
   3. inpaint/outpaint on Canvas — i2i-adjacent; hold until i2i is un-deferred.
   4. ControlNet UI — i2i-adjacent; hold.
   5. Moodboard — reference-image conditioning; hold.
-- Canvas later phases: node connections, on-canvas generation, prompt/text
-  nodes, export board.
+- Canvas: export board — DONE (9b45131). Later phases still open: node
+  connections, on-canvas generation, prompt/text nodes.
+
+## Autonomous session close (owner away 48h, laptop locked)
+
+All explicit requests complete. Extra non-deferred items built: Creative
+Upscale action, Canvas PNG export. Full suite green: 567 server + 185 desktop
+tests. Everything committed on `main`; app + server binaries rebuilt (server
+routes still await the daemon's next idle restart). Remaining work all requires
+either the deferred i2i plumbing or is a proposed later-phase — nothing else
+safe to build without owner input. Held here to avoid speculative scope.
 
 ## GUI verification owed on owner's return (laptop locked, validated by tests)
 
