@@ -214,4 +214,68 @@ final class PresetStoreTests: XCTestCase {
   func testDecodeGarbageFallsBackToEmpty() {
     XCTAssertTrue(PresetStore.decode(Data("not json".utf8)).isEmpty)
   }
+
+  // MARK: - Legacy image-service import
+
+  private func writeLegacyPreset(_ json: String, named name: String, in dir: URL) throws {
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    try Data(json.utf8).write(to: dir.appendingPathComponent(name))
+  }
+
+  func testImportLegacyImageServicePresets() throws {
+    let path = try makeTempPath()
+    let legacyDir = path.deletingLastPathComponent().appendingPathComponent("legacy", isDirectory: true)
+    // Two legacy presets: one with LoRAs (path/scale), one bare.
+    try writeLegacyPreset(#"""
+    {
+      "id": "cs-nsfw", "name": "CoffeeShop NSFW",
+      "description": "Explicit content preset with character LoRAs.",
+      "model": "Tongyi-MAI/Z-Image-Turbo-BF16",
+      "steps": 16, "guidance": 3.5, "width": 1024, "height": 1024,
+      "loras": [{"path": "cs-bree.safetensors", "scale": 0.85}],
+      "injectedKeywords": "cinematic, detailed",
+      "negativePrompt": "blurry, child"
+    }
+    """#, named: "cs-nsfw.json", in: legacyDir)
+    try writeLegacyPreset(#"""
+    {
+      "id": "cs-control", "name": "Control Test", "description": "Bare ZIT.",
+      "model": "z-image-turbo-bf16", "steps": 12, "guidance": 5.0,
+      "width": 1024, "height": 1024, "loras": [], "injectedKeywords": "", "negativePrompt": ""
+    }
+    """#, named: "cs-control.json", in: legacyDir)
+
+    let store = PresetStore(path: path, seedDefaults: false)
+    let imported = store.importLegacyImageService(from: legacyDir)
+    XCTAssertEqual(imported, 2)
+
+    // Prefixed id avoids clobbering built-ins; fields mapped correctly.
+    let nsfw = store.get("imported-cs-nsfw")
+    XCTAssertEqual(nsfw?.name, "CoffeeShop NSFW")
+    XCTAssertEqual(nsfw?.model, "Tongyi-MAI/Z-Image-Turbo-BF16")
+    XCTAssertEqual(nsfw?.steps, 16)
+    XCTAssertEqual(nsfw?.width, 1024)
+    XCTAssertEqual(nsfw?.loras.first?.filename, "cs-bree.safetensors")  // path -> filename
+    XCTAssertEqual(nsfw?.loras.first?.scale, 0.85)
+    XCTAssertEqual(nsfw?.injectedKeywords, ["cinematic", "detailed"])   // string -> [keywords]
+    XCTAssertEqual(nsfw?.negativePrompt, "blurry, child")
+    XCTAssertEqual(nsfw?.engine, "zimage")
+
+    // Empty injectedKeywords/negativePrompt become nil/empty, not [""] / "".
+    let control = store.get("imported-cs-control")
+    XCTAssertEqual(control?.loras.count, 0)
+    XCTAssertTrue((control?.injectedKeywords ?? []).isEmpty)
+
+    // Idempotent: a second import changes nothing (already present).
+    XCTAssertEqual(store.importLegacyImageService(from: legacyDir), 0)
+    XCTAssertEqual(store.list().count, 2)
+  }
+
+  func testImportLegacyMissingDirectoryIsNoOp() throws {
+    let path = try makeTempPath()
+    let store = PresetStore(path: path, seedDefaults: false)
+    XCTAssertEqual(store.importLegacyImageService(
+      from: URL(fileURLWithPath: "/nope/presets")), 0)
+    XCTAssertTrue(store.list().isEmpty)
+  }
 }

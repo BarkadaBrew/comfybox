@@ -58,6 +58,15 @@ struct PresetView: View {
             if isLoading { ProgressView().controlSize(.small) }
             Button { Task { await reload() } } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
+            Menu {
+                Button("Import from Image Service") { Task { await importLegacy() } }
+            } label: {
+                Image(systemName: "square.and.arrow.down")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(!engine.connectionState.isConnected)
+            .help("Import presets from the old image-service")
             Button {
                 isNew = true
                 editing = ServerPreset(name: "")
@@ -117,6 +126,18 @@ struct PresetView: View {
             await reload()
         } catch {
             loadError = "Save failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func importLegacy() async {
+        do {
+            let count = try await engine.importLegacyPresets()
+            loadError = count > 0
+                ? nil
+                : "No new presets to import (already imported, or none found)."
+            await reload()
+        } catch {
+            loadError = "Import failed: \(error.localizedDescription)"
         }
     }
 

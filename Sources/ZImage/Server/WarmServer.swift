@@ -305,6 +305,12 @@ public final class WarmServer {
       }
     }
 
+    // Same idempotent one-time merge for the old image-service presets.
+    let importedPresets = presetStore.importLegacyImageService()
+    if importedPresets > 0 {
+      logger.info("Presets: imported \(importedPresets) from legacy image-service")
+    }
+
     try preparePipeline()
 
     guard let port = NWEndpoint.Port(rawValue: configuration.port) else {
@@ -943,6 +949,14 @@ public final class WarmServer {
     case ("POST", "/v1/presets/resolve"):
       // Match before the generic /v1/presets/ prefix routes below.
       return resolvePresetResponse(body: request.body)
+
+    case ("POST", "/v1/presets/import-legacy"):
+      struct ImportResult: Encodable { let success: Bool; let imported: Int }
+      let count = presetStore.importLegacyImageService()
+      if count > 0 {
+        auditLog.append(kind: "preset.import", message: "Imported \(count) legacy image-service preset(s)")
+      }
+      return .json(status: 200, payload: ImportResult(success: true, imported: count))
 
     case ("POST", "/v1/presets"), ("PUT", "/v1/presets"):
       return upsertPresetResponse(body: request.body)

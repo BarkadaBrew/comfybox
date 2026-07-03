@@ -410,6 +410,84 @@ public final class PresetStore: @unchecked Sendable {
     return changed
   }
 
+  // MARK: Legacy import
+
+  /// Default location of the old Coffee Shop image-service presets (one
+  /// JSON file per preset).
+  public static func legacyImageServiceDirectory() -> URL {
+    URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+      .appendingPathComponent(".coffeeshop/image-service/presets", isDirectory: true)
+  }
+
+  /// One legacy image-service preset file (per-file JSON shape).
+  private struct LegacyPreset: Decodable {
+    struct Lora: Decodable { let path: String?; let scale: Double? }
+    let id: String?
+    let name: String?
+    let description: String?
+    let model: String?
+    let steps: Int?
+    let guidance: Double?
+    let width: Int?
+    let height: Int?
+    let loras: [Lora]?
+    let injectedKeywords: String?   // legacy stored a single comma string
+    let negativePrompt: String?
+  }
+
+  /// Import presets from the old image-service (one JSON per file), merging
+  /// idempotently. Legacy ids are prefixed `imported-` so a built-in preset
+  /// of the same name is never clobbered and a re-run is a no-op. Returns the
+  /// number newly added.
+  @discardableResult
+  public func importLegacyImageService(
+    from directory: URL = PresetStore.legacyImageServiceDirectory()
+  ) -> Int {
+    guard let files = try? fileManager.contentsOfDirectory(
+      at: directory, includingPropertiesForKeys: nil)
+    else { return 0 }
+
+    var added = 0
+    for file in files where file.pathExtension == "json" {
+      guard let data = try? Data(contentsOf: file),
+            let legacy = try? JSONDecoder().decode(LegacyPreset.self, from: data),
+            let legacyId = legacy.id ?? file.deletingPathExtension().lastPathComponent as String?
+      else { continue }
+
+      let importedId = "imported-\(legacyId)"
+      if get(importedId) != nil { continue }  // already imported
+
+      let keywords = (legacy.injectedKeywords ?? "")
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+      let negative = (legacy.negativePrompt?.isEmpty == false) ? legacy.negativePrompt : nil
+      let loras = (legacy.loras ?? []).compactMap { lora -> LoraReference? in
+        guard let path = lora.path, !path.isEmpty else { return nil }
+        return LoraReference(filename: path, scale: lora.scale ?? 1.0)
+      }
+
+      let preset = ImagePreset(
+        id: importedId,
+        name: legacy.name ?? legacyId,
+        description: legacy.description ?? "",
+        mediaKind: "image",
+        provider: "local",
+        engine: "zimage",
+        model: legacy.model,
+        negativePrompt: negative,
+        injectedKeywords: keywords.isEmpty ? nil : keywords,
+        steps: legacy.steps,
+        guidance: legacy.guidance,
+        width: legacy.width,
+        height: legacy.height,
+        loras: loras
+      )
+      if (try? upsert(preset)) != nil { added += 1 }
+    }
+    return added
+  }
+
   // MARK: Resolve
 
   /// Merge the preset `id` onto the store's ``PresetDefaults`` and return the fully-populated

@@ -899,6 +899,19 @@ public final class EngineService {
         }
     }
 
+    /// Import presets from the old image-service (idempotent). Returns the
+    /// number newly imported.
+    @discardableResult
+    public func importLegacyPresets() async throws -> Int {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let (status, data) = try await client.post("/v1/presets/import-legacy", body: Data("{}".utf8))
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Import failed")
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return (json?["imported"] as? Int) ?? 0
+    }
+
     /// Delete a server preset by id.
     public func deletePreset(id: String) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
