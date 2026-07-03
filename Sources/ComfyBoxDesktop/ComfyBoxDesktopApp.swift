@@ -32,6 +32,7 @@ struct ComfyBoxDesktopApp: App {
         case compare = "Compare"
         case presets = "Presets"
         case prompts = "Prompts"
+        case civitai = "CivitAI"
         case characters = "Characters"
         case server = "Server"
 
@@ -44,6 +45,7 @@ struct ComfyBoxDesktopApp: App {
             case .compare: return "square.grid.2x2"
             case .presets: return "slider.horizontal.below.rectangle"
             case .prompts: return "text.book.closed"
+            case .civitai: return "globe"
             case .characters: return "person.2.crop.square.stack"
             case .server: return "server.rack"
             }
@@ -60,6 +62,7 @@ struct ComfyBoxDesktopApp: App {
             case .server: return "7"
             case .health: return "8"
             case .prompts: return "9"
+            case .civitai: return "0"
             }
         }
     }
@@ -158,6 +161,9 @@ struct ComfyBoxDesktopApp: App {
                     selectedTab = .generate
                 }
             )
+
+        case .civitai:
+            CivitAIBrowserView(engine: engine, promptLibrary: promptLibrary)
 
         case .gallery:
             if let store = store, let ingestor = ingestor {

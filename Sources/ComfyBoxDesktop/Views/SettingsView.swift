@@ -71,6 +71,8 @@ struct DesktopSettings: Codable {
     /// Health-board endpoints. Optional so configs written before the
     /// health board still decode; nil means "use defaults".
     var watchedServices: [WatchedService]?
+    /// CivitAI API key (optional; unlocks auth-gated listings + downloads).
+    var civitaiApiKey: String?
 
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
@@ -92,7 +94,8 @@ struct DesktopSettings: Codable {
         defaultHeight: 1024,
         thumbnailSize: 180,
         gallerySortDefault: "date",
-        watchedServices: nil
+        watchedServices: nil,
+        civitaiApiKey: nil
     )
 
     static var configPath: String {
@@ -292,6 +295,14 @@ struct SettingsView: View {
             Section("Output") {
                 TextField("Output Directory", text: $settings.outputDirectory)
                     .onChange(of: settings.outputDirectory) { _, _ in hasUnsavedChanges = true }
+            }
+
+            Section("CivitAI") {
+                SecureField("API key (optional — unlocks gated listings & downloads)", text: Binding(
+                    get: { settings.civitaiApiKey ?? "" },
+                    set: { settings.civitaiApiKey = $0.isEmpty ? nil : $0 }
+                ))
+                .onChange(of: settings.civitaiApiKey) { _, _ in hasUnsavedChanges = true }
             }
 
             Section {

@@ -713,6 +713,15 @@ public final class EngineService {
         }
     }
 
+    /// Rescan the server's LoRA library (after downloading a new file into it).
+    public func scanLoras() async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let (status, data) = try await client.post("/v1/loras/scan", body: Data("{}".utf8))
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "LoRA scan failed")
+        }
+    }
+
     // MARK: - Queue management (/v1/queue)
 
     /// One pending job in the server render queue.
