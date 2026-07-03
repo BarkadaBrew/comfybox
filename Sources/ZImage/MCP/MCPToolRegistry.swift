@@ -32,6 +32,17 @@ public enum MCPToolRegistry {
     generateVideo,
     videoStatus,
     upscale,
+    enhancePrompt,
+    listCharacters,
+    listPresets,
+    importLegacyPresets,
+    queueList,
+    interruptRender,
+    cancelJob,
+    nearlineList,
+    nearlineScan,
+    nearlineStage,
+    nearlineEvict,
   ]
 
   // MARK: - Tool Definitions
@@ -441,6 +452,94 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["image_path"] as [String],
+    ] as [String: Any]
+  )
+
+  // MARK: - Creative layer & queue (added 2026-07)
+
+  static let enhancePrompt = MCPToolDefinition(
+    name: "enhance_prompt",
+    description: "Optimize an image prompt using the configured prompt-optimization provider (e.g. Dan's model on LM Studio). Optionally inject a named character's description.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "prompt": ["type": "string", "description": "The prompt to enhance."] as [String: Any],
+        "character": ["type": "string", "description": "Optional character name to inject."] as [String: Any],
+        "content_mode": ["type": "string", "description": "neutral | banana | avocado (gates explicit tiers)."] as [String: Any],
+      ] as [String: Any],
+      "required": ["prompt"],
+    ] as [String: Any]
+  )
+
+  static let listCharacters = MCPToolDefinition(
+    name: "list_characters",
+    description: "List creative characters and scenes (name, kind, tiered descriptions, default LoRAs, tags).",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let listPresets = MCPToolDefinition(
+    name: "list_presets",
+    description: "List saved generation presets (the canonical /v1/presets store).",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let importLegacyPresets = MCPToolDefinition(
+    name: "import_legacy_presets",
+    description: "Import presets from the old Coffee Shop image service (idempotent). Returns how many were newly imported.",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let queueList = MCPToolDefinition(
+    name: "queue_list",
+    description: "Detailed render queue: the active job (id, summary, progress) plus every pending job with its id (for cancel_job).",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let interruptRender = MCPToolDefinition(
+    name: "interrupt_render",
+    description: "Cancel the in-flight render. Pending jobs continue.",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let cancelJob = MCPToolDefinition(
+    name: "cancel_job",
+    description: "Cancel one pending render job by its id (from queue_list).",
+    inputSchema: [
+      "type": "object",
+      "properties": ["id": ["type": "string", "description": "The pending job id."] as [String: Any]] as [String: Any],
+      "required": ["id"],
+    ] as [String: Any]
+  )
+
+  static let nearlineList = MCPToolDefinition(
+    name: "nearline_list",
+    description: "List the nearline model/LoRA catalog on attached storage: each item's name, size, kind, and whether it's staged locally.",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let nearlineScan = MCPToolDefinition(
+    name: "nearline_scan",
+    description: "Rescan the configured attached-storage roots for models/LoRAs.",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+  )
+
+  static let nearlineStage = MCPToolDefinition(
+    name: "nearline_stage",
+    description: "Copy a nearline item to local storage on demand (LRU eviction keeps within the staging budget).",
+    inputSchema: [
+      "type": "object",
+      "properties": ["name": ["type": "string", "description": "The item filename from nearline_list."] as [String: Any]] as [String: Any],
+      "required": ["name"],
+    ] as [String: Any]
+  )
+
+  static let nearlineEvict = MCPToolDefinition(
+    name: "nearline_evict",
+    description: "Remove a staged nearline copy from local storage (the attached-storage original is untouched).",
+    inputSchema: [
+      "type": "object",
+      "properties": ["name": ["type": "string", "description": "The item filename to evict."] as [String: Any]] as [String: Any],
+      "required": ["name"],
     ] as [String: Any]
   )
 

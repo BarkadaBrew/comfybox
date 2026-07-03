@@ -60,6 +60,28 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeVideoStatus(arguments)
       case "upscale":
         return try await executeUpscale(arguments)
+      case "enhance_prompt":
+        return try await executeEnhancePrompt(arguments)
+      case "list_characters":
+        return try await executeGet("/v1/characters")
+      case "list_presets":
+        return try await executeGet("/v1/presets")
+      case "import_legacy_presets":
+        return try await executePostEmpty("/v1/presets/import-legacy")
+      case "queue_list":
+        return try await executeGet("/v1/queue")
+      case "interrupt_render":
+        return try await executePostEmpty("/v1/queue/interrupt")
+      case "cancel_job":
+        return try await executeCancelJob(arguments)
+      case "nearline_list":
+        return try await executeGet("/v1/nearline")
+      case "nearline_scan":
+        return try await executePostEmpty("/v1/nearline/scan")
+      case "nearline_stage":
+        return try await executeNearlineAction("/v1/nearline/stage", arguments)
+      case "nearline_evict":
+        return try await executeNearlineAction("/v1/nearline/evict", arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -422,6 +444,45 @@ public final class MCPToolExecutor: @unchecked Sendable {
   /// Generic GET endpoint handler.
   private func executeGet(_ path: String) async throws -> MCPToolResult {
     let (status, data) = try await client.get(path)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// POST an empty JSON body (for trigger-style endpoints).
+  private func executePostEmpty(_ path: String) async throws -> MCPToolResult {
+    let (status, data) = try await client.post(path, body: Data("{}".utf8))
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// enhance_prompt -> POST /v1/enhance
+  private func executeEnhancePrompt(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
+      return MCPToolResult(error: "Error: 'prompt' is required")
+    }
+    var body: [String: Any] = ["prompt": prompt]
+    if let character = params?.string("character") { body["character"] = character }
+    if let mode = params?.string("content_mode") { body["content_mode"] = mode }
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/enhance", body: jsonData)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// cancel_job -> DELETE /v1/queue/{id}
+  private func executeCancelJob(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let (status, data) = try await client.delete("/v1/queue/\(encoded)")
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// nearline_stage / nearline_evict -> POST /v1/nearline/{action} { name }
+  private func executeNearlineAction(_ path: String, _ params: MCPParams?) async throws -> MCPToolResult {
+    guard let name = params?.string("name"), !name.isEmpty else {
+      return MCPToolResult(error: "Error: 'name' is required")
+    }
+    let jsonData = try JSONSerialization.data(withJSONObject: ["name": name])
+    let (status, data) = try await client.post(path, body: jsonData)
     return mapHTTPResponse(status: status, data: data)
   }
 
