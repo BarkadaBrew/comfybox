@@ -23,6 +23,10 @@ public final class HealthMonitor {
     public var memoryUsedGB: Double?
     public var memoryTotalGB: Double?
 
+    /// Wider local-Mac metrics (CPU, load, disk, uptime), sampled each check.
+    public var hostMetrics: HostMetrics?
+    private let hostSampler = HostMetricsSampler()
+
     /// Endpoints to watch. Changing this takes effect on the next check.
     public var watchedServices: [WatchedService] = []
 
@@ -118,6 +122,7 @@ public final class HealthMonitor {
 
         services = updated
         sampleHostMemory()
+        hostMetrics = hostSampler.sample()
         lastRefresh = checkedAt
     }
 

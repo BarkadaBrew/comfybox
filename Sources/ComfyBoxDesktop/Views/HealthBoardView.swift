@@ -398,29 +398,36 @@ struct HealthBoardView: View {
 
     private var memorySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionTitle("Host")
+            HStack(spacing: 8) {
+                sectionTitle("This Mac")
+                if let uptime = monitor.hostMetrics?.uptimeSeconds {
+                    Text("up \(uptimeLabel(uptime))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
             HStack(spacing: 16) {
+                if let host = monitor.hostMetrics, let cpu = host.cpuPercent {
+                    serverGauge("CPU", fraction: cpu / 100,
+                                label: "\(Int(cpu))%",
+                                detail: host.load1.map { String(format: "load %.2f", $0) })
+                }
                 if let fraction = monitor.memoryUsedFraction,
                    let used = monitor.memoryUsedGB,
                    let total = monitor.memoryTotalGB {
-                    Gauge(value: fraction) {
-                        Text("Memory")
-                    } currentValueLabel: {
-                        Text("\(Int(fraction * 100))%")
-                            .font(.caption.monospacedDigit())
-                    }
-                    .gaugeStyle(.accessoryCircularCapacity)
-                    .tint(fraction > 0.9 ? .red : fraction > 0.75 ? .orange : .green)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Unified memory")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text(String(format: "%.1f / %.0f GB in use", used, total))
-                            .font(.body.monospacedDigit())
-                    }
-                } else {
-                    Text("Memory stats unavailable")
+                    serverGauge("Memory", fraction: fraction,
+                                label: "\(Int(fraction * 100))%",
+                                detail: String(format: "%.1f / %.0f GB", used, total))
+                }
+                if let host = monitor.hostMetrics,
+                   let disk = host.diskUsedFraction, let free = host.diskFreeGB {
+                    serverGauge("Disk", fraction: disk,
+                                label: "\(Int(disk * 100))%",
+                                detail: String(format: "%.0f GB free", free))
+                }
+                if monitor.hostMetrics == nil && monitor.memoryUsedFraction == nil {
+                    Text("Host stats unavailable")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
