@@ -17,7 +17,7 @@ struct CharactersView: View {
         guard !search.isEmpty else { return characters }
         let q = search.lowercased()
         return characters.filter {
-            $0.name.lowercased().contains(q) || $0.description.lowercased().contains(q)
+            $0.name.lowercased().contains(q) || $0.displayDescription.lowercased().contains(q)
                 || $0.tags.contains { $0.lowercased().contains(q) }
         }
     }
@@ -75,15 +75,41 @@ struct CharactersView: View {
 
     private var list: some View {
         ScrollView {
-            LazyVStack(spacing: 8) {
-                ForEach(filtered) { c in
+            LazyVStack(alignment: .leading, spacing: 8) {
+                let characters = filtered.filter { $0.kind != "scene" }
+                let scenes = filtered.filter { $0.kind == "scene" }
+                if !characters.isEmpty {
+                    groupHeader("Characters", count: characters.count)
+                    ForEach(characters) { row($0) }
+                }
+                if !scenes.isEmpty {
+                    groupHeader("Scenes", count: scenes.count)
+                        .padding(.top, characters.isEmpty ? 0 : 10)
+                    ForEach(scenes) { row($0) }
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    private func groupHeader(_ title: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.headline)
+            Text("\(count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 2)
+    }
+
+    private func row(_ c: CharacterEntry) -> some View {
                     HStack(alignment: .top, spacing: 12) {
-                        Image(systemName: "person.crop.square")
+                        Image(systemName: c.kind == "scene" ? "photo.artframe" : "person.crop.square")
                             .font(.title2).foregroundStyle(.secondary).frame(width: 28)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(c.name).font(.headline)
-                            if !c.description.isEmpty {
-                                Text(c.description).font(.caption).foregroundStyle(.secondary)
+                            if !c.displayDescription.isEmpty {
+                                Text(c.displayDescription).font(.caption).foregroundStyle(.secondary)
                                     .lineLimit(2)
                             }
                             if !c.tags.isEmpty {
@@ -103,10 +129,6 @@ struct CharactersView: View {
                     }
                     .padding(12)
                     .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
-                }
-            }
-            .padding(12)
-        }
     }
 
     private var emptyState: some View {
@@ -164,7 +186,10 @@ private struct CharacterEditor: View {
     let onCancel: () -> Void
 
     @State private var name: String
-    @State private var description: String
+    @State private var kind: String
+    @State private var baseText: String
+    @State private var bananaText: String
+    @State private var avocadoText: String
     @State private var promptSnippet: String
     @State private var tagsText: String
     @State private var lorasText: String
@@ -175,7 +200,12 @@ private struct CharacterEditor: View {
         self.onSave = onSave
         self.onCancel = onCancel
         _name = State(initialValue: original.name)
-        _description = State(initialValue: original.description)
+        _kind = State(initialValue: original.kind)
+        // The canonical text lives in the base tier; legacy entries only have
+        // the flat description. Edit whichever exists, save into `base`.
+        _baseText = State(initialValue: original.displayDescription)
+        _bananaText = State(initialValue: original.banana ?? "")
+        _avocadoText = State(initialValue: original.avocado ?? "")
         _promptSnippet = State(initialValue: original.promptSnippet)
         _tagsText = State(initialValue: original.tags.joined(separator: ", "))
         _lorasText = State(initialValue: original.defaultLoras.joined(separator: ", "))
@@ -195,25 +225,67 @@ private struct CharacterEditor: View {
         VStack(alignment: .leading, spacing: 0) {
             Text(isNew ? "New Character" : "Edit Character").font(.headline).padding()
             Divider()
-            Form {
-                TextField("Name", text: $name)
-                TextField("Description", text: $description, axis: .vertical).lineLimit(2...4)
-                TextField("Prompt snippet", text: $promptSnippet, axis: .vertical).lineLimit(1...3)
-                TextField("Tags (comma-separated)", text: $tagsText)
-                TextField("Default LoRAs (comma-separated filenames)", text: $lorasText)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    labeled("Name") {
+                        TextField("Name", text: $name)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    labeled("Type") {
+                        Picker("Type", selection: $kind) {
+                            Label("Character", systemImage: "person.crop.square").tag("character")
+                            Label("Scene", systemImage: "photo.artframe").tag("scene")
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 260)
+                    }
+                    labeled("Appearance — always used") {
+                        editor($baseText, minHeight: 140)
+                    }
+                    labeled("Suggestive additions — banana mode") {
+                        editor($bananaText, minHeight: 60)
+                    }
+                    labeled("Explicit additions — avocado mode") {
+                        editor($avocadoText, minHeight: 60)
+                    }
+                    labeled("Prompt snippet") {
+                        editor($promptSnippet, minHeight: 48)
+                    }
+                    labeled("Tags (comma-separated)") {
+                        TextField("tag1, tag2", text: $tagsText)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    labeled("Default LoRAs (comma-separated filenames)") {
+                        TextField("lora.safetensors", text: $lorasText)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+                .padding(16)
             }
-            .formStyle(.grouped)
             Divider()
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)
                 Button("Save") {
+                    let base = baseText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let banana = bananaText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let avocado = avocadoText.trimmingCharacters(in: .whitespacesAndNewlines)
                     let entry = CharacterEntry(
                         id: resolvedId,
                         name: trimmedName,
-                        description: description.trimmingCharacters(in: .whitespacesAndNewlines),
+                        kind: kind,
+                        // The edited text is saved as the base tier (which takes
+                        // precedence everywhere); the flat description passes
+                        // through untouched for legacy compatibility.
+                        description: original.description,
+                        base: base,
+                        banana: banana.isEmpty ? nil : banana,
+                        avocado: avocado.isEmpty ? nil : avocado,
                         defaultLoras: splitCSV(lorasText),
                         promptSnippet: promptSnippet.trimmingCharacters(in: .whitespacesAndNewlines),
+                        negativePrompt: original.negativePrompt,
+                        triggerWords: original.triggerWords,
                         tags: splitCSV(tagsText)
                     )
                     onSave(entry)
@@ -223,7 +295,32 @@ private struct CharacterEditor: View {
             }
             .padding()
         }
-        .frame(width: 460, height: 420)
+        .frame(minWidth: 560, idealWidth: 640, maxWidth: 900,
+               minHeight: 560, idealHeight: 700, maxHeight: 1000)
+    }
+
+    /// A caption label above a control.
+    private func labeled<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            content()
+        }
+    }
+
+    /// A bordered, scrollable multi-line text editor for long prose fields.
+    private func editor(_ text: Binding<String>, minHeight: CGFloat) -> some View {
+        TextEditor(text: text)
+            .font(.body)
+            .scrollContentBackground(.hidden)
+            .padding(6)
+            .frame(minHeight: minHeight, maxHeight: minHeight * 2.5)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+            )
     }
 
     private func splitCSV(_ s: String) -> [String] {

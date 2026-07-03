@@ -670,9 +670,15 @@ public final class EngineService {
                 return CharacterEntry(
                     id: id,
                     name: name,
+                    kind: (dict["kind"] as? String) ?? "character",
                     description: (dict["description"] as? String) ?? "",
+                    base: dict["base"] as? String,
+                    banana: dict["banana"] as? String,
+                    avocado: dict["avocado"] as? String,
                     defaultLoras: loras,
                     promptSnippet: (dict["prompt_snippet"] as? String) ?? "",
+                    negativePrompt: dict["negative_prompt"] as? String,
+                    triggerWords: dict["trigger_words"] as? String,
                     tags: (dict["tags"] as? [String]) ?? []
                 )
             }
@@ -682,16 +688,24 @@ public final class EngineService {
     }
 
     /// Create or update a character. The server accepts camelCase input (tolerant decode).
+    /// Sends every field — the server upsert replaces the whole entry, so omitting
+    /// a field (e.g. the description tiers) would silently erase it.
     public func saveCharacter(_ c: CharacterEntry) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
-        let dict: [String: Any] = [
+        var dict: [String: Any] = [
             "id": c.id,
             "name": c.name,
+            "kind": c.kind,
             "description": c.description,
             "promptSnippet": c.promptSnippet,
             "tags": c.tags,
             "defaultLoras": c.defaultLoras.map { ["filename": $0, "scale": 1.0] as [String: Any] }
         ]
+        if let base = c.base { dict["base"] = base }
+        if let banana = c.banana { dict["banana"] = banana }
+        if let avocado = c.avocado { dict["avocado"] = avocado }
+        if let negativePrompt = c.negativePrompt { dict["negativePrompt"] = negativePrompt }
+        if let triggerWords = c.triggerWords { dict["triggerWords"] = triggerWords }
         let body = try JSONSerialization.data(withJSONObject: dict)
         let (status, data) = try await client.post("/v1/characters", body: body)
         guard status == 200 else {
