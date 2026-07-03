@@ -123,6 +123,65 @@ public final class AssetIngestor {
         return removedIds.count
     }
 
+    // MARK: - Folder import
+
+    /// Outcome of importing a folder.
+    public struct ImportSummary: Sendable {
+        public var total: Int      // images found
+        public var imported: Int   // newly ingested
+        public var skipped: Int    // already tracked
+        public var failed: Int
+    }
+
+    /// Add an existing folder to the gallery (Photo Mechanic style): scan it
+    /// recursively for images, ingest each one — generating a thumbnail and
+    /// merging any sidecar / embedded metadata exactly as a local render — and
+    /// report progress. Already-tracked files are skipped, so re-importing is
+    /// cheap. Files are read in place; nothing is moved or copied.
+    @discardableResult
+    public func importFolder(
+        at folderPath: String,
+        progress: (@MainActor (_ done: Int, _ total: Int) -> Void)? = nil
+    ) async throws -> ImportSummary {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: folderPath, isDirectory: true)
+        guard let enumerator = fm.enumerator(
+            at: root, includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles])
+        else {
+            throw NSError(domain: "AssetIngestor", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Cannot read folder: \(folderPath)"])
+        }
+
+        let paths = enumerator.compactMap { $0 as? URL }
+            .filter { isImageFile($0.lastPathComponent) }
+            .map(\.path)
+            .sorted()
+
+        var summary = ImportSummary(total: paths.count, imported: 0, skipped: 0, failed: 0)
+        for (index, path) in paths.enumerated() {
+            let alreadyTracked: Bool
+            if knownPaths.contains(path) {
+                alreadyTracked = true
+            } else {
+                alreadyTracked = ((try? await store.fetchAsset(byPath: path)) ?? nil) != nil
+            }
+            if alreadyTracked {
+                summary.skipped += 1
+            } else {
+                do {
+                    try await ingestFile(at: path)
+                    summary.imported += 1
+                } catch {
+                    summary.failed += 1
+                    lastError = "Failed to import \((path as NSString).lastPathComponent): \(error.localizedDescription)"
+                }
+            }
+            progress?(index + 1, paths.count)
+        }
+        return summary
+    }
+
     // MARK: - Asset security
 
     /// Vault for secured assets. The .noindex suffix keeps Spotlight out;

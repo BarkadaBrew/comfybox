@@ -79,4 +79,64 @@ struct AssetIngestorTests {
         let count = try await env.store.assetCount()
         #expect(count == 1)
     }
+
+    // MARK: - Folder import
+
+    @Test("importFolder ingests all images with metadata merged from sidecars")
+    @MainActor
+    func importFolder() async throws {
+        let env = try await makeEnvironment()
+        // A source folder unrelated to the watch dir, with images, a sidecar,
+        // a nested subfolder, and a non-image to ignore.
+        let source = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("import-src-\(UUID().uuidString)")
+        let nested = (source as NSString).appendingPathComponent("sub")
+        try FileManager.default.createDirectory(atPath: nested, withIntermediateDirectories: true)
+        _ = writeFile("a.png", in: source)
+        _ = writeFile("b.jpg", in: source)
+        _ = writeFile("notes.txt", in: source)          // ignored
+        _ = writeFile("c.png", in: nested)               // recursive
+        // Sidecar metadata for a.png, merged as if rendered locally.
+        _ = writeFile("a.json", in: source,
+                      contents: #"{"prompt": "imported sunset", "seed": 7, "steps": 20}"#)
+
+        var progressSeen: [Int] = []
+        let summary = try await env.ingestor.importFolder(at: source) { done, total in
+            progressSeen.append(done)
+            #expect(total == 3)
+        }
+
+        #expect(summary.imported == 3)
+        #expect(summary.total == 3)
+        #expect(progressSeen.last == 3)
+
+        let count = try await env.store.assetCount()
+        #expect(count == 3)
+
+        // Metadata from the sidecar came through.
+        let hits = try await env.store.searchPrompts(query: "sunset")
+        #expect(hits.count == 1)
+        #expect(hits.first?.seed == 7)
+        #expect(hits.first?.steps == 20)
+    }
+
+    @Test("importFolder is idempotent — re-importing adds nothing")
+    @MainActor
+    func importFolderIdempotent() async throws {
+        let env = try await makeEnvironment()
+        let source = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("import-src-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: source, withIntermediateDirectories: true)
+        _ = writeFile("x.png", in: source)
+        _ = writeFile("y.png", in: source)
+
+        let first = try await env.ingestor.importFolder(at: source)
+        #expect(first.imported == 2)
+        let second = try await env.ingestor.importFolder(at: source)
+        #expect(second.imported == 0)
+        #expect(second.skipped == 2)
+
+        let count = try await env.store.assetCount()
+        #expect(count == 2)
+    }
 }

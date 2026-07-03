@@ -71,6 +71,10 @@ struct GalleryView: View {
         case folder(String)
     }
 
+    // Folder import (Photo Mechanic-style "add existing folder")
+    @State private var importProgress: (done: Int, total: Int)?
+    @State private var importSummary: String?
+
     // Search field focus
     @FocusState private var searchFieldFocused: Bool
 
@@ -562,17 +566,84 @@ struct GalleryView: View {
             .scrollContentBackground(.hidden)
 
             Divider()
-            Button {
-                pendingFolderAssets = []
-                showNewFolderPrompt = true
-            } label: {
-                Label("New Folder", systemImage: "folder.badge.plus")
-                    .font(.callout)
+
+            if let importProgress {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Importing \(importProgress.done) / \(importProgress.total)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ProgressView(value: Double(importProgress.done),
+                                 total: Double(max(importProgress.total, 1)))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            } else if let importSummary {
+                Text(importSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 6)
             }
-            .buttonStyle(.borderless)
+
+            HStack(spacing: 4) {
+                Button {
+                    pendingFolderAssets = []
+                    showNewFolderPrompt = true
+                } label: {
+                    Label("New", systemImage: "folder.badge.plus")
+                        .font(.callout)
+                }
+                .buttonStyle(.borderless)
+
+                Spacer()
+
+                Button {
+                    chooseFolderToImport()
+                } label: {
+                    Label("Add Folder…", systemImage: "square.and.arrow.down.on.square")
+                        .font(.callout)
+                }
+                .buttonStyle(.borderless)
+                .disabled(importProgress != nil)
+                .help("Import an existing folder of images into the gallery")
+            }
             .padding(10)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    // MARK: - Folder import
+
+    /// Prompt for a folder and import it (Photo Mechanic style).
+    private func chooseFolderToImport() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add to Gallery"
+        panel.message = "Choose a folder of images to add to the gallery."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await importFolder(url.path) }
+    }
+
+    private func importFolder(_ path: String) async {
+        importSummary = nil
+        importProgress = (0, 0)
+        do {
+            let summary = try await ingestor.importFolder(at: path) { done, total in
+                importProgress = (done, total)
+            }
+            importProgress = nil
+            var parts = ["Imported \(summary.imported)"]
+            if summary.skipped > 0 { parts.append("\(summary.skipped) already added") }
+            if summary.failed > 0 { parts.append("\(summary.failed) failed") }
+            importSummary = parts.joined(separator: " · ")
+            await loadAssets()
+        } catch {
+            importProgress = nil
+            errorMessage = "Import failed: \(error.localizedDescription)"
+        }
     }
 
     private func folderRow(label: String, icon: String, count: Int, tag: FolderFilter) -> some View {
