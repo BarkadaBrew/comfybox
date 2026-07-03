@@ -207,6 +207,7 @@ struct ComfyBoxDesktopApp: App {
                 GalleryView(
                     store: store,
                     ingestor: ingestor,
+                    engine: engine,
                     onCompare: { assets in
                         comparisonAssets = assets
                         selectedTab = .compare

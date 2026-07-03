@@ -20,6 +20,8 @@ enum GallerySortOrder: String, CaseIterable {
 struct GalleryView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
+    /// For server-backed actions (upscale). Optional so previews/tests can omit.
+    var engine: EngineService?
     var onCompare: (([DAMAsset]) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
@@ -521,6 +523,12 @@ struct GalleryView: View {
                             copyAssets(isSelectMode && selectedIds.contains(asset.id)
                                 ? selectedAssetsList : [asset])
                         }
+                        if engine != nil {
+                            Menu("Upscale") {
+                                Button("to 2048px (long side)") { Task { await upscaleAsset(asset, to: 2048) } }
+                                Button("to 4096px (long side)") { Task { await upscaleAsset(asset, to: 4096) } }
+                            }
+                        }
                         Button(asset.favorite ? "Unfavorite" : "Favorite") {
                             Task { await toggleFavorite(asset) }
                         }
@@ -984,6 +992,20 @@ struct GalleryView: View {
                            x: 60 + Double(offset) * 28, y: 60 + Double(offset) * 28,
                            width: w, height: h),
                 toCanvas: canvasId)
+        }
+    }
+
+    /// Upscale an asset via SeedVR2 and ingest the result into the gallery.
+    private func upscaleAsset(_ asset: DAMAsset, to target: Int) async {
+        guard let engine else { return }
+        errorMessage = "Upscaling \(asset.filename) to \(target)px… (this runs on the server and may take a while)"
+        do {
+            let outputPath = try await engine.upscale(imagePath: asset.absolutePath, targetResolution: target)
+            try? await ingestor.ingestFile(at: outputPath)
+            errorMessage = nil
+            await loadAssets()
+        } catch {
+            errorMessage = "Upscale failed: \(error.localizedDescription)"
         }
     }
 

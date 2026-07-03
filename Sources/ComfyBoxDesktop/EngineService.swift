@@ -783,6 +783,28 @@ public final class EngineService {
         return parseNearline(data)
     }
 
+    // MARK: - Upscale (/v1/upscale — SeedVR2 creative upscale)
+
+    /// Upscale an image to a target long-side resolution. Returns the output
+    /// file path written by the server. Runs through the render queue, so it
+    /// can take a while on large targets.
+    @discardableResult
+    public func upscale(imagePath: String, targetResolution: Int) async throws -> String {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "image_path": imagePath,
+            "target_resolution": targetResolution,
+        ])
+        let (status, data) = try await client.post("/v1/upscale", body: body)
+        guard status == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let outputPath = json["output_path"] as? String
+        else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Upscale failed")
+        }
+        return outputPath
+    }
+
     /// Rescan the server's LoRA library (after downloading a new file into it).
     public func scanLoras() async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
