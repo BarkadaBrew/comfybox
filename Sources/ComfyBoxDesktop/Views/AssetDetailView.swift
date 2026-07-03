@@ -7,40 +7,112 @@
 import SwiftUI
 
 struct AssetDetailView: View {
-    let asset: DAMAsset
-    let thumbnailPath: String?
+    /// The full set the card can navigate through (the gallery's filtered list).
+    let assets: [DAMAsset]
+    /// Thumbnail path for a given asset (fallback when the full image fails).
+    let thumbnailProvider: (DAMAsset) -> String?
     let onUpdate: (DAMAsset) -> Void
+    /// Open the given asset in the full-screen lightbox.
+    var onFullScreen: ((DAMAsset) -> Void)?
 
-    @State private var rating: Int
-    @State private var isFavorite: Bool
-    @State private var notes: String
+    @State private var currentIndex: Int
+    @State private var rating: Int = 0
+    @State private var isFavorite: Bool = false
+    @State private var notes: String = ""
     @State private var fullImage: NSImage?
     @State private var isLoadingImage: Bool = false
+    @State private var usedThumbnailFallback: Bool = false
     @Environment(\.dismiss) private var dismiss
 
+    /// Single-asset convenience (no navigation).
     init(asset: DAMAsset, thumbnailPath: String?, onUpdate: @escaping (DAMAsset) -> Void) {
-        self.asset = asset
-        self.thumbnailPath = thumbnailPath
+        self.assets = [asset]
+        self.thumbnailProvider = { _ in thumbnailPath }
         self.onUpdate = onUpdate
-        self._rating = State(initialValue: asset.rating)
-        self._isFavorite = State(initialValue: asset.favorite)
-        self._notes = State(initialValue: "")
+        self.onFullScreen = nil
+        self._currentIndex = State(initialValue: 0)
     }
 
-    var body: some View {
-        HSplitView {
-            // Left: Full-size image
-            imagePanel
-                .frame(minWidth: 400)
+    /// Navigable initializer used by the gallery.
+    init(
+        assets: [DAMAsset],
+        index: Int,
+        thumbnailProvider: @escaping (DAMAsset) -> String?,
+        onUpdate: @escaping (DAMAsset) -> Void,
+        onFullScreen: ((DAMAsset) -> Void)? = nil
+    ) {
+        self.assets = assets
+        self.thumbnailProvider = thumbnailProvider
+        self.onUpdate = onUpdate
+        self.onFullScreen = onFullScreen
+        self._currentIndex = State(initialValue: index)
+    }
 
-            // Right: Metadata and controls
-            metadataPanel
-                .frame(minWidth: 280, maxWidth: 360)
+    /// The asset currently shown.
+    private var asset: DAMAsset { assets[min(max(currentIndex, 0), assets.count - 1)] }
+    private var thumbnailPath: String? { thumbnailProvider(asset) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            navigationBar
+            Divider()
+            HSplitView {
+                // Left: Full-size image
+                imagePanel
+                    .frame(minWidth: 400)
+
+                // Right: Metadata and controls
+                metadataPanel
+                    .frame(minWidth: 280, maxWidth: 360)
+            }
         }
         .frame(minWidth: 800, minHeight: 500)
-        .task {
+        .task(id: asset.id) {
+            syncEditableState()
             await loadFullImage()
         }
+        .onKeyPress(.leftArrow) { step(-1); return .handled }
+        .onKeyPress(.rightArrow) { step(1); return .handled }
+    }
+
+    // MARK: - Navigation bar
+
+    private var navigationBar: some View {
+        HStack(spacing: 12) {
+            Button { step(-1) } label: { Image(systemName: "chevron.left") }
+                .disabled(currentIndex <= 0)
+            Button { step(1) } label: { Image(systemName: "chevron.right") }
+                .disabled(currentIndex >= assets.count - 1)
+            Text("\(currentIndex + 1) / \(assets.count)")
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Text(asset.filename)
+                .font(.callout.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            if let onFullScreen {
+                Button { onFullScreen(asset) } label: {
+                    Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
+                }
+            }
+            Button { dismiss() } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+        }
+        .padding(12)
+    }
+
+    private func step(_ delta: Int) {
+        let next = currentIndex + delta
+        guard assets.indices.contains(next) else { return }
+        currentIndex = next
+    }
+
+    private func syncEditableState() {
+        rating = asset.rating
+        isFavorite = asset.favorite
+        notes = ""
     }
 
     // MARK: - Image Panel
@@ -54,6 +126,16 @@ struct AssetDetailView: View {
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .padding(16)
+                    .overlay(alignment: .bottom) {
+                        if usedThumbnailFallback {
+                            Text("Preview from thumbnail — original file not found")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .padding(6)
+                                .background(.black.opacity(0.4), in: Capsule())
+                                .padding(.bottom, 20)
+                        }
+                    }
             } else if isLoadingImage {
                 VStack(spacing: 8) {
                     ProgressView()
@@ -68,6 +150,12 @@ struct AssetDetailView: View {
                         .foregroundStyle(.tertiary)
                     Text("Image not available")
                         .foregroundStyle(.secondary)
+                    Text(asset.absolutePath)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 20)
                 }
             }
         }
@@ -273,12 +361,19 @@ struct AssetDetailView: View {
 
     private func loadFullImage() async {
         isLoadingImage = true
+        fullImage = nil
+        usedThumbnailFallback = false
         let path = asset.absolutePath
-        let image = await Task.detached {
-            NSImage(contentsOfFile: path)
+        let thumb = thumbnailPath
+        let (image, fellBack) = await Task.detached { () -> (NSImage?, Bool) in
+            if let full = NSImage(contentsOfFile: path) { return (full, false) }
+            // Original gone — show the cached thumbnail so the card isn't blank.
+            if let thumb, let preview = NSImage(contentsOfFile: thumb) { return (preview, true) }
+            return (nil, false)
         }.value
         await MainActor.run {
             fullImage = image
+            usedThumbnailFallback = fellBack
             isLoadingImage = false
         }
     }

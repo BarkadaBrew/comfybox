@@ -112,6 +112,17 @@ public final class AssetIngestor {
         return stored
     }
 
+    /// Remove DAM rows whose file was deleted out from under us, dropping
+    /// their cached thumbnails too. Returns how many were pruned.
+    @discardableResult
+    public func pruneOrphans() async throws -> Int {
+        let removedIds = try await store.pruneOrphans()
+        for id in removedIds {
+            try? FileManager.default.removeItem(atPath: thumbnailPath(for: id))
+        }
+        return removedIds.count
+    }
+
     // MARK: - Asset security
 
     /// Vault for secured assets. The .noindex suffix keeps Spotlight out;

@@ -328,6 +328,52 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    @Test("pruneOrphans removes rows whose file is gone, keeps present files")
+    func pruneOrphans() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+
+        // One real file, two rows pointing at nonexistent files.
+        let realPath = (tmpDir as NSString).appendingPathComponent("real-\(UUID().uuidString).png")
+        try Data([0x89, 0x50]).write(to: URL(fileURLWithPath: realPath))
+        try await store.insertAsset(DAMAsset(id: "real", filename: "real.png", absolutePath: realPath, prompt: "kept"))
+        try await store.insertAsset(DAMAsset(id: "ghost1", filename: "g1.png", absolutePath: "/nope/g1.png", prompt: "gone one"))
+        try await store.insertAsset(DAMAsset(id: "ghost2", filename: "g2.png", absolutePath: "/nope/g2.png"))
+        // A ghost that's filed into a folder — mapping must go too.
+        let folder = try await store.createFolder(name: "F")
+        try await store.assignAssets(ids: ["ghost1"], toFolder: folder.id)
+
+        let removed = try await store.pruneOrphans()
+        #expect(Set(removed) == ["ghost1", "ghost2"])
+
+        let remaining = try await store.fetchAssets(limit: 10)
+        #expect(remaining.map(\.id) == ["real"])
+        // FTS and folder mapping for the pruned rows are gone.
+        #expect(try await store.searchPrompts(query: "gone").isEmpty)
+        #expect(try await store.folderAssignments().isEmpty)
+
+        try? FileManager.default.removeItem(atPath: realPath)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("pruneOrphans keeps secured assets even though their path is in the vault")
+    func pruneKeepsSecured() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let vaultPath = (tmpDir as NSString).appendingPathComponent("vault-\(UUID().uuidString).png")
+        try Data([0x89]).write(to: URL(fileURLWithPath: vaultPath))
+        try await store.insertAsset(DAMAsset(id: "sec", filename: "sec.png", absolutePath: vaultPath))
+        try await store.secureAsset(id: "sec", securedPath: vaultPath, originalPath: "/tmp/orig.png")
+
+        let removed = try await store.pruneOrphans()
+        #expect(removed.isEmpty)
+        #expect(try await store.assetCount() == 1)
+        try? FileManager.default.removeItem(atPath: vaultPath)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("preserves all asset fields through insert and fetch")
     func allFields() async throws {
         let tmpDir = NSTemporaryDirectory()

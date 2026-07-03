@@ -143,11 +143,15 @@ struct GalleryView: View {
         }
         .sheet(item: $selectedAsset) { asset in
             AssetDetailView(
-                asset: asset,
-                thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+                assets: filteredAssets,
+                index: filteredAssets.firstIndex(where: { $0.id == asset.id }) ?? 0,
+                thumbnailProvider: { ingestor.thumbnailPath(for: $0.id) },
                 onUpdate: { updated in
                     Task { await updateAsset(updated) }
+                },
+                onFullScreen: { target in
                     selectedAsset = nil
+                    lightboxIndex = filteredAssets.firstIndex(where: { $0.id == target.id })
                 }
             )
             .frame(minWidth: 800, minHeight: 500)
@@ -157,6 +161,8 @@ struct GalleryView: View {
                 GalleryLightbox(
                     assets: filteredAssets,
                     index: idx,
+                    labelForAsset: { colorLabels[$0.id] },
+                    onSetLabel: { asset, color in applyColorLabel(color, to: [asset]) },
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
@@ -721,6 +727,11 @@ struct GalleryView: View {
     private func loadAssets() async {
         isLoading = assets.isEmpty
         do {
+            // Self-heal: drop rows whose file was deleted out from under the
+            // DAM before presenting (only worth it on a full, unfiltered load).
+            if searchText.isEmpty {
+                _ = try? await ingestor.pruneOrphans()
+            }
             if !searchText.isEmpty {
                 let ftsResults = try await store.searchPrompts(query: searchText, limit: 200)
                 assets = ftsResults
@@ -1106,6 +1117,10 @@ struct GalleryCellView: View {
 private struct GalleryLightbox: View {
     let assets: [DAMAsset]
     let index: Int
+    /// Current Finder color label for an asset (nil = unlabeled).
+    var labelForAsset: (DAMAsset) -> FinderColor? = { _ in nil }
+    /// Set/clear the label on an asset (writes the Finder tag).
+    var onSetLabel: (DAMAsset, FinderColor?) -> Void = { _, _ in }
     let onIndexChange: (Int) -> Void
     let onClose: () -> Void
 
@@ -1164,7 +1179,47 @@ private struct GalleryLightbox: View {
                 HStack {
                     Text("\(index + 1) / \(assets.count)")
                         .font(.callout.monospacedDigit()).foregroundStyle(.white.opacity(0.7))
+
                     Spacer()
+
+                    // Photo Mechanic-style color classes: click a swatch or
+                    // press 1-7 (0 clears). Mirrors the file's Finder tag.
+                    if let asset {
+                        let current = labelForAsset(asset)
+                        HStack(spacing: 7) {
+                            ForEach(Array(FinderColor.keyboardOrder.enumerated()), id: \.element) { i, color in
+                                Button {
+                                    onSetLabel(asset, current == color ? nil : color)
+                                } label: {
+                                    Circle()
+                                        .fill(color.displayColor)
+                                        .frame(width: 16, height: 16)
+                                        .overlay(
+                                            Circle().stroke(
+                                                current == color ? .white : .white.opacity(0.25),
+                                                lineWidth: current == color ? 2.5 : 1)
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                                .help("\(color.rawValue) — press \(i + 1)")
+                            }
+                            Button {
+                                onSetLabel(asset, nil)
+                            } label: {
+                                Image(systemName: "slash.circle")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(.white.opacity(current == nil ? 0.9 : 0.4))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear label — press 0")
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(.black.opacity(0.5), in: Capsule())
+                    }
+
+                    Spacer()
+
                     Button { onClose() } label: {
                         Image(systemName: "xmark.circle.fill").font(.title)
                     }
@@ -1188,6 +1243,14 @@ private struct GalleryLightbox: View {
         .onKeyPress(.leftArrow) { step(-1); return .handled }
         .onKeyPress(.rightArrow) { step(1); return .handled }
         .onKeyPress(.escape) { onClose(); return .handled }
+        .onKeyPress(characters: CharacterSet(charactersIn: "01234567")) { press in
+            // The lightbox owns keyboard focus, so it must handle the color
+            // classes itself — the gallery-level handler never sees these.
+            guard let asset, let character = press.characters.first,
+                  let digit = character.wholeNumberValue else { return .ignored }
+            onSetLabel(asset, digit == 0 ? nil : FinderColor.keyboardOrder[digit - 1])
+            return .handled
+        }
         .task(id: index) { await load() }
         .onAppear { focused = true }
     }

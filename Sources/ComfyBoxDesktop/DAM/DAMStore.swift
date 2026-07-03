@@ -131,6 +131,25 @@ public actor DAMStore {
         return asset
     }
 
+    /// Delete rows whose backing file no longer exists (deleted out from
+    /// under the DAM), cleaning FTS + folder mappings + returning their ids
+    /// so the caller can drop cached thumbnails. Secured assets are skipped —
+    /// their path points into the vault and is expected to be non-obvious.
+    @discardableResult
+    public func pruneOrphans() throws -> [String] {
+        let secured = try securedAssetIds()
+        let all = try fetchAssets(limit: 100_000)
+        var removed: [String] = []
+        for asset in all {
+            guard !secured.contains(asset.id) else { continue }
+            if !FileManager.default.fileExists(atPath: asset.absolutePath) {
+                try deleteAsset(id: asset.id)  // handles FTS + folder mapping
+                removed.append(asset.id)
+            }
+        }
+        return removed
+    }
+
     /// All asset creation timestamps (for activity stats). Lightweight — one
     /// column, served by the created_at index.
     public func assetCreationTimestamps() throws -> [Date] {
