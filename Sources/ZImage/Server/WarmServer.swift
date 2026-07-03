@@ -167,6 +167,8 @@ public final class WarmServer {
 
   /// Character registry (~/.comfybox/characters.json).
   let characterStore = CharacterStore()
+  /// Nearline model/LoRA catalog (attached storage staged on demand).
+  let nearlineLibrary = NearlineLibrary()
   /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
   let presetStore = PresetStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
@@ -452,11 +454,50 @@ public final class WarmServer {
 
     case ("POST", "/v1/lora/swap"):
       do {
-        let payload = try decode(LoRASwapPayload.self, from: request.body)
+        var payload = try decode(LoRASwapPayload.self, from: request.body)
+        payload = stageNearlineLoras(in: payload)
         let result = try await coordinator.enqueueSwap(payload)
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
+      }
+
+    // MARK: - Nearline storage
+
+    case ("GET", "/v1/nearline"):
+      return nearlineListResponse()
+
+    case ("POST", "/v1/nearline/scan"):
+      let count = nearlineLibrary.scan()
+      auditLog.append(kind: "nearline.scan", message: "Nearline scan found \(count) items")
+      return nearlineListResponse()
+
+    case ("POST", "/v1/nearline/stage"):
+      struct NameBody: Decodable { let name: String }
+      do {
+        let body = try decode(NameBody.self, from: request.body)
+        let staged = try nearlineLibrary.stage(name: body.name)
+        auditLog.append(kind: "nearline.stage", message: "Staged \(body.name)", metadata: ["path": staged])
+        return nearlineListResponse()
+      } catch let error as NearlineError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: "Stage failed: \(error.localizedDescription)"))
+      }
+
+    case ("POST", "/v1/nearline/evict"):
+      struct NameBody: Decodable { let name: String }
+      do {
+        let body = try decode(NameBody.self, from: request.body)
+        let evicted = nearlineLibrary.evict(name: body.name)
+        if evicted {
+          auditLog.append(kind: "nearline.evict", message: "Evicted \(body.name)")
+        }
+        return evicted
+          ? nearlineListResponse()
+          : .error(.error(status: 404, message: "Not staged: \(body.name)"))
+      } catch {
+        return .error(.error(status: 400, message: "Invalid evict payload"))
       }
 
     case ("POST", "/v1/shutdown"):
@@ -966,6 +1007,54 @@ public final class WarmServer {
     let decoded = raw.removingPercentEncoding ?? raw
     guard !decoded.isEmpty, !decoded.contains("/") else { return nil }
     return decoded
+  }
+
+  // Nearline -------------------------------------------------------------------
+
+  /// GET /v1/nearline payload: config + full catalog with staging state.
+  private func nearlineListResponse() -> RoutedResponse {
+    let iso = ISO8601DateFormatter()
+    let config = nearlineLibrary.configuration
+    let payload: [String: Any] = [
+      "roots": config.roots,
+      "cache_limit_gb": config.cacheLimitGB,
+      "staged_mb": nearlineLibrary.stagedMB,
+      "items": nearlineLibrary.list().map { item -> [String: Any] in
+        var dict: [String: Any] = [
+          "name": item.name,
+          "path": item.path,
+          "size_mb": item.sizeMB,
+          "kind": item.kind,
+          "staged": item.staged,
+        ]
+        if let stagedPath = item.stagedPath { dict["staged_path"] = stagedPath }
+        if let lastUsed = item.lastUsedAt { dict["last_used_at"] = iso.string(from: lastUsed) }
+        return dict
+      },
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+      return .error(.error(status: 500, message: "Failed to serialize nearline catalog"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
+  }
+
+  /// Auto-stage: rewrite bare LoRA filenames that only exist on nearline
+  /// storage to their freshly staged local paths, so a preset (or any swap
+  /// request) can reference archived LoRAs and they appear on demand.
+  private func stageNearlineLoras(in payload: LoRASwapPayload) -> LoRASwapPayload {
+    let entries = payload.loras.map { entry -> LoRAEntry in
+      // Only bare safetensors filenames are candidates — absolute/relative
+      // paths and HF ids resolve through the normal machinery.
+      guard !entry.path.hasPrefix("/"), !entry.path.hasPrefix("~"), !entry.path.hasPrefix("."),
+            entry.path.hasSuffix(".safetensors"),
+            !FileManager.default.fileExists(atPath: (entry.path as NSString).expandingTildeInPath),
+            nearlineLibrary.item(named: entry.path) != nil
+      else { return entry }
+      guard let staged = try? nearlineLibrary.stage(name: entry.path) else { return entry }
+      logger.info("Nearline: auto-staged \(entry.path) for LoRA swap")
+      return LoRAEntry(path: staged, scale: entry.scale)
+    }
+    return LoRASwapPayload(loras: entries)
   }
 
   // Queue ----------------------------------------------------------------------

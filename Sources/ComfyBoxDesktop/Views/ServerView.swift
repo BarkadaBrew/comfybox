@@ -9,17 +9,138 @@ struct ServerView: View {
     @State private var busy: String?          // id of a model with an op in flight
     @State private var actionError: String?
 
+    // Nearline storage
+    @State private var nearline: EngineService.NearlineCatalog?
+    @State private var nearlineBusy: String?
+    @State private var nearlineFilter: String = ""
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 statusSection
                 loadedPoolSection
                 availableModelsSection
+                nearlineSection
             }
             .padding(20)
         }
         .navigationTitle("Server")
-        .task { await refreshAll() }
+        .task {
+            await refreshAll()
+            nearline = await engine.fetchNearline()
+        }
+    }
+
+    // MARK: - Nearline storage
+
+    private var nearlineSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Nearline Storage").font(.headline)
+                if let nearline {
+                    Text("\(nearline.items.count) items · \(String(format: "%.1f", nearline.stagedMB / 1024)) / \(Int(nearline.cacheLimitGB)) GB staged")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                TextField("Filter…", text: $nearlineFilter)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 160)
+                Button {
+                    Task { nearline = try? await engine.scanNearline() }
+                } label: { Label("Scan", systemImage: "arrow.clockwise") }
+                    .controlSize(.small)
+                    .disabled(!engine.connectionState.isConnected)
+            }
+
+            if let nearline {
+                if let root = nearline.roots.first {
+                    Text(root)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                let visible = filteredNearlineItems(nearline.items)
+                if visible.isEmpty {
+                    emptyRow(nearline.items.isEmpty
+                             ? "No catalog yet — press Scan to index attached storage."
+                             : "No items match the filter.")
+                } else {
+                    VStack(spacing: 0) {
+                        // Staged first, then by name; cap the list to keep the pane light.
+                        ForEach(visible.prefix(60)) { item in
+                            nearlineRow(item)
+                            if item.id != visible.prefix(60).last?.id { Divider() }
+                        }
+                    }
+                    .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                    if visible.count > 60 {
+                        Text("\(visible.count - 60) more — narrow with the filter.")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            } else {
+                emptyRow("Connect to the server to browse nearline storage.")
+            }
+        }
+    }
+
+    private func filteredNearlineItems(_ items: [EngineService.NearlineEntry]) -> [EngineService.NearlineEntry] {
+        let base = nearlineFilter.isEmpty
+            ? items
+            : items.filter { $0.name.lowercased().contains(nearlineFilter.lowercased()) }
+        return base.sorted {
+            if $0.staged != $1.staged { return $0.staged }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func nearlineRow(_ item: EngineService.NearlineEntry) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: item.kind == "model" ? "cube" : "square.stack.3d.up")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            Text(item.name)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if item.staged {
+                Text("staged")
+                    .font(.caption2)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(.green.opacity(0.2), in: Capsule())
+                    .foregroundStyle(.green)
+            }
+            Spacer()
+            Text(item.sizeLabel)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            if nearlineBusy == item.name {
+                ProgressView().controlSize(.small)
+            } else if item.staged {
+                Button("Evict") { Task { await nearlineAct("evict", item) } }
+                    .controlSize(.small)
+            } else {
+                Button("Stage") { Task { await nearlineAct("stage", item) } }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+    }
+
+    private func nearlineAct(_ action: String, _ item: EngineService.NearlineEntry) async {
+        nearlineBusy = item.name
+        defer { nearlineBusy = nil }
+        do {
+            nearline = try await engine.nearlineAction(action, name: item.name)
+        } catch {
+            actionError = error.localizedDescription
+        }
     }
 
     // MARK: - Status

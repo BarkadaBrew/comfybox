@@ -713,6 +713,76 @@ public final class EngineService {
         }
     }
 
+    // MARK: - Nearline storage (/v1/nearline)
+
+    /// One catalog entry on attached storage, possibly staged locally.
+    public struct NearlineEntry: Identifiable, Sendable, Equatable {
+        public let name: String
+        public let path: String
+        public let sizeMB: Double
+        public let kind: String
+        public let staged: Bool
+        public var id: String { name }
+
+        public var sizeLabel: String {
+            sizeMB >= 1024 ? String(format: "%.1f GB", sizeMB / 1024) : String(format: "%.0f MB", sizeMB)
+        }
+    }
+
+    public struct NearlineCatalog: Sendable, Equatable {
+        public var roots: [String] = []
+        public var cacheLimitGB: Double = 0
+        public var stagedMB: Double = 0
+        public var items: [NearlineEntry] = []
+    }
+
+    private func parseNearline(_ data: Data) -> NearlineCatalog? {
+        guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        var catalog = NearlineCatalog()
+        catalog.roots = (dict["roots"] as? [String]) ?? []
+        catalog.cacheLimitGB = (dict["cache_limit_gb"] as? Double) ?? 0
+        catalog.stagedMB = (dict["staged_mb"] as? Double) ?? 0
+        catalog.items = ((dict["items"] as? [[String: Any]]) ?? []).compactMap { item in
+            guard let name = item["name"] as? String else { return nil }
+            return NearlineEntry(
+                name: name,
+                path: (item["path"] as? String) ?? "",
+                sizeMB: (item["size_mb"] as? Double) ?? 0,
+                kind: (item["kind"] as? String) ?? "lora",
+                staged: (item["staged"] as? Bool) ?? false
+            )
+        }
+        return catalog
+    }
+
+    /// Fetch the nearline catalog (attached-storage models/LoRAs).
+    public func fetchNearline() async -> NearlineCatalog? {
+        guard let client = client, connectionState.isConnected else { return nil }
+        guard let (status, data) = try? await client.get("/v1/nearline"), status == 200 else { return nil }
+        return parseNearline(data)
+    }
+
+    /// Rescan the attached-storage roots. Returns the fresh catalog.
+    public func scanNearline() async throws -> NearlineCatalog? {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let (status, data) = try await client.post("/v1/nearline/scan", body: Data("{}".utf8))
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Nearline scan failed")
+        }
+        return parseNearline(data)
+    }
+
+    /// Stage an item to local storage (or evict its staged copy).
+    public func nearlineAction(_ action: String, name: String) async throws -> NearlineCatalog? {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONSerialization.data(withJSONObject: ["name": name])
+        let (status, data) = try await client.post("/v1/nearline/\(action)", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Nearline \(action) failed")
+        }
+        return parseNearline(data)
+    }
+
     /// Rescan the server's LoRA library (after downloading a new file into it).
     public func scanLoras() async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
