@@ -53,6 +53,8 @@ struct GenerationView: View {
     var onGenerated: ((String, GenerationRequest) -> Void)?
     /// Preset queued by the Presets tab; consumed on appear / on change.
     @Binding var pendingPreset: GenerationPreset?
+    /// Prompt queued by the Prompt Library; replaces the prompt field once.
+    @Binding var pendingPromptInsert: String?
 
     // Generation parameters
     @State private var prompt: String = ""
@@ -98,8 +100,9 @@ struct GenerationView: View {
             previewPanel
                 .frame(minWidth: 400)
         }
-        .onAppear { consumePendingPreset() }
+        .onAppear { consumePendingPreset(); consumePendingPrompt() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
+        .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
         .sheet(isPresented: $showingSavePreset) {
             SavePresetSheet(
                 promptTemplate: prompt,
@@ -550,6 +553,14 @@ struct GenerationView: View {
         guard let preset = pendingPreset else { return }
         pendingPreset = nil
         applyPreset(preset)
+    }
+
+    /// Consume a prompt queued by the Prompt Library, if any. Replaces the
+    /// prompt text; other parameters are untouched.
+    private func consumePendingPrompt() {
+        guard let text = pendingPromptInsert, !text.isEmpty else { return }
+        pendingPromptInsert = nil
+        prompt = text
     }
 
     /// Apply a preset to the current generation parameters.

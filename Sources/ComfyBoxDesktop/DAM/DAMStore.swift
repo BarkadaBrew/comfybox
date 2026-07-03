@@ -148,6 +148,35 @@ public actor DAMStore {
         return results
     }
 
+    /// Distinct prompts from generated assets with use counts, most recent
+    /// first (backs the prompt-history section of the Prompt Library).
+    public func promptHistory(limit: Int = 100) throws -> [(prompt: String, count: Int, lastUsed: Date)] {
+        let sql = """
+            SELECT prompt, COUNT(*), MAX(created_at)
+            FROM assets
+            WHERE prompt IS NOT NULL AND prompt != ''
+            GROUP BY prompt
+            ORDER BY MAX(created_at) DESC
+            LIMIT ?1
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(limit))
+
+        var results: [(prompt: String, count: Int, lastUsed: Date)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            results.append((
+                prompt: String(cString: sqlite3_column_text(stmt, 0)),
+                count: Int(sqlite3_column_int(stmt, 1)),
+                lastUsed: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))
+            ))
+        }
+        return results
+    }
+
     /// Fetch assets ordered by creation date (newest first).
     public func fetchAssets(limit: Int = 50, offset: Int = 0) throws -> [DAMAsset] {
         let sql = """

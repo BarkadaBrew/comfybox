@@ -15,6 +15,8 @@ struct ComfyBoxDesktopApp: App {
     @State private var ingestor: AssetIngestor?
     @State private var presetManager = PresetManager()
     @State private var healthMonitor = HealthMonitor()
+    @State private var promptLibrary = PromptLibraryStore()
+    @State private var pendingPromptInsert: String?
     @State private var selectedTab: AppTab = .gallery
     @State private var initError: String?
     @State private var characters: [CharacterEntry] = []
@@ -29,6 +31,7 @@ struct ComfyBoxDesktopApp: App {
         case gallery = "Gallery"
         case compare = "Compare"
         case presets = "Presets"
+        case prompts = "Prompts"
         case characters = "Characters"
         case server = "Server"
 
@@ -40,6 +43,7 @@ struct ComfyBoxDesktopApp: App {
             case .gallery: return "photo.on.rectangle"
             case .compare: return "square.grid.2x2"
             case .presets: return "slider.horizontal.below.rectangle"
+            case .prompts: return "text.book.closed"
             case .characters: return "person.2.crop.square.stack"
             case .server: return "server.rack"
             }
@@ -55,6 +59,7 @@ struct ComfyBoxDesktopApp: App {
             case .characters: return "6"
             case .server: return "7"
             case .health: return "8"
+            case .prompts: return "9"
             }
         }
     }
@@ -140,7 +145,18 @@ struct ComfyBoxDesktopApp: App {
                 presetManager: presetManager,
                 characters: characters,
                 onGenerated: handleGenerated,
-                pendingPreset: $pendingPreset
+                pendingPreset: $pendingPreset,
+                pendingPromptInsert: $pendingPromptInsert
+            )
+
+        case .prompts:
+            PromptLibraryView(
+                library: promptLibrary,
+                store: store,
+                onInsert: { text in
+                    pendingPromptInsert = text
+                    selectedTab = .generate
+                }
             )
 
         case .gallery:
