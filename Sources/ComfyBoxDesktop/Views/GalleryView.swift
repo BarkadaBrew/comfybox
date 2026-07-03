@@ -21,6 +21,8 @@ struct GalleryView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
     var onCompare: (([DAMAsset]) -> Void)?
+    /// Canvas projects images can be added to (Add to Canvas menu).
+    var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
     @Binding var searchFocusRequests: Int
 
@@ -526,6 +528,17 @@ struct GalleryView: View {
                             moveToFolderMenuItems(for: isSelectMode && selectedIds.contains(asset.id)
                                 ? Array(selectedIds) : [asset.id])
                         }
+                        if let canvasStore, !canvasStore.projects.isEmpty {
+                            Menu("Add to Canvas") {
+                                ForEach(canvasStore.projects) { project in
+                                    Button(project.name) {
+                                        addToCanvas(
+                                            isSelectMode && selectedIds.contains(asset.id) ? selectedAssetsList : [asset],
+                                            canvasId: project.id, store: canvasStore)
+                                    }
+                                }
+                            }
+                        }
                         Menu("Label") {
                             labelMenuItems(for: isSelectMode && selectedIds.contains(asset.id)
                                 ? selectedAssetsList : [asset])
@@ -956,6 +969,22 @@ struct GalleryView: View {
             asset.absolutePath,
             inFileViewerRootedAtPath: ""
         )
+    }
+
+    /// Add assets to a canvas, cascading their positions so they don't stack.
+    private func addToCanvas(_ assets: [DAMAsset], canvasId: String, store canvasStore: CanvasStore) {
+        for (offset, asset) in assets.enumerated() {
+            var w = 320.0, h = 320.0
+            if let w0 = asset.width, let h0 = asset.height, w0 > 0, h0 > 0 {
+                let aspect = Double(w0) / Double(h0)
+                if aspect >= 1 { h = 320 / aspect } else { w = 320 * aspect }
+            }
+            canvasStore.addItem(
+                CanvasItem(imagePath: asset.absolutePath,
+                           x: 60 + Double(offset) * 28, y: 60 + Double(offset) * 28,
+                           width: w, height: h),
+                toCanvas: canvasId)
+        }
     }
 
     /// Copy assets to the clipboard as both file references (paste into Finder)

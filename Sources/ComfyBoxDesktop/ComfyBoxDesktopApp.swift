@@ -16,6 +16,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var presetManager = PresetManager()
     @State private var healthMonitor = HealthMonitor()
     @State private var promptLibrary = PromptLibraryStore()
+    @State private var canvasStore = CanvasStore()
     @State private var pendingPromptInsert: String?
     @State private var uiScale: String? = DesktopSettings.load().uiScale
     @State private var selectedTab: AppTab = .gallery
@@ -33,6 +34,7 @@ struct ComfyBoxDesktopApp: App {
         case compare = "Compare"
         case presets = "Presets"
         case prompts = "Prompts"
+        case canvas = "Canvas"
         case civitai = "CivitAI"
         case characters = "Characters"
         case server = "Server"
@@ -46,6 +48,7 @@ struct ComfyBoxDesktopApp: App {
             case .compare: return "square.grid.2x2"
             case .presets: return "slider.horizontal.below.rectangle"
             case .prompts: return "text.book.closed"
+            case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
             case .characters: return "person.2.crop.square.stack"
             case .server: return "server.rack"
@@ -64,6 +67,7 @@ struct ComfyBoxDesktopApp: App {
             case .health: return "8"
             case .prompts: return "9"
             case .civitai: return "0"
+            case .canvas: return "k"
             }
         }
     }
@@ -167,6 +171,14 @@ struct ComfyBoxDesktopApp: App {
                 }
             )
 
+        case .canvas:
+            CanvasView(
+                store: canvasStore,
+                onSendToGenerate: { path in
+                    Task { await sendCanvasImageToGenerate(path) }
+                }
+            )
+
         case .civitai:
             CivitAIBrowserView(engine: engine, promptLibrary: promptLibrary)
 
@@ -179,6 +191,7 @@ struct ComfyBoxDesktopApp: App {
                         comparisonAssets = assets
                         selectedTab = .compare
                     },
+                    canvasStore: canvasStore,
                     searchFocusRequests: $gallerySearchFocusRequests
                 )
             } else if let error = initError {
@@ -301,6 +314,27 @@ struct ComfyBoxDesktopApp: App {
     /// Called when GenerationView successfully generates an image.
     /// Writes a metadata sidecar and ingests the output into DAMStore
     /// so it appears in the gallery with its generation parameters.
+    /// Re-render a canvas image: load its original prompt (from the DAM asset
+    /// at that path, else the JSON sidecar) into Generate and switch tabs.
+    private func sendCanvasImageToGenerate(_ path: String) async {
+        var prompt: String?
+        if let store, let asset = try? await store.fetchAsset(byPath: path) {
+            prompt = asset.prompt
+        }
+        if prompt == nil {
+            // Fall back to a {name}.json sidecar next to the file.
+            let sidecar = ((path as NSString).deletingPathExtension) + ".json"
+            if let data = FileManager.default.contents(atPath: sidecar),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                prompt = json["prompt"] as? String
+            }
+        }
+        if let prompt, !prompt.isEmpty {
+            pendingPromptInsert = prompt
+        }
+        selectedTab = .generate
+    }
+
     private func handleGenerated(_ path: String, _ request: GenerationRequest) {
         guard let ingestor = ingestor else { return }
         Task {
