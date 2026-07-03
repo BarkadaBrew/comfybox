@@ -49,6 +49,10 @@ struct GalleryView: View {
     @State private var securedIds: Set<String> = []
     @State private var revealSecured: Bool = false
 
+    // Finder color labels (the file's own tags are the source of truth).
+    @State private var colorLabels: [String: FinderColor] = [:]
+    @State private var filterLabel: FinderColor?
+
     // Virtual folders
     @State private var folders: [DAMFolder] = []
     @State private var folderCounts: [String: Int] = [:]
@@ -178,6 +182,11 @@ struct GalleryView: View {
             }
             return .handled
         }
+        .onKeyPress(characters: CharacterSet(charactersIn: "01234567")) { press in
+            // Photo Mechanic-style color classes — skip while typing a search.
+            guard !searchFieldFocused, let character = press.characters.first else { return .ignored }
+            return handleLabelKey(character) ? .handled : .ignored
+        }
         .confirmationDialog(
             pendingDelete.count == 1
                 ? "Delete \"\(pendingDelete.first?.filename ?? "")\"?"
@@ -280,6 +289,21 @@ struct GalleryView: View {
                 }
             }
 
+            // Finder color-label filter.
+            Menu {
+                Button("Any Label") { filterLabel = nil }
+                Divider()
+                ForEach(FinderColor.keyboardOrder, id: \.self) { color in
+                    Button(color.rawValue) { filterLabel = color }
+                }
+            } label: {
+                Image(systemName: filterLabel == nil ? "circle.dashed" : "circle.fill")
+                    .foregroundStyle(filterLabel?.displayColor ?? Color.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help(filterLabel.map { "Showing \($0.rawValue)-labeled images" } ?? "Filter by Finder color label")
+
             // Secured assets: locked by default, Touch ID / password to reveal.
             if !securedIds.isEmpty || revealSecured {
                 Button {
@@ -377,6 +401,23 @@ struct GalleryView: View {
                                 .padding(6)
                         }
                     }
+                    // Photo Mechanic-style color class: a colored frame + dot,
+                    // mirroring the file's Finder tag.
+                    .overlay {
+                        if let label = colorLabels[asset.id] {
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(label.displayColor, lineWidth: 2.5)
+                        }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if let label = colorLabels[asset.id] {
+                            Circle()
+                                .fill(label.displayColor)
+                                .frame(width: 10, height: 10)
+                                .overlay(Circle().stroke(.white.opacity(0.8), lineWidth: 1))
+                                .padding(8)
+                        }
+                    }
                     .onTapGesture {
                         if isSelectMode {
                             toggleSelection(asset)
@@ -397,6 +438,10 @@ struct GalleryView: View {
                         Menu("Move to Folder") {
                             moveToFolderMenuItems(for: isSelectMode && selectedIds.contains(asset.id)
                                 ? Array(selectedIds) : [asset.id])
+                        }
+                        Menu("Label") {
+                            labelMenuItems(for: isSelectMode && selectedIds.contains(asset.id)
+                                ? selectedAssetsList : [asset])
                         }
                         if securedIds.contains(asset.id) {
                             Button("Unsecure") {
@@ -614,6 +659,11 @@ struct GalleryView: View {
             results = results.filter { !securedIds.contains($0.id) }
         }
 
+        // Finder color-label filter.
+        if let filterLabel {
+            results = results.filter { colorLabels[$0.id] == filterLabel }
+        }
+
         // Apply folder filter.
         switch folderFilter {
         case .all:
@@ -681,6 +731,7 @@ struct GalleryView: View {
             folderCounts = try await store.folderCounts()
             folderAssignments = try await store.folderAssignments()
             securedIds = try await store.securedAssetIds()
+            refreshColorLabels()
             extractFilterValues()
         } catch {
             errorMessage = error.localizedDescription
@@ -767,6 +818,77 @@ struct GalleryView: View {
 
     private func sendToComparison() {
         onCompare?(selectedAssetsList)
+    }
+
+    // MARK: - Finder color labels
+
+    /// Read every visible asset's Finder tag (fast getxattr per file).
+    private func refreshColorLabels() {
+        var labels: [String: FinderColor] = [:]
+        for asset in assets {
+            if let color = FinderTags.colorLabel(atPath: asset.absolutePath) {
+                labels[asset.id] = color
+            }
+        }
+        colorLabels = labels
+    }
+
+    /// Photo Mechanic-style targets: the lightbox image when open, else the
+    /// multi-selection, else nothing.
+    private var labelTargets: [DAMAsset] {
+        if let idx = lightboxIndex, filteredAssets.indices.contains(idx) {
+            return [filteredAssets[idx]]
+        }
+        if isSelectMode { return selectedAssetsList }
+        return []
+    }
+
+    /// Write the label onto the files (real Finder tags) and refresh.
+    private func applyColorLabel(_ color: FinderColor?, to targets: [DAMAsset]) {
+        guard !targets.isEmpty else { return }
+        var failures: [String] = []
+        for asset in targets {
+            do {
+                try FinderTags.setColorLabel(color, atPath: asset.absolutePath)
+                if let color {
+                    colorLabels[asset.id] = color
+                } else {
+                    colorLabels.removeValue(forKey: asset.id)
+                }
+            } catch {
+                failures.append(asset.filename)
+            }
+        }
+        if !failures.isEmpty {
+            errorMessage = "Failed to tag: \(failures.joined(separator: ", "))"
+        }
+    }
+
+    /// Handle Photo Mechanic-style digit shortcuts: 1–7 set colors, 0 clears.
+    private func handleLabelKey(_ character: Character) -> Bool {
+        guard let digit = character.wholeNumberValue, (0...7).contains(digit) else { return false }
+        let targets = labelTargets
+        guard !targets.isEmpty else { return false }
+        if digit == 0 {
+            applyColorLabel(nil, to: targets)
+        } else {
+            applyColorLabel(FinderColor.keyboardOrder[digit - 1], to: targets)
+        }
+        return true
+    }
+
+    /// The label picker shared by the context menu and toolbar.
+    @ViewBuilder
+    private func labelMenuItems(for targets: [DAMAsset]) -> some View {
+        ForEach(Array(FinderColor.keyboardOrder.enumerated()), id: \.element) { index, color in
+            Button("\(color.rawValue)  (\(index + 1))") {
+                applyColorLabel(color, to: targets)
+            }
+        }
+        Divider()
+        Button("Clear Label  (0)") {
+            applyColorLabel(nil, to: targets)
+        }
     }
 
     // MARK: - Asset security
