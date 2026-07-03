@@ -38,11 +38,17 @@ struct HealthBoardView: View {
     @State private var renderTimestamps: [Date] = []
     @State private var range: HealthRange = .month
 
+    // littleroundbox server metrics (Netdata).
+    @State private var serverMetrics: ServerMetrics?
+    @State private var serverMetricsFetchedAt: Date?
+    private static let netdataURL = URL(string: "http://10.0.100.232:19999")!
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 header
                 comfyBoxSection
+                littleroundboxSection
                 activitySection
                 servicesSection
                 memorySection
@@ -52,6 +58,21 @@ struct HealthBoardView: View {
         }
         .navigationTitle("Health")
         .task { await loadActivity() }
+        .task { await pollServerMetrics() }
+    }
+
+    /// Refresh littleroundbox metrics every 15s while the pane is visible.
+    private func pollServerMetrics() async {
+        let client = NetdataClient(baseURL: Self.netdataURL)
+        while !Task.isCancelled {
+            if let metrics = await client.fetchMetrics() {
+                serverMetrics = metrics
+                serverMetricsFetchedAt = Date()
+            } else {
+                serverMetrics = nil
+            }
+            try? await Task.sleep(for: .seconds(15))
+        }
     }
 
     private func loadActivity() async {
@@ -142,6 +163,106 @@ struct HealthBoardView: View {
                     .lineLimit(2)
             }
         }
+    }
+
+    // MARK: - littleroundbox server (Netdata)
+
+    private var littleroundboxSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                sectionTitle("littleroundbox")
+                if let metrics = serverMetrics {
+                    if let uptime = metrics.uptimeSeconds {
+                        Text("up \(uptimeLabel(uptime))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Label("Unreachable", systemImage: "wifi.slash")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+                if let fetched = serverMetricsFetchedAt {
+                    Text(fetched, format: .dateTime.hour().minute().second())
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            if let metrics = serverMetrics {
+                HStack(spacing: 16) {
+                    if let cpu = metrics.cpuPercent {
+                        serverGauge("CPU", fraction: cpu / 100,
+                                    label: "\(Int(cpu))%",
+                                    detail: metrics.load1.map { String(format: "load %.2f", $0) })
+                    }
+                    if let ram = metrics.ramUsedFraction {
+                        serverGauge("RAM", fraction: ram,
+                                    label: "\(Int(ram * 100))%",
+                                    detail: metrics.ramUsedMiB.map { String(format: "%.1f GiB used", $0 / 1024) })
+                    }
+                    if let disk = metrics.diskUsedFraction {
+                        serverGauge("Disk /", fraction: disk,
+                                    label: "\(Int(disk * 100))%",
+                                    detail: metrics.diskAvailGiB.map { String(format: "%.0f GiB free", $0) })
+                    }
+                    if let inKbps = metrics.netInKbps, let outKbps = metrics.netOutKbps {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Network")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text("↓ \(rateLabel(inKbps))")
+                                .font(.callout.monospacedDigit())
+                            Text("↑ \(rateLabel(outKbps))")
+                                .font(.callout.monospacedDigit())
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(12)
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+            } else {
+                Text("Netdata on 10.0.100.232:19999 is not responding.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func serverGauge(_ title: String, fraction: Double, label: String, detail: String?) -> some View {
+        HStack(spacing: 8) {
+            Gauge(value: min(max(fraction, 0), 1)) {
+                Text(title)
+            } currentValueLabel: {
+                Text(label)
+                    .font(.caption.monospacedDigit())
+            }
+            .gaugeStyle(.accessoryCircularCapacity)
+            .tint(fraction > 0.9 ? .red : fraction > 0.75 ? .orange : .green)
+            .scaleEffect(0.85)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let detail {
+                    Text(detail)
+                        .font(.caption.monospacedDigit())
+                }
+            }
+        }
+    }
+
+    private func uptimeLabel(_ seconds: Double) -> String {
+        let days = Int(seconds) / 86_400
+        if days > 0 { return "\(days)d" }
+        let hours = Int(seconds) / 3600
+        return hours > 0 ? "\(hours)h" : "\(Int(seconds) / 60)m"
+    }
+
+    private func rateLabel(_ kbps: Double) -> String {
+        kbps >= 1000 ? String(format: "%.1f Mb/s", kbps / 1000) : String(format: "%.0f kb/s", kbps)
     }
 
     // MARK: - Render activity
