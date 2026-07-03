@@ -53,9 +53,18 @@ public struct CharacterLoraReference: Codable, Equatable, Sendable {
 /// registered characters that predate the tiered fields; when `base` is present it takes
 /// precedence for assembly (see ``resolvedDescription(for:)``).
 public struct CharacterEntry: Codable, Equatable, Sendable, Identifiable {
+  /// Entry categories: a person/subject vs. a reusable environment.
+  public static let kindCharacter = "character"
+  public static let kindScene = "scene"
+
   /// Stable identity. Defaults to a slug of `name` when not supplied.
   public var id: String
   public var name: String
+
+  /// "character" (a subject) or "scene" (an environment/location). Legacy
+  /// entries without the field are derived from their text: descriptions
+  /// written as "environment: …" are scenes.
+  public var kind: String
 
   /// Flat description (legacy / fallback). Also used when no tiered `base` is present.
   public var description: String
@@ -85,6 +94,7 @@ public struct CharacterEntry: Codable, Equatable, Sendable, Identifiable {
   public init(
     id: String? = nil,
     name: String,
+    kind: String? = nil,
     description: String = "",
     base: String? = nil,
     banana: String? = nil,
@@ -100,6 +110,7 @@ public struct CharacterEntry: Codable, Equatable, Sendable, Identifiable {
     let now = CharacterEntry.nowMillis()
     self.id = id ?? CharacterEntry.slug(name)
     self.name = name
+    self.kind = kind ?? CharacterEntry.deriveKind(base: base, description: description)
     self.description = description
     self.base = base
     self.banana = banana
@@ -114,7 +125,7 @@ public struct CharacterEntry: Codable, Equatable, Sendable, Identifiable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case id, name, description, base, banana, avocado
+    case id, name, kind, description, base, banana, avocado
     case defaultLoras, promptSnippet, negativePrompt, triggerWords, tags
     case createdAt, updatedAt
   }
@@ -126,6 +137,8 @@ public struct CharacterEntry: Codable, Equatable, Sendable, Identifiable {
     self.id = try c.decodeIfPresent(String.self, forKey: .id) ?? CharacterEntry.slug(name)
     self.description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
     self.base = try c.decodeIfPresent(String.self, forKey: .base)
+    self.kind = try c.decodeIfPresent(String.self, forKey: .kind)
+      ?? CharacterEntry.deriveKind(base: self.base, description: self.description)
     self.banana = try c.decodeIfPresent(String.self, forKey: .banana)
     self.avocado = try c.decodeIfPresent(String.self, forKey: .avocado)
     self.defaultLoras = try c.decodeIfPresent([CharacterLoraReference].self, forKey: .defaultLoras) ?? []
@@ -151,6 +164,14 @@ public struct CharacterEntry: Codable, Equatable, Sendable, Identifiable {
   }
 
   // MARK: - Helpers
+
+  /// Legacy entries carry no kind; ones written as "environment: …" are scenes.
+  static func deriveKind(base: String?, description: String) -> String {
+    let text = (base?.isEmpty == false ? base! : description)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    return text.hasPrefix("environment:") ? kindScene : kindCharacter
+  }
 
   static func nowMillis() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
@@ -268,5 +289,97 @@ public actor CharacterStore {
     let removed = characters.removeValue(forKey: id.lowercased()) != nil
     if removed { persist() }
     return removed
+  }
+
+  /// Insert an entry exactly as given (timestamps preserved, no persist).
+  /// Test seam for migration tests that need controlled `createdAt`/`updatedAt`.
+  func seedForTesting(_ character: CharacterEntry) {
+    characters[character.id.lowercased()] = character
+  }
+
+  // MARK: - Legacy image-service migration
+
+  /// Default location of the Coffee Shop image service's character registry.
+  public static func legacyImageServicePath() -> URL {
+    URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+      .appendingPathComponent(".coffeeshop/image-service/characters.json")
+  }
+
+  /// One-shot merge of the legacy Electron image-service registry (source of truth
+  /// for hand-written character text). Safe to call on every startup:
+  ///
+  /// - Entries whose slug is absent locally are imported. A legacy flat
+  ///   `description` becomes the `base` tier so mode-gated assembly works.
+  /// - Local entries that were never edited (`updatedAt == createdAt`) get the
+  ///   legacy text: `base`/`banana`/`avocado` win where the legacy entry has
+  ///   them; local tiers the legacy entry lacks survive (e.g. an explicit tier
+  ///   added only on this side). Tags are taken from legacy when local has none.
+  /// - Entries edited locally since creation are left untouched, and updating
+  ///   an entry bumps `updatedAt`, so a later run never claws back user edits.
+  ///
+  /// Returns the number of entries added or changed.
+  @discardableResult
+  public func importLegacyRegistry(at legacyURL: URL = CharacterStore.legacyImageServicePath()) -> Int {
+    guard let data = try? Data(contentsOf: legacyURL), !data.isEmpty,
+          let object = try? JSONDecoder().decode([String: CharacterEntry].self, from: data)
+    else { return 0 }
+
+    var changed = 0
+    let now = CharacterEntry.nowMillis()
+
+    for (key, rawLegacy) in object {
+      var legacy = rawLegacy
+      if legacy.name.isEmpty { legacy.name = key }
+      let id = CharacterEntry.slug(legacy.name)
+
+      // The canonical legacy text: explicit base tier, else the flat description.
+      let legacyBase = (legacy.base?.isEmpty == false) ? legacy.base! : legacy.description
+      guard !legacyBase.isEmpty else { continue }
+
+      if var local = characters[id.lowercased()] {
+        // Skip entries the user has edited since creation.
+        guard local.updatedAt == local.createdAt else { continue }
+
+        var mutated = false
+        if local.base != legacyBase {
+          local.base = legacyBase
+          mutated = true
+        }
+        if let banana = legacy.banana, !banana.isEmpty, local.banana != banana {
+          local.banana = banana
+          mutated = true
+        }
+        if let avocado = legacy.avocado, !avocado.isEmpty, local.avocado != avocado {
+          local.avocado = avocado
+          mutated = true
+        }
+        if local.tags.isEmpty, !legacy.tags.isEmpty {
+          local.tags = legacy.tags
+          mutated = true
+        }
+        if mutated {
+          local.updatedAt = now
+          characters[id.lowercased()] = local
+          changed += 1
+        }
+      } else {
+        let entry = CharacterEntry(
+          id: id,
+          name: legacy.name,
+          description: legacy.description,
+          base: legacyBase,
+          banana: legacy.banana,
+          avocado: legacy.avocado,
+          tags: legacy.tags,
+          createdAt: now,
+          updatedAt: now + 1  // > createdAt so a re-run treats it as settled
+        )
+        characters[id.lowercased()] = entry
+        changed += 1
+      }
+    }
+
+    if changed > 0 { persist() }
+    return changed
   }
 }

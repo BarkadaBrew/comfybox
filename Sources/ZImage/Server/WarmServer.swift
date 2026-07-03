@@ -291,6 +291,18 @@ public final class WarmServer {
     // killing the daemon during the ~40s pipeline initialization phase.
     signal(SIGHUP, SIG_IGN)
 
+    // Merge the legacy Coffee Shop image-service character registry (source of
+    // truth for hand-written character text) before serving. Idempotent: only
+    // missing or never-edited entries change, so user edits are never clawed back.
+    let store = characterStore
+    let migrationLogger = logger
+    Task {
+      let migrated = await store.importLegacyRegistry()
+      if migrated > 0 {
+        migrationLogger.info("Characters: merged \(migrated) entries from legacy image-service registry")
+      }
+    }
+
     try preparePipeline()
 
     guard let port = NWEndpoint.Port(rawValue: configuration.port) else {
@@ -838,6 +850,9 @@ public final class WarmServer {
     // Character registry parity with the image service. Path-parameter routes follow the
     // /v1/loras/ hasPrefix pattern.
 
+    case ("POST", "/v1/enhance"):
+      return await enhancePromptResponse(body: request.body)
+
     case ("GET", "/v1/characters"):
       return await listCharactersResponse()
 
@@ -922,6 +937,81 @@ public final class WarmServer {
     let decoded = raw.removingPercentEncoding ?? raw
     guard !decoded.isEmpty, !decoded.contains("/") else { return nil }
     return decoded
+  }
+
+  // Prompt enhancement --------------------------------------------------------
+
+  /// POST /v1/enhance body (snake_case over the wire).
+  private struct EnhanceRequest: Decodable {
+    let prompt: String
+    let character: String?
+    let characterDescription: String?
+    let contentMode: String?
+  }
+
+  /// Enhance a prompt through the configured prompt-optimization provider
+  /// (Settings → AI Providers; e.g. Dan's heresy model on LM Studio). Falls
+  /// back to the raw prompt when the provider is unreachable — the optimizer
+  /// never blocks a render.
+  private func enhancePromptResponse(body: Data) async -> RoutedResponse {
+    guard let req = try? decode(EnhanceRequest.self, from: body),
+          !req.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+      return .error(.error(status: 400, message: "'prompt' is required"))
+    }
+
+    let config = ComfyBoxServerConfig.loadOrMigrate()
+    guard let endpoint = config.providers.promptOptimization else {
+      return .error(.error(
+        status: 503,
+        message: "No prompt-optimization provider configured (Settings → AI Providers)"))
+    }
+
+    // PromptOptimizer appends /v1/chat/completions itself; the configured
+    // baseUrl is an OpenAI-style root that usually already ends in /v1.
+    var base = endpoint.baseUrl
+    while base.hasSuffix("/") { base.removeLast() }
+    if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+    while base.hasSuffix("/") { base.removeLast() }
+
+    let optimizer = PromptOptimizer(
+      configuration: PromptOptimizer.Configuration(
+        ollamaBaseURL: base,
+        lmStudioBaseURL: nil,
+        model: endpoint.model,
+        timeoutSeconds: 90,
+        enabled: true
+      ),
+      logger: logger
+    )
+
+    // Resolve a named character to its mode-gated description when the
+    // caller didn't supply one.
+    let mode = req.contentMode ?? ContentModeManager.Mode.neutral.rawValue
+    var characterDescription = req.characterDescription
+    if characterDescription == nil, let name = req.character,
+       let entry = await characterStore.get(CharacterEntry.slug(name)) {
+      characterDescription = entry.resolvedDescription(
+        for: ContentModeManager.Mode(rawValue: mode) ?? .neutral)
+    }
+
+    let result = await optimizer.optimize(
+      prompt: req.prompt,
+      character: req.character,
+      characterDescription: characterDescription,
+      contentMode: mode
+    )
+
+    var payload: [String: Any] = [
+      "success": true,
+      "prompt": result.prompt,
+      "enhanced": result.enhanced,
+    ]
+    if let note = result.note { payload["note"] = note }
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+      return .error(.error(status: 500, message: "Failed to serialize enhance response"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
   }
 
   // Characters ---------------------------------------------------------------

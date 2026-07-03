@@ -51,6 +51,34 @@ final class CharacterStoreTests: XCTestCase {
     XCTAssertEqual(c.resolvedDescription(for: .avocado), "flat only")
   }
 
+  func testKindDerivedFromEnvironmentPrefix() throws {
+    // Legacy entries (no explicit kind): "environment: …" text means scene.
+    let scene = CharacterEntry(name: "Apartment", description: "environment: cozy studio")
+    XCTAssertEqual(scene.kind, CharacterEntry.kindScene)
+    let person = CharacterEntry(name: "Bree", description: "A tall athletic woman")
+    XCTAssertEqual(person.kind, CharacterEntry.kindCharacter)
+
+    // Decoding without a kind derives it; an explicit kind wins.
+    let decoded = try JSONDecoder().decode(
+      CharacterEntry.self,
+      from: Data(#"{ "name": "BackRoom", "base": "environment: back room" }"#.utf8))
+    XCTAssertEqual(decoded.kind, CharacterEntry.kindScene)
+
+    let explicit = try JSONDecoder().decode(
+      CharacterEntry.self,
+      from: Data(#"{ "name": "Weird", "kind": "character", "base": "environment: but a person" }"#.utf8))
+    XCTAssertEqual(explicit.kind, CharacterEntry.kindCharacter)
+  }
+
+  func testKindPersistsThroughStore() async throws {
+    let path = try makeTempPath()
+    let store = CharacterStore(path: path)
+    await store.upsert(CharacterEntry(name: "Apartment", kind: CharacterEntry.kindScene, description: "cozy studio"))
+    let reloaded = CharacterStore(path: path)
+    let apartment = await reloaded.get("apartment")
+    XCTAssertEqual(apartment?.kind, CharacterEntry.kindScene)
+  }
+
   // MARK: - CRUD
 
   func testUpsertGetListDelete() async throws {
@@ -191,5 +219,122 @@ final class CharacterStoreTests: XCTestCase {
     let ref = try JSONDecoder().decode(CharacterLoraReference.self, from: json)
     XCTAssertEqual(ref.filename, "x.safetensors")
     XCTAssertEqual(ref.scale, 1.0)
+  }
+
+  // MARK: - Legacy image-service registry migration
+
+  private func writeLegacyRegistry(_ json: String) throws -> URL {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("comfybox-legacy-registry-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("characters.json")
+    try Data(json.utf8).write(to: url)
+    return url
+  }
+
+  /// The Electron image-service registry shape: object keyed by display name,
+  /// entries carry a flat `description`, `tags`, and optional tier fields.
+  private static let legacyJSON = #"""
+  {
+    "Bree": { "description": "A tall athletic woman, rich hand-written text.", "tags": ["Bree"] },
+    "Todd": {
+      "description": "Flat todd text.",
+      "base": "Tiered todd base.",
+      "avocado": "Legacy explicit tier.",
+      "tags": ["Todd"]
+    },
+    "CoffeeShop": {
+      "description": "Cozy corner coffee shop interior.",
+      "tags": ["coffeeshop", "cafe"]
+    }
+  }
+  """#
+
+  func testImportLegacyRegistryAddsMissingEntries() async throws {
+    let path = try makeTempPath()
+    let legacy = try writeLegacyRegistry(Self.legacyJSON)
+    let store = CharacterStore(path: path)
+
+    let changed = await store.importLegacyRegistry(at: legacy)
+    XCTAssertEqual(changed, 3)
+
+    let list = await store.list()
+    XCTAssertEqual(list.count, 3)
+
+    // Flat-description entries become the base tier so resolvedDescription shows them.
+    let bree = await store.get("bree")
+    XCTAssertEqual(bree?.resolvedDescription(for: .neutral), "A tall athletic woman, rich hand-written text.")
+    XCTAssertEqual(bree?.tags, ["Bree"])
+
+    // Explicit tiers pass through.
+    let todd = await store.get("todd")
+    XCTAssertEqual(todd?.base, "Tiered todd base.")
+    XCTAssertEqual(todd?.avocado, "Legacy explicit tier.")
+
+    // Location-style entries import too.
+    let shop = await store.get("coffeeshop")
+    XCTAssertEqual(shop?.tags, ["coffeeshop", "cafe"])
+  }
+
+  func testImportLegacyRegistryOverwritesUneditedEntriesOnly() async throws {
+    let path = try makeTempPath()
+    let legacy = try writeLegacyRegistry(Self.legacyJSON)
+    let store = CharacterStore(path: path)
+
+    // A never-edited entry (updatedAt == createdAt): legacy text should win,
+    // but a local explicit tier the legacy entry lacks must survive.
+    await store.seedForTesting(CharacterEntry(
+      id: "bree", name: "bree",
+      base: "Condensed machine summary.",
+      avocado: "Local-only explicit tier.",
+      createdAt: 42, updatedAt: 42
+    ))
+
+    // An edited entry (updatedAt > createdAt) must be left alone entirely.
+    await store.seedForTesting(CharacterEntry(
+      id: "todd", name: "todd",
+      base: "Hand-edited todd.",
+      createdAt: 42, updatedAt: 99
+    ))
+
+    let changed = await store.importLegacyRegistry(at: legacy)
+    XCTAssertEqual(changed, 2) // bree updated + coffeeshop added
+
+    let bree = await store.get("bree")
+    XCTAssertEqual(bree?.base, "A tall athletic woman, rich hand-written text.")
+    XCTAssertEqual(bree?.avocado, "Local-only explicit tier.")
+    XCTAssertEqual(bree?.createdAt, 42)
+    XCTAssertGreaterThan(bree?.updatedAt ?? 0, 42)
+
+    let todd = await store.get("todd")
+    XCTAssertEqual(todd?.base, "Hand-edited todd.")
+    XCTAssertNil(todd?.avocado)
+    XCTAssertEqual(todd?.updatedAt, 99)
+  }
+
+  func testImportLegacyRegistryIsIdempotent() async throws {
+    let path = try makeTempPath()
+    let legacy = try writeLegacyRegistry(Self.legacyJSON)
+    let store = CharacterStore(path: path)
+
+    let first = await store.importLegacyRegistry(at: legacy)
+    XCTAssertEqual(first, 3)
+    // Imported entries now have updatedAt > createdAt (or identical content),
+    // so a second run must change nothing.
+    let second = await store.importLegacyRegistry(at: legacy)
+    XCTAssertEqual(second, 0)
+
+    // And the merge persists across instances.
+    let reloaded = CharacterStore(path: path)
+    let list = await reloaded.list()
+    XCTAssertEqual(list.count, 3)
+  }
+
+  func testImportLegacyRegistryMissingFileIsNoOp() async throws {
+    let path = try makeTempPath()
+    let store = CharacterStore(path: path)
+    let changed = await store.importLegacyRegistry(
+      at: URL(fileURLWithPath: "/nonexistent/nowhere/characters.json"))
+    XCTAssertEqual(changed, 0)
   }
 }
