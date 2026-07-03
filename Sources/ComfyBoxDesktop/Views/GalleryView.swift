@@ -78,7 +78,8 @@ struct GalleryView: View {
     // Search field focus
     @FocusState private var searchFieldFocused: Bool
 
-    private let columns = [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 12)]
+    /// Target masonry column width; the size control steps it.
+    @State private var cellTargetWidth: CGFloat = 210
 
     var body: some View {
         HStack(spacing: 0) {
@@ -310,6 +311,18 @@ struct GalleryView: View {
                 }
             }
 
+            // Thumbnail size (masonry column width).
+            Menu {
+                Button("Small") { cellTargetWidth = 150 }
+                Button("Medium") { cellTargetWidth = 210 }
+                Button("Large") { cellTargetWidth = 300 }
+            } label: {
+                Image(systemName: "square.grid.2x2")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Thumbnail size")
+
             // Finder color-label filter.
             Menu {
                 Button("Any Label") { filterLabel = nil }
@@ -402,16 +415,65 @@ struct GalleryView: View {
 
     // MARK: - Gallery Grid
 
+    private static let gridSpacing: CGFloat = 12
+
     private var galleryGrid: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 12) {
-                ForEach(filteredAssets) { asset in
-                    let isSelected = selectedIds.contains(asset.id)
-                    GalleryCellView(
-                        asset: asset,
-                        thumbnailPath: ingestor.thumbnailPath(for: asset.id),
-                        isComparisonSelected: isSelectMode ? isSelected : nil
-                    )
+        GeometryReader { geo in
+            // Masonry: pack the filtered assets into aspect-ratio-preserving
+            // columns so portraits, landscapes, and squares all show in full.
+            let available = geo.size.width - Self.gridSpacing * 2   // outer padding
+            let columnCount = max(1, Int(available / (cellTargetWidth + Self.gridSpacing)))
+            let cellWidth = (available - Self.gridSpacing * CGFloat(columnCount - 1)) / CGFloat(columnCount)
+            let cols = masonryColumns(filteredAssets, columnCount: columnCount, cellWidth: cellWidth)
+
+            ScrollView {
+                HStack(alignment: .top, spacing: Self.gridSpacing) {
+                    ForEach(Array(cols.enumerated()), id: \.offset) { _, column in
+                        LazyVStack(spacing: Self.gridSpacing) {
+                            ForEach(column) { asset in
+                                decoratedCell(for: asset, width: cellWidth)
+                            }
+                        }
+                    }
+                }
+                .padding(Self.gridSpacing)
+            }
+        }
+    }
+
+    /// Aspect ratio (w/h) from the stored dimensions, clamped so a freak
+    /// panorama or sliver can't blow out a column. Falls back to square.
+    private func aspectRatio(_ asset: DAMAsset) -> CGFloat {
+        guard let w = asset.width, let h = asset.height, w > 0, h > 0 else { return 1 }
+        return min(max(CGFloat(w) / CGFloat(h), 0.4), 2.5)
+    }
+
+    /// Distribute assets into `columnCount` columns, always appending to the
+    /// currently-shortest column (classic masonry packing) using each image's
+    /// aspect ratio to estimate cell height.
+    private func masonryColumns(_ assets: [DAMAsset], columnCount: Int, cellWidth: CGFloat) -> [[DAMAsset]] {
+        var columns = [[DAMAsset]](repeating: [], count: columnCount)
+        var heights = [CGFloat](repeating: 0, count: columnCount)
+        let captionAllowance: CGFloat = 40   // prompt + rating row + padding
+        for asset in assets {
+            let cellHeight = cellWidth / aspectRatio(asset) + captionAllowance
+            let shortest = heights.enumerated().min(by: { $0.element < $1.element })?.offset ?? 0
+            columns[shortest].append(asset)
+            heights[shortest] += cellHeight + Self.gridSpacing
+        }
+        return columns
+    }
+
+    @ViewBuilder
+    private func decoratedCell(for asset: DAMAsset, width: CGFloat) -> some View {
+        let isSelected = selectedIds.contains(asset.id)
+        GalleryCellView(
+            asset: asset,
+            thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+            cellWidth: width,
+            aspectRatio: aspectRatio(asset),
+            isComparisonSelected: isSelectMode ? isSelected : nil
+        )
                     .overlay(alignment: .topLeading) {
                         if securedIds.contains(asset.id) {
                             Image(systemName: "lock.fill")
@@ -492,10 +554,6 @@ struct GalleryView: View {
                         }
                     }
                     .draggable(DraggableAsset(path: asset.absolutePath))
-                }
-            }
-            .padding(12)
-        }
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -1114,14 +1172,24 @@ struct DraggableAsset: Transferable {
 struct GalleryCellView: View {
     let asset: DAMAsset
     let thumbnailPath: String
+    /// Column width in the masonry layout; nil = legacy fixed 160px height.
+    var cellWidth: CGFloat?
+    /// Image aspect ratio (w/h) used to size the cell to the true shape.
+    var aspectRatio: CGFloat = 1
     var isComparisonSelected: Bool?
 
     @State private var thumbnail: NSImage?
 
+    /// Height of the thumbnail area: aspect-derived in masonry, else fixed.
+    private var thumbHeight: CGFloat {
+        guard let cellWidth else { return 160 }
+        return cellWidth / max(aspectRatio, 0.01)
+    }
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
             VStack(spacing: 4) {
-                // Thumbnail
+                // Thumbnail — shown in full at its aspect ratio (no crop).
                 ZStack {
                     Color(nsColor: .controlBackgroundColor)
 
@@ -1135,7 +1203,7 @@ struct GalleryCellView: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                .frame(height: 160)
+                .frame(height: thumbHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
                 // Prompt preview
