@@ -73,6 +73,9 @@ struct DesktopSettings: Codable {
     var watchedServices: [WatchedService]?
     /// CivitAI API key (optional; unlocks auth-gated listings + downloads).
     var civitaiApiKey: String?
+    /// UI scale step ("default" | "large" | "xlarge" | "xxlarge") — bumps
+    /// fonts and controls app-wide for high-density or distant screens.
+    var uiScale: String?
 
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
@@ -95,8 +98,22 @@ struct DesktopSettings: Codable {
         thumbnailSize: 180,
         gallerySortDefault: "date",
         watchedServices: nil,
-        civitaiApiKey: nil
+        civitaiApiKey: nil,
+        uiScale: nil
     )
+
+    /// Map the persisted scale step to SwiftUI's type-size ladder.
+    static func dynamicTypeSize(for scale: String?) -> DynamicTypeSize {
+        switch scale {
+        case "large": return .xLarge
+        case "xlarge": return .xxLarge
+        case "xxlarge": return .xxxLarge
+        default: return .large   // the macOS default
+        }
+    }
+
+    /// Posted after save() so live views can re-read the file.
+    static let didChangeNotification = Notification.Name("DesktopSettingsDidChange")
 
     static var configPath: String {
         let dir = NSString(string: "~/.comfybox").expandingTildeInPath
@@ -132,6 +149,7 @@ struct DesktopSettings: Codable {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(self)
             try data.write(to: URL(fileURLWithPath: path))
+            NotificationCenter.default.post(name: Self.didChangeNotification, object: nil)
         } catch {
             // Save failure is non-fatal — settings revert to defaults on next launch.
         }
@@ -303,6 +321,22 @@ struct SettingsView: View {
                     set: { settings.civitaiApiKey = $0.isEmpty ? nil : $0 }
                 ))
                 .onChange(of: settings.civitaiApiKey) { _, _ in hasUnsavedChanges = true }
+            }
+
+            Section("Appearance") {
+                Picker("UI Scale", selection: Binding(
+                    get: { settings.uiScale ?? "default" },
+                    set: { settings.uiScale = $0 == "default" ? nil : $0 }
+                )) {
+                    Text("Default").tag("default")
+                    Text("Large").tag("large")
+                    Text("Extra Large").tag("xlarge")
+                    Text("Huge").tag("xxlarge")
+                }
+                .onChange(of: settings.uiScale) { _, _ in hasUnsavedChanges = true }
+                Text("Scales fonts and controls app-wide — handy on distant or high-density screens. Applies on save.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

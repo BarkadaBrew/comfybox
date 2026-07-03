@@ -2,6 +2,7 @@
 
 import Testing
 import Foundation
+import SwiftUI
 @testable import ComfyBoxDesktop
 
 @Suite("DesktopSettings")
@@ -54,5 +55,15 @@ struct DesktopSettingsTests {
         let path = DesktopSettings.configPath
         #expect(path.contains(".comfybox"))
         #expect(path.contains("desktop-config.json"))
+    }
+
+    @Test("uiScale maps to the dynamic type ladder, default when unset")
+    func uiScaleMapping() {
+        #expect(DesktopSettings.dynamicTypeSize(for: nil) == .large)
+        #expect(DesktopSettings.dynamicTypeSize(for: "default") == .large)
+        #expect(DesktopSettings.dynamicTypeSize(for: "large") == .xLarge)
+        #expect(DesktopSettings.dynamicTypeSize(for: "xlarge") == .xxLarge)
+        #expect(DesktopSettings.dynamicTypeSize(for: "xxlarge") == .xxxLarge)
+        #expect(DesktopSettings.dynamicTypeSize(for: "garbage") == .large)
     }
 }

@@ -17,6 +17,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var healthMonitor = HealthMonitor()
     @State private var promptLibrary = PromptLibraryStore()
     @State private var pendingPromptInsert: String?
+    @State private var uiScale: String? = DesktopSettings.load().uiScale
     @State private var selectedTab: AppTab = .gallery
     @State private var initError: String?
     @State private var characters: [CharacterEntry] = []
@@ -79,6 +80,10 @@ struct ComfyBoxDesktopApp: App {
             }
             .navigationTitle("ComfyBox Desktop")
             .frame(minWidth: 900, minHeight: 600)
+            .dynamicTypeSize(DesktopSettings.dynamicTypeSize(for: uiScale))
+            .onReceive(NotificationCenter.default.publisher(for: DesktopSettings.didChangeNotification)) { _ in
+                uiScale = DesktopSettings.load().uiScale
+            }
             .toolbar {
                 ToolbarItem(placement: .automatic) {
                     connectionButton
