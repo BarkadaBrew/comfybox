@@ -73,6 +73,11 @@ struct AssetDetailView: View {
         }
         .onKeyPress(.leftArrow) { step(-1); return .handled }
         .onKeyPress(.rightArrow) { step(1); return .handled }
+        .onKeyPress(keys: ["c"]) { press in
+            guard press.modifiers.contains(.command) else { return .ignored }
+            copyToClipboard()
+            return .handled
+        }
     }
 
     // MARK: - Navigation bar
@@ -91,6 +96,14 @@ struct AssetDetailView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
+            Button { copyToClipboard() } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+            .help("Copy image (⌘C)")
+            Button { revealInFinder() } label: {
+                Label("Reveal", systemImage: "magnifyingglass")
+            }
+            .help("Reveal in Finder")
             if let onFullScreen {
                 Button { onFullScreen(asset) } label: {
                     Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
@@ -113,6 +126,22 @@ struct AssetDetailView: View {
         rating = asset.rating
         isFavorite = asset.favorite
         notes = ""
+    }
+
+    private func revealInFinder() {
+        NSWorkspace.shared.selectFile(asset.absolutePath, inFileViewerRootedAtPath: "")
+    }
+
+    /// Copy the current image to the clipboard as both a file reference and,
+    /// when it loads, its bitmap.
+    private func copyToClipboard() {
+        let url = URL(fileURLWithPath: asset.absolutePath)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        var items: [NSPasteboardWriting] = [url as NSURL]
+        if let image = fullImage ?? NSImage(contentsOf: url) { items.append(image) }
+        pasteboard.writeObjects(items)
     }
 
     // MARK: - Image Panel

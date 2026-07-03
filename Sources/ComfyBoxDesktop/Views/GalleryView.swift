@@ -167,6 +167,8 @@ struct GalleryView: View {
                     index: idx,
                     labelForAsset: { colorLabels[$0.id] },
                     onSetLabel: { asset, color in applyColorLabel(color, to: [asset]) },
+                    onCopy: { copyAssets([$0]) },
+                    onReveal: { revealInFinder($0) },
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
@@ -196,6 +198,15 @@ struct GalleryView: View {
             // Photo Mechanic-style color classes — skip while typing a search.
             guard !searchFieldFocused, let character = press.characters.first else { return .ignored }
             return handleLabelKey(character) ? .handled : .ignored
+        }
+        .onKeyPress(keys: ["c"]) { press in
+            // Cmd+C copies the lightbox image, the selection, or the hovered
+            // detail — skip while typing in the search field.
+            guard press.modifiers.contains(.command), !searchFieldFocused else { return .ignored }
+            let targets = labelTargets.isEmpty ? (selectedAsset.map { [$0] } ?? []) : labelTargets
+            guard !targets.isEmpty else { return .ignored }
+            copyAssets(targets)
+            return .handled
         }
         .confirmationDialog(
             pendingDelete.count == 1
@@ -441,6 +452,10 @@ struct GalleryView: View {
                         }
                         Button("Reveal in Finder") {
                             revealInFinder(asset)
+                        }
+                        Button("Copy") {
+                            copyAssets(isSelectMode && selectedIds.contains(asset.id)
+                                ? selectedAssetsList : [asset])
                         }
                         Button(asset.favorite ? "Unfavorite" : "Favorite") {
                             Task { await toggleFavorite(asset) }
@@ -885,6 +900,24 @@ struct GalleryView: View {
         )
     }
 
+    /// Copy assets to the clipboard as both file references (paste into Finder)
+    /// and, for a single image, its bitmap (paste into image editors / docs).
+    private func copyAssets(_ assets: [DAMAsset]) {
+        let urls = assets
+            .map { URL(fileURLWithPath: $0.absolutePath) }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !urls.isEmpty else { return }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        var items: [NSPasteboardWriting] = urls.map { $0 as NSURL }
+        // A single image also goes on as an image so ⌘V pastes the picture.
+        if urls.count == 1, let image = NSImage(contentsOf: urls[0]) {
+            items.append(image)
+        }
+        pasteboard.writeObjects(items)
+    }
+
     /// Assets for the current selection, in display order.
     private var selectedAssetsList: [DAMAsset] {
         filteredAssets.filter { selectedIds.contains($0.id) }
@@ -1192,6 +1225,8 @@ private struct GalleryLightbox: View {
     var labelForAsset: (DAMAsset) -> FinderColor? = { _ in nil }
     /// Set/clear the label on an asset (writes the Finder tag).
     var onSetLabel: (DAMAsset, FinderColor?) -> Void = { _, _ in }
+    var onCopy: (DAMAsset) -> Void = { _ in }
+    var onReveal: (DAMAsset) -> Void = { _ in }
     let onIndexChange: (Int) -> Void
     let onClose: () -> Void
 
@@ -1291,6 +1326,19 @@ private struct GalleryLightbox: View {
 
                     Spacer()
 
+                    if let asset {
+                        Button { onCopy(asset) } label: {
+                            Image(systemName: "doc.on.doc").font(.title3)
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
+                        .help("Copy image (⌘C)")
+                        Button { onReveal(asset) } label: {
+                            Image(systemName: "magnifyingglass.circle").font(.title3)
+                        }
+                        .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
+                        .help("Reveal in Finder")
+                    }
+
                     Button { onClose() } label: {
                         Image(systemName: "xmark.circle.fill").font(.title)
                     }
@@ -1314,6 +1362,11 @@ private struct GalleryLightbox: View {
         .onKeyPress(.leftArrow) { step(-1); return .handled }
         .onKeyPress(.rightArrow) { step(1); return .handled }
         .onKeyPress(.escape) { onClose(); return .handled }
+        .onKeyPress(keys: ["c"]) { press in
+            guard press.modifiers.contains(.command), let asset else { return .ignored }
+            onCopy(asset)
+            return .handled
+        }
         .onKeyPress(characters: CharacterSet(charactersIn: "01234567")) { press in
             // The lightbox owns keyboard focus, so it must handle the color
             // classes itself — the gallery-level handler never sees these.
