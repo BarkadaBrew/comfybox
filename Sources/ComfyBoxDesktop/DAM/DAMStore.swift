@@ -131,6 +131,23 @@ public actor DAMStore {
         return asset
     }
 
+    /// All asset creation timestamps (for activity stats). Lightweight — one
+    /// column, served by the created_at index.
+    public func assetCreationTimestamps() throws -> [Date] {
+        let sql = "SELECT created_at FROM assets ORDER BY created_at ASC"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [Date] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            results.append(Date(timeIntervalSince1970: sqlite3_column_double(stmt, 0)))
+        }
+        return results
+    }
+
     /// Fetch assets ordered by creation date (newest first).
     public func fetchAssets(limit: Int = 50, offset: Int = 0) throws -> [DAMAsset] {
         let sql = """
@@ -221,6 +238,143 @@ public actor DAMStore {
             results.append(assetFromRow(stmt))
         }
         return results
+    }
+
+    /// Delete an asset row, its FTS entry, and its folder mapping. Unknown
+    /// ids are a no-op. Does not touch files on disk — see
+    /// AssetIngestor.deleteAsset for the full file + thumbnail + database removal.
+    public func deleteAsset(id: String) throws {
+        let sql = "DELETE FROM assets WHERE id = ?1"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DAMStoreError.execFailed(sql, lastError)
+        }
+        try deleteFTS(id: id)
+        try runSimple("DELETE FROM asset_folders WHERE asset_id = ?1", text: [id])
+    }
+
+    // MARK: - Folders
+
+    /// Create a folder and return it.
+    @discardableResult
+    public func createFolder(name: String, id: String = UUID().uuidString) throws -> DAMFolder {
+        let folder = DAMFolder(id: id, name: name, createdAt: Date())
+        let sql = "INSERT INTO folders (id, name, created_at) VALUES (?1, ?2, ?3)"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (folder.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (folder.name as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 3, folder.createdAt.timeIntervalSince1970)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DAMStoreError.insertFailed(lastError)
+        }
+        return folder
+    }
+
+    /// All folders, sorted by name (case-insensitive).
+    public func listFolders() throws -> [DAMFolder] {
+        let sql = "SELECT id, name, created_at FROM folders ORDER BY name COLLATE NOCASE ASC"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        var results: [DAMFolder] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            results.append(DAMFolder(
+                id: String(cString: sqlite3_column_text(stmt, 0)),
+                name: String(cString: sqlite3_column_text(stmt, 1)),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))
+            ))
+        }
+        return results
+    }
+
+    /// Rename a folder. Unknown ids are a no-op.
+    public func renameFolder(id: String, name: String) throws {
+        try runSimple("UPDATE folders SET name = ?2 WHERE id = ?1", text: [id, name])
+    }
+
+    /// Delete a folder. Its assets are unfiled, not deleted.
+    public func deleteFolder(id: String) throws {
+        try runSimple("DELETE FROM asset_folders WHERE folder_id = ?1", text: [id])
+        try runSimple("DELETE FROM folders WHERE id = ?1", text: [id])
+    }
+
+    /// File assets into a folder, or unfile them when `toFolder` is nil.
+    /// An asset lives in at most one folder; refiling replaces the mapping.
+    public func assignAssets(ids: [String], toFolder folderId: String?) throws {
+        for assetId in ids {
+            if let folderId {
+                try runSimple(
+                    "INSERT OR REPLACE INTO asset_folders (asset_id, folder_id) VALUES (?1, ?2)",
+                    text: [assetId, folderId])
+            } else {
+                try runSimple("DELETE FROM asset_folders WHERE asset_id = ?1", text: [assetId])
+            }
+        }
+    }
+
+    /// The full asset→folder mapping (assets without a folder are absent).
+    public func folderAssignments() throws -> [String: String] {
+        let sql = "SELECT asset_id, folder_id FROM asset_folders"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        var results: [String: String] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            results[String(cString: sqlite3_column_text(stmt, 0))] =
+                String(cString: sqlite3_column_text(stmt, 1))
+        }
+        return results
+    }
+
+    /// Asset counts per folder id.
+    public func folderCounts() throws -> [String: Int] {
+        let sql = "SELECT folder_id, COUNT(*) FROM asset_folders GROUP BY folder_id"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        var results: [String: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            results[String(cString: sqlite3_column_text(stmt, 0))] = Int(sqlite3_column_int(stmt, 1))
+        }
+        return results
+    }
+
+    /// Prepare, bind text parameters in order, and step a one-shot statement.
+    private func runSimple(_ sql: String, text: [String]) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        for (index, value) in text.enumerated() {
+            sqlite3_bind_text(stmt, Int32(index + 1), (value as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        }
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DAMStoreError.execFailed(sql, lastError)
+        }
+    }
+
+    /// Delete multiple assets by id.
+    public func deleteAssets(ids: [String]) throws {
+        for id in ids {
+            try deleteAsset(id: id)
+        }
     }
 
     /// Fetch a single asset by absolute path, or nil if not tracked.
@@ -328,6 +482,24 @@ public actor DAMStore {
             """)
 
         try execute("CREATE INDEX IF NOT EXISTS idx_assets_created ON assets(created_at DESC)")
+
+        // Virtual folders. Membership lives in a separate mapping table (one
+        // folder per asset) so INSERT OR REPLACE re-ingests of an asset row
+        // can't wipe its filing.
+        try execute("""
+            CREATE TABLE IF NOT EXISTS folders (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """)
+        try execute("""
+            CREATE TABLE IF NOT EXISTS asset_folders (
+                asset_id TEXT PRIMARY KEY,
+                folder_id TEXT NOT NULL
+            )
+            """)
+        try execute("CREATE INDEX IF NOT EXISTS idx_asset_folders_folder ON asset_folders(folder_id)")
 
         // FTS5 virtual table for full-text prompt search.
         try execute("""

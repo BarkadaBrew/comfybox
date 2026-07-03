@@ -189,6 +189,145 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    @Test("deleteAsset removes the row and its FTS entry")
+    func deleteAsset() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let asset = TestData.makeAsset(id: "del-1", filename: "del.png", prompt: "obsidian tower at dusk")
+        try await store.insertAsset(asset)
+        try await store.deleteAsset(id: "del-1")
+        let count = try await store.assetCount()
+        #expect(count == 0)
+        let ftsResults = try await store.searchPrompts(query: "obsidian")
+        #expect(ftsResults.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("deleteAsset of unknown id is a no-op")
+    func deleteUnknownAsset() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let asset = TestData.makeAsset(id: "keep-1", filename: "keep.png")
+        try await store.insertAsset(asset)
+        try await store.deleteAsset(id: "no-such-id")
+        let count = try await store.assetCount()
+        #expect(count == 1)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("deleteAssets removes only the given ids")
+    func deleteMultipleAssets() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        for i in 0..<5 {
+            let asset = DAMAsset(
+                id: "bulk-\(i)", filename: "bulk-\(i).png",
+                absolutePath: "/tmp/bulk-\(i).png",
+                prompt: "bulk prompt \(i)"
+            )
+            try await store.insertAsset(asset)
+        }
+        try await store.deleteAssets(ids: ["bulk-1", "bulk-3"])
+        let remaining = try await store.fetchAssets(limit: 10)
+        let ids = Set(remaining.map(\.id))
+        #expect(ids == ["bulk-0", "bulk-2", "bulk-4"])
+        // FTS rows for deleted assets are gone too.
+        let fts1 = try await store.searchPrompts(query: "\"bulk prompt 1\"")
+        #expect(fts1.isEmpty)
+        let fts2 = try await store.searchPrompts(query: "\"bulk prompt 2\"")
+        #expect(fts2.count == 1)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("folders: create, list, rename, delete")
+    func folderCRUD() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+
+        let folder = try await store.createFolder(name: "Portraits")
+        #expect(!folder.id.isEmpty)
+        #expect(folder.name == "Portraits")
+
+        _ = try await store.createFolder(name: "Landscapes")
+        var folders = try await store.listFolders()
+        #expect(folders.map(\.name).sorted() == ["Landscapes", "Portraits"])
+
+        try await store.renameFolder(id: folder.id, name: "People")
+        folders = try await store.listFolders()
+        #expect(folders.map(\.name).sorted() == ["Landscapes", "People"])
+
+        try await store.deleteFolder(id: folder.id)
+        folders = try await store.listFolders()
+        #expect(folders.map(\.name) == ["Landscapes"])
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("folders: assign, reassign, and unfile assets")
+    func folderAssignment() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        for i in 0..<3 {
+            try await store.insertAsset(TestData.makeAsset(id: "a\(i)", filename: "a\(i).png"))
+        }
+        let folder = try await store.createFolder(name: "Picks")
+
+        try await store.assignAssets(ids: ["a0", "a1"], toFolder: folder.id)
+        var assignments = try await store.folderAssignments()
+        #expect(assignments == ["a0": folder.id, "a1": folder.id])
+
+        let counts = try await store.folderCounts()
+        #expect(counts[folder.id] == 2)
+
+        try await store.assignAssets(ids: ["a0"], toFolder: nil)
+        assignments = try await store.folderAssignments()
+        #expect(assignments == ["a1": folder.id])
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("folders: deleting a folder unfiles assets; deleting an asset drops its mapping")
+    func folderCleanup() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        try await store.insertAsset(TestData.makeAsset(id: "x1", filename: "x1.png"))
+        try await store.insertAsset(TestData.makeAsset(id: "x2", filename: "x2.png"))
+        let folder = try await store.createFolder(name: "Temp")
+        try await store.assignAssets(ids: ["x1", "x2"], toFolder: folder.id)
+
+        try await store.deleteAsset(id: "x1")
+        var assignments = try await store.folderAssignments()
+        #expect(assignments == ["x2": folder.id])
+
+        try await store.deleteFolder(id: folder.id)
+        assignments = try await store.folderAssignments()
+        #expect(assignments.isEmpty)
+        // Assets themselves survive folder deletion.
+        let count = try await store.assetCount()
+        #expect(count == 1)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("folders: membership survives asset re-ingest (INSERT OR REPLACE)")
+    func folderSurvivesReingest() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let asset = TestData.makeAsset(id: "r1", filename: "r1.png")
+        try await store.insertAsset(asset)
+        let folder = try await store.createFolder(name: "Keep")
+        try await store.assignAssets(ids: ["r1"], toFolder: folder.id)
+
+        try await store.insertAsset(asset)  // re-ingest same asset
+        let assignments = try await store.folderAssignments()
+        #expect(assignments["r1"] == folder.id)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("preserves all asset fields through insert and fetch")
     func allFields() async throws {
         let tmpDir = NSTemporaryDirectory()

@@ -6,7 +6,7 @@
 
 import Foundation
 
-public struct DAMAsset: Identifiable, Sendable {
+public struct DAMAsset: Identifiable, Sendable, Equatable {
     public let id: String
     public let kind: String  // "image" or "video"
     public let filename: String

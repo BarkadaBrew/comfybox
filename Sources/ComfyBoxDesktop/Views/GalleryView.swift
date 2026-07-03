@@ -30,16 +30,37 @@ struct GalleryView: View {
     @State private var filterContentMode: String?
     @State private var filterCharacter: String?
     @State private var selectedAsset: DAMAsset?
+    @State private var lightboxIndex: Int? = nil
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
 
-    // Comparison selection
-    @State private var comparisonSelection: Set<String> = []
-    @State private var isComparisonMode: Bool = false
+    // Multi-selection (compare, bulk delete)
+    @State private var selectedIds: Set<String> = []
+    @State private var isSelectMode: Bool = false
+    @State private var pendingDelete: [DAMAsset] = []
+    @State private var showDeleteConfirmation: Bool = false
 
     // Available filter values extracted from assets.
     @State private var contentModes: [String] = []
     @State private var characters: [String] = []
+
+    // Virtual folders
+    @State private var folders: [DAMFolder] = []
+    @State private var folderCounts: [String: Int] = [:]
+    @State private var folderAssignments: [String: String] = [:]
+    @State private var folderFilter: FolderFilter = .all
+    @State private var showNewFolderPrompt: Bool = false
+    @State private var newFolderName: String = ""
+    /// Assets staged to be filed into the folder created by the prompt.
+    @State private var pendingFolderAssets: [String] = []
+    @State private var renamingFolder: DAMFolder?
+    @State private var renameText: String = ""
+
+    enum FolderFilter: Equatable, Hashable {
+        case all
+        case unfiled
+        case folder(String)
+    }
 
     // Search field focus
     @FocusState private var searchFieldFocused: Bool
@@ -47,29 +68,69 @@ struct GalleryView: View {
     private let columns = [GridItem(.adaptive(minimum: 180, maximum: 240), spacing: 12)]
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Toolbar: search, sort, filter
-            toolbarView
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color(nsColor: .windowBackgroundColor))
-
+        HStack(spacing: 0) {
+            folderSidebar
+                .frame(width: 190)
             Divider()
+            VStack(spacing: 0) {
+                // Toolbar: search, sort, filter
+                toolbarView
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(nsColor: .windowBackgroundColor))
 
-            // Gallery grid
-            if isLoading {
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .controlSize(.large)
-                    Text("Loading gallery...")
-                        .foregroundStyle(.secondary)
+                Divider()
+
+                if let message = errorMessage {
+                    errorBanner(message)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if filteredAssets.isEmpty {
-                emptyState
-            } else {
-                galleryGrid
+
+                // Gallery grid
+                if isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("Loading gallery...")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if filteredAssets.isEmpty {
+                    emptyState
+                } else {
+                    galleryGrid
+                }
             }
+        }
+        .alert("New Folder", isPresented: $showNewFolderPrompt) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Create") {
+                let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let staged = pendingFolderAssets
+                newFolderName = ""
+                pendingFolderAssets = []
+                guard !name.isEmpty else { return }
+                Task { await createFolder(named: name, filing: staged) }
+            }
+            Button("Cancel", role: .cancel) {
+                newFolderName = ""
+                pendingFolderAssets = []
+            }
+        }
+        .alert("Rename Folder", isPresented: Binding(
+            get: { renamingFolder != nil },
+            set: { if !$0 { renamingFolder = nil } }
+        )) {
+            TextField("Folder name", text: $renameText)
+            Button("Rename") {
+                if let folder = renamingFolder {
+                    let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !name.isEmpty {
+                        Task { await renameFolder(folder, to: name) }
+                    }
+                }
+                renamingFolder = nil
+            }
+            Button("Cancel", role: .cancel) { renamingFolder = nil }
         }
         .sheet(item: $selectedAsset) { asset in
             AssetDetailView(
@@ -81,6 +142,17 @@ struct GalleryView: View {
                 }
             )
             .frame(minWidth: 800, minHeight: 500)
+        }
+        .overlay {
+            if let idx = lightboxIndex {
+                GalleryLightbox(
+                    assets: filteredAssets,
+                    index: idx,
+                    onIndexChange: { lightboxIndex = $0 },
+                    onClose: { lightboxIndex = nil }
+                )
+                .transition(.opacity)
+            }
         }
         .task(id: searchText) {
             // Debounce while the user is typing, then re-run the FTS query.
@@ -100,6 +172,24 @@ struct GalleryView: View {
                 quickLookAsset(asset)
             }
             return .handled
+        }
+        .confirmationDialog(
+            pendingDelete.count == 1
+                ? "Delete \"\(pendingDelete.first?.filename ?? "")\"?"
+                : "Delete \(pendingDelete.count) images?",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Move to Trash", role: .destructive) {
+                let toDelete = pendingDelete
+                pendingDelete = []
+                Task { await deleteAssets(toDelete) }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDelete = []
+            }
+        } message: {
+            Text("The image files and their metadata are moved to the Trash.")
         }
     }
 
@@ -129,29 +219,60 @@ struct GalleryView: View {
 
             Spacer()
 
-            // Comparison mode toggle
-            Toggle(isOn: $isComparisonMode) {
+            // Selection mode toggle
+            Toggle(isOn: $isSelectMode) {
                 HStack(spacing: 4) {
-                    Image(systemName: "square.grid.2x2")
-                    if isComparisonMode && !comparisonSelection.isEmpty {
-                        Text("\(comparisonSelection.count)")
+                    Image(systemName: "checkmark.circle")
+                    if isSelectMode && !selectedIds.isEmpty {
+                        Text("\(selectedIds.count)")
                             .font(.caption2)
                     }
                 }
             }
             .toggleStyle(.button)
-            .help("Toggle comparison selection mode")
-            .onChange(of: isComparisonMode) { _, newValue in
-                if !newValue { comparisonSelection.removeAll() }
+            .help("Toggle selection mode for compare and bulk actions")
+            .onChange(of: isSelectMode) { _, newValue in
+                if !newValue { selectedIds.removeAll() }
             }
 
-            // Compare button (visible when 2+ selected)
-            if isComparisonMode && comparisonSelection.count >= 2 {
-                Button(action: { sendToComparison() }) {
-                    Label("Compare \(comparisonSelection.count)", systemImage: "arrow.right.circle")
+            if isSelectMode {
+                Button("All") { selectedIds = Set(filteredAssets.map(\.id)) }
+                    .controlSize(.small)
+                    .help("Select all visible images")
+
+                if !selectedIds.isEmpty {
+                    Button("None") { selectedIds.removeAll() }
+                        .controlSize(.small)
+                        .help("Clear selection")
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+
+                // Compare button (2-4 selected)
+                if (2...4).contains(selectedIds.count) {
+                    Button(action: { sendToComparison() }) {
+                        Label("Compare \(selectedIds.count)", systemImage: "square.grid.2x2")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+
+                // Bulk move to folder
+                if !selectedIds.isEmpty {
+                    Menu {
+                        moveToFolderMenuItems(for: Array(selectedIds))
+                    } label: {
+                        Label("Move \(selectedIds.count)", systemImage: "folder")
+                    }
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+
+                // Bulk delete
+                if !selectedIds.isEmpty {
+                    Button(role: .destructive, action: { requestDelete(selectedAssetsList) }) {
+                        Label("Delete \(selectedIds.count)", systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                }
             }
 
             // Favorite filter
@@ -217,34 +338,43 @@ struct GalleryView: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(filteredAssets) { asset in
-                    let isCompSelected = comparisonSelection.contains(asset.id)
+                    let isSelected = selectedIds.contains(asset.id)
                     GalleryCellView(
                         asset: asset,
                         thumbnailPath: ingestor.thumbnailPath(for: asset.id),
-                        isComparisonSelected: isComparisonMode ? isCompSelected : nil
+                        isComparisonSelected: isSelectMode ? isSelected : nil
                     )
                     .onTapGesture {
-                        if isComparisonMode {
-                            toggleComparisonSelection(asset)
+                        if isSelectMode {
+                            toggleSelection(asset)
                         } else {
                             selectedAsset = asset
                         }
                     }
                     .contextMenu {
+                        Button("Open in Lightbox") {
+                            lightboxIndex = filteredAssets.firstIndex(where: { $0.id == asset.id })
+                        }
                         Button("Reveal in Finder") {
                             revealInFinder(asset)
                         }
                         Button(asset.favorite ? "Unfavorite" : "Favorite") {
                             Task { await toggleFavorite(asset) }
                         }
-                        if !isComparisonMode {
+                        Menu("Move to Folder") {
+                            moveToFolderMenuItems(for: isSelectMode && selectedIds.contains(asset.id)
+                                ? Array(selectedIds) : [asset.id])
+                        }
+                        if !isSelectMode {
                             Divider()
-                            Button("Add to Comparison") {
-                                if comparisonSelection.count < 4 {
-                                    comparisonSelection.insert(asset.id)
-                                    isComparisonMode = true
-                                }
+                            Button("Select") {
+                                selectedIds.insert(asset.id)
+                                isSelectMode = true
                             }
+                        }
+                        Divider()
+                        Button("Delete…", role: .destructive) {
+                            requestDelete([asset])
                         }
                     }
                     .draggable(DraggableAsset(path: asset.absolutePath))
@@ -252,6 +382,26 @@ struct GalleryView: View {
             }
             .padding(12)
         }
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.callout)
+                .lineLimit(2)
+            Spacer()
+            Button(action: { errorMessage = nil }) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.12))
     }
 
     private var emptyState: some View {
@@ -286,10 +436,144 @@ struct GalleryView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    // MARK: - Folder sidebar
+
+    private var folderSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            List(selection: $folderFilter) {
+                folderRow(label: "All Images", icon: "photo.on.rectangle",
+                          count: assets.count, tag: .all)
+                folderRow(label: "Unfiled", icon: "tray",
+                          count: max(0, assets.count - folderAssignments.count), tag: .unfiled)
+                if !folders.isEmpty {
+                    Section("Folders") {
+                        ForEach(folders) { folder in
+                            folderRow(label: folder.name, icon: "folder",
+                                      count: folderCounts[folder.id] ?? 0, tag: .folder(folder.id))
+                                .contextMenu {
+                                    Button("Rename…") {
+                                        renameText = folder.name
+                                        renamingFolder = folder
+                                    }
+                                    Button("Delete Folder", role: .destructive) {
+                                        Task { await deleteFolder(folder) }
+                                    }
+                                }
+                        }
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+
+            Divider()
+            Button {
+                pendingFolderAssets = []
+                showNewFolderPrompt = true
+            } label: {
+                Label("New Folder", systemImage: "folder.badge.plus")
+                    .font(.callout)
+            }
+            .buttonStyle(.borderless)
+            .padding(10)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func folderRow(label: String, icon: String, count: Int, tag: FolderFilter) -> some View {
+        HStack {
+            Label(label, systemImage: icon)
+                .lineLimit(1)
+            Spacer()
+            Text("\(count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        .tag(tag)
+    }
+
+    // MARK: - Folder actions
+
+    private func createFolder(named name: String, filing assetIds: [String]) async {
+        do {
+            let folder = try await store.createFolder(name: name)
+            if !assetIds.isEmpty {
+                try await store.assignAssets(ids: assetIds, toFolder: folder.id)
+                selectedIds.removeAll()
+            }
+            await loadAssets()
+            folderFilter = .folder(folder.id)
+        } catch {
+            errorMessage = "Failed to create folder: \(error.localizedDescription)"
+        }
+    }
+
+    private func renameFolder(_ folder: DAMFolder, to name: String) async {
+        do {
+            try await store.renameFolder(id: folder.id, name: name)
+            await loadAssets()
+        } catch {
+            errorMessage = "Failed to rename folder: \(error.localizedDescription)"
+        }
+    }
+
+    private func deleteFolder(_ folder: DAMFolder) async {
+        do {
+            try await store.deleteFolder(id: folder.id)
+            if folderFilter == .folder(folder.id) { folderFilter = .all }
+            await loadAssets()
+        } catch {
+            errorMessage = "Failed to delete folder: \(error.localizedDescription)"
+        }
+    }
+
+    /// File assets into a folder (nil = unfile) and refresh.
+    private func moveAssets(_ assetIds: [String], toFolder folderId: String?) async {
+        guard !assetIds.isEmpty else { return }
+        do {
+            try await store.assignAssets(ids: assetIds, toFolder: folderId)
+            selectedIds.removeAll()
+            await loadAssets()
+        } catch {
+            errorMessage = "Failed to move: \(error.localizedDescription)"
+        }
+    }
+
+    /// The shared "Move to Folder" menu body for context menus and the toolbar.
+    @ViewBuilder
+    private func moveToFolderMenuItems(for assetIds: [String]) -> some View {
+        ForEach(folders) { folder in
+            Button(folder.name) {
+                Task { await moveAssets(assetIds, toFolder: folder.id) }
+            }
+        }
+        if !folders.isEmpty { Divider() }
+        Button("New Folder…") {
+            pendingFolderAssets = assetIds
+            showNewFolderPrompt = true
+        }
+        if assetIds.contains(where: { folderAssignments[$0] != nil }) {
+            Divider()
+            Button("Remove from Folder") {
+                Task { await moveAssets(assetIds, toFolder: nil) }
+            }
+        }
+    }
+
     // MARK: - Filtering and Sorting
 
     private var filteredAssets: [DAMAsset] {
         var results = assets
+
+        // Apply folder filter.
+        switch folderFilter {
+        case .all:
+            break
+        case .unfiled:
+            results = results.filter { folderAssignments[$0.id] == nil }
+        case .folder(let folderId):
+            results = results.filter { folderAssignments[$0.id] == folderId }
+        }
 
         // Apply favorites filter.
         if filterFavorites {
@@ -344,6 +628,9 @@ struct GalleryView: View {
             } else {
                 assets = try await store.fetchAssets(limit: 500)
             }
+            folders = try await store.listFolders()
+            folderCounts = try await store.folderCounts()
+            folderAssignments = try await store.folderAssignments()
             extractFilterValues()
         } catch {
             errorMessage = error.localizedDescription
@@ -415,17 +702,48 @@ struct GalleryView: View {
         )
     }
 
-    private func toggleComparisonSelection(_ asset: DAMAsset) {
-        if comparisonSelection.contains(asset.id) {
-            comparisonSelection.remove(asset.id)
-        } else if comparisonSelection.count < 4 {
-            comparisonSelection.insert(asset.id)
+    /// Assets for the current selection, in display order.
+    private var selectedAssetsList: [DAMAsset] {
+        filteredAssets.filter { selectedIds.contains($0.id) }
+    }
+
+    private func toggleSelection(_ asset: DAMAsset) {
+        if selectedIds.contains(asset.id) {
+            selectedIds.remove(asset.id)
+        } else {
+            selectedIds.insert(asset.id)
         }
     }
 
     private func sendToComparison() {
-        let selected = assets.filter { comparisonSelection.contains($0.id) }
-        onCompare?(selected)
+        onCompare?(selectedAssetsList)
+    }
+
+    /// Stage assets for deletion and show the confirmation dialog.
+    private func requestDelete(_ toDelete: [DAMAsset]) {
+        guard !toDelete.isEmpty else { return }
+        pendingDelete = toDelete
+        showDeleteConfirmation = true
+    }
+
+    /// Delete assets via the ingestor (trash file + sidecar, drop thumbnail
+    /// and database row), then reload. Failures surface in the error banner
+    /// but do not stop the remaining deletions.
+    private func deleteAssets(_ toDelete: [DAMAsset]) async {
+        var failures: [String] = []
+        for asset in toDelete {
+            do {
+                try await ingestor.deleteAsset(asset)
+                selectedIds.remove(asset.id)
+            } catch {
+                failures.append(asset.filename)
+            }
+        }
+        if !failures.isEmpty {
+            errorMessage = "Failed to delete: \(failures.joined(separator: ", "))"
+        }
+        lightboxIndex = nil
+        await loadAssets()
     }
 
     /// Open Quick Look for an asset using macOS native preview.
@@ -550,5 +868,121 @@ struct GalleryCellView: View {
         await MainActor.run {
             thumbnail = image
         }
+    }
+}
+
+// MARK: - Lightbox
+
+/// Full-screen zoomable image viewer with keyboard/on-screen prev-next navigation.
+private struct GalleryLightbox: View {
+    let assets: [DAMAsset]
+    let index: Int
+    let onIndexChange: (Int) -> Void
+    let onClose: () -> Void
+
+    @State private var image: NSImage?
+    @State private var zoom: CGFloat = 1
+    @State private var baseZoom: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @FocusState private var focused: Bool
+
+    private var asset: DAMAsset? { assets.indices.contains(index) ? assets[index] : nil }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.93).ignoresSafeArea()
+                .onTapGesture { onClose() }
+
+            Group {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .scaleEffect(zoom)
+                        .offset(offset)
+                        .gesture(
+                            MagnifyGesture()
+                                .onChanged { zoom = min(6, max(1, baseZoom * $0.magnification)) }
+                                .onEnded { _ in baseZoom = zoom }
+                        )
+                        .highPriorityGesture(
+                            DragGesture()
+                                .onChanged { if zoom > 1 { offset = $0.translation } }
+                        )
+                        .onTapGesture(count: 2) {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                zoom = zoom > 1 ? 1 : 2
+                                baseZoom = zoom
+                                offset = .zero
+                            }
+                        }
+                } else {
+                    ProgressView().controlSize(.large).tint(.white)
+                }
+            }
+            .padding(40)
+
+            // Prev / next
+            HStack {
+                navButton("chevron.left") { step(-1) }.opacity(index > 0 ? 1 : 0.25).disabled(index <= 0)
+                Spacer()
+                navButton("chevron.right") { step(1) }.opacity(index < assets.count - 1 ? 1 : 0.25).disabled(index >= assets.count - 1)
+            }
+            .padding(.horizontal, 20)
+
+            // Close + caption chrome
+            VStack {
+                HStack {
+                    Text("\(index + 1) / \(assets.count)")
+                        .font(.callout.monospacedDigit()).foregroundStyle(.white.opacity(0.7))
+                    Spacer()
+                    Button { onClose() } label: {
+                        Image(systemName: "xmark.circle.fill").font(.title)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
+                }
+                .padding(16)
+                Spacer()
+                if let p = asset?.prompt, !p.isEmpty {
+                    Text(p)
+                        .font(.callout).foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(3).multilineTextAlignment(.center)
+                        .padding(12)
+                        .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                        .frame(maxWidth: 760)
+                        .padding(.bottom, 28)
+                }
+            }
+        }
+        .focusable()
+        .focused($focused)
+        .onKeyPress(.leftArrow) { step(-1); return .handled }
+        .onKeyPress(.rightArrow) { step(1); return .handled }
+        .onKeyPress(.escape) { onClose(); return .handled }
+        .task(id: index) { await load() }
+        .onAppear { focused = true }
+    }
+
+    private func navButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(14)
+                .background(.black.opacity(0.4), in: Circle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func step(_ delta: Int) {
+        let next = index + delta
+        guard assets.indices.contains(next) else { return }
+        zoom = 1; baseZoom = 1; offset = .zero
+        onIndexChange(next)
+    }
+
+    private func load() async {
+        guard let path = asset?.absolutePath else { image = nil; return }
+        image = await Task.detached { NSImage(contentsOfFile: path) }.value
     }
 }

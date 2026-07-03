@@ -9,6 +9,9 @@ import SwiftUI
 struct ComparisonGridView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
+    /// Assets handed off from the gallery's "Compare" action. Consumed
+    /// (reset to nil) once applied so a later handoff replaces the selection.
+    @Binding var pendingSelection: [DAMAsset]?
 
     @State private var selectedAssets: [DAMAsset] = []
     @State private var allAssets: [DAMAsset] = []
@@ -33,8 +36,19 @@ struct ComparisonGridView: View {
             }
         }
         .task {
+            consumePendingSelection()
             await loadAssets()
         }
+        .onChange(of: pendingSelection) { _, _ in
+            consumePendingSelection()
+        }
+    }
+
+    /// Apply a gallery handoff to the comparison selection.
+    private func consumePendingSelection() {
+        guard let pending = pendingSelection, !pending.isEmpty else { return }
+        selectedAssets = Array(pending.prefix(4))
+        pendingSelection = nil
     }
 
     // MARK: - Toolbar

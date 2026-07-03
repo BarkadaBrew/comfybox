@@ -112,6 +112,32 @@ public final class AssetIngestor {
         return stored
     }
 
+    /// Delete an asset: moves the image and its JSON sidecar to the Trash
+    /// (falling back to permanent removal where trashing is unavailable),
+    /// removes the cached thumbnail, and deletes the database row. The path
+    /// is un-tracked so a future file with the same name is re-ingested.
+    public func deleteAsset(_ asset: DAMAsset) async throws {
+        trashOrRemove(atPath: asset.absolutePath)
+        let sidecarPath = ((asset.absolutePath as NSString).deletingPathExtension) + ".json"
+        trashOrRemove(atPath: sidecarPath)
+        try? FileManager.default.removeItem(atPath: thumbnailPath(for: asset.id))
+
+        try await store.deleteAsset(id: asset.id)
+        knownPaths.remove(asset.absolutePath)
+    }
+
+    /// Move a file to the Trash, or remove it outright if trashing fails
+    /// (e.g. sandboxed test environments). Missing files are ignored.
+    private func trashOrRemove(atPath path: String) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return }
+        do {
+            try fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
+        } catch {
+            try? fm.removeItem(atPath: path)
+        }
+    }
+
     // MARK: - Polling
 
     private func scanForNewFiles() async {
