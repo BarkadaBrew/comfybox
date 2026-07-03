@@ -155,6 +155,7 @@ public actor DAMStore {
             SELECT prompt, COUNT(*), MAX(created_at)
             FROM assets
             WHERE prompt IS NOT NULL AND prompt != ''
+              AND id NOT IN (SELECT asset_id FROM secured_assets)
             GROUP BY prompt
             ORDER BY MAX(created_at) DESC
             LIMIT ?1
@@ -249,6 +250,7 @@ public actor DAMStore {
             FROM assets_fts fts
             JOIN assets a ON a.id = fts.id
             WHERE assets_fts MATCH ?1
+              AND a.id NOT IN (SELECT asset_id FROM secured_assets)
             ORDER BY rank
             LIMIT ?2
             """
@@ -286,6 +288,72 @@ public actor DAMStore {
         }
         try deleteFTS(id: id)
         try runSimple("DELETE FROM asset_folders WHERE asset_id = ?1", text: [id])
+    }
+
+    // MARK: - Asset security
+
+    /// Mark an asset secured: record its original location and point the
+    /// asset row at the secured file. File movement is the ingestor's job.
+    public func secureAsset(id: String, securedPath: String, originalPath: String) throws {
+        let sql = "INSERT OR REPLACE INTO secured_assets (asset_id, original_path, secured_at) VALUES (?1, ?2, ?3)"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, (originalPath as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DAMStoreError.execFailed(sql, lastError)
+        }
+        try updateAssetPath(id: id, path: securedPath)
+    }
+
+    /// Clear the secured mark and restore the asset row's path. Returns the
+    /// original path (for the ingestor to move the file back to), or nil if
+    /// the asset wasn't secured.
+    @discardableResult
+    public func unsecureAsset(id: String) throws -> String? {
+        let sql = "SELECT original_path FROM secured_assets WHERE asset_id = ?1"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        var originalPath: String?
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            originalPath = String(cString: sqlite3_column_text(stmt, 0))
+        }
+        sqlite3_finalize(stmt)
+
+        guard let originalPath else { return nil }
+        try runSimple("DELETE FROM secured_assets WHERE asset_id = ?1", text: [id])
+        try updateAssetPath(id: id, path: originalPath)
+        return originalPath
+    }
+
+    /// Ids of all secured assets (for client-side gallery filtering).
+    public func securedAssetIds() throws -> Set<String> {
+        let sql = "SELECT asset_id FROM secured_assets"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        var ids = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            ids.insert(String(cString: sqlite3_column_text(stmt, 0)))
+        }
+        return ids
+    }
+
+    /// Point an asset row at a new file location (secure/unsecure moves).
+    private func updateAssetPath(id: String, path: String) throws {
+        let filename = (path as NSString).lastPathComponent
+        try runSimple(
+            "UPDATE assets SET absolute_path = ?2, filename = ?3 WHERE id = ?1",
+            text: [id, path, filename])
     }
 
     // MARK: - Folders
@@ -529,6 +597,17 @@ public actor DAMStore {
             )
             """)
         try execute("CREATE INDEX IF NOT EXISTS idx_asset_folders_folder ON asset_folders(folder_id)")
+
+        // Secured (sensitive) assets. Separate mapping table so INSERT OR
+        // REPLACE re-ingests can't reset the flag; remembers where the file
+        // came from so unsecuring can put it back.
+        try execute("""
+            CREATE TABLE IF NOT EXISTS secured_assets (
+                asset_id TEXT PRIMARY KEY,
+                original_path TEXT NOT NULL,
+                secured_at REAL NOT NULL
+            )
+            """)
 
         // FTS5 virtual table for full-text prompt search.
         try execute("""

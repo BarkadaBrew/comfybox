@@ -112,6 +112,72 @@ public final class AssetIngestor {
         return stored
     }
 
+    // MARK: - Asset security
+
+    /// Vault for secured assets. The .noindex suffix keeps Spotlight out;
+    /// the directory is created owner-only (0700).
+    public var secureDirectory: String = {
+        let comfybox = NSString(string: "~/.comfybox").expandingTildeInPath
+        return (comfybox as NSString).appendingPathComponent("secure.noindex")
+    }()
+
+    /// Secure a sensitive asset: move the image and its sidecar into the
+    /// vault, destroy the cached thumbnail (a thumbnail of a secured image
+    /// defeats the point), and record the original location so unsecuring
+    /// can put everything back. Returns the updated asset.
+    public func secureAsset(_ asset: DAMAsset) async throws -> DAMAsset {
+        let fm = FileManager.default
+        try fm.createDirectory(
+            atPath: secureDirectory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+
+        let destination = (secureDirectory as NSString).appendingPathComponent(asset.filename)
+        try fm.moveItem(atPath: asset.absolutePath, toPath: destination)
+
+        let sidecar = ((asset.absolutePath as NSString).deletingPathExtension) + ".json"
+        if fm.fileExists(atPath: sidecar) {
+            let sidecarDest = ((destination as NSString).deletingPathExtension) + ".json"
+            try? fm.moveItem(atPath: sidecar, toPath: sidecarDest)
+        }
+
+        try? fm.removeItem(atPath: thumbnailPath(for: asset.id))
+        try await store.secureAsset(id: asset.id, securedPath: destination, originalPath: asset.absolutePath)
+        // Stop tracking the original path so the poller doesn't treat a
+        // future file with the same name as already ingested.
+        knownPaths.remove(asset.absolutePath)
+
+        return asset.withLocation(path: destination)
+    }
+
+    /// Restore a secured asset to its original location and regenerate its
+    /// thumbnail. Returns the updated asset.
+    public func unsecureAsset(_ asset: DAMAsset) async throws -> DAMAsset {
+        guard let originalPath = try await store.unsecureAsset(id: asset.id) else {
+            return asset
+        }
+        let fm = FileManager.default
+        try fm.moveItem(atPath: asset.absolutePath, toPath: originalPath)
+
+        let sidecar = ((asset.absolutePath as NSString).deletingPathExtension) + ".json"
+        if fm.fileExists(atPath: sidecar) {
+            let sidecarDest = ((originalPath as NSString).deletingPathExtension) + ".json"
+            try? fm.moveItem(atPath: sidecar, toPath: sidecarDest)
+        }
+
+        let thumbPath = thumbnailPath(for: asset.id)
+        let maxDimension = thumbnailMaxDimension
+        let quality = thumbnailJPEGQuality
+        await Task.detached(priority: .utility) {
+            Self.generateThumbnail(
+                from: originalPath, to: thumbPath,
+                maxDimension: maxDimension, jpegQuality: quality
+            )
+        }.value
+        knownPaths.insert(originalPath)
+
+        return asset.withLocation(path: originalPath)
+    }
+
     /// Delete an asset: moves the image and its JSON sidecar to the Trash
     /// (falling back to permanent removal where trashing is unavailable),
     /// removes the cached thumbnail, and deletes the database row. The path

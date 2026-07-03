@@ -8,6 +8,7 @@
 
 import SwiftUI
 import AppKit
+import LocalAuthentication
 
 /// Sort options for the gallery.
 enum GallerySortOrder: String, CaseIterable {
@@ -43,6 +44,10 @@ struct GalleryView: View {
     // Available filter values extracted from assets.
     @State private var contentModes: [String] = []
     @State private var characters: [String] = []
+
+    // Secured (sensitive) assets — hidden until unlocked with Touch ID.
+    @State private var securedIds: Set<String> = []
+    @State private var revealSecured: Bool = false
 
     // Virtual folders
     @State private var folders: [DAMFolder] = []
@@ -275,6 +280,24 @@ struct GalleryView: View {
                 }
             }
 
+            // Secured assets: locked by default, Touch ID / password to reveal.
+            if !securedIds.isEmpty || revealSecured {
+                Button {
+                    if revealSecured {
+                        revealSecured = false
+                    } else {
+                        Task { await unlockSecured() }
+                    }
+                } label: {
+                    Image(systemName: revealSecured ? "lock.open" : "lock")
+                        .foregroundStyle(revealSecured ? .orange : .secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(revealSecured
+                      ? "Hide secured images"
+                      : "Show secured images (\(securedIds.count)) — requires authentication")
+            }
+
             // Favorite filter
             Toggle(isOn: $filterFavorites) {
                 Image(systemName: filterFavorites ? "heart.fill" : "heart")
@@ -344,6 +367,16 @@ struct GalleryView: View {
                         thumbnailPath: ingestor.thumbnailPath(for: asset.id),
                         isComparisonSelected: isSelectMode ? isSelected : nil
                     )
+                    .overlay(alignment: .topLeading) {
+                        if securedIds.contains(asset.id) {
+                            Image(systemName: "lock.fill")
+                                .font(.caption)
+                                .foregroundStyle(.white)
+                                .padding(5)
+                                .background(.orange.opacity(0.85), in: Circle())
+                                .padding(6)
+                        }
+                    }
                     .onTapGesture {
                         if isSelectMode {
                             toggleSelection(asset)
@@ -364,6 +397,17 @@ struct GalleryView: View {
                         Menu("Move to Folder") {
                             moveToFolderMenuItems(for: isSelectMode && selectedIds.contains(asset.id)
                                 ? Array(selectedIds) : [asset.id])
+                        }
+                        if securedIds.contains(asset.id) {
+                            Button("Unsecure") {
+                                Task { await unsecureAssets([asset]) }
+                            }
+                        } else {
+                            Button("Secure…") {
+                                let targets = isSelectMode && selectedIds.contains(asset.id)
+                                    ? selectedAssetsList : [asset]
+                                Task { await secureAssets(targets) }
+                            }
                         }
                         if !isSelectMode {
                             Divider()
@@ -565,6 +609,11 @@ struct GalleryView: View {
     private var filteredAssets: [DAMAsset] {
         var results = assets
 
+        // Secured assets stay hidden until unlocked.
+        if !revealSecured {
+            results = results.filter { !securedIds.contains($0.id) }
+        }
+
         // Apply folder filter.
         switch folderFilter {
         case .all:
@@ -631,6 +680,7 @@ struct GalleryView: View {
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()
             folderAssignments = try await store.folderAssignments()
+            securedIds = try await store.securedAssetIds()
             extractFilterValues()
         } catch {
             errorMessage = error.localizedDescription
@@ -717,6 +767,63 @@ struct GalleryView: View {
 
     private func sendToComparison() {
         onCompare?(selectedAssetsList)
+    }
+
+    // MARK: - Asset security
+
+    /// Authenticate with Touch ID (or the login password) before revealing
+    /// secured assets.
+    private func unlockSecured() async {
+        let context = LAContext()
+        context.localizedReason = "reveal secured images"
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
+            errorMessage = "Authentication unavailable: \(error?.localizedDescription ?? "unknown")"
+            return
+        }
+        do {
+            let ok = try await context.evaluatePolicy(
+                .deviceOwnerAuthentication,
+                localizedReason: "reveal secured images")
+            if ok { revealSecured = true }
+        } catch {
+            // Cancelled or failed — stay locked, no error banner needed.
+        }
+    }
+
+    /// Move assets into the secure vault (file + sidecar out of the output
+    /// dir, thumbnail destroyed, hidden from gallery/search/history).
+    private func secureAssets(_ toSecure: [DAMAsset]) async {
+        var failures: [String] = []
+        for asset in toSecure {
+            do {
+                _ = try await ingestor.secureAsset(asset)
+                selectedIds.remove(asset.id)
+            } catch {
+                failures.append(asset.filename)
+            }
+        }
+        if !failures.isEmpty {
+            errorMessage = "Failed to secure: \(failures.joined(separator: ", "))"
+        }
+        lightboxIndex = nil
+        await loadAssets()
+    }
+
+    /// Restore assets from the vault to their original location.
+    private func unsecureAssets(_ toRestore: [DAMAsset]) async {
+        var failures: [String] = []
+        for asset in toRestore {
+            do {
+                _ = try await ingestor.unsecureAsset(asset)
+            } catch {
+                failures.append(asset.filename)
+            }
+        }
+        if !failures.isEmpty {
+            errorMessage = "Failed to unsecure: \(failures.joined(separator: ", "))"
+        }
+        await loadAssets()
     }
 
     /// Stage assets for deletion and show the confirmation dialog.

@@ -77,4 +77,23 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
         self.contentMode = contentMode
         self.characterName = characterName
     }
+
+    /// A copy of this asset pointing at a new file location (secure/unsecure
+    /// moves); filename follows the path.
+    public func withLocation(path: String) -> DAMAsset {
+        DAMAsset(
+            id: id, kind: kind,
+            filename: (path as NSString).lastPathComponent,
+            absolutePath: path,
+            fileSize: fileSize, sha256: sha256,
+            width: width, height: height,
+            createdAt: createdAt, modifiedAt: modifiedAt,
+            ingestedAt: ingestedAt, orphaned: orphaned,
+            prompt: prompt, negativePrompt: negativePrompt,
+            seed: seed, steps: steps, guidance: guidance,
+            modelFamily: modelFamily, rating: rating,
+            favorite: favorite, contentMode: contentMode,
+            characterName: characterName
+        )
+    }
 }
