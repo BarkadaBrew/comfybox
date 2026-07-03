@@ -10,14 +10,21 @@ import SwiftUI
 
 @main
 struct ComfyBoxDesktopApp: App {
-    @State private var engine = EngineService()
+    @State private var engine: EngineService
     @State private var store: DAMStore?
     @State private var ingestor: AssetIngestor?
     @State private var presetManager = PresetManager()
     @State private var healthMonitor = HealthMonitor()
     @State private var promptLibrary = PromptLibraryStore()
     @State private var canvasStore = CanvasStore()
+    @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
+
+    init() {
+        let engine = EngineService()
+        _engine = State(initialValue: engine)
+        _agentService = State(initialValue: AgentService(engine: engine))
+    }
     @State private var uiScale: String? = DesktopSettings.load().uiScale
     @State private var selectedTab: AppTab = .gallery
     @State private var initError: String?
@@ -34,6 +41,7 @@ struct ComfyBoxDesktopApp: App {
         case compare = "Compare"
         case presets = "Presets"
         case prompts = "Prompts"
+        case assistant = "Assistant"
         case canvas = "Canvas"
         case civitai = "CivitAI"
         case characters = "Characters"
@@ -48,6 +56,7 @@ struct ComfyBoxDesktopApp: App {
             case .compare: return "square.grid.2x2"
             case .presets: return "slider.horizontal.below.rectangle"
             case .prompts: return "text.book.closed"
+            case .assistant: return "sparkles"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
             case .characters: return "person.2.crop.square.stack"
@@ -68,6 +77,7 @@ struct ComfyBoxDesktopApp: App {
             case .prompts: return "9"
             case .civitai: return "0"
             case .canvas: return "k"
+            case .assistant: return "i"
             }
         }
     }
@@ -167,6 +177,15 @@ struct ComfyBoxDesktopApp: App {
                 store: store,
                 onInsert: { text in
                     pendingPromptInsert = text
+                    selectedTab = .generate
+                }
+            )
+
+        case .assistant:
+            AgentView(
+                agent: agentService,
+                onUsePrompt: { prompt in
+                    pendingPromptInsert = prompt
                     selectedTab = .generate
                 }
             )

@@ -82,6 +82,8 @@ struct GenerationView: View {
     @State private var showLoraPicker: Bool = false
     @State private var showQueuePanel: Bool = false
     @State private var showCharacters: Bool = false
+    @State private var showCamera: Bool = false
+    @State private var shotTemplates = ShotTemplateStore()
 
     // Preset save sheet
     @State private var showingSavePreset: Bool = false
@@ -188,6 +190,21 @@ struct GenerationView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                     }
+                }
+
+                // Camera / shot directives (collapsible)
+                Divider()
+                DisclosureGroup(isExpanded: $showCamera) {
+                    CameraPanel(shotTemplates: shotTemplates) { directive in
+                        prompt = directive.appended(to: prompt)
+                    } onInsertTemplate: { template in
+                        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        prompt = trimmed.isEmpty ? template.directive : "\(trimmed), \(template.directive)"
+                    }
+                    .padding(.top, 4)
+                } label: {
+                    Label("Camera & Shot", systemImage: "camera")
+                        .font(.headline)
                 }
 
                 // Characters (collapsible)
