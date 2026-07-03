@@ -312,6 +312,8 @@ private struct CanvasBoard: View {
     private var toolbar: some View {
         HStack(spacing: 10) {
             Button { addImagesFromPicker() } label: { Label("Add Images", systemImage: "photo.badge.plus") }
+            Button { exportBoard() } label: { Label("Export", systemImage: "square.and.arrow.up") }
+                .disabled(project.items.isEmpty)
             Divider().frame(height: 16)
             Button { zoomBy(0.8) } label: { Image(systemName: "minus.magnifyingglass") }
             Text("\(Int(zoom * 100))%")
@@ -371,6 +373,54 @@ private struct CanvasBoard: View {
             handled = true
         }
         return handled
+    }
+
+    /// Composite the board into a PNG (transparent background, content-bounds
+    /// sized) and save it via a panel.
+    private func exportBoard() {
+        guard let bounds = project.contentBounds else { return }
+        let width = bounds.maxX - bounds.minX
+        let height = bounds.maxY - bounds.minY
+        guard width > 0, height > 0 else { return }
+
+        let size = NSSize(width: width, height: height)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.clear.set()
+        NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+
+        for item in project.itemsInDrawOrder {
+            guard let itemImage = NSImage(contentsOfFile: item.imagePath) else { continue }
+            // Canvas y is top-down; NSImage draws bottom-up, so flip.
+            let x = item.x - bounds.minX
+            let yTop = item.y - bounds.minY
+            let drawRect = NSRect(x: x, y: height - yTop - item.height,
+                                  width: item.width, height: item.height)
+
+            let context = NSGraphicsContext.current
+            context?.saveGraphicsState()
+            let transform = NSAffineTransform()
+            let cx = drawRect.midX, cy = drawRect.midY
+            transform.translateX(by: cx, yBy: cy)
+            transform.rotate(byDegrees: -item.rotation)   // screen CW -> draw CCW
+            if item.flippedH { transform.scaleX(by: -1, yBy: 1) }
+            transform.translateX(by: -cx, yBy: -cy)
+            transform.concat()
+            itemImage.draw(in: drawRect, from: .zero, operation: .sourceOver, fraction: 1)
+            context?.restoreGraphicsState()
+        }
+        image.unlockFocus()
+
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "\(project.name).png"
+        panel.prompt = "Export"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? png.write(to: url)
     }
 
     private func addImagesFromPicker() {
