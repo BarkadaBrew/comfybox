@@ -69,6 +69,31 @@ items), /v1/queue 200, /v1/presets/import-legacy {imported:0} (idempotent),
 /v1/enhance success (528-char reply from Dan's model). All session server
 routes now operational.
 
+## Hub features — Desktop as the Coffeeshop suite hub (2026-07-06)
+
+- Service control plane: launchd (launchctl) / SSH+shell start/stop/restart on
+  Health cards + config sheet; daemon seeded (82399ee).
+- API keys → macOS Keychain (AppSecrets), one-time migration from JSON (1ab4dd0).
+- Bree panel (⌘B): vault handoff two-pane + composer; append-only convention
+  (313e776). Follow-on: live ask_bree/tasks need a Bree HTTP API (:3779 WS-only).
+- ⌘K command palette: fuzzy nav + actions; Canvas moved to ⌘Y (a38c890).
+- Menu-bar item + sidebar grouping (Create/Library/Operate/Suite) + ActivityLog
+  feed (75314a3). Follow-on: wire more activity emitters (cloud/mflux/video gen,
+  service actions, downloads); first-run wizard; panels for video-conductor/
+  capture-node/BBS/SnapAI; global content-mode toggle.
+
+## CivitAI fixes (2026-07-06)
+
+- Download was failing with opaque NSURLErrorDomain -1011. Root cause: gated/
+  NSFW model + NO CivitAI API key configured (none in Keychain or JSON). Fixed:
+  header+token auth with a redirect delegate that strips the auth header at the
+  CDN handoff (B2), and descriptive errors (401/403 → "needs API key/gated",
+  404, else HTTP+body). ACTION FOR TODD: add a CivitAI key in Settings → CivitAI
+  to download gated/NSFW LoRAs (4f566b2).
+- "View on CivitAI" link in the model sheet (honors .com/.red).
+- On import, trigger words + up to 8 sample prompts saved as <name>.civitai.json
+  sidecar AND pushed into the Prompt Library.
+
 ## mflux frontend — desktop-only backend (2026-07-06)
 
 Refined the no-Python stance (memory comfybox-no-python): the SERVER stays
