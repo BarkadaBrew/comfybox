@@ -61,14 +61,20 @@ Server deploy: `swift build -c release --product ComfyBox`, then restart the
 - Canvas: export board — DONE (9b45131). Later phases still open: node
   connections, on-canvas generation, prompt/text nodes.
 
-## Autonomous session close (owner away 48h, laptop locked)
+## Server routes ACTIVATED + verified live (2026-07-05)
 
-All explicit requests complete. Extra non-deferred items built: Creative
-Upscale action, Canvas PNG export. Full suite green: 567 server + 185 desktop
-tests. Everything committed on `main`; app + server binaries rebuilt (server
-routes still await the daemon's next idle restart). Remaining work all requires
-either the deferred i2i plumbing or is a proposed later-phase — nothing else
-safe to build without owner input. Held here to avoid speculative scope.
+Photoshoot finished (153 renders, queue idle). Restarted the daemon onto the
+current binary; verified live: /v1/nearline 200 (scan cataloged 61 Seagate
+items), /v1/queue 200, /v1/presets/import-legacy {imported:0} (idempotent),
+/v1/enhance success (528-char reply from Dan's model). All session server
+routes now operational.
+
+## Next: un-deferring img2img (foundational i2i tier)
+
+With everything else done and the owner signalling continued momentum, building
+img2img in Generate next — it unlocks the whole Draw Things tier (camera V2,
+inpaint/outpaint, ControlNet, moodboard). Backend exists: ImageToImagePipeline
+(imageStrength→denoise). If the owner still wants i2i held, redirect.
 
 ## GUI verification owed on owner's return (laptop locked, validated by tests)
 
