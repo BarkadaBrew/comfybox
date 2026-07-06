@@ -19,6 +19,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var canvasStore = CanvasStore()
     @State private var mfluxService = MfluxService()
     @State private var breeService = BreeService()
+    @State private var activityLog = ActivityLog()
     @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
     @State private var pendingReferenceImage: String?
@@ -54,6 +55,28 @@ struct ComfyBoxDesktopApp: App {
         case civitai = "CivitAI"
         case characters = "Characters"
         case server = "Server"
+
+        /// Sidebar grouping for the hub.
+        enum Section: String, CaseIterable, Identifiable {
+            case create = "Create"
+            case library = "Library"
+            case operate = "Operate"
+            case suite = "Suite"
+            var id: String { rawValue }
+        }
+
+        var section: Section {
+            switch self {
+            case .generate, .motion, .mflux, .canvas, .assistant: return .create
+            case .gallery, .compare, .presets, .prompts, .characters, .civitai: return .library
+            case .dashboard, .health, .server: return .operate
+            case .bree: return .suite
+            }
+        }
+
+        static func tabs(in section: Section) -> [AppTab] {
+            allCases.filter { $0.section == section }
+        }
 
         var icon: String {
             switch self {
@@ -99,10 +122,16 @@ struct ComfyBoxDesktopApp: App {
     var body: some Scene {
         WindowGroup {
             NavigationSplitView {
-                List(AppTab.allCases, id: \.self, selection: $selectedTab) { tab in
-                    Label(tab.rawValue, systemImage: tab.icon)
+                List(selection: $selectedTab) {
+                    ForEach(AppTab.Section.allCases) { section in
+                        Section(section.rawValue) {
+                            ForEach(AppTab.tabs(in: section), id: \.self) { tab in
+                                Label(tab.rawValue, systemImage: tab.icon).tag(tab)
+                            }
+                        }
+                    }
                 }
-                .navigationSplitViewColumnWidth(min: 140, ideal: 160, max: 200)
+                .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 210)
             } detail: {
                 detailView
             }
@@ -173,6 +202,56 @@ struct ComfyBoxDesktopApp: App {
         Settings {
             SettingsView(engine: engine)
         }
+
+        MenuBarExtra("ComfyBox", systemImage: menuBarSymbol) {
+            Text("Coffeeshop Suite").font(.headline)
+            Divider()
+            Button(engine.connectionState.isConnected
+                   ? "Connected · \(engine.serverHost):\(engine.serverPort)"
+                   : "Disconnected") {
+                engine.connectionState.isConnected ? engine.disconnect() : engine.connect()
+            }
+            if let down = downServices, !down.isEmpty {
+                Text("⚠ Down: \(down.joined(separator: ", "))")
+            }
+            Divider()
+            Button("Restart ComfyBox Daemon") {
+                Task {
+                    try? await ServiceController().perform(.restart, on: WatchedService(
+                        name: "ComfyBox Server", urlString: "",
+                        control: ServiceControl(launchdLabel: "com.barkadabrew.comfybox")))
+                }
+            }
+            Button("New Render") { selectedTab = .generate; activate() }
+            Button("Open ComfyBox") { activate() }
+            if !activityLog.recent.isEmpty {
+                Divider()
+                Text("Recent")
+                ForEach(activityLog.recent.prefix(6)) { entry in
+                    Label(entry.message, systemImage: entry.icon)
+                }
+            }
+            Divider()
+            Button("Quit ComfyBox") { NSApp.terminate(nil) }
+        }
+        .menuBarExtraStyle(.menu)
+    }
+
+    /// Menu-bar glyph reflecting suite status (template-rendered, so vary the
+    /// symbol rather than color): coffee cup when healthy, warning otherwise.
+    private var menuBarSymbol: String {
+        if let down = downServices, !down.isEmpty { return "exclamationmark.triangle.fill" }
+        return engine.connectionState.isConnected ? "cup.and.saucer.fill" : "cup.and.saucer"
+    }
+
+    private var downServices: [String]? {
+        let down = healthMonitor.services.filter { $0.state == .down }.map { $0.service.name }
+        return down.isEmpty ? nil : down
+    }
+
+    private func activate() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first?.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - Command Palette
@@ -462,6 +541,7 @@ struct ComfyBoxDesktopApp: App {
     }
 
     private func handleGenerated(_ path: String, _ request: GenerationRequest) {
+        activityLog.log("photo", "Rendered \((path as NSString).lastPathComponent)")
         guard let ingestor = ingestor else { return }
         Task {
             writeSidecarIfMissing(for: path, request: request)
