@@ -1103,6 +1103,8 @@ public final class WarmServer {
     let strength: Float?
     let extendToSeconds: Float?
     let fps: Int?
+    let loraPath: String?
+    let loraStrength: Float?
     let outputPath: String?
   }
 
@@ -1145,6 +1147,8 @@ public final class WarmServer {
         strength: req.strength ?? 1.0,
         extendToSeconds: req.extendToSeconds ?? 0,
         fps: req.fps ?? 24,
+        loraPath: req.loraPath,
+        loraStrength: req.loraStrength ?? 1.0,
         outputPath: resolvedOutput
       )
       // Validate before enqueuing so bad frames/dims fail fast.

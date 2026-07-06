@@ -33,6 +33,9 @@ public struct LTX2VideoRequest: Sendable {
     /// Target duration; >0 generates continuation chunks (I2V only).
     public var extendToSeconds: Float
     public var fps: Int
+    /// Optional LoRA merged into the transformer for this render.
+    public var loraPath: String?
+    public var loraStrength: Float
     public var outputPath: String
 
     public init(
@@ -47,6 +50,8 @@ public struct LTX2VideoRequest: Sendable {
         strength: Float = 1.0,
         extendToSeconds: Float = 0,
         fps: Int = 24,
+        loraPath: String? = nil,
+        loraStrength: Float = 1.0,
         outputPath: String
     ) {
         self.prompt = prompt
@@ -60,6 +65,8 @@ public struct LTX2VideoRequest: Sendable {
         self.strength = strength
         self.extendToSeconds = extendToSeconds
         self.fps = fps
+        self.loraPath = loraPath
+        self.loraStrength = loraStrength
         self.outputPath = outputPath
     }
 }
@@ -120,6 +127,8 @@ public final class LTX2VideoGenerator {
     private var pipeline: LTX2Pipeline?
     private var tokenizer: LTX2GemmaTokenizer?
     public private(set) var isLoaded = false
+    /// "path@strength" of the LoRA merged into the loaded transformer (nil = base).
+    private var loadedLoraKey: String?
 
     public init(config: Configuration, logger: Logger = Logger(label: "ltx2.video")) {
         self.config = config
@@ -180,10 +189,15 @@ public final class LTX2VideoGenerator {
 
     // MARK: - Model loading (lazy, cached)
 
-    /// Construct and load the transformer, VAE, text encoder, and pipeline.
-    /// Idempotent — subsequent calls are no-ops.
-    public func load() throws {
-        guard !isLoaded else { return }
+    /// Construct and load the transformer, VAE, text encoder, and pipeline,
+    /// optionally merging a LoRA into the transformer. Idempotent for the same
+    /// LoRA; a different LoRA reloads.
+    public func load(loraPath: String? = nil, loraStrength: Float = 1.0) throws {
+        let wantKey = loraPath.map { "\($0)@\(loraStrength)" }
+        if isLoaded {
+            if wantKey == loadedLoraKey { return }
+            unload()   // LoRA changed — rebuild the transformer.
+        }
         let modelDir = config.weightsDir
 
         logger.info("LTX-2: creating transformer…")
@@ -198,7 +212,29 @@ public final class LTX2VideoGenerator {
         logger.info("LTX-2: loading transformer weights (\(config.transformerFile))…")
         let transformerPath = URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent(config.transformerFile))
         let rawWeights = try MLX.loadArrays(url: transformerPath)
-        let sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+        var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+
+        // Merge a LoRA into the base weights (skip audio branches), as the CLI does.
+        if let loraPath, !loraPath.isEmpty {
+            logger.info("LTX-2: merging LoRA \(loraPath) @ \(loraStrength)…")
+            let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraPath))
+            var merged = 0
+            for (key, loraA) in loraWeights {
+                guard key.hasSuffix(".lora_A.weight") else { continue }
+                var baseKey = String(key.dropLast(".lora_A.weight".count))
+                if baseKey.hasPrefix("diffusion_model.") { baseKey = String(baseKey.dropFirst("diffusion_model.".count)) }
+                if baseKey.contains("audio_") || baseKey.contains("av_ca_")
+                    || baseKey.contains("video_to_audio_attn") || baseKey.contains("audio_to_video_attn") { continue }
+                let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
+                guard let loraB = loraWeights[bKey] else { continue }
+                let targetKey = baseKey + ".weight"
+                guard sanitized[targetKey] != nil else { continue }
+                let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+                sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+                merged += 1
+            }
+            logger.info("LTX-2: merged \(merged) LoRA pairs.")
+        }
         let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
         try transformer.update(parameters: params, verify: [.shapeMismatch])
         MLX.eval(transformer.parameters())
@@ -244,6 +280,7 @@ public final class LTX2VideoGenerator {
         self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig)
         self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
         isLoaded = true
+        loadedLoraKey = wantKey
         logger.info("LTX-2: models ready.")
     }
 
@@ -252,6 +289,7 @@ public final class LTX2VideoGenerator {
         pipeline = nil
         tokenizer = nil
         isLoaded = false
+        loadedLoraKey = nil
     }
 
     // MARK: - Generate
@@ -262,7 +300,7 @@ public final class LTX2VideoGenerator {
     ) throws -> LTX2VideoResult {
         #if canImport(CoreGraphics) && canImport(ImageIO)
         try validate(request)
-        try load()
+        try load(loraPath: request.loraPath, loraStrength: request.loraStrength)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
         let plan = Self.chunkPlan(

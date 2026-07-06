@@ -853,18 +853,23 @@ public final class EngineService {
         public var seed: UInt64
         public var strength: Float
         public var extendToSeconds: Float
+        public var loraPath: String?
+        public var loraStrength: Float
         public var outputPath: String
 
         public init(
             prompt: String, initImagePath: String? = nil,
             width: Int = 704, height: Int = 448, frames: Int = 97,
             steps: Int = 8, seed: UInt64 = 42, strength: Float = 1.0,
-            extendToSeconds: Float = 0, outputPath: String
+            extendToSeconds: Float = 0, loraPath: String? = nil,
+            loraStrength: Float = 1.0, outputPath: String
         ) {
             self.prompt = prompt; self.initImagePath = initImagePath
             self.width = width; self.height = height; self.frames = frames
             self.steps = steps; self.seed = seed; self.strength = strength
-            self.extendToSeconds = extendToSeconds; self.outputPath = outputPath
+            self.extendToSeconds = extendToSeconds
+            self.loraPath = loraPath; self.loraStrength = loraStrength
+            self.outputPath = outputPath
         }
     }
 
@@ -892,6 +897,10 @@ public final class EngineService {
         ]
         if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
             body["image_path"] = initImagePath
+        }
+        if let loraPath = request.loraPath, !loraPath.isEmpty {
+            body["lora_path"] = loraPath
+            body["lora_strength"] = request.loraStrength
         }
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         let (status, data) = try await client.post("/v1/video/generate", body: bodyData)
