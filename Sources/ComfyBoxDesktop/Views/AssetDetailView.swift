@@ -213,6 +213,9 @@ struct AssetDetailView: View {
                 // Prompt
                 promptSection
 
+                // Vision caption & tags (from the local vision model)
+                captionTagsSection
+
                 Spacer()
 
                 // Save button
@@ -296,6 +299,38 @@ struct AssetDetailView: View {
             metadataRow("Seed", value: asset.seed.map(String.init))
             metadataRow("Content Mode", value: asset.contentMode)
             metadataRow("Character", value: asset.characterName)
+        }
+    }
+
+    /// Vision caption + tags (read from Finder-aligned metadata). Populated by
+    /// "Auto-caption & Tag" in the gallery.
+    @ViewBuilder
+    private var captionTagsSection: some View {
+        let caption = FinderTags.caption(atPath: asset.absolutePath)
+        let tags = FinderTags.textTags(atPath: asset.absolutePath)
+        if caption != nil || !tags.isEmpty {
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Caption & Tags").font(.subheadline).fontWeight(.semibold)
+                if let caption {
+                    Text(caption).font(.caption).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                }
+                if !tags.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            ForEach(tags, id: \.self) { tag in
+                                Text(tag)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 7).padding(.vertical, 2)
+                                    .background(.quaternary, in: Capsule())
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

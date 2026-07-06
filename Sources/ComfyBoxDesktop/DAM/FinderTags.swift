@@ -92,6 +92,47 @@ public enum FinderTags {
         }
     }
 
+    /// The file's plain text tags (excludes color-label tags).
+    public static func textTags(atPath path: String) -> [String] {
+        rawTags(atPath: path).compactMap { tag in
+            let name = String(tag.split(separator: "\n", maxSplits: 1)[0])
+            return FinderColor(rawValue: name) == nil ? name : nil
+        }
+    }
+
+    /// Merge new plain text tags into the file's Finder tags (dedup,
+    /// case-insensitive), preserving any existing color-label tags.
+    public static func addTextTags(_ newTags: [String], atPath path: String) throws {
+        let existing = rawTags(atPath: path)
+        let existingLower = Set(existing.map { $0.split(separator: "\n").first.map(String.init)?.lowercased() ?? "" })
+        var merged = existing
+        for t in newTags {
+            let clean = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty, !existingLower.contains(clean.lowercased()) else { continue }
+            merged.append(clean)
+        }
+        try writeRawTags(merged, atPath: path)
+    }
+
+    // MARK: - Caption (custom xattr, Finder-aligned)
+
+    private static let captionXattr = "com.barkadabrew.comfybox.caption"
+
+    public static func caption(atPath path: String) -> String? {
+        let length = getxattr(path, captionXattr, nil, 0, 0, 0)
+        guard length > 0 else { return nil }
+        var data = Data(count: length)
+        let read = data.withUnsafeMutableBytes { getxattr(path, captionXattr, $0.baseAddress, length, 0, 0) }
+        guard read == length else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    public static func setCaption(_ caption: String?, atPath path: String) {
+        guard let caption, !caption.isEmpty else { removexattr(path, captionXattr, 0); return }
+        let data = Data(caption.utf8)
+        _ = data.withUnsafeBytes { setxattr(path, captionXattr, $0.baseAddress, data.count, 0, 0) }
+    }
+
     /// The file's Finder color label, if any (first color tag wins).
     public static func colorLabel(atPath path: String) -> FinderColor? {
         for tag in rawTags(atPath: path) {

@@ -602,6 +602,13 @@ struct GalleryView: View {
                                 Button("to 4096px (long side)") { Task { await upscaleAsset(asset, to: 4096) } }
                             }
                         }
+                        if engine != nil {
+                            Button("Auto-caption & Tag") {
+                                let targets = isSelectMode && selectedIds.contains(asset.id)
+                                    ? selectedAssetsList : [asset]
+                                Task { await autoCaptionTag(targets) }
+                            }
+                        }
                         Button(asset.favorite ? "Unfavorite" : "Favorite") {
                             Task { await toggleFavorite(asset) }
                         }
@@ -1071,6 +1078,28 @@ struct GalleryView: View {
                            width: w, height: h),
                 toCanvas: canvasId)
         }
+    }
+
+    /// Caption + tag assets with the local vision model. Tags → Finder tags,
+    /// caption → a Finder-aligned xattr (both visible in Finder + the gallery).
+    private func autoCaptionTag(_ assets: [DAMAsset]) async {
+        guard let engine else { return }
+        let vision = VisionService(engine: engine)
+        var done = 0, failed = 0
+        for asset in assets {
+            errorMessage = "Captioning \(asset.filename)… (\(done + 1)/\(assets.count))"
+            do {
+                let desc = try await vision.describe(imagePath: asset.absolutePath)
+                if !desc.tags.isEmpty { try? FinderTags.addTextTags(desc.tags, atPath: asset.absolutePath) }
+                if !desc.caption.isEmpty { FinderTags.setCaption(desc.caption, atPath: asset.absolutePath) }
+                done += 1
+            } catch {
+                failed += 1
+                if assets.count == 1 { errorMessage = "Caption failed: \(error.localizedDescription)"; return }
+            }
+        }
+        errorMessage = failed == 0 ? nil : "Captioned \(done), \(failed) failed."
+        await loadAssets()
     }
 
     /// Upscale an asset via SeedVR2 and ingest the result into the gallery.
