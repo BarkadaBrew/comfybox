@@ -11,7 +11,18 @@ import AppKit
 
 struct FaceView: View {
     @Bindable var mflux: MfluxService
+    @Bindable var faceSwap: FaceSwapService
     var ingestor: AssetIngestor?
+
+    // Face swap
+    @State private var swapSource: String = ""
+    @State private var swapTarget: String = ""
+    @State private var swapSourceThumb: NSImage?
+    @State private var swapTargetThumb: NSImage?
+    @State private var swapAllFaces = false
+    @State private var swapResultURL: URL?
+    @State private var swapStatus: String?
+    @State private var swapIsError = false
 
     enum Mode: String, CaseIterable, Identifiable {
         case identity = "Identity Generate", swap = "Face Swap"
@@ -147,13 +158,86 @@ struct FaceView: View {
 
     private var swapSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Image(systemName: "arrow.triangle.2.circlepath.circle").font(.largeTitle).foregroundStyle(.secondary)
-            Text("Face swap — backend pending").font(.headline)
-            Text("Post-hoc face swap (replace a face in a target image with a reference) needs an inswapper/insightface backend, which isn't installed yet. Tracked as a ticket. For identity-preserving *generation*, use Identity Generate above.")
+            if !faceSwap.isInstalled {
+                Label("Face-swap backend not installed (insightface + inswapper_128.onnx at ~/Projects/faceswap).",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Text("Replace the face in a target image with a source face (insightface + inswapper). Runs locally.")
                 .font(.caption).foregroundStyle(.secondary)
+
+            HStack(spacing: 16) {
+                swapImageWell("Source face", path: $swapSource, thumb: $swapSourceThumb)
+                Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                swapImageWell("Target image", path: $swapTarget, thumb: $swapTargetThumb)
+            }
+            Toggle("Swap all faces in target", isOn: $swapAllFaces)
+            if faceSwap.isRunning {
+                HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Swapping…").font(.caption) }
+            }
+            Button { Task { await runSwap() } } label: {
+                Label("Swap Face", systemImage: "arrow.triangle.2.circlepath").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(faceSwap.isRunning || !faceSwap.isInstalled || swapSource.isEmpty || swapTarget.isEmpty)
+
+            if let swapStatus {
+                Label(swapStatus, systemImage: swapIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .font(.caption).foregroundStyle(swapIsError ? .orange : .green)
+            }
+            if let swapResultURL {
+                AsyncImage(url: swapResultURL) { phase in
+                    if case .success(let img) = phase {
+                        img.resizable().scaledToFit().frame(maxHeight: 320)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(24)
+        .padding(12)
+    }
+
+    private func swapImageWell(_ title: String, path: Binding<String>, thumb: Binding<NSImage?>) -> some View {
+        VStack(spacing: 4) {
+            Button {
+                let panel = NSOpenPanel()
+                panel.canChooseFiles = true; panel.allowsMultipleSelection = false
+                panel.allowedContentTypes = [.png, .jpeg, .image]
+                if panel.runModal() == .OK, let url = panel.url {
+                    path.wrappedValue = url.path
+                    Task { let i = await Task.detached { NSImage(contentsOfFile: url.path) }.value
+                        await MainActor.run { thumb.wrappedValue = i } }
+                }
+            } label: {
+                Group {
+                    if let t = thumb.wrappedValue {
+                        Image(nsImage: t).resizable().aspectRatio(contentMode: .fill)
+                    } else {
+                        Image(systemName: "photo.badge.plus").font(.title2).foregroundStyle(.tertiary)
+                    }
+                }
+                .frame(width: 96, height: 96)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private func runSwap() async {
+        swapStatus = nil; swapResultURL = nil
+        let dir = DesktopSettings.load().outputDirectory
+        let output = (dir as NSString).appendingPathComponent("faceswap-\(Int(Date().timeIntervalSince1970)).png")
+        do {
+            _ = try await faceSwap.swap(source: swapSource, target: swapTarget, output: output, allFaces: swapAllFaces)
+            swapResultURL = URL(fileURLWithPath: output)
+            try? await ingestor?.ingestFile(at: output)
+            swapStatus = "Swapped → \(URL(fileURLWithPath: output).lastPathComponent)"
+            swapIsError = false
+        } catch {
+            swapStatus = error.localizedDescription; swapIsError = true
+        }
     }
 
     private var consoleTail: some View {

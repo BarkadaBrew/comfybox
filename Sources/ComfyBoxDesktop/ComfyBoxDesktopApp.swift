@@ -20,6 +20,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var mfluxService = MfluxService()
     @State private var breeService = BreeService()
     @State private var decoupageService = DecoupageService()
+    @State private var faceSwapService = FaceSwapService()
     @State private var activityLog = ActivityLog()
     @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
@@ -397,7 +398,7 @@ struct ComfyBoxDesktopApp: App {
             DecoupageView(decoupage: decoupageService, ingestor: ingestor)
 
         case .face:
-            FaceView(mflux: mfluxService, ingestor: ingestor)
+            FaceView(mflux: mfluxService, faceSwap: faceSwapService, ingestor: ingestor)
 
         case .bree:
             BreeView(bree: breeService)
