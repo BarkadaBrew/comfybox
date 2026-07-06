@@ -82,6 +82,19 @@ routes now operational.
   service actions, downloads); first-run wizard; panels for video-conductor/
   capture-node/BBS/SnapAI; global content-mode toggle.
 
+## PRD directives + CivitAI key wiring (2026-07-06)
+
+Todd's answers to the get_server_health PRD questions, built desktop-side:
+1. PULL model — 60s periodic polling + configurable serverHealthEndpoint
+   setting (8eea0c8).
+2. Kira represented — ServerHealthKira (pool/last-build/watchdog) card in the
+   Littleroundbox section (8eea0c8). Refines "drop Kira": it's server DATA now.
+3. Trends in-app (Datadog-style) — MetricsHistory (persisted CPU/disk/services-
+   up samples) + Swift Charts "Trends" section over 7d/30d/All (a6363f1).
+CivitAI key: was in $CIVITAI_API_KEY (env) but the GUI app's Keychain was empty
+— seeded the Keychain from env + added AppSecrets env fallback; authed download
+verified 200 (678c528). #1122 (server tool) still open/unassigned — Bree's PRD.
+
 ## Server-health consumer + Generate lighting + CivitAI base-model fix (2026-07-06)
 
 - Health board now consumes coffeeshop-server's get_server_health (per the
