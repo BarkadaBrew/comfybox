@@ -53,6 +53,7 @@ struct ComfyBoxDesktopApp: App {
         case bree = "Bree"
         case canvas = "Canvas"
         case civitai = "CivitAI"
+        case models = "Models"
         case characters = "Characters"
         case server = "Server"
 
@@ -68,7 +69,7 @@ struct ComfyBoxDesktopApp: App {
         var section: Section {
             switch self {
             case .generate, .motion, .mflux, .canvas, .assistant: return .create
-            case .gallery, .compare, .presets, .prompts, .characters, .civitai: return .library
+            case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models: return .library
             case .dashboard, .health, .server: return .operate
             case .bree: return .suite
             }
@@ -93,6 +94,7 @@ struct ComfyBoxDesktopApp: App {
             case .bree: return "brain.head.profile"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
+            case .models: return "square.stack.3d.up.fill"
             case .characters: return "person.2.crop.square.stack"
             case .server: return "server.rack"
             }
@@ -115,6 +117,7 @@ struct ComfyBoxDesktopApp: App {
             case .motion: return "m"
             case .mflux: return "x"
             case .bree: return "b"
+            case .models: return "l"
             }
         }
     }
@@ -375,6 +378,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .civitai:
             CivitAIBrowserView(engine: engine, promptLibrary: promptLibrary)
+
+        case .models:
+            ModelsView(engine: engine)
 
         case .gallery:
             if let store = store, let ingestor = ingestor {
