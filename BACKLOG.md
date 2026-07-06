@@ -82,6 +82,35 @@ routes now operational.
   service actions, downloads); first-run wizard; panels for video-conductor/
   capture-node/BBS/SnapAI; global content-mode toggle.
 
+## Feature batch — creative tabs + face identity (2026-07-06)
+
+- Models & LoRAs tab (⌘L) split out; Server tab slimmed (1cb6f1a).
+- Storage mgmt: primary-drive + staged-budget gauges, evict-all, LoRA library
+  (sizes/quarantine/reveal) (09cb4cb).
+- LTX-2 LoRA in Motion — merge-at-load/reload-on-change, route+UI (aaa4f65).
+- DyPE high-res scaling in Generate (Off/NTK/YaRN) (fe10bb7).
+- Découpage tab (⌘D) — generate/composite/elements over the CLI (2cf0580).
+- Zeta-Chroma + CoffeeShop as featured Art Models in Models tab (18b563a).
+- Face tab (⌘F) — identity generation via mflux dev-krea + identity LoRA
+  (PuLID/FaceID-equivalent, works today) (fdf00fe).
+  PENDING BACKENDS: native PuLID/IP-Adapter-FaceID (#51 — server IPAdapter
+  bridge unverified), face swap via inswapper/insightface (#52 — not installed;
+  scaffolded as "backend pending").
+
+## "What's missing" audit (surfaced to Todd 2026-07-06)
+
+Verification debt (most built headless), inpaint/outpaint + ControlNet UI (no
+UI, backend ready), live render progress/preview, presets don't capture new
+params (img2img/dype/lighting/seed/backend), video not first-class in gallery,
+batch/multi-seed gen, Settings gaps (venv paths, server-health endpoint field,
+nearline roots), activity-feed emitters (renders only), tile-pipeline workflow.
+
+## App icon (pending) — need the file path
+
+User pasted a portrait to use as the app icon, but clipboard only yields a
+JPEG file-icon placeholder and chat paste isn't a readable file. Need the
+on-disk path, then: square-crop → AppIcon set → .icns → bundle + re-sign.
+
 ## Model/LoRA/storage management + #1122 contract (2026-07-06)
 
 - Posted the desktop consumer's decode contract as a comment on coffeeshop-server
