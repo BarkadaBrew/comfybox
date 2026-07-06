@@ -84,8 +84,12 @@ Local video generation wired into the warm server:
 - NOT YET verified with a live 38GB render (would evict the image model + take
   minutes; needs a dedicated run, ideally a separate instance, with the owner).
   Do NOT enable --ltx2-weights on the shared image-serving daemon casually.
-- Follow-on: desktop video UI (a Motion/Animate tab or gallery "Animate"
-  action calling /v1/video/generate).
+- Follow-on DONE: desktop Motion tab (⌘M) — T2V + I2V form, inline AVKit
+  preview, gallery "Animate" action; Settings → Motion defaults (0ea34ae,
+  cfe5f4c). Still awaiting a live 38GB render to confirm end-to-end.
+- Settings surface now complete: prompt-optimizer/vision/captioning models
+  (AI Providers), server/generation/gallery/motion defaults, CivitAI key, UI
+  scale; watched health services edited on the Health board.
 
 ## img2img SHIPPED + verified live (2026-07-05)
 
