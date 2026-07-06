@@ -797,6 +797,74 @@ public final class EngineService {
         return parseNearline(data)
     }
 
+    // MARK: - Video (LTX-2 local, /v1/video/generate)
+
+    public struct VideoRequest: Sendable {
+        public var prompt: String
+        public var initImagePath: String?   // nil = text-to-video
+        public var width: Int
+        public var height: Int
+        public var frames: Int               // 1 + 8k
+        public var steps: Int
+        public var seed: UInt64
+        public var strength: Float
+        public var extendToSeconds: Float
+        public var outputPath: String
+
+        public init(
+            prompt: String, initImagePath: String? = nil,
+            width: Int = 704, height: Int = 448, frames: Int = 97,
+            steps: Int = 8, seed: UInt64 = 42, strength: Float = 1.0,
+            extendToSeconds: Float = 0, outputPath: String
+        ) {
+            self.prompt = prompt; self.initImagePath = initImagePath
+            self.width = width; self.height = height; self.frames = frames
+            self.steps = steps; self.seed = seed; self.strength = strength
+            self.extendToSeconds = extendToSeconds; self.outputPath = outputPath
+        }
+    }
+
+    public struct VideoResult: Sendable {
+        public let outputPath: String
+        public let frameCount: Int
+        public let durationSeconds: Double
+        public let elapsedSeconds: Double
+    }
+
+    /// Generate a video locally via LTX-2. Long-running (minutes); the local
+    /// backend responds synchronously with the MP4 path.
+    public func generateVideo(_ request: VideoRequest) async throws -> VideoResult {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        var body: [String: Any] = [
+            "prompt": request.prompt,
+            "width": request.width,
+            "height": request.height,
+            "frames": request.frames,
+            "steps": request.steps,
+            "seed": request.seed,
+            "strength": request.strength,
+            "extend_to_seconds": request.extendToSeconds,
+            "output_path": request.outputPath,
+        ]
+        if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
+            body["image_path"] = initImagePath
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let (status, data) = try await client.post("/v1/video/generate", body: bodyData)
+        guard status == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let outputPath = json["output_path"] as? String
+        else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Video generation failed (is the server started with --ltx2-weights?)")
+        }
+        return VideoResult(
+            outputPath: outputPath,
+            frameCount: (json["frame_count"] as? Int) ?? 0,
+            durationSeconds: (json["duration_seconds"] as? Double) ?? 0,
+            elapsedSeconds: (json["elapsed_seconds"] as? Double) ?? 0
+        )
+    }
+
     // MARK: - Upscale (/v1/upscale — SeedVR2 creative upscale)
 
     /// Upscale an image to a target long-side resolution. Returns the output

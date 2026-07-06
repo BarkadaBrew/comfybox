@@ -20,6 +20,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
     @State private var pendingReferenceImage: String?
+    @State private var pendingMotionReference: String?
 
     init() {
         let engine = EngineService()
@@ -43,6 +44,7 @@ struct ComfyBoxDesktopApp: App {
         case presets = "Presets"
         case prompts = "Prompts"
         case assistant = "Assistant"
+        case motion = "Motion"
         case canvas = "Canvas"
         case civitai = "CivitAI"
         case characters = "Characters"
@@ -58,6 +60,7 @@ struct ComfyBoxDesktopApp: App {
             case .presets: return "slider.horizontal.below.rectangle"
             case .prompts: return "text.book.closed"
             case .assistant: return "sparkles"
+            case .motion: return "film.stack"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
             case .characters: return "person.2.crop.square.stack"
@@ -79,6 +82,7 @@ struct ComfyBoxDesktopApp: App {
             case .civitai: return "0"
             case .canvas: return "k"
             case .assistant: return "i"
+            case .motion: return "m"
             }
         }
     }
@@ -193,6 +197,9 @@ struct ComfyBoxDesktopApp: App {
                 }
             )
 
+        case .motion:
+            MotionView(engine: engine, pendingMotionReference: $pendingMotionReference)
+
         case .canvas:
             CanvasView(
                 store: canvasStore,
@@ -221,6 +228,10 @@ struct ComfyBoxDesktopApp: App {
                     onUseAsReference: { asset in
                         pendingReferenceImage = asset.absolutePath
                         selectedTab = .generate
+                    },
+                    onAnimate: { asset in
+                        pendingMotionReference = asset.absolutePath
+                        selectedTab = .motion
                     },
                     canvasStore: canvasStore,
                     searchFocusRequests: $gallerySearchFocusRequests
