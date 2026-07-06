@@ -68,6 +68,12 @@ struct GenerationView: View {
     @State private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
+    // img2img reference
+    @State private var referenceImagePath: String?
+    @State private var referenceThumbnail: NSImage?
+    @State private var imageStrength: Double = 0.6
+    @State private var showReference: Bool = false
+
     /// Output dimensions: the picked preset, or the custom fields.
     private var effectiveWidth: Int {
         selectedResolution.id == ResolutionPreset.custom.id ? customWidth : selectedResolution.width
@@ -187,6 +193,11 @@ struct GenerationView: View {
 
                 // Prompt
                 promptSection
+
+                Divider()
+
+                // Reference image (img2img)
+                referenceSection
 
                 Divider()
 
@@ -367,6 +378,83 @@ struct GenerationView: View {
         }
     }
 
+    /// img2img reference image + strength. Nil path = pure text-to-image.
+    private var referenceSection: some View {
+        DisclosureGroup(isExpanded: $showReference) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let path = referenceImagePath {
+                    HStack(alignment: .top, spacing: 10) {
+                        Group {
+                            if let thumb = referenceThumbnail {
+                                Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
+                            } else {
+                                Image(systemName: "photo").foregroundStyle(.tertiary)
+                            }
+                        }
+                        .frame(width: 72, height: 72)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text((path as NSString).lastPathComponent)
+                                .font(.caption).lineLimit(1).truncationMode(.middle)
+                            Button("Remove", role: .destructive) { clearReference() }
+                                .controlSize(.small)
+                        }
+                        Spacer()
+                    }
+                    NumericSliderField(label: "Strength", value: $imageStrength,
+                                       range: 0...1, step: 0.05, fractionDigits: 2)
+                    Text("Higher strength follows the reference more closely; lower lets the prompt reinvent it.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                } else {
+                    Button {
+                        chooseReferenceImage()
+                    } label: {
+                        Label("Choose Reference Image…", systemImage: "photo.badge.plus")
+                    }
+                    .controlSize(.small)
+                    Text("Add an image to guide generation (image-to-image).")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Reference (img2img)", systemImage: "photo.on.rectangle").font(.headline)
+                if referenceImagePath != nil {
+                    Text(String(format: "%.0f%%", imageStrength * 100))
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    private func chooseReferenceImage() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.png, .jpeg, .image]
+        panel.prompt = "Use as Reference"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setReference(path: url.path)
+    }
+
+    /// Set the reference image (called by the picker or an external "use as
+    /// reference" hook) and load its thumbnail.
+    func setReference(path: String) {
+        referenceImagePath = path
+        showReference = true
+        Task {
+            let image = await Task.detached { NSImage(contentsOfFile: path) }.value
+            await MainActor.run { referenceThumbnail = image }
+        }
+    }
+
+    private func clearReference() {
+        referenceImagePath = nil
+        referenceThumbnail = nil
+    }
+
     private var parameterSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Parameters")
@@ -545,7 +633,9 @@ struct GenerationView: View {
             guidance: Float(guidance),
             seed: seed,
             modelId: engine.currentModel,
-            loras: selectedLoras
+            loras: selectedLoras,
+            initImagePath: referenceImagePath,
+            imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil
         )
 
         Task {

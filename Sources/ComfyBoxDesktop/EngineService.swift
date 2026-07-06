@@ -19,6 +19,10 @@ public struct GenerationRequest: Sendable {
     public var seed: UInt64  // 0 = random
     public var modelId: String?
     public var loras: [LoRASelection]
+    /// img2img reference image path (nil = pure text-to-image).
+    public var initImagePath: String?
+    /// How much the reference constrains the result: 0 = ignore, 1 = copy.
+    public var imageStrength: Float?
 
     public init(
         prompt: String = "",
@@ -28,7 +32,9 @@ public struct GenerationRequest: Sendable {
         guidance: Float = 3.5,
         seed: UInt64 = 0,
         modelId: String? = nil,
-        loras: [LoRASelection] = []
+        loras: [LoRASelection] = [],
+        initImagePath: String? = nil,
+        imageStrength: Float? = nil
     ) {
         self.prompt = prompt
         self.width = width
@@ -38,6 +44,8 @@ public struct GenerationRequest: Sendable {
         self.seed = seed
         self.modelId = modelId
         self.loras = loras
+        self.initImagePath = initImagePath
+        self.imageStrength = imageStrength
     }
 }
 
@@ -329,6 +337,12 @@ public final class EngineService {
 
         if request.seed > 0 {
             payloadDict["seed"] = request.seed
+        }
+
+        // img2img: reference image + strength (server maps strength->denoise).
+        if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
+            payloadDict["imagePath"] = initImagePath
+            payloadDict["imageStrength"] = request.imageStrength ?? 0.6
         }
 
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
