@@ -19,6 +19,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var canvasStore = CanvasStore()
     @State private var mfluxService = MfluxService()
     @State private var breeService = BreeService()
+    @State private var decoupageService = DecoupageService()
     @State private var activityLog = ActivityLog()
     @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
@@ -50,6 +51,7 @@ struct ComfyBoxDesktopApp: App {
         case assistant = "Assistant"
         case motion = "Motion"
         case mflux = "mflux"
+        case decoupage = "Découpage"
         case bree = "Bree"
         case canvas = "Canvas"
         case civitai = "CivitAI"
@@ -68,7 +70,7 @@ struct ComfyBoxDesktopApp: App {
 
         var section: Section {
             switch self {
-            case .generate, .motion, .mflux, .canvas, .assistant: return .create
+            case .generate, .motion, .mflux, .decoupage, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models: return .library
             case .dashboard, .health, .server: return .operate
             case .bree: return .suite
@@ -91,6 +93,7 @@ struct ComfyBoxDesktopApp: App {
             case .assistant: return "sparkles"
             case .motion: return "film.stack"
             case .mflux: return "cube.transparent"
+            case .decoupage: return "square.3.layers.3d"
             case .bree: return "brain.head.profile"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
@@ -118,6 +121,7 @@ struct ComfyBoxDesktopApp: App {
             case .mflux: return "x"
             case .bree: return "b"
             case .models: return "l"
+            case .decoupage: return "d"
             }
         }
     }
@@ -360,6 +364,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .mflux:
             MfluxView(mflux: mfluxService, ingestor: ingestor)
+
+        case .decoupage:
+            DecoupageView(decoupage: decoupageService, ingestor: ingestor)
 
         case .bree:
             BreeView(bree: breeService)
