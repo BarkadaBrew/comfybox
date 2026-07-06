@@ -145,7 +145,7 @@ struct ComfyBoxDesktopApp: App {
             } detail: {
                 detailView
             }
-            .navigationTitle("ComfyBox Desktop")
+            .navigationTitle("CoffeeShop Desktop")
             .frame(minWidth: 900, minHeight: 600)
             .overlay {
                 if showCommandPalette {
@@ -213,8 +213,8 @@ struct ComfyBoxDesktopApp: App {
             SettingsView(engine: engine)
         }
 
-        MenuBarExtra("ComfyBox", systemImage: menuBarSymbol) {
-            Text("Coffeeshop Suite").font(.headline)
+        MenuBarExtra("CoffeeShop", systemImage: menuBarSymbol) {
+            Text("CoffeeShop Suite").font(.headline)
             Divider()
             Button(engine.connectionState.isConnected
                    ? "Connected · \(engine.serverHost):\(engine.serverPort)"
@@ -233,7 +233,7 @@ struct ComfyBoxDesktopApp: App {
                 }
             }
             Button("New Render") { selectedTab = .generate; activate() }
-            Button("Open ComfyBox") { activate() }
+            Button("Open CoffeeShop Desktop") { activate() }
             if !activityLog.recent.isEmpty {
                 Divider()
                 Text("Recent")
@@ -242,7 +242,7 @@ struct ComfyBoxDesktopApp: App {
                 }
             }
             Divider()
-            Button("Quit ComfyBox") { NSApp.terminate(nil) }
+            Button("Quit CoffeeShop Desktop") { NSApp.terminate(nil) }
         }
         .menuBarExtraStyle(.menu)
     }
