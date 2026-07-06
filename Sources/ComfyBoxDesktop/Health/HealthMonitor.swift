@@ -14,6 +14,8 @@ public final class HealthMonitor {
     // MARK: - Published State
 
     public var services: [ServiceHealth] = []
+    /// Time-series samples for the in-app trends charts.
+    public let metricsHistory = MetricsHistory()
     public var events: [HealthEvent] = []
     public var isMonitoring: Bool = false
     public var lastRefresh: Date?
@@ -124,6 +126,15 @@ public final class HealthMonitor {
         sampleHostMemory()
         hostMetrics = hostSampler.sample()
         lastRefresh = checkedAt
+
+        // Record a trend sample (CPU / disk / service availability).
+        let up = updated.filter { $0.state == .healthy }.count
+        metricsHistory.record(MetricsSample(
+            date: checkedAt,
+            cpuPercent: hostMetrics?.cpuPercent,
+            diskUsedPercent: hostMetrics?.diskUsedFraction.map { $0 * 100 },
+            servicesUp: up,
+            servicesTotal: updated.count))
     }
 
     // MARK: - Events

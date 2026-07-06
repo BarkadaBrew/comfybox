@@ -7,6 +7,7 @@
 // never color alone.
 
 import SwiftUI
+import Charts
 
 /// Trailing window for activity stats and uptime figures.
 enum HealthRange: String, CaseIterable, Identifiable {
@@ -58,6 +59,7 @@ struct HealthBoardView: View {
                 comfyBoxSection
                 littleroundboxSection
                 serverHealthSection
+                trendsSection
                 activitySection
                 servicesSection
                 memorySection
@@ -349,6 +351,65 @@ struct HealthBoardView: View {
     }
 
     // MARK: - Watched services
+
+    /// Datadog-style time-series trends from persisted samples (CPU, disk,
+    /// service availability) over the selected range.
+    private var trendsSection: some View {
+        let samples = MetricsHistory.downsample(
+            monitor.metricsHistory.samples(days: range.days), maxPoints: 120)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionTitle("Trends")
+                Spacer()
+                Picker("", selection: $range) {
+                    ForEach(HealthRange.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented).fixedSize().labelsHidden()
+            }
+            if samples.count < 2 {
+                Text("Collecting samples… trends appear as the monitor runs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 12)], spacing: 12) {
+                    trendChart("CPU", samples: samples, unit: "%", color: .blue) { $0.cpuPercent }
+                    trendChart("Disk used", samples: samples, unit: "%", color: .purple) { $0.diskUsedPercent }
+                    trendChart("Services up", samples: samples, unit: "%", color: .green) { $0.serviceUpPercent }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func trendChart(_ title: String, samples: [MetricsSample], unit: String,
+                            color: Color, value: @escaping (MetricsSample) -> Double?) -> some View {
+        let points = samples.compactMap { s -> (Date, Double)? in value(s).map { (s.date, $0) } }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if let last = points.last {
+                    Text(String(format: "%.0f%@", last.1, unit)).font(.caption.monospacedDigit())
+                }
+            }
+            if points.count < 2 {
+                Text("no data").font(.caption2).foregroundStyle(.tertiary).frame(height: 90)
+            } else {
+                Chart(points, id: \.0) { pt in
+                    AreaMark(x: .value("t", pt.0), y: .value(unit, pt.1))
+                        .foregroundStyle(color.opacity(0.15))
+                    LineMark(x: .value("t", pt.0), y: .value(unit, pt.1))
+                        .foregroundStyle(color)
+                        .interpolationMethod(.monotone)
+                }
+                .chartYScale(domain: 0...100)
+                .chartYAxis { AxisMarks(values: [0, 50, 100]) }
+                .chartXAxis { AxisMarks(values: .automatic(desiredCount: 3)) }
+                .frame(height: 90)
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
+    }
 
     /// Littleroundbox server health from the get_server_health tool. Containers
     /// and — always — the Suppressed Alerts section (per the 2026-07-06 handoff:
