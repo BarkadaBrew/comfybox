@@ -189,6 +189,7 @@ struct SettingsView: View {
     @State private var loadedServerConfig: ComfyBoxServerConfig?
     @State private var providerStatus: String?
     @State private var providerIsError: Bool = false
+    @State private var nsfwPassword: String = ""
 
     init(engine: EngineService) {
         self.engine = engine
@@ -345,6 +346,16 @@ struct SettingsView: View {
                     set: { AppSecrets.set(.civitai, $0.isEmpty ? nil : $0) }
                 ))
                 Text("Stored in the macOS Keychain.").font(.caption2).foregroundStyle(.tertiary)
+            }
+
+            Section("NSFW Gallery Gate") {
+                SecureField(NSFWGate.isConfigured ? "Change password (blank clears)" : "Set a password",
+                            text: $nsfwPassword)
+                    .onChange(of: nsfwPassword) { _, v in NSFWGate.setPassword(v.isEmpty ? nil : v) }
+                Text(NSFWGate.isConfigured
+                     ? "A password is set — NSFW content is gated in the Gallery. Clear the field to remove it."
+                     : "Set a password to require it before revealing NSFW content in the Gallery. Stored as a salted hash in the Keychain.")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
 
             Section("Appearance") {

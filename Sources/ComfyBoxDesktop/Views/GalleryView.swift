@@ -57,6 +57,13 @@ struct GalleryView: View {
     @State private var securedIds: Set<String> = []
     @State private var revealSecured: Bool = false
 
+    // NSFW content gate (content-mode based, unlocked by a gallery password).
+    @State private var nsfwMode: NSFWFilterMode = .blur
+    @State private var nsfwUnlocked: Bool = false
+    @State private var showNSFWPasswordSheet: Bool = false
+    @State private var nsfwPasswordInput: String = ""
+    @State private var nsfwPasswordError: Bool = false
+
     // Finder color labels (the file's own tags are the source of truth).
     @State private var colorLabels: [String: FinderColor] = [:]
     @State private var filterLabel: FinderColor?
@@ -168,6 +175,26 @@ struct GalleryView: View {
                 }
             )
             .frame(minWidth: 800, minHeight: 500)
+        }
+        .sheet(isPresented: $showNSFWPasswordSheet) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Unlock NSFW content", systemImage: "eye.trianglebadge.exclamationmark")
+                    .font(.headline)
+                Text("Enter the gallery password to reveal NSFW content this session.")
+                    .font(.caption).foregroundStyle(.secondary)
+                SecureField("Password", text: $nsfwPasswordInput)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(submitNSFWPassword)
+                if nsfwPasswordError {
+                    Label("Incorrect password.", systemImage: "xmark.circle").font(.caption).foregroundStyle(.red)
+                }
+                HStack {
+                    Spacer()
+                    Button("Cancel") { showNSFWPasswordSheet = false }
+                    Button("Unlock") { submitNSFWPassword() }.buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(18).frame(width: 360)
         }
         .overlay {
             if let idx = lightboxIndex {
@@ -364,6 +391,23 @@ struct GalleryView: View {
                       : "Show secured images (\(securedIds.count)) — requires authentication")
             }
 
+            // NSFW filter: Show / Blur / Hide, with a password-gated unlock.
+            Menu {
+                Picker("NSFW", selection: $nsfwMode) {
+                    ForEach(NSFWFilterMode.allCases) { Label($0.rawValue, systemImage: $0.symbol).tag($0) }
+                }
+                Divider()
+                if nsfwUnlocked {
+                    Button("Lock NSFW") { nsfwUnlocked = false }
+                } else {
+                    Button("Unlock NSFW…") { requestNSFWUnlock() }
+                }
+            } label: {
+                Image(systemName: nsfwUnlocked ? "eye" : nsfwMode.symbol)
+                    .foregroundStyle(nsfwUnlocked ? .orange : .secondary)
+            }
+            .help("NSFW content: \(nsfwMode.rawValue)\(nsfwUnlocked ? " (unlocked)" : "")")
+
             // Favorite filter
             Toggle(isOn: $filterFavorites) {
                 Image(systemName: filterFavorites ? "heart.fill" : "heart")
@@ -472,9 +516,15 @@ struct GalleryView: View {
         return columns
     }
 
+    /// Blur NSFW cells when Blur mode is on and NSFW isn't unlocked.
+    private func shouldBlurNSFW(_ asset: DAMAsset) -> Bool {
+        nsfwMode == .blur && !nsfwUnlocked && asset.isNSFW
+    }
+
     @ViewBuilder
     private func decoratedCell(for asset: DAMAsset, width: CGFloat) -> some View {
         let isSelected = selectedIds.contains(asset.id)
+        let blurNSFW = shouldBlurNSFW(asset)
         GalleryCellView(
             asset: asset,
             thumbnailPath: ingestor.thumbnailPath(for: asset.id),
@@ -482,6 +532,19 @@ struct GalleryView: View {
             aspectRatio: aspectRatio(asset),
             isComparisonSelected: isSelectMode ? isSelected : nil
         )
+                    .blur(radius: blurNSFW ? 22 : 0)
+                    .overlay {
+                        if blurNSFW {
+                            VStack(spacing: 4) {
+                                Image(systemName: "eye.trianglebadge.exclamationmark").font(.title3)
+                                Text("NSFW").font(.caption2.weight(.semibold))
+                            }
+                            .foregroundStyle(.white)
+                            .padding(8)
+                            .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                            .onTapGesture { requestNSFWUnlock() }
+                        }
+                    }
                     .overlay(alignment: .topLeading) {
                         if securedIds.contains(asset.id) {
                             Image(systemName: "lock.fill")
@@ -840,6 +903,11 @@ struct GalleryView: View {
             results = results.filter { !securedIds.contains($0.id) }
         }
 
+        // NSFW: hide entirely when mode is .hide and not unlocked.
+        if nsfwMode == .hide && !nsfwUnlocked {
+            results = results.filter { !$0.isNSFW }
+        }
+
         // Finder color-label filter.
         if let filterLabel {
             results = results.filter { colorLabels[$0.id] == filterLabel }
@@ -1129,6 +1197,27 @@ struct GalleryView: View {
 
     /// Authenticate with Touch ID (or the login password) before revealing
     /// secured assets.
+    /// Unlock NSFW content for the session. No password set → unlock directly;
+    /// otherwise prompt for the gallery password.
+    private func requestNSFWUnlock() {
+        if !NSFWGate.isConfigured {
+            nsfwUnlocked = true
+        } else {
+            nsfwPasswordInput = ""
+            nsfwPasswordError = false
+            showNSFWPasswordSheet = true
+        }
+    }
+
+    private func submitNSFWPassword() {
+        if NSFWGate.verify(nsfwPasswordInput) {
+            nsfwUnlocked = true
+            showNSFWPasswordSheet = false
+        } else {
+            nsfwPasswordError = true
+        }
+    }
+
     private func unlockSecured() async {
         let context = LAContext()
         context.localizedReason = "reveal secured images"
