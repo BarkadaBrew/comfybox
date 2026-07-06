@@ -82,6 +82,16 @@ routes now operational.
   service actions, downloads); first-run wizard; panels for video-conductor/
   capture-node/BBS/SnapAI; global content-mode toggle.
 
+## Model/LoRA/storage management + #1122 contract (2026-07-06)
+
+- Posted the desktop consumer's decode contract as a comment on coffeeshop-server
+  #1122 (issuecomment-4896856507) so get_server_health is built to match.
+- Server tab storage management (curb primary-drive overuse): primary-drive
+  gauge (warn <50GB) + nearline staged-vs-budget gauge (warn >85%) + "Evict all
+  staged"; LoRA Library section (sizes largest-first, total, quarantine/release,
+  reveal) (09cb4cb). Follow-ons: LRU auto-evict policy, per-preset nearline
+  definitions, full LoRA delete, model move between drives.
+
 ## PRD directives + CivitAI key wiring (2026-07-06)
 
 Todd's answers to the get_server_health PRD questions, built desktop-side:
