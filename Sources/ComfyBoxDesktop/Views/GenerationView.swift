@@ -690,10 +690,15 @@ struct GenerationView: View {
         VStack {
             if engine.isGenerating {
                 VStack(spacing: 12) {
-                    ProgressView()
-                        .controlSize(.large)
-                    Text("Generating image...")
-                        .foregroundStyle(.secondary)
+                    if let pct = engine.queueInfo?.progressPercent, pct > 0 {
+                        ProgressView(value: Double(pct), total: 100)
+                            .frame(width: 220)
+                        Text("\(batchProgress.map { $0 + " · " } ?? "")\(pct)%")
+                            .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView().controlSize(.large)
+                        Text(batchProgress ?? "Generating image…").foregroundStyle(.secondary)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let image = displayedImage {

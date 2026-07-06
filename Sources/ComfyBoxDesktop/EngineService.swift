@@ -316,7 +316,15 @@ public final class EngineService {
         isGenerating = true
         lastError = nil
 
-        defer { isGenerating = false }
+        // Poll health quickly while the render runs so progress_percent updates
+        // smoothly (the idle poll is every 3s).
+        let progressPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(700))
+                await self?.pollHealth()
+            }
+        }
+        defer { isGenerating = false; progressPoll.cancel() }
 
         // Build the output path.
         let timestamp = Int(Date().timeIntervalSince1970)
