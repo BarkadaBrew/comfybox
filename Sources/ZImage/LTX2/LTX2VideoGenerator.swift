@@ -1,0 +1,335 @@
+// LTX2VideoGenerator.swift — Server-callable local LTX-2 video generation
+//
+// Lifts the proven `ComfyBox ltx2-i2v` CLI flow into a reusable service so the
+// warm server can generate video locally (text-to-video and image-to-video)
+// instead of only via the Replicate cloud proxy. Models are loaded lazily and
+// cached; frame/chunk math and request validation are pure so they're testable
+// without the 38 GB model.
+
+import Foundation
+import Logging
+import MLX
+import MLXNN
+
+#if canImport(CoreGraphics) && canImport(ImageIO)
+import CoreGraphics
+import ImageIO
+#endif
+
+/// Parameters for one local LTX-2 video generation.
+public struct LTX2VideoRequest: Sendable {
+    public var prompt: String
+    public var negativePrompt: String?
+    /// nil → text-to-video; a path → image-to-video conditioned on it.
+    public var initImagePath: String?
+    public var width: Int
+    public var height: Int
+    /// Frames per chunk; must be 1 + 8k (9, 17, 25, …, 97).
+    public var framesPerChunk: Int
+    public var steps: Int
+    public var seed: UInt64
+    /// I2V conditioning strength (0–1).
+    public var strength: Float
+    /// Target duration; >0 generates continuation chunks (I2V only).
+    public var extendToSeconds: Float
+    public var fps: Int
+    public var outputPath: String
+
+    public init(
+        prompt: String,
+        negativePrompt: String? = nil,
+        initImagePath: String? = nil,
+        width: Int = 704,
+        height: Int = 448,
+        framesPerChunk: Int = 97,
+        steps: Int = 8,
+        seed: UInt64 = 42,
+        strength: Float = 1.0,
+        extendToSeconds: Float = 0,
+        fps: Int = 24,
+        outputPath: String
+    ) {
+        self.prompt = prompt
+        self.negativePrompt = negativePrompt
+        self.initImagePath = initImagePath
+        self.width = width
+        self.height = height
+        self.framesPerChunk = framesPerChunk
+        self.steps = steps
+        self.seed = seed
+        self.strength = strength
+        self.extendToSeconds = extendToSeconds
+        self.fps = fps
+        self.outputPath = outputPath
+    }
+}
+
+public struct LTX2VideoResult: Sendable {
+    public let outputPath: String
+    public let frameCount: Int
+    public let durationSeconds: Float
+    public let elapsedSeconds: Double
+}
+
+public enum LTX2VideoError: Error, LocalizedError {
+    case invalidFrameCount(Int)
+    case invalidDimensions(Int, Int)
+    case weightsMissing(String)
+    case imageLoadFailed(String)
+    case unsupportedPlatform
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidFrameCount(let n):
+            return "LTX-2 frames must be 1 + 8k (9, 17, 25, …, 97); got \(n)."
+        case .invalidDimensions(let w, let h):
+            return "LTX-2 width/height must be divisible by 32; got \(w)x\(h)."
+        case .weightsMissing(let path):
+            return "LTX-2 weights not found: \(path)"
+        case .imageLoadFailed(let path):
+            return "Failed to load init image: \(path)"
+        case .unsupportedPlatform:
+            return "LTX-2 video requires CoreGraphics/ImageIO (macOS)."
+        }
+    }
+}
+
+public final class LTX2VideoGenerator {
+    public struct Configuration: Sendable {
+        /// Directory holding transformer / vae_{encoder,decoder} / connector.
+        public var weightsDir: String
+        /// Gemma-3 tokenizer + text-encoder snapshot directory.
+        public var gemmaPath: String
+        /// Transformer weights filename inside `weightsDir`.
+        public var transformerFile: String
+
+        public init(
+            weightsDir: String,
+            gemmaPath: String,
+            transformerFile: String = "transformer-distilled.safetensors"
+        ) {
+            self.weightsDir = weightsDir
+            self.gemmaPath = gemmaPath
+            self.transformerFile = transformerFile
+        }
+    }
+
+    public let config: Configuration
+    private let logger: Logger
+
+    private var pipeline: LTX2Pipeline?
+    private var tokenizer: LTX2GemmaTokenizer?
+    public private(set) var isLoaded = false
+
+    public init(config: Configuration, logger: Logger = Logger(label: "ltx2.video")) {
+        self.config = config
+        self.logger = logger
+    }
+
+    // MARK: - Pure planning helpers (testable without the model)
+
+    /// A frame count is valid when it's 1 + 8k and ≥ 9.
+    public static func isValidFrameCount(_ n: Int) -> Bool {
+        n >= 9 && (n - 1) % 8 == 0
+    }
+
+    /// Dimensions must be positive multiples of 32.
+    public static func areValidDimensions(width: Int, height: Int) -> Bool {
+        width > 0 && height > 0 && width % 32 == 0 && height % 32 == 0
+    }
+
+    public struct ChunkPlan: Equatable, Sendable {
+        public let totalChunks: Int
+        public let totalFrames: Int
+        public let durationSeconds: Float
+    }
+
+    /// How many chunks and frames a request produces. Each continuation chunk
+    /// re-uses the previous chunk's last frame, so it adds `framesPerChunk - 1`
+    /// new frames. `extendToSeconds == 0` → a single chunk.
+    public static func chunkPlan(framesPerChunk: Int, extendToSeconds: Float, fps: Int) -> ChunkPlan {
+        let totalChunks: Int
+        if extendToSeconds > 0 {
+            let targetFrames = Int(extendToSeconds * Float(fps))
+            let continuations = max(0, Int(ceil(Float(targetFrames - framesPerChunk) / Float(framesPerChunk - 1))))
+            totalChunks = 1 + continuations
+        } else {
+            totalChunks = 1
+        }
+        let totalFrames = framesPerChunk + (framesPerChunk - 1) * (totalChunks - 1)
+        return ChunkPlan(
+            totalChunks: totalChunks,
+            totalFrames: totalFrames,
+            durationSeconds: Float(totalFrames) / Float(fps)
+        )
+    }
+
+    /// Validate a request without loading anything.
+    public func validate(_ request: LTX2VideoRequest) throws {
+        guard Self.isValidFrameCount(request.framesPerChunk) else {
+            throw LTX2VideoError.invalidFrameCount(request.framesPerChunk)
+        }
+        guard Self.areValidDimensions(width: request.width, height: request.height) else {
+            throw LTX2VideoError.invalidDimensions(request.width, request.height)
+        }
+        let transformerPath = (config.weightsDir as NSString).appendingPathComponent(config.transformerFile)
+        guard FileManager.default.fileExists(atPath: transformerPath) else {
+            throw LTX2VideoError.weightsMissing(transformerPath)
+        }
+    }
+
+    // MARK: - Model loading (lazy, cached)
+
+    /// Construct and load the transformer, VAE, text encoder, and pipeline.
+    /// Idempotent — subsequent calls are no-ops.
+    public func load() throws {
+        guard !isLoaded else { return }
+        let modelDir = config.weightsDir
+
+        logger.info("LTX-2: creating transformer…")
+        let transformer = LTX2Transformer(
+            numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
+            numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
+            normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+            positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+            useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true
+        )
+
+        logger.info("LTX-2: loading transformer weights (\(config.transformerFile))…")
+        let transformerPath = URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent(config.transformerFile))
+        let rawWeights = try MLX.loadArrays(url: transformerPath)
+        let sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+        let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
+        try transformer.update(parameters: params, verify: [.shapeMismatch])
+        MLX.eval(transformer.parameters())
+
+        logger.info("LTX-2: loading VAE…")
+        let vae = LTX2VAE(config: .v23)
+        var combinedVAEWeights: [String: MLXArray] = [:]
+        let rawDecoderWeights = try MLX.loadArrays(url: URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent("vae_decoder.safetensors")))
+        for (key, value) in rawDecoderWeights where key.hasPrefix("vae_decoder.") {
+            combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+        }
+        let rawEncoderWeights = try MLX.loadArrays(url: URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent("vae_encoder.safetensors")))
+        for (key, value) in rawEncoderWeights where key.hasPrefix("vae_encoder.") {
+            combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+        }
+        if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+            combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+        }
+        if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+            combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+        }
+        try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: logger)
+        MLX.eval(vae.parameters())
+
+        logger.info("LTX-2: loading text encoder (Gemma 3 12B)…")
+        let gemmaConfig = LTX2GemmaConfig(
+            vocabSize: 262208, hiddenSize: 3840,
+            numHiddenLayers: 48, numAttentionHeads: 16,
+            numKeyValueHeads: 8, headDim: 256,
+            intermediateSize: 15360,
+            rmsNormEps: 1e-6, ropeTheta: 1_000_000.0,
+            slidingWindow: 1024, slidingWindowPattern: 6,
+            quantization: nil
+        )
+        let textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
+        try textEncoder.loadWeights(
+            modelPath: URL(fileURLWithPath: modelDir),
+            textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
+        )
+        MLX.eval(textEncoder.parameters())
+
+        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true)
+        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig)
+        self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
+        isLoaded = true
+        logger.info("LTX-2: models ready.")
+    }
+
+    /// Free the loaded models.
+    public func unload() {
+        pipeline = nil
+        tokenizer = nil
+        isLoaded = false
+    }
+
+    // MARK: - Generate
+
+    public func generate(
+        _ request: LTX2VideoRequest,
+        progress: ((Int, Int, Int, Int) -> Void)? = nil   // (chunk, totalChunks, step, totalSteps)
+    ) throws -> LTX2VideoResult {
+        #if canImport(CoreGraphics) && canImport(ImageIO)
+        try validate(request)
+        try load()
+        guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
+
+        let plan = Self.chunkPlan(
+            framesPerChunk: request.framesPerChunk,
+            extendToSeconds: request.extendToSeconds, fps: request.fps)
+
+        let batch = tokenizer.encode(prompt: request.prompt, maxLength: 128)
+        MLX.eval(batch.inputIds, batch.attentionMask)
+
+        let start = CFAbsoluteTimeGetCurrent()
+        var allFrames: [CGImage] = []
+
+        // Seed image: the init image for I2V, else nil (T2V first chunk).
+        var currentImage: MLXArray? = try request.initImagePath.map { path in
+            let url = URL(fileURLWithPath: path)
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                throw LTX2VideoError.imageLoadFailed(path)
+            }
+            let pixels = try QwenImageIO.resizedPixelArray(
+                from: cgImage, width: request.width, height: request.height,
+                addBatchDimension: true, dtype: .float32)
+            return QwenImageIO.normalizeForEncoder(pixels)
+        }
+
+        for chunk in 0..<plan.totalChunks {
+            let chunkSeed = request.seed + UInt64(chunk)
+            let output: LTX2PipelineOutput
+            if let image = currentImage {
+                output = pipeline.generateI2V(
+                    inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                    image: image, strength: request.strength,
+                    width: request.width, height: request.height,
+                    numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                    progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+            } else {
+                output = pipeline.generateT2V(
+                    inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                    width: request.width, height: request.height,
+                    numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                    progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+            }
+
+            let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+            allFrames.append(contentsOf: chunk == 0 ? chunkFrames : Array(chunkFrames.dropFirst()))
+
+            // Re-feed the last frame as the seed for the next continuation chunk.
+            if chunk < plan.totalChunks - 1 {
+                let t = output.decoded.dim(2)
+                let lastFrame = output.decoded[0..., 0..., (t - 1)..<t, 0..., 0...].squeezed(axis: 2)
+                currentImage = lastFrame * 2.0 - 1.0
+                MLX.eval(currentImage!)
+            }
+        }
+
+        try LTX2PostProcess.writeMP4(
+            frames: allFrames, outputPath: request.outputPath,
+            fps: request.fps, width: request.width, height: request.height)
+
+        return LTX2VideoResult(
+            outputPath: request.outputPath,
+            frameCount: allFrames.count,
+            durationSeconds: Float(allFrames.count) / Float(request.fps),
+            elapsedSeconds: CFAbsoluteTimeGetCurrent() - start
+        )
+        #else
+        throw LTX2VideoError.unsupportedPlatform
+        #endif
+    }
+}
