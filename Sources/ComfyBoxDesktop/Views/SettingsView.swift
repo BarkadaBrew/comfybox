@@ -81,6 +81,9 @@ struct DesktopSettings: Codable {
     var videoHeight: Int?
     var videoFrames: Int?
     var videoSteps: Int?
+    /// Cloud generation-provider API keys (Replicate, Fal).
+    var replicateApiKey: String?
+    var falApiKey: String?
 
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
@@ -108,7 +111,9 @@ struct DesktopSettings: Codable {
         videoWidth: nil,
         videoHeight: nil,
         videoFrames: nil,
-        videoSteps: nil
+        videoSteps: nil,
+        replicateApiKey: nil,
+        falApiKey: nil
     )
 
     /// Map the persisted scale step to SwiftUI's type-size ladder.
@@ -492,6 +497,21 @@ struct SettingsView: View {
             endpointSection("Prompt Optimization", form: $providerForm.prompt)
             endpointSection("Vision (optional)", form: $providerForm.vision)
             endpointSection("Captioning (optional)", form: $providerForm.captioning)
+
+            Section("Cloud Image Providers") {
+                SecureField("Replicate API token (r8_…)", text: Binding(
+                    get: { settings.replicateApiKey ?? "" },
+                    set: { settings.replicateApiKey = $0.isEmpty ? nil : $0 }
+                ))
+                .onChange(of: settings.replicateApiKey) { _, _ in hasUnsavedChanges = true; settings.save() }
+                SecureField("Fal API key", text: Binding(
+                    get: { settings.falApiKey ?? "" },
+                    set: { settings.falApiKey = $0.isEmpty ? nil : $0 }
+                ))
+                .onChange(of: settings.falApiKey) { _, _ in hasUnsavedChanges = true; settings.save() }
+                Text("Enable Replicate / Fal as backends in the Generate tab's Backend picker. Keys stay in ~/.comfybox/desktop-config.json.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
 
             if let status = providerStatus {
                 Section {

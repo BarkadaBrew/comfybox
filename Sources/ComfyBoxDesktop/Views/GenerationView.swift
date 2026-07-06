@@ -95,6 +95,10 @@ struct GenerationView: View {
     @State private var showCharacters: Bool = false
     @State private var showCamera: Bool = false
     @State private var showAssistant: Bool = true
+    // Cloud backend selection (Local / Replicate / Fal)
+    @State private var backend: CloudProvider = .local
+    @State private var cloudModel: String = ""
+    @State private var isCloudGenerating: Bool = false
     @State private var shotTemplates = ShotTemplateStore()
     @State private var lastAppliedActionSummary: String?
 
@@ -194,6 +198,11 @@ struct GenerationView: View {
                     }
                     Divider()
                 }
+
+                // Backend (Local / Replicate / Fal)
+                backendSection
+
+                Divider()
 
                 // Prompt
                 promptSection
@@ -341,6 +350,45 @@ struct GenerationView: View {
         case .connecting: return .yellow
         case .disconnected: return .gray
         case .error: return .red
+        }
+    }
+
+    /// Choose Local (MLX server) or a cloud provider (Replicate / Fal).
+    private var backendSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Backend", systemImage: "cpu").font(.headline)
+                Spacer()
+                Picker("", selection: $backend) {
+                    ForEach(CloudProvider.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+                .onChange(of: backend) { _, newValue in
+                    cloudModel = newValue.defaultModel
+                }
+            }
+            if backend != .local {
+                TextField("Model (e.g. \(backend.defaultModel))", text: $cloudModel)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                if cloudBackendKey.isEmpty {
+                    Label("Add a \(backend.rawValue) key in Settings → AI Providers.", systemImage: "key")
+                        .font(.caption2).foregroundStyle(.orange)
+                } else {
+                    Text("Renders on \(backend.rawValue). LoRAs and the local model are ignored; steps map to the provider's schema.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    private var cloudBackendKey: String {
+        let s = DesktopSettings.load()
+        switch backend {
+        case .replicate: return s.replicateApiKey ?? ""
+        case .fal: return s.falApiKey ?? ""
+        case .local: return ""
         }
     }
 
@@ -529,14 +577,14 @@ struct GenerationView: View {
             // Generate button
             Button(action: { submitGeneration() }) {
                 HStack {
-                    if engine.isGenerating {
+                    if engine.isGenerating || isCloudGenerating {
                         ProgressView()
                             .controlSize(.small)
                             .padding(.trailing, 4)
-                        Text("Generating...")
+                        Text(isCloudGenerating ? "Generating on \(backend.rawValue)…" : "Generating...")
                     } else {
                         Image(systemName: "wand.and.stars")
-                        Text("Generate")
+                        Text(backend == .local ? "Generate" : "Generate on \(backend.rawValue)")
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -573,9 +621,12 @@ struct GenerationView: View {
     }
 
     private var canGenerate: Bool {
-        engine.connectionState.isConnected
-            && !engine.isGenerating
-            && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if backend == .local {
+            return engine.connectionState.isConnected && !engine.isGenerating && hasPrompt
+        }
+        // Cloud backends don't need the local server, just a key.
+        return !isCloudGenerating && hasPrompt && !cloudBackendKey.isEmpty
     }
 
     private var canEnhance: Bool {
@@ -649,6 +700,12 @@ struct GenerationView: View {
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil
         )
 
+        // Cloud backend: route to Replicate / Fal instead of the local server.
+        if backend != .local {
+            submitCloudGeneration(request: request, seed: seed)
+            return
+        }
+
         Task {
             // Swap LoRAs if any selected (before generation).
             if !selectedLoras.isEmpty {
@@ -677,6 +734,39 @@ struct GenerationView: View {
                 await MainActor.run {
                     engine.lastError = error.localizedDescription
                 }
+            }
+        }
+    }
+
+    /// Generate via a cloud provider (Replicate / Fal), download the result
+    /// into the output directory, and ingest it like a local render.
+    private func submitCloudGeneration(request: GenerationRequest, seed: UInt64) {
+        let key = cloudBackendKey
+        guard !key.isEmpty else {
+            engine.lastError = "\(backend.rawValue) API key not set — add it in Settings → AI Providers."
+            return
+        }
+        let client = CloudImageClient(provider: backend, model: cloudModel, apiKey: key)
+        let params = CloudImageParams(
+            prompt: request.prompt,
+            width: request.width, height: request.height,
+            steps: request.steps, seed: seed,
+            initImagePath: referenceImagePath
+        )
+        let outputDir = URL(fileURLWithPath: DesktopSettings.load().outputDirectory)
+
+        isCloudGenerating = true
+        engine.lastError = nil
+        Task {
+            defer { isCloudGenerating = false }
+            do {
+                let fileURL = try await client.generate(params, downloadTo: outputDir)
+                if let image = NSImage(contentsOfFile: fileURL.path) {
+                    await MainActor.run { displayedImage = image }
+                }
+                onGenerated?(fileURL.path, request)
+            } catch {
+                await MainActor.run { engine.lastError = error.localizedDescription }
             }
         }
     }
