@@ -36,6 +36,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var comparisonAssets: [DAMAsset]?
     @State private var pendingPreset: GenerationPreset?
     @State private var gallerySearchFocusRequests: Int = 0
+    @State private var showCommandPalette = false
 
     enum AppTab: String, CaseIterable {
         case dashboard = "Dashboard"
@@ -86,7 +87,7 @@ struct ComfyBoxDesktopApp: App {
             case .health: return "8"
             case .prompts: return "9"
             case .civitai: return "0"
-            case .canvas: return "k"
+            case .canvas: return "y"
             case .assistant: return "i"
             case .motion: return "m"
             case .mflux: return "x"
@@ -107,6 +108,18 @@ struct ComfyBoxDesktopApp: App {
             }
             .navigationTitle("ComfyBox Desktop")
             .frame(minWidth: 900, minHeight: 600)
+            .overlay {
+                if showCommandPalette {
+                    ZStack(alignment: .top) {
+                        Color.black.opacity(0.15).ignoresSafeArea()
+                            .onTapGesture { showCommandPalette = false }
+                        CommandPaletteView(isPresented: $showCommandPalette, commands: paletteCommands)
+                            .padding(.top, 80)
+                            .shadow(radius: 30)
+                    }
+                    .transition(.opacity)
+                }
+            }
             .dynamicTypeSize(DesktopSettings.dynamicTypeSize(for: uiScale))
             .onReceive(NotificationCenter.default.publisher(for: DesktopSettings.didChangeNotification)) { _ in
                 uiScale = DesktopSettings.load().uiScale
@@ -130,6 +143,11 @@ struct ComfyBoxDesktopApp: App {
         }
         .defaultSize(width: 1200, height: 800)
         .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Command Palette") { showCommandPalette.toggle() }
+                    .keyboardShortcut("k", modifiers: .command)
+            }
+
             // Tab switching shortcuts
             CommandGroup(after: .toolbar) {
                 ForEach(AppTab.allCases, id: \.self) { tab in
@@ -155,6 +173,56 @@ struct ComfyBoxDesktopApp: App {
         Settings {
             SettingsView(engine: engine)
         }
+    }
+
+    // MARK: - Command Palette
+
+    /// Commands offered by ⌘K: navigate to any tab + a handful of actions.
+    private var paletteCommands: [PaletteCommand] {
+        var commands: [PaletteCommand] = AppTab.allCases.map { tab in
+            PaletteCommand(
+                title: "Go to \(tab.rawValue)",
+                subtitle: "Tab",
+                systemImage: tab.icon,
+                keywords: [tab.rawValue],
+                action: { selectedTab = tab }
+            )
+        }
+        commands.append(contentsOf: [
+            PaletteCommand(
+                title: engine.connectionState.isConnected ? "Disconnect Server" : "Connect Server",
+                subtitle: "ComfyBox", systemImage: "bolt.horizontal",
+                keywords: ["server", "connection"],
+                action: { engine.connectionState.isConnected ? engine.disconnect() : engine.connect() }),
+            PaletteCommand(
+                title: "Restart ComfyBox Daemon", subtitle: "launchctl kickstart",
+                systemImage: "arrow.clockwise", keywords: ["daemon", "server", "restart", "launchctl"],
+                action: {
+                    Task {
+                        try? await ServiceController().perform(.restart, on: WatchedService(
+                            name: "ComfyBox Server", urlString: "",
+                            control: ServiceControl(launchdLabel: "com.barkadabrew.comfybox")))
+                    }
+                }),
+            PaletteCommand(
+                title: "Reload Bree Handoff", subtitle: "Bree", systemImage: "brain.head.profile",
+                keywords: ["companion", "vault"], action: { breeService.reload(); selectedTab = .bree }),
+            PaletteCommand(
+                title: "New Render", subtitle: "Generate", systemImage: "wand.and.stars",
+                keywords: ["generate", "image"], action: { selectedTab = .generate }),
+            PaletteCommand(
+                title: "Find in Gallery", subtitle: "Gallery", systemImage: "magnifyingglass",
+                keywords: ["search"], action: { selectedTab = .gallery; gallerySearchFocusRequests += 1 }),
+            PaletteCommand(
+                title: "Open Settings", subtitle: "Preferences", systemImage: "gearshape",
+                keywords: ["preferences", "config", "keys"],
+                action: {
+                    if #available(macOS 14, *) {
+                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                    }
+                }),
+        ])
+        return commands
     }
 
     // MARK: - Detail View Router
