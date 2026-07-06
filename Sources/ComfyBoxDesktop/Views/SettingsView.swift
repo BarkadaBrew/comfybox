@@ -76,6 +76,11 @@ struct DesktopSettings: Codable {
     /// UI scale step ("default" | "large" | "xlarge" | "xxlarge") — bumps
     /// fonts and controls app-wide for high-density or distant screens.
     var uiScale: String?
+    /// Motion (LTX-2 video) defaults. Optional for back-compat; nil = built-ins.
+    var videoWidth: Int?
+    var videoHeight: Int?
+    var videoFrames: Int?
+    var videoSteps: Int?
 
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
@@ -99,7 +104,11 @@ struct DesktopSettings: Codable {
         gallerySortDefault: "date",
         watchedServices: nil,
         civitaiApiKey: nil,
-        uiScale: nil
+        uiScale: nil,
+        videoWidth: nil,
+        videoHeight: nil,
+        videoFrames: nil,
+        videoSteps: nil
     )
 
     /// Map the persisted scale step to SwiftUI's type-size ladder.
@@ -193,12 +202,17 @@ struct SettingsView: View {
                     Label("Gallery", systemImage: "photo.on.rectangle")
                 }
 
+            motionTab
+                .tabItem {
+                    Label("Motion", systemImage: "film.stack")
+                }
+
             providersTab
                 .tabItem {
                     Label("AI Providers", systemImage: "brain")
                 }
         }
-        .frame(width: 480, height: 460)
+        .frame(width: 500, height: 480)
         .onDisappear {
             if hasUnsavedChanges {
                 applyAndSave()
@@ -392,6 +406,72 @@ struct SettingsView: View {
                     }
                     .disabled(!hasUnsavedChanges)
                     .buttonStyle(.borderedProminent)
+                    Spacer()
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Motion (LTX-2 Video) Tab
+
+    private var motionTab: some View {
+        Form {
+            Section("Default Video Parameters") {
+                HStack {
+                    Text("Width")
+                    Spacer()
+                    TextField("Width", value: Binding(
+                        get: { settings.videoWidth ?? 704 },
+                        set: { settings.videoWidth = $0 }
+                    ), format: .number)
+                    .frame(width: 80).multilineTextAlignment(.trailing)
+                    .onChange(of: settings.videoWidth) { _, _ in hasUnsavedChanges = true }
+                }
+                HStack {
+                    Text("Height")
+                    Spacer()
+                    TextField("Height", value: Binding(
+                        get: { settings.videoHeight ?? 448 },
+                        set: { settings.videoHeight = $0 }
+                    ), format: .number)
+                    .frame(width: 80).multilineTextAlignment(.trailing)
+                    .onChange(of: settings.videoHeight) { _, _ in hasUnsavedChanges = true }
+                }
+                Picker("Frames", selection: Binding(
+                    get: { settings.videoFrames ?? 97 },
+                    set: { settings.videoFrames = $0 }
+                )) {
+                    ForEach([25, 49, 97, 121], id: \.self) { f in
+                        Text("\(f)  (\(String(format: "%.1fs", Double(f) / 24.0)))").tag(f)
+                    }
+                }
+                .onChange(of: settings.videoFrames) { _, _ in hasUnsavedChanges = true }
+                HStack {
+                    Text("Steps")
+                    Spacer()
+                    TextField("Steps", value: Binding(
+                        get: { settings.videoSteps ?? 8 },
+                        set: { settings.videoSteps = $0 }
+                    ), format: .number)
+                    .frame(width: 60).multilineTextAlignment(.trailing)
+                    .onChange(of: settings.videoSteps) { _, _ in hasUnsavedChanges = true }
+                }
+                Text("Frames must be 1 + 8k (25, 49, 97, 121). These prefill the Motion tab.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("LTX-2 Backend") {
+                Text("Local video needs the server started with --ltx2-weights and --ltx2-gemma. When those aren't set, the Motion tab falls back to the Replicate cloud proxy if configured.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
+                HStack {
+                    Spacer()
+                    Button("Apply & Save") { applyAndSave() }
+                        .disabled(!hasUnsavedChanges)
+                        .buttonStyle(.borderedProminent)
                     Spacer()
                 }
             }

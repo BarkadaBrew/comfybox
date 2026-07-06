@@ -20,6 +20,7 @@ struct MotionView: View {
     @State private var resolution: VideoResolution = .landscape
     @State private var frames: Int = 97
     @State private var steps: Double = 8
+    @State private var didApplyDefaults = false
     @State private var seedText: String = ""
     @State private var strength: Double = 1.0
     @State private var extendSeconds: Double = 0
@@ -54,7 +55,7 @@ struct MotionView: View {
             preview.frame(minWidth: 420)
         }
         .navigationTitle("Motion")
-        .onAppear { consumePendingReference() }
+        .onAppear { applyDefaults(); consumePendingReference() }
         .onChange(of: pendingMotionReference) { _, _ in consumePendingReference() }
     }
 
@@ -220,6 +221,20 @@ struct MotionView: View {
         Task {
             let img = await Task.detached { NSImage(contentsOfFile: path) }.value
             await MainActor.run { referenceThumb = img }
+        }
+    }
+
+    /// Prefill from Settings → Motion (once), matching a stored resolution to a
+    /// preset when possible.
+    private func applyDefaults() {
+        guard !didApplyDefaults else { return }
+        didApplyDefaults = true
+        let s = DesktopSettings.load()
+        if let f = s.videoFrames, Self.frameOptions.contains(f) { frames = f }
+        if let st = s.videoSteps { steps = Double(st) }
+        if let w = s.videoWidth, let h = s.videoHeight,
+           let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
+            resolution = match
         }
     }
 
