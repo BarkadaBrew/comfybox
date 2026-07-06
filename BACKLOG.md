@@ -69,6 +69,18 @@ items), /v1/queue 200, /v1/presets/import-legacy {imported:0} (idempotent),
 /v1/enhance success (528-char reply from Dan's model). All session server
 routes now operational.
 
+## CivitAI + cloud providers (2026-07-06)
+
+- CivitAI browser: civitai.com/civitai.red source toggle (.red verified live,
+  same /api/v1, NSFW-on default), richer filters (Type/Base/Sort/Period +
+  NSFW toggle) with display→API mapping, search clear button (000e12a).
+- Replicate + Fal cloud generation backends (desktop-side): CloudImageProvider
+  with pure, unit-tested request/parse logic; Generate gains a Backend picker
+  (Local/Replicate/Fal) + model id; keys in Settings → AI Providers; result
+  downloaded + ingested like a local render (c478a3b). Live cloud render needs
+  a configured key to verify. v1 targets the Flux family (flux-schnell/flux);
+  custom models may need matching input params.
+
 ## LTX-2 integrated into ComfyBox server (2026-07-06)
 
 Local video generation wired into the warm server:
