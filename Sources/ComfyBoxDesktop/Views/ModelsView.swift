@@ -28,6 +28,7 @@ struct ModelsView: View {
                     Text(err).font(.caption).foregroundStyle(.red)
                 }
                 storageSection
+                featuredModelsSection
                 loadedPoolSection
                 availableModelsSection
                 loraLibrarySection
@@ -41,6 +42,57 @@ struct ModelsView: View {
             await engine.refreshLoras()
             nearline = await engine.fetchNearline()
         }
+    }
+
+    // MARK: - Featured art models (Zeta-Chroma, CoffeeShop)
+
+    private var featuredModelsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Art Models").font(.headline)
+            ForEach(FeaturedModels.all) { fm in featuredRow(fm) }
+        }
+    }
+
+    private func featuredRow(_ fm: FeaturedModel) -> some View {
+        // Match against the live catalog, pool, and nearline.
+        let catalogMatch = engine.availableModels.first { fm.matches($0.id) || fm.matches($0.displayName) }
+        let poolMatch = engine.poolModels.first { fm.matches($0.id) || fm.matches($0.model) }
+        let nearMatch = nearline?.items.first { fm.matches($0.name) }
+        let (statusText, statusColor): (String, Color) =
+            poolMatch?.active == true ? ("active", .green)
+            : poolMatch != nil ? ("loaded", .green)
+            : catalogMatch != nil ? ("available", .blue)
+            : nearMatch?.staged == true ? ("staged", .blue)
+            : nearMatch != nil ? ("on attached storage", .orange)
+            : ("not found — mount its drive to stage", .secondary)
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Image(systemName: "paintpalette.fill").foregroundStyle(.pink)
+                Text(fm.name).font(.callout.weight(.medium))
+                Text(fm.family).font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(.quaternary, in: Capsule())
+                Spacer()
+                Text(statusText).font(.caption).foregroundStyle(statusColor)
+            }
+            Text(fm.blurb).font(.caption2).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                if let cat = catalogMatch, poolMatch == nil {
+                    Button("Load") { Task { await run(cat.id) { try await engine.loadModel(id: cat.id) } } }
+                        .controlSize(.small)
+                } else if let pool = poolMatch, pool.active != true {
+                    Button("Activate") { Task { await run(pool.id) { try await engine.activateModel(id: pool.id) } } }
+                        .controlSize(.small)
+                } else if let near = nearMatch, !near.staged {
+                    Button("Stage") { Task { await nearlineAct("stage", near) } }
+                        .controlSize(.small).disabled(nearlineBusy != nil)
+                } else if catalogMatch == nil && poolMatch == nil && nearMatch == nil, let hint = fm.nearlineHint {
+                    Text(hint).font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                }
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: - Storage overview (reduce primary-drive overuse)
