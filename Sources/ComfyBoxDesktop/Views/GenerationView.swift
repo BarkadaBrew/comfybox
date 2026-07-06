@@ -97,6 +97,9 @@ struct GenerationView: View {
     @State private var showLighting: Bool = false
     /// DyPE high-resolution scaling: "none" | "ntk" | "yarn".
     @State private var dype: String = "none"
+    /// Number of images to generate in one batch (seed sweep).
+    @State private var batchCount: Int = 1
+    @State private var batchProgress: String?
     @State private var showAssistant: Bool = true
     // Cloud backend selection (Local / Replicate / Fal)
     @State private var backend: CloudProvider = .local
@@ -586,6 +589,17 @@ struct GenerationView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            // Batch count (seed sweep)
+            HStack {
+                Text("Batch").font(.subheadline).foregroundStyle(.secondary)
+                Stepper(value: $batchCount, in: 1...16) {
+                    Text("\(batchCount) image\(batchCount == 1 ? "" : "s")").font(.subheadline.monospacedDigit())
+                }
+                if batchCount > 1 {
+                    Text("seed sweep").font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+
             // DyPE high-resolution scaling
             VStack(alignment: .leading, spacing: 4) {
                 Text("High-res scaling (DyPE)")
@@ -613,10 +627,12 @@ struct GenerationView: View {
                         ProgressView()
                             .controlSize(.small)
                             .padding(.trailing, 4)
-                        Text(isCloudGenerating ? "Generating on \(backend.rawValue)…" : "Generating...")
+                        Text(batchProgress ?? (isCloudGenerating ? "Generating on \(backend.rawValue)…" : "Generating..."))
                     } else {
                         Image(systemName: "wand.and.stars")
-                        Text(backend == .local ? "Generate" : "Generate on \(backend.rawValue)")
+                        Text(backend == .local
+                             ? (batchCount > 1 ? "Generate \(batchCount)" : "Generate")
+                             : "Generate on \(backend.rawValue)")
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -739,6 +755,7 @@ struct GenerationView: View {
             return
         }
 
+        let count = max(1, batchCount)
         Task {
             // Swap LoRAs if any selected (before generation).
             if !selectedLoras.isEmpty {
@@ -750,24 +767,24 @@ struct GenerationView: View {
                 }
             }
 
-            do {
-                let outputPath = try await engine.generate(request)
-                // Load the generated image for display.
-                if let image = NSImage(contentsOfFile: outputPath) {
-                    await MainActor.run {
-                        displayedImage = image
+            // Batch: generate `count` images. A fixed seed sweeps seed, seed+1…;
+            // seed 0 (random) yields a fresh random each time.
+            for i in 0..<count {
+                if count > 1 { await MainActor.run { batchProgress = "Generating \(i + 1) of \(count)…" } }
+                var req = request
+                if seed > 0 { req.seed = seed + UInt64(i) }
+                do {
+                    let outputPath = try await engine.generate(req)
+                    if let image = NSImage(contentsOfFile: outputPath) {
+                        await MainActor.run { displayedImage = image }
                     }
-                }
-                // Notify app to ingest the generated file into DAM.
-                onGenerated?(outputPath, request)
-            } catch {
-                // Surface the error to the UI. EngineService sets lastError
-                // for server errors, but not for every failure mode (e.g.
-                // connection loss), so record it here as well.
-                await MainActor.run {
-                    engine.lastError = error.localizedDescription
+                    onGenerated?(outputPath, req)
+                } catch {
+                    await MainActor.run { engine.lastError = error.localizedDescription }
+                    break
                 }
             }
+            await MainActor.run { batchProgress = nil }
         }
     }
 
