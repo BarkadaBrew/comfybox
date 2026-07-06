@@ -338,10 +338,10 @@ struct SettingsView: View {
 
             Section("CivitAI") {
                 SecureField("API key (optional — unlocks gated listings & downloads)", text: Binding(
-                    get: { settings.civitaiApiKey ?? "" },
-                    set: { settings.civitaiApiKey = $0.isEmpty ? nil : $0 }
+                    get: { AppSecrets.civitai ?? "" },
+                    set: { AppSecrets.set(.civitai, $0.isEmpty ? nil : $0) }
                 ))
-                .onChange(of: settings.civitaiApiKey) { _, _ in hasUnsavedChanges = true }
+                Text("Stored in the macOS Keychain.").font(.caption2).foregroundStyle(.tertiary)
             }
 
             Section("Appearance") {
@@ -502,16 +502,14 @@ struct SettingsView: View {
 
             Section("Cloud Image Providers") {
                 SecureField("Replicate API token (r8_…)", text: Binding(
-                    get: { settings.replicateApiKey ?? "" },
-                    set: { settings.replicateApiKey = $0.isEmpty ? nil : $0 }
+                    get: { AppSecrets.replicate ?? "" },
+                    set: { AppSecrets.set(.replicate, $0.isEmpty ? nil : $0) }
                 ))
-                .onChange(of: settings.replicateApiKey) { _, _ in hasUnsavedChanges = true; settings.save() }
                 SecureField("Fal API key", text: Binding(
-                    get: { settings.falApiKey ?? "" },
-                    set: { settings.falApiKey = $0.isEmpty ? nil : $0 }
+                    get: { AppSecrets.fal ?? "" },
+                    set: { AppSecrets.set(.fal, $0.isEmpty ? nil : $0) }
                 ))
-                .onChange(of: settings.falApiKey) { _, _ in hasUnsavedChanges = true; settings.save() }
-                Text("Enable Replicate / Fal as backends in the Generate tab's Backend picker. Keys stay in ~/.comfybox/desktop-config.json.")
+                Text("Enable Replicate / Fal as backends in the Generate tab's Backend picker. Keys are stored in the macOS Keychain.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

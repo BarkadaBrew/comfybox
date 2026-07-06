@@ -384,10 +384,9 @@ struct GenerationView: View {
     }
 
     private var cloudBackendKey: String {
-        let s = DesktopSettings.load()
         switch backend {
-        case .replicate: return s.replicateApiKey ?? ""
-        case .fal: return s.falApiKey ?? ""
+        case .replicate: return AppSecrets.replicate ?? ""
+        case .fal: return AppSecrets.fal ?? ""
         case .local: return ""
         }
     }

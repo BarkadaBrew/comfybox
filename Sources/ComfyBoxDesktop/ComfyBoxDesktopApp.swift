@@ -323,6 +323,8 @@ struct ComfyBoxDesktopApp: App {
 
     /// Apply persisted settings to the engine on launch.
     private func applySettings() {
+        // One-time: move any plaintext API keys into the Keychain.
+        AppSecrets.migrateFromSettingsIfNeeded()
         let settings = DesktopSettings.load()
         engine.serverHost = settings.serverHost
         engine.serverPort = settings.serverPort

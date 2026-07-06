@@ -73,7 +73,7 @@ struct CivitAIBrowserView: View {
     }
 
     private var client: CivitAIClient {
-        CivitAIClient(baseURL: source.baseURL, apiKey: DesktopSettings.load().civitaiApiKey)
+        CivitAIClient(baseURL: source.baseURL, apiKey: AppSecrets.civitai)
     }
 
     var body: some View {
