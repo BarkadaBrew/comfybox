@@ -43,6 +43,9 @@ struct HealthBoardView: View {
     @State private var renderTimestamps: [Date] = []
     @State private var range: HealthRange = .month
 
+    // Littleroundbox server health (get_server_health consumer).
+    @State private var serverHealth = ServerHealthService()
+
     // littleroundbox server metrics (Netdata).
     @State private var serverMetrics: ServerMetrics?
     @State private var serverMetricsFetchedAt: Date?
@@ -54,6 +57,7 @@ struct HealthBoardView: View {
                 header
                 comfyBoxSection
                 littleroundboxSection
+                serverHealthSection
                 activitySection
                 servicesSection
                 memorySection
@@ -64,6 +68,7 @@ struct HealthBoardView: View {
         .navigationTitle("Health")
         .task { await loadActivity() }
         .task { await pollServerMetrics() }
+        .task { await serverHealth.fetch() }
     }
 
     /// Refresh littleroundbox metrics every 15s while the pane is visible.
@@ -339,6 +344,112 @@ struct HealthBoardView: View {
     }
 
     // MARK: - Watched services
+
+    /// Littleroundbox server health from the get_server_health tool. Containers
+    /// and — always — the Suppressed Alerts section (per the 2026-07-06 handoff:
+    /// a silently-muted-for-7-weeks container must never be invisible again).
+    private var serverHealthSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                sectionTitle("Littleroundbox Server")
+                if serverHealth.isLoading { ProgressView().controlSize(.small) }
+                Spacer()
+                if let ts = serverHealth.lastFetched {
+                    Text(ts.formatted(date: .omitted, time: .shortened))
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+                Button { Task { await serverHealth.fetch() } } label: { Image(systemName: "arrow.clockwise") }
+                    .controlSize(.small)
+            }
+
+            if let h = serverHealth.health {
+                if let sys = h.system {
+                    HStack(spacing: 14) {
+                        ForEach(serverStats(sys), id: \.0) { stat in
+                            Text("\(stat.0): \(stat.1)").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                // Problem containers (running ones stay quiet).
+                if !h.problemContainers.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 10)], spacing: 10) {
+                        ForEach(h.problemContainers) { c in containerCard(c) }
+                    }
+                }
+                // Suppressed alerts — ALWAYS shown (empty is a signal too).
+                suppressedAlertsView(h.suppressed)
+                // Mac pipeline reachability, if the server reports it.
+                if let pipeline = h.macPipeline, !pipeline.isEmpty {
+                    Text("Mac pipeline: " + pipeline.map { "\($0.name) \($0.isHealthy ? "✓" : "✗")" }.joined(separator: "  "))
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } else {
+                Text(serverHealth.lastError ?? "Server health not loaded.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Consumes coffeeshop-server's get_server_health MCP tool (in progress). Endpoint: \(serverHealth.endpoint)")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func serverStats(_ s: ServerHealthSystem) -> [(String, String)] {
+        var out: [(String, String)] = []
+        if let d = s.disk { out.append(("disk", d)) }
+        if let m = s.memory { out.append(("mem", m)) }
+        if let l = s.load { out.append(("load", l)) }
+        if let u = s.uptime { out.append(("up", u)) }
+        return out
+    }
+
+    private func containerCard(_ c: ServerHealthContainer) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(c.name).font(.callout.weight(.medium)).lineLimit(1)
+                Spacer()
+                if c.isSuppressed {
+                    Text("SUPPRESSED").font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(Color.orange, in: Capsule()).foregroundStyle(.white)
+                }
+            }
+            Text(c.state ?? "unknown").font(.caption).foregroundStyle(.red)
+            if c.lacksRestartPolicy {
+                Label("no restart policy", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.red.opacity(0.5), lineWidth: 1.5))
+    }
+
+    @ViewBuilder
+    private func suppressedAlertsView(_ alerts: [ServerHealthSuppressed]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: alerts.isEmpty ? "bell.slash" : "bell.badge.fill")
+                    .foregroundStyle(alerts.isEmpty ? Color.secondary : Color.orange)
+                Text("Suppressed Alerts (\(alerts.count))").font(.caption.weight(.semibold))
+            }
+            if alerts.isEmpty {
+                Text("None — nothing is being hidden.").font(.caption2).foregroundStyle(.secondary)
+            } else {
+                ForEach(alerts) { a in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(a.alert).font(.caption)
+                        Text([a.reason, a.since].compactMap { $0 }.joined(separator: " · "))
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                    .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
 
     private var servicesSection: some View {
         VStack(alignment: .leading, spacing: 8) {
