@@ -69,6 +69,23 @@ items), /v1/queue 200, /v1/presets/import-legacy {imported:0} (idempotent),
 /v1/enhance success (528-char reply from Dan's model). All session server
 routes now operational.
 
+## mflux frontend — desktop-only backend (2026-07-06)
+
+Refined the no-Python stance (memory comfybox-no-python): the SERVER stays
+pure Swift/MLX and clients never touch mflux, but the DESKTOP app may shell out
+to the local mflux venv for UI use.
+- MfluxService: runs ~/Projects/mflux/.venv/bin scripts with live streamed
+  output; version (pip show), update (pip install -U). Pure arg-builders for
+  generate/train/save unit-tested (8 tests) (a90a4a0).
+- mflux tab (⌘X): Generate (all base-model variants, quantize, LoRA, img2img),
+  Train (mflux-train config/resume + dry-run), Tools (mflux-save quantize/bake),
+  Update — with a shared live console.
+- NOT verified with a live mflux generation/training run (heavy: model
+  download + GPU); wrapper + args verified by tests and the real --help surface.
+- Follow-on ideas: mflux as a choice in the Generate Backend picker too;
+  training-config authoring form (currently config-file/resume only);
+  mflux-upscale-seedvr2 / controlnet variants in Tools.
+
 ## CivitAI + cloud providers (2026-07-06)
 
 - CivitAI browser: civitai.com/civitai.red source toggle (.red verified live,
