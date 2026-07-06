@@ -23,6 +23,8 @@ struct GalleryView: View {
     /// For server-backed actions (upscale). Optional so previews/tests can omit.
     var engine: EngineService?
     var onCompare: (([DAMAsset]) -> Void)?
+    /// Send an image to Generate as an img2img reference.
+    var onUseAsReference: ((DAMAsset) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
@@ -522,6 +524,9 @@ struct GalleryView: View {
                         Button("Copy") {
                             copyAssets(isSelectMode && selectedIds.contains(asset.id)
                                 ? selectedAssetsList : [asset])
+                        }
+                        if onUseAsReference != nil {
+                            Button("Use as Reference (img2img)") { onUseAsReference?(asset) }
                         }
                         if engine != nil {
                             Menu("Upscale") {

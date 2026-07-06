@@ -55,6 +55,9 @@ struct GenerationView: View {
     @Binding var pendingPreset: GenerationPreset?
     /// Prompt queued by the Prompt Library; replaces the prompt field once.
     @Binding var pendingPromptInsert: String?
+    /// Image queued as an img2img reference (from Gallery/Canvas "Use as
+    /// Reference"); consumed once.
+    @Binding var pendingReferenceImage: String?
     /// Shared image assistant (Dan's v1.3) that can drive these controls.
     var agent: AgentService?
 
@@ -112,9 +115,10 @@ struct GenerationView: View {
             previewPanel
                 .frame(minWidth: 400)
         }
-        .onAppear { consumePendingPreset(); consumePendingPrompt() }
+        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
+        .onChange(of: pendingReferenceImage) { _, _ in consumePendingReference() }
         .sheet(isPresented: $showingSavePreset) {
             SavePresetSheet(
                 promptTemplate: prompt,
@@ -453,6 +457,13 @@ struct GenerationView: View {
     private func clearReference() {
         referenceImagePath = nil
         referenceThumbnail = nil
+    }
+
+    /// Consume an img2img reference queued by the Gallery/Canvas.
+    private func consumePendingReference() {
+        guard let path = pendingReferenceImage, !path.isEmpty else { return }
+        pendingReferenceImage = nil
+        setReference(path: path)
     }
 
     private var parameterSection: some View {

@@ -19,6 +19,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var canvasStore = CanvasStore()
     @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
+    @State private var pendingReferenceImage: String?
 
     init() {
         let engine = EngineService()
@@ -169,6 +170,7 @@ struct ComfyBoxDesktopApp: App {
                 onGenerated: handleGenerated,
                 pendingPreset: $pendingPreset,
                 pendingPromptInsert: $pendingPromptInsert,
+                pendingReferenceImage: $pendingReferenceImage,
                 agent: agentService
             )
 
@@ -196,6 +198,10 @@ struct ComfyBoxDesktopApp: App {
                 store: canvasStore,
                 onSendToGenerate: { path in
                     Task { await sendCanvasImageToGenerate(path) }
+                },
+                onUseAsReference: { path in
+                    pendingReferenceImage = path
+                    selectedTab = .generate
                 }
             )
 
@@ -211,6 +217,10 @@ struct ComfyBoxDesktopApp: App {
                     onCompare: { assets in
                         comparisonAssets = assets
                         selectedTab = .compare
+                    },
+                    onUseAsReference: { asset in
+                        pendingReferenceImage = asset.absolutePath
+                        selectedTab = .generate
                     },
                     canvasStore: canvasStore,
                     searchFocusRequests: $gallerySearchFocusRequests

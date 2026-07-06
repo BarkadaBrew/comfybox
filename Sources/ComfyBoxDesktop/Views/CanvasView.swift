@@ -16,6 +16,8 @@ struct CanvasView: View {
     /// Send an image on the board to the Generate tab to re-render it
     /// (the app resolves the path's original prompt from the DAM).
     var onSendToGenerate: ((String) -> Void)?
+    /// Send an image on the board to Generate as an img2img reference.
+    var onUseAsReference: ((String) -> Void)?
 
     @State private var selectedCanvasId: String?
     @State private var renaming: CanvasProject?
@@ -29,7 +31,7 @@ struct CanvasView: View {
                 .frame(width: 200)
             Divider()
             if let id = selectedCanvasId, store.project(id) != nil {
-                CanvasBoard(store: store, canvasId: id, onSendToGenerate: onSendToGenerate)
+                CanvasBoard(store: store, canvasId: id, onSendToGenerate: onSendToGenerate, onUseAsReference: onUseAsReference)
                     .id(id)
             } else {
                 emptyBoard
@@ -133,6 +135,7 @@ private struct CanvasBoard: View {
     @Bindable var store: CanvasStore
     let canvasId: String
     var onSendToGenerate: ((String) -> Void)?
+    var onUseAsReference: ((String) -> Void)?
 
     // View transform: board pan (screen points) + zoom.
     @State private var pan: CGSize = .zero
@@ -263,6 +266,9 @@ private struct CanvasBoard: View {
         Divider()
         if onSendToGenerate != nil {
             Button("Send to Generate (Re-render)") { onSendToGenerate?(item.imagePath) }
+        }
+        if onUseAsReference != nil {
+            Button("Use as Reference (img2img)") { onUseAsReference?(item.imagePath) }
         }
         Button("Replace Image…") { replaceImage(item) }
         Button("Duplicate") { store.mutateCanvas(canvasId) { $0.duplicate(id: item.id) } }
