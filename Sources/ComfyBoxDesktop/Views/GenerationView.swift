@@ -94,6 +94,7 @@ struct GenerationView: View {
     @State private var showQueuePanel: Bool = false
     @State private var showCharacters: Bool = false
     @State private var showCamera: Bool = false
+    @State private var showLighting: Bool = false
     @State private var showAssistant: Bool = true
     // Cloud backend selection (Local / Replicate / Fal)
     @State private var backend: CloudProvider = .local
@@ -250,6 +251,18 @@ struct GenerationView: View {
                     .padding(.top, 4)
                 } label: {
                     Label("Camera & Shot", systemImage: "camera")
+                        .font(.headline)
+                }
+
+                // Lighting direction (collapsible)
+                Divider()
+                DisclosureGroup(isExpanded: $showLighting) {
+                    LightingPanel { directive in
+                        prompt = directive.appended(to: prompt)
+                    }
+                    .padding(.top, 4)
+                } label: {
+                    Label("Lighting", systemImage: "lightbulb")
                         .font(.headline)
                 }
 
