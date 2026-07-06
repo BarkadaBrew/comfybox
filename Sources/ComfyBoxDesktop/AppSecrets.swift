@@ -61,7 +61,21 @@ enum Keychain {
 enum AppSecrets {
     enum Key: String { case civitai, replicate, fal }
 
-    static func value(_ key: Key) -> String? { Keychain.get(key.rawValue) }
+    /// Standard environment-variable names, used as a fallback when the Keychain
+    /// has no value (e.g. the app launched from a shell that exports them).
+    private static let envVarName: [Key: String] = [
+        .civitai: "CIVITAI_API_KEY",
+        .replicate: "REPLICATE_API_TOKEN",
+        .fal: "FAL_KEY",
+    ]
+
+    static func value(_ key: Key) -> String? {
+        if let k = Keychain.get(key.rawValue), !k.isEmpty { return k }
+        if let name = envVarName[key],
+           let v = ProcessInfo.processInfo.environment[name], !v.isEmpty { return v }
+        return nil
+    }
+
     static func set(_ key: Key, _ value: String?) { Keychain.set(value, key.rawValue) }
 
     static var civitai: String? { value(.civitai) }
@@ -83,5 +97,15 @@ enum AppSecrets {
             set(.fal, k); settings.falApiKey = nil; changed = true
         }
         if changed { settings.save() }
+
+        // Seed the Keychain from environment variables when it's empty, so a
+        // key exported in the shell persists for later Finder launches too.
+        for key in [Key.civitai, .replicate, .fal] {
+            if Keychain.get(key.rawValue) == nil,
+               let name = envVarName[key],
+               let v = ProcessInfo.processInfo.environment[name], !v.isEmpty {
+                set(key, v)
+            }
+        }
     }
 }
