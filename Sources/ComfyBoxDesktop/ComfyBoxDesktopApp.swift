@@ -26,6 +26,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingPromptInsert: String?
     @State private var pendingReferenceImage: String?
     @State private var pendingMotionReference: String?
+    @State private var pendingInpaintImage: String?
 
     init() {
         let engine = EngineService()
@@ -55,6 +56,7 @@ struct ComfyBoxDesktopApp: App {
         case mflux = "mflux"
         case decoupage = "Découpage"
         case face = "Face"
+        case inpaint = "Inpaint"
         case bree = "Bree"
         case canvas = "Canvas"
         case civitai = "CivitAI"
@@ -73,7 +75,7 @@ struct ComfyBoxDesktopApp: App {
 
         var section: Section {
             switch self {
-            case .generate, .motion, .mflux, .decoupage, .face, .canvas, .assistant: return .create
+            case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models: return .library
             case .dashboard, .health, .server: return .operate
             case .bree: return .suite
@@ -98,6 +100,7 @@ struct ComfyBoxDesktopApp: App {
             case .mflux: return "cube.transparent"
             case .decoupage: return "square.3.layers.3d"
             case .face: return "person.crop.circle.badge.checkmark"
+            case .inpaint: return "paintbrush.pointed"
             case .bree: return "brain.head.profile"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
@@ -127,6 +130,7 @@ struct ComfyBoxDesktopApp: App {
             case .models: return "l"
             case .decoupage: return "d"
             case .face: return "f"
+            case .inpaint: return "e"
             }
         }
     }
@@ -400,6 +404,9 @@ struct ComfyBoxDesktopApp: App {
         case .face:
             FaceView(mflux: mfluxService, faceSwap: faceSwapService, ingestor: ingestor)
 
+        case .inpaint:
+            InpaintView(engine: engine, ingestor: ingestor, pendingImage: $pendingInpaintImage)
+
         case .bree:
             BreeView(bree: breeService)
 
@@ -438,6 +445,10 @@ struct ComfyBoxDesktopApp: App {
                     onAnimate: { asset in
                         pendingMotionReference = asset.absolutePath
                         selectedTab = .motion
+                    },
+                    onInpaint: { asset in
+                        pendingInpaintImage = asset.absolutePath
+                        selectedTab = .inpaint
                     },
                     canvasStore: canvasStore,
                     searchFocusRequests: $gallerySearchFocusRequests

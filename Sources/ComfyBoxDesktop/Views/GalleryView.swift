@@ -28,6 +28,8 @@ struct GalleryView: View {
     var onUseAsReference: ((DAMAsset) -> Void)?
     /// Send an image to the Motion tab as an image-to-video reference.
     var onAnimate: ((DAMAsset) -> Void)?
+    /// Send an image to the Inpaint tab.
+    var onInpaint: ((DAMAsset) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
@@ -605,6 +607,9 @@ struct GalleryView: View {
                         }
                         if onAnimate != nil {
                             Button("Animate (LTX-2 video)") { onAnimate?(asset) }
+                        }
+                        if onInpaint != nil {
+                            Button("Edit / Inpaint") { onInpaint?(asset) }
                         }
                         if engine != nil {
                             Menu("Upscale") {

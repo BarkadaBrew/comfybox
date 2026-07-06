@@ -857,6 +857,39 @@ public final class EngineService {
         return total > 0 ? (free, total) : nil
     }
 
+    // MARK: - Inpaint (/v1/generate with base image + mask)
+
+    /// Inpaint the masked (white) region of `baseImagePNG` using `prompt`.
+    /// `maskPNG` is white where content should be regenerated, black elsewhere.
+    public func inpaint(
+        baseImagePNG: Data, maskPNG: Data, prompt: String, negativePrompt: String? = nil,
+        width: Int, height: Int, steps: Int, guidance: Float, denoise: Float,
+        maskGrow: Int = 8, maskFeather: Int = 8, seed: UInt64 = 0, outputPath: String
+    ) async throws -> String {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "width": width, "height": height,
+            "steps": steps, "guidance": guidance,
+            "denoise": denoise,
+            "maskGrow": maskGrow, "maskFeather": maskFeather,
+            "inpaint_image_base64": baseImagePNG.base64EncodedString(),
+            "mask_base64": maskPNG.base64EncodedString(),
+            "outputPath": outputPath,
+        ]
+        if let n = negativePrompt, !n.isEmpty { body["negativePrompt"] = n }
+        if seed > 0 { body["seed"] = seed }
+        let data = try JSONSerialization.data(withJSONObject: body)
+        let (status, responseData) = try await client.post("/v1/generate", body: data)
+        guard status == 200,
+              let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let out = (json["output_path"] ?? json["outputPath"]) as? String
+        else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: responseData) ?? "Inpaint failed")
+        }
+        return out
+    }
+
     // MARK: - Video (LTX-2 local, /v1/video/generate)
 
     public struct VideoRequest: Sendable {

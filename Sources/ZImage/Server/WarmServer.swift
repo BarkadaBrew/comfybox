@@ -3765,7 +3765,9 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
-    case denoise
+    case denoise, maskGrow, maskFeather
+    case inpaintImageData = "inpaint_image_base64"
+    case maskImageData = "mask_base64"
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
   }
@@ -3786,11 +3788,14 @@ extension GeneratePayload: Decodable {
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
-    inpaintImageData = nil
-    maskData = nil
+    // Inpaint image + mask arrive as base64 strings from the HTTP API.
+    inpaintImageData = (try c.decodeIfPresent(String.self, forKey: .inpaintImageData))
+        .flatMap { Data(base64Encoded: $0) }
+    maskData = (try c.decodeIfPresent(String.self, forKey: .maskImageData))
+        .flatMap { Data(base64Encoded: $0) }
     denoise = try c.decodeIfPresent(Float.self, forKey: .denoise)
-    maskGrow = nil
-    maskFeather = nil
+    maskGrow = try c.decodeIfPresent(Int.self, forKey: .maskGrow)
+    maskFeather = try c.decodeIfPresent(Int.self, forKey: .maskFeather)
     maskCropX = nil
     maskCropY = nil
     cfg = try c.decodeIfPresent(Float.self, forKey: .cfg)
