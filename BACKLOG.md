@@ -82,6 +82,22 @@ routes now operational.
   service actions, downloads); first-run wizard; panels for video-conductor/
   capture-node/BBS/SnapAI; global content-mode toggle.
 
+## Server-health consumer + Generate lighting + CivitAI base-model fix (2026-07-06)
+
+- Health board now consumes coffeeshop-server's get_server_health (per the
+  origin/claude/handoff-desktop-health handoff): tolerant ServerHealth model +
+  service (MCP tools/execute, envelope-digging), "Littleroundbox Server"
+  section with problem containers (no-restart-policy warning + SUPPRESSED
+  badge) and an ALWAYS-present Suppressed Alerts panel. Degrades gracefully
+  until the server ships the tool (daemon MCP loopback-only, needs #936 tunnel).
+  6 decoder tests (bfd2564). TODO: reply in Bree handoff channel with the exact
+  decode contract so the server builder matches it; make the endpoint a setting.
+- Generate: Lighting direction control (direction/quality/mood → prompt phrase),
+  5 tests (d86e1c4).
+- CivitAI base-model pulldown fixed to real API strings — Z-Image split into
+  ZImageTurbo/ZImageBase (old "Z-Image" matched nothing), + Flux Krea/Wan/LTXV/
+  HiDream/NoobAI (7fcdf42).
+
 ## CivitAI fixes (2026-07-06)
 
 - Download was failing with opaque NSURLErrorDomain -1011. Root cause: gated/
