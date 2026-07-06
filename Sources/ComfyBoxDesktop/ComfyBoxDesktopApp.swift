@@ -17,6 +17,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var healthMonitor = HealthMonitor()
     @State private var promptLibrary = PromptLibraryStore()
     @State private var canvasStore = CanvasStore()
+    @State private var mfluxService = MfluxService()
     @State private var agentService: AgentService
     @State private var pendingPromptInsert: String?
     @State private var pendingReferenceImage: String?
@@ -45,6 +46,7 @@ struct ComfyBoxDesktopApp: App {
         case prompts = "Prompts"
         case assistant = "Assistant"
         case motion = "Motion"
+        case mflux = "mflux"
         case canvas = "Canvas"
         case civitai = "CivitAI"
         case characters = "Characters"
@@ -61,6 +63,7 @@ struct ComfyBoxDesktopApp: App {
             case .prompts: return "text.book.closed"
             case .assistant: return "sparkles"
             case .motion: return "film.stack"
+            case .mflux: return "cube.transparent"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
             case .characters: return "person.2.crop.square.stack"
@@ -83,6 +86,7 @@ struct ComfyBoxDesktopApp: App {
             case .canvas: return "k"
             case .assistant: return "i"
             case .motion: return "m"
+            case .mflux: return "x"
             }
         }
     }
@@ -199,6 +203,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .motion:
             MotionView(engine: engine, pendingMotionReference: $pendingMotionReference)
+
+        case .mflux:
+            MfluxView(mflux: mfluxService, ingestor: ingestor)
 
         case .canvas:
             CanvasView(
