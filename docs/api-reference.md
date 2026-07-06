@@ -23,8 +23,13 @@ ComfyBox MCP server (`Sources/ZImage/MCP/`).
 | POST | `/v1/generate` | Text-to-image (also ControlNet / img2img via fields) | `generate_image` |
 | POST | `/v1/enhance` | Optimize a prompt via the configured provider (Dan's model); optional character injection | `enhance_prompt` |
 | POST | `/v1/upscale` | Creative upscale (SeedVR2 / ESRGAN) | `upscale` |
-| POST | `/v1/video/generate` | Image-to-video (Wan 2.2) | `generate_video` |
-| GET | `/v1/video/status/{id}` | Video job status | `video_status` |
+| POST | `/v1/video/generate` | Video generation. **Local LTX-2** (T2V + I2V) when the server is started with `--ltx2-weights` + `--ltx2-gemma` (runs through the render queue, returns 200 with the MP4 path); otherwise the Replicate cloud proxy (202, job-based). | `generate_video` |
+| GET | `/v1/video/status/{id}` | Video job status (Replicate proxy) | `video_status` |
+
+Local LTX-2 body (snake_case): `{prompt, negative_prompt?, image_path?, width?, height?, frames? (1+8k), steps?, seed?, strength?, extend_to_seconds?, fps?, output_path?}`
+→ `{success, output_path, frame_count, duration_seconds, elapsed_seconds, backend: "ltx2-local"}`.
+`image_path` present = image-to-video; absent = text-to-video. Output is
+contained to the server's allowed output directory.
 
 `POST /v1/enhance` body: `{prompt, character?, character_description?, content_mode?}`
 → `{success, prompt, enhanced, note?}`.

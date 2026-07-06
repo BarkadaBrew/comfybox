@@ -1593,6 +1593,8 @@ struct ZImageCLI {
     var host = config.host
     var allowedOutputDirectory = config.allowedOutputDirectory ?? FileManager.default.currentDirectoryPath
     var seedvr2Weights: String? = config.seedvr2WeightsPath
+    var ltx2Weights: String? = nil
+    var ltx2Gemma: String? = nil
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1628,6 +1630,10 @@ struct ZImageCLI {
         loraScaleOverrides.append(contentsOf: floatListValue(for: arg, iterator: &iterator, fallback: 1.0))
       case "--seedvr2-weights":
         seedvr2Weights = nextValue(for: arg, iterator: &iterator)
+      case "--ltx2-weights":
+        ltx2Weights = nextValue(for: arg, iterator: &iterator)
+      case "--ltx2-gemma":
+        ltx2Gemma = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printServeUsage()
         return
@@ -1659,7 +1665,9 @@ struct ZImageCLI {
       maxSequenceLength: maxSequenceLength,
       maxPendingRequests: 10,
       allowedOutputDirectory: allowedOutputDirectory,
-      seedvr2WeightsPath: seedvr2Weights
+      seedvr2WeightsPath: seedvr2Weights,
+      ltx2WeightsPath: ltx2Weights,
+      ltx2GemmaPath: ltx2Gemma
     )
 
     let server = WarmServer(configuration: configuration, host: host, logger: logger)
@@ -1680,6 +1688,8 @@ struct ZImageCLI {
       --max-sequence-length     Maximum sequence length for text encoding (default: 512)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override
       --seedvr2-weights            Path to SeedVR2 upscale model weights directory
+      --ltx2-weights               Path to LTX-2 weights dir (enables LOCAL video on /v1/video/generate; lazy ~38GB)
+      --ltx2-gemma                 Gemma-3 tokenizer/text-encoder snapshot dir for LTX-2
       --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs

@@ -20,6 +20,13 @@ public struct WarmServerConfiguration: Sendable {
   /// When set, enables upscale via the ComfyUI bridge. The pipeline is lazy-loaded
   /// on first upscale request to avoid the ~6GB memory cost until needed.
   public var seedvr2WeightsPath: String?
+  /// Path to the LTX-2 weights directory (transformer / VAE / connector).
+  /// When set (with `ltx2GemmaPath`), enables LOCAL video generation on
+  /// /v1/video/generate. Lazy-loaded on first request (~38GB), so it's off
+  /// until a video is requested.
+  public var ltx2WeightsPath: String?
+  /// Gemma-3 tokenizer + text-encoder snapshot dir for LTX-2.
+  public var ltx2GemmaPath: String?
 
   public init(
     port: UInt16 = ComfyBoxServerConfig.canonicalPort,
@@ -30,7 +37,9 @@ public struct WarmServerConfiguration: Sendable {
     maxSequenceLength: Int = 512,
     maxPendingRequests: Int = 10,
     allowedOutputDirectory: String = FileManager.default.currentDirectoryPath,
-    seedvr2WeightsPath: String? = nil
+    seedvr2WeightsPath: String? = nil,
+    ltx2WeightsPath: String? = nil,
+    ltx2GemmaPath: String? = nil
   ) {
     self.port = port
     self.modelSpec = modelSpec
@@ -41,6 +50,8 @@ public struct WarmServerConfiguration: Sendable {
     self.maxPendingRequests = max(1, maxPendingRequests)
     self.allowedOutputDirectory = allowedOutputDirectory
     self.seedvr2WeightsPath = seedvr2WeightsPath
+    self.ltx2WeightsPath = ltx2WeightsPath
+    self.ltx2GemmaPath = ltx2GemmaPath
   }
 }
 
@@ -169,6 +180,8 @@ public final class WarmServer {
   let characterStore = CharacterStore()
   /// Nearline model/LoRA catalog (attached storage staged on demand).
   let nearlineLibrary = NearlineLibrary()
+  /// Local LTX-2 video generator, built lazily when the weights are configured.
+  private var ltx2Generator: LTX2VideoGenerator?
   /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
   let presetStore = PresetStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
@@ -830,8 +843,12 @@ public final class WarmServer {
     // MARK: - Video Endpoints
 
     case ("POST", "/v1/video/generate"):
+      // Prefer the local LTX-2 backend when configured (weights + gemma path).
+      if let localResponse = await localVideoResponseIfConfigured(body: request.body) {
+        return localResponse
+      }
       guard let proxy = replicateVideoProxy else {
-        return .error(.error(status: 503, message: "Video generation not available: Replicate API key not configured"))
+        return .error(.error(status: 503, message: "Video generation not available: configure LTX-2 (--ltx2-weights) for local video, or a Replicate API key for cloud"))
       }
       do {
         let videoRequest = try decode(VideoGenerateRequest.self, from: request.body)
@@ -1069,6 +1086,88 @@ public final class WarmServer {
       return LoRAEntry(path: staged, scale: entry.scale)
     }
     return LoRASwapPayload(loras: entries)
+  }
+
+  // Local video (LTX-2) ---------------------------------------------------------
+
+  /// Body for the local LTX-2 video route (snake_case over the wire).
+  private struct LocalVideoRequest: Decodable {
+    let prompt: String
+    let negativePrompt: String?
+    let imagePath: String?
+    let width: Int?
+    let height: Int?
+    let frames: Int?
+    let steps: Int?
+    let seed: UInt64?
+    let strength: Float?
+    let extendToSeconds: Float?
+    let fps: Int?
+    let outputPath: String?
+  }
+
+  private struct LocalVideoResponse: Encodable {
+    let success: Bool
+    let outputPath: String
+    let frameCount: Int
+    let durationSeconds: Float
+    let elapsedSeconds: Double
+    let backend: String
+  }
+
+  /// If LTX-2 is configured, generate the video locally and return the result;
+  /// otherwise nil so the caller falls through to the Replicate proxy.
+  private func localVideoResponseIfConfigured(body: Data) async -> RoutedResponse? {
+    guard let weights = configuration.ltx2WeightsPath, let gemma = configuration.ltx2GemmaPath else {
+      return nil
+    }
+    do {
+      let req = try decode(LocalVideoRequest.self, from: body)
+
+      // Contain the output within the allowed directory (default alongside models).
+      let requestedOutput = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
+      let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+        requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+
+      let generator = ltx2Generator ?? LTX2VideoGenerator(
+        config: .init(weightsDir: weights, gemmaPath: gemma), logger: logger)
+      ltx2Generator = generator
+
+      let videoRequest = LTX2VideoRequest(
+        prompt: req.prompt,
+        negativePrompt: req.negativePrompt,
+        initImagePath: req.imagePath,
+        width: req.width ?? 704,
+        height: req.height ?? 448,
+        framesPerChunk: req.frames ?? 97,
+        steps: req.steps ?? 8,
+        seed: req.seed ?? 42,
+        strength: req.strength ?? 1.0,
+        extendToSeconds: req.extendToSeconds ?? 0,
+        fps: req.fps ?? 24,
+        outputPath: resolvedOutput
+      )
+      // Validate before enqueuing so bad frames/dims fail fast.
+      try generator.validate(videoRequest)
+
+      logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f)")
+      let result = try await coordinator.enqueueLocalVideo {
+        try generator.generate(videoRequest)
+      }
+      auditLog.append(kind: "video.local", message: "LTX-2 video \(result.frameCount)f -> \(result.outputPath)")
+      return .json(status: 200, payload: LocalVideoResponse(
+        success: true,
+        outputPath: result.outputPath,
+        frameCount: result.frameCount,
+        durationSeconds: result.durationSeconds,
+        elapsedSeconds: result.elapsedSeconds,
+        backend: "ltx2-local"
+      ))
+    } catch let error as LTX2VideoError {
+      return .error(.error(status: 400, message: error.localizedDescription))
+    } catch {
+      return .error(.error(status: 500, message: "LTX-2 video failed: \(error.localizedDescription)"))
+    }
   }
 
   // Queue ----------------------------------------------------------------------
@@ -2566,6 +2665,22 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Enqueue a local LTX-2 video generation through the FIFO render queue so
+  /// it never runs the GPU concurrently with an image render.
+  func enqueueLocalVideo(_ body: @escaping @Sendable () throws -> LTX2VideoResult) async throws -> LTX2VideoResult {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation))))
+      startProcessingIfNeeded()
+    }
+  }
+
   func enqueueShutdown() async throws -> ShutdownResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -2663,6 +2778,8 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
       cont.resume(throwing: ServerError.cancelled)
+    case .localVideo(_, let cont):
+      cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
       cont.resume(throwing: ServerError.cancelled)
     }
@@ -2679,6 +2796,8 @@ private actor WarmServerCoordinator {
       return "LoRA swap (\(payload.loras.count))"
     case .modelSwitch:
       return "Model switch"
+    case .localVideo:
+      return "LTX-2 video"
     case .shutdown:
       return "Shutdown"
     }
@@ -2690,6 +2809,7 @@ private actor WarmServerCoordinator {
     case .controlGenerate: return "controlnet"
     case .swap: return "lora_swap"
     case .modelSwitch: return "model_switch"
+    case .localVideo: return "video"
     case .shutdown: return "shutdown"
     }
   }
@@ -2777,6 +2897,16 @@ private actor WarmServerCoordinator {
       case .modelSwitch(let body, let continuation):
         do {
           continuation.resume(returning: try await body())
+        } catch {
+          continuation.resume(throwing: error)
+        }
+      case .localVideo(let body, let continuation):
+        // Runs on the serial queue so LTX-2 never shares the GPU with a render.
+        activeRenderStartedAt = Date()
+        activeJobId = UUID().uuidString
+        defer { activeRenderStartedAt = nil; activeJobId = nil }
+        do {
+          continuation.resume(returning: try body())
         } catch {
           continuation.resume(throwing: error)
         }
@@ -4038,6 +4168,9 @@ private enum QueuedOperation: Sendable {
   case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
+  /// Local LTX-2 video generation, run through the queue so it serializes with
+  /// image renders on the shared GPU. The closure captures the generator+request.
+  case localVideo(@Sendable () throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
 
