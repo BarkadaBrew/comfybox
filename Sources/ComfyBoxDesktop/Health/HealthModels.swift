@@ -59,11 +59,44 @@ public struct WatchedService: Codable, Identifiable, Sendable, Equatable, Hashab
     public var id: String
     public var name: String
     public var urlString: String
+    /// Optional lifecycle control (start/stop/restart). nil = monitor-only.
+    public var control: ServiceControl?
 
-    public init(id: String = UUID().uuidString, name: String, urlString: String) {
+    public init(id: String = UUID().uuidString, name: String, urlString: String,
+                control: ServiceControl? = nil) {
         self.id = id
         self.name = name
         self.urlString = urlString
+        self.control = control
+    }
+}
+
+/// How to start/stop/restart a watched service. Either a local launchd agent
+/// (by label) or shell commands run locally or over SSH.
+public struct ServiceControl: Codable, Sendable, Equatable, Hashable {
+    /// Local launchd label, e.g. "com.barkadabrew.comfybox". When set, the
+    /// controller uses `launchctl` on the current GUI domain.
+    public var launchdLabel: String?
+    /// SSH target "user@host" for remote services. When set, commands run there.
+    public var sshHost: String?
+    /// Explicit shell commands (used when launchdLabel is nil).
+    public var startCommand: String?
+    public var stopCommand: String?
+    public var restartCommand: String?
+
+    public init(launchdLabel: String? = nil, sshHost: String? = nil,
+                startCommand: String? = nil, stopCommand: String? = nil,
+                restartCommand: String? = nil) {
+        self.launchdLabel = launchdLabel
+        self.sshHost = sshHost
+        self.startCommand = startCommand
+        self.stopCommand = stopCommand
+        self.restartCommand = restartCommand
+    }
+
+    /// True if any control action is possible.
+    public var isActionable: Bool {
+        launchdLabel != nil || startCommand != nil || stopCommand != nil || restartCommand != nil
     }
 }
 

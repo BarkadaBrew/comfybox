@@ -33,6 +33,11 @@ struct HealthBoardView: View {
     @State private var newServiceName: String = ""
     @State private var newServiceURL: String = ""
     @State private var showAddService: Bool = false
+    // Service control
+    private let controller = ServiceController()
+    @State private var busyServiceId: String?
+    @State private var controlToast: (service: String, message: String, isError: Bool)?
+    @State private var editingControl: WatchedService?
 
     // Render-activity data (from the DAM).
     @State private var renderTimestamps: [Date] = []
@@ -121,7 +126,11 @@ struct HealthBoardView: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
                 let q = engine.queueInfo
                 serviceCard(
-                    name: "ComfyBox Server",
+                    service: WatchedService(
+                        id: "comfybox-engine",
+                        name: "ComfyBox Server",
+                        urlString: "\(engine.serverHost):\(engine.serverPort)",
+                        control: ServiceControl(launchdLabel: "com.barkadabrew.comfybox")),
                     state: engineHealthState,
                     detail: engine.connectionState.isConnected
                         ? "\(engine.serverHost):\(engine.serverPort)"
@@ -355,7 +364,7 @@ struct HealthBoardView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], spacing: 12) {
                     ForEach(monitor.services) { health in
                         serviceCard(
-                            name: health.service.name,
+                            service: health.service,
                             state: health.state,
                             detail: health.detail ?? health.service.urlString,
                             latencyMs: health.latencyMs,
@@ -365,12 +374,24 @@ struct HealthBoardView: View {
                             )
                         )
                         .contextMenu {
+                            Button("Configure Control…") { editingControl = health.service }
                             Button("Remove", role: .destructive) {
                                 removeService(health.service)
                             }
                         }
                     }
                 }
+            }
+        }
+        .sheet(item: $editingControl) { service in
+            ServiceControlEditor(service: service) { updated in
+                if let idx = monitor.watchedServices.firstIndex(where: { $0.id == updated.id }) {
+                    monitor.watchedServices[idx] = updated
+                    persistWatchedServices()
+                }
+                editingControl = nil
+            } onCancel: {
+                editingControl = nil
             }
         }
     }
@@ -488,16 +509,19 @@ struct HealthBoardView: View {
     }
 
     private func serviceCard(
-        name: String, state: HealthState, detail: String?, latencyMs: Int?,
+        service: WatchedService, state: HealthState, detail: String?, latencyMs: Int?,
         uptime: UptimeStats? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let isBusy = busyServiceId == service.id
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(name)
+                Text(service.name)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
                 Spacer()
-                if let latencyMs {
+                if isBusy {
+                    ProgressView().controlSize(.small)
+                } else if let latencyMs {
                     Text("\(latencyMs) ms")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -522,6 +546,30 @@ struct HealthBoardView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(uptime.interruptions > 0 ? .orange : .secondary)
             }
+
+            // Control buttons (only when a control is configured).
+            if let control = service.control, control.isActionable {
+                HStack(spacing: 6) {
+                    Button { performControl(.restart, on: service) } label: {
+                        Label("Restart", systemImage: "arrow.clockwise").labelStyle(.iconOnly)
+                    }.help("Restart")
+                    Button { performControl(.start, on: service) } label: {
+                        Label("Start", systemImage: "play.fill").labelStyle(.iconOnly)
+                    }.help("Start")
+                    Button { performControl(.stop, on: service) } label: {
+                        Label("Stop", systemImage: "stop.fill").labelStyle(.iconOnly)
+                    }.help("Stop")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isBusy)
+            }
+            if let toast = controlToast, toast.service == service.name {
+                Text(toast.message)
+                    .font(.caption2)
+                    .foregroundStyle(toast.isError ? .orange : .green)
+                    .lineLimit(2)
+            }
         }
         .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
         .padding(12)
@@ -530,6 +578,23 @@ struct HealthBoardView: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(stateColor(state).opacity(state == .healthy ? 0 : 0.5), lineWidth: 1.5)
         )
+    }
+
+    private func performControl(_ action: ServiceAction, on service: WatchedService) {
+        busyServiceId = service.id
+        controlToast = nil
+        Task {
+            defer { busyServiceId = nil }
+            do {
+                _ = try await controller.perform(action, on: service)
+                controlToast = (service.name, "\(action.rawValue.capitalized) ok", false)
+                // Re-probe shortly so the badge reflects the new state.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await monitor.checkNow()
+            } catch {
+                controlToast = (service.name, error.localizedDescription, true)
+            }
+        }
     }
 
     private func stateColor(_ state: HealthState) -> Color {

@@ -89,6 +89,8 @@ struct DesktopSettings: Codable {
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
     /// plus the local LM Studio prompt-enhancement endpoint.
     static let defaultWatchedServices: [WatchedService] = [
+        WatchedService(name: "ComfyBox Server", urlString: "http://127.0.0.1:7870/health",
+                       control: ServiceControl(launchdLabel: "com.barkadabrew.comfybox")),
         WatchedService(name: "LM Studio", urlString: "http://127.0.0.1:1234/v1/models"),
         WatchedService(name: "Image Service", urlString: "http://127.0.0.1:7861/health"),
         WatchedService(name: "Bree Server", urlString: "http://10.0.100.232:3000/health"),
