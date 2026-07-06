@@ -10,6 +10,7 @@
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import AVFoundation
 
 /// Watches an output directory and ingests new images into DAMStore.
 /// MainActor-isolated so its @Observable state is only mutated on the
@@ -302,9 +303,13 @@ public final class AssetIngestor {
 
     // MARK: - Asset Building
 
+    static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "webm"]
+
     private func buildAsset(from path: String) throws -> DAMAsset {
         let fm = FileManager.default
         let filename = (path as NSString).lastPathComponent
+        let ext = (path as NSString).pathExtension.lowercased()
+        let isVideo = Self.videoExtensions.contains(ext)
 
         // File attributes.
         let attrs = try fm.attributesOfItem(atPath: path)
@@ -312,10 +317,15 @@ public final class AssetIngestor {
         let createdAt = (attrs[.creationDate] as? Date) ?? Date()
         let modifiedAt = (attrs[.modificationDate] as? Date) ?? Date()
 
-        // Image dimensions via ImageIO (no full decode).
+        // Dimensions: ImageIO for images, AVAsset for video.
         var width: Int?
         var height: Int?
-        if let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) {
+        if isVideo {
+            if let track = AVURLAsset(url: URL(fileURLWithPath: path)).tracks(withMediaType: .video).first {
+                let size = track.naturalSize.applying(track.preferredTransform)
+                width = Int(abs(size.width)); height = Int(abs(size.height))
+            }
+        } else if let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) {
             if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
                 width = props[kCGImagePropertyPixelWidth as String] as? Int
                 height = props[kCGImagePropertyPixelHeight as String] as? Int
@@ -326,7 +336,7 @@ public final class AssetIngestor {
         let sidecar = readSidecar(for: path)
 
         return DAMAsset(
-            kind: "image",
+            kind: isVideo ? "video" : "image",
             filename: filename,
             absolutePath: path,
             fileSize: fileSize,
@@ -401,6 +411,14 @@ public final class AssetIngestor {
         // Skip if thumbnail already exists.
         guard !FileManager.default.fileExists(atPath: thumbPath) else { return }
 
+        // Video: grab a representative frame with AVAssetImageGenerator.
+        let ext = (imagePath as NSString).pathExtension.lowercased()
+        if videoExtensions.contains(ext) {
+            generateVideoThumbnail(from: imagePath, to: thumbPath,
+                                   maxDimension: maxDimension, jpegQuality: jpegQuality)
+            return
+        }
+
         guard let source = CGImageSourceCreateWithURL(
             URL(fileURLWithPath: imagePath) as CFURL, nil
         ) else { return }
@@ -429,6 +447,25 @@ public final class AssetIngestor {
         CGImageDestinationFinalize(dest)
     }
 
+    private nonisolated static func generateVideoThumbnail(
+        from videoPath: String, to thumbPath: String,
+        maxDimension: CGFloat, jpegQuality: CGFloat
+    ) {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: videoPath))
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: maxDimension, height: maxDimension)
+        // A frame ~1s in (or the first frame for very short clips).
+        let dur = asset.duration.seconds
+        let time = CMTime(seconds: min(1.0, max(0, dur / 2)), preferredTimescale: 600)
+        guard let cg = try? gen.copyCGImage(at: time, actualTime: nil) else { return }
+        guard let dest = CGImageDestinationCreateWithURL(
+            URL(fileURLWithPath: thumbPath) as CFURL, UTType.jpeg.identifier as CFString, 1, nil
+        ) else { return }
+        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary)
+        CGImageDestinationFinalize(dest)
+    }
+
     /// Returns the thumbnail file path for a given asset ID.
     public func thumbnailPath(for assetId: String) -> String {
         (thumbnailDirectory as NSString).appendingPathComponent("\(assetId).jpg")
@@ -438,7 +475,7 @@ public final class AssetIngestor {
 
     private func isImageFile(_ filename: String) -> Bool {
         let ext = (filename as NSString).pathExtension.lowercased()
-        return ext == "png" || ext == "jpg" || ext == "jpeg"
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || Self.videoExtensions.contains(ext)
     }
 
     private func isFileStable(at path: String) -> Bool {

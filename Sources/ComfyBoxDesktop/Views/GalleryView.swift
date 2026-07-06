@@ -7,6 +7,7 @@
 // selection, Quick Look via Space bar.
 
 import SwiftUI
+import AVKit
 import AppKit
 import LocalAuthentication
 
@@ -543,6 +544,15 @@ struct GalleryView: View {
                             .padding(8)
                             .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
                             .onTapGesture { requestNSFWUnlock() }
+                        }
+                    }
+                    .overlay(alignment: .bottomLeading) {
+                        if asset.kind == "video" {
+                            Image(systemName: "play.circle.fill")
+                                .font(.title3)
+                                .foregroundStyle(.white)
+                                .shadow(radius: 2)
+                                .padding(6)
                         }
                     }
                     .overlay(alignment: .topLeading) {
@@ -1491,7 +1501,11 @@ private struct GalleryLightbox: View {
                 .onTapGesture { onClose() }
 
             Group {
-                if let image {
+                if asset?.kind == "video", let path = asset?.absolutePath {
+                    VideoPlayer(player: AVPlayer(url: URL(fileURLWithPath: path)))
+                        .aspectRatio(contentMode: .fit)
+                        .padding(24)
+                } else if let image {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
