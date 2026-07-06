@@ -19,11 +19,28 @@ public final class ServerHealthService {
     public private(set) var lastFetched: Date?
     public private(set) var isLoading = false
 
+    private var polling = false
+
     public init(endpoint: String = ServerHealthService.defaultEndpoint) {
         self.endpoint = endpoint
     }
 
     public nonisolated static let defaultEndpoint = "http://10.0.100.232:3777/v1/tools/execute"
+
+    /// Pull periodically (the desktop pulls from the server; no server push).
+    /// Idempotent — a second call is a no-op.
+    public func startPolling(every seconds: UInt64 = 60) {
+        guard !polling else { return }
+        polling = true
+        Task { [weak self] in
+            while let self, self.polling {
+                await self.fetch()
+                try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            }
+        }
+    }
+
+    public func stopPolling() { polling = false }
 
     /// Dig the `get_server_health` payload out of a tools/execute envelope.
     /// Handles a bare object, `{result: …}`, or MCP `{content:[{text: "json"}]}`.

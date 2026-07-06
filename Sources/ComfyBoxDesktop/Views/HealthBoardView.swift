@@ -68,7 +68,12 @@ struct HealthBoardView: View {
         .navigationTitle("Health")
         .task { await loadActivity() }
         .task { await pollServerMetrics() }
-        .task { await serverHealth.fetch() }
+        .task {
+            if let ep = DesktopSettings.load().serverHealthEndpoint, !ep.isEmpty {
+                serverHealth.endpoint = ep
+            }
+            serverHealth.startPolling(every: 60)
+        }
     }
 
     /// Refresh littleroundbox metrics every 15s while the pane is visible.
@@ -376,6 +381,8 @@ struct HealthBoardView: View {
                         ForEach(h.problemContainers) { c in containerCard(c) }
                     }
                 }
+                // Kira image-pipeline health (surfaced from the server).
+                if let kira = h.kira { kiraView(kira) }
                 // Suppressed alerts — ALWAYS shown (empty is a signal too).
                 suppressedAlertsView(h.suppressed)
                 // Mac pipeline reachability, if the server reports it.
@@ -422,6 +429,28 @@ struct HealthBoardView: View {
         .padding(10)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(.red.opacity(0.5), lineWidth: 1.5))
+    }
+
+    private func kiraView(_ k: ServerHealthKira) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Image(systemName: k.isHealthy ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    .foregroundStyle(k.isHealthy ? Color.green : Color.orange)
+                Text("Kira pipeline").font(.caption.weight(.semibold))
+                if let state = k.state { Text(state).font(.caption2).foregroundStyle(.secondary) }
+            }
+            HStack(spacing: 14) {
+                if let p = k.poolStock { Text("pool: \(p)").font(.caption2).foregroundStyle(.secondary) }
+                if let b = k.lastBuild {
+                    Text("last build: \(b)\(k.lastBuildStatus.map { " (\($0))" } ?? "")")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let w = k.watchdog { Text("watchdog: \(w)").font(.caption2).foregroundStyle(.secondary) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder

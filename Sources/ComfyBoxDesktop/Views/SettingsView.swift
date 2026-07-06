@@ -84,6 +84,8 @@ struct DesktopSettings: Codable {
     /// Cloud generation-provider API keys (Replicate, Fal).
     var replicateApiKey: String?
     var falApiKey: String?
+    /// Littleroundbox get_server_health endpoint (MCP tools/execute).
+    var serverHealthEndpoint: String?
 
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
@@ -115,7 +117,8 @@ struct DesktopSettings: Codable {
         videoFrames: nil,
         videoSteps: nil,
         replicateApiKey: nil,
-        falApiKey: nil
+        falApiKey: nil,
+        serverHealthEndpoint: nil
     )
 
     /// Map the persisted scale step to SwiftUI's type-size ladder.

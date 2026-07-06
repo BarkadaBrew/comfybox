@@ -16,11 +16,12 @@ public struct ServerHealth: Decodable, Sendable, Equatable {
     public var services: [ServerHealthUnit]? = nil
     public var containers: [ServerHealthContainer]? = nil
     public var macPipeline: [ServerHealthUnit]? = nil
+    public var kira: ServerHealthKira? = nil
     public var suppressedAlerts: [ServerHealthSuppressed]? = nil
     public var checkedAt: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case summary, system, services, containers
+        case summary, system, services, containers, kira
         case macPipeline = "mac_pipeline"
         case suppressedAlerts = "suppressed_alerts"
         case checkedAt = "checked_at"
@@ -41,6 +42,29 @@ public struct ServerHealthSystem: Decodable, Sendable, Equatable {
     public var memory: String?
     public var load: String?
     public var uptime: String?
+}
+
+/// Kira image-pipeline health (surfaced FROM the server, not run by ComfyBox):
+/// character/LoRA pool stock, last nightly build, watchdog state.
+public struct ServerHealthKira: Decodable, Sendable, Equatable {
+    public var state: String?
+    public var poolStock: Int?
+    public var lastBuild: String?
+    public var lastBuildStatus: String?
+    public var watchdog: String?
+    public var detail: String?
+
+    enum CodingKeys: String, CodingKey {
+        case state, watchdog, detail
+        case poolStock = "pool_stock"
+        case lastBuild = "last_build"
+        case lastBuildStatus = "last_build_status"
+    }
+
+    public var isHealthy: Bool {
+        let s = (state ?? lastBuildStatus ?? "").lowercased()
+        return ["ok", "healthy", "success", "up", "green"].contains(s)
+    }
 }
 
 public struct ServerHealthUnit: Decodable, Sendable, Equatable, Identifiable {
