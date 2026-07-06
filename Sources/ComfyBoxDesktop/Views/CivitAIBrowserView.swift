@@ -8,25 +8,72 @@
 
 import SwiftUI
 
+/// A user-facing filter label mapped to the CivitAI API value (nil = no filter).
+struct CivitAIFilterOption: Hashable {
+    let label: String
+    let apiValue: String?
+}
+
+/// Which CivitAI host to query. `.red` is the uncensored mirror; it defaults
+/// NSFW on. Both speak the same /api/v1 shape.
+enum CivitAISource: String, CaseIterable, Identifiable {
+    case com = "civitai.com"
+    case red = "civitai.red"
+    var id: String { rawValue }
+    var baseURL: URL { URL(string: "https://\(rawValue)")! }
+    var defaultsNSFW: Bool { self == .red }
+}
+
 struct CivitAIBrowserView: View {
     @Bindable var engine: EngineService
     var promptLibrary: PromptLibraryStore?
 
     @State private var query: String = ""
-    @State private var typeFilter: String = "LORA"
-    @State private var baseModelFilter: String = "Z-Image"
+    @State private var source: CivitAISource = .com
+    @State private var typeFilter = CivitAIFilterOption(label: "LoRA", apiValue: "LORA")
+    @State private var baseModelFilter = CivitAIFilterOption(label: "Z-Image", apiValue: "Z-Image")
     @State private var sort: CivitAIClient.SortOrder = .mostDownloaded
+    @State private var period: CivitAIClient.Period = .allTime
+    @State private var includeNSFW = false
     @State private var results: [CivitAIModel] = []
     @State private var nextCursor: String?
     @State private var isLoading = false
     @State private var loadError: String?
     @State private var selected: CivitAIModel?
 
-    private static let typeOptions = ["LORA", "Checkpoint", "All"]
-    private static let baseModelOptions = ["Z-Image", "All"]
+    private static let typeOptions: [CivitAIFilterOption] = [
+        .init(label: "LoRA", apiValue: "LORA"),
+        .init(label: "LyCORIS", apiValue: "LoCon"),
+        .init(label: "Checkpoint", apiValue: "Checkpoint"),
+        .init(label: "Embedding", apiValue: "TextualInversion"),
+        .init(label: "ControlNet", apiValue: "Controlnet"),
+        .init(label: "VAE", apiValue: "VAE"),
+        .init(label: "Poses", apiValue: "Poses"),
+        .init(label: "Wildcards", apiValue: "Wildcards"),
+        .init(label: "All types", apiValue: nil),
+    ]
+
+    private static let baseModelOptions: [CivitAIFilterOption] = [
+        .init(label: "Z-Image", apiValue: "Z-Image"),
+        .init(label: "Flux.1 D", apiValue: "Flux.1 D"),
+        .init(label: "Flux.1 S", apiValue: "Flux.1 S"),
+        .init(label: "Qwen", apiValue: "Qwen"),
+        .init(label: "SDXL 1.0", apiValue: "SDXL 1.0"),
+        .init(label: "Pony", apiValue: "Pony"),
+        .init(label: "Illustrious", apiValue: "Illustrious"),
+        .init(label: "SD 1.5", apiValue: "SD 1.5"),
+        .init(label: "SD 3.5", apiValue: "SD 3.5"),
+        .init(label: "Wan Video", apiValue: "Wan Video"),
+        .init(label: "All base models", apiValue: nil),
+    ]
+
+    private func sortLabel(_ s: CivitAIClient.SortOrder) -> String { s.rawValue }
+    private func periodLabel(_ p: CivitAIClient.Period) -> String {
+        p == .allTime ? "All Time" : p.rawValue
+    }
 
     private var client: CivitAIClient {
-        CivitAIClient(apiKey: DesktopSettings.load().civitaiApiKey)
+        CivitAIClient(baseURL: source.baseURL, apiKey: DesktopSettings.load().civitaiApiKey)
     }
 
     var body: some View {
@@ -57,41 +104,87 @@ struct CivitAIBrowserView: View {
     }
 
     private var toolbar: some View {
-        HStack(spacing: 10) {
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search CivitAI…", text: $query)
-                    .textFieldStyle(.plain)
-                    .frame(maxWidth: 220)
-                    .onSubmit { Task { await search(reset: true) } }
-            }
-            .padding(6)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+        VStack(spacing: 8) {
+            // Row 1: source + search + refresh
+            HStack(spacing: 10) {
+                Picker("", selection: $source) {
+                    ForEach(CivitAISource.allCases) { src in
+                        Text(src.rawValue).tag(src)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .onChange(of: source) { _, newValue in
+                    includeNSFW = newValue.defaultsNSFW
+                    Task { await search(reset: true) }
+                }
 
-            Picker("Type", selection: $typeFilter) {
-                ForEach(Self.typeOptions, id: \.self) { Text($0).tag($0) }
-            }
-            .fixedSize()
-            .onChange(of: typeFilter) { _, _ in Task { await search(reset: true) } }
+                HStack {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("Search \(source.rawValue)…", text: $query)
+                        .textFieldStyle(.plain)
+                        .onSubmit { Task { await search(reset: true) } }
+                    if !query.isEmpty {
+                        Button { query = ""; Task { await search(reset: true) } } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                        }.buttonStyle(.plain)
+                    }
+                }
+                .padding(6)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
 
-            Picker("Base", selection: $baseModelFilter) {
-                ForEach(Self.baseModelOptions, id: \.self) { Text($0).tag($0) }
+                if isLoading { ProgressView().controlSize(.small) }
+                Button { Task { await search(reset: true) } } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless)
+                    .help("Refresh")
             }
-            .fixedSize()
-            .onChange(of: baseModelFilter) { _, _ in Task { await search(reset: true) } }
 
-            Picker("Sort", selection: $sort) {
-                ForEach(CivitAIClient.SortOrder.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            // Row 2: filter pulldowns
+            HStack(spacing: 10) {
+                labeledPicker("Type", systemImage: "square.stack.3d.up") {
+                    Picker("", selection: $typeFilter) {
+                        ForEach(Self.typeOptions, id: \.self) { Text($0.label).tag($0) }
+                    }.labelsHidden().fixedSize()
+                    .onChange(of: typeFilter) { _, _ in Task { await search(reset: true) } }
+                }
+                labeledPicker("Base", systemImage: "cube") {
+                    Picker("", selection: $baseModelFilter) {
+                        ForEach(Self.baseModelOptions, id: \.self) { Text($0.label).tag($0) }
+                    }.labelsHidden().fixedSize()
+                    .onChange(of: baseModelFilter) { _, _ in Task { await search(reset: true) } }
+                }
+                labeledPicker("Sort", systemImage: "arrow.up.arrow.down") {
+                    Picker("", selection: $sort) {
+                        ForEach(CivitAIClient.SortOrder.allCases, id: \.self) { Text(sortLabel($0)).tag($0) }
+                    }.labelsHidden().fixedSize()
+                    .onChange(of: sort) { _, _ in Task { await search(reset: true) } }
+                }
+                labeledPicker("Period", systemImage: "calendar") {
+                    Picker("", selection: $period) {
+                        ForEach(CivitAIClient.Period.allCases, id: \.self) { Text(periodLabel($0)).tag($0) }
+                    }.labelsHidden().fixedSize()
+                    .onChange(of: period) { _, _ in Task { await search(reset: true) } }
+                }
+
+                Spacer()
+
+                Toggle(isOn: $includeNSFW) {
+                    Label("NSFW", systemImage: includeNSFW ? "eye" : "eye.slash")
+                }
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .onChange(of: includeNSFW) { _, _ in Task { await search(reset: true) } }
+                .help("Include adult content")
             }
-            .fixedSize()
-            .onChange(of: sort) { _, _ in Task { await search(reset: true) } }
-
-            Spacer()
-            if isLoading { ProgressView().controlSize(.small) }
-            Button { Task { await search(reset: true) } } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.borderless)
         }
         .padding(12)
+    }
+
+    private func labeledPicker<Content: View>(_ title: String, systemImage: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage).font(.caption2).foregroundStyle(.secondary)
+            content()
+        }
     }
 
     private var resultsGrid: some View {
@@ -129,15 +222,17 @@ struct CivitAIBrowserView: View {
         do {
             let page = try await client.searchModels(
                 query: query,
-                types: typeFilter == "All" ? [] : [typeFilter],
-                baseModel: baseModelFilter == "All" ? nil : baseModelFilter,
+                types: typeFilter.apiValue.map { [$0] } ?? [],
+                baseModel: baseModelFilter.apiValue,
                 sort: sort,
+                period: period,
+                nsfw: includeNSFW,
                 cursor: reset ? nil : nextCursor
             )
             results = reset ? page.items : results + page.items
             nextCursor = page.nextCursor
         } catch {
-            loadError = "CivitAI request failed: \(error.localizedDescription)"
+            loadError = "\(source.rawValue) request failed: \(error.localizedDescription)"
         }
     }
 }

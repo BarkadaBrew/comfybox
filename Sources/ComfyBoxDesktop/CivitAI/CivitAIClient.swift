@@ -11,7 +11,17 @@ public struct CivitAIClient: Sendable {
     public enum SortOrder: String, CaseIterable, Sendable {
         case highestRated = "Highest Rated"
         case mostDownloaded = "Most Downloaded"
+        case mostLiked = "Most Liked"
         case newest = "Newest"
+    }
+
+    /// Time window the sort applies over (CivitAI `period`).
+    public enum Period: String, CaseIterable, Sendable {
+        case allTime = "AllTime"
+        case year = "Year"
+        case month = "Month"
+        case week = "Week"
+        case day = "Day"
     }
 
     public let baseURL: URL
@@ -45,6 +55,7 @@ public struct CivitAIClient: Sendable {
         types: [String] = [],
         baseModel: String? = nil,
         sort: SortOrder = .mostDownloaded,
+        period: Period = .allTime,
         nsfw: Bool = false,
         cursor: String? = nil,
         limit: Int = 24
@@ -52,6 +63,7 @@ public struct CivitAIClient: Sendable {
         var items = [
             URLQueryItem(name: "limit", value: String(limit)),
             URLQueryItem(name: "sort", value: sort.rawValue),
+            URLQueryItem(name: "period", value: period.rawValue),
         ]
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { items.append(URLQueryItem(name: "query", value: trimmed)) }
@@ -59,7 +71,9 @@ public struct CivitAIClient: Sendable {
         if let baseModel, !baseModel.isEmpty {
             items.append(URLQueryItem(name: "baseModels", value: baseModel))
         }
-        if nsfw { items.append(URLQueryItem(name: "nsfw", value: "true")) }
+        // `nsfw=true` includes adult content; omitting it lets the server default
+        // (SFW). civitai.red callers pass true.
+        items.append(URLQueryItem(name: "nsfw", value: nsfw ? "true" : "false"))
         if let cursor { items.append(URLQueryItem(name: "cursor", value: cursor)) }
 
         guard let request = request(path: "api/v1/models", query: items) else {
