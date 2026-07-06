@@ -154,6 +154,8 @@ struct GenerationView: View {
                         if model.hasPrefix("/") { withModel.customModelPath = model }
                         else { withModel.model = model }
                     }
+                    // Capture the seed so the preset reproduces exactly (0/empty = random).
+                    if let s = UInt64(seedText), s > 0 { withModel.seed = Int(truncatingIfNeeded: s) }
                     let toSave = withModel
                     Task { try? await engine.savePreset(toSave) }
                     showingSavePreset = false
@@ -851,6 +853,8 @@ struct GenerationView: View {
         prompt = preset.promptTemplate
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
+        // Restore a saved seed (nil/0 = random).
+        seedText = (preset.seed ?? 0) > 0 ? String(preset.seed!) : ""
 
         // Find a matching resolution preset, else carry the preset's exact
         // dimensions through the custom fields.

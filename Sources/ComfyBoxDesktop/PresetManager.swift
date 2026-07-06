@@ -18,6 +18,8 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var width: Int
     public var height: Int
     public var sampler: String?
+    /// Fixed seed to reproduce the preset (nil/0 = random).
+    public var seed: UInt64?
     public var createdAt: Date
     public var modifiedAt: Date
 
@@ -32,9 +34,11 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         width: Int = 1024,
         height: Int = 1024,
         sampler: String? = nil,
+        seed: UInt64? = nil,
         createdAt: Date = Date(),
         modifiedAt: Date = Date()
     ) {
+        self.seed = seed
         self.id = id
         self.name = name
         self.promptTemplate = promptTemplate
