@@ -69,6 +69,24 @@ items), /v1/queue 200, /v1/presets/import-legacy {imported:0} (idempotent),
 /v1/enhance success (528-char reply from Dan's model). All session server
 routes now operational.
 
+## LTX-2 integrated into ComfyBox server (2026-07-06)
+
+Local video generation wired into the warm server:
+- LTX2VideoGenerator (reusable service lifted from the ltx2-i2v CLI): lazy
+  model load, T2V + I2V, chunked extend, MP4 out; pure helpers tested (b34b0ce).
+- /v1/video/generate local backend behind --ltx2-weights + --ltx2-gemma; runs
+  through the coordinator queue (.localVideo op) so it never shares the GPU
+  with an image render; falls through to Replicate when unset (1f2ebce).
+- API reference + serve help updated. 574 server tests pass.
+- Weights present at ~/Models/ltx2-distilled (38GB transformer + VAE +
+  upsamplers). Gemma text-encoder path NOT at the default HF location — the
+  operator must pass --ltx2-gemma <snapshot dir>.
+- NOT YET verified with a live 38GB render (would evict the image model + take
+  minutes; needs a dedicated run, ideally a separate instance, with the owner).
+  Do NOT enable --ltx2-weights on the shared image-serving daemon casually.
+- Follow-on: desktop video UI (a Motion/Animate tab or gallery "Animate"
+  action calling /v1/video/generate).
+
 ## img2img SHIPPED + verified live (2026-07-05)
 
 Un-deferred and delivered:
