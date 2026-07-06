@@ -303,6 +303,14 @@ private struct CivitAIModelSheet: View {
         model.modelVersions.first(where: { $0.id == selectedVersionId }) ?? model.modelVersions.first
     }
 
+    /// The model's page on whichever CivitAI host we're browsing.
+    private var modelWebURL: URL? {
+        guard model.id > 0 else { return nil }
+        var s = "\(client.baseURL.absoluteString)/models/\(model.id)"
+        if let vid = version?.id, vid > 0 { s += "?modelVersionId=\(vid)" }
+        return URL(string: s)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
@@ -316,6 +324,12 @@ private struct CivitAIModelSheet: View {
                     }
                 }
                 Spacer()
+                if let url = modelWebURL {
+                    Link(destination: url) {
+                        Label("View on CivitAI", systemImage: "safari")
+                    }
+                    .font(.callout)
+                }
                 Button { dismiss() } label: { Image(systemName: "xmark.circle.fill").font(.title3) }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
             }
@@ -435,6 +449,47 @@ private struct CivitAIModelSheet: View {
         scrapedImages = (try? await client.images(modelVersionId: version.id)) ?? []
     }
 
+    /// All prompts we've collected for the current version (inline + scraped).
+    private var collectedPrompts: [String] {
+        guard let version else { return [] }
+        let inline = version.images.compactMap(\.prompt)
+        let scraped = scrapedImages.compactMap(\.prompt)
+        return (Array(NSOrderedSet(array: inline + scraped)) as? [String]) ?? inline
+    }
+
+    /// Persist a LoRA's trigger words + sample prompts alongside the downloaded
+    /// file (a `<name>.civitai.json` sidecar) and into the Prompt Library, so
+    /// they travel with the import automatically.
+    private func saveLoraMetadata(next file: URL) {
+        let triggers = version?.trainedWords ?? []
+        let prompts = Array(collectedPrompts.prefix(8))
+        let meta: [String: Any] = [
+            "model": model.name,
+            "modelId": model.id,
+            "version": version?.name ?? "",
+            "baseModel": version?.baseModel ?? "",
+            "creator": model.creatorName ?? "",
+            "triggerWords": triggers,
+            "prompts": prompts,
+            "url": modelWebURL?.absoluteString ?? "",
+        ]
+        let sidecar = file.deletingPathExtension().appendingPathExtension("civitai.json")
+        if let data = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: sidecar)
+        }
+        // Push into the Prompt Library, tagged with the LoRA name + trigger words.
+        if let promptLibrary {
+            let tags = ["civitai", "lora", model.name] + triggers
+            if !triggers.isEmpty {
+                _ = promptLibrary.add(title: "\(model.name) — triggers",
+                                      text: triggers.joined(separator: ", "), tags: tags)
+            }
+            for prompt in prompts.prefix(4) {
+                _ = promptLibrary.add(title: model.name, text: prompt, tags: tags)
+            }
+        }
+    }
+
     private func download(_ file: CivitAIFile) async {
         downloadProgress = 0
         statusMessage = nil
@@ -445,8 +500,9 @@ private struct CivitAIModelSheet: View {
             downloadProgress = nil
             statusMessage = "Saved to \(destination.path). Rescanning library…"
             statusIsError = false
+            saveLoraMetadata(next: destination)
             try? await engine.scanLoras()
-            statusMessage = "Saved to \(destination.lastPathComponent) and library rescanned."
+            statusMessage = "Saved \(destination.lastPathComponent) — trigger words + \(min(collectedPrompts.count, 8)) sample prompts imported."
         } catch {
             downloadProgress = nil
             statusMessage = "Download failed: \(error.localizedDescription)"

@@ -111,30 +111,52 @@ public struct CivitAIClient: Sendable {
     }
 
     /// Download a model file into `directory`, reporting fractional progress.
-    /// The API key rides along as a token query parameter (CivitAI's download
-    /// endpoint convention). Returns the final file URL.
+    /// Auth rides along both as a `?token=` query parameter and an
+    /// `Authorization: Bearer` header; a redirect delegate strips the header
+    /// when CivitAI hands off to its CDN (which uses its own query-param auth
+    /// and would reject a stray Bearer header). Returns the final file URL.
     public func download(
         file: CivitAIFile,
         to directory: URL = CivitAIClient.loraLibraryDirectory(),
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> URL {
         guard var components = URLComponents(string: file.downloadUrl) else {
-            throw URLError(.badURL)
+            throw CivitAIDownloadError.badURL
         }
         if let apiKey {
             var query = components.queryItems ?? []
             query.append(URLQueryItem(name: "token", value: apiKey))
             components.queryItems = query
         }
-        guard let url = components.url else { throw URLError(.badURL) }
+        guard let url = components.url else { throw CivitAIDownloadError.badURL }
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 3600
         request.setValue("ComfyBox/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
+        if let apiKey {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw URLError(.badServerResponse)
+        let session = URLSession(
+            configuration: .default,
+            delegate: CivitAIRedirectStripper(originalHost: url.host),
+            delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CivitAIDownloadError.http(-1, "No HTTP response")
+        }
+        guard http.statusCode == 200 else {
+            // Read a little of the body for a useful message.
+            var snippet = ""
+            var count = 0
+            for try await byte in bytes {
+                snippet.append(Character(UnicodeScalar(byte)))
+                count += 1
+                if count >= 300 { break }
+            }
+            throw CivitAIDownloadError.forStatus(http.statusCode, body: snippet, hasKey: apiKey != nil)
         }
 
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -177,5 +199,56 @@ public struct CivitAIClient: Sendable {
         try FileManager.default.moveItem(at: temp, to: destination)
         progress?(1.0)
         return destination
+    }
+}
+
+/// Strips the `Authorization` header when a redirect crosses to a different
+/// host — CivitAI's CDN (Backblaze B2 / Cloudflare) authenticates via its own
+/// signed query params and rejects a forwarded Bearer header.
+final class CivitAIRedirectStripper: NSObject, URLSessionTaskDelegate {
+    private let originalHost: String?
+    init(originalHost: String?) { self.originalHost = originalHost }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        var newRequest = request
+        if request.url?.host != originalHost {
+            newRequest.setValue(nil, forHTTPHeaderField: "Authorization")
+        }
+        completionHandler(newRequest)
+    }
+}
+
+public enum CivitAIDownloadError: LocalizedError {
+    case badURL
+    case authRequired(hasKey: Bool)
+    case notFound
+    case http(Int, String)
+
+    /// Map an HTTP status to a friendly error.
+    static func forStatus(_ code: Int, body: String, hasKey: Bool) -> CivitAIDownloadError {
+        switch code {
+        case 401, 403: return .authRequired(hasKey: hasKey)
+        case 404: return .notFound
+        default: return .http(code, body.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .badURL: return "Invalid download URL."
+        case .authRequired(let hasKey):
+            return hasKey
+                ? "CivitAI rejected the download — your API key may be invalid, or this model is early-access/gated for your account."
+                : "This download needs a CivitAI API key. Add one in Settings → CivitAI (some NSFW/gated models require it)."
+        case .notFound: return "That file was not found on CivitAI (it may have been removed)."
+        case .http(let code, let body):
+            let extra = body.isEmpty ? "" : " — \(body.prefix(120))"
+            return "CivitAI download failed (HTTP \(code))\(extra)"
+        }
     }
 }
