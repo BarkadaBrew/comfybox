@@ -797,6 +797,50 @@ public final class EngineService {
         return parseNearline(data)
     }
 
+    /// Evict every staged nearline item to free the primary drive. Returns the
+    /// refreshed catalog and how many were evicted.
+    @discardableResult
+    public func evictAllStaged() async throws -> (catalog: NearlineCatalog?, evicted: Int) {
+        guard client != nil, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let catalog = await fetchNearline()
+        let staged = catalog?.items.filter { $0.staged } ?? []
+        var last: NearlineCatalog?
+        var count = 0
+        for item in staged {
+            if let cat = try? await nearlineAction("evict", name: item.name) { last = cat; count += 1 }
+        }
+        if last == nil { last = await fetchNearline() }
+        return (last, count)
+    }
+
+    /// Quarantine (or release) a LoRA in the server's library.
+    public func quarantineLora(id: String, quarantine: Bool) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let path = "/v1/loras/\(id)/quarantine"
+        let (status, data): (Int, Data)
+        if quarantine {
+            (status, data) = try await client.post(path, body: Data("{}".utf8))
+        } else {
+            (status, data) = try await client.delete(path)
+        }
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Quarantine failed")
+        }
+        await refreshLoras()
+    }
+
+    /// Free/total bytes of the volume backing the home directory (the primary
+    /// drive staged copies land on).
+    public nonisolated static func primaryDiskInfo() -> (freeGB: Double, totalGB: Double)? {
+        let url = URL(fileURLWithPath: NSHomeDirectory())
+        guard let values = try? url.resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]) else { return nil }
+        let gb = 1024.0 * 1024.0 * 1024.0
+        let free = Double(values.volumeAvailableCapacityForImportantUsage ?? 0) / gb
+        let total = Double(values.volumeTotalCapacity ?? 0) / gb
+        return total > 0 ? (free, total) : nil
+    }
+
     // MARK: - Video (LTX-2 local, /v1/video/generate)
 
     public struct VideoRequest: Sendable {
