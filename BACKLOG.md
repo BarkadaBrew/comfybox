@@ -69,12 +69,25 @@ items), /v1/queue 200, /v1/presets/import-legacy {imported:0} (idempotent),
 /v1/enhance success (528-char reply from Dan's model). All session server
 routes now operational.
 
-## Next: un-deferring img2img (foundational i2i tier)
+## img2img SHIPPED + verified live (2026-07-05)
 
-With everything else done and the owner signalling continued momentum, building
-img2img in Generate next — it unlocks the whole Draw Things tier (camera V2,
-inpaint/outpaint, ControlNet, moodboard). Backend exists: ImageToImagePipeline
-(imageStrength→denoise). If the owner still wants i2i held, redirect.
+Un-deferred and delivered:
+- GenerationRequest gains initImagePath + imageStrength → /v1/generate payload
+  (imagePath + imageStrength). "Reference (img2img)" section in Generate:
+  choose image, thumbnail, Strength slider, Remove (a186098).
+- "Use as Reference (img2img)" in Gallery + Canvas menus → Generate (684b093).
+- VERIFIED LIVE: img2img render of the apple as oil-painting kept the
+  reference composition; server accepted imagePath+imageStrength. NOTE: server
+  sandboxes outputPath to ~/Pictures/ComfyBox.
+
+This unlocks the rest of the Draw Things tier. Next candidates (all bigger,
+owner-steer welcome):
+- Camera V2 — reference + camera directive already works manually; a "Camera
+  Angles" batch action (N angles from one reference) would automate it.
+- Inpaint/outpaint on Canvas — server supports inpaintImageData+maskData;
+  needs a mask-painting UI (substantial, own effort).
+- ControlNet UI — pose/depth/canny reference (enqueueControlGenerate exists).
+- Moodboard — multi-reference conditioning.
 
 ## GUI verification owed on owner's return (laptop locked, validated by tests)
 
