@@ -33,6 +33,15 @@ final class MfluxServiceTests: XCTestCase {
         XCTAssertEqual(args[lpIdx + 2], "/b.safetensors")
     }
 
+    func testGenerateArgsLoraStyleForIdentity() {
+        let args = MfluxService.generateArgs(.init(
+            model: "dev-krea", prompt: "portrait", imagePath: "/face.png",
+            imageStrength: 0.65, loraStyle: "identity", output: "/o.png"))
+        XCTAssertEqual(valueAfter("--lora-style", in: args), "identity")
+        XCTAssertEqual(valueAfter("--image-path", in: args), "/face.png")
+        XCTAssertEqual(valueAfter("--image-strength", in: args), "0.65")
+    }
+
     func testGenerateArgsOmitsOptional() {
         let args = MfluxService.generateArgs(.init(model: "schnell", prompt: "x", output: "/o.png"))
         XCTAssertFalse(args.contains("--quantize"))

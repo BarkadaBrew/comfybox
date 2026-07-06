@@ -70,6 +70,8 @@ public final class MfluxService {
         public var loraScales: [Double]
         public var imagePath: String?
         public var imageStrength: Double?
+        /// Built-in LoRA style (e.g. "identity" for face-identity generation).
+        public var loraStyle: String?
         public var lowRam: Bool
         public var output: String
 
@@ -78,13 +80,13 @@ public final class MfluxService {
                     guidance: Double? = nil, seed: UInt64? = nil, quantize: Int? = nil,
                     loraPaths: [String] = [], loraScales: [Double] = [],
                     imagePath: String? = nil, imageStrength: Double? = nil,
-                    lowRam: Bool = false, output: String) {
+                    loraStyle: String? = nil, lowRam: Bool = false, output: String) {
             self.model = model; self.prompt = prompt; self.negativePrompt = negativePrompt
             self.width = width; self.height = height; self.steps = steps
             self.guidance = guidance; self.seed = seed; self.quantize = quantize
             self.loraPaths = loraPaths; self.loraScales = loraScales
             self.imagePath = imagePath; self.imageStrength = imageStrength
-            self.lowRam = lowRam; self.output = output
+            self.loraStyle = loraStyle; self.lowRam = lowRam; self.output = output
         }
     }
 
@@ -107,6 +109,7 @@ public final class MfluxService {
                 args.append("--lora-scales"); args += o.loraScales.map { String($0) }
             }
         }
+        if let style = o.loraStyle, !style.isEmpty { args += ["--lora-style", style] }
         if let img = o.imagePath, !img.isEmpty {
             args += ["--image-path", img]
             if let st = o.imageStrength { args += ["--image-strength", String(st)] }

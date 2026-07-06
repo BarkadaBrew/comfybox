@@ -52,6 +52,7 @@ struct ComfyBoxDesktopApp: App {
         case motion = "Motion"
         case mflux = "mflux"
         case decoupage = "Découpage"
+        case face = "Face"
         case bree = "Bree"
         case canvas = "Canvas"
         case civitai = "CivitAI"
@@ -70,7 +71,7 @@ struct ComfyBoxDesktopApp: App {
 
         var section: Section {
             switch self {
-            case .generate, .motion, .mflux, .decoupage, .canvas, .assistant: return .create
+            case .generate, .motion, .mflux, .decoupage, .face, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models: return .library
             case .dashboard, .health, .server: return .operate
             case .bree: return .suite
@@ -94,6 +95,7 @@ struct ComfyBoxDesktopApp: App {
             case .motion: return "film.stack"
             case .mflux: return "cube.transparent"
             case .decoupage: return "square.3.layers.3d"
+            case .face: return "person.crop.circle.badge.checkmark"
             case .bree: return "brain.head.profile"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
@@ -122,6 +124,7 @@ struct ComfyBoxDesktopApp: App {
             case .bree: return "b"
             case .models: return "l"
             case .decoupage: return "d"
+            case .face: return "f"
             }
         }
     }
@@ -367,6 +370,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .decoupage:
             DecoupageView(decoupage: decoupageService, ingestor: ingestor)
+
+        case .face:
+            FaceView(mflux: mfluxService, ingestor: ingestor)
 
         case .bree:
             BreeView(bree: breeService)
