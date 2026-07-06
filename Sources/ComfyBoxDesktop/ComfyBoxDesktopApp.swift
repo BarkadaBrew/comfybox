@@ -326,7 +326,7 @@ struct ComfyBoxDesktopApp: App {
             HealthBoardView(engine: engine, monitor: healthMonitor, store: store)
 
         case .server:
-            ServerView(engine: engine)
+            ServerView(engine: engine, store: store)
 
         case .characters:
             CharactersView(engine: engine)

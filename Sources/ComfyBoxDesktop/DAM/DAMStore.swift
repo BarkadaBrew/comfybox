@@ -167,6 +167,25 @@ public actor DAMStore {
         return results
     }
 
+    /// Creation timestamps grouped by asset kind (image / video / voice / …),
+    /// for per-type activity stats and heatmaps.
+    public func assetCreationTimestampsByKind() throws -> [String: [Date]] {
+        let sql = "SELECT kind, created_at FROM assets ORDER BY created_at ASC"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [String: [Date]] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let kind = (sqlite3_column_text(stmt, 0).map { String(cString: $0) }) ?? "image"
+            let date = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 1))
+            results[kind, default: []].append(date)
+        }
+        return results
+    }
+
     /// Distinct prompts from generated assets with use counts, most recent
     /// first (backs the prompt-history section of the Prompt Library).
     public func promptHistory(limit: Int = 100) throws -> [(prompt: String, count: Int, lastUsed: Date)] {
