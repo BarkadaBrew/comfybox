@@ -39,6 +39,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingPreset: GenerationPreset?
     @State private var gallerySearchFocusRequests: Int = 0
     @State private var showCommandPalette = false
+    @State private var showSplash = true
 
     enum AppTab: String, CaseIterable {
         case dashboard = "Dashboard"
@@ -148,6 +149,13 @@ struct ComfyBoxDesktopApp: App {
             .navigationTitle("CoffeeShop Desktop")
             .frame(minWidth: 900, minHeight: 600)
             .overlay {
+                if showSplash {
+                    SplashView(isPresented: $showSplash)
+                        .transition(.opacity)
+                        .zIndex(10)
+                }
+            }
+            .overlay {
                 if showCommandPalette {
                     ZStack(alignment: .top) {
                         Color.black.opacity(0.15).ignoresSafeArea()
@@ -182,6 +190,9 @@ struct ComfyBoxDesktopApp: App {
         }
         .defaultSize(width: 1200, height: 800)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About \(Branding.appName)") { showAboutPanel() }
+            }
             CommandGroup(after: .toolbar) {
                 Button("Command Palette") { showCommandPalette.toggle() }
                     .keyboardShortcut("k", modifiers: .command)
@@ -262,6 +273,20 @@ struct ComfyBoxDesktopApp: App {
     private func activate() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.windows.first?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Native About panel — macOS auto-includes the app icon as the logo.
+    private func showAboutPanel() {
+        let credits = NSAttributedString(
+            string: "\(Branding.tagline)\n\nThe hub for the entire Coffeeshop suite — images, video, and voice; models & LoRAs; mflux, Découpage, and face identity; stack monitoring; and Bree.\n\nPowered by the ComfyBox engine (Z-Image / MLX).",
+            attributes: [.foregroundColor: NSColor.secondaryLabelColor,
+                         .font: NSFont.systemFont(ofSize: 11)])
+        NSApplication.shared.orderFrontStandardAboutPanel(options: [
+            .applicationName: Branding.appName,
+            .applicationVersion: Branding.version,
+            .credits: credits,
+        ])
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - Command Palette
