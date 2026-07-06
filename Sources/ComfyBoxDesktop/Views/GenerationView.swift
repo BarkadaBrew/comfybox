@@ -95,6 +95,8 @@ struct GenerationView: View {
     @State private var showCharacters: Bool = false
     @State private var showCamera: Bool = false
     @State private var showLighting: Bool = false
+    /// DyPE high-resolution scaling: "none" | "ntk" | "yarn".
+    @State private var dype: String = "none"
     @State private var showAssistant: Bool = true
     // Cloud backend selection (Local / Replicate / Fal)
     @State private var backend: CloudProvider = .local
@@ -581,6 +583,22 @@ struct GenerationView: View {
                 TextField("Random", text: $seedText)
                     .textFieldStyle(.roundedBorder)
             }
+
+            // DyPE high-resolution scaling
+            VStack(alignment: .leading, spacing: 4) {
+                Text("High-res scaling (DyPE)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Picker("", selection: $dype) {
+                    Text("Off").tag("none")
+                    Text("NTK (fast)").tag("ntk")
+                    Text("YaRN (quality)").tag("yarn")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                Text("Dynamic Position Extrapolation renders natively above the model's base resolution. Use for large sizes.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
         }
     }
 
@@ -709,7 +727,8 @@ struct GenerationView: View {
             modelId: engine.currentModel,
             loras: selectedLoras,
             initImagePath: referenceImagePath,
-            imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil
+            imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
+            dype: dype == "none" ? nil : dype
         )
 
         // Cloud backend: route to Replicate / Fal instead of the local server.

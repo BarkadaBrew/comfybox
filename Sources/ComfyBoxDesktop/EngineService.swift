@@ -23,6 +23,8 @@ public struct GenerationRequest: Sendable {
     public var initImagePath: String?
     /// How much the reference constrains the result: 0 = ignore, 1 = copy.
     public var imageStrength: Float?
+    /// DyPE high-resolution scaling method: "ntk", "yarn", or nil/"none".
+    public var dype: String?
 
     public init(
         prompt: String = "",
@@ -34,7 +36,8 @@ public struct GenerationRequest: Sendable {
         modelId: String? = nil,
         loras: [LoRASelection] = [],
         initImagePath: String? = nil,
-        imageStrength: Float? = nil
+        imageStrength: Float? = nil,
+        dype: String? = nil
     ) {
         self.prompt = prompt
         self.width = width
@@ -42,6 +45,7 @@ public struct GenerationRequest: Sendable {
         self.steps = steps
         self.guidance = guidance
         self.seed = seed
+        self.dype = dype
         self.modelId = modelId
         self.loras = loras
         self.initImagePath = initImagePath
@@ -343,6 +347,10 @@ public final class EngineService {
         if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
             payloadDict["imagePath"] = initImagePath
             payloadDict["imageStrength"] = request.imageStrength ?? 0.6
+        }
+        // DyPE high-resolution scaling (ntk / yarn).
+        if let dype = request.dype, dype != "none", !dype.isEmpty {
+            payloadDict["dype"] = dype
         }
 
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
