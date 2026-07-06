@@ -31,7 +31,7 @@ struct CivitAIBrowserView: View {
     @State private var query: String = ""
     @State private var source: CivitAISource = .com
     @State private var typeFilter = CivitAIFilterOption(label: "LoRA", apiValue: "LORA")
-    @State private var baseModelFilter = CivitAIFilterOption(label: "Z-Image", apiValue: "Z-Image")
+    @State private var baseModelFilter = CivitAIFilterOption(label: "Z-Image Turbo", apiValue: "ZImageTurbo")
     @State private var sort: CivitAIClient.SortOrder = .mostDownloaded
     @State private var period: CivitAIClient.Period = .allTime
     @State private var includeNSFW = false
@@ -53,17 +53,24 @@ struct CivitAIBrowserView: View {
         .init(label: "All types", apiValue: nil),
     ]
 
+    // Values are CivitAI's exact `baseModels` API strings (verified against the
+    // live API), NOT display guesses — e.g. Z-Image is "ZImageBase"/"ZImageTurbo".
     private static let baseModelOptions: [CivitAIFilterOption] = [
-        .init(label: "Z-Image", apiValue: "Z-Image"),
-        .init(label: "Flux.1 D", apiValue: "Flux.1 D"),
-        .init(label: "Flux.1 S", apiValue: "Flux.1 S"),
+        .init(label: "Z-Image Turbo", apiValue: "ZImageTurbo"),
+        .init(label: "Z-Image Base", apiValue: "ZImageBase"),
+        .init(label: "Flux.1 Dev", apiValue: "Flux.1 D"),
+        .init(label: "Flux.1 Schnell", apiValue: "Flux.1 S"),
+        .init(label: "Flux.1 Krea", apiValue: "Flux.1 Krea"),
         .init(label: "Qwen", apiValue: "Qwen"),
+        .init(label: "Wan Video", apiValue: "Wan Video"),
+        .init(label: "LTXV 2.3", apiValue: "LTXV 2.3"),
+        .init(label: "HiDream", apiValue: "HiDream"),
         .init(label: "SDXL 1.0", apiValue: "SDXL 1.0"),
         .init(label: "Pony", apiValue: "Pony"),
         .init(label: "Illustrious", apiValue: "Illustrious"),
-        .init(label: "SD 1.5", apiValue: "SD 1.5"),
+        .init(label: "NoobAI", apiValue: "NoobAI"),
         .init(label: "SD 3.5", apiValue: "SD 3.5"),
-        .init(label: "Wan Video", apiValue: "Wan Video"),
+        .init(label: "SD 1.5", apiValue: "SD 1.5"),
         .init(label: "All base models", apiValue: nil),
     ]
 
