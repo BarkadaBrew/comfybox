@@ -13,16 +13,39 @@ struct LoRAPicker: View {
 
     @State private var searchText: String = ""
     @State private var errorMessage: String?
+    @State private var compatibleOnly: Bool = true
+
+    /// The active model's identifier for compatibility checks (family or name).
+    private var activeModel: String? {
+        engine.currentModelFamily ?? engine.currentModel
+    }
+
+    private func compatStatus(_ lora: LoRAInfo) -> LoRACompatibility.Status {
+        LoRACompatibility.status(loraCompatibility: lora.modelCompatibility, modelIdentifier: activeModel)
+    }
+
+    private func isIncompatible(_ lora: LoRAInfo) -> Bool {
+        if case .incompatible = compatStatus(lora) { return true }
+        return false
+    }
 
     private var filteredLoras: [LoRAInfo] {
-        let nonQuarantined = engine.availableLoras.filter { !$0.quarantined }
+        var base = engine.availableLoras.filter { !$0.quarantined }
+
+        // Hide LoRAs designed for a different model family (keep unknowns +
+        // selected ones so nothing already chosen silently vanishes).
+        if compatibleOnly {
+            base = base.filter { lora in
+                !isIncompatible(lora) || selectedLoras.contains { $0.id == lora.id }
+            }
+        }
 
         guard !searchText.isEmpty else {
-            return sortedLoras(nonQuarantined)
+            return sortedLoras(base)
         }
 
         let query = searchText.lowercased()
-        let filtered = nonQuarantined.filter { lora in
+        let filtered = base.filter { lora in
             lora.id.lowercased().contains(query)
                 || lora.filename.lowercased().contains(query)
                 || lora.tags.contains { $0.lowercased().contains(query) }
@@ -65,6 +88,16 @@ struct LoRAPicker: View {
                 }
                 .buttonStyle(.plain)
                 .help("Refresh LoRA library")
+            }
+
+            // Compatibility filter — hide LoRAs built for a different model.
+            if let model = activeModel, !model.isEmpty {
+                Toggle(isOn: $compatibleOnly) {
+                    Text("Only \(LoRACompatibility.label(for: LoRACompatibility.family(from: model))) LoRAs")
+                        .font(.caption2)
+                }
+                .toggleStyle(.checkbox)
+                .help("Hide LoRAs designed for a different model family")
             }
 
             // Search
@@ -176,6 +209,7 @@ struct LoRAPicker: View {
                                 .background(Color.green.opacity(0.1))
                                 .clipShape(RoundedRectangle(cornerRadius: 3))
                         }
+                        compatibilityBadge(lora)
                     }
 
                     HStack(spacing: 4) {
@@ -242,12 +276,33 @@ struct LoRAPicker: View {
         .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 
+    @ViewBuilder
+    private func compatibilityBadge(_ lora: LoRAInfo) -> some View {
+        switch compatStatus(lora) {
+        case .incompatible(let loraFam, _):
+            Text("⚠ \(LoRACompatibility.label(for: loraFam))")
+                .font(.system(size: 9))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 4).padding(.vertical, 1)
+                .background(Color.orange.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .help("This LoRA is built for \(LoRACompatibility.label(for: loraFam)), not the active model.")
+        case .compatible, .unknown:
+            EmptyView()
+        }
+    }
+
     // MARK: - Actions
 
     private func toggleLora(_ lora: LoRAInfo) {
         if let index = selectedLoras.firstIndex(where: { $0.id == lora.id }) {
             selectedLoras.remove(at: index)
+            errorMessage = nil
         } else {
+            // Warn (don't block) when selecting a LoRA for a different model.
+            if case .incompatible(let loraFam, let modelFam) = compatStatus(lora) {
+                errorMessage = "⚠ \(lora.id) is a \(LoRACompatibility.label(for: loraFam)) LoRA but the active model is \(LoRACompatibility.label(for: modelFam)) — results may be poor."
+            }
             selectedLoras.append(LoRASelection(
                 id: lora.id,
                 filename: lora.filename,

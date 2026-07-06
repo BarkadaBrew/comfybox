@@ -60,6 +60,7 @@ struct CivitAIBrowserView: View {
         .init(label: "Z-Image Base", apiValue: "ZImageBase"),
         .init(label: "Flux.1 Dev", apiValue: "Flux.1 D"),
         .init(label: "Flux.1 Schnell", apiValue: "Flux.1 S"),
+        .init(label: "Krea 2", apiValue: "Krea 2"),
         .init(label: "Flux.1 Krea", apiValue: "Flux.1 Krea"),
         .init(label: "Qwen", apiValue: "Qwen"),
         .init(label: "Wan Video", apiValue: "Wan Video"),

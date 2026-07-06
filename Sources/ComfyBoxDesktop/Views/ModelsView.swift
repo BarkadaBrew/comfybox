@@ -173,11 +173,49 @@ struct ModelsView: View {
                 Text(engine.connectionState.isConnected ? "No LoRAs match." : "Connect to browse the LoRA library.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                ForEach(loras.prefix(60)) { lora in loraRow(lora) }
-                if loras.count > 60 {
-                    Text("+\(loras.count - 60) more — filter to narrow.").font(.caption2).foregroundStyle(.tertiary)
+                // LoRAs are subordinate to their requisite model — group under
+                // the model family they're designed for.
+                ForEach(groupedLoras(loras), id: \.family) { group in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "cube.fill").font(.caption2).foregroundStyle(.secondary)
+                            Text(group.title).font(.subheadline.weight(.semibold))
+                            Text("\(group.loras.count) · \(group.sizeLabel)")
+                                .font(.caption2).foregroundStyle(.tertiary)
+                        }
+                        .padding(.top, 4)
+                        ForEach(group.loras.prefix(40)) { lora in loraRow(lora) }
+                        if group.loras.count > 40 {
+                            Text("+\(group.loras.count - 40) more — filter to narrow.")
+                                .font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    private struct LoRAGroup { let family: String; let title: String; let loras: [LoRAInfo]; let sizeLabel: String }
+
+    /// Group LoRAs by the model family they're built for, active model's family
+    /// first, then by total size. Unknowns fall into an "Uncategorized" group.
+    private func groupedLoras(_ loras: [LoRAInfo]) -> [LoRAGroup] {
+        let activeFamily = (engine.currentModelFamily ?? engine.currentModel).map { LoRACompatibility.family(from: $0) }
+        let buckets = Dictionary(grouping: loras) { LoRACompatibility.family(from: $0.modelCompatibility) }
+        return buckets.map { fam, items in
+            let bytes = items.reduce(0) { $0 + $1.sizeBytes }
+            let mb = Double(bytes) / 1_048_576
+            let size = mb >= 1024 ? String(format: "%.1f GB", mb / 1024) : String(format: "%.0f MB", mb)
+            let title = fam.isEmpty ? "Uncategorized" : LoRACompatibility.label(for: fam)
+            return LoRAGroup(family: fam.isEmpty ? "~" : fam, title: title,
+                             loras: items.sorted { $0.sizeBytes > $1.sizeBytes }, sizeLabel: size)
+        }
+        .sorted { a, b in
+            if let af = activeFamily {                     // active model's family first
+                if (a.family == af) != (b.family == af) { return a.family == af }
+            }
+            if (a.family == "~") != (b.family == "~") { return b.family == "~" }  // Uncategorized last
+            return a.title < b.title
         }
     }
 
@@ -188,7 +226,12 @@ struct ModelsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(lora.filename).font(.callout).lineLimit(1).truncationMode(.middle)
                 HStack(spacing: 8) {
-                    Text(lora.modelCompatibility).font(.caption2).foregroundStyle(.secondary)
+                    let fam = LoRACompatibility.family(from: lora.modelCompatibility)
+                    Text(fam.isEmpty ? lora.modelCompatibility : LoRACompatibility.label(for: fam))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(.quaternary.opacity(0.5), in: Capsule())
                     if lora.rank > 0 { Text("rank \(lora.rank)").font(.caption2).foregroundStyle(.tertiary) }
                     if lora.isActive { Text("active").font(.caption2).foregroundStyle(.green) }
                 }
