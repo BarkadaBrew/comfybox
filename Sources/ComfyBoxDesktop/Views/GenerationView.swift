@@ -117,6 +117,10 @@ struct GenerationView: View {
     /// Name of the currently-loaded preset (nil = none / custom).
     @State private var activePresetName: String?
 
+    /// Fruit mode steering the optimizer + negative prompt. View state only →
+    /// resets to Neutral each launch (never silently persists 🥑).
+    @State private var contentMode: ContentMode = .neutral
+
     // Prompt enhancement
     @State private var isEnhancing: Bool = false
     @State private var enhanceAvailable: Bool = true
@@ -433,6 +437,16 @@ struct GenerationView: View {
                 Text("Prompt")
                     .font(.headline)
                 Spacer()
+                // Fruit mode — steers the optimizer + negative prompt (text only).
+                Picker("Mode", selection: $contentMode) {
+                    ForEach(ContentMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Content mode: steers prompt optimization and negative prompt (not guidance)")
                 // Enhance button
                 Button(action: { enhancePrompt() }) {
                     HStack(spacing: 4) {
