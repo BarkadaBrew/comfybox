@@ -38,6 +38,7 @@ struct ServerView: View {
             VStack(alignment: .leading, spacing: 20) {
                 statusSection
                 activeModelSection
+                externalClientsSection
                 serverStatsSection
                 heatmapSection
             }
@@ -45,6 +46,60 @@ struct ServerView: View {
         }
         .navigationTitle("Server")
         .task { await engine.refreshPool(); await loadStats() }
+    }
+
+    // MARK: - External clients (Krita / ComfyUI bridge)
+
+    private var externalClientsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("External Clients (Krita / ComfyUI)").font(.headline)
+            Text("ComfyBox exposes a ComfyUI-compatible bridge. In Krita AI Diffusion → Custom ComfyUI Server, use one of these:")
+                .font(.caption).foregroundStyle(.secondary)
+            endpointRow(label: "This Mac", url: "http://127.0.0.1:\(engine.serverPort)")
+            if let ip = Self.lanIPv4() {
+                endpointRow(label: "LAN", url: "http://\(ip):\(engine.serverPort)")
+            }
+            Text("Supports text-to-image, inpaint/outpaint, and DyPE (auto-enabled above 1024px). Results stream back over WebSocket.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        }
+    }
+
+    private func endpointRow(label: String, url: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 56, alignment: .leading)
+            Text(url).font(.callout.monospaced()).textSelection(.enabled)
+            Spacer()
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url, forType: .string)
+            } label: { Image(systemName: "doc.on.doc") }
+                .buttonStyle(.borderless).help("Copy")
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Primary LAN IPv4 (en0/en1), for pointing external clients at this Mac.
+    static func lanIPv4() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            guard let sa = ptr.pointee.ifa_addr else { continue }
+            let family = sa.pointee.sa_family
+            let name = String(cString: ptr.pointee.ifa_name)
+            if (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING),
+               family == UInt8(AF_INET), name == "en0" || name == "en1" {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                               nil, 0, NI_NUMERICHOST) == 0 {
+                    address = String(cString: host)
+                }
+            }
+        }
+        return address
     }
 
     // MARK: - Server Stats (Daily / Weekly / All-time, by asset type)
