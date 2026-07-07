@@ -28,6 +28,29 @@ public struct ZImageGenerationRequest: Sendable {
     set { loras = newValue.map { [$0] } ?? [] }
   }
 
+  /// Generation params embedded into the saved PNG (Finder/Spotlight-readable),
+  /// so every render carries its own sidecar — the mflux-style default.
+  public var embeddedMetadata: QwenImageIO.ImageMetadata {
+    var params: [String: Any] = [
+      "prompt": prompt, "width": width, "height": height,
+      "steps": steps, "guidance": Double(guidanceScale),
+    ]
+    if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
+    if let seed { params["seed"] = seed }
+    if let model, !model.isEmpty { params["model"] = model }
+    let json = (try? JSONSerialization.data(withJSONObject: params))
+      .flatMap { String(data: $0, encoding: .utf8) }
+    // Keyword = clean model name (basename without extension), not the full path.
+    let modelName = model.flatMap { p -> String? in
+      guard !p.isEmpty else { return nil }
+      return ((p as NSString).lastPathComponent as NSString).deletingPathExtension
+    }
+    return QwenImageIO.ImageMetadata(
+      description: prompt,
+      keywords: [modelName].compactMap { $0 },
+      parametersJSON: json)
+  }
+
   public var enhancePrompt: Bool
 
   public var enhanceMaxTokens: Int
@@ -940,7 +963,7 @@ public final class ZImagePipeline {
     let decoded = try await generateCore(request, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
 
     progressHandler?(GenerationProgress(stage: .saving, stepIndex: request.steps, totalSteps: request.steps))
-    try QwenImageIO.saveImage(array: decoded, to: request.outputPath)
+    try QwenImageIO.saveImage(array: decoded, to: request.outputPath, metadata: request.embeddedMetadata)
     logger.info("Wrote image to \(request.outputPath.path)")
 
     return request.outputPath

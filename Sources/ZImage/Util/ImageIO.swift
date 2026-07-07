@@ -175,12 +175,48 @@ public enum QwenImageIO {
     (image + 1) / 2
   }
 
-  public static func saveImage(array: MLXArray, to url: URL) throws {
+  /// Generation metadata embedded into the saved image as standard EXIF/IPTC/
+  /// TIFF/PNG fields, so macOS Finder (Get Info → More Info) and Spotlight read
+  /// it — the mflux-style "the image carries its own parameters" default.
+  public struct ImageMetadata: Sendable {
+    public var description: String        // the prompt
+    public var keywords: [String]         // e.g. model family
+    public var parametersJSON: String?    // full params for exact round-trip
+    public var software: String
+    public init(description: String, keywords: [String] = [],
+                parametersJSON: String? = nil, software: String = "ComfyBox") {
+      self.description = description; self.keywords = keywords
+      self.parametersJSON = parametersJSON; self.software = software
+    }
+  }
+
+  /// Build a CGImageDestination properties dict from `metadata`.
+  static func cgProperties(for m: ImageMetadata) -> [CFString: Any] {
+    var props: [CFString: Any] = [:]
+    props[kCGImagePropertyPNGDictionary] = [
+      kCGImagePropertyPNGDescription: m.description,
+      kCGImagePropertyPNGSoftware: m.software,
+    ] as [CFString: Any]
+    props[kCGImagePropertyTIFFDictionary] = [
+      kCGImagePropertyTIFFImageDescription: m.description,
+      kCGImagePropertyTIFFSoftware: m.software,
+    ] as [CFString: Any]
+    var iptc: [CFString: Any] = [kCGImagePropertyIPTCCaptionAbstract: m.description]
+    if !m.keywords.isEmpty { iptc[kCGImagePropertyIPTCKeywords] = m.keywords }
+    props[kCGImagePropertyIPTCDictionary] = iptc
+    if let json = m.parametersJSON {
+      props[kCGImagePropertyExifDictionary] = [kCGImagePropertyExifUserComment: json] as [CFString: Any]
+    }
+    return props
+  }
+
+  public static func saveImage(array: MLXArray, to url: URL, metadata: ImageMetadata? = nil) throws {
     let cg = try image(from: array)
     guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
       throw QwenImageIOError.writeFailed
     }
-    CGImageDestinationAddImage(destination, cg, nil)
+    let props = metadata.map { cgProperties(for: $0) as CFDictionary }
+    CGImageDestinationAddImage(destination, cg, props)
     guard CGImageDestinationFinalize(destination) else {
       throw QwenImageIOError.writeFailed
     }
