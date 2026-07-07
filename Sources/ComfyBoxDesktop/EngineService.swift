@@ -339,6 +339,7 @@ public final class EngineService {
 
         // Build JSON payload matching the server API GeneratePayload.
         var payloadDict: [String: Any] = [
+            "source": "desktop",
             "prompt": request.prompt,
             "width": request.width,
             "height": request.height,
@@ -1005,14 +1006,17 @@ public final class EngineService {
         public let id: String
         public let kind: String
         public let summary: String
+        public let source: String
         public let enqueuedAt: Date?
     }
 
     /// Snapshot of the server queue: active operation + pending jobs.
     public struct QueueJobList: Sendable, Equatable {
         public var isRendering: Bool = false
+        public var isPaused: Bool = false
         public var activeJobId: String?
         public var activeSummary: String?
+        public var activeSource: String?
         public var progressPercent: Int?
         public var pending: [QueueJob] = []
         public var renderCount: Int = 0
@@ -1030,8 +1034,10 @@ public final class EngineService {
             let iso = ISO8601DateFormatter()
             var list = QueueJobList()
             list.isRendering = (dict["is_rendering"] as? Bool) ?? false
+            list.isPaused = (dict["is_paused"] as? Bool) ?? false
             list.activeJobId = dict["active_job_id"] as? String
             list.activeSummary = dict["active_summary"] as? String
+            list.activeSource = dict["active_source"] as? String
             list.progressPercent = dict["progress_percent"] as? Int
             list.renderCount = (dict["render_count"] as? Int) ?? 0
             list.failedCount = (dict["failed_count"] as? Int) ?? 0
@@ -1041,6 +1047,7 @@ public final class EngineService {
                     id: id,
                     kind: (job["kind"] as? String) ?? "job",
                     summary: (job["summary"] as? String) ?? "",
+                    source: (job["source"] as? String) ?? "api",
                     enqueuedAt: (job["enqueued_at"] as? String).flatMap { iso.date(from: $0) }
                 )
             }
@@ -1075,6 +1082,27 @@ public final class EngineService {
         let (status, data) = try await client.post("/v1/queue/clear", body: Data("{}".utf8))
         guard status == 200 else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Clear failed")
+        }
+    }
+
+    /// Pause or resume the queue (a paused queue finishes the current render but
+    /// starts no new pending jobs).
+    public func setQueuePaused(_ paused: Bool) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let (status, data) = try await client.post("/v1/queue/\(paused ? "pause" : "resume")", body: Data("{}".utf8))
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Pause failed")
+        }
+    }
+
+    /// Reorder a pending job. direction: up | down | top | bottom.
+    public func moveQueueJob(id: String, direction: String) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let enc = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let body = Data("{\"direction\":\"\(direction)\"}".utf8)
+        let (status, data) = try await client.post("/v1/queue/\(enc)/move", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Move failed")
         }
     }
 

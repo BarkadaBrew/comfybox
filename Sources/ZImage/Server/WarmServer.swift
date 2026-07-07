@@ -465,7 +465,7 @@ public final class WarmServer {
       do {
         let payload = try decode(GeneratePayload.self, from: request.body)
         try payload.validateOutputPath(configuration: configuration)
-        let result = try await coordinator.enqueueGenerate(payload)
+        let result = try await coordinator.enqueueGenerate(payload, source: payload.source ?? "api")
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -934,6 +934,25 @@ public final class WarmServer {
       auditLog.append(kind: "queue.clear", message: "Cleared \(cleared) pending job(s)")
       return .json(status: 200, payload: ClearResult(success: true, cleared: cleared))
 
+    case ("POST", "/v1/queue/pause"), ("POST", "/v1/queue/resume"):
+      struct PauseResult: Encodable { let success: Bool; let paused: Bool }
+      let paused = request.path.hasSuffix("/pause")
+      await coordinator.setPaused(paused)
+      auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
+      return .json(status: 200, payload: PauseResult(success: true, paused: paused))
+
+    case ("POST", _) where request.path.hasPrefix("/v1/queue/") && request.path.hasSuffix("/move"):
+      let mid = request.path.dropFirst("/v1/queue/".count).dropLast("/move".count)
+      guard let id = Self.pathIdComponent(String(mid)) else {
+        return .error(.error(status: 400, message: "Invalid job id"))
+      }
+      struct MoveBody: Decodable { let direction: String }
+      let direction = (try? JSONDecoder().decode(MoveBody.self, from: request.body))?.direction ?? "up"
+      struct MoveResult: Encodable { let success: Bool; let moved: Bool }
+      let moved = await coordinator.movePending(id: id, direction: direction)
+      if moved { auditLog.append(kind: "queue.move", message: "Moved job \(id) \(direction)", metadata: ["id": id, "direction": direction]) }
+      return .json(status: 200, payload: MoveResult(success: true, moved: moved))
+
     case ("DELETE", _) where request.path.hasPrefix("/v1/queue/"):
       guard let id = Self.pathIdComponent(String(request.path.dropFirst("/v1/queue/".count))) else {
         return .error(.error(status: 400, message: "Invalid job id"))
@@ -1182,6 +1201,7 @@ public final class WarmServer {
     let iso = ISO8601DateFormatter()
     var payload: [String: Any] = [
       "is_rendering": snapshot.isRendering,
+      "is_paused": snapshot.isPaused,
       "max_pending": snapshot.maxPending,
       "render_count": snapshot.renderCount,
       "failed_count": snapshot.failedCount,
@@ -1190,12 +1210,14 @@ public final class WarmServer {
           "id": job.id,
           "kind": job.kind,
           "summary": job.summary,
+          "source": job.source,
           "enqueued_at": iso.string(from: job.enqueuedAt),
         ] as [String: Any]
       },
     ]
     if let id = snapshot.activeJobId { payload["active_job_id"] = id }
     if let summary = snapshot.activeSummary { payload["active_summary"] = summary }
+    if let source = snapshot.activeSource { payload["active_source"] = source }
     if let started = snapshot.activeStartedAt { payload["active_started_at"] = iso.string(from: started) }
     if let pct = snapshot.progressPercent { payload["progress_percent"] = pct }
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
@@ -1723,14 +1745,14 @@ public final class WarmServer {
             maskCropY: payload.maskCropY
           )
         }
-        let result = try await coordinator.enqueueGenerate(batchPayload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview)
+        let result = try await coordinator.enqueueGenerate(batchPayload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview, source: "comfyui")
         totalDurationMs += result.durationMs
         lastResult = ComfyBridgeGenerateResult(outputPath: result.outputPath, durationMs: totalDurationMs)
       }
       return lastResult!
     }
 
-    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview)
+    let result = try await coordinator.enqueueGenerate(payload, progressHandler: pipelineProgress, latentPreviewHandler: pipelineLatentPreview, source: "comfyui")
     return ComfyBridgeGenerateResult(
       outputPath: result.outputPath,
       durationMs: result.durationMs
@@ -2214,13 +2236,20 @@ private actor WarmServerCoordinator {
   private struct PendingJob {
     let id = UUID().uuidString
     let enqueuedAt = Date()
+    /// Which client/app submitted this job (desktop, comfyui/krita, bree, api…).
+    var source: String = "api"
     let operation: QueuedOperation
   }
 
   private var pending: [PendingJob] = []
   /// Human-readable summary of the operation the loop is currently running.
   private var activeJobSummary: String?
+  /// Source/app of the currently-running job.
+  private var activeJobSource: String?
   private var isProcessing = false
+  /// When paused, the process loop finishes the current job (if any) but does
+  /// not start pending ones until resumed.
+  private var isPaused = false
   private var shuttingDown = false
   private var successfulRenderCount = 0
   private var failedRenderCount = 0
@@ -2608,7 +2637,8 @@ private actor WarmServerCoordinator {
   func enqueueGenerate(
     _ payload: GeneratePayload,
     progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil,
-    latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil
+    latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil,
+    source: String = "api"
   ) async throws -> GenerateResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -2618,7 +2648,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler)))
+      pending.append(PendingJob(source: source, operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler)))
       startProcessingIfNeeded()
     }
   }
@@ -2823,6 +2853,7 @@ private actor WarmServerCoordinator {
     let id: String
     let kind: String
     let summary: String
+    let source: String
     let enqueuedAt: Date
   }
 
@@ -2830,8 +2861,10 @@ private actor WarmServerCoordinator {
   /// pending job with enough identity to cancel it.
   struct QueueSnapshot: Sendable {
     let isRendering: Bool
+    let isPaused: Bool
     let activeJobId: String?
     let activeSummary: String?
+    let activeSource: String?
     let activeStartedAt: Date?
     let progressPercent: Int?
     let pending: [QueueJobInfo]
@@ -2843,8 +2876,10 @@ private actor WarmServerCoordinator {
   func queueSnapshot() -> QueueSnapshot {
     QueueSnapshot(
       isRendering: activeRenderStartedAt != nil,
+      isPaused: isPaused,
       activeJobId: activeJobId,
       activeSummary: activeJobSummary,
+      activeSource: activeJobSource,
       activeStartedAt: activeRenderStartedAt,
       progressPercent: progressTracker.get(),
       pending: pending.map { job in
@@ -2852,6 +2887,7 @@ private actor WarmServerCoordinator {
           id: job.id,
           kind: Self.kind(of: job.operation),
           summary: Self.describe(job.operation),
+          source: job.source,
           enqueuedAt: job.enqueuedAt
         )
       },
@@ -2859,6 +2895,30 @@ private actor WarmServerCoordinator {
       renderCount: successfulRenderCount,
       failedCount: failedRenderCount
     )
+  }
+
+  // MARK: - Queue controls (pause / resume / reorder)
+
+  func setPaused(_ paused: Bool) {
+    isPaused = paused
+    if !paused { startProcessingIfNeeded() }
+  }
+
+  /// Move a pending job within the queue. direction: up | down | top | bottom.
+  /// Returns true if the job was found and moved.
+  func movePending(id: String, direction: String) -> Bool {
+    guard let idx = pending.firstIndex(where: { $0.id == id }) else { return false }
+    let job = pending.remove(at: idx)
+    let target: Int
+    switch direction {
+    case "top": target = 0
+    case "bottom": target = pending.count
+    case "up": target = max(0, idx - 1)
+    case "down": target = min(pending.count, idx + 1)
+    default: pending.insert(job, at: idx); return false
+    }
+    pending.insert(job, at: target)
+    return true
   }
 
   private func startProcessingIfNeeded() {
@@ -2871,6 +2931,11 @@ private actor WarmServerCoordinator {
 
   private func processLoop() async {
     while true {
+      // Paused: stop pulling new jobs until resumed (setPaused restarts the loop).
+      if isPaused {
+        isProcessing = false
+        return
+      }
       guard !pending.isEmpty else {
         isProcessing = false
         return
@@ -2878,7 +2943,8 @@ private actor WarmServerCoordinator {
 
       let job = pending.removeFirst()
       activeJobSummary = Self.describe(job.operation)
-      defer { activeJobSummary = nil }
+      activeJobSource = job.source
+      defer { activeJobSummary = nil; activeJobSource = nil }
       switch job.operation {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
@@ -3734,6 +3800,9 @@ private struct GeneratePayload: Sendable {
   let imageStrength: Float?
   let creativity: Float?
 
+  /// Submitting client/app (desktop, bree, api…) — for queue attribution.
+  let source: String?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -3745,8 +3814,10 @@ private struct GeneratePayload: Sendable {
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
-    imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil
+    imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
+    source: String? = nil
   ) {
+    self.source = source
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -3770,6 +3841,7 @@ extension GeneratePayload: Decodable {
     case maskImageData = "mask_base64"
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
+    case source
   }
 
   init(from decoder: Decoder) throws {
@@ -3803,6 +3875,7 @@ extension GeneratePayload: Decodable {
     imagePath = try c.decodeIfPresent(String.self, forKey: .imagePath)
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
+    source = try c.decodeIfPresent(String.self, forKey: .source)
   }
 
   func makePipelineRequest(
