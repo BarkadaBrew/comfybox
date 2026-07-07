@@ -29,6 +29,9 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
     public let favorite: Bool
     public let contentMode: String?
     public let characterName: String?
+    /// Which app/persona generated this image (desktop / bree / kira / api…).
+    /// Used to place persona renders (Kira, Bree) in their own gallery sections.
+    public let source: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -52,8 +55,10 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
         rating: Int = 0,
         favorite: Bool = false,
         contentMode: String? = nil,
-        characterName: String? = nil
+        characterName: String? = nil,
+        source: String? = nil
     ) {
+        self.source = source
         self.id = id
         self.kind = kind
         self.filename = filename

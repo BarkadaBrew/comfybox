@@ -3481,7 +3481,8 @@ private actor WarmServerCoordinator {
     // Save image (with embedded, Finder-readable generation metadata)
     try QwenImageIO.saveImage(array: imageArray, to: outputURL,
       metadata: .generation(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
-        seed: seed, steps: steps, guidance: guidance, width: width, height: height))
+        seed: seed, steps: steps, guidance: guidance, width: width, height: height,
+        generatedBy: payload.source))
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
@@ -4055,6 +4056,7 @@ extension GeneratePayload: Decodable {
       levelsMin: levelsMin ?? 0.0,
       levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
+      source: source,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
       loras: activeLoRAs,

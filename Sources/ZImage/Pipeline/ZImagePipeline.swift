@@ -28,11 +28,16 @@ public struct ZImageGenerationRequest: Sendable {
     set { loras = newValue.map { [$0] } ?? [] }
   }
 
+  /// Which app/persona requested this render (desktop/bree/kira/api…) — embedded
+  /// so the gallery can section persona renders.
+  public var source: String?
+
   /// Generation params embedded into the saved PNG (Finder/Spotlight-readable),
   /// so every render carries its own sidecar — the mflux-style default.
   public var embeddedMetadata: QwenImageIO.ImageMetadata {
     .generation(prompt: prompt, negativePrompt: negativePrompt, seed: seed,
-                steps: steps, guidance: guidanceScale, width: width, height: height, model: model)
+                steps: steps, guidance: guidanceScale, width: width, height: height,
+                model: model, generatedBy: source)
   }
 
   public var enhancePrompt: Bool
@@ -83,6 +88,7 @@ public struct ZImageGenerationRequest: Sendable {
     levelsMin: Float = 0.0,
     levelsMax: Float = 1.0,
     model: String? = nil,
+    source: String? = nil,
     textEncoderPath: String? = nil,
     maxSequenceLength: Int = 512,
     lora: LoRAConfiguration? = nil,
@@ -113,6 +119,7 @@ public struct ZImageGenerationRequest: Sendable {
     self.levelsMin = levelsMin
     self.levelsMax = levelsMax
     self.model = model
+    self.source = source
     self.textEncoderPath = textEncoderPath
     self.maxSequenceLength = maxSequenceLength
     self.loras = loras.isEmpty ? (lora.map { [$0] } ?? []) : loras

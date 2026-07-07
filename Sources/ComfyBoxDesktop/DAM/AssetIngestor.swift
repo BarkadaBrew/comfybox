@@ -352,7 +352,8 @@ public final class AssetIngestor {
             guidance: sidecar?.guidance,
             modelFamily: sidecar?.modelFamily,
             contentMode: sidecar?.contentMode,
-            characterName: sidecar?.characterName
+            characterName: sidecar?.characterName,
+            source: sidecar?.source
         )
     }
 
@@ -367,6 +368,7 @@ public final class AssetIngestor {
         let modelFamily: String?
         let contentMode: String?
         let characterName: String?
+        var source: String? = nil
     }
 
     /// Read generation metadata embedded in the image's standard EXIF/IPTC/TIFF
@@ -401,7 +403,8 @@ public final class AssetIngestor {
             guidance: (params["guidance"] as? Double) ?? (params["guidance"] as? Int).map(Double.init),
             modelFamily: params["model"] as? String,
             contentMode: nil,
-            characterName: nil
+            characterName: nil,
+            source: params["source"] as? String ?? params["generated_by"] as? String
         )
     }
 
@@ -434,7 +437,10 @@ public final class AssetIngestor {
                 ?? json["content_mode"] as? String,
             characterName: json["characterName"] as? String
                 ?? json["character_name"] as? String
-                ?? json["character"] as? String
+                ?? json["character"] as? String,
+            source: json["source"] as? String
+                ?? json["generated_by"] as? String
+                ?? json["generatedBy"] as? String
         )
     }
 

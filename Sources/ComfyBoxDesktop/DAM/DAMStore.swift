@@ -79,12 +79,12 @@ public actor DAMStore {
                 id, kind, filename, absolute_path, file_size, sha256,
                 width, height, created_at, modified_at, ingested_at, orphaned,
                 prompt, negative_prompt, seed, steps, guidance,
-                model_family, rating, favorite, content_mode, character_name
+                model_family, rating, favorite, content_mode, character_name, source
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16, ?17,
-                ?18, ?19, ?20, ?21, ?22
+                ?18, ?19, ?20, ?21, ?22, ?23
             )
             """
 
@@ -116,6 +116,7 @@ public actor DAMStore {
         sqlite3_bind_int(stmt, 20, asset.favorite ? 1 : 0)
         bindOptionalText(stmt, 21, asset.contentMode)
         bindOptionalText(stmt, 22, asset.characterName)
+        bindOptionalText(stmt, 23, asset.source)
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DAMStoreError.insertFailed(lastError)
@@ -222,7 +223,7 @@ public actor DAMStore {
             SELECT id, kind, filename, absolute_path, file_size, sha256,
                    width, height, created_at, modified_at, ingested_at, orphaned,
                    prompt, negative_prompt, seed, steps, guidance,
-                   model_family, rating, favorite, content_mode, character_name
+                   model_family, rating, favorite, content_mode, character_name, source
             FROM assets
             ORDER BY created_at DESC
             LIMIT ?1 OFFSET ?2
@@ -518,7 +519,7 @@ public actor DAMStore {
             SELECT id, kind, filename, absolute_path, file_size, sha256,
                    width, height, created_at, modified_at, ingested_at, orphaned,
                    prompt, negative_prompt, seed, steps, guidance,
-                   model_family, rating, favorite, content_mode, character_name
+                   model_family, rating, favorite, content_mode, character_name, source
             FROM assets
             WHERE absolute_path = ?1
             LIMIT 1
@@ -612,9 +613,14 @@ public actor DAMStore {
                 rating INTEGER NOT NULL DEFAULT 0,
                 favorite INTEGER NOT NULL DEFAULT 0,
                 content_mode TEXT,
-                character_name TEXT
+                character_name TEXT,
+                source TEXT
             )
             """)
+
+        // Migration: add `source` to pre-existing databases (idempotent — a
+        // duplicate-column error on already-migrated DBs is ignored).
+        _ = try? execute("ALTER TABLE assets ADD COLUMN source TEXT")
 
         try execute("CREATE INDEX IF NOT EXISTS idx_assets_created ON assets(created_at DESC)")
 
@@ -708,7 +714,8 @@ public actor DAMStore {
             rating: Int(sqlite3_column_int(stmt, 18)),
             favorite: sqlite3_column_int(stmt, 19) != 0,
             contentMode: columnText(stmt, 20),
-            characterName: columnText(stmt, 21)
+            characterName: columnText(stmt, 21),
+            source: columnText(stmt, 22)
         )
     }
 

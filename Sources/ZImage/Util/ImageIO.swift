@@ -194,7 +194,7 @@ public enum QwenImageIO {
     public static func generation(
       prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil,
       steps: Int? = nil, guidance: Float? = nil, width: Int? = nil,
-      height: Int? = nil, model: String? = nil
+      height: Int? = nil, model: String? = nil, generatedBy: String? = nil
     ) -> ImageMetadata {
       var params: [String: Any] = ["prompt": prompt]
       if let width { params["width"] = width }
@@ -203,6 +203,8 @@ public enum QwenImageIO {
       if let guidance { params["guidance"] = Double(guidance) }
       if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
       if let seed { params["seed"] = seed }
+      // Which app/persona generated it — placed persona renders in the gallery.
+      if let generatedBy, !generatedBy.isEmpty { params["source"] = generatedBy }
       let modelName = model.flatMap { p -> String? in
         p.isEmpty ? nil : ((p as NSString).lastPathComponent as NSString).deletingPathExtension
       }

@@ -78,6 +78,23 @@ struct GalleryView: View {
     @State private var folderCounts: [String: Int] = [:]
     @State private var folderAssignments: [String: String] = [:]
     @State private var folderFilter: FolderFilter = .all
+    /// Persona section filter: nil = main gallery (excludes agent/persona renders);
+    /// a value shows only that persona's (source's) images.
+    @State private var personaFilter: String?
+
+    /// Sources that belong to the main gallery, not a persona section.
+    static let mainSources: Set<String> = ["", "desktop", "comfyui"]
+    static func isMainSource(_ source: String?) -> Bool {
+        mainSources.contains((source ?? "").lowercased())
+    }
+    /// Distinct persona (non-main) sources present in the library, with counts.
+    private var personaSources: [(name: String, count: Int)] {
+        var counts: [String: Int] = [:]
+        for a in assets where !Self.isMainSource(a.source) {
+            counts[(a.source ?? "").lowercased(), default: 0] += 1
+        }
+        return counts.sorted { $0.key < $1.key }.map { (name: $0.key, count: $0.value) }
+    }
     @State private var showNewFolderPrompt: Bool = false
     @State private var newFolderName: String = ""
     /// Assets staged to be filed into the folder created by the prompt.
@@ -780,9 +797,30 @@ struct GalleryView: View {
                         }
                     }
                 }
+                // Persona sections: agent-generated renders (Kira, Bree, …) live
+                // in their own sections, kept out of the main gallery.
+                if !personaSources.isEmpty {
+                    Section("Personas") {
+                        ForEach(personaSources, id: \.name) { p in
+                            Button {
+                                personaFilter = (personaFilter == p.name) ? nil : p.name
+                            } label: {
+                                HStack {
+                                    Image(systemName: "person.crop.circle")
+                                    Text(p.name.capitalized)
+                                    Spacer()
+                                    Text("\(p.count)").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .listRowBackground(personaFilter == p.name ? Color.accentColor.opacity(0.18) : nil)
+                        }
+                    }
+                }
             }
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
+            .onChange(of: folderFilter) { _, _ in personaFilter = nil }
 
             Divider()
 
@@ -949,6 +987,14 @@ struct GalleryView: View {
 
     private var filteredAssets: [DAMAsset] {
         var results = assets
+
+        // Persona sectioning: the main gallery excludes persona/agent renders
+        // (Kira, Bree, …); selecting a persona shows only that source's images.
+        if let personaFilter {
+            results = results.filter { ($0.source ?? "").lowercased() == personaFilter }
+        } else {
+            results = results.filter { Self.isMainSource($0.source) }
+        }
 
         // Secured assets stay hidden until unlocked.
         if !revealSecured {
