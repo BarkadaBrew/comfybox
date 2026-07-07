@@ -369,6 +369,42 @@ public final class AssetIngestor {
         let characterName: String?
     }
 
+    /// Read generation metadata embedded in the image's standard EXIF/IPTC/TIFF
+    /// fields (fast, in-process via ImageIO) — for images that carry it instead
+    /// of a .json sidecar. Prompt comes from the params JSON (UserComment) or the
+    /// image description; other fields from the params JSON.
+    private func readEmbeddedMetadata(imagePath: String) -> SidecarMetadata? {
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: imagePath) as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        else { return nil }
+        let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+        let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any]
+        let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any]
+        let png = props[kCGImagePropertyPNGDictionary] as? [CFString: Any]
+
+        let description = (tiff?[kCGImagePropertyTIFFImageDescription] as? String)
+            ?? (iptc?[kCGImagePropertyIPTCCaptionAbstract] as? String)
+            ?? (png?[kCGImagePropertyPNGDescription] as? String)
+
+        var params: [String: Any] = [:]
+        if let uc = exif?[kCGImagePropertyExifUserComment] as? String,
+           let d = uc.data(using: .utf8),
+           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            params = j
+        }
+        guard description != nil || !params.isEmpty else { return nil }
+        return SidecarMetadata(
+            prompt: (params["prompt"] as? String) ?? description,
+            negativePrompt: params["negative_prompt"] as? String,
+            seed: params["seed"] as? Int,
+            steps: params["steps"] as? Int,
+            guidance: (params["guidance"] as? Double) ?? (params["guidance"] as? Int).map(Double.init),
+            modelFamily: params["model"] as? String,
+            contentMode: nil,
+            characterName: nil
+        )
+    }
+
     private func readSidecar(for imagePath: String) -> SidecarMetadata? {
         // ComfyBox writes {filename}.json next to each output image.
         let basePath = (imagePath as NSString).deletingPathExtension
@@ -378,7 +414,9 @@ public final class AssetIngestor {
               let data = FileManager.default.contents(atPath: jsonPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return nil
+            // No .json sidecar — fall back to metadata embedded in the image itself
+            // (our exiftool embed, or mflux/A1111-style params).
+            return readEmbeddedMetadata(imagePath: imagePath)
         }
 
         return SidecarMetadata(

@@ -50,6 +50,7 @@ struct GalleryView: View {
     @State private var selectedIds: Set<String> = []
     @State private var isSelectMode: Bool = false
     @State private var mediaTools = MediaToolsService()
+    @State private var sidecar = SidecarService()
     @State private var pendingDelete: [DAMAsset] = []
     @State private var showDeleteConfirmation: Bool = false
 
@@ -637,6 +638,9 @@ struct GalleryView: View {
                                 }
                             }
                         }
+                        if sidecar.isAvailable {
+                            Button("Write Finder Metadata") { Task { await embedFinderMetadata(asset) } }
+                        }
                         if engine != nil {
                             Menu("Upscale") {
                                 Button("to 2048px (long side)") { Task { await upscaleAsset(asset, to: 2048) } }
@@ -1113,6 +1117,29 @@ struct GalleryView: View {
             NSWorkspace.shared.selectFile(out, inFileViewerRootedAtPath: "")
         } catch {
             errorMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Embed generation metadata into the image as standard EXIF/XMP/IPTC fields
+    /// so Finder Get Info → More Info (Description + Keywords) and Spotlight read it.
+    private func embedFinderMetadata(_ asset: DAMAsset) async {
+        let tags = FinderTags.textTags(atPath: asset.absolutePath)
+        var params: [String: Any] = [:]
+        if let p = asset.prompt { params["prompt"] = p }
+        if let n = asset.negativePrompt { params["negative_prompt"] = n }
+        if let s = asset.seed { params["seed"] = s }
+        if let st = asset.steps { params["steps"] = st }
+        if let g = asset.guidance { params["guidance"] = g }
+        if let m = asset.modelFamily { params["model"] = m }
+        let json = (try? JSONSerialization.data(withJSONObject: params)).flatMap { String(data: $0, encoding: .utf8) }
+        let meta = SidecarService.Metadata(
+            description: asset.prompt ?? asset.filename,
+            keywords: SidecarService.keywords(tags: tags, character: asset.characterName, contentMode: asset.contentMode),
+            parametersJSON: json)
+        do {
+            try await sidecar.embed(meta, into: asset.absolutePath)
+        } catch {
+            errorMessage = "Metadata embed failed: \(error.localizedDescription)"
         }
     }
 
