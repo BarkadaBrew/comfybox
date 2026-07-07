@@ -873,7 +873,11 @@ public final class WarmServer {
       }
       logger.info("video: routing to Replicate cloud (\(ReplicateVideoProxy.i2vModel))")
       do {
-        let videoRequest = try decode(VideoGenerateRequest.self, from: request.body)
+        var videoRequest = try decode(VideoGenerateRequest.self, from: request.body)
+        // Accept a bytes-uploaded init image (image_base64) when no path is given.
+        if videoRequest.imagePath == nil, let tempPath = Self.writeTempImage(base64: videoRequest.imageBase64) {
+          videoRequest.imagePath = tempPath
+        }
         if let validationError = videoRequest.validate() {
           return .error(.error(status: 400, message: validationError))
         }
@@ -919,6 +923,25 @@ public final class WarmServer {
         return .json(.rawJSON(status: 200, data: data))
       } catch {
         return .error(.error(status: 500, message: "Failed to encode job status"))
+      }
+
+    case ("GET", "/v1/video/output"):
+      // Download a rendered video's bytes so remote clients don't need SCP.
+      // ?path=<server output path>, validated to be within the allowed dir.
+      guard let raw = request.queryParameters["path"], !raw.isEmpty,
+            let path = raw.removingPercentEncoding else {
+        return .error(.error(status: 400, message: "Missing ?path= for video output"))
+      }
+      do {
+        let resolved = try WarmServerOutputPathValidator.resolveOutputPath(
+          path, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+        guard FileManager.default.fileExists(atPath: resolved),
+              let data = FileManager.default.contents(atPath: resolved) else {
+          return .error(.error(status: 404, message: "Video output not found (still rendering?): \(path)"))
+        }
+        return .json(.binary(status: 200, contentType: "video/mp4", data: data))
+      } catch {
+        return .error(response(for: error))
       }
 
     // MARK: - Upscale Endpoint
@@ -1132,10 +1155,21 @@ public final class WarmServer {
   // Local video (LTX-2) ---------------------------------------------------------
 
   /// Body for the local LTX-2 video route (snake_case over the wire).
+  /// Decode a base64 image (image_base64) to a temp PNG and return its path, so
+  /// remote clients can send an init image without a pre-existing server file.
+  /// Returns nil when the string is absent/undecodable.
+  private static func writeTempImage(base64: String?) -> String? {
+    guard let base64, let data = Data(base64Encoded: base64) else { return nil }
+    let path = NSTemporaryDirectory() + "zimage-vidinit-\(UUID().uuidString).png"
+    return (try? data.write(to: URL(fileURLWithPath: path))) != nil ? path : nil
+  }
+
   private struct LocalVideoRequest: Decodable {
     let prompt: String
     let negativePrompt: String?
     let imagePath: String?
+    /// I2V init image sent as base64 (image_base64) for remote clients.
+    let imageBase64: String?
     let width: Int?
     let height: Int?
     let frames: Int?
@@ -1176,10 +1210,13 @@ public final class WarmServer {
         config: .init(weightsDir: weights, gemmaPath: gemma), logger: logger)
       ltx2Generator = generator
 
+      // Accept an init image as bytes (image_base64) when no server path is given.
+      let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
+
       let videoRequest = LTX2VideoRequest(
         prompt: req.prompt,
         negativePrompt: req.negativePrompt,
-        initImagePath: req.imagePath,
+        initImagePath: effectiveInitImage,
         width: req.width ?? 704,
         height: req.height ?? 448,
         framesPerChunk: req.frames ?? 97,

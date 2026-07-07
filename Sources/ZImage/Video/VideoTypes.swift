@@ -33,7 +33,12 @@ public struct VideoGenerateRequest: Codable, Sendable {
   public let prompt: String
 
   /// Absolute path to source image for I2V mode. Nil for T2V.
-  public let imagePath: String?
+  /// var: may be filled in from imageBase64 (bytes upload) by the server.
+  public var imagePath: String?
+
+  /// I2V init image as base64 (image_base64) — for remote clients that can't
+  /// place a file on the server's filesystem.
+  public let imageBase64: String?
 
   /// Video duration in seconds. T2V only: 6, 8, 10, 12, 14, 16, 18, or 20 (default: 6). Ignored for I2V.
   public let duration: Int?
@@ -72,10 +77,12 @@ public struct VideoGenerateRequest: Codable, Sendable {
     seed: Int? = nil,
     outputPath: String? = nil,
     backend: String? = nil,
-    model: String? = nil
+    model: String? = nil,
+    imageBase64: String? = nil
   ) {
     self.prompt = prompt
     self.imagePath = imagePath
+    self.imageBase64 = imageBase64
     self.duration = duration
     self.resolution = resolution
     self.aspectRatio = aspectRatio
