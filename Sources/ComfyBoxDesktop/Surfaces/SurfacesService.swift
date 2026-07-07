@@ -95,9 +95,10 @@ public final class SurfacesService {
                 hint = "Set the plugin's ComfyUI server to http://127.0.0.1:\(port)."
             }
         }
+        let endpoint = serverURL.map { $0.contains("://") ? $0 : "http://\($0)" }
         return Surface(id: "krita", name: "Krita AI Diffusion",
                        detail: bits.joined(separator: " · "),
-                       health: health, endpoint: serverURL.map { "http://\($0)" }, hint: hint)
+                       health: health, endpoint: endpoint, hint: hint)
     }
 
     /// The known Krita bug: ai_diffusion.action present in BOTH the plugin dir

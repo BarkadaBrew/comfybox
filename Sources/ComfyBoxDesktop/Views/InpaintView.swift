@@ -134,7 +134,10 @@ struct InpaintView: View {
                         for stroke in strokes + (currentStroke.map { [$0] } ?? []) {
                             var path = Path()
                             path.addLines(stroke.points.map { CGPoint(x: $0.x * rect.width, y: $0.y * rect.height) })
-                            ctx.stroke(path, with: .color(stroke.erase ? .black.opacity(0.35) : .red.opacity(0.45)),
+                            // Erase strokes subtract from the painted mask (destinationOut)
+                            // so the preview matches the exported black/white mask.
+                            ctx.blendMode = stroke.erase ? .destinationOut : .normal
+                            ctx.stroke(path, with: .color(stroke.erase ? .white : .red.opacity(0.45)),
                                        style: StrokeStyle(lineWidth: stroke.size * rect.width, lineCap: .round, lineJoin: .round))
                         }
                     }

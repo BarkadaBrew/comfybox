@@ -2944,7 +2944,9 @@ private actor WarmServerCoordinator {
       let job = pending.removeFirst()
       activeJobSummary = Self.describe(job.operation)
       activeJobSource = job.source
-      defer { activeJobSummary = nil; activeJobSource = nil }
+      // Keep the same id the job had while pending, so clients can correlate.
+      activeJobId = job.id
+      defer { activeJobSummary = nil; activeJobSource = nil; activeJobId = nil }
       switch job.operation {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
@@ -2973,7 +2975,7 @@ private actor WarmServerCoordinator {
       case .localVideo(let body, let continuation):
         // Runs on the serial queue so LTX-2 never shares the GPU with a render.
         activeRenderStartedAt = Date()
-        activeJobId = UUID().uuidString
+        // activeJobId is set from job.id at the top of the loop.
         defer { activeRenderStartedAt = nil; activeJobId = nil }
         do {
           continuation.resume(returning: try body())
@@ -2997,7 +2999,7 @@ private actor WarmServerCoordinator {
     // (success or failure) via defer. flux1 forwards the wrapped handler so the
     // pipeline's per-step callback updates progress; other families currently
     // have no per-step callback, so they report only is_rendering + job id.
-    activeJobId = UUID().uuidString
+    // (activeJobId is set from job.id at the top of the process loop.)
     progressTracker.set(0)
     let tracker = progressTracker
     let trackedHandler: @Sendable (ZImagePipeline.GenerationProgress) -> Void = { progress in
@@ -3767,7 +3769,7 @@ enum RoutedResponse {
   }
 }
 
-private struct GeneratePayload: Sendable {
+struct GeneratePayload: Sendable {
   let prompt: String
   let negativePrompt: String?
   let width: Int?
@@ -3837,8 +3839,12 @@ extension GeneratePayload: Decodable {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
     case denoise, maskGrow, maskFeather
-    case inpaintImageData = "inpaint_image_base64"
-    case maskImageData = "mask_base64"
+    // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
+    // incoming keys to camelCase BEFORE matching CodingKey stringValues. So the
+    // wire keys inpaint_image_base64 / mask_base64 arrive as these camelCase
+    // forms — the rawValues MUST be the post-conversion spelling, not snake_case.
+    case inpaintImageData = "inpaintImageBase64"
+    case maskImageData = "maskBase64"
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
     case source
