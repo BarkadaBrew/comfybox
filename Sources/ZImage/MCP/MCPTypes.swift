@@ -192,15 +192,27 @@ public struct MCPContentBlock: Sendable {
 public struct MCPToolResult: Sendable {
   public let content: [MCPContentBlock]
   public let isError: Bool
+  /// Parsed structured payload (JSON bytes) surfaced as MCP `structuredContent`,
+  /// so consumers get real fields instead of a JSON string inside a text block.
+  public let structuredJSON: Data?
 
   public init(text: String) {
     self.content = [MCPContentBlock(text: text)]
     self.isError = false
+    self.structuredJSON = nil
+  }
+
+  /// Success result carrying both a text block (compat) and structured fields.
+  public init(text: String, structuredJSON: Data?) {
+    self.content = [MCPContentBlock(text: text)]
+    self.isError = false
+    self.structuredJSON = structuredJSON
   }
 
   public init(error: String) {
     self.content = [MCPContentBlock(text: error)]
     self.isError = true
+    self.structuredJSON = nil
   }
 
   /// Encode as a JSON-serializable dictionary for the MCP response.
@@ -212,6 +224,9 @@ public struct MCPToolResult: Sendable {
         return dict
       }
     ]
+    if let structuredJSON, let obj = try? JSONSerialization.jsonObject(with: structuredJSON) {
+      result["structuredContent"] = obj
+    }
     if isError {
       result["isError"] = true
     }

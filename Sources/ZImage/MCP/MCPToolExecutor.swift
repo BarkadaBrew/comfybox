@@ -487,11 +487,20 @@ public final class MCPToolExecutor: @unchecked Sendable {
   }
 
   /// Map WarmServer HTTP response to MCP tool result.
-  /// 200 -> success text, any other -> error text.
+  /// 200 -> success (text + structured fields), any other -> error text.
   private func mapHTTPResponse(status: Int, data: Data) -> MCPToolResult {
     let text = String(data: data, encoding: .utf8) ?? "{}"
     if status == 200 {
-      return MCPToolResult(text: text)
+      // Surface parsed fields as structuredContent (not a JSON string), and pin
+      // a canonical status vocabulary: map "succeeded" -> "completed" so all
+      // consumers see one done-state.
+      if var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        Self.normalizeStatus(&obj)
+        let normalized = (try? JSONSerialization.data(withJSONObject: obj)) ?? data
+        let normalizedText = String(data: normalized, encoding: .utf8) ?? text
+        return MCPToolResult(text: normalizedText, structuredJSON: normalized)
+      }
+      return MCPToolResult(text: text, structuredJSON: data)
     } else {
       // Try to extract error message from JSON response
       if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -499,6 +508,13 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return MCPToolResult(error: "Error (\(status)): \(message)")
       }
       return MCPToolResult(error: "Error (\(status)): \(text)")
+    }
+  }
+
+  /// Canonical done-state: map any "succeeded" status/state field to "completed".
+  private static func normalizeStatus(_ obj: inout [String: Any]) {
+    for key in ["status", "state"] {
+      if let s = obj[key] as? String, s == "succeeded" { obj[key] = "completed" }
     }
   }
 }
