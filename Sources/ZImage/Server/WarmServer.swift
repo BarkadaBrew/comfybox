@@ -4199,8 +4199,16 @@ extension GeneratePayload: Decodable {
     defaultFilename: String
   ) throws -> URL {
     guard let outputPath, !outputPath.isEmpty else {
-      return URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent(defaultFilename)
+      // Default to the gallery folder, NOT temp — otherwise renders from clients
+      // that omit outputPath (e.g. HTTP/MCP pipelines) land in /var/folders/T and
+      // are silently purged by macOS. Fall back to temp only if the gallery dir
+      // can't be created.
+      let dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
+      let created = (try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)) != nil
+      if created || FileManager.default.fileExists(atPath: dir) {
+        return URL(fileURLWithPath: dir).appendingPathComponent(defaultFilename)
+      }
+      return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(defaultFilename)
     }
 
     return try WarmServerOutputPathValidator.resolveOutputPath(
