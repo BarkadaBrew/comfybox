@@ -49,6 +49,7 @@ struct GalleryView: View {
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
     @State private var isSelectMode: Bool = false
+    @State private var mediaTools = MediaToolsService()
     @State private var pendingDelete: [DAMAsset] = []
     @State private var showDeleteConfirmation: Bool = false
 
@@ -340,6 +341,19 @@ struct GalleryView: View {
                     .fixedSize()
                 }
 
+                // Export selection to a video (2+ images)
+                if selectedIds.count >= 2 && mediaTools.hasFFmpeg {
+                    Menu {
+                        ForEach([6, 8, 12, 24], id: \.self) { fps in
+                            Button("\(fps) fps") { Task { await exportSelectionToVideo(fps: fps) } }
+                        }
+                    } label: {
+                        Label("To Video", systemImage: "film")
+                    }
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+
                 // Bulk delete
                 if !selectedIds.isEmpty {
                     Button(role: .destructive, action: { requestDelete(selectedAssetsList) }) {
@@ -610,6 +624,18 @@ struct GalleryView: View {
                         }
                         if onInpaint != nil {
                             Button("Edit / Inpaint") { onInpaint?(asset) }
+                        }
+                        if mediaTools.hasMagick {
+                            Menu("Export As") {
+                                ForEach(MediaToolsService.ImageFormat.allCases, id: \.self) { fmt in
+                                    Button(fmt.display) { Task { await exportAsset(asset, to: fmt) } }
+                                }
+                            }
+                            Menu("Transform & Export") {
+                                ForEach(MediaToolsService.Transform.allCases.filter { $0 != .none }, id: \.self) { t in
+                                    Button(t.display) { Task { await exportAsset(asset, to: .png, transform: t) } }
+                                }
+                            }
                         }
                         if engine != nil {
                             Menu("Upscale") {
@@ -1077,6 +1103,35 @@ struct GalleryView: View {
             asset.absolutePath,
             inFileViewerRootedAtPath: ""
         )
+    }
+
+    /// Export/transform one image via ImageMagick, then reveal it in Finder.
+    private func exportAsset(_ asset: DAMAsset, to format: MediaToolsService.ImageFormat,
+                             transform: MediaToolsService.Transform = .none) async {
+        do {
+            let out = try await mediaTools.export(source: asset.absolutePath, to: format, transform: transform)
+            NSWorkspace.shared.selectFile(out, inFileViewerRootedAtPath: "")
+        } catch {
+            errorMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Export the current multi-selection as a video (sorted by date), ingest it.
+    private func exportSelectionToVideo(fps: Int = 8) async {
+        let paths = filteredAssets
+            .filter { selectedIds.contains($0.id) && $0.kind != "video" }
+            .sorted { $0.createdAt < $1.createdAt }
+            .map { $0.absolutePath }
+        guard paths.count >= 2 else { errorMessage = "Select 2+ images to export a video."; return }
+        let dir = DesktopSettings.load().outputDirectory
+        let out = (dir as NSString).appendingPathComponent("sequence-\(Int(Date().timeIntervalSince1970)).mp4")
+        do {
+            _ = try await mediaTools.exportVideo(images: paths, fps: fps, output: out)
+            try? await ingestor.ingestFile(at: out)
+            NSWorkspace.shared.selectFile(out, inFileViewerRootedAtPath: "")
+        } catch {
+            errorMessage = "Video export failed: \(error.localizedDescription)"
+        }
     }
 
     /// Add assets to a canvas, cascading their positions so they don't stack.
