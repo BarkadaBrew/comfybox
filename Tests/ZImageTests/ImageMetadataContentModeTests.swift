@@ -16,4 +16,10 @@ final class ImageMetadataContentModeTests: XCTestCase {
         let json = try XCTUnwrap(m.parametersJSON)
         XCTAssertFalse(json.contains("content_mode"))
     }
+
+    func testGenerationOmitsEmptyStringContentMode() throws {
+        let m = QwenImageIO.ImageMetadata.generation(prompt: "x", contentMode: "")
+        let json = try XCTUnwrap(m.parametersJSON)
+        XCTAssertFalse(json.contains("content_mode"))
+    }
 }

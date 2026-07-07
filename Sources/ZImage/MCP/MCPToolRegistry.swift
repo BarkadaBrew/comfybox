@@ -101,6 +101,10 @@ public enum MCPToolRegistry {
           "type": "number",
           "description": "Img2img denoise strength (0.0-1.0). 1.0 = full txt2img, 0.5 = preserve composition. Default: 0.7.",
         ] as [String: Any],
+        "content_mode": [
+          "type": "string",
+          "description": "neutral | banana | avocado (gates explicit tiers). Stamped into the rendered image's embedded metadata.",
+        ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
     ] as [String: Any]

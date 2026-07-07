@@ -135,6 +135,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let imageStrength = params?.number("image_strength") {
       body["image_strength"] = imageStrength
     }
+    if let mode = params?.string("content_mode") {
+      body["content_mode"] = mode
+    }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/generate", body: jsonData)

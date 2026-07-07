@@ -3270,7 +3270,8 @@ private actor WarmServerCoordinator {
         levelsMax: payload.levelsMax ?? 1.0,
         maxSequenceLength: configuration.maxSequenceLength,
         inputImagePath: inputImageURL,
-        denoise: resolvedDenoise
+        denoise: resolvedDenoise,
+        contentMode: payload.contentMode
       )
 
       let result = try await f2.generate(flux2Request, progressHandler: { progress in
@@ -3338,7 +3339,8 @@ private actor WarmServerCoordinator {
         seed: payload.seed,
         outputPath: outputURL,
         levelsMin: payload.levelsMin ?? 0.0,
-        levelsMax: payload.levelsMax ?? 1.0
+        levelsMax: payload.levelsMax ?? 1.0,
+        contentMode: payload.contentMode
       )
 
       let result = try await fp.generate(fiboRequest, progressHandler: nil)
@@ -4063,6 +4065,7 @@ extension GeneratePayload: Decodable {
       levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
       source: source,
+      contentMode: contentMode,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
       loras: activeLoRAs,

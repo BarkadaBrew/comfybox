@@ -36,6 +36,9 @@ public struct Flux2GenerationRequest: Sendable {
   /// Only used when `inputImagePath` is set.
   public var denoise: Float
 
+  /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
+  public var contentMode: String?
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -49,7 +52,8 @@ public struct Flux2GenerationRequest: Sendable {
     levelsMax: Float = 1.0,
     maxSequenceLength: Int = 512,
     inputImagePath: URL? = nil,
-    denoise: Float = 1.0
+    denoise: Float = 1.0,
+    contentMode: String? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -64,6 +68,7 @@ public struct Flux2GenerationRequest: Sendable {
     self.maxSequenceLength = maxSequenceLength
     self.inputImagePath = inputImagePath
     self.denoise = denoise
+    self.contentMode = contentMode
   }
 }
 
@@ -303,7 +308,7 @@ public final class Flux2Pipeline {
     try QwenImageIO.saveImage(array: decoded, to: request.outputPath,
       metadata: .generation(prompt: request.prompt, negativePrompt: request.negativePrompt,
         seed: request.seed, steps: request.steps, guidance: request.guidanceScale,
-        width: request.width, height: request.height))
+        width: request.width, height: request.height, contentMode: request.contentMode))
     logger.info("Wrote image to \(request.outputPath.path)")
 
     return request.outputPath

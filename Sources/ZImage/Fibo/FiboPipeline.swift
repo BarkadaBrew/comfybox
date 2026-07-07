@@ -37,6 +37,9 @@ public struct FiboGenerationRequest: Sendable {
   public var levelsMin: Float
   public var levelsMax: Float
 
+  /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
+  public var contentMode: String?
+
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -47,7 +50,8 @@ public struct FiboGenerationRequest: Sendable {
     seed: UInt64? = nil,
     outputPath: URL = URL(fileURLWithPath: "fibo-output.png"),
     levelsMin: Float = 0.0,
-    levelsMax: Float = 1.0
+    levelsMax: Float = 1.0,
+    contentMode: String? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -59,6 +63,7 @@ public struct FiboGenerationRequest: Sendable {
     self.outputPath = outputPath
     self.levelsMin = levelsMin
     self.levelsMax = levelsMax
+    self.contentMode = contentMode
   }
 }
 
@@ -191,7 +196,7 @@ public final class FiboPipeline {
     try QwenImageIO.saveImage(array: decoded, to: request.outputPath,
       metadata: .generation(prompt: request.prompt, negativePrompt: request.negativePrompt,
         seed: request.seed, steps: request.steps, guidance: request.guidanceScale,
-        width: request.width, height: request.height))
+        width: request.width, height: request.height, contentMode: request.contentMode))
     logger.info("Wrote image to \(request.outputPath.path)")
 
     return request.outputPath
