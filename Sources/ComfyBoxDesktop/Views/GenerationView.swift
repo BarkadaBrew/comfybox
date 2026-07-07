@@ -825,7 +825,7 @@ struct GenerationView: View {
                 var req = request
                 if seed > 0 { req.seed = seed + UInt64(i) }
                 do {
-                    let outputPath = try await engine.generate(req)
+                    let outputPath = try await engine.generate(req, contentMode: contentMode)
                     // Optional SeedVR2 upscale of the render.
                     var finalPath = outputPath
                     if seedvrUpscale > 0 {

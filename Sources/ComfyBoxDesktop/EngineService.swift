@@ -313,7 +313,7 @@ public final class EngineService {
 
     /// Submit a generation request to the server. Returns the output file path on success.
     @discardableResult
-    public func generate(_ request: GenerationRequest) async throws -> String {
+    public func generate(_ request: GenerationRequest, contentMode: ContentMode = .neutral) async throws -> String {
         guard let client = client, connectionState.isConnected else {
             throw EngineServiceError.notConnected
         }
@@ -369,6 +369,8 @@ public final class EngineService {
         if let dype = request.dype, dype != "none", !dype.isEmpty {
             payloadDict["dype"] = dype
         }
+
+        payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)
 
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
         let (status, responseData) = try await client.post("/v1/generate", body: bodyData)
