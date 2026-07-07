@@ -65,6 +65,7 @@ struct ComfyBoxDesktopApp: App {
         case server = "Server"
         case applications = "Applications"
         case queue = "Queue"
+        case remoteGallery = "Remote Gallery"
 
         /// Sidebar grouping for the hub.
         enum Section: String, CaseIterable, Identifiable {
@@ -78,7 +79,7 @@ struct ComfyBoxDesktopApp: App {
         var section: Section {
             switch self {
             case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
-            case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models: return .library
+            case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery: return .library
             case .dashboard, .health, .server, .applications, .queue: return .operate
             case .bree: return .suite
             }
@@ -111,6 +112,7 @@ struct ComfyBoxDesktopApp: App {
             case .server: return "server.rack"
             case .applications: return "square.grid.3x3.square"
             case .queue: return "list.bullet.rectangle"
+            case .remoteGallery: return "photo.stack"
             }
         }
 
@@ -135,6 +137,7 @@ struct ComfyBoxDesktopApp: App {
             case .decoupage: return "d"
             case .applications: return "a"
             case .queue: return "q"
+            case .remoteGallery: return "r"
             case .face: return "f"
             case .inpaint: return "e"
             }
@@ -369,6 +372,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .queue:
             QueueView(engine: engine)
+
+        case .remoteGallery:
+            RemoteGalleryView(engine: engine, ingestor: ingestor)
 
         case .characters:
             CharactersView(engine: engine)

@@ -944,6 +944,66 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    // MARK: - Remote gallery (browse the server's output folder)
+
+    case ("GET", "/v1/gallery/list"):
+      // List media in the gallery output folder for remote desktop browsing.
+      let limit = request.queryParameters["limit"].flatMap { Int($0) } ?? 500
+      let dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
+      let fm = FileManager.default
+      let exts: Set<String> = ["png", "jpg", "jpeg", "webp", "tiff", "heic", "mp4", "mov", "m4v"]
+      var items: [[String: Any]] = []
+      if let en = fm.enumerator(at: URL(fileURLWithPath: dir), includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey], options: [.skipsHiddenFiles]) {
+        for case let url as URL in en {
+          let ext = url.pathExtension.lowercased()
+          guard exts.contains(ext) else { continue }
+          let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+          let isVideo = ["mp4", "mov", "m4v"].contains(ext)
+          items.append([
+            "path": url.path,
+            "filename": url.lastPathComponent,
+            "kind": isVideo ? "video" : "image",
+            "size": vals?.fileSize ?? 0,
+            "modified": (vals?.contentModificationDate.map { ISO8601DateFormatter().string(from: $0) }) ?? "",
+          ])
+        }
+      }
+      items.sort { (($0["modified"] as? String) ?? "") > (($1["modified"] as? String) ?? "") }
+      if items.count > limit { items = Array(items.prefix(limit)) }
+      guard let data = try? JSONSerialization.data(withJSONObject: ["items": items]) else {
+        return .error(.error(status: 500, message: "Failed to serialize gallery list"))
+      }
+      return .json(.rawJSON(status: 200, data: data))
+
+    case ("GET", "/v1/gallery/file"):
+      // Serve a gallery file's bytes (validated within the allowed dir).
+      guard let raw = request.queryParameters["path"], !raw.isEmpty,
+            let path = raw.removingPercentEncoding else {
+        return .error(.error(status: 400, message: "Missing ?path="))
+      }
+      do {
+        let resolved = try WarmServerOutputPathValidator.resolveOutputPath(
+          path, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+        guard FileManager.default.fileExists(atPath: resolved),
+              let data = FileManager.default.contents(atPath: resolved) else {
+          return .error(.error(status: 404, message: "File not found: \(path)"))
+        }
+        let ct: String
+        switch (resolved as NSString).pathExtension.lowercased() {
+        case "png": ct = "image/png"
+        case "jpg", "jpeg": ct = "image/jpeg"
+        case "webp": ct = "image/webp"
+        case "tiff": ct = "image/tiff"
+        case "heic": ct = "image/heic"
+        case "mp4", "m4v": ct = "video/mp4"
+        case "mov": ct = "video/quicktime"
+        default: ct = "application/octet-stream"
+        }
+        return .json(.binary(status: 200, contentType: ct, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
     // MARK: - Upscale Endpoint
 
     case ("POST", "/v1/upscale"):
