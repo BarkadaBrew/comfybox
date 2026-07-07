@@ -112,6 +112,10 @@ struct GenerationView: View {
 
     // Preset save sheet
     @State private var showingSavePreset: Bool = false
+    /// Server presets available to load from the Generate tab.
+    @State private var serverPresets: [ServerPreset] = []
+    /// Name of the currently-loaded preset (nil = none / custom).
+    @State private var activePresetName: String?
 
     // Prompt enhancement
     @State private var isEnhancing: Bool = false
@@ -128,6 +132,7 @@ struct GenerationView: View {
                 .frame(minWidth: 400)
         }
         .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference() }
+        .task { await loadServerPresets() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
         .onChange(of: pendingReferenceImage) { _, _ in consumePendingReference() }
@@ -162,7 +167,11 @@ struct GenerationView: View {
                     // Capture the seed so the preset reproduces exactly (0/empty = random).
                     if let s = UInt64(seedText), s > 0 { withModel.seed = Int(truncatingIfNeeded: s) }
                     let toSave = withModel
-                    Task { try? await engine.savePreset(toSave) }
+                    Task {
+                        try? await engine.savePreset(toSave)
+                        await loadServerPresets()
+                    }
+                    activePresetName = name
                     showingSavePreset = false
                 },
                 onCancel: { showingSavePreset = false }
@@ -208,6 +217,11 @@ struct GenerationView: View {
                     }
                     Divider()
                 }
+
+                // Preset load / save
+                presetBar
+
+                Divider()
 
                 // Backend (Local / Replicate / Fal)
                 backendSection
@@ -896,6 +910,59 @@ struct GenerationView: View {
         if action.generate == true, !engine.isGenerating {
             submitGeneration()
         }
+    }
+
+    // MARK: - Preset bar (load / save presets from the Generate tab)
+
+    @ViewBuilder private var presetBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "slider.horizontal.below.rectangle").foregroundStyle(.secondary)
+            Menu {
+                if serverPresets.isEmpty {
+                    Text("No saved presets")
+                } else {
+                    ForEach(serverPresets) { preset in
+                        Button {
+                            applyServerPreset(preset)
+                        } label: {
+                            if activePresetName == preset.name {
+                                Label(preset.name, systemImage: "checkmark")
+                            } else {
+                                Text(preset.name)
+                            }
+                        }
+                    }
+                }
+                Divider()
+                Button { Task { await loadServerPresets() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(activePresetName ?? "Load Preset").lineLimit(1)
+                    Image(systemName: "chevron.down").font(.caption2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize(horizontal: false, vertical: true)
+
+            Button { showingSavePreset = true } label: {
+                Label("Save", systemImage: "square.and.arrow.down")
+            }
+            .controlSize(.small)
+            .help("Save the current prompt, LoRAs and settings as a preset")
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func loadServerPresets() async {
+        serverPresets = await engine.fetchPresets()
+    }
+
+    /// Load a server preset into the controls (prompt, LoRAs, model, settings).
+    private func applyServerPreset(_ preset: ServerPreset) {
+        applyPreset(preset.toGenerationPreset())
+        activePresetName = preset.name
     }
 
     /// Apply a preset to the current generation parameters.
