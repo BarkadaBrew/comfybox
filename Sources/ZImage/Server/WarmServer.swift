@@ -3478,8 +3478,10 @@ private actor WarmServerCoordinator {
     // Transpose from NHWC [1, H, W, 3] to CHW [3, H, W] for QwenImageIO
     let imageArray = result.squeezed(axis: 0).transposed(2, 0, 1)
 
-    // Save image
-    try QwenImageIO.saveImage(array: imageArray, to: outputURL)
+    // Save image (with embedded, Finder-readable generation metadata)
+    try QwenImageIO.saveImage(array: imageArray, to: outputURL,
+      metadata: .generation(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+        seed: seed, steps: steps, guidance: guidance, width: width, height: height))
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {

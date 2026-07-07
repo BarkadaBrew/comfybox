@@ -31,24 +31,8 @@ public struct ZImageGenerationRequest: Sendable {
   /// Generation params embedded into the saved PNG (Finder/Spotlight-readable),
   /// so every render carries its own sidecar — the mflux-style default.
   public var embeddedMetadata: QwenImageIO.ImageMetadata {
-    var params: [String: Any] = [
-      "prompt": prompt, "width": width, "height": height,
-      "steps": steps, "guidance": Double(guidanceScale),
-    ]
-    if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
-    if let seed { params["seed"] = seed }
-    if let model, !model.isEmpty { params["model"] = model }
-    let json = (try? JSONSerialization.data(withJSONObject: params))
-      .flatMap { String(data: $0, encoding: .utf8) }
-    // Keyword = clean model name (basename without extension), not the full path.
-    let modelName = model.flatMap { p -> String? in
-      guard !p.isEmpty else { return nil }
-      return ((p as NSString).lastPathComponent as NSString).deletingPathExtension
-    }
-    return QwenImageIO.ImageMetadata(
-      description: prompt,
-      keywords: [modelName].compactMap { $0 },
-      parametersJSON: json)
+    .generation(prompt: prompt, negativePrompt: negativePrompt, seed: seed,
+                steps: steps, guidance: guidanceScale, width: width, height: height, model: model)
   }
 
   public var enhancePrompt: Bool

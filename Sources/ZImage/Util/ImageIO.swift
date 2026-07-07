@@ -188,6 +188,31 @@ public enum QwenImageIO {
       self.description = description; self.keywords = keywords
       self.parametersJSON = parametersJSON; self.software = software
     }
+
+    /// Build from common generation params — shared by every image pipeline so
+    /// all model families embed the same Finder-readable sidecar.
+    public static func generation(
+      prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil,
+      steps: Int? = nil, guidance: Float? = nil, width: Int? = nil,
+      height: Int? = nil, model: String? = nil
+    ) -> ImageMetadata {
+      var params: [String: Any] = ["prompt": prompt]
+      if let width { params["width"] = width }
+      if let height { params["height"] = height }
+      if let steps { params["steps"] = steps }
+      if let guidance { params["guidance"] = Double(guidance) }
+      if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
+      if let seed { params["seed"] = seed }
+      let modelName = model.flatMap { p -> String? in
+        p.isEmpty ? nil : ((p as NSString).lastPathComponent as NSString).deletingPathExtension
+      }
+      if let modelName { params["model"] = modelName }
+      let json = (try? JSONSerialization.data(withJSONObject: params))
+        .flatMap { String(data: $0, encoding: .utf8) }
+      return ImageMetadata(description: prompt,
+                           keywords: [modelName].compactMap { $0 },
+                           parametersJSON: json)
+    }
   }
 
   /// Build a CGImageDestination properties dict from `metadata`.

@@ -1171,7 +1171,9 @@ public class ZImageControlPipeline {
       decoded = ImageLevels.apply(image: decoded, min: request.levelsMin, max: request.levelsMax)
       MLX.eval(decoded)
     }
-    try QwenImageIO.saveImage(array: decoded, to: outputPath)
+    try QwenImageIO.saveImage(array: decoded, to: outputPath,
+      metadata: .generation(prompt: request.prompt, seed: request.seed, steps: request.steps,
+        width: request.width, height: request.height))
     logger.info("Wrote image to \(outputPath.path)")
     return outputPath
   }
