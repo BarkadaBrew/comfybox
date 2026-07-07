@@ -303,6 +303,14 @@ public final class EngineService {
 
     // MARK: - Generation
 
+    /// Attach the fruit mode to a request body as `content_mode`. Always sent
+    /// (including neutral) so the server's behavior is explicit, never inferred.
+    nonisolated static func attachingContentMode(_ base: [String: Any], mode: ContentMode) -> [String: Any] {
+        var out = base
+        out["content_mode"] = mode.rawValue
+        return out
+    }
+
     /// Submit a generation request to the server. Returns the output file path on success.
     @discardableResult
     public func generate(_ request: GenerationRequest) async throws -> String {
@@ -652,12 +660,12 @@ public final class EngineService {
 
     /// Send a prompt to the server's LLM enhancement endpoint.
     /// Returns the enhanced prompt string on success.
-    public func enhancePrompt(_ prompt: String) async throws -> String {
+    public func enhancePrompt(_ prompt: String, contentMode: ContentMode = .neutral) async throws -> String {
         guard let client = client, connectionState.isConnected else {
             throw EngineServiceError.notConnected
         }
 
-        let payloadDict: [String: Any] = ["prompt": prompt]
+        let payloadDict = Self.attachingContentMode(["prompt": prompt], mode: contentMode)
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
         let (status, responseData) = try await client.post("/v1/enhance", body: bodyData)
 

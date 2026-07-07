@@ -1038,7 +1038,7 @@ struct GenerationView: View {
 
         Task {
             do {
-                let enhanced = try await engine.enhancePrompt(prompt)
+                let enhanced = try await engine.enhancePrompt(prompt, contentMode: contentMode)
                 await MainActor.run {
                     prompt = enhanced
                     isEnhancing = false
