@@ -843,13 +843,28 @@ public final class WarmServer {
     // MARK: - Video Endpoints
 
     case ("POST", "/v1/video/generate"):
-      // Prefer the local LTX-2 backend when configured (weights + gemma path).
-      if let localResponse = await localVideoResponseIfConfigured(body: request.body) {
-        return localResponse
+      // Determine the caller's backend intent (local / cloud / unspecified).
+      let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
+
+      // Explicit cloud is the ONLY way to reach paid Replicate. Otherwise prefer
+      // local, and never silently fall back to cloud for an explicit-local request.
+      if videoIntent != .cloud {
+        if let localResponse = await localVideoResponseIfConfigured(body: request.body) {
+          logger.info("video: routing to local LTX-2")
+          return localResponse
+        }
+        if videoIntent == .local {
+          return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights). Pass backend: \"replicate\" to explicitly use paid cloud."))
+        }
+        // Unspecified + local unavailable: fall back to cloud, but LOUDLY — this
+        // spends money and leaves the device. Callers wanting zero-cloud should
+        // pass backend: "local".
+        logger.warning("video: local LTX-2 not configured; falling back to PAID Replicate cloud (\(ReplicateVideoProxy.i2vModel)). Pass backend:\"local\" to forbid, backend:\"replicate\" to silence this warning.")
       }
       guard let proxy = replicateVideoProxy else {
         return .error(.error(status: 503, message: "Video generation not available: configure LTX-2 (--ltx2-weights) for local video, or a Replicate API key for cloud"))
       }
+      logger.info("video: routing to Replicate cloud (\(ReplicateVideoProxy.i2vModel))")
       do {
         let videoRequest = try decode(VideoGenerateRequest.self, from: request.body)
         if let validationError = videoRequest.validate() {

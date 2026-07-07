@@ -50,6 +50,14 @@ public struct VideoGenerateRequest: Codable, Sendable {
   /// Output file path for the .mp4. Must be within the allowed output directory.
   public let outputPath: String?
 
+  /// Explicit backend routing: "local"/"ltx" (on-device LTX-2) or
+  /// "replicate"/"cloud" (paid Replicate). Nil = unspecified.
+  public let backend: String?
+
+  /// Requested model (e.g. "ltx"). Used only to infer local vs cloud intent
+  /// when `backend` is absent; the actual model per backend is fixed.
+  public let model: String?
+
   /// Derived mode based on whether image_path is present.
   public var mode: VideoMode {
     imagePath != nil ? .i2v : .t2v
@@ -62,7 +70,9 @@ public struct VideoGenerateRequest: Codable, Sendable {
     resolution: String? = nil,
     aspectRatio: String? = nil,
     seed: Int? = nil,
-    outputPath: String? = nil
+    outputPath: String? = nil,
+    backend: String? = nil,
+    model: String? = nil
   ) {
     self.prompt = prompt
     self.imagePath = imagePath
@@ -71,6 +81,18 @@ public struct VideoGenerateRequest: Codable, Sendable {
     self.aspectRatio = aspectRatio
     self.seed = seed
     self.outputPath = outputPath
+    self.backend = backend
+    self.model = model
+  }
+
+  /// Classify the caller's backend intent from `backend`/`model`.
+  public enum BackendIntent { case local, cloud, unspecified }
+  public var backendIntent: BackendIntent {
+    let b = (backend ?? "").lowercased()
+    let m = (model ?? "").lowercased()
+    if b == "replicate" || b == "cloud" { return .cloud }
+    if b == "local" || b == "ltx" || b == "ltx2" || m.contains("ltx") { return .local }
+    return .unspecified
   }
 
   // MARK: - Validation
