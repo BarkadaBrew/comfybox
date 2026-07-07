@@ -30,6 +30,12 @@ final class GeneratePayloadDecodeTests: XCTestCase {
         XCTAssertEqual(p.denoise, 0.9)
     }
 
+    func testInitImageBase64DecodesForImg2Img() throws {
+        let p = try decode(#"{"prompt":"x","init_image_base64":"aGk=","image_strength":0.55}"#)
+        XCTAssertNotNil(p.initImageData, "init_image_base64 must survive .convertFromSnakeCase")
+        XCTAssertEqual(p.imageStrength, 0.55)
+    }
+
     func testSourceDecodes() throws {
         let p = try decode(#"{"prompt":"x","source":"desktop"}"#)
         XCTAssertEqual(p.source, "desktop")

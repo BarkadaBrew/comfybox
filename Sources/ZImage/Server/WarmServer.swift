@@ -463,7 +463,14 @@ public final class WarmServer {
 
     case ("POST", "/v1/generate"):
       do {
-        let payload = try decode(GeneratePayload.self, from: request.body)
+        var payload = try decode(GeneratePayload.self, from: request.body)
+        // Bytes-uploaded img2img init image (init_image_base64) — write it to a
+        // temp file so remote clients don't need a pre-existing server path.
+        if let initData = payload.initImageData, payload.imagePath == nil {
+          let tempPath = NSTemporaryDirectory() + "zimage-init-\(UUID().uuidString).png"
+          try initData.write(to: URL(fileURLWithPath: tempPath))
+          payload.imagePath = tempPath
+        }
         try payload.validateOutputPath(configuration: configuration)
         let result = try await coordinator.enqueueGenerate(payload, source: payload.source ?? "api")
         return .json(status: 200, payload: result)
@@ -3813,7 +3820,10 @@ struct GeneratePayload: Sendable {
   let firstNStepsWithoutCFG: Int?
 
   // Phase 4: Img2img (set via HTTP API)
-  let imagePath: String?
+  var imagePath: String?   // var: may be filled in from initImageData (bytes upload)
+  /// Img2img init image sent as base64 (init_image_base64) — for remote clients
+  /// that can't put a file on the server's filesystem. Decoded to a temp file.
+  let initImageData: Data?
   let imageStrength: Float?
   let creativity: Float?
 
@@ -3832,9 +3842,10 @@ struct GeneratePayload: Sendable {
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
-    source: String? = nil
+    source: String? = nil, initImageData: Data? = nil
   ) {
     self.source = source
+    self.initImageData = initImageData
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -3863,6 +3874,9 @@ extension GeneratePayload: Decodable {
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
     case source
+    // Wire key init_image_base64 arrives as this camelCase form after
+    // .convertFromSnakeCase (same gotcha as the inpaint keys).
+    case initImageData = "initImageBase64"
   }
 
   init(from decoder: Decoder) throws {
@@ -3894,6 +3908,8 @@ extension GeneratePayload: Decodable {
     cfg = try c.decodeIfPresent(Float.self, forKey: .cfg)
     firstNStepsWithoutCFG = try c.decodeIfPresent(Int.self, forKey: .firstNStepsWithoutCFG)
     imagePath = try c.decodeIfPresent(String.self, forKey: .imagePath)
+    initImageData = (try c.decodeIfPresent(String.self, forKey: .initImageData))
+        .flatMap { Data(base64Encoded: $0) }
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
     source = try c.decodeIfPresent(String.self, forKey: .source)
