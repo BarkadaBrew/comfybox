@@ -100,6 +100,8 @@ struct GenerationView: View {
     /// Number of images to generate in one batch (seed sweep).
     @State private var batchCount: Int = 1
     @State private var batchProgress: String?
+    /// SeedVR2 upscale of the render (0 = off, else target long-side px).
+    @State private var seedvrUpscale: Int = 0
     @State private var showAssistant: Bool = true
     // Cloud backend selection (Local / Replicate / Fal)
     @State private var backend: CloudProvider = .local
@@ -600,6 +602,22 @@ struct GenerationView: View {
                 }
             }
 
+            // SeedVR2 upscale (post-render creative scaling)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Upscale (SeedVR2)").font(.subheadline).foregroundStyle(.secondary)
+                Picker("", selection: $seedvrUpscale) {
+                    Text("Off").tag(0)
+                    Text("2048px").tag(2048)
+                    Text("4096px").tag(4096)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                if seedvrUpscale > 0 {
+                    Text("Each render is upscaled to \(seedvrUpscale)px long-side after generation.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+
             // DyPE high-resolution scaling
             VStack(alignment: .leading, spacing: 4) {
                 Text("High-res scaling (DyPE)")
@@ -780,10 +798,20 @@ struct GenerationView: View {
                 if seed > 0 { req.seed = seed + UInt64(i) }
                 do {
                     let outputPath = try await engine.generate(req)
-                    if let image = NSImage(contentsOfFile: outputPath) {
+                    // Optional SeedVR2 upscale of the render.
+                    var finalPath = outputPath
+                    if seedvrUpscale > 0 {
+                        await MainActor.run { batchProgress = "Upscaling to \(seedvrUpscale)px…" }
+                        if let up = try? await engine.upscale(imagePath: outputPath, targetResolution: seedvrUpscale) {
+                            finalPath = up
+                        } else {
+                            await MainActor.run { engine.lastError = "SeedVR2 upscale unavailable (server needs --seedvr2-weights); kept the base render." }
+                        }
+                    }
+                    if let image = NSImage(contentsOfFile: finalPath) {
                         await MainActor.run { displayedImage = image }
                     }
-                    onGenerated?(outputPath, req)
+                    onGenerated?(finalPath, req)
                 } catch {
                     await MainActor.run { engine.lastError = error.localizedDescription }
                     break

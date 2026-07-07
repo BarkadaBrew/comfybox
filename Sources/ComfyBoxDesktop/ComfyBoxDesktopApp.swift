@@ -63,6 +63,7 @@ struct ComfyBoxDesktopApp: App {
         case models = "Models"
         case characters = "Characters"
         case server = "Server"
+        case applications = "Applications"
 
         /// Sidebar grouping for the hub.
         enum Section: String, CaseIterable, Identifiable {
@@ -77,7 +78,7 @@ struct ComfyBoxDesktopApp: App {
             switch self {
             case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models: return .library
-            case .dashboard, .health, .server: return .operate
+            case .dashboard, .health, .server, .applications: return .operate
             case .bree: return .suite
             }
         }
@@ -107,6 +108,7 @@ struct ComfyBoxDesktopApp: App {
             case .models: return "square.stack.3d.up.fill"
             case .characters: return "person.2.crop.square.stack"
             case .server: return "server.rack"
+            case .applications: return "square.grid.3x3.square"
             }
         }
 
@@ -129,6 +131,7 @@ struct ComfyBoxDesktopApp: App {
             case .bree: return "b"
             case .models: return "l"
             case .decoupage: return "d"
+            case .applications: return "a"
             case .face: return "f"
             case .inpaint: return "e"
             }
@@ -357,6 +360,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .server:
             ServerView(engine: engine, store: store)
+
+        case .applications:
+            ApplicationsView(engine: engine)
 
         case .characters:
             CharactersView(engine: engine)
