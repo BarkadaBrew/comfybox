@@ -117,6 +117,10 @@ struct GenerationView: View {
     /// Name of the currently-loaded preset (nil = none / custom).
     @State private var activePresetName: String?
 
+    /// Fruit mode steering the optimizer + negative prompt. View state only →
+    /// resets to Neutral each launch (never silently persists 🥑).
+    @State private var contentMode: ContentMode = .neutral
+
     // Prompt enhancement
     @State private var isEnhancing: Bool = false
     @State private var enhanceAvailable: Bool = true
@@ -433,6 +437,16 @@ struct GenerationView: View {
                 Text("Prompt")
                     .font(.headline)
                 Spacer()
+                // Fruit mode — steers the optimizer + negative prompt (text only).
+                Picker("Mode", selection: $contentMode) {
+                    ForEach(ContentMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Content mode: steers prompt optimization and negative prompt (not guidance)")
                 // Enhance button
                 Button(action: { enhancePrompt() }) {
                     HStack(spacing: 4) {
@@ -811,7 +825,7 @@ struct GenerationView: View {
                 var req = request
                 if seed > 0 { req.seed = seed + UInt64(i) }
                 do {
-                    let outputPath = try await engine.generate(req)
+                    let outputPath = try await engine.generate(req, contentMode: contentMode)
                     // Optional SeedVR2 upscale of the render.
                     var finalPath = outputPath
                     if seedvrUpscale > 0 {
@@ -1024,7 +1038,7 @@ struct GenerationView: View {
 
         Task {
             do {
-                let enhanced = try await engine.enhancePrompt(prompt)
+                let enhanced = try await engine.enhancePrompt(prompt, contentMode: contentMode)
                 await MainActor.run {
                     prompt = enhanced
                     isEnhancing = false

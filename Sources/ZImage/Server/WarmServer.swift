@@ -3270,7 +3270,8 @@ private actor WarmServerCoordinator {
         levelsMax: payload.levelsMax ?? 1.0,
         maxSequenceLength: configuration.maxSequenceLength,
         inputImagePath: inputImageURL,
-        denoise: resolvedDenoise
+        denoise: resolvedDenoise,
+        contentMode: payload.contentMode
       )
 
       let result = try await f2.generate(flux2Request, progressHandler: { progress in
@@ -3338,7 +3339,8 @@ private actor WarmServerCoordinator {
         seed: payload.seed,
         outputPath: outputURL,
         levelsMin: payload.levelsMin ?? 0.0,
-        levelsMax: payload.levelsMax ?? 1.0
+        levelsMax: payload.levelsMax ?? 1.0,
+        contentMode: payload.contentMode
       )
 
       let result = try await fp.generate(fiboRequest, progressHandler: nil)
@@ -3482,7 +3484,7 @@ private actor WarmServerCoordinator {
     try QwenImageIO.saveImage(array: imageArray, to: outputURL,
       metadata: .generation(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
         seed: seed, steps: steps, guidance: guidance, width: width, height: height,
-        generatedBy: payload.source))
+        generatedBy: payload.source, contentMode: payload.contentMode))
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
@@ -3930,6 +3932,9 @@ struct GeneratePayload: Sendable {
   /// Submitting client/app (desktop, bree, api…) — for queue attribution.
   let source: String?
 
+  /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
+  let contentMode: String?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -3942,9 +3947,10 @@ struct GeneratePayload: Sendable {
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
-    source: String? = nil, initImageData: Data? = nil
+    source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil
   ) {
     self.source = source
+    self.contentMode = contentMode
     self.initImageData = initImageData
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -3974,6 +3980,7 @@ extension GeneratePayload: Decodable {
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
     case source
+    case contentMode
     // Wire key init_image_base64 arrives as this camelCase form after
     // .convertFromSnakeCase (same gotcha as the inpaint keys).
     case initImageData = "initImageBase64"
@@ -4013,6 +4020,7 @@ extension GeneratePayload: Decodable {
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
     source = try c.decodeIfPresent(String.self, forKey: .source)
+    contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
   }
 
   func makePipelineRequest(
@@ -4057,6 +4065,7 @@ extension GeneratePayload: Decodable {
       levelsMax: levelsMax ?? 1.0,
       model: configuration.modelSpec,
       source: source,
+      contentMode: contentMode,
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
       loras: activeLoRAs,
