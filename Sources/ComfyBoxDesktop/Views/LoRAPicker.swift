@@ -55,12 +55,13 @@ struct LoRAPicker: View {
         return sortedLoras(filtered)
     }
 
-    /// Sort: selected first, then active on server, then alphabetical.
+    /// Stable order: active on server first, then alphabetical. Deliberately does
+    /// NOT sort by selection — reordering a row at the moment it's selected (while
+    /// its content also changes to reveal the scale slider) leaves SwiftUI showing
+    /// a stale row until the list is rebuilt. Keeping order stable lets the row
+    /// gain its slider in place.
     private func sortedLoras(_ loras: [LoRAInfo]) -> [LoRAInfo] {
         loras.sorted { a, b in
-            let aSelected = selectedLoras.contains { $0.id == a.id }
-            let bSelected = selectedLoras.contains { $0.id == b.id }
-            if aSelected != bSelected { return aSelected }
             if a.isActive != b.isActive { return a.isActive }
             return a.id < b.id
         }
