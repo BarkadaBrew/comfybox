@@ -1782,9 +1782,12 @@ public final class WarmServer {
           logger.info("[WarmServer] Z-Image Base override: steps=\(resolvedSteps) (was \(request.steps)), sampler=\(resolvedSampler ?? "nil") (was \(request.sampler ?? "nil"))")
         }
       } else {
-        // Z-Image Turbo: distilled, optimal at 9 steps, no CFG, no negative prompts
+        // Z-Image Turbo: distilled, optimal at 9 steps. Honor the requested
+        // guidance rather than hardcoding 0 — merged/finetuned "turbo"
+        // checkpoints do respond to CFG, so forcing 0 removed real user control
+        // (0 is the recommended default, passed through when the client sends it).
         resolvedSteps = min(request.steps, 9)
-        resolvedGuidance = 0.0
+        resolvedGuidance = request.guidance
         resolvedNegativePrompt = nil
         resolvedSampler = request.sampler
       }
