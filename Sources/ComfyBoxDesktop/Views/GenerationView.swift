@@ -63,6 +63,7 @@ struct GenerationView: View {
 
     // Generation parameters
     @State private var prompt: String = ""
+    @State private var negativePrompt: String = ""
     @State private var selectedResolution: ResolutionPreset = ResolutionPreset.presets[2]
     @State private var customWidth: Int = 1024
     @State private var customHeight: Int = 1024
@@ -476,6 +477,11 @@ struct GenerationView: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                 )
+
+            Text("Negative prompt").font(.caption).foregroundStyle(.secondary)
+            TextField("things to avoid (optional)", text: $negativePrompt, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...3)
         }
     }
 
@@ -788,6 +794,7 @@ struct GenerationView: View {
 
         let request = GenerationRequest(
             prompt: prompt,
+            negativePrompt: negativePrompt,
             width: effectiveWidth,
             height: effectiveHeight,
             steps: Int(steps),
@@ -982,6 +989,7 @@ struct GenerationView: View {
     /// Apply a preset to the current generation parameters.
     func applyPreset(_ preset: GenerationPreset) {
         prompt = preset.promptTemplate
+        negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
         // Restore a saved seed (nil/0 = random).

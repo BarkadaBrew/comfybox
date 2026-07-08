@@ -11,6 +11,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var id: String
     public var name: String
     public var promptTemplate: String
+    public var negativePrompt: String?
     public var modelId: String?
     public var loras: [PresetLoRA]
     public var steps: Int
@@ -27,6 +28,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         id: String = UUID().uuidString,
         name: String,
         promptTemplate: String = "",
+        negativePrompt: String? = nil,
         modelId: String? = nil,
         loras: [PresetLoRA] = [],
         steps: Int = 9,
@@ -42,6 +44,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.id = id
         self.name = name
         self.promptTemplate = promptTemplate
+        self.negativePrompt = negativePrompt
         self.modelId = modelId
         self.loras = loras
         self.steps = steps

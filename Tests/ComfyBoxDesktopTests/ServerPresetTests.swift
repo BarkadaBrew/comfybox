@@ -1,6 +1,7 @@
 // ServerPresetTests.swift — Wire-format tests for the server preset mirror
 
 import Testing
+import XCTest
 import Foundation
 @testable import ComfyBoxDesktop
 
@@ -89,5 +90,13 @@ struct ServerPresetTests {
         #expect(!p.id.isEmpty)
         #expect(p.loras.isEmpty)
         #expect(p.steps == nil)
+    }
+}
+
+final class ServerPresetNegativeTests: XCTestCase {
+    func testToGenerationPresetCarriesNegative() {
+        let sp = ServerPreset(id: "k", name: "Kira", model: "m",
+                              negativePrompt: "blurry, watermark")
+        XCTAssertEqual(sp.toGenerationPreset().negativePrompt, "blurry, watermark")
     }
 }
