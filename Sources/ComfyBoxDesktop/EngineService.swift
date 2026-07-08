@@ -57,7 +57,7 @@ public struct GenerationRequest: Sendable {
 }
 
 /// A LoRA selected for generation with its scale.
-public struct LoRASelection: Sendable, Identifiable, Equatable {
+public struct LoRASelection: Sendable, Identifiable, Equatable, Codable {
     public var id: String
     public var filename: String
     public var scale: Float

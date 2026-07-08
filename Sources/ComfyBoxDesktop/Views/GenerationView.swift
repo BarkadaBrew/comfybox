@@ -64,14 +64,17 @@ struct GenerationView: View {
     var agent: AgentService?
 
     // Generation parameters
-    @State private var prompt: String = ""
-    @State private var negativePrompt: String = ""
+    // Persisted across tab switches (and app relaunch) so leaving Generate and
+    // coming back doesn't wipe your work. @SceneStorage is a drop-in for @State.
+    @SceneStorage("gen.prompt") private var prompt: String = ""
+    @SceneStorage("gen.negativePrompt") private var negativePrompt: String = ""
+    @SceneStorage("gen.resolutionId") private var resolutionId: String = ResolutionPreset.presets[2].id
     @State private var selectedResolution: ResolutionPreset = ResolutionPreset.presets[2]
-    @State private var customWidth: Int = 1024
-    @State private var customHeight: Int = 1024
-    @State private var steps: Double = 9
-    @State private var guidance: Double = 3.5
-    @State private var seedText: String = ""
+    @SceneStorage("gen.customWidth") private var customWidth: Int = 1024
+    @SceneStorage("gen.customHeight") private var customHeight: Int = 1024
+    @SceneStorage("gen.steps") private var steps: Double = 9
+    @SceneStorage("gen.guidance") private var guidance: Double = 3.5
+    @SceneStorage("gen.seedText") private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
     // img2img reference
@@ -90,6 +93,8 @@ struct GenerationView: View {
 
     // LoRA selections
     @State private var selectedLoras: [LoRASelection] = []
+    /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
+    @SceneStorage("gen.lorasJSON") private var lorasJSON: String = ""
 
     // Sidebar sections
     @State private var showModelSelector: Bool = true
@@ -132,13 +137,30 @@ struct GenerationView: View {
         HSplitView {
             // Left panel: Controls
             controlPanel
-                .frame(minWidth: 340, maxWidth: 420)
+                .frame(minWidth: 360, idealWidth: 460, maxWidth: 760)
 
             // Right panel: Image preview
             previewPanel
                 .frame(minWidth: 400)
         }
-        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference(); consumePendingContentMode() }
+        .onAppear {
+            // Restore persisted resolution + LoRA stack first, then let any pending
+            // preset/prompt (from another tab) override them.
+            if resolutionId == ResolutionPreset.custom.id {
+                selectedResolution = .custom
+            } else if let match = ResolutionPreset.presets.first(where: { $0.id == resolutionId }) {
+                selectedResolution = match
+            }
+            if selectedLoras.isEmpty, let data = lorasJSON.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([LoRASelection].self, from: data) {
+                selectedLoras = decoded
+            }
+            consumePendingPreset(); consumePendingPrompt(); consumePendingReference(); consumePendingContentMode()
+        }
+        .onChange(of: selectedResolution.id) { _, id in resolutionId = id }
+        .onChange(of: selectedLoras) { _, loras in
+            if let data = try? JSONEncoder().encode(loras) { lorasJSON = String(decoding: data, as: UTF8.self) }
+        }
         .task { await loadServerPresets() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }

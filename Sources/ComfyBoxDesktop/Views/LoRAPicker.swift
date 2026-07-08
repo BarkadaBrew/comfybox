@@ -247,10 +247,16 @@ struct LoRAPicker: View {
                     Slider(
                         value: Binding(
                             get: { selectedLoras[index].scale },
-                            set: { selectedLoras[index].scale = $0 }
+                            set: { newValue in
+                                // Magnetic detent at 0 so it's easy to neutralize/disable a
+                                // LoRA; otherwise round to 0.01 for fine-grained control across
+                                // the wider -5...5 range (sliders often need negatives/overdrive).
+                                selectedLoras[index].scale = abs(newValue) < 0.08
+                                    ? 0.0
+                                    : (newValue * 100).rounded() / 100
+                            }
                         ),
-                        in: 0.0...2.0,
-                        step: 0.05
+                        in: -5.0...5.0
                     )
                     .controlSize(.mini)
 
@@ -258,7 +264,7 @@ struct LoRAPicker: View {
                         "",
                         value: Binding(
                             get: { selectedLoras[safe: index]?.scale ?? 1.0 },
-                            set: { selectedLoras[index].scale = min(max($0, 0.0), 2.0) }
+                            set: { selectedLoras[index].scale = min(max($0, -5.0), 5.0) }
                         ),
                         format: .number.precision(.fractionLength(0...2))
                     )
