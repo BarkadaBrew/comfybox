@@ -108,6 +108,9 @@ struct GenerationView: View {
     /// Number of images to generate in one batch (seed sweep).
     @State private var batchCount: Int = 1
     @State private var batchProgress: String?
+    /// Set when a LoRA swap fails at generate time, so it's visible instead of
+    /// silently rendering with no LoRAs.
+    @State private var loraSwapWarning: String?
     /// SeedVR2 upscale of the render (0 = off, else target long-side px).
     @State private var seedvrUpscale: Int = 0
     @State private var showAssistant: Bool = true
@@ -695,8 +698,40 @@ struct GenerationView: View {
         }
     }
 
+    /// Compact "what will render" summary shown above Generate so the config is
+    /// confirmable at a glance — notably the LoRA stack (with scales) that used
+    /// to be silently dropped.
+    private var configSummary: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            summaryRow("Model", (engine.currentModel as NSString?)?.lastPathComponent ?? "—")
+            summaryRow("LoRAs", selectedLoras.isEmpty
+                ? "none"
+                : selectedLoras.map {
+                    "\($0.filename.replacingOccurrences(of: ".safetensors", with: "")) @\(String(format: "%g", $0.scale))"
+                  }.joined(separator: ", "))
+            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
+            if let warn = loraSwapWarning {
+                Text(warn).foregroundStyle(.orange)
+            }
+        }
+        .font(.caption2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func summaryRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(label).foregroundStyle(.secondary).frame(width: 46, alignment: .leading)
+            Text(value).textSelection(.enabled).lineLimit(3)
+            Spacer(minLength: 0)
+        }
+    }
+
     private var actionButtons: some View {
         VStack(spacing: 8) {
+            configSummary
             // Generate button
             Button(action: { submitGeneration() }) {
                 HStack {
@@ -840,14 +875,19 @@ struct GenerationView: View {
 
         let count = max(1, batchCount)
         Task {
-            // Swap LoRAs if any selected (before generation).
+            // Swap LoRAs if any selected (before generation). Surface failures —
+            // silently swallowing them is how renders ended up with no LoRAs.
             if !selectedLoras.isEmpty {
                 do {
                     try await engine.swapLoras(selectedLoras)
+                    await MainActor.run { loraSwapWarning = nil }
                 } catch {
-                    // LoRA swap failure — still attempt generation with
-                    // whatever LoRAs are currently loaded.
+                    await MainActor.run {
+                        loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
+                    }
                 }
+            } else {
+                await MainActor.run { loraSwapWarning = nil }
             }
 
             // Batch: generate `count` images. A fixed seed sweeps seed, seed+1…;

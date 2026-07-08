@@ -80,14 +80,18 @@ public struct CameraDirective: Equatable, Sendable {
     /// Focal length; also implies depth-of-field feel.
     public enum Lens: String, CaseIterable, Sendable {
         case none, mm24, mm35, mm50, mm85, mm135
+        /// Prose-first: describe the resulting LOOK (framing, perspective, depth of
+        /// field) rather than the focal-length number — Z-Image/Krea use LLM text
+        /// encoders that respond to described effect, not lens jargon. The picker
+        /// label still shows the focal length.
         public var phrase: String {
             switch self {
             case .none: return ""
-            case .mm24: return "24mm wide lens"
-            case .mm35: return "35mm lens"
-            case .mm50: return "50mm lens"
-            case .mm85: return "85mm portrait lens, shallow depth of field"
-            case .mm135: return "135mm telephoto, compressed background"
+            case .mm24: return "wide-angle framing with expansive context and slight edge stretch, deep focus front to back"
+            case .mm35: return "natural reportage framing with mild environmental context, moderate depth of field"
+            case .mm50: return "natural perspective close to human vision, balanced depth of field"
+            case .mm85: return "flattering portrait compression, tight subject framing, background melting into soft creamy blur with only the subject in sharp focus"
+            case .mm135: return "strong telephoto compression, subject isolated against a smoothly blurred distant background"
             }
         }
         public var label: String {

@@ -656,6 +656,12 @@ struct ComfyBoxDesktopApp: App {
         if let model = request.modelId ?? engine.currentModel {
             metadata["model"] = model
         }
+        if !request.loras.isEmpty {
+            metadata["loras"] = request.loras.map { lora in
+                ["name": lora.filename.replacingOccurrences(of: ".safetensors", with: ""),
+                 "scale": Double(lora.scale)]
+            }
+        }
 
         if let data = try? JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: jsonPath))

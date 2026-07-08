@@ -605,7 +605,10 @@ public final class EngineService {
         defer { isSwappingLoras = false }
 
         let loraEntries = selections.map { lora -> [String: Any] in
-            ["path": lora.id, "scale": lora.scale]
+            // Server resolves LoRAs by filename (e.g. "Anneliese_Zbase3.safetensors"),
+            // NOT by the slugified library id ("anneliese-zbase3") — sending the id
+            // silently fails to resolve and renders with no LoRAs.
+            ["path": lora.filename, "scale": lora.scale]
         }
         let payloadDict: [String: Any] = ["loras": loraEntries]
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)

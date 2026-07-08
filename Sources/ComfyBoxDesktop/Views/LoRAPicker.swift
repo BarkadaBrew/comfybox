@@ -150,22 +150,12 @@ struct LoRAPicker: View {
                 .frame(maxHeight: 240)
             }
 
-            // Apply button if selections differ from server state
+            // LoRAs are applied automatically at Generate time — no separate step.
             if !selectedLoras.isEmpty {
-                Button(action: { Task { await applyLoras() } }) {
-                    HStack(spacing: 4) {
-                        if engine.isSwappingLoras {
-                            ProgressView()
-                                .controlSize(.mini)
-                        }
-                        Text(engine.isSwappingLoras ? "Applying..." : "Apply LoRAs")
-                    }
-                    .frame(maxWidth: .infinity)
-                    .font(.caption)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(engine.isSwappingLoras)
+                Text("\(selectedLoras.count) LoRA\(selectedLoras.count == 1 ? "" : "s") selected — applied automatically on Generate")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             // Error display
@@ -315,15 +305,6 @@ struct LoRAPicker: View {
                 filename: lora.filename,
                 scale: lora.recommendedScale
             ))
-        }
-    }
-
-    private func applyLoras() async {
-        errorMessage = nil
-        do {
-            try await engine.swapLoras(selectedLoras)
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 
