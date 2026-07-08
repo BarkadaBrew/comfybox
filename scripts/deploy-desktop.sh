@@ -6,16 +6,15 @@ IDENT="CoffeeShop Desktop Signing"
 KC="$HOME/Library/Keychains/coffeeshop-signing.keychain-db"
 APP="/Applications/CoffeeShop Desktop.app"
 cd "$(dirname "$0")/.."
-ENT="scripts/comfybox-desktop.entitlements"
 swift build -c release --product ComfyBoxDesktop
 pkill -f "CoffeeShop Desktop" 2>/dev/null || true; sleep 1
 /bin/cp -f .build/release/ComfyBoxDesktop "$APP/Contents/MacOS/ComfyBoxDesktop"
 security unlock-keychain -p coffeeshop-local "$KC" 2>/dev/null || true
 if security find-identity "$KC" 2>/dev/null | grep -q "$IDENT"; then
-  codesign --force --deep --sign "$IDENT" --keychain "$KC" --entitlements "$ENT" "$APP"
-  echo "Signed with stable identity + keychain-access-group entitlement."
+  codesign --force --deep --sign "$IDENT" --keychain "$KC" "$APP"
+  echo "Signed with stable identity."
 else
-  codesign --force --deep --sign - --entitlements "$ENT" "$APP"
+  codesign --force --deep --sign - "$APP"
   echo "WARN: stable identity missing — fell back to ad-hoc (run setup-signing-identity.sh)."
 fi
 touch "$APP"; killall Dock 2>/dev/null || true

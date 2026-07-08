@@ -9,76 +9,51 @@ import Foundation
 import Security
 
 /// Minimal Keychain wrapper for generic-password items keyed by account.
-///
-/// Items live in the **data-protection keychain** (`kSecUseDataProtectionKeychain`),
-/// whose access is governed by the app's `keychain-access-groups` entitlement rather
-/// than an interactive per-signature ACL. That's what stops macOS from re-prompting
-/// "…wants to access…" every time the app is re-signed. Legacy (file-based) items
-/// written by older builds are read as a fallback and migrated forward on first
-/// access, so existing keys are preserved (one Keychain prompt during migration,
-/// then never again).
 enum Keychain {
     static let service = "com.barkadabrew.comfybox.desktop"
 
-    private static func baseQuery(_ account: String, dataProtection: Bool) -> [String: Any] {
-        var q: [String: Any] = [
+    static func get(_ account: String) -> String? {
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
-        // true  -> modern data-protection keychain (no interactive prompts)
-        // false -> legacy file-based keychain (old items live here)
-        q[kSecUseDataProtectionKeychain as String] = dataProtection
-        return q
-    }
-
-    private static func read(_ account: String, dataProtection: Bool) -> String? {
-        var q = baseQuery(account, dataProtection: dataProtection)
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data, let string = String(data: data, encoding: .utf8),
               !string.isEmpty else { return nil }
         return string
     }
 
     @discardableResult
-    private static func write(_ value: String, _ account: String, dataProtection: Bool) -> Bool {
+    static func set(_ value: String?, _ account: String) -> Bool {
+        // Clearing the value deletes the item.
+        guard let value, !value.isEmpty else { return delete(account) }
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
         let data = Data(value.utf8)
-        var base = baseQuery(account, dataProtection: dataProtection)
+        // Try update first, then add.
         let update = SecItemUpdate(base as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if update == errSecSuccess { return true }
-        base[kSecValueData as String] = data
-        base[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        return SecItemAdd(base as CFDictionary, nil) == errSecSuccess
-    }
-
-    static func get(_ account: String) -> String? {
-        // Prefer the prompt-free data-protection keychain.
-        if let v = read(account, dataProtection: true) { return v }
-        // Fall back to a legacy item (may prompt once) and migrate it forward so
-        // the next read is prompt-free.
-        if let v = read(account, dataProtection: false) {
-            _ = write(v, account, dataProtection: true)
-            return v
-        }
-        return nil
-    }
-
-    @discardableResult
-    static func set(_ value: String?, _ account: String) -> Bool {
-        // Clearing the value deletes the item (from both keychains).
-        guard let value, !value.isEmpty else { return delete(account) }
-        return write(value, account, dataProtection: true)
+        var add = base
+        add[kSecValueData as String] = data
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
     @discardableResult
     static func delete(_ account: String) -> Bool {
-        let dp = SecItemDelete(baseQuery(account, dataProtection: true) as CFDictionary)
-        let legacy = SecItemDelete(baseQuery(account, dataProtection: false) as CFDictionary)
-        let ok: (OSStatus) -> Bool = { $0 == errSecSuccess || $0 == errSecItemNotFound }
-        return ok(dp) && ok(legacy)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 
