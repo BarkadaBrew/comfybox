@@ -259,9 +259,15 @@ enum ComfyBridgeWorkflowParser {
     }
 
     // --- CFG ---
+    // CFGGuider carries `cfg`; but Krita AI Diffusion drives checkpoint models with a
+    // KSampler that carries `cfg` inline (and a BasicGuider with no cfg). Read the
+    // KSampler's cfg too — otherwise the user's CFG is silently dropped to 0.0, which
+    // renders a base model blurry/washed.
     let cfg: Float
-    if let guider = guiderNode, guider.classType == "CFGGuider" {
-      cfg = floatValue(guider.inputs["cfg"]) ?? 0.0
+    if let guider = guiderNode, guider.classType == "CFGGuider", let c = floatValue(guider.inputs["cfg"]) {
+      cfg = c
+    } else if let ks = kSamplerNode, let c = floatValue(ks.inputs["cfg"]) {
+      cfg = c
     } else {
       cfg = 0.0
     }
