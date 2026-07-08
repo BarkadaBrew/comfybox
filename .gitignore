@@ -25,3 +25,6 @@ default.profraw
 /comfybox-*.png
 /server/
 release-artifacts/
+
+# Krea-2 MLX reference impl (third-party, re-fetchable from HF avlp12/Krea-2-Turbo-Alis-MLX-8bit)
+docs/krea2-reference/
