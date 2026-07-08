@@ -28,4 +28,23 @@ final class LoRAMetadataTests: XCTestCase {
         let json = try XCTUnwrap(m.parametersJSON)
         XCTAssertFalse(json.contains("loras"), json)
     }
+
+    /// Scales and guidance must serialize as clean, human-entered numbers, not
+    /// Float32→Double drift (0.8, not 0.80000000000000004).
+    func testNumbersSerializeCleanly() throws {
+        let m = QwenImageIO.ImageMetadata.generation(
+            prompt: "x", guidance: 0.1,
+            loras: [
+                .local("/models/A.safetensors", scale: 0.8),
+                .local("/models/B.safetensors", scale: 0.4),
+                .local("/models/C.safetensors", scale: -3),
+            ])
+        let json = try XCTUnwrap(m.parametersJSON)
+        XCTAssertTrue(json.contains("\"scale\":0.8"), json)
+        XCTAssertTrue(json.contains("\"scale\":0.4"), json)
+        XCTAssertTrue(json.contains("\"scale\":-3"), json)
+        XCTAssertTrue(json.contains("\"guidance\":0.1"), json)
+        XCTAssertFalse(json.contains("0.80000000000000004"), json)
+        XCTAssertFalse(json.contains("0.10000000149011612"), json)
+    }
 }

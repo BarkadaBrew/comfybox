@@ -201,7 +201,7 @@ public enum QwenImageIO {
       if let width { params["width"] = width }
       if let height { params["height"] = height }
       if let steps { params["steps"] = steps }
-      if let guidance { params["guidance"] = Double(guidance) }
+      if let guidance { params["guidance"] = Self.cleanNumber(guidance) }
       if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
       if let seed { params["seed"] = seed }
       // Which app/persona generated it — placed persona renders in the gallery.
@@ -209,11 +209,8 @@ public enum QwenImageIO {
       if let contentMode, !contentMode.isEmpty { params["content_mode"] = contentMode }
       if !loras.isEmpty {
         params["loras"] = loras.map { c -> [String: Any] in
-          // Round-trip through Float32 loses precision (e.g. 0.8 -> 0.800000011920929);
-          // round to 6 decimal places so the embedded JSON matches the human-entered scale.
-          let roundedScale = (Double(c.scale) * 1_000_000).rounded() / 1_000_000
-          return ["name": (c.source.displayName as NSString).deletingPathExtension,
-                  "scale": roundedScale]
+          ["name": (c.source.displayName as NSString).deletingPathExtension,
+           "scale": Self.cleanNumber(c.scale)]
         }
       }
       let modelName = model.flatMap { p -> String? in
@@ -225,6 +222,14 @@ public enum QwenImageIO {
       return ImageMetadata(description: prompt,
                            keywords: [modelName].compactMap { $0 },
                            parametersJSON: json)
+    }
+
+    /// Render a Float as a JSON-clean number. `JSONSerialization` prints a
+    /// `Double` at full precision (0.8 -> 0.80000000000000004); routing through
+    /// the Float's shortest round-trippable decimal string via `NSDecimalNumber`
+    /// yields the human-entered value (0.8, 0.4, -3) in the embedded JSON.
+    static func cleanNumber(_ value: Float) -> NSNumber {
+      NSDecimalNumber(string: String(value))
     }
   }
 
