@@ -37,10 +37,10 @@ public struct ZImageGenerationRequest: Sendable {
 
   /// Generation params embedded into the saved PNG (Finder/Spotlight-readable),
   /// so every render carries its own sidecar — the mflux-style default.
-  public var embeddedMetadata: QwenImageIO.ImageMetadata {
+  public func embeddedMetadata(loras: [LoRAConfiguration] = []) -> QwenImageIO.ImageMetadata {
     .generation(prompt: prompt, negativePrompt: negativePrompt, seed: seed,
                 steps: steps, guidance: guidanceScale, width: width, height: height,
-                model: model, generatedBy: source, contentMode: contentMode)
+                model: model, generatedBy: source, contentMode: contentMode, loras: loras)
   }
 
   public var enhancePrompt: Bool
@@ -959,7 +959,7 @@ public final class ZImagePipeline {
     let decoded = try await generateCore(request, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
 
     progressHandler?(GenerationProgress(stage: .saving, stepIndex: request.steps, totalSteps: request.steps))
-    try QwenImageIO.saveImage(array: decoded, to: request.outputPath, metadata: request.embeddedMetadata)
+    try QwenImageIO.saveImage(array: decoded, to: request.outputPath, metadata: request.embeddedMetadata(loras: loadedLoRAConfigs))
     logger.info("Wrote image to \(request.outputPath.path)")
 
     return request.outputPath

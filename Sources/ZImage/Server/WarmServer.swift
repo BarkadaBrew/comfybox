@@ -3409,7 +3409,8 @@ private actor WarmServerCoordinator {
         pipeline: pipeline,
         tokenizer: tokenizer,
         payload: payload,
-        outputURL: outputURL
+        outputURL: outputURL,
+        loras: activeLoRAs
       )
 
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
@@ -3443,7 +3444,8 @@ private actor WarmServerCoordinator {
     pipeline: ChromaPipeline,
     tokenizer: ChromaTokenizer,
     payload: GeneratePayload,
-    outputURL: URL
+    outputURL: URL,
+    loras: [LoRAConfiguration]
   ) async throws {
     let width = payload.width ?? 1024
     let height = payload.height ?? 1024
@@ -3484,7 +3486,7 @@ private actor WarmServerCoordinator {
     try QwenImageIO.saveImage(array: imageArray, to: outputURL,
       metadata: .generation(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
         seed: seed, steps: steps, guidance: guidance, width: width, height: height,
-        generatedBy: payload.source, contentMode: payload.contentMode))
+        generatedBy: payload.source, contentMode: payload.contentMode, loras: loras))
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {

@@ -308,7 +308,7 @@ public final class Flux2Pipeline {
     try QwenImageIO.saveImage(array: decoded, to: request.outputPath,
       metadata: .generation(prompt: request.prompt, negativePrompt: request.negativePrompt,
         seed: request.seed, steps: request.steps, guidance: request.guidanceScale,
-        width: request.width, height: request.height, contentMode: request.contentMode))
+        width: request.width, height: request.height, contentMode: request.contentMode, loras: loadedLoRAConfigs))
     logger.info("Wrote image to \(request.outputPath.path)")
 
     return request.outputPath
