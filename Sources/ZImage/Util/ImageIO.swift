@@ -195,7 +195,7 @@ public enum QwenImageIO {
       prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil,
       steps: Int? = nil, guidance: Float? = nil, width: Int? = nil,
       height: Int? = nil, model: String? = nil, generatedBy: String? = nil,
-      contentMode: String? = nil
+      contentMode: String? = nil, loras: [LoRAConfiguration] = []
     ) -> ImageMetadata {
       var params: [String: Any] = ["prompt": prompt]
       if let width { params["width"] = width }
@@ -207,6 +207,15 @@ public enum QwenImageIO {
       // Which app/persona generated it — placed persona renders in the gallery.
       if let generatedBy, !generatedBy.isEmpty { params["source"] = generatedBy }
       if let contentMode, !contentMode.isEmpty { params["content_mode"] = contentMode }
+      if !loras.isEmpty {
+        params["loras"] = loras.map { c -> [String: Any] in
+          // Round-trip through Float32 loses precision (e.g. 0.8 -> 0.800000011920929);
+          // round to 6 decimal places so the embedded JSON matches the human-entered scale.
+          let roundedScale = (Double(c.scale) * 1_000_000).rounded() / 1_000_000
+          return ["name": (c.source.displayName as NSString).deletingPathExtension,
+                  "scale": roundedScale]
+        }
+      }
       let modelName = model.flatMap { p -> String? in
         p.isEmpty ? nil : ((p as NSString).lastPathComponent as NSString).deletingPathExtension
       }

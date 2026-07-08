@@ -1173,7 +1173,7 @@ public class ZImageControlPipeline {
     }
     try QwenImageIO.saveImage(array: decoded, to: outputPath,
       metadata: .generation(prompt: request.prompt, seed: request.seed, steps: request.steps,
-        width: request.width, height: request.height))
+        width: request.width, height: request.height, loras: loadedLoRAConfigs))
     logger.info("Wrote image to \(outputPath.path)")
     return outputPath
   }

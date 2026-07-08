@@ -19,7 +19,7 @@ final class Img2ImgMetadataTests: XCTestCase {
             prompt: "a cat", sourceImagePath: src,
             contentMode: "banana", source: "desktop")
         let pipeline = try ZImagePipeline.makeImg2ImgPipelineRequestForTesting(req)
-        let json = try XCTUnwrap(pipeline.embeddedMetadata.parametersJSON)
+        let json = try XCTUnwrap(pipeline.embeddedMetadata().parametersJSON)
         XCTAssertTrue(json.contains("\"content_mode\":\"banana\""), json)
         XCTAssertTrue(json.contains("\"source\":\"desktop\""), json)
     }
@@ -29,7 +29,7 @@ final class Img2ImgMetadataTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: src) }
         let req = Img2ImgRequest(prompt: "a cat", sourceImagePath: src)
         let pipeline = try ZImagePipeline.makeImg2ImgPipelineRequestForTesting(req)
-        let json = try XCTUnwrap(pipeline.embeddedMetadata.parametersJSON)
+        let json = try XCTUnwrap(pipeline.embeddedMetadata().parametersJSON)
         XCTAssertFalse(json.contains("content_mode"), json)
         XCTAssertFalse(json.contains("\"source\""), json)
     }
