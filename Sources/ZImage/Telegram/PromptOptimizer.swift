@@ -159,7 +159,7 @@ public final class PromptOptimizer: @unchecked Sendable {
   Your output MUST use this two-block structure:
 
   YOUR CONTEXT:
-  [Style/technical persona — camera type, lens, lighting philosophy, aesthetic, skin texture approach]
+  [Style/technical persona — described look and depth-of-field, lighting philosophy, aesthetic, skin texture approach]
   YOUR PHOTO:
   [Scene description — subject with physical traits woven in, action, composition, environment, atmosphere]
 
@@ -167,15 +167,15 @@ public final class PromptOptimizer: @unchecked Sendable {
 
   ## YOUR CONTEXT BLOCK
 
-  Set the photographic persona and technical constraints. This tells Z-Image HOW to render:
-  - Lens and aperture (e.g. "85mm f/1.4", "35mm f/2") — NEVER mention camera body brands
-  - Optical characteristics (e.g. "shallow depth of field with creamy bokeh")
+  Set the photographic persona and technical constraints. Describe the resulting LOOK in plain language — an LLM encoder responds to described effect, NOT camera jargon like "85mm f/1.4":
+  - Depth of field / framing as EFFECT (e.g. "tight portrait framing, background melting into soft creamy blur, only the eyes tack-sharp") — NOT focal lengths or f-stops
+  - Perspective as EFFECT (e.g. "gentle facial compression" for a tele look; "expansive wide framing with slight edge stretch" for a wide look)
   - Lighting approach (e.g. "soft diffused window light, warm tungsten fill")
   - Skin/texture style (e.g. "visible pores, peach fuzz, natural imperfections")
   - Aesthetic (e.g. "intimate candid photography", "editorial portrait")
   - Film stock if relevant (e.g. "Kodak Portra 400 color palette")
 
-  CRITICAL: Do NOT mention camera body brands (Canon, Sony, Nikon, Fujifilm, Hasselblad, Leica, etc.).
+  CRITICAL: Do NOT mention camera body brands, focal-length numbers ("85mm"), or f-stops ("f/1.4") — describe the depth of field, bokeh, and compression they produce, in words.
 
   Keep this block 20-40 words.
 
@@ -201,7 +201,7 @@ public final class PromptOptimizer: @unchecked Sendable {
   3. NO quality keywords: masterpiece, best quality, 8k, ultra-detailed, hyperrealistic.
   4. NO negatives. State what IS there only.
   5. Skin tone early for non-white subjects.
-  6. Lens + aperture in YOUR CONTEXT block only. NEVER mention camera body brands.
+  6. Describe optical EFFECT (depth of field, bokeh, compression, framing) in prose — NEVER focal-length numbers, f-stops, or camera body brands.
   7. Preserve user's compositional intent.
   8. Target: YOUR CONTEXT 20-40 words, YOUR PHOTO 60-140 words. Front-load subject + action.
   9. Character name AT MOST ONCE. Pronouns after.
@@ -282,9 +282,9 @@ public final class PromptOptimizer: @unchecked Sendable {
     parts.append("INPUT PROMPT:\n\(prompt)")
 
     if contentMode.lowercased() == "avocado" {
-      parts.append("Rewrite the INPUT PROMPT for Z-Image Turbo. This is EXPLICIT PORNOGRAPHIC content — use crude anatomical language, describe nudity and sex acts graphically, never soften or use euphemisms. Do NOT mention any camera body brands. Return only the rewritten prompt.")
+      parts.append("Rewrite the INPUT PROMPT for Z-Image Turbo. This is EXPLICIT PORNOGRAPHIC content — use crude anatomical language, describe nudity and sex acts graphically, never soften or use euphemisms. Do NOT mention camera body brands, focal-length numbers, or f-stops — describe the look (depth of field, framing) in prose. Return only the rewritten prompt.")
     } else {
-      parts.append("Rewrite the INPUT PROMPT for Z-Image Turbo. Do NOT mention any camera body brands — use lens specs only. Match the lens to the scene type. Return only the rewritten prompt.")
+      parts.append("Rewrite the INPUT PROMPT for Z-Image Turbo. Describe the photographic look as visual EFFECT (depth of field, bokeh, compression, framing) in prose — NO focal-length numbers, f-stops, or camera body brands. Match the look to the scene type. Return only the rewritten prompt.")
     }
 
     return parts.joined(separator: "\n\n")
@@ -295,22 +295,22 @@ public final class PromptOptimizer: @unchecked Sendable {
     let p = prompt.lowercased()
 
     if p.contains("pov") || p.contains("phone") || p.contains("selfie") {
-      return "SCENE TYPE: POV/phone — use 26-28mm wide angle, amateur aesthetic."
+      return "SCENE TYPE: POV/phone — wide framing with slight edge stretch, deep focus, amateur aesthetic."
     }
     if p.contains("close-up") || p.contains("closeup") || p.contains("headshot") || p.contains("portrait") {
-      return "SCENE TYPE: portrait/close-up — use 85mm or 105mm, shallow depth of field."
+      return "SCENE TYPE: portrait/close-up — tight framing, shallow depth of field, soft creamy background blur."
     }
     if p.contains("macro") || p.contains("extreme close") || p.contains("texture") {
-      return "SCENE TYPE: macro/detail — use 100mm macro f/2.8."
+      return "SCENE TYPE: macro/detail — extreme close focus on texture, very shallow depth of field."
     }
     if p.contains("full body") || p.contains("standing") || p.contains("walking") {
-      return "SCENE TYPE: full body — use 50mm f/1.4, natural perspective."
+      return "SCENE TYPE: full body — natural perspective, whole figure in frame, moderate depth of field."
     }
     if p.contains("wide") || p.contains("room") || p.contains("landscape") || p.contains("street") {
-      return "SCENE TYPE: environment/wide — use 24-35mm."
+      return "SCENE TYPE: environment/wide — expansive framing showing surroundings, deep focus front to back."
     }
     if p.contains("cinematic") || p.contains("widescreen") || p.contains("film") {
-      return "SCENE TYPE: cinematic — use 35mm anamorphic f/2."
+      return "SCENE TYPE: cinematic — wide filmic framing, shallow focus, anamorphic-style mood."
     }
     return ""
   }
@@ -359,11 +359,11 @@ public final class PromptOptimizer: @unchecked Sendable {
     let context: String
     switch contentMode.lowercased() {
     case "avocado":
-      context = "50mm f/1.4, warm tungsten bedside lamp, skin rendered with sweat sheen and visible pores, amateur bedroom aesthetic with shallow depth of field"
+      context = "warm tungsten bedside lamp, skin rendered with sweat sheen and visible pores, amateur bedroom aesthetic with shallow depth of field and soft background blur"
     case "banana":
-      context = "85mm f/1.4, golden hour backlight, warm tungsten fill, shallow depth of field with creamy bokeh, skin with natural sheen, intimate boudoir aesthetic"
+      context = "golden hour backlight with warm tungsten fill, shallow depth of field and creamy background blur, tight flattering framing, skin with natural sheen, intimate boudoir aesthetic"
     default:
-      context = "35mm f/2, soft natural daylight with gentle fill, natural skin texture with visible pores, warm documentary intimacy with Kodak Portra 400 palette"
+      context = "soft natural daylight with gentle fill, natural skin texture with visible pores, tight natural framing with gentle background separation, warm documentary intimacy with Kodak Portra 400 palette"
     }
     return "YOUR CONTEXT:\n\(context)\n\nYOUR PHOTO:\n\(prompt)"
   }

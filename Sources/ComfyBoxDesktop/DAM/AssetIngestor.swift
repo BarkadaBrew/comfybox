@@ -359,6 +359,34 @@ public final class AssetIngestor {
 
     // MARK: - Sidecar Metadata
 
+    /// LoRAs recorded in an image's metadata — read on demand for display.
+    /// Checks the `.json` sidecar first, then the embedded EXIF UserComment JSON.
+    /// Returns "name @scale" strings (empty if none were used).
+    static func embeddedLoras(imagePath: String) -> [String] {
+        func loras(from params: [String: Any]) -> [String] {
+            guard let arr = params["loras"] as? [[String: Any]] else { return [] }
+            return arr.compactMap { l in
+                guard let name = l["name"] as? String else { return nil }
+                let scale = (l["scale"] as? Double) ?? (l["scale"] as? Int).map(Double.init) ?? 1.0
+                return "\(name) @\(String(format: "%g", scale))"
+            }
+        }
+        let jsonPath = ((imagePath as NSString).deletingPathExtension) + ".json"
+        if let data = FileManager.default.contents(atPath: jsonPath),
+           let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let l = loras(from: j); if !l.isEmpty { return l }
+        }
+        if let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: imagePath) as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any],
+           let uc = exif[kCGImagePropertyExifUserComment] as? String,
+           let d = uc.data(using: .utf8),
+           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            return loras(from: j)
+        }
+        return []
+    }
+
     private struct SidecarMetadata {
         let prompt: String?
         let negativePrompt: String?

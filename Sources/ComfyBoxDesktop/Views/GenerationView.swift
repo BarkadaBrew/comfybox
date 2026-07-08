@@ -64,14 +64,17 @@ struct GenerationView: View {
     var agent: AgentService?
 
     // Generation parameters
-    @State private var prompt: String = ""
-    @State private var negativePrompt: String = ""
+    // Persisted across tab switches (and app relaunch) so leaving Generate and
+    // coming back doesn't wipe your work. @SceneStorage is a drop-in for @State.
+    @SceneStorage("gen.prompt") private var prompt: String = ""
+    @SceneStorage("gen.negativePrompt") private var negativePrompt: String = ""
+    @SceneStorage("gen.resolutionId") private var resolutionId: String = ResolutionPreset.presets[2].id
     @State private var selectedResolution: ResolutionPreset = ResolutionPreset.presets[2]
-    @State private var customWidth: Int = 1024
-    @State private var customHeight: Int = 1024
-    @State private var steps: Double = 9
-    @State private var guidance: Double = 3.5
-    @State private var seedText: String = ""
+    @SceneStorage("gen.customWidth") private var customWidth: Int = 1024
+    @SceneStorage("gen.customHeight") private var customHeight: Int = 1024
+    @SceneStorage("gen.steps") private var steps: Double = 9
+    @SceneStorage("gen.guidance") private var guidance: Double = 3.5
+    @SceneStorage("gen.seedText") private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
     // img2img reference
@@ -90,6 +93,8 @@ struct GenerationView: View {
 
     // LoRA selections
     @State private var selectedLoras: [LoRASelection] = []
+    /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
+    @SceneStorage("gen.lorasJSON") private var lorasJSON: String = ""
 
     // Sidebar sections
     @State private var showModelSelector: Bool = true
@@ -103,6 +108,9 @@ struct GenerationView: View {
     /// Number of images to generate in one batch (seed sweep).
     @State private var batchCount: Int = 1
     @State private var batchProgress: String?
+    /// Set when a LoRA swap fails at generate time, so it's visible instead of
+    /// silently rendering with no LoRAs.
+    @State private var loraSwapWarning: String?
     /// SeedVR2 upscale of the render (0 = off, else target long-side px).
     @State private var seedvrUpscale: Int = 0
     @State private var showAssistant: Bool = true
@@ -132,13 +140,30 @@ struct GenerationView: View {
         HSplitView {
             // Left panel: Controls
             controlPanel
-                .frame(minWidth: 340, maxWidth: 420)
+                .frame(minWidth: 360, idealWidth: 460, maxWidth: 760)
 
             // Right panel: Image preview
             previewPanel
                 .frame(minWidth: 400)
         }
-        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference(); consumePendingContentMode() }
+        .onAppear {
+            // Restore persisted resolution + LoRA stack first, then let any pending
+            // preset/prompt (from another tab) override them.
+            if resolutionId == ResolutionPreset.custom.id {
+                selectedResolution = .custom
+            } else if let match = ResolutionPreset.presets.first(where: { $0.id == resolutionId }) {
+                selectedResolution = match
+            }
+            if selectedLoras.isEmpty, let data = lorasJSON.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode([LoRASelection].self, from: data) {
+                selectedLoras = decoded
+            }
+            consumePendingPreset(); consumePendingPrompt(); consumePendingReference(); consumePendingContentMode()
+        }
+        .onChange(of: selectedResolution.id) { _, id in resolutionId = id }
+        .onChange(of: selectedLoras) { _, loras in
+            if let data = try? JSONEncoder().encode(loras) { lorasJSON = String(decoding: data, as: UTF8.self) }
+        }
         .task { await loadServerPresets() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
@@ -673,8 +698,40 @@ struct GenerationView: View {
         }
     }
 
+    /// Compact "what will render" summary shown above Generate so the config is
+    /// confirmable at a glance — notably the LoRA stack (with scales) that used
+    /// to be silently dropped.
+    private var configSummary: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            summaryRow("Model", (engine.currentModel as NSString?)?.lastPathComponent ?? "—")
+            summaryRow("LoRAs", selectedLoras.isEmpty
+                ? "none"
+                : selectedLoras.map {
+                    "\($0.filename.replacingOccurrences(of: ".safetensors", with: "")) @\(String(format: "%g", $0.scale))"
+                  }.joined(separator: ", "))
+            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
+            if let warn = loraSwapWarning {
+                Text(warn).foregroundStyle(.orange)
+            }
+        }
+        .font(.caption2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func summaryRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(label).foregroundStyle(.secondary).frame(width: 46, alignment: .leading)
+            Text(value).textSelection(.enabled).lineLimit(3)
+            Spacer(minLength: 0)
+        }
+    }
+
     private var actionButtons: some View {
         VStack(spacing: 8) {
+            configSummary
             // Generate button
             Button(action: { submitGeneration() }) {
                 HStack {
@@ -818,14 +875,19 @@ struct GenerationView: View {
 
         let count = max(1, batchCount)
         Task {
-            // Swap LoRAs if any selected (before generation).
+            // Swap LoRAs if any selected (before generation). Surface failures —
+            // silently swallowing them is how renders ended up with no LoRAs.
             if !selectedLoras.isEmpty {
                 do {
                     try await engine.swapLoras(selectedLoras)
+                    await MainActor.run { loraSwapWarning = nil }
                 } catch {
-                    // LoRA swap failure — still attempt generation with
-                    // whatever LoRAs are currently loaded.
+                    await MainActor.run {
+                        loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
+                    }
                 }
+            } else {
+                await MainActor.run { loraSwapWarning = nil }
             }
 
             // Batch: generate `count` images. A fixed seed sweeps seed, seed+1…;

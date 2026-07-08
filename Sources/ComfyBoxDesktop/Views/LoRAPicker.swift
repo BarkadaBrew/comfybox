@@ -55,12 +55,13 @@ struct LoRAPicker: View {
         return sortedLoras(filtered)
     }
 
-    /// Sort: selected first, then active on server, then alphabetical.
+    /// Stable order: active on server first, then alphabetical. Deliberately does
+    /// NOT sort by selection — reordering a row at the moment it's selected (while
+    /// its content also changes to reveal the scale slider) leaves SwiftUI showing
+    /// a stale row until the list is rebuilt. Keeping order stable lets the row
+    /// gain its slider in place.
     private func sortedLoras(_ loras: [LoRAInfo]) -> [LoRAInfo] {
         loras.sorted { a, b in
-            let aSelected = selectedLoras.contains { $0.id == a.id }
-            let bSelected = selectedLoras.contains { $0.id == b.id }
-            if aSelected != bSelected { return aSelected }
             if a.isActive != b.isActive { return a.isActive }
             return a.id < b.id
         }
@@ -149,22 +150,12 @@ struct LoRAPicker: View {
                 .frame(maxHeight: 240)
             }
 
-            // Apply button if selections differ from server state
+            // LoRAs are applied automatically at Generate time — no separate step.
             if !selectedLoras.isEmpty {
-                Button(action: { Task { await applyLoras() } }) {
-                    HStack(spacing: 4) {
-                        if engine.isSwappingLoras {
-                            ProgressView()
-                                .controlSize(.mini)
-                        }
-                        Text(engine.isSwappingLoras ? "Applying..." : "Apply LoRAs")
-                    }
-                    .frame(maxWidth: .infinity)
-                    .font(.caption)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(engine.isSwappingLoras)
+                Text("\(selectedLoras.count) LoRA\(selectedLoras.count == 1 ? "" : "s") selected — applied automatically on Generate")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             // Error display
@@ -247,10 +238,16 @@ struct LoRAPicker: View {
                     Slider(
                         value: Binding(
                             get: { selectedLoras[index].scale },
-                            set: { selectedLoras[index].scale = $0 }
+                            set: { newValue in
+                                // Magnetic detent at 0 so it's easy to neutralize/disable a
+                                // LoRA; otherwise round to 0.01 for fine-grained control across
+                                // the wider -5...5 range (sliders often need negatives/overdrive).
+                                selectedLoras[index].scale = abs(newValue) < 0.08
+                                    ? 0.0
+                                    : (newValue * 100).rounded() / 100
+                            }
                         ),
-                        in: 0.0...2.0,
-                        step: 0.05
+                        in: -5.0...5.0
                     )
                     .controlSize(.mini)
 
@@ -258,7 +255,7 @@ struct LoRAPicker: View {
                         "",
                         value: Binding(
                             get: { selectedLoras[safe: index]?.scale ?? 1.0 },
-                            set: { selectedLoras[index].scale = min(max($0, 0.0), 2.0) }
+                            set: { selectedLoras[index].scale = min(max($0, -5.0), 5.0) }
                         ),
                         format: .number.precision(.fractionLength(0...2))
                     )
@@ -308,15 +305,6 @@ struct LoRAPicker: View {
                 filename: lora.filename,
                 scale: lora.recommendedScale
             ))
-        }
-    }
-
-    private func applyLoras() async {
-        errorMessage = nil
-        do {
-            try await engine.swapLoras(selectedLoras)
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 

@@ -304,6 +304,7 @@ struct AssetDetailView: View {
                 .fontWeight(.semibold)
 
             metadataRow("Model", value: asset.modelFamily)
+            if let loras = lorasSummary { metadataRow("LoRAs", value: loras) }
             metadataRow("Steps", value: asset.steps.map(String.init))
             metadataRow("Guidance", value: asset.guidance.map { String(format: "%.1f", $0) })
             metadataRow("Seed", value: asset.seed.map(String.init))
@@ -415,6 +416,12 @@ struct AssetDetailView: View {
         fmt.dateStyle = .medium
         fmt.timeStyle = .short
         return fmt.string(from: date)
+    }
+
+    /// LoRAs read on demand from the asset's embedded metadata / sidecar.
+    private var lorasSummary: String? {
+        let loras = AssetIngestor.embeddedLoras(imagePath: asset.absolutePath)
+        return loras.isEmpty ? nil : loras.joined(separator: ", ")
     }
 
     @ViewBuilder

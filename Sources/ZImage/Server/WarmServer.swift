@@ -1603,12 +1603,17 @@ public final class WarmServer {
     // The coordinator serializes operations, so swap completes before generate starts.
     if !request.loras.isEmpty {
       let loraEntries = request.loras.map { lora -> LoRAEntry in
-        // Resolve bare filenames to full paths in the LoRA directory.
+        // Resolve the LoRA name to a path. Prefer an uploaded LoRA in the bridge
+        // dir; otherwise pass the BARE filename so the applicator resolves it
+        // against the LoRA library — the same resolution /v1/lora/swap uses.
+        // (Blindly prepending the upload dir turned resolvable library LoRAs like
+        // "Anneliese_Zbase3.safetensors" into non-existent paths → fileNotFound.)
         let resolvedPath: String
         if lora.name.contains("/") || lora.name.hasPrefix("~") {
-          resolvedPath = lora.name
+          resolvedPath = (lora.name as NSString).expandingTildeInPath
         } else {
-          resolvedPath = Self.loraDirectoryPath + "/" + lora.name
+          let uploadPath = Self.loraDirectoryPath + "/" + lora.name
+          resolvedPath = FileManager.default.fileExists(atPath: uploadPath) ? uploadPath : lora.name
         }
         return LoRAEntry(path: resolvedPath, scale: lora.scale)
       }
@@ -1782,9 +1787,12 @@ public final class WarmServer {
           logger.info("[WarmServer] Z-Image Base override: steps=\(resolvedSteps) (was \(request.steps)), sampler=\(resolvedSampler ?? "nil") (was \(request.sampler ?? "nil"))")
         }
       } else {
-        // Z-Image Turbo: distilled, optimal at 9 steps, no CFG, no negative prompts
+        // Z-Image Turbo: distilled, optimal at 9 steps. Honor the requested
+        // guidance rather than hardcoding 0 — merged/finetuned "turbo"
+        // checkpoints do respond to CFG, so forcing 0 removed real user control
+        // (0 is the recommended default, passed through when the client sends it).
         resolvedSteps = min(request.steps, 9)
-        resolvedGuidance = 0.0
+        resolvedGuidance = request.guidance
         resolvedNegativePrompt = nil
         resolvedSampler = request.sampler
       }
