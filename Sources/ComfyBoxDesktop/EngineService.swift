@@ -12,6 +12,7 @@ import ZImage
 /// Generation parameters submitted to the server.
 public struct GenerationRequest: Sendable {
     public var prompt: String
+    public var negativePrompt: String
     public var width: Int
     public var height: Int
     public var steps: Int
@@ -28,6 +29,7 @@ public struct GenerationRequest: Sendable {
 
     public init(
         prompt: String = "",
+        negativePrompt: String = "",
         width: Int = 1024,
         height: Int = 1024,
         steps: Int = 9,
@@ -40,6 +42,7 @@ public struct GenerationRequest: Sendable {
         dype: String? = nil
     ) {
         self.prompt = prompt
+        self.negativePrompt = negativePrompt
         self.width = width
         self.height = height
         self.steps = steps
@@ -358,6 +361,10 @@ public final class EngineService {
 
         if request.seed > 0 {
             payloadDict["seed"] = request.seed
+        }
+
+        if !request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            payloadDict["negative_prompt"] = request.negativePrompt
         }
 
         // img2img: reference image + strength (server maps strength->denoise).

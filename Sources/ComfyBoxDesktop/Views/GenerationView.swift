@@ -58,11 +58,14 @@ struct GenerationView: View {
     /// Image queued as an img2img reference (from Gallery/Canvas "Use as
     /// Reference"); consumed once.
     @Binding var pendingReferenceImage: String?
+    /// Content mode queued by "Send to Generate" (Gallery/detail); consumed once.
+    @Binding var pendingContentMode: ContentMode?
     /// Shared image assistant (Dan's v1.3) that can drive these controls.
     var agent: AgentService?
 
     // Generation parameters
     @State private var prompt: String = ""
+    @State private var negativePrompt: String = ""
     @State private var selectedResolution: ResolutionPreset = ResolutionPreset.presets[2]
     @State private var customWidth: Int = 1024
     @State private var customHeight: Int = 1024
@@ -135,11 +138,12 @@ struct GenerationView: View {
             previewPanel
                 .frame(minWidth: 400)
         }
-        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference() }
+        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference(); consumePendingContentMode() }
         .task { await loadServerPresets() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
         .onChange(of: pendingReferenceImage) { _, _ in consumePendingReference() }
+        .onChange(of: pendingContentMode) { _, _ in consumePendingContentMode() }
         .sheet(isPresented: $showingSavePreset) {
             SavePresetSheet(
                 promptTemplate: prompt,
@@ -476,6 +480,11 @@ struct GenerationView: View {
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                 )
+
+            Text("Negative prompt").font(.caption).foregroundStyle(.secondary)
+            TextField("things to avoid (optional)", text: $negativePrompt, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...3)
         }
     }
 
@@ -788,6 +797,7 @@ struct GenerationView: View {
 
         let request = GenerationRequest(
             prompt: prompt,
+            negativePrompt: negativePrompt,
             width: effectiveWidth,
             height: effectiveHeight,
             steps: Int(steps),
@@ -904,6 +914,13 @@ struct GenerationView: View {
         prompt = text
     }
 
+    /// Consume a content mode queued by "Send to Generate" (Gallery/detail), if any.
+    private func consumePendingContentMode() {
+        guard let mode = pendingContentMode else { return }
+        pendingContentMode = nil
+        contentMode = mode
+    }
+
     /// Apply an assistant action to the generation controls. Only fields the
     /// action set are changed; a `generate` flag kicks off a render.
     private func applyAgentAction(_ action: AgentAction) {
@@ -982,6 +999,7 @@ struct GenerationView: View {
     /// Apply a preset to the current generation parameters.
     func applyPreset(_ preset: GenerationPreset) {
         prompt = preset.promptTemplate
+        negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
         // Restore a saved seed (nil/0 = random).

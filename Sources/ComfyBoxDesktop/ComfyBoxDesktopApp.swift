@@ -27,6 +27,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingReferenceImage: String?
     @State private var pendingMotionReference: String?
     @State private var pendingInpaintImage: String?
+    @State private var pendingContentMode: ContentMode?
 
     init() {
         let engine = EngineService()
@@ -388,6 +389,7 @@ struct ComfyBoxDesktopApp: App {
                 pendingPreset: $pendingPreset,
                 pendingPromptInsert: $pendingPromptInsert,
                 pendingReferenceImage: $pendingReferenceImage,
+                pendingContentMode: $pendingContentMode,
                 agent: agentService
             )
 
@@ -458,6 +460,12 @@ struct ComfyBoxDesktopApp: App {
                     },
                     onUseAsReference: { asset in
                         pendingReferenceImage = asset.absolutePath
+                        selectedTab = .generate
+                    },
+                    onSendToGenerate: { asset in
+                        guard let recipe = ImageRecipe.read(fromImageAt: asset.absolutePath, fallback: asset) else { return }
+                        pendingPreset = recipe.preset
+                        pendingContentMode = recipe.contentMode
                         selectedTab = .generate
                     },
                     onAnimate: { asset in

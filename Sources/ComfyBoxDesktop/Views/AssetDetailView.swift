@@ -14,6 +14,8 @@ struct AssetDetailView: View {
     let onUpdate: (DAMAsset) -> Void
     /// Open the given asset in the full-screen lightbox.
     var onFullScreen: ((DAMAsset) -> Void)?
+    /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
+    var onSendToGenerate: ((DAMAsset) -> Void)?
 
     @State private var currentIndex: Int
     @State private var rating: Int = 0
@@ -30,6 +32,7 @@ struct AssetDetailView: View {
         self.thumbnailProvider = { _ in thumbnailPath }
         self.onUpdate = onUpdate
         self.onFullScreen = nil
+        self.onSendToGenerate = nil
         self._currentIndex = State(initialValue: 0)
     }
 
@@ -39,12 +42,14 @@ struct AssetDetailView: View {
         index: Int,
         thumbnailProvider: @escaping (DAMAsset) -> String?,
         onUpdate: @escaping (DAMAsset) -> Void,
-        onFullScreen: ((DAMAsset) -> Void)? = nil
+        onFullScreen: ((DAMAsset) -> Void)? = nil,
+        onSendToGenerate: ((DAMAsset) -> Void)? = nil
     ) {
         self.assets = assets
         self.thumbnailProvider = thumbnailProvider
         self.onUpdate = onUpdate
         self.onFullScreen = onFullScreen
+        self.onSendToGenerate = onSendToGenerate
         self._currentIndex = State(initialValue: index)
     }
 
@@ -104,6 +109,11 @@ struct AssetDetailView: View {
                 Label("Reveal", systemImage: "magnifyingglass")
             }
             .help("Reveal in Finder")
+            if let onSendToGenerate {
+                Button { onSendToGenerate(asset) } label: {
+                    Label("Send to Generate", systemImage: "wand.and.stars")
+                }
+            }
             if let onFullScreen {
                 Button { onFullScreen(asset) } label: {
                     Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")

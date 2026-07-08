@@ -150,6 +150,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             id: id,
             name: name,
             promptTemplate: prompt ?? "",
+            negativePrompt: negativePrompt,
             modelId: customModelPath ?? model,
             loras: loras.map { PresetLoRA(id: $0.filename, filename: $0.filename, scale: Float($0.scale)) },
             steps: steps ?? 9,
