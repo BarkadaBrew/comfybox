@@ -26,6 +26,8 @@ struct GalleryView: View {
     var onCompare: (([DAMAsset]) -> Void)?
     /// Send an image to Generate as an img2img reference.
     var onUseAsReference: ((DAMAsset) -> Void)?
+    /// Send an image's full recipe (prompt, params, LoRAs, content mode) to Generate.
+    var onSendToGenerate: ((DAMAsset) -> Void)?
     /// Send an image to the Motion tab as an image-to-video reference.
     var onAnimate: ((DAMAsset) -> Void)?
     /// Send an image to the Inpaint tab.
@@ -194,7 +196,8 @@ struct GalleryView: View {
                 onFullScreen: { target in
                     selectedAsset = nil
                     lightboxIndex = filteredAssets.firstIndex(where: { $0.id == target.id })
-                }
+                },
+                onSendToGenerate: onSendToGenerate
             )
             .frame(minWidth: 800, minHeight: 500)
         }
@@ -227,6 +230,7 @@ struct GalleryView: View {
                     onSetLabel: { asset, color in applyColorLabel(color, to: [asset]) },
                     onCopy: { copyAssets([$0]) },
                     onReveal: { revealInFinder($0) },
+                    onSendToGenerate: onSendToGenerate,
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
@@ -636,6 +640,9 @@ struct GalleryView: View {
                         }
                         if onUseAsReference != nil {
                             Button("Use as Reference (img2img)") { onUseAsReference?(asset) }
+                        }
+                        if onSendToGenerate != nil {
+                            Button("Send to Generate") { onSendToGenerate?(asset) }
                         }
                         if onAnimate != nil {
                             Button("Animate (LTX-2 video)") { onAnimate?(asset) }
@@ -1617,6 +1624,8 @@ private struct GalleryLightbox: View {
     var onSetLabel: (DAMAsset, FinderColor?) -> Void = { _, _ in }
     var onCopy: (DAMAsset) -> Void = { _ in }
     var onReveal: (DAMAsset) -> Void = { _ in }
+    /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
+    var onSendToGenerate: ((DAMAsset) -> Void)?
     let onIndexChange: (Int) -> Void
     let onClose: () -> Void
 
@@ -1731,6 +1740,13 @@ private struct GalleryLightbox: View {
                         }
                         .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
                         .help("Reveal in Finder")
+                        if let onSendToGenerate {
+                            Button { onSendToGenerate(asset) } label: {
+                                Image(systemName: "wand.and.stars.inverse").font(.title3)
+                            }
+                            .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
+                            .help("Send to Generate")
+                        }
                     }
 
                     Button { onClose() } label: {

@@ -58,6 +58,8 @@ struct GenerationView: View {
     /// Image queued as an img2img reference (from Gallery/Canvas "Use as
     /// Reference"); consumed once.
     @Binding var pendingReferenceImage: String?
+    /// Content mode queued by "Send to Generate" (Gallery/detail); consumed once.
+    @Binding var pendingContentMode: ContentMode?
     /// Shared image assistant (Dan's v1.3) that can drive these controls.
     var agent: AgentService?
 
@@ -136,11 +138,12 @@ struct GenerationView: View {
             previewPanel
                 .frame(minWidth: 400)
         }
-        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference() }
+        .onAppear { consumePendingPreset(); consumePendingPrompt(); consumePendingReference(); consumePendingContentMode() }
         .task { await loadServerPresets() }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
         .onChange(of: pendingReferenceImage) { _, _ in consumePendingReference() }
+        .onChange(of: pendingContentMode) { _, _ in consumePendingContentMode() }
         .sheet(isPresented: $showingSavePreset) {
             SavePresetSheet(
                 promptTemplate: prompt,
@@ -909,6 +912,13 @@ struct GenerationView: View {
         guard let text = pendingPromptInsert, !text.isEmpty else { return }
         pendingPromptInsert = nil
         prompt = text
+    }
+
+    /// Consume a content mode queued by "Send to Generate" (Gallery/detail), if any.
+    private func consumePendingContentMode() {
+        guard let mode = pendingContentMode else { return }
+        pendingContentMode = nil
+        contentMode = mode
     }
 
     /// Apply an assistant action to the generation controls. Only fields the
