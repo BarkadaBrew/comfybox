@@ -4159,7 +4159,9 @@ extension GeneratePayload: Decodable {
       dyPE: dyPEConfig,
       sourceImagePath: imagePath,
       strength: resolvedStrength,
-      specifiedAs: specifiedAs
+      specifiedAs: specifiedAs,
+      contentMode: contentMode,
+      source: source
     )
   }
 

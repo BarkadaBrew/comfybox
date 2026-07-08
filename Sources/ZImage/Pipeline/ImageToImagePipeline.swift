@@ -52,6 +52,12 @@ public struct Img2ImgRequest: Sendable {
   /// How the user specified the value — "strength" or "creativity".
   public var specifiedAs: Img2ImgSpecifier
 
+  /// Fruit mode (neutral|banana|avocado) — stamped into embedded metadata.
+  public var contentMode: String?
+
+  /// Submitting app/persona (desktop/bree/api…) — stamped as metadata provenance.
+  public var source: String?
+
   public enum Img2ImgSpecifier: String, Sendable {
     case strength
     case creativity
@@ -82,7 +88,9 @@ public struct Img2ImgRequest: Sendable {
     dyPE: DyPEConfig = .disabled,
     sourceImagePath: String,
     strength: Float = 0.3,
-    specifiedAs: Img2ImgSpecifier = .strength
+    specifiedAs: Img2ImgSpecifier = .strength,
+    contentMode: String? = nil,
+    source: String? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -108,6 +116,8 @@ public struct Img2ImgRequest: Sendable {
     self.sourceImagePath = sourceImagePath
     self.strength = strength
     self.specifiedAs = specifiedAs
+    self.contentMode = contentMode
+    self.source = source
   }
 
   /// Convert img2img strength to inpainting denoise value.
@@ -226,7 +236,22 @@ extension ZImagePipeline {
 
   /// Convert an Img2ImgRequest to a ZImageGenerationRequest by loading
   /// the source image, generating a white mask, and computing denoise.
-  private func makeImg2ImgPipelineRequest(_ request: Img2ImgRequest) throws -> ZImageGenerationRequest {
+  ///
+  /// Forwards to the static conversion below, which reads no instance state
+  /// (only `request` + `FileManager`) and is exposed separately so it can be
+  /// unit-tested without constructing a live `ZImagePipeline`.
+  internal func makeImg2ImgPipelineRequest(_ request: Img2ImgRequest) throws -> ZImageGenerationRequest {
+    try Self.makeImg2ImgPipelineRequest(request)
+  }
+
+  /// Test-only: exposes makeImg2ImgPipelineRequest's pure conversion without a
+  /// live pipeline instance. Not used in production code paths.
+  static func makeImg2ImgPipelineRequestForTesting(_ request: Img2ImgRequest) throws -> ZImageGenerationRequest {
+    try makeImg2ImgPipelineRequest(request)
+  }
+
+  /// Pure conversion logic shared by the instance method and the test shim.
+  static func makeImg2ImgPipelineRequest(_ request: Img2ImgRequest) throws -> ZImageGenerationRequest {
     let sourceURL = URL(fileURLWithPath: request.sourceImagePath)
     guard FileManager.default.fileExists(atPath: sourceURL.path) else {
       throw Img2ImgUtilities.Img2ImgError.sourceImageNotFound(request.sourceImagePath)
@@ -285,6 +310,8 @@ extension ZImagePipeline {
       levelsMin: request.levelsMin,
       levelsMax: request.levelsMax,
       model: request.model,
+      source: request.source,
+      contentMode: request.contentMode,
       textEncoderPath: request.textEncoderPath,
       maxSequenceLength: request.maxSequenceLength,
       loras: request.loras,
