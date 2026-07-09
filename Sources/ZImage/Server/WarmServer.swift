@@ -1642,9 +1642,10 @@ public final class WarmServer {
     // --- Phase 4: ControlNet routing ---
     // If the workflow contains ControlNet nodes, route to ZImageControlPipeline
     // instead of the standard ZImagePipeline.
-    // ControlNet is not supported for Flux 2 models.
+    // ControlNet is not supported for Flux 2 or Krea-2 models.
     if request.isControlNet, let controlnetModel = request.controlnetModel {
-      if await coordinator.modelFamily == .flux2 {
+      let family = await coordinator.modelFamily
+      if family == .flux2 || family == .krea2 {
         throw WarmServerError.controlNetNotSupported
       }
       logger.info("WarmServer: routing to ControlNet pipeline — model=\(controlnetModel), strength=\(request.controlnetStrength)")
@@ -3592,7 +3593,7 @@ private actor WarmServerCoordinator {
   }
 
   private func runControlGenerate(_ request: ZImageControlGenerationRequest, continuation: ContinuationBox<GenerateResponse>) async {
-    if currentModelFamily == .flux2 || currentModelFamily == .fibo || currentModelFamily == .chroma {
+    if currentModelFamily == .flux2 || currentModelFamily == .fibo || currentModelFamily == .chroma || currentModelFamily == .krea2 {
       continuation.resume(throwing: WarmServerError.controlNetNotSupported)
       return
     }
@@ -3644,7 +3645,7 @@ private actor WarmServerCoordinator {
   }
 
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
-    if currentModelFamily == .fibo || currentModelFamily == .chroma {
+    if currentModelFamily == .fibo || currentModelFamily == .chroma || currentModelFamily == .krea2 {
       continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
       return
     }

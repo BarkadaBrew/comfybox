@@ -75,6 +75,7 @@ xcodebuild -scheme ComfyBox -configuration Release \
 | Flux 2 Klein 9B | 20-50 | ~21 GB | High quality, 8-bit available (~12 GB) |
 | FIBO 8B | 20+ | ~21 GB | JSON prompts, CC-BY-NC-4.0 |
 | Chroma 8.9B | 20+ | ~21 GB | Guidance-free |
+| Krea-2-Turbo | 8-9 | ~22 GB (8-bit) | Guidance-free, no LoRA/ControlNet |
 | SeedVR2 3B/7B | 1 | 7/16 GB | AI upscaling only |
 
 ## Features
@@ -87,7 +88,7 @@ xcodebuild -scheme ComfyBox -configuration Release \
 - **Batch mode** — multi-seed/multi-prompt with checkpoint resume
 
 ### Models & LoRA
-- **Multi-model** — Z-Image, Flux 2 Klein, FIBO, Chroma families
+- **Multi-model** — Z-Image, Flux 2 Klein, FIBO, Chroma, Krea-2-Turbo families
 - **Quantization** — 4-bit and 8-bit weight compression
 - **Multi-LoRA** — stack multiple style adapters with per-LoRA scaling
 - **Hot swap** — change LoRAs without model reload (~2s)

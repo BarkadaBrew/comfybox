@@ -56,7 +56,7 @@ public enum LoRACompatibility {
       return ["klein-9b", "klein-4b"]
     case .chroma:
       return ["chroma"]
-    case .fibo, .seedvr2, .esrgan:
+    case .fibo, .seedvr2, .esrgan, .krea2:
       return []
     }
   }

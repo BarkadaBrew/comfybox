@@ -20,6 +20,7 @@ public enum ComfyBoxModelFamily: String, Codable, CaseIterable, Sendable {
   case seedvr2 = "seedvr2"
   case chroma = "chroma"
   case esrgan = "esrgan"
+  case krea2 = "krea2"
 
   /// Human-readable display name.
   public var displayName: String {
@@ -30,6 +31,7 @@ public enum ComfyBoxModelFamily: String, Codable, CaseIterable, Sendable {
     case .seedvr2: return "SeedVR2"
     case .chroma: return "Chroma"
     case .esrgan: return "ESRGAN"
+    case .krea2: return "Krea-2-Turbo"
     }
   }
 
@@ -42,6 +44,7 @@ public enum ComfyBoxModelFamily: String, Codable, CaseIterable, Sendable {
     case .seedvr2: return "3B upscaler, 2× resolution enhancement"
     case .chroma: return "8.9B DiT, T5-XXL text encoder, FLUX.1 VAE, Approximator"
     case .esrgan: return "RRDBNet 4× image upscaler"
+    case .krea2: return "SingleStreamDiT, Qwen3-VL-4B text encoder (12-layer tap), Qwen-Image VAE"
     }
   }
 }
@@ -393,6 +396,24 @@ public enum ComfyBoxModelRegistry {
       description: "Lodestone Horizon's Chroma model. T5-XXL encoder, CFG via Approximator. No guidance needed."
     ),
 
+    // ─── Krea-2 Family ───────────────────────────────────────────────
+    // Native Swift port. SingleStreamDiT, Qwen3-VL-4B text encoder (12-layer
+    // tap), Qwen-Image VAE. Guidance-distilled turbo — no CFG.
+
+    ComfyBoxModel(
+      id: "krea2-turbo-q8",
+      family: .krea2, variant: .turbo, quantization: .q8,
+      huggingFaceId: "krea/Krea-2-Turbo",
+      parametersBillions: 13.5, latentChannels: 16,
+      defaultSteps: 9, defaultGuidance: 0.0,
+      supportsGuidance: false, supportsLoRA: false,
+      supportsControlNet: false, supportsImg2Img: false,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 22.0,
+      displayName: "Krea-2-Turbo",
+      description: "Krea's distilled turbo model. Native Swift port — 8-step, guidance-free."
+    ),
+
     // ─── ESRGAN Family ───────────────────────────────────────────────
     // RRDBNet-based 4× upscalers. Various community weights.
 
@@ -495,10 +516,11 @@ public enum ComfyBoxModelRegistry {
     case "diffusion_models", "unet":
       var result: [String: Any] = [:]
       for model in allModels where model.variant != .upscaler {
-        // FIBO and Chroma workloads are not usable from the Krita plugin
-        // (unrecognized or unsupported Arch) — omit them until supported so
-        // they neither vanish silently nor surface as broken entries.
-        if model.family == .fibo || model.family == .chroma { continue }
+        // FIBO, Chroma, and Krea-2 workloads are not usable from the Krita
+        // plugin (unrecognized or unsupported Arch) — omit them until
+        // supported so they neither vanish silently nor surface as broken
+        // entries.
+        if model.family == .fibo || model.family == .chroma || model.family == .krea2 { continue }
         result[model.id] = [
           "base_model": kritaBaseModel(for: model),
           "type": kritaType(for: model),
