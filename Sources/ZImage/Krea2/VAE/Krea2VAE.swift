@@ -110,10 +110,11 @@ public final class Krea2VAEMidBlock: Module {
   }
 }
 
-/// Checkpoint stores the spatial conv at `upsamplers.0.resample.1` (index 1 of a
-/// [nearest-upsample, conv] sequential). Mirror that nesting for key parity.
+/// Checkpoint stores the spatial conv at `upsamplers.0.resample.1`; the loader
+/// remaps that numeric segment to `resample.conv` (numeric keys unflatten as
+/// array indices in MLX-Swift).
 public final class Krea2VAEResampleSeq: Module {
-  @ModuleInfo(key: "1") var conv: Conv2d
+  @ModuleInfo(key: "conv") var conv: Conv2d
   public init(_ inChannels: Int, _ outChannels: Int) {
     self._conv.wrappedValue = Conv2d(
       inputChannels: inChannels, outputChannels: outChannels, kernelSize: 3, padding: 1)

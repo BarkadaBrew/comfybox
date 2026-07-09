@@ -303,10 +303,11 @@ public final class Krea2TextFusionTransformer: Module {
 
 // MARK: - Mixed sequences (weight-less slots preserve index-based keys)
 
-/// tmlp = [Linear "0", GELU "1", Linear "2"].
+/// tmlp = [Linear "0", GELU "1", Linear "2"] (checkpoint keys remapped to lin0/lin2
+/// in the loader — numeric path segments unflatten as array indices in MLX-Swift).
 public final class Krea2TMLP: Module {
-  @ModuleInfo(key: "0") var l0: Linear
-  @ModuleInfo(key: "2") var l2: Linear
+  @ModuleInfo(key: "lin0") var l0: Linear
+  @ModuleInfo(key: "lin2") var l2: Linear
   public init(tdim: Int, features: Int) {
     self._l0.wrappedValue = Linear(tdim, features)
     self._l2.wrappedValue = Linear(features, features)
@@ -314,18 +315,18 @@ public final class Krea2TMLP: Module {
   public func callAsFunction(_ x: MLXArray) -> MLXArray { l2(kreaGeluTanh(l0(x))) }
 }
 
-/// tproj = [GELU "0", Linear "1"].
+/// tproj = [GELU "0", Linear "1"] (checkpoint key remapped to lin1 in the loader).
 public final class Krea2TProj: Module {
-  @ModuleInfo(key: "1") var l1: Linear
+  @ModuleInfo(key: "lin1") var l1: Linear
   public init(features: Int) { self._l1.wrappedValue = Linear(features, features * 6) }
   public func callAsFunction(_ x: MLXArray) -> MLXArray { l1(kreaGeluTanh(x)) }
 }
 
-/// txtmlp = [RMSNorm "0", Linear "1", GELU "2", Linear "3"].
+/// txtmlp = [RMSNorm "0", Linear "1", GELU "2", Linear "3"] (keys remapped in loader).
 public final class Krea2TxtMLP: Module {
-  @ModuleInfo(key: "0") var norm: Krea2RMSNorm
-  @ModuleInfo(key: "1") var l1: Linear
-  @ModuleInfo(key: "3") var l3: Linear
+  @ModuleInfo(key: "norm0") var norm: Krea2RMSNorm
+  @ModuleInfo(key: "lin1") var l1: Linear
+  @ModuleInfo(key: "lin3") var l3: Linear
   public init(txtDim: Int, features: Int) {
     self._norm.wrappedValue = Krea2RMSNorm(txtDim)
     self._l1.wrappedValue = Linear(txtDim, features)

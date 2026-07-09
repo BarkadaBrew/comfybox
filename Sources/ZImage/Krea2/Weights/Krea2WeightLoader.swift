@@ -43,9 +43,21 @@ public enum Krea2WeightLoader {
     for meta in reader.allMetadata() {
       var tensor = try reader.tensor(named: meta.name)
       if tensor.dtype != dtype { tensor = tensor.asType(dtype) }
-      weights[meta.name] = tensor
+      weights[Self.mapTransformerKey(meta.name)] = tensor
     }
     try transformer.update(parameters: ModuleParameters.unflattened(weights), verify: [.shapeMismatch])
+  }
+
+  /// Remap numeric sequential indices (which MLX-Swift unflattens as array
+  /// indices) to the named keys used by the Swift modules.
+  static func mapTransformerKey(_ key: String) -> String {
+    if key.hasPrefix("tmlp.0.") { return "tmlp.lin0." + key.dropFirst("tmlp.0.".count) }
+    if key.hasPrefix("tmlp.2.") { return "tmlp.lin2." + key.dropFirst("tmlp.2.".count) }
+    if key.hasPrefix("tproj.1.") { return "tproj.lin1." + key.dropFirst("tproj.1.".count) }
+    if key.hasPrefix("txtmlp.0.") { return "txtmlp.norm0." + key.dropFirst("txtmlp.0.".count) }
+    if key.hasPrefix("txtmlp.1.") { return "txtmlp.lin1." + key.dropFirst("txtmlp.1.".count) }
+    if key.hasPrefix("txtmlp.3.") { return "txtmlp.lin3." + key.dropFirst("txtmlp.3.".count) }
+    return key
   }
 
   // MARK: - Text encoder
@@ -101,7 +113,7 @@ public enum Krea2WeightLoader {
       } else if key.hasSuffix(".weight") && tensor.ndim > 2 {
         throw Krea2WeightLoaderError.unexpectedShape(key: key, shape: tensor.shape)
       }
-      weights[key] = tensor
+      weights[key.replacingOccurrences(of: ".resample.1.", with: ".resample.conv.")] = tensor
     }
     try vae.update(parameters: ModuleParameters.unflattened(weights), verify: [.shapeMismatch])
   }
