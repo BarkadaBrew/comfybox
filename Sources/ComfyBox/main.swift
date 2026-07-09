@@ -240,6 +240,9 @@ struct ZImageCLI {
       case "telegram":
         try runTelegram(args: Array(args.dropFirst()))
         return
+      case "krea2":
+        try runKrea2(args: Array(args.dropFirst()))
+        return
       default:
         logger.warning("Unknown argument: \(arg)")
       }
@@ -4504,6 +4507,54 @@ struct ZImageCLI {
 
 
   // MARK: - Telegram Bot Subcommand
+
+  /// `ComfyBox krea2 -p "prompt" [-W 1024] [-H 1024] [-s 9] [--seed N] [-q 8]
+  ///  [--model-dir path] [-o out.png]` — Krea-2-Turbo text-to-image (native port).
+  private static func runKrea2(args: [String]) throws {
+    var prompt = "a photo of a fox in a snowy forest, golden hour"
+    var width = 1024
+    var height = 1024
+    var steps = 9
+    var seed: UInt64 = 0
+    var outputPath = "krea2.png"
+    var modelDir: String?
+    var quantBits: Int?
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--prompt", "-p": prompt = nextValue(for: arg, iterator: &iterator) ?? prompt
+      case "--width", "-W": width = intValue(for: arg, iterator: &iterator, minimum: 64, fallback: width)
+      case "--height", "-H": height = intValue(for: arg, iterator: &iterator, minimum: 64, fallback: height)
+      case "--steps", "-s": steps = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: steps)
+      case "--seed": seed = UInt64(nextValue(for: arg, iterator: &iterator) ?? "0") ?? 0
+      case "--output", "-o": outputPath = nextValue(for: arg, iterator: &iterator) ?? outputPath
+      case "--model-dir": modelDir = nextValue(for: arg, iterator: &iterator)
+      case "--quantize", "-q": quantBits = intValue(for: arg, iterator: &iterator, minimum: 2, fallback: 8)
+      default: logger.warning("krea2: unknown argument \(arg)")
+      }
+    }
+
+    let paths = try Krea2ModelPaths.resolve(modelDir: modelDir)
+    logger.info("krea2: model root \(paths.root.path)")
+
+    let loadStart = Date()
+    let pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: quantBits)
+    logger.info("krea2: models loaded in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s")
+
+    let genStart = Date()
+    let image = pipeline.generate(
+      .init(prompt: prompt, width: width, height: height, steps: steps, seed: seed)
+    ) { step, total in
+      logger.info("krea2: step \(step)/\(total)")
+    }
+    logger.info("krea2: generated in \(String(format: "%.1f", Date().timeIntervalSince(genStart)))s")
+
+    // saveImage expects [3,H,W]; pipeline returns (H,W,3).
+    let chw = image.transposed(2, 0, 1)
+    try QwenImageIO.saveImage(array: chw, to: URL(fileURLWithPath: outputPath))
+    logger.info("krea2: saved \(outputPath)")
+  }
 
   private static func runTelegram(args: [String]) throws {
     var botToken: String? = nil
