@@ -147,6 +147,9 @@ private enum VRAMEstimates {
     case .fibo:
       if quant == "4bit" || quant == "q4" { return 8192 }
       return 22528    // BF16
+    case .krea2:
+      // 8-bit transformer (~13.5GB) + bf16 Qwen3-VL-4B encoder (~8GB) + VAE
+      return 22528
     case .chroma:
       return 17408    // Always BF16
     }
@@ -457,7 +460,9 @@ actor ModelPool {
 
   /// Detect the model family for a given model spec.
   private func detectFamily(modelSpec: String) async throws -> WarmModelFamily {
-    if ChromaModelDetection.isKnownChromaModel(modelSpec) {
+    if Krea2ModelDetection.isKnownKrea2Model(modelSpec) {
+      return .krea2
+    } else if ChromaModelDetection.isKnownChromaModel(modelSpec) {
       return .chroma
     } else if FiboModelDetection.isKnownFiboModel(modelSpec) {
       return .fibo
@@ -489,7 +494,9 @@ actor ModelPool {
       filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
     )
 
-    if ChromaModelDetection.detect(at: resolved) != nil {
+    if Krea2ModelDetection.detect(at: resolved) != nil {
+      return .krea2
+    } else if ChromaModelDetection.detect(at: resolved) != nil {
       return .chroma
     } else if FiboModelDetection.detect(at: resolved) != nil {
       return .fibo
@@ -509,12 +516,24 @@ actor ModelPool {
     quantization: String?,
     initialLoRAs: [LoRAConfiguration]
   ) async throws -> (PipelineBox, Any?) {
+    if family == .krea2 {
+      // Krea-2 resolves its own weights (HF cache snapshot or explicit dir) —
+      // skip the generic snapshot resolution.
+      let paths = try Krea2ModelDetection.resolve(spec: modelSpec)
+      let bits: Int? = (quantization?.lowercased() == "bf16") ? nil : 8
+      let pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: bits)
+      return (PipelineBox(pipeline: pipeline as AnyObject), nil)
+    }
     let resolved = try await ModelResolution.resolveOrDefault(
       modelSpec: modelSpec,
       filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
     )
 
     switch family {
+    case .krea2:
+      // Handled by the early return above — unreachable.
+      throw ModelPoolError.modelDetectionFailed(modelSpec)
+
     case .chroma:
       guard let detected = ChromaModelDetection.detect(at: resolved) else {
         throw ModelPoolError.modelDetectionFailed(modelSpec)

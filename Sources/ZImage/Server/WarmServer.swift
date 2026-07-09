@@ -61,6 +61,7 @@ enum WarmModelFamily: String, Sendable {
   case flux2
   case fibo
   case chroma
+  case krea2
 }
 
 enum WarmServerOutputPathValidator {
@@ -1758,6 +1759,12 @@ public final class WarmServer {
     let resolvedSampler: String?
 
     switch family {
+    case .krea2:
+      // Krea-2-Turbo: 8-step distilled, no CFG. Clamp runaway KSampler defaults.
+      resolvedSteps = request.steps > 0 ? min(request.steps, 12) : 9
+      resolvedGuidance = 0.0
+      resolvedNegativePrompt = nil
+      resolvedSampler = request.sampler
     case .fibo:
       // FIBO: use model defaults, no step clamping
       resolvedSteps = request.steps
@@ -2199,7 +2206,7 @@ public final class WarmServer {
       case .invalidOutputPath, .invalidRequest:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
-           .chromaNotLoaded, .chromaDetectionFailed:
+           .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
@@ -2344,6 +2351,9 @@ private actor WarmServerCoordinator {
   private var fiboPipeline: FiboPipeline?
   /// Chroma pipeline — created when the model is detected as Chroma.
   private var chromaPipeline: ChromaPipeline?
+
+  /// Krea-2-Turbo pipeline (native port), loaded when the model spec is Krea-2.
+  private var krea2Pipeline: Krea2Pipeline?
   /// Chroma tokenizer — loaded alongside the Chroma pipeline.
   private var chromaTokenizer: ChromaTokenizer?
   /// Which model family is loaded — determines generation routing.
@@ -2423,10 +2433,13 @@ private actor WarmServerCoordinator {
 
     var isFibo = false
     var isChroma = false
+    var isKrea2 = false
 
     if let spec = modelSpec {
       // Check by known model ID first
-      if ChromaModelDetection.isKnownChromaModel(spec) {
+      if Krea2ModelDetection.isKnownKrea2Model(spec) {
+        isKrea2 = true
+      } else if ChromaModelDetection.isKnownChromaModel(spec) {
         isChroma = true
       } else if FiboModelDetection.isKnownFiboModel(spec) {
         isFibo = true
@@ -2434,26 +2447,38 @@ private actor WarmServerCoordinator {
         isFlux2 = true
       }
 
-      // Resolve snapshot — needed for both detection and loading
-      let resolved = try await ModelResolution.resolveOrDefault(
-        modelSpec: spec,
-        filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
-      )
-      snapshotURL = resolved
+      if !isKrea2 {
+        // Resolve snapshot — needed for both detection and loading
+        let resolved = try await ModelResolution.resolveOrDefault(
+          modelSpec: spec,
+          filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
+        )
+        snapshotURL = resolved
 
-      // If not already detected by name, check the snapshot directory
-      if !isFibo && !isFlux2 && !isChroma {
-        if ChromaModelDetection.detect(at: resolved) != nil {
-          isChroma = true
-        } else if FiboModelDetection.detect(at: resolved) != nil {
-          isFibo = true
-        } else if Flux2ModelDetection.detectFamily(at: resolved) == .flux2 {
-          isFlux2 = true
+        // If not already detected by name, check the snapshot directory
+        if !isFibo && !isFlux2 && !isChroma {
+          if Krea2ModelDetection.detect(at: resolved) != nil {
+            isKrea2 = true
+          } else if ChromaModelDetection.detect(at: resolved) != nil {
+            isChroma = true
+          } else if FiboModelDetection.detect(at: resolved) != nil {
+            isFibo = true
+          } else if Flux2ModelDetection.detectFamily(at: resolved) == .flux2 {
+            isFlux2 = true
+          }
         }
       }
     }
 
-    if isChroma, let snapshot = snapshotURL {
+    if isKrea2, let spec = modelSpec {
+      // --- Krea-2-Turbo path (native port) ---
+      currentModelFamily = .krea2
+      let paths = try Krea2ModelDetection.resolve(spec: spec)
+      logger.info("Detected Krea-2-Turbo — 8-bit transformer, estimated GPU memory: ~22GB")
+      krea2Pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: 8)
+      pipelinePrepared = true
+      logger.info("Warm server pipeline ready (Krea-2-Turbo)")
+    } else if isChroma, let snapshot = snapshotURL {
       // --- Chroma path ---
       currentModelFamily = .chroma
 
@@ -2607,6 +2632,10 @@ private actor WarmServerCoordinator {
         box = PipelineBox(pipeline: pipeline as AnyObject)
         detectedInfo = zimageVariant
         vramMB = 12288
+      case .krea2:
+        box = PipelineBox(pipeline: krea2Pipeline! as AnyObject)
+        detectedInfo = nil
+        vramMB = 22528
       }
       let poolKey = ModelPool.poolKey(for: spec)
       await modelPool.registerExisting(
@@ -2695,6 +2724,8 @@ private actor WarmServerCoordinator {
     // the correct model instead of the startup configuration.modelSpec.
     activePoolModelSpec = entry.modelSpec
     switch entry.family {
+    case .krea2:
+      krea2Pipeline = entry.box.pipeline as? Krea2Pipeline
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -3142,6 +3173,8 @@ private actor WarmServerCoordinator {
       await runChromaGenerate(payload, continuation: continuation)
     case .fibo:
       await runFiboGenerate(payload, continuation: continuation)
+    case .krea2:
+      await runKrea2Generate(payload, continuation: continuation)
     case .flux2:
       await runFlux2Generate(payload, continuation: continuation)
     case .flux1:
@@ -3301,6 +3334,67 @@ private actor WarmServerCoordinator {
           durationMs: durationMs
         )
       )
+    } catch {
+      failedRenderCount += 1
+      lastError = error.localizedDescription
+      activeRenderStartedAt = nil
+      resumed = true
+      continuation.resume(throwing: error)
+    }
+  }
+
+  private func runKrea2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+    activeRenderStartedAt = Date()
+    let start = Date()
+    var resumed = false
+    defer {
+      if !resumed {
+        logger.error("runKrea2Generate: continuation was not resumed — resuming with error.")
+        failedRenderCount += 1
+        lastError = "Krea2 generation failed unexpectedly (continuation not resumed)"
+        activeRenderStartedAt = nil
+        continuation.resume(throwing: WarmServerError.invalidRequest(message: "Krea2 generation failed unexpectedly"))
+      }
+    }
+    do {
+      guard let k2 = krea2Pipeline else {
+        throw WarmServerError.krea2NotLoaded
+      }
+      let outputURL = try payload.resolvedOutputURL(
+        configuration: configuration,
+        defaultFilename: "zimage-krea2-\(UUID().uuidString).png"
+      )
+
+      let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
+      let steps = payload.steps ?? 9
+      let width = payload.width ?? 1024
+      let height = payload.height ?? 1024
+
+      let image = k2.generate(
+        .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed)
+      ) { [logger] step, total in
+        logger.info("Krea2: step \(step)/\(total)")
+      }
+      let metadata = QwenImageIO.ImageMetadata.generation(
+        prompt: payload.prompt,
+        seed: seed,
+        steps: steps,
+        guidance: 0,
+        width: width,
+        height: height,
+        model: "krea-2-turbo",
+        generatedBy: payload.source,
+        contentMode: payload.contentMode
+      )
+      try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
+
+      let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
+      successfulRenderCount += 1
+      lastRenderDurationMs = durationMs
+      lastError = nil
+      activeRenderStartedAt = nil
+      resumed = true
+      continuation.resume(returning: GenerateResponse(success: true, outputPath: outputURL.path, durationMs: durationMs))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -4478,6 +4572,7 @@ public enum WarmServerError: Error, LocalizedError {
   case fiboNotLoaded
   case chromaDetectionFailed(String)
   case chromaNotLoaded
+  case krea2NotLoaded
   case loraSwapNotSupported
   case controlNetNotSupported
 
@@ -4501,6 +4596,8 @@ public enum WarmServerError: Error, LocalizedError {
       return "Model '\(model)' was identified as Chroma but detection failed at the snapshot directory"
     case .chromaNotLoaded:
       return "Chroma pipeline is not loaded"
+    case .krea2NotLoaded:
+      return "Krea-2 pipeline is not loaded"
     case .loraSwapNotSupported:
       return "LoRA swap is not supported for this model family"
     case .controlNetNotSupported:
