@@ -149,6 +149,8 @@ public enum LoRAScanner {
         return ["flux1"]
       case "chroma":
         return ["chroma"]
+      case "krea2", "krea-2", "krea-2-turbo":
+        return ["krea2"]
       default:
         break
       }

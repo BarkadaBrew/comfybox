@@ -806,6 +806,35 @@ public final class WarmServer {
         return .error(.error(status: 500, message: "Scan failed: \(error.localizedDescription)"))
       }
 
+    case ("POST", "/v1/loras/import"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
+            let sourcePath = json["path"] as? String, !sourcePath.isEmpty
+      else {
+        return .error(.error(status: 400, message: "Missing 'path'"))
+      }
+      let category = (json["category"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "vault"
+      do {
+        let entry = try library.importFile(from: sourcePath, category: category)
+        let responseDict: [String: Any] = [
+          "success": true,
+          "id": entry.id,
+          "filename": entry.filename,
+          "model_compatibility": entry.modelCompatibility,
+          "triggerwords": entry.triggerwords,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
+          return .json(.rawJSON(status: 200, data: data))
+        }
+        return .error(.error(status: 500, message: "Failed to serialize imported entry"))
+      } catch let error as LoRALibraryError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: "Import failed: \(error.localizedDescription)"))
+      }
+
     case ("POST", _) where request.path.hasSuffix("/quarantine") && request.path.hasPrefix("/v1/loras/"):
       guard let library = loraLibrary else {
         return .error(.error(status: 503, message: "LoRA Library not initialized"))

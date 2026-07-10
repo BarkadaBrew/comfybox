@@ -304,6 +304,11 @@ public final class LoRALibrary: @unchecked Sendable {
   public func scan(force: Bool = false) throws -> LoRALibraryScanResult {
     logger.info("Scanning \(libraryRoot.path)...")
 
+    let importedCount = autoImportFromWatchedDirectories()
+    if importedCount > 0 {
+      logger.info("Auto-imported \(importedCount) new LoRA(s) from watched directories")
+    }
+
     // Collect all .safetensors files recursively
     let safetensorsFiles = collectSafetensorsFiles(in: libraryRoot)
     logger.info("Found \(safetensorsFiles.count) safetensors files")
@@ -538,6 +543,87 @@ public final class LoRALibrary: @unchecked Sendable {
     try saveIndex()
 
     logger.info("Un-quarantined: \(entry.filename)")
+  }
+
+  // MARK: - Import
+
+  /// Directories auto-scanned (in addition to the library root itself) for
+  /// new LoRAs on every scan() — files here that aren't already anywhere in
+  /// the library get copied into `{root}/vault/` automatically. Ad-hoc/test
+  /// LoRAs commonly land in Downloads before being filed properly.
+  private static let autoImportWatchDirectories = ["~/Downloads"]
+
+  /// Copy a LoRA file from anywhere on disk into the library (under
+  /// `vault/` by default) and index it immediately — the explicit "Import
+  /// LoRA…" action. Does nothing and returns the existing entry if a file
+  /// with the same name is already in the library.
+  @discardableResult
+  public func importFile(from sourcePath: String, category: String = "vault") throws -> LoRALibraryEntry {
+    let sourceURL = URL(fileURLWithPath: (sourcePath as NSString).expandingTildeInPath)
+    guard fm.fileExists(atPath: sourceURL.path) else {
+      throw LoRALibraryError.entryNotFound(sourcePath)
+    }
+    let filename = sourceURL.lastPathComponent
+
+    lock.lock()
+    if let existing = entries.values.first(where: { $0.filename == filename }) {
+      lock.unlock()
+      return existing
+    }
+    lock.unlock()
+
+    let destinationDir = libraryRoot.appendingPathComponent(category, isDirectory: true)
+    try fm.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+    let destination = destinationDir.appendingPathComponent(filename)
+    if !fm.fileExists(atPath: destination.path) {
+      try fm.copyItem(at: sourceURL, to: destination)
+      logger.info("Imported \(filename) → \(destination.path)")
+    }
+
+    _ = try scan()
+    lock.lock()
+    defer { lock.unlock() }
+    guard let entry = entries.values.first(where: { $0.filename == filename }) else {
+      throw LoRALibraryError.entryNotFound(filename)
+    }
+    return entry
+  }
+
+  /// Copy any new LoRA files found in the watched directories into
+  /// `vault/`, skipping filenames already present anywhere in the library.
+  /// Best-effort — a single bad file never blocks the rest of the scan.
+  /// Returns the number of files imported.
+  private func autoImportFromWatchedDirectories() -> Int {
+    lock.lock()
+    let knownFilenames = Set(entries.values.map { $0.filename })
+    lock.unlock()
+
+    var imported = 0
+    let vaultDir = libraryRoot.appendingPathComponent("vault", isDirectory: true)
+
+    for rawDir in Self.autoImportWatchDirectories {
+      let dir = URL(fileURLWithPath: (rawDir as NSString).expandingTildeInPath)
+      guard let contents = try? fm.contentsOfDirectory(
+        at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+      ) else { continue }
+
+      for file in contents where file.pathExtension.lowercased() == "safetensors" {
+        let filename = file.lastPathComponent
+        guard !knownFilenames.contains(filename) else { continue }
+
+        do {
+          try fm.createDirectory(at: vaultDir, withIntermediateDirectories: true)
+          let destination = vaultDir.appendingPathComponent(filename)
+          guard !fm.fileExists(atPath: destination.path) else { continue }
+          try fm.copyItem(at: file, to: destination)
+          logger.info("Auto-imported \(filename) from \(dir.path) → vault/")
+          imported += 1
+        } catch {
+          logger.warning("Auto-import failed for \(filename): \(error.localizedDescription)")
+        }
+      }
+    }
+    return imported
   }
 
   // MARK: - SHA-256
