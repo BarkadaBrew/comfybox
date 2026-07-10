@@ -386,6 +386,7 @@ struct ComfyBoxDesktopApp: App {
                 presetManager: presetManager,
                 characters: characters,
                 onGenerated: handleGenerated,
+                onBatchComplete: handleBatchComplete,
                 pendingPreset: $pendingPreset,
                 pendingPromptInsert: $pendingPromptInsert,
                 pendingReferenceImage: $pendingReferenceImage,
@@ -632,6 +633,29 @@ struct ComfyBoxDesktopApp: App {
             } catch {
                 // Ingestion failure is non-fatal; the file is still on disk.
                 print("[ComfyBoxDesktop] Auto-ingest failed for \(path): \(error)")
+            }
+        }
+    }
+
+    /// After a multi-image batch (Studio Packs FR-4 / #202), hand the whole
+    /// set off to the Compare tab — same pendingSelection mechanism Gallery's
+    /// "Compare" action already uses. ingestFile is upsert-safe (INSERT OR
+    /// REPLACE keyed by id), so re-ingesting paths handleGenerated already
+    /// queued independently is safe, not a duplicate.
+    private func handleBatchComplete(_ paths: [String], _ request: GenerationRequest) {
+        guard let ingestor = ingestor else { return }
+        Task {
+            var assets: [DAMAsset] = []
+            for path in paths {
+                writeSidecarIfMissing(for: path, request: request)
+                if let asset = try? await ingestor.ingestFile(at: path) {
+                    assets.append(asset)
+                }
+            }
+            guard !assets.isEmpty else { return }
+            await MainActor.run {
+                comparisonAssets = assets
+                selectedTab = .compare
             }
         }
     }

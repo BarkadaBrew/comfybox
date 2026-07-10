@@ -53,6 +53,10 @@ struct GenerationView: View {
     var presetManager: PresetManager?
     var characters: [CharacterEntry]
     var onGenerated: ((String, GenerationRequest) -> Void)?
+    /// Fired once after a multi-image batch (batchCount > 1) finishes, with
+    /// every output path in generation order — lets the app hand the set off
+    /// to the Compare tab (Studio Packs FR-4 / #202: batch variation board).
+    var onBatchComplete: (([String], GenerationRequest) -> Void)?
     /// Preset queued by the Presets tab; consumed on appear / on change.
     @Binding var pendingPreset: GenerationPreset?
     /// Prompt queued by the Prompt Library; replaces the prompt field once.
@@ -980,10 +984,11 @@ struct GenerationView: View {
 
             // Batch: generate `count` images. A fixed seed sweeps seed, seed+1…;
             // seed 0 (random) yields a fresh random each time.
+            var batchPaths: [String] = []
             for i in 0..<count {
                 if count > 1 { await MainActor.run { batchProgress = "Generating \(i + 1) of \(count)…" } }
                 var req = request
-                if seed > 0 { req.seed = seed + UInt64(i) }
+                req.seed = BatchSeedSweep.seed(baseSeed: seed, index: i)
                 do {
                     let outputPath = try await engine.generate(req, contentMode: contentMode)
                     // Optional SeedVR2 upscale of the render.
@@ -1004,6 +1009,7 @@ struct GenerationView: View {
                     } else {
                         await MainActor.run { svgOutputPath = nil; svgExportError = nil }
                     }
+                    batchPaths.append(finalPath)
                     onGenerated?(finalPath, req)
                 } catch {
                     await MainActor.run { engine.lastError = error.localizedDescription }
@@ -1011,6 +1017,9 @@ struct GenerationView: View {
                 }
             }
             await MainActor.run { batchProgress = nil }
+            if batchPaths.count > 1 {
+                onBatchComplete?(batchPaths, request)
+            }
         }
     }
 
