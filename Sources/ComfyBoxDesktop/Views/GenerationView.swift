@@ -123,6 +123,10 @@ struct GenerationView: View {
     @State private var activeStudioPackRecipe: StudioPackRecipe?
     @State private var svgOutputPath: String?
     @State private var svgExportError: String?
+    /// QA lint results (FR-8 / #201) — prompt lint runs at apply time,
+    /// output lint runs after generation.
+    @State private var promptQAResults: [StudioPackQAResult] = []
+    @State private var outputQAResults: [StudioPackQAResult] = []
     /// DyPE high-resolution scaling: "none" | "ntk" | "yarn".
     @State private var dype: String = "none"
     /// Number of images to generate in one batch (seed sweep).
@@ -1009,6 +1013,14 @@ struct GenerationView: View {
                     } else {
                         await MainActor.run { svgOutputPath = nil; svgExportError = nil }
                     }
+                    if let recipe = activeStudioPackRecipe {
+                        let svgWanted = recipe.svgDefaults?.enabled ?? false
+                        let results = StudioPackQALinter.lintOutput(
+                            rules: recipe.qaRules, packId: recipe.packId,
+                            svgWanted: svgWanted, svgExported: svgOutputPath != nil
+                        )
+                        await MainActor.run { outputQAResults = results }
+                    }
                     batchPaths.append(finalPath)
                     onGenerated?(finalPath, req)
                 } catch {
@@ -1218,6 +1230,29 @@ struct GenerationView: View {
                         .font(.caption2)
                         .foregroundStyle(.orange)
                 }
+                if !promptQAResults.isEmpty {
+                    qaResultsView(title: "Prompt QA", results: promptQAResults)
+                }
+                if !outputQAResults.isEmpty {
+                    qaResultsView(title: "Output QA", results: outputQAResults)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func qaResultsView(title: String, results: [StudioPackQAResult]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption2).fontWeight(.semibold).foregroundStyle(.secondary)
+            ForEach(results) { result in
+                HStack(spacing: 4) {
+                    Image(systemName: result.passed ? "checkmark.circle.fill" : (result.blocks ? "xmark.octagon.fill" : "exclamationmark.triangle.fill"))
+                        .foregroundStyle(result.passed ? .green : (result.blocks ? .red : .orange))
+                        .font(.caption2)
+                    Text(result.description)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -1348,6 +1383,10 @@ struct GenerationView: View {
         // Carried into the next render so it knows whether to also export
         // SVG and which pack/template to record in metadata.
         activeStudioPackRecipe = recipe
+        outputQAResults = []
+        promptQAResults = StudioPackQALinter.lintPrompt(
+            rules: recipe.qaRules, prompt: recipe.prompt, negativePrompt: recipe.negativePrompt
+        )
     }
 
     /// Apply a preset to the current generation parameters.

@@ -29,6 +29,9 @@ public struct StudioPackRecipe: Sendable, Equatable {
   public var cameraAngle: String?
   public var cameraOrientation: String?
   public var lightingStyle: String?
+  /// Carried through so callers can run StudioPackQALinter without a second
+  /// pack lookup (FR-8 / #201).
+  public var qaRules: [StudioPackQARule]
   /// Human-readable notes about anything that couldn't be fully resolved
   /// (e.g. a missing optional LoRA). Never blocks applying the pack.
   public var warnings: [String]
@@ -111,6 +114,7 @@ public enum StudioPackResolver {
       cameraAngle: pack.cameraAngle,
       cameraOrientation: pack.cameraOrientation,
       lightingStyle: pack.lightingStyle,
+      qaRules: pack.qaRules,
       warnings: warnings
     )
   }

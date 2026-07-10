@@ -191,6 +191,64 @@ final class StudioPackTests: XCTestCase {
     XCTAssertNil(recipe.templateId)
   }
 
+  // MARK: - QA lint (FR-8 / #201)
+
+  func testLintPromptPassesLifeDesignPromptAndNegative() {
+    let pack = BuiltInStudioPacks.lifeDesignHealthcare
+    let recipe = StudioPackResolver.resolve(pack: pack, subject: "CPR training", availableLoraIds: [])
+    let results = StudioPackQALinter.lintPrompt(rules: recipe.qaRules, prompt: recipe.prompt, negativePrompt: recipe.negativePrompt)
+    let byId = Dictionary(uniqueKeysWithValues: results.map { ($0.id, $0) })
+    XCTAssertEqual(byId["faceless"]?.passed, true)
+    XCTAssertEqual(byId["flat-vector-terms"]?.passed, true)
+    XCTAssertEqual(byId["no-photorealism"]?.passed, true)
+    // Post-gen-only rules aren't evaluated at prompt-lint time.
+    XCTAssertNil(byId["svg-export-requested"])
+    XCTAssertNil(byId["has-pack-metadata"])
+  }
+
+  func testLintPromptFailsWhenStyleTermsMissing() {
+    let rules = [StudioPackQARule(id: "faceless", description: "d"), StudioPackQARule(id: "flat-vector-terms", description: "d")]
+    let results = StudioPackQALinter.lintPrompt(rules: rules, prompt: "a photorealistic portrait", negativePrompt: nil)
+    XCTAssertEqual(results.first { $0.id == "faceless" }?.passed, false)
+    XCTAssertEqual(results.first { $0.id == "flat-vector-terms" }?.passed, false)
+  }
+
+  func testLintPromptSkipsUnrecognizedRuleIds() {
+    let rules = [StudioPackQARule(id: "some-future-rule", description: "d")]
+    let results = StudioPackQALinter.lintPrompt(rules: rules, prompt: "anything", negativePrompt: nil)
+    XCTAssertTrue(results.isEmpty)
+  }
+
+  func testLintOutputPassesWhenSVGExportedAndPackIdPresent() {
+    let rules = [
+      StudioPackQARule(id: "svg-export-requested", description: "d"),
+      StudioPackQARule(id: "has-pack-metadata", description: "d"),
+    ]
+    let results = StudioPackQALinter.lintOutput(rules: rules, packId: "life-design-healthcare", svgWanted: true, svgExported: true)
+    XCTAssertTrue(results.allSatisfy { $0.passed })
+  }
+
+  func testLintOutputFailsWhenSVGWantedButNotExported() {
+    let rules = [StudioPackQARule(id: "svg-export-requested", description: "d")]
+    let results = StudioPackQALinter.lintOutput(rules: rules, packId: "p", svgWanted: true, svgExported: false)
+    XCTAssertEqual(results.first?.passed, false)
+  }
+
+  func testLintOutputSkipsSVGRuleWhenSVGNotWanted() {
+    let rules = [StudioPackQARule(id: "svg-export-requested", description: "d")]
+    let results = StudioPackQALinter.lintOutput(rules: rules, packId: "p", svgWanted: false, svgExported: false)
+    XCTAssertTrue(results.isEmpty)
+  }
+
+  func testQAResultBlocksOnlyWhenRequiredAndFailed() {
+    let optionalFail = StudioPackQAResult(id: "r", description: "d", passed: false, required: false)
+    let requiredPass = StudioPackQAResult(id: "r", description: "d", passed: true, required: true)
+    let requiredFail = StudioPackQAResult(id: "r", description: "d", passed: false, required: true)
+    XCTAssertFalse(optionalFail.blocks)
+    XCTAssertFalse(requiredPass.blocks)
+    XCTAssertTrue(requiredFail.blocks)
+  }
+
   // MARK: - Library loading (built-in vs. user override)
 
   func testLoadAllReturnsBuiltInsWhenNoUserDirectoryExists() {
