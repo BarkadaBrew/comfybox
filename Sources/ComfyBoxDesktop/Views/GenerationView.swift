@@ -7,6 +7,7 @@
 // Phase 4: Added preset save, prompt enhancement, keyboard shortcuts.
 
 import SwiftUI
+import ZImage
 
 /// Common resolution presets.
 struct ResolutionPreset: Identifiable, Hashable {
@@ -103,6 +104,9 @@ struct GenerationView: View {
     @State private var showCharacters: Bool = false
     @State private var showCamera: Bool = false
     @State private var showLighting: Bool = false
+    @State private var showStudioPacks: Bool = false
+    @State private var studioPacks: [StudioPack] = []
+    @State private var studioPackWarning: String?
     /// DyPE high-resolution scaling: "none" | "ntk" | "yarn".
     @State private var dype: String = "none"
     /// Number of images to generate in one batch (seed sweep).
@@ -165,6 +169,9 @@ struct GenerationView: View {
             if let data = try? JSONEncoder().encode(loras) { lorasJSON = String(decoding: data, as: UTF8.self) }
         }
         .task { await loadServerPresets() }
+        .task {
+            studioPacks = StudioPackLibrary.loadAll().packs
+        }
         .onChange(of: pendingPreset?.id) { _, _ in consumePendingPreset() }
         .onChange(of: pendingPromptInsert) { _, _ in consumePendingPrompt() }
         .onChange(of: pendingReferenceImage) { _, _ in consumePendingReference() }
@@ -294,6 +301,16 @@ struct GenerationView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                     }
+                }
+
+                // Studio Packs (collapsible)
+                Divider()
+                DisclosureGroup(isExpanded: $showStudioPacks) {
+                    studioPacksSection
+                        .padding(.top, 4)
+                } label: {
+                    Label("Studio Packs", systemImage: "square.stack.3d.up")
+                        .font(.headline)
                 }
 
                 // Camera / shot directives (collapsible)
@@ -1094,6 +1111,90 @@ struct GenerationView: View {
     private func applyServerPreset(_ preset: ServerPreset) {
         applyPreset(preset.toGenerationPreset())
         activePresetName = preset.name
+    }
+
+    // MARK: - Studio Packs
+
+    @ViewBuilder
+    private var studioPacksSection: some View {
+        if studioPacks.isEmpty {
+            Text("No Studio Packs available")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Applies prompt, negative prompt, settings, and LoRA stack. Type your subject in the prompt field first — the pack wraps it.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                ForEach(studioPacks) { pack in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(pack.name).font(.caption).fontWeight(.semibold)
+                            Spacer()
+                            Button("Apply") { applyStudioPack(pack) }
+                                .controlSize(.small)
+                        }
+                        Text(pack.description)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        if let svg = pack.svgDefaults, svg.enabled {
+                            Text("SVG export recommended (\(svg.preset ?? "default") preset) — export via CLI --svg for now.")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(6)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                if let warning = studioPackWarning {
+                    Text(warning)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    /// Resolve a Studio Pack against the local LoRA library and apply it to
+    /// the current generation controls. Does not touch saved presets.
+    private func applyStudioPack(_ pack: StudioPack) {
+        let availableIds = Set(engine.availableLoras.map { $0.id })
+        let recipe = StudioPackResolver.resolve(pack: pack, subject: prompt, availableLoraIds: availableIds)
+
+        prompt = recipe.prompt
+        if let neg = recipe.negativePrompt { negativePrompt = neg }
+        if let s = recipe.steps { steps = Double(s) }
+        if let g = recipe.guidance { guidance = Double(g) }
+        if let w = recipe.width, let h = recipe.height {
+            if let match = ResolutionPreset.presets.first(where: { $0.width == w && $0.height == h }) {
+                selectedResolution = match
+            } else {
+                customWidth = w
+                customHeight = h
+                selectedResolution = .custom
+            }
+        }
+        selectedLoras = recipe.loras.compactMap { ref in
+            guard let info = engine.availableLoras.first(where: { $0.id == ref.loraId }) else { return nil }
+            return LoRASelection(id: info.id, filename: info.filename, scale: ref.scale)
+        }
+        if let modelId = recipe.model, modelId != engine.currentModel {
+            Task {
+                do {
+                    try await engine.activateModel(id: modelId)
+                } catch {
+                    do {
+                        try await engine.loadModel(id: modelId)
+                    } catch {
+                        engine.lastError = "Failed to activate pack model \(modelId): \(error.localizedDescription)"
+                    }
+                }
+            }
+        }
+        activePresetName = nil
+        studioPackWarning = recipe.warnings.isEmpty ? nil : recipe.warnings.joined(separator: " ")
+        lastAppliedActionSummary = "Applied Studio Pack: \(pack.name)"
     }
 
     /// Apply a preset to the current generation parameters.
