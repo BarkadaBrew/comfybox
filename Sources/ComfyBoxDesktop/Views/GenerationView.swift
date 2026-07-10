@@ -280,6 +280,7 @@ struct GenerationView: View {
                 DisclosureGroup(isExpanded: $showLoraPicker) {
                     LoRAPicker(engine: engine, selectedLoras: $selectedLoras)
                         .padding(.top, 4)
+                    selectedLoraKeywordsRow
                 } label: {
                     HStack {
                         Label("LoRA Adapters", systemImage: "slider.horizontal.3")
@@ -595,6 +596,43 @@ struct GenerationView: View {
         guard let path = pendingReferenceImage, !path.isEmpty else { return }
         pendingReferenceImage = nil
         setReference(path: path)
+    }
+
+    /// Trigger-word chips for currently-selected LoRAs — tap to insert into the prompt.
+    @ViewBuilder
+    private var selectedLoraKeywordsRow: some View {
+        let words: [String] = selectedLoras.reduce(into: []) { acc, selection in
+            guard let info = engine.availableLoras.first(where: { $0.id == selection.id }) else { return }
+            acc.append(contentsOf: info.triggerwords)
+        }
+        let uniqueWords = Array(NSOrderedSet(array: words)) as? [String] ?? words
+
+        if !uniqueWords.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Trigger words — tap to insert into prompt")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                FlowLayout(spacing: 4) {
+                    ForEach(uniqueWords, id: \.self) { word in
+                        Button(action: { insertKeyword(word) }) {
+                            Text(word)
+                                .font(.caption2)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.12))
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    private func insertKeyword(_ word: String) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        prompt = trimmed.isEmpty ? word : "\(trimmed), \(word)"
     }
 
     private var parameterSection: some View {

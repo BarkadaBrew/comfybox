@@ -14,6 +14,8 @@ struct LoRAPicker: View {
     @State private var searchText: String = ""
     @State private var errorMessage: String?
     @State private var compatibleOnly: Bool = true
+    @State private var editingLoraID: String?
+    @State private var editingKeywordsText: String = ""
 
     /// The active model's identifier for compatibility checks (family or name).
     private var activeModel: String? {
@@ -221,6 +223,20 @@ struct LoRAPicker: View {
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                         }
+
+                        Button(action: { beginEditingKeywords(lora) }) {
+                            Image(systemName: lora.triggerwords.isEmpty ? "plus.circle" : "pencil.circle")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(lora.triggerwords.isEmpty ? "Add trigger words" : "Edit trigger words")
+                        .popover(isPresented: Binding(
+                            get: { editingLoraID == lora.id },
+                            set: { if !$0 { editingLoraID = nil } }
+                        )) {
+                            keywordEditorPopover(lora)
+                        }
                     }
                 }
 
@@ -271,6 +287,46 @@ struct LoRAPicker: View {
         .padding(.vertical, 4)
         .background(isSelected ? Color.accentColor.opacity(0.06) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+
+    private func keywordEditorPopover(_ lora: LoRAInfo) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Trigger words for \(lora.id)")
+                .font(.caption)
+                .fontWeight(.semibold)
+            Text("Comma-separated. Included in generation metadata; not auto-inserted into your prompt.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            TextField("e.g. Pinay, portrait", text: $editingKeywordsText)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .frame(width: 240)
+            HStack {
+                Spacer()
+                Button("Cancel") { editingLoraID = nil }
+                Button("Save") { Task { await saveKeywords(for: lora) } }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(12)
+    }
+
+    private func beginEditingKeywords(_ lora: LoRAInfo) {
+        editingKeywordsText = lora.triggerwords.joined(separator: ", ")
+        editingLoraID = lora.id
+    }
+
+    private func saveKeywords(for lora: LoRAInfo) async {
+        let words = editingKeywordsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        editingLoraID = nil
+        do {
+            try await engine.updateLoRATriggerwords(id: lora.id, triggerwords: words)
+        } catch {
+            errorMessage = "Failed to save trigger words: \(error.localizedDescription)"
+        }
     }
 
     @ViewBuilder

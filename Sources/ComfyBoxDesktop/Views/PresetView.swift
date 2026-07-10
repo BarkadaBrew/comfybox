@@ -41,6 +41,7 @@ struct PresetView: View {
             ServerPresetEditor(
                 original: preset,
                 isNew: isNew,
+                availableLoras: engine.availableLoras,
                 onSave: { updated in Task { await save(updated) } },
                 onCancel: { editing = nil }
             )
@@ -238,6 +239,7 @@ private struct ServerPresetRow: View {
 private struct ServerPresetEditor: View {
     let original: ServerPreset
     let isNew: Bool
+    let availableLoras: [LoRAInfo]
     let onSave: (ServerPreset) -> Void
     let onCancel: () -> Void
 
@@ -253,10 +255,11 @@ private struct ServerPresetEditor: View {
     @State private var lorasText: String
     @State private var scheduler: String
 
-    init(original: ServerPreset, isNew: Bool,
+    init(original: ServerPreset, isNew: Bool, availableLoras: [LoRAInfo],
          onSave: @escaping (ServerPreset) -> Void, onCancel: @escaping () -> Void) {
         self.original = original
         self.isNew = isNew
+        self.availableLoras = availableLoras
         self.onSave = onSave
         self.onCancel = onCancel
         _name = State(initialValue: original.name)
@@ -299,6 +302,7 @@ private struct ServerPresetEditor: View {
                         TextField("Scheduler", text: $scheduler)
                     }
                     TextField("LoRAs (file=scale, comma-separated)", text: $lorasText)
+                    presetLoraKeywordsRow
                 }
             }
             .formStyle(.grouped)
@@ -313,6 +317,40 @@ private struct ServerPresetEditor: View {
             .padding()
         }
         .frame(minWidth: 540, idealWidth: 600, minHeight: 540, idealHeight: 620)
+    }
+
+    /// Trigger words for the LoRAs currently listed in `lorasText` — tap to
+    /// insert into the preset's prompt template.
+    @ViewBuilder
+    private var presetLoraKeywordsRow: some View {
+        let filenames = Set(lorasText.split(separator: ",").compactMap { part -> String? in
+            let token = part.trimmingCharacters(in: .whitespaces)
+            guard !token.isEmpty else { return nil }
+            return String(token.split(separator: "=", maxSplits: 1)[0]).trimmingCharacters(in: .whitespaces)
+        })
+        let words: [String] = availableLoras
+            .filter { filenames.contains($0.filename) }
+            .reduce(into: []) { $0.append(contentsOf: $1.triggerwords) }
+        let uniqueWords = Array(NSOrderedSet(array: words)) as? [String] ?? words
+
+        if !uniqueWords.isEmpty {
+            FlowLayout(spacing: 4) {
+                ForEach(uniqueWords, id: \.self) { word in
+                    Button(action: {
+                        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        prompt = trimmed.isEmpty ? word : "\(trimmed), \(word)"
+                    }) {
+                        Text(word)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
     }
 
     /// Apply the edited fields onto the original so unedited (legacy routing)

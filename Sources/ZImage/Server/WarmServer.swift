@@ -848,6 +848,49 @@ public final class WarmServer {
         return .error(.error(status: 500, message: error.localizedDescription))
       }
 
+    case ("POST", _) where request.path.hasSuffix("/update") && request.path.hasPrefix("/v1/loras/"):
+      guard let library = loraLibrary else {
+        return .error(.error(status: 503, message: "LoRA Library not initialized"))
+      }
+      let id = String(request.path.dropFirst("/v1/loras/".count).dropLast("/update".count))
+      guard !id.isEmpty, !id.contains("/") else {
+        return .error(.error(status: 400, message: "Invalid LoRA ID"))
+      }
+      guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
+        return .error(.error(status: 400, message: "Invalid request body"))
+      }
+      let patch = LoRAEntryPatch(
+        triggerwords: json["triggerwords"] as? [String],
+        recommendedScale: (json["recommended_scale"] as? NSNumber)?.floatValue,
+        scaleRange: (json["scale_range"] as? [NSNumber])?.map { $0.floatValue },
+        tags: json["tags"] as? [String],
+        notes: json["notes"] as? String,
+        sourceURL: json["source_url"] as? String,
+        civitaiModelId: json["civitai_model_id"] as? Int
+      )
+      do {
+        try library.update(id, patch: patch)
+        guard let entry = library.entry(for: id) else {
+          return .error(.error(status: 404, message: "LoRA not found: \(id)"))
+        }
+        let responseDict: [String: Any] = [
+          "success": true,
+          "id": entry.id,
+          "triggerwords": entry.triggerwords,
+          "recommended_scale": entry.recommendedScale,
+          "tags": entry.tags,
+          "notes": entry.notes,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
+          return .json(.rawJSON(status: 200, data: data))
+        }
+        return .error(.error(status: 500, message: "Failed to serialize updated entry"))
+      } catch let error as LoRALibraryError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: error.localizedDescription))
+      }
+
     // MARK: - Video Endpoints
 
     case ("POST", "/v1/video/generate"):
@@ -3385,7 +3428,8 @@ private actor WarmServerCoordinator {
         height: height,
         model: "krea-2-turbo",
         generatedBy: payload.source,
-        contentMode: payload.contentMode
+        contentMode: payload.contentMode,
+        loras: k2.loadedLoRAConfigs
       )
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 

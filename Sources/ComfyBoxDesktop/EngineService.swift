@@ -866,6 +866,17 @@ public final class EngineService {
         await refreshLoras()
     }
 
+    /// Persist trigger words for a LoRA library entry to the server.
+    public func updateLoRATriggerwords(id: String, triggerwords: [String]) async throws {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONSerialization.data(withJSONObject: ["triggerwords": triggerwords])
+        let (status, data) = try await client.post("/v1/loras/\(id)/update", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Update failed")
+        }
+        await refreshLoras()
+    }
+
     /// Free/total bytes of the volume backing the home directory (the primary
     /// drive staged copies land on).
     public nonisolated static func primaryDiskInfo() -> (freeGB: Double, totalGB: Double)? {

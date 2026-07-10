@@ -24,6 +24,10 @@ public struct LoRAScanResult: Sendable {
   public let keyCount: Int
   /// Which layer types are targeted.
   public let layerTargets: [String]
+  /// Candidate trigger/activation words auto-extracted from kohya-style
+  /// `ss_tag_frequency` training metadata, if present. Empty if the LoRA
+  /// wasn't trained with that tooling or no tags were captured.
+  public let triggerWords: [String]
   /// Raw metadata from the safetensors __metadata__ header.
   public let safetensorsMetadata: [String: String]?
 }
@@ -74,6 +78,7 @@ public enum LoRAScanner {
     let rank = inferRank(keys: allKeys, metadata: metadata, reader: reader)
     let alpha = extractAlpha(metadata: metadata)
     let layerTargets = detectLayerTargets(keys: allKeys)
+    let triggerWords = extractTriggerWords(metadata: metadata)
 
     return LoRAScanResult(
       compatibility: compatibility,
@@ -82,8 +87,36 @@ public enum LoRAScanner {
       alpha: alpha,
       keyCount: allKeys.count,
       layerTargets: layerTargets,
+      triggerWords: triggerWords,
       safetensorsMetadata: metadata
     )
+  }
+
+  // MARK: - Trigger Word Extraction
+
+  /// Extract candidate trigger words from kohya-style `ss_tag_frequency`
+  /// training metadata: `{"1_Pinay": {"Pinay": 1, ...}, ...}` — a JSON object
+  /// mapping dataset subfolder name to a tag→count histogram. Aggregates
+  /// counts across all datasets and returns tags sorted by frequency,
+  /// highest first, capped to avoid dumping an entire caption vocabulary.
+  private static func extractTriggerWords(metadata: [String: String]?) -> [String] {
+    guard let raw = metadata?["ss_tag_frequency"],
+          let data = raw.data(using: .utf8),
+          let datasets = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Int]]
+    else { return [] }
+
+    var counts: [String: Int] = [:]
+    for (_, tags) in datasets {
+      for (tag, count) in tags {
+        let trimmed = tag.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { continue }
+        counts[trimmed, default: 0] += count
+      }
+    }
+
+    return counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+      .prefix(10)
+      .map { $0.key }
   }
 
   // MARK: - Compatibility Detection

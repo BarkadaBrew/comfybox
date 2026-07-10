@@ -394,6 +394,11 @@ public final class LoRALibrary: @unchecked Sendable {
         updated.safetensorsMetadata = scanResult.safetensorsMetadata
         updated.category = category
         updated.quarantined = isQuarantined
+        // Only backfill auto-extracted trigger words when the entry has none
+        // yet — never clobber a user's manually-curated keywords on rescan.
+        if updated.triggerwords.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+          updated.triggerwords = scanResult.triggerWords
+        }
         newEntries[id] = updated
         updatedCount += 1
       } else {
@@ -410,7 +415,7 @@ public final class LoRALibrary: @unchecked Sendable {
           alpha: scanResult.alpha,
           keyCount: scanResult.keyCount,
           layerTargets: scanResult.layerTargets,
-          triggerwords: [],
+          triggerwords: scanResult.triggerWords,
           recommendedScale: 1.0,
           scaleRange: [0.0, 2.0],
           tags: [],
