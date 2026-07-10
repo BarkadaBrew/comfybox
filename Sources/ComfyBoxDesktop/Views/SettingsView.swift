@@ -269,6 +269,22 @@ struct SettingsView: View {
                             .truncationMode(.middle)
                     }
                 }
+
+                HStack {
+                    Text("Warm-Start Model")
+                    Spacer()
+                    if let spec = loadedServerConfig?.modelSpec, !spec.isEmpty {
+                        Text(spec)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } else {
+                        Text("Not set — see Presets").foregroundStyle(.tertiary)
+                    }
+                }
+                Text("Set from a preset's ••• menu → \"Set as Warm\" — loads it now and makes it the default on the next server restart.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
 
             Section {
@@ -289,6 +305,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .task { await loadProviders() }
     }
 
     // MARK: - Generation Tab

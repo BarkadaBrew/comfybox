@@ -16,6 +16,10 @@ struct PresetView: View {
     @State private var isNew: Bool = false
     @State private var isLoading = false
     @State private var loadError: String?
+    /// The server's configured warm-start model (ComfyBoxServerConfig.modelSpec),
+    /// so a preset whose model matches can show a "Warm" badge instead of the
+    /// user having to hand-edit ~/.comfybox/config.json or a launchd plist arg.
+    @State private var warmModelSpec: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -33,7 +37,10 @@ struct PresetView: View {
             }
         }
         .navigationTitle("Presets")
-        .task { await reload() }
+        .task {
+            await reload()
+            warmModelSpec = (try? await engine.fetchServerConfig())?.modelSpec
+        }
         .onChange(of: engine.connectionState.isConnected) { _, connected in
             if connected { Task { await reload() } }
         }
@@ -85,10 +92,12 @@ struct PresetView: View {
                 ForEach(presets) { preset in
                     ServerPresetRow(
                         preset: preset,
+                        isWarm: presetModelSpec(preset) != nil && presetModelSpec(preset) == warmModelSpec,
                         onApply: { onApply?(preset.toGenerationPreset()) },
                         onEdit: { isNew = false; editing = preset },
                         onDuplicate: { Task { await duplicate(preset) } },
-                        onDelete: { Task { await delete(preset) } }
+                        onDelete: { Task { await delete(preset) } },
+                        onSetWarm: presetModelSpec(preset) != nil ? { Task { await setAsWarm(preset) } } : nil
                     )
                 }
             }
@@ -157,16 +166,48 @@ struct PresetView: View {
             loadError = "Delete failed: \(error.localizedDescription)"
         }
     }
+
+    /// A preset's effective model spec, matching how Apply/applyPreset already
+    /// resolve it (custom path takes precedence over a catalog/CivitAI id).
+    private func presetModelSpec(_ preset: ServerPreset) -> String? {
+        let path = preset.customModelPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let path, !path.isEmpty { return path }
+        let model = preset.model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (model?.isEmpty == false) ? model : nil
+    }
+
+    /// Make a preset's model the server's warm-start default: load + activate
+    /// it now (so the change is visible immediately) and persist modelSpec to
+    /// ~/.comfybox/config.json (so it survives the next server restart) —
+    /// replaces having to hand-edit the config file or a launchd plist arg.
+    private func setAsWarm(_ preset: ServerPreset) async {
+        guard let spec = presetModelSpec(preset) else { return }
+        do {
+            do {
+                try await engine.activateModel(id: spec)
+            } catch {
+                try await engine.loadModel(id: spec)
+            }
+            var config = try await engine.fetchServerConfig()
+            config.modelSpec = spec
+            try await engine.saveServerConfig(config)
+            warmModelSpec = spec
+        } catch {
+            loadError = "Set Warm failed: \(error.localizedDescription)"
+        }
+    }
 }
 
 // MARK: - Row
 
 private struct ServerPresetRow: View {
     let preset: ServerPreset
+    var isWarm: Bool = false
     var onApply: () -> Void
     var onEdit: () -> Void
     var onDuplicate: () -> Void
     var onDelete: () -> Void
+    var onSetWarm: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -181,6 +222,14 @@ private struct ServerPresetRow: View {
                     }
                     if let provider = preset.provider, provider != "local" {
                         chip(provider)
+                    }
+                    if isWarm {
+                        Label("Warm", systemImage: "flame.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(.orange.opacity(0.15), in: Capsule())
+                            .help("This preset's model loads by default on server startup.")
                     }
                 }
                 if !preset.description.isEmpty {
@@ -200,6 +249,9 @@ private struct ServerPresetRow: View {
             Button { onEdit() } label: { Image(systemName: "pencil") }
                 .buttonStyle(.borderless)
             Menu {
+                if let onSetWarm, !isWarm {
+                    Button("Set as Warm", action: onSetWarm)
+                }
                 Button("Duplicate", action: onDuplicate)
                 Button("Delete", role: .destructive, action: onDelete)
             } label: {
