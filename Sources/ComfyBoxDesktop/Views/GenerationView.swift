@@ -97,6 +97,19 @@ struct GenerationView: View {
         selectedResolution.id == ResolutionPreset.custom.id ? customHeight : selectedResolution.height
     }
 
+    private var seedWalkHint: String {
+        guard let base = UInt64(seedText), base > 0 else {
+            return seedWalkDirection == .random
+                ? "\(batchCount) fresh random seeds."
+                : "No fixed seed set — every image is already random regardless of direction."
+        }
+        switch seedWalkDirection {
+        case .up: return "Sweeps \(base) → \(base + UInt64(batchCount - 1))."
+        case .down: return "Sweeps \(base) → \(max(1, Int(base) - batchCount + 1))."
+        case .random: return "\(batchCount) fresh random seeds (ignores the seed field)."
+        }
+    }
+
     // LoRA selections
     @State private var selectedLoras: [LoRASelection] = []
     /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
@@ -131,6 +144,11 @@ struct GenerationView: View {
     @State private var dype: String = "none"
     /// Number of images to generate in one batch (seed sweep).
     @State private var batchCount: Int = 1
+    /// Direction the batch's seed walks across iterations when a fixed seed
+    /// is set — Up/Down sweep from it, Random ignores it entirely.
+    @State private var seedWalkDirection: SeedWalkDirection = .up
+    /// Number of variants queued via "Add to Queue" this session (display only).
+    @State private var queuedVariantCount: Int = 0
     @State private var batchProgress: String?
     /// Set when a LoRA swap fails at generate time, so it's visible instead of
     /// silently rendering with no LoRAs.
@@ -736,14 +754,26 @@ struct GenerationView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            // Batch count (seed sweep)
-            HStack {
-                Text("Batch").font(.subheadline).foregroundStyle(.secondary)
-                Stepper(value: $batchCount, in: 1...16) {
-                    Text("\(batchCount) image\(batchCount == 1 ? "" : "s")").font(.subheadline.monospacedDigit())
+            // Batch count + Seed Walk direction
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Batch").font(.subheadline).foregroundStyle(.secondary)
+                    Stepper(value: $batchCount, in: 1...16) {
+                        Text("\(batchCount) image\(batchCount == 1 ? "" : "s")").font(.subheadline.monospacedDigit())
+                    }
                 }
                 if batchCount > 1 {
-                    Text("seed sweep").font(.caption2).foregroundStyle(.tertiary)
+                    Text("Seed Walk").font(.subheadline).foregroundStyle(.secondary)
+                    Picker("", selection: $seedWalkDirection) {
+                        ForEach(SeedWalkDirection.allCases) { direction in
+                            Text(direction.label).tag(direction)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    Text(seedWalkHint)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
 
@@ -837,6 +867,21 @@ struct GenerationView: View {
             .disabled(!canGenerate)
             .keyboardShortcut(.return, modifiers: .command)
 
+            // Add to Queue — submits without taking over the preview, so you
+            // can queue several variants (e.g. via Seed Walk) back to back.
+            if backend == .local {
+                Button(action: { queueVariant() }) {
+                    HStack {
+                        Image(systemName: "text.badge.plus")
+                        Text(queuedVariantCount > 0 ? "Add to Queue (\(queuedVariantCount) pending)" : "Add to Queue")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canQueue)
+                .help("Submit the current settings as a queued render without taking over the preview pane.")
+            }
+
             // Save / Clear row
             HStack(spacing: 8) {
                 Button(action: { showingSavePreset = true }) {
@@ -870,6 +915,13 @@ struct GenerationView: View {
         }
         // Cloud backends don't need the local server, just a key.
         return !isCloudGenerating && hasPrompt && !cloudBackendKey.isEmpty
+    }
+
+    /// Unlike canGenerate, does NOT require the server to be idle — the
+    /// whole point of Add to Queue is stacking variants while one runs.
+    private var canQueue: Bool {
+        backend == .local && engine.connectionState.isConnected
+            && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var canEnhance: Bool {
@@ -979,40 +1031,88 @@ struct GenerationView: View {
 
         let count = max(1, batchCount)
         Task {
-            // Swap LoRAs if any selected (before generation). Surface failures —
-            // silently swallowing them is how renders ended up with no LoRAs.
-            if !selectedLoras.isEmpty {
-                do {
-                    try await engine.swapLoras(selectedLoras)
-                    await MainActor.run { loraSwapWarning = nil }
-                } catch {
-                    await MainActor.run {
-                        loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
+            await runGenerationBatch(request: request, seed: seed, count: count, updatePreview: true)
+        }
+    }
+
+    /// Add the current settings as a queued variant instead of taking over
+    /// the preview pane — lets you stack up several variants (e.g. via Seed
+    /// Walk) without watching each one finish before queuing the next. Runs
+    /// through the same server queue as Generate; still results land in the
+    /// Gallery/Compare tab via onGenerated/onBatchComplete.
+    private func queueVariant() {
+        let seed: UInt64
+        if let parsed = UInt64(seedText), parsed > 0 {
+            seed = parsed
+        } else {
+            seed = 0
+        }
+
+        let request = GenerationRequest(
+            prompt: prompt,
+            negativePrompt: negativePrompt,
+            width: effectiveWidth,
+            height: effectiveHeight,
+            steps: Int(steps),
+            guidance: Float(guidance),
+            seed: seed,
+            modelId: engine.currentModel,
+            loras: selectedLoras,
+            initImagePath: referenceImagePath,
+            imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
+            dype: dype == "none" ? nil : dype
+        )
+
+        guard backend == .local else { return }  // cloud queueing isn't wired — local server queue only.
+
+        let count = max(1, batchCount)
+        queuedVariantCount += count
+        Task {
+            await runGenerationBatch(request: request, seed: seed, count: count, updatePreview: false)
+        }
+    }
+
+    /// Shared batch-generation core for both Generate and Add to Queue.
+    /// `updatePreview` controls whether the result takes over the main
+    /// preview pane — Add to Queue leaves whatever's currently shown alone.
+    private func runGenerationBatch(request: GenerationRequest, seed: UInt64, count: Int, updatePreview: Bool) async {
+        // Swap LoRAs if any selected (before generation). Surface failures —
+        // silently swallowing them is how renders ended up with no LoRAs.
+        if !selectedLoras.isEmpty {
+            do {
+                try await engine.swapLoras(selectedLoras)
+                await MainActor.run { loraSwapWarning = nil }
+            } catch {
+                await MainActor.run {
+                    loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
+                }
+            }
+        } else {
+            await MainActor.run { loraSwapWarning = nil }
+        }
+
+        // Batch: generate `count` images. A fixed seed walks per
+        // seedWalkDirection; seed 0 (random) yields a fresh random each time.
+        var batchPaths: [String] = []
+        for i in 0..<count {
+            if updatePreview, count > 1 {
+                await MainActor.run { batchProgress = "Generating \(i + 1) of \(count)…" }
+            }
+            var req = request
+            req.seed = BatchSeedSweep.seed(baseSeed: seed, index: i, direction: seedWalkDirection)
+            do {
+                let outputPath = try await engine.generate(req, contentMode: contentMode)
+                // Optional SeedVR2 upscale of the render.
+                var finalPath = outputPath
+                if seedvrUpscale > 0 {
+                    if updatePreview { await MainActor.run { batchProgress = "Upscaling to \(seedvrUpscale)px…" } }
+                    if let up = try? await engine.upscale(imagePath: outputPath, targetResolution: seedvrUpscale) {
+                        finalPath = up
+                    } else {
+                        await MainActor.run { engine.lastError = "SeedVR2 upscale unavailable (server needs --seedvr2-weights); kept the base render." }
                     }
                 }
-            } else {
-                await MainActor.run { loraSwapWarning = nil }
-            }
-
-            // Batch: generate `count` images. A fixed seed sweeps seed, seed+1…;
-            // seed 0 (random) yields a fresh random each time.
-            var batchPaths: [String] = []
-            for i in 0..<count {
-                if count > 1 { await MainActor.run { batchProgress = "Generating \(i + 1) of \(count)…" } }
-                var req = request
-                req.seed = BatchSeedSweep.seed(baseSeed: seed, index: i)
-                do {
-                    let outputPath = try await engine.generate(req, contentMode: contentMode)
-                    // Optional SeedVR2 upscale of the render.
-                    var finalPath = outputPath
-                    if seedvrUpscale > 0 {
-                        await MainActor.run { batchProgress = "Upscaling to \(seedvrUpscale)px…" }
-                        if let up = try? await engine.upscale(imagePath: outputPath, targetResolution: seedvrUpscale) {
-                            finalPath = up
-                        } else {
-                            await MainActor.run { engine.lastError = "SeedVR2 upscale unavailable (server needs --seedvr2-weights); kept the base render." }
-                        }
-                    }
+                if updatePreview {
                     if let image = NSImage(contentsOfFile: finalPath) {
                         await MainActor.run { displayedImage = image }
                     }
@@ -1029,17 +1129,18 @@ struct GenerationView: View {
                         )
                         await MainActor.run { outputQAResults = results }
                     }
-                    batchPaths.append(finalPath)
-                    onGenerated?(finalPath, req)
-                } catch {
-                    await MainActor.run { engine.lastError = error.localizedDescription }
-                    break
                 }
+                batchPaths.append(finalPath)
+                onGenerated?(finalPath, req)
+            } catch {
+                await MainActor.run { engine.lastError = error.localizedDescription }
+                break
             }
-            await MainActor.run { batchProgress = nil }
-            if batchPaths.count > 1 {
-                onBatchComplete?(batchPaths, request)
-            }
+        }
+        if updatePreview { await MainActor.run { batchProgress = nil } }
+        await MainActor.run { queuedVariantCount = max(0, queuedVariantCount - (updatePreview ? 0 : count)) }
+        if batchPaths.count > 1 {
+            onBatchComplete?(batchPaths, request)
         }
     }
 

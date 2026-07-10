@@ -215,7 +215,11 @@ public final class EngineService {
     public var currentModel: String?
     public var currentModelFamily: String?
     public var queueCount: Int = 0
-    public var isGenerating: Bool = false
+    /// Counter rather than a bool so a queued/background generate() running
+    /// alongside the foreground one doesn't clear this out from under it —
+    /// isGenerating stays true until the LAST concurrent call finishes.
+    private var activeGenerateCount: Int = 0
+    public var isGenerating: Bool { activeGenerateCount > 0 }
     public var lastGeneratedImagePath: String?
     public var lastError: String?
     public var lastDurationMs: Int?
@@ -324,7 +328,7 @@ public final class EngineService {
             throw EngineServiceError.emptyPrompt
         }
 
-        isGenerating = true
+        activeGenerateCount += 1
         lastError = nil
 
         // Poll health quickly while the render runs so progress_percent updates
@@ -335,7 +339,7 @@ public final class EngineService {
                 await self?.pollHealth()
             }
         }
-        defer { isGenerating = false; progressPoll.cancel() }
+        defer { activeGenerateCount -= 1; progressPoll.cancel() }
 
         // Build the output path.
         let timestamp = Int(Date().timeIntervalSince1970)
