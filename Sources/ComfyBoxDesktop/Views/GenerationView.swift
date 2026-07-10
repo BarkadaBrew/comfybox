@@ -144,6 +144,9 @@ struct GenerationView: View {
     @State private var isCloudGenerating: Bool = false
     @State private var shotTemplates = ShotTemplateStore()
     @State private var lastAppliedActionSummary: String?
+    /// Unresolvable pack/model/LoRA references from the assistant's last
+    /// action (FR-6 / #199) — flagged, never silently dropped.
+    @State private var agentActionWarning: String?
 
     // Preset save sheet
     @State private var showingSavePreset: Bool = false
@@ -274,6 +277,11 @@ struct GenerationView: View {
                                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                             }
                         }
+                    }
+                    if let warning = agentActionWarning {
+                        Text(warning)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
                     }
                     Divider()
                 }
@@ -1137,6 +1145,23 @@ struct GenerationView: View {
     /// Apply an assistant action to the generation controls. Only fields the
     /// action set are changed; a `generate` flag kicks off a render.
     private func applyAgentAction(_ action: AgentAction) {
+        let warnings = action.validationWarnings(
+            availablePackIds: Set(studioPacks.map { $0.id }),
+            availableModelIds: Set([engine.currentModel].compactMap { $0 }),
+            availableLoRAFilenames: Set(engine.availableLoras.map { $0.filename })
+        )
+        agentActionWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
+
+        // Apply a named Studio Pack (and template, if also named) first —
+        // explicit fields below still override anything it sets.
+        if let packId = action.studioPackId, let pack = studioPacks.first(where: { $0.id == packId }) {
+            if let templateId = action.templateId, let template = pack.templates.first(where: { $0.id == templateId }) {
+                applyStudioPackTemplate(pack, template: template)
+            } else {
+                applyStudioPack(pack)
+            }
+        }
+
         if let p = action.prompt { prompt = p }
         if let s = action.steps { steps = Double(min(max(s, 1), 50)) }
         if let g = action.guidance { guidance = min(max(g, 0), 20) }

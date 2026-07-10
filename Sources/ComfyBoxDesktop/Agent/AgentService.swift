@@ -22,16 +22,29 @@ public struct AgentAction: Equatable, Sendable {
     public var loras: [String]?
     /// When true, the Generate view kicks off a render after applying.
     public var generate: Bool?
+    /// Studio Pack id to apply (FR-6 / #199), resolved against locally
+    /// available packs — the assistant names a pack by id, Generate applies it.
+    public var studioPackId: String?
+    /// One of the named pack's templates, if the assistant wants a specific
+    /// slot-based template rather than the pack's raw prompt wrapping.
+    public var templateId: String?
+    /// A model spec/id the assistant wants active (validated before apply —
+    /// unknown ids are flagged, not silently ignored).
+    public var model: String?
 
     /// True when at least one field is set.
     public var hasChanges: Bool {
         prompt != nil || negativePrompt != nil || steps != nil || guidance != nil
             || width != nil || height != nil || seed != nil || loras != nil || generate == true
+            || studioPackId != nil || templateId != nil || model != nil
     }
 
     /// A short human summary of what will change, for the UI.
     public var summary: String {
         var parts: [String] = []
+        if let studioPackId { parts.append("pack \(studioPackId)") }
+        if let templateId { parts.append("template \(templateId)") }
+        if let model { parts.append("model \(model)") }
         if prompt != nil { parts.append("prompt") }
         if negativePrompt != nil { parts.append("negative") }
         if let s = steps { parts.append("steps \(s)") }
@@ -41,6 +54,36 @@ public struct AgentAction: Equatable, Sendable {
         if let loras, !loras.isEmpty { parts.append("\(loras.count) LoRA\(loras.count == 1 ? "" : "s")") }
         if generate == true { parts.append("generate") }
         return parts.joined(separator: " · ")
+    }
+
+    /// Check pack/template/model/LoRA references against what's actually
+    /// available locally. Returns human-readable warnings for anything
+    /// unresolvable — callers surface these and skip applying that one
+    /// field rather than silently ignoring a typo'd or stale reference.
+    public func validationWarnings(
+        availablePackIds: Set<String>,
+        availableModelIds: Set<String>,
+        availableLoRAFilenames: Set<String>
+    ) -> [String] {
+        var warnings: [String] = []
+        if let studioPackId, !availablePackIds.contains(studioPackId) {
+            warnings.append("Studio Pack '\(studioPackId)' not found locally.")
+        }
+        // Template validity against the pack's own template list needs the
+        // actual StudioPack (not just ids) — checked by the caller when it
+        // resolves the pack, not here.
+        if let model, !availableModelIds.contains(model) {
+            warnings.append("Model '\(model)' not found — request will use the currently active model.")
+        }
+        if let loras {
+            for entry in loras {
+                let filename = entry.split(separator: "=", maxSplits: 1).first.map(String.init) ?? entry
+                if !availableLoRAFilenames.contains(filename) {
+                    warnings.append("LoRA '\(filename)' not found locally — skipped.")
+                }
+            }
+        }
+        return warnings
     }
 }
 
@@ -84,7 +127,9 @@ public final class AgentService {
     block containing only the keys you want to change, from: prompt, negative_prompt, \
     steps (int), guidance (number), width (int), height (int), seed (int), loras \
     (array of "filename" or "filename=scale"), generate (bool, true to start a \
-    render). Example:
+    render), studio_pack_id (a Studio Pack id to apply, e.g. "life-design-healthcare"), \
+    template_id (one of that pack's template ids), model (a model id to switch to). \
+    Example:
     ```json
     {"prompt": "kira at golden hour, 85mm", "steps": 9, "guidance": 3.5, "width": 1024, "height": 1536}
     ```
@@ -154,9 +199,15 @@ public final class AgentService {
         action.seed = int("seed")
         action.loras = object["loras"] as? [String]
         action.generate = object["generate"] as? Bool
-        // Drop empty-string prompt fields.
+        action.studioPackId = (object["studio_pack_id"] as? String) ?? (object["studioPackId"] as? String)
+        action.templateId = (object["template_id"] as? String) ?? (object["templateId"] as? String)
+        action.model = object["model"] as? String
+        // Drop empty-string fields.
         if action.prompt?.isEmpty == true { action.prompt = nil }
         if action.negativePrompt?.isEmpty == true { action.negativePrompt = nil }
+        if action.studioPackId?.isEmpty == true { action.studioPackId = nil }
+        if action.templateId?.isEmpty == true { action.templateId = nil }
+        if action.model?.isEmpty == true { action.model = nil }
 
         return action.hasChanges ? action : nil
     }
