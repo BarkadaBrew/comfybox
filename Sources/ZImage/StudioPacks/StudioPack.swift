@@ -60,6 +60,71 @@ public struct StudioPackQARule: Codable, Sendable, Equatable, Identifiable {
   }
 }
 
+// MARK: - Template Slot
+
+/// A single fillable slot in a pack template, e.g. `{clinician_role}`.
+public struct StudioPackTemplateSlot: Codable, Sendable, Equatable, Identifiable {
+  /// Matches the `{id}` placeholder in the owning template's `template` string.
+  public var id: String
+  public var label: String
+  public var placeholder: String
+  public var defaultValue: String
+  /// Suggested values for a picker; empty means freeform text entry.
+  public var options: [String]
+
+  public init(
+    id: String, label: String, placeholder: String = "", defaultValue: String = "",
+    options: [String] = []
+  ) {
+    self.id = id
+    self.label = label
+    self.placeholder = placeholder
+    self.defaultValue = defaultValue
+    self.options = options
+  }
+}
+
+// MARK: - Template
+
+/// A slot-based prompt template (FR-2 / #198). `template` contains `{slotId}`
+/// placeholders matching entries in `slots`.
+public struct StudioPackTemplate: Codable, Sendable, Equatable, Identifiable {
+  public var id: String
+  public var name: String
+  public var category: String
+  public var template: String
+  public var slots: [StudioPackTemplateSlot]
+
+  enum CodingKeys: String, CodingKey {
+    case id, name, category, template, slots
+  }
+
+  public init(
+    id: String, name: String, category: String, template: String,
+    slots: [StudioPackTemplateSlot] = []
+  ) {
+    self.id = id
+    self.name = name
+    self.category = category
+    self.template = template
+    self.slots = slots
+  }
+
+  /// Render the template by substituting `{slotId}` with the provided value,
+  /// falling back to the slot's default when a value is missing or blank.
+  /// Unrecognized placeholders (no matching slot) are left as-is rather than
+  /// silently dropped, so a malformed template is visibly wrong, not blank.
+  public func render(slotValues: [String: String]) -> String {
+    var result = template
+    for slot in slots {
+      let provided = slotValues[slot.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let value = provided.isEmpty ? slot.defaultValue : provided
+      result = result.replacingOccurrences(of: "{\(slot.id)}", with: value)
+    }
+    return result
+  }
+}
+
 // MARK: - Studio Pack
 
 /// A single Studio Pack: a named, versioned production recipe.
@@ -97,9 +162,12 @@ public struct StudioPack: Codable, Sendable, Identifiable, Equatable {
   public var cameraOrientation: String?
   public var lightingStyle: String?
 
-  // Template categories (full slot-based templates are FR-2 / #198 — this
-  // is just the category list a pack advertises).
+  // Template categories a pack advertises (used by control template
+  // library grouping — FR-5 / #200).
   public var templateCategories: [String]
+
+  // Slot-based prompt templates (FR-2 / #198).
+  public var templates: [StudioPackTemplate]
 
   // QA rules (execution is FR-8 / #201)
   public var qaRules: [StudioPackQARule]
@@ -119,6 +187,7 @@ public struct StudioPack: Codable, Sendable, Identifiable, Equatable {
     case cameraOrientation = "camera_orientation"
     case lightingStyle = "lighting_style"
     case templateCategories = "template_categories"
+    case templates
     case qaRules = "qa_rules"
     case mcpTags = "mcp_tags"
   }
@@ -132,6 +201,7 @@ public struct StudioPack: Codable, Sendable, Identifiable, Equatable {
     svgDefaults: StudioPackSVGDefaults? = nil,
     cameraAngle: String? = nil, cameraOrientation: String? = nil, lightingStyle: String? = nil,
     templateCategories: [String] = [],
+    templates: [StudioPackTemplate] = [],
     qaRules: [StudioPackQARule] = [],
     mcpTags: [String] = []
   ) {
@@ -155,6 +225,7 @@ public struct StudioPack: Codable, Sendable, Identifiable, Equatable {
     self.cameraOrientation = cameraOrientation
     self.lightingStyle = lightingStyle
     self.templateCategories = templateCategories
+    self.templates = templates
     self.qaRules = qaRules
     self.mcpTags = mcpTags
   }

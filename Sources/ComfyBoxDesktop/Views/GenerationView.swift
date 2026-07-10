@@ -107,6 +107,12 @@ struct GenerationView: View {
     @State private var showStudioPacks: Bool = false
     @State private var studioPacks: [StudioPack] = []
     @State private var studioPackWarning: String?
+    /// Selected template id per pack id — absent means "no template chosen,
+    /// use the raw prompt-field subject" for that pack's Apply button.
+    @State private var selectedTemplateByPackId: [String: String] = [:]
+    /// Current slot values for whichever template is selected. Reset to the
+    /// new template's defaults each time a different template is chosen.
+    @State private var templateSlotValues: [String: String] = [:]
     /// DyPE high-resolution scaling: "none" | "ntk" | "yarn".
     @State private var dype: String = "none"
     /// Number of images to generate in one batch (seed sweep).
@@ -1123,29 +1129,11 @@ struct GenerationView: View {
                 .foregroundStyle(.tertiary)
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Applies prompt, negative prompt, settings, and LoRA stack. Type your subject in the prompt field first — the pack wraps it.")
+                Text("Applies prompt, negative prompt, settings, and LoRA stack. Pick a template and fill its slots, or use the prompt field's text as the subject directly.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                 ForEach(studioPacks) { pack in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(pack.name).font(.caption).fontWeight(.semibold)
-                            Spacer()
-                            Button("Apply") { applyStudioPack(pack) }
-                                .controlSize(.small)
-                        }
-                        Text(pack.description)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        if let svg = pack.svgDefaults, svg.enabled {
-                            Text("SVG export recommended (\(svg.preset ?? "default") preset) — export via CLI --svg for now.")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(6)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    studioPackCard(pack)
                 }
                 if let warning = studioPackWarning {
                     Text(warning)
@@ -1156,12 +1144,96 @@ struct GenerationView: View {
         }
     }
 
+    @ViewBuilder
+    private func studioPackCard(_ pack: StudioPack) -> some View {
+        let selectedTemplate = selectedTemplateByPackId[pack.id].flatMap { id in
+            pack.templates.first { $0.id == id }
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(pack.name).font(.caption).fontWeight(.semibold)
+                Spacer()
+                Button("Apply") { applyStudioPack(pack) }
+                    .controlSize(.small)
+                    .help("Apply using the current prompt field as the subject")
+            }
+            Text(pack.description)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if let svg = pack.svgDefaults, svg.enabled {
+                Text("SVG export recommended (\(svg.preset ?? "default") preset) — export via CLI --svg for now.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            if !pack.templates.isEmpty {
+                Menu {
+                    ForEach(pack.templates) { template in
+                        Button(template.name) { selectTemplate(template, in: pack) }
+                    }
+                } label: {
+                    Text(selectedTemplate?.name ?? "Choose a template…")
+                        .font(.caption2)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+
+                if let template = selectedTemplate {
+                    ForEach(template.slots) { slot in
+                        HStack(spacing: 4) {
+                            Text(slot.label)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 80, alignment: .leading)
+                            TextField(
+                                slot.placeholder,
+                                text: Binding(
+                                    get: { templateSlotValues[slot.id] ?? slot.defaultValue },
+                                    set: { templateSlotValues[slot.id] = $0 }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption2)
+                        }
+                    }
+                    Button("Apply Template") { applyStudioPackTemplate(pack, template: template) }
+                        .controlSize(.small)
+                }
+            }
+        }
+        .padding(6)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func selectTemplate(_ template: StudioPackTemplate, in pack: StudioPack) {
+        selectedTemplateByPackId[pack.id] = template.id
+        var values: [String: String] = [:]
+        for slot in template.slots { values[slot.id] = slot.defaultValue }
+        templateSlotValues = values
+    }
+
     /// Resolve a Studio Pack against the local LoRA library and apply it to
-    /// the current generation controls. Does not touch saved presets.
+    /// the current generation controls, using the current prompt text as the
+    /// subject. Does not touch saved presets.
     private func applyStudioPack(_ pack: StudioPack) {
         let availableIds = Set(engine.availableLoras.map { $0.id })
         let recipe = StudioPackResolver.resolve(pack: pack, subject: prompt, availableLoraIds: availableIds)
+        applyResolvedRecipe(recipe, packName: pack.name)
+    }
 
+    /// Resolve a Studio Pack template with its filled slot values and apply
+    /// the result. Does not touch saved presets.
+    private func applyStudioPackTemplate(_ pack: StudioPack, template: StudioPackTemplate) {
+        let availableIds = Set(engine.availableLoras.map { $0.id })
+        let recipe = StudioPackResolver.resolve(
+            pack: pack, template: template, slotValues: templateSlotValues, availableLoraIds: availableIds
+        )
+        applyResolvedRecipe(recipe, packName: "\(pack.name) — \(template.name)")
+    }
+
+    private func applyResolvedRecipe(_ recipe: StudioPackRecipe, packName: String) {
         prompt = recipe.prompt
         if let neg = recipe.negativePrompt { negativePrompt = neg }
         if let s = recipe.steps { steps = Double(s) }
@@ -1194,7 +1266,7 @@ struct GenerationView: View {
         }
         activePresetName = nil
         studioPackWarning = recipe.warnings.isEmpty ? nil : recipe.warnings.joined(separator: " ")
-        lastAppliedActionSummary = "Applied Studio Pack: \(pack.name)"
+        lastAppliedActionSummary = "Applied Studio Pack: \(packName)"
     }
 
     /// Apply a preset to the current generation parameters.

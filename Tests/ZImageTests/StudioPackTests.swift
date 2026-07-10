@@ -16,6 +16,7 @@ final class StudioPackTests: XCTestCase {
       "svg_defaults": {"enabled": true, "preset": "logo"},
       "camera_angle": "lowAngle", "camera_orientation": "front", "lighting_style": "soft",
       "template_categories": ["a", "b"],
+      "templates": [{"id": "t1", "name": "Template 1", "category": "a", "template": "{x}", "slots": []}],
       "qa_rules": [{"id": "r1", "description": "desc", "required": true}],
       "mcp_tags": ["tag1"]
     }
@@ -29,6 +30,7 @@ final class StudioPackTests: XCTestCase {
     XCTAssertEqual(pack.loraStack.first?.optional, false)
     XCTAssertEqual(pack.svgDefaults?.preset, "logo")
     XCTAssertEqual(pack.templateCategories, ["a", "b"])
+    XCTAssertEqual(pack.templates.first?.id, "t1")
     XCTAssertEqual(pack.qaRules.first?.required, true)
   }
 
@@ -115,6 +117,78 @@ final class StudioPackTests: XCTestCase {
     XCTAssertTrue(recipe.warnings.isEmpty)
     XCTAssertTrue(recipe.prompt.contains("CPR training"))
     XCTAssertTrue(recipe.prompt.contains("faceless"))
+  }
+
+  // MARK: - Template rendering (FR-2 / #198)
+
+  func testTemplateRendersProvidedSlotValues() {
+    let template = StudioPackTemplate(
+      id: "t", name: "T", category: "c",
+      template: "{clinician_role} performing CPR on {patient_role} in {setting}",
+      slots: [
+        StudioPackTemplateSlot(id: "clinician_role", label: "Clinician", defaultValue: "a nurse"),
+        StudioPackTemplateSlot(id: "patient_role", label: "Patient", defaultValue: "a patient"),
+        StudioPackTemplateSlot(id: "setting", label: "Setting", defaultValue: "a hospital room"),
+      ]
+    )
+    let rendered = template.render(slotValues: [
+      "clinician_role": "a paramedic", "patient_role": "an elderly man", "setting": "an ambulance",
+    ])
+    XCTAssertEqual(rendered, "a paramedic performing CPR on an elderly man in an ambulance")
+  }
+
+  func testTemplateFallsBackToDefaultsForMissingOrBlankSlots() {
+    let template = StudioPackTemplate(
+      id: "t", name: "T", category: "c",
+      template: "{role} in {place}",
+      slots: [
+        StudioPackTemplateSlot(id: "role", label: "Role", defaultValue: "a nurse"),
+        StudioPackTemplateSlot(id: "place", label: "Place", defaultValue: "a clinic"),
+      ]
+    )
+    // Missing key entirely, and blank/whitespace-only value both fall back to default.
+    XCTAssertEqual(template.render(slotValues: ["place": "   "]), "a nurse in a clinic")
+    XCTAssertEqual(template.render(slotValues: [:]), "a nurse in a clinic")
+  }
+
+  func testTemplateLeavesUnrecognizedPlaceholdersAsIs() {
+    let template = StudioPackTemplate(
+      id: "t", name: "T", category: "c",
+      template: "{known} and {unknown}",
+      slots: [StudioPackTemplateSlot(id: "known", label: "Known", defaultValue: "X")]
+    )
+    XCTAssertEqual(template.render(slotValues: [:]), "X and {unknown}")
+  }
+
+  func testLifeDesignPackShipsFiveTemplatesMatchingCategories() {
+    let pack = BuiltInStudioPacks.lifeDesignHealthcare
+    let templateIds = Set(pack.templates.map { $0.id })
+    XCTAssertEqual(templateIds, Set(pack.templateCategories))
+  }
+
+  // MARK: - Resolving through a template (composer)
+
+  func testResolveWithTemplateRendersAndComposesWithPackStyle() throws {
+    let pack = BuiltInStudioPacks.lifeDesignHealthcare
+    let template = try XCTUnwrap(pack.templates.first { $0.id == "clinical-handoff" })
+    let recipe = StudioPackResolver.resolve(
+      pack: pack, template: template,
+      slotValues: ["procedure": "medication reconciliation", "clinician_role": "a pharmacist", "patient_role": "an outpatient"],
+      availableLoraIds: []
+    )
+    XCTAssertEqual(recipe.templateId, "clinical-handoff")
+    XCTAssertTrue(recipe.prompt.contains("medication reconciliation training scene"))
+    XCTAssertTrue(recipe.prompt.contains("a pharmacist assisting an outpatient"))
+    // Pack style layer still applied on top of the rendered template.
+    XCTAssertTrue(recipe.prompt.contains("faceless"))
+    XCTAssertTrue(recipe.warnings.isEmpty)
+  }
+
+  func testResolveWithSubjectLeavesTemplateIdNil() {
+    let recipe = StudioPackResolver.resolve(
+      pack: BuiltInStudioPacks.lifeDesignHealthcare, subject: "x", availableLoraIds: []
+    )
+    XCTAssertNil(recipe.templateId)
   }
 
   // MARK: - Library loading (built-in vs. user override)

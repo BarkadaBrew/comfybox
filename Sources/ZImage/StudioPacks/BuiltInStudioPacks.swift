@@ -29,6 +29,50 @@ public enum BuiltInStudioPacks {
     templateCategories: [
       "cpr", "hospital-bed", "seated-patient", "clinical-handoff", "medical-equipment-tutorial",
     ],
+    templates: [
+      StudioPackTemplate(
+        id: "cpr", name: "CPR Training", category: "cpr",
+        template: "{clinician_role} performing CPR on {patient_role} in {setting}",
+        slots: [
+          StudioPackTemplateSlot(id: "clinician_role", label: "Clinician", placeholder: "a nurse", defaultValue: "a nurse"),
+          StudioPackTemplateSlot(id: "patient_role", label: "Patient", placeholder: "a patient", defaultValue: "a patient"),
+          StudioPackTemplateSlot(id: "setting", label: "Setting", placeholder: "a hospital room", defaultValue: "a hospital room"),
+        ]
+      ),
+      StudioPackTemplate(
+        id: "hospital-bed", name: "Hospital Bed Check", category: "hospital-bed",
+        template: "{patient_role} resting in a hospital bed while {clinician_role} checks vital signs",
+        slots: [
+          StudioPackTemplateSlot(id: "patient_role", label: "Patient", placeholder: "a patient", defaultValue: "a patient"),
+          StudioPackTemplateSlot(id: "clinician_role", label: "Clinician", placeholder: "a nurse", defaultValue: "a nurse"),
+        ]
+      ),
+      StudioPackTemplate(
+        id: "seated-patient", name: "Seated Consultation", category: "seated-patient",
+        template: "{patient_role} seated in a consultation room speaking with {clinician_role}",
+        slots: [
+          StudioPackTemplateSlot(id: "patient_role", label: "Patient", placeholder: "a patient", defaultValue: "a patient"),
+          StudioPackTemplateSlot(id: "clinician_role", label: "Clinician", placeholder: "a doctor", defaultValue: "a doctor"),
+        ]
+      ),
+      StudioPackTemplate(
+        id: "clinical-handoff", name: "Clinical Handoff", category: "clinical-handoff",
+        template: "{procedure} training scene, {clinician_role} assisting {patient_role}",
+        slots: [
+          StudioPackTemplateSlot(id: "procedure", label: "Procedure", placeholder: "shift handoff", defaultValue: "shift handoff"),
+          StudioPackTemplateSlot(id: "clinician_role", label: "Clinician", placeholder: "a nurse", defaultValue: "a nurse"),
+          StudioPackTemplateSlot(id: "patient_role", label: "Patient", placeholder: "a patient", defaultValue: "a patient"),
+        ]
+      ),
+      StudioPackTemplate(
+        id: "medical-equipment-tutorial", name: "Equipment Tutorial", category: "medical-equipment-tutorial",
+        template: "{clinician_role} demonstrating how to use {equipment}",
+        slots: [
+          StudioPackTemplateSlot(id: "clinician_role", label: "Clinician", placeholder: "a technician", defaultValue: "a technician"),
+          StudioPackTemplateSlot(id: "equipment", label: "Equipment", placeholder: "an IV pump", defaultValue: "an IV pump"),
+        ]
+      ),
+    ],
     qaRules: [
       StudioPackQARule(id: "faceless", description: "Prompt requests faceless/no facial features", required: false),
       StudioPackQARule(id: "flat-vector-terms", description: "Prompt includes flat/vector-friendly terms", required: false),
