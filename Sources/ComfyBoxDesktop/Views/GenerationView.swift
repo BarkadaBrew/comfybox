@@ -1364,9 +1364,12 @@ struct GenerationView: View {
         }
     }
 
-    /// Load a server preset into the controls (prompt, LoRAs, model, settings).
+    /// Switch to a different server preset's model/LoRAs/settings while
+    /// keeping the current prompt and seed — so you can rerender the same
+    /// thing with a different model+LoRA combo (e.g. a Krea2 preset in
+    /// place of a Z-Image one) without retyping anything.
     private func applyServerPreset(_ preset: ServerPreset) {
-        applyPreset(preset.toGenerationPreset())
+        applyPreset(preset.toGenerationPreset(), preserveContent: true)
         activePresetName = preset.name
     }
 
@@ -1551,13 +1554,21 @@ struct GenerationView: View {
     }
 
     /// Apply a preset to the current generation parameters.
-    func applyPreset(_ preset: GenerationPreset) {
-        prompt = preset.promptTemplate
+    /// Apply a preset's model/LoRAs/settings. `preserveContent` keeps the
+    /// current prompt and seed untouched — for switching presets mid-session
+    /// (e.g. rerendering the same prompt/seed with a different model+LoRA
+    /// combo) rather than loading a preset fresh (Send-to-Generate, the
+    /// Presets tab's Apply, both of which should load the preset's own
+    /// prompt/seed).
+    func applyPreset(_ preset: GenerationPreset, preserveContent: Bool = false) {
+        if !preserveContent {
+            prompt = preset.promptTemplate
+            // Restore a saved seed (nil/0 = random).
+            seedText = (preset.seed ?? 0) > 0 ? String(preset.seed!) : ""
+        }
         negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
-        // Restore a saved seed (nil/0 = random).
-        seedText = (preset.seed ?? 0) > 0 ? String(preset.seed!) : ""
 
         // Find a matching resolution preset, else carry the preset's exact
         // dimensions through the custom fields.

@@ -241,6 +241,9 @@ private struct CharacterEditor: View {
                         .frame(maxWidth: 260)
                     }
                     labeled("Appearance — always used") {
+                        Text("e.g. subject: … · age: … · build: … · skin: … · hair: … · eyes: … · distinguishing features: …")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                         editor($baseText, minHeight: 140)
                     }
                     labeled("Suggestive additions — banana mode") {
