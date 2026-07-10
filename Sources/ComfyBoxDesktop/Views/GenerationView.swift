@@ -6,6 +6,7 @@
 // generation, calls onGenerated to trigger DAM ingestion.
 // Phase 4: Added preset save, prompt enhancement, keyboard shortcuts.
 
+import AppKit
 import SwiftUI
 import ZImage
 
@@ -113,6 +114,11 @@ struct GenerationView: View {
     /// Current slot values for whichever template is selected. Reset to the
     /// new template's defaults each time a different template is chosen.
     @State private var templateSlotValues: [String: String] = [:]
+    /// The recipe most recently applied via a Studio Pack — drives
+    /// vector-first SVG export and metadata recording on the next render.
+    @State private var activeStudioPackRecipe: StudioPackRecipe?
+    @State private var svgOutputPath: String?
+    @State private var svgExportError: String?
     /// DyPE high-resolution scaling: "none" | "ntk" | "yarn".
     @State private var dype: String = "none"
     /// Number of images to generate in one batch (seed sweep).
@@ -888,6 +894,27 @@ struct GenerationView: View {
                             .foregroundStyle(.secondary)
                             .padding(.bottom, 8)
                     }
+                    if let svgPath = svgOutputPath {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            Text("SVG exported")
+                            Button("Reveal") {
+                                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: svgPath)])
+                            }
+                            .buttonStyle(.link)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 8)
+                    } else if let svgError = svgExportError {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Text(svgError)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 8)
+                    }
                 }
             } else {
                 VStack(spacing: 8) {
@@ -972,6 +999,11 @@ struct GenerationView: View {
                     if let image = NSImage(contentsOfFile: finalPath) {
                         await MainActor.run { displayedImage = image }
                     }
+                    if let recipe = activeStudioPackRecipe, let svg = recipe.svgDefaults, svg.enabled {
+                        await exportVectorSVG(from: finalPath, recipe: recipe, preset: svg.preset ?? "default")
+                    } else {
+                        await MainActor.run { svgOutputPath = nil; svgExportError = nil }
+                    }
                     onGenerated?(finalPath, req)
                 } catch {
                     await MainActor.run { engine.lastError = error.localizedDescription }
@@ -980,6 +1012,43 @@ struct GenerationView: View {
             }
             await MainActor.run { batchProgress = nil }
         }
+    }
+
+    /// Export a vector-first render's SVG alongside its PNG. SVG failure is
+    /// surfaced as a warning and never hides the already-successful PNG.
+    private func exportVectorSVG(from pngPath: String, recipe: StudioPackRecipe, preset: String) async {
+        let pngURL = URL(fileURLWithPath: pngPath)
+        let svgURL = pngURL.deletingPathExtension().appendingPathExtension("svg")
+        do {
+            try await Task.detached(priority: .utility) {
+                try SVGExporter.convert(input: pngURL, output: svgURL, preset: preset)
+            }.value
+            await MainActor.run {
+                svgOutputPath = svgURL.path
+                svgExportError = nil
+            }
+            await recordVectorMetadata(pngPath: pngPath, recipe: recipe, preset: preset)
+        } catch {
+            await MainActor.run {
+                svgOutputPath = nil
+                svgExportError = "SVG export failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Best-effort: record pack/template/vector-mode provenance as searchable
+    /// Finder keywords on the rendered PNG. Never blocks or fails the render.
+    private func recordVectorMetadata(pngPath: String, recipe: StudioPackRecipe, preset: String) async {
+        let sidecar = SidecarService()
+        guard sidecar.isAvailable else { return }
+        var keywords = ["studio-pack:\(recipe.packId)", "vector-mode", "svg-preset:\(preset)"]
+        if let templateId = recipe.templateId { keywords.append("template:\(templateId)") }
+        let existing = await sidecar.read(from: pngPath)
+        let metadata = SidecarService.Metadata(
+            description: existing.description ?? recipe.prompt,
+            keywords: existing.keywords + keywords
+        )
+        try? await sidecar.embed(metadata, into: pngPath)
     }
 
     /// Generate via a cloud provider (Replicate / Fal), download the result
@@ -1267,6 +1336,9 @@ struct GenerationView: View {
         activePresetName = nil
         studioPackWarning = recipe.warnings.isEmpty ? nil : recipe.warnings.joined(separator: " ")
         lastAppliedActionSummary = "Applied Studio Pack: \(packName)"
+        // Carried into the next render so it knows whether to also export
+        // SVG and which pack/template to record in metadata.
+        activeStudioPackRecipe = recipe
     }
 
     /// Apply a preset to the current generation parameters.

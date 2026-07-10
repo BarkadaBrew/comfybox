@@ -1167,43 +1167,7 @@ struct ZImageCLI {
   }
 
   private static func convertToSVG(input: URL, output: URL, preset: String) throws {
-    let vtracerPath = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent(".cargo/bin/vtracer").path
-    guard FileManager.default.fileExists(atPath: vtracerPath) else {
-      throw NSError(domain: "ZImageCLI", code: 1,
-        userInfo: [NSLocalizedDescriptionKey: "vtracer not found. Install with: cargo install vtracer"])
-    }
-    var args = ["--input", input.path, "--output", output.path]
-    switch preset {
-    case "logo":
-      args += ["--colormode", "color", "--hierarchical", "cutout", "--mode", "polygon",
-               "-f", "10", "-p", "3", "-g", "48", "-c", "120", "-l", "8", "-s", "90", "--path_precision", "2"]
-    case "detailed":
-      args += ["--colormode", "color", "--hierarchical", "stacked", "--mode", "spline",
-               "-f", "2", "-p", "8", "-g", "0", "-c", "45", "-l", "4", "-s", "60", "--path_precision", "8"]
-    case "simplified":
-      args += ["--colormode", "color", "--hierarchical", "stacked", "--mode", "polygon",
-               "-f", "6", "-p", "5", "-g", "16", "-c", "90", "-l", "6", "-s", "75", "--path_precision", "3"]
-    case "bw":
-      args += ["--colormode", "binary", "--hierarchical", "stacked", "--mode", "spline",
-               "-f", "4", "-p", "6", "-g", "0", "-c", "60", "-l", "4", "-s", "60", "--path_precision", "5"]
-    default:
-      args += ["--colormode", "color", "--hierarchical", "stacked", "--mode", "spline",
-               "-f", "4", "-p", "6", "-g", "0", "-c", "60", "-l", "4", "-s", "60", "--path_precision", "5"]
-    }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: vtracerPath)
-    process.arguments = args
-    let pipe = Pipe()
-    process.standardError = pipe
-    try process.run()
-    process.waitUntilExit()
-    if process.terminationStatus != 0 {
-      let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
-      let errorMessage = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-      throw NSError(domain: "ZImageCLI", code: Int(process.terminationStatus),
-        userInfo: [NSLocalizedDescriptionKey: "vtracer failed: \(errorMessage)"])
-    }
+    try SVGExporter.convert(input: input, output: output, preset: preset)
   }
 
   private static func runAudit(modelSpec: String?, textEncoderPath: String?) async throws {
