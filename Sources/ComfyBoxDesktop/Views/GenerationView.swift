@@ -176,6 +176,8 @@ struct GenerationView: View {
     /// Fruit mode steering the optimizer + negative prompt. View state only →
     /// resets to Neutral each launch (never silently persists 🥑).
     @State private var contentMode: ContentMode = .neutral
+    /// Content mode → preset id (Settings → Server → Content Mode Defaults).
+    @State private var contentModeDefaultPresets: [ContentMode: String] = [:]
 
     // Prompt enhancement
     @State private var isEnhancing: Bool = false
@@ -540,6 +542,13 @@ struct GenerationView: View {
                 .labelsHidden()
                 .fixedSize()
                 .help("Content mode: steers prompt optimization and negative prompt (not guidance)")
+                .onChange(of: contentMode) { _, mode in
+                    if let presetId = contentModeDefaultPresets[mode],
+                       let preset = serverPresets.first(where: { $0.id == presetId }) {
+                        applyPreset(preset.toGenerationPreset())
+                        activePresetName = preset.name
+                    }
+                }
                 // Enhance button
                 Button(action: { enhancePrompt() }) {
                     HStack(spacing: 4) {
@@ -1076,19 +1085,40 @@ struct GenerationView: View {
     /// `updatePreview` controls whether the result takes over the main
     /// preview pane — Add to Queue leaves whatever's currently shown alone.
     private func runGenerationBatch(request: GenerationRequest, seed: UInt64, count: Int, updatePreview: Bool) async {
-        // Swap LoRAs if any selected (before generation). Surface failures —
-        // silently swallowing them is how renders ended up with no LoRAs.
-        if !selectedLoras.isEmpty {
+        // Swap LoRAs if any selected (before generation). Preselected LoRAs
+        // left over from a different model (e.g. Send-to-Generate on a
+        // Z-Image render, then switching to Krea2) are shown in the picker
+        // but skipped here rather than attempted and failing the whole
+        // swap — only what's actually compatible with the active model
+        // goes to the server.
+        let activeModel = engine.currentModelFamily ?? engine.currentModel
+        let (compatibleLoras, skippedLoras) = selectedLoras.reduce(into: ([LoRASelection](), [LoRASelection]())) { acc, sel in
+            let lora = engine.availableLoras.first { $0.id == sel.id }
+            let compat = lora?.modelCompatibility ?? ""
+            if case .incompatible = LoRACompatibility.status(loraCompatibility: compat, modelIdentifier: activeModel) {
+                acc.1.append(sel)
+            } else {
+                acc.0.append(sel)
+            }
+        }
+
+        if !compatibleLoras.isEmpty {
             do {
-                try await engine.swapLoras(selectedLoras)
-                await MainActor.run { loraSwapWarning = nil }
+                try await engine.swapLoras(compatibleLoras)
+                await MainActor.run {
+                    loraSwapWarning = skippedLoras.isEmpty ? nil
+                        : "Skipped \(skippedLoras.count) LoRA(s) not compatible with the active model: \(skippedLoras.map { $0.filename }.joined(separator: ", "))"
+                }
             } catch {
                 await MainActor.run {
                     loraSwapWarning = "⚠ LoRA load failed — rendering without them: \(error.localizedDescription)"
                 }
             }
         } else {
-            await MainActor.run { loraSwapWarning = nil }
+            await MainActor.run {
+                loraSwapWarning = skippedLoras.isEmpty ? nil
+                    : "Skipped \(skippedLoras.count) LoRA(s) not compatible with the active model: \(skippedLoras.map { $0.filename }.joined(separator: ", "))"
+            }
         }
 
         // Batch: generate `count` images. A fixed seed walks per
@@ -1327,6 +1357,11 @@ struct GenerationView: View {
 
     private func loadServerPresets() async {
         serverPresets = await engine.fetchPresets()
+        if let config = try? await engine.fetchServerConfig() {
+            contentModeDefaultPresets = Dictionary(uniqueKeysWithValues: config.contentModeDefaultPresets.compactMap { key, value in
+                ContentMode(rawValue: key).map { ($0, value) }
+            })
+        }
     }
 
     /// Load a server preset into the controls (prompt, LoRAs, model, settings).

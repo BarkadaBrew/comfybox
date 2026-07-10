@@ -78,7 +78,11 @@ public enum LoRAScanner {
     let rank = inferRank(keys: allKeys, metadata: metadata, reader: reader)
     let alpha = extractAlpha(metadata: metadata)
     let layerTargets = detectLayerTargets(keys: allKeys)
-    let triggerWords = extractTriggerWords(metadata: metadata)
+    // CivitAI downloads (Desktop's CivitAIBrowserView) write a sidecar with
+    // curated trigger words — prefer that over ss_tag_frequency auto-
+    // extraction when present, since it's the model author's own list
+    // rather than a training-caption tag histogram.
+    let triggerWords = civitaiSidecarTriggerWords(for: url) ?? extractTriggerWords(metadata: metadata)
 
     return LoRAScanResult(
       compatibility: compatibility,
@@ -93,6 +97,19 @@ public enum LoRAScanner {
   }
 
   // MARK: - Trigger Word Extraction
+
+  /// Read trigger words from a `{basename}.civitai.json` sidecar next to the
+  /// LoRA file, if one exists (written by Desktop's CivitAI download flow).
+  /// Returns nil (not empty) when no sidecar exists, so callers can fall
+  /// back to auto-extraction; returns [] only if the sidecar exists but
+  /// genuinely lists no trigger words.
+  private static func civitaiSidecarTriggerWords(for url: URL) -> [String]? {
+    let sidecar = url.deletingPathExtension().appendingPathExtension("civitai.json")
+    guard let data = try? Data(contentsOf: sidecar),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return (json["triggerWords"] as? [String]) ?? []
+  }
 
   /// Extract candidate trigger words from kohya-style `ss_tag_frequency`
   /// training metadata: `{"1_Pinay": {"Pinay": 1, ...}, ...}` — a JSON object

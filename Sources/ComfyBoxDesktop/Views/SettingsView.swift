@@ -191,6 +191,10 @@ struct SettingsView: View {
     @State private var providerIsError: Bool = false
     @State private var nsfwPassword: String = ""
 
+    // Content mode → default preset mapping (/v1/config contentModeDefaultPresets)
+    @State private var availablePresets: [ServerPreset] = []
+    @State private var contentModePresetIds: [ContentMode: String] = [:]
+
     init(engine: EngineService) {
         self.engine = engine
         self._settings = State(initialValue: DesktopSettings.load())
@@ -283,6 +287,23 @@ struct SettingsView: View {
                     }
                 }
                 Text("Set from a preset's ••• menu → \"Set as Warm\" — loads it now and makes it the default on the next server restart.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Section("Content Mode Defaults") {
+                ForEach(ContentMode.allCases) { mode in
+                    Picker(mode.label, selection: Binding(
+                        get: { contentModePresetIds[mode] ?? "" },
+                        set: { newValue in Task { await saveContentModeDefault(mode, presetId: newValue.isEmpty ? nil : newValue) } }
+                    )) {
+                        Text("None").tag("")
+                        ForEach(availablePresets) { preset in
+                            Text(preset.name).tag(preset.id)
+                        }
+                    }
+                }
+                Text("Switching content mode in Generate applies that mode's preset automatically.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -589,10 +610,36 @@ struct SettingsView: View {
             let config = try await engine.fetchServerConfig()
             loadedServerConfig = config
             providerForm = ProviderFormBundle(config.providers)
+            contentModePresetIds = Dictionary(uniqueKeysWithValues: config.contentModeDefaultPresets.compactMap { key, value in
+                ContentMode(rawValue: key).map { ($0, value) }
+            })
             providerStatus = nil
             providerIsError = false
         } catch {
             providerStatus = "Failed to load: \(error.localizedDescription)"
+            providerIsError = true
+        }
+        availablePresets = await engine.fetchPresets()
+    }
+
+    private func saveContentModeDefault(_ mode: ContentMode, presetId: String?) async {
+        if let presetId, !presetId.isEmpty {
+            contentModePresetIds[mode] = presetId
+        } else {
+            contentModePresetIds.removeValue(forKey: mode)
+        }
+        do {
+            var config: ComfyBoxServerConfig
+            if let loaded = loadedServerConfig {
+                config = loaded
+            } else {
+                config = try await engine.fetchServerConfig()
+            }
+            config.contentModeDefaultPresets = Dictionary(uniqueKeysWithValues: contentModePresetIds.map { ($0.key.rawValue, $0.value) })
+            try await engine.saveServerConfig(config)
+            loadedServerConfig = config
+        } catch {
+            providerStatus = "Failed to save content mode default: \(error.localizedDescription)"
             providerIsError = true
         }
     }

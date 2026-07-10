@@ -12,7 +12,7 @@ public enum LoRACompatibility {
     public static func family(from raw: String) -> String {
         let s = raw.lowercased()
         // Order matters: check more specific tokens first.
-        if s.contains("krea 2") || s.contains("krea2") { return "krea2" }
+        if s.contains("krea 2") || s.contains("krea2") || s.contains("krea-2") { return "krea2" }
         if s.contains("flux2") || s.contains("flux.2") || s.contains("klein") { return "flux2" }
         if s.contains("zeta") || s.contains("z-image") || s.contains("zimage") || s == "z_image" { return "z-image" }
         if s.contains("qwen") { return "qwen" }

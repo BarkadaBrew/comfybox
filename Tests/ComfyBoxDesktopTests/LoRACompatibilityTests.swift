@@ -8,6 +8,12 @@ final class LoRACompatibilityTests: XCTestCase {
         XCTAssertEqual(LoRACompatibility.family(from: "z-image-turbo"), "z-image")
         XCTAssertEqual(LoRACompatibility.family(from: "zeta-chroma"), "z-image")
         XCTAssertEqual(LoRACompatibility.family(from: "Krea 2"), "krea2")
+        // Real server model id formats (hyphenated) — regression: the family
+        // detector originally only recognized space/no-separator variants,
+        // so "Only krea2 LoRAs" never matched the actual active model string.
+        XCTAssertEqual(LoRACompatibility.family(from: "krea-2-turbo"), "krea2")
+        XCTAssertEqual(LoRACompatibility.family(from: "krea/Krea-2-Turbo"), "krea2")
+        XCTAssertEqual(LoRACompatibility.family(from: "krea2-turbo-q8"), "krea2")
         XCTAssertEqual(LoRACompatibility.family(from: "Flux.1 Krea"), "flux")   // Krea 1 = Flux-based
         XCTAssertEqual(LoRACompatibility.family(from: "krea-dev"), "flux")
         XCTAssertEqual(LoRACompatibility.family(from: "Flux.1 D"), "flux")

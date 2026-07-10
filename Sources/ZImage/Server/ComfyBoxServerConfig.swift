@@ -85,6 +85,9 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   public var seedvr2WeightsPath: String?
   public var providers: AIProviderRegistry
   public var replicate: ReplicateProviderConfig?
+  /// Content mode (rawValue, e.g. "neutral"/"banana"/"avocado") → default
+  /// preset id, applied automatically when Generate's content mode changes.
+  public var contentModeDefaultPresets: [String: String]
 
   /// The one true ComfyBox HTTP port.
   public static let canonicalPort: UInt16 = 7870
@@ -99,7 +102,8 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     allowedOutputDirectory: String? = nil,
     seedvr2WeightsPath: String? = nil,
     providers: AIProviderRegistry = AIProviderRegistry(promptOptimization: AIProviderRegistry.lmStudioPromptDefault),
-    replicate: ReplicateProviderConfig? = nil
+    replicate: ReplicateProviderConfig? = nil,
+    contentModeDefaultPresets: [String: String] = [:]
   ) {
     self.port = port
     self.host = host
@@ -108,10 +112,12 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     self.seedvr2WeightsPath = seedvr2WeightsPath
     self.providers = providers
     self.replicate = replicate
+    self.contentModeDefaultPresets = contentModeDefaultPresets
   }
 
   private enum CodingKeys: String, CodingKey {
     case port, host, modelSpec, allowedOutputDirectory, seedvr2WeightsPath, providers, replicate
+    case contentModeDefaultPresets
     // Legacy keys written by the desktop AppConfig (read-only, for smooth upgrade).
     case serverPort, serverHost, outputDirectory
   }
@@ -133,6 +139,7 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     providers = try c.decodeIfPresent(AIProviderRegistry.self, forKey: .providers)
       ?? AIProviderRegistry(promptOptimization: AIProviderRegistry.lmStudioPromptDefault)
     replicate = try c.decodeIfPresent(ReplicateProviderConfig.self, forKey: .replicate)
+    contentModeDefaultPresets = try c.decodeIfPresent([String: String].self, forKey: .contentModeDefaultPresets) ?? [:]
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -144,6 +151,9 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     try c.encodeIfPresent(seedvr2WeightsPath, forKey: .seedvr2WeightsPath)
     try c.encode(providers, forKey: .providers)
     try c.encodeIfPresent(replicate, forKey: .replicate)
+    if !contentModeDefaultPresets.isEmpty {
+      try c.encode(contentModeDefaultPresets, forKey: .contentModeDefaultPresets)
+    }
   }
 
   // MARK: - Paths
