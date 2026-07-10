@@ -1536,25 +1536,47 @@ struct GenerationView: View {
             selectedResolution = .custom
         }
 
-        // Convert preset LoRAs to LoRASelections
-        selectedLoras = preset.loras.map {
-            LoRASelection(id: $0.id, filename: $0.filename, scale: $0.scale)
+        // Convert preset LoRAs to LoRASelections. Presets reconstructed from
+        // embedded image metadata only ever carry a display name (never the
+        // real library id — PNG metadata doesn't store it), so look up the
+        // actual library id by filename; the picker's "selected" check keys
+        // on id, and a mismatched id silently fails to show the checkmark
+        // even though generation itself would still use the right file.
+        selectedLoras = preset.loras.map { presetLora in
+            if let match = engine.availableLoras.first(where: { $0.filename == presetLora.filename }) {
+                return LoRASelection(id: match.id, filename: match.filename, scale: presetLora.scale)
+            }
+            return LoRASelection(id: presetLora.id, filename: presetLora.filename, scale: presetLora.scale)
         }
 
         // Activate the preset's model via the model-pool API if it differs
-        // from the currently active model.
-        if let modelId = preset.modelId, modelId != engine.currentModel {
-            Task {
-                do {
-                    try await engine.activateModel(id: modelId)
-                } catch {
-                    // Not in the pool yet — try loading (and activating) it.
+        // from the currently active model. Embedded/preset model ids are
+        // short display names (e.g. "krea-2-turbo", "cyberrealisticZImage_v50")
+        // never the server's full path/spec, so resolve before comparing —
+        // a raw string mismatch here used to trigger a doomed activate call
+        // on nearly every image sent back to Generate.
+        if let modelId = preset.modelId {
+            switch ModelReferenceResolver.resolve(
+                modelId, currentModel: engine.currentModel,
+                availableModels: engine.availableModels.map { ($0.id, $0.displayName) }
+            ) {
+            case .alreadyActive:
+                break
+            case .resolved(let resolvedId):
+                Task {
                     do {
-                        try await engine.loadModel(id: modelId)
+                        try await engine.activateModel(id: resolvedId)
                     } catch {
-                        engine.lastError = "Failed to activate preset model \(modelId): \(error.localizedDescription)"
+                        // Not in the pool yet — try loading (and activating) it.
+                        do {
+                            try await engine.loadModel(id: resolvedId)
+                        } catch {
+                            engine.lastError = "Failed to activate preset model \(resolvedId): \(error.localizedDescription)"
+                        }
                     }
                 }
+            case .unresolved:
+                engine.lastError = "Preset model '\(modelId)' isn't in the local catalog — keeping the active model."
             }
         }
     }
