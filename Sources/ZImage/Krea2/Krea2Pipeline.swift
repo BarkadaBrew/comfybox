@@ -9,6 +9,7 @@ import Foundation
 import MLX
 import MLXNN
 import MLXRandom
+import Logging
 
 // MARK: - Model file locations
 
@@ -112,6 +113,14 @@ public final class Krea2Pipeline {
   public let conditioner: Krea2TextConditioner
   public let vae: Krea2VAE
 
+  private let logger = Logger(label: "z-image.krea2-pipeline")
+
+  /// Currently applied LoRA configurations (for hot-swap tracking).
+  private var appliedLoRAs: [LoRAConfiguration] = []
+
+  /// Public accessor for currently loaded LoRA configurations.
+  public var loadedLoRAConfigs: [LoRAConfiguration] { appliedLoRAs }
+
   public struct Request {
     public var prompt: String
     public var width: Int
@@ -152,6 +161,33 @@ public final class Krea2Pipeline {
     self.vae = vae
 
     MLX.eval(transformer.parameters(), encoder.parameters(), vae.parameters())
+  }
+
+  // MARK: - LoRA Support
+
+  /// Load and apply LoRAs to the Krea-2 transformer.
+  ///
+  /// Clears any previously applied LoRAs before applying the new set. Uses
+  /// ``LoRAWeightLoader/loadForKrea2(from:)`` — Krea-2 LoRA keys match
+  /// `Krea2SingleStreamDiT` module paths 1:1, no remapping needed.
+  ///
+  /// - Parameter configs: LoRA configurations to apply. Pass an empty array to clear all LoRAs.
+  public func loadLoRAs(_ configs: [LoRAConfiguration]) async throws {
+    if !appliedLoRAs.isEmpty {
+      LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      appliedLoRAs = []
+    }
+
+    guard !configs.isEmpty else { return }
+
+    for config in configs {
+      let url = try await LoRAWeightLoader.resolveSource(config.source)
+      let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+      logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), scale=\(config.scale))")
+      LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
+    }
+
+    appliedLoRAs = configs
   }
 
   /// Generate one image. Returns RGB float array (H, W, 3) in [0,1].

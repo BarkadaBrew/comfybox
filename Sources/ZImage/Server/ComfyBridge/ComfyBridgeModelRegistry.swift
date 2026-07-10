@@ -406,7 +406,7 @@ public enum ComfyBoxModelRegistry {
       huggingFaceId: "krea/Krea-2-Turbo",
       parametersBillions: 13.5, latentChannels: 16,
       defaultSteps: 9, defaultGuidance: 0.0,
-      supportsGuidance: false, supportsLoRA: false,
+      supportsGuidance: false, supportsLoRA: true,
       supportsControlNet: false, supportsImg2Img: false,
       defaultWidth: 1024, defaultHeight: 1024,
       estimatedVRAM_GB: 22.0,

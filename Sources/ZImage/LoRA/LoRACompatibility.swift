@@ -39,6 +39,8 @@ public enum LoRACompatibility {
       return .flux2Klein
     case "chroma":
       return .chroma
+    case "krea2", "krea-2", "krea-2-turbo":
+      return .krea2
     default:
       return nil
     }
@@ -56,7 +58,9 @@ public enum LoRACompatibility {
       return ["klein-9b", "klein-4b"]
     case .chroma:
       return ["chroma"]
-    case .fibo, .seedvr2, .esrgan, .krea2:
+    case .krea2:
+      return ["krea2"]
+    case .fibo, .seedvr2, .esrgan:
       return []
     }
   }
@@ -210,6 +214,20 @@ public enum LoRACompatibility {
         // Valid Chroma targets start with double_blocks., single_blocks., txt_in, img_in
         if mapped.hasPrefix("double_blocks.") || mapped.hasPrefix("single_blocks.") ||
            mapped.hasPrefix("txt_in") || mapped.hasPrefix("img_in") {
+          matchedCount += 1
+        }
+      }
+
+    case .krea2:
+      // Krea2SingleStreamDiT keys match 1:1 (no remapping) once the
+      // diffusion_model. prefix is stripped — valid targets are
+      // blocks.<n>.attn.* or blocks.<n>.mlp.*.
+      for baseKey in baseKeys {
+        var key = baseKey
+        if key.hasPrefix("diffusion_model.") {
+          key = String(key.dropFirst("diffusion_model.".count))
+        }
+        if key.hasPrefix("blocks.") && (key.contains(".attn.") || key.contains(".mlp.")) {
           matchedCount += 1
         }
       }

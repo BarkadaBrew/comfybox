@@ -7,9 +7,12 @@ public struct LoRAApplicator {
 
     private static func linearDims(for module: Module) -> (out: Int, in: Int)? {
         if let qlin = module as? QuantizedLinear {
-            let outDim = qlin.weight.dim(max(0, qlin.weight.ndim - 2))
-            let inDim = qlin.weight.dim(max(0, qlin.weight.ndim - 1))
-            return (out: outDim, in: inDim)
+            // qlin.weight is packed (bits-per-element < 32), so its last axis
+            // is NOT the true input dimension — qlin.shape already unpacks it
+            // via (cols * 32 / bits). Reading weight.dim() directly here silently
+            // fails every LoRA shape match against a quantized model.
+            let shape = qlin.shape
+            return (out: shape.0, in: shape.1)
         }
         if let lin = module as? Linear {
             let outDim = lin.weight.dim(max(0, lin.weight.ndim - 2))

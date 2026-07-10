@@ -3644,8 +3644,18 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Currently-loaded LoRA configs for whichever pipeline is active — used to
+  /// resync `activeLoRAs` after a failed or crashed swap.
+  private func loadedLoRAConfigs(for family: WarmModelFamily?) -> [LoRAConfiguration] {
+    switch family {
+    case .flux2: return flux2Pipeline?.loadedLoRAConfigs ?? []
+    case .krea2: return krea2Pipeline?.loadedLoRAConfigs ?? []
+    default: return pipeline.loadedLoRAConfigs
+    }
+  }
+
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
-    if currentModelFamily == .fibo || currentModelFamily == .chroma || currentModelFamily == .krea2 {
+    if currentModelFamily == .fibo || currentModelFamily == .chroma {
       continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
       return
     }
@@ -3655,11 +3665,7 @@ private actor WarmServerCoordinator {
     defer {
       if !resumed {
         logger.error("runSwap: continuation was not resumed — likely a crash in LoRA application. Resuming with error.")
-        if currentModelFamily == .flux2 {
-          activeLoRAs = flux2Pipeline?.loadedLoRAConfigs ?? []
-        } else {
-          activeLoRAs = pipeline.loadedLoRAConfigs
-        }
+        activeLoRAs = loadedLoRAConfigs(for: currentModelFamily)
         lastError = "LoRA swap failed unexpectedly (continuation not resumed)"
         continuation.resume(throwing: WarmServerError.invalidRequest(message: "LoRA swap failed unexpectedly"))
       }
@@ -3677,6 +3683,15 @@ private actor WarmServerCoordinator {
         }
         try await f2.loadLoRAs(newLoRAs)
         activeLoRAs = newLoRAs
+      } else if currentModelFamily == .krea2 {
+        // Krea-2 LoRA swap via Krea2Pipeline.loadLoRAs()
+        guard let k2 = krea2Pipeline else {
+          resumed = true
+          continuation.resume(throwing: WarmServerError.krea2NotLoaded)
+          return
+        }
+        try await k2.loadLoRAs(newLoRAs)
+        activeLoRAs = newLoRAs
       } else {
         // Flux 1 LoRA swap via ZImagePipeline.swapLoRAs()
         try await pipeline.swapLoRAs(newLoRAs)
@@ -3693,11 +3708,7 @@ private actor WarmServerCoordinator {
         )
       )
     } catch {
-      if currentModelFamily == .flux2 {
-        activeLoRAs = flux2Pipeline?.loadedLoRAConfigs ?? []
-      } else {
-        activeLoRAs = pipeline.loadedLoRAConfigs
-      }
+      activeLoRAs = loadedLoRAConfigs(for: currentModelFamily)
       lastError = error.localizedDescription
       resumed = true
       continuation.resume(throwing: error)

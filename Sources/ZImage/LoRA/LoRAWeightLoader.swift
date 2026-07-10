@@ -406,7 +406,60 @@ public final class LoRAWeightLoader {
         return LoRAWeights(weights: loraPairs, rank: rank, alpha: alpha)
     }
 
-    private static func mapLoKrModuleKey(_ key: String) -> (moduleKey: String, suffix: LoKrSuffix)? {
+    // MARK: - Krea-2 LoRA Loading
+
+  /// Load a safetensors LoRA file for the Krea-2 `SingleStreamDiT` transformer.
+  ///
+  /// Krea-2 LoRAs (e.g. from the `krea2` training pipeline) use
+  /// `diffusion_model.blocks.<n>.<attn|mlp>.<proj>.lora_A/lora_B` keys that
+  /// already match `Krea2SingleStreamDiT`'s module paths 1:1 once the
+  /// `diffusion_model.` prefix is stripped — unlike Z-Image, no block/component
+  /// remapping is needed, so this bypasses ``LoRAKeyMapper`` entirely (same
+  /// reasoning as ``loadForFlux2(from:)``).
+  ///
+  /// - Parameter url: Path to a `.safetensors` file.
+  /// - Returns: LoRAWeights with keys matching Krea2SingleStreamDiT module paths.
+  public static func loadForKrea2(from url: URL) throws -> LoRAWeights {
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw LoRAError.fileNotFound(url.path)
+    }
+
+    let reader = try SafeTensorsReader(fileURL: url)
+    let keys = reader.tensorNames
+
+    var processedKeys = Set<String>()
+    var loraPairs: [String: (down: MLXArray, up: MLXArray)] = [:]
+
+    for key in keys {
+      if processedKeys.contains(key) { continue }
+
+      guard let (downKey, upKey, baseKey) = resolveKeyPair(key) else { continue }
+      guard reader.contains(downKey), reader.contains(upKey) else { continue }
+
+      let downWeight = try reader.tensor(named: downKey)
+      let upWeight = try reader.tensor(named: upKey)
+
+      processedKeys.insert(downKey)
+      processedKeys.insert(upKey)
+
+      let targetKey = baseKey.hasSuffix(".weight") ? baseKey : baseKey + ".weight"
+      loraPairs[targetKey] = (down: downWeight, up: upWeight)
+    }
+
+    guard !loraPairs.isEmpty else {
+      throw LoRAError.invalidFormat(
+        "No valid Krea-2 LoRA weight pairs found in \(url.lastPathComponent). " +
+        "Expected keys matching diffusion_model.blocks.<n>.<attn|mlp>.<proj> patterns."
+      )
+    }
+
+    let rank = inferRank(from: loraPairs)
+    let alpha = loadAlpha(from: url.deletingLastPathComponent())
+
+    return LoRAWeights(weights: loraPairs, rank: rank, alpha: alpha)
+  }
+
+  private static func mapLoKrModuleKey(_ key: String) -> (moduleKey: String, suffix: LoKrSuffix)? {
         let suffix: LoKrSuffix
         if key.hasSuffix(LoKrSuffix.w1.rawValue) {
             suffix = .w1
