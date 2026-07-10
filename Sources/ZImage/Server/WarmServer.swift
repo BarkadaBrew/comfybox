@@ -4485,6 +4485,27 @@ private struct LoRAEntry: Codable, Sendable {
     return min(max(scale, Self.scaleRange.lowerBound), Self.scaleRange.upperBound)
   }
 
+  /// Directories searched, in order, when a LoRA is named by bare filename
+  /// (no path — typically reconstructed from embedded PNG metadata, which
+  /// only ever stores a display name, never the original absolute path).
+  /// COMFYBOX_MODELS matches the same env var LoRALibrary itself resolves
+  /// against — this used to hardcode a stale, unrelated "~/Models/loras"
+  /// path that nothing actually writes to, so bare-filename resolution
+  /// against the real library silently never worked.
+  private static var bareFilenameSearchRoots: [String] {
+    var roots: [String] = []
+    if let envRoot = ProcessInfo.processInfo.environment["COMFYBOX_MODELS"], !envRoot.isEmpty {
+      roots.append((envRoot as NSString).expandingTildeInPath)
+    }
+    roots.append(("~/.comfybox/loras" as NSString).expandingTildeInPath)
+    roots.append("/Volumes/Bolt/Models/loras")
+    // Ad-hoc/test LoRAs commonly land in Downloads before being filed into
+    // the library proper — worth checking before giving up.
+    roots.append(("~/Downloads" as NSString).expandingTildeInPath)
+    var seen = Set<String>()
+    return roots.filter { seen.insert($0).inserted }
+  }
+
   func makeConfiguration() throws -> LoRAConfiguration {
     let clampedScale = try resolvedScale()
     let expanded = (path as NSString).expandingTildeInPath
@@ -4495,11 +4516,14 @@ private struct LoRAEntry: Codable, Sendable {
       return .local(expanded, scale: clampedScale)
     }
 
-    // Library resolution: search the LoRA library root for the filename
-    let libraryRoot = ("~/Models/loras" as NSString).expandingTildeInPath
+    // Library resolution: search known local LoRA locations for the bare
+    // filename before assuming it's a remote reference.
     let fm = FileManager.default
-    if let enumerator = fm.enumerator(at: URL(fileURLWithPath: libraryRoot),
-                                       includingPropertiesForKeys: [.isRegularFileKey]) {
+    for root in Self.bareFilenameSearchRoots {
+      guard fm.fileExists(atPath: root) else { continue }
+      guard let enumerator = fm.enumerator(
+        at: URL(fileURLWithPath: root), includingPropertiesForKeys: [.isRegularFileKey]
+      ) else { continue }
       for case let fileURL as URL in enumerator {
         if fileURL.lastPathComponent == path {
           return .local(fileURL.path, scale: clampedScale)
@@ -4507,7 +4531,21 @@ private struct LoRAEntry: Codable, Sendable {
       }
     }
 
-    // HuggingFace fallback
+    // A string shaped like a local filename (ends in a known weight
+    // extension, no "/") is never a valid HuggingFace repo id — don't
+    // attempt a network download that's certain to fail with a confusing
+    // "Model not found" error. This is almost always a stale reference
+    // (e.g. reconstructed from a PNG's embedded metadata, which only ever
+    // stores a display name, not the original path) — say so plainly.
+    let looksLikeLocalFilename = !path.contains("/") &&
+      [".safetensors", ".ckpt", ".pt", ".bin"].contains { path.hasSuffix($0) }
+    if looksLikeLocalFilename {
+      throw WarmServerError.invalidRequest(
+        message: "LoRA '\(path)' not found. Searched: \(Self.bareFilenameSearchRoots.joined(separator: ", "))."
+      )
+    }
+
+    // HuggingFace fallback — only for strings actually shaped like a repo id.
     return .huggingFace(path, scale: clampedScale)
   }
 }
