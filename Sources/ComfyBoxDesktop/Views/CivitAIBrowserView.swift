@@ -237,7 +237,16 @@ struct CivitAIBrowserView: View {
                 nsfw: includeNSFW,
                 cursor: reset ? nil : nextCursor
             )
-            results = reset ? page.items : results + page.items
+            var items = page.items
+            // The server-side baseModels filter is skipped for text queries
+            // (see CivitAIClient.searchModels) — apply it client-side here.
+            let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedQuery.isEmpty, let baseModel = baseModelFilter.apiValue {
+                items = items.filter { model in
+                    model.modelVersions.contains { $0.baseModel == baseModel }
+                }
+            }
+            results = reset ? items : results + items
             nextCursor = page.nextCursor
         } catch {
             loadError = "\(source.rawValue) request failed: \(error.localizedDescription)"

@@ -138,6 +138,9 @@ public final class WarmServer {
   private let host: String
   private let logger: Logger
   private let coordinator: WarmServerCoordinator
+  /// Submit/poll tracker for async image generation (GH: queue-submit —
+  /// see ImageJobTracker's doc comment for the incident that motivated it).
+  private let imageJobTracker = ImageJobTracker()
   let comfyBridge: ComfyBridge
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
   private let lifecycleLock = NSLock()
@@ -372,6 +375,14 @@ public final class WarmServer {
       pruneTimer.resume()
     }
 
+    // Same cleanup for async image generation jobs (queue-submit).
+    let imageJobPruneTimer = DispatchSource.makeTimerSource(queue: listenerQueue)
+    imageJobPruneTimer.schedule(deadline: .now() + 600, repeating: 600)
+    imageJobPruneTimer.setEventHandler { [weak self] in
+      self?.imageJobTracker.pruneCompleted()
+    }
+    imageJobPruneTimer.resume()
+
     listener.start(queue: listenerQueue)
 
     // Use dispatchMain() instead of semaphore.wait() for daemon reliability.
@@ -464,20 +475,48 @@ public final class WarmServer {
 
     case ("POST", "/v1/generate"):
       do {
-        var payload = try decode(GeneratePayload.self, from: request.body)
-        // Bytes-uploaded img2img init image (init_image_base64) — write it to a
-        // temp file so remote clients don't need a pre-existing server path.
-        if let initData = payload.initImageData, payload.imagePath == nil {
-          let tempPath = NSTemporaryDirectory() + "zimage-init-\(UUID().uuidString).png"
-          try initData.write(to: URL(fileURLWithPath: tempPath))
-          payload.imagePath = tempPath
-        }
-        try payload.validateOutputPath(configuration: configuration)
+        let payload = try decodedGeneratePayload(from: request.body)
         let result = try await coordinator.enqueueGenerate(payload, source: payload.source ?? "api")
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
       }
+
+    // Queue-submit: returns a job id immediately instead of blocking the HTTP
+    // connection for the whole render. Poll GET /v1/generate/status/{id} for
+    // completion — same convention as /v1/video/generate + /v1/video/status.
+    // Built after a render's Telegram delivery was orphaned by a blocking
+    // /v1/generate call outliving the caller's own turn timeout.
+    case ("POST", "/v1/generate/async"):
+      do {
+        let payload = try decodedGeneratePayload(from: request.body)
+        let status = imageJobTracker.submit(payload, source: payload.source ?? "api", coordinator: coordinator)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(status)
+        return .json(.rawJSON(status: 202, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", _) where request.path.hasPrefix("/v1/generate/status/"):
+      let jobId = String(request.path.dropFirst("/v1/generate/status/".count))
+      guard !jobId.isEmpty else {
+        return .error(.error(status: 400, message: "Missing job_id in path"))
+      }
+      guard let status = imageJobTracker.status(jobId: jobId) else {
+        return .error(.error(status: 404, message: "Image job not found: \(jobId)"))
+      }
+      let encoder = JSONEncoder()
+      encoder.keyEncodingStrategy = .convertToSnakeCase
+      let data = try? encoder.encode(status)
+      return .json(.rawJSON(status: 200, data: data ?? Data()))
+
+    case ("GET", "/v1/generate/preview"):
+      guard let frame = await coordinator.latestPreviewFrame() else {
+        return .json(.empty(status: 204))
+      }
+      return .json(.binary(status: 200, contentType: "image/jpeg", data: frame))
 
     case ("POST", "/v1/lora/swap"):
       do {
@@ -2247,6 +2286,21 @@ public final class WarmServer {
     return try decoder.decode(type, from: data)
   }
 
+  /// Shared decode + validation for both the synchronous and queue-submit
+  /// generate routes, so output-path containment can't drift between them.
+  private func decodedGeneratePayload(from body: Data) throws -> GeneratePayload {
+    var payload = try decode(GeneratePayload.self, from: body)
+    // Bytes-uploaded img2img init image (init_image_base64) — write it to a
+    // temp file so remote clients don't need a pre-existing server path.
+    if let initData = payload.initImageData, payload.imagePath == nil {
+      let tempPath = NSTemporaryDirectory() + "zimage-init-\(UUID().uuidString).png"
+      try initData.write(to: URL(fileURLWithPath: tempPath))
+      payload.imagePath = tempPath
+    }
+    try payload.validateOutputPath(configuration: configuration)
+    return payload
+  }
+
   private func response(for error: Error) -> HTTPResponse {
     switch error {
     case let error as WarmServerCoordinator.ServerError:
@@ -2407,6 +2461,145 @@ private final class RenderProgressTracker: @unchecked Sendable {
   func get() -> Int? { lock.lock(); defer { lock.unlock() }; return percent }
 }
 
+/// Holds the latest live-denoising preview JPEG for polling clients (the
+/// Desktop app, which already polls /health for progress_percent — see
+/// GH #216). Krita/ComfyUI get previews pushed over their own WebSocket;
+/// this is the same frame made available to REST/polling clients instead.
+private final class RenderPreviewTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private var frame: Data?
+  func set(_ value: Data?) { lock.lock(); frame = value; lock.unlock() }
+  func get() -> Data? { lock.lock(); defer { lock.unlock() }; return frame }
+}
+
+/// State of an async-submitted image generation job — mirrors `VideoJobState`
+/// so image and video generation share one submit/poll convention.
+public enum ImageJobState: String, Codable, Sendable {
+  case queued
+  case processing
+  case succeeded
+  case failed
+}
+
+/// Wire status for `POST /v1/generate/async` / `GET /v1/generate/status/{id}`.
+public struct ImageJobStatus: Codable, Sendable {
+  public let jobId: String
+  public let status: ImageJobState
+  public let source: String
+  public let outputPath: String?
+  public let durationMs: Int?
+  public let error: String?
+  public let elapsedMs: Int
+}
+
+/// Internal mutable state for a tracked async image generation job.
+private final class ImageJob: @unchecked Sendable {
+  let id: String
+  let source: String
+  let startTime = Date()
+  var state: ImageJobState = .queued
+  var outputPath: String?
+  var durationMs: Int?
+  var error: String?
+  var completedAt: Date?
+
+  init(id: String, source: String) {
+    self.id = id
+    self.source = source
+  }
+
+  var elapsedMs: Int {
+    let end = completedAt ?? Date()
+    return Int(end.timeIntervalSince(startTime) * 1000)
+  }
+
+  func toStatus() -> ImageJobStatus {
+    ImageJobStatus(
+      jobId: id, status: state, source: source, outputPath: outputPath,
+      durationMs: durationMs, error: error, elapsedMs: elapsedMs
+    )
+  }
+}
+
+/// Submit-and-poll wrapper around `WarmServerCoordinator.enqueueGenerate` so
+/// callers (Bree's async envelope, the Telegram bot, MCP tools) can fire a
+/// render without holding a connection open for the whole denoising run.
+/// A blocking `POST /v1/generate` that takes minutes is what orphaned a
+/// Telegram delivery in production once: the caller's own turn timeout
+/// (180s) expired before the render finished, and there was no live turn
+/// left to deliver through. Queue-submit decouples render time from the
+/// caller's timeout — submit returns a job id immediately, and the caller
+/// polls `GET /v1/generate/status/{id}` (or `/v1/video/status/{id}`'s twin)
+/// until it sees `succeeded`/`failed`, exactly like the video path already
+/// does via `ReplicateVideoProxy`.
+final class ImageJobTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private var jobs: [String: ImageJob] = [:]
+
+  /// Submit a job. Returns immediately with `queued` status; the render
+  /// itself runs in a detached Task against the existing FIFO render queue,
+  /// so submitting async doesn't skip the line ahead of synchronous callers.
+  fileprivate func submit(_ payload: GeneratePayload, source: String, coordinator: WarmServerCoordinator) -> ImageJobStatus {
+    let jobId = UUID().uuidString
+    let job = ImageJob(id: jobId, source: source)
+    lock.lock(); jobs[jobId] = job; lock.unlock()
+
+    Task { [weak self] in
+      guard let self else { return }
+      self.markProcessing(jobId)
+      do {
+        let result = try await coordinator.enqueueGenerate(payload, source: source)
+        self.markSucceeded(jobId, result: result)
+      } catch {
+        self.markFailed(jobId, error: error)
+      }
+    }
+    return job.toStatus()
+  }
+
+  func status(jobId: String) -> ImageJobStatus? {
+    lock.lock(); defer { lock.unlock() }
+    return jobs[jobId]?.toStatus()
+  }
+
+  private func markProcessing(_ jobId: String) {
+    lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
+  }
+
+  private func markSucceeded(_ jobId: String, result: GenerateResponse) {
+    lock.lock()
+    if let job = jobs[jobId] {
+      job.state = .succeeded
+      job.outputPath = result.outputPath
+      job.durationMs = result.durationMs
+      job.completedAt = Date()
+    }
+    lock.unlock()
+  }
+
+  private func markFailed(_ jobId: String, error: Error) {
+    lock.lock()
+    if let job = jobs[jobId] {
+      job.state = .failed
+      job.error = error.localizedDescription
+      job.completedAt = Date()
+    }
+    lock.unlock()
+  }
+
+  /// Drop completed/failed jobs older than `ttl` so this doesn't grow
+  /// unboundedly on a long-running server. Mirrors `ReplicateVideoProxy`'s
+  /// prune convention.
+  func pruneCompleted(olderThan ttl: TimeInterval = 3600) {
+    lock.lock(); defer { lock.unlock() }
+    let cutoff = Date().addingTimeInterval(-ttl)
+    jobs = jobs.filter { _, job in
+      guard let completedAt = job.completedAt else { return true }
+      return completedAt > cutoff
+    }
+  }
+}
+
 private actor WarmServerCoordinator {
   enum ServerError: Error {
     case queueFull(maxPending: Int)
@@ -2475,6 +2668,7 @@ private actor WarmServerCoordinator {
   /// Live progress (0-100) of the active render; nil when idle. Updated from the
   /// pipeline denoising callback, read by `queueStatus()`.
   private let progressTracker = RenderProgressTracker()
+  private let previewTracker = RenderPreviewTracker()
   private var pipelinePrepared = false
   /// When a pool model is activated, this holds its modelSpec so that
   /// generation requests use the pool model instead of the startup
@@ -3239,7 +3433,28 @@ private actor WarmServerCoordinator {
       }
       progressHandler?(progress)
     }
-    defer { activeJobId = nil; progressTracker.set(nil) }
+
+    // Live denoising preview (GH #216): approximate each step's latents as a
+    // small JPEG and stash it for REST/polling clients (Desktop already
+    // polls /health for progress_percent — this rides the same cadence).
+    // Krita/ComfyUI still get their own frame pushed via the bridge
+    // WebSocket, forwarded first so that behavior is unchanged.
+    let preview = previewTracker
+    let trackedPreviewHandler: ZImagePipeline.LatentPreviewHandler = { latents, step, total, latentH, latentW in
+      latentPreviewHandler?(latents, step, total, latentH, latentW)
+      #if canImport(CoreGraphics)
+      guard step > 0, step % Self.previewStepInterval == 0, step < total else { return }
+      guard let approx = LatentPreviewApproximator.latentsToRGBA(latents, latentHeight: latentH, latentWidth: latentW) else { return }
+      guard let framed = ComfyBridgePreviewEncoder.encodePreviewFrame(
+        fromRGBA: approx.data, width: approx.width, height: approx.height,
+        maxDimension: Self.previewMaxDimension, jpegQuality: Self.previewJPEGQuality
+      ) else { return }
+      // Strip the 8-byte ComfyUI WebSocket binary-frame header — REST
+      // clients just want the raw JPEG bytes.
+      preview.set(framed.dropFirst(8))
+      #endif
+    }
+    defer { activeJobId = nil; progressTracker.set(nil); previewTracker.set(nil) }
 
     switch currentModelFamily {
     case .chroma:
@@ -3251,8 +3466,19 @@ private actor WarmServerCoordinator {
     case .flux2:
       await runFlux2Generate(payload, continuation: continuation)
     case .flux1:
-      await runFlux1Generate(payload, continuation: continuation, progressHandler: trackedHandler, latentPreviewHandler: latentPreviewHandler)
+      await runFlux1Generate(payload, continuation: continuation, progressHandler: trackedHandler, latentPreviewHandler: trackedPreviewHandler)
     }
+  }
+
+  /// How often (in denoising steps) to refresh the live preview frame.
+  private static let previewStepInterval = 2
+  private static let previewMaxDimension = 256
+  private static let previewJPEGQuality: CGFloat = 0.6
+
+  /// The latest live-denoising preview JPEG, if a render is active and has
+  /// produced at least one frame. Served by GET /v1/generate/preview.
+  func latestPreviewFrame() -> Data? {
+    previewTracker.get()
   }
 
   private func runFlux1Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {

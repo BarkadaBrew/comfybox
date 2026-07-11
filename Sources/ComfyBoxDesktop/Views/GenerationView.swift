@@ -945,16 +945,42 @@ struct GenerationView: View {
     private var previewPanel: some View {
         VStack {
             if engine.isGenerating {
-                VStack(spacing: 12) {
-                    if let pct = engine.queueInfo?.progressPercent, pct > 0 {
-                        ProgressView(value: Double(pct), total: 100)
-                            .frame(width: 220)
-                        Text("\(batchProgress.map { $0 + " · " } ?? "")\(pct)%")
-                            .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
-                    } else {
-                        ProgressView().controlSize(.large)
-                        Text(batchProgress ?? "Generating image…").foregroundStyle(.secondary)
+                ZStack(alignment: .bottom) {
+                    if let liveFrame = engine.livePreviewImage {
+                        Image(nsImage: liveFrame)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .padding()
+                            .blur(radius: 1.5)
+                            .overlay(alignment: .topLeading) {
+                                Label("Live Preview", systemImage: "eye")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 8).padding(.vertical, 4)
+                                    .background(.black.opacity(0.5), in: Capsule())
+                                    .foregroundStyle(.white)
+                                    .padding(10)
+                            }
                     }
+                    VStack(spacing: 12) {
+                        if let pct = engine.queueInfo?.progressPercent, pct > 0 {
+                            ProgressView(value: Double(pct), total: 100)
+                                .frame(width: 220)
+                            Text("\(batchProgress.map { $0 + " · " } ?? "")\(pct)%")
+                                .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                        } else {
+                            ProgressView().controlSize(.large)
+                            Text(batchProgress ?? "Generating image…").foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background {
+                        if engine.livePreviewImage != nil {
+                            RoundedRectangle(cornerRadius: 10).fill(.thinMaterial)
+                        }
+                    }
+                    .padding(.bottom, engine.livePreviewImage != nil ? 20 : 0)
+                    .frame(maxWidth: .infinity, maxHeight: engine.livePreviewImage != nil ? nil : .infinity, alignment: .center)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let image = displayedImage {

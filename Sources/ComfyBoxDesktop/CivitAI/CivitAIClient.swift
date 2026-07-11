@@ -68,7 +68,11 @@ public struct CivitAIClient: Sendable {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { items.append(URLQueryItem(name: "query", value: trimmed)) }
         for type in types { items.append(URLQueryItem(name: "types", value: type)) }
-        if let baseModel, !baseModel.isEmpty {
+        // CivitAI's API silently returns zero results (HTTP 200, empty items)
+        // whenever both `query` and `baseModels` are present. Only send
+        // `baseModels` for a plain browse (no text query); text searches
+        // filter by base model client-side instead (see CivitAIBrowserView).
+        if let baseModel, !baseModel.isEmpty, trimmed.isEmpty {
             items.append(URLQueryItem(name: "baseModels", value: baseModel))
         }
         // `nsfw=true` includes adult content; omitting it lets the server default

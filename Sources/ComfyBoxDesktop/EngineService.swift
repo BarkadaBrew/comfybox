@@ -7,6 +7,7 @@
 
 import Foundation
 import SwiftUI
+import AppKit
 import ZImage
 
 /// Generation parameters submitted to the server.
@@ -237,6 +238,10 @@ public final class EngineService {
     // Queue state
     public var queueInfo: QueueInfo?
 
+    /// Latest live-denoising preview frame, polled alongside health while a
+    /// render is active (GH #216). nil when idle or before the first frame.
+    public var livePreviewImage: NSImage?
+
     // MARK: - Configuration
 
     public var serverHost: String = "127.0.0.1"
@@ -330,6 +335,9 @@ public final class EngineService {
 
         activeGenerateCount += 1
         lastError = nil
+        // Clear any stale frame from a previous render so the preview pane
+        // doesn't briefly show the last render's final denoising step.
+        livePreviewImage = nil
 
         // Poll health quickly while the render runs so progress_percent updates
         // smoothly (the idle poll is every 3s).
@@ -663,12 +671,34 @@ public final class EngineService {
                 currentJobId: health.currentJobId,
                 progressPercent: health.progressPercent
             )
+
+            if health.isRendering ?? false {
+                await fetchLivePreview()
+            } else if livePreviewImage != nil {
+                livePreviewImage = nil
+            }
         } catch is WarmServerClientError {
             connectionState = .disconnected
             queueInfo = nil
+            livePreviewImage = nil
         } catch {
             connectionState = .error(error.localizedDescription)
             queueInfo = nil
+            livePreviewImage = nil
+        }
+    }
+
+    /// Fetch the current live-denoising preview frame (GH #216). Best-effort:
+    /// a miss (204, no frame yet) or transient error just leaves the last
+    /// frame in place rather than flickering the preview pane.
+    private func fetchLivePreview() async {
+        guard let client else { return }
+        do {
+            let (status, data) = try await client.get("/v1/generate/preview")
+            guard status == 200, !data.isEmpty, let image = NSImage(data: data) else { return }
+            livePreviewImage = image
+        } catch {
+            // Best-effort — ignore.
         }
     }
 

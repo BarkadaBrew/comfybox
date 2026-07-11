@@ -104,6 +104,13 @@ struct GalleryView: View {
     @State private var renamingFolder: DAMFolder?
     @State private var renameText: String = ""
 
+    // Smart tabs — saved filter combinations.
+    @State private var smartTabs: [SmartTab] = []
+    @State private var showSaveTabPrompt: Bool = false
+    @State private var newTabName: String = ""
+    @State private var renamingSmartTab: SmartTab?
+    @State private var renameSmartTabText: String = ""
+
     enum FolderFilter: Equatable, Hashable {
         case all
         case unfiled
@@ -130,6 +137,9 @@ struct GalleryView: View {
                 toolbarView
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
+                    .background(Color(nsColor: .windowBackgroundColor))
+
+                smartTabsRow
                     .background(Color(nsColor: .windowBackgroundColor))
 
                 Divider()
@@ -184,6 +194,32 @@ struct GalleryView: View {
                 renamingFolder = nil
             }
             Button("Cancel", role: .cancel) { renamingFolder = nil }
+        }
+        .alert("Save Current View", isPresented: $showSaveTabPrompt) {
+            TextField("Name", text: $newTabName)
+            Button("Save") {
+                let name = newTabName.trimmingCharacters(in: .whitespacesAndNewlines)
+                newTabName = ""
+                guard !name.isEmpty else { return }
+                saveCurrentAsSmartTab(named: name)
+            }
+            Button("Cancel", role: .cancel) { newTabName = "" }
+        } message: {
+            Text("Saves the current search, filters, and sort order as a tab you can jump back to.")
+        }
+        .alert("Rename Tab", isPresented: Binding(
+            get: { renamingSmartTab != nil },
+            set: { if !$0 { renamingSmartTab = nil } }
+        )) {
+            TextField("Name", text: $renameSmartTabText)
+            Button("Rename") {
+                if let tab = renamingSmartTab {
+                    let name = renameSmartTabText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !name.isEmpty { renameSmartTab(tab, to: name) }
+                }
+                renamingSmartTab = nil
+            }
+            Button("Cancel", role: .cancel) { renamingSmartTab = nil }
         }
         .sheet(item: $selectedAsset) { asset in
             AssetDetailView(
@@ -248,7 +284,10 @@ struct GalleryView: View {
         .onChange(of: ingestor.ingestedCount) { _, _ in
             Task { await loadAssets() }
         }
-        .onAppear { consumeSearchFocusRequest() }
+        .onAppear {
+            consumeSearchFocusRequest()
+            smartTabs = SmartTabStore.load()
+        }
         .onChange(of: searchFocusRequests) { _, _ in consumeSearchFocusRequest() }
         .onKeyPress(.space) {
             if let asset = selectedAsset {
@@ -502,6 +541,107 @@ struct GalleryView: View {
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
         }
+    }
+
+    // MARK: - Smart Tabs
+
+    /// A saved tab is "active" when the current filter state exactly matches
+    /// it — computed rather than tracked, so it self-clears the moment any
+    /// filter is changed by hand.
+    private func matchesCurrentFilters(_ tab: SmartTab) -> Bool {
+        guard tab.searchText == searchText else { return false }
+        guard tab.filterFavorites == filterFavorites else { return false }
+        guard tab.filterContentMode == filterContentMode else { return false }
+        guard tab.filterCharacter == filterCharacter else { return false }
+        guard tab.filterLabel == filterLabel?.rawValue else { return false }
+        guard tab.sortOrder == sortOrder.rawValue else { return false }
+        return true
+    }
+
+    private var activeSmartTabId: String? {
+        smartTabs.first(where: matchesCurrentFilters)?.id
+    }
+
+    private var smartTabsRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(smartTabs) { tab in
+                    smartTabButton(tab)
+                }
+                Button {
+                    newTabName = ""
+                    showSaveTabPrompt = true
+                } label: {
+                    Label("Save View", systemImage: "plus.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+
+    @ViewBuilder
+    private func smartTabButton(_ tab: SmartTab) -> some View {
+        let isActive = activeSmartTabId == tab.id
+        Button(tab.name) { applySmartTab(tab) }
+            .buttonStyle(.bordered)
+            .tint(isActive ? Color.accentColor : Color.secondary)
+            .controlSize(.small)
+            .contextMenu {
+                Button("Update with Current Filters") { updateSmartTab(tab) }
+                Button("Rename…") {
+                    renameSmartTabText = tab.name
+                    renamingSmartTab = tab
+                }
+                Divider()
+                Button("Delete", role: .destructive) { deleteSmartTab(tab) }
+            }
+    }
+
+    private func smartTab(from tab: SmartTab? = nil, id: String, name: String) -> SmartTab {
+        SmartTab(
+            id: id,
+            name: name,
+            searchText: searchText,
+            filterFavorites: filterFavorites,
+            filterContentMode: filterContentMode,
+            filterCharacter: filterCharacter,
+            filterLabel: filterLabel?.rawValue,
+            sortOrder: sortOrder.rawValue
+        )
+    }
+
+    private func applySmartTab(_ tab: SmartTab) {
+        searchText = tab.searchText
+        filterFavorites = tab.filterFavorites
+        filterContentMode = tab.filterContentMode
+        filterCharacter = tab.filterCharacter
+        filterLabel = tab.filterLabel.flatMap { FinderColor(rawValue: $0) }
+        sortOrder = GallerySortOrder(rawValue: tab.sortOrder) ?? .date
+    }
+
+    private func saveCurrentAsSmartTab(named name: String) {
+        smartTabs.append(smartTab(id: UUID().uuidString, name: name))
+        SmartTabStore.save(smartTabs)
+    }
+
+    private func updateSmartTab(_ tab: SmartTab) {
+        guard let index = smartTabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        smartTabs[index] = smartTab(id: tab.id, name: tab.name)
+        SmartTabStore.save(smartTabs)
+    }
+
+    private func renameSmartTab(_ tab: SmartTab, to name: String) {
+        guard let index = smartTabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        smartTabs[index].name = name
+        SmartTabStore.save(smartTabs)
+    }
+
+    private func deleteSmartTab(_ tab: SmartTab) {
+        smartTabs.removeAll { $0.id == tab.id }
+        SmartTabStore.save(smartTabs)
     }
 
     // MARK: - Gallery Grid
@@ -1085,6 +1225,9 @@ struct GalleryView: View {
                 assets = ftsResults
             } else {
                 assets = try await store.fetchAssets(limit: 500)
+                // Self-heal: backfill any thumbnail that's missing or was
+                // left as a 0-byte file by a previously-interrupted write.
+                await ingestor.regenerateMissingThumbnails(for: assets)
             }
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()

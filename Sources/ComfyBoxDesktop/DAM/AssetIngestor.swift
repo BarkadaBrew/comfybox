@@ -113,6 +113,29 @@ public final class AssetIngestor {
         return stored
     }
 
+    /// Regenerate thumbnails for already-known assets whose cached thumbnail
+    /// is missing or empty — e.g. left over from a write that was
+    /// interrupted before the thumbnail-generation fix below existed.
+    /// Cheap to call on every gallery load: most assets already have a
+    /// valid thumbnail, so this is just a file-size stat per asset.
+    public func regenerateMissingThumbnails(for assets: [DAMAsset]) async {
+        let maxDimension = thumbnailMaxDimension
+        let quality = thumbnailJPEGQuality
+        for asset in assets {
+            let thumbPath = thumbnailPath(for: asset.id)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: thumbPath)
+            let size = (attrs?[.size] as? Int) ?? 0
+            if size > 0 { continue }
+            let sourcePath = asset.absolutePath
+            await Task.detached(priority: .utility) {
+                Self.generateThumbnail(
+                    from: sourcePath, to: thumbPath,
+                    maxDimension: maxDimension, jpegQuality: quality
+                )
+            }.value
+        }
+    }
+
     /// Remove DAM rows whose file was deleted out from under us, dropping
     /// their cached thumbnails too. Returns how many were pruned.
     @discardableResult
@@ -480,8 +503,13 @@ public final class AssetIngestor {
         maxDimension: CGFloat,
         jpegQuality: CGFloat
     ) {
-        // Skip if thumbnail already exists.
-        guard !FileManager.default.fileExists(atPath: thumbPath) else { return }
+        // Skip if a real (non-empty) thumbnail already exists. A 0-byte file
+        // means a prior write was interrupted or failed — treat it as missing
+        // so generation retries instead of leaving a permanently blank cell.
+        if let existingSize = try? FileManager.default.attributesOfItem(atPath: thumbPath)[.size] as? Int,
+           existingSize > 0 {
+            return
+        }
 
         // Video: grab a representative frame with AVAssetImageGenerator.
         let ext = (imagePath as NSString).pathExtension.lowercased()
@@ -516,7 +544,11 @@ public final class AssetIngestor {
             kCGImageDestinationLossyCompressionQuality: jpegQuality,
         ]
         CGImageDestinationAddImage(dest, thumbnail, destOptions as CFDictionary)
-        CGImageDestinationFinalize(dest)
+        if !CGImageDestinationFinalize(dest) {
+            // Don't leave a corrupt/partial file behind masquerading as a
+            // completed thumbnail — the next ingest attempt should retry.
+            try? FileManager.default.removeItem(atPath: thumbPath)
+        }
     }
 
     private nonisolated static func generateVideoThumbnail(
@@ -535,7 +567,9 @@ public final class AssetIngestor {
             URL(fileURLWithPath: thumbPath) as CFURL, UTType.jpeg.identifier as CFString, 1, nil
         ) else { return }
         CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary)
-        CGImageDestinationFinalize(dest)
+        if !CGImageDestinationFinalize(dest) {
+            try? FileManager.default.removeItem(atPath: thumbPath)
+        }
     }
 
     /// Returns the thumbnail file path for a given asset ID.
