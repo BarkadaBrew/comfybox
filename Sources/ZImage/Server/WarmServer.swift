@@ -1399,8 +1399,26 @@ public final class WarmServer {
       let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
         requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
 
-      let generator = ltx2Generator ?? LTX2VideoGenerator(
-        config: .init(weightsDir: weights, gemmaPath: gemma), logger: logger)
+      let generator: LTX2VideoGenerator
+      if let existing = ltx2Generator {
+        generator = existing
+      } else {
+        // Both fields accept either a local path or a "org/repo[:revision]"
+        // HuggingFace spec — resolved (and downloaded/cached if needed) on
+        // this first local video request, same warm/on-demand pattern the
+        // main image pipeline already uses via ModelResolution.
+        logger.info("LTX-2: resolving weights/text-encoder (downloads on first use if not cached)…")
+        let weightsURL = try await ModelResolution.resolve(
+          modelSpec: weights,
+          filePatterns: ["*.safetensors", "*.json"]
+        )
+        let gemmaURL = try await ModelResolution.resolve(
+          modelSpec: gemma,
+          filePatterns: ["*.safetensors", "*.json", "tokenizer/*", "*.model"]
+        )
+        generator = LTX2VideoGenerator(
+          config: .init(weightsDir: weightsURL.path, gemmaPath: gemmaURL.path), logger: logger)
+      }
       ltx2Generator = generator
 
       // Accept an init image as bytes (image_base64) when no server path is given.
@@ -3477,6 +3495,39 @@ private actor WarmServerCoordinator {
     }
     defer { activeJobId = nil; progressTracker.set(nil); previewTracker.set(nil) }
 
+    // Per-job model/LoRA application (queue-submit race fix): a job's own
+    // model+loras are applied right before it runs, instead of trusting
+    // whatever the shared pool's "currently active" model/LoRAs happen to
+    // be by the time it dequeues — a plain synchronous /v1/generate caller
+    // activates the model right before calling generate, but async
+    // queue-submit (POST /v1/generate/async) can dequeue well after a
+    // different request has changed global state. nil model/loras preserve
+    // the old caller-activates-first behavior exactly.
+    if let modelSpec = payload.model, !modelSpec.isEmpty {
+      let resolvedSpec = WarmServer.parseModelSpec(from: modelSpec)
+      let currentSpec = activePoolModelSpec ?? configuration.modelSpec
+      if resolvedSpec != currentSpec {
+        let resolvedQuant = WarmServer.parseQuantization(from: modelSpec)
+        do {
+          _ = try await poolLoad(modelSpec: resolvedSpec, quantization: resolvedQuant, activate: true)
+        } catch {
+          lastError = error.localizedDescription
+          continuation.resume(throwing: error)
+          return
+        }
+      }
+    }
+    if let loraEntries = payload.loras {
+      do {
+        let newLoRAs = try loraEntries.map { try $0.makeConfiguration() }
+        try await applyActiveLoRAs(newLoRAs)
+      } catch {
+        lastError = error.localizedDescription
+        continuation.resume(throwing: error)
+        return
+      }
+    }
+
     switch currentModelFamily {
     case .chroma:
       await runChromaGenerate(payload, continuation: continuation)
@@ -3974,6 +4025,24 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Apply LoRAs to whichever pipeline is active for `currentModelFamily`.
+  /// Shared by POST /v1/lora/swap and per-job LoRA application at generate
+  /// dequeue time (queue-submit race fix — see GeneratePayload.loras).
+  private func applyActiveLoRAs(_ newLoRAs: [LoRAConfiguration]) async throws {
+    if currentModelFamily == .flux2 {
+      guard let f2 = flux2Pipeline else { throw WarmServerError.flux2NotLoaded }
+      try await f2.loadLoRAs(newLoRAs)
+      activeLoRAs = newLoRAs
+    } else if currentModelFamily == .krea2 {
+      guard let k2 = krea2Pipeline else { throw WarmServerError.krea2NotLoaded }
+      try await k2.loadLoRAs(newLoRAs)
+      activeLoRAs = newLoRAs
+    } else {
+      try await pipeline.swapLoRAs(newLoRAs)
+      activeLoRAs = newLoRAs
+    }
+  }
+
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
     if currentModelFamily == .fibo || currentModelFamily == .chroma {
       continuation.resume(throwing: WarmServerError.loraSwapNotSupported)
@@ -3993,30 +4062,7 @@ private actor WarmServerCoordinator {
 
     do {
       let newLoRAs = try payload.makeConfigurations()
-
-      if currentModelFamily == .flux2 {
-        // Flux 2 LoRA swap via Flux2Pipeline.loadLoRAs()
-        guard let f2 = flux2Pipeline else {
-          resumed = true
-          continuation.resume(throwing: WarmServerError.flux2NotLoaded)
-          return
-        }
-        try await f2.loadLoRAs(newLoRAs)
-        activeLoRAs = newLoRAs
-      } else if currentModelFamily == .krea2 {
-        // Krea-2 LoRA swap via Krea2Pipeline.loadLoRAs()
-        guard let k2 = krea2Pipeline else {
-          resumed = true
-          continuation.resume(throwing: WarmServerError.krea2NotLoaded)
-          return
-        }
-        try await k2.loadLoRAs(newLoRAs)
-        activeLoRAs = newLoRAs
-      } else {
-        // Flux 1 LoRA swap via ZImagePipeline.swapLoRAs()
-        try await pipeline.swapLoRAs(newLoRAs)
-        activeLoRAs = newLoRAs
-      }
+      try await applyActiveLoRAs(newLoRAs)
 
       lastError = nil
       resumed = true
@@ -4371,6 +4417,17 @@ struct GeneratePayload: Sendable {
   /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
   let contentMode: String?
 
+  /// Per-job model override (spec/CivitAI id/pool key). When set, the job's
+  /// own model is loaded/activated at dequeue time instead of trusting
+  /// whatever the shared pool's "currently active" model happens to be —
+  /// required for queue-submit (POST /v1/generate/async) to be race-free,
+  /// since a job's dequeue can happen well after another request changed
+  /// the active model. nil preserves the old "caller activates first"
+  /// behavior for direct /v1/generate callers.
+  let model: String?
+  /// Per-job LoRA override, applied the same way as `model` at dequeue time.
+  let loras: [LoRAEntry]?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -4383,11 +4440,14 @@ struct GeneratePayload: Sendable {
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
-    source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil
+    source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
+    model: String? = nil, loras: [LoRAEntry]? = nil
   ) {
     self.source = source
     self.contentMode = contentMode
     self.initImageData = initImageData
+    self.model = model
+    self.loras = loras
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -4420,6 +4480,7 @@ extension GeneratePayload: Decodable {
     // Wire key init_image_base64 arrives as this camelCase form after
     // .convertFromSnakeCase (same gotcha as the inpaint keys).
     case initImageData = "initImageBase64"
+    case model, loras
   }
 
   init(from decoder: Decoder) throws {
@@ -4457,6 +4518,8 @@ extension GeneratePayload: Decodable {
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
     source = try c.decodeIfPresent(String.self, forKey: .source)
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
+    model = try c.decodeIfPresent(String.self, forKey: .model)
+    loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
   }
 
   func makePipelineRequest(
@@ -4742,7 +4805,7 @@ private struct LoRASwapResponse: Encodable, Sendable {
   let loras: [LoRAState]
 }
 
-private struct LoRAEntry: Codable, Sendable {
+struct LoRAEntry: Codable, Sendable {
   let path: String
   let scale: Float?
 

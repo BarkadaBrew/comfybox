@@ -1655,8 +1655,8 @@ struct ZImageCLI {
       --max-sequence-length     Maximum sequence length for text encoding (default: 512)
       --force-transformer-override-only  Treat a local .safetensors as transformer-only override
       --seedvr2-weights            Path to SeedVR2 upscale model weights directory
-      --ltx2-weights               Path to LTX-2 weights dir (enables LOCAL video on /v1/video/generate; lazy ~38GB)
-      --ltx2-gemma                 Gemma-3 tokenizer/text-encoder snapshot dir for LTX-2
+      --ltx2-weights               LTX-2 weights dir OR "org/repo[:rev]" HF spec (enables LOCAL video on /v1/video/generate; lazy-loaded + auto-downloaded on first request, ~38GB)
+      --ltx2-gemma                 Gemma-3 tokenizer/text-encoder snapshot dir OR HF spec for LTX-2 (required alongside --ltx2-weights; ~24GB, downloaded on first request, not swappable for a different encoder)
       --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs
