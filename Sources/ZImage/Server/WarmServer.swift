@@ -412,6 +412,27 @@ public final class WarmServer {
       logger.info("Warm server listening on http://\(self.host):\(self.configuration.port)")
     case .failed(let error):
       logger.error("Warm server listener failed: \(error.localizedDescription)")
+      if case .posix(.EADDRINUSE) = error {
+        // The most common cause on this machine: com.barkadabrew.comfybox is a
+        // KeepAlive=true launchd agent, so killing a manually-started `serve`
+        // process's port-holder — or even just a stray manual `serve` left
+        // running — gets silently re-occupied within ~5s (ThrottleInterval).
+        // Point at the actual fix instead of a bare "address in use" (GH #153).
+        fputs("""
+        Port \(self.configuration.port) is already in use.
+
+        If you're trying to run a manual/dev server, com.barkadabrew.comfybox \
+        (a launchd agent with KeepAlive) may have respawned onto this port. \
+        Stop it first:
+          launchctl bootout gui/\(getuid())/com.barkadabrew.comfybox
+        Then restart it later with:
+          launchctl bootstrap gui/\(getuid()) ~/Library/LaunchAgents/com.barkadabrew.comfybox.plist
+
+        To restart the managed server normally (rebuild + relaunch in place),
+        use scripts/deploy-server.sh instead of killing the process directly.
+
+        """, stderr)
+      }
       initiateShutdown(exitCode: 1)
     case .cancelled:
       // Only exit if we intentionally cancelled (via /v1/shutdown or signal).
