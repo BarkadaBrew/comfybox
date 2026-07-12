@@ -306,7 +306,13 @@ public final class LTX2VideoGenerator {
         )
         MLX.eval(textEncoder.parameters())
 
-        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true)
+        // Reference ComfyUI-LTXVideo workflows always decode through
+        // VAEDecodeTiled, never a plain single-pass decode — the decoder
+        // likely relies on windowed/local processing that the (already
+        // implemented, just never enabled) tiled path is designed for.
+        // Running it as one giant pass is the leading suspect for the
+        // uniform grid/mesh artifact seen in every local I2V test tonight.
+        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: true)
         self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig)
         self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
         isLoaded = true
