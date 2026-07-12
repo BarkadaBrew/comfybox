@@ -1419,8 +1419,13 @@ public final class WarmServer {
         // actually opens (transformer file + VAE encoder/decoder).
         let weightsURL = try await ModelResolution.resolve(
           modelSpec: weights,
-          // Must match LTX2VideoGenerator.Configuration's default transformerFile.
-          filePatterns: ["transformer-distilled.safetensors",
+          // Must match LTX2VideoGenerator.Configuration's default transformerFile,
+          // plus connector.safetensors — LTX2TextEncoder.loadProjectionWeights()
+          // needs it to bridge Gemma-3's embeddings into the transformer; without
+          // it, generation "succeeds" but produces output uncorrelated with the
+          // prompt/init image (missing this file was the actual root cause of a
+          // completely broken first test run, not just conditioning being weak).
+          filePatterns: ["transformer-distilled.safetensors", "connector.safetensors",
                           "vae_decoder.safetensors", "vae_encoder.safetensors", "config.json"]
         )
         let gemmaURL = try await ModelResolution.resolve(

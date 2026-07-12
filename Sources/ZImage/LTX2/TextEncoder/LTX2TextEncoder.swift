@@ -324,9 +324,13 @@ public final class LTX2TextEncoder: Module {
     }
 
     guard !weights.isEmpty else {
-      print("WARNING: No connector weights found for text projection.")
-      print("  Text conditioning will use uninitialized weights!")
-      return
+      // Silently falling back to uninitialized weights here produces a
+      // "successful" render that's actually garbage (uncorrelated with the
+      // prompt or, for I2V, the init image) — fail loudly instead so a
+      // missing/incomplete weights directory is caught immediately rather
+      // than burning minutes of compute on meaningless output.
+      throw LTX2VideoError.weightsMissing(
+        "connector.safetensors (or text_projections/, or a monolithic ltx-2-19*.safetensors) not found in \(modelPath.path)")
     }
 
     // Detect format from key prefixes
