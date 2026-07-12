@@ -1373,6 +1373,9 @@ public final class WarmServer {
     let fps: Int?
     let loraPath: String?
     let loraStrength: Float?
+    /// Multiple LoRAs, applied in order — same {path, scale} shape as image
+    /// LoRA requests. `loraPath`/`loraStrength` still work for a single LoRA.
+    let loras: [LoRAEntry]?
     let outputPath: String?
   }
 
@@ -1408,9 +1411,17 @@ public final class WarmServer {
         // this first local video request, same warm/on-demand pattern the
         // main image pipeline already uses via ModelResolution.
         logger.info("LTX-2: resolving weights/text-encoder (downloads on first use if not cached)…")
+        // IMPORTANT: the weights repo bundles multiple ~35GB transformer
+        // variants (distilled, distilled-1.1, dev) plus upscaler/vocoder/
+        // audio files this loader never reads — a wildcard "*.safetensors"
+        // pattern here downloaded 130GB+ of unused files and nearly filled
+        // the boot disk. Only fetch the exact files LTX2VideoGenerator.load()
+        // actually opens (transformer file + VAE encoder/decoder).
         let weightsURL = try await ModelResolution.resolve(
           modelSpec: weights,
-          filePatterns: ["*.safetensors", "*.json"]
+          // Must match LTX2VideoGenerator.Configuration's default transformerFile.
+          filePatterns: ["transformer-distilled.safetensors",
+                          "vae_decoder.safetensors", "vae_encoder.safetensors", "config.json"]
         )
         let gemmaURL = try await ModelResolution.resolve(
           modelSpec: gemma,
@@ -1423,6 +1434,18 @@ public final class WarmServer {
 
       // Accept an init image as bytes (image_base64) when no server path is given.
       let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
+
+      // Resolve each requested LoRA the same way image generation does
+      // (bare-filename search against the LoRA library, etc.) — LTX video
+      // LoRAs are managed identically to every other model's.
+      let resolvedLoRAs: [LTX2LoRAReference] = try (req.loras ?? []).map { entry in
+        let config = try entry.makeConfiguration()
+        guard case .local(let url) = config.source else {
+          throw WarmServerError.invalidRequest(
+            message: "LTX-2 video LoRAs must be local files (got a HuggingFace reference for '\(entry.path)')")
+        }
+        return LTX2LoRAReference(path: url.path, scale: config.scale)
+      }
 
       let videoRequest = LTX2VideoRequest(
         prompt: req.prompt,
@@ -1438,6 +1461,7 @@ public final class WarmServer {
         fps: req.fps ?? 24,
         loraPath: req.loraPath,
         loraStrength: req.loraStrength ?? 1.0,
+        loras: resolvedLoRAs,
         outputPath: resolvedOutput
       )
       // Validate before enqueuing so bad frames/dims fail fast.

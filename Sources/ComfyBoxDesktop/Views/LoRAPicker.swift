@@ -10,6 +10,12 @@ import SwiftUI
 struct LoRAPicker: View {
     @Bindable var engine: EngineService
     @Binding var selectedLoras: [LoRASelection]
+    /// Overrides compatibility filtering to a specific family (e.g. "ltx")
+    /// instead of whatever image model is currently active — for contexts
+    /// like video generation where the relevant family never changes with
+    /// the loaded image model. nil (default) preserves the original
+    /// "filter against the active model" behavior.
+    var familyOverride: String? = nil
 
     @State private var searchText: String = ""
     @State private var errorMessage: String?
@@ -19,7 +25,7 @@ struct LoRAPicker: View {
 
     /// The active model's identifier for compatibility checks (family or name).
     private var activeModel: String? {
-        engine.currentModelFamily ?? engine.currentModel
+        familyOverride ?? engine.currentModelFamily ?? engine.currentModel
     }
 
     private func compatStatus(_ lora: LoRAInfo) -> LoRACompatibility.Status {

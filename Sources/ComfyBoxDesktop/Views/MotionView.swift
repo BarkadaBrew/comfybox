@@ -8,7 +8,6 @@
 import SwiftUI
 import AVKit
 import AppKit
-import UniformTypeIdentifiers
 
 struct MotionView: View {
     @Bindable var engine: EngineService
@@ -25,8 +24,7 @@ struct MotionView: View {
     @State private var seedText: String = ""
     @State private var strength: Double = 1.0
     @State private var extendSeconds: Double = 0
-    @State private var loraPath: String = ""
-    @State private var loraStrength: Double = 1.0
+    @State private var selectedLoras: [LoRASelection] = []
 
     @State private var isGenerating = false
     @State private var statusMessage: String?
@@ -113,18 +111,9 @@ struct MotionView: View {
                     TextField("Random", text: $seedText).textFieldStyle(.roundedBorder)
                 }
 
-                labeled("LoRA (optional .safetensors)") {
-                    HStack {
-                        TextField("", text: $loraPath).textFieldStyle(.roundedBorder)
-                        if !loraPath.isEmpty {
-                            Button { loraPath = "" } label: { Image(systemName: "xmark.circle.fill") }
-                                .buttonStyle(.plain).foregroundStyle(.tertiary)
-                        }
-                        Button("Browse…") { pickLora() }
-                    }
-                }
-                if !loraPath.isEmpty {
-                    NumericSliderField(label: "LoRA strength", value: $loraStrength, range: 0...2, step: 0.05, fractionDigits: 2)
+                labeled("LoRAs") {
+                    LoRAPicker(engine: engine, selectedLoras: $selectedLoras, familyOverride: "ltx")
+                        .frame(minHeight: 180, maxHeight: 260)
                 }
 
                 Button(action: generate) {
@@ -233,14 +222,6 @@ struct MotionView: View {
         setReference(url.path)
     }
 
-    private func pickLora() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        if let t = UTType(filenameExtension: "safetensors") { panel.allowedContentTypes = [t] }
-        panel.prompt = "Use LoRA"
-        if panel.runModal() == .OK, let url = panel.url { loraPath = url.path }
-    }
-
     private func setReference(_ path: String) {
         referencePath = path
         Task {
@@ -286,8 +267,7 @@ struct MotionView: View {
             width: w, height: h, frames: frames,
             steps: Int(steps), seed: seed, strength: Float(strength),
             extendToSeconds: Float(extendSeconds),
-            loraPath: loraPath.isEmpty ? nil : loraPath,
-            loraStrength: Float(loraStrength),
+            loras: selectedLoras,
             outputPath: outputPath
         )
 

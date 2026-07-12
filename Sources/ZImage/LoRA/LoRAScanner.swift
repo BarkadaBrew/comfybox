@@ -168,6 +168,8 @@ public enum LoRAScanner {
         return ["chroma"]
       case "krea2", "krea-2", "krea-2-turbo":
         return ["krea2"]
+      case "ltx2", "ltx-2", "ltxv", "ltx-video", "ltx_video":
+        return ["ltx"]
       default:
         break
       }
@@ -184,6 +186,9 @@ public enum LoRAScanner {
       }
       if lower.contains("chroma") {
         return ["chroma"]
+      }
+      if lower.contains("ltx") {
+        return ["ltx"]
       }
       if lower.contains("flux") {
         return ["flux1"]
@@ -206,8 +211,16 @@ public enum LoRAScanner {
     var hasSingleBlocks = false
     var hasImgAttn = false
     var hasTxtAttn = false
+    var hasLTX2AudioVideoBranch = false
 
     for key in baseKeys {
+      // LTX-2's transformer is the only architecture with audio/video
+      // cross-attention branches — a reliable, distinctive signal since its
+      // 48 numbered `layers.N.` otherwise look like Z-Image's.
+      if key.contains("audio_") || key.contains("av_ca_")
+          || key.contains("video_to_audio_attn") || key.contains("audio_to_video_attn") {
+        hasLTX2AudioVideoBranch = true
+      }
       if key.contains("diffusion_model.layers.") || key.contains("layers.") {
         hasLayers = true
       }
@@ -229,6 +242,13 @@ public enum LoRAScanner {
       if key.contains("txt_attn") {
         hasTxtAttn = true
       }
+    }
+
+    // LTX-2 video: distinctive audio/video cross-attention branches. Checked
+    // first — LTX-2's plain numbered `layers.N.` would otherwise fall
+    // through to the Z-Image heuristics below.
+    if hasLTX2AudioVideoBranch {
+      return ["ltx"]
     }
 
     // Z-Image: layers + context_refiner + noise_refiner

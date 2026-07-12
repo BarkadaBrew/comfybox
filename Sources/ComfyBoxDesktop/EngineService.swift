@@ -970,6 +970,10 @@ public final class EngineService {
         public var extendToSeconds: Float
         public var loraPath: String?
         public var loraStrength: Float
+        /// LoRAs managed the same way as image generation's — via the LoRA
+        /// library picker, not a raw path field. `loraPath`/`loraStrength`
+        /// still work for a single ad-hoc LoRA.
+        public var loras: [LoRASelection]
         public var outputPath: String
 
         public init(
@@ -977,13 +981,14 @@ public final class EngineService {
             width: Int = 704, height: Int = 448, frames: Int = 97,
             steps: Int = 8, seed: UInt64 = 42, strength: Float = 1.0,
             extendToSeconds: Float = 0, loraPath: String? = nil,
-            loraStrength: Float = 1.0, outputPath: String
+            loraStrength: Float = 1.0, loras: [LoRASelection] = [], outputPath: String
         ) {
             self.prompt = prompt; self.initImagePath = initImagePath
             self.width = width; self.height = height; self.frames = frames
             self.steps = steps; self.seed = seed; self.strength = strength
             self.extendToSeconds = extendToSeconds
             self.loraPath = loraPath; self.loraStrength = loraStrength
+            self.loras = loras
             self.outputPath = outputPath
         }
     }
@@ -1016,6 +1021,11 @@ public final class EngineService {
         if let loraPath = request.loraPath, !loraPath.isEmpty {
             body["lora_path"] = loraPath
             body["lora_strength"] = request.loraStrength
+        }
+        if !request.loras.isEmpty {
+            // Same convention as image LoRA swap: the server resolves by
+            // filename, not the slugified library id.
+            body["loras"] = request.loras.map { ["path": $0.filename, "scale": $0.scale] }
         }
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         let (status, data) = try await client.post("/v1/video/generate", body: bodyData)

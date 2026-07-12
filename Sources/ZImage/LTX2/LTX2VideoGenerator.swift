@@ -16,6 +16,18 @@ import CoreGraphics
 import ImageIO
 #endif
 
+/// One LoRA to merge into the LTX-2 transformer for a render, applied in
+/// the order given. Mirrors the image side's {path, scale} shape so LTX
+/// video LoRAs are managed the same way as every other model's.
+public struct LTX2LoRAReference: Sendable, Equatable {
+    public var path: String
+    public var scale: Float
+    public init(path: String, scale: Float = 1.0) {
+        self.path = path
+        self.scale = scale
+    }
+}
+
 /// Parameters for one local LTX-2 video generation.
 public struct LTX2VideoRequest: Sendable {
     public var prompt: String
@@ -33,10 +45,25 @@ public struct LTX2VideoRequest: Sendable {
     /// Target duration; >0 generates continuation chunks (I2V only).
     public var extendToSeconds: Float
     public var fps: Int
-    /// Optional LoRA merged into the transformer for this render.
+    /// Deprecated single-LoRA fields — kept for wire/call-site back-compat.
+    /// New callers should use `loras` instead. Folded into `effectiveLoRAs`.
     public var loraPath: String?
     public var loraStrength: Float
+    /// LoRAs merged into the transformer for this render, applied in order.
+    public var loras: [LTX2LoRAReference]
     public var outputPath: String
+
+    /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
+    /// prepended — the single field always applied first, matching the old
+    /// single-LoRA behavior when only it is set.
+    public var effectiveLoRAs: [LTX2LoRAReference] {
+        var result: [LTX2LoRAReference] = []
+        if let loraPath, !loraPath.isEmpty {
+            result.append(LTX2LoRAReference(path: loraPath, scale: loraStrength))
+        }
+        result.append(contentsOf: loras)
+        return result
+    }
 
     public init(
         prompt: String,
@@ -52,6 +79,7 @@ public struct LTX2VideoRequest: Sendable {
         fps: Int = 24,
         loraPath: String? = nil,
         loraStrength: Float = 1.0,
+        loras: [LTX2LoRAReference] = [],
         outputPath: String
     ) {
         self.prompt = prompt
@@ -67,6 +95,7 @@ public struct LTX2VideoRequest: Sendable {
         self.fps = fps
         self.loraPath = loraPath
         self.loraStrength = loraStrength
+        self.loras = loras
         self.outputPath = outputPath
     }
 }
@@ -190,13 +219,13 @@ public final class LTX2VideoGenerator {
     // MARK: - Model loading (lazy, cached)
 
     /// Construct and load the transformer, VAE, text encoder, and pipeline,
-    /// optionally merging a LoRA into the transformer. Idempotent for the same
-    /// LoRA; a different LoRA reloads.
-    public func load(loraPath: String? = nil, loraStrength: Float = 1.0) throws {
-        let wantKey = loraPath.map { "\($0)@\(loraStrength)" }
+    /// optionally merging one or more LoRAs into the transformer (applied in
+    /// order). Idempotent for the same LoRA set; a different set reloads.
+    public func load(loras: [LTX2LoRAReference] = []) throws {
+        let wantKey = loras.isEmpty ? nil : loras.map { "\($0.path)@\($0.scale)" }.joined(separator: "|")
         if isLoaded {
             if wantKey == loadedLoraKey { return }
-            unload()   // LoRA changed — rebuild the transformer.
+            unload()   // LoRA set changed — rebuild the transformer.
         }
         let modelDir = config.weightsDir
 
@@ -214,10 +243,11 @@ public final class LTX2VideoGenerator {
         let rawWeights = try MLX.loadArrays(url: transformerPath)
         var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
 
-        // Merge a LoRA into the base weights (skip audio branches), as the CLI does.
-        if let loraPath, !loraPath.isEmpty {
-            logger.info("LTX-2: merging LoRA \(loraPath) @ \(loraStrength)…")
-            let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: loraPath))
+        // Merge each LoRA into the base weights in order (skip audio branches),
+        // as the CLI does — multiple LoRAs simply accumulate their deltas.
+        for lora in loras {
+            logger.info("LTX-2: merging LoRA \(lora.path) @ \(lora.scale)…")
+            let loraWeights = try MLX.loadArrays(url: URL(fileURLWithPath: lora.path))
             var merged = 0
             for (key, loraA) in loraWeights {
                 guard key.hasSuffix(".lora_A.weight") else { continue }
@@ -229,11 +259,11 @@ public final class LTX2VideoGenerator {
                 guard let loraB = loraWeights[bKey] else { continue }
                 let targetKey = baseKey + ".weight"
                 guard sanitized[targetKey] != nil else { continue }
-                let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(loraStrength)
+                let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(lora.scale)
                 sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
                 merged += 1
             }
-            logger.info("LTX-2: merged \(merged) LoRA pairs.")
+            logger.info("LTX-2: merged \(merged) LoRA pairs from \(lora.path).")
         }
         let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
         try transformer.update(parameters: params, verify: [.shapeMismatch])
@@ -300,7 +330,7 @@ public final class LTX2VideoGenerator {
     ) throws -> LTX2VideoResult {
         #if canImport(CoreGraphics) && canImport(ImageIO)
         try validate(request)
-        try load(loraPath: request.loraPath, loraStrength: request.loraStrength)
+        try load(loras: request.effectiveLoRAs)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
         let plan = Self.chunkPlan(
