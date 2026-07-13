@@ -191,6 +191,9 @@ public final class WarmServer {
   /// Unified-memory pressure monitor (#218). On warning/critical it sheds the
   /// MLX buffer cache and any idle heavy model to stay clear of jetsam.
   private var memoryPressureSource: DispatchSourceMemoryPressure?
+  /// Lock-based health snapshot the coordinator publishes to, so GET /health is
+  /// served without hopping onto the actor — stays responsive during a render (#217).
+  private let liveHealth = LiveHealthState()
   /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
   let presetStore = PresetStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
@@ -210,7 +213,7 @@ public final class WarmServer {
     self.configuration = configuration
     self.host = host
     self.logger = logger
-    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger, videoHolder: self.videoHolder)
+    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger, videoHolder: self.videoHolder, liveHealth: self.liveHealth)
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
@@ -509,7 +512,11 @@ public final class WarmServer {
     switch (request.method, request.path) {
     case ("GET", "/health"):
       let memoryBytes = Self.currentMemoryFootprintBytes()
-      let health = await coordinator.health(memoryBytes: memoryBytes)
+      // #217: read from the lock-based snapshot instead of `await
+      // coordinator.health()`. The coordinator actor is blocked for a whole
+      // synchronous render, so awaiting it made /health hang (HTTP 000) for the
+      // render's duration. The snapshot is published on every state transition.
+      let health = liveHealthResponse(memoryBytes: memoryBytes)
       // Encode base health, then inject video section
       let encoder = JSONEncoder()
       encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -2511,6 +2518,43 @@ public final class WarmServer {
     return info.phys_footprint
   }
 
+  /// Max render age (ms) before /health flags the render as likely deadlocked.
+  private static let healthRenderStaleThresholdMs = 300_000  // 5 minutes (#141)
+
+  /// Assemble the /health payload from the lock-based ``LiveHealthState``
+  /// snapshot — NO actor hop — so /health stays responsive during a render (#217).
+  private func liveHealthResponse(memoryBytes: UInt64) -> HealthResponse {
+    let (snap, progress) = liveHealth.read()
+    let uptimeSeconds = Int(Date().timeIntervalSince(serverStartTime))
+    let activeAgeMs = snap.activeRenderStartedAt.map { Int(Date().timeIntervalSince($0) * 1000.0) }
+    let status = WarmServerHealthStatus.derive(
+      shuttingDown: snap.shuttingDown,
+      activeRenderAgeMs: activeAgeMs,
+      staleThresholdMs: Self.healthRenderStaleThresholdMs)
+    return HealthResponse(
+      status: status,
+      model: snap.model.isEmpty ? (configuration.modelSpec ?? ZImageRepository.id) : snap.model,
+      modelFamily: snap.modelFamily,
+      modelVariant: snap.modelVariant,
+      textEncoderPath: configuration.textEncoderPath,
+      loaded: snap.loaded,
+      loras: snap.loras,
+      uptimeSeconds: uptimeSeconds,
+      renderCount: snap.renderCount,
+      failedRenderCount: snap.failedRenderCount,
+      pendingCount: snap.pendingCount,
+      maxPending: configuration.maxPendingRequests,
+      isRendering: snap.isRendering,
+      activeRequestAgeMs: activeAgeMs,
+      currentJobId: snap.activeJobId,
+      progressPercent: progress,
+      memoryUsageBytes: memoryBytes,
+      memoryUsageMB: memoryBytes / (1024 * 1024),
+      lastRenderDurationMs: snap.lastRenderDurationMs,
+      lastError: snap.lastError
+    )
+  }
+
   // MARK: - Krita Model Detection Helpers
 
   /// Parse quantization suffix from a model ID string.
@@ -2556,6 +2600,56 @@ public final class WarmServer {
       }
     }
     return modelId
+  }
+}
+
+/// Snapshot of the coordinator's health-relevant state, published to the
+/// lock-based ``LiveHealthState`` so GET /health can be served WITHOUT hopping
+/// onto the ``WarmServerCoordinator`` actor.
+///
+/// The actor is blocked for the full duration of a synchronous GPU render
+/// (seconds to minutes). Routing /health through `await coordinator.health()`
+/// made the endpoint queue behind the render and return nothing (HTTP 000) for
+/// the render's whole duration, then respond instantly once it finished — the
+/// Desktop queue/progress UI and external monitors went stale mid-render (#217).
+/// The coordinator publishes this snapshot at each state transition instead.
+private struct HealthSnapshot: Sendable {
+  var shuttingDown: Bool
+  var model: String
+  var modelFamily: String
+  var modelVariant: String?
+  var loaded: Bool
+  var loras: [LoRAState]
+  var renderCount: Int
+  var failedRenderCount: Int
+  var pendingCount: Int
+  var isRendering: Bool
+  var activeRenderStartedAt: Date?
+  var activeJobId: String?
+  var lastRenderDurationMs: Int?
+  var lastError: String?
+
+  static let initial = HealthSnapshot(
+    shuttingDown: false, model: "", modelFamily: WarmModelFamily.flux1.rawValue,
+    modelVariant: nil, loaded: false, loras: [], renderCount: 0, failedRenderCount: 0,
+    pendingCount: 0, isRendering: false, activeRenderStartedAt: nil, activeJobId: nil,
+    lastRenderDurationMs: nil, lastError: nil)
+}
+
+/// Lock-based publisher for ``HealthSnapshot`` + live progress. Written on the
+/// actor at each state transition and from the off-actor progress callback;
+/// read by the /health route with no actor hop, so /health stays responsive
+/// throughout a render (#217).
+private final class LiveHealthState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var snapshot = HealthSnapshot.initial
+  private var progressPercent: Int?
+
+  func publish(_ s: HealthSnapshot) { lock.lock(); snapshot = s; lock.unlock() }
+  func setProgress(_ p: Int?) { lock.lock(); progressPercent = p; lock.unlock() }
+  func read() -> (HealthSnapshot, Int?) {
+    lock.lock(); defer { lock.unlock() }
+    return (snapshot, progressPercent)
   }
 }
 
@@ -2796,6 +2890,12 @@ private actor WarmServerCoordinator {
   /// Pure single-heavy-model residency accounting (#218).
   private let heavyAdmission = HeavyModelAdmission()
 
+  /// Lock-based health snapshot the /health route reads without an actor hop (#217).
+  private let liveHealth: LiveHealthState
+  /// When the current queue job started processing — the /health start time even
+  /// before a render method sets `activeRenderStartedAt` past its first await.
+  private var currentJobStartedAt: Date?
+
   /// True after the image models were released to make room for LTX-2 video —
   /// the next image render must reload before it can run (#218).
   private var imageModelsEvicted = false
@@ -2803,10 +2903,11 @@ private actor WarmServerCoordinator {
   /// image render can restore exactly that model.
   private var lastActiveImageSpec: String?
 
-  init(configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder) {
+  init(configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder, liveHealth: LiveHealthState) {
     self.configuration = configuration
     self.logger = logger
     self.videoHolder = videoHolder
+    self.liveHealth = liveHealth
     self.pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
     self.activeLoRAs = configuration.initialLoRAs
     self.modelPool = ModelPool(
@@ -2839,6 +2940,7 @@ private actor WarmServerCoordinator {
     imageModelsEvicted = true
     GPU.clearCache()
     logger.info("Released image models for LTX-2 video (~\(freedMB)MB pool est; base pipeline + per-family pipelines unloaded) (#218)")
+    publishHealth()
     return freedMB
   }
 
@@ -3087,6 +3189,9 @@ private actor WarmServerCoordinator {
       )
       logger.info("ModelPool: initial model '\(poolKey)' registered and activated")
     }
+    // Seed the lock-based health snapshot now that the model is loaded, so
+    // GET /health returns real data before the first render (#217).
+    publishHealth()
   }
 
   /// Expose the current model family for routing decisions outside the actor.
@@ -3200,6 +3305,8 @@ private actor WarmServerCoordinator {
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }
     pipelinePrepared = true
+    // Model/family/variant just changed — refresh the health snapshot (#217).
+    publishHealth()
 
     return ModelActivateResponse(
       status: "activated",
@@ -3334,37 +3441,33 @@ private actor WarmServerCoordinator {
     }
   }
 
-  /// Maximum render age before the health endpoint reports the render as stale.
-  /// After this threshold, the health status changes to "render_stale" to signal
-  /// that the render is likely deadlocked (issue #141).
-  private static let renderStaleThresholdMs = 300_000 // 5 minutes
-
-  func health(memoryBytes: UInt64) -> HealthResponse {
-    let uptimeSeconds = Int(Date().timeIntervalSince(startTime))
-    let activeAgeMs = activeRenderStartedAt.map { Int(Date().timeIntervalSince($0) * 1000.0) }
-
-    return HealthResponse(
-      status: shuttingDown ? "shutting_down" : (activeAgeMs.map { $0 > Self.renderStaleThresholdMs } ?? false ? "render_stale" : "ok"),
+  /// Publish the current health-relevant state into the lock-based
+  /// ``LiveHealthState`` so GET /health reads it without hopping onto this
+  /// actor (which blocks for a whole render). Call at every state transition:
+  /// job start/end, enqueue, model/LoRA change, pause, shutdown, startup (#217).
+  ///
+  /// `isRendering` keys off `activeJobId` (set the instant a job is dequeued,
+  /// before the render method's first await sets `activeRenderStartedAt`), and
+  /// the render start time falls back to `currentJobStartedAt` so the age/stale
+  /// signal is correct throughout the synchronous GPU section.
+  private func publishHealth() {
+    let snap = HealthSnapshot(
+      shuttingDown: shuttingDown,
       model: activePoolModelSpec ?? configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
       modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
-      textEncoderPath: configuration.textEncoderPath,
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),
-      uptimeSeconds: uptimeSeconds,
       renderCount: successfulRenderCount,
       failedRenderCount: failedRenderCount,
       pendingCount: pending.count,
-      maxPending: configuration.maxPendingRequests,
-      isRendering: activeRenderStartedAt != nil,
-      activeRequestAgeMs: activeAgeMs,
-      currentJobId: activeJobId,
-      progressPercent: progressTracker.get(),
-      memoryUsageBytes: memoryBytes,
-      memoryUsageMB: memoryBytes / (1024 * 1024),
+      isRendering: activeJobId != nil,
+      activeRenderStartedAt: activeRenderStartedAt ?? currentJobStartedAt,
+      activeJobId: activeJobId,
       lastRenderDurationMs: lastRenderDurationMs,
       lastError: lastError
     )
+    liveHealth.publish(snap)
   }
 
   /// Queue status for the ComfyUI bridge /queue endpoint.
@@ -3397,6 +3500,7 @@ private actor WarmServerCoordinator {
       Self.cancel(job.operation)
     }
     pending.removeAll()
+    publishHealth()
     return count
   }
 
@@ -3509,6 +3613,7 @@ private actor WarmServerCoordinator {
   func setPaused(_ paused: Bool) {
     isPaused = paused
     if !paused { startProcessingIfNeeded() }
+    publishHealth()
   }
 
   /// Move a pending job within the queue. direction: up | down | top | bottom.
@@ -3529,6 +3634,9 @@ private actor WarmServerCoordinator {
   }
 
   private func startProcessingIfNeeded() {
+    // Every enqueue routes through here, so this is the one spot that reflects a
+    // just-changed pending count into the lock-based health snapshot (#217).
+    publishHealth()
     guard !isProcessing else { return }
     isProcessing = true
     Task {
@@ -3553,7 +3661,11 @@ private actor WarmServerCoordinator {
       activeJobSource = job.source
       // Keep the same id the job had while pending, so clients can correlate.
       activeJobId = job.id
-      defer { activeJobSummary = nil; activeJobSource = nil; activeJobId = nil }
+      currentJobStartedAt = Date()
+      // Publish is_rendering + job id BEFORE the synchronous GPU section begins,
+      // so /health reflects the render for its whole (actor-blocking) duration (#217).
+      publishHealth()
+      defer { activeJobSummary = nil; activeJobSource = nil; activeJobId = nil; currentJobStartedAt = nil; publishHealth() }
       switch job.operation {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
@@ -3626,10 +3738,16 @@ private actor WarmServerCoordinator {
     // have no per-step callback, so they report only is_rendering + job id.
     // (activeJobId is set from job.id at the top of the process loop.)
     progressTracker.set(0)
+    liveHealth.setProgress(0)
     let tracker = progressTracker
+    // Feed the lock-based health snapshot too, so /health's progress_percent
+    // advances live during the render without an actor hop (#217).
+    let health = liveHealth
     let trackedHandler: @Sendable (ZImagePipeline.GenerationProgress) -> Void = { progress in
       if progress.stage == .denoising {
-        tracker.set(Int(progress.fractionCompleted * 100))
+        let pct = Int(progress.fractionCompleted * 100)
+        tracker.set(pct)
+        health.setProgress(pct)
       }
       progressHandler?(progress)
     }
@@ -3654,7 +3772,7 @@ private actor WarmServerCoordinator {
       preview.set(framed.dropFirst(8))
       #endif
     }
-    defer { activeJobId = nil; progressTracker.set(nil); previewTracker.set(nil) }
+    defer { activeJobId = nil; progressTracker.set(nil); liveHealth.setProgress(nil); previewTracker.set(nil) }
 
     // #218: if a prior LTX-2 video render evicted the image models, restore the
     // previously-active image model before this render can run. poolLoad also
@@ -4214,6 +4332,8 @@ private actor WarmServerCoordinator {
       try await pipeline.swapLoRAs(newLoRAs)
       activeLoRAs = newLoRAs
     }
+    // Active LoRA set changed — refresh the health snapshot (#217).
+    publishHealth()
   }
 
   private func runSwap(_ payload: LoRASwapPayload, continuation: ContinuationBox<LoRASwapResponse>) async {
