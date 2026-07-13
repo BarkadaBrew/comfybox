@@ -6,6 +6,7 @@ struct RemoteGalleryView: View {
     @State private var remote: RemoteGalleryService
     var ingestor: AssetIngestor?
     @State private var status: String?
+    @State private var lightboxIndex: Int?
 
     private let columns = [GridItem(.adaptive(minimum: 180), spacing: 10)]
 
@@ -22,6 +23,19 @@ struct RemoteGalleryView: View {
         }
         .navigationTitle("Remote Gallery")
         .task { await remote.load() }
+        .overlay {
+            if let idx = lightboxIndex {
+                RemoteGalleryLightbox(
+                    assets: remote.assets,
+                    index: idx,
+                    remote: remote,
+                    onSave: { asset in Task { await pull(asset) } },
+                    onIndexChange: { lightboxIndex = $0 },
+                    onClose: { lightboxIndex = nil }
+                )
+                .transition(.opacity)
+            }
+        }
     }
 
     private var header: some View {
@@ -76,6 +90,10 @@ struct RemoteGalleryView: View {
             }
             .frame(height: 160)
             .clipShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+            .onTapGesture {
+                lightboxIndex = remote.assets.firstIndex(where: { $0.id == asset.id })
+            }
             Text(asset.filename).font(.caption2).lineLimit(1).truncationMode(.middle)
             if !remote.isLocalServer, ingestor != nil {
                 Button { Task { await pull(asset) } } label: {
