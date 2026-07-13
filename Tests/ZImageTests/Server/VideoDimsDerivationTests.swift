@@ -78,3 +78,19 @@ final class VideoDimsDerivationTests: XCTestCase {
     XCTAssertGreaterThanOrEqual(dims.width, 512)
   }
 }
+
+// MARK: duration → extendToSeconds mapping (#219 follow-up: long renders)
+
+extension VideoDimsDerivationTests {
+  func testDurationWithinOneChunkIsSingleChunk() {
+    // 97 frames @ 24fps ≈ 4.04s — a 4s request needs no continuation.
+    XCTAssertEqual(WarmServer.extendSecondsFromDuration(4, framesPerChunk: 97, fps: 24), 0)
+    XCTAssertEqual(WarmServer.extendSecondsFromDuration(nil, framesPerChunk: 97, fps: 24), 0)
+    XCTAssertEqual(WarmServer.extendSecondsFromDuration(0, framesPerChunk: 97, fps: 24), 0)
+  }
+
+  func testDurationBeyondOneChunkExtends() {
+    XCTAssertEqual(WarmServer.extendSecondsFromDuration(12, framesPerChunk: 97, fps: 24), 12)
+    XCTAssertEqual(WarmServer.extendSecondsFromDuration(20, framesPerChunk: 97, fps: 24), 20)
+  }
+}

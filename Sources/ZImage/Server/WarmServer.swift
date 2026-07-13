@@ -1425,6 +1425,11 @@ public final class WarmServer {
     let seed: UInt64?
     let strength: Float?
     let extendToSeconds: Float?
+    /// Target duration in seconds — the daemon/MCP vocabulary. For local
+    /// renders this maps onto `extendToSeconds` (chunked continuation, each
+    /// chunk re-anchored on the previous chunk\u{27}s last frame) when it
+    /// exceeds one chunk. `extend_to_seconds` still wins when both are set.
+    let duration: Float?
     let fps: Int?
     let loraPath: String?
     let loraStrength: Float?
@@ -1435,6 +1440,10 @@ public final class WarmServer {
     /// Which client/app submitted this job (desktop, bree, api…) — surfaced in
     /// the async job status and /health, same as image `GeneratePayload.source`.
     let source: String?
+    /// Optional preset id resolved from the shared PresetStore (mediaKind
+    /// "video"): LoRAs, prompt prefix/suffix, negative prompt, dims budget,
+    /// steps, seed. Explicit request fields always override preset values.
+    let preset: String?
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1499,6 +1508,15 @@ public final class WarmServer {
     let source: String
   }
 
+  /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
+  /// the request fits one chunk (single-chunk render, no continuation cost),
+  /// else the requested seconds. Pure for unit testing.
+  static func extendSecondsFromDuration(_ duration: Float?, framesPerChunk: Int, fps: Int) -> Float {
+    guard let seconds = duration, seconds > 0, fps > 0 else { return 0 }
+    let singleChunkSeconds = Float(framesPerChunk) / Float(fps)
+    return seconds > singleChunkSeconds ? seconds : 0
+  }
+
   /// Snap a render dimension to the nearest multiple of 64 (floor 256).
   /// LTX-2 renders at dims that are 32-multiples but NOT 64-multiples (e.g.
   /// 480) exhibit progressive haze (#219) — every clean render in the 07-13
@@ -1552,6 +1570,19 @@ public final class WarmServer {
     }
     let req = try decode(LocalVideoRequest.self, from: body)
 
+    // Video presets — same PresetStore as images (mediaKind "video"). A
+    // preset is a named bundle: LoRAs (bare filenames resolve through the
+    // LoRA library search roots), prompt shaping, negative prompt, dims
+    // budget, steps, seed. Explicit request fields win over the preset.
+    var videoPreset: ImagePreset? = nil
+    if let presetId = req.preset, !presetId.isEmpty {
+      guard let found = presetStore.get(presetId) else {
+        throw WarmServerError.invalidRequest(message: "Unknown preset \u{27}\(presetId)\u{27} — see /v1/presets")
+      }
+      videoPreset = found
+      logger.info("LTX-2: applying video preset \u{27}\(presetId)\u{27} (\(found.loras.count) LoRA(s))")
+    }
+
     // Contain the output within the allowed directory. A relative (or absent)
     // output path is resolved against the ALLOWED directory, not the process
     // CWD — under launchd the CWD is the repo checkout, so the old bare-name
@@ -1593,6 +1624,9 @@ public final class WarmServer {
     let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
 
     var loraEntries: [LoRAEntry] = req.loras ?? []
+    if loraEntries.isEmpty, req.loraPath == nil, let preset = videoPreset, !preset.loras.isEmpty {
+      loraEntries = preset.loras.map { LoRAEntry(path: $0.filename, scale: Float($0.scale)) }
+    }
     if loraEntries.isEmpty, req.loraPath == nil,
        let defaultLoRA = configuration.ltx2DefaultLoRA, !defaultLoRA.isEmpty {
       // "path" or "path@scale"
@@ -1616,8 +1650,8 @@ public final class WarmServer {
     // preset like 704x448 applied to a portrait source distorts the
     // conditioning frame and the render drifts off the image. The requested
     // width x height is kept only as a pixel-area budget for I2V.
-    var renderWidth = req.width ?? 704
-    var renderHeight = req.height ?? 448
+    var renderWidth = req.width ?? videoPreset?.width ?? 704
+    var renderHeight = req.height ?? videoPreset?.height ?? 448
     if let initPath = effectiveInitImage,
        let sourceSize = Self.imagePixelSize(atPath: initPath) {
       let derived = Self.deriveVideoDims(
@@ -1643,17 +1677,24 @@ public final class WarmServer {
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
     }
 
+    var effectivePrompt = req.prompt
+    if let preset = videoPreset {
+      if let prefix = preset.promptPrefix, !prefix.isEmpty { effectivePrompt = prefix + ", " + effectivePrompt }
+      if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
+    }
+
     let videoRequest = LTX2VideoRequest(
-      prompt: req.prompt,
-      negativePrompt: req.negativePrompt,
+      prompt: effectivePrompt,
+      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
       initImagePath: effectiveInitImage,
       width: renderWidth,
       height: renderHeight,
       framesPerChunk: req.frames ?? 97,
-      steps: req.steps ?? 8,
-      seed: req.seed ?? 42,
+      steps: req.steps ?? videoPreset?.steps ?? 8,
+      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
-      extendToSeconds: req.extendToSeconds ?? 0,
+      extendToSeconds: req.extendToSeconds
+        ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,
       loraPath: req.loraPath,
       loraStrength: req.loraStrength ?? 1.0,

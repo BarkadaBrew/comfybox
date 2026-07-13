@@ -392,6 +392,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let outputPath = params?.string("output_path") {
       body["output_path"] = outputPath
     }
+    if let preset = params?.string("preset") {
+      body["preset"] = preset
+    }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     // Async route for BOTH backends: local renders return 202 + job_id

@@ -397,6 +397,10 @@ public enum MCPToolRegistry {
           "type": "integer",
           "description": "Random seed for reproducibility. Omit for random.",
         ] as [String: Any],
+        "preset": [
+          "type": "string",
+          "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",
+        ],
         "output_path": [
           "type": "string",
           "description": "Output file path for the .mp4. Must be within the allowed output directory. Omit to auto-generate.",
