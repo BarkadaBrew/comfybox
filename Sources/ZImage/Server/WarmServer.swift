@@ -191,6 +191,10 @@ public final class WarmServer {
   /// Unified-memory pressure monitor (#218). On warning/critical it sheds the
   /// MLX buffer cache and any idle heavy model to stay clear of jetsam.
   private var memoryPressureSource: DispatchSourceMemoryPressure?
+  /// Auto-rescans the LoRA library on any external filesystem change (CivitAI
+  /// browser download, curl, cp, an MCP/Bree fetch) so new LoRAs are indexed
+  /// without a manual `lora scan`. Started in `run()` once `loraLibrary` exists.
+  private var loraLibraryWatcher: LoRALibraryWatcher?
   /// Lock-based health snapshot the coordinator publishes to, so GET /health is
   /// served without hopping onto the actor — stays responsive during a render (#217).
   private let liveHealth = LiveHealthState()
@@ -423,6 +427,10 @@ public final class WarmServer {
     }
     pressureSource.resume()
     self.memoryPressureSource = pressureSource
+
+    if let library = loraLibrary {
+      self.loraLibraryWatcher = LoRALibraryWatcher(library: library, queue: listenerQueue, logger: logger)
+    }
 
     listener.start(queue: listenerQueue)
 

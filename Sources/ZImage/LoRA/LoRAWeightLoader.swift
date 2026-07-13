@@ -411,11 +411,11 @@ public final class LoRAWeightLoader {
   /// Load a safetensors LoRA file for the Krea-2 `SingleStreamDiT` transformer.
   ///
   /// Krea-2 LoRAs (e.g. from the `krea2` training pipeline) use
-  /// `diffusion_model.blocks.<n>.<attn|mlp>.<proj>.lora_A/lora_B` keys that
-  /// already match `Krea2SingleStreamDiT`'s module paths 1:1 once the
-  /// `diffusion_model.` prefix is stripped — unlike Z-Image, no block/component
-  /// remapping is needed, so this bypasses ``LoRAKeyMapper`` entirely (same
-  /// reasoning as ``loadForFlux2(from:)``).
+  /// `diffusion_model.blocks.<n>.<attn|mlp>.<proj>.lora_A/lora_B` (or LyCORIS
+  /// `.lokr_w1/.lokr_w2/.alpha`) keys that already match `Krea2SingleStreamDiT`'s
+  /// module paths 1:1 once the `diffusion_model.` prefix is stripped — unlike
+  /// Z-Image, no block/component remapping is needed, so this bypasses
+  /// ``LoRAKeyMapper`` entirely (same reasoning as ``loadForFlux2(from:)``).
   ///
   /// - Parameter url: Path to a `.safetensors` file.
   /// - Returns: LoRAWeights with keys matching Krea2SingleStreamDiT module paths.
@@ -429,9 +429,27 @@ public final class LoRAWeightLoader {
 
     var processedKeys = Set<String>()
     var loraPairs: [String: (down: MLXArray, up: MLXArray)] = [:]
+    var lokrW1: [String: MLXArray] = [:]
+    var lokrW2: [String: MLXArray] = [:]
+    var moduleAlphas: [String: Float] = [:]
 
     for key in keys {
       if processedKeys.contains(key) { continue }
+
+      if let (moduleKey, suffix) = mapKrea2LoKrModuleKey(key) {
+        switch suffix {
+        case .w1:
+          lokrW1[moduleKey] = try reader.tensor(named: key)
+        case .w2:
+          lokrW2[moduleKey] = try reader.tensor(named: key)
+        case .alpha:
+          let tensor = try reader.tensor(named: key)
+          if let value = tensor.asArray(Float.self).first {
+            moduleAlphas[moduleKey] = value
+          }
+        }
+        continue
+      }
 
       guard let (downKey, upKey, baseKey) = resolveKeyPair(key) else { continue }
       guard reader.contains(downKey), reader.contains(upKey) else { continue }
@@ -446,17 +464,48 @@ public final class LoRAWeightLoader {
       loraPairs[targetKey] = (down: downWeight, up: upWeight)
     }
 
-    guard !loraPairs.isEmpty else {
+    var lokrWeights: [String: LoKrWeights] = [:]
+    lokrWeights.reserveCapacity(min(lokrW1.count, lokrW2.count))
+    for (key, w1) in lokrW1 {
+      guard let w2 = lokrW2[key] else { continue }
+      lokrWeights[key] = LoKrWeights(w1: w1, w2: w2, alpha: moduleAlphas[key])
+    }
+
+    guard !loraPairs.isEmpty || !lokrWeights.isEmpty else {
       throw LoRAError.invalidFormat(
         "No valid Krea-2 LoRA weight pairs found in \(url.lastPathComponent). " +
-        "Expected keys matching diffusion_model.blocks.<n>.<attn|mlp>.<proj> patterns."
+        "Expected keys matching diffusion_model.blocks.<n>.<attn|mlp>.<proj> patterns, " +
+        "or LyCORIS LoKr (.lokr_w1/.lokr_w2)."
       )
     }
 
     let rank = inferRank(from: loraPairs)
     let alpha = loadAlpha(from: url.deletingLastPathComponent())
 
-    return LoRAWeights(weights: loraPairs, rank: rank, alpha: alpha)
+    return LoRAWeights(weights: loraPairs, lokrWeights: lokrWeights, rank: rank, alpha: alpha)
+  }
+
+  /// Krea-2 analogue of ``mapLoKrModuleKey(_:)``: strips the `diffusion_model.`
+  /// prefix only, with no ``LoRAKeyMapper`` remap, since Krea-2 LoKr keys
+  /// already match `Krea2SingleStreamDiT`'s module paths 1:1 (see
+  /// ``loadForKrea2(from:)``).
+  private static func mapKrea2LoKrModuleKey(_ key: String) -> (moduleKey: String, suffix: LoKrSuffix)? {
+    let suffix: LoKrSuffix
+    if key.hasSuffix(LoKrSuffix.w1.rawValue) {
+      suffix = .w1
+    } else if key.hasSuffix(LoKrSuffix.w2.rawValue) {
+      suffix = .w2
+    } else if key.hasSuffix(LoKrSuffix.alpha.rawValue) {
+      suffix = .alpha
+    } else {
+      return nil
+    }
+
+    var base = String(key.dropLast(suffix.rawValue.count))
+    if base.hasPrefix("diffusion_model.") {
+      base = String(base.dropFirst("diffusion_model.".count))
+    }
+    return (base, suffix)
   }
 
   private static func mapLoKrModuleKey(_ key: String) -> (moduleKey: String, suffix: LoKrSuffix)? {
