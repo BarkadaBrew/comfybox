@@ -226,6 +226,82 @@ public final class LTX2TextEncoder: Module {
     try loadProjectionWeights(from: modelPath)
   }
 
+  /// Load text-encoder weights from a JoyAI-Echo monolithic checkpoint.
+  ///
+  /// Gemma weights still live in their own directory (`gemmaPath`); the
+  /// connectors and aggregate-embed projections come from the already-loaded
+  /// monolith tensor dict instead of a separate `connector.safetensors`.
+  ///
+  /// Echo namespaces the connectors under `model.diffusion_model.` and the
+  /// aggregate embeds under a bare `text_embedding_projection.` prefix (no
+  /// `connector.` prefix). `normalizeMonolithProjectionKeys` rewrites those into
+  /// the bare layout the existing `hasConnectorPrefix: false` loaders expect, so
+  /// they are reused unchanged.
+  ///
+  /// - Parameters:
+  ///   - gemmaPath: Path to the Gemma 3 weights directory.
+  ///   - monolithTensors: The full Echo checkpoint tensor dict (subset filtered here).
+  public func loadWeightsFromMonolith(
+    gemmaPath: URL,
+    monolithTensors: [String: MLXArray]
+  ) throws {
+    let resolvedGemma: URL = {
+      let subDir = gemmaPath.appendingPathComponent("text_encoder")
+      return FileManager.default.fileExists(atPath: subDir.path) ? subDir : gemmaPath
+    }()
+    try loadGemmaWeights(from: resolvedGemma)
+
+    let projection = Self.normalizeMonolithProjectionKeys(monolithTensors)
+    guard !projection.isEmpty else {
+      throw LTX2VideoError.weightsMissing(
+        "no connector / text_embedding_projection keys found in the Echo monolith")
+    }
+
+    // Reuse the existing per-component loaders with the bare-prefix layout.
+    loadFeatureExtractorWeights(projection, hasConnectorPrefix: false)
+    loadConnectorWeights(
+      name: "video_embeddings_connector",
+      connector: videoConnector,
+      weights: projection,
+      hasConnectorPrefix: false
+    )
+    loadConnectorWeights(
+      name: "audio_embeddings_connector",
+      connector: audioConnector,
+      weights: projection,
+      hasConnectorPrefix: false
+    )
+  }
+
+  /// Rewrite JoyAI-Echo monolith connector / projection keys into the bare
+  /// layout the `hasConnectorPrefix: false` loaders consume.
+  ///
+  /// - `model.diffusion_model.{video,audio}_embeddings_connector.*`
+  ///     → `{video,audio}_embeddings_connector.*`
+  /// - `text_embedding_projection.{video,audio}_aggregate_embed.*`
+  ///     → `{video,audio}_aggregate_embed.*`
+  ///
+  /// All other keys (DiT body, VAEs, vocoder) are dropped.
+  public static func normalizeMonolithProjectionKeys(
+    _ tensors: [String: MLXArray]
+  ) -> [String: MLXArray] {
+    var out: [String: MLXArray] = [:]
+    let ditPrefix = "model.diffusion_model."
+    let projPrefix = "text_embedding_projection."
+    for (key, value) in tensors {
+      if key.hasPrefix(ditPrefix) {
+        let stripped = String(key.dropFirst(ditPrefix.count))
+        if stripped.hasPrefix("video_embeddings_connector.")
+            || stripped.hasPrefix("audio_embeddings_connector.") {
+          out[stripped] = value
+        }
+      } else if key.hasPrefix(projPrefix) {
+        out[String(key.dropFirst(projPrefix.count))] = value
+      }
+    }
+    return out
+  }
+
   /// Load Gemma 3 weights from safetensors files.
   private func loadGemmaWeights(from path: URL) throws {
     let fm = FileManager.default

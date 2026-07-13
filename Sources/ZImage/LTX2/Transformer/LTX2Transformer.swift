@@ -352,6 +352,25 @@ public final class LTX2Transformer: Module {
           continue
         }
 
+        // Skip the audio / cross-modal DiT branch — our Swift transformer is
+        // video-only (audio arrives in Phase 2). JoyAI-Echo's monolith carries
+        // the full dual-stream half under this `model.diffusion_model.` prefix;
+        // without this the audio keys would be silently dropped by
+        // `verify:[.shapeMismatch]`. Make the video-only load explicit so it's
+        // intentional, mirroring the skip already present on the `transformer.`
+        // branch above.
+        let ditKey = String(key.dropFirst("model.diffusion_model.".count))
+        let isAudioOnly = ditKey.hasPrefix("audio_")
+          || ditKey.hasPrefix("av_ca_")
+          || ditKey.contains(".audio_attn")
+          || ditKey.contains(".audio_ff")
+          || ditKey.contains(".audio_prompt_scale_shift_table")
+          || ditKey.contains(".audio_scale_shift_table")
+          || ditKey.contains(".audio_to_video_attn")
+          || ditKey.contains(".video_to_audio_attn")
+          || ditKey.contains(".scale_shift_table_a2v")
+        if isAudioOnly { continue }
+
         newKey = key.replacingOccurrences(of: "model.diffusion_model.", with: "")
         newKey = newKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
         newKey = newKey.replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj_in.")
