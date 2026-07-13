@@ -347,6 +347,8 @@ public final class WarmServer {
 
     try preparePipeline()
 
+    recoverPersistedQueue()
+
     guard let port = NWEndpoint.Port(rawValue: configuration.port) else {
       throw WarmServerError.invalidPort(configuration.port)
     }
@@ -556,7 +558,7 @@ public final class WarmServer {
     case ("POST", "/v1/generate"):
       do {
         let payload = try decodedGeneratePayload(from: request.body)
-        let result = try await coordinator.enqueueGenerate(payload, source: payload.source ?? "api")
+        let result = try await coordinator.enqueueGenerate(payload, source: payload.source ?? "api", rawBody: request.body)
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -570,7 +572,7 @@ public final class WarmServer {
     case ("POST", "/v1/generate/async"):
       do {
         let payload = try decodedGeneratePayload(from: request.body)
-        let status = imageJobTracker.submit(payload, source: payload.source ?? "api", coordinator: coordinator)
+        let status = imageJobTracker.submit(payload, source: payload.source ?? "api", coordinator: coordinator, rawBody: request.body)
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try encoder.encode(status)
@@ -602,7 +604,7 @@ public final class WarmServer {
       do {
         var payload = try decode(LoRASwapPayload.self, from: request.body)
         payload = stageNearlineLoras(in: payload)
-        let result = try await coordinator.enqueueSwap(payload)
+        let result = try await coordinator.enqueueSwap(payload, rawBody: request.body)
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -2523,6 +2525,42 @@ public final class WarmServer {
     return payload
   }
 
+  /// Replay any queue jobs left over from before a crash (see
+  /// QueuePersistence.swift) — the "active" slot (if any) first, since it
+  /// was originally at the front, then everything still pending, in order.
+  /// Each job is decoded through the exact same path its live route handler
+  /// uses, then re-enqueued with no caller to respond to (fire-and-forget —
+  /// the original HTTP connection is long gone by the time a crashed process
+  /// restarts). Runs as a detached background task so a large recovered
+  /// queue never delays the listener from coming up.
+  private func recoverPersistedQueue() {
+    guard let state = QueueStateStore.load() else { return }
+    let jobs = (state.active.map { [$0] } ?? []) + state.pending
+    guard !jobs.isEmpty else { return }
+    logger.info("Queue recovery: replaying \(jobs.count) job(s) left over from before a restart")
+
+    Task {
+      for job in jobs {
+        do {
+          switch job.kind {
+          case "generate":
+            let payload = try decodedGeneratePayload(from: job.rawBody)
+            _ = try await coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody)
+            logger.info("Queue recovery: completed generate job \(job.id)")
+          case "lora_swap":
+            let payload = stageNearlineLoras(in: try decode(LoRASwapPayload.self, from: job.rawBody))
+            _ = try await coordinator.enqueueSwap(payload, rawBody: job.rawBody)
+            logger.info("Queue recovery: completed lora_swap job \(job.id)")
+          default:
+            logger.warning("Queue recovery: unknown job kind '\(job.kind)' for \(job.id), skipping")
+          }
+        } catch {
+          logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
+        }
+      }
+    }
+  }
+
   private func response(for error: Error) -> HTTPResponse {
     switch error {
     case let error as WarmServerCoordinator.ServerError:
@@ -2857,7 +2895,7 @@ final class ImageJobTracker: @unchecked Sendable {
   /// Submit a job. Returns immediately with `queued` status; the render
   /// itself runs in a detached Task against the existing FIFO render queue,
   /// so submitting async doesn't skip the line ahead of synchronous callers.
-  fileprivate func submit(_ payload: GeneratePayload, source: String, coordinator: WarmServerCoordinator) -> ImageJobStatus {
+  fileprivate func submit(_ payload: GeneratePayload, source: String, coordinator: WarmServerCoordinator, rawBody: Data? = nil) -> ImageJobStatus {
     let jobId = UUID().uuidString
     let job = ImageJob(id: jobId, source: source)
     lock.lock(); jobs[jobId] = job; lock.unlock()
@@ -2866,7 +2904,7 @@ final class ImageJobTracker: @unchecked Sendable {
       guard let self else { return }
       self.markProcessing(jobId)
       do {
-        let result = try await coordinator.enqueueGenerate(payload, source: source)
+        let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
         self.markSucceeded(jobId, result: result)
       } catch {
         self.markFailed(jobId, error: error)
@@ -3113,6 +3151,12 @@ private actor WarmServerCoordinator {
     /// Which client/app submitted this job (desktop, comfyui/krita, bree, api…).
     var source: String = "api"
     let operation: QueuedOperation
+    /// The original raw JSON request body, kept only for kinds that can be
+    /// replayed after a crash (see QueuePersistence.swift). nil for kinds
+    /// that can't be recovered (modelSwitch/localVideo close over live
+    /// in-memory state; controlGenerate closes over resolved temp files;
+    /// shutdown never needs recovery).
+    var rawBody: Data? = nil
   }
 
   private var pending: [PendingJob] = []
@@ -3163,6 +3207,12 @@ private actor WarmServerCoordinator {
   /// When the current queue job started processing — the /health start time even
   /// before a render method sets `activeRenderStartedAt` past its first await.
   private var currentJobStartedAt: Date?
+  /// Raw request body + kind of the currently-active job, kept only long
+  /// enough to persist it as the "active" slot in QueueStateStore — cleared
+  /// alongside the other activeJob* fields once the job finishes (see
+  /// QueuePersistence.swift for why only these two kinds are recoverable).
+  private var activeJobRawBody: Data?
+  private var activeJobKindForPersistence: String?
 
   /// True after the image models were released to make room for LTX-2 video —
   /// the next image render must reload before it can run (#218).
@@ -3620,7 +3670,8 @@ private actor WarmServerCoordinator {
     _ payload: GeneratePayload,
     progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil,
     latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil,
-    source: String = "api"
+    source: String = "api",
+    rawBody: Data? = nil
   ) async throws -> GenerateResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -3630,12 +3681,12 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(source: source, operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler)))
+      pending.append(PendingJob(source: source, operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler), rawBody: rawBody))
       startProcessingIfNeeded()
     }
   }
 
-  func enqueueSwap(_ payload: LoRASwapPayload) async throws -> LoRASwapResponse {
+  func enqueueSwap(_ payload: LoRASwapPayload, rawBody: Data? = nil) async throws -> LoRASwapResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -3644,7 +3695,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .swap(payload, ContinuationBox(continuation))))
+      pending.append(PendingJob(operation: .swap(payload, ContinuationBox(continuation)), rawBody: rawBody))
       startProcessingIfNeeded()
     }
   }
@@ -3756,6 +3807,29 @@ private actor WarmServerCoordinator {
     liveHealth.publish(snap)
   }
 
+  /// Mirror the recoverable slice of the queue (see QueuePersistence.swift)
+  /// to disk so it survives a crash. Called at every mutation: enqueue,
+  /// dequeue-into-active, job completion, cancel, reorder, clear. Cheap
+  /// (small JSON, atomic write) relative to how rarely the queue actually
+  /// changes compared to render duration.
+  private func persistQueueState() {
+    let active: PersistedQueueJob? = {
+      guard let rawBody = activeJobRawBody,
+            let kind = activeJobKindForPersistence,
+            let id = activeJobId else { return nil }
+      return PersistedQueueJob(
+        id: id, kind: kind, source: activeJobSource ?? "api",
+        enqueuedAt: currentJobStartedAt ?? Date(), rawBody: rawBody)
+    }()
+    let pendingJobs: [PersistedQueueJob] = pending.compactMap { job in
+      guard let rawBody = job.rawBody else { return nil }
+      return PersistedQueueJob(
+        id: job.id, kind: Self.kind(of: job.operation), source: job.source,
+        enqueuedAt: job.enqueuedAt, rawBody: rawBody)
+    }
+    QueueStateStore.save(PersistedQueueState(active: active, pending: pendingJobs))
+  }
+
   /// Queue status for the ComfyUI bridge /queue endpoint.
   func queueStatus() -> ComfyBridgeQueueStatus {
     return ComfyBridgeQueueStatus(
@@ -3787,6 +3861,7 @@ private actor WarmServerCoordinator {
     }
     pending.removeAll()
     publishHealth()
+    persistQueueState()
     return count
   }
 
@@ -3797,6 +3872,7 @@ private actor WarmServerCoordinator {
     Self.cancel(pending[index].operation)
     pending.remove(at: index)
     publishHealth()
+    persistQueueState()
     return true
   }
 
@@ -3878,6 +3954,7 @@ private actor WarmServerCoordinator {
     }
     pending.insert(job, at: target)
     publishHealth()
+    persistQueueState()
     return true
   }
 
@@ -3885,6 +3962,7 @@ private actor WarmServerCoordinator {
     // Every enqueue routes through here, so this is the one spot that reflects a
     // just-changed pending count into the lock-based health snapshot (#217).
     publishHealth()
+    persistQueueState()
     guard !isProcessing else { return }
     isProcessing = true
     Task {
@@ -3910,10 +3988,22 @@ private actor WarmServerCoordinator {
       // Keep the same id the job had while pending, so clients can correlate.
       activeJobId = job.id
       currentJobStartedAt = Date()
+      // Move the job's recoverable data (if any) from "pending" to "active" in
+      // the persisted queue snapshot, so a crash mid-render still recovers it
+      // (replayed from scratch on restart — there's no way to resume a
+      // partial diffusion render, so "at least once" is the correctness goal).
+      activeJobRawBody = job.rawBody
+      activeJobKindForPersistence = Self.kind(of: job.operation)
       // Publish is_rendering + job id BEFORE the synchronous GPU section begins,
       // so /health reflects the render for its whole (actor-blocking) duration (#217).
       publishHealth()
-      defer { activeJobSummary = nil; activeJobSource = nil; activeJobId = nil; currentJobStartedAt = nil; publishHealth() }
+      persistQueueState()
+      defer {
+        activeJobSummary = nil; activeJobSource = nil; activeJobId = nil; currentJobStartedAt = nil
+        activeJobRawBody = nil; activeJobKindForPersistence = nil
+        publishHealth()
+        persistQueueState()
+      }
       switch job.operation {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
