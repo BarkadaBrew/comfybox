@@ -4089,7 +4089,7 @@ struct ZImageCLI {
   // MARK: - LTX2 VAE Decoder Test
   private static func runLTX2VAETest(args: [String]) throws {
     print("=== LTX2 VAE Decoder Test ===")
-    let modelDir = "/Users/toddwalderman/Models/ltx2-distilled"
+    let modelDir = "/Users/toddwalderman/.cache/huggingface/hub/models/dgrauet/ltx-2.3-mlx"
     var vaeLogger = Logger(label: "ltx2.vae.test")
     vaeLogger.logLevel = .info
 
@@ -4119,6 +4119,33 @@ struct ZImageCLI {
     MLX.eval(vae.parameters())
     print("VAE weights loaded")
 
+    // --- SWIFT ENCODER TEST: encode source.png via the generator's exact path ---
+    #if canImport(CoreGraphics) && canImport(ImageIO)
+    let srcPath = "/tmp/ltx2-test/source.png"
+    if let imgSource = CGImageSourceCreateWithURL(URL(fileURLWithPath: srcPath) as CFURL, nil),
+       let cgImage = CGImageSourceCreateImageAtIndex(imgSource, 0, nil) {
+      let pixels = try QwenImageIO.resizedPixelArray(
+        from: cgImage, width: 704, height: 448, addBatchDimension: true, dtype: .float32)
+      let normed = QwenImageIO.normalizeForEncoder(pixels)   // (1,3,H,W) in [-1,1]
+      print("Encoder input: \(normed.shape) min=\(MLX.min(normed).item(Float.self)) max=\(MLX.max(normed).item(Float.self))")
+      let encLat = vae.encode(normed)
+      MLX.eval(encLat)
+      let el = encLat.asType(.float32)
+      print(String(format: "SWIFT encoded latent: %@ mean=%.5f std=%.5f  (PY ref: mean=-0.01928 std=0.78448)",
+        "\(el.shape)", MLX.mean(el).item(Float.self), MLX.sqrt(MLX.variance(el)).item(Float.self)))
+      try? MLX.save(arrays: ["latent": el], url: URL(fileURLWithPath: "/tmp/swift_latent.safetensors"))
+      // round-trip: decode the swift-encoded latent
+      let rt = vae.decode(el)
+      MLX.eval(rt)
+      let rtf = MLX.clip((rt[0..., 0..., 0..<1, 0..., 0...].squeezed(axis: 2) + 1.0) / 2.0, min: 0, max: 1)
+      MLX.eval(rtf)
+      try? QwenImageIO.saveImage(array: rtf[0], to: URL(fileURLWithPath: "/tmp/ltx2-test/swift_roundtrip.png"))
+      print("Saved swift round-trip -> /tmp/ltx2-test/swift_roundtrip.png ; latent -> /tmp/swift_latent.safetensors")
+    } else {
+      print("(encoder test skipped: could not load \(srcPath))")
+    }
+    #endif
+
     let latTensors = try MLX.loadArrays(url: URL(fileURLWithPath: "/tmp/test_latent.safetensors"))
     guard let lat = latTensors["latent"] else { print("ERROR: No latent"); return }
     let latF32 = lat.asType(.float32)
@@ -4144,11 +4171,11 @@ struct ZImageCLI {
       print("  row \(row): \(vals.joined(separator: " "))")
     }
 
-    print("\nPython ref (first 4x4):")
-    print("  row 0: -0.269 -0.259 -0.259 -0.272")
-    print("  row 1: -0.275 -0.270 -0.258 -0.262")
-    print("  row 2: -0.282 -0.272 -0.273 -0.265")
-    print("  row 3: -0.291 -0.267 -0.280 -0.276")
+    print("\nPython ref R-channel (first 8x8) — smooth gradient, no grid:")
+    print("  -0.104 -0.103 -0.103 -0.101 -0.098 -0.097 -0.096 -0.091")
+    print("  -0.122 -0.120 -0.109 -0.105 -0.099 -0.094 -0.097 -0.095")
+    print("  -0.121 -0.118 -0.122 -0.117 -0.118 -0.110 -0.111 -0.106")
+    print("  -0.136 -0.130 -0.128 -0.124 -0.131 -0.122 -0.118 -0.124")
 
     print("\nGrid analysis:")
     for startRow in stride(from: 0, to: 12, by: 4) {
@@ -4161,6 +4188,15 @@ struct ZImageCLI {
       print(String(format: "  Block row %d: q0=%.4f q1=%.4f q2=%.4f q3=%.4f spread=%.4f",
         startRow, subs[0], subs[1], subs[2], subs[3], subs.max()! - subs.min()!))
     }
+
+    // Save decoded frame 0 to PNG for visual inspection.
+    #if canImport(CoreGraphics) && canImport(ImageIO)
+    let rescaled = MLX.clip((df[0..., 0..., 0..<1, 0..., 0...].squeezed(axis: 2) + 1.0) / 2.0, min: 0, max: 1)
+    MLX.eval(rescaled)
+    let chw = rescaled[0]  // (3, H, W)
+    try? QwenImageIO.saveImage(array: chw, to: URL(fileURLWithPath: "/tmp/ltx2-test/swift_decode.png"))
+    print("Saved decoded frame 0 -> /tmp/ltx2-test/swift_decode.png")
+    #endif
     print("=== Done ===")
   }
 
