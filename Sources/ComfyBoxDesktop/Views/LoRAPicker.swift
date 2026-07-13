@@ -16,13 +16,13 @@ struct LoRAPicker: View {
     /// the loaded image model. nil (default) preserves the original
     /// "filter against the active model" behavior.
     var familyOverride: String? = nil
-    /// When true (only meaningful alongside familyOverride), hides LoRAs
-    /// with unknown/untagged compatibility too, not just confirmed-
-    /// incompatible ones — for contexts like video where a wrong-family
-    /// LoRA is architecturally useless, not just "unverified." The default
-    /// (false) keeps the Generate tab's original behavior of showing
-    /// untagged LoRAs rather than silently hiding them.
-    var strictFamilyFilter: Bool = false
+    /// When true, hides LoRAs with unknown/untagged compatibility too, not
+    /// just confirmed-incompatible ones — a LoRA that isn't confirmed to
+    /// match the active model shouldn't show up as a candidate. Default
+    /// true; set false only if a future caller genuinely wants untagged
+    /// LoRAs to still appear (compatibleOnly can also be toggled off
+    /// entirely by the user to see everything, tagged or not).
+    var strictFamilyFilter: Bool = true
 
     @State private var searchText: String = ""
     @State private var errorMessage: String?
