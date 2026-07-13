@@ -228,13 +228,20 @@ struct CivitAIBrowserView: View {
         defer { isLoading = false }
         loadError = nil
         do {
+            // Always fetch with nsfw=true — CivitAI's API filters sample
+            // IMAGES (not just models) when nsfw=false, so plenty of
+            // otherwise-SFW-flagged models come back with zero images and a
+            // blank thumbnail card. Fetching unfiltered guarantees the
+            // fullest available image set; `includeNSFW` now controls
+            // whether NSFW-flagged models are kept in `results` below,
+            // client-side, instead of being sent to CivitAI at all.
             let page = try await client.searchModels(
                 query: query,
                 types: typeFilter.apiValue.map { [$0] } ?? [],
                 baseModel: baseModelFilter.apiValue,
                 sort: sort,
                 period: period,
-                nsfw: includeNSFW,
+                nsfw: true,
                 cursor: reset ? nil : nextCursor
             )
             var items = page.items
@@ -245,6 +252,9 @@ struct CivitAIBrowserView: View {
                 items = items.filter { model in
                     model.modelVersions.contains { $0.baseModel == baseModel }
                 }
+            }
+            if !includeNSFW {
+                items = items.filter { !$0.nsfw }
             }
             results = reset ? items : results + items
             nextCursor = page.nextCursor
