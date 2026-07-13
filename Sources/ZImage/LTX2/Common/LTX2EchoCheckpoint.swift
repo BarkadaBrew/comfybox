@@ -87,4 +87,48 @@ public enum LTX2EchoCheckpoint {
         }
         return out
     }
+
+    /// Extracts the audio-VAE subset (`audio_vae.*`) from a monolith tensor dict,
+    /// in the `audio_vae.encoder.*` / `audio_vae.decoder.*` /
+    /// `audio_vae.per_channel_statistics.*` layout `LTX2AudioVAE` expects.
+    ///
+    /// Mirrors `videoVAETensors`: the checkpoint stores per-channel statistics
+    /// only at the top level (`audio_vae.per_channel_statistics.mean-of-means` /
+    /// `std-of-means`); the decoder module needs its own copy for un-normalize, so
+    /// we mirror the top-level stats into the decoder path.
+    ///
+    /// The `audio_vae.` prefix is *longer* than `vae.` and does not start with it,
+    /// so the video-VAE selector never captures these keys and vice-versa —
+    /// confirmed by unit tests on both sides.
+    public static func audioVAETensors(from monolith: [String: MLXArray]) -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        for (key, value) in monolith where key.hasPrefix("audio_vae.") {
+            out[key] = value
+        }
+        if let mean = out["audio_vae.per_channel_statistics.mean-of-means"],
+           out["audio_vae.decoder.per_channel_statistics.mean"] == nil {
+            out["audio_vae.decoder.per_channel_statistics.mean"] = mean
+        }
+        if let std = out["audio_vae.per_channel_statistics.std-of-means"],
+           out["audio_vae.decoder.per_channel_statistics.std"] == nil {
+            out["audio_vae.decoder.per_channel_statistics.std"] = std
+        }
+        return out
+    }
+
+    /// Extracts the vocoder subset (`vocoder.*`) from a monolith tensor dict.
+    ///
+    /// Covers all three vocoder sub-generators the checkpoint carries:
+    /// `vocoder.vocoder.*` (main BigVGAN v2), `vocoder.bwe_generator.*`
+    /// (16k→48k bandwidth extension), and `vocoder.mel_stft.*` (mel filterbank +
+    /// STFT bases). No key rewriting here — the vocoder loader owns its own
+    /// key-map; this is a pure prefix cut that keeps audio_vae / video-VAE keys
+    /// out.
+    public static func vocoderTensors(from monolith: [String: MLXArray]) -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        for (key, value) in monolith where key.hasPrefix("vocoder.") {
+            out[key] = value
+        }
+        return out
+    }
 }
