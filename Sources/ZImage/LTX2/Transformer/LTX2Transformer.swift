@@ -75,6 +75,20 @@ public final class LTX2Transformer: Module {
   @ModuleInfo(key: "norm_out") var normOut: LayerNorm
   @ModuleInfo(key: "proj_out") var projOut: Linear
 
+  // ---- Top-level audio branch (JoyAI-Echo, Phase 2) — built when `hasAudio`. ----
+  public let hasAudio: Bool
+  let audioInnerDim: Int
+  @ModuleInfo(key: "audio_patchify_proj") var audioPatchifyProj: Linear?
+  @ModuleInfo(key: "audio_proj_out") var audioProjOut: Linear?
+  @ModuleInfo(key: "audio_adaln_single") var audioAdaLNSingle: LTX2AdaLayerNormSingle?
+  @ModuleInfo(key: "audio_prompt_adaln_single") var audioPromptAdaLNSingle: LTX2AdaLayerNormSingle?
+  @ParameterInfo(key: "audio_scale_shift_table") var audioScaleShiftTable: MLXArray?
+  // Cross-modal gate / scale-shift AdaLN modules (shared across blocks).
+  @ModuleInfo(key: "av_ca_a2v_gate_adaln_single") var avCaA2vGateAdaLN: LTX2AdaLayerNormSingle?
+  @ModuleInfo(key: "av_ca_v2a_gate_adaln_single") var avCaV2aGateAdaLN: LTX2AdaLayerNormSingle?
+  @ModuleInfo(key: "av_ca_video_scale_shift_adaln_single") var avCaVideoScaleShiftAdaLN: LTX2AdaLayerNormSingle?
+  @ModuleInfo(key: "av_ca_audio_scale_shift_adaln_single") var avCaAudioScaleShiftAdaLN: LTX2AdaLayerNormSingle?
+
   /// Initialize the LTX-2 transformer.
   ///
   /// - Parameters:
@@ -107,8 +121,13 @@ public final class LTX2Transformer: Module {
     positionalEmbeddingMaxPos: [Int] = [20, 2048, 2048],
     useMiddleIndicesGrid: Bool = true,
     ropeMode: LTX2RoPEMode = .split,
-    doublePrecisionRoPE: Bool = false
+    doublePrecisionRoPE: Bool = false,
+    hasAudio: Bool = false,
+    audioInnerDim: Int = 2048,
+    audioInChannels: Int = 128
   ) {
+    self.hasAudio = hasAudio
+    self.audioInnerDim = audioInnerDim
     self.innerDim = numHeads * headDim
     self.numHeads = numHeads
     self.headDim = headDim
@@ -159,7 +178,9 @@ public final class LTX2Transformer: Module {
         dimHead: headDim,
         normEps: normEps,
         ropeMode: ropeMode,
-        hasPromptAdaLN: hasPromptAdaLN
+        hasPromptAdaLN: hasPromptAdaLN,
+        hasAudio: hasAudio,
+        audioDim: audioInnerDim
       ))
     }
     self._transformerBlocks.wrappedValue = blocks
@@ -168,6 +189,25 @@ public final class LTX2Transformer: Module {
     self._scaleShiftTable.wrappedValue = MLXArray.zeros([2, innerDim])
     self._normOut.wrappedValue = LayerNorm(dimensions: innerDim, eps: normEps, affine: false)
     self._projOut.wrappedValue = Linear(innerDim, outChannels)
+
+    // Top-level audio branch.
+    if hasAudio {
+      self._audioPatchifyProj.wrappedValue = Linear(audioInChannels, audioInnerDim, bias: true)
+      self._audioProjOut.wrappedValue = Linear(audioInnerDim, audioInChannels, bias: true)
+      self._audioAdaLNSingle.wrappedValue =
+        LTX2AdaLayerNormSingle(embeddingDim: audioInnerDim, embeddingCoefficient: 9)
+      self._audioPromptAdaLNSingle.wrappedValue =
+        LTX2AdaLayerNormSingle(embeddingDim: audioInnerDim, embeddingCoefficient: 2)
+      self._audioScaleShiftTable.wrappedValue = MLXArray.zeros([2, audioInnerDim])
+      self._avCaA2vGateAdaLN.wrappedValue =
+        LTX2AdaLayerNormSingle(embeddingDim: innerDim, embeddingCoefficient: 1)
+      self._avCaV2aGateAdaLN.wrappedValue =
+        LTX2AdaLayerNormSingle(embeddingDim: audioInnerDim, embeddingCoefficient: 1)
+      self._avCaVideoScaleShiftAdaLN.wrappedValue =
+        LTX2AdaLayerNormSingle(embeddingDim: innerDim, embeddingCoefficient: 4)
+      self._avCaAudioScaleShiftAdaLN.wrappedValue =
+        LTX2AdaLayerNormSingle(embeddingDim: audioInnerDim, embeddingCoefficient: 4)
+    }
 
     super.init()
   }
@@ -312,6 +352,37 @@ public final class LTX2Transformer: Module {
   ///
   /// - Parameter weights: Raw weight dictionary.
   /// - Returns: Sanitized weight dictionary.
+  /// Audio-inclusive weight sanitization for the JoyAI-Echo dual-stream load.
+  ///
+  /// Same as `sanitizeWeights` for the video keys, but instead of DROPPING the
+  /// `model.diffusion_model.` audio branch it KEEPS and remaps it onto this
+  /// module's (hasAudio) parameter namespace: strips the prefix, applies the
+  /// shared name remaps (`.to_out.0.`→`.to_out.`, video `.ff.net.*`→`.ff.proj_*`)
+  /// plus the audio-FF remaps (`.audio_ff.net.0.proj.`→`.audio_ff.proj_in.`,
+  /// `.audio_ff.net.2.`→`.audio_ff.proj_out.`). Connectors and aggregate embeds
+  /// (text-encoder concerns) are still skipped.
+  ///
+  /// Use only with a transformer built `hasAudio: true`.
+  public static func sanitizeWeightsWithAudio(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+    var sanitized: [String: MLXArray] = [:]
+    for (key, value) in weights where key.hasPrefix("model.diffusion_model.") {
+      // Connectors + aggregate embeds live on the text-encoder side.
+      if key.contains("embeddings_connector") || key.contains("aggregate_embed") { continue }
+
+      var newKey = String(key.dropFirst("model.diffusion_model.".count))
+      newKey = newKey.replacingOccurrences(of: ".to_out.0.", with: ".to_out.")
+      // Audio FF first (more specific), then video FF.
+      newKey = newKey.replacingOccurrences(of: ".audio_ff.net.0.proj.", with: ".audio_ff.proj_in.")
+      newKey = newKey.replacingOccurrences(of: ".audio_ff.net.2.", with: ".audio_ff.proj_out.")
+      newKey = newKey.replacingOccurrences(of: ".ff.net.0.proj.", with: ".ff.proj_in.")
+      newKey = newKey.replacingOccurrences(of: ".ff.net.2.", with: ".ff.proj_out.")
+      newKey = newKey.replacingOccurrences(of: ".linear_1.", with: ".linear1.")
+      newKey = newKey.replacingOccurrences(of: ".linear_2.", with: ".linear2.")
+      sanitized[newKey] = value
+    }
+    return sanitized
+  }
+
   public static func sanitizeWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     // Detect which prefix format the checkpoint uses.
     // LTX-2.3 distilled/dev weights use "transformer." prefix.
