@@ -213,6 +213,9 @@ struct ZImageCLI {
       case "upscale":
         try runUpscale(args: Array(args.dropFirst()))
         return
+      case "mcp":
+        try runMCP(args: Array(args.dropFirst()))
+        return
       case "lora":
         try runLoRA(args: Array(args.dropFirst()))
         return
