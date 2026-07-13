@@ -159,6 +159,122 @@ public final class Krea2VAEUpBlock: Module {
   }
 }
 
+// MARK: - Encoder blocks
+
+/// Checkpoint stores the spatial downsample conv at `resample.1`; the loader
+/// remaps that numeric segment to `resample.conv`, mirroring the decoder's
+/// upsampler convention. Ported from mflux's `QwenImageResample3D`
+/// downsample2d/downsample3d mode (`qwen_image_resample_3d.py`): the two
+/// modes are architecturally identical in the reference forward pass — both
+/// only ever exercise the spatial `resample_conv`; a `time_conv` submodule is
+/// constructed for the "3d" variant but is dead code (never invoked), so it
+/// is not ported here, same as the decoder skips it.
+public final class Krea2VAEDownsampleSeq: Module {
+  @ModuleInfo(key: "conv") var conv: Conv2d
+  public init(_ channels: Int) {
+    self._conv.wrappedValue = Conv2d(
+      inputChannels: channels, outputChannels: channels, kernelSize: 3, stride: 2, padding: 0)
+  }
+}
+
+public final class Krea2VAEDownsampler: Module {
+  @ModuleInfo(key: "resample") var resample: Krea2VAEDownsampleSeq
+
+  public init(_ channels: Int) {
+    self._resample.wrappedValue = Krea2VAEDownsampleSeq(channels)
+  }
+
+  public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    // Asymmetric zero-pad (bottom/right by 1 on H, W) then a stride-2 3x3
+    // conv, halving spatial dims — matches QwenImageResample3D exactly.
+    let padded = MLX.padded(x, widths: [IntOrPair((0, 0)), IntOrPair((0, 1)), IntOrPair((0, 1)), IntOrPair((0, 0))])
+    return resample.conv(padded)
+  }
+}
+
+/// One flat entry in the encoder's `down_blocks` list — either a residual
+/// block or a spatial downsampler, mirroring the checkpoint's own flat
+/// indexing exactly (mflux's `QwenImageEncoder3D` groups these into 4
+/// logical stages for construction, but the raw weights are one flat list —
+/// modeling it flat here means the loader needs no index remapping).
+public final class Krea2VAEEncDownEntry: Module {
+  @ModuleInfo(key: "norm1") var norm1: Krea2VAENorm?
+  @ModuleInfo(key: "conv1") var conv1: Conv2d?
+  @ModuleInfo(key: "norm2") var norm2: Krea2VAENorm?
+  @ModuleInfo(key: "conv2") var conv2: Conv2d?
+  @ModuleInfo(key: "conv_shortcut") var convShortcut: Conv2d?
+  @ModuleInfo(key: "resample") var resample: Krea2VAEDownsampleSeq?
+
+  private let isDownsampler: Bool
+
+  public static func resBlock(_ inChannels: Int, _ outChannels: Int) -> Krea2VAEEncDownEntry {
+    Krea2VAEEncDownEntry(resBlockIn: inChannels, out: outChannels)
+  }
+  public static func downsampler(_ channels: Int) -> Krea2VAEEncDownEntry {
+    Krea2VAEEncDownEntry(downsampleChannels: channels)
+  }
+
+  private init(resBlockIn inChannels: Int, out outChannels: Int) {
+    self.isDownsampler = false
+    self._norm1.wrappedValue = Krea2VAENorm(inChannels)
+    self._conv1.wrappedValue = Conv2d(inputChannels: inChannels, outputChannels: outChannels, kernelSize: 3, padding: 1)
+    self._norm2.wrappedValue = Krea2VAENorm(outChannels)
+    self._conv2.wrappedValue = Conv2d(inputChannels: outChannels, outputChannels: outChannels, kernelSize: 3, padding: 1)
+    self._convShortcut.wrappedValue = inChannels != outChannels
+      ? Conv2d(inputChannels: inChannels, outputChannels: outChannels, kernelSize: 1)
+      : nil
+  }
+
+  private init(downsampleChannels channels: Int) {
+    self.isDownsampler = true
+    self._resample.wrappedValue = Krea2VAEDownsampleSeq(channels)
+  }
+
+  public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    if isDownsampler {
+      let padded = MLX.padded(x, widths: [IntOrPair((0, 0)), IntOrPair((0, 1)), IntOrPair((0, 1)), IntOrPair((0, 0))])
+      return resample!.conv(padded)
+    }
+    var h = conv1!(silu(norm1!(x)))
+    h = conv2!(silu(norm2!(h)))
+    let residual = convShortcut.map { $0(x) } ?? x
+    return h + residual
+  }
+}
+
+/// Qwen-Image VAE encoder, ported from mflux's `QwenImageEncoder3D`. 4 stages
+/// (dims 96→96→192→384→384, downsampling after the first 3), a shared
+/// `Krea2VAEMidBlock`, then `norm_out`/`conv_out` to 32 channels (mean +
+/// logvar, kept concatenated to match the checkpoint — see `Krea2VAE.encode`).
+public final class Krea2VAEEncoder: Module {
+  @ModuleInfo(key: "conv_in") var convIn: Conv2d
+  @ModuleInfo(key: "down_blocks") var downBlocks: [Krea2VAEEncDownEntry]
+  @ModuleInfo(key: "mid_block") var midBlock: Krea2VAEMidBlock
+  @ModuleInfo(key: "norm_out") var normOut: Krea2VAENorm
+  @ModuleInfo(key: "conv_out") var convOut: Conv2d
+
+  public override init() {
+    self._convIn.wrappedValue = Conv2d(inputChannels: 3, outputChannels: 96, kernelSize: 3, padding: 1)
+    self._downBlocks.wrappedValue = [
+      .resBlock(96, 96), .resBlock(96, 96), .downsampler(96),
+      .resBlock(96, 192), .resBlock(192, 192), .downsampler(192),
+      .resBlock(192, 384), .resBlock(384, 384), .downsampler(384),
+      .resBlock(384, 384), .resBlock(384, 384),
+    ]
+    self._midBlock.wrappedValue = Krea2VAEMidBlock(384)
+    self._normOut.wrappedValue = Krea2VAENorm(384)
+    self._convOut.wrappedValue = Conv2d(inputChannels: 384, outputChannels: 32, kernelSize: 3, padding: 1)
+  }
+
+  public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    var h = convIn(x)
+    for entry in downBlocks { h = entry(h) }
+    h = midBlock(h)
+    h = convOut(silu(normOut(h)))
+    return h
+  }
+}
+
 // MARK: - Decoder
 
 public final class Krea2VAEDecoder: Module {
@@ -190,7 +306,7 @@ public final class Krea2VAEDecoder: Module {
   }
 }
 
-// MARK: - VAE (decoder-only)
+// MARK: - VAE
 
 public final class Krea2VAE: Module {
   public static let spatialScale = 8
@@ -207,10 +323,14 @@ public final class Krea2VAE: Module {
 
   @ModuleInfo(key: "post_quant_conv") var postQuantConv: Conv2d
   @ModuleInfo(key: "decoder") var decoder: Krea2VAEDecoder
+  @ModuleInfo(key: "quant_conv") var quantConv: Conv2d
+  @ModuleInfo(key: "encoder") var encoder: Krea2VAEEncoder
 
   public override init() {
     self._postQuantConv.wrappedValue = Conv2d(inputChannels: 16, outputChannels: 16, kernelSize: 1)
     self._decoder.wrappedValue = Krea2VAEDecoder()
+    self._quantConv.wrappedValue = Conv2d(inputChannels: 32, outputChannels: 32, kernelSize: 1)
+    self._encoder.wrappedValue = Krea2VAEEncoder()
   }
 
   /// latents: (B, latH, latW, 16) NHWC, normalized (as sampled).
@@ -222,5 +342,22 @@ public final class Krea2VAE: Module {
     h = postQuantConv(h)
     h = decoder(h)
     return MLX.clip(h, min: -1, max: 1) * 0.5 + 0.5
+  }
+
+  /// pixels: (B, H, W, 3) NHWC, RGB in [-1,1] (see `QwenImageIO.normalizeForEncoder`).
+  /// Returns normalized latents (B, H/8, W/8, 16) NHWC, in the same
+  /// (mean-0-ish) space `decode` expects and the Euler loop's noise uses.
+  ///
+  /// The encoder's conv_out produces 32 channels (mean + logvar of the
+  /// diagonal Gaussian posterior); matching mflux's `QwenVAE.encode` and this
+  /// codebase's `AutoencoderKL`/`InpaintUtilities` convention, only the
+  /// deterministic mean half is kept — no posterior sampling.
+  public func encode(_ pixels: MLXArray) -> MLXArray {
+    var h = encoder(pixels)
+    h = quantConv(h)
+    let mean = h[0..., 0..., 0..., 0..<Krea2VAE.latentChannels]
+    let datasetMean = MLXArray(Krea2VAE.latentsMean).reshaped(1, 1, 1, 16).asType(mean.dtype)
+    let datasetStd = MLXArray(Krea2VAE.latentsStd).reshaped(1, 1, 1, 16).asType(mean.dtype)
+    return (mean - datasetMean) / datasetStd
   }
 }

@@ -6,10 +6,11 @@
 //  - Text encoder (`text_encoder/model.safetensors`): strip the `language_model.`
 //    prefix (keys then match Qwen3TextEncoder: embed_tokens/layers/norm) and skip
 //    the unused `visual.*` vision tower.
-//  - VAE (`vae/diffusion_pytorch_model.safetensors`): decoder-only. 3D causal conv
-//    kernels [O,I,kT,kH,kW] reduce to their LAST temporal slice for images (see
+//  - VAE (`vae/diffusion_pytorch_model.safetensors`): encoder + decoder. 3D causal
+//    conv kernels [O,I,kT,kH,kW] reduce to their LAST temporal slice for images (see
 //    Krea2VAE.swift) then transpose NCHW→NHWC ([O,kH,kW,I]); norm `gamma` tensors
-//    flatten to [C]; encoder/quant_conv/time_conv weights are skipped.
+//    flatten to [C]; `time_conv` weights are skipped (dead code in the reference
+//    forward pass — see Krea2VAEDownsampler's doc comment).
 
 import Foundation
 import MLX
@@ -81,9 +82,9 @@ public enum Krea2WeightLoader {
     try encoder.update(parameters: ModuleParameters.unflattened(weights), verify: [.shapeMismatch])
   }
 
-  // MARK: - VAE (decoder-only)
+  // MARK: - VAE
 
-  /// Load `vae/diffusion_pytorch_model.safetensors` (decoder path only).
+  /// Load `vae/diffusion_pytorch_model.safetensors` (encoder + decoder).
   public static func loadVAE(
     _ vae: Krea2VAE, from file: URL, dtype: DType = .float32
   ) throws {
@@ -94,8 +95,8 @@ public enum Krea2WeightLoader {
     var weights: [String: MLXArray] = [:]
     for meta in reader.allMetadata() {
       let key = meta.name
-      // Decoder-only: skip the encoder, its quant conv, and unused temporal convs.
-      if key.hasPrefix("encoder.") || key.hasPrefix("quant_conv") || key.contains(".time_conv.") {
+      // Unused temporal convs (see Krea2VAEDownsampler's doc comment).
+      if key.contains(".time_conv.") {
         continue
       }
       var tensor = try reader.tensor(named: key).asType(dtype)
