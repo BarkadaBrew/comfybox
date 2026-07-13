@@ -1773,6 +1773,7 @@ private struct GalleryLightbox: View {
     let onClose: () -> Void
 
     @State private var image: NSImage?
+    @State private var player: AVPlayer?
     @State private var zoom: CGFloat = 1
     @State private var baseZoom: CGFloat = 1
     @State private var offset: CGSize = .zero
@@ -1786,8 +1787,8 @@ private struct GalleryLightbox: View {
                 .onTapGesture { onClose() }
 
             Group {
-                if asset?.kind == "video", let path = asset?.absolutePath {
-                    VideoPlayer(player: AVPlayer(url: URL(fileURLWithPath: path)))
+                if asset?.kind == "video", let player {
+                    VideoPlayer(player: player)
                         .aspectRatio(contentMode: .fit)
                         .padding(24)
                 } else if let image {
@@ -1951,7 +1952,20 @@ private struct GalleryLightbox: View {
     }
 
     private func load() async {
-        guard let path = asset?.absolutePath else { image = nil; return }
-        image = await Task.detached { NSImage(contentsOfFile: path) }.value
+        // Tear down any previous player before constructing a new one —
+        // building AVPlayer/VideoPlayer inline in the view body (one per
+        // re-render) is a known source of a Swift generic-metadata crash
+        // inside _AVKit_SwiftUI; owning exactly one player per asset here
+        // avoids the churn that triggers it.
+        player?.pause()
+        player = nil
+        image = nil
+        guard let asset else { return }
+        if asset.kind == "video" {
+            player = AVPlayer(url: URL(fileURLWithPath: asset.absolutePath))
+        } else {
+            let path = asset.absolutePath
+            image = await Task.detached { NSImage(contentsOfFile: path) }.value
+        }
     }
 }
