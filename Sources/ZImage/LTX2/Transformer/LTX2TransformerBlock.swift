@@ -53,6 +53,30 @@ public final class LTX2TransformerBlock: Module {
   // LTX-2.3: prompt-conditioned scale-shift for cross-attention context
   @ParameterInfo(key: "prompt_scale_shift_table") var promptScaleShiftTable: MLXArray?
 
+  // ---- Audio branch (JoyAI-Echo, Phase 2) — built only when `hasAudio`. ----
+  // All optional so the video-only path (and its weight layout) is untouched.
+  public let hasAudio: Bool
+  let audioDim: Int
+  private let audioRmsNormOnes: MLXArray
+
+  /// Audio self-attention (`audio_attn1`, dim 2048, 32×64).
+  @ModuleInfo(key: "audio_attn1") var audioAttn1: LTX2Attention?
+  /// Audio cross-attention with the audio text embeddings (`audio_attn2`).
+  @ModuleInfo(key: "audio_attn2") var audioAttn2: LTX2Attention?
+  /// Audio feed-forward (`audio_ff`).
+  @ModuleInfo(key: "audio_ff") var audioFF: LTX2FeedForward?
+  /// Audio AdaLN table (`audio_scale_shift_table`, [9, 2048]).
+  @ParameterInfo(key: "audio_scale_shift_table") var audioScaleShiftTable: MLXArray?
+  /// Audio prompt AdaLN table (`audio_prompt_scale_shift_table`, [2, 2048]).
+  @ParameterInfo(key: "audio_prompt_scale_shift_table") var audioPromptScaleShiftTable: MLXArray?
+  /// A2V cross-modal attention: Q=video(4096), KV=audio(2048), out→video(4096).
+  @ModuleInfo(key: "audio_to_video_attn") var audioToVideoAttn: LTX2Attention?
+  /// V2A cross-modal attention: Q=audio(2048), KV=video(4096), out→audio(2048).
+  @ModuleInfo(key: "video_to_audio_attn") var videoToAudioAttn: LTX2Attention?
+  /// Per-block cross-modal AdaLN tables ([5, 4096] / [5, 2048]).
+  @ParameterInfo(key: "scale_shift_table_a2v_ca_video") var scaleShiftTableA2VCaVideo: MLXArray?
+  @ParameterInfo(key: "scale_shift_table_a2v_ca_audio") var scaleShiftTableA2VCaAudio: MLXArray?
+
   /// Initialize a transformer block.
   ///
   /// - Parameters:
@@ -70,12 +94,19 @@ public final class LTX2TransformerBlock: Module {
     dimHead: Int = 128,
     normEps: Float = 1e-6,
     ropeMode: LTX2RoPEMode = .split,
-    hasPromptAdaLN: Bool = false
+    hasPromptAdaLN: Bool = false,
+    hasAudio: Bool = false,
+    audioDim: Int = 2048,
+    audioHeads: Int = 32,
+    audioDimHead: Int = 64
   ) {
     self.normEps = normEps
     self.hasPromptAdaLN = hasPromptAdaLN
     self.numAdaParams = hasPromptAdaLN ? 9 : 6
     self.rmsNormOnes = MLXArray.ones([dim]).asType(.bfloat16)
+    self.hasAudio = hasAudio
+    self.audioDim = audioDim
+    self.audioRmsNormOnes = MLXArray.ones([audioDim]).asType(.bfloat16)
 
     // Self-attention (no context_dim = self-attention)
     self._attn1.wrappedValue = LTX2Attention(
@@ -108,6 +139,123 @@ public final class LTX2TransformerBlock: Module {
     if hasPromptAdaLN {
       self._promptScaleShiftTable.wrappedValue = MLXArray.zeros([2, dim])
     }
+
+    if hasAudio {
+      // Audio self / cross / FF (dim 2048, 32×64, gated like the 2.3 video attns).
+      self._audioAttn1.wrappedValue = LTX2Attention(
+        queryDim: audioDim, contextDim: nil, heads: audioHeads, dimHead: audioDimHead,
+        normEps: normEps, ropeMode: ropeMode, hasGateLogits: true)
+      self._audioAttn2.wrappedValue = LTX2Attention(
+        queryDim: audioDim, contextDim: audioDim, heads: audioHeads, dimHead: audioDimHead,
+        normEps: normEps, ropeMode: ropeMode, hasGateLogits: true)
+      self._audioFF.wrappedValue = LTX2FeedForward(dim: audioDim, dimOut: audioDim)
+      self._audioScaleShiftTable.wrappedValue = MLXArray.zeros([9, audioDim])
+      self._audioPromptScaleShiftTable.wrappedValue = MLXArray.zeros([2, audioDim])
+      // Cross-modal: A2V updates video (Q=video), V2A updates audio (Q=audio).
+      self._audioToVideoAttn.wrappedValue = LTX2Attention(
+        queryDim: dim, contextDim: audioDim, heads: audioHeads, dimHead: audioDimHead,
+        normEps: normEps, ropeMode: ropeMode, hasGateLogits: true)
+      self._videoToAudioAttn.wrappedValue = LTX2Attention(
+        queryDim: audioDim, contextDim: dim, heads: audioHeads, dimHead: audioDimHead,
+        normEps: normEps, ropeMode: ropeMode, hasGateLogits: true)
+      self._scaleShiftTableA2VCaVideo.wrappedValue = MLXArray.zeros([5, dim])
+      self._scaleShiftTableA2VCaAudio.wrappedValue = MLXArray.zeros([5, audioDim])
+    }
+  }
+
+  /// Weight-free RMSNorm over the audio hidden width.
+  private func audioRMSNorm(_ x: MLXArray) -> MLXArray {
+    MLXFast.rmsNorm(x, weight: audioRmsNormOnes, eps: normEps)
+  }
+
+  /// Dual-stream forward: run the video sub-steps (self-attn, text cross-attn,
+  /// FF) alongside the audio sub-steps and the bidirectional a2v/v2a cross-modal
+  /// attention, returning updated `(video, audio)`.
+  ///
+  /// PARITY DEFERRED: the module *structure* (and thus weight loading) is exact,
+  /// but the precise interleaving / AdaLN composition of the reference dual-stream
+  /// block is not numerically validated here (no reference on-box). The video-only
+  /// `callAsFunction` above is unchanged and remains the verified path.
+  ///
+  /// - Parameters:
+  ///   - video: Video hidden states `(B, T_v, dim)`.
+  ///   - audio: Audio hidden states `(B, T_a, audioDim)`.
+  ///   - context: Video text embeddings.
+  ///   - audioContext: Audio text embeddings `(B, S_a, audioDim)`.
+  ///   - timestep: Video timestep embedding `(B, 1, 9*dim)`.
+  ///   - audioTimestep: Audio timestep embedding `(B, 1, 9*audioDim)`.
+  ///   - pe: Video RoPE.
+  ///   - audioPE: Audio RoPE.
+  public func callDualStream(
+    video: MLXArray,
+    audio: MLXArray,
+    context: MLXArray,
+    audioContext: MLXArray,
+    contextMask: MLXArray? = nil,
+    audioContextMask: MLXArray? = nil,
+    timestep: MLXArray,
+    audioTimestep: MLXArray,
+    pe: (cos: MLXArray, sin: MLXArray)? = nil,
+    audioPE: (cos: MLXArray, sin: MLXArray)? = nil,
+    promptTimestep: MLXArray? = nil,
+    audioPromptTimestep: MLXArray? = nil
+  ) -> (video: MLXArray, audio: MLXArray) {
+    precondition(hasAudio, "callDualStream requires hasAudio")
+    let b = video.dim(0)
+
+    // ---- Video stream: self-attn, text cross-attn (reuse video sub-logic) ----
+    var v = video
+    let vMSA = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 0..<3)
+    var vNorm = weightFreeRMSNorm(v) * (1 + vMSA[1]) + vMSA[0]
+    v = v + attn1(vNorm, pe: pe) * vMSA[2]
+
+    let vCross = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 6..<9)
+    var vCtx = context
+    if let pTS = promptTimestep, let pTable = promptScaleShiftTable {
+      let pp = getAdaValues(table: pTable, batchSize: b, timestep: pTS, range: 0..<2)
+      vCtx = context * (1 + pp[1]) + pp[0]
+    }
+    v = v + attn2(weightFreeRMSNorm(v) * (1 + vCross[1]) + vCross[0],
+                  context: vCtx, mask: contextMask) * vCross[2]
+
+    // ---- Audio stream: self-attn, text cross-attn ----
+    var a = audio
+    let aMSA = getAdaValues(table: audioScaleShiftTable!, batchSize: b, timestep: audioTimestep, range: 0..<3)
+    a = a + audioAttn1!(audioRMSNorm(a) * (1 + aMSA[1]) + aMSA[0], pe: audioPE) * aMSA[2]
+
+    let aCross = getAdaValues(table: audioScaleShiftTable!, batchSize: b, timestep: audioTimestep, range: 6..<9)
+    var aCtx = audioContext
+    if let pTS = audioPromptTimestep, let pTable = audioPromptScaleShiftTable {
+      let pp = getAdaValues(table: pTable, batchSize: b, timestep: pTS, range: 0..<2)
+      aCtx = audioContext * (1 + pp[1]) + pp[0]
+    }
+    a = a + audioAttn2!(audioRMSNorm(a) * (1 + aCross[1]) + aCross[0],
+                        context: aCtx, mask: audioContextMask) * aCross[2]
+
+    // ---- Cross-modal: A2V (update video from audio) + V2A (update audio) ----
+    // NOTE (parity deferred): the reference conditions this gating on the
+    // top-level av_ca_*_adaln_single timestep modules; here we use the per-block
+    // scale_shift_table_a2v_ca_* rows directly (shift/scale/gate = rows 0/1/2 of
+    // the [5, dim] table). Shape-correct and runs; timestep-conditioned av_ca is
+    // wired in the generateAV pipeline step (not yet landed).
+    let vShift = scaleShiftTableA2VCaVideo![0].reshaped(1, 1, -1)
+    let vScale = scaleShiftTableA2VCaVideo![1].reshaped(1, 1, -1)
+    let vGate = scaleShiftTableA2VCaVideo![2].reshaped(1, 1, -1)
+    v = v + audioToVideoAttn!(weightFreeRMSNorm(v) * (1 + vScale) + vShift,
+                              context: audioRMSNorm(a)) * vGate
+    let aShift = scaleShiftTableA2VCaAudio![0].reshaped(1, 1, -1)
+    let aScale = scaleShiftTableA2VCaAudio![1].reshaped(1, 1, -1)
+    let aGate = scaleShiftTableA2VCaAudio![2].reshaped(1, 1, -1)
+    a = a + videoToAudioAttn!(audioRMSNorm(a) * (1 + aScale) + aShift,
+                              context: weightFreeRMSNorm(v)) * aGate
+
+    // ---- Feed-forward on both streams ----
+    let vMLP = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 3..<6)
+    v = v + ff(weightFreeRMSNorm(v) * (1 + vMLP[1]) + vMLP[0]) * vMLP[2]
+    let aMLP = getAdaValues(table: audioScaleShiftTable!, batchSize: b, timestep: audioTimestep, range: 3..<6)
+    a = a + audioFF!(audioRMSNorm(a) * (1 + aMLP[1]) + aMLP[0]) * aMLP[2]
+
+    return (v, a)
   }
 
   /// Extract adaptive normalization values from the scale-shift table.
