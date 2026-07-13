@@ -383,7 +383,7 @@ public enum MCPToolRegistry {
         ] as [String: Any],
         "duration": [
           "type": "number",
-          "description": "Video duration in seconds. I2V: fixed ~5s (ignored). T2V: 6, 8, 10, 12, 14, 16, 18, or 20 (default: 6).",
+          "description": "Video duration in seconds (default: one ~4s chunk). Longer values render as spliced ~4s chunks, each re-anchored on the previous chunk\u{27}s last frame plus a soft identity anchor to the source \u{2014} budget ~2.5 min per chunk (e.g. 12 \u{2192} 3 chunks).",
         ] as [String: Any],
         "resolution": [
           "type": "string",

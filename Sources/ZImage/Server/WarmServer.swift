@@ -1430,6 +1430,9 @@ public final class WarmServer {
     /// chunk re-anchored on the previous chunk\u{27}s last frame) when it
     /// exceeds one chunk. `extend_to_seconds` still wins when both are set.
     let duration: Float?
+    /// Identity re-anchor strength for continuation chunks (0 disables).
+    /// Default 0.5 for extended renders \u{2014} counters per-chunk subject drift.
+    let identityAnchorStrength: Float?
     let fps: Int?
     let loraPath: String?
     let loraStrength: Float?
@@ -1693,6 +1696,7 @@ public final class WarmServer {
       steps: req.steps ?? videoPreset?.steps ?? 8,
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
+      identityAnchorStrength: req.identityAnchorStrength ?? 0.5,
       extendToSeconds: req.extendToSeconds
         ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,
