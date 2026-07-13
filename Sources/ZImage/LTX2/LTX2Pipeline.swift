@@ -527,6 +527,166 @@ public final class LTX2Pipeline {
     )
   }
 
+  // MARK: - Multi-Keyframe ("tween") Generation
+
+  /// One keyframe image anchoring the generated video at a specific point in
+  /// its timeline — the primitive behind multi-keyframe "tween" generation.
+  public struct Keyframe {
+    /// Normalized pixel image, same format `generateI2V`'s `image:` expects.
+    public let image: MLXArray
+    /// Target position in VIDEO frames (0 = first frame) — converted
+    /// internally to a latent-frame index via the VAE's temporal compression.
+    public let videoFrameIndex: Int
+    /// Denoising strength at this keyframe (1.0 = fully replace with the image).
+    public let strength: Float
+
+    public init(image: MLXArray, videoFrameIndex: Int, strength: Float = 1.0) {
+      self.image = image
+      self.videoFrameIndex = videoFrameIndex
+      self.strength = strength
+    }
+  }
+
+  /// Generate a video conditioned on MULTIPLE keyframe images placed at
+  /// different points in the timeline, letting the transformer's own
+  /// temporal self-attention interpolate ("tween") between them during
+  /// denoising. There is no separate interpolation step — each keyframe is
+  /// spliced into the dense latent grid exactly like `generateI2V`'s single
+  /// frame-0 image, just at its own frame index. `LTX2Conditioning.
+  /// applyConditioning` already accepted a list of conditions; until this
+  /// method, it was only ever called with one (frame 0). Positions here come
+  /// from `createPositionGrid` over the WHOLE dense grid uniformly (not a
+  /// separately-offset token sequence, unlike the Lightricks Python
+  /// reference's frame>0 path) — mid-sequence keyframes are architecturally
+  /// consistent with frame-0 conditioning in this port, but see
+  /// docs/ltx2-multi-keyframe-fdd.md for the empirical verification (a real
+  /// two-keyframe render, both keyframes landed correctly with no
+  /// corruption) and the caveats around transition smoothness.
+  public func generateMultiKeyframe(
+    inputIds: MLXArray,
+    attentionMask: MLXArray,
+    keyframes: [Keyframe],
+    width: Int,
+    height: Int,
+    numFrames: Int,
+    steps: Int,
+    seed: UInt64? = nil,
+    guidance: Float? = nil,
+    negativeInputIds: MLXArray? = nil,
+    negativeAttentionMask: MLXArray? = nil,
+    progressCallback: ((Int, Int) -> Void)? = nil
+  ) -> LTX2PipelineOutput {
+    precondition(!keyframes.isEmpty, "generateMultiKeyframe requires at least one keyframe")
+    precondition((numFrames - 1) % 8 == 0, "numFrames must be 1 + 8k (got \(numFrames))")
+
+    let startTime = CFAbsoluteTimeGetCurrent()
+    let cfgScale = guidance ?? config.guidance
+
+    logger.info("Multi-keyframe generation: \(width)x\(height), \(numFrames) frames, \(keyframes.count) keyframe(s)")
+
+    // Step 1: Encode prompt
+    logger.info("Encoding prompt...")
+    let textOutput = textEncoder.encode(
+      inputIds: inputIds, attentionMask: attentionMask, returnAudioEmbeddings: false
+    )
+    eval(textOutput.videoEmbeddings)
+
+    var negativeEmbeddings: MLXArray? = nil
+    if cfgScale > 1.0, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+      let negOutput = textEncoder.encode(
+        inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
+      )
+      negativeEmbeddings = negOutput.videoEmbeddings
+      eval(negativeEmbeddings!)
+    }
+
+    // Step 2: Compute latent dimensions (needed to convert video-frame ->
+    // latent-frame indices before encoding each keyframe).
+    let latH = height / spatialCompression
+    let latW = width / spatialCompression
+    let latF = (numFrames - 1) / temporalCompression + 1
+
+    // Step 3: Encode each keyframe image via VAE.
+    logger.info("Encoding \(keyframes.count) keyframe image(s) via VAE...")
+    let conditions: [LTX2VideoCondition] = keyframes.map { kf in
+      var imageInput = kf.image
+      if imageInput.ndim == 4 {
+        imageInput = imageInput.expandedDimensions(axis: 2)
+      }
+      let latent = vae.encode(imageInput)
+      eval(latent)
+      let latentFrameIndex = min(kf.videoFrameIndex / temporalCompression, latF - 1)
+      return LTX2VideoCondition(latent: latent, frameIndex: latentFrameIndex, strength: kf.strength)
+    }
+
+    // Step 4: Create initial noisy state, apply ALL keyframe conditions.
+    if let seed = seed {
+      MLXRandom.seed(seed)
+    }
+    let sigmas = getSigmaSchedule(steps: steps, latF: latF, latH: latH, latW: latW)
+    var state = LTX2Conditioning.createInitialState(
+      shape: [1, 128, latF, latH, latW],
+      noiseScale: sigmas[0]
+    )
+    state = LTX2Conditioning.applyConditioning(state: state, conditions: conditions)
+    eval(state.latent, state.cleanLatent, state.denoiseMask)
+
+    // Step 5: Build position grid
+    let positions = createPositionGrid(
+      batchSize: 1, latF: latF, latH: latH, latW: latW
+    )
+    let precomputedPE = ltx2PrecomputeFreqsCIS(
+      indicesGrid: positions,
+      dim: innerDim,
+      theta: transformer.positionalEmbeddingTheta,
+      maxPos: transformer.positionalEmbeddingMaxPos,
+      useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
+      numAttentionHeads: transformer.numHeads,
+      ropeMode: transformer.ropeMode,
+      doublePrecision: transformer.doublePrecisionRoPE
+    )
+    eval(precomputedPE.cos, precomputedPE.sin)
+
+    // Step 6: Denoise
+    logger.info("Denoising with \(keyframes.count)-keyframe conditioning...")
+    let latents = denoisingLoop(
+      latents: state.latent,
+      positions: positions,
+      precomputedPE: precomputedPE,
+      textEmbeddings: textOutput.videoEmbeddings,
+      negativeEmbeddings: negativeEmbeddings,
+      sigmas: sigmas,
+      cfgScale: cfgScale,
+      state: state,
+      progressCallback: progressCallback
+    )
+
+    // Step 7: Decode
+    logger.info("Decoding latents via VAE...")
+    let decoded: MLXArray
+    if config.tiledDecode {
+      decoded = vae.decodeTiled(latents.asType(.bfloat16))
+    } else {
+      decoded = vae.decode(latents.asType(.bfloat16))
+    }
+    eval(decoded)
+
+    let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
+    let clamped = MLX.clip(rescaled, min: 0, max: 1)
+    eval(clamped)
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+    logger.info("Multi-keyframe generation complete in \(String(format: "%.1f", elapsed))s")
+
+    return LTX2PipelineOutput(
+      decoded: clamped,
+      numFrames: numFrames,
+      width: width,
+      height: height,
+      elapsedSeconds: elapsed
+    )
+  }
+
   // MARK: - Internal: Denoising Loop
 
   /// Core denoising loop shared by T2V and I2V.

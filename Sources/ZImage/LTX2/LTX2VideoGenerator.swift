@@ -156,6 +156,13 @@ public final class LTX2VideoGenerator {
     private var pipeline: LTX2Pipeline?
     private var tokenizer: LTX2GemmaTokenizer?
     public private(set) var isLoaded = false
+
+    /// Exposes the loaded pipeline + tokenizer for call sites that need a
+    /// generation shape `generate(request:)` doesn't cover yet (e.g. the
+    /// multi-keyframe path — see LTX2Pipeline.generateMultiKeyframe). nil
+    /// until `load()` succeeds.
+    public var loadedPipeline: LTX2Pipeline? { pipeline }
+    public var loadedTokenizer: LTX2GemmaTokenizer? { tokenizer }
     /// "path@strength" of the LoRA merged into the loaded transformer (nil = base).
     private var loadedLoraKey: String?
 
