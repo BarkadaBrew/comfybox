@@ -210,10 +210,36 @@ public final class LTX2VideoGenerator {
         guard Self.areValidDimensions(width: request.width, height: request.height) else {
             throw LTX2VideoError.invalidDimensions(request.width, request.height)
         }
-        let transformerPath = (config.weightsDir as NSString).appendingPathComponent(config.transformerFile)
-        guard FileManager.default.fileExists(atPath: transformerPath) else {
-            throw LTX2VideoError.weightsMissing(transformerPath)
+        let weightsURL = resolveWeightsFileURL()
+        guard FileManager.default.fileExists(atPath: weightsURL.path) else {
+            throw LTX2VideoError.weightsMissing(weightsURL.path)
         }
+    }
+
+    /// Resolve the checkpoint file to load. Prefers the configured per-component
+    /// transformer file; if that's absent, falls back to a JoyAI-Echo monolith
+    /// (`*.safetensors` in `weightsDir` that isn't one of the per-component
+    /// VAE/connector files). Returns the configured path (possibly nonexistent)
+    /// as a last resort so callers surface a clear `weightsMissing` error.
+    private func resolveWeightsFileURL() -> URL {
+        let configured = URL(fileURLWithPath:
+            (config.weightsDir as NSString).appendingPathComponent(config.transformerFile))
+        if FileManager.default.fileExists(atPath: configured.path) { return configured }
+
+        let fm = FileManager.default
+        if let entries = try? fm.contentsOfDirectory(
+            at: URL(fileURLWithPath: config.weightsDir),
+            includingPropertiesForKeys: nil
+        ) {
+            let perComponent: Set<String> = [
+                "vae_encoder.safetensors", "vae_decoder.safetensors", "connector.safetensors",
+            ]
+            let candidates = entries
+                .filter { $0.pathExtension == "safetensors" && !perComponent.contains($0.lastPathComponent) }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            if let monolith = candidates.first { return monolith }
+        }
+        return configured
     }
 
     // MARK: - Model loading (lazy, cached)
@@ -238,9 +264,18 @@ public final class LTX2VideoGenerator {
             useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true
         )
 
-        logger.info("LTX-2: loading transformer weights (\(config.transformerFile))…")
-        let transformerPath = URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent(config.transformerFile))
-        let rawWeights = try MLX.loadArrays(url: transformerPath)
+        let weightsURL = resolveWeightsFileURL()
+        logger.info("LTX-2: loading transformer weights (\(weightsURL.lastPathComponent))…")
+        let rawWeights = try MLX.loadArrays(url: weightsURL)
+        // JoyAI-Echo ships one monolithic file (DiT + VAE + audio + vocoder). When
+        // detected, the VAE and connector/projection weights come from this same
+        // already-loaded dict via prefix-filtered subsets rather than separate
+        // files — the audio/vocoder tensors stay lazy (never eval'd) on the
+        // video-only path, so they don't hit RAM.
+        let isMonolith = LTX2EchoCheckpoint.isMonolithLayout(rawWeights.keys)
+        if isMonolith {
+            logger.info("LTX-2: JoyAI-Echo monolithic checkpoint detected — prefix-filtered video-only load.")
+        }
         var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
 
         // Merge each LoRA into the base weights in order (skip audio branches),
@@ -265,28 +300,51 @@ public final class LTX2VideoGenerator {
             }
             logger.info("LTX-2: merged \(merged) LoRA pairs from \(lora.path).")
         }
+        // Anti-noise guard: update(verify:[.shapeMismatch]) silently DROPS any key
+        // that doesn't match a module parameter — a mis-remapped checkpoint loads
+        // 0 weights and renders pure noise while reporting success. Log how many of
+        // the module's parameters the remap actually covers; a near-zero match on a
+        // non-empty checkpoint means the key remap is wrong (e.g. leftover
+        // `model.diffusion_model.` prefix), not that the load "succeeded".
+        let moduleKeys = Set(transformer.parameters().flattened().map { $0.0 })
+        let matched = sanitized.keys.filter { moduleKeys.contains($0) }.count
+        let unmatchedSanitized = sanitized.count - matched
+        logger.info("LTX-2: transformer remap matched \(matched)/\(moduleKeys.count) module params (\(sanitized.count) sanitized keys, \(unmatchedSanitized) unmatched/dropped).")
+        if matched * 2 < moduleKeys.count {
+            logger.error("LTX-2: transformer weight remap covered only \(matched)/\(moduleKeys.count) params — checkpoint key format likely unrecognized; output would be noise.")
+            throw LTX2VideoError.weightsMissing(
+                "transformer key remap matched only \(matched)/\(moduleKeys.count) module params from \(weightsURL.lastPathComponent) — unrecognized checkpoint key format")
+        }
         let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
         try transformer.update(parameters: params, verify: [.shapeMismatch])
         MLX.eval(transformer.parameters())
 
         logger.info("LTX-2: loading VAE…")
         let vae = LTX2VAE(config: .v23)
-        var combinedVAEWeights: [String: MLXArray] = [:]
-        let rawDecoderWeights = try MLX.loadArrays(url: URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent("vae_decoder.safetensors")))
-        for (key, value) in rawDecoderWeights where key.hasPrefix("vae_decoder.") {
-            combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+        if isMonolith {
+            // Echo carries the video VAE under the `vae.` prefix in the monolith,
+            // exactly the layout loadVAEWeightsFromTensors expects (top-level
+            // per-channel stats are mirrored into the decoder path by the adapter).
+            let vaeTensors = LTX2EchoCheckpoint.videoVAETensors(from: rawWeights)
+            try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: vaeTensors, logger: logger)
+        } else {
+            var combinedVAEWeights: [String: MLXArray] = [:]
+            let rawDecoderWeights = try MLX.loadArrays(url: URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent("vae_decoder.safetensors")))
+            for (key, value) in rawDecoderWeights where key.hasPrefix("vae_decoder.") {
+                combinedVAEWeights["vae.decoder." + String(key.dropFirst("vae_decoder.".count))] = value
+            }
+            let rawEncoderWeights = try MLX.loadArrays(url: URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent("vae_encoder.safetensors")))
+            for (key, value) in rawEncoderWeights where key.hasPrefix("vae_encoder.") {
+                combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
+            }
+            if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
+                combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
+            }
+            if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
+                combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
+            }
+            try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: logger)
         }
-        let rawEncoderWeights = try MLX.loadArrays(url: URL(fileURLWithPath: (modelDir as NSString).appendingPathComponent("vae_encoder.safetensors")))
-        for (key, value) in rawEncoderWeights where key.hasPrefix("vae_encoder.") {
-            combinedVAEWeights["vae.encoder." + String(key.dropFirst("vae_encoder.".count))] = value
-        }
-        if let m = combinedVAEWeights["vae.decoder.per_channel_statistics.mean"] {
-            combinedVAEWeights["vae.per_channel_statistics.mean-of-means"] = m
-        }
-        if let s = combinedVAEWeights["vae.decoder.per_channel_statistics.std"] {
-            combinedVAEWeights["vae.per_channel_statistics.std-of-means"] = s
-        }
-        try LTX2WeightLoader.loadVAEWeightsFromTensors(into: vae, tensors: combinedVAEWeights, logger: logger)
         MLX.eval(vae.parameters())
 
         logger.info("LTX-2: loading text encoder (Gemma 3 12B)…")
@@ -300,10 +358,20 @@ public final class LTX2VideoGenerator {
             quantization: nil
         )
         let textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
-        try textEncoder.loadWeights(
-            modelPath: URL(fileURLWithPath: modelDir),
-            textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
-        )
+        if isMonolith {
+            // Connectors (model.diffusion_model.*_embeddings_connector) and the
+            // aggregate embeds (text_embedding_projection.*) live in the monolith;
+            // Gemma still loads from its own directory.
+            try textEncoder.loadWeightsFromMonolith(
+                gemmaPath: URL(fileURLWithPath: config.gemmaPath),
+                monolithTensors: rawWeights
+            )
+        } else {
+            try textEncoder.loadWeights(
+                modelPath: URL(fileURLWithPath: modelDir),
+                textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
+            )
+        }
         MLX.eval(textEncoder.parameters())
 
         // Reference ComfyUI-LTXVideo workflows always decode through
