@@ -581,10 +581,18 @@ public final class LTX2Pipeline {
 
       let sigmaArray = MLXArray([sigma]).asType(dtype)
 
-      // Positive pass through transformer
+      // Positive pass through transformer.
+      // Pass PER-TOKEN timesteps so the model sees conditioned frames (mask=0)
+      // at timestep 0 (clean) and generated frames at `sigma`. Without this the
+      // transformer treats every token as equally noisy and cannot tell which
+      // frame is the I2V conditioning frame — it discounts the image and
+      // produces T2V-like output. Matches reference guided_denoise_loop which
+      // passes `video_timesteps = denoise_mask * sigma` when the mask is
+      // non-uniform. For T2V, `timesteps` is a scalar (1,1) → broadcast, so this
+      // is a no-op there.
       let velocityPos = transformer(
         latent: latentsFlat,
-        timestep: MLXArray(sigma).asType(dtype),
+        timestep: timesteps,
         context: textEmbeddings.asType(dtype),
         positions: positions,
         sigma: sigmaArray,
@@ -602,7 +610,7 @@ public final class LTX2Pipeline {
       if useCFG, let negEmb = negativeEmbeddings {
         let velocityNeg = transformer(
           latent: latentsFlat,
-          timestep: MLXArray(sigma).asType(dtype),
+          timestep: timesteps,
           context: negEmb.asType(dtype),
           positions: positions,
           sigma: sigmaArray,
