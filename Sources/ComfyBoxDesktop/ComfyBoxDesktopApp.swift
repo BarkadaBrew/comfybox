@@ -46,7 +46,6 @@ struct ComfyBoxDesktopApp: App {
 
     enum AppTab: String, CaseIterable {
         case dashboard = "Dashboard"
-        case health = "Health"
         case generate = "Generate"
         case gallery = "Gallery"
         case compare = "Compare"
@@ -63,7 +62,6 @@ struct ComfyBoxDesktopApp: App {
         case civitai = "CivitAI"
         case models = "Models"
         case characters = "Characters"
-        case server = "Server"
         case applications = "Applications"
         case queue = "Queue"
         case remoteGallery = "Remote Gallery"
@@ -81,7 +79,7 @@ struct ComfyBoxDesktopApp: App {
             switch self {
             case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery: return .library
-            case .dashboard, .health, .server, .applications, .queue: return .operate
+            case .dashboard, .applications, .queue: return .operate
             case .bree: return .suite
             }
         }
@@ -93,7 +91,6 @@ struct ComfyBoxDesktopApp: App {
         var icon: String {
             switch self {
             case .dashboard: return "gauge.with.dots.needle.bottom.50percent"
-            case .health: return "waveform.path.ecg"
             case .generate: return "wand.and.stars"
             case .gallery: return "photo.on.rectangle"
             case .compare: return "square.grid.2x2"
@@ -110,7 +107,6 @@ struct ComfyBoxDesktopApp: App {
             case .civitai: return "globe"
             case .models: return "square.stack.3d.up.fill"
             case .characters: return "person.2.crop.square.stack"
-            case .server: return "server.rack"
             case .applications: return "square.grid.3x3.square"
             case .queue: return "list.bullet.rectangle"
             case .remoteGallery: return "photo.stack"
@@ -125,8 +121,6 @@ struct ComfyBoxDesktopApp: App {
             case .compare: return "4"
             case .presets: return "5"
             case .characters: return "6"
-            case .server: return "7"
-            case .health: return "8"
             case .prompts: return "9"
             case .civitai: return "0"
             case .canvas: return "y"
@@ -360,13 +354,7 @@ struct ComfyBoxDesktopApp: App {
     private var detailView: some View {
         switch selectedTab {
         case .dashboard:
-            DashboardView(engine: engine, store: store, ingestor: ingestor)
-
-        case .health:
-            HealthBoardView(engine: engine, monitor: healthMonitor, store: store)
-
-        case .server:
-            ServerView(engine: engine, store: store)
+            DashboardView(engine: engine, monitor: healthMonitor, store: store, ingestor: ingestor)
 
         case .applications:
             ApplicationsView(engine: engine)
