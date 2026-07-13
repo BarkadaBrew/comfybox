@@ -1696,7 +1696,11 @@ public final class WarmServer {
       steps: req.steps ?? videoPreset?.steps ?? 8,
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
-      identityAnchorStrength: req.identityAnchorStrength ?? 0.5,
+      // OPT-IN until stable: the first at-scale run of the multi-keyframe
+      // continuation path hard-crashed MLX (mutex lock failed, 2026-07-13,
+      // 11 crash-loop restarts via the durable queue) — see #219. Callers
+      // can still request identity_anchor_strength explicitly for testing.
+      identityAnchorStrength: req.identityAnchorStrength ?? 0,
       extendToSeconds: req.extendToSeconds
         ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,
