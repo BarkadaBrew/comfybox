@@ -160,6 +160,11 @@ struct GenerationView: View {
     @State private var backend: CloudProvider = .local
     @State private var cloudModel: String = ""
     @State private var isCloudGenerating: Bool = false
+    /// True while a preset/Studio Pack/agent-action-triggered model switch is
+    /// in flight — gates Generate/Queue so a render can't fire against a
+    /// still-switching model (the render, and its gallery metadata, would
+    /// silently record the wrong model/LoRAs otherwise).
+    @State private var isApplyingPreset: Bool = false
     @State private var shotTemplates = ShotTemplateStore()
     @State private var lastAppliedActionSummary: String?
     /// Unresolvable pack/model/LoRA references from the assistant's last
@@ -286,7 +291,7 @@ struct GenerationView: View {
                     DisclosureGroup(isExpanded: $showAssistant) {
                         GenerateAssistantPanel(
                             agent: agent,
-                            onApply: { action in applyAgentAction(action) }
+                            onApply: { action in Task { await applyAgentAction(action) } }
                         )
                         .padding(.top, 4)
                     } label: {
@@ -545,7 +550,7 @@ struct GenerationView: View {
                 .onChange(of: contentMode) { _, mode in
                     if let presetId = contentModeDefaultPresets[mode],
                        let preset = serverPresets.first(where: { $0.id == presetId }) {
-                        applyPreset(preset.toGenerationPreset())
+                        Task { await applyPreset(preset.toGenerationPreset()) }
                         activePresetName = preset.name
                     }
                 }
@@ -857,7 +862,12 @@ struct GenerationView: View {
             // Generate button
             Button(action: { submitGeneration() }) {
                 HStack {
-                    if engine.isGenerating || isCloudGenerating {
+                    if isApplyingPreset {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.trailing, 4)
+                        Text("Switching model…")
+                    } else if engine.isGenerating || isCloudGenerating {
                         ProgressView()
                             .controlSize(.small)
                             .padding(.trailing, 4)
@@ -920,7 +930,7 @@ struct GenerationView: View {
     private var canGenerate: Bool {
         let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if backend == .local {
-            return engine.connectionState.isConnected && !engine.isGenerating && hasPrompt
+            return engine.connectionState.isConnected && !engine.isGenerating && !isApplyingPreset && hasPrompt
         }
         // Cloud backends don't need the local server, just a key.
         return !isCloudGenerating && hasPrompt && !cloudBackendKey.isEmpty
@@ -929,7 +939,7 @@ struct GenerationView: View {
     /// Unlike canGenerate, does NOT require the server to be idle — the
     /// whole point of Add to Queue is stacking variants while one runs.
     private var canQueue: Bool {
-        backend == .local && engine.connectionState.isConnected
+        backend == .local && engine.connectionState.isConnected && !isApplyingPreset
             && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -1281,7 +1291,7 @@ struct GenerationView: View {
     private func consumePendingPreset() {
         guard let preset = pendingPreset else { return }
         pendingPreset = nil
-        applyPreset(preset)
+        Task { await applyPreset(preset) }
     }
 
     /// Consume a prompt queued by the Prompt Library, if any. Replaces the
@@ -1301,7 +1311,7 @@ struct GenerationView: View {
 
     /// Apply an assistant action to the generation controls. Only fields the
     /// action set are changed; a `generate` flag kicks off a render.
-    private func applyAgentAction(_ action: AgentAction) {
+    private func applyAgentAction(_ action: AgentAction) async {
         let warnings = action.validationWarnings(
             availablePackIds: Set(studioPacks.map { $0.id }),
             availableModelIds: Set([engine.currentModel].compactMap { $0 }),
@@ -1310,12 +1320,13 @@ struct GenerationView: View {
         agentActionWarning = warnings.isEmpty ? nil : warnings.joined(separator: " ")
 
         // Apply a named Studio Pack (and template, if also named) first —
-        // explicit fields below still override anything it sets.
+        // explicit fields below still override anything it sets. Awaited so
+        // a queued `generate` below never races the pack's model switch.
         if let packId = action.studioPackId, let pack = studioPacks.first(where: { $0.id == packId }) {
             if let templateId = action.templateId, let template = pack.templates.first(where: { $0.id == templateId }) {
-                applyStudioPackTemplate(pack, template: template)
+                await applyStudioPackTemplate(pack, template: template)
             } else {
-                applyStudioPack(pack)
+                await applyStudioPack(pack)
             }
         }
 
@@ -1349,7 +1360,7 @@ struct GenerationView: View {
                 } else {
                     ForEach(serverPresets) { preset in
                         Button {
-                            applyServerPreset(preset)
+                            Task { await applyServerPreset(preset) }
                         } label: {
                             if activePresetName == preset.name {
                                 Label(preset.name, systemImage: "checkmark")
@@ -1394,8 +1405,8 @@ struct GenerationView: View {
     /// keeping the current prompt and seed — so you can rerender the same
     /// thing with a different model+LoRA combo (e.g. a Krea2 preset in
     /// place of a Z-Image one) without retyping anything.
-    private func applyServerPreset(_ preset: ServerPreset) {
-        applyPreset(preset.toGenerationPreset(), preserveContent: true)
+    private func applyServerPreset(_ preset: ServerPreset) async {
+        await applyPreset(preset.toGenerationPreset(), preserveContent: true)
         activePresetName = preset.name
     }
 
@@ -1457,7 +1468,7 @@ struct GenerationView: View {
             HStack {
                 Text(pack.name).font(.caption).fontWeight(.semibold)
                 Spacer()
-                Button("Apply") { applyStudioPack(pack) }
+                Button("Apply") { Task { await applyStudioPack(pack) } }
                     .controlSize(.small)
                     .help("Apply using the current prompt field as the subject")
             }
@@ -1500,7 +1511,7 @@ struct GenerationView: View {
                             .font(.caption2)
                         }
                     }
-                    Button("Apply Template") { applyStudioPackTemplate(pack, template: template) }
+                    Button("Apply Template") { Task { await applyStudioPackTemplate(pack, template: template) } }
                         .controlSize(.small)
                 }
             }
@@ -1520,23 +1531,23 @@ struct GenerationView: View {
     /// Resolve a Studio Pack against the local LoRA library and apply it to
     /// the current generation controls, using the current prompt text as the
     /// subject. Does not touch saved presets.
-    private func applyStudioPack(_ pack: StudioPack) {
+    private func applyStudioPack(_ pack: StudioPack) async {
         let availableIds = Set(engine.availableLoras.map { $0.id })
         let recipe = StudioPackResolver.resolve(pack: pack, subject: prompt, availableLoraIds: availableIds)
-        applyResolvedRecipe(recipe, packName: pack.name)
+        await applyResolvedRecipe(recipe, packName: pack.name)
     }
 
     /// Resolve a Studio Pack template with its filled slot values and apply
     /// the result. Does not touch saved presets.
-    private func applyStudioPackTemplate(_ pack: StudioPack, template: StudioPackTemplate) {
+    private func applyStudioPackTemplate(_ pack: StudioPack, template: StudioPackTemplate) async {
         let availableIds = Set(engine.availableLoras.map { $0.id })
         let recipe = StudioPackResolver.resolve(
             pack: pack, template: template, slotValues: templateSlotValues, availableLoraIds: availableIds
         )
-        applyResolvedRecipe(recipe, packName: "\(pack.name) — \(template.name)")
+        await applyResolvedRecipe(recipe, packName: "\(pack.name) — \(template.name)")
     }
 
-    private func applyResolvedRecipe(_ recipe: StudioPackRecipe, packName: String) {
+    private func applyResolvedRecipe(_ recipe: StudioPackRecipe, packName: String) async {
         prompt = recipe.prompt
         if let neg = recipe.negativePrompt { negativePrompt = neg }
         if let s = recipe.steps { steps = Double(s) }
@@ -1555,15 +1566,15 @@ struct GenerationView: View {
             return LoRASelection(id: info.id, filename: info.filename, scale: ref.scale)
         }
         if let modelId = recipe.model, modelId != engine.currentModel {
-            Task {
+            isApplyingPreset = true
+            defer { isApplyingPreset = false }
+            do {
+                try await engine.activateModel(id: modelId)
+            } catch {
                 do {
-                    try await engine.activateModel(id: modelId)
+                    try await engine.loadModel(id: modelId)
                 } catch {
-                    do {
-                        try await engine.loadModel(id: modelId)
-                    } catch {
-                        engine.lastError = "Failed to activate pack model \(modelId): \(error.localizedDescription)"
-                    }
+                    engine.lastError = "Failed to activate pack model \(modelId): \(error.localizedDescription)"
                 }
             }
         }
@@ -1586,7 +1597,7 @@ struct GenerationView: View {
     /// combo) rather than loading a preset fresh (Send-to-Generate, the
     /// Presets tab's Apply, both of which should load the preset's own
     /// prompt/seed).
-    func applyPreset(_ preset: GenerationPreset, preserveContent: Bool = false) {
+    func applyPreset(_ preset: GenerationPreset, preserveContent: Bool = false) async {
         if !preserveContent {
             prompt = preset.promptTemplate
             // Restore a saved seed (nil/0 = random).
@@ -1635,16 +1646,22 @@ struct GenerationView: View {
             case .alreadyActive:
                 break
             case .resolved(let resolvedId):
-                Task {
+                // Awaited (not fire-and-forget) so callers — and the
+                // isApplyingPreset-gated Generate button — can rely on the
+                // switch having actually completed once this function
+                // returns, instead of racing a render against a still-active
+                // old model (the render, and its gallery metadata, would
+                // silently use the wrong model/LoRAs).
+                isApplyingPreset = true
+                defer { isApplyingPreset = false }
+                do {
+                    try await engine.activateModel(id: resolvedId)
+                } catch {
+                    // Not in the pool yet — try loading (and activating) it.
                     do {
-                        try await engine.activateModel(id: resolvedId)
+                        try await engine.loadModel(id: resolvedId)
                     } catch {
-                        // Not in the pool yet — try loading (and activating) it.
-                        do {
-                            try await engine.loadModel(id: resolvedId)
-                        } catch {
-                            engine.lastError = "Failed to activate preset model \(resolvedId): \(error.localizedDescription)"
-                        }
+                        engine.lastError = "Failed to activate preset model \(resolvedId): \(error.localizedDescription)"
                     }
                 }
             case .unresolved:

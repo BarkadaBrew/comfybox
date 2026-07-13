@@ -529,6 +529,12 @@ public final class EngineService {
         }
 
         await refreshPool()
+        // currentModel/currentModelFamily otherwise only update on the next
+        // 3-second health poll — refreshing immediately closes the window
+        // where a caller (preset apply, model selector) reads a stale active
+        // model right after switching (a mismatched result could otherwise
+        // reach the gallery tagged with the wrong model/LoRAs).
+        await pollHealth()
     }
 
     /// Activate an already-loaded model in the pool.
@@ -547,6 +553,7 @@ public final class EngineService {
         }
 
         await refreshPool()
+        await pollHealth()
     }
 
     /// Unload a model from the pool.
