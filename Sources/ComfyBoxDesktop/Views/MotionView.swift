@@ -8,6 +8,7 @@
 import SwiftUI
 import AVKit
 import AppKit
+import UniformTypeIdentifiers
 
 struct MotionView: View {
     @Bindable var engine: EngineService
@@ -17,6 +18,7 @@ struct MotionView: View {
     @State private var prompt: String = ""
     @State private var referencePath: String?
     @State private var referenceThumb: NSImage?
+    @State private var isReferenceDropTargeted: Bool = false
     @State private var resolution: VideoResolution = .landscape
     @State private var frames: Int = 97
     @State private var steps: Double = 8
@@ -163,7 +165,17 @@ struct MotionView: View {
                     chooseReference()
                 } label: { Label("Choose Image…", systemImage: "photo.badge.plus") }
                     .controlSize(.small)
+                Text("Or drag a PNG in.")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
+        }
+        .padding(6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(isReferenceDropTargeted ? Color.accentColor : Color.clear, style: StrokeStyle(lineWidth: 2, dash: [5]))
+        )
+        .onDrop(of: [.fileURL, .image], isTargeted: $isReferenceDropTargeted) { providers in
+            handleImageDrop(providers, apply: setReference)
         }
     }
 

@@ -8,6 +8,7 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import ZImage
 
 /// Common resolution presets.
@@ -87,6 +88,7 @@ struct GenerationView: View {
     @State private var referenceImagePath: String?
     @State private var referenceThumbnail: NSImage?
     @State private var imageStrength: Double = 0.6
+    @State private var isReferenceDropTargeted: Bool = false
     @State private var showReference: Bool = false
 
     /// Output dimensions: the picked preset, or the custom fields.
@@ -625,11 +627,19 @@ struct GenerationView: View {
                         Label("Choose Reference Image…", systemImage: "photo.badge.plus")
                     }
                     .controlSize(.small)
-                    Text("Add an image to guide generation (image-to-image).")
+                    Text("Add an image to guide generation (image-to-image), or drag a PNG in.")
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
             }
             .padding(.top, 4)
+            .padding(6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(isReferenceDropTargeted ? Color.accentColor : Color.clear, style: StrokeStyle(lineWidth: 2, dash: [5]))
+            )
+            .onDrop(of: [.fileURL, .image], isTargeted: $isReferenceDropTargeted) { providers in
+                handleImageDrop(providers, apply: setReference)
+            }
         } label: {
             HStack(spacing: 6) {
                 Label("Reference (img2img)", systemImage: "photo.on.rectangle").font(.headline)
