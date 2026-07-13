@@ -206,6 +206,61 @@ final class LTX2EchoCheckpointTests: XCTestCase {
         XCTAssertNotNil(vae["vae.decoder.per_channel_statistics.std"])
     }
 
+    // MARK: - Audio VAE subset (Phase 2)
+
+    func testAudioVAETensorsSelectsOnlyAudioVaePrefix() {
+        var keys = echoMonolithKeys()
+        keys["audio_vae.decoder.conv_out.conv.weight"] = t()
+        keys["audio_vae.per_channel_statistics.std-of-means"] = t(2.0)
+        let avae = LTX2EchoCheckpoint.audioVAETensors(from: keys)
+        XCTAssertNotNil(avae["audio_vae.encoder.conv_in.conv.weight"])
+        XCTAssertNotNil(avae["audio_vae.decoder.conv_out.conv.weight"])
+        XCTAssertNotNil(avae["audio_vae.per_channel_statistics.mean-of-means"])
+        // The video VAE (`vae.`) and vocoder must never leak into the audio VAE.
+        for k in avae.keys {
+            XCTAssertTrue(k.hasPrefix("audio_vae."), "non-audio_vae key leaked: \(k)")
+            XCTAssertFalse(k.hasPrefix("vocoder."), "vocoder leaked into audio VAE: \(k)")
+        }
+    }
+
+    func testAudioVAETensorsInjectsDecoderStats() {
+        var keys = echoMonolithKeys()
+        keys["audio_vae.per_channel_statistics.std-of-means"] = t(2.0)
+        let avae = LTX2EchoCheckpoint.audioVAETensors(from: keys)
+        XCTAssertNotNil(avae["audio_vae.decoder.per_channel_statistics.mean"])
+        XCTAssertNotNil(avae["audio_vae.decoder.per_channel_statistics.std"])
+    }
+
+    func testVideoAndAudioVaeSelectorsAreDisjoint() {
+        let keys = echoMonolithKeys()
+        let vae = LTX2EchoCheckpoint.videoVAETensors(from: keys)
+        let avae = LTX2EchoCheckpoint.audioVAETensors(from: keys)
+        // No source (non-injected) key should appear in both selectors.
+        for k in vae.keys where k.hasPrefix("vae.") {
+            XCTAssertNil(avae[k], "video-VAE key also captured by audio-VAE selector: \(k)")
+        }
+        for k in avae.keys where k.hasPrefix("audio_vae.") {
+            XCTAssertFalse(vae.keys.contains(k), "audio-VAE key also captured by video-VAE selector: \(k)")
+        }
+    }
+
+    // MARK: - Vocoder subset (Phase 2)
+
+    func testVocoderTensorsSelectsAllVocoderSubgenerators() {
+        var keys = echoMonolithKeys()
+        keys["vocoder.vocoder.resblocks.0.acts1.0.act.alpha"] = t()
+        keys["vocoder.bwe_generator.conv_pre.weight"] = t()
+        let voc = LTX2EchoCheckpoint.vocoderTensors(from: keys)
+        XCTAssertNotNil(voc["vocoder.vocoder.conv_pre.weight"])
+        XCTAssertNotNil(voc["vocoder.vocoder.resblocks.0.acts1.0.act.alpha"])
+        XCTAssertNotNil(voc["vocoder.bwe_generator.conv_pre.weight"])
+        XCTAssertNotNil(voc["vocoder.mel_stft.mel_basis"])
+        // audio_vae / video VAE must not leak into the vocoder subset.
+        for k in voc.keys {
+            XCTAssertTrue(k.hasPrefix("vocoder."), "non-vocoder key leaked: \(k)")
+        }
+    }
+
     // MARK: - Connector / projection normalization for the text encoder
 
     func testNormalizeMonolithProjectionKeysStripsPrefixes() {
