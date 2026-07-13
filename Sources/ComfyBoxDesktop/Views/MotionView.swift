@@ -112,7 +112,7 @@ struct MotionView: View {
                 }
 
                 labeled("LoRAs") {
-                    LoRAPicker(engine: engine, selectedLoras: $selectedLoras, familyOverride: "ltx")
+                    LoRAPicker(engine: engine, selectedLoras: $selectedLoras, familyOverride: "ltx", strictFamilyFilter: true)
                         .frame(minHeight: 180, maxHeight: 260)
                 }
 

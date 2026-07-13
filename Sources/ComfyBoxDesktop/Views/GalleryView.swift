@@ -785,7 +785,7 @@ struct GalleryView: View {
                             Button("Send to Generate") { onSendToGenerate?(asset) }
                         }
                         if onAnimate != nil {
-                            Button("Animate (LTX-2 video)") { onAnimate?(asset) }
+                            Button("Send to Motion (I2V)") { onAnimate?(asset) }
                         }
                         if onInpaint != nil {
                             Button("Edit / Inpaint") { onInpaint?(asset) }

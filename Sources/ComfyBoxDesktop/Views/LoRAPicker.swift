@@ -16,6 +16,13 @@ struct LoRAPicker: View {
     /// the loaded image model. nil (default) preserves the original
     /// "filter against the active model" behavior.
     var familyOverride: String? = nil
+    /// When true (only meaningful alongside familyOverride), hides LoRAs
+    /// with unknown/untagged compatibility too, not just confirmed-
+    /// incompatible ones — for contexts like video where a wrong-family
+    /// LoRA is architecturally useless, not just "unverified." The default
+    /// (false) keeps the Generate tab's original behavior of showing
+    /// untagged LoRAs rather than silently hiding them.
+    var strictFamilyFilter: Bool = false
 
     @State private var searchText: String = ""
     @State private var errorMessage: String?
@@ -37,14 +44,25 @@ struct LoRAPicker: View {
         return false
     }
 
+    private func passesCompatibilityFilter(_ lora: LoRAInfo) -> Bool {
+        if strictFamilyFilter {
+            if case .compatible = compatStatus(lora) { return true }
+            return false
+        }
+        return !isIncompatible(lora)
+    }
+
     private var filteredLoras: [LoRAInfo] {
         var base = engine.availableLoras.filter { !$0.quarantined }
 
-        // Hide LoRAs designed for a different model family (keep unknowns +
-        // selected ones so nothing already chosen silently vanishes).
+        // Hide LoRAs designed for a different model family. Non-strict mode
+        // (Generate tab) keeps unknowns + selected ones so nothing already
+        // chosen silently vanishes; strict mode (e.g. Motion) requires a
+        // confirmed match, since an untagged or wrong-family LoRA is
+        // architecturally useless there, not just "unverified."
         if compatibleOnly {
             base = base.filter { lora in
-                !isIncompatible(lora) || selectedLoras.contains { $0.id == lora.id }
+                passesCompatibilityFilter(lora) || selectedLoras.contains { $0.id == lora.id }
             }
         }
 
