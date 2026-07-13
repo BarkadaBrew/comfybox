@@ -1543,16 +1543,22 @@ public final class WarmServer {
   // Queue ----------------------------------------------------------------------
 
   /// GET /v1/queue: the active operation + every pending job (cancellable by id).
+  /// GET /v1/queue — served from the lock-based ``LiveHealthState`` snapshot
+  /// instead of `await coordinator.queueSnapshot()` so the Queue tab stays
+  /// responsive during a render, matching the /health fix (#217). Hopping
+  /// onto the actor here queued this request behind the whole render and
+  /// also read `isRendering` off a stale field, so the tab showed an empty,
+  /// not-rendering queue while a job was actually active.
   private func queueListResponse() async -> RoutedResponse {
-    let snapshot = await coordinator.queueSnapshot()
+    let (snap, progress) = liveHealth.read()
     let iso = ISO8601DateFormatter()
     var payload: [String: Any] = [
-      "is_rendering": snapshot.isRendering,
-      "is_paused": snapshot.isPaused,
-      "max_pending": snapshot.maxPending,
-      "render_count": snapshot.renderCount,
-      "failed_count": snapshot.failedCount,
-      "pending": snapshot.pending.map { job in
+      "is_rendering": snap.isRendering,
+      "is_paused": snap.isPaused,
+      "max_pending": snap.maxPending,
+      "render_count": snap.renderCount,
+      "failed_count": snap.failedRenderCount,
+      "pending": snap.pending.map { job in
         [
           "id": job.id,
           "kind": job.kind,
@@ -1562,11 +1568,11 @@ public final class WarmServer {
         ] as [String: Any]
       },
     ]
-    if let id = snapshot.activeJobId { payload["active_job_id"] = id }
-    if let summary = snapshot.activeSummary { payload["active_summary"] = summary }
-    if let source = snapshot.activeSource { payload["active_source"] = source }
-    if let started = snapshot.activeStartedAt { payload["active_started_at"] = iso.string(from: started) }
-    if let pct = snapshot.progressPercent { payload["progress_percent"] = pct }
+    if let id = snap.activeJobId { payload["active_job_id"] = id }
+    if let summary = snap.activeSummary { payload["active_summary"] = summary }
+    if let source = snap.activeSource { payload["active_source"] = source }
+    if let started = snap.activeRenderStartedAt { payload["active_started_at"] = iso.string(from: started) }
+    if let pct = progress { payload["progress_percent"] = pct }
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
     }
@@ -2628,6 +2634,15 @@ private struct HealthSnapshot: Sendable {
   var activeJobId: String?
   var lastRenderDurationMs: Int?
   var lastError: String?
+  /// Queue-specific fields (#217 follow-up: GET /v1/queue also used to hop
+  /// onto the actor via `coordinator.queueSnapshot()`, so the Queue tab went
+  /// stale during a render exactly like /health used to before this snapshot
+  /// existed). Populated alongside everything else in `publishHealth()`.
+  var isPaused: Bool = false
+  var activeSummary: String?
+  var activeSource: String?
+  var pending: [WarmServerCoordinator.QueueJobInfo] = []
+  var maxPending: Int = 0
 
   static let initial = HealthSnapshot(
     shuttingDown: false, model: "", modelFamily: WarmModelFamily.flux1.rawValue,
@@ -3465,7 +3480,20 @@ private actor WarmServerCoordinator {
       activeRenderStartedAt: activeRenderStartedAt ?? currentJobStartedAt,
       activeJobId: activeJobId,
       lastRenderDurationMs: lastRenderDurationMs,
-      lastError: lastError
+      lastError: lastError,
+      isPaused: isPaused,
+      activeSummary: activeJobSummary,
+      activeSource: activeJobSource,
+      pending: pending.map { job in
+        QueueJobInfo(
+          id: job.id,
+          kind: Self.kind(of: job.operation),
+          summary: Self.describe(job.operation),
+          source: job.source,
+          enqueuedAt: job.enqueuedAt
+        )
+      },
+      maxPending: configuration.maxPendingRequests
     )
     liveHealth.publish(snap)
   }
@@ -3510,6 +3538,7 @@ private actor WarmServerCoordinator {
     guard let index = pending.firstIndex(where: { $0.id == id }) else { return false }
     Self.cancel(pending[index].operation)
     pending.remove(at: index)
+    publishHealth()
     return true
   }
 
@@ -3568,46 +3597,6 @@ private actor WarmServerCoordinator {
     let enqueuedAt: Date
   }
 
-  /// Full queue listing for /v1/queue: the running operation plus every
-  /// pending job with enough identity to cancel it.
-  struct QueueSnapshot: Sendable {
-    let isRendering: Bool
-    let isPaused: Bool
-    let activeJobId: String?
-    let activeSummary: String?
-    let activeSource: String?
-    let activeStartedAt: Date?
-    let progressPercent: Int?
-    let pending: [QueueJobInfo]
-    let maxPending: Int
-    let renderCount: Int
-    let failedCount: Int
-  }
-
-  func queueSnapshot() -> QueueSnapshot {
-    QueueSnapshot(
-      isRendering: activeRenderStartedAt != nil,
-      isPaused: isPaused,
-      activeJobId: activeJobId,
-      activeSummary: activeJobSummary,
-      activeSource: activeJobSource,
-      activeStartedAt: activeRenderStartedAt,
-      progressPercent: progressTracker.get(),
-      pending: pending.map { job in
-        QueueJobInfo(
-          id: job.id,
-          kind: Self.kind(of: job.operation),
-          summary: Self.describe(job.operation),
-          source: job.source,
-          enqueuedAt: job.enqueuedAt
-        )
-      },
-      maxPending: configuration.maxPendingRequests,
-      renderCount: successfulRenderCount,
-      failedCount: failedRenderCount
-    )
-  }
-
   // MARK: - Queue controls (pause / resume / reorder)
 
   func setPaused(_ paused: Bool) {
@@ -3630,6 +3619,7 @@ private actor WarmServerCoordinator {
     default: pending.insert(job, at: idx); return false
     }
     pending.insert(job, at: target)
+    publishHealth()
     return true
   }
 
