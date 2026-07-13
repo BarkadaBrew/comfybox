@@ -1565,6 +1565,7 @@ struct ZImageCLI {
     var seedvr2Weights: String? = config.seedvr2WeightsPath
     var ltx2Weights: String? = nil
     var ltx2Gemma: String? = nil
+    var ltx2DefaultLoRA: String? = nil
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1604,6 +1605,8 @@ struct ZImageCLI {
         ltx2Weights = nextValue(for: arg, iterator: &iterator)
       case "--ltx2-gemma":
         ltx2Gemma = nextValue(for: arg, iterator: &iterator)
+      case "--ltx2-lora":
+        ltx2DefaultLoRA = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printServeUsage()
         return
@@ -1637,7 +1640,8 @@ struct ZImageCLI {
       allowedOutputDirectory: allowedOutputDirectory,
       seedvr2WeightsPath: seedvr2Weights,
       ltx2WeightsPath: ltx2Weights,
-      ltx2GemmaPath: ltx2Gemma
+      ltx2GemmaPath: ltx2Gemma,
+      ltx2DefaultLoRA: ltx2DefaultLoRA
     )
 
     let server = WarmServer(configuration: configuration, host: host, logger: logger)
@@ -1660,6 +1664,7 @@ struct ZImageCLI {
       --seedvr2-weights            Path to SeedVR2 upscale model weights directory
       --ltx2-weights               LTX-2 weights dir OR "org/repo[:rev]" HF spec (enables LOCAL video on /v1/video/generate; lazy-loaded + auto-downloaded on first request, ~38GB)
       --ltx2-gemma                 Gemma-3 tokenizer/text-encoder snapshot dir OR HF spec for LTX-2 (required alongside --ltx2-weights; ~24GB, downloaded on first request, not swappable for a different encoder)
+      --ltx2-lora                  Default LoRA for LOCAL video renders when the request carries none, as "path" or "path@scale" (e.g. a distill LoRA for a non-distilled checkpoint). Request LoRAs override it.
       --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs

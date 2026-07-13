@@ -27,6 +27,10 @@ public struct WarmServerConfiguration: Sendable {
   public var ltx2WeightsPath: String?
   /// Gemma-3 tokenizer + text-encoder snapshot dir for LTX-2.
   public var ltx2GemmaPath: String?
+  /// Default LoRA ("path" or "path@scale") merged into every LOCAL video
+  /// render when the request carries none — lets preset-only callers (daemon
+  /// MCP) get e.g. a distill LoRA required by a non-distilled checkpoint.
+  public var ltx2DefaultLoRA: String?
 
   public init(
     port: UInt16 = ComfyBoxServerConfig.canonicalPort,
@@ -39,7 +43,8 @@ public struct WarmServerConfiguration: Sendable {
     allowedOutputDirectory: String = FileManager.default.currentDirectoryPath,
     seedvr2WeightsPath: String? = nil,
     ltx2WeightsPath: String? = nil,
-    ltx2GemmaPath: String? = nil
+    ltx2GemmaPath: String? = nil,
+    ltx2DefaultLoRA: String? = nil
   ) {
     self.port = port
     self.modelSpec = modelSpec
@@ -52,6 +57,7 @@ public struct WarmServerConfiguration: Sendable {
     self.seedvr2WeightsPath = seedvr2WeightsPath
     self.ltx2WeightsPath = ltx2WeightsPath
     self.ltx2GemmaPath = ltx2GemmaPath
+    self.ltx2DefaultLoRA = ltx2DefaultLoRA
   }
 }
 
@@ -1493,6 +1499,40 @@ public final class WarmServer {
     let source: String
   }
 
+  /// Snap a render dimension to the nearest multiple of 64 (floor 256).
+  /// LTX-2 renders at dims that are 32-multiples but NOT 64-multiples (e.g.
+  /// 480) exhibit progressive haze (#219) — every clean render in the 07-13
+  /// bisect used /64 dims, every hazy one used 480.
+  static func snapDim64(_ value: Int) -> Int {
+    max(256, Int((Double(value) / 64.0).rounded()) * 64)
+  }
+
+  /// Derive I2V render dims matching the source image aspect within the
+  /// requested pixel-area budget, both dims /64. Pure for unit testing.
+  static func deriveVideoDims(
+    sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int
+  ) -> (width: Int, height: Int) {
+    guard sourceWidth > 0, sourceHeight > 0 else {
+      return (snapDim64(budgetWidth), snapDim64(budgetHeight))
+    }
+    let aspect = Double(sourceWidth) / Double(sourceHeight)
+    let budget = Double(max(budgetWidth, 64) * max(budgetHeight, 64))
+    let idealW = (budget * aspect).squareRoot()
+    let idealH = idealW / aspect
+    return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
+  }
+
+  /// Pixel dimensions of an image file without decoding the bitmap.
+  static func imagePixelSize(atPath path: String) -> (width: Int, height: Int)? {
+    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = props[kCGImagePropertyPixelWidth] as? Int,
+          let height = props[kCGImagePropertyPixelHeight] as? Int
+    else { return nil }
+    return (width, height)
+  }
+
   /// Map an LTX-2 (chunk, step) progress tick to an overall 0-100 percent across
   /// all chunks. Pure so it can be unit-tested and reused by both local paths.
   static func localVideoProgressPercent(chunk: Int, totalChunks: Int, step: Int, totalSteps: Int) -> Int {
@@ -1512,8 +1552,18 @@ public final class WarmServer {
     }
     let req = try decode(LocalVideoRequest.self, from: body)
 
-    // Contain the output within the allowed directory (default alongside models).
-    let requestedOutput = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
+    // Contain the output within the allowed directory. A relative (or absent)
+    // output path is resolved against the ALLOWED directory, not the process
+    // CWD — under launchd the CWD is the repo checkout, so the old bare-name
+    // default failed its own containment check on every submit (#219).
+    let requestedOutputRaw = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
+    let requestedOutput: String
+    if requestedOutputRaw.hasPrefix("/") || requestedOutputRaw.hasPrefix("~") {
+      requestedOutput = requestedOutputRaw
+    } else {
+      requestedOutput = (configuration.allowedOutputDirectory as NSString)
+        .appendingPathComponent(requestedOutputRaw)
+    }
     let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
       requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
 
@@ -1542,7 +1592,16 @@ public final class WarmServer {
     // Accept an init image as bytes (image_base64) when no server path is given.
     let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
 
-    let resolvedLoRAs: [LTX2LoRAReference] = try (req.loras ?? []).map { entry in
+    var loraEntries: [LoRAEntry] = req.loras ?? []
+    if loraEntries.isEmpty, req.loraPath == nil,
+       let defaultLoRA = configuration.ltx2DefaultLoRA, !defaultLoRA.isEmpty {
+      // "path" or "path@scale"
+      let parts = defaultLoRA.split(separator: "@", maxSplits: 1).map(String.init)
+      let scale = parts.count == 2 ? Float(parts[1]) ?? 1.0 : 1.0
+      loraEntries = [LoRAEntry(path: parts[0], scale: scale)]
+      logger.info("LTX-2: applying default video LoRA \(parts[0]) @ \(scale) (--ltx2-lora)")
+    }
+    let resolvedLoRAs: [LTX2LoRAReference] = try loraEntries.map { entry in
       let config = try entry.makeConfiguration()
       guard case .local(let url) = config.source else {
         throw WarmServerError.invalidRequest(
@@ -1551,12 +1610,45 @@ public final class WarmServer {
       return LTX2LoRAReference(path: url.path, scale: config.scale)
     }
 
+    // LTX-2 render dims must be divisible by 64: 32-multiples that are not
+    // 64-multiples (e.g. 480) produce progressive haze/ghosting (#219). I2V
+    // output must additionally match the SOURCE image aspect ratio — a fixed
+    // preset like 704x448 applied to a portrait source distorts the
+    // conditioning frame and the render drifts off the image. The requested
+    // width x height is kept only as a pixel-area budget for I2V.
+    var renderWidth = req.width ?? 704
+    var renderHeight = req.height ?? 448
+    if let initPath = effectiveInitImage,
+       let sourceSize = Self.imagePixelSize(atPath: initPath) {
+      let derived = Self.deriveVideoDims(
+        sourceWidth: sourceSize.width, sourceHeight: sourceSize.height,
+        budgetWidth: renderWidth, budgetHeight: renderHeight)
+      if derived.width != renderWidth || derived.height != renderHeight {
+        logger.info(
+          "LTX-2 I2V: adjusted \(renderWidth)x\(renderHeight) -> \(derived.width)x\(derived.height) (source \(sourceSize.width)x\(sourceSize.height), aspect-matched, /64)")
+        renderWidth = derived.width
+        renderHeight = derived.height
+      }
+    } else {
+      let snappedW = Self.snapDim64(renderWidth)
+      let snappedH = Self.snapDim64(renderHeight)
+      if snappedW != renderWidth || snappedH != renderHeight {
+        logger.info("LTX-2: snapped \(renderWidth)x\(renderHeight) -> \(snappedW)x\(snappedH) (dims must be /64, #219)")
+        renderWidth = snappedW
+        renderHeight = snappedH
+      }
+    }
+    if let requestedSteps = req.steps, requestedSteps != 8 {
+      logger.warning(
+        "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
+    }
+
     let videoRequest = LTX2VideoRequest(
       prompt: req.prompt,
       negativePrompt: req.negativePrompt,
       initImagePath: effectiveInitImage,
-      width: req.width ?? 704,
-      height: req.height ?? 448,
+      width: renderWidth,
+      height: renderHeight,
       framesPerChunk: req.frames ?? 97,
       steps: req.steps ?? 8,
       seed: req.seed ?? 42,
