@@ -33,14 +33,17 @@ import MLXNN
 public final class LTX2Encoder3D: Module {
 
   /// Initial 3D convolution after patchify.
-  @ModuleInfo(key: "conv_in") var convIn: CausalConv3d
+  /// Wrapped in LTX2ConvWrapper to match the LTX-2.3 checkpoint key path
+  /// (`conv_in.conv.weight`). See LTX2ResnetBlock3D for why a bare CausalConv3d
+  /// silently fails to load its weights against the 2.3 weight file.
+  @ModuleInfo(key: "conv_in") var convIn: LTX2ConvWrapper
 
   /// Encoder blocks: residual groups and downsamplers.
   /// Uses a dictionary (not array) because MLX-Swift only tracks dict-keyed modules.
   @ModuleInfo(key: "down_blocks") var downBlocks: [String: Module]
 
   /// Output convolution producing latent channels (+1 for uniform logvar).
-  @ModuleInfo(key: "conv_out") var convOut: CausalConv3d
+  @ModuleInfo(key: "conv_out") var convOut: LTX2ConvWrapper
 
   /// Per-channel statistics for normalizing encoder output.
   @ModuleInfo(key: "per_channel_statistics") var perChannelStatistics: LTX2PerChannelStatistics
@@ -61,10 +64,9 @@ public final class LTX2Encoder3D: Module {
     let inChannels = config.inChannels * config.patchSize * config.patchSize
     var featureChannels = config.latentChannels
 
-    // Initial convolution
-    self._convIn.wrappedValue = CausalConv3d(
-      inChannels: inChannels, outChannels: featureChannels,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+    // Initial convolution (causal temporal padding, as in the reference encoder)
+    self._convIn.wrappedValue = LTX2ConvWrapper(
+      inChannels: inChannels, outChannels: featureChannels, causalTemporal: true
     )
 
     // Build encoder blocks
@@ -103,9 +105,8 @@ public final class LTX2Encoder3D: Module {
 
     // Output convolution: latentChannels + 1 for uniform logvar
     let convOutChannels = config.latentChannels + 1
-    self._convOut.wrappedValue = CausalConv3d(
-      inChannels: featureChannels, outChannels: convOutChannels,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+    self._convOut.wrappedValue = LTX2ConvWrapper(
+      inChannels: featureChannels, outChannels: convOutChannels, causalTemporal: true
     )
 
     self._perChannelStatistics.wrappedValue = LTX2PerChannelStatistics(

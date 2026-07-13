@@ -24,10 +24,14 @@ import MLXNN
 public final class LTX2ResnetBlock3D: Module {
 
   /// First causal 3D convolution (C_in → C_out).
-  @ModuleInfo(key: "conv1") var conv1: CausalConv3d
+  /// Wrapped in LTX2ConvWrapper to match the LTX-2.3 checkpoint key path
+  /// (`conv1.conv.weight`). A bare CausalConv3d expects `conv1.weight`, which
+  /// does NOT exist in the 2.3 weight file — its weights would silently fail to
+  /// load and the conv would run with zero weights (dead conv → blank latent).
+  @ModuleInfo(key: "conv1") var conv1: LTX2ConvWrapper
 
   /// Second causal 3D convolution (C_out → C_out).
-  @ModuleInfo(key: "conv2") var conv2: CausalConv3d
+  @ModuleInfo(key: "conv2") var conv2: LTX2ConvWrapper
 
   /// Optional 1x1x1 shortcut convolution when channel counts differ.
   @ModuleInfo(key: "shortcut") var shortcut: CausalConv3d?
@@ -53,13 +57,11 @@ public final class LTX2ResnetBlock3D: Module {
     self.hasShortcut = inChannels != outCh
     self.eps = eps
 
-    self._conv1.wrappedValue = CausalConv3d(
-      inChannels: inChannels, outChannels: outCh,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+    self._conv1.wrappedValue = LTX2ConvWrapper(
+      inChannels: inChannels, outChannels: outCh, causalTemporal: true
     )
-    self._conv2.wrappedValue = CausalConv3d(
-      inChannels: outCh, outChannels: outCh,
-      kernelSize: (3, 3, 3), stride: (1, 1, 1), padding: (1, 1, 1)
+    self._conv2.wrappedValue = LTX2ConvWrapper(
+      inChannels: outCh, outChannels: outCh, causalTemporal: true
     )
 
     if hasShortcut {
