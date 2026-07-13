@@ -366,7 +366,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
   }
 
 
-  /// generate_video -> POST /v1/video/generate
+  /// generate_video -> POST /v1/video/generate/async (submit; poll video_status)
   private func executeGenerateVideo(_ params: MCPParams?) async throws -> MCPToolResult {
     guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
       return MCPToolResult(error: "Error: 'prompt' is required")
@@ -394,8 +394,11 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
-    let (status, data) = try await client.post("/v1/video/generate", body: jsonData)
-    // 202 is the expected status for async job submission
+    // Async route for BOTH backends: local renders return 202 + job_id
+    // immediately (poll video_status), instead of blocking the MCP call for
+    // the entire multi-minute render — which overran the daemon-side 300s
+    // MCP tool timeout on every cold-start render (#219).
+    let (status, data) = try await client.post("/v1/video/generate/async", body: jsonData)
     if status == 200 || status == 202 {
       let text = String(data: data, encoding: .utf8) ?? "{}"
       return MCPToolResult(text: text)
