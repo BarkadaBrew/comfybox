@@ -309,11 +309,23 @@ public struct LoRAApplicator {
     /// as the smaller dimension of w2 — the `lora_dim` a factorized w2 would
     /// have used. LyCORIS stores alpha == dim for full-matrix modules, so
     /// this typically evaluates to 1.0. Internal for unit testing.
+    ///
+    /// Some exporters (observed from `ai-toolkit`-trained LoKr adapters, e.g.
+    /// Krea2-realism-V2 and the zit_fdpo_v1/zit-sda-v1 Z-Image LoKr LoRAs)
+    /// write a fixed ~1e10 sentinel into every `.alpha` tensor instead of
+    /// following the alpha == dim convention or omitting the field. Dividing
+    /// that by a typical dim (hundreds to a few thousand) yields a scale in
+    /// the millions, which blows up the delta and reduces output to pure
+    /// noise even at a caller-requested scale like 0.4. Any ratio far outside
+    /// what a real trained LoRA would use is treated as "no real alpha
+    /// metadata" and falls back to the neutral 1.0.
     static func lokrAlphaScale(alpha: Float?, w2Shape: [Int]) -> Float {
         guard let alpha, w2Shape.count == 2 else { return 1.0 }
         let dim = min(w2Shape[0], w2Shape[1])
         guard dim > 0, alpha > 0 else { return 1.0 }
-        return alpha / Float(dim)
+        let scale = alpha / Float(dim)
+        guard scale.isFinite, scale < 1000 else { return 1.0 }
+        return scale
     }
 
     private static func applyLoKrInternal<T: Module>(
@@ -530,7 +542,10 @@ public struct LoRAApplicator {
         } else {
             logger?.info("Dynamic LoRA applied to \(appliedCount) layers")
         }
-        if appliedCount == 0 {
+        // A LoRA can be 100% LoKr (no plain lora_down/lora_up pairs at all), in
+        // which case appliedCount is legitimately 0 here even though applyLoKr
+        // above matched every layer — check hasLoKr too before warning.
+        if appliedCount == 0 && !loraWeights.hasLoKr {
             logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
         }
     }
