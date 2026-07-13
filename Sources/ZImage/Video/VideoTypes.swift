@@ -206,6 +206,15 @@ public struct VideoJobStatus: Codable, Sendable {
   /// Replicate prediction ID (for proxy mode debugging).
   public let replicatePredictionId: String?
 
+  /// Live render progress (0-100) while queued/processing. Populated for the
+  /// local LTX-2 backend (which streams a per-chunk/per-step callback); nil for
+  /// the Replicate cloud path, which doesn't expose fine-grained progress.
+  public let progressPercent: Int?
+
+  /// Number of frames written (set on success). Populated by the local LTX-2
+  /// backend; nil for the cloud path (which reports duration, not frame count).
+  public let frameCount: Int?
+
   public init(
     jobId: String,
     status: VideoJobState,
@@ -219,7 +228,9 @@ public struct VideoJobStatus: Codable, Sendable {
     error: String? = nil,
     estimatedSeconds: Int? = nil,
     elapsedMs: Int? = nil,
-    replicatePredictionId: String? = nil
+    replicatePredictionId: String? = nil,
+    progressPercent: Int? = nil,
+    frameCount: Int? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -234,5 +245,7 @@ public struct VideoJobStatus: Codable, Sendable {
     self.estimatedSeconds = estimatedSeconds
     self.elapsedMs = elapsedMs
     self.replicatePredictionId = replicatePredictionId
+    self.progressPercent = progressPercent
+    self.frameCount = frameCount
   }
 }

@@ -273,7 +273,18 @@ struct MotionView: View {
 
         Task {
             do {
-                let result = try await engine.generateVideo(request)
+                // Submit + poll: a multi-minute / multi-chunk render never holds
+                // the HTTP connection open, so the UI stays live and shows real
+                // per-chunk/per-step progress instead of freezing on one request.
+                let jobId = try await engine.submitVideoJob(request)
+                statusMessage = "Queued LTX-2 job — loading model…"
+                let result = try await engine.pollVideoStatus(jobId: jobId) { job in
+                    if let pct = job.progressPercent, job.status == "processing" {
+                        statusMessage = "Rendering \(frames) frames… \(pct)%"
+                    } else if job.status == "processing" {
+                        statusMessage = "Rendering \(frames) frames…"
+                    }
+                }
                 statusMessage = String(format: "Done — %d frames, %.1fs video in %.0fs",
                                        result.frameCount, result.durationSeconds, result.elapsedSeconds)
                 resultURL = URL(fileURLWithPath: result.outputPath)

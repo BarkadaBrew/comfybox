@@ -1000,10 +1000,24 @@ public final class EngineService {
         public let elapsedSeconds: Double
     }
 
-    /// Generate a video locally via LTX-2. Long-running (minutes); the local
-    /// backend responds synchronously with the MP4 path.
-    public func generateVideo(_ request: VideoRequest) async throws -> VideoResult {
-        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+    /// Live status of an async LOCAL video job — decoded from
+    /// GET /v1/video/status/{id}. Mirrors the server's `VideoJobStatus`.
+    public struct VideoJobStatus: Sendable {
+        public let jobId: String
+        public let status: String            // queued | processing | succeeded | failed
+        public let outputPath: String?
+        public let error: String?
+        public let progressPercent: Int?
+        public let frameCount: Int?
+        public let videoDurationSeconds: Int?
+        public let elapsedMs: Int?
+
+        public var isTerminal: Bool { status == "succeeded" || status == "failed" }
+    }
+
+    /// Build the JSON body shared by the sync and async video paths.
+    /// `forceLocal` pins the render to on-device LTX-2 (never paid cloud).
+    private func videoRequestBody(_ request: VideoRequest, forceLocal: Bool) -> [String: Any] {
         var body: [String: Any] = [
             "prompt": request.prompt,
             "width": request.width,
@@ -1014,7 +1028,9 @@ public final class EngineService {
             "strength": request.strength,
             "extend_to_seconds": request.extendToSeconds,
             "output_path": request.outputPath,
+            "source": "desktop",
         ]
+        if forceLocal { body["backend"] = "local" }
         if let initImagePath = request.initImagePath, !initImagePath.isEmpty {
             body["image_path"] = initImagePath
         }
@@ -1027,7 +1043,82 @@ public final class EngineService {
             // filename, not the slugified library id.
             body["loras"] = request.loras.map { ["path": $0.filename, "scale": $0.scale] }
         }
-        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        return body
+    }
+
+    private func parseVideoJobStatus(_ data: Data) -> VideoJobStatus? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let jobId = json["job_id"] as? String,
+              let status = json["status"] as? String
+        else { return nil }
+        return VideoJobStatus(
+            jobId: jobId,
+            status: status,
+            outputPath: json["output_path"] as? String,
+            error: json["error"] as? String,
+            progressPercent: json["progress_percent"] as? Int,
+            frameCount: json["frame_count"] as? Int,
+            videoDurationSeconds: json["video_duration_seconds"] as? Int,
+            elapsedMs: json["elapsed_ms"] as? Int
+        )
+    }
+
+    /// Submit an async LOCAL video render. Returns immediately with the job id —
+    /// the render runs on the server's GPU queue. Poll `pollVideoStatus` for
+    /// completion. This is the path a long (multi-minute) render must take: the
+    /// HTTP request returns in milliseconds, so nothing times out mid-render.
+    public func submitVideoJob(_ request: VideoRequest) async throws -> String {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let bodyData = try JSONSerialization.data(withJSONObject: videoRequestBody(request, forceLocal: true))
+        let (status, data) = try await client.post("/v1/video/generate/async", body: bodyData)
+        guard status == 202, let job = parseVideoJobStatus(data) else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Video job submit failed (is the server started with --ltx2-weights?)")
+        }
+        return job.jobId
+    }
+
+    /// Poll GET /v1/video/status/{id} until the job reaches a terminal state.
+    /// `onProgress` fires with the latest 0-100 percent on every poll (mirrors
+    /// the `pollHealth()` loop). Throws on failure; returns the MP4 result on
+    /// success. `pollInterval` seconds between polls.
+    public func pollVideoStatus(
+        jobId: String,
+        pollInterval: Double = 2.0,
+        onProgress: @MainActor (VideoJobStatus) -> Void = { _ in }
+    ) async throws -> VideoResult {
+        guard let client = client else { throw EngineServiceError.notConnected }
+        while true {
+            let (status, data) = try await client.get("/v1/video/status/\(jobId)")
+            guard status == 200, let job = parseVideoJobStatus(data) else {
+                throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Video status poll failed")
+            }
+            onProgress(job)
+            switch job.status {
+            case "succeeded":
+                guard let outputPath = job.outputPath else {
+                    throw EngineServiceError.serverError(200, "Video job succeeded without an output path")
+                }
+                return VideoResult(
+                    outputPath: outputPath,
+                    frameCount: job.frameCount ?? 0,
+                    durationSeconds: Double(job.videoDurationSeconds ?? 0),
+                    elapsedSeconds: Double(job.elapsedMs ?? 0) / 1000.0
+                )
+            case "failed":
+                throw EngineServiceError.serverError(200, job.error ?? "Video generation failed")
+            default:
+                try await Task.sleep(for: .seconds(pollInterval))
+            }
+        }
+    }
+
+    /// Generate a video locally via LTX-2 (SYNCHRONOUS — blocks for the whole
+    /// render). Kept for backward compatibility; new callers should use
+    /// `submitVideoJob` + `pollVideoStatus` so a long render doesn't freeze the
+    /// UI or hit a request timeout.
+    public func generateVideo(_ request: VideoRequest) async throws -> VideoResult {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let bodyData = try JSONSerialization.data(withJSONObject: videoRequestBody(request, forceLocal: false))
         let (status, data) = try await client.post("/v1/video/generate", body: bodyData)
         guard status == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],

@@ -141,6 +141,11 @@ public final class WarmServer {
   /// Submit/poll tracker for async image generation (GH: queue-submit —
   /// see ImageJobTracker's doc comment for the incident that motivated it).
   private let imageJobTracker = ImageJobTracker()
+  /// Tracks async-submitted LOCAL LTX-2 video jobs (submit → 202 + jobId, poll
+  /// GET /v1/video/status/{id}). Mirrors `imageJobTracker` so a multi-minute
+  /// local render never holds an HTTP connection open. The Replicate cloud path
+  /// keeps its own tracker inside `replicateVideoProxy`.
+  private let videoJobTracker = VideoJobTracker()
   let comfyBridge: ComfyBridge
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
   private let lifecycleLock = NSLock()
@@ -392,6 +397,7 @@ public final class WarmServer {
     imageJobPruneTimer.schedule(deadline: .now() + 600, repeating: 600)
     imageJobPruneTimer.setEventHandler { [weak self] in
       self?.imageJobTracker.pruneCompleted()
+      self?.videoJobTracker.pruneCompleted()
     }
     imageJobPruneTimer.resume()
 
@@ -1036,70 +1042,58 @@ public final class WarmServer {
     // MARK: - Video Endpoints
 
     case ("POST", "/v1/video/generate"):
-      // Determine the caller's backend intent (local / cloud / unspecified).
+      // Backward-compatible route. LOCAL renders here still block the HTTP
+      // connection for the whole (synchronous) render — kept working for
+      // existing callers. New / long renders should POST /v1/video/generate/async
+      // and poll GET /v1/video/status/{id}. The Replicate cloud path was always
+      // submit-and-poll (202), and stays so.
       let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
-
-      // Explicit cloud is the ONLY way to reach paid Replicate. Otherwise prefer
-      // local, and never silently fall back to cloud for an explicit-local request.
       if videoIntent != .cloud {
         if let localResponse = await localVideoResponseIfConfigured(body: request.body) {
-          logger.info("video: routing to local LTX-2")
+          logger.info("video: routing to local LTX-2 (synchronous)")
           return localResponse
         }
         if videoIntent == .local {
           return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights). Pass backend: \"replicate\" to explicitly use paid cloud."))
         }
-        // Unspecified + local unavailable: fall back to cloud, but LOUDLY — this
-        // spends money and leaves the device. Callers wanting zero-cloud should
-        // pass backend: "local".
         logger.warning("video: local LTX-2 not configured; falling back to PAID Replicate cloud (\(ReplicateVideoProxy.i2vModel)). Pass backend:\"local\" to forbid, backend:\"replicate\" to silence this warning.")
       }
-      guard let proxy = replicateVideoProxy else {
-        return .error(.error(status: 503, message: "Video generation not available: configure LTX-2 (--ltx2-weights) for local video, or a Replicate API key for cloud"))
+      return await submitReplicateVideo(body: request.body)
+
+    // Async LOCAL video: submit → 202 + job id immediately; poll
+    // GET /v1/video/status/{id} for completion. This is the path a multi-minute /
+    // multi-chunk render must take — the HTTP connection is never held open for
+    // the whole denoise, and /health stays live (#217) so progress can be polled.
+    // Cloud requests are already async via the Replicate proxy; this route
+    // delegates to it for the cloud/fallback case, so one endpoint covers both.
+    case ("POST", "/v1/video/generate/async"):
+      let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
+      if videoIntent != .cloud {
+        if let localResponse = await localVideoAsyncResponseIfConfigured(body: request.body) {
+          logger.info("video: async-submitting local LTX-2 job")
+          return localResponse
+        }
+        if videoIntent == .local {
+          return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights). Pass backend: \"replicate\" to explicitly use paid cloud."))
+        }
+        logger.warning("video: local LTX-2 not configured; async-submitting to PAID Replicate cloud (\(ReplicateVideoProxy.i2vModel)). Pass backend:\"local\" to forbid, backend:\"replicate\" to silence this warning.")
       }
-      logger.info("video: routing to Replicate cloud (\(ReplicateVideoProxy.i2vModel))")
-      do {
-        var videoRequest = try decode(VideoGenerateRequest.self, from: request.body)
-        // Accept a bytes-uploaded init image (image_base64) when no path is given.
-        if videoRequest.imagePath == nil, let tempPath = Self.writeTempImage(base64: videoRequest.imageBase64) {
-          videoRequest.imagePath = tempPath
-        }
-        if let validationError = videoRequest.validate() {
-          return .error(.error(status: 400, message: validationError))
-        }
-        // Enforce output path containment within the allowed output directory
-        // (throws WarmServerError.invalidOutputPath -> 400 via response(for:)).
-        if let outputPath = videoRequest.outputPath, !outputPath.isEmpty {
-          _ = try WarmServerOutputPathValidator.resolveOutputPath(
-            outputPath,
-            allowedOutputDirectory: configuration.allowedOutputDirectory
-          )
-        }
-        // I2V: verify image_path exists, is a regular file, and has PNG/JPEG
-        // magic bytes before it gets base64-uploaded to Replicate.
-        if let imagePath = videoRequest.imagePath {
-          if let imageError = ReplicateVideoProxy.validateSourceImage(atPath: imagePath) {
-            return .error(.error(status: 400, message: imageError))
-          }
-        }
-        let jobStatus = await proxy.submit(videoRequest)
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let data = try encoder.encode(jobStatus)
-        return .json(.rawJSON(status: 202, data: data))
-      } catch {
-        return .error(response(for: error))
-      }
+      return await submitReplicateVideo(body: request.body)
 
     case ("GET", _) where request.path.hasPrefix("/v1/video/status/"):
       let jobId = String(request.path.dropFirst("/v1/video/status/".count))
       guard !jobId.isEmpty else {
         return .error(.error(status: 400, message: "Missing job_id in path"))
       }
-      guard let proxy = replicateVideoProxy else {
-        return .error(.error(status: 503, message: "Video generation not available: Replicate API key not configured"))
-      }
-      guard let jobStatus = proxy.status(jobId: jobId) else {
+      // Local jobs first (this box owns them), then the Replicate proxy. Both
+      // report the same `VideoJobStatus` shape, so a single poll loop covers
+      // whichever backend produced the job.
+      let jobStatus: VideoJobStatus
+      if let local = videoJobTracker.status(jobId: jobId) {
+        jobStatus = local
+      } else if let proxy = replicateVideoProxy, let cloud = proxy.status(jobId: jobId) {
+        jobStatus = cloud
+      } else {
         return .error(.error(status: 404, message: "Video job not found: \(jobId)"))
       }
       do {
@@ -1315,7 +1309,7 @@ public final class WarmServer {
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
-          "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/upscale",
+          "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/video/generate/async", "/v1/upscale",
           "/v1/characters", "/v1/presets", "/v1/presets/resolve",
           "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log"
       ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
@@ -1430,6 +1424,9 @@ public final class WarmServer {
     /// LoRA requests. `loraPath`/`loraStrength` still work for a single LoRA.
     let loras: [LoRAEntry]?
     let outputPath: String?
+    /// Which client/app submitted this job (desktop, bree, api…) — surfaced in
+    /// the async job status and /health, same as image `GeneratePayload.source`.
+    let source: String?
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1441,96 +1438,191 @@ public final class WarmServer {
     let backend: String
   }
 
-  /// If LTX-2 is configured, generate the video locally and return the result;
-  /// otherwise nil so the caller falls through to the Replicate proxy.
-  private func localVideoResponseIfConfigured(body: Data) async -> RoutedResponse? {
+  /// Submit a video render to the paid Replicate cloud proxy and return its 202
+  /// job status (already submit-and-poll). Shared by the sync and async video
+  /// routes for the cloud / unspecified-fallback case.
+  private func submitReplicateVideo(body: Data) async -> RoutedResponse {
+    guard let proxy = replicateVideoProxy else {
+      return .error(.error(status: 503, message: "Video generation not available: configure LTX-2 (--ltx2-weights) for local video, or a Replicate API key for cloud"))
+    }
+    logger.info("video: routing to Replicate cloud (\(ReplicateVideoProxy.i2vModel))")
+    do {
+      var videoRequest = try decode(VideoGenerateRequest.self, from: body)
+      // Accept a bytes-uploaded init image (image_base64) when no path is given.
+      if videoRequest.imagePath == nil, let tempPath = Self.writeTempImage(base64: videoRequest.imageBase64) {
+        videoRequest.imagePath = tempPath
+      }
+      if let validationError = videoRequest.validate() {
+        return .error(.error(status: 400, message: validationError))
+      }
+      // Enforce output path containment within the allowed output directory
+      // (throws WarmServerError.invalidOutputPath -> 400 via response(for:)).
+      if let outputPath = videoRequest.outputPath, !outputPath.isEmpty {
+        _ = try WarmServerOutputPathValidator.resolveOutputPath(
+          outputPath,
+          allowedOutputDirectory: configuration.allowedOutputDirectory
+        )
+      }
+      // I2V: verify image_path exists, is a regular file, and has PNG/JPEG
+      // magic bytes before it gets base64-uploaded to Replicate.
+      if let imagePath = videoRequest.imagePath {
+        if let imageError = ReplicateVideoProxy.validateSourceImage(atPath: imagePath) {
+          return .error(.error(status: 400, message: imageError))
+        }
+      }
+      let jobStatus = await proxy.submit(videoRequest)
+      let encoder = JSONEncoder()
+      encoder.keyEncodingStrategy = .convertToSnakeCase
+      let data = try encoder.encode(jobStatus)
+      return .json(.rawJSON(status: 202, data: data))
+    } catch {
+      return .error(response(for: error))
+    }
+  }
+
+  /// A LTX-2 generator + validated request, ready to enqueue. Shared by the
+  /// synchronous (`/v1/video/generate`) and async (`/v1/video/generate/async`)
+  /// local video paths so they build the render identically.
+  private struct PreparedLocalVideo {
+    let generator: LTX2VideoGenerator
+    let request: LTX2VideoRequest
+    /// t2v when there's no init image, i2v otherwise.
+    let mode: VideoMode
+    let source: String
+  }
+
+  /// Map an LTX-2 (chunk, step) progress tick to an overall 0-100 percent across
+  /// all chunks. Pure so it can be unit-tested and reused by both local paths.
+  static func localVideoProgressPercent(chunk: Int, totalChunks: Int, step: Int, totalSteps: Int) -> Int {
+    let chunks = max(1, totalChunks)
+    let steps = max(1, totalSteps)
+    let done = max(0, chunk) * steps + max(0, step)
+    let total = chunks * steps
+    return min(100, max(0, Int((Double(done) / Double(total)) * 100.0)))
+  }
+
+  /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
+  /// local LTX-2 isn't configured (caller falls through to Replicate); throws for
+  /// a malformed request or invalid output path.
+  private func prepareLocalVideo(body: Data) async throws -> PreparedLocalVideo? {
     guard let weights = configuration.ltx2WeightsPath, let gemma = configuration.ltx2GemmaPath else {
       return nil
     }
-    do {
-      let req = try decode(LocalVideoRequest.self, from: body)
+    let req = try decode(LocalVideoRequest.self, from: body)
 
-      // Contain the output within the allowed directory (default alongside models).
-      let requestedOutput = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
-      let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
-        requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+    // Contain the output within the allowed directory (default alongside models).
+    let requestedOutput = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
+    let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+      requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
 
-      let generator: LTX2VideoGenerator
-      if let existing = videoHolder.get() {
-        generator = existing
-      } else {
-        // Both fields accept either a local path or a "org/repo[:revision]"
-        // HuggingFace spec — resolved (and downloaded/cached if needed) on
-        // this first local video request, same warm/on-demand pattern the
-        // main image pipeline already uses via ModelResolution.
-        logger.info("LTX-2: resolving weights/text-encoder (downloads on first use if not cached)…")
-        // IMPORTANT: the weights repo bundles multiple ~35GB transformer
-        // variants (distilled, distilled-1.1, dev) plus upscaler/vocoder/
-        // audio files this loader never reads — a wildcard "*.safetensors"
-        // pattern here downloaded 130GB+ of unused files and nearly filled
-        // the boot disk. Only fetch the exact files LTX2VideoGenerator.load()
-        // actually opens (transformer file + VAE encoder/decoder).
-        let weightsURL = try await ModelResolution.resolve(
-          modelSpec: weights,
-          // Must match LTX2VideoGenerator.Configuration's default transformerFile,
-          // plus connector.safetensors — LTX2TextEncoder.loadProjectionWeights()
-          // needs it to bridge Gemma-3's embeddings into the transformer; without
-          // it, generation "succeeds" but produces output uncorrelated with the
-          // prompt/init image (missing this file was the actual root cause of a
-          // completely broken first test run, not just conditioning being weak).
-          filePatterns: ["transformer-distilled.safetensors", "connector.safetensors",
-                          "vae_decoder.safetensors", "vae_encoder.safetensors", "config.json"]
-        )
-        let gemmaURL = try await ModelResolution.resolve(
-          modelSpec: gemma,
-          filePatterns: ["*.safetensors", "*.json", "tokenizer/*", "*.model"]
-        )
-        generator = LTX2VideoGenerator(
-          config: .init(weightsDir: weightsURL.path, gemmaPath: gemmaURL.path), logger: logger)
-      }
-      // Publish into the shared holder so the coordinator can evict it before an
-      // image load, and so the render queue evicts image models before this one
-      // actually loads its ~65GB of weights inside generate() (#218).
-      videoHolder.set(generator)
-
-      // Accept an init image as bytes (image_base64) when no server path is given.
-      let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
-
-      // Resolve each requested LoRA the same way image generation does
-      // (bare-filename search against the LoRA library, etc.) — LTX video
-      // LoRAs are managed identically to every other model's.
-      let resolvedLoRAs: [LTX2LoRAReference] = try (req.loras ?? []).map { entry in
-        let config = try entry.makeConfiguration()
-        guard case .local(let url) = config.source else {
-          throw WarmServerError.invalidRequest(
-            message: "LTX-2 video LoRAs must be local files (got a HuggingFace reference for '\(entry.path)')")
-        }
-        return LTX2LoRAReference(path: url.path, scale: config.scale)
-      }
-
-      let videoRequest = LTX2VideoRequest(
-        prompt: req.prompt,
-        negativePrompt: req.negativePrompt,
-        initImagePath: effectiveInitImage,
-        width: req.width ?? 704,
-        height: req.height ?? 448,
-        framesPerChunk: req.frames ?? 97,
-        steps: req.steps ?? 8,
-        seed: req.seed ?? 42,
-        strength: req.strength ?? 1.0,
-        extendToSeconds: req.extendToSeconds ?? 0,
-        fps: req.fps ?? 24,
-        loraPath: req.loraPath,
-        loraStrength: req.loraStrength ?? 1.0,
-        loras: resolvedLoRAs,
-        outputPath: resolvedOutput
+    let generator: LTX2VideoGenerator
+    if let existing = videoHolder.get() {
+      generator = existing
+    } else {
+      logger.info("LTX-2: resolving weights/text-encoder (downloads on first use if not cached)…")
+      let weightsURL = try await ModelResolution.resolve(
+        modelSpec: weights,
+        filePatterns: ["transformer-distilled.safetensors", "connector.safetensors",
+                        "vae_decoder.safetensors", "vae_encoder.safetensors", "config.json"]
       )
-      // Validate before enqueuing so bad frames/dims fail fast.
-      try generator.validate(videoRequest)
+      let gemmaURL = try await ModelResolution.resolve(
+        modelSpec: gemma,
+        filePatterns: ["*.safetensors", "*.json", "tokenizer/*", "*.model"]
+      )
+      generator = LTX2VideoGenerator(
+        config: .init(weightsDir: weightsURL.path, gemmaPath: gemmaURL.path), logger: logger)
+    }
+    // Publish into the shared holder so the coordinator can evict it before an
+    // image load, and so the render queue evicts image models before this one
+    // actually loads its ~65GB of weights inside generate() (#218).
+    videoHolder.set(generator)
+
+    // Accept an init image as bytes (image_base64) when no server path is given.
+    let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
+
+    let resolvedLoRAs: [LTX2LoRAReference] = try (req.loras ?? []).map { entry in
+      let config = try entry.makeConfiguration()
+      guard case .local(let url) = config.source else {
+        throw WarmServerError.invalidRequest(
+          message: "LTX-2 video LoRAs must be local files (got a HuggingFace reference for '\(entry.path)')")
+      }
+      return LTX2LoRAReference(path: url.path, scale: config.scale)
+    }
+
+    let videoRequest = LTX2VideoRequest(
+      prompt: req.prompt,
+      negativePrompt: req.negativePrompt,
+      initImagePath: effectiveInitImage,
+      width: req.width ?? 704,
+      height: req.height ?? 448,
+      framesPerChunk: req.frames ?? 97,
+      steps: req.steps ?? 8,
+      seed: req.seed ?? 42,
+      strength: req.strength ?? 1.0,
+      extendToSeconds: req.extendToSeconds ?? 0,
+      fps: req.fps ?? 24,
+      loraPath: req.loraPath,
+      loraStrength: req.loraStrength ?? 1.0,
+      loras: resolvedLoRAs,
+      outputPath: resolvedOutput
+    )
+    // Validate before enqueuing so bad frames/dims fail fast.
+    try generator.validate(videoRequest)
+
+    return PreparedLocalVideo(
+      generator: generator,
+      request: videoRequest,
+      mode: (effectiveInitImage?.isEmpty == false) ? .i2v : .t2v,
+      source: req.source ?? "api")
+  }
+
+  /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
+  /// job status immediately; otherwise nil so the caller falls through to the
+  /// Replicate proxy. Poll GET /v1/video/status/{id} for completion. This is the
+  /// path a long (multi-minute / multi-chunk) render must take — it never holds
+  /// the HTTP connection open for the whole denoise.
+  private func localVideoAsyncResponseIfConfigured(body: Data) async -> RoutedResponse? {
+    do {
+      guard let prep = try await prepareLocalVideo(body: body) else { return nil }
+      logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
+      let status = videoJobTracker.submit(
+        source: prep.source, mode: prep.mode, coordinator: coordinator
+      ) { report in
+        try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
+          report(Self.localVideoProgressPercent(
+            chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+        }
+      }
+      let encoder = JSONEncoder()
+      encoder.keyEncodingStrategy = .convertToSnakeCase
+      let data = try encoder.encode(status)
+      return .json(.rawJSON(status: 202, data: data))
+    } catch let error as LTX2VideoError {
+      return .error(.error(status: 400, message: error.localizedDescription))
+    } catch {
+      return .error(response(for: error))
+    }
+  }
+
+  /// If LTX-2 is configured, generate the video locally and return the result
+  /// SYNCHRONOUSLY (blocks the HTTP connection for the whole render); otherwise
+  /// nil so the caller falls through to the Replicate proxy. Kept for backward
+  /// compatibility — new/long renders should use the async path above.
+  private func localVideoResponseIfConfigured(body: Data) async -> RoutedResponse? {
+    guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
+      return nil
+    }
+    do {
+      guard let prep = try await prepareLocalVideo(body: body) else { return nil }
+      let generator = prep.generator
+      let videoRequest = prep.request
 
       logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f)")
-      let result = try await coordinator.enqueueLocalVideo {
-        try generator.generate(videoRequest)
+      let result = try await coordinator.enqueueLocalVideo { report in
+        try generator.generate(videoRequest) { chunk, totalChunks, step, totalSteps in
+          report(Self.localVideoProgressPercent(
+            chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+        }
       }
       auditLog.append(kind: "video.local", message: "LTX-2 video \(result.frameCount)f -> \(result.outputPath)")
       return .json(status: 200, payload: LocalVideoResponse(
@@ -2826,6 +2918,159 @@ final class ImageJobTracker: @unchecked Sendable {
   }
 }
 
+/// Internal mutable state for a tracked async LOCAL LTX-2 video job. Mirrors
+/// `ImageJob`, with the extra video fields (`mode`, `frameCount`,
+/// `videoDurationSeconds`, live `progressPercent`) the wire `VideoJobStatus`
+/// carries.
+private final class LocalVideoJob: @unchecked Sendable {
+  let id: String
+  let source: String
+  let mode: VideoMode
+  let startTime = Date()
+  var state: VideoJobState = .queued
+  var outputPath: String?
+  var frameCount: Int?
+  var videoDurationSeconds: Int?
+  var durationMs: Int?
+  var error: String?
+  var progressPercent: Int?
+  var completedAt: Date?
+
+  init(id: String, source: String, mode: VideoMode) {
+    self.id = id
+    self.source = source
+    self.mode = mode
+  }
+
+  var elapsedMs: Int {
+    let end = completedAt ?? Date()
+    return Int(end.timeIntervalSince(startTime) * 1000)
+  }
+
+  func toStatus() -> VideoJobStatus {
+    VideoJobStatus(
+      jobId: id,
+      status: state,
+      mode: mode,
+      backend: "ltx2-local",
+      outputPath: outputPath,
+      durationMs: durationMs,
+      videoDurationSeconds: videoDurationSeconds,
+      error: error,
+      elapsedMs: elapsedMs,
+      progressPercent: progressPercent,
+      frameCount: frameCount
+    )
+  }
+}
+
+/// Submit-and-poll tracker for LOCAL LTX-2 video renders — the video twin of
+/// ``ImageJobTracker``. A local render can run for minutes across multiple
+/// chunks; holding the HTTP connection open for the whole thing is what the
+/// async `POST /v1/video/generate/async` + `GET /v1/video/status/{id}` pair
+/// avoids. Submit returns a job id immediately; the render itself runs on the
+/// coordinator's serial GPU queue (so it never shares the GPU with an image
+/// render), streaming progress into the job as it goes.
+///
+/// The state-transition surface (`register`/`markProcessing`/`markSucceeded`/
+/// `markFailed`/`setProgress`/`status`/`pruneCompleted`) is deliberately kept
+/// free of any coordinator dependency so the state machine is unit-testable in
+/// isolation; `submit` is the thin production wrapper that drives it against the
+/// real render queue.
+final class VideoJobTracker: @unchecked Sendable {
+  private let lock = NSLock()
+  private var jobs: [String: LocalVideoJob] = [:]
+
+  /// Create a tracked job in `.queued` and return (jobId, its status). Testable
+  /// without a coordinator.
+  @discardableResult
+  func register(source: String, mode: VideoMode) -> (jobId: String, status: VideoJobStatus) {
+    let jobId = UUID().uuidString
+    let job = LocalVideoJob(id: jobId, source: source, mode: mode)
+    lock.lock(); jobs[jobId] = job; lock.unlock()
+    return (jobId, job.toStatus())
+  }
+
+  /// Submit a local render. Returns immediately with a `.queued` status; the
+  /// render runs in a detached Task against the coordinator's FIFO GPU queue.
+  /// `render` receives a `report(percent)` callback to stream progress; the
+  /// tracker fans that out to both this job's status and (via the coordinator's
+  /// own report wired in `enqueueLocalVideo`) the /health + /queue trackers.
+  fileprivate func submit(
+    source: String,
+    mode: VideoMode,
+    coordinator: WarmServerCoordinator,
+    render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
+  ) -> VideoJobStatus {
+    let (jobId, queued) = register(source: source, mode: mode)
+    Task { [weak self] in
+      guard let self else { return }
+      self.markProcessing(jobId)
+      do {
+        let result = try await coordinator.enqueueLocalVideo { coordReport in
+          try render { pct in
+            // Fan progress to both the coordinator's health/queue trackers and
+            // this job's own status.
+            coordReport(pct)
+            self.setProgress(jobId, pct)
+          }
+        }
+        self.markSucceeded(jobId, result: result)
+      } catch {
+        self.markFailed(jobId, error: error)
+      }
+    }
+    return queued
+  }
+
+  func status(jobId: String) -> VideoJobStatus? {
+    lock.lock(); defer { lock.unlock() }
+    return jobs[jobId]?.toStatus()
+  }
+
+  func markProcessing(_ jobId: String) {
+    lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
+  }
+
+  func setProgress(_ jobId: String, _ percent: Int) {
+    lock.lock(); jobs[jobId]?.progressPercent = min(100, max(0, percent)); lock.unlock()
+  }
+
+  func markSucceeded(_ jobId: String, result: LTX2VideoResult) {
+    lock.lock()
+    if let job = jobs[jobId] {
+      job.state = .succeeded
+      job.outputPath = result.outputPath
+      job.frameCount = result.frameCount
+      job.videoDurationSeconds = Int(result.durationSeconds.rounded())
+      job.durationMs = Int(result.elapsedSeconds * 1000)
+      job.progressPercent = 100
+      job.completedAt = Date()
+    }
+    lock.unlock()
+  }
+
+  func markFailed(_ jobId: String, error: Error) {
+    lock.lock()
+    if let job = jobs[jobId] {
+      job.state = .failed
+      job.error = error.localizedDescription
+      job.completedAt = Date()
+    }
+    lock.unlock()
+  }
+
+  /// Drop completed/failed jobs older than `ttl`. Mirrors `ImageJobTracker`.
+  func pruneCompleted(olderThan ttl: TimeInterval = 3600) {
+    lock.lock(); defer { lock.unlock() }
+    let cutoff = Date().addingTimeInterval(-ttl)
+    jobs = jobs.filter { _, job in
+      guard let completedAt = job.completedAt else { return true }
+      return completedAt > cutoff
+    }
+  }
+}
+
 private actor WarmServerCoordinator {
   enum ServerError: Error {
     case queueFull(maxPending: Int)
@@ -3438,7 +3683,12 @@ private actor WarmServerCoordinator {
 
   /// Enqueue a local LTX-2 video generation through the FIFO render queue so
   /// it never runs the GPU concurrently with an image render.
-  func enqueueLocalVideo(_ body: @escaping @Sendable () throws -> LTX2VideoResult) async throws -> LTX2VideoResult {
+  /// Enqueue a local LTX-2 render on the serial GPU queue. `body` receives a
+  /// `report(percent)` callback (0-100) it should call from the generator's
+  /// per-chunk/per-step progress hook; the coordinator wires it into the
+  /// lock-based progress + health trackers so /health and /v1/queue reflect the
+  /// live render without an actor hop (mirrors the image render path, #217).
+  func enqueueLocalVideo(_ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult) async throws -> LTX2VideoResult {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -3710,9 +3960,25 @@ private actor WarmServerCoordinator {
             message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB)"))
         } else {
           videoHolder.beginRender()
-          defer { videoHolder.endRender() }
+          // Stream render progress into the lock-based trackers /health + /queue
+          // read, exactly like the image path. Both trackers are Sendable, so the
+          // off-actor @Sendable report closure can update them without an actor
+          // hop. Cleared on completion via defer.
+          let progress = self.progressTracker
+          let health = self.liveHealth
+          progress.set(0)
+          health.setProgress(0)
+          let report: @Sendable (Int) -> Void = { pct in
+            progress.set(pct)
+            health.setProgress(pct)
+          }
+          defer {
+            videoHolder.endRender()
+            progress.set(nil)
+            health.setProgress(nil)
+          }
           do {
-            continuation.resume(returning: try body())
+            continuation.resume(returning: try body(report))
           } catch {
             continuation.resume(throwing: error)
           }
@@ -5237,7 +5503,7 @@ private enum QueuedOperation: Sendable {
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
   /// Local LTX-2 video generation, run through the queue so it serializes with
   /// image renders on the shared GPU. The closure captures the generator+request.
-  case localVideo(@Sendable () throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>)
+  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
 
