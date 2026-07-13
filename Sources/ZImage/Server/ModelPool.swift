@@ -374,6 +374,42 @@ actor ModelPool {
     return freedMB
   }
 
+  /// Release EVERY loaded model (including the active one) and clear the pool.
+  ///
+  /// Used when a heavy model of a *different class* — the LTX-2 video stack —
+  /// must take over unified memory. Image and video cannot co-reside on a
+  /// 128GB machine (#218); the pool's VRAM budget is blind to LTX-2, so the
+  /// only safe handoff is to fully vacate the image side first. Unlike
+  /// `unload`, this deliberately releases the active model too. Returns the
+  /// estimated MB freed.
+  @discardableResult
+  func releaseAll() -> Int {
+    let freed = totalVramMB()
+    for (_, entry) in pool { entry.box.release() }
+    pool.removeAll()
+    activeId = nil
+    GPU.clearCache()
+    logger.info("ModelPool: released ALL loaded models (~\(freed)MB) — vacating for heavy-model handoff")
+    return freed
+  }
+
+  /// Release the least-recently-used *non-active* model, if any. Used by the
+  /// memory-pressure guard to shed memory without disturbing an in-flight
+  /// render. Returns the MB freed (0 if nothing was evictable).
+  @discardableResult
+  func releaseLRUInactive() -> Int {
+    guard let lru = pool.values
+      .filter({ $0.id != activeId })
+      .min(by: { $0.lastUsed < $1.lastUsed })
+    else { return 0 }
+    let freed = lru.vramEstimateMB
+    lru.box.release()
+    pool.removeValue(forKey: lru.id)
+    GPU.clearCache()
+    logger.warning("ModelPool: memory-pressure eviction of '\(lru.id)' (~\(freed)MB)")
+    return freed
+  }
+
   /// Get the currently active pool entry.
   func activeEntry() -> PoolEntry? {
     guard let id = activeId else { return nil }

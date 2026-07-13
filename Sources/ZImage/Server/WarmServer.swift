@@ -185,7 +185,12 @@ public final class WarmServer {
   /// Nearline model/LoRA catalog (attached storage staged on demand).
   let nearlineLibrary = NearlineLibrary()
   /// Local LTX-2 video generator, built lazily when the weights are configured.
-  private var ltx2Generator: LTX2VideoGenerator?
+  /// Held in a shared, lock-based box so the coordinator can evict it before an
+  /// image load — image + video cannot co-reside in unified memory (#218).
+  let videoHolder = VideoGeneratorHolder()
+  /// Unified-memory pressure monitor (#218). On warning/critical it sheds the
+  /// MLX buffer cache and any idle heavy model to stay clear of jetsam.
+  private var memoryPressureSource: DispatchSourceMemoryPressure?
   /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
   let presetStore = PresetStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
@@ -205,7 +210,7 @@ public final class WarmServer {
     self.configuration = configuration
     self.host = host
     self.logger = logger
-    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger)
+    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger, videoHolder: self.videoHolder)
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
@@ -382,6 +387,39 @@ public final class WarmServer {
       self?.imageJobTracker.pruneCompleted()
     }
     imageJobPruneTimer.resume()
+
+    // Unified-memory pressure guard (#218). Loading LTX-2 outside the pool used
+    // to co-reside with an image model and trip OS_REASON_JETSAM. As a
+    // last-resort backstop to the single-heavy-model residency logic, when the
+    // kernel signals memory pressure we drop the MLX buffer cache and release
+    // any idle heavy model (a resident-but-not-rendering LTX-2 stack first,
+    // then the LRU inactive image model) — never disturbing an in-flight render.
+    let pressureSource = DispatchSource.makeMemoryPressureSource(
+      eventMask: [.warning, .critical], queue: listenerQueue)
+    pressureSource.setEventHandler { [weak self] in
+      guard let self else { return }
+      let event = pressureSource.data
+      let level = event.contains(.critical) ? "critical" : "warning"
+      self.logger.warning("Memory pressure: \(level) — shedding caches/idle heavy models (#218)")
+      // Always drop the MLX buffer cache; cheap and often enough.
+      GPU.clearCache()
+      // Release an idle (not mid-render) LTX-2 stack — the single biggest chunk.
+      if self.videoHolder.releaseIfIdle() {
+        self.logger.warning("Memory pressure: released idle LTX-2 video stack")
+      }
+      // On critical, also shed the LRU inactive image model from the pool.
+      if event.contains(.critical) {
+        Task { [weak self] in
+          guard let self else { return }
+          let freed = await self.coordinator.shedInactivePoolModelUnderPressure()
+          if freed > 0 {
+            self.logger.warning("Memory pressure: evicted LRU inactive image model (~\(freed)MB)")
+          }
+        }
+      }
+    }
+    pressureSource.resume()
+    self.memoryPressureSource = pressureSource
 
     listener.start(queue: listenerQueue)
 
@@ -1403,7 +1441,7 @@ public final class WarmServer {
         requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
 
       let generator: LTX2VideoGenerator
-      if let existing = ltx2Generator {
+      if let existing = videoHolder.get() {
         generator = existing
       } else {
         // Both fields accept either a local path or a "org/repo[:revision]"
@@ -1435,7 +1473,10 @@ public final class WarmServer {
         generator = LTX2VideoGenerator(
           config: .init(weightsDir: weightsURL.path, gemmaPath: gemmaURL.path), logger: logger)
       }
-      ltx2Generator = generator
+      // Publish into the shared holder so the coordinator can evict it before an
+      // image load, and so the render queue evicts image models before this one
+      // actually loads its ~65GB of weights inside generate() (#218).
+      videoHolder.set(generator)
 
       // Accept an init image as bytes (image_base64) when no server path is given.
       let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
@@ -2747,9 +2788,25 @@ private actor WarmServerCoordinator {
   /// Model hot-swap pool — holds loaded pipelines with LRU eviction.
   let modelPool: ModelPool
 
-  init(configuration: WarmServerConfiguration, logger: Logger) {
+  /// Shared, lock-based owner of the LTX-2 video generator (#218). The video
+  /// stack lives outside the pool; this lets the coordinator evict it before an
+  /// image load, keeping a single heavy model resident across image + video.
+  private let videoHolder: VideoGeneratorHolder
+
+  /// Pure single-heavy-model residency accounting (#218).
+  private let heavyAdmission = HeavyModelAdmission()
+
+  /// True after the image models were released to make room for LTX-2 video —
+  /// the next image render must reload before it can run (#218).
+  private var imageModelsEvicted = false
+  /// The image model that was active when it was evicted for video, so the next
+  /// image render can restore exactly that model.
+  private var lastActiveImageSpec: String?
+
+  init(configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder) {
     self.configuration = configuration
     self.logger = logger
+    self.videoHolder = videoHolder
     self.pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
     self.activeLoRAs = configuration.initialLoRAs
     self.modelPool = ModelPool(
@@ -2758,6 +2815,53 @@ private actor WarmServerCoordinator {
       forceTransformerOverrideOnly: configuration.forceTransformerOverrideOnly,
       logger: logger
     )
+  }
+
+  // MARK: - Single-heavy-model residency (#218)
+
+  /// Release EVERY resident image model — the pool (including the active model)
+  /// and the coordinator's own per-family pipelines — to vacate unified memory
+  /// for the ~65GB LTX-2 video stack. Records what was active so the next image
+  /// render can restore it. Returns the estimated MB freed.
+  @discardableResult
+  func releaseImageModelsForVideo() async -> Int {
+    lastActiveImageSpec = activePoolModelSpec ?? configuration.modelSpec
+    let freedMB = await modelPool.releaseAll()
+    pipeline.unloadModel()
+    flux2Pipeline = nil
+    fiboPipeline = nil
+    chromaPipeline = nil
+    krea2Pipeline = nil
+    chromaTokenizer = nil
+    controlPipeline = nil
+    pipelinePrepared = false
+    activePoolModelSpec = nil
+    imageModelsEvicted = true
+    GPU.clearCache()
+    logger.info("Released image models for LTX-2 video (~\(freedMB)MB pool est; base pipeline + per-family pipelines unloaded) (#218)")
+    return freedMB
+  }
+
+  /// If image models were evicted for a video render, reload the previously
+  /// active image model (or the one this request explicitly asks for) before
+  /// rendering. Throws if the reload fails. No-op when nothing was evicted.
+  private func reloadImageModelIfEvicted(requestedModel: String?) async throws {
+    guard imageModelsEvicted else { return }
+    let spec = requestedModel.map { WarmServer.parseModelSpec(from: $0) }
+      ?? lastActiveImageSpec
+      ?? configuration.modelSpec
+    guard let reloadSpec = spec else { imageModelsEvicted = false; return }
+    let quant = requestedModel.flatMap { WarmServer.parseQuantization(from: $0) }
+    logger.info("Reloading image model '\(reloadSpec)' after video eviction (#218)")
+    _ = try await poolLoad(modelSpec: reloadSpec, quantization: quant, activate: true)
+    imageModelsEvicted = false
+  }
+
+  /// Shed the least-recently-used *inactive* pool model under memory pressure.
+  /// Never touches the active model or an in-flight render. Returns MB freed.
+  @discardableResult
+  func shedInactivePoolModelUnderPressure() async -> Int {
+    await modelPool.releaseLRUInactive()
   }
 
   func prepare() async throws {
@@ -3019,6 +3123,13 @@ private actor WarmServerCoordinator {
 
   /// Load a model into the pool, optionally activating it.
   func poolLoad(modelSpec: String, quantization: String?, activate: Bool) async throws -> ModelLoadResponse {
+    // #218: an image load must vacate a resident LTX-2 video stack first — the
+    // two heavy models can't co-reside on a 128GB box. Safe here because
+    // poolLoad and the video render are serialized on the same actor/queue, so
+    // no video render is ever in flight at this point.
+    if videoHolder.release() {
+      logger.info("Released resident LTX-2 video stack before image load (#218)")
+    }
     let start = Date()
     let entry = try await modelPool.load(
       modelSpec: modelSpec,
@@ -3055,6 +3166,9 @@ private actor WarmServerCoordinator {
 
     // Sync coordinator state from pool entry.
     currentModelFamily = entry.family
+    // An image model is now resident and active — clear the video-eviction flag
+    // so a later render doesn't redundantly reload (#218).
+    imageModelsEvicted = false
     // Track the activated pool model's spec so generation requests use
     // the correct model instead of the startup configuration.modelSpec.
     activePoolModelSpec = entry.modelSpec
@@ -3470,10 +3584,28 @@ private actor WarmServerCoordinator {
         activeRenderStartedAt = Date()
         // activeJobId is set from job.id at the top of the loop.
         defer { activeRenderStartedAt = nil; activeJobId = nil }
-        do {
-          continuation.resume(returning: try body())
-        } catch {
-          continuation.resume(throwing: error)
+        // #218: single-heavy-model residency. Right before the ~65GB LTX-2
+        // stack loads inside body(), vacate ALL image models (pool + per-family
+        // pipelines), then verify there is enough physical RAM to proceed —
+        // refuse cleanly instead of OOM-killing the whole process. Doing this
+        // on the serial render queue guarantees no image render can re-load
+        // between the eviction and the video load.
+        let freedForVideoMB = await releaseImageModelsForVideo()
+        let availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+        let admitVideo = heavyAdmission.admitsAfterEvict(
+          needBytes: HeavyModelAdmission.ltx2EstimateBytes, freeBytes: availableForVideo)
+        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB → admit=\(admitVideo) (#218)")
+        if !admitVideo {
+          continuation.resume(throwing: WarmServerError.invalidRequest(
+            message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB)"))
+        } else {
+          videoHolder.beginRender()
+          defer { videoHolder.endRender() }
+          do {
+            continuation.resume(returning: try body())
+          } catch {
+            continuation.resume(throwing: error)
+          }
         }
       case .shutdown(let continuation):
         continuation.resume(
@@ -3523,6 +3655,18 @@ private actor WarmServerCoordinator {
       #endif
     }
     defer { activeJobId = nil; progressTracker.set(nil); previewTracker.set(nil) }
+
+    // #218: if a prior LTX-2 video render evicted the image models, restore the
+    // previously-active image model before this render can run. poolLoad also
+    // releases any resident video stack, so image and video stay mutually
+    // exclusive. Runs before the per-job model/LoRA application below.
+    do {
+      try await reloadImageModelIfEvicted(requestedModel: payload.model)
+    } catch {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
+      return
+    }
 
     // Per-job model/LoRA application (queue-submit race fix): a job's own
     // model+loras are applied right before it runs, instead of trusting
