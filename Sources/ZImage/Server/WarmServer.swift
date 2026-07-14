@@ -205,6 +205,9 @@ public final class WarmServer {
   private let liveHealth = LiveHealthState()
   /// Generation presets (~/.comfybox/presets.json). Seeds defaults on first run.
   let presetStore = PresetStore()
+  /// Named render/browse scopes ("remote galleries", ~/.comfybox/galleries.json)
+  /// a caller can target instead of the default output folder.
+  let galleryStore = GalleryStore()
   /// Content-mode definitions (~/.comfybox/content-modes.json). Built-ins ship in-code.
   let contentModeStore = ContentModeStore.loadOrCreate()
   /// Append-only audit trail (~/.comfybox/audit-log.jsonl).
@@ -222,7 +225,7 @@ public final class WarmServer {
     self.configuration = configuration
     self.host = host
     self.logger = logger
-    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger, videoHolder: self.videoHolder, liveHealth: self.liveHealth)
+    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger, videoHolder: self.videoHolder, liveHealth: self.liveHealth, galleryStore: self.galleryStore)
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
@@ -1126,12 +1129,40 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
-    // MARK: - Remote gallery (browse the server's output folder)
+    // MARK: - Named galleries (CRUD registry)
+
+    case ("GET", "/v1/galleries"):
+      let includeHidden = ["1", "true"].contains(request.queryParameters["includeHidden"]?.lowercased() ?? "")
+      return galleriesListResponse(includeHidden: includeHidden)
+
+    case ("POST", "/v1/galleries"):
+      return createGalleryResponse(body: request.body)
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/galleries/"):
+      guard let id = Self.pathIdComponent(String(request.path.dropFirst("/v1/galleries/".count))) else {
+        return .error(.error(status: 400, message: "Invalid gallery id"))
+      }
+      return deleteGalleryResponse(id: id, password: request.queryParameters["password"])
+
+    // MARK: - Remote gallery (browse the server's output folder, or a named gallery)
 
     case ("GET", "/v1/gallery/list"):
       // List media in the gallery output folder for remote desktop browsing.
+      // ?gallery=<id>&password=<pw> scopes this to a named gallery instead of
+      // the default allowedOutputDirectory; omitted, behavior is unchanged.
       let limit = request.queryParameters["limit"].flatMap { Int($0) } ?? 500
-      let dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
+      let dir: String
+      if let galleryId = request.queryParameters["gallery"], !galleryId.isEmpty {
+        do {
+          dir = try galleryStore.authorize(id: galleryId, password: request.queryParameters["password"]).directoryPath
+        } catch let error as GalleryStoreError {
+          return galleryErrorResponse(error)
+        } catch {
+          return .error(.error(status: 500, message: error.localizedDescription))
+        }
+      } else {
+        dir = (configuration.allowedOutputDirectory as NSString).expandingTildeInPath
+      }
       let fm = FileManager.default
       let exts: Set<String> = ["png", "jpg", "jpeg", "webp", "tiff", "heic", "mp4", "mov", "m4v"]
       var items: [[String: Any]] = []
@@ -1159,13 +1190,27 @@ public final class WarmServer {
 
     case ("GET", "/v1/gallery/file"):
       // Serve a gallery file's bytes (validated within the allowed dir).
+      // ?gallery=<id>&password=<pw> scopes this to a named gallery instead of
+      // the default allowedOutputDirectory; omitted, behavior is unchanged.
       guard let raw = request.queryParameters["path"], !raw.isEmpty,
             let path = raw.removingPercentEncoding else {
         return .error(.error(status: 400, message: "Missing ?path="))
       }
+      let baseDir: String
+      if let galleryId = request.queryParameters["gallery"], !galleryId.isEmpty {
+        do {
+          baseDir = try galleryStore.authorize(id: galleryId, password: request.queryParameters["password"]).directoryPath
+        } catch let error as GalleryStoreError {
+          return galleryErrorResponse(error)
+        } catch {
+          return .error(.error(status: 500, message: error.localizedDescription))
+        }
+      } else {
+        baseDir = configuration.allowedOutputDirectory
+      }
       do {
         let resolved = try WarmServerOutputPathValidator.resolveOutputPath(
-          path, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+          path, allowedOutputDirectory: baseDir).path
         guard FileManager.default.fileExists(atPath: resolved),
               let data = FileManager.default.contents(atPath: resolved) else {
           return .error(.error(status: 404, message: "File not found: \(path)"))
@@ -1842,6 +1887,52 @@ public final class WarmServer {
       return .json(status: deleted ? 200 : 404, payload: DeleteResult(success: deleted, id: id, deleted: deleted))
     } catch {
       return .error(.error(status: 500, message: "Failed to delete preset: \(error.localizedDescription)"))
+    }
+  }
+
+  // MARK: - Named galleries
+
+  private func galleriesListResponse(includeHidden: Bool) -> RoutedResponse {
+    struct ListResult: Encodable { let galleries: [GalleryEntry.Summary] }
+    return .json(status: 200, payload: ListResult(galleries: galleryStore.list(includeHidden: includeHidden)))
+  }
+
+  private func createGalleryResponse(body: Data) -> RoutedResponse {
+    struct CreateRequest: Decodable { let name: String; let hidden: Bool?; let password: String? }
+    do {
+      let req = try decode(CreateRequest.self, from: body)
+      let entry = try galleryStore.create(name: req.name, hidden: req.hidden ?? false, password: req.password)
+      auditLog.append(kind: "gallery.create", message: "Created gallery \(entry.id)", metadata: ["id": entry.id])
+      return .json(status: 200, payload: entry.summary)
+    } catch let error as GalleryStoreError {
+      return galleryErrorResponse(error)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid gallery payload: \(error.localizedDescription)"))
+    }
+  }
+
+  private func deleteGalleryResponse(id: String, password: String?) -> RoutedResponse {
+    do {
+      let entry = try galleryStore.delete(id: id, password: password)
+      auditLog.append(kind: "gallery.delete", message: "Deleted gallery \(id)", metadata: ["id": id])
+      return .json(status: 200, payload: DeleteResult(success: true, id: entry.id, deleted: true))
+    } catch let error as GalleryStoreError {
+      return galleryErrorResponse(error)
+    } catch {
+      return .error(.error(status: 500, message: "Failed to delete gallery: \(error.localizedDescription)"))
+    }
+  }
+
+  private func galleryErrorResponse(_ error: GalleryStoreError) -> RoutedResponse {
+    switch error {
+    case .invalidName:
+      return .error(.error(status: 400, message: error.localizedDescription))
+    case .duplicateName:
+      return .error(.error(status: 409, message: error.localizedDescription))
+    case .notFound:
+      return .error(.error(status: 404, message: error.localizedDescription))
+    case .unauthorized:
+      return .error(.error(status: 401, message: error.localizedDescription))
     }
   }
 
@@ -2579,6 +2670,8 @@ public final class WarmServer {
         return .error(status: 400, message: message)
       case .loraError(let loraError):
         return .error(status: 400, message: loraError.localizedDescription)
+      case .loraLoadFailed:
+        return .error(status: 400, message: error.localizedDescription)
       default:
         return .error(status: 500, message: error.localizedDescription)
       }
@@ -3204,6 +3297,9 @@ private actor WarmServerCoordinator {
 
   /// Lock-based health snapshot the /health route reads without an actor hop (#217).
   private let liveHealth: LiveHealthState
+  /// Named render/browse scopes ("remote galleries") a job's payload.gallery
+  /// can target instead of the default allowedOutputDirectory.
+  private let galleryStore: GalleryStore
   /// When the current queue job started processing — the /health start time even
   /// before a render method sets `activeRenderStartedAt` past its first await.
   private var currentJobStartedAt: Date?
@@ -3221,11 +3317,12 @@ private actor WarmServerCoordinator {
   /// image render can restore exactly that model.
   private var lastActiveImageSpec: String?
 
-  init(configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder, liveHealth: LiveHealthState) {
+  init(configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder, liveHealth: LiveHealthState, galleryStore: GalleryStore) {
     self.configuration = configuration
     self.logger = logger
     self.videoHolder = videoHolder
     self.liveHealth = liveHealth
+    self.galleryStore = galleryStore
     self.pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
     self.activeLoRAs = configuration.initialLoRAs
     self.modelPool = ModelPool(
@@ -4173,17 +4270,163 @@ private actor WarmServerCoordinator {
       }
     }
 
+    // Resolve a per-job output-directory override (payload.gallery) before
+    // dispatch — lets a caller (Kira, Desktop, any /v1/generate client) render
+    // into a named gallery instead of the default allowedOutputDirectory.
+    let jobConfiguration: WarmServerConfiguration
+    do {
+      jobConfiguration = try effectiveConfiguration(for: payload)
+    } catch {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
+      return
+    }
+
+    if let polish = payload.polish {
+      await runPolishGenerate(payload, polish: polish, continuation: continuation, configuration: jobConfiguration, progressHandler: trackedHandler, latentPreviewHandler: trackedPreviewHandler)
+      return
+    }
+
     switch currentModelFamily {
     case .chroma:
-      await runChromaGenerate(payload, continuation: continuation)
+      await runChromaGenerate(payload, continuation: continuation, configuration: jobConfiguration)
     case .fibo:
-      await runFiboGenerate(payload, continuation: continuation)
+      await runFiboGenerate(payload, continuation: continuation, configuration: jobConfiguration)
     case .krea2:
-      await runKrea2Generate(payload, continuation: continuation)
+      await runKrea2Generate(payload, continuation: continuation, configuration: jobConfiguration)
     case .flux2:
-      await runFlux2Generate(payload, continuation: continuation)
+      await runFlux2Generate(payload, continuation: continuation, configuration: jobConfiguration)
     case .flux1:
-      await runFlux1Generate(payload, continuation: continuation, progressHandler: trackedHandler, latentPreviewHandler: trackedPreviewHandler)
+      await runFlux1Generate(payload, continuation: continuation, configuration: jobConfiguration, progressHandler: trackedHandler, latentPreviewHandler: trackedPreviewHandler)
+    }
+  }
+
+  /// Same as `configuration`, except `allowedOutputDirectory` is swapped to a
+  /// named gallery's directory when `payload.gallery` targets one (see
+  /// GalleryStore.swift) — the mechanism that lets a caller render into a
+  /// specific gallery instead of the default output folder.
+  private func effectiveConfiguration(for payload: GeneratePayload) throws -> WarmServerConfiguration {
+    guard let galleryId = payload.gallery, !galleryId.isEmpty else { return configuration }
+    let entry = try galleryStore.authorize(id: galleryId, password: payload.galleryPassword)
+    var cfg = configuration
+    cfg.allowedOutputDirectory = entry.directoryPath
+    return cfg
+  }
+
+  /// Two-pass refinement: run the base render (whichever model family is
+  /// currently active) as stage 1, capturing its result locally instead of
+  /// resuming the caller's continuation — then optionally switch to a
+  /// different model + LoRAs and re-dispatch stage 1's output as a normal
+  /// img2img request, which resumes the REAL continuation with the final,
+  /// polished image. Reuses the exact per-job model/LoRA-override and
+  /// img2img machinery every other request already goes through, so stage 2
+  /// gets Krea2's (or any family's) img2img support for free.
+  private func runPolishGenerate(
+    _ payload: GeneratePayload,
+    polish: GeneratePolishOptions,
+    continuation: ContinuationBox<GenerateResponse>,
+    configuration: WarmServerConfiguration,
+    progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil,
+    latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil
+  ) async {
+    do {
+      // Stage 1 must NEVER reuse payload.outputPath as-is: if the caller
+      // gave an explicit path, stage 2 (below) writes its own final result
+      // to that same path — reusing it here would let stage 2 silently
+      // overwrite stage 1's file before prePolishPath is ever read back,
+      // collapsing "before" and "after" into the same (post-polish) image.
+      let stage1Payload = GeneratePayload(
+        prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+        width: payload.width, height: payload.height, steps: payload.steps,
+        guidance: payload.guidance, seed: payload.seed, outputPath: nil,
+        levelsMin: payload.levelsMin, levelsMax: payload.levelsMax,
+        scheduler: payload.scheduler, sigmaSchedule: payload.sigmaSchedule, eta: payload.eta,
+        dype: payload.dype, inpaintImageData: payload.inpaintImageData, maskData: payload.maskData,
+        denoise: payload.denoise, maskGrow: payload.maskGrow, maskFeather: payload.maskFeather,
+        maskCropX: payload.maskCropX, maskCropY: payload.maskCropY,
+        cfg: payload.cfg, firstNStepsWithoutCFG: payload.firstNStepsWithoutCFG,
+        imagePath: payload.imagePath, imageStrength: payload.imageStrength, creativity: payload.creativity,
+        source: payload.source, contentMode: payload.contentMode,
+        model: payload.model, loras: payload.loras,
+        gallery: payload.gallery, galleryPassword: payload.galleryPassword
+      )
+      let stage1 = try await withCheckedThrowingContinuation { (k: CheckedContinuation<GenerateResponse, Error>) in
+        let box = ContinuationBox(k)
+        switch currentModelFamily {
+        case .chroma:
+          Task { await self.runChromaGenerate(stage1Payload, continuation: box, configuration: configuration) }
+        case .fibo:
+          Task { await self.runFiboGenerate(stage1Payload, continuation: box, configuration: configuration) }
+        case .krea2:
+          Task { await self.runKrea2Generate(stage1Payload, continuation: box, configuration: configuration) }
+        case .flux2:
+          Task { await self.runFlux2Generate(stage1Payload, continuation: box, configuration: configuration) }
+        case .flux1:
+          Task { await self.runFlux1Generate(stage1Payload, continuation: box, configuration: configuration, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler) }
+        }
+      }
+
+      if let modelSpec = polish.model, !modelSpec.isEmpty {
+        let resolvedSpec = WarmServer.parseModelSpec(from: modelSpec)
+        let currentSpec = activePoolModelSpec ?? self.configuration.modelSpec
+        if resolvedSpec != currentSpec {
+          let resolvedQuant = WarmServer.parseQuantization(from: modelSpec)
+          _ = try await poolLoad(modelSpec: resolvedSpec, quantization: resolvedQuant, activate: true)
+        }
+      }
+      if let loraEntries = polish.loras {
+        let newLoRAs = try loraEntries.map { try $0.makeConfiguration() }
+        try await applyActiveLoRAs(newLoRAs)
+      }
+
+      // Stage 2 is a fresh img2img request sourced from stage 1's output —
+      // clearing model/loras/polish prevents re-entering this same path, and
+      // reusing the original payload's other fields (prompt, dims, gallery…)
+      // keeps the polished result consistent with what stage 1 rendered.
+      let stage2Configuration = try effectiveConfiguration(for: payload)
+      let stage2Payload = GeneratePayload(
+        prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+        width: payload.width, height: payload.height, steps: polish.steps ?? payload.steps,
+        guidance: payload.guidance, seed: payload.seed, outputPath: payload.outputPath,
+        levelsMin: payload.levelsMin, levelsMax: payload.levelsMax,
+        scheduler: payload.scheduler, sigmaSchedule: payload.sigmaSchedule, eta: payload.eta,
+        dype: payload.dype,
+        cfg: payload.cfg, firstNStepsWithoutCFG: payload.firstNStepsWithoutCFG,
+        imagePath: stage1.outputPath, imageStrength: polish.strength ?? 0.35,
+        source: payload.source, contentMode: payload.contentMode,
+        gallery: payload.gallery, galleryPassword: payload.galleryPassword
+      )
+
+      // Stage 2 also runs through a locally-owned continuation (not the
+      // caller's) so its plain GenerateResponse can be enriched with
+      // stage 1's path before the REAL continuation is resumed — the
+      // caller sees one response with both the before (prePolishPath) and
+      // after (outputPath) images.
+      let stage2 = try await withCheckedThrowingContinuation { (k: CheckedContinuation<GenerateResponse, Error>) in
+        let box = ContinuationBox(k)
+        switch currentModelFamily {
+        case .chroma:
+          Task { await self.runChromaGenerate(stage2Payload, continuation: box, configuration: stage2Configuration) }
+        case .fibo:
+          Task { await self.runFiboGenerate(stage2Payload, continuation: box, configuration: stage2Configuration) }
+        case .krea2:
+          Task { await self.runKrea2Generate(stage2Payload, continuation: box, configuration: stage2Configuration) }
+        case .flux2:
+          Task { await self.runFlux2Generate(stage2Payload, continuation: box, configuration: stage2Configuration) }
+        case .flux1:
+          Task { await self.runFlux1Generate(stage2Payload, continuation: box, configuration: stage2Configuration, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler) }
+        }
+      }
+
+      continuation.resume(returning: GenerateResponse(
+        success: true,
+        outputPath: stage2.outputPath,
+        durationMs: stage1.durationMs + stage2.durationMs,
+        prePolishPath: stage1.outputPath
+      ))
+    } catch {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
     }
   }
 
@@ -4198,7 +4441,7 @@ private actor WarmServerCoordinator {
     previewTracker.get()
   }
 
-  private func runFlux1Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
+  private func runFlux1Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, configuration: WarmServerConfiguration, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -4263,7 +4506,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runFlux2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+  private func runFlux2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, configuration: WarmServerConfiguration) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -4359,7 +4602,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runKrea2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+  private func runKrea2Generate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, configuration: WarmServerConfiguration) async {
     activeRenderStartedAt = Date()
     let start = Date()
     var resumed = false
@@ -4386,10 +4629,37 @@ private actor WarmServerCoordinator {
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
 
-      let image = k2.generate(
-        .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed)
-      ) { [logger] step, total in
-        logger.info("Krea2: step \(step)/\(total)")
+      let image: MLXArray
+      if let imagePath = payload.imagePath {
+        // img2img: same reference-image + strength path Flux1/Flux2 already
+        // support (EngineService sends imagePath/imageStrength identically
+        // regardless of active model family) — Krea2 previously ignored
+        // this and always ran txt2img, silently no-oping the Desktop
+        // reference-image UI and strength slider whenever Krea2 was active.
+        guard let cgSource = CGImageSourceCreateWithURL(URL(fileURLWithPath: imagePath) as CFURL, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(cgSource, 0, nil) else {
+          throw WarmServerError.invalidRequest(message: "Krea2 img2img: could not load reference image at \(imagePath)")
+        }
+        let strength = try payload.resolvedImg2ImgStrength()
+        // QwenImageIO.resizedPixelArray/normalizeForEncoder are NCHW; Krea2VAE
+        // (and Img2ImgRequest.sourceImage) is NHWC — transpose before use.
+        let pixelsNCHW = try QwenImageIO.resizedPixelArray(
+          from: cgImage, width: width, height: height, addBatchDimension: true, dtype: .float32
+        )
+        let sourceNHWC = QwenImageIO.normalizeForEncoder(pixelsNCHW).transposed(0, 2, 3, 1)
+        let img2imgRequest = Krea2Pipeline.Img2ImgRequest(
+          prompt: payload.prompt, sourceImage: sourceNHWC,
+          width: width, height: height, steps: steps, seed: seed, strength: strength
+        )
+        image = k2.generateImg2Img(img2imgRequest) { [logger] step, total in
+          logger.info("Krea2 img2img: step \(step)/\(total)")
+        }
+      } else {
+        image = k2.generate(
+          .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed)
+        ) { [logger] step, total in
+          logger.info("Krea2: step \(step)/\(total)")
+        }
       }
       let metadata = QwenImageIO.ImageMetadata.generation(
         prompt: payload.prompt,
@@ -4421,7 +4691,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runFiboGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+  private func runFiboGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, configuration: WarmServerConfiguration) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -4487,7 +4757,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  private func runChromaGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>) async {
+  private func runChromaGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, configuration: WarmServerConfiguration) async {
     activeRenderStartedAt = Date()
     let start = Date()
 
@@ -4511,13 +4781,10 @@ private actor WarmServerCoordinator {
         throw WarmServerError.chromaNotLoaded
       }
 
-      let outputURL: URL
-      if let outputPath = payload.outputPath, !outputPath.isEmpty {
-        outputURL = URL(fileURLWithPath: outputPath)
-      } else {
-        outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
-          .appendingPathComponent("zimage-chroma-\(UUID().uuidString).png")
-      }
+      let outputURL = try payload.resolvedOutputURL(
+        configuration: configuration,
+        defaultFilename: "zimage-chroma-\(UUID().uuidString).png"
+      )
 
       // Run the synchronous Chroma render off the actor (the static helper is
       // nonisolated, so it executes on the global concurrent executor). This
@@ -5075,6 +5342,19 @@ struct GeneratePayload: Sendable {
   /// Per-job LoRA override, applied the same way as `model` at dequeue time.
   let loras: [LoRAEntry]?
 
+  /// Named gallery to render into instead of the default allowedOutputDirectory
+  /// (see GalleryStore.swift) — how a caller like Kira targets a specific
+  /// gallery rather than the server's default output folder. nil preserves the
+  /// old single-output-directory behavior.
+  let gallery: String?
+  /// Password for `gallery`, if it's password-locked.
+  let galleryPassword: String?
+
+  /// Two-pass refinement: render normally, then run a second img2img pass
+  /// (optionally on a different model + LoRAs) over the first pass's output.
+  /// nil preserves plain single-pass generation.
+  let polish: GeneratePolishOptions?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -5088,13 +5368,18 @@ struct GeneratePayload: Sendable {
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
-    model: String? = nil, loras: [LoRAEntry]? = nil
+    model: String? = nil, loras: [LoRAEntry]? = nil,
+    gallery: String? = nil, galleryPassword: String? = nil,
+    polish: GeneratePolishOptions? = nil
   ) {
     self.source = source
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
     self.loras = loras
+    self.gallery = gallery
+    self.galleryPassword = galleryPassword
+    self.polish = polish
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -5107,6 +5392,21 @@ struct GeneratePayload: Sendable {
     self.cfg = cfg; self.firstNStepsWithoutCFG = firstNStepsWithoutCFG
     self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
   }
+}
+
+/// Polish stage-2 settings: `model` picks the (optionally different) model
+/// the second img2img pass runs on — e.g. "krea-2-turbo" to refine a Z-Image
+/// render with Krea-2, or nil/omitted to stay on the model stage 1 used (the
+/// Telegram bot's existing same-model two-pass "polish" behavior). `loras`
+/// applies to that stage-2 model only, same shape as GeneratePayload.loras.
+struct GeneratePolishOptions: Decodable, Sendable {
+  let model: String?
+  let loras: [LoRAEntry]?
+  /// img2img strength for the polish pass — same 0..1 convention as
+  /// GeneratePayload.imageStrength (higher = follows stage 1 more closely).
+  /// Defaults to 0.35 (light touch) when omitted.
+  let strength: Float?
+  let steps: Int?
 }
 
 extension GeneratePayload: Decodable {
@@ -5128,6 +5428,8 @@ extension GeneratePayload: Decodable {
     // .convertFromSnakeCase (same gotcha as the inpaint keys).
     case initImageData = "initImageBase64"
     case model, loras
+    case gallery, galleryPassword
+    case polish
   }
 
   init(from decoder: Decoder) throws {
@@ -5167,6 +5469,28 @@ extension GeneratePayload: Decodable {
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
+    gallery = try c.decodeIfPresent(String.self, forKey: .gallery)
+    galleryPassword = try c.decodeIfPresent(String.self, forKey: .galleryPassword)
+    polish = try c.decodeIfPresent(GeneratePolishOptions.self, forKey: .polish)
+  }
+
+  /// Resolve img2img strength from the mutually-exclusive imageStrength/
+  /// creativity/denoise fields (same priority order as makeImg2ImgRequest
+  /// below), clamped to a sane range. Used by Krea2's img2img dispatch
+  /// (runKrea2Generate), which has no `specifiedAs` concept to track.
+  func resolvedImg2ImgStrength() throws -> Float {
+    if imageStrength != nil && creativity != nil {
+      throw Img2ImgValidationError.mutuallyExclusive("imageStrength and creativity cannot both be specified")
+    }
+    if let creativity {
+      return 1.0 - max(0.01, min(0.99, creativity))
+    } else if let imageStrength {
+      return imageStrength
+    } else if let denoise {
+      return 1.0 - max(0.01, min(0.99, denoise))
+    } else {
+      return 0.3
+    }
   }
 
   func makePipelineRequest(
@@ -5383,6 +5707,9 @@ private struct GenerateResponse: Encodable, Sendable {
   let success: Bool
   let outputPath: String
   let durationMs: Int
+  /// Stage 1's (pre-polish) output path, set only when this response came
+  /// from a Polish request — lets the caller show before/after.
+  var prePolishPath: String? = nil
 }
 
 // MARK: - Upscale Payload & Response

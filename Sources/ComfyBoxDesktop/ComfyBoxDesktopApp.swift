@@ -64,7 +64,7 @@ struct ComfyBoxDesktopApp: App {
         case characters = "Characters"
         case applications = "Applications"
         case queue = "Queue"
-        case remoteGallery = "Remote Gallery"
+        case remoteGallery = "Remote Galleries"
 
         /// Sidebar grouping for the hub.
         enum Section: String, CaseIterable, Identifiable {
@@ -363,7 +363,7 @@ struct ComfyBoxDesktopApp: App {
             QueueView(engine: engine)
 
         case .remoteGallery:
-            RemoteGalleryView(engine: engine, ingestor: ingestor)
+            GalleryHubView(engine: engine, ingestor: ingestor)
 
         case .characters:
             CharactersView(engine: engine)
@@ -373,6 +373,7 @@ struct ComfyBoxDesktopApp: App {
                 engine: engine,
                 presetManager: presetManager,
                 characters: characters,
+                ingestor: ingestor,
                 onGenerated: handleGenerated,
                 onBatchComplete: handleBatchComplete,
                 pendingPreset: $pendingPreset,

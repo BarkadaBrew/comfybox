@@ -32,6 +32,11 @@ struct MotionView: View {
     @State private var statusMessage: String?
     @State private var errorMessage: String?
     @State private var resultURL: URL?
+    /// Owned once per result and reused across re-renders — constructing a
+    /// fresh AVPlayer inline in the view body on every render is a known
+    /// source of a Swift generic-metadata crash inside _AVKit_SwiftUI (see
+    /// GalleryLightbox.swift's load() for the same fix applied there).
+    @State private var resultPlayer: AVPlayer?
 
     enum VideoResolution: String, CaseIterable, Identifiable {
         case landscape = "704 × 448 (16:10)"
@@ -186,8 +191,10 @@ struct MotionView: View {
             Color(nsColor: .controlBackgroundColor)
             if let url = resultURL {
                 VStack(spacing: 8) {
-                    VideoPlayer(player: AVPlayer(url: url))
-                        .frame(minHeight: 300)
+                    if let resultPlayer {
+                        VideoPlayer(player: resultPlayer)
+                            .frame(minHeight: 300)
+                    }
                     HStack {
                         Button { NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "") } label: {
                             Label("Reveal", systemImage: "magnifyingglass")
@@ -271,6 +278,7 @@ struct MotionView: View {
         isGenerating = true
         errorMessage = nil
         resultURL = nil
+        resultPlayer = nil
         statusMessage = "Loading LTX-2 and generating \(frames) frames…"
 
         let request = EngineService.VideoRequest(
@@ -299,7 +307,9 @@ struct MotionView: View {
                 }
                 statusMessage = String(format: "Done — %d frames, %.1fs video in %.0fs",
                                        result.frameCount, result.durationSeconds, result.elapsedSeconds)
-                resultURL = URL(fileURLWithPath: result.outputPath)
+                let url = URL(fileURLWithPath: result.outputPath)
+                resultPlayer = AVPlayer(url: url)
+                resultURL = url
             } catch {
                 errorMessage = error.localizedDescription
                 statusMessage = nil

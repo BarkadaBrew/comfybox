@@ -53,6 +53,10 @@ struct GenerationView: View {
     @Bindable var engine: EngineService
     var presetManager: PresetManager?
     var characters: [CharacterEntry]
+    /// For explicit DAM ingestion GenerationView does itself (the polish
+    /// interstitial and produced videos) — the final image still goes
+    /// through onGenerated/onBatchComplete like before.
+    var ingestor: AssetIngestor?
     var onGenerated: ((String, GenerationRequest) -> Void)?
     /// Fired once after a multi-image batch (batchCount > 1) finishes, with
     /// every output path in generation order — lets the app hand the set off
@@ -83,6 +87,9 @@ struct GenerationView: View {
     @SceneStorage("gen.guidance") private var guidance: Double = 3.5
     @SceneStorage("gen.seedText") private var seedText: String = ""
     @State private var displayedImage: NSImage?
+    /// Stage 1's (pre-polish) result, shown alongside the final image when
+    /// the last render had Polish enabled — nil otherwise.
+    @State private var prePolishThumbnail: NSImage?
 
     // img2img reference
     @State private var referenceImagePath: String?
@@ -90,6 +97,27 @@ struct GenerationView: View {
     @State private var imageStrength: Double = 0.6
     @State private var isReferenceDropTargeted: Bool = false
     @State private var showReference: Bool = false
+
+    // Polish: optional second img2img pass, possibly on a different model + LoRAs.
+    @State private var polishEnabled: Bool = false
+    @State private var polishModelId: String = ""
+    @State private var polishLoras: [LoRASelection] = []
+    @State private var polishStrength: Double = 0.35
+    @State private var showPolish: Bool = false
+    /// Keep the pre-polish (interstitial) render as its own Gallery asset
+    /// instead of it just sitting on disk unindexed.
+    @State private var polishSaveInterstitial: Bool = false
+
+    // Video: optional LTX-2 image-to-video render off the final image,
+    // fired in the background (video takes minutes — never blocks Generate).
+    @State private var videoEnabled: Bool = false
+    @State private var videoLoras: [LoRASelection] = []
+    @State private var videoFrames: Double = 97
+    @State private var videoSteps: Double = 8
+    @State private var videoStrength: Double = 1.0
+    @State private var showVideo: Bool = false
+    @State private var isProducingVideo: Bool = false
+    @State private var videoStatusMessage: String?
 
     /// Output dimensions: the picked preset, or the custom fields.
     private var effectiveWidth: Int {
@@ -330,6 +358,17 @@ struct GenerationView: View {
 
                 // Reference image (img2img)
                 referenceSection
+
+                Divider()
+
+                // Polish: optional second img2img pass, possibly on a
+                // different model + LoRAs.
+                polishSection
+
+                Divider()
+
+                // Video: optional LTX-2 image-to-video render off the result.
+                videoSection
 
                 Divider()
 
@@ -651,6 +690,105 @@ struct GenerationView: View {
         }
     }
 
+    /// Second img2img pass over the render, optionally on a different model +
+    /// LoRAs (e.g. render Z-Image, then refine with Krea-2 + a realism LoRA).
+    /// Empty polishModelId stays on whatever model the first pass used.
+    private var polishSection: some View {
+        DisclosureGroup(isExpanded: $showPolish) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Polish this render", isOn: $polishEnabled)
+                if polishEnabled {
+                    if !serverPresets.isEmpty {
+                        Menu {
+                            ForEach(serverPresets) { preset in
+                                Button(preset.name) { applyPresetToPolish(preset) }
+                            }
+                        } label: {
+                            Label("Apply Preset", systemImage: "slider.horizontal.below.rectangle")
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Set the polish model + LoRAs from a saved preset")
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Model").font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            TextField("Same model (leave blank), or e.g. krea-2-turbo", text: $polishModelId)
+                                .textFieldStyle(.roundedBorder)
+                            if !engine.availableModels.isEmpty {
+                                Menu {
+                                    ForEach(engine.availableModels, id: \.id) { model in
+                                        Button(model.displayName) { polishModelId = model.id }
+                                    }
+                                } label: {
+                                    Image(systemName: "chevron.down.circle")
+                                }
+                                .menuStyle(.borderlessButton)
+                                .frame(width: 24)
+                            }
+                        }
+                    }
+                    LoRAPicker(engine: engine, selectedLoras: $polishLoras)
+                    NumericSliderField(label: "Strength", value: $polishStrength,
+                                       range: 0...1, step: 0.05, fractionDigits: 2)
+                    Text("Higher strength follows the first pass more closely; lower lets the polish model rework it more.")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                    Toggle("Save the interstitial (pre-polish) image too", isOn: $polishSaveInterstitial)
+                        .disabled(ingestor == nil)
+                        .help(ingestor == nil ? "Not available in this context" : "Adds the before image to the Gallery as its own asset, in addition to the polished result")
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Label("Polish", systemImage: "sparkles").font(.headline)
+                if polishEnabled {
+                    Text(polishModelId.isEmpty ? "same model" : polishModelId)
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+
+    /// Optional LTX-2 image-to-video render off the final (post-polish, if
+    /// enabled) image. Fires in the background — video takes minutes, so
+    /// enabling this never blocks Generate or holds up the next render.
+    private var videoSection: some View {
+        DisclosureGroup(isExpanded: $showVideo) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Also produce a video from this", isOn: $videoEnabled)
+                if videoEnabled {
+                    LoRAPicker(engine: engine, selectedLoras: $videoLoras, familyOverride: "ltx")
+                        .frame(minHeight: 140, maxHeight: 200)
+                    HStack {
+                        Text("Frames").font(.caption).foregroundStyle(.secondary)
+                        Picker("", selection: $videoFrames) {
+                            ForEach([25.0, 49.0, 97.0, 121.0], id: \.self) { f in
+                                Text("\(Int(f))").tag(f)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 90)
+                        Spacer()
+                    }
+                    NumericSliderField(label: "Steps", value: $videoSteps, range: 1...30, step: 1, fractionDigits: 0)
+                    NumericSliderField(label: "Strength", value: $videoStrength, range: 0...1, step: 0.05, fractionDigits: 2)
+                    if isProducingVideo {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text(videoStatusMessage ?? "Rendering video…").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    } else if let videoStatusMessage {
+                        Text(videoStatusMessage).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            Label("Video", systemImage: "film").font(.headline)
+        }
+    }
+
     private func chooseReferenceImage() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -660,6 +798,33 @@ struct GenerationView: View {
         panel.prompt = "Use as Reference"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         setReference(path: url.path)
+    }
+
+    /// Set the polish model + LoRAs from a saved preset (same LoRA
+    /// filename-lookup applyPreset uses for the main render, GenerationView.swift
+    /// ~1709). Unlike applyPreset, this never activates the model — the polish
+    /// model is only actually loaded server-side at render time.
+    private func applyPresetToPolish(_ preset: ServerPreset) {
+        polishLoras = preset.loras.map { presetLora in
+            if let match = engine.availableLoras.first(where: { $0.filename == presetLora.filename }) {
+                return LoRASelection(id: match.id, filename: match.filename, scale: Float(presetLora.scale))
+            }
+            return LoRASelection(id: presetLora.filename, filename: presetLora.filename, scale: Float(presetLora.scale))
+        }
+        if let modelId = preset.customModelPath ?? preset.model {
+            polishModelId = modelId
+        }
+    }
+
+    /// Polish settings for the next request, or nil when disabled — shared by
+    /// submitGeneration() and queueVariant() so both stay in sync.
+    private var currentPolishSettings: GenerationRequest.PolishSettings? {
+        guard polishEnabled else { return nil }
+        return GenerationRequest.PolishSettings(
+            model: polishModelId.trimmingCharacters(in: .whitespacesAndNewlines),
+            loras: polishLoras,
+            strength: Float(polishStrength)
+        )
     }
 
     /// Set the reference image (called by the picker or an external "use as
@@ -1005,6 +1170,26 @@ struct GenerationView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let image = displayedImage {
                 VStack {
+                    if let before = prePolishThumbnail {
+                        HStack(spacing: 10) {
+                            VStack(spacing: 2) {
+                                Image(nsImage: before)
+                                    .resizable().aspectRatio(contentMode: .fit)
+                                    .frame(maxHeight: 140)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                                Text("Before").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                            VStack(spacing: 2) {
+                                Image(nsImage: image)
+                                    .resizable().aspectRatio(contentMode: .fit)
+                                    .frame(maxHeight: 140)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                                Text("Polished").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.bottom, 8)
+                    }
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -1075,7 +1260,8 @@ struct GenerationView: View {
             loras: selectedLoras,
             initImagePath: referenceImagePath,
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
-            dype: dype == "none" ? nil : dype
+            dype: dype == "none" ? nil : dype,
+            polish: currentPolishSettings
         )
 
         // Cloud backend: route to Replicate / Fal instead of the local server.
@@ -1115,7 +1301,8 @@ struct GenerationView: View {
             loras: selectedLoras,
             initImagePath: referenceImagePath,
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
-            dype: dype == "none" ? nil : dype
+            dype: dype == "none" ? nil : dype,
+            polish: currentPolishSettings
         )
 
         guard backend == .local else { return }  // cloud queueing isn't wired — local server queue only.
@@ -1192,6 +1379,15 @@ struct GenerationView: View {
                     if let image = NSImage(contentsOfFile: finalPath) {
                         await MainActor.run { displayedImage = image }
                     }
+                    if let prePolishPath = engine.lastPrePolishImagePath,
+                       let before = NSImage(contentsOfFile: prePolishPath) {
+                        await MainActor.run { prePolishThumbnail = before }
+                    } else {
+                        await MainActor.run { prePolishThumbnail = nil }
+                    }
+                    if polishSaveInterstitial, let prePolishPath = engine.lastPrePolishImagePath, let ingestor {
+                        Task { try? await ingestor.ingestFile(at: prePolishPath) }
+                    }
                     if let recipe = activeStudioPackRecipe, let svg = recipe.svgDefaults, svg.enabled {
                         await exportVectorSVG(from: finalPath, recipe: recipe, preset: svg.preset ?? "default")
                     } else {
@@ -1208,6 +1404,9 @@ struct GenerationView: View {
                 }
                 batchPaths.append(finalPath)
                 onGenerated?(finalPath, req)
+                if videoEnabled {
+                    Task { await produceVideo(from: finalPath) }
+                }
             } catch {
                 await MainActor.run { engine.lastError = error.localizedDescription }
                 break
@@ -1218,6 +1417,39 @@ struct GenerationView: View {
         if batchPaths.count > 1 {
             onBatchComplete?(batchPaths, request)
         }
+    }
+
+    /// Submit + poll an LTX-2 image-to-video job off `imagePath` (the final,
+    /// post-polish image if Polish ran) — background/fire-and-forget, since
+    /// video takes minutes and must never block Generate or the next render.
+    private func produceVideo(from imagePath: String) async {
+        await MainActor.run { isProducingVideo = true; videoStatusMessage = "Queued video job…" }
+        let outputDir = DesktopSettings.load().outputDirectory
+        let outputPath = (outputDir as NSString).appendingPathComponent("ltx2-\(Int(Date().timeIntervalSince1970)).mp4")
+        let request = EngineService.VideoRequest(
+            prompt: prompt,
+            initImagePath: imagePath,
+            frames: Int(videoFrames),
+            steps: Int(videoSteps),
+            strength: Float(videoStrength),
+            loras: videoLoras,
+            outputPath: outputPath
+        )
+        do {
+            let jobId = try await engine.submitVideoJob(request)
+            let result = try await engine.pollVideoStatus(jobId: jobId) { job in
+                if let pct = job.progressPercent, job.status == "processing" {
+                    videoStatusMessage = "Rendering video… \(pct)%"
+                }
+            }
+            await MainActor.run { videoStatusMessage = "Video ready: \((result.outputPath as NSString).lastPathComponent)" }
+            if let ingestor {
+                try? await ingestor.ingestFile(at: result.outputPath)
+            }
+        } catch {
+            await MainActor.run { videoStatusMessage = "Video failed: \(error.localizedDescription)" }
+        }
+        await MainActor.run { isProducingVideo = false }
     }
 
     /// Export a vector-first render's SVG alongside its PNG. SVG failure is

@@ -5,14 +5,18 @@ import SwiftUI
 struct RemoteGalleryView: View {
     @State private var remote: RemoteGalleryService
     var ingestor: AssetIngestor?
+    /// Display name when scoped to a named gallery (GalleryHubView) — nil for
+    /// the default/legacy single-folder view.
+    var galleryName: String?
     @State private var status: String?
     @State private var lightboxIndex: Int?
 
     private let columns = [GridItem(.adaptive(minimum: 180), spacing: 10)]
 
-    init(engine: EngineService, ingestor: AssetIngestor?) {
-        _remote = State(initialValue: RemoteGalleryService(engine: engine))
+    init(engine: EngineService, ingestor: AssetIngestor?, galleryId: String? = nil, galleryPassword: String? = nil, galleryName: String? = nil) {
+        _remote = State(initialValue: RemoteGalleryService(engine: engine, galleryId: galleryId, galleryPassword: galleryPassword))
         self.ingestor = ingestor
+        self.galleryName = galleryName
     }
 
     var body: some View {
@@ -21,7 +25,7 @@ struct RemoteGalleryView: View {
             Divider()
             content
         }
-        .navigationTitle("Remote Gallery")
+        .navigationTitle(galleryName.map { "Gallery: \($0)" } ?? "Remote Gallery")
         .task { await remote.load() }
         .overlay {
             if let idx = lightboxIndex {
@@ -33,7 +37,12 @@ struct RemoteGalleryView: View {
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
-                .transition(.opacity)
+                // No .transition() here: a video asset's VideoPlayer isn't
+                // mounted until its AVPlayer loads a beat after insertion (see
+                // RemoteGalleryLightbox.load()) — if that mount lands while an
+                // insertion transition is still being processed by the graph
+                // host, AVKit's SwiftUI bridging can crash with a Swift
+                // generic-metadata fatal error inside _AVKit_SwiftUI.
             }
         }
     }
@@ -41,7 +50,7 @@ struct RemoteGalleryView: View {
     private var header: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Remote Gallery").font(.headline)
+                Text(galleryName ?? "Remote Gallery").font(.headline)
                 Text(remote.baseURL + (remote.isLocalServer ? " (this Mac)" : ""))
                     .font(.caption.monospaced()).foregroundStyle(.secondary)
             }

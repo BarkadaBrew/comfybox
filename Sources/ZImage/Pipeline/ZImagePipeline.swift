@@ -163,6 +163,10 @@ public final class ZImagePipeline {
     case weightsMissing(String)
     case modelNotLoaded
     case loraError(LoRAError)
+    /// A specific LoRA failed to load — `source`/`index`/`total` identify
+    /// which one out of the requested stack, so a multi-LoRA failure (e.g.
+    /// 1 bad file among 3 requested) doesn't surface as an anonymous error.
+    case loraLoadFailed(source: String, index: Int, total: Int, message: String)
   }
 
   private var logger: Logger
@@ -922,9 +926,9 @@ public final class ZImagePipeline {
     progressHandler?(GenerationProgress(stage: .loadingLoRA, stepIndex: 0, totalSteps: 1))
     logger.info("Loading \(configs.count) LoRA(s)...")
 
-    do {
-      currentLoRAs.removeAll(keepingCapacity: true)
-      for (index, config) in configs.enumerated() {
+    currentLoRAs.removeAll(keepingCapacity: true)
+    for (index, config) in configs.enumerated() {
+      do {
         logger.info("Loading LoRA \(index + 1)/\(configs.count) from \(config.source.displayName)...")
         let loraWeights = try await LoRAWeightLoader.load(from: config)
         logger.info("Loaded LoRA: rank=\(loraWeights.rank), alpha=\(loraWeights.alpha), layers=\(loraWeights.layerCount)")
@@ -933,15 +937,19 @@ public final class ZImagePipeline {
         LoRAApplicator.applyDynamically(to: trans, loraWeights: loraWeights, scale: config.scale, logger: logger)
         currentLoRAs.append(AppliedLoRA(weights: loraWeights, configuration: config))
         logger.info("LoRA applied successfully with scale=\(config.scale)")
+      } catch {
+        unloadLoRA()
+        // Identify which LoRA failed (by display name + position) — a bulk
+        // catch around the whole loop used to lose this, surfacing only an
+        // anonymous "PipelineError error 8" to the caller even with several
+        // LoRAs requested.
+        throw PipelineError.loraLoadFailed(
+          source: config.source.displayName, index: index, total: configs.count,
+          message: error.localizedDescription
+        )
       }
-      logger.info("Applied \(currentLoRAs.count) LoRA(s) successfully")
-    } catch let error as LoRAError {
-      unloadLoRA()
-      throw PipelineError.loraError(error)
-    } catch {
-      unloadLoRA()
-      throw error
     }
+    logger.info("Applied \(currentLoRAs.count) LoRA(s) successfully")
   }
   public var hasLoRALoaded: Bool {
     return !currentLoRAs.isEmpty
@@ -1439,4 +1447,36 @@ public final class ZImagePipeline {
     }
   }
 
+}
+
+extension ZImagePipeline.PipelineError: LocalizedError {
+  // Without this conformance, Swift's default Error bridging produces the
+  // generic "The operation couldn't be completed. (...PipelineError error N.)"
+  // text whenever .localizedDescription is called directly on a PipelineError
+  // value — which is exactly what surfaced in place of a real message when a
+  // LoRA failed to load (see .loraLoadFailed below).
+  public var errorDescription: String? {
+    switch self {
+    case .notImplemented:
+      return "Not implemented"
+    case .tokenizerNotLoaded:
+      return "Tokenizer not loaded"
+    case .invalidDimensions(let message):
+      return message
+    case .textEncoderNotLoaded:
+      return "Text encoder not loaded"
+    case .transformerNotLoaded:
+      return "Transformer not loaded"
+    case .vaeNotLoaded:
+      return "VAE not loaded"
+    case .weightsMissing(let message):
+      return message
+    case .modelNotLoaded:
+      return "Model not loaded"
+    case .loraError(let error):
+      return error.localizedDescription
+    case .loraLoadFailed(let source, let index, let total, let message):
+      return "LoRA \(index + 1)/\(total) ('\(source)') failed to load: \(message)"
+    }
+  }
 }

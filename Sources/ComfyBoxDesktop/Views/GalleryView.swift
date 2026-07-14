@@ -45,6 +45,9 @@ struct GalleryView: View {
     @State private var filterCharacter: String?
     @State private var selectedAsset: DAMAsset?
     @State private var lightboxIndex: Int? = nil
+    // Asset queued to open full-screen once the detail sheet finishes
+    // dismissing -- see the .sheet(onDismiss:) below (crash fix 2026-07-13).
+    @State private var pendingFullScreenAssetId: String?
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
 
@@ -55,6 +58,13 @@ struct GalleryView: View {
     @State private var sidecar = SidecarService()
     @State private var pendingDelete: [DAMAsset] = []
     @State private var showDeleteConfirmation: Bool = false
+
+    // Archive: move the whole gallery's files into a new named remote
+    // gallery, purging the local DAM (declutter, not delete).
+    @State private var showArchiveSheet: Bool = false
+    @State private var archiveNameInput: String = ""
+    @State private var isArchiving: Bool = false
+    @State private var archiveStatusMessage: String?
 
     // Available filter values extracted from assets.
     @State private var contentModes: [String] = []
@@ -221,7 +231,19 @@ struct GalleryView: View {
             }
             Button("Cancel", role: .cancel) { renamingSmartTab = nil }
         }
-        .sheet(item: $selectedAsset) { asset in
+        .sheet(item: $selectedAsset, onDismiss: {
+            // Open the full-screen lightbox ONLY after the detail sheet's
+            // dismissal transition has fully completed. Mounting the lightbox
+            // (which builds an _AVKit_SwiftUI VideoPlayer for a video asset)
+            // while the sheet-dismiss transition is still live in the SwiftUI
+            // graph crashes with a Swift generic-metadata fatal inside
+            // _AVKit_SwiftUI (crash 2026-07-13: Full Screen on a video asset).
+            // onDismiss fires post-transition, so the mount is clean.
+            if let pid = pendingFullScreenAssetId {
+                pendingFullScreenAssetId = nil
+                lightboxIndex = filteredAssets.firstIndex(where: { $0.id == pid })
+            }
+        }) { asset in
             AssetDetailView(
                 assets: filteredAssets,
                 index: filteredAssets.firstIndex(where: { $0.id == asset.id }) ?? 0,
@@ -230,8 +252,12 @@ struct GalleryView: View {
                     Task { await updateAsset(updated) }
                 },
                 onFullScreen: { target in
+                    // Defer to the sheet's onDismiss (above): dismiss now,
+                    // present the lightbox once the transition is done. Setting
+                    // lightboxIndex here directly overlapped the two transitions
+                    // and crashed on video assets.
+                    pendingFullScreenAssetId = target.id
                     selectedAsset = nil
-                    lightboxIndex = filteredAssets.firstIndex(where: { $0.id == target.id })
                 },
                 onSendToGenerate: onSendToGenerate
             )
@@ -270,7 +296,12 @@ struct GalleryView: View {
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
-                .transition(.opacity)
+                // No .transition() here: a video asset's VideoPlayer isn't
+                // mounted until its AVPlayer loads a beat after insertion (see
+                // GalleryLightbox.load()) — if that mount lands while an
+                // insertion transition is still being processed by the graph
+                // host, AVKit's SwiftUI bridging can crash with a Swift
+                // generic-metadata fatal error inside _AVKit_SwiftUI.
             }
         }
         .task(id: searchText) {
@@ -326,6 +357,57 @@ struct GalleryView: View {
             }
         } message: {
             Text("The image files and their metadata are moved to the Trash.")
+        }
+        .sheet(isPresented: $showArchiveSheet) { archiveSheet }
+    }
+
+    private static let archiveDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// Archive-the-whole-gallery sheet: name the new remote gallery, then
+    /// move every asset here into it and purge the local index.
+    private var archiveSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Archive Gallery", systemImage: "archivebox").font(.headline)
+            Text("Moves everything in the local gallery into a new Remote Gallery and clears it from this Gallery. Files aren't deleted — the archive can be browsed, compressed, or deleted later from Remote Galleries.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextField("Archive name", text: $archiveNameInput)
+                .textFieldStyle(.roundedBorder)
+                .disabled(isArchiving)
+            if let archiveStatusMessage {
+                Label(archiveStatusMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.red)
+            }
+            HStack {
+                if isArchiving { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel") { showArchiveSheet = false }.disabled(isArchiving)
+                Button("Archive") { Task { await performArchive() } }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isArchiving || archiveNameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(18).frame(width: 420)
+    }
+
+    private func performArchive() async {
+        guard let engine else { return }
+        isArchiving = true
+        archiveStatusMessage = nil
+        defer { isArchiving = false }
+        do {
+            let hub = GalleryHubService(engine: engine)
+            _ = try await GalleryArchiver.archiveAll(
+                store: store, ingestor: ingestor, hub: hub,
+                name: archiveNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            showArchiveSheet = false
+            await loadAssets()
+        } catch {
+            archiveStatusMessage = error.localizedDescription
         }
     }
 
@@ -534,6 +616,17 @@ struct GalleryView: View {
                 Image(systemName: "arrow.clockwise")
             }
             .help("Refresh gallery")
+
+            // Archive: move everything here into a new remote gallery and
+            // purge the local index — a declutter action, not a delete.
+            Button {
+                archiveNameInput = "Archive \(Self.archiveDateFormatter.string(from: Date()))"
+                showArchiveSheet = true
+            } label: {
+                Image(systemName: "archivebox")
+            }
+            .disabled(engine == nil || isArchiving)
+            .help("Archive this gallery to a new Remote Gallery and clear it locally")
 
             // Asset count
             Text("\(filteredAssets.count) images")

@@ -4,6 +4,10 @@
 // server's files. This fetches the server's gallery listing (/v1/gallery/list)
 // and builds URLs to stream each file (/v1/gallery/file?path=). Images can be
 // pulled down into the local gallery on demand.
+//
+// galleryId/galleryPassword scope every request to a named gallery (see
+// GalleryStore.swift server-side) instead of the server's default output
+// folder — nil (the default) preserves the original single-folder behavior.
 
 import Foundation
 
@@ -11,6 +15,10 @@ import Foundation
 @MainActor
 public final class RemoteGalleryService {
     public let engine: EngineService
+    /// Named gallery to browse instead of the default output folder, and its
+    /// password if it's locked. Set by GalleryHubView before load()/pull().
+    public var galleryId: String?
+    public var galleryPassword: String?
     public private(set) var assets: [RemoteAsset] = []
     public private(set) var isLoading = false
     public var error: String?
@@ -24,14 +32,27 @@ public final class RemoteGalleryService {
         public var id: String { path }
     }
 
-    public init(engine: EngineService) { self.engine = engine }
+    public init(engine: EngineService, galleryId: String? = nil, galleryPassword: String? = nil) {
+        self.engine = engine
+        self.galleryId = galleryId
+        self.galleryPassword = galleryPassword
+    }
 
     public var baseURL: String { "http://\(engine.serverHost):\(engine.serverPort)" }
+
+    private var galleryQueryItems: [URLQueryItem] {
+        guard let galleryId, !galleryId.isEmpty else { return [] }
+        var items = [URLQueryItem(name: "gallery", value: galleryId)]
+        if let galleryPassword, !galleryPassword.isEmpty {
+            items.append(URLQueryItem(name: "password", value: galleryPassword))
+        }
+        return items
+    }
 
     /// URL that streams a server-side file's bytes.
     public func fileURL(for path: String) -> URL? {
         var c = URLComponents(string: baseURL + "/v1/gallery/file")
-        c?.queryItems = [URLQueryItem(name: "path", value: path)]
+        c?.queryItems = [URLQueryItem(name: "path", value: path)] + galleryQueryItems
         return c?.url
     }
 
@@ -44,7 +65,9 @@ public final class RemoteGalleryService {
         isLoading = true
         defer { isLoading = false }
         error = nil
-        guard let url = URL(string: baseURL + "/v1/gallery/list?limit=1000") else { return }
+        var c = URLComponents(string: baseURL + "/v1/gallery/list")
+        c?.queryItems = [URLQueryItem(name: "limit", value: "1000")] + galleryQueryItems
+        guard let url = c?.url else { return }
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {

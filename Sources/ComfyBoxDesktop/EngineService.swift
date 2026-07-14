@@ -27,6 +27,10 @@ public struct GenerationRequest: Sendable {
     public var imageStrength: Float?
     /// DyPE high-resolution scaling method: "ntk", "yarn", or nil/"none".
     public var dype: String?
+    /// Two-pass refinement: render normally, then run a second img2img pass
+    /// (optionally on a different model + LoRAs) over the result. nil = a
+    /// plain single-pass render.
+    public var polish: PolishSettings?
 
     public init(
         prompt: String = "",
@@ -40,7 +44,8 @@ public struct GenerationRequest: Sendable {
         loras: [LoRASelection] = [],
         initImagePath: String? = nil,
         imageStrength: Float? = nil,
-        dype: String? = nil
+        dype: String? = nil,
+        polish: PolishSettings? = nil
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -54,6 +59,26 @@ public struct GenerationRequest: Sendable {
         self.loras = loras
         self.initImagePath = initImagePath
         self.imageStrength = imageStrength
+        self.polish = polish
+    }
+
+    /// Stage-2 settings for a Polish pass — mirrors the server's
+    /// GeneratePolishOptions (WarmServer.swift). `model` nil/empty stays on
+    /// whatever model stage 1 rendered with (the Telegram bot's existing
+    /// same-model two-pass "polish" behavior); set it (e.g. "krea-2-turbo")
+    /// to refine on a different model instead.
+    public struct PolishSettings: Sendable, Equatable {
+        public var model: String?
+        public var loras: [LoRASelection]
+        public var strength: Float
+        public var steps: Int?
+
+        public init(model: String? = nil, loras: [LoRASelection] = [], strength: Float = 0.35, steps: Int? = nil) {
+            self.model = model
+            self.loras = loras
+            self.strength = strength
+            self.steps = steps
+        }
     }
 }
 
@@ -76,11 +101,15 @@ struct ServerGenerateResponse: Decodable {
     let success: Bool
     let outputPath: String
     let durationMs: Int
+    /// Stage 1's (pre-polish) output path — present only when the request
+    /// had `polish` set, letting the caller show before/after.
+    let prePolishPath: String?
 
     enum CodingKeys: String, CodingKey {
         case success
         case outputPath = "output_path"
         case durationMs = "duration_ms"
+        case prePolishPath = "pre_polish_path"
     }
 }
 
@@ -222,6 +251,11 @@ public final class EngineService {
     private var activeGenerateCount: Int = 0
     public var isGenerating: Bool { activeGenerateCount > 0 }
     public var lastGeneratedImagePath: String?
+    /// Stage 1's (pre-polish) output path from the last render — nil unless
+    /// that request had Polish enabled. Reset at the start of every
+    /// generate() call so a stale value never lingers from an earlier,
+    /// polish-enabled render onto a later plain one.
+    public var lastPrePolishImagePath: String?
     public var lastError: String?
     public var lastDurationMs: Int?
 
@@ -335,6 +369,7 @@ public final class EngineService {
 
         activeGenerateCount += 1
         lastError = nil
+        lastPrePolishImagePath = nil
         // Clear any stale frame from a previous render so the preview pane
         // doesn't briefly show the last render's final denoising step.
         livePreviewImage = nil
@@ -389,6 +424,18 @@ public final class EngineService {
             payloadDict["dype"] = dype
         }
 
+        if let polish = request.polish {
+            var polishDict: [String: Any] = ["strength": polish.strength]
+            if let model = polish.model, !model.isEmpty { polishDict["model"] = model }
+            if !polish.loras.isEmpty {
+                // Server resolves LoRAs by filename, not the slugified library
+                // id (same gotcha as swapLoras below).
+                polishDict["loras"] = polish.loras.map { ["path": $0.filename, "scale": $0.scale] }
+            }
+            if let steps = polish.steps { polishDict["steps"] = steps }
+            payloadDict["polish"] = polishDict
+        }
+
         payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)
 
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
@@ -422,6 +469,7 @@ public final class EngineService {
         }
 
         lastGeneratedImagePath = response.outputPath
+        lastPrePolishImagePath = response.prePolishPath
         lastDurationMs = response.durationMs
         return response.outputPath
     }
