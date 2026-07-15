@@ -148,18 +148,24 @@ public struct Img2ImgRequest: Sendable {
 private enum Img2ImgUtilities {
   private static let pngSignature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
 
-  enum Img2ImgError: Error, CustomStringConvertible {
+  enum Img2ImgError: Error, CustomStringConvertible, LocalizedError {
     case sourceImageNotFound(String)
     case sourceImageLoadFailed(String)
     case maskGenerationFailed(String)
+    case maskNotFound(String)
+    case maskLoadFailed(String)
 
     var description: String {
       switch self {
       case .sourceImageNotFound(let path): return "Source image not found: \(path)"
       case .sourceImageLoadFailed(let msg): return "Source image load failed: \(msg)"
       case .maskGenerationFailed(let msg): return "Mask generation failed: \(msg)"
+      case .maskNotFound(let path): return "Mask image not found: \(path)"
+      case .maskLoadFailed(let msg): return "Mask image load failed: \(msg)"
       }
     }
+
+    var errorDescription: String? { description }
   }
 
   /// Generate a solid white PNG image of the given dimensions.
@@ -294,10 +300,16 @@ extension ZImagePipeline {
     // A provided partial mask (white where to inpaint, black to keep) lets callers
     // add elements to a region while locking the rest of the frame.
     let maskData: Data
-    if let maskPath = request.maskPath, !maskPath.isEmpty,
-       FileManager.default.fileExists(atPath: maskPath),
-       let providedMask = try? Data(contentsOf: URL(fileURLWithPath: maskPath)),
-       !providedMask.isEmpty {
+    if let maskPath = request.maskPath, !maskPath.isEmpty {
+      // The caller explicitly asked for selective inpainting — an unusable mask
+      // must fail loudly, not silently regenerate the whole frame.
+      guard FileManager.default.fileExists(atPath: maskPath) else {
+        throw Img2ImgUtilities.Img2ImgError.maskNotFound(maskPath)
+      }
+      guard let providedMask = try? Data(contentsOf: URL(fileURLWithPath: maskPath)),
+            !providedMask.isEmpty else {
+        throw Img2ImgUtilities.Img2ImgError.maskLoadFailed("Unreadable or empty file: \(maskPath)")
+      }
       maskData = providedMask
     } else {
       maskData = try Img2ImgUtilities.generateWhiteMaskPNG(
