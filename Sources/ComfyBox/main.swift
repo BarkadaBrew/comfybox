@@ -3361,21 +3361,38 @@ struct ZImageCLI {
     print()
 
     // --- Verify weight files exist ---
+    // Per-component layout needs transformer + both VAE files; a JoyAI-Echo
+    // monolith (single .safetensors carrying DiT + VAE + vocoder — how the
+    // warm server loads sulphur2-distil) needs only ANY .safetensors present.
+    // LTX2VideoGenerator.resolveWeightsFileURL does the real resolution; this
+    // check just fails fast with a readable message.
     let fm = FileManager.default
     let transformerPath = URL(fileURLWithPath: weightsDir + "/transformer-distilled.safetensors")
     let vaeDecoderPath = URL(fileURLWithPath: weightsDir + "/vae_decoder.safetensors")
     let vaeEncoderPath = URL(fileURLWithPath: weightsDir + "/vae_encoder.safetensors")
 
-    guard fm.fileExists(atPath: transformerPath.path) else {
-      fputs("Error: transformer weights not found at \(transformerPath.path)\n", stderr)
-      exit(1)
-    }
-    guard fm.fileExists(atPath: vaeDecoderPath.path) else {
-      fputs("Error: VAE decoder weights not found at \(vaeDecoderPath.path)\n", stderr)
-      exit(1)
-    }
-    guard fm.fileExists(atPath: vaeEncoderPath.path) else {
-      fputs("Error: VAE encoder weights not found at \(vaeEncoderPath.path)\n", stderr)
+    let hasPerComponent = fm.fileExists(atPath: transformerPath.path)
+    if hasPerComponent {
+      guard fm.fileExists(atPath: vaeDecoderPath.path) else {
+        fputs("Error: VAE decoder weights not found at \(vaeDecoderPath.path)\n", stderr)
+        exit(1)
+      }
+      guard fm.fileExists(atPath: vaeEncoderPath.path) else {
+        fputs("Error: VAE encoder weights not found at \(vaeEncoderPath.path)\n", stderr)
+        exit(1)
+      }
+    } else {
+      let anySafetensors = (try? fm.contentsOfDirectory(atPath: weightsDir))?
+        .contains { $0.hasSuffix(".safetensors") } ?? false
+      guard anySafetensors else {
+        fputs("Error: no LTX-2 weights found in \(weightsDir) (need transformer-distilled.safetensors + VAEs, or a monolithic checkpoint)\n", stderr)
+        exit(1)
+      }
+      // The warm server (LTX2VideoGenerator) loads JoyAI-Echo monoliths, but
+      // this CLI command still builds its pipeline inline against the
+      // per-component layout. Fail with a pointer instead of an opaque
+      // MLXError from a nonexistent transformer-distilled.safetensors.
+      fputs("Error: \(weightsDir) holds a monolithic checkpoint. The video CLI requires per-component weights (transformer-distilled.safetensors + VAEs); render monoliths via 'ComfyBox serve' + POST /v1/video/generate instead.\n", stderr)
       exit(1)
     }
     guard fm.fileExists(atPath: gemmaPath) else {
