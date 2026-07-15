@@ -135,6 +135,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let imageStrength = params?.number("image_strength") {
       body["image_strength"] = imageStrength
     }
+    if let maskPath = params?.string("mask_path") {
+      body["mask_path"] = maskPath
+    }
     if let mode = params?.string("content_mode") {
       body["content_mode"] = mode
     }

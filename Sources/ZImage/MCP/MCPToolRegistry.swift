@@ -101,6 +101,10 @@ public enum MCPToolRegistry {
           "type": "number",
           "description": "Img2img denoise strength (0.0-1.0). 1.0 = full txt2img, 0.5 = preserve composition. Default: 0.7.",
         ] as [String: Any],
+        "mask_path": [
+          "type": "string",
+          "description": "Optional mask PNG path for SELECTIVE inpainting (requires image_path). White pixels = regenerate/inpaint that region, black = keep the original. Lets you add or change an element in one region while locking the rest of the frame (face, composition). Mask should match the source image dimensions. Omit for standard full-frame img2img.",
+        ] as [String: Any],
         "content_mode": [
           "type": "string",
           "description": "neutral | banana | avocado (gates explicit tiers). Stamped into the rendered image's embedded metadata.",

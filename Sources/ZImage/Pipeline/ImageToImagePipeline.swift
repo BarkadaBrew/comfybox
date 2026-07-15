@@ -58,6 +58,11 @@ public struct Img2ImgRequest: Sendable {
   /// Submitting app/persona (desktop/bree/api…) — stamped as metadata provenance.
   public var source: String?
 
+  /// Optional mask PNG path for selective inpainting. White (255) = inpaint/regenerate,
+  /// black (0) = keep original. When nil, a full-white mask is used (standard img2img,
+  /// i.e. regenerate everything). Mask should match the (round-to-16) output dimensions.
+  public var maskPath: String?
+
   public enum Img2ImgSpecifier: String, Sendable {
     case strength
     case creativity
@@ -90,7 +95,8 @@ public struct Img2ImgRequest: Sendable {
     strength: Float = 0.3,
     specifiedAs: Img2ImgSpecifier = .strength,
     contentMode: String? = nil,
-    source: String? = nil
+    source: String? = nil,
+    maskPath: String? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -118,6 +124,7 @@ public struct Img2ImgRequest: Sendable {
     self.specifiedAs = specifiedAs
     self.contentMode = contentMode
     self.source = source
+    self.maskPath = maskPath
   }
 
   /// Convert img2img strength to inpainting denoise value.
@@ -282,11 +289,22 @@ extension ZImagePipeline {
       #endif
     }
 
-    // Generate white mask (regenerate everything)
-    let maskData = try Img2ImgUtilities.generateWhiteMaskPNG(
-      width: resolvedWidth,
-      height: resolvedHeight
-    )
+    // Mask: use the caller-provided mask PNG (selective inpainting) when present,
+    // otherwise a full-white mask (standard img2img — regenerate everything).
+    // A provided partial mask (white where to inpaint, black to keep) lets callers
+    // add elements to a region while locking the rest of the frame.
+    let maskData: Data
+    if let maskPath = request.maskPath, !maskPath.isEmpty,
+       FileManager.default.fileExists(atPath: maskPath),
+       let providedMask = try? Data(contentsOf: URL(fileURLWithPath: maskPath)),
+       !providedMask.isEmpty {
+      maskData = providedMask
+    } else {
+      maskData = try Img2ImgUtilities.generateWhiteMaskPNG(
+        width: resolvedWidth,
+        height: resolvedHeight
+      )
+    }
 
     // Build DyPE config
     let dyPEConfig: DyPEConfig

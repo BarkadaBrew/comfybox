@@ -5199,6 +5199,10 @@ struct GeneratePayload: Sendable {
   let imageStrength: Float?
   let creativity: Float?
 
+  /// Optional mask PNG file path for selective inpainting on the img2img path.
+  /// White = inpaint region, black = keep. nil → standard full-frame img2img.
+  let maskPath: String?
+
   /// Submitting client/app (desktop, bree, api…) — for queue attribution.
   let source: String?
 
@@ -5228,6 +5232,7 @@ struct GeneratePayload: Sendable {
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
+    maskPath: String? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil
   ) {
@@ -5247,6 +5252,7 @@ struct GeneratePayload: Sendable {
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
     self.cfg = cfg; self.firstNStepsWithoutCFG = firstNStepsWithoutCFG
     self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
+    self.maskPath = maskPath
   }
 }
 
@@ -5263,6 +5269,7 @@ extension GeneratePayload: Decodable {
     case maskImageData = "maskBase64"
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
+    case maskPath
     case source
     case contentMode
     // Wire key init_image_base64 arrives as this camelCase form after
@@ -5304,6 +5311,7 @@ extension GeneratePayload: Decodable {
         .flatMap { Data(base64Encoded: $0) }
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
+    maskPath = try c.decodeIfPresent(String.self, forKey: .maskPath)
     source = try c.decodeIfPresent(String.self, forKey: .source)
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
@@ -5448,7 +5456,8 @@ extension GeneratePayload: Decodable {
       strength: resolvedStrength,
       specifiedAs: specifiedAs,
       contentMode: contentMode,
-      source: source
+      source: source,
+      maskPath: maskPath
     )
   }
 
