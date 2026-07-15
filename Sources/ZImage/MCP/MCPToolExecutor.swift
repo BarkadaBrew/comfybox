@@ -138,6 +138,18 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let maskPath = params?.string("mask_path") {
       body["mask_path"] = maskPath
     }
+    if let maskRegion = params?.string("mask_region") {
+      body["mask_region"] = maskRegion
+    }
+    if let maskInvert = params?.bool("mask_invert") {
+      body["mask_invert"] = maskInvert
+    }
+    if let maskGrow = params?.integer("mask_grow") {
+      body["mask_grow"] = maskGrow
+    }
+    if let maskFeather = params?.integer("mask_feather") {
+      body["mask_feather"] = maskFeather
+    }
     if let mode = params?.string("content_mode") {
       body["content_mode"] = mode
     }

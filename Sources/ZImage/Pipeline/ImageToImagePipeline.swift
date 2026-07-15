@@ -63,6 +63,21 @@ public struct Img2ImgRequest: Sendable {
   /// i.e. regenerate everything). Mask should match the (round-to-16) output dimensions.
   public var maskPath: String?
 
+  /// Auto-generated mask region ("face" | "upper" | "lower") — mutually exclusive
+  /// with maskPath. "face" runs Vision face detection on the source image; the
+  /// bands split the frame at half height. The named region is REGENERATED.
+  public var maskRegion: String?
+
+  /// Flip the mask (white ⇄ black). With maskRegion "face" this means: lock the
+  /// face, regenerate everything else. Requires maskPath or maskRegion.
+  public var maskInvert: Bool
+
+  /// Mask expansion in pixels before latent conversion (0 = none).
+  public var maskGrow: Int
+
+  /// Mask feather radius in pixels before latent conversion (0 = hard edges).
+  public var maskFeather: Int
+
   public enum Img2ImgSpecifier: String, Sendable {
     case strength
     case creativity
@@ -96,7 +111,11 @@ public struct Img2ImgRequest: Sendable {
     specifiedAs: Img2ImgSpecifier = .strength,
     contentMode: String? = nil,
     source: String? = nil,
-    maskPath: String? = nil
+    maskPath: String? = nil,
+    maskRegion: String? = nil,
+    maskInvert: Bool = false,
+    maskGrow: Int = 0,
+    maskFeather: Int = 0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -125,6 +144,10 @@ public struct Img2ImgRequest: Sendable {
     self.contentMode = contentMode
     self.source = source
     self.maskPath = maskPath
+    self.maskRegion = maskRegion
+    self.maskInvert = maskInvert
+    self.maskGrow = maskGrow
+    self.maskFeather = maskFeather
   }
 
   /// Convert img2img strength to inpainting denoise value.
@@ -295,14 +318,26 @@ extension ZImagePipeline {
       #endif
     }
 
-    // Mask: use the caller-provided mask PNG (selective inpainting) when present,
-    // otherwise a full-white mask (standard img2img — regenerate everything).
-    // A provided partial mask (white where to inpaint, black to keep) lets callers
-    // add elements to a region while locking the rest of the frame.
-    let maskData: Data
-    if let maskPath = request.maskPath, !maskPath.isEmpty {
-      // The caller explicitly asked for selective inpainting — an unusable mask
-      // must fail loudly, not silently regenerate the whole frame.
+    // Mask resolution, in precedence order:
+    //   mask_path  — caller-provided PNG (selective inpainting)
+    //   mask_region — auto-generated ("face" via Vision, "upper"/"lower" bands)
+    //   neither    — full-white mask (standard img2img, regenerate everything)
+    // White = regenerate, black = keep; mask_invert flips the roles.
+    // An explicit request that can't be honored fails loudly — silently
+    // regenerating the whole frame is the opposite of the caller's intent.
+    let hasMaskPath = !(request.maskPath ?? "").isEmpty
+    let hasMaskRegion = !(request.maskRegion ?? "").isEmpty
+    if hasMaskPath && hasMaskRegion {
+      throw Img2ImgUtilities.Img2ImgError.maskLoadFailed(
+        "mask_path and mask_region are mutually exclusive")
+    }
+    if request.maskInvert && !hasMaskPath && !hasMaskRegion {
+      throw Img2ImgUtilities.Img2ImgError.maskLoadFailed(
+        "mask_invert requires mask_path or mask_region")
+    }
+
+    var maskData: Data
+    if hasMaskPath, let maskPath = request.maskPath {
       guard FileManager.default.fileExists(atPath: maskPath) else {
         throw Img2ImgUtilities.Img2ImgError.maskNotFound(maskPath)
       }
@@ -311,6 +346,28 @@ extension ZImagePipeline {
         throw Img2ImgUtilities.Img2ImgError.maskLoadFailed("Unreadable or empty file: \(maskPath)")
       }
       maskData = providedMask
+      #if canImport(CoreGraphics)
+      if request.maskInvert {
+        maskData = try RegionMaskUtilities.invertMaskPNG(maskData)
+      }
+      #endif
+    } else if hasMaskRegion, let maskRegion = request.maskRegion {
+      #if canImport(CoreGraphics)
+      // Face detection reads the source image; band regions don't need it.
+      let sourceCG: CGImage? = maskRegion.lowercased() == RegionMaskUtilities.Region.face.rawValue
+        ? try InpaintUtilities.loadCGImage(from: imageData)
+        : nil
+      maskData = try RegionMaskUtilities.makeRegionMaskPNG(
+        region: maskRegion,
+        sourceImage: sourceCG,
+        width: resolvedWidth,
+        height: resolvedHeight,
+        invert: request.maskInvert
+      )
+      #else
+      throw Img2ImgUtilities.Img2ImgError.maskGenerationFailed(
+        "mask_region requires CoreGraphics")
+      #endif
     } else {
       maskData = try Img2ImgUtilities.generateWhiteMaskPNG(
         width: resolvedWidth,
@@ -354,7 +411,9 @@ extension ZImagePipeline {
       dyPE: dyPEConfig,
       inpaintImageData: imageData,
       maskData: maskData,
-      denoise: request.denoise
+      denoise: request.denoise,
+      maskGrow: request.maskGrow,
+      maskFeather: request.maskFeather
     )
   }
 }

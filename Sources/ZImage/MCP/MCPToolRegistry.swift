@@ -99,11 +99,28 @@ public enum MCPToolRegistry {
         ] as [String: Any],
         "image_strength": [
           "type": "number",
-          "description": "Img2img denoise strength (0.0-1.0). 1.0 = full txt2img, 0.5 = preserve composition. Default: 0.7.",
+          "description": "Img2img source-preservation strength (0.0-1.0). HIGHER = closer to the source (engine denoise = 1 - strength): 0.9 = tiny touch-up, 0.5 = preserve composition, 0.1 = near-total regeneration. Default: 0.3.",
         ] as [String: Any],
         "mask_path": [
           "type": "string",
           "description": "Optional mask PNG path for SELECTIVE inpainting (requires image_path). White pixels = regenerate/inpaint that region, black = keep the original. Lets you add or change an element in one region while locking the rest of the frame (face, composition). Mask should match the source image dimensions. Omit for standard full-frame img2img.",
+        ] as [String: Any],
+        "mask_region": [
+          "type": "string",
+          "enum": ["face", "upper", "lower"] as [String],
+          "description": "Auto-generate the inpaint mask (requires image_path; mutually exclusive with mask_path). 'face' = Vision face detection on the source; 'upper'/'lower' = top/bottom half of the frame. The named region is REGENERATED. Combine with mask_invert to lock the region instead (e.g. face + mask_invert = keep the face, regenerate the rest).",
+        ] as [String: Any],
+        "mask_invert": [
+          "type": "boolean",
+          "description": "Flip the mask (white <-> black). Requires mask_path or mask_region.",
+        ] as [String: Any],
+        "mask_grow": [
+          "type": "integer",
+          "description": "Expand the inpaint mask by N pixels before rendering (default 0).",
+        ] as [String: Any],
+        "mask_feather": [
+          "type": "integer",
+          "description": "Feather the inpaint mask edges by N pixels for softer seams (default 0).",
         ] as [String: Any],
         "content_mode": [
           "type": "string",

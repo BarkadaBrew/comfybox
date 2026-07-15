@@ -5203,6 +5203,14 @@ struct GeneratePayload: Sendable {
   /// White = inpaint region, black = keep. nil → standard full-frame img2img.
   let maskPath: String?
 
+  /// Auto-generated mask region ("face" | "upper" | "lower") for img2img —
+  /// mutually exclusive with maskPath. The named region is regenerated.
+  let maskRegion: String?
+
+  /// Flip the img2img mask (white ⇄ black): e.g. mask_region "face" +
+  /// mask_invert = lock the face, regenerate everything else.
+  let maskInvert: Bool?
+
   /// Submitting client/app (desktop, bree, api…) — for queue attribution.
   let source: String?
 
@@ -5232,7 +5240,7 @@ struct GeneratePayload: Sendable {
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
-    maskPath: String? = nil,
+    maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil
   ) {
@@ -5253,6 +5261,8 @@ struct GeneratePayload: Sendable {
     self.cfg = cfg; self.firstNStepsWithoutCFG = firstNStepsWithoutCFG
     self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
     self.maskPath = maskPath
+    self.maskRegion = maskRegion
+    self.maskInvert = maskInvert
   }
 }
 
@@ -5270,6 +5280,8 @@ extension GeneratePayload: Decodable {
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
     case maskPath
+    case maskRegion
+    case maskInvert
     case source
     case contentMode
     // Wire key init_image_base64 arrives as this camelCase form after
@@ -5312,6 +5324,8 @@ extension GeneratePayload: Decodable {
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
     maskPath = try c.decodeIfPresent(String.self, forKey: .maskPath)
+    maskRegion = try c.decodeIfPresent(String.self, forKey: .maskRegion)
+    maskInvert = try c.decodeIfPresent(Bool.self, forKey: .maskInvert)
     source = try c.decodeIfPresent(String.self, forKey: .source)
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
@@ -5457,7 +5471,11 @@ extension GeneratePayload: Decodable {
       specifiedAs: specifiedAs,
       contentMode: contentMode,
       source: source,
-      maskPath: maskPath
+      maskPath: maskPath,
+      maskRegion: maskRegion,
+      maskInvert: maskInvert ?? false,
+      maskGrow: maskGrow ?? 0,
+      maskFeather: maskFeather ?? 0
     )
   }
 
