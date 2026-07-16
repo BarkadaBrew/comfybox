@@ -82,4 +82,31 @@ final class HeavyModelAdmissionTests: XCTestCase {
   func testLtx2EstimateIsHeavy() {
     XCTAssertGreaterThanOrEqual(HeavyModelAdmission.ltx2EstimateBytes, 60 * gb)
   }
+
+  // MARK: - Precision-keyed estimate (#230)
+
+  func testLtx2EstimateKeyedByQuantManifest() throws {
+    // int8 estimate is meaningfully below bf16 but still heavy.
+    XCTAssertLessThan(HeavyModelAdmission.ltx2EstimateBytesInt8, HeavyModelAdmission.ltx2EstimateBytes)
+    XCTAssertGreaterThanOrEqual(HeavyModelAdmission.ltx2EstimateBytesInt8, 30 * gb)
+
+    // No path / no manifest → bf16 figure.
+    XCTAssertEqual(HeavyModelAdmission.ltx2EstimateBytes(forWeightsPath: nil),
+                   HeavyModelAdmission.ltx2EstimateBytes)
+    let plainDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("ltx2-est-plain-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: plainDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: plainDir) }
+    XCTAssertEqual(HeavyModelAdmission.ltx2EstimateBytes(forWeightsPath: plainDir.path),
+                   HeavyModelAdmission.ltx2EstimateBytes)
+
+    // Directory with quant_manifest.json → int8 figure.
+    let quantDir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("ltx2-est-quant-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: quantDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: quantDir) }
+    try Data("{\"bits\":8}".utf8).write(to: quantDir.appendingPathComponent("quant_manifest.json"))
+    XCTAssertEqual(HeavyModelAdmission.ltx2EstimateBytes(forWeightsPath: quantDir.path),
+                   HeavyModelAdmission.ltx2EstimateBytesInt8)
+  }
 }

@@ -204,6 +204,9 @@ struct ZImageCLI {
       case "quantize-controlnet":
         try runQuantizeControlnet(args: Array(args.dropFirst()))
         return
+      case "quantize-ltx2":
+        try runQuantizeLTX2(args: Array(args.dropFirst()))
+        return
       case "control":
         try runControl(args: Array(args.dropFirst()))
         return
@@ -1411,6 +1414,88 @@ struct ZImageCLI {
 
     Example:
       ComfyBox quantize -i models/z-image-turbo -o models/z-image-turbo-q8 --verbose
+    """)
+  }
+
+  private static func runQuantizeLTX2(args: [String]) throws {
+    var input: String?
+    var output: String?
+    var bits = 8
+    var groupSize = 64
+    var verbose = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--input", "-i":
+        input = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        output = nextValue(for: arg, iterator: &iterator)
+      case "--bits":
+        bits = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: bits)
+      case "--group-size":
+        groupSize = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: groupSize)
+      case "--verbose":
+        verbose = true
+      case "--help", "-h":
+        printQuantizeLTX2Usage()
+        return
+      default:
+        logger.warning("Unknown quantize-ltx2 argument: \(arg)")
+      }
+    }
+
+    guard let inputPath = input, let outputPath = output else {
+      logger.error("Missing required --input/--output arguments")
+      printQuantizeLTX2Usage()
+      exit(1)
+    }
+
+    // Accept a checkpoint file directly, or a directory holding a monolith
+    // (resolved the same way LTX2VideoGenerator does — first non-component
+    // .safetensors).
+    var sourceURL = URL(fileURLWithPath: inputPath)
+    if (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+      let perComponent: Set<String> = [
+        "vae_encoder.safetensors", "vae_decoder.safetensors", "connector.safetensors",
+      ]
+      let candidates = ((try? FileManager.default.contentsOfDirectory(
+        at: sourceURL, includingPropertiesForKeys: nil)) ?? [])
+        .filter { $0.pathExtension == "safetensors" && !perComponent.contains($0.lastPathComponent) }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+      guard let monolith = candidates.first else {
+        logger.error("No checkpoint .safetensors found in \(inputPath)")
+        exit(1)
+      }
+      sourceURL = monolith
+    }
+
+    print("Quantizing LTX-2 DiT: \(sourceURL.path) -> \(outputPath)")
+    print("Config: \(bits)-bit affine, group_size=\(groupSize)")
+    try LTX2Quantizer.quantizeCheckpoint(
+      source: sourceURL,
+      outputDir: URL(fileURLWithPath: outputPath),
+      spec: .init(bits: bits, groupSize: groupSize),
+      verbose: verbose
+    )
+  }
+
+  private static func printQuantizeLTX2Usage() {
+    print("""
+    Quantize an LTX-2 checkpoint's video-DiT block projections to MLX affine int8/int4.
+    Norms, embeds, final proj, audio branch, VAE, and vocoder stay bf16. The output
+    keeps the source key layout, so --ltx2-weights can point at the output directory.
+
+    Usage: ComfyBox quantize-ltx2 -i <checkpoint|dir> -o <output-dir> [options]
+      --input, -i          Checkpoint .safetensors or directory holding a monolith (required)
+      --output, -o         Output directory (required)
+      --bits               Bit width: 4 or 8 (default: 8)
+      --group-size         Group size: 32, 64, 128 (default: 64)
+      --verbose            Show per-layer progress
+      --help, -h           Show help
+
+    Example:
+      ComfyBox quantize-ltx2 -i /Volumes/Bolt/Models/sulphur2-distil -o /Volumes/Bolt/Models/sulphur2-distil-int8
     """)
   }
 

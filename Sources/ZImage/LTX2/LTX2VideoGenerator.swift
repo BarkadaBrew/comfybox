@@ -310,10 +310,33 @@ public final class LTX2VideoGenerator {
                 let targetKey = baseKey + ".weight"
                 guard sanitized[targetKey] != nil else { continue }
                 let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(lora.scale)
-                sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+                if sanitized["\(baseKey).scales"] != nil {
+                    // int8/int4 base checkpoint (#230): dequantize -> merge -> requantize
+                    // so LoRAs keep working against quantized weights.
+                    guard let (dense, groupSize, bits) = LTX2Quantizer.dequantizeLayer(
+                        base: baseKey, weights: sanitized) else { continue }
+                    let mergedDense = dense.asType(.float32) + delta
+                    let (wq, scales, biases) = MLX.quantized(
+                        mergedDense, groupSize: groupSize, bits: bits, mode: .affine)
+                    sanitized[targetKey] = wq
+                    sanitized["\(baseKey).scales"] = scales.asType(.bfloat16)
+                    if let b = biases { sanitized["\(baseKey).biases"] = b.asType(.bfloat16) }
+                } else {
+                    sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+                }
                 merged += 1
             }
             logger.info("LTX-2: merged \(merged) LoRA pairs from \(lora.path).")
+        }
+
+        // Quantized checkpoint support (#230): when the sanitized weights carry
+        // `.scales` siblings (MLX affine int8/int4 from `ComfyBox quantize-ltx2`),
+        // convert exactly those Linear layers to QuantizedLinear before the
+        // update. Shapes are self-describing — no manifest needed at load.
+        let quantizedLayerCount = LTX2Quantizer.applyQuantizedLayout(
+            to: transformer, sanitizedWeights: sanitized)
+        if quantizedLayerCount > 0 {
+            logger.info("LTX-2: quantized checkpoint — \(quantizedLayerCount) block projections load as QuantizedLinear.")
         }
         // Anti-noise guard: update(verify:[.shapeMismatch]) silently DROPS any key
         // that doesn't match a module parameter — a mis-remapped checkpoint loads

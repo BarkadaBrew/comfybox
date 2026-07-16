@@ -37,6 +37,24 @@ public struct HeavyModelAdmission: Sendable, Equatable {
   /// whether an incoming image load must first evict a resident video model.
   public static let ltx2EstimateBytes: UInt64 = 65 * 1024 * 1024 * 1024
 
+  /// Estimate for an int8-quantized LTX-2 stack (`ComfyBox quantize-ltx2`
+  /// checkpoint + mlx-community int8 Gemma, comfybox#230): video-DiT blocks
+  /// 24→12 GB packed, Gemma 24→12.6 GB, plus VAE/embeds and the same
+  /// activation headroom the 65 GB bf16 gate implied. Same-seed A/B validated
+  /// 2026-07-16 (RMSE ~0.005 vs bf16, render succeeded on the first try).
+  public static let ltx2EstimateBytesInt8: UInt64 = 40 * 1024 * 1024 * 1024
+
+  /// Precision-keyed LTX-2 estimate: int8 when the weights directory carries
+  /// a `quant_manifest.json` (written by `quantize-ltx2`), else the bf16
+  /// figure. Keyed off the DIRECTORY so a launch-arg flip back to the bf16
+  /// weights restores the conservative gate with no rebuild (FDD §4.3).
+  public static func ltx2EstimateBytes(forWeightsPath path: String?) -> UInt64 {
+    guard let path, !path.isEmpty else { return ltx2EstimateBytes }
+    let manifest = URL(fileURLWithPath: path).appendingPathComponent("quant_manifest.json")
+    return FileManager.default.fileExists(atPath: manifest.path)
+      ? ltx2EstimateBytesInt8 : ltx2EstimateBytes
+  }
+
   public struct Decision: Sendable, Equatable {
     /// Release the currently-resident models of the *other* class first.
     public let evictOther: Bool

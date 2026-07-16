@@ -4183,12 +4183,16 @@ private actor WarmServerCoordinator {
         // between the eviction and the video load.
         let freedForVideoMB = await releaseImageModelsForVideo()
         let availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+        // Precision-keyed (#230): an int8-quantized checkpoint dir gates at
+        // 40GB instead of the bf16 65GB, so video coexists with LM Studio.
+        let ltx2Need = HeavyModelAdmission.ltx2EstimateBytes(
+          forWeightsPath: configuration.ltx2WeightsPath)
         let admitVideo = heavyAdmission.admitsAfterEvict(
-          needBytes: HeavyModelAdmission.ltx2EstimateBytes, freeBytes: availableForVideo)
-        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB → admit=\(admitVideo) (#218)")
+          needBytes: ltx2Need, freeBytes: availableForVideo)
+        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(ltx2Need >> 20)MB → admit=\(admitVideo) (#218)")
         if !admitVideo {
           continuation.resume(throwing: WarmServerError.invalidRequest(
-            message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB)"))
+            message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(ltx2Need >> 20)MB)"))
         } else {
           videoHolder.beginRender()
           // Stream render progress into the lock-based trackers /health + /queue
