@@ -31,8 +31,9 @@ final class MCPVideoToolTests: XCTestCase {
     // 21 through the video/upscale work + 11 creative/queue/nearline tools
     // (enhance_prompt, list_characters, list_presets, import_legacy_presets,
     // queue_list, interrupt_render, cancel_job, nearline_{list,scan,stage,evict})
-    // added 2026-07 = 32; + compose_montage (#232) + render_storyboard (#237) = 34.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 34, "Expected 34 registered MCP tools")
+    // added 2026-07 = 32; + compose_montage (#232) + render_storyboard (#237)
+    // + import/list/run_workflow + workflow_run_status (#238) = 38.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 38, "Expected 38 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)

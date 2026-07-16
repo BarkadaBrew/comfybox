@@ -33,6 +33,10 @@ public enum MCPToolRegistry {
     videoStatus,
     composeMontage,
     renderStoryboard,
+    importWorkflow,
+    listWorkflows,
+    runWorkflow,
+    workflowRunStatus,
     upscale,
     enhancePrompt,
     listCharacters,
@@ -459,6 +463,59 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["segments"] as [String],
+    ] as [String: Any]
+  )
+
+  static let importWorkflow = MCPToolDefinition(
+    name: "import_workflow",
+    description: "Import a ComfyUI workflow (API format — the JSON from ComfyUI's 'Save (API Format)') as a stored, runnable ComfyBox workflow. Returns the workflow id plus a compatibility report: which nodes map to engine features, which are ignored glue, and which are unknown (their effect is dropped). Generic LoadImage/SaveImage nodes are supported; the UI-format nodes/links JSON is rejected with instructions.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "name": ["type": "string", "description": "Display name for the workflow."] as [String: Any],
+        "workflow_json": [
+          "type": "string",
+          "description": "The ComfyUI API-format workflow JSON, as a string.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["workflow_json"] as [String],
+    ] as [String: Any]
+  )
+
+  static let listWorkflows = MCPToolDefinition(
+    name: "list_workflows",
+    description: "List imported ComfyUI workflows: id, name, imported_at, and each workflow's compatibility report (mapped/glue/unknown nodes, whether it parses).",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let workflowRunStatus = MCPToolDefinition(
+    name: "workflow_run_status",
+    description: "Check a workflow run started by run_workflow. Returns status (running | succeeded | failed) and, on success, the output image path.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "run_id": ["type": "string", "description": "Run id returned by run_workflow."] as [String: Any],
+      ] as [String: Any],
+      "required": ["run_id"] as [String],
+    ] as [String: Any]
+  )
+
+  static let runWorkflow = MCPToolDefinition(
+    name: "run_workflow",
+    description: "Run an imported ComfyUI workflow through the native engine. Optional overrides replace the graph's prompt/negative_prompt/seed; other parameters come from the workflow itself. Waits up to ~2 minutes inline; longer renders return {status: running, run_id} — poll workflow_run_status.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "workflow_id": ["type": "string", "description": "Id from import_workflow / list_workflows."] as [String: Any],
+        "prompt": ["type": "string", "description": "Override the positive prompt."] as [String: Any],
+        "negative_prompt": ["type": "string", "description": "Override the negative prompt."] as [String: Any],
+        "seed": ["type": "integer", "description": "Override the seed."] as [String: Any],
+        "output_path": ["type": "string", "description": "Output file path (within the allowed output directory). Omit to auto-generate."] as [String: Any],
+      ] as [String: Any],
+      "required": ["workflow_id"] as [String],
     ] as [String: Any]
   )
 

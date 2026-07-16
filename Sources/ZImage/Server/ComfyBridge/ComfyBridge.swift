@@ -501,6 +501,57 @@ final class ComfyBridge {
     return .error(.error(status: 500, message: "Failed to serialize prompt response"))
   }
 
+  /// Submit an already-normalized ComfyUI API graph for execution outside the
+  /// Krita wire protocol (workflow run API, #238). Parses and enqueues exactly
+  /// like POST /prompt; results land in the image cache + history under
+  /// `promptId`, and optional overrides are applied to the parsed request
+  /// before enqueue. Throws on parse failure or missing executor.
+  func submitWorkflowGraph(
+    _ graph: [String: Any],
+    promptId: String,
+    promptOverride: String? = nil,
+    negativePromptOverride: String? = nil,
+    seedOverride: UInt64? = nil
+  ) throws {
+    guard let executor = executor else {
+      throw WorkflowError.storeFailed("ComfyBridge executor not configured")
+    }
+    let body: [String: Any] = [
+      "prompt": graph,
+      "prompt_id": promptId,
+      "client_id": "workflow-api",
+    ]
+    let parsed = try ComfyBridgeWorkflowParser.parseWorkflow(body)
+    switch parsed {
+    case .generate(var request):
+      if let promptOverride { request.prompt = promptOverride }
+      if let negativePromptOverride { request.negativePrompt = negativePromptOverride }
+      if let seedOverride { request.seed = seedOverride }
+      let detectedModel = request.detectedModel
+      let switchHandler = modelSwitchHandler
+      let generateRequest = request
+      logger.info("ComfyBridge: workflow-api [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, seed=\(generateRequest.seed.map(String.init) ?? "random")")
+      executor.enqueue(promptId: generateRequest.promptId) { [logger] in
+        if let modelId = detectedModel, let handler = switchHandler {
+          do {
+            let switched = try await handler(modelId)
+            if switched {
+              logger.info("ComfyBridge: auto-switched to model '\(modelId)' for workflow run")
+            }
+          } catch {
+            logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
+          }
+        }
+        await executor.execute(generateRequest)
+      }
+    case .upscale(let upscaleRequest):
+      logger.info("ComfyBridge: workflow-api [upscale] — model=\(upscaleRequest.upscaleModelName)")
+      executor.enqueue(promptId: upscaleRequest.promptId) {
+        await executor.executeUpscale(upscaleRequest)
+      }
+    }
+  }
+
   // MARK: - POST /interrupt
 
   private func handleInterrupt() async -> RoutedResponse {

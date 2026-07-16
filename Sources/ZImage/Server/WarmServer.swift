@@ -153,6 +153,9 @@ public final class WarmServer {
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
   let comfyBridge: ComfyBridge
+
+  /// Imported ComfyUI workflows (#238), file-backed at ~/.comfybox/workflows/.
+  let workflowStore = WorkflowStore()
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
   private let lifecycleLock = NSLock()
   private var listener: NWListener?
@@ -1068,6 +1071,53 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    // Workflow import/run (#238): ComfyUI API-format workflows as first-class
+    // stored objects, executed through the existing ComfyBridge parser/executor.
+    case ("POST", "/v1/workflows/import"):
+      do {
+        return try await handleWorkflowImport(body: request.body)
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", "/v1/workflows"):
+      let items = workflowStore.list().map { $0.summaryJSON() }
+      if let data = try? JSONSerialization.data(withJSONObject: ["workflows": items]) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize workflow list"))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/workflows/"):
+      let id = String(request.path.dropFirst("/v1/workflows/".count))
+      guard workflowStore.delete(id) else {
+        return .error(.error(status: 404, message: "Workflow not found: \(id)"))
+      }
+      return .json(status: 200, payload: ["deleted": id])
+
+    case ("POST", _) where request.path.hasPrefix("/v1/workflows/") && request.path.hasSuffix("/run"):
+      let id = String(request.path.dropFirst("/v1/workflows/".count).dropLast("/run".count))
+      do {
+        return try await handleWorkflowRun(id: id, body: request.body)
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", _) where request.path.hasPrefix("/v1/workflows/runs/"):
+      let runId = String(request.path.dropFirst("/v1/workflows/runs/".count))
+      return handleWorkflowRunStatus(runId: runId)
+
+    case ("GET", _) where request.path.hasPrefix("/v1/workflows/"):
+      let id = String(request.path.dropFirst("/v1/workflows/".count))
+      guard let workflow = workflowStore.get(id) else {
+        return .error(.error(status: 404, message: "Workflow not found: \(id)"))
+      }
+      var record = workflow.summaryJSON()
+      record["graph"] = workflow.graph
+      if let data = try? JSONSerialization.data(withJSONObject: record) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize workflow"))
+
     // Storyboard renderer (#237): ordered shot list → chained i2v renders
     // (each anchored on the previous shot's extracted last frame), optional
     // i2i inserts, final assembly. Long-running → 202 + job id; poll
@@ -1566,6 +1616,17 @@ public final class WarmServer {
     return seconds > singleChunkSeconds ? seconds : 0
   }
 
+  /// Whether a video request renders more than one chunk (continuation path).
+  /// Mirrors the extendToSeconds resolution above — the identity anchor
+  /// defaults on only for these (#231).
+  static func isExtendedRender(
+    extendToSeconds: Float?, duration: Float?, framesPerChunk: Int, fps: Int
+  ) -> Bool {
+    if let explicit = extendToSeconds { return explicit > 0 }
+    return extendSecondsFromDuration(
+      duration, framesPerChunk: framesPerChunk, fps: fps) > 0
+  }
+
   /// Snap a render dimension to the nearest multiple of 64 (floor 256).
   /// LTX-2 renders at dims that are 32-multiples but NOT 64-multiples (e.g.
   /// 480) exhibit progressive haze (#219) — every clean render in the 07-13
@@ -1742,11 +1803,15 @@ public final class WarmServer {
       steps: req.steps ?? videoPreset?.steps ?? 8,
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
-      // OPT-IN until stable: the first at-scale run of the multi-keyframe
-      // continuation path hard-crashed MLX (mutex lock failed, 2026-07-13,
-      // 11 crash-loop restarts via the durable queue) — see #219. Callers
-      // can still request identity_anchor_strength explicitly for testing.
-      identityAnchorStrength: req.identityAnchorStrength ?? 0,
+      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
+      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
+      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
+      // (289f, no crash). Single-chunk renders don't anchor (nothing to
+      // drift); callers can still pass 0 to disable.
+      identityAnchorStrength: req.identityAnchorStrength
+        ?? (Self.isExtendedRender(
+              extendToSeconds: req.extendToSeconds, duration: req.duration,
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24) ? 0.5 : 0),
       extendToSeconds: req.extendToSeconds
         ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,
@@ -2695,6 +2760,194 @@ public final class WarmServer {
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     return try decoder.decode(type, from: data)
+  }
+
+  // MARK: - Workflows (#238)
+
+  private struct WorkflowImportPayload: Decodable {
+    let name: String?
+    /// The ComfyUI workflow as a JSON string. Objects also accepted via the
+    /// raw-body fallback in the handler.
+    let workflowJson: String?
+  }
+
+  private func handleWorkflowImport(body: Data) async throws -> RoutedResponse {
+    // Accept {name, workflow_json: "<string>"} or {name, workflow: {...}} or a
+    // bare graph as the whole body.
+    var name = "imported-workflow"
+    var graphData: Data = body
+    if let envelope = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+      if let n = envelope["name"] as? String, !n.isEmpty { name = n }
+      if let s = envelope["workflow_json"] as? String, let d = s.data(using: .utf8) {
+        graphData = d
+      } else if let obj = envelope["workflow"] as? [String: Any] {
+        graphData = try JSONSerialization.data(withJSONObject: obj)
+      }
+    }
+
+    let graph = try WorkflowStore.apiGraph(fromJSON: graphData)
+    // Dry-run normalization + parse so the compat report reflects
+    // runnability without touching input files.
+    var parses = true
+    var parseError: String? = nil
+    do {
+      let normalized = try WorkflowStore.normalizeGenericNodes(graph, stageImage: nil)
+      _ = try ComfyBridgeWorkflowParser.parseWorkflow(
+        ["prompt": normalized, "prompt_id": "import-validate", "client_id": "workflow-api"])
+    } catch {
+      parses = false
+      parseError = "\(error)"
+    }
+
+    let workflow = StoredWorkflow(
+      id: UUID().uuidString.lowercased(),
+      name: name,
+      importedAt: Date(),
+      graph: graph,
+      compat: WorkflowStore.compatReport(for: graph, parses: parses, parseError: parseError))
+    try workflowStore.save(workflow)
+    logger.info("Workflows: imported '\(name)' (\(workflow.compat.nodeCount) nodes, parses=\(parses)) as \(workflow.id)")
+    auditLog.append(kind: "workflow.import", message: "\(name) -> \(workflow.id)", metadata: [:])
+    if let data = try? JSONSerialization.data(withJSONObject: workflow.summaryJSON()) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize import result"))
+  }
+
+  private struct WorkflowRunPayload: Decodable {
+    let prompt: String?
+    let negativePrompt: String?
+    let seed: UInt64?
+    let outputPath: String?
+    let timeoutS: Double?
+  }
+
+  /// Pending workflow runs: run id → (workflow id, requested output path).
+  /// The status route consumes this to place the finished image on disk.
+  private let workflowRunLock = NSLock()
+  private var workflowRuns: [String: (workflowId: String, outputPath: String?, resolved: String?)] = [:]
+
+  /// Submit a workflow run. Long renders (base models run 40 steps — several
+  /// minutes) outlive the HTTP connection, so this is async by design: 202 +
+  /// run_id, polled via GET /v1/workflows/runs/{run_id} — the same convention
+  /// as /v1/generate/async and /v1/video/generate/async.
+  private func handleWorkflowRun(id: String, body: Data) async throws -> RoutedResponse {
+    guard let workflow = workflowStore.get(id) else {
+      return .error(.error(status: 404, message: "Workflow not found: \(id)"))
+    }
+    let payload: WorkflowRunPayload = body.isEmpty
+      ? WorkflowRunPayload(prompt: nil, negativePrompt: nil, seed: nil, outputPath: nil, timeoutS: nil)
+      : try decode(WorkflowRunPayload.self, from: body)
+
+    // Normalize with REAL staging: LoadImage files go into the bridge cache.
+    let normalized = try WorkflowStore.normalizeGenericNodes(workflow.graph) { data in
+      let cacheId = "wf-\(UUID().uuidString.lowercased())"
+      guard self.comfyBridge.imageCache.store(id: cacheId, data: data) else {
+        throw WorkflowError.storeFailed("image cache store failed")
+      }
+      return cacheId
+    }
+
+    let promptId = "wfrun-\(UUID().uuidString.lowercased())"
+    try comfyBridge.submitWorkflowGraph(
+      normalized,
+      promptId: promptId,
+      promptOverride: payload.prompt,
+      negativePromptOverride: payload.negativePrompt,
+      seedOverride: payload.seed)
+    workflowRunLock.lock()
+    workflowRuns[promptId] = (workflow.id, payload.outputPath, nil)
+    workflowRunLock.unlock()
+    logger.info("Workflows: run \(promptId) of '\(workflow.name)' submitted")
+
+    let response: [String: Any] = [
+      "run_id": promptId,
+      "workflow_id": workflow.id,
+      "status": "queued",
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: response) {
+      return .json(.rawJSON(status: 202, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize run submission"))
+  }
+
+  private func handleWorkflowRunStatus(runId: String) -> RoutedResponse {
+    workflowRunLock.lock()
+    let run = workflowRuns[runId]
+    workflowRunLock.unlock()
+    guard let run else {
+      return .error(.error(status: 404, message: "Workflow run not found: \(runId) (runs are tracked in memory — a server restart loses them)"))
+    }
+
+    func respond(_ dict: [String: Any]) -> RoutedResponse {
+      if let data = try? JSONSerialization.data(withJSONObject: dict) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize run status"))
+    }
+
+    // Already finalized on a previous poll.
+    if let resolved = run.resolved {
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "succeeded", "output_path": resolved])
+    }
+    guard let entry = comfyBridge.history.entry(for: runId) else {
+      return respond(["run_id": runId, "workflow_id": run.workflowId, "status": "running"])
+    }
+    // History filenames carry a .png suffix for ComfyUI /view compatibility;
+    // the cache is keyed on the bare id — try both.
+    let imageData: Data? = Self.firstImageId(inHistoryEntry: entry).flatMap { imageId in
+      comfyBridge.imageCache.retrieve(id: imageId)
+        ?? comfyBridge.imageCache.retrieve(id: (imageId as NSString).deletingPathExtension)
+    }
+    guard let imageData else {
+      var detail = "no output image recorded"
+      if let status = entry["status"],
+         let statusData = try? JSONSerialization.data(withJSONObject: status),
+         let statusText = String(data: statusData, encoding: .utf8) {
+        detail = String(statusText.prefix(400))
+      }
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "failed", "error": detail])
+    }
+
+    // Success: place the image at the requested (contained) path exactly once.
+    do {
+      let requestedRaw = run.outputPath ?? "workflow-\(run.workflowId.prefix(8))-\(runId.suffix(8)).png"
+      let requested = requestedRaw.hasPrefix("/") || requestedRaw.hasPrefix("~")
+        ? requestedRaw
+        : (configuration.allowedOutputDirectory as NSString).appendingPathComponent(requestedRaw)
+      let resolved = try WarmServerOutputPathValidator.resolveOutputPath(
+        requested, allowedOutputDirectory: configuration.allowedOutputDirectory)
+      try imageData.write(to: resolved)
+      workflowRunLock.lock()
+      workflowRuns[runId] = (run.workflowId, run.outputPath, resolved.path)
+      workflowRunLock.unlock()
+      logger.info("Workflows: run \(runId) -> \(resolved.path)")
+      auditLog.append(kind: "workflow.run", message: "\(run.workflowId) -> \(resolved.path)", metadata: [:])
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "succeeded", "output_path": resolved.path])
+    } catch {
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "failed", "error": "output write failed: \(error.localizedDescription)"])
+    }
+  }
+
+  /// Dig the first output image id out of a bridge history entry
+  /// ({outputs: {<nodeId>: {images: [{filename,...}]}}} — the bridge stores
+  /// cache ids in `filename`).
+  static func firstImageId(inHistoryEntry entry: [String: Any]) -> String? {
+    guard let outputs = entry["outputs"] as? [String: Any] else { return nil }
+    for value in outputs.values {
+      guard let node = value as? [String: Any],
+            let images = node["images"] as? [[String: Any]] else { continue }
+      for image in images {
+        if let filename = image["filename"] as? String, !filename.isEmpty {
+          return filename
+        }
+      }
+    }
+    return nil
   }
 
   // MARK: - Storyboard (#237)

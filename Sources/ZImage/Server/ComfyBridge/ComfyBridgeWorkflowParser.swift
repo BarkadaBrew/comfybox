@@ -13,7 +13,8 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let promptId: String
   let clientId: String
   var prompt: String
-  let negativePrompt: String?
+  /// Mutable so the workflow run API (#238) can override it.
+  var negativePrompt: String?
   let width: Int
   let height: Int
   let steps: Int
