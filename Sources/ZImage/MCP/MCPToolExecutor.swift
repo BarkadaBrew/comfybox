@@ -60,6 +60,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeVideoStatus(arguments)
       case "compose_montage":
         return try await executeComposeMontage(arguments)
+      case "render_storyboard":
+        return try await executeRenderStoryboard(arguments)
       case "upscale":
         return try await executeUpscale(arguments)
       case "enhance_prompt":
@@ -436,6 +438,20 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let jsonData = try JSONEncoder().encode(params.raw)
     let (status, data) = try await client.post("/v1/montage/compose", body: jsonData)
     if status == 200 {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// render_storyboard -> POST /v1/storyboard/render (202 + job id; poll
+  /// video_status). Params forward verbatim — they ARE the wire spec.
+  private func executeRenderStoryboard(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.raw["shots"] != nil else {
+      return MCPToolResult(error: "Error: 'shots' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/storyboard/render", body: jsonData)
+    if status == 200 || status == 202 {
       return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
     return mapHTTPResponse(status: status, data: data)

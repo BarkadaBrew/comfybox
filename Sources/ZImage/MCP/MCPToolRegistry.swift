@@ -32,6 +32,7 @@ public enum MCPToolRegistry {
     generateVideo,
     videoStatus,
     composeMontage,
+    renderStoryboard,
     upscale,
     enhancePrompt,
     listCharacters,
@@ -458,6 +459,36 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["segments"] as [String],
+    ] as [String: Any]
+  )
+
+  static let renderStoryboard = MCPToolDefinition(
+    name: "render_storyboard",
+    description: "Render a multi-shot video scene from a storyboard spec. Each shot is animated (i2v) from an anchor frame; by default every shot after the first chains from the PREVIOUS shot's extracted last frame, locking face/angle/character across the whole scene (no drift, no seams). A shot may instead pin an explicit anchor_image, and may apply an i2i 'insert' edit to its anchor before animating (add or change an element i2v can't invent — supports mask_path/mask_region selective inpainting). Shots are assembled with hard cuts or the requested transitions. Long-running: returns a job_id immediately — poll video_status.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "shots": [
+          "type": "array",
+          "description": "Ordered shots. Each: {prompt: <motion description>, duration_s?: <seconds, default one ~4s chunk>, anchor_image?: <Mac path — REQUIRED on the first shot, later shots default to the previous shot's last frame>, insert?: {prompt, creativity (0-1 denoise, default 0.35), negative_prompt?, mask_path?, mask_region?: face|upper|lower, mask_invert?, mask_grow?, mask_feather?, seed?}, negative_prompt?, seed?}.",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "transitions": [
+          "type": "array",
+          "description": "Assembly transitions between shots — exactly shots-1 entries ({type: cut|fade|dissolve, duration_s}) or omit for hard cuts (recommended: chained shots are already continuous).",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "output": [
+          "type": "object",
+          "description": "{width, height, fps, path}. Defaults: 640x640 @ 24fps, auto path.",
+        ] as [String: Any],
+        "loras": [
+          "type": "array",
+          "description": "LoRAs applied to every shot's i2v render: [{path, scale}].",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["shots"] as [String],
     ] as [String: Any]
   )
 

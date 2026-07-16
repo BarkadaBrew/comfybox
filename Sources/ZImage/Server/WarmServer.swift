@@ -1068,6 +1068,33 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    // Storyboard renderer (#237): ordered shot list → chained i2v renders
+    // (each anchored on the previous shot's extracted last frame), optional
+    // i2i inserts, final assembly. Long-running → 202 + job id; poll
+    // GET /v1/video/status/{id} like any local video job.
+    case ("POST", "/v1/storyboard/render"):
+      do {
+        guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
+          return .error(.error(status: 503, message: "Storyboard rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
+        }
+        let payload = try decode(StoryboardPayload.self, from: request.body)
+        let spec = try storyboardSpec(from: payload)
+        try spec.validate()
+        let source = payload.source ?? "api"
+        let status = videoJobTracker.submitOrchestrated(source: source, mode: .storyboard) { [weak self] report in
+          guard let self else {
+            throw StoryboardError.shotFailed(shot: 0, stage: "server", message: "server shutting down")
+          }
+          return try await self.runStoryboard(spec: spec, source: source, report: report)
+        }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(status)
+        return .json(.rawJSON(status: 202, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
     case ("POST", "/v1/video/generate"):
       // Backward-compatible route. LOCAL renders here still block the HTTP
       // connection for the whole (synchronous) render — kept working for
@@ -2670,6 +2697,230 @@ public final class WarmServer {
     return try decoder.decode(type, from: data)
   }
 
+  // MARK: - Storyboard (#237)
+
+  /// Wire payload for POST /v1/storyboard/render (snake_case).
+  struct StoryboardPayload: Decodable {
+    struct InsertSpec: Decodable {
+      let prompt: String
+      let creativity: Double?
+      let negativePrompt: String?
+      let maskPath: String?
+      let maskRegion: String?
+      let maskInvert: Bool?
+      let maskGrow: Int?
+      let maskFeather: Int?
+      let seed: UInt64?
+    }
+    struct ShotSpec: Decodable {
+      let prompt: String
+      let durationS: Double?
+      let anchorImage: String?
+      let insert: InsertSpec?
+      let negativePrompt: String?
+      let seed: UInt64?
+    }
+    struct TransitionSpec: Decodable {
+      let type: String
+      let durationS: Double?
+    }
+    struct OutputSpec: Decodable {
+      let width: Int?
+      let height: Int?
+      let fps: Int?
+      let path: String?
+    }
+    let shots: [ShotSpec]
+    let transitions: [TransitionSpec]?
+    let output: OutputSpec?
+    let loras: [LoRAEntry]?
+    let source: String?
+  }
+
+  private func storyboardSpec(from payload: StoryboardPayload) throws -> StoryboardSpec {
+    var transitions: [MontageTransition] = []
+    for t in payload.transitions ?? [] {
+      guard let kind = MontageTransition.Kind(rawValue: t.type) else {
+        throw WarmServerError.invalidRequest(
+          message: "transitions[].type must be cut|fade|dissolve (got '\(t.type)')")
+      }
+      transitions.append(MontageTransition(kind: kind, durationS: t.durationS ?? 0.5))
+    }
+    let shots = payload.shots.map { s in
+      StoryboardSpec.Shot(
+        prompt: s.prompt,
+        durationS: s.durationS,
+        anchorImage: s.anchorImage,
+        insert: s.insert.map { ins in
+          StoryboardSpec.Insert(
+            prompt: ins.prompt,
+            creativity: ins.creativity ?? 0.35,
+            negativePrompt: ins.negativePrompt,
+            maskPath: ins.maskPath,
+            maskRegion: ins.maskRegion,
+            maskInvert: ins.maskInvert ?? false,
+            maskGrow: ins.maskGrow ?? 0,
+            maskFeather: ins.maskFeather ?? 0,
+            seed: ins.seed)
+        },
+        negativePrompt: s.negativePrompt,
+        seed: s.seed)
+    }
+    return StoryboardSpec(
+      shots: shots,
+      transitions: transitions,
+      output: StoryboardSpec.Output(
+        width: payload.output?.width ?? 640,
+        height: payload.output?.height ?? 640,
+        fps: payload.output?.fps ?? 24,
+        path: payload.output?.path),
+      loras: (payload.loras ?? []).map { ($0.path, $0.scale ?? 1.0) })
+  }
+
+  /// Execute a storyboard: per-shot [i2i insert →] i2v render, chained on the
+  /// previous shot's extracted last frame, then montage assembly. Runs OUTSIDE
+  /// the GPU queue (via submitOrchestrated) and takes a normal queue turn for
+  /// each render, so other jobs interleave between shots. Intermediates are
+  /// named storyboard-* (NOT ltx2-*) so the daemon's orphan reconciler ignores
+  /// them.
+  private func runStoryboard(
+    spec: StoryboardSpec,
+    source: String,
+    report: @escaping @Sendable (Int) -> Void
+  ) async throws -> LTX2VideoResult {
+    let started = Date()
+    let session = UUID().uuidString.prefix(8)
+    let dir = configuration.allowedOutputDirectory
+    var anchor: String? = nil
+    var clips: [String] = []
+    // Assembly gets the final ~4%; shots split the rest evenly.
+    let shotWeight = 96.0 / Double(spec.shots.count)
+
+    for (i, shot) in spec.shots.enumerated() {
+      var shotAnchor: String
+      if let explicit = shot.anchorImage, !explicit.isEmpty {
+        guard FileManager.default.fileExists(atPath: explicit) else {
+          throw StoryboardError.anchorNotFound(shot: i, path: explicit)
+        }
+        shotAnchor = explicit
+      } else if let chained = anchor {
+        shotAnchor = chained
+      } else {
+        throw StoryboardError.shotFailed(shot: i, stage: "anchor", message: "no previous last frame to chain from")
+      }
+
+      // Optional i2i insert on the anchor (e.g. add an element i2v can't
+      // invent) — uses the #239 selective-inpainting path.
+      if let insert = shot.insert {
+        logger.info("Storyboard[\(session)] shot \(i): i2i insert (creativity \(insert.creativity))")
+        let insertOut = (dir as NSString)
+          .appendingPathComponent("storyboard-\(session)-shot\(i)-insert.png")
+        let payload = GeneratePayload(
+          prompt: insert.prompt,
+          negativePrompt: insert.negativePrompt,
+          width: spec.output.width,
+          height: spec.output.height,
+          seed: insert.seed,
+          outputPath: insertOut,
+          maskGrow: insert.maskGrow,
+          maskFeather: insert.maskFeather,
+          imagePath: shotAnchor,
+          creativity: Float(insert.creativity),
+          maskPath: insert.maskPath,
+          maskRegion: insert.maskRegion,
+          maskInvert: insert.maskInvert,
+          source: source)
+        do {
+          let generated = try await coordinator.enqueueGenerate(payload, source: source)
+          guard FileManager.default.fileExists(atPath: generated.outputPath) else {
+            throw StoryboardError.shotFailed(shot: i, stage: "insert", message: "no output produced")
+          }
+          shotAnchor = generated.outputPath
+        } catch let error as StoryboardError {
+          throw error
+        } catch {
+          throw StoryboardError.shotFailed(shot: i, stage: "insert", message: error.localizedDescription)
+        }
+      }
+
+      // i2v render for this shot, through the same preparation the video
+      // routes use (dims snapping, presets, LoRA resolution, validation).
+      logger.info("Storyboard[\(session)] shot \(i)/\(spec.shots.count): i2v from \((shotAnchor as NSString).lastPathComponent)")
+      var body: [String: Any] = [
+        "prompt": shot.prompt,
+        "image_path": shotAnchor,
+        "width": spec.output.width,
+        "height": spec.output.height,
+        "fps": spec.output.fps,
+        "output_path": "storyboard-\(session)-shot\(i).mp4",
+        "source": source,
+      ]
+      if let d = shot.durationS { body["duration"] = d }
+      if let n = shot.negativePrompt { body["negative_prompt"] = n }
+      if let s = shot.seed { body["seed"] = s }
+      if !spec.loras.isEmpty {
+        body["loras"] = spec.loras.map { ["path": $0.path, "scale": $0.scale] as [String: Any] }
+      }
+      let shotResult: LTX2VideoResult
+      do {
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        guard let prep = try await prepareLocalVideo(body: bodyData) else {
+          throw StoryboardError.shotFailed(shot: i, stage: "i2v", message: "local LTX-2 not configured")
+        }
+        let base = Double(i) * shotWeight
+        shotResult = try await coordinator.enqueueLocalVideo { coordReport in
+          try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
+            let pct = Self.localVideoProgressPercent(
+              chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
+            coordReport(pct)
+            report(Int(base + Double(pct) * shotWeight / 100.0))
+          }
+        }
+      } catch let error as StoryboardError {
+        throw error
+      } catch {
+        throw StoryboardError.shotFailed(shot: i, stage: "i2v", message: error.localizedDescription)
+      }
+      clips.append(shotResult.outputPath)
+
+      // Chain: the next shot's default anchor is this shot's last frame.
+      if i < spec.shots.count - 1 {
+        let framePath = (dir as NSString)
+          .appendingPathComponent("storyboard-\(session)-shot\(i)-lastframe.png")
+        do {
+          anchor = try LastFrameExtractor.extractLastFrame(from: shotResult.outputPath, to: framePath)
+        } catch {
+          throw StoryboardError.shotFailed(shot: i, stage: "last-frame", message: error.localizedDescription)
+        }
+      }
+    }
+
+    // Assembly (hard cuts unless the spec provided transitions).
+    let requestedOutput = spec.output.path ?? "storyboard-\(session).mp4"
+    let requested = requestedOutput.hasPrefix("/") || requestedOutput.hasPrefix("~")
+      ? requestedOutput
+      : (dir as NSString).appendingPathComponent(requestedOutput)
+    let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+      requested, allowedOutputDirectory: dir).path
+    logger.info("Storyboard[\(session)]: assembling \(clips.count) shot(s) -> \(resolvedOutput)")
+    let montage = try MontageComposer.compose(
+      segments: clips.map { MontageSegment(kind: .clip, path: $0) },
+      transitions: spec.transitions,
+      width: spec.output.width,
+      height: spec.output.height,
+      fps: spec.output.fps,
+      outputPath: resolvedOutput)
+    report(100)
+    auditLog.append(
+      kind: "video.storyboard",
+      message: "\(spec.shots.count) shots -> \(resolvedOutput)", metadata: [:])
+    return LTX2VideoResult(
+      outputPath: montage.outputPath,
+      frameCount: montage.frameCount,
+      durationSeconds: Float(montage.durationS),
+      elapsedSeconds: Date().timeIntervalSince(started))
+  }
+
   // MARK: - Montage (#232)
 
   /// Wire response for POST /v1/montage/compose.
@@ -3347,6 +3598,33 @@ final class VideoJobTracker: @unchecked Sendable {
             coordReport(pct)
             self.setProgress(jobId, pct)
           }
+        }
+        self.markSucceeded(jobId, result: result)
+      } catch {
+        self.markFailed(jobId, error: error)
+      }
+    }
+    return queued
+  }
+
+  /// Submit a multi-step orchestration (storyboard, #237). Unlike `submit`,
+  /// the work closure is NOT wrapped in a single `enqueueLocalVideo` — it
+  /// issues its OWN coordinator enqueues (one per shot render / i2i insert),
+  /// so each step takes a normal turn on the FIFO GPU queue and other jobs
+  /// can interleave between shots. Wrapping the whole storyboard in one queue
+  /// entry would deadlock: the closure would enqueue from inside the queue.
+  fileprivate func submitOrchestrated(
+    source: String,
+    mode: VideoMode,
+    work: @escaping @Sendable (@escaping @Sendable (Int) -> Void) async throws -> LTX2VideoResult
+  ) -> VideoJobStatus {
+    let (jobId, queued) = register(source: source, mode: mode)
+    Task { [weak self] in
+      guard let self else { return }
+      self.markProcessing(jobId)
+      do {
+        let result = try await work { pct in
+          self.setProgress(jobId, pct)
         }
         self.markSucceeded(jobId, result: result)
       } catch {
