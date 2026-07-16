@@ -1049,6 +1049,25 @@ public final class WarmServer {
 
     // MARK: - Video Endpoints
 
+    // Montage compositor (#232): assemble images (ken-burns) + clips into one
+    // MP4 with transitions. Memory-light editorial motion — no LTX-2, no heavy
+    // -model admission gate, runs alongside a resident video model. Sync by
+    // design: compositing a <30s montage takes seconds.
+    case ("POST", "/v1/montage/compose"):
+      do {
+        let payload = try decode(MontagePayload.self, from: request.body)
+        let result = try await composeMontage(payload)
+        return .json(status: 200, payload: MontageResponse(
+          outputPath: result.outputPath,
+          durationS: result.durationS,
+          width: result.width,
+          height: result.height,
+          segmentCount: result.segmentCount,
+          frameCount: result.frameCount))
+      } catch {
+        return .error(response(for: error))
+      }
+
     case ("POST", "/v1/video/generate"):
       // Backward-compatible route. LOCAL renders here still block the HTTP
       // connection for the whole (synchronous) render — kept working for
@@ -2649,6 +2668,141 @@ public final class WarmServer {
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     return try decoder.decode(type, from: data)
+  }
+
+  // MARK: - Montage (#232)
+
+  /// Wire response for POST /v1/montage/compose.
+  struct MontageResponse: Encodable {
+    let outputPath: String
+    let durationS: Double
+    let width: Int
+    let height: Int
+    let segmentCount: Int
+    let frameCount: Int
+
+    enum CodingKeys: String, CodingKey {
+      case outputPath = "output_path"
+      case durationS = "duration_s"
+      case width, height
+      case segmentCount = "segment_count"
+      case frameCount = "frame_count"
+    }
+  }
+
+  /// Wire payload for POST /v1/montage/compose (snake_case; see the FDD).
+  struct MontagePayload: Decodable {
+    struct Segment: Decodable {
+      struct KenBurnsSpec: Decodable {
+        /// [startScale, endScale]
+        let zoom: [Double]?
+        /// [[x0,y0],[x1,y1]] normalized output-unit offsets
+        let pan: [[Double]]?
+      }
+      let type: String
+      let path: String
+      let durationS: Double?
+      let kenburns: KenBurnsSpec?
+    }
+    struct Transition: Decodable {
+      let type: String
+      let durationS: Double?
+    }
+    struct Output: Decodable {
+      let width: Int?
+      let height: Int?
+      let fps: Int?
+      let path: String?
+    }
+    let segments: [Segment]
+    let transitions: [Transition]?
+    let output: Output?
+    let aspectPolicy: String?
+  }
+
+  private func composeMontage(_ payload: MontagePayload) async throws -> MontageResult {
+    var segments: [MontageSegment] = []
+    for (i, s) in payload.segments.enumerated() {
+      guard let kind = MontageSegment.Kind(rawValue: s.type) else {
+        throw WarmServerError.invalidRequest(
+          message: "segments[\(i)].type must be image|clip (got '\(s.type)')")
+      }
+      var kenBurns: MontageSegment.KenBurns? = nil
+      if let spec = s.kenburns {
+        var kb = MontageSegment.KenBurns()
+        if let zoom = spec.zoom {
+          guard zoom.count == 2 else {
+            throw WarmServerError.invalidRequest(
+              message: "segments[\(i)].kenburns.zoom must be [start, end]")
+          }
+          kb.zoomStart = zoom[0]
+          kb.zoomEnd = zoom[1]
+        }
+        if let pan = spec.pan {
+          guard pan.count == 2, pan[0].count == 2, pan[1].count == 2 else {
+            throw WarmServerError.invalidRequest(
+              message: "segments[\(i)].kenburns.pan must be [[x0,y0],[x1,y1]]")
+          }
+          kb.panStart = (pan[0][0], pan[0][1])
+          kb.panEnd = (pan[1][0], pan[1][1])
+        }
+        kenBurns = kb
+      }
+      segments.append(MontageSegment(kind: kind, path: s.path, durationS: s.durationS, kenBurns: kenBurns))
+    }
+
+    var transitions: [MontageTransition] = []
+    for t in payload.transitions ?? [] {
+      guard let kind = MontageTransition.Kind(rawValue: t.type) else {
+        throw WarmServerError.invalidRequest(
+          message: "transitions[].type must be cut|fade|dissolve (got '\(t.type)')")
+      }
+      transitions.append(MontageTransition(kind: kind, durationS: t.durationS ?? 0.5))
+    }
+
+    let aspectPolicy: MontageAspectPolicy
+    if let raw = payload.aspectPolicy {
+      guard let parsed = MontageAspectPolicy(rawValue: raw) else {
+        throw WarmServerError.invalidRequest(
+          message: "aspect_policy must be fill_crop|fit_pad (got '\(raw)')")
+      }
+      aspectPolicy = parsed
+    } else {
+      aspectPolicy = .fillCrop
+    }
+
+    // Output containment — same convention as the video routes (#219).
+    let requestedRaw = payload.output?.path ?? "montage-\(UUID().uuidString).mp4"
+    let requested: String
+    if requestedRaw.hasPrefix("/") || requestedRaw.hasPrefix("~") {
+      requested = requestedRaw
+    } else {
+      requested = (configuration.allowedOutputDirectory as NSString)
+        .appendingPathComponent(requestedRaw)
+    }
+    let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+      requested, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+
+    let width = payload.output?.width ?? 448
+    let height = payload.output?.height ?? 768
+    let fps = payload.output?.fps ?? 30
+
+    logger.info("Montage: \(segments.count) segment(s), \(transitions.count) transition(s) -> \(width)x\(height)@\(fps)")
+    let start = Date()
+    // Compositing is CPU-bound and synchronous — run it off the request task's
+    // executor so a long montage can't starve other routes.
+    let result = try await Task.detached(priority: .userInitiated) {
+      try MontageComposer.compose(
+        segments: segments,
+        transitions: transitions,
+        width: width, height: height, fps: fps,
+        aspectPolicy: aspectPolicy,
+        outputPath: resolvedOutput)
+    }.value
+    let elapsed = Int(Date().timeIntervalSince(start) * 1000)
+    logger.info("Montage: wrote \(result.outputPath) (\(String(format: "%.2f", result.durationS))s, \(result.frameCount) frames) in \(elapsed)ms")
+    auditLog.append(kind: "montage.compose", message: "\(segments.count) segments -> \(result.outputPath)", metadata: [:])
+    return result
   }
 
   /// Shared decode + validation for both the synchronous and queue-submit

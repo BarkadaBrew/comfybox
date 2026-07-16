@@ -31,6 +31,7 @@ public enum MCPToolRegistry {
     unloadModel,
     generateVideo,
     videoStatus,
+    composeMontage,
     upscale,
     enhancePrompt,
     listCharacters,
@@ -428,6 +429,35 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
+    ] as [String: Any]
+  )
+
+  static let composeMontage = MCPToolDefinition(
+    name: "compose_montage",
+    description: "Assemble images and video clips into a single MP4 montage with editorial motion — ken-burns pans/zooms on stills, cut/fade/dissolve transitions, and intercut real video clips (e.g. generate_video output). Memory-light (no diffusion model involved): use this to create dynamism from stills and short clips instead of rendering more video. Synchronous — returns the output path directly.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "segments": [
+          "type": "array",
+          "description": "Ordered montage segments. Each: {type: 'image'|'clip', path: <Mac absolute path>, duration_s: <seconds — required for images, optional trim for clips>, kenburns?: {zoom: [start,end], pan: [[x0,y0],[x1,y1]]}}. kenburns applies to images only: scale ramps zoom[0]→zoom[1] while the image offsets between the normalized pan points (e.g. zoom [1.0,1.2] = slow push-in).",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "transitions": [
+          "type": "array",
+          "description": "Transitions between segments — exactly segments-1 entries, or omit for hard cuts everywhere. Each: {type: 'cut'|'fade'|'dissolve', duration_s: <seconds, default 0.5>}. A transition overlaps its neighbors, so total duration = sum(segment durations) - sum(transition durations).",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "output": [
+          "type": "object",
+          "description": "Output settings: {width, height, fps, path}. Defaults: 448x768 @ 30fps, auto-generated path in the allowed output directory.",
+        ] as [String: Any],
+        "aspect_policy": [
+          "type": "string",
+          "description": "How mixed-aspect inputs map to the output frame: 'fill_crop' (scale to fill + center-crop, no bars — default) or 'fit_pad' (letterbox on black).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["segments"] as [String],
     ] as [String: Any]
   )
 

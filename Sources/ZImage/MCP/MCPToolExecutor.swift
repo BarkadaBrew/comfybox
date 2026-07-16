@@ -58,6 +58,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeGenerateVideo(arguments)
       case "video_status":
         return try await executeVideoStatus(arguments)
+      case "compose_montage":
+        return try await executeComposeMontage(arguments)
       case "upscale":
         return try await executeUpscale(arguments)
       case "enhance_prompt":
@@ -420,6 +422,21 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if status == 200 || status == 202 {
       let text = String(data: data, encoding: .utf8) ?? "{}"
       return MCPToolResult(text: text)
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// compose_montage -> POST /v1/montage/compose (sync — compositing is cheap).
+  /// The params object IS the wire payload (segments/transitions/output/
+  /// aspect_policy, already snake_case), so it forwards verbatim.
+  private func executeComposeMontage(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.raw["segments"] != nil else {
+      return MCPToolResult(error: "Error: 'segments' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/montage/compose", body: jsonData)
+    if status == 200 {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
     return mapHTTPResponse(status: status, data: data)
   }
