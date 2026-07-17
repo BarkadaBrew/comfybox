@@ -14,8 +14,11 @@ struct CameraDirectiveTests {
 
     @Test("full directive includes angle and lens")
     func fullPhrase() {
+        // Lens phrases are prose descriptions of the visual effect, not lens
+        // jargon — the Qwen text encoders parse prose ("85mm" reads as noise,
+        // "background melting into soft creamy blur" reads as intent).
         let d = CameraDirective(orientation: .threeQuarter, angle: .lowAngle, shotSize: .closeUp, lens: .mm85)
-        #expect(d.phrase == "close-up shot, three-quarter view, low-angle shot looking up, 85mm portrait lens, shallow depth of field")
+        #expect(d.phrase == "close-up shot, three-quarter view, low-angle shot looking up, flattering portrait compression, tight subject framing, background melting into soft creamy blur with only the subject in sharp focus")
     }
 
     @Test("eye-level angle is omitted; none lens is omitted")

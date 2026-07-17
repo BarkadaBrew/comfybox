@@ -19,6 +19,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var canvasStore = CanvasStore()
     @State private var mfluxService = MfluxService()
     @State private var breeService = BreeService()
+    @State private var kiraClient = KiraClient()
     @State private var decoupageService = DecoupageService()
     @State private var faceSwapService = FaceSwapService()
     @State private var activityLog = ActivityLog()
@@ -58,6 +59,7 @@ struct ComfyBoxDesktopApp: App {
         case face = "Face"
         case inpaint = "Inpaint"
         case bree = "Bree"
+        case kira = "Kira"
         case canvas = "Canvas"
         case civitai = "CivitAI"
         case models = "Models"
@@ -80,7 +82,7 @@ struct ComfyBoxDesktopApp: App {
             case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery: return .library
             case .dashboard, .applications, .queue: return .operate
-            case .bree: return .suite
+            case .bree, .kira: return .suite
             }
         }
 
@@ -103,6 +105,7 @@ struct ComfyBoxDesktopApp: App {
             case .face: return "person.crop.circle.badge.checkmark"
             case .inpaint: return "paintbrush.pointed"
             case .bree: return "brain.head.profile"
+            case .kira: return "moon.stars"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
             case .models: return "square.stack.3d.up.fill"
@@ -128,6 +131,7 @@ struct ComfyBoxDesktopApp: App {
             case .motion: return "m"
             case .mflux: return "x"
             case .bree: return "b"
+            case .kira: return "k"
             case .models: return "l"
             case .decoupage: return "d"
             case .applications: return "a"
@@ -418,6 +422,9 @@ struct ComfyBoxDesktopApp: App {
 
         case .bree:
             BreeView(bree: breeService)
+
+        case .kira:
+            KiraView(client: kiraClient)
 
         case .canvas:
             CanvasView(

@@ -59,7 +59,7 @@ enum Keychain {
 
 /// Named application secrets, backed by the Keychain.
 enum AppSecrets {
-    enum Key: String { case civitai, replicate, fal }
+    enum Key: String { case civitai, replicate, fal, kiraDaemon }
 
     /// Standard environment-variable names, used as a fallback when the Keychain
     /// has no value (e.g. the app launched from a shell that exports them).
@@ -67,6 +67,7 @@ enum AppSecrets {
         .civitai: "CIVITAI_API_KEY",
         .replicate: "REPLICATE_API_TOKEN",
         .fal: "FAL_KEY",
+        .kiraDaemon: "KIRA_DAEMON_TOKEN",
     ]
 
     static func value(_ key: Key) -> String? {
