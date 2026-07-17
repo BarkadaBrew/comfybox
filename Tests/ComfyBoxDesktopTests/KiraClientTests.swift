@@ -76,6 +76,23 @@ final class KiraClientTests: XCTestCase {
     XCTAssertNil(KiraSchedulerStatus.parse(Data(#"{"ok":true}"#.utf8)), "no paused field → nil")
   }
 
+  func testSuggestionParses() throws {
+    let item: [String: Any] = [
+      "id": "989dd184171c", "kind": "image",
+      "text": "Kira on the balcony at golden hour",
+      "status": "pending", "createdAt": "2026-07-17T18:19:02.687Z",
+    ]
+    let suggestion = try XCTUnwrap(KiraSuggestion.parse(item))
+    XCTAssertEqual(suggestion.id, "989dd184171c")
+    XCTAssertEqual(suggestion.kind, "image")
+    XCTAssertEqual(suggestion.status, "pending")
+    // Missing required field → nil, not a crash.
+    XCTAssertNil(KiraSuggestion.parse(["id": "x", "kind": "image"]))
+    // Status defaults to pending when absent.
+    let noStatus = try XCTUnwrap(KiraSuggestion.parse(["id": "y", "kind": "arc", "text": "beach week"]))
+    XCTAssertEqual(noStatus.status, "pending")
+  }
+
   func testBindingURLAndLocality() {
     // Default is loopback — correct for the interim SSH tunnel AND for the
     // post-migration local daemon (no binding change when Kira moves home).

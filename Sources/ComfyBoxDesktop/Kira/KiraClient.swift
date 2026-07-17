@@ -144,6 +144,27 @@ public struct KiraMediaItem: Identifiable, Equatable, Sendable {
     public var mtimeMs: Double
 }
 
+/// Suggestion-box entry (`/v1/kira/suggestions`). Kinds: image/video seed one
+/// render (consumed FIFO), session themes one cycle (consumed), arc is sticky
+/// context until removed.
+public struct KiraSuggestion: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var kind: String
+    public var text: String
+    public var status: String
+    public var createdAt: String
+
+    public static func parse(_ item: [String: Any]) -> KiraSuggestion? {
+        guard let id = item["id"] as? String,
+              let kind = item["kind"] as? String,
+              let text = item["text"] as? String else { return nil }
+        return KiraSuggestion(
+            id: id, kind: kind, text: text,
+            status: item["status"] as? String ?? "pending",
+            createdAt: item["createdAt"] as? String ?? "")
+    }
+}
+
 @Observable
 @MainActor
 public final class KiraClient {
@@ -174,6 +195,8 @@ public final class KiraClient {
     public private(set) var contentMode: String?
     public private(set) var allowedModes: [String] = []
     public private(set) var recentMedia: [KiraMediaItem] = []
+    public private(set) var suggestions: [KiraSuggestion] = []
+    public private(set) var suggestionKinds: [String] = ["image", "video", "arc", "session"]
     /// Raw compute payload — the SSH-bridge proxy is slow/flaky (FDD R-6), so
     /// this is fetched on demand and rendered tolerantly.
     public private(set) var computeSummary: String?
@@ -305,6 +328,7 @@ public final class KiraClient {
         async let schedulerData = fetch("v1/kira/content-scheduler/status")
         async let modeData = fetch("v1/kira/content-mode")
         async let mediaData = fetch("v1/kira/media/recent")
+        async let suggestionsData = fetch("v1/kira/suggestions")
 
         if let data = await stateData, let parsed = KiraStateSnapshot.parse(data) {
             state = parsed
@@ -331,6 +355,25 @@ public final class KiraClient {
                     mtimeMs: (item["mtimeMs"] as? NSNumber)?.doubleValue ?? 0)
             }
         }
+        if let data = await suggestionsData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["suggestions"] as? [[String: Any]] {
+            suggestions = items.compactMap(KiraSuggestion.parse).reversed()
+            if let kinds = json["kinds"] as? [String], !kinds.isEmpty {
+                suggestionKinds = kinds
+            }
+        }
+    }
+
+    /// Drop an idea in the box — Kira picks it up on her next content cycle.
+    public func addSuggestion(kind: String, text: String) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        await perform("v1/kira/suggestions", method: "POST", body: ["kind": kind, "text": trimmed])
+    }
+
+    public func deleteSuggestion(_ id: String) async {
+        await perform("v1/kira/suggestions/\(id)", method: "DELETE")
     }
 
     /// URL for a media thumbnail via the daemon's traversal-guarded file serve.

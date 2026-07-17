@@ -12,6 +12,8 @@ struct KiraView: View {
     @Bindable var client: KiraClient
     @State private var tokenDraft: String = ""
     @State private var showBindingEditor = false
+    @State private var suggestionDraft: String = ""
+    @State private var suggestionKind: String = "image"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,6 +32,7 @@ struct KiraView: View {
                     herNowCard
                     agendaCard
                     controlsCard
+                    suggestionBoxCard
                     computeCard
                     recentOutputCard
                     bindingCard
@@ -258,6 +261,66 @@ struct KiraView: View {
                 .disabled(client.actionInFlight)
                 .help("Content mode — allowlisted server-side; reflected across surfaces")
             }
+        }
+    }
+
+    private var suggestionBoxCard: some View {
+        card {
+            Label("Suggestion box", systemImage: "lightbulb").font(.headline)
+            Text("Ideas Kira picks up on her content runs — image/video seed one render, a session themes one cycle, an arc stays active until you remove it.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            HStack(spacing: 8) {
+                Picker("", selection: $suggestionKind) {
+                    ForEach(client.suggestionKinds, id: \.self) { kind in
+                        Text(kind).tag(kind)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 110)
+                TextField("e.g. golden hour on the balcony in the red dress", text: $suggestionDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { submitSuggestion() }
+                Button("Add") { submitSuggestion() }
+                    .disabled(client.actionInFlight
+                              || suggestionDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if !client.suggestions.isEmpty {
+                ForEach(client.suggestions.prefix(8)) { suggestion in
+                    HStack(spacing: 8) {
+                        chip(suggestion.kind, tint: kindTint(suggestion.kind))
+                        Text(suggestion.text).font(.caption).lineLimit(1)
+                        Spacer()
+                        Text(suggestion.status == "pending"
+                             ? (suggestion.kind == "arc" ? "active" : "pending")
+                             : "picked up")
+                            .font(.caption2)
+                            .foregroundStyle(suggestion.status == "pending" ? Color.blue : .secondary)
+                        Button {
+                            Task { await client.deleteSuggestion(suggestion.id) }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help(suggestion.status == "pending" ? "Remove before pickup" : "Clear")
+                    }
+                }
+            }
+        }
+    }
+
+    private func submitSuggestion() {
+        let text = suggestionDraft
+        suggestionDraft = ""
+        Task { await client.addSuggestion(kind: suggestionKind, text: text) }
+    }
+
+    private func kindTint(_ kind: String) -> Color {
+        switch kind {
+        case "image": return .teal
+        case "video": return .indigo
+        case "arc": return .purple
+        case "session": return .orange
+        default: return .gray
         }
     }
 
