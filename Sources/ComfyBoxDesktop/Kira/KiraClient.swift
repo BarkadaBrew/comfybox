@@ -136,6 +136,68 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     }
 }
 
+/// Structured `GET /v1/kira/compute` read model (C1). The daemon proxies three
+/// ComfyBox MCP tools; each nested value arrives as a JSON *string*, so parsing
+/// unwraps them tolerantly (string → parse, object → use, absent → nil).
+public struct KiraComputeSnapshot: Equatable, Sendable {
+    public struct PoolEntry: Equatable, Sendable, Identifiable {
+        public var model: String
+        public var vramMB: Double
+        public var active: Bool
+        public var id: String { model }
+    }
+    /// model_pool.total_vram_mb — VRAM resident in the model pool now.
+    public var residentVramMB: Double?
+    /// model_pool.budget_mb — the pool's VRAM budget = the quantized LTX-2
+    /// admission floor; a heavy video render needs roughly this much free.
+    public var budgetVramMB: Double?
+    public var activeModel: String?
+    public var modelFamily: String?
+    /// server_health.memory_usage_mb — the warm-server process RSS.
+    public var processMemoryMB: Double?
+    public var loaded: Bool?
+    public var isRendering: Bool?
+    /// system_stats device.
+    public var deviceName: String?
+    public var deviceTotalBytes: Double?
+    public var pool: [PoolEntry]
+
+    private static func asObject(_ v: Any?) -> [String: Any]? {
+        if let dict = v as? [String: Any] { return dict }
+        if let s = v as? String, let data = s.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return dict
+        }
+        return nil
+    }
+
+    public static func parse(_ compute: Any) -> KiraComputeSnapshot? {
+        guard let root = compute as? [String: Any] else { return nil }
+        let health = asObject(root["server_health"]) ?? [:]
+        let poolObj = asObject(root["model_pool"]) ?? [:]
+        let stats = asObject(root["system_stats"]) ?? [:]
+        let device = (stats["devices"] as? [[String: Any]])?.first
+        let poolEntries: [PoolEntry] = (poolObj["pool"] as? [[String: Any]] ?? []).compactMap { e in
+            guard let model = e["model"] as? String else { return nil }
+            return PoolEntry(
+                model: (model as NSString).lastPathComponent,
+                vramMB: (e["vram_mb"] as? NSNumber)?.doubleValue ?? 0,
+                active: e["active"] as? Bool ?? false)
+        }
+        return KiraComputeSnapshot(
+            residentVramMB: (poolObj["total_vram_mb"] as? NSNumber)?.doubleValue,
+            budgetVramMB: (poolObj["budget_mb"] as? NSNumber)?.doubleValue,
+            activeModel: (poolObj["active"] as? String).map { ($0 as NSString).lastPathComponent },
+            modelFamily: health["model_family"] as? String,
+            processMemoryMB: (health["memory_usage_mb"] as? NSNumber)?.doubleValue,
+            loaded: health["loaded"] as? Bool,
+            isRendering: health["is_rendering"] as? Bool,
+            deviceName: device?["name"] as? String,
+            deviceTotalBytes: (device?["vram_total"] as? NSNumber)?.doubleValue,
+            pool: poolEntries)
+    }
+}
+
 /// `GET /v1/kira/media/recent` item (A5).
 public struct KiraMediaItem: Identifiable, Equatable, Sendable {
     public var id: String { path }
@@ -199,6 +261,8 @@ public final class KiraClient {
     public private(set) var suggestionKinds: [String] = ["image", "video", "arc", "session"]
     /// Raw compute payload — the SSH-bridge proxy is slow/flaky (FDD R-6), so
     /// this is fetched on demand and rendered tolerantly.
+    public private(set) var computeSnapshot: KiraComputeSnapshot?
+    /// Raw pretty-printed payload, kept for the card's "raw" disclosure.
     public private(set) var computeSummary: String?
     public private(set) var computeError: String?
     public private(set) var computeLoading = false
@@ -416,10 +480,12 @@ public final class KiraClient {
                 computeError = "HTTP \(status) \(detail)"
                 return
             }
-            // Opaque-tolerant render: pretty-print whatever the proxy returned.
+            computeSnapshot = KiraComputeSnapshot.parse(compute)
+            // Opaque-tolerant fallback: pretty-print whatever the proxy returned
+            // for the card's "raw" disclosure (shapes aren't guaranteed stable).
             if let pretty = try? JSONSerialization.data(withJSONObject: compute, options: [.prettyPrinted, .sortedKeys]),
                let text = String(data: pretty, encoding: .utf8) {
-                computeSummary = String(text.prefix(1500))
+                computeSummary = String(text.prefix(2000))
             } else {
                 computeSummary = "\(compute)"
             }

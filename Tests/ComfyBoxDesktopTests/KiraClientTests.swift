@@ -93,6 +93,35 @@ final class KiraClientTests: XCTestCase {
     XCTAssertEqual(noStatus.status, "pending")
   }
 
+  func testComputeSnapshotParsesNestedStringPayload() throws {
+    // The daemon proxies three ComfyBox MCP tools; each nested value arrives
+    // as a JSON STRING (real shape captured 2026-07-17 via the tunnel).
+    let compute: [String: Any] = [
+      "server_health": #"{"memory_usage_mb":19983,"model_family":"flux1","loaded":true,"is_rendering":false}"#,
+      "model_pool": #"{"active":"/Users/todd/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors","total_vram_mb":12288,"budget_mb":40960,"pool":[{"vram_mb":12288,"model":"/Users/todd/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors","active":true,"family":"flux1"}]}"#,
+      "system_stats": #"{"devices":[{"name":"Apple M3 Max","type":"mps","vram_total":137438953472}]}"#,
+    ]
+    let snapshot = try XCTUnwrap(KiraComputeSnapshot.parse(compute))
+    XCTAssertEqual(snapshot.residentVramMB, 12288)
+    XCTAssertEqual(snapshot.budgetVramMB, 40960)
+    XCTAssertEqual(snapshot.activeModel, "cyberrealisticZImage_v50.safetensors", "basename only")
+    XCTAssertEqual(snapshot.modelFamily, "flux1")
+    XCTAssertEqual(snapshot.processMemoryMB, 19983)
+    XCTAssertEqual(snapshot.loaded, true)
+    XCTAssertEqual(snapshot.isRendering, false)
+    XCTAssertEqual(snapshot.deviceName, "Apple M3 Max")
+    XCTAssertEqual(snapshot.deviceTotalBytes, 137438953472)
+    XCTAssertEqual(snapshot.pool.count, 1)
+    XCTAssertEqual(snapshot.pool.first?.model, "cyberrealisticZImage_v50.safetensors")
+    XCTAssertTrue(snapshot.pool.first?.active == true)
+    // Tolerant: also accepts already-parsed objects and shrugs off absent slices.
+    let objectForm: [String: Any] = ["model_pool": ["total_vram_mb": 8192, "budget_mb": 40960, "pool": []]]
+    let s2 = try XCTUnwrap(KiraComputeSnapshot.parse(objectForm))
+    XCTAssertEqual(s2.residentVramMB, 8192)
+    XCTAssertNil(s2.deviceName)
+    XCTAssertNil(KiraComputeSnapshot.parse("not an object"))
+  }
+
   func testBindingURLAndLocality() {
     // Default is loopback — correct for the interim SSH tunnel AND for the
     // post-migration local daemon (no binding change when Kira moves home).
