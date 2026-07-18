@@ -20,6 +20,12 @@ struct ComfyBoxDesktopApp: App {
     @State private var mfluxService = MfluxService()
     @State private var breeService = BreeService()
     @State private var kiraClient = KiraClient()
+    /// App-wide "Rated G unless NSFW toggled" gate (Todd 2026-07-17). Starts
+    /// hidden every launch by design.
+    @State private var contentGate = AppContentGate()
+    @State private var showNSFWReveal = false
+    @State private var nsfwPasswordInput = ""
+    @State private var nsfwPasswordError = false
     @State private var decoupageService = DecoupageService()
     @State private var faceSwapService = FaceSwapService()
     @State private var activityLog = ActivityLog()
@@ -159,6 +165,7 @@ struct ComfyBoxDesktopApp: App {
             } detail: {
                 detailView
             }
+            .environment(contentGate)
             .navigationTitle("CoffeeShop Desktop")
             .frame(minWidth: 900, minHeight: 600)
             .overlay {
@@ -186,6 +193,10 @@ struct ComfyBoxDesktopApp: App {
             }
             .toolbar {
                 ToolbarItem(placement: .automatic) {
+                    nsfwToggleButton
+                }
+
+                ToolbarItem(placement: .automatic) {
                     connectionButton
                 }
 
@@ -194,6 +205,27 @@ struct ComfyBoxDesktopApp: App {
                         ingestorStatus(ingestor)
                     }
                 }
+            }
+            .sheet(isPresented: $showNSFWReveal) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Reveal mature content", systemImage: "eye.trianglebadge.exclamationmark")
+                        .font(.headline)
+                    Text("Enter the gallery password to show NSFW content this session. The app returns to Rated G on relaunch.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    SecureField("Password", text: $nsfwPasswordInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(submitNSFWReveal)
+                    if nsfwPasswordError {
+                        Text("Incorrect password").font(.caption).foregroundStyle(.red)
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { showNSFWReveal = false; nsfwPasswordInput = "" }
+                        Button("Reveal") { submitNSFWReveal() }.buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(20)
+                .frame(width: 380)
             }
             .task {
                 applySettings()
@@ -520,6 +552,39 @@ struct ComfyBoxDesktopApp: App {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Global "Rated G ⇄ NSFW" master toggle (Todd 2026-07-17). Off by default;
+    /// revealing prompts for the gallery password when one is configured.
+    private var nsfwToggleButton: some View {
+        Button {
+            if contentGate.revealed {
+                contentGate.hide()
+            } else if contentGate.requiresPassword {
+                nsfwPasswordInput = ""
+                nsfwPasswordError = false
+                showNSFWReveal = true
+            } else {
+                contentGate.reveal()
+            }
+        } label: {
+            Label(contentGate.revealed ? "NSFW" : "Rated G",
+                  systemImage: contentGate.revealed ? "eye.fill" : "eye.slash.fill")
+                .foregroundStyle(contentGate.revealed ? .orange : .secondary)
+        }
+        .help(contentGate.revealed
+              ? "Mature content is visible — click to hide (returns to Rated G)"
+              : "App is Rated G — click to reveal mature content (Gallery, Recents, Prompts)")
+    }
+
+    private func submitNSFWReveal() {
+        if contentGate.reveal(withPassword: nsfwPasswordInput) {
+            showNSFWReveal = false
+            nsfwPasswordInput = ""
+            nsfwPasswordError = false
+        } else {
+            nsfwPasswordError = true
+        }
     }
 
     private var connectionButton: some View {

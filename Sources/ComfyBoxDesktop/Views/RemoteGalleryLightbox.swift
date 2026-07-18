@@ -77,6 +77,7 @@ struct RemoteGalleryLightbox: View {
                 }
             }
             .padding(40)
+            .contentGated(cornerRadius: 0)
 
             // Prev / next
             HStack {

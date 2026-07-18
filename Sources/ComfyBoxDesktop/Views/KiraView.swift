@@ -446,6 +446,7 @@ struct KiraView: View {
                 }
             }
             .frame(height: 96)
+            .contentGated()   // G-rated by default (Todd 2026-07-17)
         }
     }
 
