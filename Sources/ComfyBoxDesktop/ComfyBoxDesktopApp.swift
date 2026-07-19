@@ -193,10 +193,6 @@ struct ComfyBoxDesktopApp: App {
             }
             .toolbar {
                 ToolbarItem(placement: .automatic) {
-                    nsfwToggleButton
-                }
-
-                ToolbarItem(placement: .automatic) {
                     connectionButton
                 }
 
@@ -206,11 +202,21 @@ struct ComfyBoxDesktopApp: App {
                     }
                 }
             }
+            // Hidden reveal trigger — NO visible button anywhere (a visible
+            // "Show NSFW" control would advertise hidden content to anyone who
+            // opens the app). Reveal is a keyboard shortcut only: ⌃⌥⌘U toggles
+            // the gate (prompting for the gallery password if one is set). The
+            // gate re-hides on every launch regardless. (Todd 2026-07-18)
+            .background {
+                Button("", action: toggleNSFWReveal)
+                    .keyboardShortcut("u", modifiers: [.command, .option, .control])
+                    .hidden()
+            }
             .sheet(isPresented: $showNSFWReveal) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Label("Reveal mature content", systemImage: "eye.trianglebadge.exclamationmark")
+                    Label("Unlock content", systemImage: "lock.open.fill")
                         .font(.headline)
-                    Text("Enter the gallery password to show NSFW content this session. The app returns to Rated G on relaunch.")
+                    Text("Enter the gallery password. Content re-locks on relaunch.")
                         .font(.callout).foregroundStyle(.secondary)
                     SecureField("Password", text: $nsfwPasswordInput)
                         .textFieldStyle(.roundedBorder)
@@ -221,7 +227,7 @@ struct ComfyBoxDesktopApp: App {
                     HStack {
                         Spacer()
                         Button("Cancel") { showNSFWReveal = false; nsfwPasswordInput = "" }
-                        Button("Reveal") { submitNSFWReveal() }.buttonStyle(.borderedProminent)
+                        Button("Unlock") { submitNSFWReveal() }.buttonStyle(.borderedProminent)
                     }
                 }
                 .padding(20)
@@ -554,27 +560,20 @@ struct ComfyBoxDesktopApp: App {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Global "Rated G ⇄ NSFW" master toggle (Todd 2026-07-17). Off by default;
-    /// revealing prompts for the gallery password when one is configured.
-    private var nsfwToggleButton: some View {
-        Button {
-            if contentGate.revealed {
-                contentGate.hide()
-            } else if contentGate.requiresPassword {
-                nsfwPasswordInput = ""
-                nsfwPasswordError = false
-                showNSFWReveal = true
-            } else {
-                contentGate.reveal()
-            }
-        } label: {
-            Label(contentGate.revealed ? "NSFW" : "Rated G",
-                  systemImage: contentGate.revealed ? "eye.fill" : "eye.slash.fill")
-                .foregroundStyle(contentGate.revealed ? .orange : .secondary)
+    /// Reveal/hide toggle, invoked ONLY by the hidden ⌃⌥⌘U keyboard shortcut —
+    /// there is deliberately no visible control (Todd 2026-07-18). Revealing
+    /// prompts for the gallery password when one is configured; the gate
+    /// re-hides on every launch regardless.
+    private func toggleNSFWReveal() {
+        if contentGate.revealed {
+            contentGate.hide()
+        } else if contentGate.requiresPassword {
+            nsfwPasswordInput = ""
+            nsfwPasswordError = false
+            showNSFWReveal = true
+        } else {
+            contentGate.reveal()
         }
-        .help(contentGate.revealed
-              ? "Mature content is visible — click to hide (returns to Rated G)"
-              : "App is Rated G — click to reveal mature content (Gallery, Recents, Prompts)")
     }
 
     private func submitNSFWReveal() {

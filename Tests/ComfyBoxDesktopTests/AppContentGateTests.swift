@@ -34,7 +34,7 @@ final class AppContentGateTests: XCTestCase {
     }
 
     func testPasswordGatedReveal() {
-        NSFWGate.setPassword("hunter2")
+        NSFWGate.setPassword("213tits")
         let gate = AppContentGate()
         XCTAssertTrue(gate.requiresPassword)
 
@@ -45,7 +45,7 @@ final class AppContentGateTests: XCTestCase {
         XCTAssertFalse(gate.reveal(withPassword: "wrong"))
         XCTAssertFalse(gate.revealed)
 
-        XCTAssertTrue(gate.reveal(withPassword: "hunter2"))
+        XCTAssertTrue(gate.reveal(withPassword: "213tits"))
         XCTAssertTrue(gate.revealed)
 
         // Hiding is always allowed.

@@ -94,72 +94,30 @@ public struct GatedText: View {
     }
 }
 
-/// A full-surface "content hidden" wall for browsing views (Gallery, etc.)
-/// where the requirement is that nothing shows until revealed. Owns its own
-/// reveal flow (including the password prompt) so any view can drop it in.
+/// A neutral "locked" placeholder for gated browsing views (Gallery, etc.).
+///
+/// By design it presents NO reveal affordance — a visible "Show NSFW" button
+/// would advertise hidden content to anyone who opens the app (Todd
+/// 2026-07-18). Revealing is a hidden keyboard shortcut only, handled at the
+/// app level. This just shows a quiet lock so nothing mature is on screen.
 public struct ContentHiddenWall: View {
-    @Environment(AppContentGate.self) private var gate
-    @State private var showPassword = false
-    @State private var password = ""
-    @State private var passwordError = false
     private let note: String
 
-    public init(note: String = "This view may contain mature content.") {
+    public init(note: String = "") {
         self.note = note
     }
 
     public var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "eye.slash.fill")
-                .font(.system(size: 34))
-                .foregroundStyle(.secondary)
-            Text("Content hidden")
+        VStack(spacing: 10) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 30))
+                .foregroundStyle(.tertiary)
+            Text("Locked")
                 .font(.headline)
-            Text("\(note) Turn on NSFW to view.")
-                .font(.callout)
                 .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button {
-                if gate.requiresPassword {
-                    password = ""
-                    passwordError = false
-                    showPassword = true
-                } else {
-                    gate.reveal()
-                }
-            } label: {
-                Label(gate.requiresPassword ? "Unlock NSFW…" : "Show NSFW", systemImage: "eye")
-            }
-            .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)
-        .sheet(isPresented: $showPassword) {
-            VStack(alignment: .leading, spacing: 12) {
-                Label("Reveal mature content", systemImage: "eye.trianglebadge.exclamationmark")
-                    .font(.headline)
-                SecureField("Gallery password", text: $password)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(unlock)
-                if passwordError {
-                    Text("Incorrect password").font(.caption).foregroundStyle(.red)
-                }
-                HStack {
-                    Spacer()
-                    Button("Cancel") { showPassword = false }
-                    Button("Reveal") { unlock() }.buttonStyle(.borderedProminent)
-                }
-            }
-            .padding(20)
-            .frame(width: 360)
-        }
-    }
-
-    private func unlock() {
-        if gate.reveal(withPassword: password) {
-            showPassword = false
-        } else {
-            passwordError = true
-        }
+        .accessibilityHidden(true)
     }
 }
