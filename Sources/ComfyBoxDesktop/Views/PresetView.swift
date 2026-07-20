@@ -423,9 +423,16 @@ private struct ServerPresetEditor: View {
                     .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
                     .help(lora.filename)
                 Slider(value: $lora.scale, in: 0...1.5, step: 0.05)
-                Text(String(format: "%.2f", lora.scale))
+                TextField("", value: Binding(
+                    get: { lora.scale },
+                    // Manual entry may exceed the slider range on purpose
+                    // (e.g. 2.0 overdrive) — clamp only the absurd.
+                    set: { lora.scale = min(max($0, 0), 3.0) }
+                ), format: .number.precision(.fractionLength(0...2)))
                     .font(.system(.caption, design: .monospaced))
-                    .frame(width: 36, alignment: .trailing)
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 52)
                 Button {
                     editableLoras.removeAll { $0.id == lora.id }
                 } label: {
