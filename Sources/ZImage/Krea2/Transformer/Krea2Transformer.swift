@@ -388,6 +388,13 @@ public final class Krea2SingleStreamDiT: Module {
   @ModuleInfo(key: "last") var last: Krea2LastLayer
   @ModuleInfo(key: "tproj") var tproj: Krea2TProj
 
+  // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md). Stored as plain
+  // MLXArrays (NOT @ModuleInfo) so they are excluded from q8 quantize and from
+  // update(parameters:)/eval traversal — set explicitly at control-LoRA load.
+  // Expanded input projection: weight (features, 2C), bias (features,).
+  public var controlFirstWeight: MLXArray? = nil
+  public var controlFirstBias: MLXArray? = nil
+
   public init(cfg: Krea2Config = Krea2Config()) {
     self.cfg = cfg
     self._first.wrappedValue = Linear(cfg.channels * cfg.patch * cfg.patch, cfg.features, bias: true)
@@ -406,9 +413,18 @@ public final class Krea2SingleStreamDiT: Module {
   /// img: (B, Limg, channels*patch^2); context: (B, seq, nLayers, txtdim);
   /// t: (B,) in [0,1]; pos: (L,3) for [txt; img]; mask: (B,L) validity.
   public func callAsFunction(
-    img imgIn: MLXArray, context contextIn: MLXArray, t: MLXArray, pos: MLXArray, mask: MLXArray
+    img imgIn: MLXArray, context contextIn: MLXArray, t: MLXArray, pos: MLXArray, mask: MLXArray,
+    control: MLXArray? = nil
   ) -> MLXArray {
-    let img = first(imgIn)
+    // Control ON: project concat([noisy tokens ‖ control tokens]) (B,L,2C) through the
+    // expanded input projection. Control OFF: base `first` path is byte-identical to today.
+    let img: MLXArray
+    if let cw = controlFirstWeight, let cb = controlFirstBias, let ctrl = control {
+      let x = MLX.concatenated([imgIn, ctrl], axis: -1).asType(cw.dtype)  // (B, L, 2C)
+      img = (MLX.matmul(x, cw.transposed(1, 0)) + cb).asType(imgIn.dtype) // (B, L, features)
+    } else {
+      img = first(imgIn)
+    }
     let tEmb = tmlp(Krea2Util.timestepEmbed(t, dim: cfg.tdim).asType(img.dtype))  // (B,1,feat)
     let tvec = tproj(tEmb)  // (B,1,6*feat)
 

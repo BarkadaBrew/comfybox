@@ -2184,6 +2184,7 @@ public final class WarmServer {
 
   /// Default ControlNet directory path — matches ComfyBridgeObjectInfo discovery path.
   private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
+  private static let krea2ControlLoRAPath = "/Volumes/Bolt/Models/krea2-controlnet/depth-control-lora.safetensors"
 
   private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?, latentPreviewCallback: ComfyBridgeLatentPreviewHandler? = nil) async throws -> ComfyBridgeGenerateResult {
     // --- Phase 4: Dynamic LoRA swap ---
@@ -5216,10 +5217,51 @@ private actor WarmServerCoordinator {
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
 
-      let image = k2.generate(
-        .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed)
-      ) { [logger] step, total in
-        logger.info("Krea2: step \(step)/\(total)")
+      // img2img fix (2026-07-19): Krea2Pipeline.generateImg2Img already
+      // implements VAE-encode + partial-denoise; runKrea2Generate simply never
+      // wired it, so an init image was silently ignored (txt2img). When an init
+      // image is present, load+normalize it to NHWC [-1,1] and run img2img.
+      // strength = 1 - denoise, matching flux1 makeImg2ImgRequest's convention.
+      // Depth Control-LoRA: load control weights + encode control tokens when a control image is supplied.
+      var controlPixels: MLXArray? = nil
+      if let controlData = payload.controlImageData {
+        let ccg = try InpaintUtilities.loadCGImage(from: controlData)
+        let cpix = try QwenImageIO.resizedPixelArray(from: ccg, width: width, height: height)
+        controlPixels = QwenImageIO.normalizeForEncoder(cpix).transposed(0, 2, 3, 1)
+        let loraURL = URL(fileURLWithPath: "/Volumes/Bolt/Models/krea2-controlnet/depth-control-lora.safetensors")
+        try await k2.setControlLoRA(loraURL, scale: payload.controlnetStrength ?? 1.0)
+        logger.info("Krea2: depth Control-LoRA active (strength=\(payload.controlnetStrength ?? 1.0))")
+      } else if k2.controlLoRAActive {
+        try await k2.setControlLoRA(nil)
+      }
+      let image: MLXArray
+      if let initPath = payload.imagePath {
+        let imageData = try Data(contentsOf: URL(fileURLWithPath: initPath))
+        let cg = try InpaintUtilities.loadCGImage(from: imageData)
+        let pixNCHW = try QwenImageIO.resizedPixelArray(from: cg, width: width, height: height)
+        let sourceNHWC = QwenImageIO.normalizeForEncoder(pixNCHW).transposed(0, 2, 3, 1)
+        let strength: Float
+        if let c = payload.creativity {
+          strength = 1.0 - max(0.01, min(0.99, c))
+        } else if let sVal = payload.imageStrength {
+          strength = max(0.01, min(0.99, sVal))
+        } else if let d = payload.denoise {
+          strength = 1.0 - max(0.01, min(0.99, d))
+        } else {
+          strength = 0.3
+        }
+        logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
+        image = k2.generateImg2Img(
+          .init(prompt: payload.prompt, sourceImage: sourceNHWC, width: width, height: height, steps: steps, seed: seed, strength: strength)
+        ) { [logger] step, total in
+          logger.info("Krea2 img2img: step \(step)/\(total)")
+        }
+      } else {
+        image = k2.generate(
+          .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed, controlImagePixels: controlPixels)
+        ) { [logger] step, total in
+          logger.info("Krea2: step \(step)/\(total)")
+        }
       }
       let metadata = QwenImageIO.ImageMetadata.generation(
         prompt: payload.prompt,
@@ -5916,6 +5958,9 @@ struct GeneratePayload: Sendable {
   let model: String?
   /// Per-job LoRA override, applied the same way as `model` at dequeue time.
   let loras: [LoRAEntry]?
+  // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
+  let controlImageData: Data?
+  let controlnetStrength: Float?
 
   /// Default memberwise init for bridge-created payloads.
   init(
@@ -5931,13 +5976,15 @@ struct GeneratePayload: Sendable {
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
     maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
-    model: String? = nil, loras: [LoRAEntry]? = nil
+    model: String? = nil, loras: [LoRAEntry]? = nil,
+    controlImageData: Data? = nil, controlnetStrength: Float? = nil
   ) {
     self.source = source
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
     self.loras = loras
+    self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -5976,6 +6023,8 @@ extension GeneratePayload: Decodable {
     // Wire key init_image_base64 arrives as this camelCase form after
     // .convertFromSnakeCase (same gotcha as the inpaint keys).
     case initImageData = "initImageBase64"
+    case controlImageData
+    case controlnetStrength
     case model, loras
   }
 
@@ -6019,6 +6068,8 @@ extension GeneratePayload: Decodable {
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
+    controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
+    controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
   }
 
   func makePipelineRequest(
