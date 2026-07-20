@@ -148,6 +148,26 @@ public struct LTX2PipelineConfig: Sendable {
     0.909375, 0.725, 0.421875, 0.0,
   ]
 
+  // Motion-quality tuning (2026-07-18): the 10Eros/LTX-2.3 authors sample with
+  // euler_ancestral + a DMD-specific stage-1 schedule; ComfyBox defaulted to
+  // deterministic euler + the front-clustered stock schedule, which under-
+  // resolves moving regions (motion haze). These env overrides let the plist
+  // drive sampler + schedule per loaded base with NO rebuild. Unset => identical
+  // to prior behavior.
+
+  /// Override the distilled stage-1 sigma schedule via env `LTX2_STAGE1_SIGMAS`
+  /// (comma-separated floats, e.g. "1.0,0.955,0.893,...,0.0"). nil if unset.
+  public static var envStage1Sigmas: [Float]? {
+    guard let s = ProcessInfo.processInfo.environment["LTX2_STAGE1_SIGMAS"], !s.isEmpty else { return nil }
+    let vals = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+    return vals.count >= 2 ? vals : nil
+  }
+
+  /// Ancestral (SDE) sampling toggle via env `LTX2_SAMPLER` containing "ancestral".
+  public static var envAncestral: Bool {
+    (ProcessInfo.processInfo.environment["LTX2_SAMPLER"] ?? "").lowercased().contains("ancestral")
+  }
+
   // MARK: - Dev Sigma Schedule
 
   /// Scheduling constants for dev pipeline.

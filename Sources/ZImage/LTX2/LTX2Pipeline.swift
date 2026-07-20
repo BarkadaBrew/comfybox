@@ -707,6 +707,7 @@ public final class LTX2Pipeline {
 
     // Keep latents in float32 throughout for precision
     var currentLatents = latents.asType(.float32)
+    let useSDE = LTX2PipelineConfig.envAncestral
 
     for i in 0..<numSteps {
       let sigma = sigmas[i]
@@ -800,11 +801,20 @@ public final class LTX2Pipeline {
         )
       }
 
-      // Euler step in float32
+      // Euler step (ancestral/SDE when LTX2_SAMPLER=euler_ancestral) in float32
       if sigmaNext > 0 {
-        let sigmaF32 = MLXArray(sigma)
-        let sigmaNextF32 = MLXArray(sigmaNext)
-        currentLatents = denoised + sigmaNextF32 * (currentLatents - denoised) / sigmaF32
+        if useSDE {
+          let sigmaF32 = MLXArray(sigma)
+          let eps = (currentLatents - denoised) / sigmaF32
+          let (alphaRatio, sigmaDown, sigmaUp) = getSdeCoeff(sigmaNext: sigmaNext)
+          let noise = getNewNoise(shape: currentLatents.shape)
+          currentLatents = MLXArray(alphaRatio) * (denoised + MLXArray(sigmaDown) * eps)
+            + MLXArray(sigmaUp) * noise
+        } else {
+          let sigmaF32 = MLXArray(sigma)
+          let sigmaNextF32 = MLXArray(sigmaNext)
+          currentLatents = denoised + sigmaNextF32 * (currentLatents - denoised) / sigmaF32
+        }
       } else {
         currentLatents = denoised
       }
@@ -824,7 +834,7 @@ public final class LTX2Pipeline {
   ) -> [Float] {
     switch config.pipelineType {
     case .distilled:
-      return LTX2PipelineConfig.stage1Sigmas
+      return LTX2PipelineConfig.envStage1Sigmas ?? LTX2PipelineConfig.stage1Sigmas
     case .dev, .devTwoStage:
       let numTokens = latF * latH * latW
       return LTX2PipelineConfig.devSigmaSchedule(

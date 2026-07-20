@@ -441,6 +441,14 @@ public final class LTX2VideoGenerator {
         progress: ((Int, Int, Int, Int) -> Void)? = nil   // (chunk, totalChunks, step, totalSteps)
     ) throws -> LTX2VideoResult {
         #if canImport(CoreGraphics) && canImport(ImageIO)
+        // Memory-leak fix (2026-07-18): the video render path never freed MLX
+        // activation buffers, so idle mem climbed ~20GB -> 110GB+ across renders
+        // until every render hit `Memory pressure` mid-flight and the shedding
+        // corrupted the output into rainbow noise. Clear the MLX cache before
+        // (drop leftover image-gen buffers, freeing headroom) and after (this
+        // render's activations, via defer) EVERY render.
+        GPU.clearCache()
+        defer { GPU.clearCache() }
         try validate(request)
         try load(loras: request.effectiveLoRAs)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }

@@ -139,7 +139,7 @@ private func getRes2sCoefficients(h: Double, c2: Double = 0.5) -> (Double, Doubl
 // MARK: - SDE Noise
 
 /// Compute SDE coefficients for variance-preserving noise injection.
-private func getSdeCoeff(sigmaNext: Float) -> (alphaRatio: Float, sigmaDown: Float, sigmaUp: Float) {
+func getSdeCoeff(sigmaNext: Float) -> (alphaRatio: Float, sigmaDown: Float, sigmaUp: Float) {
   var sigmaUp = sigmaNext * 0.5
   sigmaUp = min(sigmaUp, sigmaNext * 0.9999)
 
@@ -162,7 +162,7 @@ private func getSdeCoeff(sigmaNext: Float) -> (alphaRatio: Float, sigmaDown: Flo
 }
 
 /// Generate channel-wise normalized Gaussian noise.
-private func getNewNoise(shape: [Int]) -> MLXArray {
+func getNewNoise(shape: [Int]) -> MLXArray {
   var noise = MLXRandom.normal(shape, dtype: .float32)
   // Global normalization
   let mean = noise.mean()
