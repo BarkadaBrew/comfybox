@@ -5224,7 +5224,8 @@ private actor WarmServerCoordinator {
       // strength = 1 - denoise, matching flux1 makeImg2ImgRequest's convention.
       // Depth Control-LoRA: load control weights + encode control tokens when a control image is supplied.
       var controlPixels: MLXArray? = nil
-      if let controlData = payload.controlImageData {
+      let resolvedControlData: Data? = payload.controlImageData ?? payload.controlImage.flatMap { try? Data(contentsOf: URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)) }
+      if let controlData = resolvedControlData {
         let ccg = try InpaintUtilities.loadCGImage(from: controlData)
         let cpix = try QwenImageIO.resizedPixelArray(from: ccg, width: width, height: height)
         controlPixels = QwenImageIO.normalizeForEncoder(cpix).transposed(0, 2, 3, 1)
@@ -5961,6 +5962,7 @@ struct GeneratePayload: Sendable {
   // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
   let controlImageData: Data?
   let controlnetStrength: Float?
+  let controlImage: String?  // Mac-side control map path (e.g. depth), read in place
 
   /// Default memberwise init for bridge-created payloads.
   init(
@@ -5977,14 +5979,14 @@ struct GeneratePayload: Sendable {
     maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil,
-    controlImageData: Data? = nil, controlnetStrength: Float? = nil
+    controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil
   ) {
     self.source = source
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
     self.loras = loras
-    self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength
+    self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength; self.controlImage = controlImage
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -6025,6 +6027,7 @@ extension GeneratePayload: Decodable {
     case initImageData = "initImageBase64"
     case controlImageData
     case controlnetStrength
+    case controlImage
     case model, loras
   }
 
@@ -6070,6 +6073,7 @@ extension GeneratePayload: Decodable {
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
     controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
+    controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
   }
 
   func makePipelineRequest(
