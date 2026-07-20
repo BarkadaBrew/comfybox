@@ -229,18 +229,20 @@ struct GenerationView: View {
         .sheet(isPresented: $showingSavePreset) {
             SavePresetSheet(
                 promptTemplate: prompt,
+                negativePrompt: negativePrompt,
                 modelId: engine.currentModel,
                 loras: selectedLoras,
                 steps: Int(steps),
                 guidance: Float(guidance),
                 width: effectiveWidth,
                 height: effectiveHeight,
-                onSave: { name in
+                onSave: { name, editedNegative in
                     // Save to the canonical server preset store (shared with
                     // Bree/Telegram), not the old device-local list.
                     let preset = ServerPreset(
                         name: name,
                         prompt: prompt.isEmpty ? nil : prompt,
+                        negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
                         width: effectiveWidth,

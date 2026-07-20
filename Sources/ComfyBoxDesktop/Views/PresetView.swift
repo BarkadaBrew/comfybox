@@ -545,16 +545,21 @@ private struct ServerPresetEditor: View {
 
 struct SavePresetSheet: View {
     var promptTemplate: String
+    var negativePrompt: String = ""
     var modelId: String?
     var loras: [LoRASelection]
     var steps: Int
     var guidance: Float
     var width: Int
     var height: Int
-    var onSave: (String) -> Void
+    /// (name, negativePrompt) — the sheet lets the user edit the negative
+    /// prompt before saving, so the callback returns the edited value.
+    var onSave: (String, String) -> Void
     var onCancel: () -> Void
 
     @State private var presetName: String = ""
+    @State private var editedNegative: String = ""
+    @State private var didSeedNegative = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -590,6 +595,10 @@ struct SavePresetSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    TextField("Negative prompt (saved with the preset)",
+                              text: $editedNegative, axis: .vertical)
+                        .lineLimit(1...3)
+                        .font(.caption)
                 }
             }
             .formStyle(.grouped)
@@ -600,13 +609,19 @@ struct SavePresetSheet: View {
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Save Preset") { onSave(presetName) }
+                Button("Save Preset") { onSave(presetName, editedNegative) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(presetName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding()
         }
-        .frame(width: 400, height: 360)
+        .frame(width: 400, height: 400)
+        .onAppear {
+            if !didSeedNegative {
+                editedNegative = negativePrompt
+                didSeedNegative = true
+            }
+        }
     }
 }
