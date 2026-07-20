@@ -1404,12 +1404,23 @@ struct GenerationView: View {
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
     }
 
+    /// Preset applied on a fresh launch when the user hasn't picked one.
+    private static let defaultPresetName = "Krea-Kira"
+
     private func loadServerPresets() async {
         serverPresets = await engine.fetchPresets()
         if let config = try? await engine.fetchServerConfig() {
             contentModeDefaultPresets = Dictionary(uniqueKeysWithValues: config.contentModeDefaultPresets.compactMap { key, value in
                 ContentMode(rawValue: key).map { ($0, value) }
             })
+        }
+        // Default preset: on a fresh launch (no active preset yet), come up
+        // as Krea-Kira so Generate is ready to go without a manual pick.
+        if activePresetName == nil,
+           let def = serverPresets.first(where: {
+               $0.name.caseInsensitiveCompare(Self.defaultPresetName) == .orderedSame
+           }) {
+            await applyServerPreset(def)
         }
     }
 
