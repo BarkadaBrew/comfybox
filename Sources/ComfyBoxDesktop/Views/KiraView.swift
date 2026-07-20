@@ -263,6 +263,35 @@ struct KiraView: View {
                     Text(cadenceLine(scheduler))
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                // Editable pacing (Todd 2026-07-20) — live: the scheduler
+                // re-reads policy each cycle, so changes apply next tick.
+                HStack(spacing: 14) {
+                    Stepper(
+                        "Images: \(scheduler.unlimitedImages ? "∞" : String(scheduler.imageCount ?? 2))",
+                        onIncrement: {
+                            Task { await client.updateSchedulerPolicy(["imageCount": (scheduler.imageCount ?? 2) + 1]) }
+                        },
+                        onDecrement: {
+                            Task { await client.updateSchedulerPolicy(["imageCount": max(0, (scheduler.imageCount ?? 2) - 1)]) }
+                        })
+                        .disabled(client.actionInFlight || scheduler.unlimitedImages)
+                    Toggle("Unlimited (fit cycle)", isOn: Binding(
+                        get: { scheduler.unlimitedImages },
+                        set: { on in Task { await client.updateSchedulerPolicy(["unlimitedImages": on]) } }))
+                        .toggleStyle(.checkbox)
+                        .disabled(client.actionInFlight)
+                        .help("Keep rendering images for the whole cycle — throughput adapts to render times; the queue never carries into the next cycle.")
+                    Stepper(
+                        "Videos: \(scheduler.videoCount ?? 1)",
+                        onIncrement: {
+                            Task { await client.updateSchedulerPolicy(["videoCount": (scheduler.videoCount ?? 1) + 1]) }
+                        },
+                        onDecrement: {
+                            Task { await client.updateSchedulerPolicy(["videoCount": max(0, (scheduler.videoCount ?? 1) - 1)]) }
+                        })
+                        .disabled(client.actionInFlight)
+                }
+                .font(.caption)
             } else {
                 Text("scheduler status unavailable").font(.caption).foregroundStyle(.tertiary)
             }
@@ -453,7 +482,11 @@ struct KiraView: View {
     private func cadenceLine(_ scheduler: KiraSchedulerStatus) -> String {
         var parts: [String] = []
         if let interval = scheduler.intervalMinutes { parts.append("every \(interval)m") }
-        if let images = scheduler.imageCount { parts.append("\(images) img") }
+        if scheduler.unlimitedImages {
+            parts.append("∞ img (fit cycle)")
+        } else if let images = scheduler.imageCount {
+            parts.append("\(images) img")
+        }
         if let videos = scheduler.videoCount { parts.append("\(videos) video (\(scheduler.videoMode ?? "?"))") }
         return parts.joined(separator: " · ")
     }

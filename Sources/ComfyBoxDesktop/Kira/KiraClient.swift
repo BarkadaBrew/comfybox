@@ -121,6 +121,9 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     public var imageCount: Int?
     public var videoCount: Int?
     public var videoMode: String?
+    /// Unlimited-within-cycle images: renders chain until the cycle window
+    /// closes; imageCount is ignored while true.
+    public var unlimitedImages: Bool
 
     public static func parse(_ data: Data) -> KiraSchedulerStatus? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -132,7 +135,8 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             intervalMinutes: (config?["intervalMinutes"] as? NSNumber)?.intValue,
             imageCount: (config?["imageCount"] as? NSNumber)?.intValue,
             videoCount: (config?["videoCount"] as? NSNumber)?.intValue,
-            videoMode: config?["videoMode"] as? String)
+            videoMode: config?["videoMode"] as? String,
+            unlimitedImages: config?["unlimitedImages"] as? Bool ?? false)
     }
 }
 
@@ -524,5 +528,13 @@ public final class KiraClient {
     /// B5: set the default content mode (allowlisted server-side).
     public func setContentMode(_ mode: String) async {
         await perform("v1/kira/content-mode", method: "PUT", body: ["mode": mode])
+    }
+
+    /// Update the 24/7 content-scheduler pacing (partial update; validated
+    /// server-side). Live: the scheduler re-reads policy every cycle, so
+    /// edits take effect on the next tick without a daemon restart.
+    public func updateSchedulerPolicy(_ changes: [String: Any]) async {
+        await perform("v1/kira/content-scheduler/policy", method: "PUT", body: changes)
+        await refreshDashboard()
     }
 }
