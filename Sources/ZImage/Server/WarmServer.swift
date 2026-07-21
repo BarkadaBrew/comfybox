@@ -1808,17 +1808,22 @@ public final class WarmServer {
       // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
       // (289f, no crash). Single-chunk renders don't anchor (nothing to
       // drift); callers can still pass 0 to disable.
+      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
+      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
+      // faces without the multi-keyframe gap-collapse. Enable explicitly via
+      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
+      // it unless the interval is set below the frame count. Only the pre-existing
+      // extended/chunked anchor stays on by default (unchanged behavior).
       identityAnchorStrength: req.identityAnchorStrength
-        ?? ((effectiveInitImage != nil
-             && (Self.isExtendedRender(
-                   extendToSeconds: req.extendToSeconds, duration: req.duration,
-                   framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
-                 || (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 72)))
-            ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0),
-      // Mid-pass identity re-anchor interval for long single-pass i2v (#partnered):
-      // holds EVERY face (not just the central subject) across a 12s single pass.
-      identityReAnchorInterval: (effectiveInitImage != nil)
-        ? (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 72) : 0,
+        ?? (Self.isExtendedRender(
+              extendToSeconds: req.extendToSeconds, duration: req.duration,
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
+            ? 0.5
+            : ((effectiveInitImage != nil
+                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
+                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
+               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
+      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
       extendToSeconds: req.extendToSeconds
         ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,

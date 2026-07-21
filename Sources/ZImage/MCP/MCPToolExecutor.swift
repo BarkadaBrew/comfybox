@@ -416,6 +416,25 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let aspectRatio = params?.string("aspect_ratio") {
       body["aspect_ratio"] = aspectRatio
     }
+    // T2V has no source frame, so translate aspect_ratio into explicit
+    // width/height here: WarmServer's video request decodes width/height, NOT
+    // aspect_ratio, so otherwise every t2v render fell back to the 704x448
+    // landscape default regardless of the requested orientation. Portrait
+    // ("9:16") swaps to 448x704 (both /64). I2V leaves dims unset so WarmServer
+    // keeps matching the source image aspect.
+    if params?.string("image_path") == nil {
+      // Respect caller-supplied dims; otherwise orient the standard t2v dims by
+      // aspect_ratio. WarmServer reads width/height (not aspect_ratio/resolution),
+      // so without this every t2v fell back to the 704x448 landscape default.
+      if let w = params?.integer("width"), let h = params?.integer("height") {
+        body["width"] = w
+        body["height"] = h
+      } else {
+        let portrait = (params?.string("aspect_ratio") ?? "16:9") == "9:16"
+        body["width"] = portrait ? 448 : 704
+        body["height"] = portrait ? 704 : 448
+      }
+    }
     if let seed = params?.integer("seed") {
       body["seed"] = seed
     }
