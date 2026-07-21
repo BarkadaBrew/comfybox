@@ -766,6 +766,7 @@ public final class LTX2Pipeline {
         .transposed(0, 2, 1)
       let timestepsF32 = timesteps.asType(.float32).expandedDimensions(axis: -1)
       var x0GuidedF32 = latentsFlatF32 - timestepsF32 * velocityPos.asType(.float32)
+      let x0CondF32 = x0GuidedF32  // pure conditional x0, saved for the STG delta
 
       // CFG: negative pass
       if useCFG, let negEmb = negativeEmbeddings {
@@ -785,6 +786,26 @@ public final class LTX2Pipeline {
           unconditioned: x0NegF32,
           scale: cfgScale
         )
+      }
+
+      // STG: spatiotemporal guidance. A perturbed pass skips self-attention in a
+      // block subset; steer away from it to restore high-frequency motion detail.
+      // For distilled cfg=1 this is the primary guidance lever (anti-haze).
+      let stgBase = LTX2PipelineConfig.envSTGScale
+      if stgBase > 0 {
+        let stgScale = LTX2PipelineConfig.stgScaleForStep(i, base: stgBase)
+        let velocitySTG = transformer(
+          latent: latentsFlat,
+          timestep: timesteps,
+          context: textEmbeddings.asType(dtype),
+          positions: positions,
+          sigma: sigmaArray,
+          precomputedPE: precomputedPE,
+          stgBlocks: LTX2PipelineConfig.envSTGBlocks
+        )
+        eval(velocitySTG)
+        let x0STGF32 = latentsFlatF32 - timestepsF32 * velocitySTG.asType(.float32)
+        x0GuidedF32 = x0GuidedF32 + MLXArray(stgScale) * (x0CondF32 - x0STGF32)
       }
 
       // Reshape x0 from token space to spatial

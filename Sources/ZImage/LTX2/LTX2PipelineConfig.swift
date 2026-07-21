@@ -168,6 +168,35 @@ public struct LTX2PipelineConfig: Sendable {
     (ProcessInfo.processInfo.environment["LTX2_SAMPLER"] ?? "").lowercased().contains("ancestral")
   }
 
+  // STG (Spatiotemporal Guidance) — the 10Eros/LTX-2.3 authors' biggest anti-haze
+  // lever for distilled (cfg=1) sampling. A perturbed transformer pass skips
+  // self-attention in a mid-stack block subset; steering the denoised prediction
+  // AWAY from that perturbed output restores high-frequency spatiotemporal detail
+  // (kills motion haze). Env-driven, no rebuild needed to tune scale/blocks.
+
+  /// STG guidance scale via env `LTX2_STG_SCALE` (float). 0 (default) = STG off.
+  /// Vantage 10Eros uses ~1.0 tail with a boosted head (see `stgScaleForStep`).
+  public static var envSTGScale: Float {
+    Float(ProcessInfo.processInfo.environment["LTX2_STG_SCALE"] ?? "") ?? 0
+  }
+
+  /// Block indices whose self-attention is skipped in the STG perturbed pass,
+  /// via env `LTX2_STG_BLOCKS` (CSV, e.g. "14,15,16"). Default: mid-stack triplet.
+  public static var envSTGBlocks: Set<Int> {
+    guard let s = ProcessInfo.processInfo.environment["LTX2_STG_BLOCKS"], !s.isEmpty else { return [14, 15, 16] }
+    return Set(s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+  }
+
+  /// Per-step STG scale ramp. Vantage boosts the first two steps (2.0, 1.5) then
+  /// holds `base`. Additive so base==1.0 reproduces the reference 2,1.5,1,1,... schedule.
+  public static func stgScaleForStep(_ i: Int, base: Float) -> Float {
+    switch i {
+    case 0: return base + 1.0
+    case 1: return base + 0.5
+    default: return base
+    }
+  }
+
   // MARK: - Dev Sigma Schedule
 
   /// Scheduling constants for dev pipeline.
