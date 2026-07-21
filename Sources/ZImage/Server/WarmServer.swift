@@ -1809,9 +1809,16 @@ public final class WarmServer {
       // (289f, no crash). Single-chunk renders don't anchor (nothing to
       // drift); callers can still pass 0 to disable.
       identityAnchorStrength: req.identityAnchorStrength
-        ?? (Self.isExtendedRender(
-              extendToSeconds: req.extendToSeconds, duration: req.duration,
-              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24) ? 0.5 : 0),
+        ?? ((effectiveInitImage != nil
+             && (Self.isExtendedRender(
+                   extendToSeconds: req.extendToSeconds, duration: req.duration,
+                   framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
+                 || (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 72)))
+            ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0),
+      // Mid-pass identity re-anchor interval for long single-pass i2v (#partnered):
+      // holds EVERY face (not just the central subject) across a 12s single pass.
+      identityReAnchorInterval: (effectiveInitImage != nil)
+        ? (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 72) : 0,
       extendToSeconds: req.extendToSeconds
         ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,

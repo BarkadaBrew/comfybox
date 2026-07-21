@@ -48,6 +48,12 @@ public struct LTX2VideoRequest: Sendable {
     /// last frame at this strength (soft identity pull) \u{2014} counters the
     /// cumulative subject/scene drift of tail-to-head chaining (#219).
     public var identityAnchorStrength: Float
+
+    /// Frames between mid-pass identity re-anchors for a LONG single/first pass
+    /// (0 = off). With only a frame-0 anchor, peripheral subjects (e.g. a
+    /// partner's face) drift and melt over a long pass; re-splicing the source
+    /// at this interval at `identityAnchorStrength` holds EVERY face. #partnered
+    public var identityReAnchorInterval: Int
     /// Target duration; >0 generates continuation chunks (I2V only).
     public var extendToSeconds: Float
     public var fps: Int
@@ -82,6 +88,7 @@ public struct LTX2VideoRequest: Sendable {
         seed: UInt64 = 42,
         strength: Float = 1.0,
         identityAnchorStrength: Float = 0,
+        identityReAnchorInterval: Int = 0,
         extendToSeconds: Float = 0,
         fps: Int = 24,
         loraPath: String? = nil,
@@ -99,6 +106,7 @@ public struct LTX2VideoRequest: Sendable {
         self.seed = seed
         self.strength = strength
         self.identityAnchorStrength = identityAnchorStrength
+        self.identityReAnchorInterval = identityReAnchorInterval
         self.extendToSeconds = extendToSeconds
         self.fps = fps
         self.loraPath = loraPath
@@ -499,6 +507,30 @@ public final class LTX2VideoGenerator {
                             .init(image: anchor, videoFrameIndex: request.framesPerChunk - 1,
                                   strength: request.identityAnchorStrength),
                         ],
+                        width: request.width, height: request.height,
+                        numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+                } else if request.identityAnchorStrength > 0,
+                          request.identityReAnchorInterval > 0,
+                          request.framesPerChunk > request.identityReAnchorInterval + 1,
+                          let src = sourceImage {
+                    // Single/long first pass: with only a frame-0 anchor, peripheral
+                    // subjects (a partner's face) drift and melt over the pass. Re-splice
+                    // the ORIGINAL source at fixed intervals at reduced strength — soft
+                    // identity pulls that hold EVERY face across the whole pass without
+                    // freezing motion. Same primitive as the continuation-chunk anchor.
+                    var keyframes: [LTX2Pipeline.Keyframe] = [
+                        .init(image: image, videoFrameIndex: 0, strength: request.strength)
+                    ]
+                    var f = request.identityReAnchorInterval
+                    while f < request.framesPerChunk - 1 {
+                        keyframes.append(.init(image: src, videoFrameIndex: f,
+                                               strength: request.identityAnchorStrength))
+                        f += request.identityReAnchorInterval
+                    }
+                    output = pipeline.generateMultiKeyframe(
+                        inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                        keyframes: keyframes,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
