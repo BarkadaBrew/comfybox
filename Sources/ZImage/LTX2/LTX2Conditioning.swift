@@ -28,6 +28,15 @@ public struct LTX2LatentState {
   /// 1.0 = full denoise, 0.0 = keep clean.
   public var denoiseMask: MLXArray
 
+  /// Face-region latent mask `(1,1,1,H,W)` (1 inside face boxes) + the source
+  /// face reference latent `(1,C,1,H,W)` + pull strength. When set, the denoise
+  /// loop softly pulls ONLY the masked face latents (all frames) toward the
+  /// source face — holds every detected face (esp. a stationary partner) over a
+  /// long pass without touching body/motion latents. #partnered
+  public var faceMask: MLXArray? = nil
+  public var faceRef: MLXArray? = nil
+  public var faceAnchorStrength: Float = 0
+
   public init(latent: MLXArray, cleanLatent: MLXArray, denoiseMask: MLXArray) {
     self.latent = latent
     self.cleanLatent = cleanLatent
@@ -36,11 +45,13 @@ public struct LTX2LatentState {
 
   /// Create a copy of this state.
   public func copy() -> LTX2LatentState {
-    return LTX2LatentState(
+    var c = LTX2LatentState(
       latent: latent,
       cleanLatent: cleanLatent,
       denoiseMask: denoiseMask
     )
+    c.faceMask = faceMask; c.faceRef = faceRef; c.faceAnchorStrength = faceAnchorStrength
+    return c
   }
 }
 

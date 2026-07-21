@@ -489,6 +489,36 @@ public final class LTX2VideoGenerator {
         // chunk\u{27}s last frame).
         let sourceImage: MLXArray? = currentImage
 
+        // Face-anchor (#partnered): detect faces on the source once, build a
+        // latent-space mask so the denoise loop can hold EVERY face (esp. a
+        // stationary partner) across a long pass. Env-gated: LTX2_FACE_ANCHOR_STRENGTH.
+        let faceAnchorStrength = Float(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_STRENGTH"] ?? "") ?? 0
+        var faceAnchorMask: MLXArray? = nil
+        if faceAnchorStrength > 0, let path = request.initImagePath,
+           let isrc = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+           let cg = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
+            let rects = (try? RegionMaskUtilities.detectFaceRects(in: cg)) ?? []
+            let latH = request.height / pipeline.spatialCompression
+            let latW = request.width / pipeline.spatialCompression
+            if !rects.isEmpty && latH > 0 && latW > 0 {
+                var mask = [Float](repeating: 0, count: latH * latW)
+                let pad: CGFloat = 0.35
+                for r in rects {
+                    let p = r.insetBy(dx: -r.width * pad, dy: -r.height * pad)
+                    let x0 = max(0, Int(p.minX * CGFloat(latW)))
+                    let x1 = min(latW, Int((p.minX + p.width) * CGFloat(latW) + 1))
+                    // Vision rects are bottom-left origin; latent rows are top-origin -> flip Y.
+                    let rowTop = max(0, Int((1.0 - (p.minY + p.height)) * CGFloat(latH)))
+                    let rowBot = min(latH, Int((1.0 - p.minY) * CGFloat(latH) + 1))
+                    if x1 > x0 && rowBot > rowTop {
+                        for row in rowTop..<rowBot { for col in x0..<x1 { mask[row * latW + col] = 1 } }
+                    }
+                }
+                faceAnchorMask = MLXArray(mask, [1, 1, 1, latH, latW])
+                logger.info("Face-anchor: \(rects.count) face(s) detected, strength \(faceAnchorStrength)")
+            }
+        }
+
         for chunk in 0..<plan.totalChunks {
             let chunkSeed = request.seed + UInt64(chunk)
             let output: LTX2PipelineOutput
@@ -540,6 +570,8 @@ public final class LTX2VideoGenerator {
                         image: image, strength: request.strength,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        faceAnchorMask: chunk == 0 ? faceAnchorMask : nil,
+                        faceAnchorStrength: faceAnchorStrength,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 }
             } else {

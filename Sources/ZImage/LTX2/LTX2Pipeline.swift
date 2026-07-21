@@ -406,6 +406,8 @@ public final class LTX2Pipeline {
     guidance: Float? = nil,
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
+    faceAnchorMask: MLXArray? = nil,
+    faceAnchorStrength: Float = 0,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -467,6 +469,11 @@ public final class LTX2Pipeline {
       strength: strength
     )
     state = LTX2Conditioning.applyConditioning(state: state, conditions: [condition])
+    if let fm = faceAnchorMask, faceAnchorStrength > 0 {
+      state.faceMask = fm
+      state.faceRef = imageLatent  // source-encoded latent = the face identity reference
+      state.faceAnchorStrength = faceAnchorStrength
+    }
     eval(state.latent, state.cleanLatent, state.denoiseMask)
 
     // Step 5: Build position grid
@@ -820,6 +827,14 @@ public final class LTX2Pipeline {
           clean: s.cleanLatent.asType(.float32),
           denoiseMask: s.denoiseMask
         )
+      }
+      // Face-region identity hold: pull ONLY the masked face latents (all frames)
+      // toward the source face, softly + every step. No full-frame splicing, so
+      // nothing to collapse between anchors — holds a stationary partner's face.
+      if let s = state, let fm = s.faceMask, let ref = s.faceRef, s.faceAnchorStrength > 0 {
+        let m = fm.asType(.float32)
+        let wm = m * s.faceAnchorStrength
+        denoised = denoised * (MLXArray(Float(1)) - wm) + ref.asType(.float32) * wm
       }
 
       // Euler step (ancestral/SDE when LTX2_SAMPLER=euler_ancestral) in float32
