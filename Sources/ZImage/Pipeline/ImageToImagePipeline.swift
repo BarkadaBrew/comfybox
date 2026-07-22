@@ -58,6 +58,26 @@ public struct Img2ImgRequest: Sendable {
   /// Submitting app/persona (desktop/bree/api…) — stamped as metadata provenance.
   public var source: String?
 
+  /// Optional mask PNG path for selective inpainting. White (255) = inpaint/regenerate,
+  /// black (0) = keep original. When nil, a full-white mask is used (standard img2img,
+  /// i.e. regenerate everything). Mask should match the (round-to-16) output dimensions.
+  public var maskPath: String?
+
+  /// Auto-generated mask region ("face" | "upper" | "lower") — mutually exclusive
+  /// with maskPath. "face" runs Vision face detection on the source image; the
+  /// bands split the frame at half height. The named region is REGENERATED.
+  public var maskRegion: String?
+
+  /// Flip the mask (white ⇄ black). With maskRegion "face" this means: lock the
+  /// face, regenerate everything else. Requires maskPath or maskRegion.
+  public var maskInvert: Bool
+
+  /// Mask expansion in pixels before latent conversion (0 = none).
+  public var maskGrow: Int
+
+  /// Mask feather radius in pixels before latent conversion (0 = hard edges).
+  public var maskFeather: Int
+
   public enum Img2ImgSpecifier: String, Sendable {
     case strength
     case creativity
@@ -90,7 +110,12 @@ public struct Img2ImgRequest: Sendable {
     strength: Float = 0.3,
     specifiedAs: Img2ImgSpecifier = .strength,
     contentMode: String? = nil,
-    source: String? = nil
+    source: String? = nil,
+    maskPath: String? = nil,
+    maskRegion: String? = nil,
+    maskInvert: Bool = false,
+    maskGrow: Int = 0,
+    maskFeather: Int = 0
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -118,6 +143,11 @@ public struct Img2ImgRequest: Sendable {
     self.specifiedAs = specifiedAs
     self.contentMode = contentMode
     self.source = source
+    self.maskPath = maskPath
+    self.maskRegion = maskRegion
+    self.maskInvert = maskInvert
+    self.maskGrow = maskGrow
+    self.maskFeather = maskFeather
   }
 
   /// Convert img2img strength to inpainting denoise value.
@@ -141,18 +171,24 @@ public struct Img2ImgRequest: Sendable {
 private enum Img2ImgUtilities {
   private static let pngSignature: [UInt8] = [137, 80, 78, 71, 13, 10, 26, 10]
 
-  enum Img2ImgError: Error, CustomStringConvertible {
+  enum Img2ImgError: Error, CustomStringConvertible, LocalizedError {
     case sourceImageNotFound(String)
     case sourceImageLoadFailed(String)
     case maskGenerationFailed(String)
+    case maskNotFound(String)
+    case maskLoadFailed(String)
 
     var description: String {
       switch self {
       case .sourceImageNotFound(let path): return "Source image not found: \(path)"
       case .sourceImageLoadFailed(let msg): return "Source image load failed: \(msg)"
       case .maskGenerationFailed(let msg): return "Mask generation failed: \(msg)"
+      case .maskNotFound(let path): return "Mask image not found: \(path)"
+      case .maskLoadFailed(let msg): return "Mask image load failed: \(msg)"
       }
     }
+
+    var errorDescription: String? { description }
   }
 
   /// Generate a solid white PNG image of the given dimensions.
@@ -282,11 +318,62 @@ extension ZImagePipeline {
       #endif
     }
 
-    // Generate white mask (regenerate everything)
-    let maskData = try Img2ImgUtilities.generateWhiteMaskPNG(
-      width: resolvedWidth,
-      height: resolvedHeight
-    )
+    // Mask resolution, in precedence order:
+    //   mask_path  — caller-provided PNG (selective inpainting)
+    //   mask_region — auto-generated ("face" via Vision, "upper"/"lower" bands)
+    //   neither    — full-white mask (standard img2img, regenerate everything)
+    // White = regenerate, black = keep; mask_invert flips the roles.
+    // An explicit request that can't be honored fails loudly — silently
+    // regenerating the whole frame is the opposite of the caller's intent.
+    let hasMaskPath = !(request.maskPath ?? "").isEmpty
+    let hasMaskRegion = !(request.maskRegion ?? "").isEmpty
+    if hasMaskPath && hasMaskRegion {
+      throw Img2ImgUtilities.Img2ImgError.maskLoadFailed(
+        "mask_path and mask_region are mutually exclusive")
+    }
+    if request.maskInvert && !hasMaskPath && !hasMaskRegion {
+      throw Img2ImgUtilities.Img2ImgError.maskLoadFailed(
+        "mask_invert requires mask_path or mask_region")
+    }
+
+    var maskData: Data
+    if hasMaskPath, let maskPath = request.maskPath {
+      guard FileManager.default.fileExists(atPath: maskPath) else {
+        throw Img2ImgUtilities.Img2ImgError.maskNotFound(maskPath)
+      }
+      guard let providedMask = try? Data(contentsOf: URL(fileURLWithPath: maskPath)),
+            !providedMask.isEmpty else {
+        throw Img2ImgUtilities.Img2ImgError.maskLoadFailed("Unreadable or empty file: \(maskPath)")
+      }
+      maskData = providedMask
+      #if canImport(CoreGraphics)
+      if request.maskInvert {
+        maskData = try RegionMaskUtilities.invertMaskPNG(maskData)
+      }
+      #endif
+    } else if hasMaskRegion, let maskRegion = request.maskRegion {
+      #if canImport(CoreGraphics)
+      // Face detection reads the source image; band regions don't need it.
+      let sourceCG: CGImage? = maskRegion.lowercased() == RegionMaskUtilities.Region.face.rawValue
+        ? try InpaintUtilities.loadCGImage(from: imageData)
+        : nil
+      maskData = try RegionMaskUtilities.makeRegionMaskPNG(
+        region: maskRegion,
+        sourceImage: sourceCG,
+        width: resolvedWidth,
+        height: resolvedHeight,
+        invert: request.maskInvert
+      )
+      #else
+      throw Img2ImgUtilities.Img2ImgError.maskGenerationFailed(
+        "mask_region requires CoreGraphics")
+      #endif
+    } else {
+      maskData = try Img2ImgUtilities.generateWhiteMaskPNG(
+        width: resolvedWidth,
+        height: resolvedHeight
+      )
+    }
 
     // Build DyPE config
     let dyPEConfig: DyPEConfig
@@ -324,7 +411,9 @@ extension ZImagePipeline {
       dyPE: dyPEConfig,
       inpaintImageData: imageData,
       maskData: maskData,
-      denoise: request.denoise
+      denoise: request.denoise,
+      maskGrow: request.maskGrow,
+      maskFeather: request.maskFeather
     )
   }
 }

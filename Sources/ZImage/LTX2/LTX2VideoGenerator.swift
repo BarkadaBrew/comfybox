@@ -42,6 +42,12 @@ public struct LTX2VideoRequest: Sendable {
     public var seed: UInt64
     /// I2V conditioning strength (0–1).
     public var strength: Float
+    /// Identity re-anchor strength for CONTINUATION chunks (0 = off). Each
+    /// continuation chunk conditions on the previous chunk\u{27}s last frame at
+    /// frame 0 (hard continuity) AND the ORIGINAL source image at the chunk\u{27}s
+    /// last frame at this strength (soft identity pull) \u{2014} counters the
+    /// cumulative subject/scene drift of tail-to-head chaining (#219).
+    public var identityAnchorStrength: Float
     /// Target duration; >0 generates continuation chunks (I2V only).
     public var extendToSeconds: Float
     public var fps: Int
@@ -75,6 +81,7 @@ public struct LTX2VideoRequest: Sendable {
         steps: Int = 8,
         seed: UInt64 = 42,
         strength: Float = 1.0,
+        identityAnchorStrength: Float = 0,
         extendToSeconds: Float = 0,
         fps: Int = 24,
         loraPath: String? = nil,
@@ -91,6 +98,7 @@ public struct LTX2VideoRequest: Sendable {
         self.steps = steps
         self.seed = seed
         self.strength = strength
+        self.identityAnchorStrength = identityAnchorStrength
         self.extendToSeconds = extendToSeconds
         self.fps = fps
         self.loraPath = loraPath
@@ -302,10 +310,33 @@ public final class LTX2VideoGenerator {
                 let targetKey = baseKey + ".weight"
                 guard sanitized[targetKey] != nil else { continue }
                 let delta = MLX.matmul(loraB.asType(.float32), loraA.asType(.float32)) * MLXArray(lora.scale)
-                sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+                if sanitized["\(baseKey).scales"] != nil {
+                    // int8/int4 base checkpoint (#230): dequantize -> merge -> requantize
+                    // so LoRAs keep working against quantized weights.
+                    guard let (dense, groupSize, bits) = LTX2Quantizer.dequantizeLayer(
+                        base: baseKey, weights: sanitized) else { continue }
+                    let mergedDense = dense.asType(.float32) + delta
+                    let (wq, scales, biases) = MLX.quantized(
+                        mergedDense, groupSize: groupSize, bits: bits, mode: .affine)
+                    sanitized[targetKey] = wq
+                    sanitized["\(baseKey).scales"] = scales.asType(.bfloat16)
+                    if let b = biases { sanitized["\(baseKey).biases"] = b.asType(.bfloat16) }
+                } else {
+                    sanitized[targetKey] = sanitized[targetKey]!.asType(.float32) + delta
+                }
                 merged += 1
             }
             logger.info("LTX-2: merged \(merged) LoRA pairs from \(lora.path).")
+        }
+
+        // Quantized checkpoint support (#230): when the sanitized weights carry
+        // `.scales` siblings (MLX affine int8/int4 from `ComfyBox quantize-ltx2`),
+        // convert exactly those Linear layers to QuantizedLinear before the
+        // update. Shapes are self-describing — no manifest needed at load.
+        let quantizedLayerCount = LTX2Quantizer.applyQuantizedLayout(
+            to: transformer, sanitizedWeights: sanitized)
+        if quantizedLayerCount > 0 {
+            logger.info("LTX-2: quantized checkpoint — \(quantizedLayerCount) block projections load as QuantizedLinear.")
         }
         // Anti-noise guard: update(verify:[.shapeMismatch]) silently DROPS any key
         // that doesn't match a module parameter — a mis-remapped checkpoint loads
@@ -437,16 +468,40 @@ public final class LTX2VideoGenerator {
             return QwenImageIO.normalizeForEncoder(pixels)
         }
 
+        // The ORIGINAL init image, kept for identity re-anchoring of
+        // continuation chunks (currentImage is overwritten with each
+        // chunk\u{27}s last frame).
+        let sourceImage: MLXArray? = currentImage
+
         for chunk in 0..<plan.totalChunks {
             let chunkSeed = request.seed + UInt64(chunk)
             let output: LTX2PipelineOutput
             if let image = currentImage {
-                output = pipeline.generateI2V(
-                    inputIds: batch.inputIds, attentionMask: batch.attentionMask,
-                    image: image, strength: request.strength,
-                    width: request.width, height: request.height,
-                    numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
-                    progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+                if chunk > 0, request.identityAnchorStrength > 0, let anchor = sourceImage {
+                    // Continuation chunks drift chunk-by-chunk (each only sees
+                    // the previous tail). Splice the original source in at the
+                    // chunk\u{27}s last frame at reduced strength \u{2014} a soft pull
+                    // back toward the subject \u{2014} while frame 0 stays the hard
+                    // continuity anchor. First real caller of
+                    // generateMultiKeyframe (see docs/ltx2-multi-keyframe-fdd.md).
+                    output = pipeline.generateMultiKeyframe(
+                        inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                        keyframes: [
+                            .init(image: image, videoFrameIndex: 0, strength: request.strength),
+                            .init(image: anchor, videoFrameIndex: request.framesPerChunk - 1,
+                                  strength: request.identityAnchorStrength),
+                        ],
+                        width: request.width, height: request.height,
+                        numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+                } else {
+                    output = pipeline.generateI2V(
+                        inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                        image: image, strength: request.strength,
+                        width: request.width, height: request.height,
+                        numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+                }
             } else {
                 output = pipeline.generateT2V(
                     inputIds: batch.inputIds, attentionMask: batch.attentionMask,

@@ -58,6 +58,21 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeGenerateVideo(arguments)
       case "video_status":
         return try await executeVideoStatus(arguments)
+      case "compose_montage":
+        return try await executeComposeMontage(arguments)
+      case "render_storyboard":
+        return try await executeRenderStoryboard(arguments)
+      case "import_workflow":
+        return try await executeImportWorkflow(arguments)
+      case "list_workflows":
+        return try await executeGet("/v1/workflows")
+      case "run_workflow":
+        return try await executeRunWorkflow(arguments)
+      case "workflow_run_status":
+        guard let runId = arguments?.string("run_id"), !runId.isEmpty else {
+          return MCPToolResult(error: "Error: 'run_id' is required")
+        }
+        return try await executeGet("/v1/workflows/runs/\(runId)")
       case "upscale":
         return try await executeUpscale(arguments)
       case "enhance_prompt":
@@ -134,6 +149,21 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     if let imageStrength = params?.number("image_strength") {
       body["image_strength"] = imageStrength
+    }
+    if let maskPath = params?.string("mask_path") {
+      body["mask_path"] = maskPath
+    }
+    if let maskRegion = params?.string("mask_region") {
+      body["mask_region"] = maskRegion
+    }
+    if let maskInvert = params?.bool("mask_invert") {
+      body["mask_invert"] = maskInvert
+    }
+    if let maskGrow = params?.integer("mask_grow") {
+      body["mask_grow"] = maskGrow
+    }
+    if let maskFeather = params?.integer("mask_feather") {
+      body["mask_feather"] = maskFeather
     }
     if let mode = params?.string("content_mode") {
       body["content_mode"] = mode
@@ -366,7 +396,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
   }
 
 
-  /// generate_video -> POST /v1/video/generate
+  /// generate_video -> POST /v1/video/generate/async (submit; poll video_status)
   private func executeGenerateVideo(_ params: MCPParams?) async throws -> MCPToolResult {
     guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
       return MCPToolResult(error: "Error: 'prompt' is required")
@@ -392,15 +422,107 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let outputPath = params?.string("output_path") {
       body["output_path"] = outputPath
     }
+    if let preset = params?.string("preset") {
+      body["preset"] = preset
+    }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
-    let (status, data) = try await client.post("/v1/video/generate", body: jsonData)
-    // 202 is the expected status for async job submission
+    // Async route for BOTH backends: local renders return 202 + job_id
+    // immediately (poll video_status), instead of blocking the MCP call for
+    // the entire multi-minute render — which overran the daemon-side 300s
+    // MCP tool timeout on every cold-start render (#219).
+    let (status, data) = try await client.post("/v1/video/generate/async", body: jsonData)
     if status == 200 || status == 202 {
       let text = String(data: data, encoding: .utf8) ?? "{}"
       return MCPToolResult(text: text)
     }
     return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// compose_montage -> POST /v1/montage/compose (sync — compositing is cheap).
+  /// The params object IS the wire payload (segments/transitions/output/
+  /// aspect_policy, already snake_case), so it forwards verbatim.
+  private func executeComposeMontage(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.raw["segments"] != nil else {
+      return MCPToolResult(error: "Error: 'segments' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/montage/compose", body: jsonData)
+    if status == 200 {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// render_storyboard -> POST /v1/storyboard/render (202 + job id; poll
+  /// video_status). Params forward verbatim — they ARE the wire spec.
+  private func executeRenderStoryboard(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, params.raw["shots"] != nil else {
+      return MCPToolResult(error: "Error: 'shots' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/storyboard/render", body: jsonData)
+    if status == 200 || status == 202 {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// import_workflow -> POST /v1/workflows/import
+  private func executeImportWorkflow(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let workflowJson = params?.string("workflow_json"), !workflowJson.isEmpty else {
+      return MCPToolResult(error: "Error: 'workflow_json' is required")
+    }
+    var body: [String: Any] = ["workflow_json": workflowJson]
+    if let name = params?.string("name") { body["name"] = name }
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/workflows/import", body: jsonData)
+    if status == 200 {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// run_workflow -> POST /v1/workflows/{id}/run (202 + run_id), then poll the
+  /// status route briefly so fast (turbo) renders return inline. Long renders
+  /// return {status: running, run_id} — poll workflow_run_status.
+  private func executeRunWorkflow(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let workflowId = params?.string("workflow_id"), !workflowId.isEmpty else {
+      return MCPToolResult(error: "Error: 'workflow_id' is required")
+    }
+    var body: [String: Any] = [:]
+    if let prompt = params?.string("prompt") { body["prompt"] = prompt }
+    if let negative = params?.string("negative_prompt") { body["negative_prompt"] = negative }
+    if let seed = params?.integer("seed") { body["seed"] = seed }
+    if let outputPath = params?.string("output_path") { body["output_path"] = outputPath }
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/workflows/\(workflowId)/run", body: jsonData)
+    guard status == 200 || status == 202 else {
+      return mapHTTPResponse(status: status, data: data)
+    }
+    guard let submitted = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let runId = submitted["run_id"] as? String else {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    }
+
+    // Inline-wait window: covers turbo renders (~10-90s). Beyond it, hand the
+    // run_id back for workflow_run_status polling.
+    let deadline = Date().addingTimeInterval(120)
+    while Date() < deadline {
+      try await Task.sleep(nanoseconds: 2_000_000_000)
+      let (pollStatus, pollData) = try await client.get("/v1/workflows/runs/\(runId)")
+      guard pollStatus == 200,
+            let state = try? JSONSerialization.jsonObject(with: pollData) as? [String: Any],
+            let runState = state["status"] as? String else { continue }
+      if runState == "succeeded" || runState == "failed" {
+        return MCPToolResult(text: String(data: pollData, encoding: .utf8) ?? "{}")
+      }
+    }
+    return MCPToolResult(text: String(
+      data: try JSONSerialization.data(withJSONObject: [
+        "run_id": runId, "status": "running",
+        "note": "Render still in progress — poll workflow_run_status with this run_id.",
+      ]), encoding: .utf8) ?? "{}")
   }
 
   /// video_status -> GET /v1/video/status/{job_id}

@@ -13,6 +13,9 @@ public enum VideoMode: String, Codable, Sendable {
   case t2v
   /// Image-to-video: animate a source image based on a motion prompt.
   case i2v
+  /// Storyboard: an ordered shot list executed as chained i2v renders +
+  /// assembly (comfybox#237).
+  case storyboard
 }
 
 // MARK: - VideoJobState

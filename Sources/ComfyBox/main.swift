@@ -204,6 +204,9 @@ struct ZImageCLI {
       case "quantize-controlnet":
         try runQuantizeControlnet(args: Array(args.dropFirst()))
         return
+      case "quantize-ltx2":
+        try runQuantizeLTX2(args: Array(args.dropFirst()))
+        return
       case "control":
         try runControl(args: Array(args.dropFirst()))
         return
@@ -1414,6 +1417,88 @@ struct ZImageCLI {
     """)
   }
 
+  private static func runQuantizeLTX2(args: [String]) throws {
+    var input: String?
+    var output: String?
+    var bits = 8
+    var groupSize = 64
+    var verbose = false
+
+    var iterator = args.makeIterator()
+    while let arg = iterator.next() {
+      switch arg {
+      case "--input", "-i":
+        input = nextValue(for: arg, iterator: &iterator)
+      case "--output", "-o":
+        output = nextValue(for: arg, iterator: &iterator)
+      case "--bits":
+        bits = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: bits)
+      case "--group-size":
+        groupSize = intValue(for: arg, iterator: &iterator, minimum: 1, fallback: groupSize)
+      case "--verbose":
+        verbose = true
+      case "--help", "-h":
+        printQuantizeLTX2Usage()
+        return
+      default:
+        logger.warning("Unknown quantize-ltx2 argument: \(arg)")
+      }
+    }
+
+    guard let inputPath = input, let outputPath = output else {
+      logger.error("Missing required --input/--output arguments")
+      printQuantizeLTX2Usage()
+      exit(1)
+    }
+
+    // Accept a checkpoint file directly, or a directory holding a monolith
+    // (resolved the same way LTX2VideoGenerator does — first non-component
+    // .safetensors).
+    var sourceURL = URL(fileURLWithPath: inputPath)
+    if (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+      let perComponent: Set<String> = [
+        "vae_encoder.safetensors", "vae_decoder.safetensors", "connector.safetensors",
+      ]
+      let candidates = ((try? FileManager.default.contentsOfDirectory(
+        at: sourceURL, includingPropertiesForKeys: nil)) ?? [])
+        .filter { $0.pathExtension == "safetensors" && !perComponent.contains($0.lastPathComponent) }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+      guard let monolith = candidates.first else {
+        logger.error("No checkpoint .safetensors found in \(inputPath)")
+        exit(1)
+      }
+      sourceURL = monolith
+    }
+
+    print("Quantizing LTX-2 DiT: \(sourceURL.path) -> \(outputPath)")
+    print("Config: \(bits)-bit affine, group_size=\(groupSize)")
+    try LTX2Quantizer.quantizeCheckpoint(
+      source: sourceURL,
+      outputDir: URL(fileURLWithPath: outputPath),
+      spec: .init(bits: bits, groupSize: groupSize),
+      verbose: verbose
+    )
+  }
+
+  private static func printQuantizeLTX2Usage() {
+    print("""
+    Quantize an LTX-2 checkpoint's video-DiT block projections to MLX affine int8/int4.
+    Norms, embeds, final proj, audio branch, VAE, and vocoder stay bf16. The output
+    keeps the source key layout, so --ltx2-weights can point at the output directory.
+
+    Usage: ComfyBox quantize-ltx2 -i <checkpoint|dir> -o <output-dir> [options]
+      --input, -i          Checkpoint .safetensors or directory holding a monolith (required)
+      --output, -o         Output directory (required)
+      --bits               Bit width: 4 or 8 (default: 8)
+      --group-size         Group size: 32, 64, 128 (default: 64)
+      --verbose            Show per-layer progress
+      --help, -h           Show help
+
+    Example:
+      ComfyBox quantize-ltx2 -i /Volumes/Bolt/Models/sulphur2-distil -o /Volumes/Bolt/Models/sulphur2-distil-int8
+    """)
+  }
+
   private static func runQuantizeControlnet(args: [String]) throws {
     var input: String?
     var output: String?
@@ -1565,6 +1650,7 @@ struct ZImageCLI {
     var seedvr2Weights: String? = config.seedvr2WeightsPath
     var ltx2Weights: String? = nil
     var ltx2Gemma: String? = nil
+    var ltx2DefaultLoRA: String? = nil
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1604,6 +1690,8 @@ struct ZImageCLI {
         ltx2Weights = nextValue(for: arg, iterator: &iterator)
       case "--ltx2-gemma":
         ltx2Gemma = nextValue(for: arg, iterator: &iterator)
+      case "--ltx2-lora":
+        ltx2DefaultLoRA = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printServeUsage()
         return
@@ -1637,7 +1725,8 @@ struct ZImageCLI {
       allowedOutputDirectory: allowedOutputDirectory,
       seedvr2WeightsPath: seedvr2Weights,
       ltx2WeightsPath: ltx2Weights,
-      ltx2GemmaPath: ltx2Gemma
+      ltx2GemmaPath: ltx2Gemma,
+      ltx2DefaultLoRA: ltx2DefaultLoRA
     )
 
     let server = WarmServer(configuration: configuration, host: host, logger: logger)
@@ -1660,6 +1749,7 @@ struct ZImageCLI {
       --seedvr2-weights            Path to SeedVR2 upscale model weights directory
       --ltx2-weights               LTX-2 weights dir OR "org/repo[:rev]" HF spec (enables LOCAL video on /v1/video/generate; lazy-loaded + auto-downloaded on first request, ~38GB)
       --ltx2-gemma                 Gemma-3 tokenizer/text-encoder snapshot dir OR HF spec for LTX-2 (required alongside --ltx2-weights; ~24GB, downloaded on first request, not swappable for a different encoder)
+      --ltx2-lora                  Default LoRA for LOCAL video renders when the request carries none, as "path" or "path@scale" (e.g. a distill LoRA for a non-distilled checkpoint). Request LoRAs override it.
       --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs
@@ -3356,21 +3446,38 @@ struct ZImageCLI {
     print()
 
     // --- Verify weight files exist ---
+    // Per-component layout needs transformer + both VAE files; a JoyAI-Echo
+    // monolith (single .safetensors carrying DiT + VAE + vocoder — how the
+    // warm server loads sulphur2-distil) needs only ANY .safetensors present.
+    // LTX2VideoGenerator.resolveWeightsFileURL does the real resolution; this
+    // check just fails fast with a readable message.
     let fm = FileManager.default
     let transformerPath = URL(fileURLWithPath: weightsDir + "/transformer-distilled.safetensors")
     let vaeDecoderPath = URL(fileURLWithPath: weightsDir + "/vae_decoder.safetensors")
     let vaeEncoderPath = URL(fileURLWithPath: weightsDir + "/vae_encoder.safetensors")
 
-    guard fm.fileExists(atPath: transformerPath.path) else {
-      fputs("Error: transformer weights not found at \(transformerPath.path)\n", stderr)
-      exit(1)
-    }
-    guard fm.fileExists(atPath: vaeDecoderPath.path) else {
-      fputs("Error: VAE decoder weights not found at \(vaeDecoderPath.path)\n", stderr)
-      exit(1)
-    }
-    guard fm.fileExists(atPath: vaeEncoderPath.path) else {
-      fputs("Error: VAE encoder weights not found at \(vaeEncoderPath.path)\n", stderr)
+    let hasPerComponent = fm.fileExists(atPath: transformerPath.path)
+    if hasPerComponent {
+      guard fm.fileExists(atPath: vaeDecoderPath.path) else {
+        fputs("Error: VAE decoder weights not found at \(vaeDecoderPath.path)\n", stderr)
+        exit(1)
+      }
+      guard fm.fileExists(atPath: vaeEncoderPath.path) else {
+        fputs("Error: VAE encoder weights not found at \(vaeEncoderPath.path)\n", stderr)
+        exit(1)
+      }
+    } else {
+      let anySafetensors = (try? fm.contentsOfDirectory(atPath: weightsDir))?
+        .contains { $0.hasSuffix(".safetensors") } ?? false
+      guard anySafetensors else {
+        fputs("Error: no LTX-2 weights found in \(weightsDir) (need transformer-distilled.safetensors + VAEs, or a monolithic checkpoint)\n", stderr)
+        exit(1)
+      }
+      // The warm server (LTX2VideoGenerator) loads JoyAI-Echo monoliths, but
+      // this CLI command still builds its pipeline inline against the
+      // per-component layout. Fail with a pointer instead of an opaque
+      // MLXError from a nonexistent transformer-distilled.safetensors.
+      fputs("Error: \(weightsDir) holds a monolithic checkpoint. The video CLI requires per-component weights (transformer-distilled.safetensors + VAEs); render monoliths via 'ComfyBox serve' + POST /v1/video/generate instead.\n", stderr)
       exit(1)
     }
     guard fm.fileExists(atPath: gemmaPath) else {

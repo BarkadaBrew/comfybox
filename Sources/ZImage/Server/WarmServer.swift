@@ -27,6 +27,10 @@ public struct WarmServerConfiguration: Sendable {
   public var ltx2WeightsPath: String?
   /// Gemma-3 tokenizer + text-encoder snapshot dir for LTX-2.
   public var ltx2GemmaPath: String?
+  /// Default LoRA ("path" or "path@scale") merged into every LOCAL video
+  /// render when the request carries none — lets preset-only callers (daemon
+  /// MCP) get e.g. a distill LoRA required by a non-distilled checkpoint.
+  public var ltx2DefaultLoRA: String?
 
   public init(
     port: UInt16 = ComfyBoxServerConfig.canonicalPort,
@@ -39,7 +43,8 @@ public struct WarmServerConfiguration: Sendable {
     allowedOutputDirectory: String = FileManager.default.currentDirectoryPath,
     seedvr2WeightsPath: String? = nil,
     ltx2WeightsPath: String? = nil,
-    ltx2GemmaPath: String? = nil
+    ltx2GemmaPath: String? = nil,
+    ltx2DefaultLoRA: String? = nil
   ) {
     self.port = port
     self.modelSpec = modelSpec
@@ -52,6 +57,7 @@ public struct WarmServerConfiguration: Sendable {
     self.seedvr2WeightsPath = seedvr2WeightsPath
     self.ltx2WeightsPath = ltx2WeightsPath
     self.ltx2GemmaPath = ltx2GemmaPath
+    self.ltx2DefaultLoRA = ltx2DefaultLoRA
   }
 }
 
@@ -147,6 +153,9 @@ public final class WarmServer {
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
   let comfyBridge: ComfyBridge
+
+  /// Imported ComfyUI workflows (#238), file-backed at ~/.comfybox/workflows/.
+  let workflowStore = WorkflowStore()
   private let listenerQueue = DispatchQueue(label: "z-image.warm-server.listener")
   private let lifecycleLock = NSLock()
   private var listener: NWListener?
@@ -1043,6 +1052,99 @@ public final class WarmServer {
 
     // MARK: - Video Endpoints
 
+    // Montage compositor (#232): assemble images (ken-burns) + clips into one
+    // MP4 with transitions. Memory-light editorial motion — no LTX-2, no heavy
+    // -model admission gate, runs alongside a resident video model. Sync by
+    // design: compositing a <30s montage takes seconds.
+    case ("POST", "/v1/montage/compose"):
+      do {
+        let payload = try decode(MontagePayload.self, from: request.body)
+        let result = try await composeMontage(payload)
+        return .json(status: 200, payload: MontageResponse(
+          outputPath: result.outputPath,
+          durationS: result.durationS,
+          width: result.width,
+          height: result.height,
+          segmentCount: result.segmentCount,
+          frameCount: result.frameCount))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    // Workflow import/run (#238): ComfyUI API-format workflows as first-class
+    // stored objects, executed through the existing ComfyBridge parser/executor.
+    case ("POST", "/v1/workflows/import"):
+      do {
+        return try await handleWorkflowImport(body: request.body)
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", "/v1/workflows"):
+      let items = workflowStore.list().map { $0.summaryJSON() }
+      if let data = try? JSONSerialization.data(withJSONObject: ["workflows": items]) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize workflow list"))
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/workflows/"):
+      let id = String(request.path.dropFirst("/v1/workflows/".count))
+      guard workflowStore.delete(id) else {
+        return .error(.error(status: 404, message: "Workflow not found: \(id)"))
+      }
+      return .json(status: 200, payload: ["deleted": id])
+
+    case ("POST", _) where request.path.hasPrefix("/v1/workflows/") && request.path.hasSuffix("/run"):
+      let id = String(request.path.dropFirst("/v1/workflows/".count).dropLast("/run".count))
+      do {
+        return try await handleWorkflowRun(id: id, body: request.body)
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", _) where request.path.hasPrefix("/v1/workflows/runs/"):
+      let runId = String(request.path.dropFirst("/v1/workflows/runs/".count))
+      return handleWorkflowRunStatus(runId: runId)
+
+    case ("GET", _) where request.path.hasPrefix("/v1/workflows/"):
+      let id = String(request.path.dropFirst("/v1/workflows/".count))
+      guard let workflow = workflowStore.get(id) else {
+        return .error(.error(status: 404, message: "Workflow not found: \(id)"))
+      }
+      var record = workflow.summaryJSON()
+      record["graph"] = workflow.graph
+      if let data = try? JSONSerialization.data(withJSONObject: record) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize workflow"))
+
+    // Storyboard renderer (#237): ordered shot list → chained i2v renders
+    // (each anchored on the previous shot's extracted last frame), optional
+    // i2i inserts, final assembly. Long-running → 202 + job id; poll
+    // GET /v1/video/status/{id} like any local video job.
+    case ("POST", "/v1/storyboard/render"):
+      do {
+        guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
+          return .error(.error(status: 503, message: "Storyboard rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
+        }
+        let payload = try decode(StoryboardPayload.self, from: request.body)
+        let spec = try storyboardSpec(from: payload)
+        try spec.validate()
+        let source = payload.source ?? "api"
+        let status = videoJobTracker.submitOrchestrated(source: source, mode: .storyboard) { [weak self] report in
+          guard let self else {
+            throw StoryboardError.shotFailed(shot: 0, stage: "server", message: "server shutting down")
+          }
+          return try await self.runStoryboard(spec: spec, source: source, report: report)
+        }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(status)
+        return .json(.rawJSON(status: 202, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
     case ("POST", "/v1/video/generate"):
       // Backward-compatible route. LOCAL renders here still block the HTTP
       // connection for the whole (synchronous) render — kept working for
@@ -1419,6 +1521,14 @@ public final class WarmServer {
     let seed: UInt64?
     let strength: Float?
     let extendToSeconds: Float?
+    /// Target duration in seconds — the daemon/MCP vocabulary. For local
+    /// renders this maps onto `extendToSeconds` (chunked continuation, each
+    /// chunk re-anchored on the previous chunk\u{27}s last frame) when it
+    /// exceeds one chunk. `extend_to_seconds` still wins when both are set.
+    let duration: Float?
+    /// Identity re-anchor strength for continuation chunks (0 disables).
+    /// Default 0.5 for extended renders \u{2014} counters per-chunk subject drift.
+    let identityAnchorStrength: Float?
     let fps: Int?
     let loraPath: String?
     let loraStrength: Float?
@@ -1429,6 +1539,10 @@ public final class WarmServer {
     /// Which client/app submitted this job (desktop, bree, api…) — surfaced in
     /// the async job status and /health, same as image `GeneratePayload.source`.
     let source: String?
+    /// Optional preset id resolved from the shared PresetStore (mediaKind
+    /// "video"): LoRAs, prompt prefix/suffix, negative prompt, dims budget,
+    /// steps, seed. Explicit request fields always override preset values.
+    let preset: String?
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1493,6 +1607,60 @@ public final class WarmServer {
     let source: String
   }
 
+  /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
+  /// the request fits one chunk (single-chunk render, no continuation cost),
+  /// else the requested seconds. Pure for unit testing.
+  static func extendSecondsFromDuration(_ duration: Float?, framesPerChunk: Int, fps: Int) -> Float {
+    guard let seconds = duration, seconds > 0, fps > 0 else { return 0 }
+    let singleChunkSeconds = Float(framesPerChunk) / Float(fps)
+    return seconds > singleChunkSeconds ? seconds : 0
+  }
+
+  /// Whether a video request renders more than one chunk (continuation path).
+  /// Mirrors the extendToSeconds resolution above — the identity anchor
+  /// defaults on only for these (#231).
+  static func isExtendedRender(
+    extendToSeconds: Float?, duration: Float?, framesPerChunk: Int, fps: Int
+  ) -> Bool {
+    if let explicit = extendToSeconds { return explicit > 0 }
+    return extendSecondsFromDuration(
+      duration, framesPerChunk: framesPerChunk, fps: fps) > 0
+  }
+
+  /// Snap a render dimension to the nearest multiple of 64 (floor 256).
+  /// LTX-2 renders at dims that are 32-multiples but NOT 64-multiples (e.g.
+  /// 480) exhibit progressive haze (#219) — every clean render in the 07-13
+  /// bisect used /64 dims, every hazy one used 480.
+  static func snapDim64(_ value: Int) -> Int {
+    max(256, Int((Double(value) / 64.0).rounded()) * 64)
+  }
+
+  /// Derive I2V render dims matching the source image aspect within the
+  /// requested pixel-area budget, both dims /64. Pure for unit testing.
+  static func deriveVideoDims(
+    sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int
+  ) -> (width: Int, height: Int) {
+    guard sourceWidth > 0, sourceHeight > 0 else {
+      return (snapDim64(budgetWidth), snapDim64(budgetHeight))
+    }
+    let aspect = Double(sourceWidth) / Double(sourceHeight)
+    let budget = Double(max(budgetWidth, 64) * max(budgetHeight, 64))
+    let idealW = (budget * aspect).squareRoot()
+    let idealH = idealW / aspect
+    return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
+  }
+
+  /// Pixel dimensions of an image file without decoding the bitmap.
+  static func imagePixelSize(atPath path: String) -> (width: Int, height: Int)? {
+    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = props[kCGImagePropertyPixelWidth] as? Int,
+          let height = props[kCGImagePropertyPixelHeight] as? Int
+    else { return nil }
+    return (width, height)
+  }
+
   /// Map an LTX-2 (chunk, step) progress tick to an overall 0-100 percent across
   /// all chunks. Pure so it can be unit-tested and reused by both local paths.
   static func localVideoProgressPercent(chunk: Int, totalChunks: Int, step: Int, totalSteps: Int) -> Int {
@@ -1512,8 +1680,31 @@ public final class WarmServer {
     }
     let req = try decode(LocalVideoRequest.self, from: body)
 
-    // Contain the output within the allowed directory (default alongside models).
-    let requestedOutput = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
+    // Video presets — same PresetStore as images (mediaKind "video"). A
+    // preset is a named bundle: LoRAs (bare filenames resolve through the
+    // LoRA library search roots), prompt shaping, negative prompt, dims
+    // budget, steps, seed. Explicit request fields win over the preset.
+    var videoPreset: ImagePreset? = nil
+    if let presetId = req.preset, !presetId.isEmpty {
+      guard let found = presetStore.get(presetId) else {
+        throw WarmServerError.invalidRequest(message: "Unknown preset \u{27}\(presetId)\u{27} — see /v1/presets")
+      }
+      videoPreset = found
+      logger.info("LTX-2: applying video preset \u{27}\(presetId)\u{27} (\(found.loras.count) LoRA(s))")
+    }
+
+    // Contain the output within the allowed directory. A relative (or absent)
+    // output path is resolved against the ALLOWED directory, not the process
+    // CWD — under launchd the CWD is the repo checkout, so the old bare-name
+    // default failed its own containment check on every submit (#219).
+    let requestedOutputRaw = req.outputPath ?? "ltx2-\(UUID().uuidString).mp4"
+    let requestedOutput: String
+    if requestedOutputRaw.hasPrefix("/") || requestedOutputRaw.hasPrefix("~") {
+      requestedOutput = requestedOutputRaw
+    } else {
+      requestedOutput = (configuration.allowedOutputDirectory as NSString)
+        .appendingPathComponent(requestedOutputRaw)
+    }
     let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
       requestedOutput, allowedOutputDirectory: configuration.allowedOutputDirectory).path
 
@@ -1542,7 +1733,19 @@ public final class WarmServer {
     // Accept an init image as bytes (image_base64) when no server path is given.
     let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
 
-    let resolvedLoRAs: [LTX2LoRAReference] = try (req.loras ?? []).map { entry in
+    var loraEntries: [LoRAEntry] = req.loras ?? []
+    if loraEntries.isEmpty, req.loraPath == nil, let preset = videoPreset, !preset.loras.isEmpty {
+      loraEntries = preset.loras.map { LoRAEntry(path: $0.filename, scale: Float($0.scale)) }
+    }
+    if loraEntries.isEmpty, req.loraPath == nil,
+       let defaultLoRA = configuration.ltx2DefaultLoRA, !defaultLoRA.isEmpty {
+      // "path" or "path@scale"
+      let parts = defaultLoRA.split(separator: "@", maxSplits: 1).map(String.init)
+      let scale = parts.count == 2 ? Float(parts[1]) ?? 1.0 : 1.0
+      loraEntries = [LoRAEntry(path: parts[0], scale: scale)]
+      logger.info("LTX-2: applying default video LoRA \(parts[0]) @ \(scale) (--ltx2-lora)")
+    }
+    let resolvedLoRAs: [LTX2LoRAReference] = try loraEntries.map { entry in
       let config = try entry.makeConfiguration()
       guard case .local(let url) = config.source else {
         throw WarmServerError.invalidRequest(
@@ -1551,17 +1754,66 @@ public final class WarmServer {
       return LTX2LoRAReference(path: url.path, scale: config.scale)
     }
 
+    // LTX-2 render dims must be divisible by 64: 32-multiples that are not
+    // 64-multiples (e.g. 480) produce progressive haze/ghosting (#219). I2V
+    // output must additionally match the SOURCE image aspect ratio — a fixed
+    // preset like 704x448 applied to a portrait source distorts the
+    // conditioning frame and the render drifts off the image. The requested
+    // width x height is kept only as a pixel-area budget for I2V.
+    var renderWidth = req.width ?? videoPreset?.width ?? 704
+    var renderHeight = req.height ?? videoPreset?.height ?? 448
+    if let initPath = effectiveInitImage,
+       let sourceSize = Self.imagePixelSize(atPath: initPath) {
+      let derived = Self.deriveVideoDims(
+        sourceWidth: sourceSize.width, sourceHeight: sourceSize.height,
+        budgetWidth: renderWidth, budgetHeight: renderHeight)
+      if derived.width != renderWidth || derived.height != renderHeight {
+        logger.info(
+          "LTX-2 I2V: adjusted \(renderWidth)x\(renderHeight) -> \(derived.width)x\(derived.height) (source \(sourceSize.width)x\(sourceSize.height), aspect-matched, /64)")
+        renderWidth = derived.width
+        renderHeight = derived.height
+      }
+    } else {
+      let snappedW = Self.snapDim64(renderWidth)
+      let snappedH = Self.snapDim64(renderHeight)
+      if snappedW != renderWidth || snappedH != renderHeight {
+        logger.info("LTX-2: snapped \(renderWidth)x\(renderHeight) -> \(snappedW)x\(snappedH) (dims must be /64, #219)")
+        renderWidth = snappedW
+        renderHeight = snappedH
+      }
+    }
+    if let requestedSteps = req.steps, requestedSteps != 8 {
+      logger.warning(
+        "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
+    }
+
+    var effectivePrompt = req.prompt
+    if let preset = videoPreset {
+      if let prefix = preset.promptPrefix, !prefix.isEmpty { effectivePrompt = prefix + ", " + effectivePrompt }
+      if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
+    }
+
     let videoRequest = LTX2VideoRequest(
-      prompt: req.prompt,
-      negativePrompt: req.negativePrompt,
+      prompt: effectivePrompt,
+      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
       initImagePath: effectiveInitImage,
-      width: req.width ?? 704,
-      height: req.height ?? 448,
+      width: renderWidth,
+      height: renderHeight,
       framesPerChunk: req.frames ?? 97,
-      steps: req.steps ?? 8,
-      seed: req.seed ?? 42,
+      steps: req.steps ?? videoPreset?.steps ?? 8,
+      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
-      extendToSeconds: req.extendToSeconds ?? 0,
+      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
+      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
+      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
+      // (289f, no crash). Single-chunk renders don't anchor (nothing to
+      // drift); callers can still pass 0 to disable.
+      identityAnchorStrength: req.identityAnchorStrength
+        ?? (Self.isExtendedRender(
+              extendToSeconds: req.extendToSeconds, duration: req.duration,
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24) ? 0.5 : 0),
+      extendToSeconds: req.extendToSeconds
+        ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
       fps: req.fps ?? 24,
       loraPath: req.loraPath,
       loraStrength: req.loraStrength ?? 1.0,
@@ -2510,6 +2762,553 @@ public final class WarmServer {
     return try decoder.decode(type, from: data)
   }
 
+  // MARK: - Workflows (#238)
+
+  private struct WorkflowImportPayload: Decodable {
+    let name: String?
+    /// The ComfyUI workflow as a JSON string. Objects also accepted via the
+    /// raw-body fallback in the handler.
+    let workflowJson: String?
+  }
+
+  private func handleWorkflowImport(body: Data) async throws -> RoutedResponse {
+    // Accept {name, workflow_json: "<string>"} or {name, workflow: {...}} or a
+    // bare graph as the whole body.
+    var name = "imported-workflow"
+    var graphData: Data = body
+    if let envelope = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+      if let n = envelope["name"] as? String, !n.isEmpty { name = n }
+      if let s = envelope["workflow_json"] as? String, let d = s.data(using: .utf8) {
+        graphData = d
+      } else if let obj = envelope["workflow"] as? [String: Any] {
+        graphData = try JSONSerialization.data(withJSONObject: obj)
+      }
+    }
+
+    let graph = try WorkflowStore.apiGraph(fromJSON: graphData)
+    // Dry-run normalization + parse so the compat report reflects
+    // runnability without touching input files.
+    var parses = true
+    var parseError: String? = nil
+    do {
+      let normalized = try WorkflowStore.normalizeGenericNodes(graph, stageImage: nil)
+      _ = try ComfyBridgeWorkflowParser.parseWorkflow(
+        ["prompt": normalized, "prompt_id": "import-validate", "client_id": "workflow-api"])
+    } catch {
+      parses = false
+      parseError = "\(error)"
+    }
+
+    let workflow = StoredWorkflow(
+      id: UUID().uuidString.lowercased(),
+      name: name,
+      importedAt: Date(),
+      graph: graph,
+      compat: WorkflowStore.compatReport(for: graph, parses: parses, parseError: parseError))
+    try workflowStore.save(workflow)
+    logger.info("Workflows: imported '\(name)' (\(workflow.compat.nodeCount) nodes, parses=\(parses)) as \(workflow.id)")
+    auditLog.append(kind: "workflow.import", message: "\(name) -> \(workflow.id)", metadata: [:])
+    if let data = try? JSONSerialization.data(withJSONObject: workflow.summaryJSON()) {
+      return .json(.rawJSON(status: 200, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize import result"))
+  }
+
+  private struct WorkflowRunPayload: Decodable {
+    let prompt: String?
+    let negativePrompt: String?
+    let seed: UInt64?
+    let outputPath: String?
+    let timeoutS: Double?
+  }
+
+  /// Pending workflow runs: run id → (workflow id, requested output path).
+  /// The status route consumes this to place the finished image on disk.
+  private let workflowRunLock = NSLock()
+  private var workflowRuns: [String: (workflowId: String, outputPath: String?, resolved: String?)] = [:]
+
+  /// Submit a workflow run. Long renders (base models run 40 steps — several
+  /// minutes) outlive the HTTP connection, so this is async by design: 202 +
+  /// run_id, polled via GET /v1/workflows/runs/{run_id} — the same convention
+  /// as /v1/generate/async and /v1/video/generate/async.
+  private func handleWorkflowRun(id: String, body: Data) async throws -> RoutedResponse {
+    guard let workflow = workflowStore.get(id) else {
+      return .error(.error(status: 404, message: "Workflow not found: \(id)"))
+    }
+    let payload: WorkflowRunPayload = body.isEmpty
+      ? WorkflowRunPayload(prompt: nil, negativePrompt: nil, seed: nil, outputPath: nil, timeoutS: nil)
+      : try decode(WorkflowRunPayload.self, from: body)
+
+    // Normalize with REAL staging: LoadImage files go into the bridge cache.
+    let normalized = try WorkflowStore.normalizeGenericNodes(workflow.graph) { data in
+      let cacheId = "wf-\(UUID().uuidString.lowercased())"
+      guard self.comfyBridge.imageCache.store(id: cacheId, data: data) else {
+        throw WorkflowError.storeFailed("image cache store failed")
+      }
+      return cacheId
+    }
+
+    let promptId = "wfrun-\(UUID().uuidString.lowercased())"
+    try comfyBridge.submitWorkflowGraph(
+      normalized,
+      promptId: promptId,
+      promptOverride: payload.prompt,
+      negativePromptOverride: payload.negativePrompt,
+      seedOverride: payload.seed)
+    workflowRunLock.lock()
+    workflowRuns[promptId] = (workflow.id, payload.outputPath, nil)
+    workflowRunLock.unlock()
+    logger.info("Workflows: run \(promptId) of '\(workflow.name)' submitted")
+
+    let response: [String: Any] = [
+      "run_id": promptId,
+      "workflow_id": workflow.id,
+      "status": "queued",
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: response) {
+      return .json(.rawJSON(status: 202, data: data))
+    }
+    return .error(.error(status: 500, message: "Failed to serialize run submission"))
+  }
+
+  private func handleWorkflowRunStatus(runId: String) -> RoutedResponse {
+    workflowRunLock.lock()
+    let run = workflowRuns[runId]
+    workflowRunLock.unlock()
+    guard let run else {
+      return .error(.error(status: 404, message: "Workflow run not found: \(runId) (runs are tracked in memory — a server restart loses them)"))
+    }
+
+    func respond(_ dict: [String: Any]) -> RoutedResponse {
+      if let data = try? JSONSerialization.data(withJSONObject: dict) {
+        return .json(.rawJSON(status: 200, data: data))
+      }
+      return .error(.error(status: 500, message: "Failed to serialize run status"))
+    }
+
+    // Already finalized on a previous poll.
+    if let resolved = run.resolved {
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "succeeded", "output_path": resolved])
+    }
+    guard let entry = comfyBridge.history.entry(for: runId) else {
+      return respond(["run_id": runId, "workflow_id": run.workflowId, "status": "running"])
+    }
+    // History filenames carry a .png suffix for ComfyUI /view compatibility;
+    // the cache is keyed on the bare id — try both.
+    let imageData: Data? = Self.firstImageId(inHistoryEntry: entry).flatMap { imageId in
+      comfyBridge.imageCache.retrieve(id: imageId)
+        ?? comfyBridge.imageCache.retrieve(id: (imageId as NSString).deletingPathExtension)
+    }
+    guard let imageData else {
+      var detail = "no output image recorded"
+      if let status = entry["status"],
+         let statusData = try? JSONSerialization.data(withJSONObject: status),
+         let statusText = String(data: statusData, encoding: .utf8) {
+        detail = String(statusText.prefix(400))
+      }
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "failed", "error": detail])
+    }
+
+    // Success: place the image at the requested (contained) path exactly once.
+    do {
+      let requestedRaw = run.outputPath ?? "workflow-\(run.workflowId.prefix(8))-\(runId.suffix(8)).png"
+      let requested = requestedRaw.hasPrefix("/") || requestedRaw.hasPrefix("~")
+        ? requestedRaw
+        : (configuration.allowedOutputDirectory as NSString).appendingPathComponent(requestedRaw)
+      let resolved = try WarmServerOutputPathValidator.resolveOutputPath(
+        requested, allowedOutputDirectory: configuration.allowedOutputDirectory)
+      try imageData.write(to: resolved)
+      workflowRunLock.lock()
+      workflowRuns[runId] = (run.workflowId, run.outputPath, resolved.path)
+      workflowRunLock.unlock()
+      logger.info("Workflows: run \(runId) -> \(resolved.path)")
+      auditLog.append(kind: "workflow.run", message: "\(run.workflowId) -> \(resolved.path)", metadata: [:])
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "succeeded", "output_path": resolved.path])
+    } catch {
+      return respond(["run_id": runId, "workflow_id": run.workflowId,
+                      "status": "failed", "error": "output write failed: \(error.localizedDescription)"])
+    }
+  }
+
+  /// Dig the first output image id out of a bridge history entry
+  /// ({outputs: {<nodeId>: {images: [{filename,...}]}}} — the bridge stores
+  /// cache ids in `filename`).
+  static func firstImageId(inHistoryEntry entry: [String: Any]) -> String? {
+    guard let outputs = entry["outputs"] as? [String: Any] else { return nil }
+    for value in outputs.values {
+      guard let node = value as? [String: Any],
+            let images = node["images"] as? [[String: Any]] else { continue }
+      for image in images {
+        if let filename = image["filename"] as? String, !filename.isEmpty {
+          return filename
+        }
+      }
+    }
+    return nil
+  }
+
+  // MARK: - Storyboard (#237)
+
+  /// Wire payload for POST /v1/storyboard/render (snake_case).
+  struct StoryboardPayload: Decodable {
+    struct InsertSpec: Decodable {
+      let prompt: String
+      let creativity: Double?
+      let negativePrompt: String?
+      let maskPath: String?
+      let maskRegion: String?
+      let maskInvert: Bool?
+      let maskGrow: Int?
+      let maskFeather: Int?
+      let seed: UInt64?
+    }
+    struct ShotSpec: Decodable {
+      let prompt: String
+      let durationS: Double?
+      let anchorImage: String?
+      let insert: InsertSpec?
+      let negativePrompt: String?
+      let seed: UInt64?
+    }
+    struct TransitionSpec: Decodable {
+      let type: String
+      let durationS: Double?
+    }
+    struct OutputSpec: Decodable {
+      let width: Int?
+      let height: Int?
+      let fps: Int?
+      let path: String?
+    }
+    let shots: [ShotSpec]
+    let transitions: [TransitionSpec]?
+    let output: OutputSpec?
+    let loras: [LoRAEntry]?
+    let source: String?
+  }
+
+  private func storyboardSpec(from payload: StoryboardPayload) throws -> StoryboardSpec {
+    var transitions: [MontageTransition] = []
+    for t in payload.transitions ?? [] {
+      guard let kind = MontageTransition.Kind(rawValue: t.type) else {
+        throw WarmServerError.invalidRequest(
+          message: "transitions[].type must be cut|fade|dissolve (got '\(t.type)')")
+      }
+      transitions.append(MontageTransition(kind: kind, durationS: t.durationS ?? 0.5))
+    }
+    let shots = payload.shots.map { s in
+      StoryboardSpec.Shot(
+        prompt: s.prompt,
+        durationS: s.durationS,
+        anchorImage: s.anchorImage,
+        insert: s.insert.map { ins in
+          StoryboardSpec.Insert(
+            prompt: ins.prompt,
+            creativity: ins.creativity ?? 0.35,
+            negativePrompt: ins.negativePrompt,
+            maskPath: ins.maskPath,
+            maskRegion: ins.maskRegion,
+            maskInvert: ins.maskInvert ?? false,
+            maskGrow: ins.maskGrow ?? 0,
+            maskFeather: ins.maskFeather ?? 0,
+            seed: ins.seed)
+        },
+        negativePrompt: s.negativePrompt,
+        seed: s.seed)
+    }
+    return StoryboardSpec(
+      shots: shots,
+      transitions: transitions,
+      output: StoryboardSpec.Output(
+        width: payload.output?.width ?? 640,
+        height: payload.output?.height ?? 640,
+        fps: payload.output?.fps ?? 24,
+        path: payload.output?.path),
+      loras: (payload.loras ?? []).map { ($0.path, $0.scale ?? 1.0) })
+  }
+
+  /// Execute a storyboard: per-shot [i2i insert →] i2v render, chained on the
+  /// previous shot's extracted last frame, then montage assembly. Runs OUTSIDE
+  /// the GPU queue (via submitOrchestrated) and takes a normal queue turn for
+  /// each render, so other jobs interleave between shots. Intermediates are
+  /// named storyboard-* (NOT ltx2-*) so the daemon's orphan reconciler ignores
+  /// them.
+  private func runStoryboard(
+    spec: StoryboardSpec,
+    source: String,
+    report: @escaping @Sendable (Int) -> Void
+  ) async throws -> LTX2VideoResult {
+    let started = Date()
+    let session = UUID().uuidString.prefix(8)
+    let dir = configuration.allowedOutputDirectory
+    var anchor: String? = nil
+    var clips: [String] = []
+    // Assembly gets the final ~4%; shots split the rest evenly.
+    let shotWeight = 96.0 / Double(spec.shots.count)
+
+    for (i, shot) in spec.shots.enumerated() {
+      var shotAnchor: String
+      if let explicit = shot.anchorImage, !explicit.isEmpty {
+        guard FileManager.default.fileExists(atPath: explicit) else {
+          throw StoryboardError.anchorNotFound(shot: i, path: explicit)
+        }
+        shotAnchor = explicit
+      } else if let chained = anchor {
+        shotAnchor = chained
+      } else {
+        throw StoryboardError.shotFailed(shot: i, stage: "anchor", message: "no previous last frame to chain from")
+      }
+
+      // Optional i2i insert on the anchor (e.g. add an element i2v can't
+      // invent) — uses the #239 selective-inpainting path.
+      if let insert = shot.insert {
+        logger.info("Storyboard[\(session)] shot \(i): i2i insert (creativity \(insert.creativity))")
+        let insertOut = (dir as NSString)
+          .appendingPathComponent("storyboard-\(session)-shot\(i)-insert.png")
+        let payload = GeneratePayload(
+          prompt: insert.prompt,
+          negativePrompt: insert.negativePrompt,
+          width: spec.output.width,
+          height: spec.output.height,
+          seed: insert.seed,
+          outputPath: insertOut,
+          maskGrow: insert.maskGrow,
+          maskFeather: insert.maskFeather,
+          imagePath: shotAnchor,
+          creativity: Float(insert.creativity),
+          maskPath: insert.maskPath,
+          maskRegion: insert.maskRegion,
+          maskInvert: insert.maskInvert,
+          source: source)
+        do {
+          let generated = try await coordinator.enqueueGenerate(payload, source: source)
+          guard FileManager.default.fileExists(atPath: generated.outputPath) else {
+            throw StoryboardError.shotFailed(shot: i, stage: "insert", message: "no output produced")
+          }
+          shotAnchor = generated.outputPath
+        } catch let error as StoryboardError {
+          throw error
+        } catch {
+          throw StoryboardError.shotFailed(shot: i, stage: "insert", message: error.localizedDescription)
+        }
+      }
+
+      // i2v render for this shot, through the same preparation the video
+      // routes use (dims snapping, presets, LoRA resolution, validation).
+      logger.info("Storyboard[\(session)] shot \(i)/\(spec.shots.count): i2v from \((shotAnchor as NSString).lastPathComponent)")
+      var body: [String: Any] = [
+        "prompt": shot.prompt,
+        "image_path": shotAnchor,
+        "width": spec.output.width,
+        "height": spec.output.height,
+        "fps": spec.output.fps,
+        "output_path": "storyboard-\(session)-shot\(i).mp4",
+        "source": source,
+      ]
+      if let d = shot.durationS { body["duration"] = d }
+      if let n = shot.negativePrompt { body["negative_prompt"] = n }
+      if let s = shot.seed { body["seed"] = s }
+      if !spec.loras.isEmpty {
+        body["loras"] = spec.loras.map { ["path": $0.path, "scale": $0.scale] as [String: Any] }
+      }
+      let shotResult: LTX2VideoResult
+      do {
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        guard let prep = try await prepareLocalVideo(body: bodyData) else {
+          throw StoryboardError.shotFailed(shot: i, stage: "i2v", message: "local LTX-2 not configured")
+        }
+        let base = Double(i) * shotWeight
+        shotResult = try await coordinator.enqueueLocalVideo { coordReport in
+          try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
+            let pct = Self.localVideoProgressPercent(
+              chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
+            coordReport(pct)
+            report(Int(base + Double(pct) * shotWeight / 100.0))
+          }
+        }
+      } catch let error as StoryboardError {
+        throw error
+      } catch {
+        throw StoryboardError.shotFailed(shot: i, stage: "i2v", message: error.localizedDescription)
+      }
+      clips.append(shotResult.outputPath)
+
+      // Chain: the next shot's default anchor is this shot's last frame.
+      if i < spec.shots.count - 1 {
+        let framePath = (dir as NSString)
+          .appendingPathComponent("storyboard-\(session)-shot\(i)-lastframe.png")
+        do {
+          anchor = try LastFrameExtractor.extractLastFrame(from: shotResult.outputPath, to: framePath)
+        } catch {
+          throw StoryboardError.shotFailed(shot: i, stage: "last-frame", message: error.localizedDescription)
+        }
+      }
+    }
+
+    // Assembly (hard cuts unless the spec provided transitions).
+    let requestedOutput = spec.output.path ?? "storyboard-\(session).mp4"
+    let requested = requestedOutput.hasPrefix("/") || requestedOutput.hasPrefix("~")
+      ? requestedOutput
+      : (dir as NSString).appendingPathComponent(requestedOutput)
+    let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+      requested, allowedOutputDirectory: dir).path
+    logger.info("Storyboard[\(session)]: assembling \(clips.count) shot(s) -> \(resolvedOutput)")
+    let montage = try MontageComposer.compose(
+      segments: clips.map { MontageSegment(kind: .clip, path: $0) },
+      transitions: spec.transitions,
+      width: spec.output.width,
+      height: spec.output.height,
+      fps: spec.output.fps,
+      outputPath: resolvedOutput)
+    report(100)
+    auditLog.append(
+      kind: "video.storyboard",
+      message: "\(spec.shots.count) shots -> \(resolvedOutput)", metadata: [:])
+    return LTX2VideoResult(
+      outputPath: montage.outputPath,
+      frameCount: montage.frameCount,
+      durationSeconds: Float(montage.durationS),
+      elapsedSeconds: Date().timeIntervalSince(started))
+  }
+
+  // MARK: - Montage (#232)
+
+  /// Wire response for POST /v1/montage/compose.
+  struct MontageResponse: Encodable {
+    let outputPath: String
+    let durationS: Double
+    let width: Int
+    let height: Int
+    let segmentCount: Int
+    let frameCount: Int
+
+    enum CodingKeys: String, CodingKey {
+      case outputPath = "output_path"
+      case durationS = "duration_s"
+      case width, height
+      case segmentCount = "segment_count"
+      case frameCount = "frame_count"
+    }
+  }
+
+  /// Wire payload for POST /v1/montage/compose (snake_case; see the FDD).
+  struct MontagePayload: Decodable {
+    struct Segment: Decodable {
+      struct KenBurnsSpec: Decodable {
+        /// [startScale, endScale]
+        let zoom: [Double]?
+        /// [[x0,y0],[x1,y1]] normalized output-unit offsets
+        let pan: [[Double]]?
+      }
+      let type: String
+      let path: String
+      let durationS: Double?
+      let kenburns: KenBurnsSpec?
+    }
+    struct Transition: Decodable {
+      let type: String
+      let durationS: Double?
+    }
+    struct Output: Decodable {
+      let width: Int?
+      let height: Int?
+      let fps: Int?
+      let path: String?
+    }
+    let segments: [Segment]
+    let transitions: [Transition]?
+    let output: Output?
+    let aspectPolicy: String?
+  }
+
+  private func composeMontage(_ payload: MontagePayload) async throws -> MontageResult {
+    var segments: [MontageSegment] = []
+    for (i, s) in payload.segments.enumerated() {
+      guard let kind = MontageSegment.Kind(rawValue: s.type) else {
+        throw WarmServerError.invalidRequest(
+          message: "segments[\(i)].type must be image|clip (got '\(s.type)')")
+      }
+      var kenBurns: MontageSegment.KenBurns? = nil
+      if let spec = s.kenburns {
+        var kb = MontageSegment.KenBurns()
+        if let zoom = spec.zoom {
+          guard zoom.count == 2 else {
+            throw WarmServerError.invalidRequest(
+              message: "segments[\(i)].kenburns.zoom must be [start, end]")
+          }
+          kb.zoomStart = zoom[0]
+          kb.zoomEnd = zoom[1]
+        }
+        if let pan = spec.pan {
+          guard pan.count == 2, pan[0].count == 2, pan[1].count == 2 else {
+            throw WarmServerError.invalidRequest(
+              message: "segments[\(i)].kenburns.pan must be [[x0,y0],[x1,y1]]")
+          }
+          kb.panStart = (pan[0][0], pan[0][1])
+          kb.panEnd = (pan[1][0], pan[1][1])
+        }
+        kenBurns = kb
+      }
+      segments.append(MontageSegment(kind: kind, path: s.path, durationS: s.durationS, kenBurns: kenBurns))
+    }
+
+    var transitions: [MontageTransition] = []
+    for t in payload.transitions ?? [] {
+      guard let kind = MontageTransition.Kind(rawValue: t.type) else {
+        throw WarmServerError.invalidRequest(
+          message: "transitions[].type must be cut|fade|dissolve (got '\(t.type)')")
+      }
+      transitions.append(MontageTransition(kind: kind, durationS: t.durationS ?? 0.5))
+    }
+
+    let aspectPolicy: MontageAspectPolicy
+    if let raw = payload.aspectPolicy {
+      guard let parsed = MontageAspectPolicy(rawValue: raw) else {
+        throw WarmServerError.invalidRequest(
+          message: "aspect_policy must be fill_crop|fit_pad (got '\(raw)')")
+      }
+      aspectPolicy = parsed
+    } else {
+      aspectPolicy = .fillCrop
+    }
+
+    // Output containment — same convention as the video routes (#219).
+    let requestedRaw = payload.output?.path ?? "montage-\(UUID().uuidString).mp4"
+    let requested: String
+    if requestedRaw.hasPrefix("/") || requestedRaw.hasPrefix("~") {
+      requested = requestedRaw
+    } else {
+      requested = (configuration.allowedOutputDirectory as NSString)
+        .appendingPathComponent(requestedRaw)
+    }
+    let resolvedOutput = try WarmServerOutputPathValidator.resolveOutputPath(
+      requested, allowedOutputDirectory: configuration.allowedOutputDirectory).path
+
+    let width = payload.output?.width ?? 448
+    let height = payload.output?.height ?? 768
+    let fps = payload.output?.fps ?? 30
+
+    logger.info("Montage: \(segments.count) segment(s), \(transitions.count) transition(s) -> \(width)x\(height)@\(fps)")
+    let start = Date()
+    // Compositing is CPU-bound and synchronous — run it off the request task's
+    // executor so a long montage can't starve other routes.
+    let result = try await Task.detached(priority: .userInitiated) {
+      try MontageComposer.compose(
+        segments: segments,
+        transitions: transitions,
+        width: width, height: height, fps: fps,
+        aspectPolicy: aspectPolicy,
+        outputPath: resolvedOutput)
+    }.value
+    let elapsed = Int(Date().timeIntervalSince(start) * 1000)
+    logger.info("Montage: wrote \(result.outputPath) (\(String(format: "%.2f", result.durationS))s, \(result.frameCount) frames) in \(elapsed)ms")
+    auditLog.append(kind: "montage.compose", message: "\(segments.count) segments -> \(result.outputPath)", metadata: [:])
+    return result
+  }
+
   /// Shared decode + validation for both the synchronous and queue-submit
   /// generate routes, so output-path containment can't drift between them.
   private func decodedGeneratePayload(from body: Data) throws -> GeneratePayload {
@@ -3052,6 +3851,33 @@ final class VideoJobTracker: @unchecked Sendable {
             coordReport(pct)
             self.setProgress(jobId, pct)
           }
+        }
+        self.markSucceeded(jobId, result: result)
+      } catch {
+        self.markFailed(jobId, error: error)
+      }
+    }
+    return queued
+  }
+
+  /// Submit a multi-step orchestration (storyboard, #237). Unlike `submit`,
+  /// the work closure is NOT wrapped in a single `enqueueLocalVideo` — it
+  /// issues its OWN coordinator enqueues (one per shot render / i2i insert),
+  /// so each step takes a normal turn on the FIFO GPU queue and other jobs
+  /// can interleave between shots. Wrapping the whole storyboard in one queue
+  /// entry would deadlock: the closure would enqueue from inside the queue.
+  fileprivate func submitOrchestrated(
+    source: String,
+    mode: VideoMode,
+    work: @escaping @Sendable (@escaping @Sendable (Int) -> Void) async throws -> LTX2VideoResult
+  ) -> VideoJobStatus {
+    let (jobId, queued) = register(source: source, mode: mode)
+    Task { [weak self] in
+      guard let self else { return }
+      self.markProcessing(jobId)
+      do {
+        let result = try await work { pct in
+          self.setProgress(jobId, pct)
         }
         self.markSucceeded(jobId, result: result)
       } catch {
@@ -4042,12 +4868,16 @@ private actor WarmServerCoordinator {
         // between the eviction and the video load.
         let freedForVideoMB = await releaseImageModelsForVideo()
         let availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+        // Precision-keyed (#230): an int8-quantized checkpoint dir gates at
+        // 40GB instead of the bf16 65GB, so video coexists with LM Studio.
+        let ltx2Need = HeavyModelAdmission.ltx2EstimateBytes(
+          forWeightsPath: configuration.ltx2WeightsPath)
         let admitVideo = heavyAdmission.admitsAfterEvict(
-          needBytes: HeavyModelAdmission.ltx2EstimateBytes, freeBytes: availableForVideo)
-        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB → admit=\(admitVideo) (#218)")
+          needBytes: ltx2Need, freeBytes: availableForVideo)
+        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(ltx2Need >> 20)MB → admit=\(admitVideo) (#218)")
         if !admitVideo {
           continuation.resume(throwing: WarmServerError.invalidRequest(
-            message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(HeavyModelAdmission.ltx2EstimateBytes >> 20)MB)"))
+            message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(ltx2Need >> 20)MB)"))
         } else {
           videoHolder.beginRender()
           // Stream render progress into the lock-based trackers /health + /queue
@@ -5058,6 +5888,18 @@ struct GeneratePayload: Sendable {
   let imageStrength: Float?
   let creativity: Float?
 
+  /// Optional mask PNG file path for selective inpainting on the img2img path.
+  /// White = inpaint region, black = keep. nil → standard full-frame img2img.
+  let maskPath: String?
+
+  /// Auto-generated mask region ("face" | "upper" | "lower") for img2img —
+  /// mutually exclusive with maskPath. The named region is regenerated.
+  let maskRegion: String?
+
+  /// Flip the img2img mask (white ⇄ black): e.g. mask_region "face" +
+  /// mask_invert = lock the face, regenerate everything else.
+  let maskInvert: Bool?
+
   /// Submitting client/app (desktop, bree, api…) — for queue attribution.
   let source: String?
 
@@ -5087,6 +5929,7 @@ struct GeneratePayload: Sendable {
     maskCropX: Int? = nil, maskCropY: Int? = nil,
     cfg: Float? = nil, firstNStepsWithoutCFG: Int? = nil,
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
+    maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil
   ) {
@@ -5106,6 +5949,9 @@ struct GeneratePayload: Sendable {
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
     self.cfg = cfg; self.firstNStepsWithoutCFG = firstNStepsWithoutCFG
     self.imagePath = imagePath; self.imageStrength = imageStrength; self.creativity = creativity
+    self.maskPath = maskPath
+    self.maskRegion = maskRegion
+    self.maskInvert = maskInvert
   }
 }
 
@@ -5122,6 +5968,9 @@ extension GeneratePayload: Decodable {
     case maskImageData = "maskBase64"
     case cfg, firstNStepsWithoutCFG
     case imagePath, imageStrength, creativity
+    case maskPath
+    case maskRegion
+    case maskInvert
     case source
     case contentMode
     // Wire key init_image_base64 arrives as this camelCase form after
@@ -5163,6 +6012,9 @@ extension GeneratePayload: Decodable {
         .flatMap { Data(base64Encoded: $0) }
     imageStrength = try c.decodeIfPresent(Float.self, forKey: .imageStrength)
     creativity = try c.decodeIfPresent(Float.self, forKey: .creativity)
+    maskPath = try c.decodeIfPresent(String.self, forKey: .maskPath)
+    maskRegion = try c.decodeIfPresent(String.self, forKey: .maskRegion)
+    maskInvert = try c.decodeIfPresent(Bool.self, forKey: .maskInvert)
     source = try c.decodeIfPresent(String.self, forKey: .source)
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
@@ -5307,7 +6159,12 @@ extension GeneratePayload: Decodable {
       strength: resolvedStrength,
       specifiedAs: specifiedAs,
       contentMode: contentMode,
-      source: source
+      source: source,
+      maskPath: maskPath,
+      maskRegion: maskRegion,
+      maskInvert: maskInvert ?? false,
+      maskGrow: maskGrow ?? 0,
+      maskFeather: maskFeather ?? 0
     )
   }
 

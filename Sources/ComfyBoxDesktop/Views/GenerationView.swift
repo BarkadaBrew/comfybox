@@ -179,6 +179,11 @@ struct GenerationView: View {
     @State private var serverPresets: [ServerPreset] = []
     /// Name of the currently-loaded preset (nil = none / custom).
     @State private var activePresetName: String?
+    /// One-shot: the Krea-Kira launch default is applied at most once per
+    /// session. Gating on `activePresetName == nil` alone re-fired the default
+    /// on later reloads (e.g. Refresh after a Studio Pack cleared the name),
+    /// clobbering the user's current model/LoRAs/settings.
+    @State private var didApplyLaunchDefault = false
 
     /// Fruit mode steering the optimizer + negative prompt. View state only →
     /// resets to Neutral each launch (never silently persists 🥑).
@@ -229,18 +234,20 @@ struct GenerationView: View {
         .sheet(isPresented: $showingSavePreset) {
             SavePresetSheet(
                 promptTemplate: prompt,
+                negativePrompt: negativePrompt,
                 modelId: engine.currentModel,
                 loras: selectedLoras,
                 steps: Int(steps),
                 guidance: Float(guidance),
                 width: effectiveWidth,
                 height: effectiveHeight,
-                onSave: { name in
+                onSave: { name, editedNegative in
                     // Save to the canonical server preset store (shared with
                     // Bree/Telegram), not the old device-local list.
                     let preset = ServerPreset(
                         name: name,
                         prompt: prompt.isEmpty ? nil : prompt,
+                        negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
                         width: effectiveWidth,
@@ -1402,12 +1409,29 @@ struct GenerationView: View {
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
     }
 
+    /// Preset applied on a fresh launch when the user hasn't picked one.
+    private static let defaultPresetName = "Krea-Kira"
+
     private func loadServerPresets() async {
         serverPresets = await engine.fetchPresets()
         if let config = try? await engine.fetchServerConfig() {
             contentModeDefaultPresets = Dictionary(uniqueKeysWithValues: config.contentModeDefaultPresets.compactMap { key, value in
                 ContentMode(rawValue: key).map { ($0, value) }
             })
+        }
+        // Default preset: on the FIRST load of a session with no active
+        // preset, come up as Krea-Kira so Generate is ready without a manual
+        // pick. One-shot — never re-applies on later reloads (Refresh, post-
+        // save, or after a Studio Pack nils activePresetName), which would
+        // silently overwrite whatever the user has set up.
+        if !didApplyLaunchDefault {
+            didApplyLaunchDefault = true
+            if activePresetName == nil,
+               let def = serverPresets.first(where: {
+                   $0.name.caseInsensitiveCompare(Self.defaultPresetName) == .orderedSame
+               }) {
+                await applyServerPreset(def)
+            }
         }
     }
 

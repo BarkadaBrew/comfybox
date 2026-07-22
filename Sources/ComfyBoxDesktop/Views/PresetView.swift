@@ -40,6 +40,9 @@ struct PresetView: View {
         .task {
             await reload()
             warmModelSpec = (try? await engine.fetchServerConfig())?.modelSpec
+            // The editor's Add-LoRA picker needs the server's library list;
+            // Generate populates it lazily, so make sure it's fresh here too.
+            await engine.refreshLoras()
         }
         .onChange(of: engine.connectionState.isConnected) { _, connected in
             if connected { Task { await reload() } }
@@ -295,6 +298,14 @@ private struct ServerPresetEditor: View {
     let onSave: (ServerPreset) -> Void
     let onCancel: () -> Void
 
+    /// Editable LoRA row — stable identity for ForEach even when the same
+    /// file appears twice while the user is rearranging.
+    private struct EditableLora: Identifiable, Equatable {
+        let id = UUID()
+        var filename: String
+        var scale: Double
+    }
+
     @State private var name: String
     @State private var descriptionText: String
     @State private var prompt: String
@@ -304,8 +315,10 @@ private struct ServerPresetEditor: View {
     @State private var heightText: String
     @State private var stepsText: String
     @State private var guidanceText: String
-    @State private var lorasText: String
+    @State private var editableLoras: [EditableLora]
     @State private var scheduler: String
+    @State private var saveAsName: String = ""
+    @State private var showingSaveAs = false
 
     init(original: ServerPreset, isNew: Bool, availableLoras: [LoRAInfo],
          onSave: @escaping (ServerPreset) -> Void, onCancel: @escaping () -> Void) {
@@ -323,9 +336,8 @@ private struct ServerPresetEditor: View {
         _heightText = State(initialValue: original.height.map(String.init) ?? "")
         _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
         _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
-        _lorasText = State(initialValue: original.loras
-            .map { $0.scale == 1.0 ? $0.filename : "\($0.filename)=\($0.scale)" }
-            .joined(separator: ", "))
+        _editableLoras = State(initialValue: original.loras
+            .map { EditableLora(filename: $0.filename, scale: $0.scale) })
         _scheduler = State(initialValue: original.scheduler ?? "")
     }
 
@@ -353,7 +365,10 @@ private struct ServerPresetEditor: View {
                         TextField("Guidance", text: $guidanceText).frame(width: 90)
                         TextField("Scheduler", text: $scheduler)
                     }
-                    TextField("LoRAs (file=scale, comma-separated)", text: $lorasText)
+                }
+                Section("LoRAs") {
+                    loraRows
+                    addLoraMenu
                     presetLoraKeywordsRow
                 }
             }
@@ -362,6 +377,13 @@ private struct ServerPresetEditor: View {
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)
+                if !isNew {
+                    Button("Save as New…") {
+                        saveAsName = name.trimmingCharacters(in: .whitespaces) + " copy"
+                        showingSaveAs = true
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
                 Button("Save") { onSave(buildPreset()) }
                     .buttonStyle(.borderedProminent)
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -369,17 +391,106 @@ private struct ServerPresetEditor: View {
             .padding()
         }
         .frame(minWidth: 540, idealWidth: 600, minHeight: 540, idealHeight: 620)
+        .alert("Save as New Preset", isPresented: $showingSaveAs) {
+            TextField("New preset name", text: $saveAsName)
+            Button("Cancel", role: .cancel) { }
+            Button("Save Copy") {
+                var copy = buildPreset()
+                copy.id = UUID().uuidString
+                copy.name = saveAsName.trimmingCharacters(in: .whitespaces)
+                onSave(copy)
+            }
+            .disabled(saveAsName.trimmingCharacters(in: .whitespaces).isEmpty)
+        } message: {
+            Text("Creates a separate preset with these settings; “\(original.name)” is left unchanged.")
+        }
     }
 
-    /// Trigger words for the LoRAs currently listed in `lorasText` — tap to
-    /// insert into the preset's prompt template.
+    // MARK: - LoRA editing
+
+    /// One row per selected LoRA: name, scale slider, numeric value, remove.
+    @ViewBuilder
+    private var loraRows: some View {
+        if editableLoras.isEmpty {
+            Text("No LoRAs — add one below.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        ForEach($editableLoras) { $lora in
+            HStack(spacing: 8) {
+                Text(displayName(for: lora.filename))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
+                    .help(lora.filename)
+                // Slider range matches the field's clamp (0...3) so a typed
+                // overdrive value (e.g. 2.0) is not silently snapped back on
+                // the next slider nudge. Everyday range is the low end.
+                Slider(value: $lora.scale, in: 0...3, step: 0.05)
+                TextField("", value: Binding(
+                    get: { lora.scale },
+                    // Manual entry may exceed the everyday range on purpose
+                    // (e.g. 2.0 overdrive) — clamp only the absurd.
+                    set: { lora.scale = min(max($0, 0), 3.0) }
+                ), format: .number.precision(.fractionLength(0...2)))
+                    .font(.system(.caption, design: .monospaced))
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 52)
+                Button {
+                    editableLoras.removeAll { $0.id == lora.id }
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Remove this LoRA")
+            }
+        }
+    }
+
+    /// Picker for adding a LoRA from the server's library. Quarantined and
+    /// already-added files are excluded; selection seeds the recommended scale.
+    @ViewBuilder
+    private var addLoraMenu: some View {
+        let added = Set(editableLoras.map(\.filename))
+        let candidates = availableLoras
+            .filter { !$0.quarantined && !added.contains($0.filename) }
+            .sorted { $0.filename.localizedCaseInsensitiveCompare($1.filename) == .orderedAscending }
+        Menu {
+            if candidates.isEmpty {
+                Text(availableLoras.isEmpty ? "No LoRAs on the server (is it connected?)" : "All available LoRAs added")
+            }
+            ForEach(candidates) { info in
+                Button {
+                    editableLoras.append(EditableLora(
+                        filename: info.filename,
+                        scale: Double(info.recommendedScale)
+                    ))
+                } label: {
+                    if info.category.isEmpty {
+                        Text(displayName(for: info.filename))
+                    } else {
+                        Text("\(displayName(for: info.filename))  —  \(info.category)")
+                    }
+                }
+            }
+        } label: {
+            Label("Add LoRA", systemImage: "plus.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func displayName(for filename: String) -> String {
+        filename
+            .replacingOccurrences(of: ".safetensors", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// Trigger words for the currently selected LoRAs — tap to insert into
+    /// the preset's prompt template.
     @ViewBuilder
     private var presetLoraKeywordsRow: some View {
-        let filenames = Set(lorasText.split(separator: ",").compactMap { part -> String? in
-            let token = part.trimmingCharacters(in: .whitespaces)
-            guard !token.isEmpty else { return nil }
-            return String(token.split(separator: "=", maxSplits: 1)[0]).trimmingCharacters(in: .whitespaces)
-        })
+        let filenames = Set(editableLoras.map(\.filename))
         let words: [String] = availableLoras
             .filter { filenames.contains($0.filename) }
             .reduce(into: []) { $0.append(contentsOf: $1.triggerwords) }
@@ -426,14 +537,9 @@ private struct ServerPresetEditor: View {
         p.steps = Int(stepsText)
         p.guidance = Double(guidanceText.replacingOccurrences(of: ",", with: "."))
         p.scheduler = scheduler.isEmpty ? nil : scheduler
-        p.loras = lorasText.split(separator: ",").compactMap { part in
-            let token = part.trimmingCharacters(in: .whitespaces)
-            guard !token.isEmpty else { return nil }
-            let pieces = token.split(separator: "=", maxSplits: 1)
-            let filename = String(pieces[0]).trimmingCharacters(in: .whitespaces)
-            let scale = pieces.count > 1 ? (Double(pieces[1]) ?? 1.0) : 1.0
-            return ServerPresetLora(filename: filename, scale: scale)
-        }
+        p.loras = editableLoras
+            .filter { !$0.filename.isEmpty }
+            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale) }
         return p
     }
 }
@@ -442,16 +548,21 @@ private struct ServerPresetEditor: View {
 
 struct SavePresetSheet: View {
     var promptTemplate: String
+    var negativePrompt: String = ""
     var modelId: String?
     var loras: [LoRASelection]
     var steps: Int
     var guidance: Float
     var width: Int
     var height: Int
-    var onSave: (String) -> Void
+    /// (name, negativePrompt) — the sheet lets the user edit the negative
+    /// prompt before saving, so the callback returns the edited value.
+    var onSave: (String, String) -> Void
     var onCancel: () -> Void
 
     @State private var presetName: String = ""
+    @State private var editedNegative: String = ""
+    @State private var didSeedNegative = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -487,6 +598,10 @@ struct SavePresetSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    TextField("Negative prompt (saved with the preset)",
+                              text: $editedNegative, axis: .vertical)
+                        .lineLimit(1...3)
+                        .font(.caption)
                 }
             }
             .formStyle(.grouped)
@@ -497,13 +612,19 @@ struct SavePresetSheet: View {
                 Button("Cancel") { onCancel() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Save Preset") { onSave(presetName) }
+                Button("Save Preset") { onSave(presetName, editedNegative) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(presetName.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding()
         }
-        .frame(width: 400, height: 360)
+        .frame(width: 400, height: 400)
+        .onAppear {
+            if !didSeedNegative {
+                editedNegative = negativePrompt
+                didSeedNegative = true
+            }
+        }
     }
 }

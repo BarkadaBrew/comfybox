@@ -109,8 +109,8 @@ struct PromptLibraryView: View {
             Image(systemName: "bookmark.fill")
                 .font(.callout).foregroundStyle(Color.accentColor).frame(width: 20)
             VStack(alignment: .leading, spacing: 3) {
-                Text(entry.displayTitle).font(.callout.weight(.medium))
-                Text(entry.text).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                GatedText(entry.displayTitle, font: .callout.weight(.medium))
+                GatedText(entry.text, font: .caption).foregroundStyle(.secondary).lineLimit(2)
                 HStack(spacing: 8) {
                     if !entry.tags.isEmpty {
                         Text(entry.tags.joined(separator: " · ")).font(.caption2).foregroundStyle(.tertiary)
@@ -142,7 +142,7 @@ struct PromptLibraryView: View {
             Image(systemName: "clock")
                 .font(.callout).foregroundStyle(.secondary).frame(width: 20)
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.prompt).font(.caption).lineLimit(3)
+                GatedText(item.prompt, font: .caption).lineLimit(3)
                 Text("\(item.count) render\(item.count == 1 ? "" : "s") · \(item.lastUsed.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
             }

@@ -190,6 +190,14 @@ struct SettingsView: View {
     @State private var providerStatus: String?
     @State private var providerIsError: Bool = false
     @State private var nsfwPassword: String = ""
+    @State private var nsfwPasswordStatus: String = ""
+
+    private func commitNSFWPassword() {
+        guard !nsfwPassword.isEmpty else { return }
+        NSFWGate.setPassword(nsfwPassword)
+        nsfwPassword = ""
+        nsfwPasswordStatus = "Password saved — ⌃⌥⌘U now requires it."
+    }
 
     // Content mode → default preset mapping (/v1/config contentModeDefaultPresets)
     @State private var availablePresets: [ServerPreset] = []
@@ -387,12 +395,28 @@ struct SettingsView: View {
             }
 
             Section("NSFW Gallery Gate") {
-                SecureField(NSFWGate.isConfigured ? "Change password (blank clears)" : "Set a password",
-                            text: $nsfwPassword)
-                    .onChange(of: nsfwPassword) { _, v in NSFWGate.setPassword(v.isEmpty ? nil : v) }
+                HStack {
+                    SecureField(NSFWGate.isConfigured ? "New password" : "Set a password",
+                                text: $nsfwPassword)
+                        .textFieldStyle(.roundedBorder)
+                        .focusable(true)
+                        .onSubmit { commitNSFWPassword() }
+                    Button(NSFWGate.isConfigured ? "Change" : "Set") { commitNSFWPassword() }
+                        .disabled(nsfwPassword.isEmpty)
+                    if NSFWGate.isConfigured {
+                        Button("Remove", role: .destructive) {
+                            NSFWGate.setPassword(nil)
+                            nsfwPassword = ""
+                            nsfwPasswordStatus = "Password removed."
+                        }
+                    }
+                }
+                if !nsfwPasswordStatus.isEmpty {
+                    Text(nsfwPasswordStatus).font(.caption).foregroundStyle(.green)
+                }
                 Text(NSFWGate.isConfigured
-                     ? "A password is set — NSFW content is gated in the Gallery. Clear the field to remove it."
-                     : "Set a password to require it before revealing NSFW content in the Gallery. Stored as a salted hash in the Keychain.")
+                     ? "A password is set — ⌃⌥⌘U asks for it before revealing NSFW content."
+                     : "Set a password to require it before revealing NSFW content (⌃⌥⌘U). Stored as a salted hash in the Keychain.")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
 

@@ -423,6 +423,15 @@ final class ComfyBridgeExecutor {
       logger.error("ComfyBridge: generation failed — prompt_id=\(request.promptId): \(error)")
       sendError(promptId: request.promptId, clientId: request.clientId,
                 message: error.localizedDescription)
+      // Record the failure so non-websocket consumers (workflow run API,
+      // /history callers) can see the terminal state instead of timing out.
+      history.record(
+        promptId: request.promptId,
+        clientId: request.clientId,
+        outputNodeId: request.outputNodeId,
+        imageFilename: "",
+        success: false,
+        errorMessage: error.localizedDescription)
     }
   }
 

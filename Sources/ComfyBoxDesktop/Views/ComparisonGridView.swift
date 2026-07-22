@@ -334,9 +334,9 @@ private struct PickerCell: View {
                 }
                 .frame(height: 100)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
+                .contentGated()
 
-                Text(asset.filename)
-                    .font(.caption2)
+                GatedText(asset.filename, font: .caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -382,6 +382,7 @@ struct AsyncThumbnail: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        .contentGated()
         .task {
             image = await Task.detached {
                 NSImage(contentsOfFile: thumbnailPath) ?? NSImage(contentsOfFile: fallbackPath)

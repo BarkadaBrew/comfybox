@@ -19,6 +19,13 @@ struct ComfyBoxDesktopApp: App {
     @State private var canvasStore = CanvasStore()
     @State private var mfluxService = MfluxService()
     @State private var breeService = BreeService()
+    @State private var kiraClient = KiraClient()
+    /// App-wide "Rated G unless NSFW toggled" gate (Todd 2026-07-17). Starts
+    /// hidden every launch by design.
+    @State private var contentGate = AppContentGate()
+    @State private var showNSFWReveal = false
+    @State private var nsfwPasswordInput = ""
+    @State private var nsfwPasswordError = false
     @State private var decoupageService = DecoupageService()
     @State private var faceSwapService = FaceSwapService()
     @State private var activityLog = ActivityLog()
@@ -58,6 +65,7 @@ struct ComfyBoxDesktopApp: App {
         case face = "Face"
         case inpaint = "Inpaint"
         case bree = "Bree"
+        case kira = "Kira"
         case canvas = "Canvas"
         case civitai = "CivitAI"
         case models = "Models"
@@ -80,7 +88,7 @@ struct ComfyBoxDesktopApp: App {
             case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery: return .library
             case .dashboard, .applications, .queue: return .operate
-            case .bree: return .suite
+            case .bree, .kira: return .suite
             }
         }
 
@@ -103,6 +111,7 @@ struct ComfyBoxDesktopApp: App {
             case .face: return "person.crop.circle.badge.checkmark"
             case .inpaint: return "paintbrush.pointed"
             case .bree: return "brain.head.profile"
+            case .kira: return "moon.stars"
             case .canvas: return "rectangle.on.rectangle.angled"
             case .civitai: return "globe"
             case .models: return "square.stack.3d.up.fill"
@@ -128,6 +137,7 @@ struct ComfyBoxDesktopApp: App {
             case .motion: return "m"
             case .mflux: return "x"
             case .bree: return "b"
+            case .kira: return "k"
             case .models: return "l"
             case .decoupage: return "d"
             case .applications: return "a"
@@ -155,6 +165,7 @@ struct ComfyBoxDesktopApp: App {
             } detail: {
                 detailView
             }
+            .environment(contentGate)
             .navigationTitle("CoffeeShop Desktop")
             .frame(minWidth: 900, minHeight: 600)
             .overlay {
@@ -190,6 +201,37 @@ struct ComfyBoxDesktopApp: App {
                         ingestorStatus(ingestor)
                     }
                 }
+            }
+            // Hidden reveal trigger — NO visible button anywhere (a visible
+            // "Show NSFW" control would advertise hidden content to anyone who
+            // opens the app). Reveal is a keyboard shortcut only: ⌃⌥⌘U toggles
+            // the gate (prompting for the gallery password if one is set). The
+            // gate re-hides on every launch regardless. (Todd 2026-07-18)
+            .background {
+                Button("", action: toggleNSFWReveal)
+                    .keyboardShortcut("u", modifiers: [.command, .option, .control])
+                    .hidden()
+            }
+            .sheet(isPresented: $showNSFWReveal) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Unlock content", systemImage: "lock.open.fill")
+                        .font(.headline)
+                    Text("Enter the gallery password. Content re-locks on relaunch.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    SecureField("Password", text: $nsfwPasswordInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(submitNSFWReveal)
+                    if nsfwPasswordError {
+                        Text("Incorrect password").font(.caption).foregroundStyle(.red)
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { showNSFWReveal = false; nsfwPasswordInput = "" }
+                        Button("Unlock") { submitNSFWReveal() }.buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(20)
+                .frame(width: 380)
             }
             .task {
                 applySettings()
@@ -419,6 +461,9 @@ struct ComfyBoxDesktopApp: App {
         case .bree:
             BreeView(bree: breeService)
 
+        case .kira:
+            KiraView(client: kiraClient)
+
         case .canvas:
             CanvasView(
                 store: canvasStore,
@@ -513,6 +558,32 @@ struct ComfyBoxDesktopApp: App {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Reveal/hide toggle, invoked ONLY by the hidden ⌃⌥⌘U keyboard shortcut —
+    /// there is deliberately no visible control (Todd 2026-07-18). Revealing
+    /// prompts for the gallery password when one is configured; the gate
+    /// re-hides on every launch regardless.
+    private func toggleNSFWReveal() {
+        if contentGate.revealed {
+            contentGate.hide()
+        } else if contentGate.requiresPassword {
+            nsfwPasswordInput = ""
+            nsfwPasswordError = false
+            showNSFWReveal = true
+        } else {
+            contentGate.reveal()
+        }
+    }
+
+    private func submitNSFWReveal() {
+        if contentGate.reveal(withPassword: nsfwPasswordInput) {
+            showNSFWReveal = false
+            nsfwPasswordInput = ""
+            nsfwPasswordError = false
+        } else {
+            nsfwPasswordError = true
+        }
     }
 
     private var connectionButton: some View {
