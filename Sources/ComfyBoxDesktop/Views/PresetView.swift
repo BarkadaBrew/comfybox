@@ -422,10 +422,13 @@ private struct ServerPresetEditor: View {
                     .truncationMode(.middle)
                     .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
                     .help(lora.filename)
-                Slider(value: $lora.scale, in: 0...1.5, step: 0.05)
+                // Slider range matches the field's clamp (0...3) so a typed
+                // overdrive value (e.g. 2.0) is not silently snapped back on
+                // the next slider nudge. Everyday range is the low end.
+                Slider(value: $lora.scale, in: 0...3, step: 0.05)
                 TextField("", value: Binding(
                     get: { lora.scale },
-                    // Manual entry may exceed the slider range on purpose
+                    // Manual entry may exceed the everyday range on purpose
                     // (e.g. 2.0 overdrive) — clamp only the absurd.
                     set: { lora.scale = min(max($0, 0), 3.0) }
                 ), format: .number.precision(.fractionLength(0...2)))
