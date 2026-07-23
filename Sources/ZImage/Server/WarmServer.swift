@@ -1551,6 +1551,10 @@ public final class WarmServer {
     /// Content mode (neutral/apple/banana/avocado) gating the character's
     /// mode-specific description addendum. Defaults to the server's current mode.
     let contentMode: String?
+    /// Auto-enhance the prompt through the configured prompt-optimization
+    /// provider (Dan's-PE via LM Studio) before encoding. Default on when a
+    /// provider is configured; set false to send the raw prompt.
+    let enhance: Bool?
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1797,24 +1801,55 @@ public final class WarmServer {
 
     var effectivePrompt = req.prompt
 
-    // Character identity: prepend the on-model canonical description. For T2V
-    // (no init image) there is no other identity source, so default to "kira"
-    // when the caller names no character. For I2V the init image already carries
-    // identity — inject only when the character is explicitly requested.
+    // Character identity + optional prompt enhancement. For T2V (no init image)
+    // there is no other identity source, so default to "kira" when the caller
+    // names no character. For I2V the init image already carries identity.
     let isT2V = (effectiveInitImage == nil)
     let characterName = req.character ?? (isT2V ? "kira" : nil)
+    let charMode = req.contentMode.flatMap { ContentModeManager.Mode(rawValue: $0) } ?? .neutral
+    var characterDesc: String? = nil
     if let name = characterName,
        let entry = await characterStore.get(CharacterEntry.slug(name)) {
-      let mode = req.contentMode.flatMap { ContentModeManager.Mode(rawValue: $0) } ?? .neutral
-      let desc = entry.resolvedDescription(for: mode)
-      // Idempotency: skip if the caller already wrote the character's description
-      // into the prompt (e.g. Bree composes the full prompt) — avoid doubling.
+      characterDesc = entry.resolvedDescription(for: charMode)
+    }
+
+    // Auto-enhance the video prompt through the configured prompt-optimization
+    // provider (Dan's-PE via LM Studio). The optimizer weaves in the character
+    // description AND enriches the scene, so it replaces the manual character
+    // prepend. Opt out per request with enhance:false; falls back to the manual
+    // prepend when no provider is configured or enhancement fails.
+    var enhancedApplied = false
+    let aiProviderConfig = ComfyBoxServerConfig.loadOrMigrate()
+    if req.enhance != false, let endpoint = aiProviderConfig.providers.promptOptimization {
+      var base = endpoint.baseUrl
+      while base.hasSuffix("/") { base.removeLast() }
+      if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+      while base.hasSuffix("/") { base.removeLast() }
+      let optimizer = PromptOptimizer(
+        configuration: PromptOptimizer.Configuration(
+          ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
+          timeoutSeconds: 90, enabled: true),
+        logger: logger)
+      let result = await optimizer.optimize(
+        prompt: req.prompt, character: characterName,
+        characterDescription: characterDesc, contentMode: charMode.rawValue,
+        mediaKind: "video")
+      if result.enhanced {
+        effectivePrompt = result.prompt
+        enhancedApplied = true
+        logger.info("Video: enhanced prompt via \(endpoint.model)\(characterName.map { " (character \($0))" } ?? "").")
+      }
+    }
+
+    // Fallback: manual character prepend when enhancement didn't run/apply.
+    if !enhancedApplied, let name = characterName, let desc = characterDesc, !desc.isEmpty {
+      // Idempotency: skip if the caller already wrote the description in.
       let alreadyPresent = desc.split(separator: " ").prefix(4).allSatisfy {
         effectivePrompt.localizedCaseInsensitiveContains($0)
       }
-      if !desc.isEmpty && !alreadyPresent {
+      if !alreadyPresent {
         effectivePrompt = desc + " " + effectivePrompt
-        logger.info("Video: prepended character '\(name)' (mode \(mode.rawValue)) to prompt.")
+        logger.info("Video: prepended character '\(name)' (mode \(charMode.rawValue)) to prompt.")
       }
     }
 
@@ -1983,6 +2018,10 @@ public final class WarmServer {
     let character: String?
     let characterDescription: String?
     let contentMode: String?
+    /// Target model family: "image" (Z-Image, default) or "video" (LTX). Selects
+    /// the prompt FORMAT — image uses YOUR CONTEXT/YOUR PHOTO, video uses LTX-2.3
+    /// cinematic prose.
+    let mediaKind: String?
   }
 
   /// Enhance a prompt through the configured prompt-optimization provider
@@ -2035,7 +2074,8 @@ public final class WarmServer {
       prompt: req.prompt,
       character: req.character,
       characterDescription: characterDescription,
-      contentMode: mode
+      contentMode: mode,
+      mediaKind: req.mediaKind ?? "image"
     )
 
     var payload: [String: Any] = [

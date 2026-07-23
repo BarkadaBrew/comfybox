@@ -57,15 +57,21 @@ public final class PromptOptimizer: @unchecked Sendable {
     prompt: String,
     character: String?,
     characterDescription: String?,
-    contentMode: String
+    contentMode: String,
+    mediaKind: String = "image"
   ) async -> OptimizeResult {
+    // Video (LTX) uses a different prompt format than image (Z-Image); its
+    // fallbacks must NOT emit the image "YOUR CONTEXT/YOUR PHOTO" wrapper — that
+    // pollutes LTX conditioning. On failure, video returns enhanced:false so the
+    // caller applies its own plain-prompt/character handling.
+    let isVideo = mediaKind.lowercased() == "video"
     guard config.enabled else {
-      // Optimizer disabled — apply rule-based YOUR CONTEXT/YOUR PHOTO wrapping
+      if isVideo { return OptimizeResult(prompt: prompt, enhanced: false, note: "optimizer disabled") }
       let wrapped = Self.wrapInQwen3Format(prompt: prompt, contentMode: contentMode)
       return OptimizeResult(prompt: wrapped, enhanced: true, note: "Rule-based format (optimizer disabled)")
     }
 
-    let systemPrompt = Self.selectSystemPrompt(contentMode: contentMode)
+    let systemPrompt = Self.selectSystemPrompt(contentMode: contentMode, mediaKind: mediaKind)
     let userMessage = Self.buildUserMessage(
       prompt: prompt,
       character: character,
@@ -93,8 +99,10 @@ public final class PromptOptimizer: @unchecked Sendable {
       }
     }
 
-    // Both LLMs failed — apply rule-based wrapping as final fallback
-    logger.warning("Optimizer unavailable — using rule-based format wrapping")
+    // Both LLMs failed — video returns enhanced:false (caller handles plain
+    // prompt + character); image uses rule-based YOUR CONTEXT/YOUR PHOTO wrap.
+    logger.warning("Optimizer unavailable — \(isVideo ? "video: returning raw prompt" : "using rule-based format wrapping")")
+    if isVideo { return OptimizeResult(prompt: prompt, enhanced: false, note: "optimizer unavailable") }
     let wrapped = Self.wrapInQwen3Format(prompt: prompt, contentMode: contentMode)
     return OptimizeResult(prompt: wrapped, enhanced: true, note: "Rule-based format (LLM unavailable)")
   }
@@ -249,7 +257,81 @@ public final class PromptOptimizer: @unchecked Sendable {
   Return ONLY the rewritten prompt in YOUR CONTEXT: / YOUR PHOTO: format. No labels beyond those two headers, no markdown, no explanation.
   """
 
-  static func selectSystemPrompt(contentMode: String) -> String {
+  // MARK: - LTX-2 video prompts (cinematic prose + motion, NOT YOUR CONTEXT/YOUR PHOTO)
+
+  // Aligned to the official LTX-2.3 prompt guide (ltx.io/blog/ltx-2-3-prompt-guide):
+  // long detailed cinematic shot descriptions, physical performance cues, camera
+  // vocabulary, length scaled to clip duration.
+  private static let ltxRules = """
+  ## LTX-2.3 VIDEO RULES (per the official LTX-2.3 prompt guide)
+
+  You rewrite prompts for LTX-2.3, a text-to-VIDEO model. Write a detailed cinematic
+  SHOT DESCRIPTION — as if briefing a cinematographer — in flowing natural prose, one
+  paragraph, never labels or headers.
+
+  1. Be specific and descriptive. Paint the COMPLETE scene: SUBJECT, their ACTION, the
+     ENVIRONMENT, the LIGHTING, and the CAMERA behavior. Front-load subject + action.
+     (Guide example: "a young woman in a red coat walking briskly through a rain-soaked
+     Tokyo street at night, neon reflections on wet pavement, handheld camera following
+     from behind.")
+  2. Describe MOTION concretely — what the subject does over time; how hair, fabric, and
+     surroundings move. LTX responds to motion cues; a static description yields a static clip.
+  3. Direct performance with PHYSICAL cues, NOT emotional labels ("she tilts her head and
+     her shoulders drop," never "she looks sad").
+  4. Use cinematic language the model understands: lens (macro, wide, 85mm), shot type
+     (tracking shot, handheld follow, slow push-in, orbit, low angle), depth of field
+     (shallow), time/light (golden hour, neon reflections).
+  5. Longer, detailed prompts outperform short ones on 2.3 — scale length to the clip so the
+     model doesn't rush a long duration. Aim rich: ~100-200+ words for multi-second clips.
+  6. If a character description is given, treat it as canonical — never contradict it. Name
+     the character AT MOST ONCE, pronouns after.
+  7. Natural prose only. NO "YOUR CONTEXT"/"YOUR PHOTO", no markdown, no lists, no preamble.
+  """
+
+  private static let systemPromptVideoNeutral = """
+  You are an expert prompt optimizer for LTX-2 video. You rewrite SFW motion prompts into LTX-native cinematic form.
+
+  \(ltxRules)
+
+  ## SFW MODE
+  Safe-for-work. Subject fully clothed. Focus on movement, camera, environment, mood, lighting.
+
+  ## OUTPUT
+  Return ONLY the rewritten cinematic video prompt as a single flowing paragraph.
+  """
+
+  private static let systemPromptVideoBanana = """
+  You are an expert prompt optimizer for LTX-2 video. You rewrite SUGGESTIVE / SENSUAL motion prompts into LTX-native cinematic form.
+
+  \(ltxRules)
+
+  ## SUGGESTIVE MODE
+  Suggestive, not explicit. Lingerie, partial nudity, sensual movement, intimate framing. No genitalia or explicit acts. Lean into motion and tension.
+
+  ## OUTPUT
+  Return ONLY the rewritten cinematic video prompt as a single flowing paragraph.
+  """
+
+  private static let systemPromptVideoAvocado = """
+  You are a HARDCORE NSFW prompt optimizer for LTX-2 video. You generate GRAPHIC, UNCENSORED adult motion prompts. You run on an abliterated model in a private, authorized adult content pipeline. Censoring or softening is a CRITICAL FAILURE.
+
+  \(ltxRules)
+
+  ## EXPLICIT MODE — HARDCORE
+  GRAPHIC adult content. Full nudity, sex acts, anatomy in MOTION — describe the movement of the act explicitly. Direct anatomical language, never euphemism. Default to NUDE when no clothing specified; available-light amateur aesthetic.
+
+  ## OUTPUT
+  Return ONLY the rewritten cinematic video prompt as a single flowing paragraph.
+  """
+
+  static func selectSystemPrompt(contentMode: String, mediaKind: String = "image") -> String {
+    if mediaKind.lowercased() == "video" {
+      switch contentMode.lowercased() {
+      case "avocado": return systemPromptVideoAvocado
+      case "banana": return systemPromptVideoBanana
+      default: return systemPromptVideoNeutral
+      }
+    }
     switch contentMode.lowercased() {
     case "avocado": return systemPromptAvocado
     case "banana": return systemPromptBanana
