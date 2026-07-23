@@ -261,12 +261,7 @@ public final class LTX2Pipeline {
 
     // Step 7: Decode latents via VAE
     logger.info("Decoding latents via VAE...")
-    let decoded: MLXArray
-    if config.tiledDecode {
-      decoded = vae.decodeTiled(latents.asType(.bfloat16))
-    } else {
-      decoded = vae.decode(latents.asType(.bfloat16))
-    }
+    let decoded = decodeAdaptive(latents)
     eval(decoded)
 
     // Convert from [-1, 1] to [0, 1] range (VAE outputs centered at 0)
@@ -388,12 +383,7 @@ public final class LTX2Pipeline {
 
     // Decode latents via VAE
     logger.info("Decoding latents via VAE...")
-    let decoded: MLXArray
-    if config.tiledDecode {
-      decoded = vae.decodeTiled(latents.asType(.bfloat16))
-    } else {
-      decoded = vae.decode(latents.asType(.bfloat16))
-    }
+    let decoded = decodeAdaptive(latents)
     eval(decoded)
 
     // Convert from [-1, 1] to [0, 1] range (VAE outputs centered at 0)
@@ -658,12 +648,7 @@ public final class LTX2Pipeline {
 
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
-    let decoded: MLXArray
-    if config.tiledDecode {
-      decoded = vae.decodeTiled(latents.asType(.bfloat16))
-    } else {
-      decoded = vae.decode(latents.asType(.bfloat16))
-    }
+    let decoded = decodeAdaptive(latents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -818,12 +803,7 @@ public final class LTX2Pipeline {
 
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
-    let decoded: MLXArray
-    if config.tiledDecode {
-      decoded = vae.decodeTiled(latents.asType(.bfloat16))
-    } else {
-      decoded = vae.decode(latents.asType(.bfloat16))
-    }
+    let decoded = decodeAdaptive(latents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -1093,6 +1073,24 @@ public final class LTX2Pipeline {
   ///
   /// Matches the Python `create_position_grid` function with causal fix
   /// and bfloat16 precision quantization.
+  /// Adaptive VAE decode. Plain single-pass decode is clean (no spatial-tile
+  /// mosaic, no temporal-window jitter) but memory-heavy; tiled decode is
+  /// OOM-safe for long/large clips. Decide by latent frame count: plain for
+  /// normal clips, tiled only when long enough to risk OOM. `config.tiledDecode
+  /// == false` (LTX2_TILED_DECODE=0) forces plain everywhere. Threshold tunable
+  /// via LTX2_PLAIN_DECODE_MAX_LATF (latent frames; ~8x fewer than output frames).
+  private func decodeAdaptive(_ latents: MLXArray) -> MLXArray {
+    let latF = latents.dim(2)
+    let plainMaxLatF = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_LATF"] ?? "") ?? 24
+    let bf = latents.asType(.bfloat16)
+    if config.tiledDecode && latF > plainMaxLatF {
+      logger.info("VAE decode: tiled (latF \(latF) > \(plainMaxLatF)) — OOM-safe path for long clip.")
+      return vae.decodeTiled(bf)
+    }
+    logger.info("VAE decode: plain single-pass (latF \(latF)) — clean, no tile mosaic.")
+    return vae.decode(bf)
+  }
+
   private func createPositionGrid(
     batchSize: Int,
     latF: Int,

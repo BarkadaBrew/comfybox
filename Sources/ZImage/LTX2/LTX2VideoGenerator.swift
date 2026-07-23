@@ -457,7 +457,12 @@ public final class LTX2VideoGenerator {
             upsampler = up
             logger.info("LTX-2: two-stage refine upsampler loaded (\(w.count) tensors)")
         }
-        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: true)
+        // Tiled/chunked VAE decode is OOM-safe on long/large clips but seams on
+        // fast motion (spatial-tile mosaic + temporal-window jitter). Plain
+        // single-pass decode (as ComfyUI does) is clean but memory-heavier.
+        // LTX2_TILED_DECODE=0 selects plain decode. Default stays tiled.
+        let tiled = ProcessInfo.processInfo.environment["LTX2_TILED_DECODE"] != "0"
+        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: tiled)
         self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
         self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
         isLoaded = true
