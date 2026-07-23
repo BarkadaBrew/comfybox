@@ -252,7 +252,7 @@ public final class LTX2Pipeline {
         latents: refineInit, positions: refinePos, precomputedPE: refinePE,
         textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
         sigmas: refineSigmas, cfgScale: cfgScale, state: nil,
-        forceDeterministic: true,
+        forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
         progressCallback: progressCallback)
       eval(latents)
       MLX.GPU.clearCache()
@@ -648,7 +648,7 @@ public final class LTX2Pipeline {
         latents: refineInit, positions: refinePos, precomputedPE: refinePE,
         textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
         sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
-        forceDeterministic: true,
+        forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
         progressCallback: progressCallback)
       eval(latents)
       MLX.GPU.clearCache()
@@ -1010,7 +1010,9 @@ public final class LTX2Pipeline {
           let x0UncondSpatial = x0Neg
             .transposed(0, 2, 1)
             .reshaped(b, c, f, h, w)
-          let alphaS = 1.0 - sigma
+          // Guard the σ=1.0 first step: alphaS→0 makes sf=σ/alphaS blow up to inf
+          // and NaN the ancestral term. Clamp alphaS to a small floor.
+          let alphaS = max(1.0 - sigma, 1e-4)
           let alphaT = 1.0 - sigmaNext
           let d = (currentLatents - MLXArray(alphaS) * x0UncondSpatial) / MLXArray(sigma)
           var sigmaDown = sigmaNext
@@ -1020,20 +1022,24 @@ public final class LTX2Pipeline {
             // σ_down = alpha_t · σ_down'
             let sf = sigma / alphaS
             let st = sigmaNext / alphaT
-            let up = min(st, (st * st * (sf * sf - st * st) / (sf * sf)).squareRoot())
-            sigmaDown = alphaT * (st * st - up * up).squareRoot()
+            let inner = st * st * (sf * sf - st * st) / (sf * sf)
+            let up = min(st, (inner > 0 ? inner : 0).squareRoot())
+            sigmaDown = alphaT * (max(st * st - up * up, 0)).squareRoot()
             sigmaUp = up
           }
           currentLatents = MLXArray(alphaT) * denoised + MLXArray(sigmaDown) * d
           if useSDE && sigmaUp > 0 {
-            let noise = getNewNoise(shape: currentLatents.shape)
+            // Plain Gaussian ancestral noise, matching ComfyUI's noise_sampler
+            // (randn_like). getNewNoise's per-channel normalization flattens the
+            // stochasticity that drives inter-frame motion — do NOT use it here.
+            let noise = MLXRandom.normal(currentLatents.shape, dtype: .float32)
             currentLatents = currentLatents + MLXArray(alphaT) * noise * MLXArray(sigmaUp)
           }
         } else if useSDE {
           let sigmaF32 = MLXArray(sigma)
           let eps = (currentLatents - denoised) / sigmaF32
           let (alphaRatio, sigmaDown, sigmaUp) = getSdeCoeff(sigmaNext: sigmaNext)
-          let noise = getNewNoise(shape: currentLatents.shape)
+          let noise = MLXRandom.normal(currentLatents.shape, dtype: .float32)
           currentLatents = MLXArray(alphaRatio) * (denoised + MLXArray(sigmaDown) * eps)
             + MLXArray(sigmaUp) * noise
         } else {
@@ -1120,13 +1126,16 @@ public final class LTX2Pipeline {
             var tStart = Float(tf) * temporalScale
             var tEnd = Float(tf + 1) * temporalScale
 
-            // Causal fix: shift temporal coordinates
+            // Causal fix: shift temporal coordinates (matches reference
+            // latent_to_pixel_coords: pixel_coords[:,0] = (pc + 1 - scale[0]).clamp(0)).
             tStart = max(0, tStart + 1 - temporalScale)
             tEnd = max(0, tEnd + 1 - temporalScale)
 
-            // Divide temporal by fps
-            tStart /= fps
-            tEnd /= fps
+            // NOTE: NO fps division. The reference ComfyUI LTX pipeline
+            // (symmetric_patchifier.latent_to_pixel_coords + get_fractional_positions)
+            // scales temporal coords by the VAE factor and normalizes ONLY by
+            // max_pos — never by fps. The previous /= fps compressed the temporal
+            // RoPE ~24x, flattening frame-to-frame progression → near-static motion.
 
             // Spatial in pixel space
             let hStart = Float(h) * spatialScale
