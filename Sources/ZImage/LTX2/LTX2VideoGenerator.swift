@@ -624,6 +624,8 @@ public final class LTX2VideoGenerator {
                     inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                     width: request.width, height: request.height,
                     numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                    negativeInputIds: negBatch?.inputIds,
+                    negativeAttentionMask: negBatch?.attentionMask,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 

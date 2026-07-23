@@ -153,10 +153,11 @@ public final class LTX2Pipeline {
     )
     eval(textOutput.videoEmbeddings)
 
-    // Encode negative prompt for CFG (dev pipeline)
+    // Encode negative prompt for CFG, or for CFG++ (needs it every step at cfg=1).
     var negativeEmbeddings: MLXArray? = nil
-    if cfgScale > 1.0, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
-      logger.info("Encoding negative prompt for CFG (scale=\(cfgScale))...")
+    if cfgScale > 1.0 || LTX2PipelineConfig.envCfgPP,
+       let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+      logger.info("Encoding negative prompt (scale=\(cfgScale), cfgPP=\(LTX2PipelineConfig.envCfgPP))...")
       let negOutput = textEncoder.encode(
         inputIds: negIds,
         attentionMask: negMask,
@@ -216,6 +217,47 @@ public final class LTX2Pipeline {
       state: nil,
       progressCallback: progressCallback
     )
+
+    // Step 6b: Two-stage refine (env LTX2_TWO_STAGE) — identical machinery to the
+    // i2v refine, minus the frame-0 identity re-anchor (t2v has no source frame,
+    // so the refine runs free with state:nil). Upsample x2 -> flow re-noise ->
+    // short deterministic refine denoise.
+    if let ups = self.upsampler, ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
+      MLX.GPU.clearCache()
+      logger.info("T2V two-stage refine: upsampling latents 2x...")
+      let stats = vae.decoder.perChannelStatistics
+      let upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
+      eval(upLatent)
+      let rLatH = latH * 2, rLatW = latW * 2
+      let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
+        let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+        return v.count >= 2 ? v : nil
+      } ?? [0.85, 0.7250, 0.4219, 0.0]
+      if let seed = seed { MLXRandom.seed(seed &+ 1000) }
+      let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
+      let sigma0 = refineSigmas[0]
+      let refineInit = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)  // flow re-noise
+      let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
+      let refinePE = ltx2PrecomputeFreqsCIS(
+        indicesGrid: refinePos, dim: innerDim,
+        theta: transformer.positionalEmbeddingTheta,
+        maxPos: transformer.positionalEmbeddingMaxPos,
+        useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
+        numAttentionHeads: transformer.numHeads,
+        ropeMode: transformer.ropeMode,
+        doublePrecision: transformer.doublePrecisionRoPE)
+      eval(refinePE.cos, refinePE.sin)
+      logger.info("T2V two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
+      latents = denoisingLoop(
+        latents: refineInit, positions: refinePos, precomputedPE: refinePE,
+        textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
+        sigmas: refineSigmas, cfgScale: cfgScale, state: nil,
+        forceDeterministic: true,
+        progressCallback: progressCallback)
+      eval(latents)
+      MLX.GPU.clearCache()
+      logger.info("T2V two-stage refine complete.")
+    }
 
     // Step 7: Decode latents via VAE
     logger.info("Decoding latents via VAE...")

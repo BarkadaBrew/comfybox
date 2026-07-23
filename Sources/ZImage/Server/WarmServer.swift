@@ -1543,6 +1543,14 @@ public final class WarmServer {
     /// "video"): LoRAs, prompt prefix/suffix, negative prompt, dims budget,
     /// steps, seed. Explicit request fields always override preset values.
     let preset: String?
+    /// Character whose canonical description is prepended to the prompt so the
+    /// subject renders on-model. For T2V (no init image) this is the ONLY
+    /// identity source; defaults to "kira" when unset. For I2V the init image
+    /// already carries identity, so it's injected only when explicitly named.
+    let character: String?
+    /// Content mode (neutral/apple/banana/avocado) gating the character's
+    /// mode-specific description addendum. Defaults to the server's current mode.
+    let contentMode: String?
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1788,6 +1796,23 @@ public final class WarmServer {
     }
 
     var effectivePrompt = req.prompt
+
+    // Character identity: prepend the on-model canonical description. For T2V
+    // (no init image) there is no other identity source, so default to "kira"
+    // when the caller names no character. For I2V the init image already carries
+    // identity — inject only when the character is explicitly requested.
+    let isT2V = (effectiveInitImage == nil)
+    let characterName = req.character ?? (isT2V ? "kira" : nil)
+    if let name = characterName,
+       let entry = await characterStore.get(CharacterEntry.slug(name)) {
+      let mode = req.contentMode.flatMap { ContentModeManager.Mode(rawValue: $0) } ?? .neutral
+      let desc = entry.resolvedDescription(for: mode)
+      if !desc.isEmpty {
+        effectivePrompt = desc + " " + effectivePrompt
+        logger.info("Video: prepended character '\(name)' (mode \(mode.rawValue)) to prompt.")
+      }
+    }
+
     if let preset = videoPreset {
       if let prefix = preset.promptPrefix, !prefix.isEmpty { effectivePrompt = prefix + ", " + effectivePrompt }
       if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
