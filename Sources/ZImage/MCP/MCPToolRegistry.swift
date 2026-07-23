@@ -12,6 +12,7 @@ public enum MCPToolRegistry {
   /// All registered tool definitions.
   public static let tools: [MCPToolDefinition] = [
     generateImage,
+    repairImage,
     swapLoras,
     listModels,
     listStyles,
@@ -52,6 +53,29 @@ public enum MCPToolRegistry {
   ]
 
   // MARK: - Tool Definitions
+
+  static let repairImage = MCPToolDefinition(
+    name: "repair_image",
+    description: "Repair a DEFECTIVE image entirely on-device: a local vision model diagnoses render defects (mottled/damaged skin, disfigured anatomy, extra/fused fingers, mesh artifacts) and where they are, then img2img re-renders with a targeted negative prompt + optional region inpaint. Preserves composition and identity. Returns the repaired image path.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "image_path": [
+          "type": "string",
+          "description": "Path to the defective image to repair (Mac-local).",
+        ] as [String: Any],
+        "note": [
+          "type": "string",
+          "description": "Optional user description of the defect to steer the repair (e.g. 'left hand has extra fingers'). If omitted, the local vision model auto-diagnoses.",
+        ] as [String: Any],
+        "image_strength": [
+          "type": "number",
+          "description": "img2img source-preservation strength 0-1 (default 0.6; higher = closer to the source).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["image_path"],
+    ]
+  )
 
   static let generateImage = MCPToolDefinition(
     name: "generate_image",
