@@ -540,7 +540,10 @@ public final class LTX2VideoGenerator {
         // Face-anchor (#partnered): detect faces on the source once, build a
         // latent-space mask so the denoise loop can hold EVERY face (esp. a
         // stationary partner) across a long pass. Env-gated: LTX2_FACE_ANCHOR_STRENGTH.
-        let faceAnchorStrength = Float(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_STRENGTH"] ?? "") ?? 0
+        // Face-region anchor defaults 0.5 for i2v — with IC-control it locks the
+        // FACE across the render (IC-control alone holds body/scene but the face
+        // drifts). Only engages when an init image is present. LTX2_FACE_ANCHOR_STRENGTH=0 disables.
+        let faceAnchorStrength = Float(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_STRENGTH"] ?? "") ?? 0.5
         var faceAnchorMask: MLXArray? = nil
         if faceAnchorStrength > 0, let path = request.initImagePath,
            let isrc = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),

@@ -518,7 +518,9 @@ public final class LTX2Pipeline {
     // add_keyframe_index (temporal position -> frame_idx 0, handled in
     // createPositionGrid via refFrames). Slice back to latF before decode.
     var icRefFrames = 0
-    if ProcessInfo.processInfo.environment["LTX2_IC_CONTROL"] == "1" {
+    // IC-control (identity anchor) defaults ON for i2v: without it the subject
+    // morphs into a different person over the render. LTX2_IC_CONTROL=0 disables.
+    if ProcessInfo.processInfo.environment["LTX2_IC_CONTROL"] != "0" {
       let refStrength = Float(ProcessInfo.processInfo.environment["LTX2_IC_REF_STRENGTH"] ?? "1.0") ?? 1.0
       icRefFrames = imageLatent.dim(2)
       state.latent = MLX.concatenated([state.latent, imageLatent.asType(state.latent.dtype)], axis: 2)
