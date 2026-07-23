@@ -64,7 +64,7 @@ public final class PromptOptimizer: @unchecked Sendable {
     // fallbacks must NOT emit the image "YOUR CONTEXT/YOUR PHOTO" wrapper — that
     // pollutes LTX conditioning. On failure, video returns enhanced:false so the
     // caller applies its own plain-prompt/character handling.
-    let isVideo = mediaKind.lowercased() == "video"
+    let isVideo = mediaKind.lowercased().hasPrefix("video")
     guard config.enabled else {
       if isVideo { return OptimizeResult(prompt: prompt, enhanced: false, note: "optimizer disabled") }
       let wrapped = Self.wrapInQwen3Format(prompt: prompt, contentMode: contentMode)
@@ -263,33 +263,33 @@ public final class PromptOptimizer: @unchecked Sendable {
   // long detailed cinematic shot descriptions, physical performance cues, camera
   // vocabulary, length scaled to clip duration.
   private static let ltxRules = """
-  ## LTX-2.3 VIDEO RULES (per the official LTX-2.3 prompt guide)
+  ## LTX-2.3 VIDEO RULES (per the official + community LTX-2 prompt guides)
 
   You rewrite prompts for LTX-2.3, a text-to-VIDEO model. Write a detailed cinematic
-  SHOT DESCRIPTION — as if briefing a cinematographer — in flowing natural prose, one
-  paragraph, never labels or headers.
+  SHOT DESCRIPTION as flowing natural prose, one paragraph, PRESENT TENSE, no labels.
 
-  MOTION IS THE POINT. This is VIDEO, not a photograph. The subject must be in
-  CONTINUOUS, ENERGETIC motion for the whole clip, and the camera should MOVE. A calm,
-  posed, or static description produces a frozen clip — that is a FAILURE.
+  MOTION MUST BE NATURAL AND COHERENT. Describe the action as ONE smooth SEQUENCE that
+  flows from beginning to end — a real, physically-plausible movement, NOT a frantic
+  pile of verbs. The subject moves deliberately and continuously; the camera makes ONE
+  clean move. Avoid BOTH failure modes: a static/posed subject (frozen clip) AND a
+  chaotic spray of rapid actions (spastic, jittery clip).
 
-  1. AMPLIFY the action. Take the user's action and make it bigger and continuous —
-     describe a SEQUENCE of movements over time (she spins, throws her arms overhead,
-     drops low, hair whipping, then rises again). Strong motion verbs throughout; never
-     let the subject merely stand, pose, sit still, or gaze.
-  2. Everything MOVES: body, limbs, hair, fabric, and the environment reacting (sand
-     kicked up, water splashing, dust, wind-blown cloth).
-  3. The CAMERA MOVES — pick an ACTIVE move and state it (orbiting tracking shot, handheld
-     follow, fast push-in, whip pan, arc). Never a locked-off static camera.
-  4. FORBIDDEN — never use these motion-killing words: tranquil, tranquility, serene,
-     peaceful, still, stillness, calm, posed, candid, gazing, standing, gentle, soft,
-     dreamy, quiet, motionless, frozen. Do NOT over-emphasize shallow depth of field or
-     bokeh at the expense of action.
-  5. AFTER motion is established, add ENVIRONMENT, LIGHTING, and lens/film feel briefly
-     (golden hour, neon reflections, 85mm, low angle). Physical cues, not emotional labels.
+  1. Write the core action as a natural sequence — beginning, middle, end — and say how it
+     RESOLVES (where the subject and camera end up) so the model knows how to finish the
+     motion. e.g. "she walks forward, slows, and turns to face the camera," NOT "she spins
+     jumps twirls leaps whips."
+  2. Motion is smooth and grounded in real physics — weight, momentum, follow-through. Hair
+     and fabric move WITH the body. Prefer deliberate and flowing over fast and frantic.
+  3. ONE clean, readable camera move, stated plainly: "slow dolly in," "handheld tracking,"
+     "the camera pans right to reveal…," "orbits slowly." NOT rapid whip pans, crash zooms,
+     or several conflicting moves at once.
+  4. Direct performance with PHYSICAL cues, not emotional labels — posture, gesture, facial
+     nuance; keep it subtle. LTX excels at nuanced single-subject motion.
+  5. Then add ENVIRONMENT, LIGHTING, and lens/film feel briefly (golden hour, 85mm, shallow
+     depth of field, low angle).
   6. If a character description is given, treat it as canonical — never contradict it. Name
      the character AT MOST ONCE, pronouns after.
-  7. Longer prompts outperform on 2.3 — scale length to the clip. Natural prose only. NO
+  7. Longer prompts help on 2.3 — scale length to the clip. Natural prose only. NO
      "YOUR CONTEXT"/"YOUR PHOTO", no markdown, no lists, no preamble.
   """
 
@@ -329,8 +329,32 @@ public final class PromptOptimizer: @unchecked Sendable {
   Return ONLY the rewritten cinematic video prompt as a single flowing paragraph.
   """
 
+  // Image-to-video: the subject, appearance, wardrobe, setting, and lighting ALREADY
+  // exist in the source image. Enhancement must describe ONLY the motion — re-describing
+  // the subject or scene fights the init image and degrades i2v.
+  private static let systemPromptVideoI2V = """
+  You are a MOTION director for LTX-2.3 image-to-video. A source IMAGE already fixes the
+  subject, their appearance, clothing, the setting, and the lighting. You add ONLY the
+  MOTION that brings that image to life.
+
+  \(ltxRules)
+
+  ## IMAGE-TO-VIDEO — MOTION ONLY
+  CRITICAL: Do NOT re-describe the subject's looks, body, clothing, or the environment —
+  those come from the image and any contradiction corrupts the result. Describe ONLY:
+  how the subject moves (one natural, physically-grounded sequence), one clean camera
+  move if any, and motion-relevant detail (hair/fabric sway, ambient movement). Keep it
+  concise — motion direction, not a scene. If a content mode is set, the motion may be
+  explicit, but still describe only movement, never appearance.
+
+  ## OUTPUT
+  Return ONLY the motion description as a single short flowing paragraph.
+  """
+
   static func selectSystemPrompt(contentMode: String, mediaKind: String = "image") -> String {
-    if mediaKind.lowercased() == "video" {
+    let kind = mediaKind.lowercased()
+    if kind == "video-i2v" { return systemPromptVideoI2V }
+    if kind == "video" || kind == "video-t2v" {
       switch contentMode.lowercased() {
       case "avocado": return systemPromptVideoAvocado
       case "banana": return systemPromptVideoBanana

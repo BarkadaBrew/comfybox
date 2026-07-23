@@ -1830,10 +1830,11 @@ public final class WarmServer {
           ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
           timeoutSeconds: 90, enabled: true),
         logger: logger)
+      // i2v: motion-only enhancement (the init image fixes subject/scene); t2v: full scene.
       let result = await optimizer.optimize(
         prompt: req.prompt, character: characterName,
         characterDescription: characterDesc, contentMode: charMode.rawValue,
-        mediaKind: "video")
+        mediaKind: isT2V ? "video" : "video-i2v")
       if result.enhanced {
         effectivePrompt = result.prompt
         enhancedApplied = true
