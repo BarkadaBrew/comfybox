@@ -269,23 +269,28 @@ public final class PromptOptimizer: @unchecked Sendable {
   SHOT DESCRIPTION — as if briefing a cinematographer — in flowing natural prose, one
   paragraph, never labels or headers.
 
-  1. Be specific and descriptive. Paint the COMPLETE scene: SUBJECT, their ACTION, the
-     ENVIRONMENT, the LIGHTING, and the CAMERA behavior. Front-load subject + action.
-     (Guide example: "a young woman in a red coat walking briskly through a rain-soaked
-     Tokyo street at night, neon reflections on wet pavement, handheld camera following
-     from behind.")
-  2. Describe MOTION concretely — what the subject does over time; how hair, fabric, and
-     surroundings move. LTX responds to motion cues; a static description yields a static clip.
-  3. Direct performance with PHYSICAL cues, NOT emotional labels ("she tilts her head and
-     her shoulders drop," never "she looks sad").
-  4. Use cinematic language the model understands: lens (macro, wide, 85mm), shot type
-     (tracking shot, handheld follow, slow push-in, orbit, low angle), depth of field
-     (shallow), time/light (golden hour, neon reflections).
-  5. Longer, detailed prompts outperform short ones on 2.3 — scale length to the clip so the
-     model doesn't rush a long duration. Aim rich: ~100-200+ words for multi-second clips.
+  MOTION IS THE POINT. This is VIDEO, not a photograph. The subject must be in
+  CONTINUOUS, ENERGETIC motion for the whole clip, and the camera should MOVE. A calm,
+  posed, or static description produces a frozen clip — that is a FAILURE.
+
+  1. AMPLIFY the action. Take the user's action and make it bigger and continuous —
+     describe a SEQUENCE of movements over time (she spins, throws her arms overhead,
+     drops low, hair whipping, then rises again). Strong motion verbs throughout; never
+     let the subject merely stand, pose, sit still, or gaze.
+  2. Everything MOVES: body, limbs, hair, fabric, and the environment reacting (sand
+     kicked up, water splashing, dust, wind-blown cloth).
+  3. The CAMERA MOVES — pick an ACTIVE move and state it (orbiting tracking shot, handheld
+     follow, fast push-in, whip pan, arc). Never a locked-off static camera.
+  4. FORBIDDEN — never use these motion-killing words: tranquil, tranquility, serene,
+     peaceful, still, stillness, calm, posed, candid, gazing, standing, gentle, soft,
+     dreamy, quiet, motionless, frozen. Do NOT over-emphasize shallow depth of field or
+     bokeh at the expense of action.
+  5. AFTER motion is established, add ENVIRONMENT, LIGHTING, and lens/film feel briefly
+     (golden hour, neon reflections, 85mm, low angle). Physical cues, not emotional labels.
   6. If a character description is given, treat it as canonical — never contradict it. Name
      the character AT MOST ONCE, pronouns after.
-  7. Natural prose only. NO "YOUR CONTEXT"/"YOUR PHOTO", no markdown, no lists, no preamble.
+  7. Longer prompts outperform on 2.3 — scale length to the clip. Natural prose only. NO
+     "YOUR CONTEXT"/"YOUR PHOTO", no markdown, no lists, no preamble.
   """
 
   private static let systemPromptVideoNeutral = """
