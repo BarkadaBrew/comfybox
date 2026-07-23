@@ -1807,7 +1807,12 @@ public final class WarmServer {
        let entry = await characterStore.get(CharacterEntry.slug(name)) {
       let mode = req.contentMode.flatMap { ContentModeManager.Mode(rawValue: $0) } ?? .neutral
       let desc = entry.resolvedDescription(for: mode)
-      if !desc.isEmpty {
+      // Idempotency: skip if the caller already wrote the character's description
+      // into the prompt (e.g. Bree composes the full prompt) — avoid doubling.
+      let alreadyPresent = desc.split(separator: " ").prefix(4).allSatisfy {
+        effectivePrompt.localizedCaseInsensitiveContains($0)
+      }
+      if !desc.isEmpty && !alreadyPresent {
         effectivePrompt = desc + " " + effectivePrompt
         logger.info("Video: prepended character '\(name)' (mode \(mode.rawValue)) to prompt.")
       }
