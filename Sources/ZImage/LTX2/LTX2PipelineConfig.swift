@@ -168,6 +168,15 @@ public struct LTX2PipelineConfig: Sendable {
     (ProcessInfo.processInfo.environment["LTX2_SAMPLER"] ?? "").lowercased().contains("ancestral")
   }
 
+  /// CFG++ sampler family via env `LTX2_SAMPLER` containing "cfg_pp"
+  /// (`euler_cfg_pp` / `euler_ancestral_cfg_pp` — the SexGod/PinkCherry validated
+  /// samplers). CFG++ steps along the UNCONDITIONAL noise direction while
+  /// targeting the conditional x0, so it requires a negative-prompt pass every
+  /// step even at cfg=1. Reference: ComfyUI k_diffusion sample_euler_ancestral_cfg_pp.
+  public static var envCfgPP: Bool {
+    (ProcessInfo.processInfo.environment["LTX2_SAMPLER"] ?? "").lowercased().contains("cfg_pp")
+  }
+
   // STG (Spatiotemporal Guidance) — the 10Eros/LTX-2.3 authors' biggest anti-haze
   // lever for distilled (cfg=1) sampling. A perturbed transformer pass skips
   // self-attention in a mid-stack block subset; steering the denoised prediction

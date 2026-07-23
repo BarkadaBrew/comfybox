@@ -426,8 +426,39 @@ public final class LTX2VideoGenerator {
         // implemented, just never enabled) tiled path is designed for.
         // Running it as one giant pass is the leading suspect for the
         // uniform grid/mesh artifact seen in every local I2V test tonight.
+        // Two-stage refine (Phase 3): load the spatial latent upsampler if enabled.
+        // ltx-2.3-spatial-upscaler-x2-1.1 keys map 1:1 to LTX2LatentUpsampler.
+        var upsampler: LTX2LatentUpsampler? = nil
+        if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
+           let upPath = ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"],
+           FileManager.default.fileExists(atPath: upPath) {
+            let up = LTX2LatentUpsampler()
+            let w = try MLX.loadArrays(url: URL(fileURLWithPath: upPath))
+            // Checkpoint stores conv weights in PyTorch layout (out, in, *spatial);
+            // MLX conv layers are channels-last (out, *spatial, in). Permute conv
+            // weights by ndim: 5D Conv3d -> (0,2,3,4,1); 4D Conv2d -> (0,2,3,1).
+            // 1D params (norm weight/bias, conv bias) pass through untouched.
+            let remapped: [(String, MLXArray)] = w.map { (rawKey, v) in
+                // The spatial upsampler is a Sequential(Conv2d, PixelShuffle); the conv
+                // lands at `upsampler.0.*`. Rename to `upsampler.conv.*` to match the
+                // single-child module (avoids array-vs-dict container mismatch).
+                let key = rawKey.hasPrefix("upsampler.0.")
+                    ? "upsampler.conv." + rawKey.dropFirst("upsampler.0.".count)
+                    : rawKey
+                if key.hasSuffix(".weight") {
+                    if v.ndim == 5 { return (key, v.transposed(0, 2, 3, 4, 1)) }
+                    if v.ndim == 4 { return (key, v.transposed(0, 2, 3, 1)) }
+                }
+                return (key, v)
+            }
+            let params = ModuleParameters.unflattened(remapped)
+            try up.update(parameters: params, verify: [.shapeMismatch])
+            MLX.eval(up.parameters())
+            upsampler = up
+            logger.info("LTX-2: two-stage refine upsampler loaded (\(w.count) tensors)")
+        }
         let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: true)
-        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig)
+        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
         self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
         isLoaded = true
         loadedLoraKey = wantKey
@@ -467,6 +498,18 @@ public final class LTX2VideoGenerator {
 
         let batch = tokenizer.encode(prompt: request.prompt, maxLength: 128)
         MLX.eval(batch.inputIds, batch.attentionMask)
+
+        // Negative prompt: tokenize when provided, or default to the PinkCherry
+        // workflow negative when a CFG++ sampler is active (CFG++ requires a
+        // negative pass every step even at cfg=1).
+        let negText: String? = {
+            if let n = request.negativePrompt, !n.isEmpty { return n }
+            return LTX2PipelineConfig.envCfgPP
+                ? "subtitle, caption, text, text on screen, watermark, logo, timestamp"
+                : nil
+        }()
+        let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: 128) }
+        if let negBatch { MLX.eval(negBatch.inputIds, negBatch.attentionMask) }
 
         let start = CFAbsoluteTimeGetCurrent()
         var allFrames: [CGImage] = []
@@ -570,6 +613,8 @@ public final class LTX2VideoGenerator {
                         image: image, strength: request.strength,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        negativeInputIds: negBatch?.inputIds,
+                        negativeAttentionMask: negBatch?.attentionMask,
                         faceAnchorMask: chunk == 0 ? faceAnchorMask : nil,
                         faceAnchorStrength: faceAnchorStrength,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
@@ -594,9 +639,15 @@ public final class LTX2VideoGenerator {
             }
         }
 
+        // Use the ACTUAL decoded frame dimensions, not the request dims. With
+        // two-stage refine on, frames come back at 2x (e.g. 448x768 -> 896x1536);
+        // passing request.width/height here would downscale them and throw away
+        // all the refine detail. framesToImages carries per-frame dims.
+        let outW = allFrames.first?.width ?? request.width
+        let outH = allFrames.first?.height ?? request.height
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
-            fps: request.fps, width: request.width, height: request.height)
+            fps: request.fps, width: outW, height: outH)
 
         return LTX2VideoResult(
             outputPath: request.outputPath,

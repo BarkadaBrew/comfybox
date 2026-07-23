@@ -170,13 +170,17 @@ public enum LTX2PostProcess {
     // Create asset writer
     let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
-    // Video settings
+    // Video settings. Bitrate: 0.5 bits/pixel (~12 Mbps @ 768x1280x24) is
+    // visually equivalent to the old 4 bits/px for generated content but ~8x
+    // smaller — the old setting produced 139MB 12s files that exceeded
+    // Telegram's 50MB bot upload cap. Env-tunable via LTX2_VIDEO_BITS_PER_PX.
+    let bitsPerPixel = Double(ProcessInfo.processInfo.environment["LTX2_VIDEO_BITS_PER_PX"] ?? "") ?? 0.5
     let videoSettings: [String: Any] = [
       AVVideoCodecKey: AVVideoCodecType.h264,
       AVVideoWidthKey: width,
       AVVideoHeightKey: height,
       AVVideoCompressionPropertiesKey: [
-        AVVideoAverageBitRateKey: width * height * fps * 4,  // ~4 bits/pixel
+        AVVideoAverageBitRateKey: Int(Double(width * height * fps) * bitsPerPixel),
         AVVideoMaxKeyFrameIntervalKey: fps,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
       ] as [String: Any],

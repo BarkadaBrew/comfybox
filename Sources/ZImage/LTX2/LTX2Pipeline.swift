@@ -427,7 +427,9 @@ public final class LTX2Pipeline {
     eval(textOutput.videoEmbeddings)
 
     var negativeEmbeddings: MLXArray? = nil
-    if cfgScale > 1.0, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+    // CFG++ samplers need the negative embeddings every step even at cfg=1.
+    if cfgScale > 1.0 || LTX2PipelineConfig.envCfgPP,
+       let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       let negOutput = textEncoder.encode(
         inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
       )
@@ -474,11 +476,33 @@ public final class LTX2Pipeline {
       state.faceRef = imageLatent  // source-encoded latent = the face identity reference
       state.faceAnchorStrength = faceAnchorStrength
     }
+
+    // IC-control (union-control IC-LoRA): append the source-encoded latent as
+    // extra reference frames at temporal frame_idx 0, FROZEN (mask=1-strength).
+    // The merged union-control IC-LoRA makes self-attention lock structure to
+    // these reference frames -> coherent motion instead of morph. Env-gated
+    // LTX2_IC_CONTROL; MVP uses reference_downscale_factor=1 (no dilation).
+    // Mirrors ComfyUI LTXVAddGuide.append_keyframe (frame axis cat) +
+    // add_keyframe_index (temporal position -> frame_idx 0, handled in
+    // createPositionGrid via refFrames). Slice back to latF before decode.
+    var icRefFrames = 0
+    if ProcessInfo.processInfo.environment["LTX2_IC_CONTROL"] == "1" {
+      let refStrength = Float(ProcessInfo.processInfo.environment["LTX2_IC_REF_STRENGTH"] ?? "1.0") ?? 1.0
+      icRefFrames = imageLatent.dim(2)
+      state.latent = MLX.concatenated([state.latent, imageLatent.asType(state.latent.dtype)], axis: 2)
+      state.cleanLatent = MLX.concatenated([state.cleanLatent, imageLatent.asType(state.cleanLatent.dtype)], axis: 2)
+      let refMask = MLX.broadcast(
+        MLXArray(Float(1.0 - refStrength)).reshaped(1, 1, 1, 1, 1),
+        to: [1, 1, icRefFrames, 1, 1])
+      state.denoiseMask = MLX.concatenated([state.denoiseMask, refMask], axis: 2)
+      logger.info("IC-control: appended \(icRefFrames) reference frame(s) @ strength \(refStrength)")
+    }
     eval(state.latent, state.cleanLatent, state.denoiseMask)
 
-    // Step 5: Build position grid
+    // Step 5: Build position grid (extended by icRefFrames; ref frames get
+    // temporal frame_idx 0 inside createPositionGrid).
     let positions = createPositionGrid(
-      batchSize: 1, latF: latF, latH: latH, latW: latW
+      batchSize: 1, latF: latF, latH: latH, latW: latW, refFrames: icRefFrames
     )
 
     // Precompute RoPE
@@ -496,7 +520,7 @@ public final class LTX2Pipeline {
 
     // Step 6: Denoising loop with I2V state
     logger.info("Denoising with I2V conditioning...")
-    let latents = denoisingLoop(
+    let latentsAll = denoisingLoop(
       latents: state.latent,
       positions: positions,
       precomputedPE: precomputedPE,
@@ -507,6 +531,88 @@ public final class LTX2Pipeline {
       state: state,
       progressCallback: progressCallback
     )
+
+    // Drop the appended IC-control reference frames before decode (keep latF).
+    var latents = icRefFrames > 0
+      ? latentsAll[0..., 0..., 0..<latF, 0..., 0...]
+      : latentsAll
+
+    // Two-stage refine (Phase 3): latent upsample x2 -> re-noise -> short refine
+    // denoise at high res. Faithful to the proven two-stage i2v workflow (LTX2.3
+    // I2V GGUF 12GB): LTXVLatentUpsampler(spatial x2) -> RandomNoise ->
+    // SamplerCustomAdvanced with refine sigmas [0.8025,0.6332,0.4525,0.2425,0.0]
+    // (starts at 0.80 = partial denoise preserving the upsampled structure).
+    // Env-gated LTX2_TWO_STAGE; requires the loaded upsampler.
+    if let ups = self.upsampler, ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
+      logger.info("Two-stage refine: upsampling latents 2x...")
+      // The latent upsampler is trained on UN-normalized (VAE-scale) latents.
+      // The pipeline's working latents are per-channel normalized, so denormalize
+      // -> upsample -> renormalize (matches reference ltx2UpsampleLatents /
+      // ComfyUI LTXVLatentUpsampler). Feeding normalized latents raw produces
+      // structured garbage.
+      let stats = vae.decoder.perChannelStatistics
+      let denorm = stats.unNormalize(latents.asType(.float32))
+      let upDenorm = ups(denorm)
+      let upLatent = stats.normalize(upDenorm).asType(.float32)
+      eval(upLatent)
+      // DIAGNOSTIC: decode the upsampled latent directly (skip refine denoise) to
+      // isolate whether artifacts originate in the upsampler or the refine loop.
+      if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
+        latents = upLatent
+        logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
+      } else {
+      // Free base-pass intermediates before the memory-heavy refine (12s/289f).
+      MLX.GPU.clearCache()
+      let rLatH = latH * 2, rLatW = latW * 2
+      let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
+        let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+        return v.count >= 2 ? v : nil
+      } ?? [0.85, 0.7250, 0.4219, 0.0]  // PinkCherry v1.5 pass-2 sigmas (validated
+      // on ComfyUI 2026-07-22 with euler_cfg_pp; link-traced from the author's
+      // shipped workflow, SamplerCustomAdvanced #119).
+      if let seed = seed { MLXRandom.seed(seed &+ 1000) }
+      // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (matches ComfyUI CONST
+      // noise_scaling). NOT x0 + σ·ε — that unnormalized mix corrupts the refine.
+      let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
+      let sigma0 = refineSigmas[0]
+      let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
+      // Identity re-anchor (author's pass-2 LTXVImgToVideoInplace @ strength 1):
+      // frame 0 of the upsampled latent is the clean upscaled source frame —
+      // keep it CLEAN through the refine via a conditioning state (mask 0 at
+      // frame 0, per-token timestep 0), generated frames re-noised at σ0.
+      let rF = upLatent.dim(2)
+      let refineInit = MLX.concatenated(
+        [upLatent[0..., 0..., 0..<1, 0..., 0...], mixed[0..., 0..., 1..<rF, 0..., 0...]],
+        axis: 2)
+      let refMask = MLX.concatenated(
+        [MLXArray.zeros([1, 1, 1, 1, 1]), MLXArray.ones([1, 1, rF - 1, 1, 1])],
+        axis: 2).asType(.float32)
+      let refState = LTX2LatentState(
+        latent: refineInit, cleanLatent: upLatent, denoiseMask: refMask)
+      let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
+      let refinePE = ltx2PrecomputeFreqsCIS(
+        indicesGrid: refinePos, dim: innerDim,
+        theta: transformer.positionalEmbeddingTheta,
+        maxPos: transformer.positionalEmbeddingMaxPos,
+        useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
+        numAttentionHeads: transformer.numHeads,
+        ropeMode: transformer.ropeMode,
+        doublePrecision: transformer.doublePrecisionRoPE)
+      eval(refinePE.cos, refinePE.sin)
+      logger.info("Two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
+      // forceDeterministic drops the ancestral noise but keeps the CFG++ family:
+      // base=euler_ancestral_cfg_pp -> refine=euler_cfg_pp (the author's pairing).
+      latents = denoisingLoop(
+        latents: refineInit, positions: refinePos, precomputedPE: refinePE,
+        textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
+        sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
+        forceDeterministic: true,
+        progressCallback: progressCallback)
+      eval(latents)
+      MLX.GPU.clearCache()
+      logger.info("Two-stage refine complete.")
+      }
+    }
 
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
@@ -706,6 +812,7 @@ public final class LTX2Pipeline {
     sigmas: [Float],
     cfgScale: Float,
     state: LTX2LatentState?,
+    forceDeterministic: Bool = false,
     progressCallback: ((Int, Int) -> Void)?
   ) -> MLXArray {
     let dtype: DType = .bfloat16
@@ -714,7 +821,13 @@ public final class LTX2Pipeline {
 
     // Keep latents in float32 throughout for precision
     var currentLatents = latents.asType(.float32)
-    let useSDE = LTX2PipelineConfig.envAncestral
+    // Refine pass uses the deterministic member of the sampler family (validated
+    // PinkCherry recipe: base=euler_ancestral_cfg_pp, refine=euler_cfg_pp), so
+    // forceDeterministic drops the ancestral/SDE noise but keeps CFG++ mode.
+    let useSDE = LTX2PipelineConfig.envAncestral && !forceDeterministic
+    // CFG++ (euler[_ancestral]_cfg_pp): needs an unconditional (negative) pass
+    // every step regardless of cfgScale.
+    let useCfgPP = LTX2PipelineConfig.envCfgPP && negativeEmbeddings != nil
 
     for i in 0..<numSteps {
       let sigma = sigmas[i]
@@ -775,8 +888,12 @@ public final class LTX2Pipeline {
       var x0GuidedF32 = latentsFlatF32 - timestepsF32 * velocityPos.asType(.float32)
       let x0CondF32 = x0GuidedF32  // pure conditional x0, saved for the STG delta
 
-      // CFG: negative pass
-      if useCFG, let negEmb = negativeEmbeddings {
+      // Negative pass: needed for classic CFG (scale>1) and for CFG++ (every
+      // step, even at cfg=1 — the CFG++ update steps along the UNCONDITIONAL
+      // noise direction; see ComfyUI sample_euler_ancestral_cfg_pp which sets
+      // disable_cfg1_optimization=True for exactly this reason).
+      var x0UncondF32: MLXArray? = nil
+      if useCFG || useCfgPP, let negEmb = negativeEmbeddings {
         let velocityNeg = transformer(
           latent: latentsFlat,
           timestep: timesteps,
@@ -788,11 +905,14 @@ public final class LTX2Pipeline {
         eval(velocityNeg)
 
         let x0NegF32 = latentsFlatF32 - timestepsF32 * velocityNeg.asType(.float32)
-        x0GuidedF32 = LTX2Guidance.applyCFG(
-          conditioned: x0GuidedF32,
-          unconditioned: x0NegF32,
-          scale: cfgScale
-        )
+        x0UncondF32 = x0NegF32
+        if useCFG {
+          x0GuidedF32 = LTX2Guidance.applyCFG(
+            conditioned: x0GuidedF32,
+            unconditioned: x0NegF32,
+            scale: cfgScale
+          )
+        }
       }
 
       // STG: spatiotemporal guidance. A perturbed pass skips self-attention in a
@@ -839,7 +959,35 @@ public final class LTX2Pipeline {
 
       // Euler step (ancestral/SDE when LTX2_SAMPLER=euler_ancestral) in float32
       if sigmaNext > 0 {
-        if useSDE {
+        if useCfgPP, let x0Neg = x0UncondF32 {
+          // CFG++ step (ComfyUI sample_euler_ancestral_cfg_pp, flow/CONST model:
+          // exp(lambda(σ)) = (1-σ)/σ so alpha_s = 1-σ, alpha_t = 1-σ_next).
+          // Direction from the UNCONDITIONAL x0, target the conditional x0:
+          //   d = (x - alpha_s·x0_uncond) / σ
+          //   x = alpha_t·x0_cond + σ_down·d  (+ alpha_t·σ_up·noise, ancestral)
+          let x0UncondSpatial = x0Neg
+            .transposed(0, 2, 1)
+            .reshaped(b, c, f, h, w)
+          let alphaS = 1.0 - sigma
+          let alphaT = 1.0 - sigmaNext
+          let d = (currentLatents - MLXArray(alphaS) * x0UncondSpatial) / MLXArray(sigma)
+          var sigmaDown = sigmaNext
+          var sigmaUp: Float = 0
+          if useSDE {
+            // get_ancestral_step(σ/alpha_s, σ_next/alpha_t, eta=1), then
+            // σ_down = alpha_t · σ_down'
+            let sf = sigma / alphaS
+            let st = sigmaNext / alphaT
+            let up = min(st, (st * st * (sf * sf - st * st) / (sf * sf)).squareRoot())
+            sigmaDown = alphaT * (st * st - up * up).squareRoot()
+            sigmaUp = up
+          }
+          currentLatents = MLXArray(alphaT) * denoised + MLXArray(sigmaDown) * d
+          if useSDE && sigmaUp > 0 {
+            let noise = getNewNoise(shape: currentLatents.shape)
+            currentLatents = currentLatents + MLXArray(alphaT) * noise * MLXArray(sigmaUp)
+          }
+        } else if useSDE {
           let sigmaF32 = MLXArray(sigma)
           let eps = (currentLatents - denoised) / sigmaF32
           let (alphaRatio, sigmaDown, sigmaUp) = getSdeCoeff(sigmaNext: sigmaNext)
@@ -853,6 +1001,17 @@ public final class LTX2Pipeline {
         }
       } else {
         currentLatents = denoised
+      }
+      // CFG++ steps along the uncond direction, which drifts frames the denoise
+      // mask pins at timestep 0 (I2V conditioning / refine re-inject); re-snap
+      // them to the clean latent after every step (ComfyUI does the equivalent
+      // in its outer inpaint wrapper).
+      if useCfgPP, let s = state {
+        currentLatents = LTX2Conditioning.applyDenoiseMask(
+          denoised: currentLatents,
+          clean: s.cleanLatent.asType(.float32),
+          denoiseMask: s.denoiseMask
+        )
       }
 
       eval(currentLatents)
@@ -890,26 +1049,34 @@ public final class LTX2Pipeline {
     batchSize: Int,
     latF: Int,
     latH: Int,
-    latW: Int
+    latW: Int,
+    refFrames: Int = 0,   // IC-control: appended reference frames positioned at temporal frame_idx 0
+    spatialScaleMul: Float = 1.0   // refine: scale spatial positions to keep RoPE in-distribution at 2x
   ) -> MLXArray {
     let temporalScale = Float(temporalCompression)
-    let spatialScale = Float(spatialCompression)
+    let spatialScale = Float(spatialCompression) * spatialScaleMul
     let fps = Float(config.fps)
-    let numPatches = latF * latH * latW
+    let totalF = latF + refFrames
+    let numPatches = totalF * latH * latW
 
     // Build position indices
     var positions = [Float](repeating: 0, count: batchSize * 3 * numPatches * 2)
 
     for b in 0..<batchSize {
-      for f in 0..<latF {
+      for f in 0..<totalF {
+        // IC-control reference frames (grid index >= latF) take temporal
+        // frame_idx 0 (their own 0-based reference index) so RoPE treats them as
+        // reference context at the sequence start, not trailing frames. Mirrors
+        // ComfyUI add_keyframe_index: pixel_coords[:,0] += frame_idx(=0).
+        let tf = f < latF ? f : (f - latF)
         for h in 0..<latH {
           for w in 0..<latW {
             let tokenIdx = f * latH * latW + h * latW + w
             let baseIdx = b * 3 * numPatches * 2
 
             // Time start/end in pixel space
-            var tStart = Float(f) * temporalScale
-            var tEnd = Float(f + 1) * temporalScale
+            var tStart = Float(tf) * temporalScale
+            var tEnd = Float(tf + 1) * temporalScale
 
             // Causal fix: shift temporal coordinates
             tStart = max(0, tStart + 1 - temporalScale)
