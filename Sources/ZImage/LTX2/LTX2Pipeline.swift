@@ -857,6 +857,19 @@ public final class LTX2Pipeline {
       let sigma = sigmas[i]
       let sigmaNext = sigmas[i + 1]
 
+      // INPUT-side conditioning clamp (matches ComfyUI KSamplerX0Inpaint +
+      // LTXV.scale_latent_inpaint which returns the CLEAN latent, never
+      // re-noised): conditioned tokens (denoiseMask < 1) enter the model as
+      // clean latent every step, consistent with their per-token timestep of
+      // ~0. Without this the step update re-mixes noise into conditioned
+      // tokens, so the model reads a NOISY frame while told it's clean —
+      // misreading the reference each step (appearance divergence, i2v
+      // transition pop). Output-side x0 clamping alone is insufficient.
+      if let s = state {
+        let m = s.denoiseMask.asType(.float32)
+        currentLatents = currentLatents * m + s.cleanLatent.asType(currentLatents.dtype) * (MLXArray(Float(1)) - m)
+      }
+
       let b = currentLatents.dim(0)
       let c = currentLatents.dim(1)
       let f = currentLatents.dim(2)
@@ -1083,13 +1096,21 @@ public final class LTX2Pipeline {
   /// via LTX2_PLAIN_DECODE_MAX_LATF (latent frames; ~8x fewer than output frames).
   private func decodeAdaptive(_ latents: MLXArray) -> MLXArray {
     let latF = latents.dim(2)
-    let plainMaxLatF = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_LATF"] ?? "") ?? 24
+    let latH = latents.dim(3)
+    let latW = latents.dim(4)
+    // Gate on TOTAL latent volume, not frame count alone: a 768x1280 clip at
+    // latF 13 (24x40 spatial) is 3x the volume of 448x704 and plain decode at
+    // that size drove 40GB+ of swap with critical memory pressure mid-decode,
+    // corrupting the output (blank/gray frames). Budget = the proven-safe
+    // 448x704x97f working point (13*14*22 = 4004) with ~2x headroom.
+    let volume = latF * latH * latW
+    let plainMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_VOL"] ?? "") ?? 8000
     let bf = latents.asType(.bfloat16)
-    if config.tiledDecode && latF > plainMaxLatF {
-      logger.info("VAE decode: tiled (latF \(latF) > \(plainMaxLatF)) — OOM-safe path for long clip.")
+    if config.tiledDecode && volume > plainMaxVolume {
+      logger.info("VAE decode: tiled (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — OOM-safe path.")
       return vae.decodeTiled(bf)
     }
-    logger.info("VAE decode: plain single-pass (latF \(latF)) — clean, no tile mosaic.")
+    logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — clean, no tile mosaic.")
     return vae.decode(bf)
   }
 

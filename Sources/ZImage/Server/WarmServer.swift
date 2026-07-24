@@ -1555,6 +1555,29 @@ public final class WarmServer {
     /// provider (Dan's-PE via LM Studio) before encoding. Default on when a
     /// provider is configured; set false to send the raw prompt.
     let enhance: Bool?
+    /// Named resolution budget: "480p" | "720p" | "1080p". Maps to a
+    /// width x height pixel budget when explicit width/height are absent
+    /// (previously this key was silently DROPPED on the local path).
+    let resolution: String?
+    /// Aspect ratio for the resolution budget: "16:9" (default) or "9:16".
+    /// For I2V the source image's aspect still wins (budget only).
+    let aspectRatio: String?
+  }
+
+  /// Map a named resolution + aspect to a width x height budget. Dims are
+  /// budgets, not finals — the existing /64 snapping and I2V source-aspect
+  /// derivation still apply downstream.
+  private static func videoDims(resolution: String?, aspectRatio: String?) -> (width: Int, height: Int)? {
+    guard let res = resolution?.lowercased() else { return nil }
+    let landscape: (Int, Int)
+    switch res {
+    case "480p": landscape = (832, 480)
+    case "720p": landscape = (1280, 720)
+    case "1080p": landscape = (1920, 1080)
+    default: return nil
+    }
+    let portrait = (aspectRatio ?? "16:9") == "9:16"
+    return portrait ? (landscape.1, landscape.0) : landscape
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1772,8 +1795,14 @@ public final class WarmServer {
     // preset like 704x448 applied to a portrait source distorts the
     // conditioning frame and the render drifts off the image. The requested
     // width x height is kept only as a pixel-area budget for I2V.
-    var renderWidth = req.width ?? videoPreset?.width ?? 704
-    var renderHeight = req.height ?? videoPreset?.height ?? 448
+    // Priority: explicit width/height > named resolution ("720p" etc., FIXED:
+    // previously silently dropped) > preset dims > 704x448 default.
+    let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
+    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? 704
+    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? 448
+    if req.width == nil, let nd = namedDims {
+      logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
+    }
     if let initPath = effectiveInitImage,
        let sourceSize = Self.imagePixelSize(atPath: initPath) {
       let derived = Self.deriveVideoDims(
