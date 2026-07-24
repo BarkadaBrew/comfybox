@@ -156,7 +156,8 @@ public enum LTX2PostProcess {
     outputPath: String,
     fps: Int = 24,
     width: Int,
-    height: Int
+    height: Int,
+    bitsPerPixelOverride: Double? = nil
   ) throws {
     guard !frames.isEmpty else {
       throw LTX2PostProcessError.noFrames
@@ -174,7 +175,8 @@ public enum LTX2PostProcess {
     // visually equivalent to the old 4 bits/px for generated content but ~8x
     // smaller — the old setting produced 139MB 12s files that exceeded
     // Telegram's 50MB bot upload cap. Env-tunable via LTX2_VIDEO_BITS_PER_PX.
-    let bitsPerPixel = Double(ProcessInfo.processInfo.environment["LTX2_VIDEO_BITS_PER_PX"] ?? "") ?? 0.5
+    let bitsPerPixel = bitsPerPixelOverride
+      ?? Double(ProcessInfo.processInfo.environment["LTX2_VIDEO_BITS_PER_PX"] ?? "") ?? 0.5
     let videoSettings: [String: Any] = [
       AVVideoCodecKey: AVVideoCodecType.h264,
       AVVideoWidthKey: width,
@@ -316,6 +318,29 @@ public enum LTX2PostProcess {
 
       try data.write(to: URL(fileURLWithPath: path))
     }
+  }
+
+  /// Round-trip a single frame through a REAL H.264 encode/decode so it carries
+  /// video-codec artifacts (deblocked DCT, chroma subsampling). Ports ComfyUI's
+  /// LTXVPreprocess (PyAV libx264 CRF round-trip): LTX is trained on video
+  /// frames, and a pristine still conditioning frame freezes i2v motion.
+  /// `compression` follows the ComfyUI 0-100 scale (35 default ≈ CRF 35).
+  public static func h264RoundTrip(_ image: CGImage, compression: Int) throws -> CGImage {
+    // Per-frame bit budget: bpp ≈ 1.05·e^(−compression/28) → 35 ≈ 0.30 bpp
+    // (single I-frame at roughly CRF-35 crunch). Floor keeps the encoder sane.
+    let bpp = max(0.06, 1.05 * exp(-Double(compression) / 28.0))
+    let tmp = NSTemporaryDirectory() + "ltx2-cond-\(UUID().uuidString).mp4"
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    try writeMP4(
+      frames: [image], outputPath: tmp, fps: 24,
+      width: image.width, height: image.height,
+      bitsPerPixelOverride: bpp)
+    let asset = AVURLAsset(url: URL(fileURLWithPath: tmp))
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.requestedTimeToleranceBefore = .zero
+    gen.requestedTimeToleranceAfter = .positiveInfinity
+    gen.appliesPreferredTrackTransform = false
+    return try gen.copyCGImage(at: .zero, actualTime: nil)
   }
 }
 

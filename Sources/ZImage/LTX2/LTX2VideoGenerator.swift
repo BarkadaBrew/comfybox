@@ -536,18 +536,26 @@ public final class LTX2VideoGenerator {
             // LTX2_I2V_COMPRESSION=0 disables; 1-100 sets JPEG quality inverse.
             let compression = Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
             if compression > 0 {
-                let quality = max(0.05, 1.0 - Double(compression) / 100.0 * 1.4) // 35 -> ~0.51
-                let jpeg = NSMutableData()
-                if let dest = CGImageDestinationCreateWithData(
-                    jpeg as CFMutableData, "public.jpeg" as CFString, 1, nil) {
-                    CGImageDestinationAddImage(dest, cgImage, [
-                        kCGImageDestinationLossyCompressionQuality: quality
-                    ] as CFDictionary)
-                    if CGImageDestinationFinalize(dest),
-                       let rtSource = CGImageSourceCreateWithData(jpeg as CFData, nil),
-                       let rtImage = CGImageSourceCreateImageAtIndex(rtSource, 0, nil) {
-                        cgImage = rtImage
-                        logger.info("LTX-2 I2V: conditioning preprocess — JPEG round-trip q=\(String(format: "%.2f", quality)) (compression \(compression)).")
+                // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
+                // preprocess artifact character); fall back to JPEG if the
+                // encode fails for any reason.
+                if let rt = try? LTX2PostProcess.h264RoundTrip(cgImage, compression: compression) {
+                    cgImage = rt
+                    logger.info("LTX-2 I2V: conditioning preprocess — H.264 round-trip (compression \(compression)).")
+                } else {
+                    let quality = max(0.05, 1.0 - Double(compression) / 100.0 * 1.4)
+                    let jpeg = NSMutableData()
+                    if let dest = CGImageDestinationCreateWithData(
+                        jpeg as CFMutableData, "public.jpeg" as CFString, 1, nil) {
+                        CGImageDestinationAddImage(dest, cgImage, [
+                            kCGImageDestinationLossyCompressionQuality: quality
+                        ] as CFDictionary)
+                        if CGImageDestinationFinalize(dest),
+                           let rtSource = CGImageSourceCreateWithData(jpeg as CFData, nil),
+                           let rtImage = CGImageSourceCreateImageAtIndex(rtSource, 0, nil) {
+                            cgImage = rtImage
+                            logger.info("LTX-2 I2V: conditioning preprocess — JPEG fallback q=\(String(format: "%.2f", quality)) (compression \(compression)).")
+                        }
                     }
                 }
             }
