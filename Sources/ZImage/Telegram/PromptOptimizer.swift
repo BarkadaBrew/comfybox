@@ -286,7 +286,10 @@ public final class PromptOptimizer: @unchecked Sendable {
   4. Direct performance with PHYSICAL cues, not emotional labels — posture, gesture, facial
      nuance; keep it subtle. LTX excels at nuanced single-subject motion.
   5. Then add ENVIRONMENT, LIGHTING, and lens/film feel briefly (golden hour, 85mm, shallow
-     depth of field, low angle).
+     depth of field, low angle). LIGHTING RULE: the subject must be WELL-LIT with the face
+     clearly visible — state it explicitly ("warm light illuminating her face and body").
+     NEVER stage the subject as a backlit silhouette against a bright sky unless the user
+     explicitly asks for a silhouette.
   6. If a character description is given, treat it as canonical — never contradict it. Name
      the character AT MOST ONCE, pronouns after.
   7. Longer prompts help on 2.3 — scale length to the clip. Natural prose only. NO

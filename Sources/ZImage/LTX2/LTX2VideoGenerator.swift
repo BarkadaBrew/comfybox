@@ -523,8 +523,33 @@ public final class LTX2VideoGenerator {
         var currentImage: MLXArray? = try request.initImagePath.map { path in
             let url = URL(fileURLWithPath: path)
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                  var cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw LTX2VideoError.imageLoadFailed(path)
+            }
+            // LTX conditioning preprocess (ComfyUI LTXVPreprocess, img_compression
+            // 35 ≈ H.264 CRF 35): round-trip the still through lossy compression so
+            // it carries codec-like artifacts. LTX is trained on VIDEO frames — a
+            // pristine still is out-of-distribution and the model freezes it
+            // (mannequin i2v, no locomotion). Measured on the same source/prompt/
+            // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
+            // JPEG quality approximates the CRF-35 artifact level.
+            // LTX2_I2V_COMPRESSION=0 disables; 1-100 sets JPEG quality inverse.
+            let compression = Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
+            if compression > 0 {
+                let quality = max(0.05, 1.0 - Double(compression) / 100.0 * 1.4) // 35 -> ~0.51
+                let jpeg = NSMutableData()
+                if let dest = CGImageDestinationCreateWithData(
+                    jpeg as CFMutableData, "public.jpeg" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, cgImage, [
+                        kCGImageDestinationLossyCompressionQuality: quality
+                    ] as CFDictionary)
+                    if CGImageDestinationFinalize(dest),
+                       let rtSource = CGImageSourceCreateWithData(jpeg as CFData, nil),
+                       let rtImage = CGImageSourceCreateImageAtIndex(rtSource, 0, nil) {
+                        cgImage = rtImage
+                        logger.info("LTX-2 I2V: conditioning preprocess — JPEG round-trip q=\(String(format: "%.2f", quality)) (compression \(compression)).")
+                    }
+                }
             }
             let pixels = try QwenImageIO.resizedPixelArray(
                 from: cgImage, width: request.width, height: request.height,
