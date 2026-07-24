@@ -33,3 +33,7 @@ Tests/ZImageE2ETests/Resources/
 
 # Krea-2 MLX reference impl (third-party, re-fetchable from HF avlp12/Krea-2-Turbo-Alis-MLX-8bit)
 docs/krea2-reference/
+
+# Video QA harness: run outputs + local assets (NSFW stills etc.) stay untracked
+qa/video/runs/
+qa/video/assets/

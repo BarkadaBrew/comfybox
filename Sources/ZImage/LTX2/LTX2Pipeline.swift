@@ -1115,7 +1115,12 @@ public final class LTX2Pipeline {
     // corrupting the output (blank/gray frames). Budget = the proven-safe
     // 448x704x97f working point (13*14*22 = 4004) with ~2x headroom.
     let volume = latF * latH * latW
-    let plainMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_VOL"] ?? "") ?? 8000
+    // Default budget derived from the Metal max-buffer ceiling, measured
+    // empirically (2026-07-24): plain-decoding 49f @ 768x1280 (volume 6720,
+    // ~25GB peak intermediate) SILENTLY CORRUPTS the last ~60% of frames —
+    // no error, just garbage — while tiled decode of the same tensor is clean.
+    // 4004 (97f @ 448x704) is proven-safe; 4500 keeps margin below the cliff.
+    let plainMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_VOL"] ?? "") ?? 4500
     let bf = latents.asType(.bfloat16)
     if config.tiledDecode && volume > plainMaxVolume {
       logger.info("VAE decode: tiled (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — OOM-safe path.")
