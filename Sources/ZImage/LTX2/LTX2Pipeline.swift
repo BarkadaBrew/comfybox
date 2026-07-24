@@ -840,8 +840,19 @@ public final class LTX2Pipeline {
     progressCallback: ((Int, Int) -> Void)?
   ) -> MLXArray {
     let dtype: DType = .bfloat16
-    let useCFG = cfgScale > 1.0 && negativeEmbeddings != nil
     let numSteps = sigmas.count - 1
+    // Per-step CFG schedule (community "CFG ramp": e.g. LTX2_CFG_SCHEDULE=3,2,1 —
+    // CFG only on the first steps, where broad motion forms, then back to 1;
+    // 10Eros per-step guider pattern). Missing entries extend the last value.
+    let cfgSchedule: [Float]? = ProcessInfo.processInfo.environment["LTX2_CFG_SCHEDULE"].flatMap { s in
+      let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+      return v.isEmpty ? nil : v
+    }
+    func cfgAt(_ step: Int) -> Float {
+      guard let sch = cfgSchedule else { return cfgScale }
+      return sch[min(step, sch.count - 1)]
+    }
+    let useCFG = (cfgScale > 1.0 || (cfgSchedule?.contains { $0 > 1.0 } ?? false)) && negativeEmbeddings != nil
 
     // Keep latents in float32 throughout for precision
     var currentLatents = latents.asType(.float32)
@@ -943,11 +954,11 @@ public final class LTX2Pipeline {
 
         let x0NegF32 = latentsFlatF32 - timestepsF32 * velocityNeg.asType(.float32)
         x0UncondF32 = x0NegF32
-        if useCFG {
+        if useCFG && cfgAt(i) > 1.0 {
           x0GuidedF32 = LTX2Guidance.applyCFG(
             conditioned: x0GuidedF32,
             unconditioned: x0NegF32,
-            scale: cfgScale
+            scale: cfgAt(i)
           )
         }
       }
