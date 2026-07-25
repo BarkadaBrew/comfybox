@@ -326,9 +326,16 @@ public enum LTX2PostProcess {
   /// frames, and a pristine still conditioning frame freezes i2v motion.
   /// `compression` follows the ComfyUI 0-100 scale (35 default ≈ CRF 35).
   public static func h264RoundTrip(_ image: CGImage, compression: Int) throws -> CGImage {
-    // Per-frame bit budget: bpp ≈ 1.05·e^(−compression/28) → 35 ≈ 0.30 bpp
-    // (single I-frame at roughly CRF-35 crunch). Floor keeps the encoder sane.
-    let bpp = max(0.06, 1.05 * exp(-Double(compression) / 28.0))
+    // Per-frame bit budget mapped as CRF-equivalent: ComfyUI's LTXVPreprocess
+    // passes img_compression DIRECTLY to libx264 as CRF, and x264 halves
+    // bitrate per +6 CRF, so bpp ≈ a·2^(−crf/6). Calibrated at the proven
+    // working point (35 → ~0.30 bpp): a = 0.3·2^(35/6) ≈ 17.1. The old
+    // exponential (1.05·e^(−c/28)) matched at 33-35 but was 14x too LOSSY at
+    // low values — GT-config's img_compression=2 means CRF 2 (visually
+    // lossless, ~13 bpp), ours gave ~1 bpp, softening the conditioning frame
+    // and with it the ENTIRE render (stage-1 sharp 14.5 vs ComfyUI-content
+    // 41.4, 2026-07-25). Cap keeps single-frame encodes sane.
+    let bpp = min(16.0, max(0.06, 17.1 * pow(2.0, -Double(compression) / 6.0)))
     let tmp = NSTemporaryDirectory() + "ltx2-cond-\(UUID().uuidString).mp4"
     defer { try? FileManager.default.removeItem(atPath: tmp) }
     try writeMP4(
