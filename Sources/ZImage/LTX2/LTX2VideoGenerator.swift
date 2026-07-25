@@ -694,6 +694,17 @@ public final class LTX2VideoGenerator {
                 let lastFrame = output.decoded[0..., 0..., (t - 1)..<t, 0..., 0...].squeezed(axis: 2)
                 currentImage = lastFrame * 2.0 - 1.0
                 MLX.eval(currentImage!)
+
+                // Chunk-boundary drain (#34): the next chunk starts with the
+                // previous chunk's decode intermediates (up to ~25GB) still in
+                // the MLX pool + lazily-reclaimed by macOS. The per-JOB
+                // admission drain never sees this boundary — 2026-07-25 the
+                // server Metal-aborted 2s into chunk 1 of a 12s Kira render
+                // (crash at 10:48:12, tracker wiped, daemon polled a ghost job
+                // to timeout). Drop the pool and give the OS a beat to reclaim
+                // before the next chunk allocates.
+                MLX.GPU.clearCache()
+                Thread.sleep(forTimeInterval: 3.0)
             }
         }
 
