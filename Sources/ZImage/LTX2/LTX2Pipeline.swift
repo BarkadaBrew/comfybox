@@ -854,6 +854,30 @@ public final class LTX2Pipeline {
     }
     let useCFG = (cfgScale > 1.0 || (cfgSchedule?.contains { $0 > 1.0 } ?? false)) && negativeEmbeddings != nil
 
+    // --- Denoise-trajectory instrumentation (env-gated, off by default) ---
+    // Set LTX2_TRAJ_DUMP=<path-prefix> to append one JSON line per step to
+    // <path-prefix>.jsonl with latent/x0/velocity statistics. Used to diff
+    // sampler behavior numerically against reference implementations
+    // (e.g. ComfyUI). Zero overhead when the env var is unset.
+    let trajPrefix = ProcessInfo.processInfo.environment["LTX2_TRAJ_DUMP"]
+    var trajHandle: FileHandle? = nil
+    // Mean over all elements.
+    func trajMean(_ x: MLXArray) -> MLXArray { x.mean() }
+    // Std over all elements (population).
+    func trajStd(_ x: MLXArray) -> MLXArray {
+      let m = x.mean()
+      return MLX.sqrt(((x - m) * (x - m)).mean())
+    }
+    // Weighted mean/std over token subset. x: (B, T, C) f32, w: (B, T) f32 0/1.
+    func trajMaskedStats(_ x: MLXArray, _ w: MLXArray) -> (mean: MLXArray, std: MLXArray) {
+      let w3 = w.expandedDimensions(axis: -1)
+      let channels = Float(x.dim(-1))
+      let count = w.sum() * channels + 1e-6
+      let m = (x * w3).sum() / count
+      let v = (((x - m) * (x - m)) * w3).sum() / count
+      return (m, MLX.sqrt(v))
+    }
+
     // Keep latents in float32 throughout for precision
     var currentLatents = latents.asType(.float32)
     // Refine pass uses the deterministic member of the sampler family (validated
@@ -880,6 +904,11 @@ public final class LTX2Pipeline {
         let m = s.denoiseMask.asType(.float32)
         currentLatents = currentLatents * m + s.cleanLatent.asType(currentLatents.dtype) * (MLXArray(Float(1)) - m)
       }
+
+      // Snapshot pre-step latents for delta_norm (post input-clamp so the
+      // delta measures the denoise update; no compute or eval unless
+      // trajectory dumping is enabled).
+      let trajLatentsBefore: MLXArray? = trajPrefix != nil ? currentLatents : nil
 
       let b = currentLatents.dim(0)
       let c = currentLatents.dim(1)
@@ -1069,7 +1098,81 @@ public final class LTX2Pipeline {
       }
 
       eval(currentLatents)
+
+      // --- Trajectory dump (after step update) ---
+      if let prefix = trajPrefix, let before = trajLatentsBefore {
+        // Scalar stats via small MLX reductions; only scalars are evaluated.
+        let velocityF32 = velocityPos.asType(.float32)
+        let deltaAbs = MLX.abs(currentLatents - before)
+
+        var fields: [(String, Float)] = [
+          ("sigma", sigma),
+          ("sigmaNext", sigmaNext),
+          ("latent_mean", trajMean(currentLatents).item(Float.self)),
+          ("latent_std", trajStd(currentLatents).item(Float.self)),
+          ("x0_mean", trajMean(denoised).item(Float.self)),
+          ("x0_std", trajStd(denoised).item(Float.self)),
+          ("velocity_mean_abs", trajMean(MLX.abs(velocityF32)).item(Float.self)),
+          ("delta_norm", trajMean(deltaAbs).item(Float.self)),
+          // Plain Euler step: no ancestral noise injection (sigmaUp == 0).
+          ("noise_injected", 0),
+        ]
+
+        // Conditioned vs generated token subsets (I2V only).
+        if let s = state {
+          let maskFlat = MLX.broadcast(
+            s.denoiseMask.reshaped(b, 1, f, 1, 1),
+            to: [b, 1, f, h, w]
+          ).reshaped(b, numTokens).asType(.float32)
+          let genW = (maskFlat .> 0.5).asType(.float32)
+          let condW = 1.0 - genW
+
+          // Token-space (B, T, C) views for subset reductions.
+          let curFlat = currentLatents.reshaped(b, c, -1).transposed(0, 2, 1)
+          let x0Flat = denoised.reshaped(b, c, -1).transposed(0, 2, 1)
+          let deltaFlat = deltaAbs.reshaped(b, c, -1).transposed(0, 2, 1)
+
+          for (suffix, weight) in [("cond", condW), ("gen", genW)] {
+            let latentStats = trajMaskedStats(curFlat, weight)
+            let x0Stats = trajMaskedStats(x0Flat, weight)
+            let deltaMean = (deltaFlat * weight.expandedDimensions(axis: -1)).sum()
+              / (weight.sum() * Float(c) + 1e-6)
+            fields.append(("latent_mean_\(suffix)", latentStats.mean.item(Float.self)))
+            fields.append(("latent_std_\(suffix)", latentStats.std.item(Float.self)))
+            fields.append(("x0_mean_\(suffix)", x0Stats.mean.item(Float.self)))
+            fields.append(("x0_std_\(suffix)", x0Stats.std.item(Float.self)))
+            fields.append(("delta_norm_\(suffix)", deltaMean.item(Float.self)))
+          }
+        }
+
+        // Serialize one JSON line and append (create file on first step).
+        var jsonParts = ["\"step\":\(i)"]
+        for (key, value) in fields {
+          let v = value.isFinite ? String(format: "%.8e", value) : "null"
+          jsonParts.append("\"\(key)\":\(v)")
+        }
+        let line = "{" + jsonParts.joined(separator: ",") + "}\n"
+
+        if trajHandle == nil {
+          let path = prefix + ".jsonl"
+          FileManager.default.createFile(atPath: path, contents: nil)
+          trajHandle = FileHandle(forWritingAtPath: path)
+          if trajHandle == nil {
+            logger.warning("LTX2_TRAJ_DUMP: cannot open \(path) for writing")
+          }
+        }
+        if let handle = trajHandle, let data = line.data(using: .utf8) {
+          handle.seekToEndOfFile()
+          handle.write(data)
+          try? handle.synchronize()
+        }
+      }
+
       progressCallback?(i + 1, numSteps)
+    }
+
+    if let handle = trajHandle {
+      try? handle.close()
     }
 
     return currentLatents
