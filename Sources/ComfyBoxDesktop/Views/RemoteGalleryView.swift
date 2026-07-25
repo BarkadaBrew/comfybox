@@ -94,7 +94,8 @@ struct RemoteGalleryView: View {
             .onTapGesture {
                 lightboxIndex = remote.assets.firstIndex(where: { $0.id == asset.id })
             }
-            Text(asset.filename).font(.caption2).lineLimit(1).truncationMode(.middle)
+            .contentGated(cornerRadius: 8)
+            GatedText(asset.filename, font: .caption2).lineLimit(1)
             if !remote.isLocalServer, ingestor != nil {
                 Button { Task { await pull(asset) } } label: {
                     Label("Save locally", systemImage: "square.and.arrow.down").font(.caption2)

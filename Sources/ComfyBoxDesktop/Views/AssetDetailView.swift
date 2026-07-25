@@ -198,6 +198,7 @@ struct AssetDetailView: View {
                 }
             }
         }
+        .contentGated(cornerRadius: 0)
     }
 
     // MARK: - Metadata Panel
@@ -352,8 +353,7 @@ struct AssetDetailView: View {
                 .fontWeight(.semibold)
 
             if let prompt = asset.prompt {
-                Text(prompt)
-                    .font(.caption)
+                GatedText(prompt, font: .caption)
                     .foregroundStyle(.primary)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)

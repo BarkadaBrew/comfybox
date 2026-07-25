@@ -64,6 +64,11 @@ struct GalleryView: View {
     @State private var securedIds: Set<String> = []
     @State private var revealSecured: Bool = false
 
+    // App-wide "Rated G unless NSFW toggled" master gate (Todd 2026-07-17).
+    // When hidden, the whole gallery is walled off regardless of the per-mode
+    // filter below.
+    @Environment(AppContentGate.self) private var contentGate
+
     // NSFW content gate (content-mode based, unlocked by a gallery password).
     @State private var nsfwMode: NSFWFilterMode = .blur
     @State private var nsfwUnlocked: Bool = false
@@ -157,6 +162,8 @@ struct GalleryView: View {
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if !contentGate.revealed {
+                    ContentHiddenWall(note: "The gallery holds generated content.")
                 } else if filteredAssets.isEmpty {
                     emptyState
                 } else {
