@@ -1,10 +1,21 @@
 """Objective video metrics for the ComfyBox video QA harness.
 
-All metrics are computed on downscaled frames (320px wide) for speed; they are
-comparative fingerprints, not absolute units. Calibration anchors (2026-07-24):
-a good deliberate i2v ≈ motion 0.31 / jerk 0.14; a near-static t2v ≈ motion
-0.08-0.14 / jerk 0.015-0.03. Ground-truth ComfyUI renders scored with this same
-module define per-case target bands in suite.json.
+All motion metrics are computed on downscaled frames (320px wide) for speed;
+they are comparative fingerprints, not absolute units. Calibration anchors
+(2026-07-24): a good deliberate i2v ≈ motion 0.31 / jerk 0.14; a near-static
+t2v ≈ motion 0.08-0.14 / jerk 0.015-0.03. Ground-truth ComfyUI renders scored
+with this same module define per-case target bands in suite.json.
+
+Sharpness normalization (2026-07-25): Laplacian variance depends strongly on
+the downscale ratio (how much the source resolution exceeds the analysis
+width), so values computed on the 320px motion frames were NOT comparable
+across output resolutions — the 20260724-170839 run scored the 9:16 dance clip
+sharp 3651 vs the 384px-wide anchor at 111 with no real sharpness difference.
+`sharp_mean`/`sharp_std`/`flicker_index` are now computed on full-resolution
+frames resized to a FIXED 512px width before the Laplacian, making them
+comparable across resolutions. The old 320px-motion-frame value is preserved
+as `sharp_raw` (do not compare it across resolutions; kept only for continuity
+with pre-2026-07-25 records).
 """
 import cv2
 import numpy as np
@@ -72,12 +83,50 @@ def motion_profile(frames):
     }
 
 
-def sharpness_stability(frames, step=4):
-    lap = [cv2.Laplacian(cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
-           for i in range(0, len(frames), step)]
-    return {"sharp_mean": round(float(np.mean(lap)), 1),
-            "sharp_std": round(float(np.std(lap)), 1),
-            "flicker_index": round(float(np.std(lap) / (np.mean(lap) + 1e-6)), 3)}
+SHARP_NORM_WIDTH = 512  # fixed analysis width -> resolution-comparable Laplacian
+
+
+def _lap_var(im):
+    return cv2.Laplacian(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+
+
+def _to_norm_width(f):
+    """Resize to SHARP_NORM_WIDTH with anti-aliased downscale (INTER_AREA) /
+    smooth upscale (INTER_CUBIC). Measured on the dance clip rescaled to
+    384/640/960/1408px source widths: plain INTER_LINEAR gave a 5x sharp_mean
+    spread across source resolutions; AREA/CUBIC gives ~2x (residual is genuine
+    detail lost at low source resolutions)."""
+    h = int(f.shape[0] * SHARP_NORM_WIDTH / f.shape[1])
+    interp = cv2.INTER_AREA if f.shape[1] > SHARP_NORM_WIDTH else cv2.INTER_CUBIC
+    return cv2.resize(f, (SHARP_NORM_WIDTH, h), interpolation=interp)
+
+
+def sharpness_stability(frames, path=None, step=4):
+    """Sharpness/flicker. `frames` are the 320px motion frames (used only for
+    the legacy `sharp_raw`). When `path` is given, the normalized fields are
+    computed on full-resolution frames resized to SHARP_NORM_WIDTH so values
+    compare across output resolutions (see module docstring)."""
+    raw = [_lap_var(frames[i]) for i in range(0, len(frames), step)]
+    out = {"sharp_raw": round(float(np.mean(raw)), 1)}
+
+    lap = []
+    if path is not None:
+        cap = cv2.VideoCapture(path)
+        i = 0
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            if i % step == 0:
+                lap.append(_lap_var(_to_norm_width(f)))
+            i += 1
+        cap.release()
+    if not lap:  # no path (or unreadable): fall back to upscaling motion frames
+        lap = [_lap_var(_to_norm_width(frames[i])) for i in range(0, len(frames), step)]
+    out.update({"sharp_mean": round(float(np.mean(lap)), 1),
+                "sharp_std": round(float(np.std(lap)), 1),
+                "flicker_index": round(float(np.std(lap) / (np.mean(lap) + 1e-6)), 3)})
+    return out
 
 
 def source_similarity(frames, source_path):
@@ -124,7 +173,7 @@ def score(path, source_path=None):
         return {"error": "unreadable", "validity": {"valid": False}}
     r = {"validity": validity(frames)}
     r.update(motion_profile(frames))
-    r.update(sharpness_stability(frames))
+    r.update(sharpness_stability(frames, path=path))
     if source_path:
         r.update(source_similarity(frames, source_path))
     return r

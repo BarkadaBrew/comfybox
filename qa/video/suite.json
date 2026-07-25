@@ -114,15 +114,16 @@
         "valid": true,
         "motion_min": 1.2,
         "reversal_max": 0.1,
-        "sharp_min": 140,
+        "sharp_min": 44,
         "anatomy_min": 5
       },
-      "note": "Mirrors ~/Downloads/sexgod-validate-workflow.json base pass; ground-truth twin rendered in ComfyUI defines the target band.",
+      "note": "Mirrors ~/Downloads/sexgod-validate-workflow.json base pass; ground-truth twin rendered in ComfyUI defines the target band. sharp_min/gt sharp_mean rescaled 2026-07-25 to the normalized 512px-width metric (old raw value kept as sharp_raw).",
       "gt_reference": {
         "motion": 1.71,
         "jerk": 0.671,
         "reversal_rate": 0.064,
-        "sharp_mean": 188.7,
+        "sharp_mean": 58.8,
+        "sharp_raw": 188.7,
         "video": "runs/ground-truth/i2v-workflow-anchor_GT.mp4"
       }
     },

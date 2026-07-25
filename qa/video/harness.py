@@ -19,12 +19,14 @@ Usage:
   python3 harness.py --cases id1,id2 # explicit
   python3 harness.py --no-judge      # objective metrics only
   python3 harness.py --no-restart    # skip server restarts (fast, riskier)
+  python3 harness.py --iterate       # + ranked FAIL triage -> iterate_suggestions.json
 """
 import argparse
 import datetime
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -64,14 +66,31 @@ def server_restart():
                    capture_output=True)
     time.sleep(4)
     subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", PLIST], capture_output=True)
+    up = False
     for _ in range(60):
         try:
             http("GET", f"{SERVER}/health", timeout=3)
-            print("[harness] server ready")
-            return True
+            up = True
+            break
         except Exception:
             time.sleep(3)
-    raise RuntimeError("server did not come back after restart")
+    if not up:
+        raise RuntimeError("server did not come back after restart")
+    # /health reachable != models ready: wait for 'loaded' before submitting
+    # (submitting while loading is how last night's admission failures happened)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        try:
+            h = http("GET", f"{SERVER}/health", timeout=3)
+        except Exception:
+            time.sleep(3)
+            continue
+        if h.get("loaded"):
+            print("[harness] server ready (loaded=true)")
+            return True
+        time.sleep(3)
+    print("[harness] WARN: /health never reported loaded=true within 300s — submitting anyway")
+    return True
 
 
 def config_snapshot():
@@ -141,7 +160,14 @@ def render(case, run_dir):
                 pass
             return {"output": dst, "render_seconds": round(time.time() - t0)}
         if s == "failed":
-            return {"error": st.get("error", "failed"), "render_seconds": round(time.time() - t0)}
+            # NB: st.get("error", "failed") returned None when the server sent
+            # "error": null (default only covers a MISSING key) — that's why
+            # last night's failure records had empty error strings. Fall through
+            # alternate fields, then keep the raw status body as last resort.
+            err = st.get("error") or st.get("detail") or st.get("message")
+            if not err:
+                err = f"failed (no error field; status body: {json.dumps(st)[:300]})"
+            return {"error": err, "render_seconds": round(time.time() - t0)}
     return {"error": "timeout"}
 
 
@@ -224,12 +250,89 @@ def write_report(records, run_dir):
     open(os.path.join(run_dir, "report.md"), "w").write("\n".join(lines))
 
 
+# Documented failure-type -> lever map (qa/video iteration playbook).
+LEVERS = {
+    "motion_low": "trajectory/prompt — stronger motion verbs + explicit trajectory beats; i2v: check strength",
+    "motion_high": "trajectory/prompt — calm the prompt / control-case wording (over-motion regression)",
+    "corrupt_frames": "decode gate — volume decode gate / input-side conditioning clamp",
+    "identity": "anchors — IC-control + face anchor (anchor default-on multi-chunk)",
+    "artifacts": "recipe — aligned sexgod recipe (distill LoRA bake, refine pass, scheduler)",
+    "render_failed": "ops — inspect server error (memory admission, plist, weights); not a content lever",
+}
+_FAIL_TYPE_RULES = [
+    ("corrupt frames", "corrupt_frames"),
+    ("identity", "identity"),
+    ("not solo", "motion_high"),  # wrong subject count -> prompt-side fix
+    ("anatomy", "artifacts"),
+    ("artifacts", "artifacts"),
+    ("motion_quality", "artifacts"),   # judge-observed jumpy motion -> recipe
+    ("choreography", "motion_low"),    # missing beats -> trajectory/prompt
+    ("jerk", "artifacts"),
+]
+
+
+def _classify_failure(fail):
+    if fail.startswith("motion "):
+        return "motion_low" if "<" in fail else "motion_high"
+    for prefix, t in _FAIL_TYPE_RULES:
+        if fail.startswith(prefix):
+            return t
+    return "artifacts"
+
+
+def _band_distance(fail):
+    """Normalized distance from the band edge; hard failures count as 1.0."""
+    m = re.search(r"([\d.]+) ([<>]) ([\d.]+)", fail)
+    if not m:
+        return 1.0
+    val, band = float(m.group(1)), float(m.group(3))
+    return round(abs(val - band) / max(band, 1e-6), 3)
+
+
+def iterate_suggestions(records, run_dir):
+    entries = []
+    for r in records:
+        if r["verdict"] == "PASS":
+            continue
+        if r["verdict"] == "RENDER_FAILED":
+            entries.append({"id": r["id"], "verdict": r["verdict"], "max_distance": 1.0,
+                            "failures": [{"failure": f"render failed: {r.get('error')}",
+                                          "type": "render_failed", "distance": 1.0,
+                                          "lever": LEVERS["render_failed"]}]})
+            continue
+        fails = []
+        for f in r.get("failures", []):
+            t = _classify_failure(f)
+            fails.append({"failure": f, "type": t, "distance": _band_distance(f),
+                          "lever": LEVERS.get(t, LEVERS["artifacts"])})
+        if fails:
+            entries.append({"id": r["id"], "verdict": r["verdict"],
+                            "max_distance": max(x["distance"] for x in fails),
+                            "failures": fails})
+    entries.sort(key=lambda e: -e["max_distance"])
+    out = os.path.join(run_dir, "iterate_suggestions.json")
+    with open(out, "w") as f:
+        json.dump({"run": os.path.basename(run_dir), "suggestions": entries}, f, indent=1)
+    print("\n[harness] next actions (worst first):")
+    if not entries:
+        print("  (no failures — nothing to iterate on)")
+    for e in entries:
+        print(f"  {e['id']} [{e['verdict']}] (distance {e['max_distance']}):")
+        for x in e["failures"]:
+            print(f"    - {x['failure']}  ->  {x['lever']}")
+    print(f"[harness] wrote {out}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--cases", default=None)
     ap.add_argument("--no-judge", action="store_true")
     ap.add_argument("--no-restart", action="store_true")
+    ap.add_argument("--iterate", action="store_true",
+                    help="after the run: rank FAILs by band distance, print next actions, "
+                         "write iterate_suggestions.json")
     args = ap.parse_args()
 
     suite = json.load(open(os.path.join(HERE, "suite.json")))
@@ -256,7 +359,10 @@ def main():
             rendered = render(case, run_dir)
             rec = evaluate(case, rendered, run_dir, do_judge=False)
             records.append(rec)
-            print(f"[harness] {case['id']}: rendered ({rec.get('render_seconds','-')}s)")
+            if "output" in rendered:
+                print(f"[harness] {case['id']}: rendered ({rec.get('render_seconds','-')}s)")
+            else:
+                print(f"[harness] {case['id']}: RENDER FAILED: {rec.get('error', 'unknown')}")
     finally:
         kira_pause(False)
     # JUDGE PHASE: after all renders — the VLM shares the GPU and starves
@@ -265,13 +371,13 @@ def main():
         print("[harness] judge phase")
         for rec, case in zip(records, selected):
             if rec.get("output"):
-                for attempt in range(3):
-                    j = judge_mod.judge(rec["output"], case["prompt"], run_dir)
-                    if not j.get("error"):
-                        break
-                    time.sleep(10)
+                # judge() retries internally (3x, 15s apart, temp 0 on retry)
+                j = judge_mod.judge(rec["output"], case["prompt"], run_dir)
                 rec["judge"] = j
-                _apply_judge_bands(rec, case)
+                if j.get("skipped"):
+                    print(f"[harness] {rec['id']}: judge SKIPPED after retries "
+                          f"({j.get('error')}) — judge bands not counted, objective metrics stand")
+                _apply_judge_bands(rec, case)  # no-op for skipped/error judges
     for rec in records:
         with open(os.path.join(run_dir, "results.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -280,6 +386,8 @@ def main():
     write_report(records, run_dir)
     print(f"[harness] done: {sum(1 for r in records if r['verdict']=='PASS')}/{len(records)} PASS")
     print(f"[harness] report: {run_dir}/report.md")
+    if args.iterate:
+        iterate_suggestions(records, run_dir)
 
 
 if __name__ == "__main__":

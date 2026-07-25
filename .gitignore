@@ -37,3 +37,4 @@ docs/krea2-reference/
 # Video QA harness: run outputs + local assets (NSFW stills etc.) stay untracked
 qa/video/runs/
 qa/video/assets/
+qa/video/__pycache__/
