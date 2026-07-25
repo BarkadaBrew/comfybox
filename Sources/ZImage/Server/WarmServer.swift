@@ -4980,14 +4980,32 @@ private actor WarmServerCoordinator {
         // on the serial render queue guarantees no image render can re-load
         // between the eviction and the video load.
         let freedForVideoMB = await releaseImageModelsForVideo()
-        let availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+        var availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
         // Precision-keyed (#230): an int8-quantized checkpoint dir gates at
         // 40GB instead of the bf16 65GB, so video coexists with LM Studio.
         let ltx2Need = HeavyModelAdmission.ltx2EstimateBytes(
           forWeightsPath: configuration.ltx2WeightsPath)
+        // Drain-until-settled (#34): back-to-back renders (e.g. Kira's i2v →
+        // multi-keyframe in the same second) start while the previous job's
+        // MLX buffer pool + lazy macOS reclaim still hold tens of GB. Admission
+        // then either refuses spuriously OR passes on memory that isn't really
+        // reclaimed yet — and the render dies ~60s in on a Metal allocation
+        // abort (SIGKILL, no app error; 3x reproduced 2026-07-25). Actively
+        // drain and re-probe until free ≥ need + margin, up to ~18s, before
+        // deciding. clearCache() returns pooled buffers; the settle sleep gives
+        // the OS time to actually reclaim them.
+        let drainMargin: UInt64 = 6 * 1024 * 1024 * 1024
+        var drainAttempts = 0
+        while availableForVideo < ltx2Need + drainMargin && drainAttempts < 6 {
+          GPU.clearCache()
+          try? await Task.sleep(nanoseconds: 3_000_000_000)
+          availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+          drainAttempts += 1
+          logger.info("LTX-2 admission drain #\(drainAttempts): \(availableForVideo >> 20)MB free (target \((ltx2Need + drainMargin) >> 20)MB)")
+        }
         let admitVideo = heavyAdmission.admitsAfterEvict(
           needBytes: ltx2Need, freeBytes: availableForVideo)
-        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(ltx2Need >> 20)MB → admit=\(admitVideo) (#218)")
+        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free after \(drainAttempts) drain(s), need ~\(ltx2Need >> 20)MB → admit=\(admitVideo) (#218/#34)")
         if !admitVideo {
           continuation.resume(throwing: WarmServerError.invalidRequest(
             message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(ltx2Need >> 20)MB)"))
