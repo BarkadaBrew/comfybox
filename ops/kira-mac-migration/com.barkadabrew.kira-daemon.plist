@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      com.barkadabrew.kira-daemon — Mac port of the box's systemd unit
+      systemd/kira-daemon.service (VERIFIED in the coffeeshop-server checkout):
+        ExecStart=/usr/bin/node %h/coffeeshop-server/dist/kira-daemon.js
+        Environment=BREE_HOME=%h/.kira
+        EnvironmentFile=-/etc/coffeeshop/secrets.env
+        WorkingDirectory=%h/coffeeshop-server
+
+      Mac translation notes:
+      - node is at /Users/toddwalderman/.local/bin/node (v22.22.3). There is NO
+        /usr/bin/node on this Mac — do not "fix" the path back to the systemd form.
+      - launchd has no EnvironmentFile, so we emulate it with a /bin/sh wrapper
+        that sources ~/.kira/secrets.env (optional, like systemd's "-" prefix)
+        before exec'ing node. Create that file only if Kira actually needs env
+        secrets (see RUNBOOK §6); config-file token paths cover Telegram.
+      - dist/kira-daemon.js is a dedicated esbuild entry that fail-closes unless
+        the loaded config's role is "companion" (verified in build.mjs + unit
+        comments). A wrong BREE_HOME cannot boot a second Bree.
+      - PATH includes ~/bin so the MCP child spawn ("ComfyBox mcp --port 7870",
+        the transport:"local" rewrite) resolves; migrate.sh also pins
+        comfybox.mcpBinary to an absolute path as belt-and-suspenders.
+      - Install: cp to ~/Library/LaunchAgents/ then
+          launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.barkadabrew.kira-daemon.plist
+        (migrate.sh does this, gated behind - -execute.)
+    -->
+    <key>Label</key><string>com.barkadabrew.kira-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>set -a; [ -f "$HOME/.kira/secrets.env" ] &amp;&amp; . "$HOME/.kira/secrets.env"; set +a; exec /Users/toddwalderman/.local/bin/node /Users/toddwalderman/Projects/coffeeshop-server/dist/kira-daemon.js</string>
+    </array>
+
+    <key>WorkingDirectory</key><string>/Users/toddwalderman/Projects/coffeeshop-server</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Companion state dir — everything under ~/.kira, never ~/.bree (Kira isolation FDD §3.2). -->
+        <key>BREE_HOME</key><string>/Users/toddwalderman/.kira</string>
+        <!-- launchd default PATH is /usr/bin:/bin — too bare for node child spawns (ComfyBox, ssh, ffmpeg). -->
+        <key>PATH</key><string>/Users/toddwalderman/bin:/Users/toddwalderman/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key><string>/Users/toddwalderman</string>
+    </dict>
+
+    <key>RunAtLoad</key><true/>
+    <!-- systemd Restart=always / RestartSec=5 equivalent. -->
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <!-- systemd TimeoutStopSec=60 equivalent: give the daemon time to flush ledgers on unload. -->
+    <key>ExitTimeOut</key><integer>60</integer>
+
+    <key>StandardOutPath</key><string>/tmp/kira-daemon.log</string>
+    <key>StandardErrorPath</key><string>/tmp/kira-daemon.log</string>
+
+    <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
