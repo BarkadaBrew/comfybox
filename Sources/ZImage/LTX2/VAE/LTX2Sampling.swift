@@ -199,6 +199,19 @@ public final class LTX2DepthToSpaceUpsample: Module {
     super.init()
   }
 
+  // MARK: Streaming decode state (#36)
+  /// During a streamed decode the causal first-frame trim after temporal x2
+  /// upsampling must apply only to the FIRST chunk of the stream (ComfyUI's
+  /// drop_first_conv). The inner conv streams via its own CausalConv3d state.
+  public var streamActive = false
+  /// Whether the first-chunk trim has already been applied in this stream.
+  public var streamDroppedFirst = false
+
+  public func resetStream(active: Bool) {
+    streamActive = active
+    streamDroppedFirst = false
+  }
+
   /// Rearrange channels into spatial/temporal dimensions.
   ///
   /// `b (c st sh sw) d h w -> b c (d st) (h sh) (w sw)`
@@ -229,6 +242,11 @@ public final class LTX2DepthToSpaceUpsample: Module {
   /// - Returns: Upsampled tensor.
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
     let (st, _, _) = stride
+    // Streaming + residual would need ComfyUI's deferred-residual exchange
+    // cache (conv output lags the raw input under streaming). The v2.3
+    // decoder has no residual upsamples, so this combination is unsupported.
+    precondition(!(residual && streamActive),
+                 "streamed decode does not support residual DepthToSpaceUpsample")
 
     // Compute residual path if enabled
     var xResidual: MLXArray? = nil
@@ -249,9 +267,12 @@ public final class LTX2DepthToSpaceUpsample: Module {
     var out = conv(x)
     out = depthToSpace(out)
 
-    // Remove first frame for causal temporal upsampling
-    if st > 1 {
+    // Remove first frame for causal temporal upsampling. Under streaming this
+    // trim belongs to the FIRST emitted chunk only (the offset is a per-clip
+    // causal alignment, not per-chunk).
+    if st > 1 && out.dim(2) > 0 && (!streamActive || !streamDroppedFirst) {
       out = out[0..., 0..., 1..., 0..., 0...]
+      streamDroppedFirst = true
     }
 
     // Add residual

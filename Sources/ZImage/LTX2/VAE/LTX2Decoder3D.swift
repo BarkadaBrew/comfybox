@@ -265,6 +265,178 @@ public final class LTX2Decoder3D: Module {
   private func pixelNorm(_ x: MLXArray, eps: Float = 1e-8) -> MLXArray {
     x / MLX.sqrt(MLX.mean(x * x, axis: 1, keepDims: true) + eps)
   }
+
+  // MARK: - Streamed decode (#36)
+
+  /// Exact chunked-io decode — faithful port of ComfyUI's recursive `run_up`
+  /// (causal_video_autoencoder.py).
+  ///
+  /// Each up-block processes its input at the CURRENT level; if the block's
+  /// output is too large for one downstream call it is split along the frame
+  /// axis and each piece recurses into the remaining blocks. Per-conv temporal
+  /// caches make chunk boundaries exact, DepthToSpace applies its causal trim
+  /// once per stream, res-block skips consume frames at the conv path's pace,
+  /// and `ended` propagates only along the LAST piece of every split so each
+  /// conv appends its trailing padding exactly once. Numerically identical to
+  /// a single full-tensor `callAsFunction` (parity + real-data tests).
+  ///
+  /// Chunk-at-input topologies DON'T work here: v2.3's convs are non-causal,
+  /// so every conv lags its input and a ~40-conv stack starves until a final
+  /// flush pushes all frames through the last convs in one call — recreating
+  /// the int32-offset conv corruption this decode exists to avoid (MLX Metal,
+  /// ml-explore/mlx #3836/#3609/#3524; fixed only in mlx core >= 0.32.0,
+  /// which no mlx-swift release bundles yet).
+  ///
+  /// - Parameters:
+  ///   - sample: Latent tensor `(B, 128, F', H', W')`.
+  ///   - timestep: Optional timestep for conditioning.
+  ///   - maxRowsPerConv: Ceiling on frames x spatial positions per conv call
+  ///     at any level (int32 offset budget: rows x 3456 must stay < 2^31).
+  /// - Returns: Decoded video tensor `(B, 3, F, H, W)`.
+  public func decodeStreamed(
+    _ sample: MLXArray,
+    timestep: MLXArray? = nil,
+    maxRowsPerConv: Int = 350_000
+  ) -> MLXArray {
+    // Collect every stateful module, keyed per block for ended-marking.
+    var allConvs: [CausalConv3d] = []
+    var allUps: [LTX2DepthToSpaceUpsample] = []
+    var allRes: [LTX2DecoderResBlock] = []
+    for m in self.modules() {
+      if let c = m as? CausalConv3d { allConvs.append(c) }
+      if let u = m as? LTX2DepthToSpaceUpsample { allUps.append(u) }
+      if let r = m as? LTX2DecoderResBlock { allRes.append(r) }
+    }
+    for c in allConvs { c.resetStream(active: true) }
+    for u in allUps { u.resetStream(active: true) }
+    for r in allRes { r.resetStream(active: true) }
+    defer {
+      for c in allConvs { c.resetStream(active: false) }
+      for u in allUps { u.resetStream(active: false) }
+      for r in allRes { r.resetStream(active: false) }
+    }
+
+    func convsOf(_ module: Module) -> [CausalConv3d] {
+      module.modules().compactMap { $0 as? CausalConv3d }
+    }
+
+    let batchSize = sample.dim(0)
+    let ts: MLXArray?
+    if timestepConditioning {
+      let t = timestep ?? MLX.full([batchSize], values: MLXArray(decodeTimestep), dtype: .float32)
+      ts = t * timestepScaleMultiplier
+    } else {
+      ts = nil
+    }
+
+    let sortedKeys = upBlocks.keys.sorted { Int($0)! < Int($1)! }
+    var outputs: [MLXArray] = []
+
+    // Split `x` along frames so each piece keeps frames x H x W under the
+    // conv row budget at THIS level.
+    func splitByBudget(_ x: MLXArray) -> [MLXArray] {
+      let f = x.dim(2)
+      guard f > 0 else { return [] }
+      let rowsPerFrame = max(x.dim(3) * x.dim(4), 1)
+      // Budget the CONV-call extent, not the piece extent: each downstream
+      // conv adds up to 2 cached + 1 end-pad frames to the piece, and the
+      // empirical Metal corruption onset at 128ch/61440-spatial sits between
+      // 9-frame bodies (clean) and ~15-frame bodies (corrupt). Keep piece
+      // frames + 3 within budget.
+      let maxFrames = max(1, maxRowsPerConv / rowsPerFrame - 3)
+      guard f > maxFrames else { return [x] }
+      var pieces: [MLXArray] = []
+      var s = 0
+      while s < f {
+        let e = min(s + maxFrames, f)
+        pieces.append(x[0..., 0..., s..<e, 0..., 0...])
+        s = e
+      }
+      return pieces
+    }
+
+    func runUp(_ idx: Int, _ input: MLXArray, _ ended: Bool) {
+      if idx >= sortedKeys.count {
+        // Final head: PixelNorm -> (mod) -> SiLU -> conv_out -> unpatchify.
+        var x = pixelNorm(input)
+        if timestepConditioning, let scaledTimestep = ts {
+          let embeddedTimestep = lastTimeEmbedder(
+            scaledTimestep.flattened(), hiddenDtype: x.dtype)
+          let embedded = embeddedTimestep.reshaped(batchSize, -1, 1, 1, 1)
+          let adaBase = lastScaleShiftTable.reshaped(1, 2, lastChannels, 1, 1, 1)
+          let tsReshaped = embedded.reshaped(batchSize, 2, lastChannels, 1, 1, 1)
+          let adaValues = adaBase + tsReshaped
+          let shift = adaValues[0..., 0, 0..., 0..., 0..., 0...]
+          let scale = adaValues[0..., 1, 0..., 0..., 0..., 0...]
+          x = x * (1 + scale) + shift
+        }
+        x = silu(x)
+        for c in convsOf(convOut) { c.streamEnded = ended }
+        x = convOut(x)
+        if x.dim(2) > 0 {
+          x = LTX2Patchify.unpatchify(x, patchSizeHW: patchSize, patchSizeT: 1)
+          eval(x)
+          outputs.append(x)
+        }
+        MLX.GPU.clearCache()
+        return
+      }
+
+      let block = upBlocks[sortedKeys[idx]]!
+      for c in convsOf(block) { c.streamEnded = ended }
+      var out: MLXArray
+      if let resGroup = block as? LTX2DecoderResBlockGroup {
+        out = resGroup(input, timestep: ts)
+      } else if let upsample = block as? LTX2DepthToSpaceUpsample {
+        out = upsample(input)
+      } else {
+        out = input
+      }
+      guard out.dim(2) > 0 else { return }
+      eval(out)
+
+      let pieces = splitByBudget(out)
+      for (i, piece) in pieces.enumerated() {
+        runUp(idx + 1, piece, ended && i == pieces.count - 1)
+      }
+    }
+
+    // Entry: noise + denorm + conv_in on the full latent (small at this
+    // level), then recurse with ended = true (splits scope it downward).
+    var x = sample
+    if timestepConditioning {
+      let noise = MLXRandom.normal(x.shape) * decodeNoiseScale
+      x = noise + (1.0 - decodeNoiseScale) * x
+    }
+    x = perChannelStatistics.unNormalize(x)
+    for c in convsOf(convIn) { c.streamEnded = true }
+    x = convIn(x)
+    eval(x)
+    let entryPieces = splitByBudget(x)
+    for (i, piece) in entryPieces.enumerated() {
+      runUp(0, piece, i == entryPieces.count - 1)
+    }
+
+    precondition(!outputs.isEmpty, "streamed decode emitted no frames")
+    if outputs.count == 1 { return outputs[0] }
+    // Materialize via incremental slice-assignment, NOT a single concatenate:
+    // one-shot materialization of the ~1G-element output walks into the same
+    // int32-offset kernel bug (corrupt-frame pattern identical to plain
+    // decode). The tiled path's slice-assign accumulation is proven safe.
+    let totalF = outputs.reduce(0) { $0 + $1.dim(2) }
+    let proto = outputs[0]
+    var full = MLXArray.zeros(
+      [proto.dim(0), proto.dim(1), totalF, proto.dim(3), proto.dim(4)],
+      dtype: proto.dtype)
+    var offset = 0
+    for chunk in outputs {
+      let n = chunk.dim(2)
+      full[0..., 0..., offset..<(offset + n), 0..., 0...] = chunk
+      eval(full)
+      offset += n
+    }
+    return full
+  }
 }
 
 // MARK: - Decoder-specific helper modules
@@ -389,6 +561,19 @@ public final class LTX2DecoderResBlock: Module {
   /// Number of channels.
   public let channels: Int
 
+  // MARK: Streaming decode state (#36)
+  /// Deferred skip-connection frames. Under streaming the conv path lags the
+  /// raw input (each conv buffers temporal context), so the residual add must
+  /// consume skip frames at the conv path's emission pace and carry the
+  /// overhang to the next chunk (ComfyUI's add_exchange_cache).
+  public var streamActive = false
+  public var streamSkipQueue: MLXArray? = nil
+
+  public func resetStream(active: Bool) {
+    streamActive = active
+    streamSkipQueue = nil
+  }
+
   public init(channels: Int, timestepConditioning: Bool = false, causalTemporal: Bool = true) {
     self.channels = channels
     self.timestepConditioning = timestepConditioning
@@ -441,6 +626,16 @@ public final class LTX2DecoderResBlock: Module {
       h = conv2(h)
     }
 
+    if streamActive {
+      var queue = residual
+      if let q = streamSkipQueue {
+        queue = MLX.concatenated([q, residual], axis: 2)
+      }
+      let n = h.dim(2)
+      let out = n > 0 ? h + queue[0..., 0..., ..<n, 0..., 0...] : h
+      streamSkipQueue = queue[0..., 0..., n..., 0..., 0...]
+      return out
+    }
     return h + residual
   }
 

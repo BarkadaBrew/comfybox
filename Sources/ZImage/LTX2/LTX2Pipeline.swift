@@ -1246,6 +1246,12 @@ public final class LTX2Pipeline {
     // no error, just garbage — while tiled decode of the same tensor is clean.
     // 4004 (97f @ 448x704) is proven-safe; 4500 keeps margin below the cliff.
     let plainMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_VOL"] ?? "") ?? 4500
+    // LTX2_DUMP_LATENT=<path>: save the pre-decode latent for offline decode
+    // debugging (real-values reproduction harness, #36).
+    if let dumpPath = ProcessInfo.processInfo.environment["LTX2_DUMP_LATENT"] {
+      try? MLX.save(arrays: ["latent": latents.asType(.float32)], url: URL(fileURLWithPath: dumpPath))
+      logger.info("VAE decode: dumped pre-decode latent to \(dumpPath)")
+    }
     // LTX2_DECODE_F32=1: decode in float32 instead of bf16. Probe for the
     // Metal silent-corruption cliff (plain decode > ~4500 volume garbles the
     // last frames with no error at 95% free memory) — if the cliff is a
@@ -1254,16 +1260,20 @@ public final class LTX2Pipeline {
     let decodeF32 = ProcessInfo.processInfo.environment["LTX2_DECODE_F32"] == "1"
     let bf = latents.asType(decodeF32 ? .float32 : .bfloat16)
     if config.tiledDecode && volume > plainMaxVolume {
-      // Spatial tiling, tile size env-tunable (LTX2_DECODE_TILE, default 16).
-      // Decode-strategy shootout on the anchor case (2026-07-25, decode-only,
-      // sharp/flicker): 16-tile 18.5/0.555; 22-tile 28.4/0.79 (best VALID
-      // sharpness); 25-tile 32.8/0.71 but corrupts the last frame (per-call
-      // volume 4200 grazes the Metal cliff); full-frame temporal windows
-      // 22.6/0.75 (non-causal decoder + window blending smears detail); plain
-      // f32 36.4 but 36/49 frames corrupt. ComfyUI reference (internal
-      // chunked-io streaming, zero seams): 41.4/0.157 — closing that fully
-      // needs either exact decoder-internal streaming or the MLX/Metal
-      // large-tensor silent-corruption bug fixed upstream.
+      // Exact streamed decode (#36): frame-chunked with per-conv temporal
+      // state, numerically identical to plain decode, zero seams. Replaces
+      // the seam-based approximations, all of which measurably cost quality
+      // (2026-07-25 anchor-case shootout, decode-only sharp/flicker: 16-tile
+      // 18.5/0.555; 22-tile 28.4/0.79; blended temporal windows 22.6/0.75;
+      // plain decode 36.4 but corrupt — MLX Metal int32-offset overflow on
+      // large tensors, mlx #3836, unfixed in any mlx-swift release; ComfyUI's
+      // streaming reference: 41.4/0.157). Chunk size targets a per-chunk
+      // latent volume well under the corruption cliff (~4004 proven safe).
+      // LTX2_DECODE_STREAM=0 falls back to the legacy tiled path.
+      if ProcessInfo.processInfo.environment["LTX2_DECODE_STREAM"] != "0" {
+        logger.info("VAE decode: streamed exact chunked-io (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — zero seams.")
+        return vae.decodeStreamed(bf)
+      }
       let tile = Int(ProcessInfo.processInfo.environment["LTX2_DECODE_TILE"] ?? "") ?? 16
       logger.info("VAE decode: tiled (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — OOM-safe path, tile \(tile).")
       return vae.decodeTiled(bf, tileSize: tile, tileStride: tile - 2)

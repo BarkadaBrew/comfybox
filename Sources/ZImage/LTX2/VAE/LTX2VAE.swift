@@ -97,6 +97,20 @@ public final class LTX2VAE: Module {
     return decoder(latent, timestep: timestep)
   }
 
+  /// Exact streamed decode (#36): chunks the frame axis with per-conv temporal
+  /// state carried between chunks — numerically identical to plain `decode`,
+  /// peak memory bounded by chunk size, zero seams. See
+  /// `LTX2Decoder3D.decodeStreamed`.
+  public func decodeStreamed(
+    _ z: MLXArray, timestep: MLXArray? = nil
+  ) -> MLXArray {
+    var latent = z
+    if latent.ndim == 4 {
+      latent = latent.expandedDimensions(axis: 2)
+    }
+    return decoder.decodeStreamed(latent, timestep: timestep)
+  }
+
   /// Decodes latents using spatial tiling to reduce memory usage.
   ///
   /// Splits the latent tensor into overlapping tiles, decodes each independently,
