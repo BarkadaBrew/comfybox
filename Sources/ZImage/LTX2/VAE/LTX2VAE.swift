@@ -115,7 +115,8 @@ public final class LTX2VAE: Module {
     tileSize: Int = 16,
     tileStride: Int = 14,
     rampSize: Int = 2,
-    timestep: MLXArray? = nil
+    timestep: MLXArray? = nil,
+    frameWindow explicitFrameWindow: Int? = nil
   ) -> MLXArray {
     var latent = z
     if latent.ndim == 4 {
@@ -127,7 +128,8 @@ public final class LTX2VAE: Module {
     // with clip length and long clips OOM mid-decode. When the latent frame
     // count exceeds the window, decode in overlapping frame windows instead —
     // peak memory becomes O(window), independent of clip length.
-    let frameWindow = Int(ProcessInfo.processInfo.environment["LTX2_DECODE_FRAME_WINDOW"] ?? "") ?? 16
+    let frameWindow = explicitFrameWindow
+      ?? Int(ProcessInfo.processInfo.environment["LTX2_DECODE_FRAME_WINDOW"] ?? "") ?? 16
     if latent.dim(2) > frameWindow {
       return decodeTemporalChunked(
         latent, frameWindow: frameWindow,

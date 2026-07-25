@@ -1246,10 +1246,27 @@ public final class LTX2Pipeline {
     // no error, just garbage — while tiled decode of the same tensor is clean.
     // 4004 (97f @ 448x704) is proven-safe; 4500 keeps margin below the cliff.
     let plainMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_VOL"] ?? "") ?? 4500
-    let bf = latents.asType(.bfloat16)
+    // LTX2_DECODE_F32=1: decode in float32 instead of bf16. Probe for the
+    // Metal silent-corruption cliff (plain decode > ~4500 volume garbles the
+    // last frames with no error at 95% free memory) — if the cliff is a
+    // large-tensor bf16 kernel path, f32 unlocks exact seamless plain decode
+    // (2x activation memory; fine on 128GB).
+    let decodeF32 = ProcessInfo.processInfo.environment["LTX2_DECODE_F32"] == "1"
+    let bf = latents.asType(decodeF32 ? .float32 : .bfloat16)
     if config.tiledDecode && volume > plainMaxVolume {
-      logger.info("VAE decode: tiled (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — OOM-safe path.")
-      return vae.decodeTiled(bf)
+      // Spatial tiling, tile size env-tunable (LTX2_DECODE_TILE, default 16).
+      // Decode-strategy shootout on the anchor case (2026-07-25, decode-only,
+      // sharp/flicker): 16-tile 18.5/0.555; 22-tile 28.4/0.79 (best VALID
+      // sharpness); 25-tile 32.8/0.71 but corrupts the last frame (per-call
+      // volume 4200 grazes the Metal cliff); full-frame temporal windows
+      // 22.6/0.75 (non-causal decoder + window blending smears detail); plain
+      // f32 36.4 but 36/49 frames corrupt. ComfyUI reference (internal
+      // chunked-io streaming, zero seams): 41.4/0.157 — closing that fully
+      // needs either exact decoder-internal streaming or the MLX/Metal
+      // large-tensor silent-corruption bug fixed upstream.
+      let tile = Int(ProcessInfo.processInfo.environment["LTX2_DECODE_TILE"] ?? "") ?? 16
+      logger.info("VAE decode: tiled (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — OOM-safe path, tile \(tile).")
+      return vae.decodeTiled(bf, tileSize: tile, tileStride: tile - 2)
     }
     logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — clean, no tile mosaic.")
     return vae.decode(bf)
