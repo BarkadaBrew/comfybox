@@ -570,6 +570,20 @@ public final class LTX2VideoGenerator {
         // chunk\u{27}s last frame).
         let sourceImage: MLXArray? = currentImage
 
+        // Two-stage refine anchor: the RAW source (no compression preprocess)
+        // at 2x the base resolution, mirroring workflow nodes 19/20 — the
+        // refine re-anchors frame 0 to this for native high-res detail.
+        let refineAnchorImage: MLXArray? = try {
+            guard ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
+                  let path = request.initImagePath,
+                  let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            let pixels = try QwenImageIO.resizedPixelArray(
+                from: cgImage, width: request.width * 2, height: request.height * 2,
+                addBatchDimension: true, dtype: .float32)
+            return QwenImageIO.normalizeForEncoder(pixels)
+        }()
+
         // Face-anchor (#partnered): detect faces on the source once, build a
         // latent-space mask so the denoise loop can hold EVERY face (esp. a
         // stationary partner) across a long pass. Env-gated: LTX2_FACE_ANCHOR_STRENGTH.
@@ -658,6 +672,7 @@ public final class LTX2VideoGenerator {
                         negativeAttentionMask: negBatch?.attentionMask,
                         faceAnchorMask: chunk == 0 ? faceAnchorMask : nil,
                         faceAnchorStrength: faceAnchorStrength,
+                        refineAnchorImage: chunk == 0 ? refineAnchorImage : nil,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 }
             } else {

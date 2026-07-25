@@ -440,6 +440,7 @@ public final class LTX2Pipeline {
     negativeAttentionMask: MLXArray? = nil,
     faceAnchorMask: MLXArray? = nil,
     faceAnchorStrength: Float = 0,
+    refineAnchorImage: MLXArray? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -611,18 +612,32 @@ public final class LTX2Pipeline {
       let sigma0 = refineSigmas[0]
       let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
       // Identity re-anchor (author's pass-2 LTXVImgToVideoInplace @ strength 1):
-      // frame 0 of the upsampled latent is the clean upscaled source frame —
-      // keep it CLEAN through the refine via a conditioning state (mask 0 at
-      // frame 0, per-token timestep 0), generated frames re-noised at σ0.
+      // frame 0 stays CLEAN through the refine via a conditioning state (mask 0
+      // at frame 0, per-token timestep 0), generated frames re-noised at σ0.
+      // The workflow (nodes 19/20) anchors to the RAW source image re-encoded
+      // at the refine resolution (768x1280 lanczos -> VAEEncode) — native
+      // high-frequency detail that attention propagates to every frame. The
+      // upsampled base-pass latent is 2x-blurry by comparison; anchoring to it
+      // measured sharp_mean 22-35 vs the ComfyUI GT's 59 on the anchor case.
       let rF = upLatent.dim(2)
+      var anchorFrame = upLatent[0..., 0..., 0..<1, 0..., 0...]
+      if var refImg = refineAnchorImage {
+        if refImg.ndim == 4 { refImg = refImg.expandedDimensions(axis: 2) }
+        anchorFrame = vae.encode(refImg).asType(.float32)
+        eval(anchorFrame)
+        logger.info("Two-stage refine: frame 0 re-anchored to source re-encoded at \(rLatW * spatialCompression)x\(rLatH * spatialCompression).")
+      }
       let refineInit = MLX.concatenated(
-        [upLatent[0..., 0..., 0..<1, 0..., 0...], mixed[0..., 0..., 1..<rF, 0..., 0...]],
+        [anchorFrame, mixed[0..., 0..., 1..<rF, 0..., 0...]],
+        axis: 2)
+      let refClean = MLX.concatenated(
+        [anchorFrame, upLatent[0..., 0..., 1..<rF, 0..., 0...]],
         axis: 2)
       let refMask = MLX.concatenated(
         [MLXArray.zeros([1, 1, 1, 1, 1]), MLXArray.ones([1, 1, rF - 1, 1, 1])],
         axis: 2).asType(.float32)
       let refState = LTX2LatentState(
-        latent: refineInit, cleanLatent: upLatent, denoiseMask: refMask)
+        latent: refineInit, cleanLatent: refClean, denoiseMask: refMask)
       let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
       let refinePE = ltx2PrecomputeFreqsCIS(
         indicesGrid: refinePos, dim: innerDim,
@@ -1154,7 +1169,14 @@ public final class LTX2Pipeline {
         let line = "{" + jsonParts.joined(separator: ",") + "}\n"
 
         if trajHandle == nil {
-          let path = prefix + ".jsonl"
+          // Each denoise pass gets its own file (prefix.jsonl, prefix.2.jsonl, …)
+          // so a two-stage render's refine pass doesn't clobber the stage-1 dump.
+          var path = prefix + ".jsonl"
+          var pass = 1
+          while FileManager.default.fileExists(atPath: path) {
+            pass += 1
+            path = prefix + ".\(pass).jsonl"
+          }
           FileManager.default.createFile(atPath: path, contents: nil)
           trajHandle = FileHandle(forWritingAtPath: path)
           if trajHandle == nil {
