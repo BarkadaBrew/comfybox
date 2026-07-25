@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "defaults": {
+    "backend": "local",
+    "enhance": false,
+    "resolution": null,
+    "restart_between": true,
+    "purge_output": true
+  },
+  "smoke": [
+    "i2v-identity-walk",
+    "i2v-nsfw-caress",
+    "t2v-energetic-dance",
+    "t2v-nsfw-kneel-long"
+  ],
+  "cases": [
+    {
+      "id": "i2v-identity-walk",
+      "mode": "i2v",
+      "category": "identity-hold",
+      "init_image": "assets/kira_preset.png",
+      "prompt": "Use the provided start image exactly as the first frame. She strides toward the camera with confident purposeful steps, hips swinging with each step, covering real distance, then plants her feet, squares her shoulders, turns her face to the camera and breaks into a wide smile. The walk is continuous with clear footfalls and natural weight transfer. No extra characters unless clearly visible in the image.",
+      "negative": "3D, phasing, captions, VR, still image, bad quality, subtitles, text, watermark, overlay effects, pc game, console game, video game, cartoon, childish, ugly, blur, logo, wordmark, static, low quality, noise, censoring, mutant, horror, film grain",
+      "seed": 42,
+      "frames": 97,
+      "strength": 0.75,
+      "content_mode": "avocado",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_min": 0.6,
+        "identity_min": 6,
+        "anatomy_min": 6,
+        "reversal_max": 0.12
+      }
+    },
+    {
+      "id": "i2v-nsfw-caress",
+      "mode": "i2v",
+      "category": "nsfw-gentle",
+      "init_image": "assets/kira_nsfw_baseline.png",
+      "prompt": "Use the provided start image exactly as the first frame. She grabs her breasts firmly with both hands and kneads them in a steady rhythm, squeezing and lifting, then drags one hand down her stomach between her legs and rubs in circular motions, head tilting back with pleasure. The motions are continuous and rhythmic throughout. No extra characters unless clearly visible in the image.",
+      "negative": "3D, phasing, captions, VR, still image, bad quality, subtitles, text, watermark, overlay effects, pc game, console game, video game, cartoon, childish, ugly, blur, logo, wordmark, static, low quality, noise, censoring, mutant, horror, film grain",
+      "seed": 77,
+      "frames": 97,
+      "strength": 0.75,
+      "content_mode": "avocado",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_min": 0.6,
+        "identity_min": 6,
+        "anatomy_min": 6,
+        "reversal_max": 0.12
+      }
+    },
+    {
+      "id": "t2v-energetic-dance",
+      "mode": "t2v",
+      "category": "energetic",
+      "prompt": "A single woman alone in the scene, no other people. She dances hard on a beach at sunset: she spins a full turn, throws her arms overhead, drops her hips low, pops back up and spins again, hair and dress whipping with the momentum, feet kicking up sand with each move. The dance is continuous, athletic, with real momentum and weight. Warm sunset light on her face and body.",
+      "negative": "3D, phasing, captions, VR, still image, bad quality, subtitles, text, watermark, overlay effects, pc game, console game, video game, cartoon, childish, ugly, blur, logo, wordmark, static, low quality, noise, censoring, mutant, horror, film grain, extra person, second person, crowd",
+      "seed": 7,
+      "frames": 97,
+      "aspect_ratio": "9:16",
+      "content_mode": "banana",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_min": 0.6,
+        "solo": true,
+        "anatomy_min": 5,
+        "reversal_max": 0.12
+      }
+    },
+    {
+      "id": "t2v-nsfw-kneel-long",
+      "mode": "t2v",
+      "category": "nsfw-multi-beat",
+      "prompt": "A single woman alone in the scene, no other people. Fully nude on a bed: she kneels upright, grabs her breasts and kneads them in a steady rhythm, then drops forward onto her hands and crawls toward the camera with slow deliberate movements, arching her back, and finishes by lifting her face to the lens with parted lips. Each action completes before the next begins. Warm lamplight on her face and body.",
+      "negative": "3D, phasing, captions, VR, still image, bad quality, subtitles, text, watermark, overlay effects, pc game, console game, video game, cartoon, childish, ugly, blur, logo, wordmark, static, low quality, noise, censoring, mutant, horror, film grain, extra person, second person, crowd",
+      "seed": 77,
+      "frames": 241,
+      "content_mode": "avocado",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_min": 0.6,
+        "solo": true,
+        "anatomy_min": 6,
+        "beats": [
+          "kneels",
+          "hands over breasts",
+          "leans forward"
+        ],
+        "reversal_max": 0.12
+      }
+    },
+    {
+      "id": "i2v-workflow-anchor",
+      "mode": "i2v",
+      "category": "ground-truth-anchor",
+      "init_image": "assets/seed-girl.png",
+      "prompt": "standing sex, he thrusts into her petite body in a steady fluid rhythm, her hips rocking with each thrust, both moaning with pleasure, skin flushed, the motion continuous and rhythmic throughout",
+      "negative": "subtitle, caption, text, text on screen, watermark, logo, timestamp",
+      "seed": 43,
+      "frames": 49,
+      "width": 384,
+      "height": 640,
+      "strength": 1.0,
+      "content_mode": "avocado",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_min": 1.2,
+        "reversal_max": 0.1,
+        "sharp_min": 44,
+        "anatomy_min": 5
+      },
+      "note": "Mirrors ~/Downloads/sexgod-validate-workflow.json base pass; ground-truth twin rendered in ComfyUI defines the target band. sharp_min/gt sharp_mean rescaled 2026-07-25 to the normalized 512px-width metric (old raw value kept as sharp_raw).",
+      "gt_reference": {
+        "motion": 1.71,
+        "jerk": 0.671,
+        "reversal_rate": 0.064,
+        "sharp_mean": 58.8,
+        "sharp_raw": 188.7,
+        "video": "runs/ground-truth/i2v-workflow-anchor_GT.mp4"
+      }
+    },
+    {
+      "id": "t2v-camera-move",
+      "mode": "t2v",
+      "category": "camera",
+      "prompt": "A single woman alone in the scene. She stands on a rooftop at golden hour in a red dress. The camera slowly orbits around her from front to side as she turns her head to follow it, hair moving in the wind. One clean continuous camera move.",
+      "negative": "3D, phasing, captions, VR, still image, bad quality, subtitles, text, watermark, static, low quality, extra person",
+      "seed": 11,
+      "frames": 97,
+      "content_mode": "neutral",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_min": 0.3,
+        "solo": true
+      }
+    },
+    {
+      "id": "i2v-static-control",
+      "mode": "i2v",
+      "category": "control",
+      "init_image": "assets/kira_preset.png",
+      "prompt": "Use the provided start image exactly as the first frame. She stands still, breathing gently, only her hair and dress moving slightly in the breeze. Minimal motion.",
+      "negative": "static, still image, subtitles, text, watermark",
+      "seed": 42,
+      "frames": 97,
+      "strength": 0.75,
+      "content_mode": "neutral",
+      "character": "",
+      "expected": {
+        "valid": true,
+        "motion_max": 0.2,
+        "identity_min": 7
+      },
+      "note": "Control case: LOW motion is correct here \u2014 catches over-motion regressions."
+    }
+  ]
+}
