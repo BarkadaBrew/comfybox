@@ -149,11 +149,39 @@ public final class LTX2Attention: Module {
         attnMask = expanded
       }
 
-      var attnOut = MLXFast.scaledDotProductAttention(
-        queries: qH, keys: kH, values: vH,
-        scale: scale,
-        mask: attnMask
-      )
+      // Query-tiled attention (#37): at very long sequences (289f refine ≈
+      // 53,872 tokens) the SDPA kernel's token×token index overflows int32
+      // (same class as the conv/decode bug) and the process aborts. Splitting
+      // the QUERIES into blocks — each attending to the FULL K/V set — keeps
+      // every kernel call's qBlock×kv product under 2^31. This is exact (no
+      // online softmax needed: each block's softmax is over the complete key
+      // axis), so it's numerically identical to a single call, zero seams.
+      // Threshold well below the 2^31/kv boundary; disabled at normal lengths.
+      let attnProduct = qSeqLen * kvSeqLen
+      let tileThreshold = 1_500_000_000  // < 2^31, margin for head batching
+      let attnOut: MLXArray
+      if attnProduct > tileThreshold {
+        let maxQ = max(1, tileThreshold / max(kvSeqLen, 1))
+        var blocks: [MLXArray] = []
+        var qs = 0
+        while qs < qSeqLen {
+          let qe = min(qs + maxQ, qSeqLen)
+          let qBlock = qH[0..., 0..., qs..<qe, 0...]
+          let mBlock: MLXArray? = attnMask  // key-axis mask applies to every query block
+          let ob = MLXFast.scaledDotProductAttention(
+            queries: qBlock, keys: kH, values: vH, scale: scale, mask: mBlock)
+          eval(ob)
+          blocks.append(ob)
+          qs = qe
+        }
+        attnOut = blocks.count == 1 ? blocks[0] : MLX.concatenated(blocks, axis: 2)
+      } else {
+        attnOut = MLXFast.scaledDotProductAttention(
+          queries: qH, keys: kH, values: vH,
+          scale: scale,
+          mask: attnMask
+        )
+      }
 
       // Reshape back: (B, H, T, D) -> (B, T, H*D)
       out = attnOut.transposed(0, 2, 1, 3).reshaped(b, qSeqLen, numHeads * headDim)

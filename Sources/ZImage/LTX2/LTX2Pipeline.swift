@@ -944,6 +944,19 @@ public final class LTX2Pipeline {
             unconditioned: x0NegF32,
             scale: cfgAt(i)
           )
+          // Guidance rescale (Lin et al.; counters CFG over-saturation /
+          // shadow-crush). High CFG inflates the prediction's std -> boosted
+          // color/contrast (measured: cfg2 saturation +19% vs seed). Rescale
+          // the guided x0 back toward the CONDITIONAL prediction's std, then
+          // blend by phi — keeps the action-motion boost, restores seed color.
+          // env LTX2_GUIDANCE_RESCALE (0 = off); per-request override next.
+          let phi = Float(ProcessInfo.processInfo.environment["LTX2_GUIDANCE_RESCALE"] ?? "") ?? 0
+          if phi > 0 {
+            let stdCond = MLX.sqrt(((x0CondF32 - x0CondF32.mean()) * (x0CondF32 - x0CondF32.mean())).mean())
+            let stdGuided = MLX.sqrt(((x0GuidedF32 - x0GuidedF32.mean()) * (x0GuidedF32 - x0GuidedF32.mean())).mean())
+            let rescaled = x0GuidedF32 * (stdCond / (stdGuided + 1e-6))
+            x0GuidedF32 = MLXArray(phi) * rescaled + MLXArray(1 - phi) * x0GuidedF32
+          }
         }
       }
 
