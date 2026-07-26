@@ -551,6 +551,18 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let preset = params?.string("preset") {
       body["preset"] = preset
     }
+    // Motion vs fidelity per content type (#40): the daemon sends a high
+    // img_compression + lower strength for partnered-action prompts (motion)
+    // and low compression + strength 1.0 for solo/portrait (fidelity).
+    if let strength = params?.number("strength") {
+      body["strength"] = strength
+    }
+    if let comp = params?.integer("img_compression") {
+      body["img_compression"] = comp
+    }
+    if let neg = params?.string("negative_prompt") {
+      body["negative_prompt"] = neg
+    }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     // Async route for BOTH backends: local renders return 202 + job_id

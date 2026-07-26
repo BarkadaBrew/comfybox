@@ -448,6 +448,14 @@ public enum MCPToolRegistry {
           "type": "integer",
           "description": "Random seed for reproducibility. Omit for random.",
         ] as [String: Any],
+        "strength": [
+          "type": "number",
+          "description": "I2V conditioning strength 0-1 (default 1.0). Lower loosens the frame-0 pose lock; weak motion lever.",
+        ] as [String: Any],
+        "img_compression": [
+          "type": "integer",
+          "description": "Conditioning compression (libx264 CRF, 0-51). PRIMARY motion lever: low (0-2) = max fidelity but freezes motion; ~30 = strong motion for action/partnered scenes; default 35. Use low for solo/portrait, high for action.",
+        ] as [String: Any],
         "preset": [
           "type": "string",
           "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",
