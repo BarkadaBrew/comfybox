@@ -228,6 +228,14 @@ public final class LTX2Pipeline {
       let stats = vae.decoder.perChannelStatistics
       let upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
       eval(upLatent)
+      // Refine-volume OOM gate — same guard as the i2v path (Codex review
+      // 2026-07-26: t2v could still crash the process at large formats).
+      let t2vRefineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
+      let t2vRefineMax = Int(ProcessInfo.processInfo.environment["LTX2_REFINE_MAX_VOL"] ?? "") ?? 12_000
+      if t2vRefineVolume > t2vRefineMax {
+        logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (OOM guard).")
+        latents = upLatent
+      } else {
       let rLatH = latH * 2, rLatW = latW * 2
       let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
         let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
@@ -257,6 +265,7 @@ public final class LTX2Pipeline {
       eval(latents)
       MLX.GPU.clearCache()
       logger.info("T2V two-stage refine complete.")
+      }
     }
 
     // Step 7: Decode latents via VAE
@@ -572,107 +581,14 @@ public final class LTX2Pipeline {
       ? latentsAll[0..., 0..., 0..<latF, 0..., 0...]
       : latentsAll
 
-    // Two-stage refine (Phase 3): latent upsample x2 -> re-noise -> short refine
-    // denoise at high res. Faithful to the proven two-stage i2v workflow (LTX2.3
-    // I2V GGUF 12GB): LTXVLatentUpsampler(spatial x2) -> RandomNoise ->
-    // SamplerCustomAdvanced with refine sigmas [0.8025,0.6332,0.4525,0.2425,0.0]
-    // (starts at 0.80 = partial denoise preserving the upsampled structure).
-    // Env-gated LTX2_TWO_STAGE; requires the loaded upsampler.
-    if let ups = self.upsampler, ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
-      logger.info("Two-stage refine: upsampling latents 2x...")
-      // The latent upsampler is trained on UN-normalized (VAE-scale) latents.
-      // The pipeline's working latents are per-channel normalized, so denormalize
-      // -> upsample -> renormalize (matches reference ltx2UpsampleLatents /
-      // ComfyUI LTXVLatentUpsampler). Feeding normalized latents raw produces
-      // structured garbage.
-      let stats = vae.decoder.perChannelStatistics
-      let denorm = stats.unNormalize(latents.asType(.float32))
-      let upDenorm = ups(denorm)
-      let upLatent = stats.normalize(upDenorm).asType(.float32)
-      eval(upLatent)
-      // Refine-volume gate: the refine denoise's attention peak scales with
-      // upsampled token count and Metal-aborts the process on the largest
-      // formats (2026-07-25 23:24: 97f @ 832x448 -> refine 1664x896, latent
-      // volume 13x28x52 = 18,928; memory-pressure warning then SIGKILL mid-
-      // denoise). Above the gate, decode the upsampled latent directly —
-      // upscaled-but-unrefined output beats a dead server and a lost render.
-      let refineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
-      let refineMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_REFINE_MAX_VOL"] ?? "") ?? 12_000
-      // DIAGNOSTIC: decode the upsampled latent directly (skip refine denoise) to
-      // isolate whether artifacts originate in the upsampler or the refine loop.
-      if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
-        latents = upLatent
-        logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
-      } else if refineVolume > refineMaxVolume {
-        latents = upLatent
-        logger.info("Two-stage refine: SKIPPED denoise (refine latent volume \(refineVolume) > \(refineMaxVolume)) — decoding upsampled latent directly (OOM guard).")
-      } else {
-      // Free base-pass intermediates before the memory-heavy refine (12s/289f).
-      MLX.GPU.clearCache()
-      let rLatH = latH * 2, rLatW = latW * 2
-      let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
-        let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
-        return v.count >= 2 ? v : nil
-      } ?? [0.85, 0.7250, 0.4219, 0.0]  // PinkCherry v1.5 pass-2 sigmas (validated
-      // on ComfyUI 2026-07-22 with euler_cfg_pp; link-traced from the author's
-      // shipped workflow, SamplerCustomAdvanced #119).
-      if let seed = seed { MLXRandom.seed(seed &+ 1000) }
-      // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (matches ComfyUI CONST
-      // noise_scaling). NOT x0 + σ·ε — that unnormalized mix corrupts the refine.
-      let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
-      let sigma0 = refineSigmas[0]
-      let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
-      // Identity re-anchor (author's pass-2 LTXVImgToVideoInplace @ strength 1):
-      // frame 0 stays CLEAN through the refine via a conditioning state (mask 0
-      // at frame 0, per-token timestep 0), generated frames re-noised at σ0.
-      // The workflow (nodes 19/20) anchors to the RAW source image re-encoded
-      // at the refine resolution (768x1280 lanczos -> VAEEncode) — native
-      // high-frequency detail that attention propagates to every frame. The
-      // upsampled base-pass latent is 2x-blurry by comparison; anchoring to it
-      // measured sharp_mean 22-35 vs the ComfyUI GT's 59 on the anchor case.
-      let rF = upLatent.dim(2)
-      var anchorFrame = upLatent[0..., 0..., 0..<1, 0..., 0...]
-      if var refImg = refineAnchorImage {
-        if refImg.ndim == 4 { refImg = refImg.expandedDimensions(axis: 2) }
-        anchorFrame = vae.encode(refImg).asType(.float32)
-        eval(anchorFrame)
-        logger.info("Two-stage refine: frame 0 re-anchored to source re-encoded at \(rLatW * spatialCompression)x\(rLatH * spatialCompression).")
-      }
-      let refineInit = MLX.concatenated(
-        [anchorFrame, mixed[0..., 0..., 1..<rF, 0..., 0...]],
-        axis: 2)
-      let refClean = MLX.concatenated(
-        [anchorFrame, upLatent[0..., 0..., 1..<rF, 0..., 0...]],
-        axis: 2)
-      let refMask = MLX.concatenated(
-        [MLXArray.zeros([1, 1, 1, 1, 1]), MLXArray.ones([1, 1, rF - 1, 1, 1])],
-        axis: 2).asType(.float32)
-      let refState = LTX2LatentState(
-        latent: refineInit, cleanLatent: refClean, denoiseMask: refMask)
-      let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
-      let refinePE = ltx2PrecomputeFreqsCIS(
-        indicesGrid: refinePos, dim: innerDim,
-        theta: transformer.positionalEmbeddingTheta,
-        maxPos: transformer.positionalEmbeddingMaxPos,
-        useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
-        numAttentionHeads: transformer.numHeads,
-        ropeMode: transformer.ropeMode,
-        doublePrecision: transformer.doublePrecisionRoPE)
-      eval(refinePE.cos, refinePE.sin)
-      logger.info("Two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
-      // forceDeterministic drops the ancestral noise but keeps the CFG++ family:
-      // base=euler_ancestral_cfg_pp -> refine=euler_cfg_pp (the author's pairing).
-      latents = denoisingLoop(
-        latents: refineInit, positions: refinePos, precomputedPE: refinePE,
-        textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
-        sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
-        forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
-        progressCallback: progressCallback)
-      eval(latents)
-      MLX.GPU.clearCache()
-      logger.info("Two-stage refine complete.")
-      }
-    }
+    // Two-stage refine — shared with continuation chunks (applyTwoStageRefine).
+    latents = applyTwoStageRefine(
+      latents, latF: latF, latH: latH, latW: latW,
+      textEmbeddings: textOutput.videoEmbeddings,
+      negativeEmbeddings: negativeEmbeddings,
+      cfgScale: cfgScale, seed: seed,
+      refineAnchorImage: refineAnchorImage,
+      progressCallback: progressCallback)
 
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
@@ -760,7 +676,7 @@ public final class LTX2Pipeline {
     eval(textOutput.videoEmbeddings)
 
     var negativeEmbeddings: MLXArray? = nil
-    if cfgScale > 1.0, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+    if cfgScale > 1.0 || LTX2PipelineConfig.envCfgPP, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       let negOutput = textEncoder.encode(
         inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
       )
@@ -829,9 +745,22 @@ public final class LTX2Pipeline {
       progressCallback: progressCallback
     )
 
+    // Step 6b: Two-stage refine — SAME treatment as generateI2V. Continuation
+    // chunks previously skipped refine entirely, so chunks 2+ of every
+    // multi-chunk render were base-resolution decodes upscaled by the muxer
+    // (visible quality cliff at each chunk boundary; blockiness rose 1.14 ->
+    // 1.43 across the 2026-07-26 03:59 filed video).
+    let refinedLatents = applyTwoStageRefine(
+      latents, latF: latF, latH: latH, latW: latW,
+      textEmbeddings: textOutput.videoEmbeddings,
+      negativeEmbeddings: negativeEmbeddings,
+      cfgScale: cfgScale, seed: seed,
+      refineAnchorImage: nil,
+      progressCallback: progressCallback)
+
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
-    let decoded = decodeAdaptive(latents)
+    let decoded = decodeAdaptive(refinedLatents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -1291,6 +1220,100 @@ public final class LTX2Pipeline {
     }
     logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — clean, no tile mosaic.")
     return vae.decode(bf)
+  }
+
+  /// Shared two-stage refine (Phase 3): latent upsample x2 -> re-noise ->
+  /// short refine denoise at high res, with the refine-volume OOM gate and
+  /// optional native-res frame-0 re-anchor. Used by generateI2V AND
+  /// generateMultiKeyframe (continuation chunks) so every chunk of a
+  /// multi-chunk render gets identical refine treatment — previously chunks
+  /// 2+ skipped refine entirely, dropping to base resolution mid-video.
+  /// Returns the refined (or gated/upsampled) latents; caller decodes.
+  private func applyTwoStageRefine(
+    _ latents: MLXArray,
+    latF: Int, latH: Int, latW: Int,
+    textEmbeddings: MLXArray,
+    negativeEmbeddings: MLXArray?,
+    cfgScale: Float,
+    seed: UInt64?,
+    refineAnchorImage: MLXArray?,
+    progressCallback: ((Int, Int) -> Void)?
+  ) -> MLXArray {
+    guard let ups = self.upsampler,
+          ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" else {
+      return latents
+    }
+    logger.info("Two-stage refine: upsampling latents 2x...")
+    // The latent upsampler is trained on UN-normalized (VAE-scale) latents.
+    let stats = vae.decoder.perChannelStatistics
+    let denorm = stats.unNormalize(latents.asType(.float32))
+    let upDenorm = ups(denorm)
+    let upLatent = stats.normalize(upDenorm).asType(.float32)
+    eval(upLatent)
+    // Refine-volume OOM gate (2026-07-25 23:24 crash): above it, decode the
+    // upsampled latent directly — upscaled-but-unrefined beats a dead server.
+    let refineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
+    let refineMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_REFINE_MAX_VOL"] ?? "") ?? 12_000
+    if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
+      logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
+      return upLatent
+    }
+    if refineVolume > refineMaxVolume {
+      logger.info("Two-stage refine: SKIPPED denoise (refine latent volume \(refineVolume) > \(refineMaxVolume)) — decoding upsampled latent directly (OOM guard).")
+      return upLatent
+    }
+    MLX.GPU.clearCache()
+    let rLatH = latH * 2, rLatW = latW * 2
+    let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
+      let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+      return v.count >= 2 ? v : nil
+    } ?? [0.85, 0.7250, 0.4219, 0.0]  // PinkCherry v1.5 pass-2 sigmas
+    if let seed = seed { MLXRandom.seed(seed &+ 1000) }
+    // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (ComfyUI CONST noise_scaling).
+    let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
+    let sigma0 = refineSigmas[0]
+    let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
+    // Frame-0 re-anchor: raw source re-encoded at refine res when available
+    // (workflow nodes 19/20); else the upsampled latent's own frame 0.
+    let rF = upLatent.dim(2)
+    var anchorFrame = upLatent[0..., 0..., 0..<1, 0..., 0...]
+    if var refImg = refineAnchorImage {
+      if refImg.ndim == 4 { refImg = refImg.expandedDimensions(axis: 2) }
+      anchorFrame = vae.encode(refImg).asType(.float32)
+      eval(anchorFrame)
+      logger.info("Two-stage refine: frame 0 re-anchored to source re-encoded at \(rLatW * spatialCompression)x\(rLatH * spatialCompression).")
+    }
+    let refineInit = MLX.concatenated(
+      [anchorFrame, mixed[0..., 0..., 1..<rF, 0..., 0...]], axis: 2)
+    let refClean = MLX.concatenated(
+      [anchorFrame, upLatent[0..., 0..., 1..<rF, 0..., 0...]], axis: 2)
+    let refMask = MLX.concatenated(
+      [MLXArray.zeros([1, 1, 1, 1, 1]), MLXArray.ones([1, 1, rF - 1, 1, 1])],
+      axis: 2).asType(.float32)
+    let refState = LTX2LatentState(
+      latent: refineInit, cleanLatent: refClean, denoiseMask: refMask)
+    let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
+    let refinePE = ltx2PrecomputeFreqsCIS(
+      indicesGrid: refinePos, dim: innerDim,
+      theta: transformer.positionalEmbeddingTheta,
+      maxPos: transformer.positionalEmbeddingMaxPos,
+      useMiddleIndicesGrid: transformer.useMiddleIndicesGrid,
+      numAttentionHeads: transformer.numHeads,
+      ropeMode: transformer.ropeMode,
+      doublePrecision: transformer.doublePrecisionRoPE)
+    eval(refinePE.cos, refinePE.sin)
+    logger.info("Two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
+    // base=euler_ancestral_cfg_pp -> refine=euler_cfg_pp (the author's pairing).
+    var refined = denoisingLoop(
+      latents: refineInit, positions: refinePos, precomputedPE: refinePE,
+      textEmbeddings: textEmbeddings, negativeEmbeddings: negativeEmbeddings,
+      sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
+      forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
+      progressCallback: progressCallback)
+    eval(refined)
+    MLX.GPU.clearCache()
+    logger.info("Two-stage refine complete.")
+    return refined
   }
 
   private func createPositionGrid(

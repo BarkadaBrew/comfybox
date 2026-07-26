@@ -194,6 +194,12 @@ public final class LTX2VideoGenerator {
         n >= 9 && (n - 1) % 8 == 0
     }
 
+    /// fps must be positive and sane (chunk planning divides by it; the RoPE
+    /// temporal coords divide by it too).
+    public static func isValidFPS(_ fps: Int) -> Bool {
+        fps >= 1 && fps <= 120
+    }
+
     /// Dimensions must be positive multiples of 32.
     public static func areValidDimensions(width: Int, height: Int) -> Bool {
         width > 0 && height > 0 && width % 32 == 0 && height % 32 == 0
@@ -666,6 +672,8 @@ public final class LTX2VideoGenerator {
                         ],
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        negativeInputIds: negBatch?.inputIds,
+                        negativeAttentionMask: negBatch?.attentionMask,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 } else if request.identityAnchorStrength > 0,
                           request.identityReAnchorInterval > 0,
@@ -690,6 +698,8 @@ public final class LTX2VideoGenerator {
                         keyframes: keyframes,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        negativeInputIds: negBatch?.inputIds,
+                        negativeAttentionMask: negBatch?.attentionMask,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 } else {
                     output = pipeline.generateI2V(
@@ -733,7 +743,10 @@ public final class LTX2VideoGenerator {
                     let resized = try QwenImageIO.resize(
                         rgbArray: squeezed,
                         targetHeight: request.height, targetWidth: request.width)
-                    lastFrame = resized.expandedDimensions(axis: 0)
+                    // Lanczos overshoot can leave values outside [0,1]; the
+                    // *2-1 normalization below would push them out of the
+                    // VAE's expected range (Codex review 2026-07-26).
+                    lastFrame = MLX.clip(resized.expandedDimensions(axis: 0), min: MLXArray(Float(0)), max: MLXArray(Float(1)))
                     logger.info("Chunk seed downscaled from refine resolution to \(request.width)x\(request.height) for chaining")
                 }
                 currentImage = lastFrame * 2.0 - 1.0
