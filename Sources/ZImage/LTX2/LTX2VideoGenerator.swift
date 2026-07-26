@@ -552,6 +552,15 @@ public final class LTX2VideoGenerator {
             return cg.cropping(to: rect) ?? cg
         }
 
+        // Conditioning compression (libx264 CRF), function-scoped so BOTH the
+        // initial seed AND the chained continuation-chunk seeds get it. Chained
+        // seeds that skip it condition on a PRISTINE generated frame = the
+        // frozen-image regime → motion collapses across chunks (2026-07-26:
+        // comp30 chunk1 action-zone 6.11, chunks 2-3 crash to 2.2 because the
+        // chained frame was uncompressed). Higher = more motion.
+        let conditioningCompression = request.imgCompression
+            ?? Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
+
         // Seed image: the init image for I2V, else nil (T2V first chunk).
         var currentImage: MLXArray? = try request.initImagePath.map { path in
             let url = URL(fileURLWithPath: path)
@@ -573,7 +582,7 @@ public final class LTX2VideoGenerator {
             // (mannequin i2v, no locomotion). Measured on the same source/prompt/
             // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
             // LTX2_I2V_COMPRESSION=0 disables.
-            let compression = request.imgCompression ?? Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
+            let compression = conditioningCompression
             if compression > 0 {
                 // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
                 // preprocess artifact character); fall back to JPEG if the
@@ -753,6 +762,19 @@ public final class LTX2VideoGenerator {
                     // VAE's expected range (Codex review 2026-07-26).
                     lastFrame = MLX.clip(resized.expandedDimensions(axis: 0), min: MLXArray(Float(0)), max: MLXArray(Float(1)))
                     logger.info("Chunk seed downscaled from refine resolution to \(request.width)x\(request.height) for chaining")
+                }
+                // Apply the SAME conditioning compression the initial seed got,
+                // so continuation chunks read the chained frame as mid-motion
+                // video (not a pristine still that freezes). Round-trip the
+                // [0,1] frame through H.264; fall back to the raw frame if the
+                // codec path fails (never block a render on the preprocess).
+                if conditioningCompression > 0,
+                   let cg = try? QwenImageIO.image(from: lastFrame),
+                   let rt = try? LTX2PostProcess.h264RoundTrip(cg, compression: conditioningCompression),
+                   let arr = try? QwenImageIO.array(from: rt, addBatchDimension: true, dtype: .float32) {
+                    // array(from:) yields [1,3,H,W] in [0,1]; match lastFrame layout.
+                    lastFrame = MLX.clip(arr, min: MLXArray(Float(0)), max: MLXArray(Float(1)))
+                    logger.info("Chunk seed: conditioning compression \(conditioningCompression) applied for chaining")
                 }
                 currentImage = lastFrame * 2.0 - 1.0
                 MLX.eval(currentImage!)
