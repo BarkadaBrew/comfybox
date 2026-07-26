@@ -563,6 +563,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let cfg = params?.number("guidance") {
       body["guidance"] = cfg
     }
+    if let frames = params?.integer("frames") {
+      body["frames"] = frames
+    }
     if let neg = params?.string("negative_prompt") {
       body["negative_prompt"] = neg
     }

@@ -460,6 +460,10 @@ public enum MCPToolRegistry {
           "type": "number",
           "description": "CFG scale (default 1.0 flat). >1 AMPLIFIES action-prompt execution; 2.0 ~doubles action motion cleanly, 3.0 over-drives into artifacts. Use ~2.0 for action/partnered, 1.0 for solo/portrait fidelity.",
         ] as [String: Any],
+        "frames": [
+          "type": "integer",
+          "description": "Exact frame count (1+8k: 97, 145, 289...). Forces a SINGLE render pass at this length instead of the chunked `duration` path. Use for action clips <=12s (289f) to hold motion uniform (chunking decays it). Overrides duration.",
+        ] as [String: Any],
         "preset": [
           "type": "string",
           "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",
