@@ -732,11 +732,16 @@ public final class LTX2VideoGenerator {
                 // (2026-07-26 01:28: chunk 1's 18,928-volume decode -> chunk 2
                 // Metal-aborted 5s in). Drain adaptively like admission: drop
                 // the pool and re-probe until real headroom exists, up to ~24s.
+                // The free-memory probe LIES right after a large decode
+                // (lazy reclaim): 2026-07-26 02:57 it reported 47GB free at
+                // round 0, the threshold check passed with zero settling, and
+                // chunk 2 Metal-aborted 7s later. Settle a minimum number of
+                // rounds unconditionally, then keep going until real headroom.
                 MLX.GPU.clearCache()
                 var chunkFree = MemoryProbe.systemAvailableMemoryBytes()
-                let chunkHeadroom: UInt64 = 30 * 1024 * 1024 * 1024
+                let chunkHeadroom: UInt64 = 55 * 1024 * 1024 * 1024
                 var settleRounds = 0
-                while chunkFree < chunkHeadroom && settleRounds < 8 {
+                while settleRounds < 3 || (chunkFree < chunkHeadroom && settleRounds < 10) {
                     Thread.sleep(forTimeInterval: 3.0)
                     MLX.GPU.clearCache()
                     chunkFree = MemoryProbe.systemAvailableMemoryBytes()
