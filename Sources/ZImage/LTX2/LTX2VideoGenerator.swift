@@ -45,6 +45,9 @@ public struct LTX2VideoRequest: Sendable {
     /// Conditioning compression (libx264 CRF) override; nil = env/default.
     /// Higher = more motion (frozen-still regime at 0-2), lower = more fidelity.
     public var imgCompression: Int?
+    /// CFG guidance override; nil = env/config default. >1 amplifies the
+    /// action-prompt direction (primary motion lever, Codex 2026-07-26).
+    public var guidance: Float?
     /// Identity re-anchor strength for CONTINUATION chunks (0 = off). Each
     /// continuation chunk conditions on the previous chunk\u{27}s last frame at
     /// frame 0 (hard continuity) AND the ORIGINAL source image at the chunk\u{27}s
@@ -91,6 +94,7 @@ public struct LTX2VideoRequest: Sendable {
         seed: UInt64 = 42,
         strength: Float = 1.0,
         imgCompression: Int? = nil,
+        guidance: Float? = nil,
         identityAnchorStrength: Float = 0,
         identityReAnchorInterval: Int = 0,
         extendToSeconds: Float = 0,
@@ -110,6 +114,7 @@ public struct LTX2VideoRequest: Sendable {
         self.seed = seed
         self.strength = strength
         self.imgCompression = imgCompression
+        self.guidance = guidance
         self.identityAnchorStrength = identityAnchorStrength
         self.identityReAnchorInterval = identityReAnchorInterval
         self.extendToSeconds = extendToSeconds
@@ -721,6 +726,7 @@ public final class LTX2VideoGenerator {
                         image: image, strength: request.strength,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
                         faceAnchorMask: chunk == 0 ? faceAnchorMask : nil,

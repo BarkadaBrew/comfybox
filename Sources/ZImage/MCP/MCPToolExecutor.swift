@@ -560,6 +560,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let comp = params?.integer("img_compression") {
       body["img_compression"] = comp
     }
+    if let cfg = params?.number("guidance") {
+      body["guidance"] = cfg
+    }
     if let neg = params?.string("negative_prompt") {
       body["negative_prompt"] = neg
     }

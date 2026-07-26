@@ -456,6 +456,10 @@ public enum MCPToolRegistry {
           "type": "integer",
           "description": "Conditioning compression (libx264 CRF, 0-51). PRIMARY motion lever: low (0-2) = max fidelity but freezes motion; ~30 = strong motion for action/partnered scenes; default 35. Use low for solo/portrait, high for action.",
         ] as [String: Any],
+        "guidance": [
+          "type": "number",
+          "description": "CFG scale (default 1.0 flat). >1 AMPLIFIES action-prompt execution; 2.0 ~doubles action motion cleanly, 3.0 over-drives into artifacts. Use ~2.0 for action/partnered, 1.0 for solo/portrait fidelity.",
+        ] as [String: Any],
         "preset": [
           "type": "string",
           "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",

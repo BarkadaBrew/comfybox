@@ -1524,6 +1524,9 @@ public final class WarmServer {
     /// daemon sends a higher value (more motion) for partnered-action prompts
     /// and a low value (fidelity) for solo/portrait. nil = env default.
     let imgCompression: Int?
+    /// CFG guidance override (>1 amplifies action; motion recipe sends 2.0 for
+    /// partnered-action, omits for solo=fidelity). nil = env/config default.
+    let guidance: Float?
     let extendToSeconds: Float?
     /// Target duration in seconds — the daemon/MCP vocabulary. For local
     /// renders this maps onto `extendToSeconds` (chunked continuation, each
@@ -1903,6 +1906,7 @@ public final class WarmServer {
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
       imgCompression: req.imgCompression,
+      guidance: req.guidance,
       // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
       // 2026-07-13 MLX mutex crash on this path was memory pressure — with
       // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
