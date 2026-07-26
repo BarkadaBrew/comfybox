@@ -1167,8 +1167,8 @@ public final class LTX2Pipeline {
   /// Adaptive VAE decode. Plain single-pass decode is clean (no spatial-tile
   /// mosaic, no temporal-window jitter) but memory-heavy; tiled decode is
   /// OOM-safe for long/large clips. Decide by latent frame count: plain for
-  /// normal clips, tiled only when long enough to risk OOM. `config.tiledDecode
-  /// == false` (LTX2_TILED_DECODE=0) forces plain everywhere. Threshold tunable
+  /// normal clips, exact streamed decode above the safety gate. Mode switch:
+  /// LTX2_DECODE_MODE=auto|stream|tile|plain. Threshold tunable
   /// via LTX2_PLAIN_DECODE_MAX_LATF (latent frames; ~8x fewer than output frames).
   private func decodeAdaptive(_ latents: MLXArray) -> MLXArray {
     let latF = latents.dim(2)
@@ -1192,34 +1192,44 @@ public final class LTX2Pipeline {
       try? MLX.save(arrays: ["latent": latents.asType(.float32)], url: URL(fileURLWithPath: dumpPath))
       logger.info("VAE decode: dumped pre-decode latent to \(dumpPath)")
     }
-    // LTX2_DECODE_F32=1: decode in float32 instead of bf16. Probe for the
-    // Metal silent-corruption cliff (plain decode > ~4500 volume garbles the
-    // last frames with no error at 95% free memory) — if the cliff is a
-    // large-tensor bf16 kernel path, f32 unlocks exact seamless plain decode
-    // (2x activation memory; fine on 128GB).
+    // LTX2_DECODE_F32=1: decode in float32 instead of bf16 (debug probe).
     let decodeF32 = ProcessInfo.processInfo.environment["LTX2_DECODE_F32"] == "1"
     let bf = latents.asType(decodeF32 ? .float32 : .bfloat16)
-    if config.tiledDecode && volume > plainMaxVolume {
-      // Exact streamed decode (#36): frame-chunked with per-conv temporal
-      // state, numerically identical to plain decode, zero seams. Replaces
-      // the seam-based approximations, all of which measurably cost quality
-      // (2026-07-25 anchor-case shootout, decode-only sharp/flicker: 16-tile
-      // 18.5/0.555; 22-tile 28.4/0.79; blended temporal windows 22.6/0.75;
-      // plain decode 36.4 but corrupt — MLX Metal int32-offset overflow on
-      // large tensors, mlx #3836, unfixed in any mlx-swift release; ComfyUI's
-      // streaming reference: 41.4/0.157). Chunk size targets a per-chunk
-      // latent volume well under the corruption cliff (~4004 proven safe).
-      // LTX2_DECODE_STREAM=0 falls back to the legacy tiled path.
-      if ProcessInfo.processInfo.environment["LTX2_DECODE_STREAM"] != "0" {
-        logger.info("VAE decode: streamed exact chunked-io (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — zero seams.")
+
+    // Decode mode — ONE switch (LTX2_DECODE_MODE): auto | stream | tile | plain.
+    //   auto (default): plain under the corruption-safe volume gate, exact
+    //     streamed chunked-io above it (bit-identical to plain, zero seams).
+    //   stream: streamed always. tile: legacy spatial tiling (LTX2_DECODE_TILE).
+    //   plain: force single-pass — EXPERT/DEBUG ONLY: above the gate, MLX Metal
+    //     silently corrupts boundary frames (int32 offset overflow, mlx #3836;
+    //     unfixed in any mlx-swift release as of 0.31.6).
+    // Legacy alias honored: LTX2_DECODE_STREAM=0 -> tile. config.tiledDecode
+    // no longer disables the safety path (Codex review 2026-07-26: a default-
+    // constructed config could force a corrupting plain decode).
+    let env = ProcessInfo.processInfo.environment
+    let mode = (env["LTX2_DECODE_MODE"] ?? (env["LTX2_DECODE_STREAM"] == "0" ? "tile" : "auto")).lowercased()
+    switch mode {
+    case "plain":
+      if volume > plainMaxVolume {
+        logger.warning("VAE decode: FORCED plain above the safety gate (volume \(volume) > \(plainMaxVolume)) — output may be silently corrupt (mlx #3836).")
+      }
+      logger.info("VAE decode: plain single-pass (forced; volume \(volume) [\(latF)x\(latH)x\(latW)]).")
+      return vae.decode(bf)
+    case "tile":
+      let tile = Int(env["LTX2_DECODE_TILE"] ?? "") ?? 16
+      logger.info("VAE decode: tiled (mode=tile; volume \(volume) [\(latF)x\(latH)x\(latW)]) — tile \(tile).")
+      return vae.decodeTiled(bf, tileSize: tile, tileStride: tile - 2)
+    case "stream":
+      logger.info("VAE decode: streamed exact chunked-io (mode=stream; volume \(volume) [\(latF)x\(latH)x\(latW)]) — zero seams.")
+      return vae.decodeStreamed(bf)
+    default:  // auto
+      if volume > plainMaxVolume {
+        logger.info("VAE decode: streamed exact chunked-io (volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — zero seams.")
         return vae.decodeStreamed(bf)
       }
-      let tile = Int(ProcessInfo.processInfo.environment["LTX2_DECODE_TILE"] ?? "") ?? 16
-      logger.info("VAE decode: tiled (latent volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — OOM-safe path, tile \(tile).")
-      return vae.decodeTiled(bf, tileSize: tile, tileStride: tile - 2)
+      logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — under the safety gate.")
+      return vae.decode(bf)
     }
-    logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — clean, no tile mosaic.")
-    return vae.decode(bf)
   }
 
   /// Shared two-stage refine (Phase 3): latent upsample x2 -> re-noise ->
