@@ -720,7 +720,22 @@ public final class LTX2VideoGenerator {
             // Re-feed the last frame as the seed for the next continuation chunk.
             if chunk < plan.totalChunks - 1 {
                 let t = output.decoded.dim(2)
-                let lastFrame = output.decoded[0..., 0..., (t - 1)..<t, 0..., 0...].squeezed(axis: 2)
+                var lastFrame = output.decoded[0..., 0..., (t - 1)..<t, 0..., 0...].squeezed(axis: 2)
+                // Two-stage refine decodes at 2x the base resolution. The
+                // chained seed MUST be at base resolution: feeding the 2x frame
+                // VAE-encodes to a conditioning latent at 2x latent dims and
+                // applyConditioning fatalErrors on the shape mismatch —
+                // instant process death, no log. EVERY multi-chunk crash of
+                // 2026-07-25/26 (10:48, 01:28, 02:57, 03:16) died exactly here,
+                // seconds after "Encoding N keyframe image(s)".
+                if lastFrame.dim(2) != request.height || lastFrame.dim(3) != request.width {
+                    let squeezed = lastFrame.squeezed(axis: 0)
+                    let resized = try QwenImageIO.resize(
+                        rgbArray: squeezed,
+                        targetHeight: request.height, targetWidth: request.width)
+                    lastFrame = resized.expandedDimensions(axis: 0)
+                    logger.info("Chunk seed downscaled from refine resolution to \(request.width)x\(request.height) for chaining")
+                }
                 currentImage = lastFrame * 2.0 - 1.0
                 MLX.eval(currentImage!)
 
@@ -739,7 +754,7 @@ public final class LTX2VideoGenerator {
                 // rounds unconditionally, then keep going until real headroom.
                 MLX.GPU.clearCache()
                 var chunkFree = MemoryProbe.systemAvailableMemoryBytes()
-                let chunkHeadroom: UInt64 = 55 * 1024 * 1024 * 1024
+                let chunkHeadroom: UInt64 = 40 * 1024 * 1024 * 1024
                 var settleRounds = 0
                 while settleRounds < 3 || (chunkFree < chunkHeadroom && settleRounds < 10) {
                     Thread.sleep(forTimeInterval: 3.0)
