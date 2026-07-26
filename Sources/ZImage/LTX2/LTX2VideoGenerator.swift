@@ -42,6 +42,9 @@ public struct LTX2VideoRequest: Sendable {
     public var seed: UInt64
     /// I2V conditioning strength (0–1).
     public var strength: Float
+    /// Conditioning compression (libx264 CRF) override; nil = env/default.
+    /// Higher = more motion (frozen-still regime at 0-2), lower = more fidelity.
+    public var imgCompression: Int?
     /// Identity re-anchor strength for CONTINUATION chunks (0 = off). Each
     /// continuation chunk conditions on the previous chunk\u{27}s last frame at
     /// frame 0 (hard continuity) AND the ORIGINAL source image at the chunk\u{27}s
@@ -87,6 +90,7 @@ public struct LTX2VideoRequest: Sendable {
         steps: Int = 8,
         seed: UInt64 = 42,
         strength: Float = 1.0,
+        imgCompression: Int? = nil,
         identityAnchorStrength: Float = 0,
         identityReAnchorInterval: Int = 0,
         extendToSeconds: Float = 0,
@@ -105,6 +109,7 @@ public struct LTX2VideoRequest: Sendable {
         self.steps = steps
         self.seed = seed
         self.strength = strength
+        self.imgCompression = imgCompression
         self.identityAnchorStrength = identityAnchorStrength
         self.identityReAnchorInterval = identityReAnchorInterval
         self.extendToSeconds = extendToSeconds
@@ -568,7 +573,7 @@ public final class LTX2VideoGenerator {
             // (mannequin i2v, no locomotion). Measured on the same source/prompt/
             // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
             // LTX2_I2V_COMPRESSION=0 disables.
-            let compression = Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
+            let compression = request.imgCompression ?? Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
             if compression > 0 {
                 // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
                 // preprocess artifact character); fall back to JPEG if the
