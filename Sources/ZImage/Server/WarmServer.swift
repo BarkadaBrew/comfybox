@@ -4983,8 +4983,17 @@ private actor WarmServerCoordinator {
         var availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
         // Precision-keyed (#230): an int8-quantized checkpoint dir gates at
         // 40GB instead of the bf16 65GB, so video coexists with LM Studio.
-        let ltx2Need = HeavyModelAdmission.ltx2EstimateBytes(
-          forWeightsPath: configuration.ltx2WeightsPath)
+        // Warm-stack discount: when the LTX-2 generator is ALREADY loaded, its
+        // ~46-65GB of weights are resident and counted AGAINST free memory —
+        // demanding the full cold-load estimate double-counts them and refuses
+        // healthy back-to-back videos (observed 2026-07-25 22:38: 45GB free
+        // with the stack warm, admit=false, job bounced). A warm render only
+        // needs activation headroom (streamed decode bounds the decode peak).
+        let videoStackWarm = videoHolder.get()?.isLoaded == true
+        let ltx2Need = videoStackWarm
+          ? 24 * 1024 * 1024 * 1024
+          : HeavyModelAdmission.ltx2EstimateBytes(
+              forWeightsPath: configuration.ltx2WeightsPath)
         // Drain-until-settled (#34): back-to-back renders (e.g. Kira's i2v →
         // multi-keyframe in the same second) start while the previous job's
         // MLX buffer pool + lazy macOS reclaim still hold tens of GB. Admission
@@ -5005,7 +5014,7 @@ private actor WarmServerCoordinator {
         }
         let admitVideo = heavyAdmission.admitsAfterEvict(
           needBytes: ltx2Need, freeBytes: availableForVideo)
-        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free after \(drainAttempts) drain(s), need ~\(ltx2Need >> 20)MB → admit=\(admitVideo) (#218/#34)")
+        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free after \(drainAttempts) drain(s), need ~\(ltx2Need >> 20)MB\(videoStackWarm ? " (warm stack)" : "") → admit=\(admitVideo) (#218/#34)")
         if !admitVideo {
           continuation.resume(throwing: WarmServerError.invalidRequest(
             message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(ltx2Need >> 20)MB)"))
