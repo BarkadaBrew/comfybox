@@ -725,15 +725,24 @@ public final class LTX2VideoGenerator {
                 MLX.eval(currentImage!)
 
                 // Chunk-boundary drain (#34): the next chunk starts with the
-                // previous chunk's decode intermediates (up to ~25GB) still in
-                // the MLX pool + lazily-reclaimed by macOS. The per-JOB
-                // admission drain never sees this boundary — 2026-07-25 the
-                // server Metal-aborted 2s into chunk 1 of a 12s Kira render
-                // (crash at 10:48:12, tracker wiped, daemon polled a ghost job
-                // to timeout). Drop the pool and give the OS a beat to reclaim
-                // before the next chunk allocates.
+                // previous chunk's decode intermediates (up to ~35GB at the
+                // large formats) still in the MLX pool + lazily-reclaimed by
+                // macOS. The per-JOB admission drain never sees this boundary.
+                // A FIXED 3s settle proved insufficient at 12s/9:16 scale
+                // (2026-07-26 01:28: chunk 1's 18,928-volume decode -> chunk 2
+                // Metal-aborted 5s in). Drain adaptively like admission: drop
+                // the pool and re-probe until real headroom exists, up to ~24s.
                 MLX.GPU.clearCache()
-                Thread.sleep(forTimeInterval: 3.0)
+                var chunkFree = MemoryProbe.systemAvailableMemoryBytes()
+                let chunkHeadroom: UInt64 = 30 * 1024 * 1024 * 1024
+                var settleRounds = 0
+                while chunkFree < chunkHeadroom && settleRounds < 8 {
+                    Thread.sleep(forTimeInterval: 3.0)
+                    MLX.GPU.clearCache()
+                    chunkFree = MemoryProbe.systemAvailableMemoryBytes()
+                    settleRounds += 1
+                }
+                logger.info("Chunk-boundary drain: \(chunkFree >> 20)MB free after \(settleRounds) settle round(s) (#34)")
             }
         }
 
