@@ -519,21 +519,49 @@ public final class LTX2VideoGenerator {
         let start = CFAbsoluteTimeGetCurrent()
         var allFrames: [CGImage] = []
 
+        // Center-crop a CGImage to the target aspect ratio, matching ComfyUI's
+        // ImageScale crop="center" (workflow nodes 7 and 19). Our plain resize
+        // STRETCHES on aspect mismatch — seed stills are often 9:16 (0.5625)
+        // against 384x640 (0.6), a ~7% vertical squash that distorts the
+        // conditioning content vs the workflow's crop.
+        func centerCropped(_ cg: CGImage, targetW: Int, targetH: Int) -> CGImage {
+            let srcW = Double(cg.width), srcH = Double(cg.height)
+            let targetAspect = Double(targetW) / Double(targetH)
+            let srcAspect = srcW / srcH
+            var cropW = srcW, cropH = srcH
+            if srcAspect > targetAspect {
+                cropW = srcH * targetAspect
+            } else {
+                cropH = srcW / targetAspect
+            }
+            let rect = CGRect(
+                x: ((srcW - cropW) / 2).rounded(.down),
+                y: ((srcH - cropH) / 2).rounded(.down),
+                width: cropW.rounded(), height: cropH.rounded())
+            return cg.cropping(to: rect) ?? cg
+        }
+
         // Seed image: the init image for I2V, else nil (T2V first chunk).
         var currentImage: MLXArray? = try request.initImagePath.map { path in
             let url = URL(fileURLWithPath: path)
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  var cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                  let rawImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw LTX2VideoError.imageLoadFailed(path)
             }
+            // Workflow order (nodes 7 -> 8): center-crop + scale to the render
+            // size FIRST, then compression-preprocess at that size. Compressing
+            // at native resolution and downscaling after (the old order)
+            // changes the artifact character and stretches on aspect mismatch.
+            var cgImage = try QwenImageIO.resizedCGImage(
+                from: centerCropped(rawImage, targetW: request.width, targetH: request.height),
+                width: request.width, height: request.height)
             // LTX conditioning preprocess (ComfyUI LTXVPreprocess, img_compression
-            // 35 ≈ H.264 CRF 35): round-trip the still through lossy compression so
+            // = libx264 CRF): round-trip the still through lossy compression so
             // it carries codec-like artifacts. LTX is trained on VIDEO frames — a
             // pristine still is out-of-distribution and the model freezes it
             // (mannequin i2v, no locomotion). Measured on the same source/prompt/
             // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
-            // JPEG quality approximates the CRF-35 artifact level.
-            // LTX2_I2V_COMPRESSION=0 disables; 1-100 sets JPEG quality inverse.
+            // LTX2_I2V_COMPRESSION=0 disables.
             let compression = Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
             if compression > 0 {
                 // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
@@ -559,9 +587,8 @@ public final class LTX2VideoGenerator {
                     }
                 }
             }
-            let pixels = try QwenImageIO.resizedPixelArray(
-                from: cgImage, width: request.width, height: request.height,
-                addBatchDimension: true, dtype: .float32)
+            let pixels = try QwenImageIO.array(
+                from: cgImage, addBatchDimension: true, dtype: .float32)
             return QwenImageIO.normalizeForEncoder(pixels)
         }
 
@@ -578,8 +605,10 @@ public final class LTX2VideoGenerator {
                   let path = request.initImagePath,
                   let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
                   let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            // Workflow node 19: center-crop + lanczos to 2x, RAW (no preprocess).
             let pixels = try QwenImageIO.resizedPixelArray(
-                from: cgImage, width: request.width * 2, height: request.height * 2,
+                from: centerCropped(cgImage, targetW: request.width * 2, targetH: request.height * 2),
+                width: request.width * 2, height: request.height * 2,
                 addBatchDimension: true, dtype: .float32)
             return QwenImageIO.normalizeForEncoder(pixels)
         }()

@@ -1320,11 +1320,20 @@ public final class LTX2Pipeline {
             tStart = max(0, tStart + 1 - temporalScale)
             tEnd = max(0, tEnd + 1 - temporalScale)
 
-            // NOTE: NO fps division. The reference ComfyUI LTX pipeline
-            // (symmetric_patchifier.latent_to_pixel_coords + get_fractional_positions)
-            // scales temporal coords by the VAE factor and normalizes ONLY by
-            // max_pos — never by fps. The previous /= fps compressed the temporal
-            // RoPE ~24x, flattening frame-to-frame progression → near-static motion.
+            // fps division RESTORED (2026-07-25): ComfyUI's
+            // _prepare_positional_embeddings (ldm/lightricks/model.py) does
+            // `fractional_coords[:, 0] *= 1/frame_rate` before RoPE — temporal
+            // coordinates are in SECONDS. Without it our coords span 0..48
+            // against the trained temporal max_pos of 20 (out of range) and
+            // adjacent frames sit 24x further apart than trained — the model
+            // renders them near-independently: motion survives but fine detail
+            // decorrelates frame to frame (the shimmer: flicker 0.45-0.8 vs
+            // reference 0.157). The earlier removal ("fixed near-static
+            // motion") misattributed the freeze — that was the pristine-still
+            // conditioning bug (LTX2_I2V_COMPRESSION=0 freezing i2v), fixed
+            // separately.
+            tStart /= fps
+            tEnd /= fps
 
             // Spatial in pixel space
             let hStart = Float(h) * spatialScale
