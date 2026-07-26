@@ -590,11 +590,22 @@ public final class LTX2Pipeline {
       let upDenorm = ups(denorm)
       let upLatent = stats.normalize(upDenorm).asType(.float32)
       eval(upLatent)
+      // Refine-volume gate: the refine denoise's attention peak scales with
+      // upsampled token count and Metal-aborts the process on the largest
+      // formats (2026-07-25 23:24: 97f @ 832x448 -> refine 1664x896, latent
+      // volume 13x28x52 = 18,928; memory-pressure warning then SIGKILL mid-
+      // denoise). Above the gate, decode the upsampled latent directly —
+      // upscaled-but-unrefined output beats a dead server and a lost render.
+      let refineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
+      let refineMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_REFINE_MAX_VOL"] ?? "") ?? 12_000
       // DIAGNOSTIC: decode the upsampled latent directly (skip refine denoise) to
       // isolate whether artifacts originate in the upsampler or the refine loop.
       if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
         latents = upLatent
         logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
+      } else if refineVolume > refineMaxVolume {
+        latents = upLatent
+        logger.info("Two-stage refine: SKIPPED denoise (refine latent volume \(refineVolume) > \(refineMaxVolume)) — decoding upsampled latent directly (OOM guard).")
       } else {
       // Free base-pass intermediates before the memory-heavy refine (12s/289f).
       MLX.GPU.clearCache()
