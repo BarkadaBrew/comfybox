@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>COMFYBOX_MODELS</key>
+		<string>/Users/toddwalderman/.comfybox/loras</string>
+		<key>LTX2_FACE_ANCHOR_STRENGTH</key>
+		<string>0</string>
+		<key>LTX2_I2V_COMPRESSION</key>
+		<string>2</string>
+		<key>LTX2_IC_CONTROL</key>
+		<string>0</string>
+		<key>LTX2_PLAIN_DECODE_MAX_VOL</key>
+		<string>4500</string>
+		<key>LTX2_REANCHOR_INTERVAL</key>
+		<string>0</string>
+		<key>LTX2_REANCHOR_STRENGTH</key>
+		<string>0.3</string>
+		<key>LTX2_REFINE_DECODE_ONLY</key>
+		<string>0</string>
+		<key>LTX2_REFINE_SIGMAS</key>
+		<string>0.85, 0.7250, 0.4219, 0.0</string>
+		<key>LTX2_SAMPLER</key>
+		<string>euler_ancestral_cfg_pp</string>
+		<key>LTX2_STAGE1_SIGMAS</key>
+		<string>1.0, 0.998, 0.995, 0.99, 0.982, 0.97, 0.94, 0.89, 0.82, 0.73, 0.62, 0.50, 0.38, 0.27, 0.18, 0.11, 0.06, 0.03, 0.01, 0.0</string>
+		<key>LTX2_STG_SCALE</key>
+		<string>0</string>
+		<key>LTX2_TWO_STAGE</key>
+		<string>1</string>
+		<key>LTX2_UPSAMPLER_PATH</key>
+		<string>/Users/toddwalderman/.comfybox/loras/ltx-2.3-spatial-upscaler-x2-1.1.safetensors</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.barkadabrew.comfybox</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/toddwalderman/Projects/zimage.swift/.build/release/ComfyBox</string>
+		<string>serve</string>
+		<string>--port</string>
+		<string>7870</string>
+		<string>--host</string>
+		<string>0.0.0.0</string>
+		<string>--cache-limit</string>
+		<string>8192</string>
+		<string>--seedvr2-weights</string>
+		<string>/Users/toddwalderman/.comfybox/seedvr2-3b</string>
+		<string>--model</string>
+		<string>krea2</string>
+		<string>--ltx2-weights</string>
+		<string>/Users/toddwalderman/LocalModels/sexgod-distill06-bf16</string>
+		<string>--ltx2-gemma</string>
+		<string>/Users/toddwalderman/LocalModels/gemma-3-12b-heretic-q8</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/comfybox-serve-err.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/comfybox-serve.log</string>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/toddwalderman/Projects/zimage.swift</string>
+</dict>
+</plist>
