@@ -83,6 +83,10 @@ public struct KiraStateSnapshot: Equatable, Sendable {
     public var worldPresent: Bool
     public var fetchedAt: Date
 
+    /// Deliberate (Kimi review 2026-07-27 asked): `scores` is a tuple array, so
+    /// Equatable can't be synthesized. fetchedAt is stamped fresh (Date()) on
+    /// every parse, so two distinct fetches never compare equal — this is a
+    /// cheap identity check, not a content diff.
     public static func == (lhs: KiraStateSnapshot, rhs: KiraStateSnapshot) -> Bool {
         lhs.fetchedAt == rhs.fetchedAt
     }
@@ -525,6 +529,11 @@ public final class KiraClient {
             stateError = nil
         } else if state == nil {
             stateError = "GET /v1/kira/state unavailable"
+        } else {
+            // Keep the last snapshot on screen but SAY it's stale (Kimi review
+            // 2026-07-27) — the card's relative fetchedAt stops advancing and
+            // this line explains why.
+            stateError = "state refresh failed — showing last snapshot"
         }
         if let data = await schedulerData {
             scheduler = KiraSchedulerStatus.parse(data)
@@ -532,6 +541,8 @@ public final class KiraClient {
         if let data = await modeData,
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             contentMode = json["mode"] as? String
+            // Absent/empty allow-list keeps the previous value ON PURPOSE — a
+            // transiently malformed payload must not blank the mode picker.
             allowedModes = json["allowed"] as? [String] ?? allowedModes
         }
         if let data = await mediaData,
@@ -683,8 +694,9 @@ public final class KiraClient {
     /// server-side). Live: the scheduler re-reads policy every cycle, so
     /// edits take effect on the next tick without a daemon restart.
     public func updateSchedulerPolicy(_ changes: [String: Any]) async {
+        // perform() already refreshes the dashboard on success (Kimi review
+        // 2026-07-27: this used to call refreshDashboard() a second time).
         await perform("v1/kira/content-scheduler/policy", method: "PUT", body: changes)
-        await refreshDashboard()
     }
 
     // MARK: - Editors (Todd 2026-07-27): character / Her Now / lorebook

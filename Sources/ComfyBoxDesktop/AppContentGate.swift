@@ -51,6 +51,10 @@ public extension View {
     }
 }
 
+// Explicitly MainActor (Kimi review 2026-07-27): body already runs on the main
+// actor via SwiftUI, but the annotation makes the @Environment(AppContentGate)
+// read provably safe when the package moves to Swift 6 language mode.
+@MainActor
 struct ContentGateModifier: ViewModifier {
     @Environment(AppContentGate.self) private var gate
     let cornerRadius: CGFloat
@@ -100,6 +104,7 @@ public struct GatedText: View {
 /// would advertise hidden content to anyone who opens the app (Todd
 /// 2026-07-18). Revealing is a hidden keyboard shortcut only, handled at the
 /// app level. This just shows a quiet lock so nothing mature is on screen.
+@MainActor
 public struct ContentHiddenWall: View {
     private let note: String
 
@@ -115,6 +120,13 @@ public struct ContentHiddenWall: View {
             Text("Locked")
                 .font(.headline)
                 .foregroundStyle(.secondary)
+            // The note was accepted-but-dropped (Kimi review 2026-07-27).
+            // Rendered quietly: callers pass neutral copy, never a content tease.
+            if !note.isEmpty {
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(40)

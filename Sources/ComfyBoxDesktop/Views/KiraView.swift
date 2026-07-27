@@ -11,6 +11,8 @@ import SwiftUI
 struct KiraView: View {
     @Bindable var client: KiraClient
     @State private var tokenDraft: String = ""
+    @State private var hostDraft: String = ""
+    @State private var portDraft: String = ""
     @State private var suggestionDraft: String = ""
     @State private var suggestionKind: String = "image"
     /// Which cards are expanded. Empty by default → every card starts collapsed
@@ -57,6 +59,8 @@ struct KiraView: View {
         .navigationTitle("Kira")
         .onAppear {
             tokenDraft = client.token
+            hostDraft = client.binding.host
+            portDraft = String(client.binding.port)
             client.startPolling()
         }
         .onDisappear {
@@ -181,34 +185,48 @@ struct KiraView: View {
             .font(.callout)
             .foregroundStyle(.secondary)
         HStack {
-            TextField("Host", text: Binding(
-                get: { client.binding.host },
-                set: { client.binding.host = $0 }))
+            // Drafts, not live bindings (Kimi review 2026-07-27): binding.didSet
+            // persists to UserDefaults and restarts polling, so typing directly
+            // into client.binding did both on EVERY keystroke. Apply commits once.
+            TextField("Host", text: $hostDraft)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 160)
-            TextField("Port", value: Binding(
-                get: { client.binding.port },
-                set: { client.binding.port = $0 }), format: .number.grouping(.never))
+            TextField("Port", text: $portDraft)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 70)
             SecureField("Daemon API token", text: $tokenDraft)
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 160)
-                .onSubmit { client.token = tokenDraft }
-            Button("Apply") {
-                client.token = tokenDraft
-                Task { await client.refreshHealth() }
-            }
+                .onSubmit { applyBinding() }
+            Button("Apply") { applyBinding() }
         }
         Text("Token is stored in the macOS Keychain. One switch re-points the whole tab (host-agnostic) — no per-card configuration.")
             .font(.caption2)
             .foregroundStyle(.tertiary)
     }
 
+    /// Commit the binding drafts in one shot (persist + poll restart happen once).
+    private func applyBinding() {
+        client.token = tokenDraft
+        var binding = client.binding
+        binding.host = hostDraft.trimmingCharacters(in: .whitespaces)
+        if let port = Int(portDraft.trimmingCharacters(in: .whitespaces)), (1...65535).contains(port) {
+            binding.port = port
+        } else {
+            portDraft = String(binding.port)   // reject garbage, restore the live value
+        }
+        client.binding = binding   // no-op if unchanged (didSet guards equality)
+        Task { await client.refreshHealth() }
+    }
+
     // MARK: - Live dashboard cards (D2–D4)
 
     @ViewBuilder private var herNowBody: some View {
         if let state = client.state {
+            if let staleNote = client.stateError {
+                // Set only when a refresh failed while a snapshot is on screen.
+                Text(staleNote).font(.caption2).foregroundStyle(.orange)
+            }
             HStack(spacing: 10) {
                 chip(state.mood, tint: .pink)
                 chip(state.energy, tint: .orange)
