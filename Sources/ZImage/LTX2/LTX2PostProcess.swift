@@ -55,7 +55,13 @@ public enum LTX2PostProcess {
   }
 
   private static func colorAnchorStrength() -> Float {
-    Float(ProcessInfo.processInfo.environment["LTX2_COLOR_ANCHOR"] ?? "") ?? 0.9
+    // Default OFF. This is a POST-HOC cosmetic mask (renormalize each frame to
+    // frame 0) — it hides in-clip tone drift instead of fixing its root cause
+    // (denoise-side appearance drift from the free-running frames / conditioning
+    // decay). Kept only as a QA/export escape hatch. The real fix is a root-side
+    // appearance anchor + a sharp (low-CRF) conditioning frame. See codex review
+    // 2026-07-27 and qa/video/QA-CAMPAIGN-2026-07-26.md.
+    Float(ProcessInfo.processInfo.environment["LTX2_COLOR_ANCHOR"] ?? "") ?? 0.0
   }
 
   public static func extractFrames(

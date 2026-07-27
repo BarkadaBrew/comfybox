@@ -1349,7 +1349,14 @@ public final class LTX2Pipeline {
   ) -> MLXArray {
     let temporalScale = Float(temporalCompression)
     let spatialScale = Float(spatialCompression) * spatialScaleMul
-    let fps = Float(config.fps)
+    // Conditioning frame_rate drives the temporal RoPE spacing, which is the
+    // motion-vs-coherence dial: LOWER fps → coords spread further apart → the
+    // model assumes bigger inter-frame time gaps → MORE motion per frame (until
+    // coords exceed the trained temporal max_pos ~20 → shimmer). LTX2_COND_FPS
+    // decouples this from the OUTPUT/playback fps (config.fps) so we can drive
+    // motion from a sharp seed without making the mp4 choppy. Default: match
+    // playback fps (temporally-correct). See QA-CAMPAIGN-2026-07-26 motion sweep.
+    let fps = Float(ProcessInfo.processInfo.environment["LTX2_COND_FPS"] ?? "") ?? Float(config.fps)
     let totalF = latF + refFrames
     let numPatches = totalF * latH * latW
 
