@@ -20,7 +20,10 @@ echo "==> 4/5 restarting the ComfyBox engine"
 launchctl kickstart -k "gui/$(id -u)/com.barkadabrew.comfybox"
 
 echo "==> 5/5 restarting the MCP bridge (daemon respawns it with the new binary)"
-pkill -f "ComfyBox mcp" 2>/dev/null || true
+# Anchored to the built binary path — a bare "ComfyBox mcp" pattern matches
+# any command line containing the words (Kimi review 2026-07-27). This matches
+# both the relative and absolute invocation of .build/release/ComfyBox.
+pkill -f '\.build/release/ComfyBox mcp' 2>/dev/null || true
 
 echo ""
 echo "DONE. ComfyBox re-signed with your Developer ID + restarted."
