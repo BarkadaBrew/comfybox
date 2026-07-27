@@ -649,7 +649,20 @@ public final class LTX2VideoGenerator {
         if faceAnchorStrength > 0, let path = request.initImagePath,
            let isrc = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
            let cg = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
-            let rects = (try? RegionMaskUtilities.detectFaceRects(in: cg)) ?? []
+            var rects = (try? RegionMaskUtilities.detectFaceRects(in: cg)) ?? []
+            // Male-only anchor (LTX2_FACE_ANCHOR_MALE_ONLY=1, default on): the
+            // FEMALE subject (Kira) is already identity-held by her seed + LoRA,
+            // so anchoring her face is pure downside — it seams her skin at the
+            // mask boundary and damps her action motion. Only the MALE partner
+            // has no identity source and drifts. Heuristic: the largest face is
+            // the foreground female subject; drop it, anchor the rest (the
+            // peripheral male). Falls back to all-faces if only one detected.
+            if (ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_MALE_ONLY"] ?? "1") != "0",
+               rects.count > 1 {
+                let largest = rects.max(by: { $0.width * $0.height < $1.width * $1.height })!
+                rects = rects.filter { $0 != largest }
+                logger.info("Face-anchor: male-only — anchoring \(rects.count) peripheral face(s), skipping primary subject.")
+            }
             let latH = request.height / pipeline.spatialCompression
             let latW = request.width / pipeline.spatialCompression
             if !rects.isEmpty && latH > 0 && latW > 0 {
@@ -665,6 +678,27 @@ public final class LTX2VideoGenerator {
                     if x1 > x0 && rowBot > rowTop {
                         for row in rowTop..<rowBot { for col in x0..<x1 { mask[row * latW + col] = 1 } }
                     }
+                }
+                // FEATHER the mask (LTX2_FACE_ANCHOR_FEATHER, default 2 cells):
+                // the hard 0->1 binary edge created a visible skin-tone SEAM at
+                // the mask boundary (the anchored region holds while the body
+                // diverges, meeting at a line). Box-blur the mask to a smooth
+                // falloff so anchoring fades gradually — no seam. Multiple 3-tap
+                // passes approximate a Gaussian over the small latent grid.
+                let feather = Int(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_FEATHER"] ?? "") ?? 2
+                for _ in 0..<max(0, feather) {
+                    var blurred = mask
+                    for row in 0..<latH {
+                        for col in 0..<latW {
+                            var acc: Float = 0; var cnt: Float = 0
+                            for dr in -1...1 { for dc in -1...1 {
+                                let rr = row+dr, cc = col+dc
+                                if rr>=0 && rr<latH && cc>=0 && cc<latW { acc += mask[rr*latW+cc]; cnt += 1 }
+                            }}
+                            blurred[row*latW+col] = acc/cnt
+                        }
+                    }
+                    mask = blurred
                 }
                 faceAnchorMask = MLXArray(mask, [1, 1, 1, latH, latW])
                 logger.info("Face-anchor: \(rects.count) face(s) detected, strength \(faceAnchorStrength)")
