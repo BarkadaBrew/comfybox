@@ -82,5 +82,15 @@ Same cowgirl scene / seed 43, but: img_compression **8** (sharp), STG **1.0**, r
 - Motion near-zero (action_ratio 1.14, frames 1–7 near-identical). The f88 event is an abrupt-but-coherent late pose shift (same index in B1+B2 — likely tail/reanchor-96 related, not corruption).
 - **Problem now cleanly isolated to MOTION on top of a great static base.** Levers to test (clean→costly): strength↓ (B3, running), CFG↑ (2.5), frame_rate↓ (LTX temporal-RoPE motion lever, untried), moderate comp15-18 (partial seed freedom, small fidelity cost).
 
+### B3/B4/B5 + fps-plumbing BUG
+- B3 (strength 0.4): action_ratio 1.01 = strength is INERT with a sharp seed. Dead lever.
+- B4 (request fps=12): byte-identical to B2 (ar 1.14, flicker 0.627). **BUG found:** `LTX2VideoGenerator.swift:481` builds `LTX2PipelineConfig` with NO `fps:` arg → config.fps always 24; request.fps never reaches the temporal RoPE (only chunk-planning/output). Warm pipeline is built once, so per-request fps can't flow through config anyway — hence `LTX2_COND_FPS` env (read fresh in createPositionGrid) is the correct per-render motion dial. B5 (fps16) was the same no-op; killed on redeploy.
+- **B6 (running): LTX2_COND_FPS=12 ACTIVE** — the real frame-rate motion test. Output stays 24fps. Decisive: does lower cond-fps unlock action from the sharp seed without shimmer?
+
+### B6 (LTX2_COND_FPS=12): STILL STATIC (ar 1.04). Confirmed visually frozen.
+Frame-rate lever had ~no effect on motion. Either it's masked by the re-anchor (pose re-pin) or fps isn't the dominant lever here. Fidelity beautiful (sharp, warm, no mottle, identities locked) — pure motion gap.
+KEY: every render B2–B6 had **re-anchor ON**. Codex warned re-anchoring appearance also re-anchors POSE → likely the motion freeze. If so, the post-process color anchor (defaulted off as a "band-aid") is actually the CORRECT motion-preserving color fix (per-frame, post-decode, doesn't touch pose).
+- **B7 (running): comp30 + re-anchor ON** — isolates compression vs re-anchor for motion. If ar→3.5 = re-anchor motion-safe, sharp seed is the freeze (→ moderate comp). If ar~1 = re-anchor is the freeze (→ drop it, use post-process color anchor + moderate comp).
+
 ## Confirmed issues → fixes
 _(rolled up at end)_
