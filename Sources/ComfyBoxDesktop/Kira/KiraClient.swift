@@ -148,6 +148,112 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     }
 }
 
+/// `GET/PUT /v1/kira/character` (A6) — Kira's tiered image-prompt description.
+/// Fully editable from the tab; the daemon persists an override file and
+/// re-registers live. Empty strings mean "tier not set" and are dropped from
+/// the PUT payload.
+public struct KiraCharacterDescription: Equatable, Sendable {
+    public static let regionKeys = ["face", "upperBody", "lowerBody", "back", "handsFeet", "hair"]
+
+    public var base: String = ""
+    public var banana: String = ""
+    public var avocado: String = ""
+    public var regions: [String: String] = [:]
+    public var bananaRegion: String = ""
+    public var avocadoRegion: String = ""
+    /// Comma-joined in the editor; sent as an array.
+    public var preserveAnchors: [String] = []
+    public var avocadoAnchor: String = ""
+
+    public static func parse(_ dict: [String: Any]) -> KiraCharacterDescription {
+        var d = KiraCharacterDescription()
+        d.base = dict["base"] as? String ?? ""
+        d.banana = dict["banana"] as? String ?? ""
+        d.avocado = dict["avocado"] as? String ?? ""
+        if let regions = dict["regions"] as? [String: Any] {
+            for key in Self.regionKeys {
+                if let v = regions[key] as? String { d.regions[key] = v }
+            }
+        }
+        d.bananaRegion = dict["bananaRegion"] as? String ?? ""
+        d.avocadoRegion = dict["avocadoRegion"] as? String ?? ""
+        d.preserveAnchors = dict["preserveAnchors"] as? [String] ?? []
+        d.avocadoAnchor = dict["avocadoAnchor"] as? String ?? ""
+        return d
+    }
+
+    /// PUT body — empties dropped so the daemon's normalizer stays authoritative.
+    public func payload() -> [String: Any] {
+        var out: [String: Any] = ["base": base]
+        if !banana.isEmpty { out["banana"] = banana }
+        if !avocado.isEmpty { out["avocado"] = avocado }
+        let regionValues = regions.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        if !regionValues.isEmpty { out["regions"] = regionValues }
+        if !bananaRegion.isEmpty { out["bananaRegion"] = bananaRegion }
+        if !avocadoRegion.isEmpty { out["avocadoRegion"] = avocadoRegion }
+        let anchors = preserveAnchors.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if !anchors.isEmpty { out["preserveAnchors"] = anchors }
+        if !avocadoAnchor.isEmpty { out["avocadoAnchor"] = avocadoAnchor }
+        return out
+    }
+}
+
+/// `GET/PUT /v1/kira/state/now` (A7) — raw mood numbers + labels + arcPhase override.
+public struct KiraNowState: Equatable, Sendable {
+    public var valence: Double
+    public var energy: Double
+    public var moodLabel: String
+    public var energyLabel: String
+    /// The persisted operator override; empty = derived phases active.
+    public var arcPhase: String
+
+    public static func parse(_ json: [String: Any]) -> KiraNowState? {
+        guard let mood = json["mood"] as? [String: Any],
+              let valence = (mood["valence"] as? NSNumber)?.doubleValue,
+              let energy = (mood["energy"] as? NSNumber)?.doubleValue else { return nil }
+        let labels = json["labels"] as? [String: Any]
+        return KiraNowState(
+            valence: valence,
+            energy: energy,
+            moodLabel: labels?["mood"] as? String ?? "",
+            energyLabel: labels?["energy"] as? String ?? "",
+            arcPhase: json["arcPhase"] as? String ?? "")
+    }
+}
+
+/// `GET /v1/lorebook/entries` — the daemon's lorebook (canonical facts injected
+/// into her context by keyword match; pinned entries always ride along).
+public struct KiraLorebookEntry: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var title: String
+    public var enabled: Bool
+    public var pinned: Bool
+    public var keywords: [String]
+    public var content: String
+
+    public static func parse(_ dict: [String: Any]) -> KiraLorebookEntry? {
+        guard let id = dict["id"] as? String, let title = dict["title"] as? String else { return nil }
+        return KiraLorebookEntry(
+            id: id,
+            title: title,
+            enabled: dict["enabled"] as? Bool ?? true,
+            pinned: dict["pinned"] as? Bool ?? false,
+            keywords: dict["keywords"] as? [String] ?? [],
+            content: dict["content"] as? String ?? "")
+    }
+
+    public func payload() -> [String: Any] {
+        [
+            "id": id,
+            "title": title,
+            "enabled": enabled,
+            "pinned": pinned,
+            "keywords": keywords,
+            "content": content,
+        ]
+    }
+}
+
 /// Structured `GET /v1/kira/compute` read model (C1). The daemon proxies three
 /// ComfyBox MCP tools; each nested value arrives as a JSON *string*, so parsing
 /// unwraps them tolerantly (string → parse, object → use, absent → nil).
@@ -281,6 +387,14 @@ public final class KiraClient {
     /// In-flight control action (pause/resume/mode) — disables the controls.
     public private(set) var actionInFlight = false
     public private(set) var actionError: String?
+
+    // Editor read models (Todd 2026-07-27): character description, Her Now
+    // raw numbers, lorebook. Refreshed with the dashboard poll and after writes.
+    public private(set) var character: KiraCharacterDescription?
+    /// 'override' when an operator edit is active, 'default' otherwise.
+    public private(set) var characterSource: String?
+    public private(set) var nowState: KiraNowState?
+    public private(set) var lorebookEntries: [KiraLorebookEntry] = []
 
     private var pollTask: Task<Void, Never>?
     private var dashboardTask: Task<Void, Never>?
@@ -439,6 +553,33 @@ public final class KiraClient {
                 suggestionKinds = kinds
             }
         }
+
+        await refreshEditors()
+    }
+
+    /// Editor read models (A6/A7 + lorebook) — small payloads, refreshed with
+    /// the dashboard poll so writes from any surface converge without a
+    /// dedicated cadence.
+    public func refreshEditors() async {
+        async let characterData = fetch("v1/kira/character")
+        async let nowData = fetch("v1/kira/state/now")
+        async let lorebookData = fetch("v1/lorebook/entries")
+
+        if let data = await characterData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let dict = json["character"] as? [String: Any] {
+            character = KiraCharacterDescription.parse(dict)
+            characterSource = json["source"] as? String
+        }
+        if let data = await nowData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            nowState = KiraNowState.parse(json)
+        }
+        if let data = await lorebookData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["entries"] as? [[String: Any]] {
+            lorebookEntries = items.compactMap(KiraLorebookEntry.parse)
+        }
     }
 
     /// Drop an idea in the box — Kira picks it up on her next content cycle.
@@ -544,5 +685,46 @@ public final class KiraClient {
     public func updateSchedulerPolicy(_ changes: [String: Any]) async {
         await perform("v1/kira/content-scheduler/policy", method: "PUT", body: changes)
         await refreshDashboard()
+    }
+
+    // MARK: - Editors (Todd 2026-07-27): character / Her Now / lorebook
+
+    /// A6: persist the edited description — live for the very next render.
+    public func saveCharacter(_ desc: KiraCharacterDescription) async {
+        await perform("v1/kira/character", method: "PUT", body: desc.payload())
+    }
+
+    /// A6: drop the override, reverting to the code-canonical description.
+    public func resetCharacter() async {
+        await perform("v1/kira/character", method: "DELETE")
+    }
+
+    /// A7: pin current mood valence/energy (decays back to baseline normally).
+    public func saveMood(valence: Double, energy: Double) async {
+        await perform("v1/kira/state/now", method: "PUT",
+                      body: ["valence": valence, "energy": energy])
+    }
+
+    /// A7: set (or clear, with nil) the persistent arcPhase override.
+    public func saveArcPhase(_ phase: String?) async {
+        let value: Any = phase.map { $0 as Any } ?? NSNull()
+        await perform("v1/kira/state/now", method: "PUT", body: ["arcPhase": value])
+    }
+
+    /// Lorebook upsert: entries with a fresh id go through POST (create), the
+    /// rest through PUT (update). The daemon persists to the vault lorebook.
+    public func addLorebookEntry(title: String, keywords: [String], content: String, pinned: Bool) async {
+        await perform("v1/lorebook/entry", method: "POST", body: [
+            "title": title, "keywords": keywords, "content": content,
+            "pinned": pinned, "enabled": true,
+        ])
+    }
+
+    public func updateLorebookEntry(_ entry: KiraLorebookEntry) async {
+        await perform("v1/lorebook/entry/\(entry.id)", method: "PUT", body: entry.payload())
+    }
+
+    public func deleteLorebookEntry(_ id: String) async {
+        await perform("v1/lorebook/entry/\(id)", method: "DELETE")
     }
 }

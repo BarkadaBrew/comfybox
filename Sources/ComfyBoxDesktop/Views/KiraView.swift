@@ -34,6 +34,12 @@ struct KiraView: View {
                     foldable("Her Now", systemImage: "sparkles", "herNow") { herNowBody }
                     foldable("Agenda", systemImage: "list.bullet.rectangle", "agenda") { agendaBody }
                     foldable("Creation", systemImage: "wand.and.rays", "controls") { controlsBody }
+                    foldable("Character", systemImage: "person.text.rectangle", "character") {
+                        KiraCharacterCard(client: client)
+                    }
+                    foldable("Lorebook", systemImage: "book.closed", "lorebook") {
+                        KiraLorebookCard(client: client)
+                    }
                     foldable("Suggestion box", systemImage: "lightbulb", "suggest") { suggestionBody }
                     foldable("Compute", systemImage: "memorychip", "compute") { computeBody }
                     foldable("Recent output", systemImage: "photo.stack", "recent") { recentOutputBody }
@@ -230,6 +236,8 @@ struct KiraView: View {
                 Text("world slice not served yet (A3 gap — barkada/Ube land with it)")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
+            // Editable attributes (Todd 2026-07-27): pin mood, override arc phase.
+            HerNowEditor(client: client)
         } else {
             Text(client.stateError ?? "loading…").font(.caption).foregroundStyle(.tertiary)
         }
