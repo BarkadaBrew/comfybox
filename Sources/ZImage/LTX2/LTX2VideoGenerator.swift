@@ -729,6 +729,7 @@ public final class LTX2VideoGenerator {
                         ],
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
@@ -755,6 +756,7 @@ public final class LTX2VideoGenerator {
                         keyframes: keyframes,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })

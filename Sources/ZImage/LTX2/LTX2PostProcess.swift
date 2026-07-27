@@ -38,7 +38,7 @@ public enum LTX2PostProcess {
   /// training prior — a monotonic saturation/brightness decay confirmed
   /// universal across seeds and prompts (QA-CAMPAIGN-2026-07-26). This
   /// renormalizes each frame's per-channel mean/std back to frame 0, blended by
-  /// `strength` (LTX2_COLOR_ANCHOR, default 0.9). Frame 0 is preserved exactly.
+  /// `strength` (LTX2_COLOR_ANCHOR, default 0.0). Frame 0 is preserved exactly.
   /// Operates on the full decoded clip `(B, 3, F, H, W)`.
   public static func stabilizeColor(_ decoded: MLXArray, strength: Float) -> MLXArray {
     guard strength > 0, decoded.ndim == 5, decoded.dim(2) > 1 else { return decoded }
