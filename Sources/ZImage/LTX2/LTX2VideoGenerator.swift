@@ -478,6 +478,10 @@ public final class LTX2VideoGenerator {
         // single-pass decode (as ComfyUI does) is clean but memory-heavier.
         // LTX2_TILED_DECODE=0 selects plain decode. Default stays tiled.
         let tiled = ProcessInfo.processInfo.environment["LTX2_TILED_DECODE"] != "0"
+        // NOTE: the warm pipeline is built ONCE here, so per-request fps cannot
+        // flow through config.fps (it would bake in the first request's value).
+        // The temporal-RoPE conditioning fps (the motion dial) is therefore
+        // controlled per-render via LTX2_COND_FPS (read fresh in createPositionGrid).
         let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: tiled)
         self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
         self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
