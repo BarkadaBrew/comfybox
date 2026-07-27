@@ -292,6 +292,37 @@ struct KiraView: View {
                         .disabled(client.actionInFlight)
                 }
                 .font(.caption)
+                // Content-creation window (Todd 2026-07-27) — server-local time;
+                // the scheduler skips cycles outside it and the unlimited chain
+                // stops at the edge. Off = 24/7 (activeHours null server-side).
+                HStack(spacing: 10) {
+                    Toggle("Active hours", isOn: Binding(
+                        get: { scheduler.activeHoursStart != nil },
+                        set: { on in
+                            Task {
+                                await client.updateSchedulerPolicy(
+                                    ["activeHours": on
+                                        ? ["start": "20:00", "end": "08:00"]
+                                        : NSNull()])
+                            }
+                        }))
+                        .toggleStyle(.checkbox)
+                        .disabled(client.actionInFlight)
+                        .help("Restrict content creation to a time window (server-local). Overnight windows wrap midnight. Off = 24/7.")
+                    if scheduler.activeHoursStart != nil {
+                        Picker("from", selection: windowHourBinding(scheduler, isStart: true)) {
+                            ForEach(0..<24, id: \.self) { Text(Self.hourLabel($0)).tag($0) }
+                        }
+                        .frame(width: 110)
+                        .disabled(client.actionInFlight)
+                        Picker("to", selection: windowHourBinding(scheduler, isStart: false)) {
+                            ForEach(0..<24, id: \.self) { Text(Self.hourLabel($0)).tag($0) }
+                        }
+                        .frame(width: 110)
+                        .disabled(client.actionInFlight)
+                    }
+                }
+                .font(.caption)
             } else {
                 Text("scheduler status unavailable").font(.caption).foregroundStyle(.tertiary)
             }
@@ -488,7 +519,55 @@ struct KiraView: View {
             parts.append("\(images) img")
         }
         if let videos = scheduler.videoCount { parts.append("\(videos) video (\(scheduler.videoMode ?? "?"))") }
+        if let start = scheduler.activeHoursStart, let end = scheduler.activeHoursEnd {
+            parts.append("\(Self.windowLabel(start))–\(Self.windowLabel(end))")
+        }
         return parts.joined(separator: " · ")
+    }
+
+    // ── Content-window helpers ──
+
+    /// "HH:MM" → hour Int (minutes dropped; the pickers edit at hour grain).
+    private static func hour(from hm: String?) -> Int? {
+        guard let first = hm?.split(separator: ":").first, let h = Int(first) else { return nil }
+        return (0...23).contains(h) ? h : nil
+    }
+
+    private static func hourLabel(_ h: Int) -> String {
+        switch h {
+        case 0: return "12 AM"
+        case 12: return "12 PM"
+        case 1...11: return "\(h) AM"
+        default: return "\(h - 12) PM"
+        }
+    }
+
+    /// Display label for a stored "HH:MM" (keeps minutes when non-zero).
+    private static func windowLabel(_ hm: String) -> String {
+        let bits = hm.split(separator: ":")
+        guard let h = bits.first.flatMap({ Int($0) }) else { return hm }
+        let minutes = bits.count > 1 ? String(bits[1]) : "00"
+        let base = hourLabel(h)
+        return minutes == "00" ? base : base.replacingOccurrences(of: " ", with: ":\(minutes) ")
+    }
+
+    /// Binding for one end of the window; writing either end PUTs the pair.
+    private func windowHourBinding(_ scheduler: KiraSchedulerStatus, isStart: Bool) -> Binding<Int> {
+        Binding(
+            get: { Self.hour(from: isStart ? scheduler.activeHoursStart : scheduler.activeHoursEnd) ?? (isStart ? 20 : 8) },
+            set: { h in
+                var start = Self.hour(from: scheduler.activeHoursStart) ?? 20
+                var end = Self.hour(from: scheduler.activeHoursEnd) ?? 8
+                if isStart { start = h } else { end = h }
+                // The daemon rejects a zero-length window (use the toggle for
+                // 24/7) — don't send an update the server will 400.
+                guard start != end else { return }
+                Task {
+                    await client.updateSchedulerPolicy(
+                        ["activeHours": ["start": String(format: "%02d:00", start),
+                                         "end": String(format: "%02d:00", end)]])
+                }
+            })
     }
 
     private func chip(_ text: String?, tint: Color) -> some View {

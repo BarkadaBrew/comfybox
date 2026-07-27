@@ -124,11 +124,17 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     /// Unlimited-within-cycle images: renders chain until the cycle window
     /// closes; imageCount is ignored while true.
     public var unlimitedImages: Bool
+    /// Content-creation window "HH:MM" (server-local; start > end wraps
+    /// midnight). nil = 24/7 (the daemon serves explicit null for 24/7 and a
+    /// concrete window otherwise — absent also renders as 24/7 for old daemons).
+    public var activeHoursStart: String?
+    public var activeHoursEnd: String?
 
     public static func parse(_ data: Data) -> KiraSchedulerStatus? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let paused = json["paused"] as? Bool else { return nil }
         let config = json["config"] as? [String: Any]
+        let hours = config?["activeHours"] as? [String: Any]
         return KiraSchedulerStatus(
             paused: paused,
             enabled: config?["enabled"] as? Bool ?? false,
@@ -136,7 +142,9 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             imageCount: (config?["imageCount"] as? NSNumber)?.intValue,
             videoCount: (config?["videoCount"] as? NSNumber)?.intValue,
             videoMode: config?["videoMode"] as? String,
-            unlimitedImages: config?["unlimitedImages"] as? Bool ?? false)
+            unlimitedImages: config?["unlimitedImages"] as? Bool ?? false,
+            activeHoursStart: hours?["start"] as? String,
+            activeHoursEnd: hours?["end"] as? String)
     }
 }
 
