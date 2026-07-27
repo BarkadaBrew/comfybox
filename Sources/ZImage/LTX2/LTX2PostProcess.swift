@@ -33,10 +33,36 @@ public enum LTX2PostProcess {
   ///   - decoded: VAE decoded output `(B, 3, F, H, W)` in float32.
   ///   - batchIndex: Which batch element to extract. Default 0.
   /// - Returns: Array of `(width, height, pixelData)` tuples, one per frame.
+  /// Temporal color anchor. i2v conditioning only pins frame 0's lighting; as
+  /// temporal distance grows, frames drift toward the LoRA's darker/muddier
+  /// training prior — a monotonic saturation/brightness decay confirmed
+  /// universal across seeds and prompts (QA-CAMPAIGN-2026-07-26). This
+  /// renormalizes each frame's per-channel mean/std back to frame 0, blended by
+  /// `strength` (LTX2_COLOR_ANCHOR, default 0.9). Frame 0 is preserved exactly.
+  /// Operates on the full decoded clip `(B, 3, F, H, W)`.
+  public static func stabilizeColor(_ decoded: MLXArray, strength: Float) -> MLXArray {
+    guard strength > 0, decoded.ndim == 5, decoded.dim(2) > 1 else { return decoded }
+    let ref = decoded[0..., 0..., 0..<1]                                  // (B,3,1,H,W)
+    let refMean = MLX.mean(ref, axes: [3, 4], keepDims: true)             // (B,3,1,1,1)
+    let refVar = MLX.mean(MLX.square(ref - refMean), axes: [3, 4], keepDims: true)
+    let refStd = MLX.sqrt(refVar) + 1e-3
+    let mean = MLX.mean(decoded, axes: [3, 4], keepDims: true)            // (B,3,F,1,1)
+    let variance = MLX.mean(MLX.square(decoded - mean), axes: [3, 4], keepDims: true)
+    let std = MLX.sqrt(variance) + 1e-3
+    let matched = (decoded - mean) / std * refStd + refMean
+    let s = MLXArray(strength)
+    return s * matched + (1.0 - s) * decoded
+  }
+
+  private static func colorAnchorStrength() -> Float {
+    Float(ProcessInfo.processInfo.environment["LTX2_COLOR_ANCHOR"] ?? "") ?? 0.9
+  }
+
   public static func extractFrames(
     from decoded: MLXArray,
     batchIndex: Int = 0
   ) -> [(width: Int, height: Int, pixels: [UInt8])] {
+    let decoded = stabilizeColor(decoded, strength: colorAnchorStrength())
     // decoded shape: (B, 3, F, H, W)
     let numFrames = decoded.dim(2)
     let height = decoded.dim(3)
