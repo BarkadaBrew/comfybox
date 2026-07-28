@@ -15,6 +15,7 @@ struct KiraView: View {
     @State private var portDraft: String = ""
     @State private var suggestionDraft: String = ""
     @State private var suggestionKind: String = "image"
+    @State private var suggestionTier: String = "any"
     /// Which cards are expanded. Empty by default → every card starts collapsed
     /// on launch (Todd 2026-07-17). Expansion is per-session, not persisted.
     @State private var expandedCards: Set<String> = []
@@ -289,71 +290,37 @@ struct KiraView: View {
                     Text(cadenceLine(scheduler))
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                // Editable pacing (Todd 2026-07-20) — live: the scheduler
-                // re-reads policy each cycle, so changes apply next tick.
-                HStack(spacing: 14) {
-                    Stepper(
-                        "Images: \(scheduler.unlimitedImages ? "∞" : String(scheduler.imageCount ?? 2))",
-                        onIncrement: {
-                            Task { await client.updateSchedulerPolicy(["imageCount": (scheduler.imageCount ?? 2) + 1]) }
-                        },
-                        onDecrement: {
-                            Task { await client.updateSchedulerPolicy(["imageCount": max(0, (scheduler.imageCount ?? 2) - 1)]) }
-                        })
-                        .disabled(client.actionInFlight || scheduler.unlimitedImages)
-                    Toggle("Unlimited (fit cycle)", isOn: Binding(
-                        get: { scheduler.unlimitedImages },
-                        set: { on in Task { await client.updateSchedulerPolicy(["unlimitedImages": on]) } }))
-                        .toggleStyle(.checkbox)
-                        .disabled(client.actionInFlight)
-                        .help("Keep rendering images for the whole cycle — throughput adapts to render times; the queue never carries into the next cycle.")
-                    Stepper(
-                        "Videos: \(scheduler.videoCount ?? 1)",
-                        onIncrement: {
-                            Task { await client.updateSchedulerPolicy(["videoCount": (scheduler.videoCount ?? 1) + 1]) }
-                        },
-                        onDecrement: {
-                            Task { await client.updateSchedulerPolicy(["videoCount": max(0, (scheduler.videoCount ?? 1) - 1)]) }
-                        })
-                        .disabled(client.actionInFlight)
-                }
-                .font(.caption)
-                // Content-creation window (Todd 2026-07-27) — server-local time;
-                // the scheduler skips cycles outside it and the unlimited chain
-                // stops at the edge. Off = 24/7 (activeHours null server-side).
-                HStack(spacing: 10) {
-                    Toggle("Active hours", isOn: Binding(
-                        get: { scheduler.activeHoursStart != nil },
-                        set: { on in
-                            Task {
-                                await client.updateSchedulerPolicy(
-                                    ["activeHours": on
-                                        ? ["start": "20:00", "end": "08:00"]
-                                        : NSNull()])
-                            }
-                        }))
-                        .toggleStyle(.checkbox)
-                        .disabled(client.actionInFlight)
-                        .help("Restrict content creation to a time window (server-local). Overnight windows wrap midnight. Off = 24/7.")
-                    if scheduler.activeHoursStart != nil {
-                        Picker("from", selection: windowHourBinding(scheduler, isStart: true)) {
-                            ForEach(0..<24, id: \.self) { Text(Self.hourLabel($0)).tag($0) }
+                // Stream steering (tiered scheduler v2, Todd 2026-07-27):
+                // precedence = your override > Kira's choice > schedule.
+                if let stream = client.streamStatus {
+                    HStack(spacing: 10) {
+                        Text("Stream:").font(.caption).foregroundStyle(.secondary)
+                        Text(streamSummary(stream)).font(.caption)
+                        Picker("", selection: Binding(
+                            get: { stream.todd ?? "auto" },
+                            set: { v in Task { await client.setStreamOverride(v == "auto" ? nil : v) } })) {
+                            Text("Auto").tag("auto")
+                            ForEach(Self.tierOrder, id: \.self) { Text(modeEmoji($0)).tag($0) }
                         }
-                        .frame(width: 110)
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 240)
                         .disabled(client.actionInFlight)
-                        Picker("to", selection: windowHourBinding(scheduler, isStart: false)) {
-                            ForEach(0..<24, id: \.self) { Text(Self.hourLabel($0)).tag($0) }
-                        }
-                        .frame(width: 110)
-                        .disabled(client.actionInFlight)
+                        .help("Your sticky override — pins every cycle to a tier, all hours, until Auto. Kira's own choice and the schedule take over when cleared.")
                     }
                 }
-                .font(.caption)
+                // Per-tier schedule + pacing. Editing writes the FULL tiers
+                // map (server replaces; an unchecked tier is scheduled off).
+                ForEach(Self.tierOrder, id: \.self) { mode in
+                    tierRow(mode, scheduler: scheduler)
+                }
+                Text("Overlapping windows are fine — the most explicit open tier wins. Kira can pick any tier herself; /stream overrides from Telegram.")
+                    .font(.caption2).foregroundStyle(.tertiary)
             } else {
                 Text("scheduler status unavailable").font(.caption).foregroundStyle(.tertiary)
             }
             if !client.allowedModes.isEmpty {
-                Picker("Mode", selection: Binding(
+                Picker("Chat mode", selection: Binding(
                     get: { client.contentMode ?? "" },
                     set: { mode in Task { await client.setContentMode(mode) } })) {
                     ForEach(client.allowedModes, id: \.self) { mode in
@@ -361,9 +328,9 @@ struct KiraView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 260)
+                .frame(maxWidth: 300)
                 .disabled(client.actionInFlight)
-                .help("Content mode — allowlisted server-side; reflected across surfaces")
+                .help("Conversation register only — the 24/7 stream is driven by the tier schedule above, not this picker.")
             }
         }
     }
@@ -379,6 +346,13 @@ struct KiraView: View {
             }
             .labelsHidden()
             .frame(width: 110)
+            Picker("", selection: $suggestionTier) {
+                Text("any").tag("any")
+                ForEach(Self.tierOrder, id: \.self) { Text(modeEmoji($0)).tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 76)
+            .help("Optional tier tag — the idea waits for a cycle of that tier (an apple-tagged arc themes only apple cycles). \"any\" = next cycle regardless.")
             TextField("e.g. golden hour on the balcony in the red dress", text: $suggestionDraft)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { submitSuggestion() }
@@ -412,7 +386,10 @@ struct KiraView: View {
     private func submitSuggestion() {
         let text = suggestionDraft
         suggestionDraft = ""
-        Task { await client.addSuggestion(kind: suggestionKind, text: text) }
+        // "any" = untagged (consumed by whatever tier's cycle runs next);
+        // a tier tag holds the idea for that tier's window.
+        let tier = suggestionTier == "any" ? nil : suggestionTier
+        Task { await client.addSuggestion(kind: suggestionKind, text: text, tier: tier) }
     }
 
     private func kindTint(_ kind: String) -> Color {
@@ -536,19 +513,156 @@ struct KiraView: View {
         }
     }
 
+    /// Display order for tier rows — mildest first (the scheduler's own
+    /// overlap precedence is the reverse: most explicit wins).
+    static let tierOrder = ["neutral", "apple", "banana", "avocado"]
+
     private func cadenceLine(_ scheduler: KiraSchedulerStatus) -> String {
         var parts: [String] = []
         if let interval = scheduler.intervalMinutes { parts.append("every \(interval)m") }
-        if scheduler.unlimitedImages {
-            parts.append("∞ img (fit cycle)")
-        } else if let images = scheduler.imageCount {
-            parts.append("\(images) img")
-        }
-        if let videos = scheduler.videoCount { parts.append("\(videos) video (\(scheduler.videoMode ?? "?"))") }
-        if let start = scheduler.activeHoursStart, let end = scheduler.activeHoursEnd {
-            parts.append("\(Self.windowLabel(start))–\(Self.windowLabel(end))")
+        if scheduler.tiers.isEmpty {
+            // Pre-v2 daemon: legacy flat summary.
+            if scheduler.unlimitedImages {
+                parts.append("∞ img (fit cycle)")
+            } else if let images = scheduler.imageCount {
+                parts.append("\(images) img")
+            }
+            if let videos = scheduler.videoCount { parts.append("\(videos) video") }
+            if let start = scheduler.activeHoursStart, let end = scheduler.activeHoursEnd {
+                parts.append("\(Self.windowLabel(start))–\(Self.windowLabel(end))")
+            }
+        } else {
+            for mode in Self.tierOrder {
+                guard let tier = scheduler.tiers[mode] else { continue }
+                var bit = modeEmoji(mode)
+                if let start = tier.activeHoursStart, let end = tier.activeHoursEnd {
+                    bit += " \(Self.windowLabel(start))–\(Self.windowLabel(end))"
+                } else {
+                    bit += " 24/7"
+                }
+                bit += tier.unlimitedImages ? " ∞" : " \(tier.imageCount)img"
+                if mode != "neutral" && tier.videoCount > 0 { bit += " \(tier.videoCount)v" }
+                parts.append(bit)
+            }
         }
         return parts.joined(separator: " · ")
+    }
+
+    private func streamSummary(_ stream: KiraStreamStatus) -> String {
+        let mode = stream.effectiveMode.map { "\(modeEmoji($0)) \($0)" } ?? "idle (no window open)"
+        switch stream.source {
+        case "override-todd": return "\(mode) — your override"
+        case "override-kira": return "\(mode) — Kira's choice"
+        case "none-open": return mode
+        default: return "\(mode) — schedule"
+        }
+    }
+
+    // ── Tier rows (tiered scheduler v2) ──
+
+    /// Mutate-and-PUT: the server treats the tiers map as a full replacement.
+    private func putTiers(_ mutate: (inout [String: KiraTierConfig]) -> Void) {
+        guard var tiers = client.scheduler?.tiers else { return }
+        mutate(&tiers)
+        Task { await client.updateSchedulerTiers(tiers) }
+    }
+
+    @ViewBuilder private func tierRow(_ mode: String, scheduler: KiraSchedulerStatus) -> some View {
+        HStack(spacing: 10) {
+            Toggle(isOn: Binding(
+                get: { scheduler.tiers[mode] != nil },
+                set: { on in
+                    putTiers { tiers in
+                        if on {
+                            tiers[mode] = KiraTierConfig(
+                                activeHoursStart: nil, activeHoursEnd: nil,
+                                imageCount: 2, unlimitedImages: false,
+                                videoCount: mode == "neutral" ? 0 : 1)
+                        } else {
+                            tiers.removeValue(forKey: mode)
+                        }
+                    }
+                })) {
+                Text("\(modeEmoji(mode)) \(mode)")
+                    .font(.caption)
+                    .frame(width: 78, alignment: .leading)
+            }
+            .toggleStyle(.checkbox)
+            .disabled(client.actionInFlight)
+
+            if let tier = scheduler.tiers[mode] {
+                Toggle("window", isOn: Binding(
+                    get: { tier.activeHoursStart != nil },
+                    set: { on in
+                        putTiers { tiers in
+                            tiers[mode]?.activeHoursStart = on ? "20:00" : nil
+                            tiers[mode]?.activeHoursEnd = on ? "08:00" : nil
+                        }
+                    }))
+                    .toggleStyle(.checkbox).font(.caption)
+                    .disabled(client.actionInFlight)
+                    .help("Off = this tier is eligible 24/7. Overnight windows wrap midnight; the most explicit open tier wins overlaps.")
+                if tier.activeHoursStart != nil {
+                    Picker("", selection: tierHourBinding(mode, isStart: true)) {
+                        ForEach(0..<24, id: \.self) { Text(Self.hourLabel($0)).tag($0) }
+                    }
+                    .labelsHidden().frame(width: 86)
+                    .disabled(client.actionInFlight)
+                    Text("–").font(.caption).foregroundStyle(.tertiary)
+                    Picker("", selection: tierHourBinding(mode, isStart: false)) {
+                        ForEach(0..<24, id: \.self) { Text(Self.hourLabel($0)).tag($0) }
+                    }
+                    .labelsHidden().frame(width: 86)
+                    .disabled(client.actionInFlight)
+                }
+                Stepper("img: \(tier.unlimitedImages ? "∞" : String(tier.imageCount))",
+                        onIncrement: { putTiers { $0[mode]?.imageCount = tier.imageCount + 1 } },
+                        onDecrement: { putTiers { $0[mode]?.imageCount = max(0, tier.imageCount - 1) } })
+                    .font(.caption)
+                    .disabled(client.actionInFlight || tier.unlimitedImages)
+                Toggle("∞", isOn: Binding(
+                    get: { tier.unlimitedImages },
+                    set: { on in putTiers { $0[mode]?.unlimitedImages = on } }))
+                    .toggleStyle(.checkbox).font(.caption)
+                    .disabled(client.actionInFlight)
+                    .help("Unlimited-within-cycle: image renders chain until the cycle (or this tier's window) closes.")
+                if mode != "neutral" {
+                    Stepper("vid: \(tier.videoCount)",
+                            onIncrement: { putTiers { $0[mode]?.videoCount = tier.videoCount + 1 } },
+                            onDecrement: { putTiers { $0[mode]?.videoCount = max(0, tier.videoCount - 1) } })
+                        .font(.caption)
+                        .disabled(client.actionInFlight)
+                } else {
+                    Text("stills only").font(.caption2).foregroundStyle(.tertiary)
+                        .help("Neutral is the Autocord film stream — no video.")
+                }
+                Spacer(minLength: 0)
+            } else {
+                Text("off").font(.caption2).foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    /// Hour-grain binding for one end of a tier's window (writes the pair).
+    private func tierHourBinding(_ mode: String, isStart: Bool) -> Binding<Int> {
+        Binding(
+            get: {
+                let tier = client.scheduler?.tiers[mode]
+                return Self.hour(from: isStart ? tier?.activeHoursStart : tier?.activeHoursEnd) ?? (isStart ? 20 : 8)
+            },
+            set: { h in
+                putTiers { tiers in
+                    guard var tier = tiers[mode] else { return }
+                    var start = Self.hour(from: tier.activeHoursStart) ?? 20
+                    var end = Self.hour(from: tier.activeHoursEnd) ?? 8
+                    if isStart { start = h } else { end = h }
+                    guard start != end else { return }   // zero-length → server 400; use the window toggle for 24/7
+                    tier.activeHoursStart = String(format: "%02d:00", start)
+                    tier.activeHoursEnd = String(format: "%02d:00", end)
+                    tiers[mode] = tier
+                }
+            })
     }
 
     // ── Content-window helpers ──
@@ -575,25 +689,6 @@ struct KiraView: View {
         let minutes = bits.count > 1 ? String(bits[1]) : "00"
         let base = hourLabel(h)
         return minutes == "00" ? base : base.replacingOccurrences(of: " ", with: ":\(minutes) ")
-    }
-
-    /// Binding for one end of the window; writing either end PUTs the pair.
-    private func windowHourBinding(_ scheduler: KiraSchedulerStatus, isStart: Bool) -> Binding<Int> {
-        Binding(
-            get: { Self.hour(from: isStart ? scheduler.activeHoursStart : scheduler.activeHoursEnd) ?? (isStart ? 20 : 8) },
-            set: { h in
-                var start = Self.hour(from: scheduler.activeHoursStart) ?? 20
-                var end = Self.hour(from: scheduler.activeHoursEnd) ?? 8
-                if isStart { start = h } else { end = h }
-                // The daemon rejects a zero-length window (use the toggle for
-                // 24/7) — don't send an update the server will 400.
-                guard start != end else { return }
-                Task {
-                    await client.updateSchedulerPolicy(
-                        ["activeHours": ["start": String(format: "%02d:00", start),
-                                         "end": String(format: "%02d:00", end)]])
-                }
-            })
     }
 
     private func chip(_ text: String?, tint: Color) -> some View {

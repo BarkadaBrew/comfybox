@@ -133,12 +133,22 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     /// concrete window otherwise — absent also renders as 24/7 for old daemons).
     public var activeHoursStart: String?
     public var activeHoursEnd: String?
+    /// Tiered scheduler v2: per-tier schedule + pacing, keyed by tier name.
+    /// A tier absent from the map is scheduled off.
+    public var tiers: [String: KiraTierConfig] = [:]
 
     public static func parse(_ data: Data) -> KiraSchedulerStatus? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let paused = json["paused"] as? Bool else { return nil }
         let config = json["config"] as? [String: Any]
         let hours = config?["activeHours"] as? [String: Any]
+        var tiers: [String: KiraTierConfig] = [:]
+        if let rawTiers = config?["tiers"] as? [String: Any] {
+            for (key, value) in rawTiers {
+                guard let dict = value as? [String: Any] else { continue }
+                tiers[key] = KiraTierConfig.parse(dict)
+            }
+        }
         return KiraSchedulerStatus(
             paused: paused,
             enabled: config?["enabled"] as? Bool ?? false,
@@ -148,7 +158,63 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             videoMode: config?["videoMode"] as? String,
             unlimitedImages: config?["unlimitedImages"] as? Bool ?? false,
             activeHoursStart: hours?["start"] as? String,
-            activeHoursEnd: hours?["end"] as? String)
+            activeHoursEnd: hours?["end"] as? String,
+            tiers: tiers)
+    }
+}
+
+/// One tier's schedule + pacing (tiered scheduler v2). nil window = 24/7.
+public struct KiraTierConfig: Equatable, Sendable {
+    public var activeHoursStart: String?
+    public var activeHoursEnd: String?
+    public var imageCount: Int
+    public var unlimitedImages: Bool
+    public var videoCount: Int
+
+    public static func parse(_ dict: [String: Any]) -> KiraTierConfig {
+        let hours = dict["activeHours"] as? [String: Any]
+        return KiraTierConfig(
+            activeHoursStart: hours?["start"] as? String,
+            activeHoursEnd: hours?["end"] as? String,
+            imageCount: (dict["imageCount"] as? NSNumber)?.intValue ?? 2,
+            unlimitedImages: dict["unlimitedImages"] as? Bool ?? false,
+            videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1)
+    }
+
+    /// PUT payload fragment. The tiers PUT is a FULL REPLACEMENT server-side,
+    /// and every tier must carry the activeHours key (null = 24/7).
+    public func payload(isNeutral: Bool) -> [String: Any] {
+        var out: [String: Any] = [:]
+        if let start = activeHoursStart, let end = activeHoursEnd {
+            out["activeHours"] = ["start": start, "end": end]
+        } else {
+            out["activeHours"] = NSNull()
+        }
+        out["imageCount"] = imageCount
+        out["unlimitedImages"] = unlimitedImages
+        if !isNeutral { out["videoCount"] = videoCount }
+        return out
+    }
+}
+
+/// `GET/PUT /v1/kira/stream-mode` — who steers the 24/7 stream.
+/// Precedence: todd override > Kira's choice > schedule.
+public struct KiraStreamStatus: Equatable, Sendable {
+    /// nil exactly when schedule-driven and no tier window is open.
+    public var effectiveMode: String?
+    public var source: String
+    public var todd: String?
+    public var kira: String?
+    public var openTiers: [String]
+
+    public static func parse(_ json: [String: Any]) -> KiraStreamStatus? {
+        guard let source = json["source"] as? String else { return nil }
+        return KiraStreamStatus(
+            effectiveMode: json["effectiveMode"] as? String,
+            source: source,
+            todd: json["todd"] as? String,
+            kira: json["kira"] as? String,
+            openTiers: json["openTiers"] as? [String] ?? [])
     }
 }
 
@@ -399,6 +465,8 @@ public final class KiraClient {
     public private(set) var characterSource: String?
     public private(set) var nowState: KiraNowState?
     public private(set) var lorebookEntries: [KiraLorebookEntry] = []
+    /// Tiered scheduler v2: who steers the 24/7 stream right now.
+    public private(set) var streamStatus: KiraStreamStatus?
 
     private var pollTask: Task<Void, Never>?
     private var dashboardTask: Task<Void, Never>?
@@ -575,6 +643,7 @@ public final class KiraClient {
         async let characterData = fetch("v1/kira/character")
         async let nowData = fetch("v1/kira/state/now")
         async let lorebookData = fetch("v1/lorebook/entries")
+        async let streamData = fetch("v1/kira/stream-mode")
 
         if let data = await characterData,
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -591,13 +660,20 @@ public final class KiraClient {
            let items = json["entries"] as? [[String: Any]] {
             lorebookEntries = items.compactMap(KiraLorebookEntry.parse)
         }
+        if let data = await streamData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            streamStatus = KiraStreamStatus.parse(json)
+        }
     }
 
     /// Drop an idea in the box — Kira picks it up on her next content cycle.
-    public func addSuggestion(kind: String, text: String) async {
+    /// An optional tier tag holds the idea for a cycle of that tier.
+    public func addSuggestion(kind: String, text: String, tier: String? = nil) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        await perform("v1/kira/suggestions", method: "POST", body: ["kind": kind, "text": trimmed])
+        var body: [String: Any] = ["kind": kind, "text": trimmed]
+        if let tier { body["tier"] = tier }
+        await perform("v1/kira/suggestions", method: "POST", body: body)
     }
 
     public func deleteSuggestion(_ id: String) async {
@@ -697,6 +773,22 @@ public final class KiraClient {
         // perform() already refreshes the dashboard on success (Kimi review
         // 2026-07-27: this used to call refreshDashboard() a second time).
         await perform("v1/kira/content-scheduler/policy", method: "PUT", body: changes)
+    }
+
+    /// Tiered scheduler v2: replace the whole tiers map (server semantics —
+    /// a tier omitted from the payload is scheduled off).
+    public func updateSchedulerTiers(_ tiers: [String: KiraTierConfig]) async {
+        var payload: [String: Any] = [:]
+        for (mode, tier) in tiers {
+            payload[mode] = tier.payload(isNeutral: mode == "neutral")
+        }
+        await perform("v1/kira/content-scheduler/policy", method: "PUT", body: ["tiers": payload])
+    }
+
+    /// Tiered scheduler v2: set/clear the owner's sticky stream override.
+    public func setStreamOverride(_ mode: String?) async {
+        await perform("v1/kira/stream-mode", method: "PUT",
+                      body: ["todd": mode.map { $0 as Any } ?? NSNull()])
     }
 
     // MARK: - Editors (Todd 2026-07-27): character / Her Now / lorebook
