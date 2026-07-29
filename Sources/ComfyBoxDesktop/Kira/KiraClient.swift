@@ -83,6 +83,10 @@ public struct KiraStateSnapshot: Equatable, Sendable {
     public var worldPresent: Bool
     public var fetchedAt: Date
 
+    /// Deliberate (Kimi review 2026-07-27 asked): `scores` is a tuple array, so
+    /// Equatable can't be synthesized. fetchedAt is stamped fresh (Date()) on
+    /// every parse, so two distinct fetches never compare equal — this is a
+    /// cheap identity check, not a content diff.
     public static func == (lhs: KiraStateSnapshot, rhs: KiraStateSnapshot) -> Bool {
         lhs.fetchedAt == rhs.fetchedAt
     }
@@ -124,11 +128,27 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     /// Unlimited-within-cycle images: renders chain until the cycle window
     /// closes; imageCount is ignored while true.
     public var unlimitedImages: Bool
+    /// Content-creation window "HH:MM" (server-local; start > end wraps
+    /// midnight). nil = 24/7 (the daemon serves explicit null for 24/7 and a
+    /// concrete window otherwise — absent also renders as 24/7 for old daemons).
+    public var activeHoursStart: String?
+    public var activeHoursEnd: String?
+    /// Tiered scheduler v2: per-tier schedule + pacing, keyed by tier name.
+    /// A tier absent from the map is scheduled off.
+    public var tiers: [String: KiraTierConfig] = [:]
 
     public static func parse(_ data: Data) -> KiraSchedulerStatus? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let paused = json["paused"] as? Bool else { return nil }
         let config = json["config"] as? [String: Any]
+        let hours = config?["activeHours"] as? [String: Any]
+        var tiers: [String: KiraTierConfig] = [:]
+        if let rawTiers = config?["tiers"] as? [String: Any] {
+            for (key, value) in rawTiers {
+                guard let dict = value as? [String: Any] else { continue }
+                tiers[key] = KiraTierConfig.parse(dict)
+            }
+        }
         return KiraSchedulerStatus(
             paused: paused,
             enabled: config?["enabled"] as? Bool ?? false,
@@ -136,7 +156,171 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             imageCount: (config?["imageCount"] as? NSNumber)?.intValue,
             videoCount: (config?["videoCount"] as? NSNumber)?.intValue,
             videoMode: config?["videoMode"] as? String,
-            unlimitedImages: config?["unlimitedImages"] as? Bool ?? false)
+            unlimitedImages: config?["unlimitedImages"] as? Bool ?? false,
+            activeHoursStart: hours?["start"] as? String,
+            activeHoursEnd: hours?["end"] as? String,
+            tiers: tiers)
+    }
+}
+
+/// One tier's schedule + pacing (tiered scheduler v2). nil window = 24/7.
+public struct KiraTierConfig: Equatable, Sendable {
+    public var activeHoursStart: String?
+    public var activeHoursEnd: String?
+    public var imageCount: Int
+    public var unlimitedImages: Bool
+    public var videoCount: Int
+
+    public static func parse(_ dict: [String: Any]) -> KiraTierConfig {
+        let hours = dict["activeHours"] as? [String: Any]
+        return KiraTierConfig(
+            activeHoursStart: hours?["start"] as? String,
+            activeHoursEnd: hours?["end"] as? String,
+            imageCount: (dict["imageCount"] as? NSNumber)?.intValue ?? 2,
+            unlimitedImages: dict["unlimitedImages"] as? Bool ?? false,
+            videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1)
+    }
+
+    /// PUT payload fragment. The tiers PUT is a FULL REPLACEMENT server-side,
+    /// and every tier must carry the activeHours key (null = 24/7).
+    public func payload(isNeutral: Bool) -> [String: Any] {
+        var out: [String: Any] = [:]
+        if let start = activeHoursStart, let end = activeHoursEnd {
+            out["activeHours"] = ["start": start, "end": end]
+        } else {
+            out["activeHours"] = NSNull()
+        }
+        out["imageCount"] = imageCount
+        out["unlimitedImages"] = unlimitedImages
+        if !isNeutral { out["videoCount"] = videoCount }
+        return out
+    }
+}
+
+/// `GET/PUT /v1/kira/stream-mode` — who steers the 24/7 stream.
+/// Precedence: todd override > Kira's choice > schedule.
+public struct KiraStreamStatus: Equatable, Sendable {
+    /// nil exactly when schedule-driven and no tier window is open.
+    public var effectiveMode: String?
+    public var source: String
+    public var todd: String?
+    public var kira: String?
+    public var openTiers: [String]
+
+    public static func parse(_ json: [String: Any]) -> KiraStreamStatus? {
+        guard let source = json["source"] as? String else { return nil }
+        return KiraStreamStatus(
+            effectiveMode: json["effectiveMode"] as? String,
+            source: source,
+            todd: json["todd"] as? String,
+            kira: json["kira"] as? String,
+            openTiers: json["openTiers"] as? [String] ?? [])
+    }
+}
+
+/// `GET/PUT /v1/kira/character` (A6) — Kira's tiered image-prompt description.
+/// Fully editable from the tab; the daemon persists an override file and
+/// re-registers live. Empty strings mean "tier not set" and are dropped from
+/// the PUT payload.
+public struct KiraCharacterDescription: Equatable, Sendable {
+    public static let regionKeys = ["face", "upperBody", "lowerBody", "back", "handsFeet", "hair"]
+
+    public var base: String = ""
+    public var banana: String = ""
+    public var avocado: String = ""
+    public var regions: [String: String] = [:]
+    public var bananaRegion: String = ""
+    public var avocadoRegion: String = ""
+    /// Comma-joined in the editor; sent as an array.
+    public var preserveAnchors: [String] = []
+    public var avocadoAnchor: String = ""
+
+    public static func parse(_ dict: [String: Any]) -> KiraCharacterDescription {
+        var d = KiraCharacterDescription()
+        d.base = dict["base"] as? String ?? ""
+        d.banana = dict["banana"] as? String ?? ""
+        d.avocado = dict["avocado"] as? String ?? ""
+        if let regions = dict["regions"] as? [String: Any] {
+            for key in Self.regionKeys {
+                if let v = regions[key] as? String { d.regions[key] = v }
+            }
+        }
+        d.bananaRegion = dict["bananaRegion"] as? String ?? ""
+        d.avocadoRegion = dict["avocadoRegion"] as? String ?? ""
+        d.preserveAnchors = dict["preserveAnchors"] as? [String] ?? []
+        d.avocadoAnchor = dict["avocadoAnchor"] as? String ?? ""
+        return d
+    }
+
+    /// PUT body — empties dropped so the daemon's normalizer stays authoritative.
+    public func payload() -> [String: Any] {
+        var out: [String: Any] = ["base": base]
+        if !banana.isEmpty { out["banana"] = banana }
+        if !avocado.isEmpty { out["avocado"] = avocado }
+        let regionValues = regions.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        if !regionValues.isEmpty { out["regions"] = regionValues }
+        if !bananaRegion.isEmpty { out["bananaRegion"] = bananaRegion }
+        if !avocadoRegion.isEmpty { out["avocadoRegion"] = avocadoRegion }
+        let anchors = preserveAnchors.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if !anchors.isEmpty { out["preserveAnchors"] = anchors }
+        if !avocadoAnchor.isEmpty { out["avocadoAnchor"] = avocadoAnchor }
+        return out
+    }
+}
+
+/// `GET/PUT /v1/kira/state/now` (A7) — raw mood numbers + labels + arcPhase override.
+public struct KiraNowState: Equatable, Sendable {
+    public var valence: Double
+    public var energy: Double
+    public var moodLabel: String
+    public var energyLabel: String
+    /// The persisted operator override; empty = derived phases active.
+    public var arcPhase: String
+
+    public static func parse(_ json: [String: Any]) -> KiraNowState? {
+        guard let mood = json["mood"] as? [String: Any],
+              let valence = (mood["valence"] as? NSNumber)?.doubleValue,
+              let energy = (mood["energy"] as? NSNumber)?.doubleValue else { return nil }
+        let labels = json["labels"] as? [String: Any]
+        return KiraNowState(
+            valence: valence,
+            energy: energy,
+            moodLabel: labels?["mood"] as? String ?? "",
+            energyLabel: labels?["energy"] as? String ?? "",
+            arcPhase: json["arcPhase"] as? String ?? "")
+    }
+}
+
+/// `GET /v1/lorebook/entries` — the daemon's lorebook (canonical facts injected
+/// into her context by keyword match; pinned entries always ride along).
+public struct KiraLorebookEntry: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var title: String
+    public var enabled: Bool
+    public var pinned: Bool
+    public var keywords: [String]
+    public var content: String
+
+    public static func parse(_ dict: [String: Any]) -> KiraLorebookEntry? {
+        guard let id = dict["id"] as? String, let title = dict["title"] as? String else { return nil }
+        return KiraLorebookEntry(
+            id: id,
+            title: title,
+            enabled: dict["enabled"] as? Bool ?? true,
+            pinned: dict["pinned"] as? Bool ?? false,
+            keywords: dict["keywords"] as? [String] ?? [],
+            content: dict["content"] as? String ?? "")
+    }
+
+    public func payload() -> [String: Any] {
+        [
+            "id": id,
+            "title": title,
+            "enabled": enabled,
+            "pinned": pinned,
+            "keywords": keywords,
+            "content": content,
+        ]
     }
 }
 
@@ -210,6 +394,39 @@ public struct KiraMediaItem: Identifiable, Equatable, Sendable {
     public var mtimeMs: Double
 }
 
+/// World-map entity (`/v1/kira/world`, Todd 2026-07-29): her people AND
+/// places in one bounded store — kinds friend/pet/person/place, with the
+/// map-specific `relation` ("her Tita") and `where` ("above Barkada Brew").
+public struct KiraWorldEntity: Identifiable, Equatable, Sendable {
+    public var id: String { name.lowercased() }
+    public var name: String
+    public var kind: String
+    public var persona: String
+    public var relation: String
+    public var location: String   // wire field `where` (Swift keyword)
+    public var facts: [String]
+
+    public var isPlace: Bool { kind == "place" }
+
+    public static func parse(_ item: [String: Any]) -> KiraWorldEntity? {
+        guard let name = item["name"] as? String, !name.isEmpty else { return nil }
+        return KiraWorldEntity(
+            name: name,
+            kind: item["kind"] as? String ?? "friend",
+            persona: item["persona"] as? String ?? "",
+            relation: item["relation"] as? String ?? "",
+            location: item["where"] as? String ?? "",
+            facts: item["facts"] as? [String] ?? [])
+    }
+
+    public func payload() -> [String: Any] {
+        var out: [String: Any] = ["name": name, "kind": kind, "persona": persona, "facts": facts]
+        if !relation.isEmpty { out["relation"] = relation }
+        if !location.isEmpty { out["where"] = location }
+        return out
+    }
+}
+
 /// Suggestion-box entry (`/v1/kira/suggestions`). Kinds: image/video seed one
 /// render (consumed FIFO), session themes one cycle (consumed), arc is sticky
 /// context until removed.
@@ -273,6 +490,20 @@ public final class KiraClient {
     /// In-flight control action (pause/resume/mode) — disables the controls.
     public private(set) var actionInFlight = false
     public private(set) var actionError: String?
+
+    // Editor read models (Todd 2026-07-27): character description, Her Now
+    // raw numbers, lorebook. Refreshed with the dashboard poll and after writes.
+    public private(set) var character: KiraCharacterDescription?
+    /// 'override' when an operator edit is active, 'default' otherwise.
+    public private(set) var characterSource: String?
+    public private(set) var nowState: KiraNowState?
+    public private(set) var lorebookEntries: [KiraLorebookEntry] = []
+    /// Tiered scheduler v2: who steers the 24/7 stream right now.
+    public private(set) var streamStatus: KiraStreamStatus?
+    /// World map (Todd 2026-07-29): her people + places, editable.
+    public private(set) var world: [KiraWorldEntity] = []
+    /// Per-path taste verdicts sent this app run (for immediate ❤️/😐 feedback).
+    public private(set) var tasteSent: [String: String] = [:]
 
     private var pollTask: Task<Void, Never>?
     private var dashboardTask: Task<Void, Never>?
@@ -403,6 +634,11 @@ public final class KiraClient {
             stateError = nil
         } else if state == nil {
             stateError = "GET /v1/kira/state unavailable"
+        } else {
+            // Keep the last snapshot on screen but SAY it's stale (Kimi review
+            // 2026-07-27) — the card's relative fetchedAt stops advancing and
+            // this line explains why.
+            stateError = "state refresh failed — showing last snapshot"
         }
         if let data = await schedulerData {
             scheduler = KiraSchedulerStatus.parse(data)
@@ -410,6 +646,8 @@ public final class KiraClient {
         if let data = await modeData,
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             contentMode = json["mode"] as? String
+            // Absent/empty allow-list keeps the previous value ON PURPOSE — a
+            // transiently malformed payload must not blank the mode picker.
             allowedModes = json["allowed"] as? [String] ?? allowedModes
         }
         if let data = await mediaData,
@@ -431,13 +669,55 @@ public final class KiraClient {
                 suggestionKinds = kinds
             }
         }
+
+        await refreshEditors()
+    }
+
+    /// Editor read models (A6/A7 + lorebook) — small payloads, refreshed with
+    /// the dashboard poll so writes from any surface converge without a
+    /// dedicated cadence.
+    public func refreshEditors() async {
+        async let characterData = fetch("v1/kira/character")
+        async let nowData = fetch("v1/kira/state/now")
+        async let lorebookData = fetch("v1/lorebook/entries")
+        async let streamData = fetch("v1/kira/stream-mode")
+        async let worldData = fetch("v1/kira/world")
+
+        if let data = await worldData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["entities"] as? [[String: Any]] {
+            world = items.compactMap(KiraWorldEntity.parse)
+        }
+
+        if let data = await characterData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let dict = json["character"] as? [String: Any] {
+            character = KiraCharacterDescription.parse(dict)
+            characterSource = json["source"] as? String
+        }
+        if let data = await nowData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            nowState = KiraNowState.parse(json)
+        }
+        if let data = await lorebookData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["entries"] as? [[String: Any]] {
+            lorebookEntries = items.compactMap(KiraLorebookEntry.parse)
+        }
+        if let data = await streamData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            streamStatus = KiraStreamStatus.parse(json)
+        }
     }
 
     /// Drop an idea in the box — Kira picks it up on her next content cycle.
-    public func addSuggestion(kind: String, text: String) async {
+    /// An optional tier tag holds the idea for a cycle of that tier.
+    public func addSuggestion(kind: String, text: String, tier: String? = nil) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        await perform("v1/kira/suggestions", method: "POST", body: ["kind": kind, "text": trimmed])
+        var body: [String: Any] = ["kind": kind, "text": trimmed]
+        if let tier { body["tier"] = tier }
+        await perform("v1/kira/suggestions", method: "POST", body: body)
     }
 
     public func deleteSuggestion(_ id: String) async {
@@ -534,7 +814,84 @@ public final class KiraClient {
     /// server-side). Live: the scheduler re-reads policy every cycle, so
     /// edits take effect on the next tick without a daemon restart.
     public func updateSchedulerPolicy(_ changes: [String: Any]) async {
+        // perform() already refreshes the dashboard on success (Kimi review
+        // 2026-07-27: this used to call refreshDashboard() a second time).
         await perform("v1/kira/content-scheduler/policy", method: "PUT", body: changes)
-        await refreshDashboard()
+    }
+
+    /// Tiered scheduler v2: replace the whole tiers map (server semantics —
+    /// a tier omitted from the payload is scheduled off).
+    public func updateSchedulerTiers(_ tiers: [String: KiraTierConfig]) async {
+        var payload: [String: Any] = [:]
+        for (mode, tier) in tiers {
+            payload[mode] = tier.payload(isNeutral: mode == "neutral")
+        }
+        await perform("v1/kira/content-scheduler/policy", method: "PUT", body: ["tiers": payload])
+    }
+
+    /// Tiered scheduler v2: set/clear the owner's sticky stream override.
+    public func setStreamOverride(_ mode: String?) async {
+        await perform("v1/kira/stream-mode", method: "PUT",
+                      body: ["todd": mode.map { $0 as Any } ?? NSNull()])
+    }
+
+    // MARK: - Editors (Todd 2026-07-27): character / Her Now / lorebook
+
+    /// A6: persist the edited description — live for the very next render.
+    public func saveCharacter(_ desc: KiraCharacterDescription) async {
+        await perform("v1/kira/character", method: "PUT", body: desc.payload())
+    }
+
+    /// A6: drop the override, reverting to the code-canonical description.
+    public func resetCharacter() async {
+        await perform("v1/kira/character", method: "DELETE")
+    }
+
+    /// A7: pin current mood valence/energy (decays back to baseline normally).
+    public func saveMood(valence: Double, energy: Double) async {
+        await perform("v1/kira/state/now", method: "PUT",
+                      body: ["valence": valence, "energy": energy])
+    }
+
+    /// A7: set (or clear, with nil) the persistent arcPhase override.
+    public func saveArcPhase(_ phase: String?) async {
+        let value: Any = phase.map { $0 as Any } ?? NSNull()
+        await perform("v1/kira/state/now", method: "PUT", body: ["arcPhase": value])
+    }
+
+    /// Lorebook upsert: entries with a fresh id go through POST (create), the
+    /// rest through PUT (update). The daemon persists to the vault lorebook.
+    public func addLorebookEntry(title: String, keywords: [String], content: String, pinned: Bool) async {
+        await perform("v1/lorebook/entry", method: "POST", body: [
+            "title": title, "keywords": keywords, "content": content,
+            "pinned": pinned, "enabled": true,
+        ])
+    }
+
+    public func updateLorebookEntry(_ entry: KiraLorebookEntry) async {
+        await perform("v1/lorebook/entry/\(entry.id)", method: "PUT", body: entry.payload())
+    }
+
+    public func deleteLorebookEntry(_ id: String) async {
+        await perform("v1/lorebook/entry/\(id)", method: "DELETE")
+    }
+
+    // MARK: - World map (Todd 2026-07-29)
+
+    /// PUT is a FULL replacement — the daemon caps/validates and the next
+    /// refresh reads back exactly what it kept.
+    public func saveWorld(_ entities: [KiraWorldEntity]) async {
+        await perform("v1/kira/world", method: "PUT",
+                      body: ["entities": entities.map { $0.payload() }])
+        await refreshEditors()
+    }
+
+    // MARK: - Taste (Inner Loop F3)
+
+    /// ❤️/😐 on a rendered item — feeds her draw-weighting taste store.
+    public func sendTaste(path: String, verdict: String) async {
+        await perform("v1/kira/taste", method: "POST",
+                      body: ["path": path, "verdict": verdict])
+        tasteSent[path] = verdict
     }
 }
