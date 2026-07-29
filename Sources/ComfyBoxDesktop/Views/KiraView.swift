@@ -43,6 +43,9 @@ struct KiraView: View {
                     foldable("Lorebook", systemImage: "book.closed", "lorebook") {
                         KiraLorebookCard(client: client)
                     }
+                    foldable("World map", systemImage: "map", "world") {
+                        KiraWorldMapCard(client: client)
+                    }
                     foldable("Suggestion box", systemImage: "lightbulb", "suggest") { suggestionBody }
                     foldable("Compute", systemImage: "memorychip", "compute") { computeBody }
                     foldable("Recent output", systemImage: "photo.stack", "recent") { recentOutputBody }
@@ -745,6 +748,28 @@ private struct KiraMediaThumb: View {
         }
         .frame(width: 84, height: 96)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(alignment: .bottomTrailing) {
+            // Taste verdicts (Inner Loop F3): ❤️/😐 feed her draw-weighting
+            // store via POST /v1/kira/taste — she renders more of what lands.
+            if let sent = client.tasteSent[item.path] {
+                Text(sent == "up" ? "❤️" : "😐")
+                    .font(.caption2)
+                    .padding(3)
+                    .background(.black.opacity(0.45), in: Capsule())
+                    .padding(3)
+            } else {
+                HStack(spacing: 2) {
+                    Button { Task { await client.sendTaste(path: item.path, verdict: "up") } }
+                        label: { Text("❤️").font(.caption2) }
+                    Button { Task { await client.sendTaste(path: item.path, verdict: "down") } }
+                        label: { Text("😐").font(.caption2) }
+                }
+                .buttonStyle(.borderless)
+                .padding(2)
+                .background(.black.opacity(0.45), in: Capsule())
+                .padding(3)
+            }
+        }
         .help((item.path as NSString).lastPathComponent)
         .task {
             guard image == nil, item.kind == "image" else { return }

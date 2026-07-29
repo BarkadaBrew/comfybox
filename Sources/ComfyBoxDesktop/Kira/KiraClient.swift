@@ -394,6 +394,39 @@ public struct KiraMediaItem: Identifiable, Equatable, Sendable {
     public var mtimeMs: Double
 }
 
+/// World-map entity (`/v1/kira/world`, Todd 2026-07-29): her people AND
+/// places in one bounded store — kinds friend/pet/person/place, with the
+/// map-specific `relation` ("her Tita") and `where` ("above Barkada Brew").
+public struct KiraWorldEntity: Identifiable, Equatable, Sendable {
+    public var id: String { name.lowercased() }
+    public var name: String
+    public var kind: String
+    public var persona: String
+    public var relation: String
+    public var location: String   // wire field `where` (Swift keyword)
+    public var facts: [String]
+
+    public var isPlace: Bool { kind == "place" }
+
+    public static func parse(_ item: [String: Any]) -> KiraWorldEntity? {
+        guard let name = item["name"] as? String, !name.isEmpty else { return nil }
+        return KiraWorldEntity(
+            name: name,
+            kind: item["kind"] as? String ?? "friend",
+            persona: item["persona"] as? String ?? "",
+            relation: item["relation"] as? String ?? "",
+            location: item["where"] as? String ?? "",
+            facts: item["facts"] as? [String] ?? [])
+    }
+
+    public func payload() -> [String: Any] {
+        var out: [String: Any] = ["name": name, "kind": kind, "persona": persona, "facts": facts]
+        if !relation.isEmpty { out["relation"] = relation }
+        if !location.isEmpty { out["where"] = location }
+        return out
+    }
+}
+
 /// Suggestion-box entry (`/v1/kira/suggestions`). Kinds: image/video seed one
 /// render (consumed FIFO), session themes one cycle (consumed), arc is sticky
 /// context until removed.
@@ -467,6 +500,10 @@ public final class KiraClient {
     public private(set) var lorebookEntries: [KiraLorebookEntry] = []
     /// Tiered scheduler v2: who steers the 24/7 stream right now.
     public private(set) var streamStatus: KiraStreamStatus?
+    /// World map (Todd 2026-07-29): her people + places, editable.
+    public private(set) var world: [KiraWorldEntity] = []
+    /// Per-path taste verdicts sent this app run (for immediate ❤️/😐 feedback).
+    public private(set) var tasteSent: [String: String] = [:]
 
     private var pollTask: Task<Void, Never>?
     private var dashboardTask: Task<Void, Never>?
@@ -644,6 +681,13 @@ public final class KiraClient {
         async let nowData = fetch("v1/kira/state/now")
         async let lorebookData = fetch("v1/lorebook/entries")
         async let streamData = fetch("v1/kira/stream-mode")
+        async let worldData = fetch("v1/kira/world")
+
+        if let data = await worldData,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let items = json["entities"] as? [[String: Any]] {
+            world = items.compactMap(KiraWorldEntity.parse)
+        }
 
         if let data = await characterData,
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -830,5 +874,24 @@ public final class KiraClient {
 
     public func deleteLorebookEntry(_ id: String) async {
         await perform("v1/lorebook/entry/\(id)", method: "DELETE")
+    }
+
+    // MARK: - World map (Todd 2026-07-29)
+
+    /// PUT is a FULL replacement — the daemon caps/validates and the next
+    /// refresh reads back exactly what it kept.
+    public func saveWorld(_ entities: [KiraWorldEntity]) async {
+        await perform("v1/kira/world", method: "PUT",
+                      body: ["entities": entities.map { $0.payload() }])
+        await refreshEditors()
+    }
+
+    // MARK: - Taste (Inner Loop F3)
+
+    /// ❤️/😐 on a rendered item — feeds her draw-weighting taste store.
+    public func sendTaste(path: String, verdict: String) async {
+        await perform("v1/kira/taste", method: "POST",
+                      body: ["path": path, "verdict": verdict])
+        tasteSent[path] = verdict
     }
 }

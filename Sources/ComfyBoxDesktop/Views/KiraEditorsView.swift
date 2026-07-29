@@ -282,3 +282,111 @@ struct KiraLorebookCard: View {
         }
     }
 }
+
+// MARK: - World map (Todd 2026-07-29)
+
+/// Her people + places (`/v1/kira/world`) — the persisted map that rides every
+/// turn's state block. Full-replacement PUT: edit drafts locally, Apply saves
+/// the whole map; the daemon caps/validates and the next poll reads back what
+/// it kept. Kira edits the same store live via her `update_world` tool, so
+/// Revert also picks up anything she added since the drafts loaded.
+struct KiraWorldMapCard: View {
+    @Bindable var client: KiraClient
+    @State private var draft: [KiraWorldEntity] = []
+    @State private var loadedFor: [KiraWorldEntity]?
+    @State private var newName = ""
+    @State private var newKind = "place"
+
+    private static let kinds = ["friend", "person", "pet", "place"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            section("People", entities: draft.filter { !$0.isPlace })
+            section("Places", entities: draft.filter { $0.isPlace })
+            HStack(spacing: 8) {
+                TextField("new entry name", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 180)
+                Picker("", selection: $newKind) {
+                    ForEach(Self.kinds, id: \.self) { Text($0) }
+                }
+                .frame(width: 90)
+                Button("Add") {
+                    let name = newName.trimmingCharacters(in: .whitespaces)
+                    guard !name.isEmpty,
+                          !draft.contains(where: { $0.name.lowercased() == name.lowercased() })
+                    else { return }
+                    draft.append(KiraWorldEntity(
+                        name: name, kind: newKind, persona: "",
+                        relation: "", location: "", facts: []))
+                    newName = ""
+                }
+                .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
+                Spacer()
+                Button("Revert") { draft = client.world; loadedFor = client.world }
+                    .disabled(draft == client.world)
+                Button("Apply") { Task { await client.saveWorld(draft) } }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(draft == client.world || client.actionInFlight)
+            }
+            Text("She maintains this map herself with update_world — Revert pulls in anything she added. Deleting here sticks: seeds never resurrect.")
+                .font(.caption2).foregroundStyle(.tertiary)
+        }
+        .onAppear { syncDrafts() }
+        .onChange(of: client.world) { syncDrafts() }
+    }
+
+    /// Load drafts from the live map, but never clobber unsaved local edits
+    /// (same guard pattern as the character card's loadedFor).
+    private func syncDrafts() {
+        guard loadedFor != client.world else { return }
+        if draft == (loadedFor ?? []) { draft = client.world }
+        loadedFor = client.world
+    }
+
+    @ViewBuilder private func section(_ title: String, entities: [KiraWorldEntity]) -> some View {
+        if !entities.isEmpty {
+            Text(title).font(.caption).bold().foregroundStyle(.secondary)
+            ForEach(entities) { entity in
+                row(entity)
+            }
+        }
+    }
+
+    @ViewBuilder private func row(_ entity: KiraWorldEntity) -> some View {
+        if let idx = draft.firstIndex(where: { $0.id == entity.id }) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(draft[idx].name).font(.callout).bold()
+                    Text(draft[idx].kind)
+                        .font(.caption2)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                    Spacer()
+                    Button(role: .destructive) {
+                        draft.remove(at: idx)
+                    } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless)
+                        .help("Remove from her map (Apply to persist — the deletion sticks)")
+                }
+                TextField("persona — short sketch", text: $draft[idx].persona)
+                    .textFieldStyle(.roundedBorder).font(.caption)
+                if draft[idx].isPlace {
+                    TextField("where — e.g. above Barkada Brew", text: $draft[idx].location)
+                        .textFieldStyle(.roundedBorder).font(.caption)
+                } else {
+                    TextField("relation — how they stand to her", text: $draft[idx].relation)
+                        .textFieldStyle(.roundedBorder).font(.caption)
+                }
+                if !draft[idx].facts.isEmpty {
+                    Text(draft[idx].facts.joined(separator: " · "))
+                        .font(.caption2).foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                        .help("Facts accumulate from her update_world calls")
+                }
+            }
+            .padding(6)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+}
