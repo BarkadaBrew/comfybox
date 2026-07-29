@@ -661,11 +661,21 @@ public final class LTX2VideoGenerator {
             // has no identity source and drifts. Heuristic: the largest face is
             // the foreground female subject; drop it, anchor the rest (the
             // peripheral male). Falls back to all-faces if only one detected.
-            if (ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_MALE_ONLY"] ?? "1") != "0",
-               rects.count > 1 {
-                let largest = rects.max(by: { $0.width * $0.height < $1.width * $1.height })!
-                rects = rects.filter { $0 != largest }
-                logger.info("Face-anchor: male-only — anchoring \(rects.count) peripheral face(s), skipping primary subject.")
+            if (ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_MALE_ONLY"] ?? "1") != "0" {
+                if rects.count > 1 {
+                    let largest = rects.max(by: { $0.width * $0.height < $1.width * $1.height })!
+                    rects = rects.filter { $0 != largest }
+                    logger.info("Face-anchor: male-only — anchoring \(rects.count) peripheral face(s), skipping primary subject.")
+                } else if rects.count == 1 {
+                    // Solo clip: the ONE detected face IS the primary subject. Anchoring
+                    // it pins the seed frame's features as a static ghost overlay while
+                    // the head moves (doubled nose/mouth — matched-seed A/B 2026-07-29:
+                    // anchor-off arm was clean AND livelier) and damps facial animation.
+                    // Identity is already held by the seed + LoRA; anchor nothing.
+                    // Partnered clips (2+ faces) keep the peripheral-face anchor above.
+                    rects = []
+                    logger.info("Face-anchor: single face = primary subject; anchoring nothing (solo ghost fix 2026-07-29).")
+                }
             }
             let latH = request.height / pipeline.spatialCompression
             let latW = request.width / pipeline.spatialCompression
