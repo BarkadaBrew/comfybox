@@ -1895,14 +1895,6 @@ public final class WarmServer {
       if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
     }
 
-    // Hard age floor (2026-07-28): whatever authored the final prompt — the
-    // local optimizer above, a preset, or the caller — a sub-18 descriptor
-    // can never reach the generator.
-    if AgeFloor.violates(effectivePrompt) {
-      logger.warning("AgeFloor: rewrote sub-18 descriptor in video prompt")
-      effectivePrompt = AgeFloor.enforce(effectivePrompt)
-    }
-
     let videoRequest = LTX2VideoRequest(
       prompt: effectivePrompt,
       negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
@@ -2423,7 +2415,7 @@ public final class WarmServer {
       }
 
       let controlRequest = ZImageControlGenerationRequest(
-        prompt: AgeFloor.enforce(request.prompt),
+        prompt: request.prompt,
         negativePrompt: nil,
         controlImage: controlImageURL,
         inpaintImage: inpaintImageURL,
@@ -2532,7 +2524,7 @@ public final class WarmServer {
     }
 
     let payload = GeneratePayload(
-      prompt: AgeFloor.enforce(request.prompt),
+      prompt: request.prompt,
       negativePrompt: resolvedNegativePrompt,
       width: genWidth,
       height: genHeight,
