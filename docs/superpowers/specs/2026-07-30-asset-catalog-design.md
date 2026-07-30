@@ -119,12 +119,16 @@ gallery/Bree/` is a Bree-character render inside the Kira realm.
 
 Realm cannot be derived from a Mac path, because every realm's renders pass
 through the same engine output dir. **The caller stamps it.** For backfill it is
-recovered from which server tree holds the copy.
+recovered from which server tree holds the copy; a Mac asset with no server twin
+defaults to `realm = todd`.
 
 ### Identity — one asset, many locations
 
-Merge key is `sha256` (column already exists; server copies are byte-identical
-file copies). `recovered_from` and the filename UUID are fallback joins. A new
+Merge key is `sha256` (column already exists). `recovered_from` and the filename
+UUID are fallback joins. **Verification item for the plan:** confirm the
+server copy is a byte-identical file copy rather than a re-encode — if any path
+re-encodes or resizes, `sha256` cannot be the primary merge key and
+`recovered_from` becomes primary. A new
 `asset_locations(asset_id, host, path, mtime)` table holds the Mac original and
 the server copy as two rows against one asset. `assets.absolute_path` stays the
 Mac primary so every existing `DAMStore` query keeps working.
