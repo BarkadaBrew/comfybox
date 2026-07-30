@@ -12,6 +12,7 @@
 // Every read is best-effort: a missing tool, a missing file or garbage JSON
 // yields fewer facts, never a throw.
 
+import Dispatch
 import Foundation
 
 public struct FileMetadata: Sendable, Equatable {
@@ -36,6 +37,12 @@ public struct FileMetadata: Sendable, Equatable {
     public var sealed: Bool = false
     public var sourceImagePath: String?
     public var software: String?
+    /// The sidecar's `provider` field ("which application produced this").
+    /// Images recover this from `EXIF:Software`; video has no embedded
+    /// metadata at all, so for video this is the ONLY source of `source`.
+    /// Not wired into anything else here — a later task decides how it
+    /// feeds the catalog's `source` column.
+    public var provider: String?
 
     public init() {}
 }
@@ -50,9 +57,13 @@ public enum MetadataReader {
     /// or the file has nothing — never throws.
     public static func readEmbedded(path: String) -> FileMetadata? {
         guard FileManager.default.isExecutableFile(atPath: exiftoolPath) else { return nil }
+        // Note: IPTC:Keywords / XMP-dc:Subject are deliberately NOT requested —
+        // FileMetadata has no field for them and nothing reads them; asking
+        // exiftool to extract tags we then discard is dead work. Add both the
+        // field and the flag together if a future task needs keyword tags.
         let args = ["-j", "-n",
                     "-EXIF:UserComment", "-EXIF:ImageDescription", "-EXIF:Software",
-                    "-XMP-dc:Description", "-IPTC:Keywords", "-XMP-dc:Subject",
+                    "-XMP-dc:Description",
                     path]
         guard let out = runTool(exiftoolPath, args),
               let arr = try? JSONSerialization.jsonObject(with: out) as? [[String: Any]],
@@ -113,6 +124,7 @@ public enum MetadataReader {
         m.resolution = obj["resolution"] as? String
         m.aspectRatio = obj["aspect_ratio"] as? String
         m.sourceImagePath = obj["source_image"] as? String
+        m.provider = obj["provider"] as? String
         m.sealed = (obj["sealed"] as? Bool) ?? false
         if let loras = obj["loras"], let d = try? JSONSerialization.data(withJSONObject: loras) {
             m.loras = String(data: d, encoding: .utf8)
@@ -167,16 +179,50 @@ public enum MetadataReader {
 
     // MARK: - Helpers
 
-    private static func runTool(_ launchPath: String, _ args: [String]) -> Data? {
+    /// Wall-clock ceiling for any external tool invocation. A later task runs
+    /// these readers over several thousand files in sequence, so one hung
+    /// process (corrupt file, stalled filesystem, network-mounted media) must
+    /// not stall the whole run.
+    static let toolTimeoutSeconds: TimeInterval = 20
+
+    /// Run an external tool and capture its stdout, with a wall-clock timeout.
+    /// Never throws and never blocks past `timeout`: on expiry the process is
+    /// terminated and this returns nil, same as any other missing-data case.
+    ///
+    /// `timeout` defaults to `toolTimeoutSeconds` and is only overridden by
+    /// tests (to exercise the timeout path without slowing the suite down).
+    static func runTool(_ launchPath: String, _ args: [String],
+                        timeout: TimeInterval = toolTimeoutSeconds) -> Data? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: launchPath)
         p.arguments = args
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
+
+        do { try p.run() } catch {
+            try? pipe.fileHandleForReading.close()
+            return nil
+        }
+
+        // Safety valve: if the child never exits on its own, force it to so
+        // the blocking read below cannot hang forever. Runs on a background
+        // queue so it never competes with the read/wait for the same thread.
+        let watchdog = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        watchdog.schedule(deadline: .now() + timeout)
+        watchdog.setEventHandler { [weak p] in
+            guard let p, p.isRunning else { return }
+            p.terminate()
+        }
+        watchdog.resume()
+        defer { watchdog.cancel() }
+
+        // Terminating the child closes its stdout, which is what unblocks this
+        // read if the watchdog had to fire; on the normal path the child
+        // closes stdout on its own exit well before the deadline.
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        try? pipe.fileHandleForReading.close()
         return data.isEmpty ? nil : data
     }
 

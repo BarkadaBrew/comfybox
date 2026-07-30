@@ -44,6 +44,10 @@ final class MetadataReaderTests: XCTestCase {
         XCTAssertEqual(m.modelFamily, "krea2")
         XCTAssertEqual(m.seed, 1387857967)
         XCTAssertFalse(m.sealed)
+        XCTAssertEqual(m.provider, "comfybox")
+        XCTAssertNotNil(m.loras, "the path-shaped loras array must round-trip too, not just the name-shaped one")
+        XCTAssertTrue(m.loras!.contains("KNPV4.1_pre.safetensors"))
+        XCTAssertTrue(m.loras!.contains("Filipina_Pinay_Women.safetensors"))
     }
 
     /// Verbatim shape of a real VIDEO sidecar — note source_image and prompt_raw.
@@ -62,7 +66,26 @@ final class MetadataReaderTests: XCTestCase {
         XCTAssertEqual(m.promptRaw, "original text")
         XCTAssertEqual(m.sourceImagePath,
                        "/home/todd/.kira/studio/gallery/Bree/generated/1783770983068_x.png")
+        XCTAssertEqual(m.provider, "comfybox",
+                       "video has no embedded metadata at all — the sidecar's provider is the ONLY source of `source` for video")
         XCTAssertNil(m.durationMs, "sidecar duration is null — must NOT be invented")
+    }
+
+    /// Same asymmetry as above, but proves the field is IGNORED rather than
+    /// merely absent: even when the sidecar supplies a real, non-null
+    /// duration, readSidecar must not surface it. Duration must always come
+    /// from `probeContainer` (the container itself), because real sidecars
+    /// are unreliable for it — this is the load-bearing assertion for that
+    /// design decision; without it, a regression that started trusting the
+    /// sidecar's duration would go undetected by the null-duration test alone.
+    func testSidecarDurationIsIgnoredEvenWhenNotNull() throws {
+        let json = """
+        {"character":"bree","mode":"i2v","duration":12.5,"provider":"comfybox","model":"ltx",
+         "resolution":"480p","aspect_ratio":"9:16","content_mode":"avocado"}
+        """
+        let m = try XCTUnwrap(MetadataReader.readSidecar(jsonData: Data(json.utf8)))
+        XCTAssertNil(m.durationMs,
+                      "sidecar duration must be ignored even when present — container probe is the only trusted source")
     }
 
     func testSealedSidecarIsFlagged() throws {
@@ -83,5 +106,20 @@ final class MetadataReaderTests: XCTestCase {
                 galleryRoot: "/home/todd/.kira/studio/gallery",
                 metadataRoot: "/home/todd/.kira/studio/metadata"),
             "/home/todd/.kira/studio/metadata/Kira/generated/x.json")
+    }
+
+    /// A backfill runs `runTool` over several thousand files in sequence; one
+    /// hung child process (corrupt file, stalled filesystem, network-mounted
+    /// media) must not stall the whole run. Uses an injected short timeout
+    /// (not the production 20s constant) so the suite stays fast, against a
+    /// deliberately slow command that would otherwise still be sleeping when
+    /// this assertion runs.
+    func testRunToolTimesOutRatherThanHangingForever() {
+        let start = Date()
+        let result = MetadataReader.runTool("/bin/sh", ["-c", "sleep 5; echo done"], timeout: 0.2)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertNil(result, "a hung/slow process must degrade to nil, never block forever")
+        XCTAssertLessThan(elapsed, 2.0,
+                           "the timeout must terminate the process well before its natural 5s completion")
     }
 }
