@@ -48,6 +48,12 @@ final class CatalogStoreTests: XCTestCase {
             let rows = try await store.search(q)
             XCTAssertFalse(rows.contains { $0.realm != .kira },
                            "leaked a non-kira row for query \(q)")
+            // The negative assertion alone is trivially true of an EMPTY result,
+            // so every variation must also still FIND her row. Without this, a
+            // placeholder-numbering bug that made every query match nothing would
+            // pass the leak check with flying colours.
+            XCTAssertEqual(rows.map(\.id), ["k1"],
+                           "the lock must narrow the result, not empty it, for \(q)")
         }
     }
 
@@ -61,20 +67,75 @@ final class CatalogStoreTests: XCTestCase {
     // MARK: - Mode clamp
 
     func testTierCeilingHidesTextAndPathButKeepsCounts() async throws {
-        try await store.upsert(make("a", realm: .kira, tier: "avocado", prompt: "explicit text"),
-                               explicitCollectionIDs: [])
+        // EVERY text field is populated: a clamp that withheld `prompt` but
+        // leaked `caption`, `promptRaw`, `negativePrompt`, `captionSource` or the
+        // filename would pass a prompt-only test while still spilling the text.
+        try await store.upsert(
+            CatalogAsset(id: "a", filename: "a.png", absolutePath: "/tmp/a.png",
+                         realm: .kira,
+                         prompt: "explicit text", negativePrompt: "explicit negative",
+                         promptRaw: "explicit raw", caption: "explicit caption",
+                         captionSource: "explicit captioner",
+                         contentMode: "avocado", characterName: "Kira", lane: "shoot",
+                         rating: 4),
+            explicitCollectionIDs: [])
         try await store.upsert(make("n", realm: .kira, tier: "neutral", prompt: "a tulip"),
                                explicitCollectionIDs: [])
 
         let clamped = try await store.search(CatalogQuery(scope: .kira, ceiling: "apple"))
         let avocado = try XCTUnwrap(clamped.first { $0.id == "a" })
         XCTAssertNil(avocado.prompt, "text above the ceiling must not surface")
+        XCTAssertNil(avocado.negativePrompt, "negative prompt is text too")
+        XCTAssertNil(avocado.promptRaw, "the raw phrasing is text too")
+        XCTAssertNil(avocado.caption, "caption is text too")
+        XCTAssertNil(avocado.captionSource, "caption source is text too")
         XCTAssertEqual(avocado.absolutePath, "", "path above the ceiling must not surface")
+        XCTAssertEqual(avocado.filename, "", "the filename is a path fragment, not metadata")
+        // ...while everything that is genuinely metadata survives, so counts and
+        // facets over a clamped result set are still true.
         XCTAssertEqual(avocado.contentMode, "avocado", "the tier LABEL is metadata and stays")
+        XCTAssertEqual(avocado.characterName, "Kira")
+        XCTAssertEqual(avocado.lane, "shoot")
+        XCTAssertEqual(avocado.rating, 4)
+        XCTAssertEqual(avocado.realm, .kira)
 
         let neutral = try XCTUnwrap(clamped.first { $0.id == "n" })
         XCTAssertEqual(neutral.prompt, "a tulip")
         XCTAssertEqual(neutral.absolutePath, "/tmp/n.png")
+    }
+
+    /// tierRank used to return 0 for any tier it did not recognise, so an asset
+    /// carrying a vocabulary the desktop gate already emits — NSFWGate treats
+    /// "explicit", "nsfw" and "suggestive" as NSFW — ranked as NEUTRAL and walked
+    /// straight through the clamp with its prompt and its absolute path.
+    func testAnUnrecognisedTierVocabularyIsStillClamped() async throws {
+        try await store.upsert(make("e", realm: .kira, tier: "explicit", prompt: "explicit text"),
+                               explicitCollectionIDs: [])
+        try await store.upsert(make("z", realm: .kira, tier: "wildly-unknown", prompt: "unknown text"),
+                               explicitCollectionIDs: [])
+
+        let rows = try await store.search(CatalogQuery(scope: .kira, ceiling: "neutral"))
+        let explicit = try XCTUnwrap(rows.first { $0.id == "e" })
+        XCTAssertNil(explicit.prompt, "'explicit' means avocado, not neutral")
+        XCTAssertEqual(explicit.absolutePath, "")
+        XCTAssertEqual(explicit.contentMode, "explicit", "the label still stays")
+
+        let unknown = try XCTUnwrap(rows.first { $0.id == "z" })
+        XCTAssertNil(unknown.prompt, "an unrecognised tier must fail CLOSED")
+        XCTAssertEqual(unknown.absolutePath, "")
+    }
+
+    func testTierSynonymsRankWithTheirFruit() {
+        XCTAssertEqual(tierRank("explicit"), tierRank("avocado"))
+        XCTAssertEqual(tierRank("nsfw"), tierRank("avocado"))
+        XCTAssertEqual(tierRank("suggestive"), tierRank("banana"))
+        XCTAssertEqual(tierRank("EXPLICIT"), tierRank("avocado"), "case must not matter")
+        XCTAssertEqual(tierRank(nil), 0, "untiered is not secretly explicit")
+        XCTAssertEqual(tierRank("never-heard-of-it"), CATALOG_TIER_ORDER.count,
+                       "an unknown tier outranks every known one")
+        // The ceiling rounds the other way, so an unknown ceiling admits least.
+        XCTAssertEqual(ceilingRank("never-heard-of-it"), 0)
+        XCTAssertEqual(ceilingRank("explicit"), tierRank("avocado"))
     }
 
     func testNoCeilingMeansNoClamp() async throws {
@@ -180,6 +241,28 @@ final class CatalogStoreTests: XCTestCase {
             try await store.file(assetID: "s1", into: "col-kira-still-life", by: .kira))
     }
 
+    /// The prohibition belongs to the data, not to the caller: the service actor
+    /// (nil) used to bypass it, so backfill or the desktop app could put a shared
+    /// row inside her realm.
+    func testNotEvenTheServiceCanFileASharedRowIntoAKiraCollection() async throws {
+        try await store.upsert(make("s1", realm: .shared), explicitCollectionIDs: [])
+        await XCTAssertThrowsErrorAsync(
+            try await store.file(assetID: "s1", into: "col-kira-still-life", by: nil))
+        let inHers = try await store.search(
+            CatalogQuery(scope: nil, collectionID: "col-kira-still-life"))
+        XCTAssertTrue(inHers.isEmpty)
+    }
+
+    /// The same rule on the upsert path: naming a kira collection explicitly for
+    /// a shared asset must not file it there.
+    func testExplicitKiraCollectionIsIgnoredForASharedAsset() async throws {
+        try await store.upsert(make("s1", realm: .shared),
+                               explicitCollectionIDs: ["col-kira-still-life"])
+        let rows = try await store.search(
+            CatalogQuery(scope: nil, collectionID: "col-kira-still-life"))
+        XCTAssertTrue(rows.isEmpty, "a shared asset cannot be filed into her realm by request")
+    }
+
     func testCollectionsVisibleToKiraExcludeOtherRealmsPrivateOnes() async throws {
         try await store.createCollection(
             CatalogCollection(id: "c-secret", slug: "x", name: "X", realm: .kira), by: .kira)
@@ -214,7 +297,50 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(edges.count, 1)
     }
 
+    /// The escalation chain the realm lock exists to stop: a scoped search hands
+    /// her one of her OWN ids, and the graph walk from it must not hand back a
+    /// shared one.
+    func testScopedEdgesDoNotRevealASharedEndpoint() async throws {
+        try await store.upsert(make("shared-still", realm: .shared), explicitCollectionIDs: [])
+        try await store.upsert(make("her-clip", realm: .kira, kind: "video", mode: "i2v"),
+                               explicitCollectionIDs: [])
+        try await store.addEdge(AssetEdge(fromAssetID: "her-clip", toAssetID: "shared-still",
+                                          relation: .i2vSource))
+
+        let unscoped = try await store.edges(for: "her-clip")
+        XCTAssertEqual(unscoped.map(\.toAssetID), ["shared-still"], "the service still sees it")
+
+        let scoped = try await store.edges(for: "her-clip", scope: .kira)
+        XCTAssertTrue(scoped.isEmpty, "an edge to a shared asset must not survive her scope")
+    }
+
     // MARK: - Locations
+
+    func testScopedLookupsRefuseAnOutOfRealmAsset() async throws {
+        try await store.upsert(
+            CatalogAsset(id: "s1", filename: "s1.png", absolutePath: "/tmp/s1.png",
+                         sha256: "deadbeef", realm: .shared),
+            explicitCollectionIDs: [])
+        try await store.addLocation(assetID: "s1",
+            AssetLocation(host: "mac", path: "/Users/t/Pictures/ComfyBox/s1.png", mtime: Date()))
+
+        // Unscoped — the service itself — resolves all three.
+        let serviceLocations = try await store.locations(of: "s1")
+        XCTAssertEqual(serviceLocations.count, 1)
+        let serviceByPath = try await store.assetID(forPath: "/tmp/s1.png")
+        XCTAssertEqual(serviceByPath, "s1")
+        let serviceBySHA = try await store.assetID(forSHA256: "deadbeef")
+        XCTAssertEqual(serviceBySHA, "s1")
+
+        // Scoped to her realm, all three go quiet — including the two that would
+        // otherwise confirm a GUESSED path or hash.
+        let herLocations = try await store.locations(of: "s1", scope: .kira)
+        XCTAssertTrue(herLocations.isEmpty, "on-disk paths of a shared asset are not hers")
+        let herByPath = try await store.assetID(forPath: "/tmp/s1.png", scope: .kira)
+        XCTAssertNil(herByPath, "a guessed path must not be confirmable")
+        let herBySHA = try await store.assetID(forSHA256: "deadbeef", scope: .kira)
+        XCTAssertNil(herBySHA, "a guessed hash must not be confirmable")
+    }
 
     func testOneAssetManyLocations() async throws {
         try await store.upsert(make("a", realm: .kira), explicitCollectionIDs: [])
@@ -224,6 +350,37 @@ final class CatalogStoreTests: XCTestCase {
             AssetLocation(host: "kira", path: "/home/todd/.kira/studio/gallery/Kira/a.png", mtime: Date()))
         let locations = try await store.locations(of: "a")
         XCTAssertEqual(locations.count, 2)
+    }
+
+    // MARK: - Paging
+
+    /// limit and offset are the last two placeholders in the generated SQL — the
+    /// part most likely to break if the parameter numbering ever drifts — and
+    /// nothing else in the suite moves them off their defaults.
+    func testLimitAndOffsetPageTheResult() async throws {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        for (i, id) in ["oldest", "middle", "newest"].enumerated() {
+            try await store.upsert(
+                CatalogAsset(id: id, filename: "\(id).png", absolutePath: "/tmp/\(id).png",
+                             createdAt: base.addingTimeInterval(Double(i) * 60),
+                             realm: .kira, lane: "shoot"),
+                explicitCollectionIDs: [])
+        }
+
+        let all = try await store.search(CatalogQuery(scope: .kira))
+        XCTAssertEqual(all.map(\.id), ["newest", "middle", "oldest"])
+
+        let firstPage = try await store.search(CatalogQuery(scope: .kira, limit: 2))
+        XCTAssertEqual(firstPage.map(\.id), ["newest", "middle"])
+
+        let secondPage = try await store.search(CatalogQuery(scope: .kira, limit: 2, offset: 2))
+        XCTAssertEqual(secondPage.map(\.id), ["oldest"])
+
+        // Paging must not widen the scope either.
+        try await store.upsert(make("s1", realm: .shared, lane: "shoot"), explicitCollectionIDs: [])
+        let pagedWithOther = try await store.search(
+            CatalogQuery(scope: .kira, limit: 10, offset: 0))
+        XCTAssertFalse(pagedWithOther.contains { $0.realm != .kira })
     }
 
     // MARK: - Facets

@@ -99,9 +99,43 @@ public struct CatalogFacets: Sendable, Equatable {
 /// The fruit tiers, least to most explicit. Used only for ceiling comparison.
 public let CATALOG_TIER_ORDER: [String] = ["neutral", "apple", "banana", "avocado"]
 
+/// Other vocabularies that mean the same thing. The desktop gate already sees
+/// these values in `content_mode` (NSFWGate.swift: "explicit", "suggestive" and
+/// "nsfw" are all treated as NSFW), so the catalog must rank them rather than
+/// meet them as strangers.
+public let CATALOG_TIER_ALIASES: [String: String] = [
+    "explicit": "avocado",
+    "nsfw": "avocado",
+    "suggestive": "banana",
+]
+
+/// How explicit an ASSET's tier is. Fails CLOSED: a non-nil tier this table does
+/// not recognise ranks above every known tier, so an unrecognised vocabulary is
+/// withheld from every ceiling rather than waved through as if it were neutral.
+/// nil stays 0 — an asset that was never tiered is untiered, not secretly explicit.
 public func tierRank(_ tier: String?) -> Int {
-    guard let t = tier?.lowercased(), let i = CATALOG_TIER_ORDER.firstIndex(of: t) else { return 0 }
-    return i
+    guard let raw = tier?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines),
+          !raw.isEmpty else { return 0 }
+    if let i = CATALOG_TIER_ORDER.firstIndex(of: raw) { return i }
+    if let alias = CATALOG_TIER_ALIASES[raw], let i = CATALOG_TIER_ORDER.firstIndex(of: alias) {
+        return i
+    }
+    return CATALOG_TIER_ORDER.count
+}
+
+/// How permissive a CEILING is. Fails closed in the other direction: an
+/// unrecognised ceiling admits the least, so a typo or an unknown chat mode
+/// clamps everything above neutral instead of clamping nothing.
+///
+/// This is deliberately NOT `tierRank`. The two sides round opposite ways, and
+/// one shared function would have to fail open on one of them.
+func ceilingRank(_ ceiling: String) -> Int {
+    let raw = ceiling.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    if let i = CATALOG_TIER_ORDER.firstIndex(of: raw) { return i }
+    if let alias = CATALOG_TIER_ALIASES[raw], let i = CATALOG_TIER_ORDER.firstIndex(of: alias) {
+        return i
+    }
+    return 0
 }
 
 /// One bound parameter value, captured while the WHERE clause is assembled and
@@ -156,6 +190,12 @@ public actor CatalogStore {
             try FileManager.default.createDirectory(
                 atPath: dir, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: 0o700])
+            // `attributes:` applies only when createDirectory actually creates the
+            // directory. ~/.comfybox already exists at 0755 in the field, so the
+            // mode has to be set unconditionally or the 0700 half of the contract
+            // never lands on any existing install.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: dir)
             resolved = (dir as NSString).appendingPathComponent("dam.sqlite3")
         }
 
@@ -173,14 +213,25 @@ public actor CatalogStore {
     }
 
     private func initialize() throws {
+        // sqlite3_open_v2 has ALREADY created the file by the time we get here, so
+        // tighten before writing a byte to it — and again on the way out, whether
+        // we leave by return or by throw, to catch the -wal and -shm that
+        // journal_mode=WAL creates. A migration that throws must not leave raw
+        // prompt text sitting at the umask default.
+        tightenPermissions()
+        defer { tightenPermissions() }
+
         try CatalogSchema.exec(db, "PRAGMA journal_mode=WAL")
+        // Four consumers share this file under WAL and the desktop app writes to
+        // it concurrently; without a busy timeout a collision is an immediate
+        // SQLITE_BUSY rather than a short wait.
+        try CatalogSchema.exec(db, "PRAGMA busy_timeout = 5000")
         // `migrate` deliberately fails when `assets` is missing entirely (it must
         // never mask a real problem on the live database). A brand-new file has
         // no `assets` table at all, so create the base shape first; it is
         // CREATE TABLE IF NOT EXISTS, so an existing database is untouched.
         try CatalogSchema.ensureBaseSchema(db: db)
         try CatalogSchema.migrate(db: db)
-        tightenPermissions()
     }
 
     /// Catalog holds raw prompt text under the extended 2026-07-07 provenance
@@ -203,7 +254,28 @@ public actor CatalogStore {
     /// Insert or update an asset and (re-)apply its non-manual collection
     /// membership. Manual filings (`manual = 1`) are never removed here —
     /// precedence is manual > explicit > derived.
+    /// One asset's row, its FTS entry and its filing are one fact, so they move
+    /// together or not at all. Without this, a throw between the membership
+    /// DELETE and the re-INSERT leaves an asset filed nowhere, and a throw
+    /// between the FTS delete and insert leaves it permanently unsearchable —
+    /// both silent, both only visible much later as an absence.
     public func upsert(_ asset: CatalogAsset, explicitCollectionIDs: [String]) throws {
+        try CatalogSchema.exec(db, "SAVEPOINT catalog_upsert")
+        do {
+            try writeAssetRow(asset)
+            try reindexFTS(asset)
+            try applyDerivedFiling(asset, explicitCollectionIDs: explicitCollectionIDs)
+            try CatalogSchema.exec(db, "RELEASE catalog_upsert")
+        } catch {
+            // ROLLBACK TO rewinds but LEAVES the savepoint on the stack; the
+            // RELEASE pops it so a later upsert on this connection starts clean.
+            _ = try? CatalogSchema.exec(db, "ROLLBACK TO catalog_upsert")
+            _ = try? CatalogSchema.exec(db, "RELEASE catalog_upsert")
+            throw error
+        }
+    }
+
+    private func writeAssetRow(_ asset: CatalogAsset) throws {
         let sql = """
             INSERT INTO assets (
                 id, kind, filename, absolute_path, file_size, sha256, width, height,
@@ -277,7 +349,7 @@ public actor CatalogStore {
         bindInt(stmt, 13, asset.steps)
         bindDouble(stmt, 14, asset.guidance)
         bindText(stmt, 15, asset.modelFamily)
-        sqlite3_bind_int(stmt, 16, Int32(asset.rating))
+        sqlite3_bind_int(stmt, 16, Int32(clamping: asset.rating))
         sqlite3_bind_int(stmt, 17, asset.favorite ? 1 : 0)
         bindText(stmt, 18, asset.contentMode)
         bindText(stmt, 19, asset.characterName)
@@ -307,9 +379,6 @@ public actor CatalogStore {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
-
-        try reindexFTS(asset)
-        try applyDerivedFiling(asset, explicitCollectionIDs: explicitCollectionIDs)
     }
 
     /// A sealed row is never full-text indexed — that is what makes it
@@ -317,7 +386,10 @@ public actor CatalogStore {
     private func reindexFTS(_ asset: CatalogAsset) throws {
         try execBind("DELETE FROM assets_fts WHERE id = ?1", [.text(asset.id)])
         guard !asset.sealed else { return }
-        let hasText = (asset.prompt ?? asset.caption ?? asset.promptRaw) != nil
+        // negativePrompt counts: a row whose only text is a negative prompt is
+        // still findable by it, and omitting it here made that row invisible.
+        let hasText = (asset.prompt ?? asset.caption ?? asset.promptRaw
+                        ?? asset.negativePrompt) != nil
         guard hasText else { return }
         // prompt_raw rides the prompt column so both phrasings are findable.
         let promptText = [asset.prompt, asset.promptRaw].compactMap { $0 }.joined(separator: " ")
@@ -443,8 +515,11 @@ public actor CatalogStore {
         defer { sqlite3_finalize(stmt) }
 
         for (i, b) in binds.enumerated() { b.apply(to: stmt, at: Int32(i + 1)) }
-        sqlite3_bind_int(stmt, limitIndex, Int32(query.limit))
-        sqlite3_bind_int(stmt, offsetIndex, Int32(query.offset))
+        // int64, not Int32(...): limit and offset arrive from MCP tool arguments
+        // and chat commands, and `Int32(someHugeInt)` TRAPS — crashing the process
+        // that hosts the actor on what should be a bad-input no-op.
+        sqlite3_bind_int64(stmt, limitIndex, Int64(query.limit))
+        sqlite3_bind_int64(stmt, offsetIndex, Int64(query.offset))
 
         var rows: [CatalogAsset] = []
         var rc = sqlite3_step(stmt)
@@ -474,7 +549,7 @@ public actor CatalogStore {
     /// THE MODE CLAMP. Above the ceiling the tier LABEL survives — it is
     /// metadata — while text and the file path do not. Matches render-journal.ts.
     private func clamp(_ a: CatalogAsset, to ceiling: String?) -> CatalogAsset {
-        guard let ceiling, tierRank(a.contentMode) > tierRank(ceiling) else { return a }
+        guard let ceiling, tierRank(a.contentMode) > ceilingRank(ceiling) else { return a }
         return CatalogAsset(
             id: a.id, kind: a.kind, filename: "", absolutePath: "",
             sha256: a.sha256, fileSize: a.fileSize, width: a.width, height: a.height,
@@ -550,7 +625,16 @@ public actor CatalogStore {
         guard let row = try collectionRow(collectionID) else {
             throw CatalogError.noSuchCollection(collectionID)
         }
-        if let actor, try assetRealm(assetID) != actor {
+        // A shared asset can never enter a kira collection. This is a property of
+        // the DATA, not of who is asking, so it holds for the nil actor — the
+        // service, backfill, the desktop app — exactly as applyDerivedFiling
+        // already enforces it. Previously only a non-nil actor was checked, which
+        // left `file(assetID: <shared>, into: <kira collection>, by: nil)` open.
+        let owner = try assetRealm(assetID)
+        if owner == .shared, row.realm == .kira {
+            throw CatalogError.notPermitted("a shared asset may not be filed into a kira collection")
+        }
+        if let actor, owner != actor {
             throw CatalogError.notPermitted("\(actor.rawValue) may not file an asset outside its realm")
         }
         // Contributing to a SHARED collection is allowed; restructuring it is not.
@@ -614,17 +698,27 @@ public actor CatalogStore {
 
     /// Every edge touching this asset, in either direction — so a still finds
     /// its clips and a clip finds its still with one call.
-    public func edges(for assetID: String) throws -> [AssetEdge] {
+    ///
+    /// `scope` carries the same realm lock `search` does, and for the same
+    /// reason: without it a confined caller could take an id her scoped search
+    /// legitimately returned, follow its i2v_source edge to a SHARED still, and
+    /// read an id she was never allowed to see. BOTH endpoints must be in scope,
+    /// so the graph cannot be walked out of the realm in either direction.
+    public func edges(for assetID: String, scope: CatalogRealm? = nil) throws -> [AssetEdge] {
         var stmt: OpaquePointer?
         let sql = """
-            SELECT from_asset_id, to_asset_id, relation FROM asset_edges
-            WHERE from_asset_id = ?1 OR to_asset_id = ?1
+            SELECT e.from_asset_id, e.to_asset_id, e.relation FROM asset_edges e
+            WHERE (e.from_asset_id = ?1 OR e.to_asset_id = ?1)
+              AND (?2 IS NULL OR (
+                    EXISTS (SELECT 1 FROM assets a WHERE a.id = e.from_asset_id AND a.realm = ?2)
+                AND EXISTS (SELECT 1 FROM assets a WHERE a.id = e.to_asset_id   AND a.realm = ?2)))
             """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, assetID)
+        bindText(stmt, 2, scope?.rawValue)
         var out: [AssetEdge] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let r = text(stmt, 2).flatMap({ AssetRelation(rawValue: $0) }) else { continue }
@@ -643,14 +737,24 @@ public actor CatalogStore {
              .double(loc.mtime.timeIntervalSince1970)])
     }
 
-    public func locations(of assetID: String) throws -> [AssetLocation] {
+    /// Locations are real on-disk paths on real hosts — the most valuable thing
+    /// in the schema to leak — so this takes the realm lock too. Out of scope
+    /// returns empty rather than throwing: a confined caller learns nothing about
+    /// whether the id exists.
+    public func locations(of assetID: String, scope: CatalogRealm? = nil) throws -> [AssetLocation] {
         var stmt: OpaquePointer?
-        let sql = "SELECT host, path, mtime FROM asset_locations WHERE asset_id = ?1"
+        let sql = """
+            SELECT l.host, l.path, l.mtime FROM asset_locations l
+            WHERE l.asset_id = ?1
+              AND (?2 IS NULL
+                   OR EXISTS (SELECT 1 FROM assets a WHERE a.id = l.asset_id AND a.realm = ?2))
+            """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, assetID)
+        bindText(stmt, 2, scope?.rawValue)
         var out: [AssetLocation] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             out.append(AssetLocation(host: text(stmt, 0) ?? "", path: text(stmt, 1) ?? "",
@@ -661,27 +765,41 @@ public actor CatalogStore {
 
     /// Asset id for a known file path — used by backfill to resolve
     /// `source_image` into an `i2v_source` edge.
-    public func assetID(forPath path: String) throws -> String? {
+    ///
+    /// Scoped for the same reason as `locations`, with one extra edge: unscoped,
+    /// this is an oracle. A confined caller who GUESSES a path gets back a real
+    /// id when the guess is right, which both confirms the file exists and hands
+    /// her a key for `edges`/`locations`. Out of scope is nil.
+    public func assetID(forPath path: String, scope: CatalogRealm? = nil) throws -> String? {
         var stmt: OpaquePointer?
         let sql = """
-            SELECT id FROM assets WHERE absolute_path = ?1
-            UNION SELECT asset_id FROM asset_locations WHERE path = ?1 LIMIT 1
+            SELECT id FROM assets WHERE absolute_path = ?1 AND (?2 IS NULL OR realm = ?2)
+            UNION
+            SELECT l.asset_id FROM asset_locations l
+              JOIN assets a ON a.id = l.asset_id
+             WHERE l.path = ?1 AND (?2 IS NULL OR a.realm = ?2)
+            LIMIT 1
             """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, path)
+        bindText(stmt, 2, scope?.rawValue)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return text(stmt, 0)
     }
 
-    public func assetID(forSHA256 sha: String) throws -> String? {
+    /// Same oracle problem as `assetID(forPath:)` — a hash is guessable when the
+    /// file is one the caller already has a copy of.
+    public func assetID(forSHA256 sha: String, scope: CatalogRealm? = nil) throws -> String? {
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id FROM assets WHERE sha256 = ?1 LIMIT 1", -1, &stmt, nil) == SQLITE_OK
+        let sql = "SELECT id FROM assets WHERE sha256 = ?1 AND (?2 IS NULL OR realm = ?2) LIMIT 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK
         else { throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db))) }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, sha)
+        bindText(stmt, 2, scope?.rawValue)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return text(stmt, 0)
     }
