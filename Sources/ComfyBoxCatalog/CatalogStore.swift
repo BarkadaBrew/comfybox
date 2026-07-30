@@ -849,21 +849,54 @@ public actor CatalogStore {
         return rowToAsset(stmt)
     }
 
+    /// The asset that OWNS this path — the one whose `absolute_path` it is.
+    ///
+    /// Deliberately NOT `assetID(forPath:)`. That one is a UNION over
+    /// `absolute_path` and `asset_locations.path`; a compound UNION dedups
+    /// through a temporary b-tree, so under `LIMIT 1` the row it hands back is
+    /// not guaranteed to be the path's owner — with rows ('zzz','/P') and
+    /// ('aaa','/Q') and a stale location ('aaa','/P') it returns 'aaa'.
+    /// Backfill needs the owner EXACTLY: writing a second row with an existing
+    /// `absolute_path` violates NOT NULL UNIQUE, and `ON CONFLICT(id)` does not
+    /// absorb it, so the throw aborts the whole sweep.
+    public func assetID(owningPath path: String, scope: CatalogRealm? = nil) throws -> String? {
+        var stmt: OpaquePointer?
+        let sql = "SELECT id FROM assets WHERE absolute_path = ?1 AND (?2 IS NULL OR realm = ?2)"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, path)
+        bindText(stmt, 2, scope?.rawValue)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return text(stmt, 0)
+    }
+
     /// Ids of the assets with this exact filename, capped at `limit`.
     ///
     /// Backfill's LAST-RESORT way to resolve a `source_image` recorded on a host
     /// whose paths it cannot translate. The cap defaults to 2 because the only
     /// question asked is "is this basename unambiguous?" — two hits is already
     /// the answer, and backfill skips rather than guesses.
-    public func assetIDs(forFilename name: String, limit: Int = 2) throws -> [String] {
+    ///
+    /// `scope` carries the same realm lock every other lookup here does. A
+    /// filename is the most guessable key in the schema, so unscoped this would
+    /// be the plainest oracle of the lot — and a confined caller resolving a
+    /// basename across the boundary could mint an edge into a realm she cannot
+    /// see.
+    public func assetIDs(forFilename name: String, limit: Int = 2,
+                         scope: CatalogRealm? = nil) throws -> [String] {
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id FROM assets WHERE filename = ?1 LIMIT ?2",
-                                 -1, &stmt, nil) == SQLITE_OK else {
+        let sql = """
+            SELECT id FROM assets WHERE filename = ?1 AND (?3 IS NULL OR realm = ?3) LIMIT ?2
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, name)
         sqlite3_bind_int64(stmt, 2, Int64(limit))
+        bindText(stmt, 3, scope?.rawValue)
         var out: [String] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             if let id = text(stmt, 0) { out.append(id) }

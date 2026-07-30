@@ -17,10 +17,14 @@ import Foundation
 
 /// Everything the readers can recover about one file, from any source.
 ///
-/// THE FIELD LIST LIVES IN EXACTLY TWO PLACES: here, and in
-/// `fillingNils(from:)` below. Adding a field means adding it to both, and to
-/// nothing else — `CatalogBackfill.row(file:existing:meta:)` is the single
-/// place this becomes a `CatalogAsset`. That is deliberate: `lane` was silently
+/// THE FIELD LIST LIVES IN EXACTLY TWO PLACES: the properties below, and
+/// `CatalogBackfill.row(file:existing:meta:)`, which is the single place any of
+/// this becomes a `CatalogAsset`. There is no merge function with a third copy
+/// of the list — precedence is applied by folding `row` over the sources in
+/// order. Two is the floor without reflection: the properties ARE the type, and
+/// the two structs are genuinely different shapes. Swift cannot check the
+/// remaining hop, so `CatalogBackfillTests.testEveryFileMetadataFieldIsMapped`
+/// fails loudly when a field is added here and nowhere else. `lane` was silently
 /// dropped for exactly as long as there were four hand-maintained lists.
 public struct FileMetadata: Sendable, Equatable {
     public var prompt: String?
@@ -63,49 +67,6 @@ public struct FileMetadata: Sendable, Equatable {
     public var provider: String?
 
     public init() {}
-
-    /// This value, with every nil filled from `weaker`. Precedence is expressed
-    /// by the direction of the call — `sidecar.fillingNils(from: embedded)` —
-    /// so a source can never overwrite a stronger one's fact.
-    ///
-    /// `sealed` is the one field that is not "first non-nil wins": it ORs, so
-    /// any source saying a file is sealed seals it.
-    public func fillingNils(from weaker: FileMetadata) -> FileMetadata {
-        var m = self
-        m.prompt = m.prompt ?? weaker.prompt
-        m.negativePrompt = m.negativePrompt ?? weaker.negativePrompt
-        m.promptRaw = m.promptRaw ?? weaker.promptRaw
-        m.promptInjected = m.promptInjected ?? weaker.promptInjected
-        m.seed = m.seed ?? weaker.seed
-        m.steps = m.steps ?? weaker.steps
-        m.guidance = m.guidance ?? weaker.guidance
-        m.width = m.width ?? weaker.width
-        m.height = m.height ?? weaker.height
-        m.modelFamily = m.modelFamily ?? weaker.modelFamily
-        m.preset = m.preset ?? weaker.preset
-        m.loras = m.loras ?? weaker.loras
-        m.renderID = m.renderID ?? weaker.renderID
-        m.characterName = m.characterName ?? weaker.characterName
-        m.contentMode = m.contentMode ?? weaker.contentMode
-        m.lane = m.lane ?? weaker.lane
-        m.arc = m.arc ?? weaker.arc
-        m.theme = m.theme ?? weaker.theme
-        m.stock = m.stock ?? weaker.stock
-        m.genre = m.genre ?? weaker.genre
-        m.family = m.family ?? weaker.family
-        m.style = m.style ?? weaker.style
-        m.mode = m.mode ?? weaker.mode
-        m.resolution = m.resolution ?? weaker.resolution
-        m.aspectRatio = m.aspectRatio ?? weaker.aspectRatio
-        m.durationMs = m.durationMs ?? weaker.durationMs
-        m.fps = m.fps ?? weaker.fps
-        m.frames = m.frames ?? weaker.frames
-        m.sourceImagePath = m.sourceImagePath ?? weaker.sourceImagePath
-        m.software = m.software ?? weaker.software
-        m.provider = m.provider ?? weaker.provider
-        m.sealed = m.sealed || weaker.sealed
-        return m
-    }
 }
 
 public enum MetadataReader {
@@ -241,15 +202,7 @@ public enum MetadataReader {
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let path = obj["path"] as? String, !path.isEmpty else { continue }
             var m = FileMetadata()
-            // `tier` is overloaded in this ecosystem: the journal means the
-            // fruit tier, but image sidecars use the same word for a QUALITY
-            // tier ("standard"). Only a recognised tier vocabulary is accepted,
-            // because an unrecognised content_mode ranks above every ceiling
-            // (tierRank fails closed) and would withhold the row from everyone.
-            if let tier = (obj["tier"] as? String)?.lowercased(),
-               CATALOG_TIER_ORDER.contains(tier) || CATALOG_TIER_ALIASES[tier] != nil {
-                m.contentMode = tier
-            }
+            m.contentMode = fruitTier(obj["tier"])
             m.lane = obj["lane"] as? String
             m.arc = obj["arc"] as? String
             m.theme = obj["theme"] as? String
@@ -276,7 +229,10 @@ public enum MetadataReader {
             var m = FileMetadata()
             m.prompt = r["prompt"] as? String
             m.characterName = r["character"] as? String
-            m.contentMode = r["contentMode"] as? String
+            // Same gate as the journal's `tier`, for the same reason: this is a
+            // weak source, and one odd value withholds the asset from EVERY
+            // ceiling rather than from none.
+            m.contentMode = fruitTier(r["contentMode"])
             m.width = intValue(r["width"])
             m.height = intValue(r["height"])
             m.steps = intValue(r["steps"])
@@ -325,6 +281,20 @@ public enum MetadataReader {
     }
 
     // MARK: - Helpers
+
+    /// A content-mode value, but only if it is one the tier ladder recognises.
+    ///
+    /// The word "tier" is overloaded in this ecosystem: the render journal means
+    /// the fruit tier, while real image sidecars use it for a QUALITY tier
+    /// ("standard"). `tierRank` fails CLOSED, so an unrecognised content_mode
+    /// ranks above every ceiling and would withhold the row from everyone —
+    /// the opposite of what a weak, best-effort source should ever cause.
+    static func fruitTier(_ any: Any?) -> String? {
+        guard let raw = (any as? String)?.lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        guard CATALOG_TIER_ORDER.contains(raw) || CATALOG_TIER_ALIASES[raw] != nil else { return nil }
+        return raw
+    }
 
     /// Wall-clock ceiling for any external tool invocation. A later task runs
     /// these readers over several thousand files in sequence, so one hung

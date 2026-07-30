@@ -238,6 +238,94 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(locations.count, 1, "no duplicate location for the same path")
     }
 
+    /// A DOWNSTREAM copy whose bytes diverge is a new asset, not an update to
+    /// the row it used to duplicate. Reusing the row the path is merely a
+    /// LOCATION of would drag that row's `absolute_path` across to the copy.
+    func testAChangedDownstreamCopyBecomesItsOwnRow() async throws {
+        let homePath = root + "/home/shot.png"
+        let copyPath = root + "/kira/gallery/Kira/generated/copy.png"
+        try write("shot.png", bytes: "SAME", tree: "home")
+        try write("Kira/generated/copy.png", bytes: "SAME", tree: "kira/gallery")
+        _ = try await CatalogBackfill.run(store: store, trees: trees())
+        let foundHomeID = try await store.assetID(forPath: homePath)
+        let homeID = try XCTUnwrap(foundHomeID)
+
+        // The copy diverges — a re-render into the same server filename.
+        try write("Kira/generated/copy.png", bytes: "DIVERGED", tree: "kira/gallery")
+        let second = try await CatalogBackfill.run(store: store, trees: trees())
+
+        let rows = try await store.search(CatalogQuery(scope: nil, limit: 500))
+        XCTAssertEqual(rows.count, 2, "the diverged copy is its own asset")
+        XCTAssertEqual(second.assetsIndexed, 1)
+        let foundOriginal = try await store.asset(id: homeID)
+        let original = try XCTUnwrap(foundOriginal)
+        XCTAssertEqual(original.absolutePath, homePath, "the original keeps its own path")
+        let foundCopyID = try await store.assetID(owningPath: copyPath)
+        let copyID = try XCTUnwrap(foundCopyID)
+        XCTAssertNotEqual(copyID, homeID)
+    }
+
+    /// The state the test above CREATES is the dangerous one: a row owning P and
+    /// a DIFFERENT row holding a stale location at P. `assetID(forPath:)` is a
+    /// UNION over both, and a compound UNION dedups through a temp b-tree, so
+    /// under LIMIT 1 it can hand back the row that merely has the location.
+    /// Reuse then looks impossible, a fresh UUID is minted, and the INSERT
+    /// violates `absolute_path NOT NULL UNIQUE` — aborting the whole sweep.
+    ///
+    /// The ids are seeded by hand rather than left to UUIDs precisely because
+    /// that b-tree orders by id: "aaa-…" must come back first for the hazard to
+    /// be reproduced deterministically instead of half the time.
+    func testAStaleLocationCannotStealTheReuseLookupAndAbortTheSweep() async throws {
+        let contested = root + "/home/contested.png"
+        try write("contested.png", bytes: "ORIGINAL", tree: "home")
+
+        // The row that OWNS the contested path — id sorts last.
+        try await store.upsert(CatalogAsset(
+            id: "zzz-owner", filename: "contested.png", absolutePath: contested,
+            sha256: "stale-sha", realm: .shared), explicitCollectionIDs: [])
+        // An unrelated row that merely has a stale LOCATION there — id sorts first.
+        try await store.upsert(CatalogAsset(
+            id: "aaa-other", filename: "other.png", absolutePath: root + "/home/other.png",
+            sha256: "other-sha", realm: .shared), explicitCollectionIDs: [])
+        try await store.addLocation(assetID: "aaa-other",
+            AssetLocation(host: "kira", path: contested, mtime: Date()))
+
+        // The contested file's bytes are not either recorded sha, so the sweep
+        // takes the reuse path for it.
+        _ = try await CatalogBackfill.run(store: store, trees: trees())
+
+        let foundOwner = try await store.asset(id: "zzz-owner")
+        let owner = try XCTUnwrap(foundOwner)
+        XCTAssertEqual(owner.absolutePath, contested, "the owner still owns the path")
+        XCTAssertNotEqual(owner.sha256, "stale-sha", "and was updated in place")
+        let foundOther = try await store.asset(id: "aaa-other")
+        let other = try XCTUnwrap(foundOther)
+        XCTAssertEqual(other.absolutePath, root + "/home/other.png", "the other row did not move")
+        let owners = try await store.assetIDs(forFilename: "contested.png", limit: 10)
+        XCTAssertEqual(owners, ["zzz-owner"], "exactly one row for the contested path")
+    }
+
+    /// Swift cannot check that a field added to `FileMetadata` is also mapped in
+    /// `CatalogBackfill.row(file:existing:meta:)` — every `CatalogAsset.init`
+    /// parameter is defaulted, so forgetting one compiles clean and silently
+    /// drops the fact. That is exactly how `lane` was lost. This is the tripwire.
+    func testEveryFileMetadataFieldIsMapped() {
+        let labels = Mirror(reflecting: FileMetadata()).children.compactMap(\.label).sorted()
+        XCTAssertEqual(labels, [
+            "arc", "aspectRatio", "characterName", "contentMode", "durationMs",
+            "family", "fps", "frames", "genre", "guidance", "height", "lane",
+            "loras", "mode", "modelFamily", "negativePrompt", "preset", "prompt",
+            "promptInjected", "promptRaw", "provider", "renderID", "resolution",
+            "sealed", "seed", "software", "sourceImagePath", "steps", "stock",
+            "style", "theme", "width",
+        ], """
+        A field was added to or removed from FileMetadata. Map it in \
+        CatalogBackfill.row(file:existing:meta:) — or, if it deliberately has no \
+        home on CatalogAsset (sourceImagePath, software, provider and sealed do \
+        not), say so there — then update this list.
+        """)
+    }
+
     // MARK: - Server paths (source_image lives in the server's namespace)
 
     /// A tree that knows what it is called on its own host.
@@ -480,6 +568,24 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(rows.first?.seed, 42)
         XCTAssertNil(rows.first?.durationMs,
                      "history's durationMs is render time, not clip length — it must not become a duration")
+    }
+
+    /// `contentMode` from history gets the same fruit-tier gate the journal's
+    /// `tier` does: it is a weak source, and an unrecognised value ranks above
+    /// EVERY ceiling (tierRank fails closed), withholding the asset from
+    /// everyone rather than from nobody.
+    func testAHistoryContentModeThatIsNotAFruitTierIsIgnored() async throws {
+        try write("Kira/generated/h.png", bytes: "H", tree: "kira/gallery")
+        let history = try write("history.json", bytes: """
+            {"version":1,"records":[
+              {"id":"r-1","character":"kira","contentMode":"premium",
+               "outputPath":"/home/todd/.kira/studio/gallery/Kira/generated/h.png"}]}
+            """, tree: "kira")
+        _ = try await CatalogBackfill.run(store: store, trees: journalTrees(history: history))
+
+        let rows = try await store.search(CatalogQuery(scope: .kira, limit: 500))
+        XCTAssertEqual(rows.first?.characterName, "kira", "the rest of the record is still taken")
+        XCTAssertNil(rows.first?.contentMode, "an unrecognised tier is not a content mode")
     }
 
     // MARK: - Prompts, coverage and junk files

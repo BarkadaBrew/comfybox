@@ -244,6 +244,26 @@ final class CatalogStoreTests: XCTestCase {
     /// The prohibition belongs to the data, not to the caller: the service actor
     /// (nil) used to bypass it, so backfill or the desktop app could put a shared
     /// row inside her realm.
+    /// A filename is the most guessable key in the schema, so the lookup that
+    /// takes one carries the same realm lock every other lookup here does.
+    /// Without it, backfill's basename fallback could link a clip to a still in
+    /// a realm the caller cannot see.
+    func testFilenameLookupTakesTheRealmLock() async throws {
+        try await store.upsert(CatalogAsset(id: "k1", filename: "still.png",
+                                            absolutePath: "/tmp/hers/still.png", realm: .kira),
+                               explicitCollectionIDs: [])
+        try await store.upsert(CatalogAsset(id: "s1", filename: "still.png",
+                                            absolutePath: "/tmp/theirs/still.png", realm: .shared),
+                               explicitCollectionIDs: [])
+
+        let hers = try await store.assetIDs(forFilename: "still.png", scope: .kira)
+        XCTAssertEqual(hers, ["k1"], "her scope sees only hers")
+        let theirs = try await store.assetIDs(forFilename: "still.png", scope: .shared)
+        XCTAssertEqual(theirs, ["s1"])
+        let unscoped = try await store.assetIDs(forFilename: "still.png")
+        XCTAssertEqual(unscoped.count, 2, "the service still sees both")
+    }
+
     func testNotEvenTheServiceCanFileASharedRowIntoAKiraCollection() async throws {
         try await store.upsert(make("s1", realm: .shared), explicitCollectionIDs: [])
         await XCTAssertThrowsErrorAsync(

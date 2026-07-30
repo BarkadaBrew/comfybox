@@ -141,9 +141,8 @@ public enum CatalogBackfill {
         // sha256 → asset id, so the second sighting of the same bytes adds a
         // location instead of a row.
         var bySHA: [String: String] = [:]
-        // Deferred i2v links: (clip path, source image path as the sidecar
-        // recorded it — i.e. usually a path on the SERVER).
-        var pendingEdges: [(String, String)] = []
+        // Deferred i2v links — resolved once every still is indexed.
+        var pendingEdges: [PendingEdge] = []
 
         for tree in trees {
             let journal = journalIndex(for: tree)
@@ -171,11 +170,11 @@ public enum CatalogBackfill {
                 }
                 let sha = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 
-                // Strongest first: embedded EXIF (images only — a container
-                // carries none), then the sidecar, then the journal, then the
-                // probe. Each step only fills what is still nil.
-                var meta = kind == "image" ? (MetadataReader.readEmbedded(path: path) ?? FileMetadata())
-                                           : FileMetadata()
+                // The sources, STRONGEST FIRST. They are folded one at a time
+                // into the row (see `fold`), each filling only what the ones
+                // before it left unknown, so precedence is the array's order and
+                // nothing else.
+                var sources: [FileMetadata] = []
                 if let mroot = tree.metadataRoot,
                    let sidecar = MetadataReader.sidecarPath(forMedia: path,
                                                             galleryRoot: tree.mediaRoot,
@@ -183,10 +182,14 @@ public enum CatalogBackfill {
                    let sdata = FileManager.default.contents(atPath: sidecar),
                    let smeta = MetadataReader.readSidecar(jsonData: sdata) {
                     report.sidecarsRead += 1
-                    meta = smeta.fillingNils(from: meta)
+                    sources.append(smeta)
+                }
+                // Embedded EXIF — images only, a container carries none.
+                if kind == "image", let embedded = MetadataReader.readEmbedded(path: path) {
+                    sources.append(embedded)
                 }
                 if let jmeta = journal[path] {
-                    meta = meta.fillingNils(from: jmeta)
+                    sources.append(jmeta)
                 }
                 // The container is the only trustworthy source of duration —
                 // real sidecars record `"duration": null` — and the only source
@@ -198,8 +201,11 @@ public enum CatalogBackfill {
                     probe.frames = info.frames
                     probe.width = info.width
                     probe.height = info.height
-                    meta = meta.fillingNils(from: probe)
+                    sources.append(probe)
                 }
+                // `source_image` is the one fact with no column on the asset, so
+                // it is picked off the sources directly, same precedence.
+                let sourceImage = sources.compactMap(\.sourceImagePath).first
 
                 let attrs = try? FileManager.default.attributesOfItem(atPath: path)
                 let mtime = (attrs?[.modificationDate] as? Date) ?? Date()
@@ -232,12 +238,13 @@ public enum CatalogBackfill {
                     // character / lane / tier facets exist — dropping them here
                     // would leave the common case permanently unfiled. Identity
                     // stays the row's own, so a copy never steals the primary path.
-                    if meta != FileMetadata(), let old = existing {
-                        let filled = row(file: facts(of: old), existing: old, meta: meta)
+                    if let old = existing {
+                        let filled = fold(identity: facts(of: old), existing: old, sources: sources)
                         if filled != old { try await store.upsert(filled, explicitCollectionIDs: []) }
                     }
-                    if kind == "video", let src = meta.sourceImagePath {
-                        pendingEdges.append((path, src))
+                    if kind == "video", let src = sourceImage {
+                        pendingEdges.append(PendingEdge(clipPath: path, sourceImage: src,
+                                                        scope: tree.realm))
                     }
                     continue
                 }
@@ -249,11 +256,15 @@ public enum CatalogBackfill {
                 // with `absolute_path NOT NULL UNIQUE` — which `ON CONFLICT(id)`
                 // does not absorb — and the throw would abort the whole sweep,
                 // leaving a half-written catalog.
+                //
+                // The lookup MUST be by `absolute_path` alone.
+                // `assetID(forPath:)` is a UNION with `asset_locations`, and a
+                // compound UNION under LIMIT 1 can return a row that merely has
+                // a stale LOCATION here rather than the path's owner — which
+                // reintroduces exactly the collision above, non-deterministically.
                 var reuse: CatalogAsset?
-                if let candidate = try await store.assetID(forPath: path),
-                   let candidateRow = try await store.asset(id: candidate),
-                   candidateRow.absolutePath == path {
-                    reuse = candidateRow
+                if let owner = try await store.assetID(owningPath: path) {
+                    reuse = try await store.asset(id: owner)
                 }
                 let identity = FileFacts(
                     id: reuse?.id ?? UUID().uuidString,
@@ -264,7 +275,7 @@ public enum CatalogBackfill {
                     createdAt: (attrs?[.creationDate] as? Date) ?? mtime,
                     // Re-indexing must not demote a realm a twin already settled.
                     realm: reuse?.realm == .kira ? .kira : (tree.realm ?? .shared))
-                let asset = row(file: identity, existing: reuse, meta: meta)
+                let asset = fold(identity: identity, existing: reuse, sources: sources)
 
                 try await store.upsert(asset, explicitCollectionIDs: [])
                 try await store.addLocation(assetID: asset.id,
@@ -272,16 +283,18 @@ public enum CatalogBackfill {
                 bySHA[sha] = asset.id
                 if reuse == nil { report.assetsIndexed += 1 }
 
-                if kind == "video", let src = meta.sourceImagePath {
-                    pendingEdges.append((path, src))
+                if kind == "video", let src = sourceImage {
+                    pendingEdges.append(PendingEdge(clipPath: path, sourceImage: src,
+                                                    scope: tree.realm))
                 }
             }
         }
 
         // Pass 2 — i2v edges, now that every still is indexed.
-        for (clipPath, sourcePath) in pendingEdges {
-            guard let clipID = try await store.assetID(forPath: clipPath),
-                  let stillID = try await resolveSource(sourcePath, trees: trees, store: store),
+        for pending in pendingEdges {
+            guard let clipID = try await store.assetID(forPath: pending.clipPath),
+                  let stillID = try await resolveSource(pending.sourceImage, scope: pending.scope,
+                                                        trees: trees, store: store),
                   stillID != clipID else {
                 report.edgesUnresolved += 1
                 continue
@@ -299,9 +312,20 @@ public enum CatalogBackfill {
         return report
     }
 
+    /// One clip waiting for its still, deferred until every still is indexed.
+    struct PendingEdge {
+        let clipPath: String
+        /// As the sidecar recorded it — usually a path on the SERVER.
+        let sourceImage: String
+        /// The realm of the tree the CLIP came from, so a guessed match cannot
+        /// reach across the boundary.
+        let scope: CatalogRealm?
+    }
+
     /// Resolve a sidecar's `source_image` — recorded on the SERVER — to a local
     /// asset id.
-    static func resolveSource(_ remote: String, trees: [BackfillTree],
+    static func resolveSource(_ remote: String, scope: CatalogRealm?,
+                              trees: [BackfillTree],
                               store: CatalogStore) async throws -> String? {
         guard !isVaultPath(remote) else { return nil }
         var candidates = [remote]
@@ -314,9 +338,13 @@ public enum CatalogBackfill {
         // Last resort: the basename, and ONLY when it names exactly one asset.
         // Two assets sharing a filename is normal (every tree has its own
         // `still.png`), and a wrong i2v edge is worse than a missing one.
+        //
+        // Scoped to the clip's own realm: this is the one lookup here that
+        // GUESSES, and an unscoped guess could link her clip to a shared still
+        // (or the reverse) purely because two files happen to share a name.
         let base = (remote as NSString).lastPathComponent
         guard !base.isEmpty else { return nil }
-        let ids = try await store.assetIDs(forFilename: base)
+        let ids = try await store.assetIDs(forFilename: base, scope: scope)
         return ids.count == 1 ? ids[0] : nil
     }
 
@@ -333,9 +361,11 @@ public enum CatalogBackfill {
                 guard !isVaultPath(e.path) else { continue }
                 let local = tree.localPath(for: e.path) ?? e.path
                 // Several journal lines can describe one output (a retry, a
-                // re-render). The first wins and the rest fill its gaps, which
-                // is the same rule the rest of the sweep uses.
-                out[local] = out[local].map { $0.fillingNils(from: e.meta) } ?? e.meta
+                // re-render). The first wins, the same rule the rest of the
+                // sweep uses. (Not "first wins per FIELD": that would need a
+                // second copy of the field list, which is the bug class this
+                // whole design is trying to close.)
+                if out[local] == nil { out[local] = e.meta }
             }
         }
         let fm = FileManager.default
@@ -356,6 +386,22 @@ public enum CatalogBackfill {
     /// only filing input a shared asset has.
     static func sourceLabel(_ meta: FileMetadata) -> String? {
         (meta.provider ?? meta.software)?.lowercased()
+    }
+
+    /// Fold every source into one row, strongest first.
+    ///
+    /// `row` already means "existing wins, meta fills the gaps", so applying the
+    /// sources in order gives exactly the precedence their order describes, with
+    /// no second merge function and therefore no second field list to forget a
+    /// field in. Four struct constructions per file is the price; it is nothing
+    /// next to the exiftool call standing beside it.
+    static func fold(identity: FileFacts, existing: CatalogAsset?,
+                     sources: [FileMetadata]) -> CatalogAsset {
+        var acc = row(file: identity, existing: existing, meta: sources.first ?? FileMetadata())
+        for source in sources.dropFirst() {
+            acc = row(file: identity, existing: acc, meta: source)
+        }
+        return acc
     }
 
     /// The ONE place a `CatalogAsset` is built.
