@@ -6,7 +6,7 @@ Repos touched: `zimage.swift` (ComfyBox engine + desktop), `coffeeshop-server` (
 
 ## Problem
 
-Media is produced by five paths into three trees, and indexed by four partial,
+Media is produced by five paths into four trees, and indexed by four partial,
 mutually-ignorant records — three of which are rolling windows. Nothing can
 answer a question about work older than a couple of days.
 
@@ -394,7 +394,7 @@ with the existing rollback (binary backup `ComfyBox.bak-KNOWN-GOOD-20260730`,
 restart under `~/.kira/coordination/comfybox-restart.lock`).
 
 Plan A alone already delivers the ask: Kira stops being capped at two days of
-memory, and every gallery becomes searchable across all three trees. Plan B is
+memory, and every gallery becomes searchable across all four trees. Plan B is
 what stops the index from drifting again. Every step is independently
 revertible; the catalog is additive throughout, so reverting any step leaves the
 existing four indexes working exactly as they do today.
