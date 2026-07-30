@@ -47,6 +47,11 @@ public enum CatalogSchema {
         ("frames", "INTEGER"),
         ("resolution", "TEXT"),
         ("aspect_ratio", "TEXT"),
+        // The third real prompt spelling in the sidecars (the prompt after
+        // character / trigger injection). Appended at the END, like every other
+        // addition, so a database migrated by an earlier build and a fresh one
+        // end up with the same physical column order.
+        ("prompt_injected", "TEXT"),
     ]
 
     /// The seeded bodies of work. Ids are stable literals so re-seeding is a

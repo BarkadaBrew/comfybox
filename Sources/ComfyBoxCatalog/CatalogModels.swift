@@ -90,6 +90,9 @@ public struct CatalogAsset: Sendable, Equatable {
     public let prompt: String?
     public let negativePrompt: String?
     public let promptRaw: String?
+    /// The prompt after character / trigger injection — a third real spelling
+    /// in the sidecars, indexed for search alongside the other two.
+    public let promptInjected: String?
     public let caption: String?
     public let captionSource: String?
 
@@ -132,7 +135,8 @@ public struct CatalogAsset: Sendable, Equatable {
         width: Int? = nil, height: Int? = nil, createdAt: Date = Date(),
         realm: CatalogRealm = .shared, source: String? = nil, sealed: Bool = false,
         prompt: String? = nil, negativePrompt: String? = nil,
-        promptRaw: String? = nil, caption: String? = nil, captionSource: String? = nil,
+        promptRaw: String? = nil, promptInjected: String? = nil,
+        caption: String? = nil, captionSource: String? = nil,
         seed: Int? = nil, steps: Int? = nil, guidance: Double? = nil,
         modelFamily: String? = nil, preset: String? = nil, loras: String? = nil,
         renderID: String? = nil, contentMode: String? = nil, characterName: String? = nil,
@@ -152,6 +156,7 @@ public struct CatalogAsset: Sendable, Equatable {
         self.prompt = sealed ? nil : prompt
         self.negativePrompt = sealed ? nil : negativePrompt
         self.promptRaw = sealed ? nil : promptRaw
+        self.promptInjected = sealed ? nil : promptInjected
         self.caption = sealed ? nil : caption
         self.captionSource = sealed ? nil : captionSource
         self.seed = seed; self.steps = steps; self.guidance = guidance

@@ -284,7 +284,8 @@ public actor CatalogStore {
                 rating, favorite, content_mode, character_name, source,
                 realm, sealed, lane, arc, theme, stock, genre, family, style,
                 preset, loras, render_id, caption, caption_source, prompt_raw,
-                mode, duration_ms, fps, frames, resolution, aspect_ratio
+                mode, duration_ms, fps, frames, resolution, aspect_ratio,
+                prompt_injected
             ) VALUES (
                 ?1,?2,?3,?4,?5,?6,?7,?8,
                 ?9,?9,?9,0,
@@ -292,7 +293,8 @@ public actor CatalogStore {
                 ?16,?17,?18,?19,?20,
                 ?21,?22,?23,?24,?25,?26,?27,?28,?29,
                 ?30,?31,?32,?33,?34,?35,
-                ?36,?37,?38,?39,?40,?41
+                ?36,?37,?38,?39,?40,?41,
+                ?42
             )
             ON CONFLICT(id) DO UPDATE SET
                 kind=excluded.kind, filename=excluded.filename,
@@ -326,7 +328,8 @@ public actor CatalogStore {
                 fps=COALESCE(excluded.fps, assets.fps),
                 frames=COALESCE(excluded.frames, assets.frames),
                 resolution=COALESCE(excluded.resolution, assets.resolution),
-                aspect_ratio=COALESCE(excluded.aspect_ratio, assets.aspect_ratio)
+                aspect_ratio=COALESCE(excluded.aspect_ratio, assets.aspect_ratio),
+                prompt_injected=excluded.prompt_injected
             """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -375,6 +378,7 @@ public actor CatalogStore {
         bindInt(stmt, 39, asset.frames)
         bindText(stmt, 40, asset.resolution)
         bindText(stmt, 41, asset.aspectRatio)
+        bindText(stmt, 42, asset.promptInjected)
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
@@ -389,10 +393,14 @@ public actor CatalogStore {
         // negativePrompt counts: a row whose only text is a negative prompt is
         // still findable by it, and omitting it here made that row invisible.
         let hasText = (asset.prompt ?? asset.caption ?? asset.promptRaw
-                        ?? asset.negativePrompt) != nil
+                        ?? asset.promptInjected ?? asset.negativePrompt) != nil
         guard hasText else { return }
-        // prompt_raw rides the prompt column so both phrasings are findable.
-        let promptText = [asset.prompt, asset.promptRaw].compactMap { $0 }.joined(separator: " ")
+        // All three prompt spellings ride the prompt column so every phrasing is
+        // findable: the sidecars carry prompt_optimized, prompt_raw AND
+        // prompt_injected, and which one holds the words a search will use
+        // varies by producer.
+        let promptText = [asset.prompt, asset.promptRaw, asset.promptInjected]
+            .compactMap { $0 }.joined(separator: " ")
         try execBind("""
             INSERT INTO assets_fts (id, prompt, negative_prompt, caption)
             VALUES (?1, ?2, ?3, ?4)
@@ -501,7 +509,7 @@ public actor CatalogStore {
                    a.render_id, a.content_mode, a.character_name,
                    a.lane, a.arc, a.theme, a.stock, a.genre, a.family, a.style,
                    a.mode, a.duration_ms, a.fps, a.frames, a.resolution, a.aspect_ratio,
-                   a.rating, a.favorite
+                   a.rating, a.favorite, a.prompt_injected
             FROM assets a
             \(whereSQL)
             ORDER BY \(order)
@@ -554,7 +562,8 @@ public actor CatalogStore {
             id: a.id, kind: a.kind, filename: "", absolutePath: "",
             sha256: a.sha256, fileSize: a.fileSize, width: a.width, height: a.height,
             createdAt: a.createdAt, realm: a.realm, source: a.source, sealed: a.sealed,
-            prompt: nil, negativePrompt: nil, promptRaw: nil, caption: nil, captionSource: nil,
+            prompt: nil, negativePrompt: nil, promptRaw: nil, promptInjected: nil,
+            caption: nil, captionSource: nil,
             seed: a.seed, steps: a.steps, guidance: a.guidance, modelFamily: a.modelFamily,
             preset: a.preset, loras: a.loras, renderID: a.renderID,
             contentMode: a.contentMode, characterName: a.characterName,
@@ -827,7 +836,7 @@ public actor CatalogStore {
                    a.render_id, a.content_mode, a.character_name,
                    a.lane, a.arc, a.theme, a.stock, a.genre, a.family, a.style,
                    a.mode, a.duration_ms, a.fps, a.frames, a.resolution, a.aspect_ratio,
-                   a.rating, a.favorite
+                   a.rating, a.favorite, a.prompt_injected
             FROM assets a WHERE a.id = ?1
             """
         var stmt: OpaquePointer?
@@ -838,6 +847,46 @@ public actor CatalogStore {
         bindText(stmt, 1, id)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return rowToAsset(stmt)
+    }
+
+    /// Ids of the assets with this exact filename, capped at `limit`.
+    ///
+    /// Backfill's LAST-RESORT way to resolve a `source_image` recorded on a host
+    /// whose paths it cannot translate. The cap defaults to 2 because the only
+    /// question asked is "is this basename unambiguous?" — two hits is already
+    /// the answer, and backfill skips rather than guesses.
+    public func assetIDs(forFilename name: String, limit: Int = 2) throws -> [String] {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT id FROM assets WHERE filename = ?1 LIMIT ?2",
+                                 -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, name)
+        sqlite3_bind_int64(stmt, 2, Int64(limit))
+        var out: [String] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let id = text(stmt, 0) { out.append(id) }
+        }
+        return out
+    }
+
+    /// How many assets ended up in NO collection at all. Backfill reports this
+    /// so a coverage gap is a number in the log rather than an absence nobody
+    /// notices — most of the fleet has no `lane` in its sidecar, and lane is
+    /// what most filing rules key on.
+    public func unfiledAssetCount() throws -> Int {
+        var stmt: OpaquePointer?
+        let sql = """
+            SELECT COUNT(*) FROM assets a
+            WHERE NOT EXISTS (SELECT 1 FROM asset_collections ac WHERE ac.asset_id = a.id)
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
     }
 
     // MARK: - Facets
@@ -902,6 +951,7 @@ public actor CatalogStore {
             realm: CatalogRealm(rawValue: text(s, 9) ?? "shared") ?? .shared,
             source: text(s, 10), sealed: sqlite3_column_int(s, 11) != 0,
             prompt: text(s, 12), negativePrompt: text(s, 13), promptRaw: text(s, 14),
+            promptInjected: text(s, 41),
             caption: text(s, 15), captionSource: text(s, 16),
             seed: optInt(s, 17), steps: optInt(s, 18), guidance: optDouble(s, 19),
             modelFamily: text(s, 20), preset: text(s, 21), loras: text(s, 22),
