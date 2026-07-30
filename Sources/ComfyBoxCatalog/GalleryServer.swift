@@ -4,10 +4,10 @@
 // X-Catalog-Actor header the daemon sets per tool, never from a query
 // parameter. A client cannot widen its own scope by asking.
 //
-// Every store call on these routes that TAKES a scope is GIVEN one. Those
-// parameters default to nil so backfill can stay unscoped, which means an
-// omission compiles silently and leaks — `locations`, `edges` and the by-id
-// fetch are the three, and all three are passed `scope` below.
+// Every store call on these routes that TAKES a scope is GIVEN one. `edges`,
+// `locations` and the by-id fetch no longer DEFAULT that parameter, so an
+// omission is a compile error rather than a silent leak — the first draft of
+// this file omitted two of the three and still built.
 
 import Foundation
 
@@ -18,14 +18,58 @@ public enum GalleryServer {
     /// Never let a client page the whole catalog out in one request.
     static let maxLimit = 500
 
+    enum ActorScope {
+        case resolved(CatalogRealm?)
+        case unrecognised
+    }
+
+    /// Resolve `X-Catalog-Actor` into a realm scope, failing CLOSED on anything
+    /// unfamiliar.
+    ///
+    /// The distinction that matters is ABSENT versus PRESENT-BUT-UNKNOWN.
+    /// Absent is unscoped: the desktop app and the backfill tooling depend on
+    /// that, and a caller who sends no actor is not claiming to be one.
+    /// Present-but-unknown is an ERROR — a daemon typo, a `kira-worker`, a
+    /// renamed tool. Treating those as unscoped is how a confined caller gets
+    /// silently promoted to full cross-realm access, raw prompts and on-disk
+    /// paths included, by nothing more than a misspelling.
+    ///
+    /// The value is trimmed and lowercased first, so `Kira ` still lands in her
+    /// realm rather than 400ing.
+    static func actorScope(_ raw: String?) -> ActorScope {
+        guard let raw else { return .resolved(nil) }   // absent: unscoped
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch name {
+        case "kira": return .resolved(.kira)
+        default: return .unrecognised   // includes an empty value
+        }
+    }
+
     public static func handle(request: HTTPKit.Request, store: CatalogStore) async -> HTTPKit.Response {
+        // A browser must not be able to read the catalog from a page. Nothing
+        // here is authenticated — it is a loopback service the daemon calls —
+        // so today the only thing standing between a local web page and every
+        // raw prompt in the database is the accident that we send no
+        // Access-Control-Allow-Origin. Make it deliberate instead.
+        //
+        // curl and the daemon send neither header; a browser fetch always sends
+        // one or the other. `sec-fetch-site: none` is direct navigation and
+        // `same-origin` is a page this service itself served, so both are left
+        // open for a future local UI.
+        if request.headers["origin"] != nil {
+            return .error(403, "cross-origin requests are not accepted")
+        }
+        if let site = request.headers["sec-fetch-site"]?.lowercased(),
+           site == "cross-site" || site == "same-site" {
+            return .error(403, "cross-origin requests are not accepted")
+        }
+
         // Scope and ceiling are HEADERS, set by the trusted daemon per caller.
-        // The actor value is normalised before comparison: a daemon that sends
-        // "Kira" must still land inside her realm. Normalising can only ever
-        // ADD callers to the confined set, so it fails in the safe direction.
-        let actor = request.headers["x-catalog-actor"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let scope: CatalogRealm? = actor == "kira" ? .kira : nil
+        let scope: CatalogRealm?
+        switch actorScope(request.headers["x-catalog-actor"]) {
+        case let .resolved(realm): scope = realm
+        case .unrecognised: return .error(400, "unrecognised X-Catalog-Actor")
+        }
         let ceiling = request.headers["x-catalog-ceiling"]
 
         do {
@@ -87,8 +131,19 @@ public enum GalleryServer {
                 return .error(404, "no such route")
             }
         } catch {
-            return .error(500, error.localizedDescription)
+            return internalError(error, for: request)
         }
+    }
+
+    /// SQLite's errmsg carries table and column names and fragments of the
+    /// failing statement — `error.localizedDescription` put all of it on the
+    /// wire. That detail is exactly what an operator reading logs needs and
+    /// exactly what someone probing this service wants, so it goes to stderr
+    /// and a fixed, uninformative body goes to the caller.
+    static func internalError(_ error: Error, for request: HTTPKit.Request) -> HTTPKit.Response {
+        FileHandle.standardError.write(
+            Data("gallery: \(request.method) \(request.path) failed: \(error)\n".utf8))
+        return .error(500, "internal error")
     }
 
     private static func query(from request: HTTPKit.Request,
@@ -175,8 +230,14 @@ public enum GalleryServer {
                 }
                 live.store = store
                 live.server = server
-                try server.start()
-                FileHandle.standardError.write(Data("gallery listening on 127.0.0.1:\(port)\n".utf8))
+                // Throws if the listener never reaches .ready — a port already
+                // held by an overlapping launchd restart used to leave this
+                // process logging "listening" and then blocking on `sem.wait()`
+                // forever, which is a process KeepAlive will never recycle
+                // because it never exits.
+                try await server.start()
+                let bound = server.boundPort ?? port
+                FileHandle.standardError.write(Data("gallery listening on 127.0.0.1:\(bound)\n".utf8))
             } catch {
                 FileHandle.standardError.write(Data("gallery failed to start: \(error)\n".utf8))
                 exit(1)

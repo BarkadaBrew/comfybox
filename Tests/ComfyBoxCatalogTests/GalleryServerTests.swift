@@ -152,6 +152,91 @@ final class GalleryServerTests: XCTestCase {
         XCTAssertEqual(body["count"] as? Int, 1)
     }
 
+    // MARK: - Who is asking
+
+    /// Absent stays unscoped: the desktop app and the backfill tooling send no
+    /// actor, and a caller who claims nothing is not claiming to be Kira.
+    func testAnAbsentActorHeaderIsUnscoped() async throws {
+        let body = try await get("/v1/catalog/search?limit=100")
+        XCTAssertEqual(body["count"] as? Int, 3)
+    }
+
+    /// PRESENT-but-unrecognised is the dangerous case, and it used to fail OPEN:
+    /// anything that was not exactly "kira" fell through to full cross-realm
+    /// access, raw prompts and on-disk paths included. A daemon typo, a renamed
+    /// tool or a `kira-worker` silently became an unconfined caller.
+    func testAnUnrecognisedActorIsRejectedRatherThanWidened() async throws {
+        for imposter in ["kira-worker", "kira2", "todd", "shared", "", "  ", "KIRA-WORKER"] {
+            let res = await response("/v1/catalog/search?limit=100", actor: imposter)
+            XCTAssertEqual(res.status, 400, "actor '\(imposter)' was not rejected")
+            let text = String(decoding: res.body, as: UTF8.self)
+            XCTAssertFalse(text.contains("/tmp/"), "a rejected actor still saw paths")
+            XCTAssertFalse(text.contains("tulip"), "a rejected actor still saw prompts")
+        }
+    }
+
+    /// Case and surrounding whitespace must not turn her into a stranger — that
+    /// direction would 400 a legitimate caller, and the normalisation can only
+    /// ever ADD callers to the confined set.
+    func testActorMatchingIgnoresCaseAndWhitespace() async throws {
+        for spelling in ["kira", "Kira", "  KIRA  "] {
+            let body = try await get("/v1/catalog/search?limit=100", actor: spelling)
+            let items = try XCTUnwrap(body["items"] as? [[String: Any]])
+            XCTAssertTrue(items.allSatisfy { ($0["realm"] as? String) == "kira" },
+                          "'\(spelling)' did not land in her realm")
+        }
+    }
+
+    /// Nothing here is authenticated, so a web page on any local origin could
+    /// read the whole catalog if the browser let it. Today the only thing
+    /// stopping it is that we happen not to send Access-Control-Allow-Origin.
+    func testBrowserOriginatedRequestsAreRefused() async throws {
+        for origin in ["http://localhost:3000", "https://evil.example", "null"] {
+            let req = HTTPKit.Request(method: "GET", target: "/v1/catalog/search?limit=100",
+                                      headers: ["origin": origin], body: Data())
+            let res = await GalleryServer.handle(request: req, store: store)
+            XCTAssertEqual(res.status, 403, "origin '\(origin)' was served")
+        }
+        for site in ["cross-site", "same-site"] {
+            let req = HTTPKit.Request(method: "GET", target: "/healthz",
+                                      headers: ["sec-fetch-site": site], body: Data())
+            let res = await GalleryServer.handle(request: req, store: store)
+            XCTAssertEqual(res.status, 403, "sec-fetch-site '\(site)' was served")
+        }
+        // Direct navigation and a page this service itself served stay open, so
+        // a future local UI is not pre-emptively broken.
+        for site in ["none", "same-origin"] {
+            let req = HTTPKit.Request(method: "GET", target: "/healthz",
+                                      headers: ["sec-fetch-site": site], body: Data())
+            let res = await GalleryServer.handle(request: req, store: store)
+            XCTAssertEqual(res.status, 200, "sec-fetch-site '\(site)' should be allowed")
+        }
+    }
+
+    /// SQLite's errmsg names tables and columns and quotes the failing SQL, and
+    /// `error.localizedDescription` put all of it on the wire.
+    ///
+    /// This tests the formatter the route's `catch` calls rather than trying to
+    /// provoke SQLite through a query string. I could not find an input that
+    /// makes a healthy database fail — which is good news, and also means an
+    /// end-to-end version of this test would assert nothing (an earlier draft
+    /// silently skipped). The catch block exists for disk-full and corruption,
+    /// so the error is injected directly.
+    func testInternalErrorsDoNotLeakSchemaDetail() throws {
+        let leaky = CatalogError.prepareFailed(
+            "no such column: a.promt in \"SELECT a.id, a.prompt FROM assets a WHERE a.realm = ?1\"")
+        let req = HTTPKit.Request(method: "GET", target: "/v1/catalog/search", headers: [:], body: Data())
+        let res = GalleryServer.internalError(leaky, for: req)
+
+        XCTAssertEqual(res.status, 500)
+        let text = String(decoding: res.body, as: UTF8.self).lowercased()
+        XCTAssertFalse(text.contains("assets"), "leaked a table name")
+        XCTAssertFalse(text.contains("select"), "leaked SQL")
+        XCTAssertFalse(text.contains("realm"), "leaked a column name")
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: res.body) as? [String: String],
+                       ["error": "internal error"])
+    }
+
     func testUnknownRouteIs404() async throws {
         let req = HTTPKit.Request(method: "GET", target: "/nope", headers: [:], body: Data())
         let res = await GalleryServer.handle(request: req, store: store)
@@ -165,79 +250,103 @@ final class GalleryServerTests: XCTestCase {
         XCTAssertEqual(q["limit"], "10")
     }
 
-    /// A TCP read is not a message boundary. The parser must hold its peace
-    /// until the headers are terminated and the declared body has arrived.
-    /// End to end over a real socket. Every route test above calls `handle`
-    /// directly, which cannot see whether the listener ever delivers a
-    /// connection to it — and the first version of the CLI entry point bound the
-    /// port, reported "listening", and then dropped every request on the floor
-    /// because the `Server` had been deallocated and `newConnectionHandler`
-    /// held it weakly. A bound port that answers nothing passes every health
-    /// check, so the only test that catches it is one that actually asks.
+    // MARK: - Over a real socket
+
+    /// Every route test above calls `handle` directly, which cannot see whether
+    /// the listener ever delivers a connection to it — the first version of the
+    /// CLI entry point bound the port, reported "listening", and then dropped
+    /// every request on the floor.
+    ///
+    /// Port 0 rather than a fixed one: the kernel picks a free port, so two
+    /// copies of this test binary running at once cannot collide, and — more to
+    /// the point — cannot silently be answered by EACH OTHER. With a fixed port
+    /// and a fixture this deterministic, a second instance whose bind failed
+    /// would get a 200 and the right `count` from the FIRST instance's server
+    /// and pass without ever having served anything.
     func testServerAnswersOverLoopback() async throws {
         let store = self.store!
-        var started: HTTPKit.Server?
-        var port: UInt16 = 0
-        for candidate in UInt16(47_900)...UInt16(47_930) {
-            let s = HTTPKit.Server(port: candidate) { await GalleryServer.handle(request: $0, store: store) }
-            if (try? s.start()) != nil { started = s; port = candidate; break }
-        }
-        let server = try XCTUnwrap(started, "could not bind any loopback port")
+        let server = HTTPKit.Server(port: 0) { await GalleryServer.handle(request: $0, store: store) }
+        try await server.start()
         defer { server.stop() }
+        let port = try XCTUnwrap(server.boundPort, "started but reported no bound port")
+        XCTAssertNotEqual(port, 0, "the kernel-assigned port was never read back")
 
         let url = URL(string: "http://127.0.0.1:\(port)/v1/catalog/search?limit=100")!
-        var request = URLRequest(url: url, timeoutInterval: 2)
+        var request = URLRequest(url: url, timeoutInterval: 5)
         request.setValue("kira", forHTTPHeaderField: "X-Catalog-Actor")
 
-        var data: Data?
-        var status = 0
-        // The listener needs a moment to reach .ready.
-        for _ in 0..<8 {
-            if let (d, r) = try? await URLSession.shared.data(for: request),
-               let http = r as? HTTPURLResponse {
-                data = d; status = http.statusCode; break
-            }
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-        XCTAssertEqual(status, 200, "the socket accepted but never answered")
-        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(data)) as? [String: Any])
+        // No retry loop: `start()` does not return until the listener is .ready.
+        let (data, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200,
+                       "the socket accepted but never answered")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         // The realm lock holds over the wire, not just in the function.
         XCTAssertEqual(body["count"] as? Int, 2)
     }
 
-    /// The bug above, isolated: a STARTED server must keep serving after the
-    /// caller drops its reference, because that is precisely what
-    /// `runCLIEntryPoint` does — it builds the server inside a Task whose body
-    /// then ends. With a weakly-captured `newConnectionHandler` this request
-    /// gets a bound socket and no answer.
+    /// A STARTED server must keep serving after the caller drops its reference,
+    /// because that is precisely what `runCLIEntryPoint` does — it builds the
+    /// server inside a Task whose body then ends. With a weakly-captured
+    /// `newConnectionHandler` this request gets a bound socket and no answer.
     ///
-    /// Nothing here can call `stop()` — having a reference would defeat the
+    /// Nothing here can call `stop()` — holding a reference would defeat the
     /// test — so this leaks one listener for the lifetime of the test process.
-    /// That is the cost of testing the ownership rule rather than asserting it.
+    /// On a kernel-assigned port that leak is inert; on a fixed one it was a
+    /// booby trap for the next run.
     func testAStartedServerKeepsServingAfterTheCallerDropsIt() async throws {
         let store = self.store!
-        func startAndForget() -> UInt16? {
-            for candidate in UInt16(47_940)...UInt16(47_970) {
-                let s = HTTPKit.Server(port: candidate) {
-                    await GalleryServer.handle(request: $0, store: store)
-                }
-                if (try? s.start()) != nil { return candidate }
+        func startAndForget() async throws -> UInt16? {
+            let s = HTTPKit.Server(port: 0) {
+                await GalleryServer.handle(request: $0, store: store)
             }
-            return nil
+            try await s.start()
+            return s.boundPort
         }
-        let port = try XCTUnwrap(startAndForget(), "could not bind any loopback port")
+        let bound = try await startAndForget()
+        let port = try XCTUnwrap(bound, "could not bind a loopback port")
 
         let request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/healthz")!,
-                                 timeoutInterval: 2)
-        var status = 0
-        for _ in 0..<8 {
-            if let (_, r) = try? await URLSession.shared.data(for: request),
-               let http = r as? HTTPURLResponse {
-                status = http.statusCode; break
-            }
-            try await Task.sleep(nanoseconds: 100_000_000)
+                                 timeoutInterval: 5)
+        let (_, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200,
+                       "the server was deallocated out from under its own listener")
+    }
+
+    /// A listener that cannot bind must say so. `NWListener.start(queue:)` is
+    /// non-throwing and reports failure only through `stateUpdateHandler`, so
+    /// without one this returned success and the caller went on to announce a
+    /// service that was never listening — and, under launchd, to block forever
+    /// rather than exit and be recycled.
+    func testStartFailsWhenThePortIsAlreadyTaken() async throws {
+        let store = self.store!
+        let first = HTTPKit.Server(port: 0) { await GalleryServer.handle(request: $0, store: store) }
+        try await first.start()
+        defer { first.stop() }
+        let taken = try XCTUnwrap(first.boundPort)
+
+        let second = HTTPKit.Server(port: taken) { _ in .json(["ok": true]) }
+        do {
+            try await second.start(timeout: 3)
+            second.stop()
+            XCTFail("bound a port already in use and reported success")
+        } catch {
+            XCTAssertNil(second.boundPort, "a failed start must not leave a listener behind")
         }
-        XCTAssertEqual(status, 200, "the server was deallocated out from under its own listener")
+    }
+
+    func testASecondStartIsRejected() async throws {
+        let store = self.store!
+        let server = HTTPKit.Server(port: 0) { await GalleryServer.handle(request: $0, store: store) }
+        try await server.start()
+        defer { server.stop() }
+        let port = server.boundPort
+
+        do {
+            try await server.start()
+            XCTFail("a second start must not silently replace the first listener")
+        } catch {
+            XCTAssertEqual(server.boundPort, port, "the original listener was disturbed")
+        }
     }
 
     func testParserWaitsForASplitRequest() throws {

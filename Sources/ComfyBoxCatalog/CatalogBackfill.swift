@@ -305,7 +305,7 @@ public enum CatalogBackfill {
             let edge = AssetEdge(fromAssetID: clipID, toAssetID: stillID, relation: .i2vSource)
             // Count edges INSERTED, not attempted: addEdge is INSERT OR IGNORE,
             // so a re-sweep would otherwise report a fresh edge every time.
-            let known = try await store.edges(for: clipID).contains(edge)
+            let known = try await store.edges(for: clipID, scope: nil).contains(edge)
             guard !known else { continue }
             try await store.addEdge(edge)
             report.edgesCreated += 1

@@ -713,7 +713,12 @@ public actor CatalogStore {
     /// legitimately returned, follow its i2v_source edge to a SHARED still, and
     /// read an id she was never allowed to see. BOTH endpoints must be in scope,
     /// so the graph cannot be walked out of the realm in either direction.
-    public func edges(for assetID: String, scope: CatalogRealm? = nil) throws -> [AssetEdge] {
+    ///
+    /// `scope` has NO DEFAULT, deliberately. It used to default to nil, and the
+    /// first route written against it simply omitted the argument — which
+    /// compiled, and leaked. Backfill's `scope: nil` is correct and now says so
+    /// at the call site, where a reviewer can see it.
+    public func edges(for assetID: String, scope: CatalogRealm?) throws -> [AssetEdge] {
         var stmt: OpaquePointer?
         let sql = """
             SELECT e.from_asset_id, e.to_asset_id, e.relation FROM asset_edges e
@@ -750,7 +755,9 @@ public actor CatalogStore {
     /// in the schema to leak — so this takes the realm lock too. Out of scope
     /// returns empty rather than throwing: a confined caller learns nothing about
     /// whether the id exists.
-    public func locations(of assetID: String, scope: CatalogRealm? = nil) throws -> [AssetLocation] {
+    ///
+    /// No default on `scope`, for the reason given on `edges(for:scope:)`.
+    public func locations(of assetID: String, scope: CatalogRealm?) throws -> [AssetLocation] {
         var stmt: OpaquePointer?
         let sql = """
             SELECT l.host, l.path, l.mtime FROM asset_locations l
@@ -825,9 +832,13 @@ public actor CatalogStore {
         }
     }
 
-    /// Fetch one row by id, unscoped and unclamped. Internal helper for
-    /// backfill; consumers go through `search`, which applies the realm lock.
-    public func asset(id: String) throws -> CatalogAsset? {
+    /// Fetch one row by id, unscoped and unclamped.
+    ///
+    /// INTERNAL on purpose. This is backfill's helper and it obeys neither of
+    /// the store's two rules; a doc comment is not enough to keep it out of a
+    /// future route, so the module boundary does it instead. Service callers
+    /// want `asset(id:visibleTo:ceiling:)` or `search`.
+    func asset(id: String) throws -> CatalogAsset? {
         let sql = """
             SELECT a.id, a.kind, a.filename, a.absolute_path, a.sha256, a.file_size,
                    a.width, a.height, a.created_at, a.realm, a.source, a.sealed,

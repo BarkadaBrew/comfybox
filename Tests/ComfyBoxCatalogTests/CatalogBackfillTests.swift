@@ -63,7 +63,7 @@ final class CatalogBackfillTests: XCTestCase {
         let rows = try await store.search(CatalogQuery(scope: nil))
         XCTAssertEqual(rows.count, 1, "same bytes = one asset")
         XCTAssertEqual(report.duplicatesMerged, 1)
-        let locations = try await store.locations(of: rows[0].id)
+        let locations = try await store.locations(of: rows[0].id, scope: nil)
         XCTAssertEqual(locations.count, 2)
     }
 
@@ -136,7 +136,7 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(report.edgesCreated, 1)
         let foundClip = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4")
         let clipID = try XCTUnwrap(foundClip)
-        let edges = try await store.edges(for: clipID)
+        let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.relation, .i2vSource)
     }
 
@@ -158,14 +158,14 @@ final class CatalogBackfillTests: XCTestCase {
         let firstCount = try await store.search(CatalogQuery(scope: nil, limit: 500)).count
         let firstFound = try await store.assetID(forPath: root + "/home/a.png")
         let firstID = try XCTUnwrap(firstFound)
-        let firstLocations = try await store.locations(of: firstID).count
+        let firstLocations = try await store.locations(of: firstID, scope: nil).count
 
         _ = try await CatalogBackfill.run(store: store, trees: trees())
         let secondCount = try await store.search(CatalogQuery(scope: nil, limit: 500)).count
         XCTAssertEqual(secondCount, firstCount)
         let secondFound = try await store.assetID(forPath: root + "/home/a.png")
         let secondID = try XCTUnwrap(secondFound)
-        let secondLocations = try await store.locations(of: secondID).count
+        let secondLocations = try await store.locations(of: secondID, scope: nil).count
         XCTAssertEqual(secondLocations, firstLocations)
     }
 
@@ -234,7 +234,7 @@ final class CatalogBackfillTests: XCTestCase {
         let foundUpdated = try await store.asset(id: firstID)
         let updated = try XCTUnwrap(foundUpdated)
         XCTAssertEqual(updated.fileSize, Int64("V2 IS LONGER".utf8.count))
-        let locations = try await store.locations(of: firstID)
+        let locations = try await store.locations(of: firstID, scope: nil)
         XCTAssertEqual(locations.count, 1, "no duplicate location for the same path")
     }
 
@@ -369,7 +369,7 @@ final class CatalogBackfillTests: XCTestCase {
         let clipID = try XCTUnwrap(foundClipID)
         let foundStillID = try await store.assetID(forPath: still)
         let stillID = try XCTUnwrap(foundStillID)
-        let edges = try await store.edges(for: clipID)
+        let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.toAssetID, stillID, "the edge must point at the translated still")
     }
 
@@ -404,7 +404,7 @@ final class CatalogBackfillTests: XCTestCase {
         let clipID = try XCTUnwrap(foundClipID)
         let foundStillID = try await store.assetID(forPath: still)
         let stillID = try XCTUnwrap(foundStillID)
-        let edges = try await store.edges(for: clipID)
+        let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.toAssetID, stillID)
     }
 
@@ -463,14 +463,14 @@ final class CatalogBackfillTests: XCTestCase {
                          tree: "kira/metadata")
         _ = try await CatalogBackfill.run(store: store, trees: trees())
         let before = try await store.search(CatalogQuery(scope: nil, limit: 500))
-        let beforeLocations = try await store.locations(of: before[0].id).count
+        let beforeLocations = try await store.locations(of: before[0].id, scope: nil).count
         let beforeFiled = try await store.search(CatalogQuery(scope: .kira, collectionID: "col-kira-decoupage"))
 
         let second = try await CatalogBackfill.run(store: store, trees: trees())
         let after = try await store.search(CatalogQuery(scope: nil, limit: 500))
         XCTAssertEqual(after, before, "a re-sweep must not churn the row")
         XCTAssertEqual(second.assetsIndexed, 0)
-        let afterLocations = try await store.locations(of: after[0].id).count
+        let afterLocations = try await store.locations(of: after[0].id, scope: nil).count
         XCTAssertEqual(afterLocations, beforeLocations)
         let afterFiled = try await store.search(CatalogQuery(scope: .kira, collectionID: "col-kira-decoupage"))
         XCTAssertEqual(afterFiled.count, beforeFiled.count)

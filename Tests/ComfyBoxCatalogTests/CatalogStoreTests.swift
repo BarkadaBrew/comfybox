@@ -300,8 +300,8 @@ final class CatalogStoreTests: XCTestCase {
                                explicitCollectionIDs: [])
         try await store.addEdge(AssetEdge(fromAssetID: "clip", toAssetID: "still", relation: .i2vSource))
 
-        let fromClip = try await store.edges(for: "clip")
-        let fromStill = try await store.edges(for: "still")
+        let fromClip = try await store.edges(for: "clip", scope: nil)
+        let fromStill = try await store.edges(for: "still", scope: nil)
         XCTAssertEqual(fromClip.map(\.toAssetID), ["still"])
         XCTAssertEqual(fromStill.map(\.fromAssetID), ["clip"],
                        "from the still, find its clips")
@@ -313,7 +313,7 @@ final class CatalogStoreTests: XCTestCase {
         let e = AssetEdge(fromAssetID: "a", toAssetID: "b", relation: .memberOf)
         try await store.addEdge(e)
         try await store.addEdge(e)
-        let edges = try await store.edges(for: "a")
+        let edges = try await store.edges(for: "a", scope: nil)
         XCTAssertEqual(edges.count, 1)
     }
 
@@ -327,7 +327,7 @@ final class CatalogStoreTests: XCTestCase {
         try await store.addEdge(AssetEdge(fromAssetID: "her-clip", toAssetID: "shared-still",
                                           relation: .i2vSource))
 
-        let unscoped = try await store.edges(for: "her-clip")
+        let unscoped = try await store.edges(for: "her-clip", scope: nil)
         XCTAssertEqual(unscoped.map(\.toAssetID), ["shared-still"], "the service still sees it")
 
         let scoped = try await store.edges(for: "her-clip", scope: .kira)
@@ -345,7 +345,7 @@ final class CatalogStoreTests: XCTestCase {
             AssetLocation(host: "mac", path: "/Users/t/Pictures/ComfyBox/s1.png", mtime: Date()))
 
         // Unscoped — the service itself — resolves all three.
-        let serviceLocations = try await store.locations(of: "s1")
+        let serviceLocations = try await store.locations(of: "s1", scope: nil)
         XCTAssertEqual(serviceLocations.count, 1)
         let serviceByPath = try await store.assetID(forPath: "/tmp/s1.png")
         XCTAssertEqual(serviceByPath, "s1")
@@ -368,7 +368,7 @@ final class CatalogStoreTests: XCTestCase {
             AssetLocation(host: "mac", path: "/Users/t/Pictures/ComfyBox/a.png", mtime: Date()))
         try await store.addLocation(assetID: "a",
             AssetLocation(host: "kira", path: "/home/todd/.kira/studio/gallery/Kira/a.png", mtime: Date()))
-        let locations = try await store.locations(of: "a")
+        let locations = try await store.locations(of: "a", scope: nil)
         XCTAssertEqual(locations.count, 2)
     }
 

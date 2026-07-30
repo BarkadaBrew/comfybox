@@ -125,21 +125,84 @@ public enum HTTPKit {
                        headers: headers, body: body)
     }
 
+    public enum ServerError: Error, LocalizedError {
+        case invalidPort(UInt16)
+        case alreadyStarted
+        case bindFailed(String)
+        case notReadyInTime(TimeInterval)
+
+        public var errorDescription: String? {
+            switch self {
+            case let .invalidPort(p): return "invalid port \(p)"
+            case .alreadyStarted: return "server is already started"
+            case let .bindFailed(m): return "listener failed: \(m)"
+            case let .notReadyInTime(t): return "listener not ready within \(t)s"
+            }
+        }
+    }
+
+    /// A continuation must be resumed exactly once, and `stateUpdateHandler`
+    /// plus the timeout can both fire.
+    final class Once: @unchecked Sendable {
+        private let lock = NSLock()
+        private var done = false
+        func run(_ body: () -> Void) {
+            lock.lock()
+            if done { lock.unlock(); return }
+            done = true
+            lock.unlock()
+            body()
+        }
+    }
+
     /// Bound to loopback only. The gallery holds raw prompt text under the
     /// provenance contract; it is not a LAN service.
     public final class Server: @unchecked Sendable {
-        private let port: UInt16
+        private let requestedPort: UInt16
         private let handler: @Sendable (Request) async -> Response
+
+        /// `listener` and `started` are touched from the caller's thread, the
+        /// listener's queue and `boundPort` readers, so they are guarded rather
+        /// than merely `@unchecked`.
+        private let lock = NSLock()
         private var listener: NWListener?
+        private var started = false
 
         public init(port: UInt16, handler: @escaping @Sendable (Request) async -> Response) {
-            self.port = port
+            self.requestedPort = port
             self.handler = handler
         }
 
-        public func start() throws {
-            guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-                throw CatalogError.prepareFailed("invalid port \(port)")
+        /// Bind and WAIT for the listener to reach `.ready`, surfacing `.failed`
+        /// to the caller.
+        ///
+        /// `NWListener.start(queue:)` is non-throwing and reports its outcome
+        /// only through `stateUpdateHandler`. Without this, an `EADDRINUSE` —
+        /// the exact case an overlapping launchd restart produces — left the
+        /// listener `.failed` with nobody watching, while the caller went on to
+        /// log "listening" and block forever. A service that cannot bind must
+        /// fail loudly enough for launchd to recycle it, not sit there healthy
+        /// and deaf.
+        ///
+        /// Pass port 0 to let the kernel choose; read `boundPort` afterwards.
+        public func start(timeout: TimeInterval = 5) async throws {
+            lock.lock()
+            if started { lock.unlock(); throw ServerError.alreadyStarted }
+            started = true
+            lock.unlock()
+
+            do {
+                try await bind(timeout: timeout)
+            } catch {
+                lock.lock(); started = false; let l = listener; listener = nil; lock.unlock()
+                l?.cancel()
+                throw error
+            }
+        }
+
+        private func bind(timeout: TimeInterval) async throws {
+            guard let nwPort = NWEndpoint.Port(rawValue: requestedPort) else {
+                throw ServerError.invalidPort(requestedPort)
             }
             let params = NWParameters.tcp
             // The single line that makes this not a LAN service.
@@ -148,29 +211,66 @@ public enum HTTPKit {
             // this process and a two-minute dead window is not acceptable.
             params.allowLocalEndpointReuse = true
             let l = try NWListener(using: params)
-            // STRONG capture, deliberately. NWListener is retained by the
-            // network framework once started, so with `[weak self]` a caller who
-            // lets the Server go out of scope — which the CLI entry point did —
-            // is left with a socket that still ACCEPTS and binds, and silently
-            // discards every request: `self?` is nil, so nothing ever reads. A
-            // listening port that answers nothing is the worst possible failure
-            // here, because every health check passes. A started server owns
-            // itself until `stop()`; the cycle is the point.
-            l.newConnectionHandler = { conn in self.accept(conn) }
-            l.start(queue: .global(qos: .userInitiated))
-            listener = l
+
+            lock.lock(); listener = l; lock.unlock()
+
+            let once = Once()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                l.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        once.run { cont.resume() }
+                    case let .failed(error):
+                        once.run { cont.resume(throwing: ServerError.bindFailed("\(error)")) }
+                    case let .waiting(error):
+                        // For a loopback listener `.waiting` means the address is
+                        // unavailable — in practice the port is taken. It will
+                        // retry forever, which is exactly the silent hang.
+                        once.run { cont.resume(throwing: ServerError.bindFailed("\(error)")) }
+                    case .cancelled:
+                        once.run { cont.resume(throwing: ServerError.bindFailed("cancelled")) }
+                    default:
+                        break
+                    }
+                }
+                // STRONG capture, deliberately. NWListener is retained by the
+                // network framework once started, so with `[weak self]` a caller
+                // who lets the Server go out of scope — which the CLI entry point
+                // did — is left with a socket that still ACCEPTS and binds, and
+                // silently discards every request. A listening port that answers
+                // nothing is the worst failure available here, because every
+                // health check passes. A started server owns itself until
+                // `stop()`; the cycle is the point.
+                l.newConnectionHandler = { conn in self.accept(conn) }
+                l.start(queue: .global(qos: .userInitiated))
+
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+                    once.run { cont.resume(throwing: ServerError.notReadyInTime(timeout)) }
+                }
+            }
         }
 
-        /// Breaks the self-reference above as well as closing the socket, so a
-        /// stopped server can be deallocated.
+        /// Cancel FIRST, then replace the handler with one that closes anything
+        /// still arriving. Assigning nil to `newConnectionHandler` on a live
+        /// listener has undocumented semantics; `{ $0.cancel() }` breaks the
+        /// self-reference just as well and is defined behaviour either way.
         public func stop() {
-            listener?.newConnectionHandler = nil
-            listener?.cancel()
+            lock.lock()
+            let l = listener
             listener = nil
+            started = false
+            lock.unlock()
+
+            l?.cancel()
+            l?.newConnectionHandler = { $0.cancel() }
+            l?.stateUpdateHandler = nil
         }
 
-        /// The port actually bound, once the listener is ready. nil before then.
-        public var boundPort: UInt16? { listener?.port?.rawValue }
+        /// The port actually bound. Valid once `start()` has returned; nil before.
+        public var boundPort: UInt16? {
+            lock.lock(); defer { lock.unlock() }
+            return listener?.port?.rawValue
+        }
 
         private func accept(_ conn: NWConnection) {
             conn.start(queue: .global(qos: .userInitiated))
