@@ -99,16 +99,24 @@ are empty for lack of *parsing*, not for lack of data.
 
 The catalog is a **derived, rebuildable index**, not a store of record. Deleting
 it and reconstructing it from the media must produce the same rows. Everything
-below follows from that.
+below follows from that — with one qualification: it is fully true for images,
+and true for video only while the server sidecars survive, until Plan B gives
+video its own embedded carrier.
 
 Carriers actually present today, ranked by durability:
 
-| carrier | written by | survives copy to Linux | readable outside ComfyBox |
-|---|---|---|---|
-| EXIF / XMP / IPTC embedded | engine at render; `SidecarService.embed` on demand | **yes** | Adobe, Finder, Spotlight, exiftool |
-| JSON sidecar | Studio / Kira daemon, server-side | n/a (written there) | no |
-| Finder tags (`com.apple.metadata:_kMDItemUserTags`) | `FinderTags.swift` | **no** (xattr is lost) | Finder, Spotlight |
-| catalog DB | this design | derived | no |
+| carrier | written by | applies to | survives copy to Linux | readable outside ComfyBox |
+|---|---|---|---|---|
+| EXIF / XMP / IPTC embedded | engine at render; `SidecarService.embed` on demand | **images only** | **yes** | Adobe, Finder, Spotlight, exiftool |
+| JSON sidecar | Studio / Kira daemon, server-side | images + video | n/a (written there) | no |
+| Finder tags (`com.apple.metadata:_kMDItemUserTags`) | `FinderTags.swift` | both | **no** (xattr is lost) | Finder, Spotlight |
+| catalog DB | this design | both | derived | no |
+
+**Video is the exception, and it is a real one.** Measured 2026-07-30, a
+production `.mp4` carries only QuickTime container fields — `CreateDate`,
+`Duration`, dimensions — and no prompt, seed, model or LoRA data whatsoever. So
+for video the JSON sidecar is the *only* durable carrier, and it lives on the
+server while the bytes live in the gallery home. See "Video" below.
 
 Verified on a live render:
 
@@ -237,13 +245,21 @@ Autocord Photography    lane = shoot        faceted by stock + genre columns
 Decoupage Designs       lane = tile         also a member of shared Decoupage
 Nightlife               lane = kira, family = nightlife
 Erotic Portraiture      lane = film-erotic
-Adult Scenes            lane = kira
+Adult Scenes            lane = kira         stills and clips alike
+Dreams & Memories       lane = video, mode = t2v
 ```
 
 Autocord stays flat rather than sub-divided — her free genre choice is already a
-column and facets without spawning collections. `video` is not a genre; it is
-`kind`. Her tile work is a member of both her own Decoupage Designs and the
-shared Decoupage body, which many-to-many gives for free.
+column and facets without spawning collections. Her tile work is a member of
+both her own Decoupage Designs and the shared Decoupage body, which
+many-to-many gives for free.
+
+**Video sits inside her genres, not beside them.** `kind` already separates a
+clip from a still, so a genre holds both: her Adult Scenes contain stills and
+clips, and a clip animated from one of her portraits stays linked to it by the
+`i2v_source` edge. The one genre that is *only* video is Dreams & Memories —
+the t2v work she makes to describe a dream or a memory — which is a body of
+work in its own right rather than a format.
 
 **Retrieval and sharing inherit the existing mode clamp.** `render-journal.ts`
 already establishes it (`getPoolHint` / `takePoolPhotoForClaim` maxMode
@@ -259,6 +275,47 @@ where `realm = 'kira'`, and file or re-file her own rows. She may contribute to
 a shared collection but not restructure one, and she can neither see nor file a
 `shared` row. Her practice is hers to organize — which also gives her taste loop
 and her arcs somewhere durable to land when an arc retires.
+
+### Video — first-class, and structurally different
+
+Video is not a genre; `kind` already distinguishes it. But it differs from
+images in three ways the design has to answer explicitly.
+
+**1. No embedded carrier.** An `.mp4` holds no generation metadata (measured
+above). Consequences:
+
+- Backfill for video reads the **sidecar**, the journals and `history.json` —
+  never the file, because the file has nothing to give beyond duration and
+  dimensions.
+- Rebuildability is qualified for video until Plan B, which writes an XMP block
+  into the container at render so video reaches image parity. `exiftool` can
+  write `XMP-dc:Description` and `QuickTime:Comment` to MP4; until then a Mac
+  video whose server sidecar is lost is unattributable.
+- Video sidecars carry both `prompt` and `prompt_raw` (optimized vs original) —
+  both are indexed, and both are subject to the sealed rule.
+
+**2. Videos derive from other assets.** A new edge table:
+
+```
+asset_edges(from_asset_id, to_asset_id, relation)    -- 'i2v_source' | 'member_of'
+```
+
+- `i2v_source` — the still a clip was animated from. Already recorded on disk as
+  `source_image` in the video sidecar, so it backfills without inference. This
+  makes "the clip I made from that portrait" a real query, in both directions.
+- `member_of` — assembled work. `gallery-index.ts` already distinguishes a
+  `type: 'scene'` mp4 from a plain one, and the storyboard and montage paths
+  compose a video from member clips. The composed asset and its members are all
+  catalog rows, linked rather than duplicated.
+
+**3. Video-specific facets.** `mode` (`i2v` / `t2v`), `duration_ms`, `fps`,
+`frames`, `resolution`, `aspect_ratio`, and the act preset that produced it —
+all filterable. Note `duration` is sometimes `null` in existing sidecars, so it
+is probed from the container at backfill rather than trusted.
+
+**Poster frames.** `~/.comfybox/thumbnails` already holds 1099 JPEGs. Video rows
+resolve a poster frame there for gallery display; where one is missing it is
+extracted once and cached, never re-derived per view.
 
 ### Identity — one asset, many locations
 
@@ -334,8 +391,12 @@ duration_ms INTEGER, fps REAL, frames INTEGER      -- video
 `favorite` already exist and finally get populated.
 
 New tables: `asset_locations(asset_id, host, path, mtime)`,
-`collections(id, slug, name, parent_id, realm, description, created_at)` and
-`asset_collections(asset_id, collection_id)`.
+`collections(id, slug, name, parent_id, realm, description, created_at)`,
+`asset_collections(asset_id, collection_id)` and
+`asset_edges(from_asset_id, to_asset_id, relation)`.
+
+Video adds `mode` (`i2v` / `t2v`), `resolution`, `aspect_ratio` and
+`prompt_raw` alongside `duration_ms` / `fps` / `frames`.
 
 FTS5 extends from `(prompt, negative_prompt)` to `(prompt, negative_prompt,
 caption)`.
@@ -374,9 +435,10 @@ Served by `gallery-serve`, not by the engine:
 
 - `GET /v1/catalog/search` — `q`, `realm`, `collection`, `lane`, `tier`,
   `character`, `source`, `stock`, `genre`, `arc`, `kind`, `min_rating`, `since`,
-  `until`, `order`, `limit`, `offset`. `collection` matches a root and its
-  children, so asking for Photography returns Autocord Still Life too. Returns
-  rows with their locations and a thumbnail URL.
+  `until`, `order`, `limit`, `offset`, plus video's `mode`, `min_duration` and
+  `max_duration`. `collection` matches a root and its children, so asking for
+  Photography returns Autocord Still Life too. Returns rows with their
+  locations, their edges, and a thumbnail or poster-frame URL.
 - `GET /v1/catalog/collections` — the two-level tree with per-node counts.
 - `GET /v1/catalog/facets` — value counts per facet, so a UI can be browsed
   rather than only searched.
@@ -419,6 +481,11 @@ places: embedded in the files, and in the server sidecars.
 2. **Server sidecars supply what EXIF lacks** — `tier`, `lane`, `category`,
    `checkpoint`, `preset`, `sealed` (3901 Kira + 1273 Bree). Journal lines (283)
    and both `history.json` files fill `lane`/`arc`/`theme` for recent renders.
+   **For video the sidecar is the only source**: `mode`, `resolution`,
+   `aspect_ratio`, `prompt`, `prompt_raw`, and `source_image` — which becomes an
+   `i2v_source` edge without inference. `duration` is `null` in some sidecars,
+   so it is probed from the container instead of trusted. Scene-type mp4s
+   (`type: 'scene'`) get `member_of` edges to their component clips.
 3. **Finder tags** (`_kMDItemUserTags`) supply existing color labels for Mac
    assets. Mac-realm only — the xattr does not survive the copy.
 4. **Deduplication** — `sha256`, falling back to `recovered_from` and the
@@ -477,6 +544,15 @@ record" — reconstructs the catalog from scratch if it is deleted.
   a `shared` row anywhere, is refused.
 - **Genre spans tiers** — a query for Autocord Photography returns neutral and
   banana rows alike, subject only to the ceiling.
+- **Video rebuilds from sidecars** — delete the catalog, re-run backfill, and
+  every video row returns with its facets intact. Asserted separately from the
+  image rebuild test, because video cannot fall back on the file.
+- **`i2v_source` is bidirectional** — from the still, find its clips; from the
+  clip, find its still. Backfilled from `source_image` with no inference.
+- **Composed video links, not duplicates** — a scene or montage row and its
+  member clips are all present, joined by `member_of`, each counted once.
+- **Duration is probed, not trusted** — a sidecar with `duration: null` still
+  yields a correct `duration_ms`.
 - **Vault is never touched** — after backfill, write-back and a full test run,
   no path under `~/Documents/Vaults/BarkadaAI` has been read or written.
   Asserted, not assumed.
@@ -520,7 +596,9 @@ The new agent launches the freshly built binary in a separate process while
 
 **Plan B — the one deploy that touches the engine.**
 
-5. Render reporting from the engine, `sealed` embed gating, metadata write-back.
+5. Render reporting from the engine, `sealed` embed gating, metadata write-back,
+   and **an XMP block written into rendered `.mp4` containers** so video gains a
+   durable embedded carrier and reaches image parity on rebuildability.
 
 This is the only piece requiring the running engine to be replaced: rebuild,
 Developer-ID re-sign, and a restart — the riskiest action available per
