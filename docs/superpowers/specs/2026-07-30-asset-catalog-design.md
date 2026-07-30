@@ -73,6 +73,9 @@ are empty for lack of *parsing*, not for lack of data.
 8. **The ComfyBox Gallery is the home** for Kira's content and for everything
    ComfyBox generates, whichever application requested it. Bree's vault is out
    of scope — see "Deferred".
+9. **Collections segregate bodies of work** — two levels, many-to-many, filed
+   automatically from lane/source/preset and overridable by hand. Any producer
+   can contribute to any collection.
 
 ## Non-goals
 
@@ -142,6 +145,67 @@ Realm cannot be derived from a Mac path, because every realm's renders pass
 through the same engine output dir. **The caller stamps it.** For backfill it is
 `kira` when the asset has a twin under a Kira studio tree or a matching journal
 record, and `shared` otherwise.
+
+### Collections — bodies of work, contributed to by anything
+
+Several bodies of work are produced by **multiple applications at once**, and
+nothing today links their output. Decoupage tile design is the clearest case —
+four independent producers, one body of work:
+
+| producer | code |
+|---|---|
+| Desktop tool | `ComfyBoxDesktop/Decoupage/DecoupageService.swift`, `DecoupageView.swift` |
+| Server tile engine | `src/tile/` — `grid-compositor`, `seamless-processor`, `tile-project` |
+| Krita | `src/tile/kra-generator.ts` (emits `.kra` projects) |
+| Kira | `src/kira/decoupage-seeds.ts` (her neutral tile lane) |
+
+A **collection** is a durable body of work, orthogonal to `realm`, `source`,
+`lane` and `tier`, that any producer can contribute to. It is distinct from an
+*arc*, which is Kira's temporary body of work: an arc can feed a collection and
+then retire, while the collection persists.
+
+Structure: **two levels, many-to-many.**
+
+```
+collections(id, slug, name, parent_id NULL, description, created_at)
+asset_collections(asset_id, collection_id)      -- composite PK, many-to-many
+```
+
+- A sub-collection's `parent_id` must reference a root. Depth beyond two is
+  rejected — deeper nesting turns back into a filesystem nobody prunes.
+- An asset belongs to any number of collections. An erotic portrait shot on the
+  Autocord is genuinely in both Autocord Still Life and Erotic Portraiture; a
+  decoupage design is in Decoupage no matter which of the four producers made it.
+- The existing `folders` / `asset_folders` tables are left untouched. They are
+  empty (0 rows, never used) and `asset_folders.asset_id` is a PRIMARY KEY, so
+  they are one-folder-per-asset by construction — the wrong shape for this.
+
+Seed collections:
+
+```
+Decoupage                       tile designs, all four producers
+Photography                     art photography — Todd, Kira or Bree
+  └ Autocord Still Life         Kira's TLR practice
+Adult                           adult entertainment
+  └ Erotic Portraiture          portrait work, distinct from scene work
+```
+
+Assignment, in precedence order:
+
+1. **Manual** — set in the gallery UI. Always wins.
+2. **Explicit** — the requesting application names it at render time via
+   `catalog.collection`.
+3. **Derived** — a rule table maps `lane` / `source` / `preset` to a default
+   collection, so nothing requires manual filing to be organized. Kira's lanes
+   already classify her output (`tile` → Decoupage, `shoot` → Autocord Still
+   Life, `film-erotic` → Erotic Portraiture), and the rule table is what lets
+   Studio, Krita, Bree and the desktop file into the same bodies without
+   adopting her scheduler's vocabulary.
+
+**Collections span realms; row visibility does not.** Photography is one body of
+work whether Todd, Kira or Bree contributed the frame. Kira sees the collection
+and browses it, but the rows she gets back are still `realm = kira` only — the
+collection is shared vocabulary, not shared content.
 
 ### Identity — one asset, many locations
 
@@ -216,7 +280,9 @@ duration_ms INTEGER, fps REAL, frames INTEGER      -- video
 `content_mode` (= tier), `character_name`, `source`, `sha256`, `rating`,
 `favorite` already exist and finally get populated.
 
-New tables: `asset_locations(asset_id, host, path, mtime)`.
+New tables: `asset_locations(asset_id, host, path, mtime)`,
+`collections(id, slug, name, parent_id, description, created_at)` and
+`asset_collections(asset_id, collection_id)`.
 
 FTS5 extends from `(prompt, negative_prompt)` to `(prompt, negative_prompt,
 caption)`.
@@ -253,9 +319,12 @@ same rule.
 
 Served by `gallery-serve`, not by the engine:
 
-- `GET /v1/catalog/search` — `q`, `realm`, `lane`, `tier`, `character`, `stock`,
-  `genre`, `arc`, `kind`, `min_rating`, `since`, `until`, `order`, `limit`,
-  `offset`. Returns rows with their locations and a thumbnail URL.
+- `GET /v1/catalog/search` — `q`, `realm`, `collection`, `lane`, `tier`,
+  `character`, `source`, `stock`, `genre`, `arc`, `kind`, `min_rating`, `since`,
+  `until`, `order`, `limit`, `offset`. `collection` matches a root and its
+  children, so asking for Photography returns Autocord Still Life too. Returns
+  rows with their locations and a thumbnail URL.
+- `GET /v1/catalog/collections` — the two-level tree with per-node counts.
 - `GET /v1/catalog/facets` — value counts per facet, so a UI can be browsed
   rather than only searched.
 - `GET /v1/catalog/asset/{id}`.
@@ -336,6 +405,14 @@ record" — reconstructs the catalog from scratch if it is deleted.
   indexed by `AssetIngestor`.
 - **Permissions** — catalog file is `0600` in a `0700` directory after init on
   both boxes.
+- **Collections are many-to-many** — one asset in Autocord Still Life *and*
+  Erotic Portraiture is returned by a query for either, and appears once in each.
+- **Depth cap** — creating a sub-collection under a sub-collection is rejected.
+- **Derived filing** — a render from each of the four decoupage producers lands
+  in Decoupage without anyone naming it; manual assignment overrides the rule.
+- **Collections span realms, rows do not** — a kira-scoped query for
+  Photography returns only `realm = kira` rows, while still resolving the
+  collection itself.
 - **Vault is never touched** — after backfill, write-back and a full test run,
   no path under `~/Documents/Vaults/BarkadaAI` has been read or written.
   Asserted, not assumed.
@@ -362,11 +439,14 @@ This is two implementation plans, split at the engine boundary.
 
 **Plan A — nothing signed, nothing restarted.**
 
-1. Schema migration + permissions tightening (additive; no reader changes).
-2. Backfill: `exiftool` sweep, sidecars, journals, dedup.
+1. Schema migration + permissions tightening (additive; no reader changes),
+   including `collections` / `asset_collections` and the seed tree.
+2. Backfill: `exiftool` sweep, sidecars, journals, dedup, derived collection
+   filing.
 3. `ComfyBox gallery-serve` subcommand + launchd agent + `DAMStore` query
    methods.
-4. Consumers: desktop facets, Bree MCP tool, Kira MCP tool, Studio fallthrough.
+4. Consumers: desktop facets + collection rail, Bree MCP tool, Kira MCP tool,
+   Studio fallthrough.
 
 The `gallery-serve` subcommand ships in the same binary as the engine, so step 3
 does involve a build — but **the running engine is not replaced or restarted**.
