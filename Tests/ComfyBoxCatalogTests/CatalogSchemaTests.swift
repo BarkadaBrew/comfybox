@@ -85,6 +85,42 @@ final class CatalogSchemaTests: XCTestCase {
         XCTAssertEqual(columns(of: "assets"), once)
     }
 
+    /// A non-duplicate ALTER failure must propagate rather than being silently
+    /// swallowed. With no `assets` table at all, the very first
+    /// `ALTER TABLE assets ADD COLUMN ...` fails with "no such table: assets" —
+    /// a message the duplicate-column check does not match — so it must be
+    /// rethrown out of `migrate`, not absorbed like an already-migrated column
+    /// would be.
+    func testMigrateThrowsWhenAssetsTableIsMissingEntirely() {
+        XCTAssertThrowsError(try CatalogSchema.migrate(db: db)) { error in
+            guard case let CatalogSchemaError.execFailed(_, msg) = error else {
+                XCTFail("expected .execFailed, got \(error)")
+                return
+            }
+            XCTAssertFalse(msg.lowercased().contains("duplicate column name"),
+                           "this must be a genuine failure, not the ignored duplicate-column case")
+        }
+    }
+
+    /// Positive case for the post-migration verification: on a correctly
+    /// migrated database every new column is present. The negative case (a
+    /// migration that silently drops one of the ALTERs) has no seam to trigger
+    /// from a black-box test — the loop's own duplicate-column filter is the
+    /// only conditional path, and bypassing it would require reaching into
+    /// `CatalogSchema` internals with test-only hooks, which would test the
+    /// hook rather than the guarantee. `verifyNewColumnsPresent` is exercised
+    /// on every call to `migrate` in every other test in this file, so its
+    /// absence of a false negative is covered throughout; this test pins down
+    /// that it does not raise a false positive either.
+    func testMigrationVerifiesAllNewColumnsPresent() throws {
+        createLegacySchema()
+        try CatalogSchema.migrate(db: db)
+        let present = Set(columns(of: "assets"))
+        for (name, _) in CatalogSchema.newColumns {
+            XCTAssertTrue(present.contains(name), "verification should have caught a missing \(name)")
+        }
+    }
+
     func testMigrationCreatesNewTablesAndLeavesLegacyTablesAlone() throws {
         createLegacySchema()
         try CatalogSchema.migrate(db: db)

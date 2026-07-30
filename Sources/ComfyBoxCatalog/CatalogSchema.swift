@@ -11,10 +11,13 @@ import SQLite3
 
 public enum CatalogSchemaError: Error, LocalizedError {
     case execFailed(String, String)
+    case missingColumns([String])
 
     public var errorDescription: String? {
         switch self {
         case let .execFailed(sql, msg): return "SQL failed: \(msg) — \(sql)"
+        case let .missingColumns(names):
+            return "Migration completed without expected column(s) on assets: \(names.joined(separator: ", "))"
         }
     }
 }
@@ -82,11 +85,26 @@ public enum CatalogSchema {
 
     public static func migrate(db: OpaquePointer?) throws {
         // Appended columns. A duplicate-column error means an earlier run already
-        // added it, which is success — hence `try?`, matching the existing
-        // `source` migration idiom at DAMStore.swift:623.
+        // added it, which is success — matching the existing `source` migration
+        // idiom at DAMStore.swift:623. Any OTHER failure (a locked database, a
+        // malformed type, a missing `assets` table) must propagate: swallowing it
+        // here would let the live migration silently skip a column with no error
+        // anywhere, surfacing later only as a "no such column" from an unrelated
+        // query. So only the specific duplicate-column message is ignored.
         for (name, type) in newColumns {
-            _ = try? exec(db, "ALTER TABLE assets ADD COLUMN \(name) \(type)")
+            do {
+                try exec(db, "ALTER TABLE assets ADD COLUMN \(name) \(type)")
+            } catch CatalogSchemaError.execFailed(_, let msg)
+                where msg.lowercased().contains("duplicate column name") {
+                // Already migrated — success.
+            }
         }
+        // Belt-and-suspenders: confirm every column we intended to add is
+        // actually there, regardless of why the loop above did or didn't throw.
+        // This is the property that actually protects the live database — it
+        // catches any failure mode the message-match above doesn't anticipate.
+        try verifyNewColumnsPresent(db: db)
+
         _ = try? exec(db, "UPDATE assets SET realm = 'shared' WHERE realm IS NULL")
 
         try exec(db, """
@@ -152,6 +170,29 @@ public enum CatalogSchema {
             SELECT id, COALESCE(prompt, ''), COALESCE(negative_prompt, ''), COALESCE(caption, '')
             FROM assets WHERE sealed = 0
             """)
+    }
+
+    /// Reads back `PRAGMA table_info(assets)` and throws naming any column in
+    /// `newColumns` that isn't actually present. This is checked unconditionally
+    /// after the ALTER loop, independent of whether that loop threw, so a
+    /// partially-applied migration (e.g. one column silently dropped by a
+    /// failure mode the duplicate-column check doesn't recognize) can never
+    /// pass unnoticed.
+    private static func verifyNewColumnsPresent(db: OpaquePointer?) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(assets)", -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogSchemaError.execFailed(
+                "PRAGMA table_info(assets)", String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        var existing = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 1) { existing.insert(String(cString: c)) }
+        }
+        let missing = newColumns.map(\.0).filter { !existing.contains($0) }
+        if !missing.isEmpty {
+            throw CatalogSchemaError.missingColumns(missing)
+        }
     }
 
     private static func ftsHasCaption(db: OpaquePointer?) -> Bool {
