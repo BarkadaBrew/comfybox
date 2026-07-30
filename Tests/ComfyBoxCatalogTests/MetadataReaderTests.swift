@@ -117,6 +117,32 @@ final class MetadataReaderTests: XCTestCase {
             "/home/todd/.kira/studio/metadata/Kira/generated/x.json")
     }
 
+    /// The real archives insert a content-tier directory into the MEDIA tree
+    /// that the METADATA tree omits. A strict mirror misses 2392 of Kira's 2648
+    /// files, taking `lane` and `source_image` with them — the difference
+    /// between a filed catalog and one that is 89% unfiled with 2 i2v edges.
+    func testSidecarCandidatesFallBackToTierFlattenedPath() {
+        let candidates = MetadataReader.sidecarCandidates(
+            forMedia: "/s/gallery/Kira/generated/avocado/1785339616729_x.png",
+            galleryRoot: "/s/gallery",
+            metadataRoot: "/s/metadata")
+        XCTAssertEqual(candidates, [
+            "/s/metadata/Kira/generated/avocado/1785339616729_x.json",
+            "/s/metadata/Kira/generated/1785339616729_x.json",
+        ], "the exact mirror must be tried first, the tier-flattened path second")
+    }
+
+    /// The fallback drops one directory, so a file sitting directly under the
+    /// gallery root must not flatten to a path OUTSIDE the metadata tree.
+    func testSidecarCandidatesNeverClimbAboveMetadataRoot() {
+        let candidates = MetadataReader.sidecarCandidates(
+            forMedia: "/s/gallery/x.png", galleryRoot: "/s/gallery", metadataRoot: "/s/metadata")
+        XCTAssertEqual(candidates, ["/s/metadata/x.json"])
+        for c in candidates {
+            XCTAssertTrue(c.hasPrefix("/s/metadata/"), "escaped the metadata root: \(c)")
+        }
+    }
+
     /// A backfill runs `runTool` over several thousand files in sequence; one
     /// hung child process (corrupt file, stalled filesystem, network-mounted
     /// media) must not stall the whole run. Uses an injected short timeout

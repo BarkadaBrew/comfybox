@@ -201,6 +201,10 @@ public enum GalleryServer {
     // MARK: - CLI
 
     public static func runCLIEntryPoint(args: [String]) {
+        if args.first == "backfill" {
+            runBackfillCLI(args: Array(args.dropFirst()))
+            return
+        }
         var port = defaultPort
         var dbPath: String? = nil
         var i = 0
@@ -245,6 +249,136 @@ public enum GalleryServer {
         }
         sem.wait()   // run forever; launchd owns the lifecycle
         withExtendedLifetime(live) {}
+    }
+
+    /// One-shot backfill. Every tree is passed explicitly so no path is ever
+    /// implied — in particular, no vault path can be reached by default.
+    ///
+    /// The studio trees are SMB mounts of the server's filesystem, so each one
+    /// is TWO roots (stills and clips) and each root needs its OWN
+    /// `remotePrefix`. `BackfillTree.localPath(for:)` strips the prefix and
+    /// appends the remainder to `mediaRoot`, so handing both roots the studio
+    /// prefix `/home/todd/.kira/studio` would translate
+    /// `…/studio/gallery/x.png` into `…/studio/gallery/gallery/x.png` — a path
+    /// that exists nowhere. Every i2v edge and every journal row would miss, and
+    /// the sweep would report success while covering nothing. Hence the prefix
+    /// is subdivided in lockstep with the media root, from a single studio-level
+    /// flag so the two cannot drift apart.
+    static func runBackfillCLI(args: [String]) {
+        var home = NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath
+        var kiraRoot: String? = nil
+        var breeRoot: String? = nil
+        var kiraRemote = "/home/todd/.kira/studio"
+        var breeRemote = "/home/todd/.bree/studio"
+        var renderJournal: String? = nil
+        var kiraHistory: String? = nil
+        var breeHistory: String? = nil
+        var dbPath: String? = nil
+
+        var i = 0
+        while i < args.count {
+            func value() -> String? {
+                guard i + 1 < args.count else { return nil }
+                i += 1
+                return args[i]
+            }
+            switch args[i] {
+            case "--home": if let v = value() { home = v }
+            case "--kira-studio": if let v = value() { kiraRoot = v }
+            case "--bree-studio": if let v = value() { breeRoot = v }
+            case "--kira-remote-prefix": if let v = value() { kiraRemote = v }
+            case "--bree-remote-prefix": if let v = value() { breeRemote = v }
+            case "--render-journal": if let v = value() { renderJournal = v }
+            case "--kira-history": if let v = value() { kiraHistory = v }
+            case "--bree-history": if let v = value() { breeHistory = v }
+            case "--db": if let v = value() { dbPath = v }
+            case "--help", "-h":
+                print("""
+                    Usage: ComfyBoxGallery backfill [options]
+                      --home PATH                 local gallery tree (default ~/Pictures/ComfyBox)
+                      --kira-studio PATH          local mount of Kira's studio
+                      --bree-studio PATH          local mount of Bree's studio
+                      --kira-remote-prefix PATH   studio path as the SERVER spells it
+                      --bree-remote-prefix PATH   studio path as the SERVER spells it
+                      --render-journal PATH       render-journal.jsonl (Kira)
+                      --kira-history PATH         Kira's history.json
+                      --bree-history PATH         Bree's history.json
+                      --db PATH                   catalog database (default ~/.comfybox/dam.sqlite3)
+                    """)
+                exit(0)
+            default: break
+            }
+            i += 1
+        }
+
+        /// Stills and clips for one studio. The journal and history are attached
+        /// to BOTH roots: each is indexed per tree and keyed by the local path
+        /// its own prefix produces, so a journal seen only by the stills tree
+        /// would leave every clip's lane unknown.
+        func studio(id: String, realm: CatalogRealm, host: String,
+                    root: String, remote: String,
+                    journal: String?, history: String?) -> [BackfillTree] {
+            [("", "gallery"), ("-video", "video")].map { suffix, leaf in
+                BackfillTree(id: id + suffix, realm: realm, host: host,
+                             mediaRoot: (root as NSString).appendingPathComponent(leaf),
+                             metadataRoot: (root as NSString).appendingPathComponent("metadata"),
+                             remotePrefix: (remote as NSString).appendingPathComponent(leaf),
+                             journalPath: journal, historyPath: history)
+            }
+        }
+
+        var trees: [BackfillTree] = [
+            BackfillTree(id: "home", realm: nil, host: "mac", mediaRoot: home, metadataRoot: nil)
+        ]
+        if let k = kiraRoot {
+            trees += studio(id: "kira", realm: .kira, host: "kira", root: k,
+                            remote: kiraRemote, journal: renderJournal, history: kiraHistory)
+        }
+        if let b = breeRoot {
+            trees += studio(id: "bree", realm: .shared, host: "bree", root: b,
+                            remote: breeRemote, journal: nil, history: breeHistory)
+        }
+
+        // Belt and braces: CatalogBackfill.run refuses these too, but a CLI that
+        // can NAME a vault path is one edit away from reading one.
+        for t in trees {
+            for p in [t.mediaRoot, t.metadataRoot, t.journalPath, t.historyPath].compactMap({ $0 })
+            where p.contains("Vaults") {
+                FileHandle.standardError.write(Data("refusing to read a vault path: \(p)\n".utf8))
+                exit(2)
+            }
+        }
+
+        let sem = DispatchSemaphore(value: 0)
+        Task {
+            do {
+                let store = try await CatalogStore.open(path: dbPath)
+                let started = Date()
+                let report = try await CatalogBackfill.run(store: store, trees: trees)
+                let elapsed = Date().timeIntervalSince(started)
+                // Every counter, including the three that report ABSENCE.
+                // `edgesUnresolved` and `assetsUnfiled` are the difference
+                // between a sweep that did the work and one that walked an empty
+                // or mistranslated tree, and neither shows up in the others.
+                print("""
+                    scanned:    \(report.filesScanned)
+                    indexed:    \(report.assetsIndexed)
+                    merged:     \(report.duplicatesMerged)
+                    sidecars:   \(report.sidecarsRead)
+                    journal:    \(report.journalEntriesRead)
+                    edges:      \(report.edgesCreated)
+                    unresolved: \(report.edgesUnresolved)
+                    unfiled:    \(report.assetsUnfiled)
+                    skipped:    \(report.skipped)
+                    elapsed:    \(String(format: "%.1fs", elapsed))
+                    """)
+            } catch {
+                FileHandle.standardError.write(Data("backfill failed: \(error)\n".utf8))
+                exit(1)
+            }
+            sem.signal()
+        }
+        sem.wait()
     }
 
     /// Process-lifetime ownership for the pieces the entry point starts.

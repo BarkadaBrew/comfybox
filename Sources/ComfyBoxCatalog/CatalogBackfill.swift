@@ -176,14 +176,20 @@ public enum CatalogBackfill {
                 // before it left unknown, so precedence is the array's order and
                 // nothing else.
                 var sources: [FileMetadata] = []
-                if let mroot = tree.metadataRoot,
-                   let sidecar = MetadataReader.sidecarPath(forMedia: path,
-                                                            galleryRoot: tree.mediaRoot,
-                                                            metadataRoot: mroot),
-                   let sdata = FileManager.default.contents(atPath: sidecar),
-                   let smeta = MetadataReader.readSidecar(jsonData: sdata) {
-                    report.sidecarsRead += 1
-                    sources.append(smeta)
+                if let mroot = tree.metadataRoot {
+                    // The metadata tree mirrors the media tree EXCEPT for the
+                    // content-tier directory, so try the mirror first and the
+                    // tier-flattened spelling second. First readable one wins;
+                    // one sidecar is still counted at most once.
+                    for sidecar in MetadataReader.sidecarCandidates(
+                        forMedia: path, galleryRoot: tree.mediaRoot, metadataRoot: mroot) {
+                        guard !isVaultPath(sidecar),
+                              let sdata = FileManager.default.contents(atPath: sidecar),
+                              let smeta = MetadataReader.readSidecar(jsonData: sdata) else { continue }
+                        report.sidecarsRead += 1
+                        sources.append(smeta)
+                        break
+                    }
                 }
                 // Embedded EXIF — images only, a container carries none.
                 if kind == "image", let embedded = MetadataReader.readEmbedded(path: path) {
