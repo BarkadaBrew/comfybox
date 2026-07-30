@@ -1856,8 +1856,14 @@ Append to `CatalogStore.swift`, inside the actor:
         try execBind("DELETE FROM asset_collections WHERE asset_id = ?1 AND manual = 0") { [weak self] s in
             self?.bindText(s, 1, asset.id)
         }
+        // UNION, not replace. The spec's worked example is exactly this case:
+        // "An erotic portrait shot on the Autocord is genuinely in both Autocord
+        // Still Life and Erotic Portraiture." Explicit filing ADDS a body of
+        // work; it does not suppress the one the lane already implies. The
+        // precedence rule (manual > explicit > derived) governs which filings
+        // survive a re-ingest, not whether they coexist.
         let derived = CollectionRules.defaultCollectionIDs(for: asset)
-        let ids = Set(explicitCollectionIDs.isEmpty ? derived : explicitCollectionIDs)
+        let ids = Set(derived).union(explicitCollectionIDs)
         for cid in ids {
             // A shared asset can never enter a kira collection, whatever the caller says.
             if asset.realm == .shared, try collectionRealm(cid) == .kira { continue }
