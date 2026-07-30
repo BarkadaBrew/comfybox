@@ -22,7 +22,9 @@ Measured 2026-07-30:
 
 Trees: `~/Pictures/ComfyBox` (Mac, 1459+ files), `~/.kira/studio` (2068 images +
 496 videos + 3901 sidecars), `~/.bree/studio` (29 images + 435 videos + 1273
-sidecars).
+sidecars), and `~/Documents/Vaults/BarkadaAI` on the server — Bree's primary
+data store, 1848 images + 230 videos across 5.9 GB, which no index covers at
+all.
 
 Three symptoms follow directly:
 
@@ -58,12 +60,19 @@ are empty for lack of *parsing*, not for lack of data.
 5. **The file is the store of record; the catalog is derived and rebuildable.**
    Embedded EXIF/XMP/IPTC and Finder tags are authoritative; the catalog is an
    index over them, and gallery edits write back to them.
+6. **The gallery is a ComfyBox service in its own process** — a
+   `ComfyBox gallery-serve` subcommand under its own launchd agent, not routes
+   inside the GPU engine. Same repo, same binary, separate lifecycle.
+7. **`kira` is the only realm exception.** Two values: `kira` and `shared`.
+8. **Bree's vault is a fourth indexed tree, and is never written to.**
 
 ## Non-goals
 
 - No embeddings or vector search. Revisit only if facets + FTS demonstrably fail.
 - No new gallery UI framework — facets land in the existing `GalleryView`.
 - No media moves. Locations are recorded; files stay exactly where they are.
+- **No writes into Bree's vault, of any kind, at any point in this work.** The
+  embedded-metadata gap described under "Known issue" is recorded, not fixed.
 - No change to `/v1/gallery/list` or `/v1/gallery/file`; `RemoteGalleryService`
   keeps working untouched.
 - The three rolling records (`render-journal.jsonl`, both `history.json`) keep
@@ -104,23 +113,60 @@ plus `SidecarService.keywords(tags:character:contentMode:)` →
 
 Two rules follow:
 
-1. **Write-back is mandatory.** Ratings, tags, captions and favorites set in the
-   gallery are written back to XMP/IPTC and Finder tags, so Adobe, Finder and
-   Spotlight keep seeing them and so they survive a catalog rebuild.
+1. **Write-back is mandatory** — except in the vault. Ratings, tags, captions
+   and favorites set in the gallery are written back to XMP/IPTC and Finder
+   tags, so Adobe, Finder and Spotlight keep seeing them and so they survive a
+   catalog rebuild. The vault is read-only; see "The Vault" below.
 2. **Finder tags are Mac-realm only.** They do not ride the copy to the server,
    so color labels are never treated as authoritative for a server-side asset.
 
-### Realm vs character — they are different columns
+### The Vault — indexed, never written
 
-`realm` is the **ownership/isolation domain**: which daemon home produced it
-(`kira`, `bree`, `todd`). `character_name` is **who is depicted** (Kira, Divine,
-Rhea, Bea, Soraya, Mahal). They do not track each other — `~/.kira/studio/
-gallery/Bree/` is a Bree-character render inside the Kira realm.
+Bree's vault (`~/Documents/Vaults/BarkadaAI` on the server) is her primary data
+store and she saves images into it. It is a **destination** tree, not a render
+output tree: assets arrive by promotion or by hand, many are copies of studio
+assets, and some are not generated at all (screenshots, pasted images).
+
+It is indexed **strictly read-only**. The catalog never writes a byte inside the
+vault — not metadata, not write-back, not a sidecar, not a thumbnail. This is a
+hard invariant, asserted by test, and it is the one place where the "write-back
+is mandatory" rule of the Metadata carriers section does **not** apply.
+
+- Realm `shared` (Kira is the only exception; nothing in the vault is `kira`).
+- Excluded: `.claude/worktrees`, and anything not a media file.
+- Vault copies of studio assets dedup into the existing asset via `sha256` and
+  become an additional `asset_locations` row — they are not new assets.
+- Vault-only assets (screenshots, pasted images, non-generated media) are
+  indexed with whatever metadata the file carries, and no more.
+
+### Known issue, recorded and out of scope
+
+PR #826/#833 established that prompt text must not land in vault-adjacent files,
+and stripped it from the alongside-image sidecar. It did not address embedded
+metadata, which rides the file itself. Measured 2026-07-30 over a 120-file
+sample of vault PNGs: **81 carry PNG text chunks and 67 carry a large `eXIf`
+block**, including IPTC captions and JSON generation parameters.
+
+This predates the catalog and is **explicitly out of scope here**. The design
+does not fix it, does not worsen it, and writes nothing into the vault. It is
+recorded so it is not rediscovered as a surprise, and so that whoever addresses
+it knows the catalog can hold the provenance if the files are ever stripped.
+
+### Realm — one exception, not a taxonomy
+
+`realm` has exactly two values: **`kira`** and **`shared`**. Kira's renders stamp
+`kira`; everything else — Todd's, Bree's, Studio's — is `shared`. Kira's tool
+sees only `kira`; the other three consumers see everything. Kira is the only
+isolation exception, so the column encodes that and nothing more.
+
+`character_name` is a **different** column: who is *depicted* (Kira, Divine,
+Rhea, Bea, Soraya, Mahal). It does not track realm — a Kira-realm render can
+depict anyone, and a shared render can depict Kira.
 
 Realm cannot be derived from a Mac path, because every realm's renders pass
 through the same engine output dir. **The caller stamps it.** For backfill it is
-recovered from which server tree holds the copy; a Mac asset with no server twin
-defaults to `realm = todd`.
+`kira` when the asset has a twin under a Kira studio tree or a matching journal
+record, and `shared` otherwise.
 
 ### Identity — one asset, many locations
 
@@ -133,15 +179,43 @@ re-encodes or resizes, `sha256` cannot be the primary merge key and
 the server copy as two rows against one asset. `assets.absolute_path` stays the
 Mac primary so every existing `DAMStore` query keeps working.
 
-### Write path — the engine writes the row
+### Service boundary — `ComfyBox gallery-serve`
 
-The engine writes the catalog row at render completion, into
+The gallery is a ComfyBox service, but **not inside the GPU process**.
+
+Today the Mac Gallery and the server Gallery differ because they are two
+independent *implementations* of the same idea — a SQLite DAM in the desktop
+app, and a `FileManager.enumerator` in `WarmServer.swift:1233`. Nothing makes
+them agree but the filesystem. One service with many views fixes that: the
+desktop Gallery tab, the Telegram browser, Bree's MCP and Kira's MCP all become
+clients.
+
+It runs as a `ComfyBox gallery-serve` subcommand under its own launchd agent, on
+its own port, owning the catalog and all read/write routes. Rationale:
+
+- `ComfyBox serve` loads models, gates at 40GB, and gets rebuilt and re-signed;
+  restarting it orphans in-flight GPU jobs. Coupling the gallery to it means
+  browsing dies during model loads, and every gallery fix requires bouncing the
+  renderer and re-signing the engine binary.
+- Same repo and binary keeps this consistent with retiring the Node image
+  service into ComfyBox — it adds a process, not a project.
+- The desktop still reads the SQLite directly, so the local UI takes no HTTP hop.
+
+### Write path — the engine reports, the gallery records
+
+The engine does not own the archive. At render completion it **reports** the
+render to `gallery-serve` over localhost, which writes the row into
 `~/.comfybox/dam.sqlite3` (already WAL, already multi-process safe,
 `DAMStore.swift:57`). Render requests gain an optional `catalog` object so the
 caller stamps facets the engine cannot know — `realm`, `lane`, `arc`, `theme`,
-`stock`, `genre`, `family`, `style`, `character`, `sealed`. The engine records
-them verbatim beside what it already knows (prompt, negative, seed, steps,
-guidance, model, preset, LoRAs, dimensions, output path).
+`stock`, `genre`, `family`, `style`, `character`, `sealed`. The engine passes
+them through verbatim beside what it already knows (prompt, negative, seed,
+steps, guidance, model, preset, LoRAs, dimensions, output path).
+
+If `gallery-serve` is down, the report is dropped, not retried into a queue —
+the asset is still on disk with full embedded metadata, and the next backfill
+sweep picks it up. This is the payoff of treating the file as the store of
+record: the reporting path is allowed to be lossy.
 
 `AssetIngestor` remains the **fallback** for assets that appear with no catalog
 write — drag-ins, mflux output, recovered clips. It is not removed.
@@ -154,7 +228,7 @@ render. It gains a catalog row written alongside that sidecar.
 New columns:
 
 ```
-realm TEXT              -- kira | bree | todd   (isolation column)
+realm TEXT              -- kira | shared   (isolation column; kira is the only exception)
 lane TEXT               -- still | shoot | tile | kira | film-erotic | video
 arc TEXT, theme TEXT
 stock TEXT, genre TEXT, family TEXT, style TEXT   -- mirrors RenderSeedMeta 1:1
@@ -202,7 +276,7 @@ same rule.
 
 ### Query surface — one API, four bindings
 
-Engine routes:
+Served by `gallery-serve`, not by the engine:
 
 - `GET /v1/catalog/search` — `q`, `realm`, `lane`, `tier`, `character`, `stock`,
   `genre`, `arc`, `kind`, `min_rating`, `since`, `until`, `order`, `limit`,
@@ -215,13 +289,13 @@ Bindings:
 
 | consumer | binding | scope |
 |---|---|---|
-| Todd | facet rail + saved searches in `GalleryView`, via `DAMStore` locally (no HTTP hop) | all realms |
-| Bree | MCP `search_gallery`, beside her existing `gallery_recent` | all realms |
-| Studio | `GenerationHistory.search` falls through to the catalog past its 500-entry window | its own root's realm |
-| Kira | MCP `search_gallery` | **`realm = kira`, locked at the tool boundary** |
+| Todd | facet rail + saved searches in `GalleryView`, via `DAMStore` locally (no HTTP hop) | both realms |
+| Bree | MCP `search_gallery`, beside her existing `gallery_recent` | both realms |
+| Studio | `GenerationHistory.search` falls through to the catalog past its 500-entry window | both realms |
+| Kira | MCP `search_gallery` | **`realm = kira` only, locked at the tool boundary** |
 
-Kira's realm lock is applied server-side, not as a parameter she supplies. She
-cannot express a query that reaches Todd's or Bree's assets. This preserves the
+Kira's realm lock is applied service-side, not as a parameter she supplies. She
+cannot express a query that reaches a `shared` asset. This preserves the
 isolation boundary already set for the backroom: no persona or content bleed.
 
 ### Kira's memory
@@ -241,7 +315,7 @@ prompt.
 Cheap and almost entirely GPU-free, because the data already exists in two
 places: embedded in the files, and in the server sidecars.
 
-1. **`exiftool` sweep over all three trees — the primary source.** Recovers
+1. **`exiftool` sweep over all four trees — the primary source.** Recovers
    prompt, LoRAs with scales, seed, steps, guidance, model, dimensions and
    `Software` from `EXIF:UserComment` / `ImageDescription` / `XMP`. Because EXIF
    rides the file copy, this covers the server trees as well as the Mac.
@@ -251,8 +325,8 @@ places: embedded in the files, and in the server sidecars.
 3. **Finder tags** (`_kMDItemUserTags`) supply existing color labels for Mac
    assets. Mac-realm only — the xattr does not survive the copy.
 4. **Deduplication** — `sha256`, falling back to `recovered_from` and the
-   filename UUID, merges each Mac original with its server copy into one asset
-   with two locations.
+   filename UUID, merges each Mac original with its server and vault copies into
+   one asset with several locations.
 5. **Vision captions last, and only** where `prompt IS NULL AND caption IS NULL`
    after steps 1–2 — a far smaller set than the 129 rows estimated before the
    EXIF sweep was known to exist. Low-priority queue that never competes with a
@@ -267,9 +341,12 @@ record" — reconstructs the catalog from scratch if it is deleted.
   kira-scoped query never returns a row whose realm is not `kira`.
 - **Sealed rows carry no text** — a sealed render produces a row with facets and
   with `prompt`, `negative_prompt`, `caption` all NULL and no FTS entry.
-- **Engine write path** — a render carrying `catalog` facets produces a row with
+- **Render reporting** — a render carrying `catalog` facets produces a row with
   those facets non-null. This is the exact failure that left the current columns
   empty; it must be asserted, not assumed.
+- **Lossy reporting is safe** — with `gallery-serve` stopped, a render still
+  lands on disk with full embedded metadata and is picked up by the next
+  backfill sweep. No queue, no retry, no lost asset.
 - **Rebuildability** — delete the catalog, re-run backfill, get the same rows.
   This is the property that makes the catalog safe to treat as derived.
 - **Write-back round-trip** — a rating/tag set in the gallery is readable by
@@ -284,24 +361,40 @@ record" — reconstructs the catalog from scratch if it is deleted.
   indexed by `AssetIngestor`.
 - **Permissions** — catalog file is `0600` in a `0700` directory after init on
   both boxes.
+- **Vault is never written** — after backfill, write-back, and a full test run,
+  no file under the vault root has a changed mtime, size or xattr set. Asserted,
+  not assumed; this is the invariant most likely to be violated by accident.
 
 ## Sequencing and rollback
 
-The engine write path is the only piece requiring a rebuild, a Developer-ID
-re-sign and a restart — the riskiest action available per
-`~/.comfybox/CHECKPOINT-video-known-good-20260730.md`. It goes **last**, as its
-own deploy with the existing rollback (binary backup
-`ComfyBox.bak-KNOWN-GOOD-20260730`, restart under
-`~/.kira/coordination/comfybox-restart.lock`).
+This is two implementation plans, split at the engine boundary.
 
-Order:
+**Plan A — nothing signed, nothing restarted.**
 
 1. Schema migration + permissions tightening (additive; no reader changes).
-2. Backfill (read-only against media; writes only the catalog).
-3. Query API + `DAMStore` query methods.
+2. Backfill: `exiftool` sweep, sidecars, journals, dedup.
+3. `ComfyBox gallery-serve` subcommand + launchd agent + `DAMStore` query
+   methods.
 4. Consumers: desktop facets, Bree MCP tool, Kira MCP tool, Studio fallthrough.
-5. Engine write path — separate deploy, separate rollback.
 
-Steps 1–4 are fully testable against the current engine binary. Every step is
-independently revertible; the catalog is additive throughout, so reverting any
-step leaves the existing four indexes working exactly as they do today.
+The `gallery-serve` subcommand ships in the same binary as the engine, so step 3
+does involve a build — but **the running engine is not replaced or restarted**.
+The new agent launches the freshly built binary in a separate process while
+`com.barkadabrew.comfybox` keeps running the checkpointed one. Rollback is
+`launchctl bootout` of the new agent; nothing else changes.
+
+**Plan B — the one deploy that touches the engine.**
+
+5. Render reporting from the engine, `sealed` embed gating, metadata write-back.
+
+This is the only piece requiring the running engine to be replaced: rebuild,
+Developer-ID re-sign, and a restart — the riskiest action available per
+`~/.comfybox/CHECKPOINT-video-known-good-20260730.md`. It deploys on its own,
+with the existing rollback (binary backup `ComfyBox.bak-KNOWN-GOOD-20260730`,
+restart under `~/.kira/coordination/comfybox-restart.lock`).
+
+Plan A alone already delivers the ask: Kira stops being capped at two days of
+memory, and every gallery becomes searchable across all three trees. Plan B is
+what stops the index from drifting again. Every step is independently
+revertible; the catalog is additive throughout, so reverting any step leaves the
+existing four indexes working exactly as they do today.
