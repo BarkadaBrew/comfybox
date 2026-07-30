@@ -859,15 +859,22 @@ public actor CatalogStore {
     /// Backfill needs the owner EXACTLY: writing a second row with an existing
     /// `absolute_path` violates NOT NULL UNIQUE, and `ON CONFLICT(id)` does not
     /// absorb it, so the throw aborts the whole sweep.
-    public func assetID(owningPath path: String, scope: CatalogRealm? = nil) throws -> String? {
+    ///
+    /// DELIBERATELY UNSCOPED, and the only lookup here that is. This answers a
+    /// WRITE-path question — "does a row already own this path?" — whose true
+    /// answer does not depend on who is asking. A scoped variant would return
+    /// nil for an owner in the other realm, the caller would mint a new id, and
+    /// the UNIQUE collision (and the aborted sweep) would be straight back. A
+    /// caller that wants the anti-oracle behaviour wants
+    /// `assetID(forPath:scope:)`, which is a different question.
+    public func assetID(owningPath path: String) throws -> String? {
         var stmt: OpaquePointer?
-        let sql = "SELECT id FROM assets WHERE absolute_path = ?1 AND (?2 IS NULL OR realm = ?2)"
+        let sql = "SELECT id FROM assets WHERE absolute_path = ?1"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, path)
-        bindText(stmt, 2, scope?.rawValue)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         return text(stmt, 0)
     }

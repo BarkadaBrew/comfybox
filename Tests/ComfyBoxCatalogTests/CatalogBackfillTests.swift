@@ -306,9 +306,16 @@ final class CatalogBackfillTests: XCTestCase {
     }
 
     /// Swift cannot check that a field added to `FileMetadata` is also mapped in
-    /// `CatalogBackfill.row(file:existing:meta:)` — every `CatalogAsset.init`
-    /// parameter is defaulted, so forgetting one compiles clean and silently
-    /// drops the fact. That is exactly how `lane` was lost. This is the tripwire.
+    /// `CatalogBackfill.row(...)` — every `CatalogAsset.init` parameter is
+    /// defaulted, so forgetting one compiles clean and silently drops the fact.
+    ///
+    /// What this CATCHES: a field added to (or removed from) `FileMetadata`
+    /// without a matching decision in `row`.
+    /// What it does NOT catch: a field that exists and is mapped but that no
+    /// READER ever populates — which is what actually happened to `lane` (it was
+    /// already a property here; `readSidecar` simply never set it). Only a test
+    /// that feeds a real fixture through a reader catches that, and
+    /// `MetadataReaderTests.testSidecarSuppliesTheFilingLane` is that test.
     func testEveryFileMetadataFieldIsMapped() {
         let labels = Mirror(reflecting: FileMetadata()).children.compactMap(\.label).sorted()
         XCTAssertEqual(labels, [
@@ -411,7 +418,7 @@ final class CatalogBackfillTests: XCTestCase {
         var meta = FileMetadata()
         meta.software = "CoffeeShop Desktop (ComfyBox)"
         meta.provider = "Krita"
-        XCTAssertEqual(CatalogBackfill.sourceLabel(meta), "krita")
+        XCTAssertEqual(CatalogBackfill.sourceLabel([meta]), "krita")
 
         // And end to end: a shared asset files by `source` alone.
         try write("tile.png", bytes: "K", tree: "home")
@@ -568,6 +575,91 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(rows.first?.seed, 42)
         XCTAssertNil(rows.first?.durationMs,
                      "history's durationMs is render time, not clip length — it must not become a duration")
+    }
+
+    /// The journal and history know DISJOINT things about the same render — the
+    /// journal has the lane, history has the character — so an output named in
+    /// both must end up with both. Letting one stand in for the other drops the
+    /// filing key of whichever lost.
+    func testAJournalLineAndAHistoryRecordForOneOutputBothSurvive() async throws {
+        try write("Kira/generated/both.png", bytes: "B", tree: "kira/gallery")
+        let journal = try write("render-journal.jsonl", bytes: """
+            {"ts":1,"tier":"neutral","lane":"tile","theme":"balcony","path":"/home/todd/.kira/studio/gallery/Kira/generated/both.png"}
+            """, tree: "kira")
+        let history = try write("history.json", bytes: """
+            {"version":1,"records":[
+              {"id":"r-9","prompt":"a quiet balcony","character":"kira","provider":"comfybox",
+               "seed":7,"outputPath":"/home/todd/.kira/studio/gallery/Kira/generated/both.png"}]}
+            """, tree: "kira")
+        let report = try await CatalogBackfill.run(
+            store: store, trees: journalTrees(journal: journal, history: history))
+        XCTAssertEqual(report.journalEntriesRead, 2)
+
+        let rows = try await store.search(CatalogQuery(scope: .kira, limit: 500))
+        XCTAssertEqual(rows.first?.lane, "tile", "the journal's lane")
+        XCTAssertEqual(rows.first?.theme, "balcony")
+        XCTAssertEqual(rows.first?.characterName, "kira", "AND history's character")
+        XCTAssertEqual(rows.first?.prompt, "a quiet balcony")
+        XCTAssertEqual(rows.first?.seed, 7)
+        let filed = try await store.search(CatalogQuery(scope: .kira, collectionID: "col-kira-decoupage"))
+        XCTAssertEqual(filed.count, 1)
+    }
+
+    /// `provider` and `software` never live in the same source: only embedded
+    /// EXIF sets software, only the sidecar and history set provider. So the
+    /// label has to be resolved across ALL of them — otherwise the first source
+    /// carrying EITHER wins, an EXIF display string lands in `source`, and the
+    /// asset files nowhere, since `source` is a shared asset's only filing input.
+    func testAProviderFromAnySourceBeatsSoftwareFromAnySource() async throws {
+        var embedded = FileMetadata()
+        embedded.software = "CoffeeShop Desktop (ComfyBox)"
+        var fromHistory = FileMetadata()
+        fromHistory.provider = "Krita"
+        XCTAssertEqual(CatalogBackfill.sourceLabel([embedded, fromHistory]), "krita",
+                       "embedded is FIRST and still loses — provider is the filing key")
+
+        // And through the fold, which is where resolving per source would put
+        // the EXIF display string in the column: embedded carries software and
+        // is applied first, history carries provider and is applied last.
+        let identity = CatalogBackfill.FileFacts(
+            id: "a1", kind: "image", filename: "shot.png", absolutePath: "/tmp/shot.png",
+            sha256: "sha", fileSize: 3, createdAt: Date(), realm: .shared)
+        let folded = CatalogBackfill.fold(identity: identity, existing: nil,
+                                          sources: [embedded, fromHistory])
+        XCTAssertEqual(folded.source, "krita",
+                       "the label is resolved across ALL sources, not folded per source")
+
+        // End to end, with the tree that has no sidecars at all (the Mac home
+        // gallery) and a history record that names the producer.
+        try write("shot.png", bytes: "S", tree: "home")
+        let history = try write("history.json", bytes: """
+            {"version":1,"records":[
+              {"id":"r-1","provider":"krita","outputPath":"\(root!)/home/shot.png"}]}
+            """, tree: "home-journals")
+        let homeTree = [
+            BackfillTree(id: "home", realm: nil, host: "mac",
+                         mediaRoot: root + "/home", metadataRoot: nil,
+                         historyPath: history),
+        ]
+        _ = try await CatalogBackfill.run(store: store, trees: homeTree)
+        let filed = try await store.search(CatalogQuery(scope: .shared, collectionID: "col-decoupage"))
+        XCTAssertEqual(filed.count, 1, "history's provider files the asset")
+        XCTAssertEqual(filed.first?.source, "krita")
+    }
+
+    /// The basename fallback is scoped to the CLIP's realm. Here the only asset
+    /// with that basename lives in the other realm, so the guess must fail —
+    /// unscoped it would mint an edge across the boundary.
+    func testTheBasenameFallbackWillNotReachIntoAnotherRealm() async throws {
+        try write("shared-still.png", bytes: "SHARED", tree: "home")
+        try write("Kira/video/clip.mp4", bytes: "CLIP", tree: "kira/gallery")
+        try writeSidecar("Kira/video/clip.json", json: """
+            {"mode":"i2v","source_image":"/home/todd/.kira/studio/gallery/Kira/generated/shared-still.png"}
+            """, tree: "kira/metadata")
+
+        let report = try await CatalogBackfill.run(store: store, trees: trees())
+        XCTAssertEqual(report.edgesCreated, 0, "her clip may not be linked to a shared still by a guess")
+        XCTAssertEqual(report.edgesUnresolved, 1)
     }
 
     /// `contentMode` from history gets the same fruit-tier gate the journal's

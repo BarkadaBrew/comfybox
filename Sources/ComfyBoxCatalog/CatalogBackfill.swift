@@ -8,12 +8,13 @@
 //           This is a second pass because the still may be indexed after the
 //           clip that references it.
 //
-// Within ONE file, metadata is resolved strongest-first:
-//   embedded EXIF  →  JSON sidecar  →  journal / history  →  container probe
-// and every step only fills what is still nil. The chain is per-file on purpose:
-// a weak source applied while sweeping an EARLIER tree would permanently block
-// the authoritative sidecar found in a later one, because the merge rule across
-// trees is "first non-nil wins, forever".
+// Within ONE file the sources are collected STRONGEST FIRST —
+//   JSON sidecar  →  embedded EXIF  →  render journal  →  history  →  container probe
+// — and folded in that order, each filling only what the ones before it left
+// unknown. The chain is per-file on purpose: a weak source applied while
+// sweeping an EARLIER tree would permanently block the authoritative sidecar
+// found in a later one, because the merge rule ACROSS trees is "first non-nil
+// wins, forever".
 //
 // Realm is recovered from which tree holds the copy: an asset with a twin under
 // a Kira tree is hers; anything else is shared. It cannot come from the Mac
@@ -145,8 +146,8 @@ public enum CatalogBackfill {
         var pendingEdges: [PendingEdge] = []
 
         for tree in trees {
-            let journal = journalIndex(for: tree)
-            report.journalEntriesRead += journal.count
+            let journals = journalIndex(for: tree)
+            report.journalEntriesRead += journals.count
 
             for path in mediaFiles(under: tree.mediaRoot) {
                 report.filesScanned += 1
@@ -188,9 +189,11 @@ public enum CatalogBackfill {
                 if kind == "image", let embedded = MetadataReader.readEmbedded(path: path) {
                     sources.append(embedded)
                 }
-                if let jmeta = journal[path] {
-                    sources.append(jmeta)
-                }
+                // Journal AND history, in that order. They carry DISJOINT
+                // fields — the journal knows lane/tier/theme/stock, history
+                // knows character/provider/prompt/seed — so letting one stand in
+                // for the other drops the filing key of whichever lost.
+                sources.append(contentsOf: journals.sources(for: path))
                 // The container is the only trustworthy source of duration —
                 // real sidecars record `"duration": null` — and the only source
                 // at all of fps/frames.
@@ -348,44 +351,70 @@ public enum CatalogBackfill {
         return ids.count == 1 ? ids[0] : nil
     }
 
-    /// Journal + history facts for one tree, keyed by LOCAL path.
+    /// One tree's journal and history, kept APART and keyed by local path.
     ///
-    /// These are the lowest-precedence source and, for most of the fleet, the
-    /// only one that knows the lane: it appears in 131/400 image sidecars and
-    /// 3/200 video ones, so without this roughly two thirds of the catalog files
+    /// Apart, because the two files know disjoint things: the journal has
+    /// lane / tier / theme / stock / style / genre / family, history has
+    /// prompt / character / contentMode / seed / provider / renderID. An output
+    /// named in both is the normal case, and merging them into one dictionary
+    /// meant whichever file was read first silently deleted the other's facts —
+    /// including `character`, which is her filing key, and `provider`, which is
+    /// the shared realm's. Two entries in the source list costs nothing: that is
+    /// exactly what `fold` is for.
+    struct JournalSources {
+        var journal: [String: FileMetadata] = [:]
+        var history: [String: FileMetadata] = [:]
+
+        var count: Int { journal.count + history.count }
+
+        /// Journal ahead of history — the journal is the more specific record of
+        /// what was rendered, history the general one.
+        func sources(for path: String) -> [FileMetadata] {
+            [journal[path], history[path]].compactMap { $0 }
+        }
+    }
+
+    /// These are the lowest-precedence sources and, for most of the fleet, the
+    /// only ones that know the lane: it appears in 131/400 image sidecars and
+    /// 3/200 video ones, so without them roughly two thirds of the catalog files
     /// into no collection at all.
-    static func journalIndex(for tree: BackfillTree) -> [String: FileMetadata] {
-        var out: [String: FileMetadata] = [:]
-        func absorb(_ entries: [MetadataReader.JournalEntry]) {
+    static func journalIndex(for tree: BackfillTree) -> JournalSources {
+        var out = JournalSources()
+        func absorb(_ entries: [MetadataReader.JournalEntry],
+                    into index: inout [String: FileMetadata]) {
             for e in entries {
                 guard !isVaultPath(e.path) else { continue }
                 let local = tree.localPath(for: e.path) ?? e.path
-                // Several journal lines can describe one output (a retry, a
+                // Several lines in ONE file can describe one output (a retry, a
                 // re-render). The first wins, the same rule the rest of the
                 // sweep uses. (Not "first wins per FIELD": that would need a
                 // second copy of the field list, which is the bug class this
                 // whole design is trying to close.)
-                if out[local] == nil { out[local] = e.meta }
+                if index[local] == nil { index[local] = e.meta }
             }
         }
         let fm = FileManager.default
         if let p = tree.journalPath, !isVaultPath(p), let d = fm.contents(atPath: p) {
-            absorb(MetadataReader.readRenderJournal(jsonlData: d))
+            absorb(MetadataReader.readRenderJournal(jsonlData: d), into: &out.journal)
         }
         if let p = tree.historyPath, !isVaultPath(p), let d = fm.contents(atPath: p) {
-            absorb(MetadataReader.readHistory(jsonData: d))
+            absorb(MetadataReader.readHistory(jsonData: d), into: &out.history)
         }
         return out
     }
 
-    /// Which application produced this. The SIDECAR is authoritative — `provider`
-    /// is a key CollectionRules matches on ("krita", "tile-engine") — while
-    /// `EXIF:Software` is a human display string ("CoffeeShop Desktop
-    /// (ComfyBox)") that matches no rule. Taking software first made `source` a
-    /// display name and unfiled every shared-realm asset, since `source` is the
-    /// only filing input a shared asset has.
-    static func sourceLabel(_ meta: FileMetadata) -> String? {
-        (meta.provider ?? meta.software)?.lowercased()
+    /// Which application produced this, across every source at once.
+    ///
+    /// `provider` — from the sidecar or history — is a key CollectionRules
+    /// matches on ("krita", "tile-engine"). `EXIF:Software` is a human display
+    /// string ("CoffeeShop Desktop (ComfyBox)") that matches no rule. So ANY
+    /// source's provider beats ANY source's software: an image with embedded
+    /// software, no sidecar and a history record naming krita must still file as
+    /// krita, since `source` is the only filing input a shared asset has.
+    static func sourceLabel(_ sources: [FileMetadata]) -> String? {
+        let provider = sources.compactMap(\.provider).first
+        let software = sources.compactMap(\.software).first
+        return (provider ?? software)?.lowercased()
     }
 
     /// Fold every source into one row, strongest first.
@@ -397,9 +426,17 @@ public enum CatalogBackfill {
     /// next to the exiftool call standing beside it.
     static func fold(identity: FileFacts, existing: CatalogAsset?,
                      sources: [FileMetadata]) -> CatalogAsset {
-        var acc = row(file: identity, existing: existing, meta: sources.first ?? FileMetadata())
+        // `source` is resolved across ALL sources FIRST, not folded per source.
+        // provider and software never appear in the same source — only
+        // readEmbedded sets software, only the sidecar and history set provider
+        // — so folding it would hand the column to whichever source came first
+        // regardless of which field it carried, and an EXIF display string in
+        // `source` unfiles every shared-realm asset.
+        let label = sourceLabel(sources)
+        var acc = row(file: identity, existing: existing,
+                      meta: sources.first ?? FileMetadata(), source: label)
         for source in sources.dropFirst() {
-            acc = row(file: identity, existing: acc, meta: source)
+            acc = row(file: identity, existing: acc, meta: source, source: label)
         }
         return acc
     }
@@ -411,7 +448,8 @@ public enum CatalogBackfill {
     /// re-sweep idempotent and stops a later tree overwriting an earlier one.
     /// `sealed` is the single exception — it ORs, so any source that says a row
     /// is sealed seals it, and `CatalogAsset.init` then drops the text.
-    static func row(file: FileFacts, existing: CatalogAsset?, meta: FileMetadata) -> CatalogAsset {
+    static func row(file: FileFacts, existing: CatalogAsset?, meta: FileMetadata,
+                    source: String?) -> CatalogAsset {
         CatalogAsset(
             id: file.id, kind: file.kind,
             filename: file.filename, absolutePath: file.absolutePath,
@@ -419,7 +457,7 @@ public enum CatalogBackfill {
             width: existing?.width ?? meta.width, height: existing?.height ?? meta.height,
             createdAt: existing?.createdAt ?? file.createdAt,
             realm: file.realm,
-            source: existing?.source ?? sourceLabel(meta),
+            source: existing?.source ?? source,
             sealed: (existing?.sealed ?? false) || meta.sealed,
             prompt: existing?.prompt ?? meta.prompt,
             negativePrompt: existing?.negativePrompt ?? meta.negativePrompt,

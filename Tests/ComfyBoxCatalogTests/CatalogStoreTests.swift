@@ -241,9 +241,6 @@ final class CatalogStoreTests: XCTestCase {
             try await store.file(assetID: "s1", into: "col-kira-still-life", by: .kira))
     }
 
-    /// The prohibition belongs to the data, not to the caller: the service actor
-    /// (nil) used to bypass it, so backfill or the desktop app could put a shared
-    /// row inside her realm.
     /// A filename is the most guessable key in the schema, so the lookup that
     /// takes one carries the same realm lock every other lookup here does.
     /// Without it, backfill's basename fallback could link a clip to a still in
@@ -264,6 +261,9 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(unscoped.count, 2, "the service still sees both")
     }
 
+    /// The prohibition belongs to the data, not to the caller: the service actor
+    /// (nil) used to bypass it, so backfill or the desktop app could put a shared
+    /// row inside her realm.
     func testNotEvenTheServiceCanFileASharedRowIntoAKiraCollection() async throws {
         try await store.upsert(make("s1", realm: .shared), explicitCollectionIDs: [])
         await XCTAssertThrowsErrorAsync(

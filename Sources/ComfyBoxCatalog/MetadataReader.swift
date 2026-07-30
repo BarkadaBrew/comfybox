@@ -146,7 +146,11 @@ public enum MetadataReader {
         m.modelFamily = obj["model"] as? String
         m.preset = obj["preset"] as? String
         m.characterName = obj["character"] as? String
-        m.contentMode = obj["content_mode"] as? String
+        // Gated like every other tier value here. The sidecar is the STRONGEST
+        // source, so a bad value would be the hardest to displace, and an
+        // unrecognised content_mode ranks above every ceiling (tierRank fails
+        // closed) — withholding the asset from everyone rather than from nobody.
+        m.contentMode = fruitTier(obj["content_mode"])
         // `lane` is the whole derived-filing key (CollectionRules maps it to the
         // body of work), and a sidecar is the ONLY place it is ever written —
         // nothing embeds it. Omitting it here left every backfilled asset
