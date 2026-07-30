@@ -52,9 +52,9 @@ which delegates to the same library. No code is duplicated and no decision is re
 | `CatalogBackfill.swift` | sweep orchestration: walk trees, dedup, file into collections, build edges. |
 | `CollectionRules.swift` | the lane/source/preset → collection rule table. Pure, table-driven. |
 | `HTTPKit.swift` | minimal `NWListener` HTTP server: request parse, routing, JSON/binary responses. |
-| `GalleryServer.swift` | the routes themselves + `runCLI(args:)`. |
+| `GalleryServer.swift` | the routes themselves + `runCLIEntryPoint(args:)`. |
 
-**New — `Sources/ComfyBoxGallery/main.swift`** — 10 lines, calls `GalleryServer.runCLI`.
+**New — `Sources/ComfyBoxGallery/main.swift`** — 10 lines, calls `GalleryServer.runCLIEntryPoint`.
 
 **New — `Tests/ComfyBoxCatalogTests/`** — one test file per source file above.
 
