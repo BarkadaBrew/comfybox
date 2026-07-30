@@ -804,6 +804,42 @@ public actor CatalogStore {
         return text(stmt, 0)
     }
 
+    /// Settle an asset's realm once a twin is found in a realm-bearing tree.
+    /// Backfill-only: realm is otherwise stamped by the caller at render time.
+    public func setRealm(_ realm: CatalogRealm, forAssetID id: String) throws {
+        try execBind("UPDATE assets SET realm = ?2 WHERE id = ?1",
+                     [.text(id), .text(realm.rawValue)])
+        // Filing depends on realm, so re-derive it. Fetch the row by id —
+        // a limit-1 search would almost never contain it.
+        if let row = try asset(id: id) {
+            try applyDerivedFiling(row, explicitCollectionIDs: [])
+        }
+    }
+
+    /// Fetch one row by id, unscoped and unclamped. Internal helper for
+    /// backfill; consumers go through `search`, which applies the realm lock.
+    public func asset(id: String) throws -> CatalogAsset? {
+        let sql = """
+            SELECT a.id, a.kind, a.filename, a.absolute_path, a.sha256, a.file_size,
+                   a.width, a.height, a.created_at, a.realm, a.source, a.sealed,
+                   a.prompt, a.negative_prompt, a.prompt_raw, a.caption, a.caption_source,
+                   a.seed, a.steps, a.guidance, a.model_family, a.preset, a.loras,
+                   a.render_id, a.content_mode, a.character_name,
+                   a.lane, a.arc, a.theme, a.stock, a.genre, a.family, a.style,
+                   a.mode, a.duration_ms, a.fps, a.frames, a.resolution, a.aspect_ratio,
+                   a.rating, a.favorite
+            FROM assets a WHERE a.id = ?1
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return rowToAsset(stmt)
+    }
+
     // MARK: - Facets
 
     public func facets(scope: CatalogRealm?) throws -> CatalogFacets {

@@ -120,6 +120,11 @@ public enum MetadataReader {
         m.preset = obj["preset"] as? String
         m.characterName = obj["character"] as? String
         m.contentMode = obj["content_mode"] as? String
+        // `lane` is the whole derived-filing key (CollectionRules maps it to the
+        // body of work), and a sidecar is the ONLY place it is ever written —
+        // nothing embeds it. Omitting it here left every backfilled asset
+        // permanently unfiled.
+        m.lane = obj["lane"] as? String
         m.mode = obj["mode"] as? String
         m.resolution = obj["resolution"] as? String
         m.aspectRatio = obj["aspect_ratio"] as? String

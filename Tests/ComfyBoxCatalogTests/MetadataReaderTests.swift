@@ -88,6 +88,15 @@ final class MetadataReaderTests: XCTestCase {
                       "sidecar duration must be ignored even when present — container probe is the only trusted source")
     }
 
+    /// `lane` decides which body of work an asset is filed into and appears
+    /// NOWHERE else — not in EXIF, not in the container. If the sidecar reader
+    /// drops it, every backfilled asset lands in no collection at all.
+    func testSidecarSuppliesTheFilingLane() throws {
+        let json = #"{"character":"kira","lane":"tile","content_mode":"neutral"}"#
+        let m = try XCTUnwrap(MetadataReader.readSidecar(jsonData: Data(json.utf8)))
+        XCTAssertEqual(m.lane, "tile")
+    }
+
     func testSealedSidecarIsFlagged() throws {
         let json = #"{"character":"bree","sealed":true,"content_mode":"apple"}"#
         let m = try XCTUnwrap(MetadataReader.readSidecar(jsonData: Data(json.utf8)))
