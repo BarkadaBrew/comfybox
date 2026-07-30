@@ -849,6 +849,26 @@ public actor CatalogStore {
         return rowToAsset(stmt)
     }
 
+    /// Fetch one row by id for a SERVICE caller: BOTH rules apply, exactly as
+    /// they do in `search`.
+    ///
+    /// The realm lock is why this exists rather than the route calling
+    /// `asset(id:)` and checking `realm` itself — and the clamp is why the route
+    /// cannot call `asset(id:)` at all. `asset(id:)` is unclamped by design
+    /// (backfill needs the true row), so a detail route built on it would hand
+    /// back the prompt and the on-disk path of a row that the very same
+    /// caller's `search` had just withheld. One row by id is not a way around
+    /// the ceiling.
+    ///
+    /// Out of realm returns nil, indistinguishable from "no such id" — the
+    /// caller cannot tell absence from exclusion, which is the point.
+    public func asset(id: String, visibleTo scope: CatalogRealm?,
+                      ceiling: String?) throws -> CatalogAsset? {
+        guard let row = try asset(id: id) else { return nil }
+        if let scope, row.realm != scope { return nil }
+        return clamp(row, to: ceiling)
+    }
+
     /// The asset that OWNS this path — the one whose `absolute_path` it is.
     ///
     /// Deliberately NOT `assetID(forPath:)`. That one is a UNION over

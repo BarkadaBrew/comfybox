@@ -412,6 +412,44 @@ final class CatalogStoreTests: XCTestCase {
         let f = try await store.facets(scope: .kira)
         XCTAssertEqual(f.lane["shoot"], 2)
     }
+
+    // MARK: - The service-side by-id fetch
+
+    /// `asset(id:)` is the unscoped, unclamped backfill helper. The variant a
+    /// SERVICE calls carries both rules, or fetching one row by id becomes the
+    /// way around the two the store exists to enforce.
+    func testScopedByIDFetchAppliesBothTheRealmLockAndTheClamp() async throws {
+        try await store.upsert(make("k1", realm: .kira, tier: "avocado", prompt: "a nightclub"),
+                               explicitCollectionIDs: [])
+        try await store.upsert(make("s1", realm: .shared, prompt: "a tulip"),
+                               explicitCollectionIDs: [])
+
+        // Realm lock: out of scope is nil, not a row — and nil is also the
+        // answer for an id that does not exist, so the two are indistinguishable.
+        let shared = try await store.asset(id: "s1", visibleTo: .kira, ceiling: nil)
+        XCTAssertNil(shared)
+        let missing = try await store.asset(id: "no-such-id", visibleTo: .kira, ceiling: nil)
+        XCTAssertNil(missing)
+
+        // Clamp: above the ceiling the label survives, the text and path do not.
+        let clamped = try await XCTUnwrapAsync(
+            try await store.asset(id: "k1", visibleTo: .kira, ceiling: "apple"))
+        XCTAssertNil(clamped.prompt)
+        XCTAssertEqual(clamped.absolutePath, "")
+        XCTAssertEqual(clamped.contentMode, "avocado")
+
+        // No ceiling, in scope: the whole row.
+        let full = try await XCTUnwrapAsync(
+            try await store.asset(id: "k1", visibleTo: .kira, ceiling: nil))
+        XCTAssertEqual(full.prompt, "a nightclub")
+        XCTAssertEqual(full.absolutePath, "/tmp/k1.png")
+    }
+}
+
+/// `XCTUnwrap` on an async expression needs the value materialised first.
+func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath,
+                       line: UInt = #line) throws -> T {
+    try XCTUnwrap(value, file: file, line: line)
 }
 
 /// XCTAssertThrowsError has no async form in this toolchain.
