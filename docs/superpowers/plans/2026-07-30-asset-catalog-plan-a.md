@@ -2535,13 +2535,25 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(dreams.count, 1, "t2v files into Dreams & Memories")
     }
 
-    func testTheVaultIsNeverTouched() async throws {
-        // A tree list may never include a vault path. This is a guard on the
-        // caller contract, asserted so a future edit cannot quietly add one.
-        for t in trees() {
-            XCTAssertFalse(t.mediaRoot.contains("Vaults"), "no tree may point into a vault")
-            XCTAssertFalse(t.metadataRoot?.contains("Vaults") ?? false)
-        }
+    /// The vault is out of scope. Assert BEHAVIOUR, not the fixture: a tree
+    /// pointing into a vault must be refused, and nothing under it read.
+    func testBackfillRefusesAVaultTree() async throws {
+        let vaultDir = root + "/Documents/Vaults/BarkadaAI"
+        try FileManager.default.createDirectory(atPath: vaultDir, withIntermediateDirectories: true)
+        let victim = vaultDir + "/private.png"
+        try Data("SECRET".utf8).write(to: URL(fileURLWithPath: victim))
+        let before = try FileManager.default.attributesOfItem(atPath: victim)[.modificationDate] as? Date
+
+        let bad = BackfillTree(id: "vault", realm: .shared, host: "kira",
+                               mediaRoot: vaultDir, metadataRoot: nil)
+        await XCTAssertThrowsErrorAsync(
+            try await CatalogBackfill.run(store: store, trees: trees() + [bad]))
+
+        // Nothing indexed from it, and the file itself untouched.
+        let rows = try await store.search(CatalogQuery(scope: nil, limit: 500))
+        XCTAssertFalse(rows.contains { $0.absolutePath.contains("Vaults") })
+        let after = try FileManager.default.attributesOfItem(atPath: victim)[.modificationDate] as? Date
+        XCTAssertEqual(before, after)
     }
 }
 ```
@@ -2591,6 +2603,16 @@ public struct BackfillTree: Sendable {
     }
 }
 
+public enum CatalogBackfillError: Error, LocalizedError {
+    case vaultPathRefused(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .vaultPathRefused(p): return "refusing to read a vault path: \(p)"
+        }
+    }
+}
+
 public struct BackfillReport: Sendable, Equatable {
     public var filesScanned = 0
     public var assetsIndexed = 0
@@ -2606,6 +2628,11 @@ public enum CatalogBackfill {
     static let videoExtensions: Set<String> = ["mp4", "mov", "m4v"]
 
     public static func run(store: CatalogStore, trees: [BackfillTree]) async throws -> BackfillReport {
+        // Bree's vault is out of scope, enforced here rather than only at the
+        // CLI, so no caller can reach it by constructing trees directly.
+        for t in trees where t.mediaRoot.contains("Vaults") || (t.metadataRoot?.contains("Vaults") ?? false) {
+            throw CatalogBackfillError.vaultPathRefused(t.mediaRoot)
+        }
         var report = BackfillReport()
 
         // Pass 1 — index, dedup, file.
