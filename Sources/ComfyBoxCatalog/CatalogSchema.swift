@@ -83,6 +83,33 @@ public enum CatalogSchema {
                           description: "The t2v work she makes to describe a dream or a memory."),
     ]
 
+    /// Create the pre-existing production `assets` shape when it is absent.
+    ///
+    /// `migrate` must NOT do this: on the live database a missing `assets` table
+    /// means something is badly wrong, and its first ALTER failing loudly is the
+    /// signal. But a brand-new file (a test temp path, a fresh install) has no
+    /// tables at all and has to start somewhere. So the greenfield case is a
+    /// separate, explicit call — `CREATE TABLE IF NOT EXISTS`, therefore a no-op
+    /// against any database that already has the table, whatever its columns.
+    /// Column list and types mirror the current production schema exactly so a
+    /// freshly created file and a migrated legacy one are indistinguishable.
+    public static func ensureBaseSchema(db: OpaquePointer?) throws {
+        try exec(db, """
+            CREATE TABLE IF NOT EXISTS assets (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'image',
+                filename TEXT NOT NULL, absolute_path TEXT NOT NULL UNIQUE,
+                file_size INTEGER NOT NULL DEFAULT 0, sha256 TEXT,
+                width INTEGER, height INTEGER,
+                created_at REAL NOT NULL, modified_at REAL NOT NULL,
+                ingested_at REAL NOT NULL, orphaned INTEGER NOT NULL DEFAULT 0,
+                prompt TEXT, negative_prompt TEXT, seed INTEGER, steps INTEGER,
+                guidance REAL, model_family TEXT,
+                rating INTEGER NOT NULL DEFAULT 0, favorite INTEGER NOT NULL DEFAULT 0,
+                content_mode TEXT, character_name TEXT, source TEXT
+            )
+            """)
+    }
+
     public static func migrate(db: OpaquePointer?) throws {
         // Appended columns. A duplicate-column error means an earlier run already
         // added it, which is success — matching the existing `source` migration
