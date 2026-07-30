@@ -274,6 +274,7 @@ public enum GalleryServer {
         var kiraHistory: String? = nil
         var breeHistory: String? = nil
         var dbPath: String? = nil
+        var refile = false
 
         var i = 0
         while i < args.count {
@@ -283,6 +284,7 @@ public enum GalleryServer {
                 return args[i]
             }
             switch args[i] {
+            case "--refile": refile = true
             case "--home": if let v = value() { home = v }
             case "--kira-studio": if let v = value() { kiraRoot = v }
             case "--bree-studio": if let v = value() { breeRoot = v }
@@ -304,9 +306,16 @@ public enum GalleryServer {
                       --kira-history PATH         Kira's history.json
                       --bree-history PATH         Bree's history.json
                       --db PATH                   catalog database (default ~/.comfybox/dam.sqlite3)
+                      --refile                    re-run derived filing over every existing row
                     """)
                 exit(0)
-            default: break
+            default:
+                // Never ignore an unknown flag. A typo'd `--kira-studo` would
+                // otherwise drop an entire archive from the sweep and still exit
+                // 0 with a plausible-looking report — the silent-success failure
+                // this whole task exists to rule out.
+                FileHandle.standardError.write(Data("unknown argument: \(args[i])\n".utf8))
+                exit(2)
             }
             i += 1
         }
@@ -341,12 +350,16 @@ public enum GalleryServer {
 
         // Belt and braces: CatalogBackfill.run refuses these too, but a CLI that
         // can NAME a vault path is one edit away from reading one.
-        for t in trees {
-            for p in [t.mediaRoot, t.metadataRoot, t.journalPath, t.historyPath].compactMap({ $0 })
-            where p.contains("Vaults") {
-                FileHandle.standardError.write(Data("refusing to read a vault path: \(p)\n".utf8))
-                exit(2)
-            }
+        //
+        // `dbPath` is in this list because the read guards do not cover it: the
+        // catalog is a WRITE target full of raw prompt text, so
+        // `--db ~/Documents/Vaults/…/x.sqlite3` would CREATE a database inside
+        // the vault rather than read one out of it.
+        for p in trees.flatMap({ [$0.mediaRoot, $0.metadataRoot, $0.journalPath, $0.historyPath] })
+                      .compactMap({ $0 }) + [dbPath].compactMap({ $0 })
+        where p.contains("Vaults") {
+            FileHandle.standardError.write(Data("refusing a vault path: \(p)\n".utf8))
+            exit(2)
         }
 
         let sem = DispatchSemaphore(value: 0)
@@ -355,6 +368,10 @@ public enum GalleryServer {
                 let store = try await CatalogStore.open(path: dbPath)
                 let started = Date()
                 let report = try await CatalogBackfill.run(store: store, trees: trees)
+                // AFTER the sweep, so rows it just re-realmed are filed under the
+                // realm they ended up with rather than the one they started in.
+                var refiled: Int? = nil
+                if refile { refiled = try await store.refileAll() }
                 let elapsed = Date().timeIntervalSince(started)
                 // Every counter, including the three that report ABSENCE.
                 // `edgesUnresolved` and `assetsUnfiled` are the difference
@@ -372,6 +389,7 @@ public enum GalleryServer {
                     skipped:    \(report.skipped)
                     elapsed:    \(String(format: "%.1fs", elapsed))
                     """)
+                if let refiled { print("refiled:    \(refiled) assets now in ≥1 collection") }
             } catch {
                 FileHandle.standardError.write(Data("backfill failed: \(error)\n".utf8))
                 exit(1)

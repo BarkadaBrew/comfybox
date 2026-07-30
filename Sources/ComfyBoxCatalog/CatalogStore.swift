@@ -176,9 +176,15 @@ public actor CatalogStore {
     private var db: OpaquePointer?
     public let dbPath: String
 
-    private init(db: OpaquePointer, dbPath: String) {
+    /// True only when `open` resolved the default `~/.comfybox` location itself.
+    /// The 0700 directory contract belongs to THAT directory, not to whatever
+    /// directory a caller's `--db` happens to sit in.
+    private let ownsDirectory: Bool
+
+    private init(db: OpaquePointer, dbPath: String, ownsDirectory: Bool) {
         self.db = db
         self.dbPath = dbPath
+        self.ownsDirectory = ownsDirectory
     }
 
     public static func open(path: String? = nil) async throws -> CatalogStore {
@@ -207,7 +213,7 @@ public actor CatalogStore {
             throw CatalogError.prepareFailed(msg)
         }
 
-        let store = CatalogStore(db: h, dbPath: resolved)
+        let store = CatalogStore(db: h, dbPath: resolved, ownsDirectory: path == nil)
         try await store.initialize()
         return store
     }
@@ -243,6 +249,12 @@ public actor CatalogStore {
         for suffix in ["-wal", "-shm"] {
             try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dbPath + suffix)
         }
+        // ONLY when this store chose the directory. Chmodding the parent of a
+        // caller-supplied `--db` silently changes the mode of whatever directory
+        // they named — `--db ~/Desktop/x.sqlite3` would make ~/Desktop 0700. The
+        // dry runs escaped that only because /tmp is root-owned and the `try?`
+        // swallowed the failure.
+        guard ownsDirectory else { return }
         try? fm.setAttributes([.posixPermissions: 0o700],
                               ofItemAtPath: (dbPath as NSString).deletingLastPathComponent)
     }
@@ -428,6 +440,51 @@ public actor CatalogStore {
                 """,
                 [.text(asset.id), .text(cid)])
         }
+    }
+
+    /// Re-run derived filing for EVERY row, and report how many assets ended up
+    /// in at least one collection.
+    ///
+    /// Derived filing is otherwise reachable only through `upsert`, and a
+    /// re-sweep takes the duplicate branch for almost every asset — which
+    /// upserts only when the folded row differs from the stored one. Nothing on
+    /// disk changes between sweeps, so nothing differs, so no filing runs. The
+    /// second live backfill demonstrated exactly that: `indexed: 0`,
+    /// `merged: 4734`, and the only new memberships came from the 10 rows whose
+    /// realm had changed. Without this, shipping new `CollectionRules` would
+    /// report success and file nothing.
+    ///
+    /// `applyDerivedFiling` deletes only `manual = 0` rows, so hand-filings
+    /// survive; that is the whole reason this is safe to re-run.
+    @discardableResult
+    public func refileAll() throws -> Int {
+        var ids: [String] = []
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT id FROM assets", -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0) { ids.append(String(cString: c)) }
+        }
+        sqlite3_finalize(stmt)
+
+        // One transaction for the lot: a partial refile would leave the catalog
+        // filed under a mix of the old and new rules with no way to tell which.
+        try CatalogSchema.exec(db, "SAVEPOINT catalog_refile")
+        do {
+            for id in ids {
+                guard let asset = try asset(id: id) else { continue }
+                // No explicit ids: this re-derives, it does not invent filings the
+                // caller never asked for.
+                try applyDerivedFiling(asset, explicitCollectionIDs: [])
+            }
+            try CatalogSchema.exec(db, "RELEASE catalog_refile")
+        } catch {
+            _ = try? CatalogSchema.exec(db, "ROLLBACK TO catalog_refile")
+            _ = try? CatalogSchema.exec(db, "RELEASE catalog_refile")
+            throw error
+        }
+        return ids.count - (try unfiledAssetCount())
     }
 
     // MARK: - Read

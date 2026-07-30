@@ -143,6 +143,40 @@ final class MetadataReaderTests: XCTestCase {
         }
     }
 
+    /// Only a RECOGNISED tier may be dropped. Dropping any directory would let a
+    /// nested asset reach the sidecar of a different asset one level up whenever
+    /// basenames collide, silently attaching another render's prompt, lane and
+    /// `source_image`.
+    func testSidecarCandidatesDoNotDropAnUnrecognisedDirectory() {
+        let candidates = MetadataReader.sidecarCandidates(
+            forMedia: "/s/gallery/Kira/sessions/2026-07-30/x.png",
+            galleryRoot: "/s/gallery", metadataRoot: "/s/metadata")
+        XCTAssertEqual(candidates, ["/s/metadata/Kira/sessions/2026-07-30/x.json"],
+                       "'2026-07-30' is not a content tier and must not be dropped")
+    }
+
+    /// Two DIFFERENT assets that share a basename under different tiers must each
+    /// resolve to their own sidecar, and neither may reach the other's.
+    func testSameBasenameUnderDifferentTiersDoNotCrossResolve() {
+        let a = MetadataReader.sidecarCandidates(
+            forMedia: "/s/gallery/Kira/generated/avocado/shot.png",
+            galleryRoot: "/s/gallery", metadataRoot: "/s/metadata")
+        let b = MetadataReader.sidecarCandidates(
+            forMedia: "/s/gallery/Kira/generated/banana/shot.png",
+            galleryRoot: "/s/gallery", metadataRoot: "/s/metadata")
+
+        XCTAssertEqual(a.first, "/s/metadata/Kira/generated/avocado/shot.json")
+        XCTAssertEqual(b.first, "/s/metadata/Kira/generated/banana/shot.json")
+        XCTAssertFalse(a.contains(b[0]), "avocado reached banana's sidecar")
+        XCTAssertFalse(b.contains(a[0]), "banana reached avocado's sidecar")
+        // They legitimately SHARE the flattened fallback — that is the archive's
+        // own shape (one sidecar per basename under …/generated) and is what the
+        // fix exists to reach. What must never happen is one tier's EXACT path
+        // being offered to the other.
+        XCTAssertEqual(a.last, "/s/metadata/Kira/generated/shot.json")
+        XCTAssertEqual(b.last, "/s/metadata/Kira/generated/shot.json")
+    }
+
     /// A backfill runs `runTool` over several thousand files in sequence; one
     /// hung child process (corrupt file, stalled filesystem, network-mounted
     /// media) must not stall the whole run. Uses an injected short timeout

@@ -199,9 +199,19 @@ public enum MetadataReader {
     /// unfiled with 2 i2v edges instead of ~274. The failure is invisible from
     /// the counters that only count what WAS read.
     ///
-    /// The fallback drops the single directory component above the file, and is
-    /// only ever consulted after the exact mirror misses, so a tree that really
-    /// does mirror is unaffected.
+    /// The fallback drops the tier directory above the file, and is only ever
+    /// consulted after the exact mirror misses, so a tree that really does mirror
+    /// is unaffected.
+    ///
+    /// It drops ONLY a directory named in `contentTiers`. Dropping an arbitrary
+    /// component would let a media file at depth ≥2 reach the sidecar of a
+    /// DIFFERENT asset one level up whenever two basenames collide — attaching
+    /// another render's prompt, lane and `source_image`, and minting a wrong i2v
+    /// edge from it. Nothing about that failure looks like a failure; it looks
+    /// like a hit. Kira's 2741 files happen to have no such collision today
+    /// (filenames are timestamp-prefixed), but that is luck, not construction.
+    public static let contentTiers: Set<String> = ["apple", "banana", "avocado", "neutral"]
+
     public static func sidecarCandidates(forMedia media: String,
                                          galleryRoot: String,
                                          metadataRoot: String) -> [String] {
@@ -211,10 +221,10 @@ public enum MetadataReader {
         // …/generated/avocado/x.json → …/generated/x.json
         let dir = (exact as NSString).deletingLastPathComponent
         let parent = (dir as NSString).deletingLastPathComponent
-        // Never climb out of the metadata root: a media file sitting directly in
-        // the gallery root has no tier to drop, and flattening it would point at
-        // a sibling of the metadata tree entirely.
-        if parent.hasPrefix(metadataRoot), parent.count >= metadataRoot.count, dir != metadataRoot {
+        // `hasPrefix` already keeps us inside the metadata root; a file sitting
+        // directly in the gallery root has no tier to drop.
+        if contentTiers.contains((dir as NSString).lastPathComponent),
+           parent.hasPrefix(metadataRoot), dir != metadataRoot {
             out.append((parent as NSString)
                 .appendingPathComponent((exact as NSString).lastPathComponent))
         }

@@ -29,6 +29,88 @@ final class CatalogStoreTests: XCTestCase {
                      family: family, mode: mode)
     }
 
+    /// The 0700 contract belongs to `~/.comfybox`, not to whatever directory a
+    /// caller's `--db` happens to name. Opening a store at an explicit path must
+    /// leave that directory's mode alone — otherwise `--db ~/Desktop/x.sqlite3`
+    /// silently makes ~/Desktop private.
+    func testExplicitDBPathDoesNotChmodTheCallersDirectory() async throws {
+        let dir = NSTemporaryDirectory() + "perm-test-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+
+        let dbFile = (dir as NSString).appendingPathComponent("x.sqlite3")
+        let s = try await CatalogStore.open(path: dbFile)
+        _ = try await s.unfiledAssetCount()
+
+        let mode = try FileManager.default.attributesOfItem(atPath: dir)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(mode?.int16Value, 0o755, "opening a store rewrote the caller's directory mode")
+        // The database file itself must still be locked down — that contract is
+        // about the file's contents and applies wherever it lives.
+        let fileMode = try FileManager.default
+            .attributesOfItem(atPath: dbFile)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(fileMode?.int16Value, 0o600)
+    }
+
+    // MARK: - refileAll
+
+    /// Derived filing is otherwise reachable only through `upsert`, which on a
+    /// re-sweep skips every asset whose folded row is unchanged. Without
+    /// `refileAll`, shipping new rules files nothing and still reports success.
+    func testRefileAllAppliesRulesThatDidNotExistAtIngestTime() async throws {
+        // Ingested with no lane and no tier — files nowhere.
+        try await store.upsert(make("a1", realm: .kira), explicitCollectionIDs: [])
+        let unfiledBefore = try await store.unfiledAssetCount()
+        XCTAssertEqual(unfiledBefore, 1)
+
+        // Simulate the row gaining a tier (as a re-sweep with better metadata
+        // would), then refile.
+        try await store.upsert(make("a1", realm: .kira, tier: "avocado"),
+                               explicitCollectionIDs: [])
+        let filed = try await store.refileAll()
+
+        XCTAssertEqual(filed, 1)
+        let unfiledAfter = try await store.unfiledAssetCount()
+        XCTAssertEqual(unfiledAfter, 0)
+        let inScenes = try await store.search(
+            CatalogQuery(scope: .kira, collectionID: "col-kira-adult-scenes"))
+        XCTAssertEqual(inScenes.map(\.id), ["a1"])
+    }
+
+    /// The whole reason `refileAll` is safe to re-run: it must never destroy a
+    /// filing a human made by hand.
+    func testRefileAllPreservesManualFilings() async throws {
+        try await store.upsert(make("m1", realm: .kira, tier: "avocado"),
+                               explicitCollectionIDs: [])
+        // A human files it somewhere the rules would never derive.
+        try await store.file(assetID: "m1", into: "col-kira-decoupage", by: nil)
+
+        try await store.refileAll()
+
+        let manual = try await store.search(
+            CatalogQuery(scope: .kira, collectionID: "col-kira-decoupage"))
+        XCTAssertEqual(manual.map(\.id), ["m1"], "refileAll destroyed a manual filing")
+        // …and the derived one is still applied alongside it.
+        let derived = try await store.search(
+            CatalogQuery(scope: .kira, collectionID: "col-kira-adult-scenes"))
+        XCTAssertEqual(derived.map(\.id), ["m1"])
+    }
+
+    /// A shared asset must not acquire a kira collection through the refile path
+    /// any more than through the upsert path.
+    func testRefileAllRespectsTheRealmGuard() async throws {
+        try await store.upsert(make("s9", realm: .shared, tier: "avocado"),
+                               explicitCollectionIDs: [])
+        try await store.refileAll()
+
+        let kiraSide = try await store.search(
+            CatalogQuery(scope: .kira, collectionID: "col-kira-adult-scenes"))
+        XCTAssertTrue(kiraSide.isEmpty, "a shared asset reached a kira collection")
+        let sharedSide = try await store.search(
+            CatalogQuery(scope: .shared, collectionID: "col-adult"))
+        XCTAssertEqual(sharedSide.map(\.id), ["s9"])
+    }
+
     // MARK: - Realm isolation (the invariant that matters most)
 
     func testKiraScopedSearchNeverReturnsASharedRow() async throws {

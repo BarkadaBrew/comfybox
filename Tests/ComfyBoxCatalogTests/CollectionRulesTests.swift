@@ -5,9 +5,11 @@ final class CollectionRulesTests: XCTestCase {
 
     private func asset(realm: CatalogRealm = .kira, lane: String? = nil,
                        source: String? = nil, family: String? = nil,
-                       mode: String? = nil, kind: String = "image") -> CatalogAsset {
+                       mode: String? = nil, kind: String = "image",
+                       contentMode: String? = nil) -> CatalogAsset {
         CatalogAsset(kind: kind, filename: "x", absolutePath: "/tmp/x",
-                     realm: realm, source: source, lane: lane, family: family, mode: mode)
+                     realm: realm, source: source, contentMode: contentMode,
+                     lane: lane, family: family, mode: mode)
     }
 
     func testKiraLanesFileIntoHerGenres() {
@@ -62,5 +64,74 @@ final class CollectionRulesTests: XCTestCase {
     func testUnknownInputFilesNowhereRatherThanGuessing() {
         XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(lane: "no-such-lane")), [])
         XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset()), [])
+    }
+
+    // MARK: - content_mode fallback
+
+    func testKiraContentModeFallbackWhenLaneIsMissingOrUnmapped() {
+        XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(contentMode: "avocado")),
+                       ["col-kira-adult-scenes"])
+        XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(contentMode: "banana")),
+                       ["col-kira-nightlife"])
+        XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(contentMode: "neutral")),
+                       ["col-kira-still-life"])
+        // `render` is the lane the field actually records, and it maps to nothing.
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(for: asset(lane: "render", contentMode: "avocado")),
+            ["col-kira-adult-scenes"],
+            "an UNMAPPED lane must still fall through to the content tier")
+    }
+
+    /// The owner declined to invent a genre for SFW lifestyle work, so these stay
+    /// unfiled — deliberately, and visibly.
+    func testAppleInKiraRealmIsDeliberatelyUnmapped() {
+        XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(contentMode: "apple")), [])
+    }
+
+    func testARealLaneAlwaysBeatsTheContentModeFallback() {
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(for: asset(lane: "still", contentMode: "avocado")),
+            ["col-kira-still-life"],
+            "a real lane wins; the fallback is last-resort only")
+        XCTAssertEqual(
+            Set(CollectionRules.defaultCollectionIDs(for: asset(lane: "tile", contentMode: "banana"))),
+            ["col-kira-decoupage", "col-decoupage"])
+    }
+
+    func testSharedContentModeFallsBackToSharedRootsOnly() {
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(for: asset(realm: .shared, contentMode: "neutral")),
+            ["col-photography"])
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(for: asset(realm: .shared, contentMode: "apple")),
+            ["col-photography"])
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(for: asset(realm: .shared, contentMode: "banana")),
+            ["col-adult"])
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(for: asset(realm: .shared, contentMode: "avocado")),
+            ["col-adult"])
+    }
+
+    /// The shared branch must never name a kira collection. If it did,
+    /// `applyDerivedFiling`'s realm guard would drop the row on the way in and
+    /// the fallback would silently file NOTHING for every Mac-only asset.
+    func testSharedContentModeFallbackNeverNamesAKiraCollection() {
+        let kiraCollectionIDs = Set(CatalogSchema.seedCollections
+            .filter { $0.realm == .kira }.map(\.id))
+        for tier in ["apple", "banana", "avocado", "neutral"] {
+            let ids = Set(CollectionRules.defaultCollectionIDs(
+                for: asset(realm: .shared, contentMode: tier)))
+            XCTAssertTrue(ids.isDisjoint(with: kiraCollectionIDs),
+                          "shared asset in tier \(tier) named a kira collection")
+        }
+    }
+
+    /// An explicit source still wins over the tier fallback.
+    func testSharedSourceBeatsTheContentModeFallback() {
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(
+                for: asset(realm: .shared, source: "krita", contentMode: "avocado")),
+            ["col-decoupage"])
     }
 }
