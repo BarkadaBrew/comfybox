@@ -1,4 +1,4 @@
-# Asset Catalog — one index across ComfyBox, Kira, Bree and CoffeeShop Studio
+# The ComfyBox Gallery — one catalog for everything ComfyBox makes
 
 Date: 2026-07-30
 Status: design, approved for planning
@@ -6,9 +6,10 @@ Repos touched: `zimage.swift` (ComfyBox engine + desktop), `coffeeshop-server` (
 
 ## Problem
 
-Media is produced by five paths into four trees, and indexed by four partial,
-mutually-ignorant records — three of which are rolling windows. Nothing can
-answer a question about work older than a couple of days.
+Media is produced by five paths into the ComfyBox Gallery and its two downstream
+copies, and indexed by four partial, mutually-ignorant records — three of which
+are rolling windows. Nothing can answer a question about work older than a
+couple of days.
 
 Measured 2026-07-30:
 
@@ -20,11 +21,16 @@ Measured 2026-07-30:
 | `~/.bree/studio/history.json` | Bree renders | ~500 | **500 entries** | character, contentMode, seed |
 | `~/.kira/studio/catalog.json` | — | — | — | counts and bytes only |
 
-Trees: `~/Pictures/ComfyBox` (Mac, 1459+ files), `~/.kira/studio` (2068 images +
-496 videos + 3901 sidecars), `~/.bree/studio` (29 images + 435 videos + 1273
-sidecars), and `~/Documents/Vaults/BarkadaAI` on the server — Bree's primary
-data store, 1848 images + 230 videos across 5.9 GB, which no index covers at
-all.
+**The ComfyBox Gallery is the home.** It holds Kira's content and every asset
+ComfyBox generates, for whichever application requested it. `~/Pictures/ComfyBox`
+(Mac, 1459+ files) is that home; the server trees — `~/.kira/studio` (2068
+images + 496 videos + 3901 sidecars) and `~/.bree/studio` (29 images + 435
+videos + 1273 sidecars) — are downstream distribution copies of it, not peers.
+
+That is why `source` (already a column, currently 100% NULL) matters as much as
+`realm`: it records **which application asked for the render** — Kira's
+scheduler, the Studio bot, Bree's MCP, the desktop app, the Krita bridge, a
+workflow run. The home indexes all of them.
 
 Three symptoms follow directly:
 
@@ -64,15 +70,17 @@ are empty for lack of *parsing*, not for lack of data.
    `ComfyBox gallery-serve` subcommand under its own launchd agent, not routes
    inside the GPU engine. Same repo, same binary, separate lifecycle.
 7. **`kira` is the only realm exception.** Two values: `kira` and `shared`.
-8. **Bree's vault is a fourth indexed tree, and is never written to.**
+8. **The ComfyBox Gallery is the home** for Kira's content and for everything
+   ComfyBox generates, whichever application requested it. Bree's vault is out
+   of scope — see "Deferred".
 
 ## Non-goals
 
 - No embeddings or vector search. Revisit only if facets + FTS demonstrably fail.
 - No new gallery UI framework — facets land in the existing `GalleryView`.
 - No media moves. Locations are recorded; files stay exactly where they are.
-- **No writes into Bree's vault, of any kind, at any point in this work.** The
-  embedded-metadata gap described under "Known issue" is recorded, not fixed.
+- **Bree's vault is untouched — not indexed, not read, not written.** It is
+  hers alone. See "Deferred".
 - No change to `/v1/gallery/list` or `/v1/gallery/file`; `RemoteGalleryService`
   keeps working untouched.
 - The three rolling records (`render-journal.jsonl`, both `history.json`) keep
@@ -113,44 +121,11 @@ plus `SidecarService.keywords(tags:character:contentMode:)` →
 
 Two rules follow:
 
-1. **Write-back is mandatory** — except in the vault. Ratings, tags, captions
-   and favorites set in the gallery are written back to XMP/IPTC and Finder
-   tags, so Adobe, Finder and Spotlight keep seeing them and so they survive a
-   catalog rebuild. The vault is read-only; see "The Vault" below.
+1. **Write-back is mandatory.** Ratings, tags, captions and favorites set in the
+   gallery are written back to XMP/IPTC and Finder tags, so Adobe, Finder and
+   Spotlight keep seeing them and so they survive a catalog rebuild.
 2. **Finder tags are Mac-realm only.** They do not ride the copy to the server,
    so color labels are never treated as authoritative for a server-side asset.
-
-### The Vault — indexed, never written
-
-Bree's vault (`~/Documents/Vaults/BarkadaAI` on the server) is her primary data
-store and she saves images into it. It is a **destination** tree, not a render
-output tree: assets arrive by promotion or by hand, many are copies of studio
-assets, and some are not generated at all (screenshots, pasted images).
-
-It is indexed **strictly read-only**. The catalog never writes a byte inside the
-vault — not metadata, not write-back, not a sidecar, not a thumbnail. This is a
-hard invariant, asserted by test, and it is the one place where the "write-back
-is mandatory" rule of the Metadata carriers section does **not** apply.
-
-- Realm `shared` (Kira is the only exception; nothing in the vault is `kira`).
-- Excluded: `.claude/worktrees`, and anything not a media file.
-- Vault copies of studio assets dedup into the existing asset via `sha256` and
-  become an additional `asset_locations` row — they are not new assets.
-- Vault-only assets (screenshots, pasted images, non-generated media) are
-  indexed with whatever metadata the file carries, and no more.
-
-### Known issue, recorded and out of scope
-
-PR #826/#833 established that prompt text must not land in vault-adjacent files,
-and stripped it from the alongside-image sidecar. It did not address embedded
-metadata, which rides the file itself. Measured 2026-07-30 over a 120-file
-sample of vault PNGs: **81 carry PNG text chunks and 67 carry a large `eXIf`
-block**, including IPTC captions and JSON generation parameters.
-
-This predates the catalog and is **explicitly out of scope here**. The design
-does not fix it, does not worsen it, and writes nothing into the vault. It is
-recorded so it is not rediscovered as a surprise, and so that whoever addresses
-it knows the catalog can hold the provenance if the files are ever stripped.
 
 ### Realm — one exception, not a taxonomy
 
@@ -315,7 +290,7 @@ prompt.
 Cheap and almost entirely GPU-free, because the data already exists in two
 places: embedded in the files, and in the server sidecars.
 
-1. **`exiftool` sweep over all four trees — the primary source.** Recovers
+1. **`exiftool` sweep over the gallery home and both server trees — the primary source.** Recovers
    prompt, LoRAs with scales, seed, steps, guidance, model, dimensions and
    `Software` from `EXIF:UserComment` / `ImageDescription` / `XMP`. Because EXIF
    rides the file copy, this covers the server trees as well as the Mac.
@@ -325,7 +300,7 @@ places: embedded in the files, and in the server sidecars.
 3. **Finder tags** (`_kMDItemUserTags`) supply existing color labels for Mac
    assets. Mac-realm only — the xattr does not survive the copy.
 4. **Deduplication** — `sha256`, falling back to `recovered_from` and the
-   filename UUID, merges each Mac original with its server and vault copies into
+   filename UUID, merges each gallery-home asset with its server copies into
    one asset with several locations.
 5. **Vision captions last, and only** where `prompt IS NULL AND caption IS NULL`
    after steps 1–2 — a far smaller set than the 129 rows estimated before the
@@ -361,9 +336,25 @@ record" — reconstructs the catalog from scratch if it is deleted.
   indexed by `AssetIngestor`.
 - **Permissions** — catalog file is `0600` in a `0700` directory after init on
   both boxes.
-- **Vault is never written** — after backfill, write-back, and a full test run,
-  no file under the vault root has a changed mtime, size or xattr set. Asserted,
-  not assumed; this is the invariant most likely to be violated by accident.
+- **Vault is never touched** — after backfill, write-back and a full test run,
+  no path under `~/Documents/Vaults/BarkadaAI` has been read or written.
+  Asserted, not assumed.
+
+## Deferred
+
+**Bree's vault** (`~/Documents/Vaults/BarkadaAI` on the server — 1848 images +
+230 videos, 5.9 GB). Out of scope: it is Bree's alone. The intended future shape
+is to normalize it as a **remote gallery** — a peer surface the catalog can
+browse rather than a tree it ingests — which keeps ownership with Bree while
+making it reachable. Nothing in this design reads or writes it.
+
+One observation to carry into that work, measured 2026-07-30 and recorded only
+so it is not rediscovered as a surprise: PR #826/#833 stripped prompt text from
+the vault-adjacent sidecar, but embedded metadata rides the file itself. Over a
+120-file sample of vault PNGs, 81 carry PNG text chunks and 67 carry a large
+`eXIf` block, including IPTC captions and JSON generation parameters. If those
+files are ever stripped, the catalog is the natural place to hold the provenance
+they would lose.
 
 ## Sequencing and rollback
 
@@ -394,7 +385,7 @@ with the existing rollback (binary backup `ComfyBox.bak-KNOWN-GOOD-20260730`,
 restart under `~/.kira/coordination/comfybox-restart.lock`).
 
 Plan A alone already delivers the ask: Kira stops being capped at two days of
-memory, and every gallery becomes searchable across all four trees. Plan B is
+memory, and every gallery becomes searchable across the gallery home and both server trees. Plan B is
 what stops the index from drifting again. Every step is independently
 revertible; the catalog is additive throughout, so reverting any step leaves the
 existing four indexes working exactly as they do today.
