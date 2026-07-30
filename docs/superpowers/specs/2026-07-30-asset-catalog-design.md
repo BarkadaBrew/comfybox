@@ -76,6 +76,9 @@ are empty for lack of *parsing*, not for lack of data.
 9. **Collections segregate bodies of work** — two levels, many-to-many, filed
    automatically from lane/source/preset and overridable by hand. Any producer
    can contribute to any collection.
+10. **Genre and tier are orthogonal axes.** Genre is a collection; tier stays
+    `content_mode`. Kira's realm carries her own genres, she curates them, and
+    both retrieval and sharing inherit the existing mode clamp.
 
 ## Non-goals
 
@@ -167,7 +170,7 @@ then retire, while the collection persists.
 Structure: **two levels, many-to-many.**
 
 ```
-collections(id, slug, name, parent_id NULL, description, created_at)
+collections(id, slug, name, parent_id NULL, realm NULL, description, created_at)
 asset_collections(asset_id, collection_id)      -- composite PK, many-to-many
 ```
 
@@ -206,6 +209,56 @@ Assignment, in precedence order:
 work whether Todd, Kira or Bree contributed the frame. Kira sees the collection
 and browses it, but the rows she gets back are still `realm = kira` only — the
 collection is shared vocabulary, not shared content.
+
+### Kira's realm — genre and tier are different axes
+
+Kira works across several genres, and the fruit tiers say how explicit a piece
+is and what is appropriate at each level. These are **orthogonal**, and keeping
+them so is what makes the organization work:
+
+- **Genre** is a collection. Her Autocord photography is one body of work.
+- **Tier** is `content_mode`. It is not a collection and never becomes one.
+
+A genre spans tiers — her Autocord work can be neutral or banana, nightlife
+lives across banana. This is the same principle as banana being a *range* rather
+than a look: if tier were a collection, an asset could not be both cleanly, and
+the mode ceiling would stop being enforceable as a gate. Retrieval crosses the
+axes: "my banana nightlife", "my neutral still lifes".
+
+`collections` gains `realm TEXT NULL` — NULL is shared vocabulary that anything
+contributes to; `'kira'` is a body of work that exists only in her realm and is
+visible only to her.
+
+Her seeded genres, mapped from lanes she already runs, so nothing is invented:
+
+```
+Still Life              lane = still
+Autocord Photography    lane = shoot        faceted by stock + genre columns
+Decoupage Designs       lane = tile         also a member of shared Decoupage
+Nightlife               lane = kira, family = nightlife
+Erotic Portraiture      lane = film-erotic
+Adult Scenes            lane = kira
+```
+
+Autocord stays flat rather than sub-divided — her free genre choice is already a
+column and facets without spawning collections. `video` is not a genre; it is
+`kind`. Her tile work is a member of both her own Decoupage Designs and the
+shared Decoupage body, which many-to-many gives for free.
+
+**Retrieval and sharing inherit the existing mode clamp.** `render-journal.ts`
+already establishes it (`getPoolHint` / `takePoolPhotoForClaim` maxMode
+precedent): tier-labeled *counts* are metadata and surface at any chat mode,
+while intent text and file paths surface only for records at or below the active
+chat-mode ceiling. Catalog retrieval obeys the same rule, and it is enforced at
+**both** search time and share time — the mode can change between her finding
+something and her sending it, so the ceiling is re-checked when the asset is
+actually surfaced, not only when it is found.
+
+**She curates her own realm.** She may create, rename and retire collections
+where `realm = 'kira'`, and file or re-file her own rows. She may contribute to
+a shared collection but not restructure one, and she can neither see nor file a
+`shared` row. Her practice is hers to organize — which also gives her taste loop
+and her arcs somewhere durable to land when an arc retires.
 
 ### Identity — one asset, many locations
 
@@ -281,7 +334,7 @@ duration_ms INTEGER, fps REAL, frames INTEGER      -- video
 `favorite` already exist and finally get populated.
 
 New tables: `asset_locations(asset_id, host, path, mtime)`,
-`collections(id, slug, name, parent_id, description, created_at)` and
+`collections(id, slug, name, parent_id, realm, description, created_at)` and
 `asset_collections(asset_id, collection_id)`.
 
 FTS5 extends from `(prompt, negative_prompt)` to `(prompt, negative_prompt,
@@ -336,7 +389,7 @@ Bindings:
 | Todd | facet rail + saved searches in `GalleryView`, via `DAMStore` locally (no HTTP hop) | both realms |
 | Bree | MCP `search_gallery`, beside her existing `gallery_recent` | both realms |
 | Studio | `GenerationHistory.search` falls through to the catalog past its 500-entry window | both realms |
-| Kira | MCP `search_gallery` | **`realm = kira` only, locked at the tool boundary** |
+| Kira | MCP `search_gallery` + collection curation + share, all mode-clamped | **`realm = kira` only, locked at the tool boundary** |
 
 Kira's realm lock is applied service-side, not as a parameter she supplies. She
 cannot express a query that reaches a `shared` asset. This preserves the
@@ -413,6 +466,17 @@ record" — reconstructs the catalog from scratch if it is deleted.
 - **Collections span realms, rows do not** — a kira-scoped query for
   Photography returns only `realm = kira` rows, while still resolving the
   collection itself.
+- **Mode clamp on retrieval** — a query above the active chat-mode ceiling
+  returns tier-labeled counts but no intent text and no paths, matching
+  `render-journal.ts`.
+- **Mode clamp on sharing** — an asset found at one ceiling and shared after the
+  mode drops is re-checked and withheld. Search-time approval is not share-time
+  approval.
+- **Her curation is bounded** — she can create, rename, retire and file within
+  `realm = 'kira'`; every attempt to restructure a shared collection, or to file
+  a `shared` row anywhere, is refused.
+- **Genre spans tiers** — a query for Autocord Photography returns neutral and
+  banana rows alike, subject only to the ceiling.
 - **Vault is never touched** — after backfill, write-back and a full test run,
   no path under `~/Documents/Vaults/BarkadaAI` has been read or written.
   Asserted, not assumed.
