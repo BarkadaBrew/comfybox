@@ -5364,6 +5364,9 @@ private actor WarmServerCoordinator {
       let steps = payload.steps ?? 9
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
+      // Krea-2 builds its requests straight from the payload rather than going
+      // through makePipelineRequest, so resolve DyPE explicitly here.
+      let krea2DyPE = payload.resolvedDyPEConfig(width: width, height: height)
 
       // img2img fix (2026-07-19): Krea2Pipeline.generateImg2Img already
       // implements VAE-encode + partial-denoise; runKrea2Generate simply never
@@ -5401,13 +5404,15 @@ private actor WarmServerCoordinator {
         }
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
         image = k2.generateImg2Img(
-          .init(prompt: payload.prompt, sourceImage: sourceNHWC, width: width, height: height, steps: steps, seed: seed, strength: strength)
+          .init(prompt: payload.prompt, sourceImage: sourceNHWC, width: width, height: height,
+                steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE)
         ) { [logger] step, total in
           logger.info("Krea2 img2img: step \(step)/\(total)")
         }
       } else {
         image = k2.generate(
-          .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed, controlImagePixels: controlPixels)
+          .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed,
+                controlImagePixels: controlPixels, dyPE: krea2DyPE)
         ) { [logger] step, total in
           logger.info("Krea2: step \(step)/\(total)")
         }
@@ -6224,6 +6229,26 @@ extension GeneratePayload: Decodable {
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
   }
 
+  /// The DyPE configuration this payload implies at the given resolution.
+  ///
+  /// An explicit `dype` always wins, including "none". Otherwise DyPE
+  /// auto-enables above the model's base resolution — the branch that matters
+  /// most, since the callers that need it (Kira's HQ 2K rerender, the Krita
+  /// bridge) send no `dype` at all.
+  ///
+  /// `.ntk` is deliberately the ceiling: `.yarn` is an unimplemented stub that
+  /// warns and falls back to NTK, so selecting it would only add log noise.
+  func resolvedDyPEConfig(width resolvedWidth: Int, height resolvedHeight: Int) -> DyPEConfig {
+    if let raw = dype?.lowercased() {
+      switch raw {
+      case "ntk": return .ntk
+      case "yarn": return .yarn
+      default: return .disabled
+      }
+    }
+    return max(resolvedWidth, resolvedHeight) > 1024 ? .ntk : .disabled
+  }
+
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
     activeLoRAs: [LoRAConfiguration]
@@ -6239,19 +6264,7 @@ extension GeneratePayload: Decodable {
     // Build DyPE config — auto-enable for high-res requests
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
-    let dyPEConfig: DyPEConfig
-    if let dypeRaw = dype?.lowercased() {
-      switch dypeRaw {
-      case "ntk": dyPEConfig = .ntk
-      case "yarn": dyPEConfig = .yarn
-      case "none", "off": dyPEConfig = .disabled
-      default: dyPEConfig = .disabled
-      }
-    } else if max(resolvedWidth, resolvedHeight) > 1024 {
-      dyPEConfig = .ntk  // Auto-enable for high-res
-    } else {
-      dyPEConfig = .disabled
-    }
+    let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     return ZImageGenerationRequest(
       prompt: prompt,
@@ -6320,18 +6333,7 @@ extension GeneratePayload: Decodable {
 
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
-    let dyPEConfig: DyPEConfig
-    if let dypeRaw = dype?.lowercased() {
-      switch dypeRaw {
-      case "ntk": dyPEConfig = .ntk
-      case "yarn": dyPEConfig = .yarn
-      default: dyPEConfig = .disabled
-      }
-    } else if max(resolvedWidth, resolvedHeight) > 1024 {
-      dyPEConfig = .ntk
-    } else {
-      dyPEConfig = .disabled
-    }
+    let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
