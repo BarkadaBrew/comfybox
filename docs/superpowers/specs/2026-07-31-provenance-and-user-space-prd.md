@@ -37,9 +37,31 @@ What he wants is a **default view**: his workspace on launch, with everyone
 else's work reachable through a filter. Ownership is a **tag to filter on**,
 not a boundary to enforce.
 
-The one genuine boundary in the system already exists and is unchanged: Kira's
-MCP tools are locked to her own content, service-side, so no persona reads
-another's work. That is enforcement. Todd's view is preference.
+There ARE genuine boundaries in the system, and they are not Todd's:
+
+- **Kira** is locked to her own content, service-side. Unchanged.
+- **Bree must not see Kira's work.** This is enforcement, not preference, and
+  the reason is not privacy between personas — it is **data egress**. Kira's
+  work is local-first, produced by a local LLM on local hardware. Bree is
+  Anthropic-backed. Her reading Kira's prompts and paths sends them to an API.
+  That is the "no persona or content bleed between the local LLM and Anthropic"
+  constraint, applied to content rather than conversation.
+
+Todd's view is preference; theirs is enforcement. Keeping those apart is the
+point of this revision. An earlier draft conflated them and proposed a grant
+table, a `visibility` column, and moving enforcement out of the HTTP layer so
+the desktop would inherit it. None of that is needed for Todd, and none of it
+would have helped Bree — spreading one concept across two mechanisms with
+different rules is how a boundary stops meaning anything.
+
+**Historical note, because the mistake is instructive.** Bree's tools shipped
+with a null actor and a permissive ceiling, justified as "a consumer on par
+with Todd." That was true of Todd and false of her, for a reason already stated
+and not applied. Worse, the instinct to fix it by *tightening her tier ceiling*
+would have been exactly backwards: a tier clamp withholds none of Kira's
+neutral work while hiding Todd's own explicit work from his own assistant.
+**Realm is the boundary; tier is a view setting inside it.** Fixed 2026-07-31
+by giving her the actor `bree` (commit `a056db9`, merged `83df8de`).
 
 Keeping those two apart is the whole point of this revision. An earlier draft
 conflated them and proposed a grant table, a `visibility` column, and moving
@@ -130,11 +152,31 @@ than silent — the failure mode points the right way.
 on 10.0.100.232, plus the metadata mirror, which holds more sidecars than there
 are media files — evidence that media moved rather than vanished.
 
-## Open decisions
+## The one blocking decision
+
+**What does the actor `bree` resolve to, service-side?** Right now the service
+recognises only `kira`, treats absent as unscoped, and 400s everything else —
+so her calls fail closed to empty. Safe, but she cannot see her own work
+either, and she reports it to Todd as "the gallery isn't answering" rather than
+"I can't see that" (the client cannot distinguish refusal from outage, which is
+deliberate — a 404 meaning "exists but forbidden" is itself a disclosure).
+
+The minimal Swift change is one line mapping `bree` to the non-Kira realm. It
+carries a decision worth making deliberately: a realm scope also grants
+`POST /v1/catalog/file`, so she could file into that realm. She does not call
+it today — search and facets only — but the grant would be implicit.
+
+Under the `owner` model this resolves more cleanly than a realm map: `bree`
+scopes to `owner IN (bree, todd, unowned)` and simply excludes `kira`. That is
+another reason to land render-time provenance first — it turns a special case
+into an ordinary predicate.
+
+## Other open decisions
 
 1. **Agent retention default** — TTL, explicit keep, or manual sweep.
-2. **Does Bree's default view mirror Todd's?** She is a consumer on par with
-   him and currently unscoped. Same treatment, or does she stay unfiltered?
+2. **Does Todd ever point Bree AT Kira's work?** He said "unless I tell her to
+   look at it." That implies a deliberate, probably per-request act rather than
+   a persistent grant — the narrower the better, since the cost is egress.
 3. **Do collections filter with the view?** A collection spanning owners — say
    Photography — could show only Todd's contributions by default, or always
    show everything and let the owner filter apply within it.
