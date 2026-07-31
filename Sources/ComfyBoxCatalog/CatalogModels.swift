@@ -159,11 +159,17 @@ public struct CatalogAsset: Sendable, Equatable {
         self.promptInjected = sealed ? nil : promptInjected
         self.caption = sealed ? nil : caption
         self.captionSource = sealed ? nil : captionSource
+        // `theme` belongs with the text above, not with the facets below. It
+        // LOOKS like a facet — a short seed-metadata field sitting between
+        // `arc` and `stock` — but MetadataReader fills it from the render
+        // journal's free-text intent line, and in the live catalog those run to
+        // full explicit sentences. It escaped this nulling for as long as it was
+        // filed by position rather than by what it holds.
         self.seed = seed; self.steps = steps; self.guidance = guidance
         self.modelFamily = modelFamily; self.preset = preset; self.loras = loras
         self.renderID = renderID; self.contentMode = contentMode
         self.characterName = characterName
-        self.lane = lane; self.arc = arc; self.theme = theme
+        self.lane = lane; self.arc = arc; self.theme = sealed ? nil : theme
         self.stock = stock; self.genre = genre; self.family = family; self.style = style
         self.mode = mode; self.durationMs = durationMs; self.fps = fps; self.frames = frames
         self.resolution = resolution; self.aspectRatio = aspectRatio

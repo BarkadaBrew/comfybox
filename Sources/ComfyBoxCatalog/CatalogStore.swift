@@ -21,6 +21,7 @@ public enum CatalogError: Error, LocalizedError {
     case depthCapExceeded
     case notPermitted(String)
     case noSuchCollection(String)
+    case noSuchAsset(String)
 
     public var errorDescription: String? {
         switch self {
@@ -29,6 +30,7 @@ public enum CatalogError: Error, LocalizedError {
         case .depthCapExceeded: return "collections are two levels deep at most"
         case let .notPermitted(m): return "not permitted: \(m)"
         case let .noSuchCollection(id): return "no such collection: \(id)"
+        case let .noSuchAsset(id): return "no such asset: \(id)"
         }
     }
 }
@@ -134,7 +136,7 @@ public let CATALOG_TIER_SPELLINGS: Set<String> =
 /// not recognise ranks above every known tier, so an unrecognised vocabulary is
 /// withheld from every ceiling rather than waved through as if it were neutral.
 /// nil stays 0 — an asset that was never tiered is untiered, not secretly explicit.
-public func tierRank(_ tier: String?) -> Int {
+func tierRank(_ tier: String?) -> Int {
     guard let raw = tier?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines),
           !raw.isEmpty else { return 0 }
     if let i = CATALOG_TIER_ORDER.firstIndex(of: raw) { return i }
@@ -157,6 +159,22 @@ func ceilingRank(_ ceiling: String) -> Int {
         return i
     }
     return 0
+}
+
+/// THE ONE PUBLIC ANSWER to "is this asset above the caller's ceiling?".
+///
+/// The two ranks above are INTERNAL on purpose, and this is why. They were
+/// `public func tierRank` beside an internal `ceilingRank`, which is an
+/// asymmetry with teeth: a cross-module caller reaching for the obvious
+/// `tierRank(asset) > tierRank(ceiling)` gets a comparison in which an
+/// unrecognised ceiling ranks ABOVE every tier and therefore withholds nothing —
+/// precisely the fail-open `ceilingRank` exists to prevent. Exposing the
+/// decision rather than its two halves makes that spelling unavailable.
+///
+/// nil ceiling = no clamp.
+public func isWithheld(tier: String?, ceiling: String?) -> Bool {
+    guard let ceiling else { return false }
+    return tierRank(tier) > ceilingRank(ceiling)
 }
 
 /// One bound parameter value, captured while the WHERE clause is assembled and
@@ -248,11 +266,18 @@ public actor CatalogStore {
         tightenPermissions()
         defer { tightenPermissions() }
 
-        try CatalogSchema.exec(db, "PRAGMA journal_mode=WAL")
+        // busy_timeout FIRST, and the order is load-bearing. `journal_mode=WAL`
+        // takes an exclusive lock on the database; with no timeout yet set, a
+        // busy file makes that very statement return SQLITE_BUSY, `open` throws,
+        // and the gallery service exits(1) — the service refusing to start
+        // precisely when the database is in use, which is when it is wanted.
+        // Setting the timeout cannot itself be busy: it is a connection-local
+        // setting that takes no lock.
+        try CatalogSchema.exec(db, "PRAGMA busy_timeout = 5000")
         // Four consumers share this file under WAL and the desktop app writes to
         // it concurrently; without a busy timeout a collision is an immediate
         // SQLITE_BUSY rather than a short wait.
-        try CatalogSchema.exec(db, "PRAGMA busy_timeout = 5000")
+        try CatalogSchema.exec(db, "PRAGMA journal_mode=WAL")
         // `migrate` deliberately fails when `assets` is missing entirely (it must
         // never mask a real problem on the live database). A brand-new file has
         // no `assets` table at all, so create the base shape first; it is
@@ -641,7 +666,11 @@ public actor CatalogStore {
     /// hyphen, a colon or a stray quote in a user's words is data, not an
     /// operator) and the terms are space-joined, which FTS5 reads as AND.
     /// Returns nil when nothing searchable survives.
-    static func ftsMatchExpression(_ raw: String) -> String? {
+    /// Public because the DESKTOP search box needs the same sanitiser: it binds
+    /// its own raw text into an FTS5 MATCH, where `sun-set` is a syntax error
+    /// that reads to the user as "no results". One sanitiser, so the two search
+    /// boxes cannot disagree about what a hyphen means.
+    public static func ftsMatchExpression(_ raw: String) -> String? {
         let terms = raw
             .split(whereSeparator: { $0.isWhitespace })
             .filter { $0.contains(where: { $0 != "\"" }) }
@@ -651,21 +680,44 @@ public actor CatalogStore {
 
     /// THE MODE CLAMP. Above the ceiling the tier LABEL survives — it is
     /// metadata — while text and the file path do not. Matches render-journal.ts.
+    ///
+    /// AN ALLOW-LIST, NOT A DENY-LIST. It was written the other way — copy every
+    /// one of ~40 fields across and nil out the handful that looked like text —
+    /// and it leaked exactly as that shape always does. `theme` was carried
+    /// through as if it were a facet; it is not. `MetadataReader` reads it out of
+    /// render-journal.jsonl, where it holds a free-text intent line, and 147 rows
+    /// above neutral in the live catalog carry one over 60 characters. At ceiling
+    /// `neutral` an avocado row correctly withheld its prompt and returned a full
+    /// explicit sentence in `theme`.
+    ///
+    /// So the clamped row is BUILT from the fields named here and nothing else.
+    /// A field added to `CatalogAsset` tomorrow is withheld by default; making it
+    /// visible above the ceiling takes an edit to this list, which is a line a
+    /// reviewer can see. The list holds only closed-vocabulary facets, numbers
+    /// and structural identity — no field that any writer can put a sentence in.
+    /// Withheld here and deliberately absent below: `filename` and
+    /// `absolutePath` (in this library the filename IS the prompt), every
+    /// prompt/caption spelling, `theme`, `arc`, `preset`, `loras` and `renderID`.
     private func clamp(_ a: CatalogAsset, to ceiling: String?) -> CatalogAsset {
-        guard let ceiling, tierRank(a.contentMode) > ceilingRank(ceiling) else { return a }
+        guard isWithheld(tier: a.contentMode, ceiling: ceiling) else { return a }
         return CatalogAsset(
+            // Identity and shape — no free text in any of them.
             id: a.id, kind: a.kind, filename: "", absolutePath: "",
             sha256: a.sha256, fileSize: a.fileSize, width: a.width, height: a.height,
-            createdAt: a.createdAt, realm: a.realm, source: a.source, sealed: a.sealed,
-            prompt: nil, negativePrompt: nil, promptRaw: nil, promptInjected: nil,
-            caption: nil, captionSource: nil,
+            createdAt: a.createdAt,
+            // Provenance. `source` is an application name from a fixed set.
+            realm: a.realm, source: a.source, sealed: a.sealed,
+            // Generation numerics and the model's own name.
             seed: a.seed, steps: a.steps, guidance: a.guidance, modelFamily: a.modelFamily,
-            preset: a.preset, loras: a.loras, renderID: a.renderID,
+            // The tier LABEL survives the clamp by design; character is a facet.
             contentMode: a.contentMode, characterName: a.characterName,
-            lane: a.lane, arc: a.arc, theme: a.theme, stock: a.stock,
-            genre: a.genre, family: a.family, style: a.style,
+            // Facets — every one of these is offered by /v1/catalog/facets and
+            // filterable on /v1/catalog/search, i.e. already a closed vocabulary.
+            lane: a.lane, stock: a.stock, genre: a.genre,
+            // Video shape.
             mode: a.mode, durationMs: a.durationMs, fps: a.fps, frames: a.frames,
             resolution: a.resolution, aspectRatio: a.aspectRatio,
+            // The viewer's own annotations.
             rating: a.rating, favorite: a.favorite)
     }
 
@@ -729,6 +781,13 @@ public actor CatalogStore {
         guard let row = try collectionRow(collectionID) else {
             throw CatalogError.noSuchCollection(collectionID)
         }
+        // The asset has to EXIST. `asset_collections` has no foreign keys, so a
+        // filing of an unknown id inserts happily and leaves a membership row
+        // pointing at nothing — which inflates every collection count and, for
+        // the unscoped POST /v1/catalog/file, is reachable by typing an id.
+        // Checked here rather than at the route because `asset_collections` is
+        // this store's table and the invariant is the store's to keep.
+        guard try assetExists(assetID) else { throw CatalogError.noSuchAsset(assetID) }
         // A shared asset can never enter a kira collection. This is a property of
         // the DATA, not of who is asking, so it holds for the nil actor — the
         // service, backfill, the desktop app — exactly as applyDerivedFiling
@@ -778,6 +837,17 @@ public actor CatalogStore {
 
     private func collectionRealm(_ id: String) throws -> CatalogRealm? {
         try collectionRow(id)?.realm
+    }
+
+    /// Whether a row with this id exists at all. Distinct from `assetRealm`,
+    /// which answers nil both for "no such asset" and for "realm is NULL".
+    private func assetExists(_ id: String) throws -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM assets WHERE id = ?1", -1, &stmt, nil) == SQLITE_OK
+        else { throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, id)
+        return sqlite3_step(stmt) == SQLITE_ROW
     }
 
     private func assetRealm(_ id: String) throws -> CatalogRealm? {
@@ -881,7 +951,12 @@ public actor CatalogStore {
     /// this is an oracle. A confined caller who GUESSES a path gets back a real
     /// id when the guess is right, which both confirms the file exists and hands
     /// her a key for `edges`/`locations`. Out of scope is nil.
-    public func assetID(forPath path: String, scope: CatalogRealm? = nil) throws -> String? {
+    ///
+    /// `scope` has NO DEFAULT, for the reason given on `edges(for:scope:)`: a
+    /// defaulted realm parameter is one a new call site can omit, and omitting
+    /// it compiles and leaks. Backfill's `scope: nil` is correct and now says so
+    /// where a reviewer can see it.
+    public func assetID(forPath path: String, scope: CatalogRealm?) throws -> String? {
         var stmt: OpaquePointer?
         let sql = """
             SELECT id FROM assets WHERE absolute_path = ?1 AND (?2 IS NULL OR realm = ?2)
@@ -903,7 +978,12 @@ public actor CatalogStore {
 
     /// Same oracle problem as `assetID(forPath:)` — a hash is guessable when the
     /// file is one the caller already has a copy of.
-    public func assetID(forSHA256 sha: String, scope: CatalogRealm? = nil) throws -> String? {
+    ///
+    /// `scope` has NO DEFAULT, for the reason given on `edges(for:scope:)`: a
+    /// defaulted realm parameter is one a new call site can omit, and omitting
+    /// it compiles and leaks. Backfill's `scope: nil` is correct and now says so
+    /// where a reviewer can see it.
+    public func assetID(forSHA256 sha: String, scope: CatalogRealm?) throws -> String? {
         var stmt: OpaquePointer?
         let sql = "SELECT id FROM assets WHERE sha256 = ?1 AND (?2 IS NULL OR realm = ?2) LIMIT 1"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK
@@ -1017,8 +1097,13 @@ public actor CatalogStore {
     /// be the plainest oracle of the lot — and a confined caller resolving a
     /// basename across the boundary could mint an edge into a realm she cannot
     /// see.
+    ///
+    /// `scope` has NO DEFAULT, for the reason given on `edges(for:scope:)`: a
+    /// defaulted realm parameter is one a new call site can omit, and omitting
+    /// it compiles and leaks. Backfill's `scope: nil` is correct and now says so
+    /// where a reviewer can see it.
     public func assetIDs(forFilename name: String, limit: Int = 2,
-                         scope: CatalogRealm? = nil) throws -> [String] {
+                         scope: CatalogRealm?) throws -> [String] {
         var stmt: OpaquePointer?
         let sql = """
             SELECT id FROM assets WHERE filename = ?1 AND (?3 IS NULL OR realm = ?3) LIMIT ?2

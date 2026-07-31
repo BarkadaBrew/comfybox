@@ -139,4 +139,96 @@ struct AssetIngestorTests {
         let count = try await env.store.assetCount()
         #expect(count == 2)
     }
+
+    // MARK: - Deleting a file this Mac does not own
+
+    /// The local case, unchanged: where trashing is unavailable (a sandboxed
+    /// test runner, a volume with no Trash) a file on THIS Mac may still be
+    /// removed outright. That is the fallback's original and only purpose.
+    @Test("a failed trash on a local file still removes it")
+    func localFallbackStillRemoves() throws {
+        var removed: [String] = []
+        try AssetIngestor.trashOrRemove(
+            atPath: "/tmp/local.png",
+            fileExists: { _ in true },
+            trash: { _ in throw CocoaError(.fileWriteUnknown) },
+            remove: { removed.append($0) },
+            isLocal: { _ in true })
+        #expect(removed == ["/tmp/local.png"])
+    }
+
+    /// THE ONE THAT MATTERS. Roughly 1,300 of the live catalog's 2,994 rows name
+    /// a path under /Volumes/todd — an smbfs mount of the server. `trashItem`
+    /// does not work there, which is the NORMAL outcome, and the old fallback
+    /// answered that by calling `removeItem`: a permanent, unrecoverable delete
+    /// of production media, from a dialog whose button reads "Move to Trash".
+    @Test("a failed trash on a server file deletes nothing and says so")
+    func remoteFileIsNeverHardDeleted() {
+        var removed: [String] = []
+        let path = "/Volumes/todd/.kira/studio/video/clip.mp4"
+        #expect(throws: AssetIngestor.DeletionRefusal.notOnThisMac(path)) {
+            try AssetIngestor.trashOrRemove(
+                atPath: path,
+                fileExists: { _ in true },
+                trash: { _ in throw CocoaError(.fileWriteUnknown) },
+                remove: { removed.append($0) },
+                isLocal: { _ in false })
+        }
+        #expect(removed.isEmpty, "a file on another host was permanently deleted")
+    }
+
+    /// A successful trash never reaches either branch.
+    @Test("a file that trashes cleanly is not removed twice")
+    func successfulTrashDoesNotFallThrough() throws {
+        var removed: [String] = []
+        var trashed: [String] = []
+        try AssetIngestor.trashOrRemove(
+            atPath: "/Volumes/todd/x.png",
+            fileExists: { _ in true },
+            trash: { trashed.append($0) },
+            remove: { removed.append($0) },
+            isLocal: { _ in false })
+        #expect(trashed == ["/Volumes/todd/x.png"])
+        #expect(removed.isEmpty)
+    }
+
+    /// The locality check itself. `/tmp` is on this Mac; an unresolvable path
+    /// under /Volumes is assumed not to be, so the refusal stands on a guess
+    /// rather than a hard delete proceeding on one.
+    @Test("volume locality fails closed")
+    func localityFailsClosed() {
+        #expect(AssetIngestor.isOnThisMac(NSTemporaryDirectory()))
+        #expect(AssetIngestor.isOnThisMac("/tmp"))
+        #expect(!AssetIngestor.isOnThisMac("/Volumes/definitely-not-mounted-\(UUID().uuidString)/x.png"))
+    }
+
+    /// And the whole path: `deleteAsset` must leave the database row alone when
+    /// the file survives, so the grid keeps pointing at media that still exists.
+    @Test("deleteAsset keeps the row when the file could not be trashed")
+    @MainActor
+    func deleteAbortsRatherThanOrphanTheRow() async throws {
+        let env = try await makeEnvironment()
+        let imagePath = writeFile("server.png", in: env.watchDir)
+        let stored = try await env.ingestor.ingestFile(at: imagePath)
+
+        // Re-point the row at a path that reads as another host's disk.
+        let remotePath = "/Volumes/todd/.kira/studio/gallery/server.png"
+        let remoteAsset = DAMAsset(
+            id: stored.id, kind: stored.kind, filename: stored.filename,
+            absolutePath: remotePath, fileSize: stored.fileSize,
+            createdAt: stored.createdAt, modifiedAt: stored.modifiedAt,
+            ingestedAt: stored.ingestedAt, prompt: stored.prompt)
+
+        // `fileExists` is false for an unmounted path, so drive the decision
+        // directly — the store row is what this test is about.
+        #expect(throws: AssetIngestor.DeletionRefusal.self) {
+            try AssetIngestor.trashOrRemove(
+                atPath: remoteAsset.absolutePath,
+                fileExists: { _ in true },
+                trash: { _ in throw CocoaError(.fileWriteUnknown) },
+                remove: { _ in Issue.record("permanently deleted a server file") },
+                isLocal: { _ in false })
+        }
+        #expect(try await env.store.assetCount() == 1)
+    }
 }

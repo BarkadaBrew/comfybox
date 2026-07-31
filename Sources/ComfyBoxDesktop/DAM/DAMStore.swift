@@ -6,6 +6,7 @@
 //
 // Database location: ~/.comfybox/dam.sqlite3
 
+import ComfyBoxCatalog
 import Foundation
 import SQLite3
 
@@ -79,8 +80,40 @@ public actor DAMStore {
     @discardableResult
     public func insertAsset(_ asset: DAMAsset) throws -> DAMAsset {
         let asset = try mergedWithExisting(asset)
+        // A TRUE UPSERT, never `INSERT OR REPLACE`.
+        //
+        // `OR REPLACE` is DELETE-then-INSERT, so every column this statement
+        // does not name reverts to its default. That was survivable while this
+        // table had 23 columns and the DAM owned all of them; it now has 45,
+        // because the catalog migrated into this same file. Under `OR REPLACE`
+        // a single ♥ click — toggleFavorite reads the row, flips one flag and
+        // writes it back through here — reset 22 catalog columns on that row:
+        // `realm` to NULL (the next open promotes NULL to 'shared', quietly
+        // moving a Kira-private asset out of her realm) and `sealed` to 0 (the
+        // row unseals, and the FTS write below then indexes its prompt,
+        // permanently breaking "a sealed row is unreachable by its own
+        // prompt"). Backfill cannot restore either.
+        //
+        // `mergedWithExisting` does NOT protect against this: it returns early
+        // when the path's owner is this very id, which is exactly the update
+        // path.
+        //
+        // Two conflict targets because the table has two unique indexes.
+        // `id` is the ordinary case. `absolute_path` is a concurrency backstop:
+        // `mergedWithExisting` normally rewrites an id collision on a tracked
+        // path into an id conflict, but another writer can claim the path in
+        // between — and losing that race must update the owning row, not delete
+        // it.
+        let ownedColumns = [
+            "kind", "filename", "file_size", "sha256", "width", "height",
+            "created_at", "modified_at", "ingested_at", "orphaned",
+            "prompt", "negative_prompt", "seed", "steps", "guidance",
+            "model_family", "rating", "favorite", "content_mode",
+            "character_name", "source",
+        ]
+        let setClause = ownedColumns.map { "\($0) = excluded.\($0)" }.joined(separator: ", ")
         let sql = """
-            INSERT OR REPLACE INTO assets (
+            INSERT INTO assets (
                 id, kind, filename, absolute_path, file_size, sha256,
                 width, height, created_at, modified_at, ingested_at, orphaned,
                 prompt, negative_prompt, seed, steps, guidance,
@@ -91,6 +124,8 @@ public actor DAMStore {
                 ?13, ?14, ?15, ?16, ?17,
                 ?18, ?19, ?20, ?21, ?22, ?23
             )
+            ON CONFLICT(id) DO UPDATE SET \(setClause), absolute_path = excluded.absolute_path
+            ON CONFLICT(absolute_path) DO UPDATE SET \(setClause)
             """
 
         var stmt: OpaquePointer?
@@ -127,14 +162,51 @@ public actor DAMStore {
             throw DAMStoreError.insertFailed(lastError)
         }
 
+        // Which id the path actually ended up under. Normally `asset.id`; in the
+        // `ON CONFLICT(absolute_path)` backstop the pre-existing row keeps its
+        // own id, and FTS + thumbnails are keyed by id, so indexing under the id
+        // we *tried* to write would leave an entry pointing at no row.
+        let stored = try assetWithStoredIdentity(asset)
+
         // Update FTS index. Delete first — FTS5 has no unique constraint on
         // id, so a bare INSERT would accumulate duplicate rows on updates.
-        try deleteFTS(id: asset.id)
-        if let prompt = asset.prompt {
-            try insertFTS(id: asset.id, prompt: prompt, negativePrompt: asset.negativePrompt)
+        try deleteFTS(id: stored.id)
+        // A SEALED row is never indexed, whatever its prompt column happens to
+        // hold. "A sealed row is unreachable by its own prompt" rested entirely
+        // on that column being NULL — which is true of a row the catalog wrote
+        // and NOT true of one whose text arrived by another path (a sidecar
+        // re-ingest, a hand-repaired row). The DAM has no `sealed` concept of
+        // its own, so it asks the file; a DAM-only database has no such column
+        // and the answer is simply "not sealed".
+        if let prompt = stored.prompt, !isSealed(id: stored.id) {
+            try insertFTS(id: stored.id, prompt: prompt, negativePrompt: stored.negativePrompt)
         }
 
-        return asset
+        return stored
+    }
+
+    /// `asset` re-labelled with the id the row at its path actually carries.
+    private func assetWithStoredIdentity(_ asset: DAMAsset) throws -> DAMAsset {
+        let sql = "SELECT id FROM assets WHERE absolute_path = ?1"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (asset.absolutePath as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW,
+              let id = columnText(stmt, 0), id != asset.id else { return asset }
+        return DAMAsset(
+            id: id, kind: asset.kind, filename: asset.filename,
+            absolutePath: asset.absolutePath, fileSize: asset.fileSize,
+            sha256: asset.sha256, width: asset.width, height: asset.height,
+            createdAt: asset.createdAt, modifiedAt: asset.modifiedAt,
+            ingestedAt: asset.ingestedAt, orphaned: asset.orphaned,
+            prompt: asset.prompt, negativePrompt: asset.negativePrompt,
+            seed: asset.seed, steps: asset.steps, guidance: asset.guidance,
+            modelFamily: asset.modelFamily, rating: asset.rating, favorite: asset.favorite,
+            contentMode: asset.contentMode, characterName: asset.characterName,
+            source: asset.source)
     }
 
     /// Delete rows whose backing file no longer exists (deleted out from
@@ -339,7 +411,14 @@ public actor DAMStore {
     }
 
     /// Full-text search across prompts. Returns matching assets.
+    ///
+    /// The desktop search box is raw user text and FTS5 MATCH is a grammar, not
+    /// a string: `sun-set`, `a:b` or a lone `"` is a syntax error, which
+    /// `sqlite3_step` reports as a failed step and the caller shows as an empty
+    /// result. Same sanitiser the catalog uses, so both search boxes read the
+    /// same words the same way.
     public func searchPrompts(query: String, limit: Int = 50) throws -> [DAMAsset] {
+        guard let match = CatalogStore.ftsMatchExpression(query) else { return [] }
         let sql = """
             SELECT a.id, a.kind, a.filename, a.absolute_path, a.file_size, a.sha256,
                    a.width, a.height, a.created_at, a.modified_at, a.ingested_at, a.orphaned,
@@ -359,7 +438,7 @@ public actor DAMStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (query as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 1, (match as NSString).utf8String, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 2, Int32(limit))
 
         var results: [DAMAsset] = []
@@ -405,6 +484,18 @@ public actor DAMStore {
             try runSimple("DELETE FROM asset_edges WHERE from_asset_id = ?1 OR to_asset_id = ?1",
                           text: [id])
         }
+    }
+
+    /// Whether the catalog has sealed this row. False whenever the question
+    /// cannot be asked — a DAM-only database has no `sealed` column at all.
+    private func isSealed(id: String) -> Bool {
+        var stmt: OpaquePointer?
+        let sql = "SELECT sealed FROM assets WHERE id = ?1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+        return sqlite3_column_int(stmt, 0) != 0
     }
 
     /// Whether a table exists in this database. Table names here are compile-time

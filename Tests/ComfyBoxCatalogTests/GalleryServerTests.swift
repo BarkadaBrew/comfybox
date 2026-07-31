@@ -12,9 +12,23 @@ final class GalleryServerTests: XCTestCase {
         try await store.upsert(CatalogAsset(id: "k1", filename: "k1.png", absolutePath: "/tmp/k1.png",
                                             realm: .kira, prompt: "a tulip", contentMode: "neutral",
                                             lane: "still"), explicitCollectionIDs: [])
+        // k2 carries one of EVERY text-bearing field, so the clamp assertions
+        // below fail loudly rather than pass because the field was empty. `theme`
+        // in particular: it looks like a facet and holds a free-text intent line.
         try await store.upsert(CatalogAsset(id: "k2", filename: "k2.png", absolutePath: "/tmp/k2.png",
-                                            realm: .kira, prompt: "a nightclub", contentMode: "avocado",
-                                            lane: "kira"), explicitCollectionIDs: [])
+                                            realm: .kira, prompt: "a nightclub",
+                                            negativePrompt: "NEGTEXT", promptRaw: "RAWTEXT",
+                                            promptInjected: "INJECTEDTEXT", caption: "CAPTIONTEXT",
+                                            captionSource: "CAPSOURCE",
+                                            preset: "PRESETTEXT", loras: "[\"LORATEXT\"]",
+                                            renderID: "RENDERIDTEXT",
+                                            contentMode: "avocado",
+                                            lane: "kira", arc: "ARCTEXT", theme: "THEMETEXT",
+                                            family: "FAMILYTEXT", style: "STYLETEXT"),
+                               explicitCollectionIDs: [])
+        try await store.addLocation(assetID: "k2", AssetLocation(
+            host: "kira", path: "/Volumes/todd/.kira/studio/video/avocado/LOCATIONTEXT.mp4",
+            mtime: Date(timeIntervalSince1970: 1)))
         try await store.upsert(CatalogAsset(id: "s1", filename: "s1.png", absolutePath: "/tmp/s1.png",
                                             realm: .shared, prompt: "a tulip", contentMode: "neutral"),
                                explicitCollectionIDs: [])
@@ -138,11 +152,71 @@ final class GalleryServerTests: XCTestCase {
 
     /// The detail route must go through the same clamp `search` does. Fetching
     /// one row by id is not a way around the ceiling.
+    ///
+    /// This used to assert `prompt` and `path` and nothing else, so it passed
+    /// while `theme` — a free-text intent line read out of render-journal.jsonl
+    /// — sailed straight through the clamp. Every withheld field is named here,
+    /// AND the whole response body is swept for each marker string, so a field
+    /// added to `CatalogAsset` and carried through the clamp by accident is
+    /// caught by the sweep even though no assertion knows its name.
     func testAssetDetailHonoursTheCeiling() async throws {
-        let body = try await get("/v1/catalog/asset/k2", actor: "kira", ceiling: "apple")
-        XCTAssertNil(body["prompt"], "the clamp was bypassed on the detail route")
-        XCTAssertNil(body["path"])
+        let res = await response("/v1/catalog/asset/k2", actor: "kira", ceiling: "apple")
+        XCTAssertEqual(res.status, 200)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: res.body) as? [String: Any])
+
+        // The tier LABEL survives — that is the point of a clamp rather than a
+        // 404 — and so do the facets and the numbers.
         XCTAssertEqual(body["tier"] as? String, "avocado")
+        XCTAssertEqual(body["realm"] as? String, "kira")
+        XCTAssertEqual(body["lane"] as? String, "kira")
+        XCTAssertEqual(body["id"] as? String, "k2")
+
+        for field in ["prompt", "prompt_raw", "caption", "theme", "arc",
+                      "preset", "family", "style", "path", "filename"] {
+            XCTAssertNil(body[field], "\(field) survived the clamp")
+        }
+
+        // Nothing withheld may appear ANYWHERE in the body, under any key.
+        let text = String(decoding: res.body, as: UTF8.self)
+        for marker in ["nightclub", "NEGTEXT", "RAWTEXT", "INJECTEDTEXT", "CAPTIONTEXT",
+                       "CAPSOURCE", "PRESETTEXT", "LORATEXT", "RENDERIDTEXT",
+                       "ARCTEXT", "THEMETEXT", "FAMILYTEXT", "STYLETEXT",
+                       "k2.png", "/tmp/k2.png"] {
+            XCTAssertFalse(text.contains(marker), "clamped response leaked \(marker)")
+        }
+    }
+
+    /// `locations` is realm-scoped in the store but knows nothing about the
+    /// ceiling, so the detail route omitted `path` from the clamped row and then
+    /// returned the very same absolute path two lines later under `locations`.
+    /// A live fetch at ceiling `neutral` came back `path: false, prompt: false`
+    /// beside a full /Volumes/todd/…/avocado/… filename — and in this library
+    /// the filename IS the prompt.
+    func testLocationsAreWithheldAboveTheCeiling() async throws {
+        let res = await response("/v1/catalog/asset/k2", actor: "kira", ceiling: "neutral")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: res.body) as? [String: Any])
+        XCTAssertEqual((body["locations"] as? [[String: Any]])?.count, 0,
+                       "on-disk paths leaked past the ceiling through locations")
+        XCTAssertFalse(String(decoding: res.body, as: UTF8.self).contains("LOCATIONTEXT"))
+
+        // The same fetch UNDER the ceiling still has them — otherwise this test
+        // would pass against a route that simply lost the locations.
+        let open = try await get("/v1/catalog/asset/k2", actor: "kira", ceiling: "avocado")
+        XCTAssertEqual((open["locations"] as? [[String: Any]])?.count, 1)
+    }
+
+    /// The clamp's only public entry point. `tierRank`/`ceilingRank` are
+    /// internal so that a cross-module caller cannot spell the comparison the
+    /// fail-open way (`tierRank(asset) > tierRank(ceiling)`, in which an
+    /// unrecognised ceiling withholds nothing).
+    func testIsWithheldIsTheOneDecision() {
+        XCTAssertFalse(isWithheld(tier: "avocado", ceiling: nil), "no ceiling, no clamp")
+        XCTAssertTrue(isWithheld(tier: "avocado", ceiling: "neutral"))
+        XCTAssertFalse(isWithheld(tier: "neutral", ceiling: "avocado"))
+        XCTAssertTrue(isWithheld(tier: "banana", ceiling: "never-heard-of-it"),
+                      "an unrecognised ceiling must admit the least, not the most")
+        XCTAssertTrue(isWithheld(tier: "never-heard-of-it", ceiling: "avocado"),
+                      "an unrecognised tier must be withheld from every ceiling")
     }
 
     /// SQLite reads a negative LIMIT as "no limit". A caller must not be able to

@@ -410,8 +410,19 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(hers, ["k1"], "her scope sees only hers")
         let theirs = try await store.assetIDs(forFilename: "still.png", scope: .shared)
         XCTAssertEqual(theirs, ["s1"])
-        let unscoped = try await store.assetIDs(forFilename: "still.png")
+        let unscoped = try await store.assetIDs(forFilename: "still.png", scope: nil)
         XCTAssertEqual(unscoped.count, 2, "the service still sees both")
+    }
+
+    /// `asset_collections` has no foreign keys, so filing an id that names no
+    /// row inserts happily and leaves a membership pointing at nothing — which
+    /// inflates every collection count. POST /v1/catalog/file is unauthenticated
+    /// and unscoped, so the id is whatever a caller typed.
+    func testFilingAnUnknownAssetIsRefusedRatherThanOrphaned() async throws {
+        await XCTAssertThrowsErrorAsync(
+            try await store.file(assetID: "no-such-asset", into: "col-kira-still-life", by: nil))
+        let counts = try await store.facets(scope: nil).collection
+        XCTAssertNil(counts["col-kira-still-life"])
     }
 
     /// The prohibition belongs to the data, not to the caller: the service actor
@@ -500,9 +511,9 @@ final class CatalogStoreTests: XCTestCase {
         // Unscoped — the service itself — resolves all three.
         let serviceLocations = try await store.locations(of: "s1", scope: nil)
         XCTAssertEqual(serviceLocations.count, 1)
-        let serviceByPath = try await store.assetID(forPath: "/tmp/s1.png")
+        let serviceByPath = try await store.assetID(forPath: "/tmp/s1.png", scope: nil)
         XCTAssertEqual(serviceByPath, "s1")
-        let serviceBySHA = try await store.assetID(forSHA256: "deadbeef")
+        let serviceBySHA = try await store.assetID(forSHA256: "deadbeef", scope: nil)
         XCTAssertEqual(serviceBySHA, "s1")
 
         // Scoped to her realm, all three go quiet — including the two that would

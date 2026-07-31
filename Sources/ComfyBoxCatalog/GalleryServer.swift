@@ -119,9 +119,23 @@ public enum GalleryServer {
                 // assets' ids. Unscoped, a confined caller walks an i2v edge
                 // from her own clip to a shared still and reads a realm she
                 // cannot search.
-                body["locations"] = try await store.locations(of: id, scope: scope).map {
-                    ["host": $0.host, "path": $0.path, "mtime": $0.mtime.timeIntervalSince1970]
+                //
+                // BOTH RULES, not just the realm lock. `locations` is realm-
+                // scoped in the store but knows nothing about the ceiling, so
+                // this route used to omit `path` from the row as clamped and
+                // then hand back the very same absolute path two lines later
+                // under `locations` — a live fetch at ceiling `neutral`
+                // returned `path: false, prompt: false` beside a full
+                // /Volumes/todd/.kira/studio/video/…/avocado/… filename. In this
+                // library the filename IS the prompt. Above the ceiling there
+                // are no locations at all.
+                var locations: [[String: Any]] = []
+                if !isWithheld(tier: row.contentMode, ceiling: ceiling) {
+                    locations = try await store.locations(of: id, scope: scope).map {
+                        ["host": $0.host, "path": $0.path, "mtime": $0.mtime.timeIntervalSince1970]
+                    }
                 }
+                body["locations"] = locations
                 body["edges"] = try await store.edges(for: id, scope: scope).map {
                     ["from": $0.fromAssetID, "to": $0.toAssetID, "relation": $0.relation.rawValue]
                 }
@@ -141,7 +155,7 @@ public enum GalleryServer {
                     try await store.file(assetID: assetID, into: collectionID, by: scope)
                 } catch let e as CatalogError {
                     switch e {
-                    case .notPermitted, .noSuchCollection, .depthCapExceeded:
+                    case .notPermitted, .noSuchCollection, .noSuchAsset, .depthCapExceeded:
                         // A refusal names the collection, its realm and the
                         // actor's — the same class of detail `internalError`
                         // keeps off the wire, and here it doubles as an oracle

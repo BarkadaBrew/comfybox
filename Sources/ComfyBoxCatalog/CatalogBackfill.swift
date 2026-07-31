@@ -223,7 +223,9 @@ public enum CatalogBackfill {
                 // `??` cannot carry the await, so the store is only asked when
                 // this run has not already seen the bytes.
                 var seenID = bySHA[sha]
-                if seenID == nil { seenID = try await store.assetID(forSHA256: sha) }
+                // Unscoped, explicitly: backfill sweeps every tree in every realm, and a
+                // scoped dedup would mint a second row for bytes it already holds.
+                if seenID == nil { seenID = try await store.assetID(forSHA256: sha, scope: nil) }
                 if let existingID = seenID {
                     // Same bytes seen before — a downstream copy.
                     report.duplicatesMerged += 1
@@ -301,7 +303,7 @@ public enum CatalogBackfill {
 
         // Pass 2 — i2v edges, now that every still is indexed.
         for pending in pendingEdges {
-            guard let clipID = try await store.assetID(forPath: pending.clipPath),
+            guard let clipID = try await store.assetID(forPath: pending.clipPath, scope: nil),
                   let stillID = try await resolveSource(pending.sourceImage, scope: pending.scope,
                                                         trees: trees, store: store),
                   stillID != clipID else {
@@ -342,7 +344,10 @@ public enum CatalogBackfill {
             if let local = t.localPath(for: remote) { candidates.append(local) }
         }
         for candidate in candidates {
-            if let id = try await store.assetID(forPath: candidate) { return id }
+            // `scope: nil` on the EXACT-path lookups: a full path is not a guess,
+            // and backfill is the unconfined sweep. Only the basename fallback
+            // below — the one that guesses — carries the clip's realm.
+            if let id = try await store.assetID(forPath: candidate, scope: nil) { return id }
         }
         // Last resort: the basename, and ONLY when it names exactly one asset.
         // Two assets sharing a filename is normal (every tree has its own

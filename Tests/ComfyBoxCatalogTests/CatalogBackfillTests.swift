@@ -134,7 +134,7 @@ final class CatalogBackfillTests: XCTestCase {
         let report = try await CatalogBackfill.run(store: store, trees: trees())
 
         XCTAssertEqual(report.edgesCreated, 1)
-        let foundClip = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4")
+        let foundClip = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4", scope: nil)
         let clipID = try XCTUnwrap(foundClip)
         let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.relation, .i2vSource)
@@ -156,14 +156,14 @@ final class CatalogBackfillTests: XCTestCase {
         try write("Kira/generated/b.png", bytes: "B", tree: "kira/gallery")
         _ = try await CatalogBackfill.run(store: store, trees: trees())
         let firstCount = try await store.search(CatalogQuery(scope: nil, limit: 500)).count
-        let firstFound = try await store.assetID(forPath: root + "/home/a.png")
+        let firstFound = try await store.assetID(forPath: root + "/home/a.png", scope: nil)
         let firstID = try XCTUnwrap(firstFound)
         let firstLocations = try await store.locations(of: firstID, scope: nil).count
 
         _ = try await CatalogBackfill.run(store: store, trees: trees())
         let secondCount = try await store.search(CatalogQuery(scope: nil, limit: 500)).count
         XCTAssertEqual(secondCount, firstCount)
-        let secondFound = try await store.assetID(forPath: root + "/home/a.png")
+        let secondFound = try await store.assetID(forPath: root + "/home/a.png", scope: nil)
         let secondID = try XCTUnwrap(secondFound)
         let secondLocations = try await store.locations(of: secondID, scope: nil).count
         XCTAssertEqual(secondLocations, firstLocations)
@@ -219,7 +219,7 @@ final class CatalogBackfillTests: XCTestCase {
         try write("a.png", bytes: "V1", tree: "home")
         try write("Kira/generated/b.png", bytes: "B", tree: "kira/gallery")
         _ = try await CatalogBackfill.run(store: store, trees: trees())
-        let foundFirstID = try await store.assetID(forPath: root + "/home/a.png")
+        let foundFirstID = try await store.assetID(forPath: root + "/home/a.png", scope: nil)
         let firstID = try XCTUnwrap(foundFirstID)
 
         try write("a.png", bytes: "V2 IS LONGER", tree: "home")
@@ -228,7 +228,7 @@ final class CatalogBackfillTests: XCTestCase {
         let rows = try await store.search(CatalogQuery(scope: nil, limit: 500))
         XCTAssertEqual(rows.count, 2, "the changed file is the same asset, not a second one")
         XCTAssertEqual(second.assetsIndexed, 0, "an update in place is not a new asset")
-        let foundAgain = try await store.assetID(forPath: root + "/home/a.png")
+        let foundAgain = try await store.assetID(forPath: root + "/home/a.png", scope: nil)
         let again = try XCTUnwrap(foundAgain)
         XCTAssertEqual(again, firstID, "the row keeps its identity")
         let foundUpdated = try await store.asset(id: firstID)
@@ -247,7 +247,7 @@ final class CatalogBackfillTests: XCTestCase {
         try write("shot.png", bytes: "SAME", tree: "home")
         try write("Kira/generated/copy.png", bytes: "SAME", tree: "kira/gallery")
         _ = try await CatalogBackfill.run(store: store, trees: trees())
-        let foundHomeID = try await store.assetID(forPath: homePath)
+        let foundHomeID = try await store.assetID(forPath: homePath, scope: nil)
         let homeID = try XCTUnwrap(foundHomeID)
 
         // The copy diverges — a re-render into the same server filename.
@@ -301,7 +301,7 @@ final class CatalogBackfillTests: XCTestCase {
         let foundOther = try await store.asset(id: "aaa-other")
         let other = try XCTUnwrap(foundOther)
         XCTAssertEqual(other.absolutePath, root + "/home/other.png", "the other row did not move")
-        let owners = try await store.assetIDs(forFilename: "contested.png", limit: 10)
+        let owners = try await store.assetIDs(forFilename: "contested.png", limit: 10, scope: nil)
         XCTAssertEqual(owners, ["zzz-owner"], "exactly one row for the contested path")
     }
 
@@ -365,9 +365,9 @@ final class CatalogBackfillTests: XCTestCase {
         XCTAssertEqual(report.edgesCreated, 1)
         XCTAssertEqual(report.edgesUnresolved, 0)
 
-        let foundClipID = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4")
+        let foundClipID = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4", scope: nil)
         let clipID = try XCTUnwrap(foundClipID)
-        let foundStillID = try await store.assetID(forPath: still)
+        let foundStillID = try await store.assetID(forPath: still, scope: nil)
         let stillID = try XCTUnwrap(foundStillID)
         let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.toAssetID, stillID, "the edge must point at the translated still")
@@ -400,9 +400,9 @@ final class CatalogBackfillTests: XCTestCase {
 
         let report = try await CatalogBackfill.run(store: store, trees: trees())
         XCTAssertEqual(report.edgesCreated, 1)
-        let foundClipID = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4")
+        let foundClipID = try await store.assetID(forPath: root + "/kira/gallery/Kira/video/clip.mp4", scope: nil)
         let clipID = try XCTUnwrap(foundClipID)
-        let foundStillID = try await store.assetID(forPath: still)
+        let foundStillID = try await store.assetID(forPath: still, scope: nil)
         let stillID = try XCTUnwrap(foundStillID)
         let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.toAssetID, stillID)

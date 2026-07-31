@@ -395,8 +395,25 @@ struct GalleryView: View {
                 pendingDelete = []
             }
         } message: {
-            Text("The image files and their metadata are moved to the Trash.")
+            Text(deleteConfirmationMessage)
         }
+    }
+
+    /// What the dialog promises, told truthfully for a mixed selection.
+    ///
+    /// The grid is catalog-backed now, so a selection can include rows whose
+    /// bytes live on the server rather than on this Mac. Those cannot be moved
+    /// to this Mac's Trash, and they will NOT be deleted permanently instead —
+    /// the dialog has to say so before the button is pressed, not afterwards in
+    /// an error banner.
+    private var deleteConfirmationMessage: String {
+        let base = "The image files and their metadata are moved to the Trash."
+        let remote = pendingDelete.filter { !AssetIngestor.isOnThisMac($0.absolutePath) }
+        guard !remote.isEmpty else { return base }
+        let noun = remote.count == 1 ? "file is" : "files are"
+        return base + "\n\n\(remote.count) selected \(noun) hosted on the server, not on this "
+            + "Mac. macOS cannot move those to the Trash, so they are left in place and their "
+            + "catalog entries are kept."
     }
 
     // MARK: - Toolbar
@@ -1889,16 +1906,29 @@ struct GalleryView: View {
     /// but do not stop the remaining deletions.
     private func deleteAssets(_ toDelete: [DAMAsset]) async {
         var failures: [String] = []
+        var refused: [String] = []
         for asset in toDelete {
             do {
                 try await ingestor.deleteAsset(asset)
                 selectedIds.remove(asset.id)
+            } catch AssetIngestor.DeletionRefusal.notOnThisMac {
+                // Not a failure to report as one: the file is on the server and
+                // was deliberately left alone rather than permanently destroyed.
+                refused.append(asset.filename)
             } catch {
                 failures.append(asset.filename)
             }
         }
+        var notes: [String] = []
+        if !refused.isEmpty {
+            notes.append("Left on the server (macOS cannot trash a network file): "
+                + refused.joined(separator: ", "))
+        }
         if !failures.isEmpty {
-            errorMessage = "Failed to delete: \(failures.joined(separator: ", "))"
+            notes.append("Failed to delete: \(failures.joined(separator: ", "))")
+        }
+        if !notes.isEmpty {
+            errorMessage = notes.joined(separator: " — ")
         }
         lightboxIndex = nil
         await loadAssets()

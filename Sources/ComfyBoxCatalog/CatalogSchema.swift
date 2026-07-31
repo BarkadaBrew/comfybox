@@ -141,7 +141,14 @@ public enum CatalogSchema {
         // catches any failure mode the message-match above doesn't anticipate.
         try verifyNewColumnsPresent(db: db)
 
-        _ = try? exec(db, "UPDATE assets SET realm = 'shared' WHERE realm IS NULL")
+        // NOT `try?`. This statement is the mechanism that turns a NULL realm
+        // into a SHARED one, and NULL is not only what a pre-migration row has —
+        // it is also what a bug elsewhere leaves behind (a wide `INSERT OR
+        // REPLACE` over this table used to blank the column on every ♥ click).
+        // Promoting Kira-private assets out of her realm is the single most
+        // consequential write in this file, so if it ever fails it must say so
+        // rather than leave the caller believing every row is realmed.
+        try exec(db, "UPDATE assets SET realm = 'shared' WHERE realm IS NULL")
 
         try exec(db, """
             CREATE TABLE IF NOT EXISTS asset_locations (
