@@ -286,6 +286,7 @@ struct GalleryView: View {
                 assets: filteredAssets,
                 index: filteredAssets.firstIndex(where: { $0.id == asset.id }) ?? 0,
                 thumbnailProvider: { ingestor.thumbnailPath(for: $0.id) },
+                mediaLocationProvider: { mediaLocation(for: $0) },
                 onUpdate: { updated in
                     Task { await updateAsset(updated) }
                 },
@@ -327,6 +328,7 @@ struct GalleryView: View {
                     onCopy: { copyAssets([$0]) },
                     onReveal: { revealInFinder($0) },
                     onSendToGenerate: onSendToGenerate,
+                    mediaLocationProvider: { mediaLocation(for: $0) },
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
@@ -794,7 +796,7 @@ struct GalleryView: View {
         GalleryCellView(
             asset: asset,
             thumbnailPath: ingestor.thumbnailPath(for: asset.id),
-            remoteURL: remoteURLs[asset.id],
+            remoteURL: mediaLocation(for: asset).remoteURL,
             cellWidth: width,
             aspectRatio: aspectRatio(asset),
             isComparisonSelected: isSelectMode ? isSelected : nil
@@ -982,6 +984,20 @@ struct GalleryView: View {
             n += 1
         }
         return path
+    }
+
+    /// Where one row's bytes are, as THIS surface decided it.
+    ///
+    /// The single accessor every surface goes through — grid cell, detail pane,
+    /// lightbox — so they cannot disagree about whether a row is remote. The
+    /// local half prefers the path `CatalogBrowser` resolved for the page (an
+    /// asset's `mac` location can spell a different path than its primary
+    /// `absolutePath`); the remote half is the stream URL the browser built for
+    /// exactly the rows it found no local file for.
+    func mediaLocation(for asset: DAMAsset) -> AssetMediaLocation {
+        AssetMediaLocation(
+            localPath: browser?.localPath(forID: asset.id) ?? asset.absolutePath,
+            remoteURL: remoteURLs[asset.id])
     }
 
     /// Download a row whose bytes are on a server into the local output folder
@@ -2094,6 +2110,11 @@ private struct GalleryLightbox: View {
     var onReveal: (DAMAsset) -> Void = { _ in }
     /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
     var onSendToGenerate: ((DAMAsset) -> Void)?
+    /// Where the gallery decided each row's bytes are — the SAME answer the grid
+    /// cell uses, so a cell that streamed its thumbnail never opens empty here.
+    var mediaLocationProvider: (DAMAsset) -> AssetMediaLocation = {
+        AssetMediaLocation(localPath: $0.absolutePath, remoteURL: nil)
+    }
     let onIndexChange: (Int) -> Void
     let onClose: () -> Void
 
@@ -2102,9 +2123,20 @@ private struct GalleryLightbox: View {
     @State private var zoom: CGFloat = 1
     @State private var baseZoom: CGFloat = 1
     @State private var offset: CGSize = .zero
+    /// Why there is nothing on screen (server unreachable, file gone). Beats a
+    /// ProgressView that spins forever.
+    @State private var loadError: String?
     @FocusState private var focused: Bool
+    @Environment(AppContentGate.self) private var contentGate
 
     private var asset: DAMAsset? { assets.indices.contains(index) ? assets[index] : nil }
+
+    /// Where the current asset's bytes come from — gate first, then disk, then
+    /// the engine.
+    private var source: AssetMediaSource {
+        guard let asset else { return .missing }
+        return AssetMediaSource.resolve(mediaLocationProvider(asset), gateRevealed: contentGate.revealed)
+    }
 
     var body: some View {
         ZStack {
@@ -2138,8 +2170,24 @@ private struct GalleryLightbox: View {
                                 offset = .zero
                             }
                         }
+                } else if let loadError {
+                    VStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 34)).foregroundStyle(.white.opacity(0.7))
+                        Text(loadError)
+                            .font(.callout).foregroundStyle(.white.opacity(0.85))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 460)
+                    }
                 } else {
-                    ProgressView().controlSize(.large).tint(.white)
+                    VStack(spacing: 10) {
+                        ProgressView().controlSize(.large).tint(.white)
+                        if source.isRemote {
+                            Text(asset?.kind == "video"
+                                 ? "Fetching video from server..." : "Loading from server...")
+                                .font(.caption).foregroundStyle(.white.opacity(0.7))
+                        }
+                    }
                 }
             }
             .padding(40)
@@ -2162,7 +2210,9 @@ private struct GalleryLightbox: View {
 
                     // Photo Mechanic-style color classes: click a swatch or
                     // press 1-7 (0 clears). Mirrors the file's Finder tag.
-                    if let asset {
+                    // Colour classes write a Finder tag to the file itself, so
+                    // they only exist for a row whose file is on this Mac.
+                    if let asset, source.isLocal {
                         let current = labelForAsset(asset)
                         HStack(spacing: 7) {
                             ForEach(Array(FinderColor.keyboardOrder.enumerated()), id: \.element) { i, color in
@@ -2199,16 +2249,27 @@ private struct GalleryLightbox: View {
                     Spacer()
 
                     if let asset {
+                        if source.isRemote {
+                            Image(systemName: "externaldrive.connected.to.line.below")
+                                .font(.title3).foregroundStyle(.white.opacity(0.6))
+                                .help("Streamed from the engine — no copy of this file on this Mac.")
+                        }
+                        // Copy and Reveal need a file on this disk; for a
+                        // server-side row they would quietly do nothing.
                         Button { onCopy(asset) } label: {
                             Image(systemName: "doc.on.doc").font(.title3)
                         }
-                        .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
-                        .help("Copy image (⌘C)")
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(source.isLocal ? 0.85 : 0.3))
+                        .disabled(!source.isLocal)
+                        .help(source.localOnlyReason ?? "Copy image (⌘C)")
                         Button { onReveal(asset) } label: {
                             Image(systemName: "magnifyingglass.circle").font(.title3)
                         }
-                        .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
-                        .help("Reveal in Finder")
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(source.isLocal ? 0.85 : 0.3))
+                        .disabled(!source.isLocal)
+                        .help(source.localOnlyReason ?? "Reveal in Finder")
                         if let onSendToGenerate {
                             Button { onSendToGenerate(asset) } label: {
                                 Image(systemName: "wand.and.stars.inverse").font(.title3)
@@ -2242,19 +2303,24 @@ private struct GalleryLightbox: View {
         .onKeyPress(.rightArrow) { step(1); return .handled }
         .onKeyPress(.escape) { onClose(); return .handled }
         .onKeyPress(keys: ["c"]) { press in
-            guard press.modifiers.contains(.command), let asset else { return .ignored }
+            // Same local-file rule as the button: ⌘C on a server-side row would
+            // put nothing on the pasteboard.
+            guard press.modifiers.contains(.command), let asset, source.isLocal else { return .ignored }
             onCopy(asset)
             return .handled
         }
         .onKeyPress(characters: CharacterSet(charactersIn: "01234567")) { press in
             // The lightbox owns keyboard focus, so it must handle the color
             // classes itself — the gallery-level handler never sees these.
-            guard let asset, let character = press.characters.first,
+            // Tagging writes to the file, so it needs one on this Mac.
+            guard let asset, source.isLocal, let character = press.characters.first,
                   let digit = character.wholeNumberValue else { return .ignored }
             onSetLabel(asset, digit == 0 ? nil : FinderColor.keyboardOrder[digit - 1])
             return .handled
         }
-        .task(id: index) { await load() }
+        // Keyed on the gate too: closing it mid-session must stop a playing
+        // video and drop the loaded bytes, not just blur them.
+        .task(id: "\(index)|\(contentGate.revealed)") { await load() }
         .onAppear { focused = true }
     }
 
@@ -2285,12 +2351,50 @@ private struct GalleryLightbox: View {
         player?.pause()
         player = nil
         image = nil
+        loadError = nil
         guard let asset else { return }
-        if asset.kind == "video" {
-            player = AVPlayer(url: URL(fileURLWithPath: asset.absolutePath))
-        } else {
-            let path = asset.absolutePath
-            image = await Task.detached { NSImage(contentsOfFile: path) }.value
+        let isVideo = asset.kind == "video"
+
+        switch source {
+        case .gated:
+            // Rated G: read nothing, from disk or network. The lightbox can
+            // only be opened from a revealed grid, but the load path itself
+            // refuses rather than relying on that.
+            loadError = "Locked."
+
+        case .local(let path):
+            if isVideo {
+                player = AVPlayer(url: URL(fileURLWithPath: path))
+            } else {
+                image = await Task.detached { NSImage(contentsOfFile: path) }.value
+                if image == nil { loadError = "Couldn't open \((path as NSString).lastPathComponent)." }
+            }
+
+        case .remote(let url):
+            if isVideo {
+                // The engine serves whole bodies with no Range support and
+                // AVPlayer needs ranges over HTTP, so fetch the file once and
+                // play the copy.
+                do {
+                    let file = try await RemoteMediaCache.localCopy(of: url, filename: asset.filename)
+                    guard !Task.isCancelled else { return }
+                    player = AVPlayer(url: file)
+                } catch {
+                    loadError = "Couldn't fetch this video from the server: \(error.localizedDescription)"
+                }
+            } else {
+                guard let (data, response) = try? await URLSession.shared.data(from: url),
+                      (response as? HTTPURLResponse)?.statusCode ?? 200 == 200,
+                      let fetched = NSImage(data: data) else {
+                    loadError = "Couldn't fetch this image from the server."
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                image = fetched
+            }
+
+        case .missing:
+            loadError = "This asset's file isn't on this Mac, and no server copy is known."
         }
     }
 }

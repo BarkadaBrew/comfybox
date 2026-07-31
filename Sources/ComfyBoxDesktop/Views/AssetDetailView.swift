@@ -3,14 +3,31 @@
 // Displays a full-size image preview with all generation metadata.
 // Provides editable fields for rating (0-5 stars), favorite toggle,
 // and notes. Changes are saved back to DAMStore.
+//
+// REMOTE ROWS. 1,278 of the converged catalog's 2,994 rows have no copy in
+// this Mac's own library; they are the server's, reachable only through the
+// smbfs mount at /Volumes/todd or the engine's stream route. This view used to
+// open `absolutePath` with NSImage and nothing else, which meant two empty
+// panes: any row whose path wasn't readable (mount down, server-only path),
+// and — 535 rows of them — every VIDEO, because NSImage cannot open an mp4 and
+// there was no player here at all. It now resolves through `AssetMediaSource`,
+// the same local/remote decision the grid cell makes, plays video, streams from
+// the engine when the bytes are only there, and says why when it can't.
 
 import SwiftUI
+import AVKit
 
 struct AssetDetailView: View {
     /// The full set the card can navigate through (the gallery's filtered list).
     let assets: [DAMAsset]
     /// Thumbnail path for a given asset (fallback when the full image fails).
     let thumbnailProvider: (DAMAsset) -> String?
+    /// Where the gallery decided this row's bytes are. Defaults to "its own
+    /// path, nothing remote", which is exactly the old behaviour for callers
+    /// that have no catalog.
+    var mediaLocationProvider: (DAMAsset) -> AssetMediaLocation = {
+        AssetMediaLocation(localPath: $0.absolutePath, remoteURL: nil)
+    }
     let onUpdate: (DAMAsset) -> Void
     /// Open the given asset in the full-screen lightbox.
     var onFullScreen: ((DAMAsset) -> Void)?
@@ -24,7 +41,14 @@ struct AssetDetailView: View {
     @State private var fullImage: NSImage?
     @State private var isLoadingImage: Bool = false
     @State private var usedThumbnailFallback: Bool = false
+    /// One player per asset, owned here. Building AVPlayer inline in the body
+    /// (one per re-render) is a known crash in _AVKit_SwiftUI — the lightbox
+    /// learned this the hard way; same rule applies here.
+    @State private var player: AVPlayer?
+    /// What went wrong fetching a server-side asset, shown instead of a blank pane.
+    @State private var mediaError: String?
     @Environment(\.dismiss) private var dismiss
+    @Environment(AppContentGate.self) private var contentGate
 
     /// Single-asset convenience (no navigation).
     init(asset: DAMAsset, thumbnailPath: String?, onUpdate: @escaping (DAMAsset) -> Void) {
@@ -41,12 +65,16 @@ struct AssetDetailView: View {
         assets: [DAMAsset],
         index: Int,
         thumbnailProvider: @escaping (DAMAsset) -> String?,
+        mediaLocationProvider: @escaping (DAMAsset) -> AssetMediaLocation = {
+            AssetMediaLocation(localPath: $0.absolutePath, remoteURL: nil)
+        },
         onUpdate: @escaping (DAMAsset) -> Void,
         onFullScreen: ((DAMAsset) -> Void)? = nil,
         onSendToGenerate: ((DAMAsset) -> Void)? = nil
     ) {
         self.assets = assets
         self.thumbnailProvider = thumbnailProvider
+        self.mediaLocationProvider = mediaLocationProvider
         self.onUpdate = onUpdate
         self.onFullScreen = onFullScreen
         self.onSendToGenerate = onSendToGenerate
@@ -56,6 +84,14 @@ struct AssetDetailView: View {
     /// The asset currently shown.
     private var asset: DAMAsset { assets[min(max(currentIndex, 0), assets.count - 1)] }
     private var thumbnailPath: String? { thumbnailProvider(asset) }
+
+    /// Where this asset's bytes come from — gate first, then disk, then engine.
+    private var source: AssetMediaSource {
+        AssetMediaSource.resolve(mediaLocationProvider(asset), gateRevealed: contentGate.revealed)
+    }
+
+    /// Nil when Copy / Reveal can run; otherwise why they can't.
+    private var localOnlyReason: String? { source.localOnlyReason }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -72,7 +108,10 @@ struct AssetDetailView: View {
             }
         }
         .frame(minWidth: 800, minHeight: 500)
-        .task(id: asset.id) {
+        // Keyed on the gate as well as the asset: closing the gate mid-session
+        // must tear the loaded bytes (and a playing video) down, not merely
+        // blur them, and opening it must then load what was withheld.
+        .task(id: "\(asset.id)|\(contentGate.revealed)") {
             syncEditableState()
             await loadFullImage()
         }
@@ -100,15 +139,26 @@ struct AssetDetailView: View {
                 .font(.callout.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if source.isRemote {
+                Label("On server", systemImage: "externaldrive.connected.to.line.below")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("Streamed from the engine — no copy of this file on this Mac.")
+            }
             Spacer()
+            // Copy and Reveal both need a real file on this disk. For a
+            // server-side row they would do nothing at all, so they say why
+            // instead of failing silently.
             Button { copyToClipboard() } label: {
                 Label("Copy", systemImage: "doc.on.doc")
             }
-            .help("Copy image (⌘C)")
+            .disabled(localOnlyReason != nil)
+            .help(localOnlyReason ?? "Copy image (⌘C)")
             Button { revealInFinder() } label: {
                 Label("Reveal", systemImage: "magnifyingglass")
             }
-            .help("Reveal in Finder")
+            .disabled(localOnlyReason != nil)
+            .help(localOnlyReason ?? "Reveal in Finder")
             if let onSendToGenerate {
                 Button { onSendToGenerate(asset) } label: {
                     Label("Send to Generate", systemImage: "wand.and.stars")
@@ -139,13 +189,15 @@ struct AssetDetailView: View {
     }
 
     private func revealInFinder() {
-        NSWorkspace.shared.selectFile(asset.absolutePath, inFileViewerRootedAtPath: "")
+        guard case .local(let path) = source else { return }
+        NSWorkspace.shared.selectFile(path, inFileViewerRootedAtPath: "")
     }
 
     /// Copy the current image to the clipboard as both a file reference and,
     /// when it loads, its bitmap.
     private func copyToClipboard() {
-        let url = URL(fileURLWithPath: asset.absolutePath)
+        guard case .local(let path) = source else { return }
+        let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -160,7 +212,11 @@ struct AssetDetailView: View {
         ZStack {
             Color(nsColor: .controlBackgroundColor)
 
-            if let image = fullImage {
+            if let player {
+                VideoPlayer(player: player)
+                    .aspectRatio(contentMode: .fit)
+                    .padding(8)
+            } else if let image = fullImage {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -179,16 +235,20 @@ struct AssetDetailView: View {
                 VStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.large)
-                    Text("Loading image...")
+                    Text(source.isRemote
+                         ? (asset.kind == "video" ? "Fetching video from server..." : "Loading from server...")
+                         : "Loading image...")
                         .foregroundStyle(.secondary)
                 }
             } else {
                 VStack(spacing: 8) {
-                    Image(systemName: "photo")
+                    Image(systemName: asset.kind == "video" ? "film" : "photo")
                         .font(.system(size: 48))
                         .foregroundStyle(.tertiary)
-                    Text("Image not available")
+                    Text(mediaError ?? "Image not available")
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 20)
                     Text(asset.absolutePath)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
@@ -440,23 +500,91 @@ struct AssetDetailView: View {
         }
     }
 
+    /// Load whatever this asset is, from wherever it is.
+    ///
+    /// Four outcomes, in the order `AssetMediaSource.resolve` decides them:
+    /// gated (nothing is read — not disk, not network), local file, engine
+    /// stream, or nothing at all.
     private func loadFullImage() async {
-        isLoadingImage = true
+        // Tear the previous asset down first; a player left running would keep
+        // playing over the next row (or past a closing gate).
+        player?.pause()
+        player = nil
         fullImage = nil
         usedThumbnailFallback = false
-        let path = asset.absolutePath
+        mediaError = nil
+        isLoadingImage = false
+
+        let isVideo = asset.kind == "video"
         let thumb = thumbnailPath
-        let (image, fellBack) = await Task.detached { () -> (NSImage?, Bool) in
-            if let full = NSImage(contentsOfFile: path) { return (full, false) }
-            // Original gone — show the cached thumbnail so the card isn't blank.
-            if let thumb, let preview = NSImage(contentsOfFile: thumb) { return (preview, true) }
-            return (nil, false)
-        }.value
-        await MainActor.run {
+
+        switch source {
+        case .gated:
+            // Rated G. Read nothing.
+            return
+
+        case .local(let path):
+            isLoadingImage = true
+            if isVideo {
+                player = AVPlayer(url: URL(fileURLWithPath: path))
+                isLoadingImage = false
+                return
+            }
+            let (image, fellBack) = await Task.detached { () -> (NSImage?, Bool) in
+                if let full = NSImage(contentsOfFile: path) { return (full, false) }
+                // Original gone — show the cached thumbnail so the card isn't blank.
+                if let thumb, let preview = NSImage(contentsOfFile: thumb) { return (preview, true) }
+                return (nil, false)
+            }.value
             fullImage = image
             usedThumbnailFallback = fellBack
+            if image == nil { mediaError = "Image not available" }
             isLoadingImage = false
+
+        case .remote(let url):
+            isLoadingImage = true
+            if isVideo {
+                // Pulled to a temp file rather than streamed: the engine route
+                // serves whole bodies with no Range support, and AVPlayer needs
+                // ranges to play over HTTP.
+                do {
+                    let file = try await RemoteMediaCache.localCopy(of: url, filename: asset.filename)
+                    guard !Task.isCancelled else { return }
+                    player = AVPlayer(url: file)
+                } catch {
+                    mediaError = "Couldn't fetch this video from the server: \(error.localizedDescription)"
+                }
+                isLoadingImage = false
+                return
+            }
+            let image = await Self.remoteImage(from: url)
+            guard !Task.isCancelled else { return }
+            if let image {
+                fullImage = image
+            } else if let thumb, let preview = NSImage(contentsOfFile: thumb) {
+                fullImage = preview
+                usedThumbnailFallback = true
+            } else {
+                mediaError = "Couldn't fetch this image from the server."
+            }
+            isLoadingImage = false
+
+        case .missing:
+            if let thumb, let preview = NSImage(contentsOfFile: thumb) {
+                fullImage = preview
+                usedThumbnailFallback = true
+            } else {
+                mediaError = "This asset's file isn't on this Mac, and no server copy is known."
+            }
         }
+    }
+
+    /// Bytes from the engine's `/v1/gallery/file` — the same route (and the
+    /// same 200-only rule) the grid's thumbnails use.
+    private static func remoteImage(from url: URL) async -> NSImage? {
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode ?? 200 == 200 else { return nil }
+        return NSImage(data: data)
     }
 
     private func saveChanges() {
