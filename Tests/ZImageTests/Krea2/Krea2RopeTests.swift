@@ -75,6 +75,38 @@ final class Krea2RopeTests: XCTestCase {
             "axis 0 must stay vanilla under any scale")
     }
 
+    // MARK: - Scale derivation
+
+    func testDisabledDyPEYieldsUnitScales() {
+        let scales = Krea2Sampling.ropeScales(
+            hTok: 128, wTok: 128, patch: 2, dyPE: .disabled)
+        XCTAssertEqual(scales, [1, 1, 1])
+    }
+
+    func test2KGridDerivesScaleOfTwo() {
+        // 2048px / (spatialScale 8 * patch 2) = 128 tokens; base is 64.
+        let scales = Krea2Sampling.ropeScales(
+            hTok: 128, wTok: 128, patch: 2, dyPE: .ntk)
+        XCTAssertEqual(scales[0], 1, "axis 0 always unit")
+        XCTAssertEqual(scales[1], 2.0, accuracy: 0.0001)
+        XCTAssertEqual(scales[2], 2.0, accuracy: 0.0001)
+    }
+
+    func testBaseResolutionGridDerivesUnitScales() {
+        let scales = Krea2Sampling.ropeScales(
+            hTok: 64, wTok: 64, patch: 2, dyPE: .ntk)
+        XCTAssertEqual(scales[1], 1.0, accuracy: 0.0001)
+        XCTAssertEqual(scales[2], 1.0, accuracy: 0.0001)
+    }
+
+    func testNonSquareGridScalesAxesIndependently() {
+        // 2048x1152 -> hTok 72, wTok 128 (height is axis 1, width is axis 2).
+        let scales = Krea2Sampling.ropeScales(
+            hTok: 72, wTok: 128, patch: 2, dyPE: .ntk)
+        XCTAssertEqual(scales[1], 1.125, accuracy: 0.0001)
+        XCTAssertEqual(scales[2], 2.0, accuracy: 0.0001)
+    }
+
     func testScaleAtOrBelowOneIsANoOp() {
         let pos = positions()
         let (cosPlain, _) = Krea2Rope.make(pos: pos, axes: axes, theta: theta)

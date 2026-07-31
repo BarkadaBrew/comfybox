@@ -426,7 +426,7 @@ public final class Krea2SingleStreamDiT: Module {
   /// t: (B,) in [0,1]; pos: (L,3) for [txt; img]; mask: (B,L) validity.
   public func callAsFunction(
     img imgIn: MLXArray, context contextIn: MLXArray, t: MLXArray, pos: MLXArray, mask: MLXArray,
-    control: MLXArray? = nil
+    control: MLXArray? = nil, ropeScales: [Float] = [1, 1, 1]
   ) -> MLXArray {
     // Control ON: project concat([noisy tokens ‖ control tokens]) (B,L,2C) through the
     // expanded input projection. Control OFF: base `first` path is byte-identical to today.
@@ -447,7 +447,8 @@ public final class Krea2SingleStreamDiT: Module {
     context = txtmlp(context)
 
     var combined = MLX.concatenated([context, img], axis: 1)
-    let (cos, sin) = Krea2Rope.make(pos: pos.asType(.float32), axes: cfg.axes, theta: cfg.theta)
+    let (cos, sin) = Krea2Rope.make(
+      pos: pos.asType(.float32), axes: cfg.axes, theta: cfg.theta, scales: ropeScales)
     let fullMask = Krea2Util.additiveMask(mask, dtype: img.dtype)
 
     for block in blocks {

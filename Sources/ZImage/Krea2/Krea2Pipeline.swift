@@ -81,6 +81,20 @@ enum Krea2Sampling {
     return MLXArray(pos, [txtLen + h * w, 3])
   }
 
+  /// Per-axis NTK scale factors for DyPE, as [axis0, height, width].
+  ///
+  /// Axis 0 is the text/frame axis and always stays at 1.0. Height and width
+  /// scale by how far the current token grid exceeds the grid the model trained
+  /// at: baseResolution / (spatialScale * patch), which is 1024/16 = 64 tokens.
+  static func ropeScales(
+    hTok: Int, wTok: Int, patch: Int, dyPE: DyPEConfig
+  ) -> [Float] {
+    guard dyPE.enabled, dyPE.method != .none else { return [1, 1, 1] }
+    let baseTokens = Float(dyPE.baseResolution / (Krea2VAE.spatialScale * patch))
+    guard baseTokens > 0 else { return [1, 1, 1] }
+    return [1, Float(hTok) / baseTokens, Float(wTok) / baseTokens]
+  }
+
   /// Resolution-shifted timestep schedule (exp/sigmoid warp), 1 → 0 inclusive.
   static func timesteps(
     seqLen: Int, steps: Int, x1: Float, x2: Float,
