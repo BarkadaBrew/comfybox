@@ -1055,6 +1055,39 @@ public actor CatalogStore {
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
+    /// Assets per collection counted the way `search(collectionID:)` returns
+    /// them: DISTINCT, and including the collection's direct children.
+    ///
+    /// NOT derivable from `CatalogFacets.collection`, which holds DIRECT filings
+    /// only. Summing a parent's facet with its children's double-counts every
+    /// asset filed in both — in the live catalog all 44 `col-decoupage` assets
+    /// are filed in the parent AND in `col-kira-decoupage`, so the sum says 88
+    /// and opening it shows 44.
+    public func collectionCounts(scope: CatalogRealm?) throws -> [String: Int] {
+        let sql = """
+            SELECT c.id, COUNT(DISTINCT ac.asset_id)
+            FROM collections c
+            LEFT JOIN asset_collections ac
+              ON ac.collection_id = c.id
+                 OR ac.collection_id IN (SELECT id FROM collections WHERE parent_id = c.id)
+            LEFT JOIN assets a ON a.id = ac.asset_id
+            WHERE ?1 IS NULL OR a.realm = ?1 OR ac.asset_id IS NULL
+            GROUP BY c.id
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, scope?.rawValue)
+        var out: [String: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let k = text(stmt, 0) else { continue }
+            out[k] = Int(sqlite3_column_int(stmt, 1))
+        }
+        return out
+    }
+
     // MARK: - Facets
 
     public func facets(scope: CatalogRealm?) throws -> CatalogFacets {

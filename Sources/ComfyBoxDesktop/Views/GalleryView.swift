@@ -61,6 +61,9 @@ struct GalleryView: View {
     @State private var lightboxIndex: Int? = nil
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
+    /// Separate from `errorMessage`, which a successful load clears: a refused
+    /// orphan sweep is the one thing the user must still see afterwards.
+    @State private var pruneWarning: String?
 
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
@@ -172,6 +175,10 @@ struct GalleryView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            // NO TEST GUARDS THIS LINE. `showsCatalogRail` is unit-tested, but
+            // nothing checks that the rail actually consults it (no ViewInspector
+            // in this repo) — delete the `if` and every test still passes while
+            // the gate is wide open. Change it by hand, carefully.
             if Self.showsCatalogRail(revealed: contentGate.revealed, hasBrowser: browser != nil) {
                 catalogRail
                     .frame(width: 210)
@@ -194,6 +201,9 @@ struct GalleryView: View {
 
                 if let message = errorMessage {
                     errorBanner(message)
+                }
+                if let warning = pruneWarning {
+                    errorBanner(warning) { pruneWarning = nil }
                 }
 
                 // Gallery grid
@@ -933,6 +943,30 @@ struct GalleryView: View {
                     .draggable(DraggableAsset(path: asset.absolutePath))
     }
 
+    /// A path in `directory` that no file occupies: `name.png`, then
+    /// `name-1.png`, `name-2.png`, …
+    ///
+    /// A server file and a local file can share a basename, and the download
+    /// below is an unattended write — without this it would silently overwrite
+    /// the local original with the remote one. Uniquing rather than prompting:
+    /// the answer is always "keep both".
+    static func uniqueDestination(inDirectory directory: String, filename: String) -> String {
+        let fm = FileManager.default
+        let base = (filename as NSString).deletingPathExtension
+        let ext = (filename as NSString).pathExtension
+        func candidate(_ suffix: String) -> String {
+            let name = ext.isEmpty ? base + suffix : "\(base)\(suffix).\(ext)"
+            return (directory as NSString).appendingPathComponent(name)
+        }
+        var path = candidate("")
+        var n = 1
+        while fm.fileExists(atPath: path) {
+            path = candidate("-\(n)")
+            n += 1
+        }
+        return path
+    }
+
     /// Download a row whose bytes are on a server into the local output folder
     /// and ingest it — the one thing the retired Remote Gallery could do that
     /// browsing the catalog cannot.
@@ -946,7 +980,7 @@ struct GalleryView: View {
             }
             let dir = DesktopSettings.load().outputDirectory
             try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            let dest = (dir as NSString).appendingPathComponent(asset.filename)
+            let dest = Self.uniqueDestination(inDirectory: dir, filename: asset.filename)
             try data.write(to: URL(fileURLWithPath: dest))
             _ = try? await ingestor.ingestFile(at: dest)
             errorMessage = nil
@@ -956,7 +990,8 @@ struct GalleryView: View {
         }
     }
 
-    private func errorBanner(_ message: String) -> some View {
+    private func errorBanner(_ message: String,
+                             dismiss: (() -> Void)? = nil) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -964,7 +999,7 @@ struct GalleryView: View {
                 .font(.callout)
                 .lineLimit(2)
             Spacer()
-            Button(action: { errorMessage = nil }) {
+            Button(action: { if let dismiss { dismiss() } else { errorMessage = nil } }) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)
             }
@@ -1409,8 +1444,15 @@ struct GalleryView: View {
         do {
             // Self-heal: drop rows whose file was deleted out from under the
             // DAM before presenting (only worth it on a full, unfiltered load).
+            // This is an unattended destructive sweep, so its refusal is SHOWN,
+            // not swallowed: a circuit breaker trip means a volume is probably
+            // unmounted, and silently skipping it would leave the gallery
+            // looking half-empty with no explanation.
             if searchText.isEmpty {
-                _ = try? await ingestor.pruneOrphans()
+                do { _ = try await ingestor.pruneOrphans() }
+                catch let error as DAMStoreError {
+                    if case .pruneRefused = error { pruneWarning = error.localizedDescription }
+                } catch { /* a prune failure must never block browsing */ }
             }
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()
@@ -1441,6 +1483,10 @@ struct GalleryView: View {
         // reader has to be told about it or converging on the catalog would
         // quietly undo every vault move. `filteredAssets` filters by the same
         // set again — this is deliberately belt AND braces.
+        // NO TEST GUARDS THIS LINE. The withholding itself is tested on
+        // CatalogBrowser, but nothing checks that this view actually feeds it the
+        // secured set — delete this line and every test still passes while every
+        // vaulted asset comes back. Change it by hand, carefully.
         browser.hiddenAssetIDs = revealSecured ? [] : securedIds
         await browser.apply(filter: catalogQuery())
         if let message = browser.error { errorMessage = message } else { errorMessage = nil }

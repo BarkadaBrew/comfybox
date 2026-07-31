@@ -157,6 +157,40 @@ final class CatalogBrowserTests: XCTestCase {
         XCTAssertEqual(b.damAsset(for: row).filename, "r.png")
     }
 
+    /// The rail's label must equal what clicking it opens. `facets.collection`
+    /// holds DIRECT filings, so summing a parent with its children double-counts
+    /// every asset filed in both — which, for decoupage, is all of them.
+    func testARailCountEqualsWhatSelectingItOpens() async throws {
+        // Kira's decoupage lane files into her genre AND the shared root.
+        try await store.upsert(CatalogAsset(id: "tile", filename: "t.png",
+                                            absolutePath: "/home/todd/.kira/t.png",
+                                            realm: .kira, lane: "tile"), explicitCollectionIDs: [])
+        let b = CatalogBrowser(store: store)
+        await b.load()
+        let root = try XCTUnwrap(b.collections.first { $0.id == "col-decoupage" })
+        XCTAssertEqual(b.count(of: root), 1, "filed in parent AND child, but it is one asset")
+
+        await b.apply(collectionID: "col-decoupage")
+        XCTAssertEqual(b.items.count, b.count(of: root))
+    }
+
+    /// "Save to this Mac" writes into the output folder unattended; a server
+    /// file sharing a basename with a local one must not clobber it.
+    func testSavingARemoteFileNeverOverwritesALocalOne() throws {
+        let existing = (dir as NSString).appendingPathComponent("l.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: existing))
+        let first = GalleryView.uniqueDestination(inDirectory: dir, filename: "l.png")
+        XCTAssertEqual((first as NSString).lastPathComponent, "l-1.png")
+
+        FileManager.default.createFile(atPath: first, contents: Data([0x01]))
+        let second = GalleryView.uniqueDestination(inDirectory: dir, filename: "l.png")
+        XCTAssertEqual((second as NSString).lastPathComponent, "l-2.png")
+
+        XCTAssertEqual((GalleryView.uniqueDestination(inDirectory: dir,
+                                                      filename: "fresh.png") as NSString).lastPathComponent,
+                       "fresh.png")
+    }
+
     func testAPathWithASpaceStreamsAsAValidURL() async throws {
         try await store.upsert(CatalogAsset(id: "spacey", filename: "a b.png",
                                             absolutePath: "/home/todd/.kira/a b.png",

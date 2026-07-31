@@ -402,6 +402,51 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    /// A mass disappearance is almost always an unmounted volume or a revoked
+    /// folder permission, not deletions — and this sweep runs unattended on
+    /// every unfiltered gallery load. It must refuse rather than proceed.
+    @Test("pruneOrphans refuses en-masse and deletes nothing")
+    func pruneCircuitBreaker() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+
+        // 100 rows, 6 of them missing — over both the 5% ceiling and the floor.
+        for i in 0..<94 {
+            let path = (tmpDir as NSString).appendingPathComponent("live-\(UUID().uuidString).png")
+            try Data([0x89]).write(to: URL(fileURLWithPath: path))
+            try await store.insertAsset(DAMAsset(id: "live\(i)", filename: "l.png", absolutePath: path))
+        }
+        for i in 0..<6 {
+            try await store.insertAsset(DAMAsset(id: "gone\(i)", filename: "g.png",
+                                                 absolutePath: "/nope/\(i).png"))
+        }
+
+        await #expect(throws: DAMStoreError.self) { try await store.pruneOrphans() }
+        #expect(try await store.assetCount() == 100, "a refused sweep deletes nothing")
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    /// The live schema has no foreign keys, so nothing cascades on its own.
+    @Test("deleteAsset also clears catalog collections, locations and edges")
+    func deleteClearsCatalogTables() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        try await store.insertAsset(DAMAsset(id: "doomed", filename: "d.png", absolutePath: "/nope/d.png"))
+
+        let catalog = try await CatalogStore.open(path: dbPath)
+        try await catalog.file(assetID: "doomed", into: "col-photography", by: nil)
+        try await catalog.addLocation(assetID: "doomed",
+            AssetLocation(host: "kira", path: "/home/todd/d.png", mtime: Date()))
+        #expect(try await catalog.locations(of: "doomed", scope: nil).count == 1)
+
+        try await store.deleteAsset(id: "doomed")
+        #expect(try await catalog.locations(of: "doomed", scope: nil).isEmpty)
+        #expect(try await catalog.collectionCounts(scope: nil)["col-photography"] == 0)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("preserves all asset fields through insert and fetch")
     func allFields() async throws {
         let tmpDir = NSTemporaryDirectory()

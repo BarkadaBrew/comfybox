@@ -44,6 +44,9 @@ public final class CatalogBrowser {
     public private(set) var items: [CatalogAsset] = []
     public private(set) var collections: [CatalogCollection] = []
     public private(set) var facets = CatalogFacets()
+    /// Distinct per-collection counts (collection + its children), as the rail
+    /// labels them. See `count(of:)`.
+    public private(set) var collectionCounts: [String: Int] = [:]
     public private(set) var isLoading = false
     /// The filter the current page was actually produced by (post-override).
     public private(set) var activeFilter = CatalogQuery()
@@ -96,6 +99,7 @@ public final class CatalogBrowser {
             let rows = try await store.search(q)
             collections = try await store.collections(visibleTo: nil)
             facets = try await store.facets(scope: nil)
+            collectionCounts = try await store.collectionCounts(scope: nil)
             await resolve(rows)
         } catch {
             self.error = error.localizedDescription
@@ -243,8 +247,13 @@ public final class CatalogBrowser {
     /// actually returns (`CatalogQuery.collectionID` matches a collection and its
     /// direct children). A parent labelled with only its own direct filings
     /// would read "Photography (0)" and then open 1,200 rows.
+    ///
+    /// Counted DISTINCTLY by the store, not summed from `facets.collection`.
+    /// Those are direct filings, and an asset filed in both a parent and its
+    /// child is counted twice by a sum — in the live catalog all 44
+    /// `col-decoupage` assets are filed in both, so the sum said 88 and opening
+    /// it showed 44, exactly the mismatch this count exists to prevent.
     public func count(of collection: CatalogCollection) -> Int {
-        let own = facets.collection[collection.id] ?? 0
-        return children(of: collection).reduce(own) { $0 + (facets.collection[$1.id] ?? 0) }
+        collectionCounts[collection.id] ?? 0
     }
 }

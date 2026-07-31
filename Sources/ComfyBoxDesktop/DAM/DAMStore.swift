@@ -148,20 +148,41 @@ public actor DAMStore {
     /// that exists only on a server. "The file isn't here" is not evidence that
     /// such a row is an orphan — it is the normal case — and pruning them would
     /// silently delete half the catalog on the next gallery load.
+    /// Above this fraction of the library, a sweep refuses to delete anything.
+    /// A mass disappearance is far more likely to be an unmounted volume, a
+    /// revoked Pictures permission or iCloud eviction than that many genuine
+    /// deletions — and this runs unattended on every unfiltered gallery load,
+    /// so "probably a mount problem" must not be spelled DELETE.
+    public static let pruneCircuitBreakerFraction = 0.05
+    /// Below this many rows the fraction is meaningless (1 of 3 is 33%), so a
+    /// sweep may always remove at least this many.
+    public static let pruneCircuitBreakerFloor = 5
+
     @discardableResult
     public func pruneOrphans() throws -> [String] {
         let secured = try securedAssetIds()
         let elsewhere = try assetIDsHostedElsewhere()
         let all = try fetchAssets(limit: 100_000)
-        var removed: [String] = []
+
+        // Decide the whole sweep before performing any of it.
+        var candidates: [String] = []
         for asset in all {
             guard !secured.contains(asset.id), !elsewhere.contains(asset.id) else { continue }
             if !FileManager.default.fileExists(atPath: asset.absolutePath) {
-                try deleteAsset(id: asset.id)  // handles FTS + folder mapping
-                removed.append(asset.id)
+                candidates.append(asset.id)
             }
         }
-        return removed
+
+        let ceiling = max(Self.pruneCircuitBreakerFloor,
+                          Int(Double(all.count) * Self.pruneCircuitBreakerFraction))
+        guard candidates.count <= ceiling else {
+            throw DAMStoreError.pruneRefused(candidates: candidates.count, total: all.count)
+        }
+
+        for id in candidates {
+            try deleteAsset(id: id)  // FTS + folders + collections + locations
+        }
+        return candidates
     }
 
     /// Ids the catalog records a copy of on a host other than this Mac.
@@ -348,9 +369,16 @@ public actor DAMStore {
         return results
     }
 
-    /// Delete an asset row, its FTS entry, and its folder mapping. Unknown
-    /// ids are a no-op. Does not touch files on disk — see
-    /// AssetIngestor.deleteAsset for the full file + thumbnail + database removal.
+    /// Delete an asset row and everything keyed to it: its FTS entry, its folder
+    /// mapping, and — since the catalog migrated into this same file — its
+    /// collection filings and its recorded locations. Unknown ids are a no-op.
+    /// Does not touch files on disk — see AssetIngestor.deleteAsset for the full
+    /// file + thumbnail + database removal.
+    ///
+    /// The live schema has no foreign keys, so nothing cascades on its own:
+    /// leaving `asset_collections` and `asset_locations` behind leaves rows
+    /// pointing at an asset that no longer exists, which inflates every
+    /// collection count and hands `assetID(forPath:)` a dead id.
     public func deleteAsset(id: String) throws {
         let sql = "DELETE FROM assets WHERE id = ?1"
         var stmt: OpaquePointer?
@@ -365,6 +393,29 @@ public actor DAMStore {
         }
         try deleteFTS(id: id)
         try runSimple("DELETE FROM asset_folders WHERE asset_id = ?1", text: [id])
+        // Catalog-side tables. Absent in a DAM-only database (a test fixture, or
+        // an install that has never run the backfill), so their absence is not
+        // an error.
+        for table in ["asset_collections", "asset_locations"] where hasTable(table) {
+            try runSimple("DELETE FROM \(table) WHERE asset_id = ?1", text: [id])
+        }
+        // Edges name their endpoints from_/to_, not asset_id — an edge is a
+        // relation between two assets, and losing either end makes it dangling.
+        if hasTable("asset_edges") {
+            try runSimple("DELETE FROM asset_edges WHERE from_asset_id = ?1 OR to_asset_id = ?1",
+                          text: [id])
+        }
+    }
+
+    /// Whether a table exists in this database. Table names here are compile-time
+    /// literals, never caller input.
+    private func hasTable(_ name: String) -> Bool {
+        var stmt: OpaquePointer?
+        let sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (name as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(stmt) == SQLITE_ROW
     }
 
     // MARK: - Asset security
@@ -806,6 +857,9 @@ public enum DAMStoreError: Error, LocalizedError {
     case prepareFailed(String)
     case insertFailed(String)
     case execFailed(String, String)
+    /// The orphan sweep would have removed an implausible share of the library
+    /// and refused, deleting nothing. See `DAMStore.pruneCircuitBreakerFraction`.
+    case pruneRefused(candidates: Int, total: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -817,6 +871,10 @@ public enum DAMStoreError: Error, LocalizedError {
             return "Insert failed: \(msg)"
         case .execFailed(let sql, let msg):
             return "SQL exec failed (\(sql)): \(msg)"
+        case .pruneRefused(let candidates, let total):
+            return "\(candidates) of \(total) images look missing — that is usually an "
+                + "unmounted volume or a revoked folder permission, not deletions. "
+                + "Nothing was removed."
         }
     }
 }
