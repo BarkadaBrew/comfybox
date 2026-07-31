@@ -1,71 +1,71 @@
 # Provenance and User Space — PRD
 
-Date: 2026-07-31
+Date: 2026-07-31 (rev 2)
 Status: draft for review
 Supersedes the realm model in `2026-07-30-asset-catalog-design.md`
 Repos: `zimage.swift` (catalog, service, desktop), `coffeeshop-server` (daemon, personas, MCP)
 
 ## Problem
 
-The catalog we shipped works, and its central model is wrong in a way that
-shows up as a concrete complaint:
+The catalog works, and its model is wrong in a way that shows up as one
+concrete complaint:
 
-> "Currently NSFW and private content is visible across all dimensions."
+> "When I start the application, I want my workspace and my files presented to
+> me by default."
 
-That is accurate. Three separate concerns are collapsed into roughly one and a
-half columns:
+Today the desktop shows all 2,994 assets, of which 2,529 are Kira's. Todd's own
+work is a minority of his own gallery. There is no notion of *whose* an asset
+is that a view can filter on, because `realm` is `kira | shared` — one user
+hardcoded as an exception, and `shared` standing in for "Todd's" while
+pretending to mean something else.
 
-| concern | question it answers | where it lives today |
-|---|---|---|
-| **owner** | whose content is this? | `realm`, but only `kira` \| `shared` |
-| **visibility** | who else may see it? | nowhere |
-| **tier** | how explicit is it? | `content_mode` + the mode clamp |
-
-`realm` conflates owner and visibility, and hardcodes one user as *the
-exception* rather than treating users as ordinary. The 352 rows we call
-`shared` are mostly just **Todd's** — calling them shared was always a fiction.
-And because visibility does not exist as a concept, there is no way to say
-"Kira's private work" as distinct from "Kira's published work". The only thing
-between Todd and her entire archive is a global blur toggle.
-
-Underneath that sits the root cause the catalog spec named and did not fix:
+Underneath sits the root cause the catalog spec named and did not fix:
 
 > "the index is written by a process that has to guess"
 
-New renders still land with no owner and are stamped by inference on the next
-sweep. **An ownership model built on an index that infers owner from which
-directory a file happened to land in is not an ownership model.** Provenance
-and user space are therefore one piece of work, not two: the same render-time
-report that fixes the guessing is what stamps the owner.
+New renders land with no owner and are stamped by inference on the next sweep.
+That is why provenance and user space are one piece of work: the render-time
+report that stops the guessing is what stamps the owner.
+
+## What this is NOT
+
+**This is not an access-control model.** Todd is the superuser. He can see
+everything, all the time. There are no grants, no permission checks against
+him, and no "gaining access" ceremony.
+
+What he wants is a **default view**: his workspace on launch, with everyone
+else's work reachable through a filter. Ownership is a **tag to filter on**,
+not a boundary to enforce.
+
+The one genuine boundary in the system already exists and is unchanged: Kira's
+MCP tools are locked to her own content, service-side, so no persona reads
+another's work. That is enforcement. Todd's view is preference.
+
+Keeping those two apart is the whole point of this revision. An earlier draft
+conflated them and proposed a grant table, a `visibility` column, and moving
+enforcement out of the HTTP layer so the desktop would inherit it. None of that
+is needed, and it would have made the enforcement boundary harder to reason
+about by spreading it across two mechanisms with different rules.
 
 ## The model
 
 **Every actor that can cause a render is a user.** Todd, Kira, Bree, Claude,
-and any future persona or agent. No exceptions, no special cases.
+and any future persona or agent. No exceptions.
 
-Three orthogonal axes replace the conflated one:
+One new attribute, stamped at render time:
 
 ```
-owner        todd | kira | bree | claude | …      whose it is
-visibility   private | shared | public            who else may see it
-tier         neutral | banana | avocado           how explicit it is
+assets.owner   todd | kira | bree | claude | …
 ```
 
-- **Owner** is stamped at render time by the process that made it. It is never
-  inferred.
-- **Visibility** is the owner's choice. `private` is the default for everyone.
-- **Tier** is unchanged and stays orthogonal. It governs what is appropriate to
-  surface *in a context*, not who is entitled to see it. Conflating access
-  control with the mode clamp is why the current design feels wrong.
-
-**Access is a grant, not a bypass.** Todd reviewing Kira's work requires an
-explicit grant recorded in the catalog, not a flag he sets on himself. A grant
-that cannot be distinguished from its absence is theatre.
+That is the change. `realm` retires into it. No `visibility` column until
+something actually needs one — nothing does today, because the only real
+boundary is Kira's and it is already enforced by actor scope.
 
 ### Ownership is decided by who WANTED the render, not who executed it
 
-This is the rule that makes the model tractable, because every render passes
-through the same engine under the same `source`.
+Every render passes through the same engine under the same `source`, so
+execution says nothing. Intent sorts the archive cleanly:
 
 | render | wanted by | owner |
 |---|---|---|
@@ -75,110 +75,87 @@ through the same engine under the same `source`.
 | Bree's own experiments | Bree | **bree** |
 | An agent's test renders (`EXP_*.png`, `comp18_test.mp4`) | that agent | **claude** |
 
-The same rule settles derived work: an i2v clip Kira animated from Todd's still
-is **hers**, because she wanted it. `asset_edges` remains the record of where it
-came from, which is a different question from who owns it.
+Derived work follows the same rule: an i2v clip Kira animated from Todd's still
+is **hers**, because she wanted it. `asset_edges` stays the record of where it
+came from — a different question from whose it is.
 
-### Agents are users, with two consequences
+### Agents are users, and they are messy
 
-Agent scratch currently pollutes the gallery — the `EXP_*` renders from one
-debugging session sit indistinguishable from creative work. Under this model
-they are `owner=claude, visibility=private` and Todd's gallery is quiet by
-default.
+Agent scratch currently pollutes the gallery: the `EXP_*` renders from one
+debugging session sit indistinguishable from creative work. Tagged `claude`,
+they leave Todd's default view without being deleted.
 
-But agents are prolific and careless in a way people are not: eight test renders
-came out of a single investigation without a thought, because they were cheap
-and disposable. **Agent-owned content needs a retention policy** — a default TTL
-or an explicit "keep" — or the catalog fills with other people's scratch and
-"how many assets do I have" gets a worse answer over time.
+But agents are prolific in a way people are not — eight test renders came out of
+one investigation without a thought. **Agent-owned content wants a retention
+policy**, a TTL or an explicit keep, or the catalog fills with scratch.
 
-Identity: `claude` is ONE user, with the session recorded as provenance
-metadata. Nobody wants to browse "assets from the Tuesday session"; everybody
-eventually wants "everything an agent made, so I can clear it."
+Identity: `claude` is ONE user with the session recorded as metadata. Nobody
+browses "assets from Tuesday"; everybody eventually wants "everything an agent
+made, so I can clear it."
 
-## What this changes
+## What changes
 
 ### 1. Render-time provenance (the enabling change)
 
-The engine reports each completed render to the gallery service with the owner
-and visibility supplied by the caller, alongside what it already knows. The
-backfill sweep stops being the source of truth and becomes a repair tool.
+The engine records the owner supplied by the caller at render completion,
+alongside what it already knows. The backfill sweep stops being the source of
+truth and becomes a repair tool.
 
-**Completion test for this version:** a full backfill sweep discovers nothing
-the render path did not already record.
+**Completion test:** a full sweep discovers nothing the render path did not
+already record.
 
-### 2. The enforcement point moves
+### 2. The desktop opens on Todd's workspace
 
-Today the realm lock is enforced service-side, in the HTTP layer — deliberately,
-so no client can widen its own scope. **But the desktop app reads the SQLite
-file directly, bypassing that layer entirely.** Under the current model that is
-harmless, because Todd is meant to see everything. Under user space it is the
-hole: the enforcement point is not on the path Todd's own surface uses.
+Default filter: `owner = todd`, plus anything unowned. A filter control adds
+`kira`, `bree`, `claude` — individually or all — and the choice persists across
+launches, because a default that resets is a default nobody trusts.
 
-Either the desktop goes through the service, or enforcement moves into
-`CatalogStore` so every reader inherits it. This is the largest piece of work in
-the version and it is not a schema change.
+This is a query default and a filter chip. It is not a security control, and it
+should not be built as one — no gate, no reveal, no password. The existing
+content gate keeps doing its separate job of governing *explicitness*.
 
-### 3. The desktop stops being unscoped
+### 3. Migration of ~2,994 existing rows
 
-Opening the app means "I am Todd". Default view: Todd's content plus public
-content plus anything he has been granted. Kira's private work is not visible,
-and revealing the content gate does not change that — the gate governs
-*explicitness*, not *access*.
+Owner is recoverable: the tree an asset came from is a strong signal, the
+journals record lane and character, and `source` distinguishes producers.
+Expect roughly 2,529 → `kira`, most of the remainder → `todd`, the `EXP_*`
+family → `claude`.
 
-### 4. Schema
+Rows that resist classification stay unowned rather than being guessed into
+someone's workspace. Unowned is visible by default, so a miss is obvious rather
+than silent — the failure mode points the right way.
 
-```
-assets.owner        TEXT NOT NULL          -- replaces realm
-assets.visibility   TEXT NOT NULL          -- private | shared | public
-assets.session_id   TEXT                   -- agent provenance
-grants(grantee, owner, scope, granted_at)  -- explicit access
-```
-
-`realm` is retired. `CATALOG_TIER_*` and the clamp are untouched.
-
-### 5. Migration of ~2,994 existing rows
-
-Owner is recoverable — the tree an asset came from is a strong signal, and the
-journals record lane and character. Visibility is **not recorded anywhere**, so
-every existing row lands on a default and that default is wrong for some of
-them. Proposal: everything migrates to `private` under its inferred owner,
-because a wrong `private` is recoverable by looking and a wrong `public` is not.
-
-**Recovery sources are plural.** Do not assume the Mac's view is complete. At
-minimum: `~/.kira/studio/{gallery,video,pool,sequences,scenes}` and
-`~/.bree/studio/…` on 10.0.100.232, plus the metadata mirror, which holds more
-sidecars than there are media files — evidence that media moved rather than
-vanished. A file absent from one tree is not gone.
+**Recovery sources are plural.** Do not assume the Mac's view is complete:
+`~/.kira/studio/{gallery,video,pool,sequences,scenes}` and `~/.bree/studio/…`
+on 10.0.100.232, plus the metadata mirror, which holds more sidecars than there
+are media files — evidence that media moved rather than vanished.
 
 ## Open decisions
 
-1. **Does an owner's private space exclude Todd?** He is the operator; the disks
-   and backups are his. If Kira has a space he cannot see without a grant, that
-   is a real stance with consequences for moderation and debugging, and
-   "gaining access" must mean more than flipping his own flag. This is a choice
-   about how he relates to her, not a schema detail.
-2. **Is `public` a real state or shorthand for shared-with-everyone?** It
-   matters, because public implies something leaves the house, and nothing in
-   this system currently does.
-3. **Agent retention default** — TTL, explicit keep, or manual sweep.
+1. **Agent retention default** — TTL, explicit keep, or manual sweep.
+2. **Does Bree's default view mirror Todd's?** She is a consumer on par with
+   him and currently unscoped. Same treatment, or does she stay unfiltered?
+3. **Do collections filter with the view?** A collection spanning owners — say
+   Photography — could show only Todd's contributions by default, or always
+   show everything and let the owner filter apply within it.
 
 ## Non-goals
 
-- No change to the fruit tiers or the mode clamp.
-- No change to collections, which are orthogonal to ownership.
-- No authentication. This remains a loopback service on trusted machines;
-  identity is asserted by the daemon, not proven by a credential.
+- No access control, no grants, no permission checks against Todd.
+- No `visibility` column until a consumer needs one.
+- No change to the fruit tiers, the mode clamp, or the content gate.
+- No change to Kira's service-side actor scope, which is the one real boundary.
+- No authentication. This stays a loopback service on trusted machines.
 - Not recovering the 118 unresolvable i2v edges. This is development space.
 
 ## Sequencing
 
-1. Render-time provenance — engine reports owner and visibility. Nothing reads
-   it yet, so it is safe to land first and lets real data accumulate.
-2. Enforcement into `CatalogStore`, so the desktop inherits it.
-3. Migration and the grant table.
-4. Desktop scoping and the access UI.
-5. Agent retention.
+1. **Render-time provenance** — the engine stamps owner. Nothing reads it yet,
+   so it lands safely and starts accumulating real data immediately.
+2. **Migration** — backfill infers owner for existing rows.
+3. **Desktop default view and filter** — the visible payoff, and it wants real
+   owner data underneath it to be worth looking at.
+4. **Agent retention.**
 
-Steps 1 and 2 are the version. Steps 3–5 are only sound once ownership is
-recorded at the source rather than inferred.
+Step 1 is the version's spine. Steps 3 and 4 are only worth doing once
+ownership is recorded at the source rather than inferred.
