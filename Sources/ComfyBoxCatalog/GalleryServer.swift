@@ -205,11 +205,17 @@ public enum GalleryServer {
     public enum CLIFailure: Error, Equatable {
         case vaultPath(String)
         case unknownArgument(String)
+        /// A flag that takes a value was given none — a trailing `--db`.
+        case missingValue(String)
+        /// A flag that takes a value was given one it cannot use — `--port abc`.
+        case badValue(flag: String, value: String)
 
         public var message: String {
             switch self {
             case .vaultPath(let p): return "refusing a vault path: \(p)"
             case .unknownArgument(let a): return "unknown argument: \(a)"
+            case .missingValue(let f): return "\(f) requires a value"
+            case .badValue(let f, let v): return "\(f): invalid value \(v)"
             }
         }
     }
@@ -240,14 +246,37 @@ public enum GalleryServer {
         var opts = ServeOptions(port: defaultPort, dbPath: nil)
         var i = 0
         while i < args.count {
-            switch args[i] {
-            case "--port": if i + 1 < args.count, let p = UInt16(args[i + 1]) { opts.port = p; i += 1 }
-            case "--db": if i + 1 < args.count { opts.dbPath = args[i + 1]; i += 1 }
+            let flag = args[i]
+            // A flag that takes a value consumes the NEXT argument, and the
+            // absence of one is an error rather than a shrug. A trailing `--db`
+            // used to fall through to the default silently — a no-op inside the
+            // one function whose entire purpose is never to ignore a flag.
+            func value() -> Result<String, CLIFailure> {
+                guard i + 1 < args.count else { return .failure(.missingValue(flag)) }
+                i += 1
+                return .success(args[i])
+            }
+            switch flag {
+            case "--port":
+                switch value() {
+                case .failure(let f): return .failure(f)
+                case .success(let v):
+                    // Report the FLAG, not the stray token: `--port abc` used to
+                    // say `unknown argument: abc`, which sends the reader looking
+                    // for a flag they never typed.
+                    guard let p = UInt16(v) else { return .failure(.badValue(flag: flag, value: v)) }
+                    opts.port = p
+                }
+            case "--db":
+                switch value() {
+                case .failure(let f): return .failure(f)
+                case .success(let v): opts.dbPath = v
+                }
             case "--help", "-h": opts.showHelp = true
             default:
                 // Never ignore an unknown flag: a typo'd option that silently
                 // does nothing is the failure mode this whole task is about.
-                return .failure(.unknownArgument(args[i]))
+                return .failure(.unknownArgument(flag))
             }
             i += 1
         }
@@ -320,7 +349,52 @@ public enum GalleryServer {
     /// the sweep would report success while covering nothing. Hence the prefix
     /// is subdivided in lockstep with the media root, from a single studio-level
     /// flag so the two cannot drift apart.
-    static func runBackfillCLI(args: [String]) {
+    /// What `runBackfillCLI` understood from its arguments.
+    public struct BackfillOptions: Equatable {
+        public var trees: [BackfillTreeSpec] = []
+        public var dbPath: String?
+        public var refile = false
+        public var showHelp = false
+    }
+
+    /// A tree as the CLI described it, comparable in a test.
+    public struct BackfillTreeSpec: Equatable {
+        public var id: String
+        public var realm: CatalogRealm?
+        public var host: String
+        public var mediaRoot: String
+        public var metadataRoot: String?
+        public var remotePrefix: String?
+        public var journalPath: String?
+        public var historyPath: String?
+
+        var tree: BackfillTree {
+            BackfillTree(id: id, realm: realm, host: host,
+                         mediaRoot: mediaRoot, metadataRoot: metadataRoot,
+                         remotePrefix: remotePrefix,
+                         journalPath: journalPath, historyPath: historyPath)
+        }
+    }
+
+    static let backfillUsage = """
+        Usage: ComfyBoxGallery backfill [options]
+          --home PATH                 local gallery tree (default ~/Pictures/ComfyBox)
+          --kira-studio PATH          local mount of Kira's studio
+          --bree-studio PATH          local mount of Bree's studio
+          --kira-remote-prefix PATH   studio path as the SERVER spells it
+          --bree-remote-prefix PATH   studio path as the SERVER spells it
+          --render-journal PATH       render-journal.jsonl (Kira)
+          --kira-history PATH         Kira's history.json
+          --bree-history PATH         Bree's history.json
+          --db PATH                   catalog database (default ~/.comfybox/dam.sqlite3)
+          --refile                    re-run derived filing over every existing row
+        """
+
+    /// Pure argument parsing for the BACKFILL path, extracted for the same reason
+    /// as `parseServeArgs`: its unknown-flag rejection and vault refusal were
+    /// reachable only through an inline `exit()`, so they could be demonstrated
+    /// in a transcript but never asserted.
+    public static func parseBackfillArgs(_ args: [String]) -> Result<BackfillOptions, CLIFailure> {
         var home = NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath
         var kiraRoot: String? = nil
         var breeRoot: String? = nil
@@ -329,50 +403,52 @@ public enum GalleryServer {
         var renderJournal: String? = nil
         var kiraHistory: String? = nil
         var breeHistory: String? = nil
-        var dbPath: String? = nil
-        var refile = false
+        var opts = BackfillOptions()
+        /// Every path the operator NAMED, whether or not it survives into a tree.
+        /// A `--kira-history <vault>` given without `--kira-studio` builds no
+        /// kira tree, so a guard that only inspects the finished trees would let
+        /// the vault path through unremarked — and would start refusing it later
+        /// if someone added the studio flag. Refuse what was asked for.
+        var namedPaths: [String?] = []
 
         var i = 0
         while i < args.count {
-            func value() -> String? {
-                guard i + 1 < args.count else { return nil }
+            let flag = args[i]
+            func value() -> Result<String, CLIFailure> {
+                guard i + 1 < args.count else { return .failure(.missingValue(flag)) }
                 i += 1
-                return args[i]
+                return .success(args[i])
             }
-            switch args[i] {
-            case "--refile": refile = true
-            case "--home": if let v = value() { home = v }
-            case "--kira-studio": if let v = value() { kiraRoot = v }
-            case "--bree-studio": if let v = value() { breeRoot = v }
-            case "--kira-remote-prefix": if let v = value() { kiraRemote = v }
-            case "--bree-remote-prefix": if let v = value() { breeRemote = v }
-            case "--render-journal": if let v = value() { renderJournal = v }
-            case "--kira-history": if let v = value() { kiraHistory = v }
-            case "--bree-history": if let v = value() { breeHistory = v }
-            case "--db": if let v = value() { dbPath = v }
-            case "--help", "-h":
-                print("""
-                    Usage: ComfyBoxGallery backfill [options]
-                      --home PATH                 local gallery tree (default ~/Pictures/ComfyBox)
-                      --kira-studio PATH          local mount of Kira's studio
-                      --bree-studio PATH          local mount of Bree's studio
-                      --kira-remote-prefix PATH   studio path as the SERVER spells it
-                      --bree-remote-prefix PATH   studio path as the SERVER spells it
-                      --render-journal PATH       render-journal.jsonl (Kira)
-                      --kira-history PATH         Kira's history.json
-                      --bree-history PATH         Bree's history.json
-                      --db PATH                   catalog database (default ~/.comfybox/dam.sqlite3)
-                      --refile                    re-run derived filing over every existing row
-                    """)
-                exit(0)
+            /// Assign, or bail out with the failure. Every value-taking flag goes
+            /// through this, so a trailing `--kira-studio` cannot silently drop an
+            /// entire archive.
+            func take(_ set: (String) -> Void) -> CLIFailure? {
+                switch value() {
+                case .failure(let f): return f
+                case .success(let v): set(v); namedPaths.append(v); return nil
+                }
+            }
+            var failure: CLIFailure? = nil
+            switch flag {
+            case "--refile": opts.refile = true
+            case "--home": failure = take { home = $0 }
+            case "--kira-studio": failure = take { kiraRoot = $0 }
+            case "--bree-studio": failure = take { breeRoot = $0 }
+            case "--kira-remote-prefix": failure = take { kiraRemote = $0 }
+            case "--bree-remote-prefix": failure = take { breeRemote = $0 }
+            case "--render-journal": failure = take { renderJournal = $0 }
+            case "--kira-history": failure = take { kiraHistory = $0 }
+            case "--bree-history": failure = take { breeHistory = $0 }
+            case "--db": failure = take { opts.dbPath = $0 }
+            case "--help", "-h": opts.showHelp = true
             default:
                 // Never ignore an unknown flag. A typo'd `--kira-studo` would
                 // otherwise drop an entire archive from the sweep and still exit
                 // 0 with a plausible-looking report — the silent-success failure
                 // this whole task exists to rule out.
-                FileHandle.standardError.write(Data("unknown argument: \(args[i])\n".utf8))
-                exit(2)
+                failure = .unknownArgument(flag)
             }
+            if let f = failure { return .failure(f) }
             i += 1
         }
 
@@ -382,41 +458,60 @@ public enum GalleryServer {
         /// would leave every clip's lane unknown.
         func studio(id: String, realm: CatalogRealm, host: String,
                     root: String, remote: String,
-                    journal: String?, history: String?) -> [BackfillTree] {
+                    journal: String?, history: String?) -> [BackfillTreeSpec] {
             [("", "gallery"), ("-video", "video")].map { suffix, leaf in
-                BackfillTree(id: id + suffix, realm: realm, host: host,
-                             mediaRoot: (root as NSString).appendingPathComponent(leaf),
-                             metadataRoot: (root as NSString).appendingPathComponent("metadata"),
-                             remotePrefix: (remote as NSString).appendingPathComponent(leaf),
-                             journalPath: journal, historyPath: history)
+                BackfillTreeSpec(id: id + suffix, realm: realm, host: host,
+                                 mediaRoot: (root as NSString).appendingPathComponent(leaf),
+                                 metadataRoot: (root as NSString).appendingPathComponent("metadata"),
+                                 remotePrefix: (remote as NSString).appendingPathComponent(leaf),
+                                 journalPath: journal, historyPath: history)
             }
         }
 
-        var trees: [BackfillTree] = [
-            BackfillTree(id: "home", realm: nil, host: "mac", mediaRoot: home, metadataRoot: nil)
+        opts.trees = [
+            BackfillTreeSpec(id: "home", realm: nil, host: "mac",
+                             mediaRoot: home, metadataRoot: nil)
         ]
         if let k = kiraRoot {
-            trees += studio(id: "kira", realm: .kira, host: "kira", root: k,
-                            remote: kiraRemote, journal: renderJournal, history: kiraHistory)
+            opts.trees += studio(id: "kira", realm: .kira, host: "kira", root: k,
+                                 remote: kiraRemote, journal: renderJournal, history: kiraHistory)
         }
         if let b = breeRoot {
-            trees += studio(id: "bree", realm: .shared, host: "bree", root: b,
-                            remote: breeRemote, journal: nil, history: breeHistory)
+            opts.trees += studio(id: "bree", realm: .shared, host: "bree", root: b,
+                                 remote: breeRemote, journal: nil, history: breeHistory)
         }
 
-        // Belt and braces: CatalogBackfill.run refuses these too, but a CLI that
-        // can NAME a vault path is one edit away from reading one.
-        //
-        // `dbPath` is in this list because the read guards do not cover it: the
-        // catalog is a WRITE target full of raw prompt text, so
-        // `--db ~/Documents/Vaults/…/x.sqlite3` would CREATE a database inside
-        // the vault rather than read one out of it.
-        if let refusal = vaultRefusal(in:
-            trees.flatMap { [$0.mediaRoot, $0.metadataRoot, $0.journalPath, $0.historyPath] }
-            + [dbPath]) {
-            FileHandle.standardError.write(Data((refusal.message + "\n").utf8))
-            exit(2)
+        // Both what was NAMED and what was BUILT. `dbPath` is covered by no read
+        // guard at all — the catalog is a WRITE target full of raw prompt text,
+        // so `--db <vault>/x.sqlite3` would CREATE a database inside the vault
+        // rather than read one out — and the derived roots are checked too, since
+        // tree construction appends `/gallery`, `/video` and `/metadata` to paths
+        // the operator only gave the stem of.
+        if let refusal = vaultRefusal(in: namedPaths
+            + opts.trees.flatMap { [$0.mediaRoot, $0.metadataRoot, $0.journalPath, $0.historyPath] }
+            + [opts.dbPath]) {
+            return .failure(refusal)
         }
+        return .success(opts)
+    }
+
+    static func runBackfillCLI(args: [String]) {
+        let parsed: BackfillOptions
+        switch parseBackfillArgs(args) {
+        case .failure(let f):
+            FileHandle.standardError.write(Data((f.message + "\n").utf8))
+            exit(2)
+        case .success(let o): parsed = o
+        }
+        if parsed.showHelp { print(backfillUsage); exit(0) }
+
+        let trees = parsed.trees.map(\.tree)
+        let dbPath = parsed.dbPath
+        let refile = parsed.refile
+
+        // (The vault refusal now lives in `parseBackfillArgs`, so it is asserted
+        // by tests rather than only demonstrated in a transcript. It still runs
+        // before a single byte is read — the parse happens above.)
 
         let sem = DispatchSemaphore(value: 0)
         Task {

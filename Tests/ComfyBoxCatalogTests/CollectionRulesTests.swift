@@ -38,10 +38,36 @@ final class CollectionRulesTests: XCTestCase {
         XCTAssertEqual(
             CollectionRules.defaultCollectionIDs(for: asset(lane: "video", mode: "t2v", kind: "video")),
             ["col-kira-dreams-memories"])
-        // An i2v clip is not a dream — it belongs to whatever genre its scene is.
+        // An i2v clip is not a dream. On a REAL lane it files by that lane, the
+        // same as any other asset — this case never reaches the video branch.
         XCTAssertEqual(
             CollectionRules.defaultCollectionIDs(for: asset(lane: "kira", mode: "i2v", kind: "video")),
             ["col-kira-adult-scenes"])
+    }
+
+    /// The `lane == "video"` + i2v path itself, which nothing covered: the branch
+    /// returns [] and therefore falls through to the content-tier fallback, so
+    /// the clip is filed by its OWN tier.
+    ///
+    /// It does NOT inherit the genre of the still it animates — that would mean
+    /// resolving the i2v edge, which this pure function cannot do and which 118
+    /// clips in the live catalog could not do anyway, their source stills having
+    /// been deleted.
+    func testAnI2VClipOnTheVideoLaneFilesByItsOwnTier() {
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(
+                for: asset(lane: "video", mode: "i2v", kind: "video", contentMode: "avocado")),
+            ["col-kira-adult-scenes"])
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(
+                for: asset(lane: "video", mode: "i2v", kind: "video", contentMode: "apple")),
+            ["col-kira-everyday"])
+        // With no tier to fall back on there is nothing to file it by, and it
+        // stays unfiled rather than being guessed into a genre.
+        XCTAssertEqual(
+            CollectionRules.defaultCollectionIDs(
+                for: asset(lane: "video", mode: "i2v", kind: "video")),
+            [])
     }
 
     func testSharedProducersFileIntoSharedBodiesOnly() {

@@ -394,4 +394,70 @@ final class GalleryServerTests: XCTestCase {
                        .vaultPath("/x/Vaults/y"))
         XCTAssertNil(GalleryServer.vaultRefusal(in: [nil, "/tmp/ok"]))
     }
+
+    /// A value-taking flag given no value used to fall through to the default —
+    /// a silent no-op inside the one function whose purpose is never to ignore a
+    /// flag.
+    func testATrailingValueFlagIsAnErrorNotADefault() {
+        XCTAssertEqual(GalleryServer.parseServeArgs(["--db"]), .failure(.missingValue("--db")))
+        XCTAssertEqual(GalleryServer.parseServeArgs(["--port"]), .failure(.missingValue("--port")))
+        XCTAssertEqual(GalleryServer.parseBackfillArgs(["--kira-studio"]),
+                       .failure(.missingValue("--kira-studio")))
+    }
+
+    /// The message must name the FLAG. `--port abc` reporting
+    /// `unknown argument: abc` sends the reader hunting for a flag they never
+    /// typed.
+    func testABadPortNamesTheFlagRatherThanTheStrayToken() {
+        XCTAssertEqual(GalleryServer.parseServeArgs(["--port", "abc"]),
+                       .failure(.badValue(flag: "--port", value: "abc")))
+        XCTAssertEqual(GalleryServer.parseServeArgs(["--port", "abc"]).failureMessage,
+                       "--port: invalid value abc")
+    }
+
+    // MARK: - CLI argument parsing (the BACKFILL path)
+
+    /// Previously reachable only through an inline `exit()`, so demonstrable in a
+    /// transcript but never asserted.
+    func testBackfillRejectsAnUnknownFlagRatherThanDroppingAnArchive() {
+        XCTAssertEqual(GalleryServer.parseBackfillArgs(["--kira-studo", "/tmp/x"]),
+                       .failure(.unknownArgument("--kira-studo")))
+    }
+
+    func testBackfillRefusesAVaultPathOnEveryRoot() {
+        XCTAssertEqual(GalleryServer.parseBackfillArgs(["--db", "/x/Vaults/y.sqlite3"]),
+                       .failure(.vaultPath("/x/Vaults/y.sqlite3")))
+        XCTAssertEqual(GalleryServer.parseBackfillArgs(["--home", "/x/Vaults/pics"]),
+                       .failure(.vaultPath("/x/Vaults/pics")))
+        XCTAssertEqual(GalleryServer.parseBackfillArgs(["--kira-history", "/x/Vaults/h.json"]),
+                       .failure(.vaultPath("/x/Vaults/h.json")))
+    }
+
+    /// The subdivision that makes i2v edges and journal rows resolve at all: each
+    /// studio becomes TWO roots and each root carries its OWN remote prefix.
+    /// Handing both the studio-level prefix would translate
+    /// `…/studio/gallery/x.png` into `…/gallery/gallery/x.png`.
+    func testBackfillSubdividesTheRemotePrefixInLockstepWithTheMediaRoot() throws {
+        let opts = try XCTUnwrap(try? GalleryServer.parseBackfillArgs(
+            ["--kira-studio", "/Volumes/todd/.kira/studio",
+             "--kira-remote-prefix", "/home/todd/.kira/studio"]).get())
+
+        let kira = opts.trees.first { $0.id == "kira" }
+        let kiraVideo = opts.trees.first { $0.id == "kira-video" }
+        XCTAssertEqual(kira?.mediaRoot, "/Volumes/todd/.kira/studio/gallery")
+        XCTAssertEqual(kira?.remotePrefix, "/home/todd/.kira/studio/gallery")
+        XCTAssertEqual(kiraVideo?.mediaRoot, "/Volumes/todd/.kira/studio/video")
+        XCTAssertEqual(kiraVideo?.remotePrefix, "/home/todd/.kira/studio/video")
+        // Both roots share one metadata tree, and the home tree has none at all.
+        XCTAssertEqual(kira?.metadataRoot, "/Volumes/todd/.kira/studio/metadata")
+        XCTAssertEqual(kiraVideo?.metadataRoot, "/Volumes/todd/.kira/studio/metadata")
+        XCTAssertNil(opts.trees.first { $0.id == "home" }?.metadataRoot)
+    }
+}
+
+private extension Result where Failure == GalleryServer.CLIFailure {
+    var failureMessage: String? {
+        if case .failure(let f) = self { return f.message }
+        return nil
+    }
 }
