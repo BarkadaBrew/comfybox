@@ -105,12 +105,24 @@ public final class Krea2SwiGLU: Module {
 
 enum Krea2Rope {
   /// pos: (L,3) -> (cos, sin) each (L, sum(axes)/2).
-  static func make(pos: MLXArray, axes: [Int], theta: Float) -> (MLXArray, MLXArray) {
+  ///
+  /// `scales` applies NTK-aware frequency widening per axis (DyPE). A scale > 1
+  /// widens theta so the model's trained frequency range covers a larger token
+  /// grid — this is what keeps 2K renders structurally coherent. Axis 0 is the
+  /// text/frame axis and is never scaled; widening it would break text-image
+  /// alignment. Formula matches ZImageRopeEmbedder.computeNTKFreqTable exactly.
+  static func make(
+    pos: MLXArray, axes: [Int], theta: Float, scales: [Float] = [1, 1, 1]
+  ) -> (MLXArray, MLXArray) {
     var cosParts: [MLXArray] = []
     var sinParts: [MLXArray] = []
     for (i, d) in axes.enumerated() {
+      let axisScale = i < scales.count ? scales[i] : 1.0
+      let axisTheta = (i == 0 || axisScale <= 1.0)
+        ? theta
+        : theta * pow(axisScale, Float(d) / Float(d - 2))
       let scale = MLXArray(stride(from: 0, to: d, by: 2).map { Float($0) }) / Float(d)
-      let omega = 1.0 / MLX.pow(MLXArray(theta), scale)  // (d/2,)
+      let omega = 1.0 / MLX.pow(MLXArray(axisTheta), scale)  // (d/2,)
       let posCol = pos[0..., i ..< (i + 1)]  // (L,1)
       let freqs = posCol * omega.expandedDimensions(axis: 0)  // (L, d/2)
       cosParts.append(MLX.cos(freqs))
