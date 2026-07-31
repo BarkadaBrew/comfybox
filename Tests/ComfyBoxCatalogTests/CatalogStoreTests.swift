@@ -608,6 +608,47 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(full.prompt, "a nightclub")
         XCTAssertEqual(full.absolutePath, "/tmp/k1.png")
     }
+
+    /// The realm-scoped ORACLES must not carry a defaulted `scope`.
+    ///
+    /// `edges` and `locations` had their defaults dropped for this exact reason
+    /// and these three are the same shape: they answer "does an asset with this
+    /// path / this hash / this filename exist?", which lets a caller CONFIRM a
+    /// guessed path or hash. A `scope: CatalogRealm? = nil` default means a new
+    /// call site can omit the realm, and omitting it compiles clean and answers
+    /// across every realm — a silent cross-realm leak with no diff to notice.
+    /// With no default, omission is a compile error and the compiler enumerates
+    /// every call site. (Backfill's explicit `scope: nil` is correct and stays.)
+    ///
+    /// This is a SOURCE pin because the guarantee is a compile-time one: a test
+    /// that omits the argument cannot be written against the fixed code, so the
+    /// only way to catch a re-added default is to read the signature.
+    func testScopedOraclesHaveNoDefaultRealm() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // ComfyBoxCatalogTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("Sources/ComfyBoxCatalog/CatalogStore.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+
+        for oracle in ["assetID(forPath path: String,",
+                       "assetID(forSHA256 sha: String,",
+                       "assetIDs(forFilename name: String,"] {
+            guard let start = text.range(of: oracle) else {
+                return XCTFail("CatalogStore no longer declares \(oracle) — update this pin")
+            }
+            // The signature runs to the opening brace of the body.
+            guard let brace = text.range(of: "{", range: start.upperBound..<text.endIndex) else {
+                return XCTFail("could not find the body of \(oracle)")
+            }
+            let signature = String(text[start.lowerBound..<brace.lowerBound])
+            XCTAssertTrue(signature.contains("scope:"),
+                          "\(oracle) must still take a realm")
+            XCTAssertFalse(signature.contains("CatalogRealm? = nil"),
+                           "\(oracle) must NOT default its realm: omitting it compiles and "
+                           + "leaks across realms. Signature was: \(signature)")
+        }
+    }
 }
 
 /// `XCTUnwrap` on an async expression needs the value materialised first.

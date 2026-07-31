@@ -109,6 +109,13 @@ public struct CatalogFacets: Sendable, Equatable {
 /// everywhere. Rows still STORE the literal string "apple"; only its RANK moved.
 public let CATALOG_TIER_ORDER: [String] = ["neutral", "banana", "avocado"]
 
+/// The least permissive ceiling: the lowest rung, admitting SFW content only.
+///
+/// Derived from the order rather than spelled "neutral" at each call site, so a
+/// consumer asking "is this above SFW?" tracks the ladder instead of pinning a
+/// word to it. This is what the desktop content gate clamps against.
+public let CATALOG_STRICTEST_CEILING: String = CATALOG_TIER_ORDER[0]
+
 /// Other vocabularies that mean the same thing. The desktop gate already sees
 /// these values in `content_mode` (NSFWGate.swift: "explicit", "suggestive" and
 /// "nsfw" are all treated as NSFW), so the catalog must rank them rather than

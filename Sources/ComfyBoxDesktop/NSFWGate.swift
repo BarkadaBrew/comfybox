@@ -7,16 +7,37 @@
 
 import Foundation
 import CryptoKit
+import ComfyBoxCatalog
 
 /// Content classification from an asset's content mode.
+///
+/// The vocabulary is NOT restated here. It used to be — a literal set beside the
+/// catalog's own tier tables — and the two copies failed in OPPOSITE directions
+/// for the same unknown string: the catalog's `tierRank` fails closed (an
+/// unrecognised tier outranks every ceiling and is withheld), while a
+/// `Set.contains` membership test fails OPEN (an unrecognised mode is not in the
+/// set, so it was shown unblurred). Two lists that disagree about the dangerous
+/// case are worse than one list, so the gate now asks the catalog.
 public enum ContentRating {
-    /// Content modes considered NSFW. `apple`/nil are SFW; `banana`
-    /// (suggestive) and `avocado` (explicit) are NSFW.
-    public static let nsfwModes: Set<String> = ["banana", "avocado", "nsfw", "explicit", "suggestive"]
+    /// The spellings this gate RECOGNISES as NSFW, derived from the catalog's
+    /// ladder: every tier vocabulary word that sits above the strictest ceiling.
+    ///
+    /// For enumeration and labelling only. Membership is NOT the gate — ask
+    /// `isNSFW`. A spelling absent from this set is not thereby SFW; unknown
+    /// vocabulary fails CLOSED and `isNSFW` returns true for it.
+    public static let nsfwModes: Set<String> = Set(
+        CATALOG_TIER_SPELLINGS.filter {
+            isWithheld(tier: $0, ceiling: CATALOG_STRICTEST_CEILING)
+        })
 
+    /// Whether an asset's content mode sits above SFW.
+    ///
+    /// One question, one answer, resolved by the same clamp the catalog and the
+    /// gallery server use — so a mode the desktop blurs is a mode the server
+    /// withholds. nil/empty stays SFW: an asset that was never tiered is
+    /// untiered, not secretly explicit.
     public static func isNSFW(contentMode: String?) -> Bool {
-        guard let m = contentMode?.lowercased(), !m.isEmpty else { return false }
-        return nsfwModes.contains(m)
+        isWithheld(tier: contentMode, ceiling: CATALOG_STRICTEST_CEILING)
     }
 }
 
