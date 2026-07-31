@@ -487,6 +487,23 @@ public actor CatalogStore {
         return ids.count - (try unfiledAssetCount())
     }
 
+    /// How many of an asset's memberships are flagged `manual = 1`.
+    ///
+    /// Membership alone cannot tell a preserved hand-filing from one that was
+    /// deleted and re-derived: both leave a row. Only the flag distinguishes
+    /// them, and the flag is what the next refile consults.
+    public func manualFilingCount(assetID: String) throws -> Int {
+        var stmt: OpaquePointer?
+        let sql = "SELECT COUNT(*) FROM asset_collections WHERE asset_id = ?1 AND manual = 1"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, assetID)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
     // MARK: - Read
 
     public func search(_ query: CatalogQuery) throws -> [CatalogAsset] {

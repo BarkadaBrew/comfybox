@@ -55,6 +55,11 @@ public actor DAMStore {
     /// Perform post-init setup within actor isolation.
     private func initialize() throws {
         try execute("PRAGMA journal_mode=WAL")
+        // This file has more than one writer: the catalog tooling holds a single
+        // long write transaction for the whole of `refileAll`, and without a
+        // timeout a render landing during that window takes an immediate
+        // SQLITE_BUSY and loses its DAM row outright. Matches the catalog side.
+        try execute("PRAGMA busy_timeout = 5000")
         try createTables()
     }
 

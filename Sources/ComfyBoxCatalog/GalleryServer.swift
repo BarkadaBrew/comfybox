@@ -200,24 +200,80 @@ public enum GalleryServer {
 
     // MARK: - CLI
 
+    /// Why a path or flag is refused, so a caller can test the decision without
+    /// the process exiting underneath it.
+    public enum CLIFailure: Error, Equatable {
+        case vaultPath(String)
+        case unknownArgument(String)
+
+        public var message: String {
+            switch self {
+            case .vaultPath(let p): return "refusing a vault path: \(p)"
+            case .unknownArgument(let a): return "unknown argument: \(a)"
+            }
+        }
+    }
+
+    /// A vault path is refused wherever it appears. The catalog is a WRITE target
+    /// full of raw prompt text, so this covers `--db` on BOTH entry points: the
+    /// serve path would otherwise CREATE a catalog inside the vault, which is the
+    /// same hazard as reading one out of it.
+    public static func vaultRefusal(in paths: [String?]) -> CLIFailure? {
+        for p in paths.compactMap({ $0 }) where p.contains("Vaults") {
+            return .vaultPath(p)
+        }
+        return nil
+    }
+
+    /// What `runCLIEntryPoint` understood from its arguments.
+    public struct ServeOptions: Equatable {
+        public var port: UInt16
+        public var dbPath: String?
+        public var showHelp = false
+    }
+
+    /// Pure argument parsing for the SERVE path, extracted so the vault refusal
+    /// and the unknown-flag rejection are unit-testable. They were previously
+    /// reachable only through an inline `exit()`, i.e. verifiable only by reading
+    /// a transcript.
+    public static func parseServeArgs(_ args: [String]) -> Result<ServeOptions, CLIFailure> {
+        var opts = ServeOptions(port: defaultPort, dbPath: nil)
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--port": if i + 1 < args.count, let p = UInt16(args[i + 1]) { opts.port = p; i += 1 }
+            case "--db": if i + 1 < args.count { opts.dbPath = args[i + 1]; i += 1 }
+            case "--help", "-h": opts.showHelp = true
+            default:
+                // Never ignore an unknown flag: a typo'd option that silently
+                // does nothing is the failure mode this whole task is about.
+                return .failure(.unknownArgument(args[i]))
+            }
+            i += 1
+        }
+        if let refusal = vaultRefusal(in: [opts.dbPath]) { return .failure(refusal) }
+        return .success(opts)
+    }
+
     public static func runCLIEntryPoint(args: [String]) {
         if args.first == "backfill" {
             runBackfillCLI(args: Array(args.dropFirst()))
             return
         }
-        var port = defaultPort
-        var dbPath: String? = nil
-        var i = 0
-        while i < args.count {
-            switch args[i] {
-            case "--port": if i + 1 < args.count, let p = UInt16(args[i + 1]) { port = p; i += 1 }
-            case "--db": if i + 1 < args.count { dbPath = args[i + 1]; i += 1 }
-            case "--help", "-h":
+        let port: UInt16
+        let dbPath: String?
+        switch parseServeArgs(args) {
+        case .failure(let f):
+            FileHandle.standardError.write(Data((f.message + "\n").utf8))
+            exit(2)
+        case .success(let opts):
+            if opts.showHelp {
                 print("Usage: ComfyBoxGallery [--port \(defaultPort)] [--db PATH]")
+                print("       ComfyBoxGallery backfill [--help]")
                 exit(0)
-            default: break
             }
-            i += 1
+            port = opts.port
+            dbPath = opts.dbPath
         }
 
         // The store and the server outlive the Task that builds them. Without
@@ -355,10 +411,10 @@ public enum GalleryServer {
         // catalog is a WRITE target full of raw prompt text, so
         // `--db ~/Documents/Vaults/…/x.sqlite3` would CREATE a database inside
         // the vault rather than read one out of it.
-        for p in trees.flatMap({ [$0.mediaRoot, $0.metadataRoot, $0.journalPath, $0.historyPath] })
-                      .compactMap({ $0 }) + [dbPath].compactMap({ $0 })
-        where p.contains("Vaults") {
-            FileHandle.standardError.write(Data("refusing a vault path: \(p)\n".utf8))
+        if let refusal = vaultRefusal(in:
+            trees.flatMap { [$0.mediaRoot, $0.metadataRoot, $0.journalPath, $0.historyPath] }
+            + [dbPath]) {
+            FileHandle.standardError.write(Data((refusal.message + "\n").utf8))
             exit(2)
         }
 

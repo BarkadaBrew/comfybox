@@ -96,6 +96,35 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(derived.map(\.id), ["m1"])
     }
 
+    /// The COLLISION case: a manual filing into a collection the rules ALSO
+    /// derive for that asset.
+    ///
+    /// The previous test files into a collection the rules would never pick, so
+    /// it never exercises the conflicting INSERT. `applyDerivedFiling` deletes
+    /// `manual = 0` and then re-inserts with `manual = 0`; only because that
+    /// insert is `INSERT OR IGNORE` does the surviving `manual = 1` row keep its
+    /// flag. Switch it to `INSERT OR REPLACE` and the row is demoted to 0, the
+    /// NEXT refile deletes it, and the older test still passes — a hand-filing
+    /// silently destroyed one run later. This is the assertion that catches that.
+    /// (Verified by mutation: under OR REPLACE this test fails, the other passes.)
+    func testRefileAllKeepsAManualFlagOnACollectionTheRulesAlsoDerive() async throws {
+        // `avocado` derives col-kira-adult-scenes on its own.
+        try await store.upsert(make("m2", realm: .kira, tier: "avocado"),
+                               explicitCollectionIDs: [])
+        try await store.file(assetID: "m2", into: "col-kira-adult-scenes", by: nil)
+        let before = try await store.manualFilingCount(assetID: "m2")
+        XCTAssertEqual(before, 1, "precondition: the filing is marked manual")
+
+        try await store.refileAll()
+        try await store.refileAll()   // the second run is where a demoted flag bites
+
+        let after = try await store.manualFilingCount(assetID: "m2")
+        XCTAssertEqual(after, 1, "a manual filing was demoted and would be deleted next refile")
+        let stillThere = try await store.search(
+            CatalogQuery(scope: .kira, collectionID: "col-kira-adult-scenes"))
+        XCTAssertEqual(stillThere.map(\.id), ["m2"])
+    }
+
     /// A shared asset must not acquire a kira collection through the refile path
     /// any more than through the upsert path.
     func testRefileAllRespectsTheRealmGuard() async throws {

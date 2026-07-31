@@ -360,4 +360,38 @@ final class GalleryServerTests: XCTestCase {
         XCTAssertEqual(req.headers["content-length"], "9")
         XCTAssertEqual(req.body.count, 9)
     }
+
+    // MARK: - CLI argument parsing (the SERVE path)
+
+    /// The serve path CREATES the database, so a vault `--db` would write a
+    /// catalog of raw prompt text INTO the vault. Same flag, same hazard as the
+    /// backfill path, one function up.
+    func testServeRefusesAVaultDBPath() {
+        let result = GalleryServer.parseServeArgs(
+            ["--db", "/Users/x/Documents/Vaults/BarkadaAI/x.sqlite3"])
+        XCTAssertEqual(result, .failure(.vaultPath("/Users/x/Documents/Vaults/BarkadaAI/x.sqlite3")))
+    }
+
+    /// A typo'd flag that silently does nothing is the failure mode this task
+    /// exists to rule out.
+    func testServeRejectsAnUnknownFlagRatherThanIgnoringIt() {
+        XCTAssertEqual(GalleryServer.parseServeArgs(["--prot", "7871"]),
+                       .failure(.unknownArgument("--prot")))
+    }
+
+    func testServeParsesPortAndDB() throws {
+        let opts = try XCTUnwrap(try? GalleryServer.parseServeArgs(
+            ["--port", "7999", "--db", "/tmp/x.sqlite3"]).get())
+        XCTAssertEqual(opts.port, 7999)
+        XCTAssertEqual(opts.dbPath, "/tmp/x.sqlite3")
+        XCTAssertFalse(opts.showHelp)
+    }
+
+    /// The refusal is on the PATH, not on the flag, so it holds wherever a vault
+    /// path is named.
+    func testVaultRefusalAppliesToAnyPathNotJustDB() {
+        XCTAssertEqual(GalleryServer.vaultRefusal(in: [nil, "/tmp/ok", "/x/Vaults/y"]),
+                       .vaultPath("/x/Vaults/y"))
+        XCTAssertNil(GalleryServer.vaultRefusal(in: [nil, "/tmp/ok"]))
+    }
 }

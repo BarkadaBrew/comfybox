@@ -86,6 +86,10 @@ public enum CatalogSchema {
         CatalogCollection(id: "col-kira-dreams-memories", slug: "kira-dreams-memories",
                           name: "Dreams & Memories", realm: .kira,
                           description: "The t2v work she makes to describe a dream or a memory."),
+        CatalogCollection(id: "col-kira-everyday", slug: "kira-everyday",
+                          name: "Everyday", realm: .kira,
+                          description: "Her SFW lifestyle work — the ordinary-life register "
+                                     + "between the art photography and the suggestive material."),
     ]
 
     /// Create the pre-existing production `assets` shape when it is absent.

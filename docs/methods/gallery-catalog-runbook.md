@@ -24,21 +24,27 @@ file:
 
 ```bash
 TS=$(date +%s)
-sqlite3 ~/.comfybox/dam.sqlite3 ".backup ~/.comfybox/dam.sqlite3.bak-$TS"
-sqlite3 ~/.comfybox/dam.sqlite3.bak-$TS "PRAGMA integrity_check; SELECT COUNT(*) FROM assets;"
-chmod 600 ~/.comfybox/dam.sqlite3.bak-$TS
+BAK="$HOME/.comfybox/dam.sqlite3.bak-$TS"
+sqlite3 "$HOME/.comfybox/dam.sqlite3" ".backup $BAK"
+sqlite3 "$BAK" "PRAGMA integrity_check; SELECT COUNT(*) FROM assets;"
+chmod 600 "$BAK"
+rm -f "$BAK-wal" "$BAK-shm"
+echo "backup: $BAK"
 ```
+
+> **`$HOME`, never `~`.** The destination of `.backup` is parsed by the *sqlite3
+> shell*, not by bash, so a `~` inside that argument is expanded by neither. The
+> command fails with `Error: cannot open "~/.comfybox/…"` and creates nothing.
+> Loud rather than silent — but this is the first command of the rollback
+> procedure, so get it right.
 
 Expect `ok` and a plausible row count. A backup you have not verified is not a
 backup.
 
-**Housekeeping.** Opening a backup with the `sqlite3` CLI creates `-wal`/`-shm`
-sidecars next to it. Delete them once the file is checkpointed (a 0-byte `-wal`
-means it is), so nobody later mistakes them for part of the backup:
-
-```bash
-rm -f ~/.comfybox/dam.sqlite3.bak-$TS-wal ~/.comfybox/dam.sqlite3.bak-$TS-shm
-```
+The trailing `rm -f` clears the `-wal`/`-shm` sidecars the `sqlite3` CLI creates
+next to the backup while reading it; once the file is checkpointed (a 0-byte
+`-wal`) they are noise, and leaving them invites someone to mistake them for part
+of the backup.
 
 ---
 
@@ -51,29 +57,73 @@ state — not an error, not a crash, just a database that is quietly part-old an
 part-new. The stale files must be removed while **no process holds the database
 open**.
 
+**Step 1 — stop the catalog writer.**
+
 ```bash
-# 1. Stop the catalog writer.
 launchctl bootout gui/$(id -u)/com.barkadabrew.comfybox-gallery
+```
 
-# 2. STOP THE ENGINE — operator action, deliberately not scripted here.
-#    com.barkadabrew.comfybox also writes to this file via DAMStore. Stop it
-#    yourself, when in-flight renders allow. Confirm nothing holds the file:
-lsof ~/.comfybox/dam.sqlite3          # must print nothing before continuing
+**Step 2 — stop the engine. Operator action, deliberately not scripted.**
 
-# 3. Remove the stale WAL and shared-memory files.
-rm -f ~/.comfybox/dam.sqlite3-wal ~/.comfybox/dam.sqlite3-shm
+`com.barkadabrew.comfybox` also writes this file via `DAMStore`. Stop it yourself,
+when in-flight renders allow. Nothing below is safe until it is down.
 
-# 4. Restore, and verify BEFORE letting anything reopen it.
-cp ~/.comfybox/dam.sqlite3.bak-<TS> ~/.comfybox/dam.sqlite3
-chmod 600 ~/.comfybox/dam.sqlite3
-sqlite3 ~/.comfybox/dam.sqlite3 "PRAGMA integrity_check; SELECT COUNT(*) FROM assets;"
+**Step 3 — run this block ON ITS OWN and read the result before going further.**
+It aborts rather than merely reporting; a gate you can paste past is not a gate.
 
-# 5. Bring the catalog service back.
+```bash
+if lsof "$HOME/.comfybox/dam.sqlite3" 2>/dev/null | grep -q .; then
+  lsof "$HOME/.comfybox/dam.sqlite3"
+  echo "STILL OPEN — do not continue. Stop the writers listed above." >&2
+else
+  echo "clear — safe to restore"
+fi
+```
+
+**Step 4 — restore.** Safe to paste as a whole: it re-checks the gate fatally,
+preserves the pre-rollback state, and swaps atomically.
+
+```bash
+set -e
+DB="$HOME/.comfybox/dam.sqlite3"
+BAK="$HOME/.comfybox/dam.sqlite3.bak-<TS>"      # <-- the backup you are restoring
+
+# The gate again, this time fatal. What follows destroys state; never run it blind.
+lsof "$DB" 2>/dev/null | grep -q . && { echo "STILL OPEN — aborting" >&2; exit 1; }
+
+# Keep the CURRENT database before touching it. Removing the WAL and overwriting
+# in place are each irreversible on their own, so without this a restore that
+# fails partway has destroyed BOTH generations.
+PRE="$DB.pre-rollback-$(date +%s)"
+sqlite3 "$DB" ".backup $PRE" && chmod 600 "$PRE" && rm -f "$PRE-wal" "$PRE-shm"
+echo "pre-rollback snapshot: $PRE"
+
+# Verify the backup BEFORE destroying anything that could stand in for it.
+sqlite3 "$BAK" "PRAGMA integrity_check;" | grep -qx ok || { echo "backup is bad — aborting" >&2; exit 1; }
+
+# Stage beside the target (same filesystem), then swap in one step, so a
+# half-copied database is never visible under the real name.
+cp "$BAK" "$DB.incoming"
+chmod 600 "$DB.incoming"
+sqlite3 "$DB.incoming" "PRAGMA integrity_check;" | grep -qx ok || { echo "copy is bad — aborting" >&2; exit 1; }
+
+rm -f "$DB-wal" "$DB-shm"     # stale WAL belongs to the REPLACED generation
+mv "$DB.incoming" "$DB"       # atomic within the filesystem
+
+sqlite3 "$DB" "PRAGMA integrity_check; SELECT COUNT(*) FROM assets;"
+```
+
+**Step 5 — bring the catalog service back.**
+
+```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.barkadabrew.comfybox-gallery.plist
 curl -s http://127.0.0.1:7871/healthz     # {"ok":true}
 ```
 
-Step 3 is the one that is easy to skip and the only one that loses data silently.
+The `rm -f` of `-wal`/`-shm` is the step that is easy to skip and the only one
+that loses data silently — which is why it happens *after* both the pre-rollback
+snapshot and the verification of the incoming copy, and immediately before the
+atomic `mv`.
 
 **The catalog is rebuildable by design.** If a restore is doubtful, the honest
 move is to rebuild from disk rather than nurse a suspect file — every fact in it

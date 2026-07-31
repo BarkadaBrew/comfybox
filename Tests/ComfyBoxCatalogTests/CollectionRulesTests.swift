@@ -82,10 +82,24 @@ final class CollectionRulesTests: XCTestCase {
             "an UNMAPPED lane must still fall through to the content tier")
     }
 
-    /// The owner declined to invent a genre for SFW lifestyle work, so these stay
-    /// unfiled — deliberately, and visibly.
-    func testAppleInKiraRealmIsDeliberatelyUnmapped() {
-        XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(contentMode: "apple")), [])
+    /// The owner's later call: her SFW lifestyle work gets its own body of work.
+    func testAppleInKiraRealmFilesIntoEveryday() {
+        XCTAssertEqual(CollectionRules.defaultCollectionIDs(for: asset(contentMode: "apple")),
+                       ["col-kira-everyday"])
+    }
+
+    /// The rules may only ever name a collection that is actually seeded — a
+    /// typo'd id files nothing and reports nothing.
+    func testEveryTierFallbackNamesASeededCollection() {
+        let seeded = Set(CatalogSchema.seedCollections.map(\.id))
+        for realm in [CatalogRealm.kira, .shared] {
+            for tier in CATALOG_TIER_ORDER {
+                for id in CollectionRules.defaultCollectionIDs(
+                    for: asset(realm: realm, contentMode: tier)) {
+                    XCTAssertTrue(seeded.contains(id), "\(realm)/\(tier) named unseeded \(id)")
+                }
+            }
+        }
     }
 
     func testARealLaneAlwaysBeatsTheContentModeFallback() {

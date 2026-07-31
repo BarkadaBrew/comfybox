@@ -49,9 +49,9 @@ public enum CollectionRules {
         "avocado": "col-kira-adult-scenes",
         "banana": "col-kira-nightlife",
         "neutral": "col-kira-still-life",
-        // `apple` is deliberately absent. There is no existing genre for her SFW
-        // lifestyle work and inventing one is a decision for the owner, not for
-        // this table. Those assets stay unfiled, and visibly so.
+        // The owner's call: her SFW lifestyle work is its own body of work rather
+        // than being folded into an existing genre.
+        "apple": "col-kira-everyday",
     ]
 
     /// The SHARED roots — never her genres.
@@ -89,7 +89,12 @@ public enum CollectionRules {
         guard let lane = asset.lane else { return [] }
 
         // t2v on the video lane is Dreams & Memories — the one genre that is
-        // only video. An i2v clip belongs to the genre of the scene it animates.
+        // only video. An i2v clip returns [] here and therefore falls through to
+        // the content-tier fallback below, so it is filed by its OWN tier. (It
+        // does NOT inherit the genre of the still it animates: that would mean
+        // resolving the i2v edge, which this pure function cannot do and which
+        // 118 clips could not resolve anyway, their source stills having been
+        // deleted.)
         if lane == "video" {
             return asset.mode == "t2v" ? ["col-kira-dreams-memories"] : []
         }

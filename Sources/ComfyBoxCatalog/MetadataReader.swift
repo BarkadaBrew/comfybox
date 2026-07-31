@@ -210,7 +210,12 @@ public enum MetadataReader {
     /// edge from it. Nothing about that failure looks like a failure; it looks
     /// like a hit. Kira's 2741 files happen to have no such collision today
     /// (filenames are timestamp-prefixed), but that is luck, not construction.
-    public static let contentTiers: Set<String> = ["apple", "banana", "avocado", "neutral"]
+    ///
+    /// Derived from `CATALOG_TIER_ORDER`, never re-spelled. A second hand-written
+    /// copy that fell out of sync would silently revert this fallback to the
+    /// strict mirror — i.e. back to the 89%-unfiled, 2-edge failure it exists to
+    /// prevent — and nothing would report an error.
+    public static let contentTiers: Set<String> = Set(CATALOG_TIER_ORDER)
 
     public static func sidecarCandidates(forMedia media: String,
                                          galleryRoot: String,
