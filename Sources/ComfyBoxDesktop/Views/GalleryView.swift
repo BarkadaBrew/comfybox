@@ -1,15 +1,29 @@
 // GalleryView.swift — Asset gallery with grid, search, and filtering
 //
-// Displays DAMStore assets as a grid of thumbnails with sorting,
-// filtering by favorite/content mode/character, and FTS5 search.
-// Clicking a cell opens the AssetDetailView for full metadata
-// display and editing. Phase 4: Added drag-and-drop, comparison
-// selection, Quick Look via Space bar.
+// Displays assets as a grid of thumbnails with sorting, filtering by
+// favorite/content mode/character, and search. Clicking a cell opens the
+// AssetDetailView for full metadata display and editing. Phase 4: Added
+// drag-and-drop, comparison selection, Quick Look via Space bar.
+//
+// ONE GALLERY (2026-07-31). The rows now come from the CATALOG via
+// `CatalogBrowser` — one query over every realm — instead of from a local-only
+// DAMStore fetch, and a row's `asset_locations` decide whether its bytes open
+// from disk or stream from the engine's /v1/gallery/file. That retires the
+// split between this view and RemoteGalleryView, which read a bare directory
+// listing with no metadata. DAMStore is unchanged and still owns ingest,
+// ratings, favourites, folders and the secure vault; only browsing moved.
+//
+// The catalog and the DAM share ONE `assets` table (dam.sqlite3 was migrated in
+// place), so ids are one id space and everything keyed by an id still matches.
+// When the catalog cannot be opened this view falls back to the DAMStore fetch
+// it always used, so a broken catalog degrades to the old gallery rather than
+// to an empty one.
 
 import SwiftUI
 import AVKit
 import AppKit
 import LocalAuthentication
+import ComfyBoxCatalog
 
 /// Sort options for the gallery.
 enum GallerySortOrder: String, CaseIterable {
@@ -53,6 +67,14 @@ struct GalleryView: View {
     @State private var isSelectMode: Bool = false
     @State private var mediaTools = MediaToolsService()
     @State private var sidecar = SidecarService()
+
+    // The one reader. nil until the catalog opens (and permanently nil if it
+    // cannot), in which case the DAMStore fetch below still serves the grid.
+    @State private var browser: CatalogBrowser?
+    @State private var selectedCollectionID: String?
+    @State private var selectedLane: String?
+    /// Engine URLs for rows whose bytes are not on this Mac, keyed by asset id.
+    @State private var remoteURLs: [String: URL] = [:]
     @State private var pendingDelete: [DAMAsset] = []
     @State private var showDeleteConfirmation: Bool = false
 
@@ -90,7 +112,12 @@ struct GalleryView: View {
     @State private var personaFilter: String?
 
     /// Sources that belong to the main gallery, not a persona section.
-    static let mainSources: Set<String> = ["", "desktop", "comfyui"]
+    ///
+    /// "comfybox" is in here because it is the APP's own name, not a persona:
+    /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
+    /// database, so leaving it out filed almost the whole library into a
+    /// "Comfybox" persona section and left the main gallery showing 87 images.
+    static let mainSources: Set<String> = ["", "desktop", "comfyui", "comfybox"]
     static func isMainSource(_ source: String?) -> Bool {
         mainSources.contains((source ?? "").lowercased())
     }
@@ -132,8 +159,24 @@ struct GalleryView: View {
     /// Target masonry column width; the size control steps it.
     @State private var cellTargetWidth: CGFloat = 210
 
+    /// Whether the collection / lane rail is on screen.
+    ///
+    /// The rail names bodies of work, and in the live catalog those names are
+    /// "Adult", "Adult Scenes", "Erotic Portraiture", "Nightlife". They are
+    /// exactly what the Rated-G-by-default gate exists to keep off the screen,
+    /// so the rail is hidden with the grid rather than left standing beside the
+    /// lock wall. A fresh gate is hidden, so this is false on every launch.
+    static func showsCatalogRail(revealed: Bool, hasBrowser: Bool) -> Bool {
+        revealed && hasBrowser
+    }
+
     var body: some View {
         HStack(spacing: 0) {
+            if Self.showsCatalogRail(revealed: contentGate.revealed, hasBrowser: browser != nil) {
+                catalogRail
+                    .frame(width: 210)
+                Divider()
+            }
             folderSidebar
                 .frame(width: 190)
             Divider()
@@ -290,6 +333,16 @@ struct GalleryView: View {
         }
         .onChange(of: ingestor.ingestedCount) { _, _ in
             Task { await loadAssets() }
+        }
+        .task {
+            // Open the catalog once. A failure here is not an error banner: the
+            // DAMStore path below still fills the grid, so the gallery degrades
+            // to its old (Mac-only) self instead of to nothing.
+            guard browser == nil else { return }
+            guard let catalog = try? await CatalogStore.open() else { return }
+            let b = CatalogBrowser(store: catalog, engineBaseURL: engineBaseURL)
+            browser = b
+            await loadAssets()
         }
         .onAppear {
             consumeSearchFocusRequest()
@@ -714,6 +767,7 @@ struct GalleryView: View {
         GalleryCellView(
             asset: asset,
             thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+            remoteURL: remoteURLs[asset.id],
             cellWidth: width,
             aspectRatio: aspectRatio(asset),
             isComparisonSelected: isSelectMode ? isSelected : nil
@@ -865,12 +919,41 @@ struct GalleryView: View {
                                 isSelectMode = true
                             }
                         }
+                        if remoteURLs[asset.id] != nil {
+                            Divider()
+                            Button("Save to this Mac") {
+                                Task { await pullRemote(asset) }
+                            }
+                        }
                         Divider()
                         Button("Delete…", role: .destructive) {
                             requestDelete([asset])
                         }
                     }
                     .draggable(DraggableAsset(path: asset.absolutePath))
+    }
+
+    /// Download a row whose bytes are on a server into the local output folder
+    /// and ingest it — the one thing the retired Remote Gallery could do that
+    /// browsing the catalog cannot.
+    private func pullRemote(_ asset: DAMAsset) async {
+        guard let url = remoteURLs[asset.id] else { return }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                errorMessage = "Server returned \(http.statusCode)"
+                return
+            }
+            let dir = DesktopSettings.load().outputDirectory
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let dest = (dir as NSString).appendingPathComponent(asset.filename)
+            try data.write(to: URL(fileURLWithPath: dest))
+            _ = try? await ingestor.ingestFile(at: dest)
+            errorMessage = nil
+            await loadAssets()
+        } catch {
+            errorMessage = "Save failed: \(error.localizedDescription)"
+        }
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -926,6 +1009,105 @@ struct GalleryView: View {
     }
 
     // MARK: - Folder sidebar
+
+    /// The engine this Mac's gallery streams server-side bytes from.
+    private var engineBaseURL: String {
+        guard let engine else { return "http://127.0.0.1:7870" }
+        return "http://\(engine.serverHost):\(engine.serverPort)"
+    }
+
+    /// Collection + lane rail over the whole catalog. Collections come first
+    /// because they are the bodies of work; lanes below them are the finer cut.
+    ///
+    /// Only rendered when the content gate is revealed — see `showsCatalogRail`.
+    @ViewBuilder
+    private var catalogRail: some View {
+        if let browser {
+            VStack(alignment: .leading, spacing: 0) {
+                List {
+                    Section {
+                        railRow(title: "Everything",
+                                icon: "square.grid.2x2",
+                                count: browser.facets.kind.values.reduce(0, +),
+                                isSelected: selectedCollectionID == nil && selectedLane == nil) {
+                            selectedCollectionID = nil
+                            selectedLane = nil
+                            Task { await applyCatalogFilter() }
+                        }
+                    }
+                    Section("Collections") {
+                        ForEach(browser.rootCollections(), id: \.id) { root in
+                            DisclosureGroup {
+                                ForEach(browser.children(of: root), id: \.id) { child in
+                                    railRow(title: child.name, icon: "folder",
+                                            count: browser.count(of: child),
+                                            isSelected: selectedCollectionID == child.id) {
+                                        selectedCollectionID = child.id
+                                        selectedLane = nil
+                                        Task { await applyCatalogFilter() }
+                                    }
+                                }
+                            } label: {
+                                railRow(title: root.name, icon: "folder.fill",
+                                        count: browser.count(of: root),
+                                        isSelected: selectedCollectionID == root.id) {
+                                    selectedCollectionID = root.id
+                                    selectedLane = nil
+                                    Task { await applyCatalogFilter() }
+                                }
+                            }
+                        }
+                    }
+                    Section("Lane") {
+                        ForEach(browser.facets.lane.sorted(by: { $0.key < $1.key }), id: \.key) { lane, count in
+                            railRow(title: lane, icon: "line.3.horizontal.decrease",
+                                    count: count, isSelected: selectedLane == lane) {
+                                selectedLane = lane
+                                selectedCollectionID = nil
+                                Task { await applyCatalogFilter() }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+
+                if browser.isLoading {
+                    ProgressView().controlSize(.small).padding(8)
+                }
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private func railRow(title: String, icon: String, count: Int,
+                         isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                Text(title).lineLimit(1)
+                Spacer()
+                Text("\(count)").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(isSelected ? Color.accentColor.opacity(0.18) : nil)
+    }
+
+    /// The catalog query the rail currently describes. Unscoped and unclamped:
+    /// this is the owner's own surface, and it is the content gate — not the
+    /// mode ceiling — that governs what reaches the screen here.
+    private func catalogQuery() -> CatalogQuery {
+        CatalogQuery(text: searchText.isEmpty ? nil : searchText,
+                     collectionID: selectedCollectionID,
+                     lane: selectedLane,
+                     limit: 500)
+    }
+
+    private func applyCatalogFilter() async {
+        guard browser != nil else { return }
+        await loadAssets()
+    }
 
     private var folderSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1190,8 +1372,11 @@ struct GalleryView: View {
             results = results.filter { $0.characterName == character }
         }
 
-        // Apply search — client-side for immediate feedback, FTS for big datasets.
-        if !searchText.isEmpty {
+        // Apply search. When the catalog is driving, the text has ALREADY been
+        // matched against the whole catalog's FTS index (prompt, injected
+        // prompt, caption, filename) — re-filtering here by substring would
+        // throw away real hits on the fields this loop does not look at.
+        if !searchText.isEmpty, browser == nil {
             let query = searchText.lowercased()
             results = results.filter { asset in
                 (asset.prompt?.lowercased().contains(query) ?? false)
@@ -1227,25 +1412,71 @@ struct GalleryView: View {
             if searchText.isEmpty {
                 _ = try? await ingestor.pruneOrphans()
             }
-            if !searchText.isEmpty {
-                let ftsResults = try await store.searchPrompts(query: searchText, limit: 200)
-                assets = ftsResults
-            } else {
-                assets = try await store.fetchAssets(limit: 500)
-                // Self-heal: backfill any thumbnail that's missing or was
-                // left as a 0-byte file by a previously-interrupted write.
-                await ingestor.regenerateMissingThumbnails(for: assets)
-            }
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()
             folderAssignments = try await store.folderAssignments()
             securedIds = try await store.securedAssetIds()
+
+            if let browser {
+                try await loadFromCatalog(browser)
+            } else {
+                try await loadFromLocalStore()
+            }
             refreshColorLabels()
             extractFilterValues()
         } catch {
             errorMessage = error.localizedDescription
         }
         isLoading = false
+    }
+
+    /// THE converged read: one query over the whole catalog, both realms, every
+    /// host. Rows keep their DAM record where the shared `assets` table has one
+    /// (so ratings, favourites, folders and dates are the real ones) and only
+    /// fall back to the catalog's own view for anything the DAM columns are
+    /// empty for. Rows whose bytes are not on this Mac get an engine URL.
+    private func loadFromCatalog(_ browser: CatalogBrowser) async throws {
+        // The vault carve-out. A secured asset's row survives in the shared
+        // table and very often still has a streamable twin on a server, so the
+        // reader has to be told about it or converging on the catalog would
+        // quietly undo every vault move. `filteredAssets` filters by the same
+        // set again — this is deliberately belt AND braces.
+        browser.hiddenAssetIDs = revealSecured ? [] : securedIds
+        await browser.apply(filter: catalogQuery())
+        if let message = browser.error { errorMessage = message } else { errorMessage = nil }
+
+        var damByID: [String: DAMAsset] = [:]
+        for row in try await store.fetchAssets(limit: 20_000) { damByID[row.id] = row }
+
+        var rows: [DAMAsset] = []
+        var urls: [String: URL] = [:]
+        rows.reserveCapacity(browser.items.count)
+        for item in browser.items {
+            rows.append(damByID[item.id] ?? browser.damAsset(for: item))
+            if browser.localPath(forID: item.id) == nil,
+               let url = browser.resolvedStreamURL(forID: item.id) {
+                urls[item.id] = url
+            }
+        }
+        assets = rows
+        remoteURLs = urls
+        // Only for rows whose bytes are actually here — regenerating a thumbnail
+        // for a file that lives on another machine is a guaranteed miss.
+        await ingestor.regenerateMissingThumbnails(for: rows.filter { urls[$0.id] == nil })
+    }
+
+    /// Fallback for when the catalog could not be opened: the Mac-only reader
+    /// this view used before the two galleries converged.
+    private func loadFromLocalStore() async throws {
+        remoteURLs = [:]
+        if !searchText.isEmpty {
+            assets = try await store.searchPrompts(query: searchText, limit: 200)
+        } else {
+            assets = try await store.fetchAssets(limit: 500)
+            // Self-heal: backfill any thumbnail that's missing or was
+            // left as a 0-byte file by a previously-interrupted write.
+            await ingestor.regenerateMissingThumbnails(for: assets)
+        }
     }
 
     private func extractFilterValues() {
@@ -1651,6 +1882,9 @@ struct DraggableAsset: Transferable {
 struct GalleryCellView: View {
     let asset: DAMAsset
     let thumbnailPath: String
+    /// Engine URL for a row whose bytes are NOT on this Mac (the catalog knows
+    /// the asset, `asset_locations` puts it on another host). nil for local rows.
+    var remoteURL: URL?
     /// Column width in the masonry layout; nil = legacy fixed 160px height.
     var cellWidth: CGFloat?
     /// Image aspect ratio (w/h) used to size the cell to the true shape.
@@ -1753,12 +1987,20 @@ struct GalleryCellView: View {
     private func loadThumbnail() async {
         let path = thumbnailPath
         let fullPath = asset.absolutePath
-        let image: NSImage? = await Task.detached {
+        let local: NSImage? = await Task.detached {
             NSImage(contentsOfFile: path) ?? NSImage(contentsOfFile: fullPath)
         }.value
-        await MainActor.run {
-            thumbnail = image
+        if let local {
+            thumbnail = local
+            return
         }
+        // Nothing on disk. If the catalog placed this row on another host, its
+        // bytes come from the engine's /v1/gallery/file — the same route the
+        // Remote Gallery used, now reached through the one converged reader.
+        guard let remoteURL else { return }
+        guard let (data, response) = try? await URLSession.shared.data(from: remoteURL),
+              (response as? HTTPURLResponse)?.statusCode ?? 200 == 200 else { return }
+        thumbnail = NSImage(data: data)
     }
 }
 

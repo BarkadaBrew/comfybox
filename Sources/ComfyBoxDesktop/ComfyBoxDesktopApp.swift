@@ -392,6 +392,49 @@ struct ComfyBoxDesktopApp: App {
 
     // MARK: - Detail View Router
 
+    /// The ONE gallery. Both the Gallery tab and the (kept) Remote Gallery tab
+    /// open it, because there is no longer a second reader for the second one
+    /// to show.
+    @ViewBuilder
+    private var galleryDetail: some View {
+        if let store = store, let ingestor = ingestor {
+            GalleryView(
+                store: store,
+                ingestor: ingestor,
+                engine: engine,
+                onCompare: { assets in
+                    comparisonAssets = assets
+                    selectedTab = .compare
+                },
+                onUseAsReference: { asset in
+                    pendingReferenceImage = asset.absolutePath
+                    selectedTab = .generate
+                },
+                onSendToGenerate: { asset in
+                    guard let recipe = ImageRecipe.read(fromImageAt: asset.absolutePath, fallback: asset) else { return }
+                    pendingPreset = recipe.preset
+                    pendingContentMode = recipe.contentMode
+                    selectedTab = .generate
+                },
+                onAnimate: { asset in
+                    pendingMotionReference = asset.absolutePath
+                    selectedTab = .motion
+                },
+                onInpaint: { asset in
+                    pendingInpaintImage = asset.absolutePath
+                    selectedTab = .inpaint
+                },
+                canvasStore: canvasStore,
+                searchFocusRequests: $gallerySearchFocusRequests
+            )
+        } else if let error = initError {
+            errorView(error)
+        } else {
+            ProgressView("Initializing database...")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     @ViewBuilder
     private var detailView: some View {
         switch selectedTab {
@@ -405,7 +448,13 @@ struct ComfyBoxDesktopApp: App {
             QueueView(engine: engine)
 
         case .remoteGallery:
-            RemoteGalleryView(engine: engine, ingestor: ingestor)
+            // One gallery (2026-07-31). This tab used to open RemoteGalleryView,
+            // a second reader over /v1/gallery/list — a bare directory listing
+            // with no metadata — which is half of why "the Mac gallery and the
+            // server gallery are different". The Gallery now reads the catalog,
+            // which covers every host, so this is the same view. The tab and its
+            // ⌘R shortcut are kept so the habit still lands somewhere.
+            galleryDetail
 
         case .characters:
             CharactersView(engine: engine)
@@ -483,42 +532,7 @@ struct ComfyBoxDesktopApp: App {
             ModelsView(engine: engine)
 
         case .gallery:
-            if let store = store, let ingestor = ingestor {
-                GalleryView(
-                    store: store,
-                    ingestor: ingestor,
-                    engine: engine,
-                    onCompare: { assets in
-                        comparisonAssets = assets
-                        selectedTab = .compare
-                    },
-                    onUseAsReference: { asset in
-                        pendingReferenceImage = asset.absolutePath
-                        selectedTab = .generate
-                    },
-                    onSendToGenerate: { asset in
-                        guard let recipe = ImageRecipe.read(fromImageAt: asset.absolutePath, fallback: asset) else { return }
-                        pendingPreset = recipe.preset
-                        pendingContentMode = recipe.contentMode
-                        selectedTab = .generate
-                    },
-                    onAnimate: { asset in
-                        pendingMotionReference = asset.absolutePath
-                        selectedTab = .motion
-                    },
-                    onInpaint: { asset in
-                        pendingInpaintImage = asset.absolutePath
-                        selectedTab = .inpaint
-                    },
-                    canvasStore: canvasStore,
-                    searchFocusRequests: $gallerySearchFocusRequests
-                )
-            } else if let error = initError {
-                errorView(error)
-            } else {
-                ProgressView("Initializing database...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            galleryDetail
 
         case .compare:
             if let store = store, let ingestor = ingestor {

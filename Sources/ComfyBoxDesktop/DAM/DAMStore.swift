@@ -141,19 +141,52 @@ public actor DAMStore {
     /// under the DAM), cleaning FTS + folder mappings + returning their ids
     /// so the caller can drop cached thumbnails. Secured assets are skipped —
     /// their path points into the vault and is expected to be non-obvious.
+    ///
+    /// So are assets that live on ANOTHER HOST. This table is now shared with
+    /// the catalog, which indexes Kira's and Bree's server trees as well as this
+    /// Mac's; roughly 1,300 of the 2,994 rows in the live database name a path
+    /// that exists only on a server. "The file isn't here" is not evidence that
+    /// such a row is an orphan — it is the normal case — and pruning them would
+    /// silently delete half the catalog on the next gallery load.
     @discardableResult
     public func pruneOrphans() throws -> [String] {
         let secured = try securedAssetIds()
+        let elsewhere = try assetIDsHostedElsewhere()
         let all = try fetchAssets(limit: 100_000)
         var removed: [String] = []
         for asset in all {
-            guard !secured.contains(asset.id) else { continue }
+            guard !secured.contains(asset.id), !elsewhere.contains(asset.id) else { continue }
             if !FileManager.default.fileExists(atPath: asset.absolutePath) {
                 try deleteAsset(id: asset.id)  // handles FTS + folder mapping
                 removed.append(asset.id)
             }
         }
         return removed
+    }
+
+    /// Ids the catalog records a copy of on a host other than this Mac.
+    ///
+    /// `asset_locations` is the catalog's table, created by its migration in the
+    /// same file. A DAM-only database (a test fixture, or an install that has
+    /// never run the backfill) does not have it, so its absence means "nothing
+    /// is hosted elsewhere" rather than an error.
+    private func assetIDsHostedElsewhere() throws -> Set<String> {
+        let exists = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_locations'"
+        var check: OpaquePointer?
+        guard sqlite3_prepare_v2(db, exists, -1, &check, nil) == SQLITE_OK else { return [] }
+        let hasTable = sqlite3_step(check) == SQLITE_ROW
+        sqlite3_finalize(check)
+        guard hasTable else { return [] }
+
+        var stmt: OpaquePointer?
+        let sql = "SELECT DISTINCT asset_id FROM asset_locations WHERE host != 'mac'"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        var out: Set<String> = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0) { out.insert(String(cString: c)) }
+        }
+        return out
     }
 
     /// All asset creation timestamps (for activity stats). Lightweight — one
