@@ -97,17 +97,38 @@ public struct CatalogFacets: Sendable, Equatable {
 }
 
 /// The fruit tiers, least to most explicit. Used only for ceiling comparison.
-public let CATALOG_TIER_ORDER: [String] = ["neutral", "apple", "banana", "avocado"]
+///
+/// `apple` is deliberately NOT a rung of its own. The daemon canonicalizes
+/// `apple -> neutral` on write (content-mode-tools.ts) and nothing a
+/// conversation can do produces a ceiling of `apple`, so ranking apple ABOVE
+/// neutral made 278 rows — 164 of them the whole `col-kira-everyday` genre —
+/// countable but permanently unopenable at every ceiling anyone could ask for.
+/// The owner's call: collapse them here to match what the daemon already does
+/// everywhere. Rows still STORE the literal string "apple"; only its RANK moved.
+public let CATALOG_TIER_ORDER: [String] = ["neutral", "banana", "avocado"]
 
 /// Other vocabularies that mean the same thing. The desktop gate already sees
 /// these values in `content_mode` (NSFWGate.swift: "explicit", "suggestive" and
 /// "nsfw" are all treated as NSFW), so the catalog must rank them rather than
 /// meet them as strangers.
 public let CATALOG_TIER_ALIASES: [String: String] = [
+    "apple": "neutral",
     "explicit": "avocado",
     "nsfw": "avocado",
     "suggestive": "banana",
 ]
+
+/// Every spelling the ladder RECOGNISES, canonical rungs and aliases alike.
+///
+/// This is not the same set as `CATALOG_TIER_ORDER` and must never be confused
+/// with it. The order is a RANKING (three rungs); this is a VOCABULARY (every
+/// word that names a tier). Anywhere a tier is matched as a literal — a
+/// directory name on disk, a filter enum, a sidecar's `content_mode` — it is
+/// this set that applies, because `apple/` directories exist in the archive and
+/// `apple` is still written into rows. Deriving those places from the three-rung
+/// order instead would silently stop recognising apple.
+public let CATALOG_TIER_SPELLINGS: Set<String> =
+    Set(CATALOG_TIER_ORDER).union(CATALOG_TIER_ALIASES.keys)
 
 /// How explicit an ASSET's tier is. Fails CLOSED: a non-nil tier this table does
 /// not recognise ranks above every known tier, so an unrecognised vocabulary is

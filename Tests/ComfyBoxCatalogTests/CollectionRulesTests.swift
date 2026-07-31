@@ -118,8 +118,12 @@ final class CollectionRulesTests: XCTestCase {
     /// typo'd id files nothing and reports nothing.
     func testEveryTierFallbackNamesASeededCollection() {
         let seeded = Set(CatalogSchema.seedCollections.map(\.id))
+        // SPELLINGS, not the three-rung order: `apple` is an alias now but is
+        // still what rows carry and still what `kiraModeToCollection` keys on,
+        // so iterating the order would quietly stop covering the tier whose
+        // collection the owner created this task for.
         for realm in [CatalogRealm.kira, .shared] {
-            for tier in CATALOG_TIER_ORDER {
+            for tier in CATALOG_TIER_SPELLINGS.sorted() {
                 for id in CollectionRules.defaultCollectionIDs(
                     for: asset(realm: realm, contentMode: tier)) {
                     XCTAssertTrue(seeded.contains(id), "\(realm)/\(tier) named unseeded \(id)")

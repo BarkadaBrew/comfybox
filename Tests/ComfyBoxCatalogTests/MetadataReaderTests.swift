@@ -132,6 +132,38 @@ final class MetadataReaderTests: XCTestCase {
         ], "the exact mirror must be tried first, the tier-flattened path second")
     }
 
+    /// `apple/` directories exist in the archive, and when apple collapsed into
+    /// neutral it left `CATALOG_TIER_ORDER` and became an alias. `contentTiers`
+    /// derives from `CATALOG_TIER_SPELLINGS` for exactly this reason: derived
+    /// from the three-rung ORDER instead, every asset under an `apple/`
+    /// directory would silently stop finding its sidecar — back to the
+    /// 89%-unfiled failure the fallback exists to prevent, with no error.
+    func testAppleIsStillATierDirectoryAfterTheRankCollapse() {
+        XCTAssertTrue(MetadataReader.contentTiers.contains("apple"),
+                      "apple/ directories exist on disk; sidecar lookup under one just broke")
+        let candidates = MetadataReader.sidecarCandidates(
+            forMedia: "/s/gallery/Kira/generated/apple/1785339616729_x.png",
+            galleryRoot: "/s/gallery",
+            metadataRoot: "/s/metadata")
+        XCTAssertEqual(candidates, [
+            "/s/metadata/Kira/generated/apple/1785339616729_x.json",
+            "/s/metadata/Kira/generated/1785339616729_x.json",
+        ])
+        // …and every other rung and alias is a tier directory too.
+        for spelling in CATALOG_TIER_ORDER + Array(CATALOG_TIER_ALIASES.keys) {
+            XCTAssertTrue(MetadataReader.contentTiers.contains(spelling),
+                          "'\(spelling)' is a recognised tier but not a tier directory")
+        }
+    }
+
+    /// A sidecar that says `apple` is still a fruit tier the ladder recognises,
+    /// so it must be adopted rather than dropped as an unknown vocabulary.
+    func testAppleIsStillAcceptedAsAFruitTier() {
+        XCTAssertEqual(MetadataReader.fruitTier("apple"), "apple")
+        XCTAssertEqual(MetadataReader.fruitTier(" Apple "), "apple")
+        XCTAssertNil(MetadataReader.fruitTier("standard"), "the QUALITY tier is not a fruit tier")
+    }
+
     /// The fallback drops one directory, so a file sitting directly under the
     /// gallery root must not flatten to a path OUTSIDE the metadata tree.
     func testSidecarCandidatesNeverClimbAboveMetadataRoot() {

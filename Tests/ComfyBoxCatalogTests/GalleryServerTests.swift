@@ -243,6 +243,196 @@ final class GalleryServerTests: XCTestCase {
         XCTAssertEqual(res.status, 404)
     }
 
+    // MARK: - POST /v1/catalog/file (the only write route)
+
+    private func post(_ target: String, json: String,
+                      actor: String? = nil,
+                      extraHeaders: [String: String] = [:]) async -> HTTPKit.Response {
+        var headers = extraHeaders
+        if let actor { headers["x-catalog-actor"] = actor }
+        headers["content-type"] = "application/json"
+        let req = HTTPKit.Request(method: "POST", target: target,
+                                  headers: headers, body: Data(json.utf8))
+        return await GalleryServer.handle(request: req, store: store)
+    }
+
+    /// Every collection the asset is in. The fixtures arrive already DERIVED-filed
+    /// by `upsert`, so these tests assert against a baseline rather than against
+    /// emptiness — a test that files an asset into the collection its lane
+    /// already implies would pass without the route existing.
+    private func memberships(of assetID: String) async throws -> Set<String> {
+        var out: Set<String> = []
+        for c in try await store.collections(visibleTo: nil) {
+            let q = CatalogQuery(scope: nil, collectionID: c.id, limit: 500)
+            if try await store.search(q).contains(where: { $0.id == assetID }) { out.insert(c.id) }
+        }
+        return out
+    }
+
+    func testFileRouteFilesAnAsset() async throws {
+        let before = try await memberships(of: "k1")
+        XCTAssertFalse(before.contains("col-kira-dreams-memories"), "fixture already filed there")
+
+        let res = await post("/v1/catalog/file",
+                             json: #"{"asset_id":"k1","collection_id":"col-kira-dreams-memories"}"#)
+        XCTAssertEqual(res.status, 200)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: res.body) as? [String: Bool],
+                       ["ok": true])
+        let ids = try await memberships(of: "k1")
+        XCTAssertTrue(ids.contains("col-kira-dreams-memories"),
+                      "the route returned ok but filed nothing")
+    }
+
+    /// Her own asset into her own collection, with the realm lock engaged. This
+    /// is the case the whole route exists for — "she curates her own realm".
+    func testKiraMayFileHerOwnAssetIntoHerOwnCollection() async throws {
+        let before = try await memberships(of: "k2")
+        XCTAssertFalse(before.contains("col-kira-nightlife"),
+                       "fixture already filed there — this test would prove nothing")
+        let res = await post("/v1/catalog/file",
+                             json: #"{"asset_id":"k2","collection_id":"col-kira-nightlife"}"#,
+                             actor: "kira")
+        XCTAssertEqual(res.status, 200)
+        let after = try await memberships(of: "k2")
+        XCTAssertTrue(after.contains("col-kira-nightlife"))
+    }
+
+    /// A shared asset can never enter a kira collection — a property of the DATA,
+    /// so it holds however the caller identifies itself. If the route ever stops
+    /// passing `by: scope` this is one of the two tests that notices.
+    func testKiraCannotFileASharedAssetIntoHerRealm() async throws {
+        let before = try await memberships(of: "s1")
+        let res = await post("/v1/catalog/file",
+                             json: #"{"asset_id":"s1","collection_id":"col-kira-everyday"}"#,
+                             actor: "kira")
+        XCTAssertEqual(res.status, 403)
+        let after = try await memberships(of: "s1")
+        XCTAssertEqual(after, before, "refused and filed it anyway")
+    }
+
+    /// The other one. `by: nil` would let her file her own work into a SHARED
+    /// collection's structure and reach rows outside her realm; with the scope
+    /// passed, an asset that is not hers is not hers to file.
+    func testKiraCannotFileAnAssetOutsideHerRealmAtAll() async throws {
+        // Not a realm-crossing COLLECTION this time — a shared collection she is
+        // otherwise allowed to contribute to. The asset is what is out of reach.
+        let res = await post("/v1/catalog/file",
+                             json: #"{"asset_id":"s1","collection_id":"col-adult"}"#,
+                             actor: "kira")
+        XCTAssertEqual(res.status, 403)
+        let after = try await memberships(of: "s1")
+        XCTAssertFalse(after.contains("col-adult"))
+    }
+
+    /// Contributing to a shared collection is allowed; restructuring one is not.
+    /// The store draws that line and the route must not blunt it.
+    func testKiraMayContributeToASharedCollection() async throws {
+        let before = try await memberships(of: "k1")
+        XCTAssertFalse(before.contains("col-photography"),
+                       "fixture already filed there — this test would prove nothing")
+        let res = await post("/v1/catalog/file",
+                             json: #"{"asset_id":"k1","collection_id":"col-photography"}"#,
+                             actor: "kira")
+        XCTAssertEqual(res.status, 200)
+        let after = try await memberships(of: "k1")
+        XCTAssertTrue(after.contains("col-photography"))
+    }
+
+    /// The store's refusal names the actor, the collection and its realm. That
+    /// is an oracle for collections a confined caller cannot otherwise see.
+    func testAFileRefusalDoesNotPutTheStoresWordsOnTheWire() async throws {
+        let res = await post("/v1/catalog/file",
+                             json: #"{"asset_id":"s1","collection_id":"col-kira-everyday"}"#,
+                             actor: "kira")
+        XCTAssertEqual(res.status, 403)
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: res.body) as? [String: String],
+                       ["error": "not permitted"])
+        let text = String(decoding: res.body, as: UTF8.self).lowercased()
+        for leak in ["kira", "realm", "collection", "shared", "everyday"] {
+            XCTAssertFalse(text.contains(leak), "leaked '\(leak)' from the store's message")
+        }
+    }
+
+    /// A collection that does not exist is refused the same way one she may not
+    /// touch is: the route must not become a way to enumerate collection ids.
+    func testAnUnknownCollectionIsRefusedIdenticallyToAForbiddenOne() async throws {
+        let unknown = await post("/v1/catalog/file",
+                                 json: #"{"asset_id":"k1","collection_id":"col-does-not-exist"}"#,
+                                 actor: "kira")
+        let forbidden = await post("/v1/catalog/file",
+                                   json: #"{"asset_id":"s1","collection_id":"col-kira-everyday"}"#,
+                                   actor: "kira")
+        XCTAssertEqual(unknown.status, 403)
+        XCTAssertEqual(unknown.status, forbidden.status)
+        XCTAssertEqual(unknown.body, forbidden.body)
+    }
+
+    func testMalformedFileBodiesAre400() async throws {
+        let bodies = [
+            "",                                             // no body at all
+            "not json",
+            "[]",                                           // an array, not an object
+            "null",
+            "{}",                                           // neither key
+            #"{"asset_id":"k1"}"#,                          // incomplete
+            #"{"collection_id":"col-kira-still-life"}"#,    // incomplete
+            #"{"asset_id":"","collection_id":"col-kira-still-life"}"#,
+            #"{"asset_id":"  ","collection_id":"col-kira-still-life"}"#,
+            #"{"asset_id":"k1","collection_id":null}"#,
+            #"{"asset_id":7,"collection_id":"col-kira-still-life"}"#,
+            #"{"asset_id":"k1","collection_id":"col-kira-still-life""#,   // truncated JSON
+        ]
+        let before = try await memberships(of: "k1")
+        for body in bodies {
+            let res = await post("/v1/catalog/file", json: body, actor: "kira")
+            XCTAssertEqual(res.status, 400, "body \(body.isEmpty ? "<empty>" : body) was not rejected")
+        }
+        let after = try await memberships(of: "k1")
+        XCTAssertEqual(after, before, "a malformed body still filed something")
+    }
+
+    /// The write route is behind the SAME two gates as every read route, and
+    /// both must fire BEFORE the body is looked at.
+    func testTheWriteRouteIsBehindTheActorAndOriginGates() async throws {
+        let good = #"{"asset_id":"k1","collection_id":"col-kira-dreams-memories"}"#
+        for imposter in ["kira-worker", "todd", "", "  "] {
+            let res = await post("/v1/catalog/file", json: good, actor: imposter)
+            XCTAssertEqual(res.status, 400, "actor '\(imposter)' was allowed to file")
+        }
+        let browser = await post("/v1/catalog/file", json: good, actor: "kira",
+                                 extraHeaders: ["origin": "http://localhost:3000"])
+        XCTAssertEqual(browser.status, 403, "a page could file into the catalog")
+        let sameSite = await post("/v1/catalog/file", json: good, actor: "kira",
+                                  extraHeaders: ["sec-fetch-site": "cross-site"])
+        XCTAssertEqual(sameSite.status, 403)
+        let after = try await memberships(of: "k1")
+        XCTAssertFalse(after.contains("col-kira-dreams-memories"),
+                       "a request that never passed the gates still wrote a row")
+    }
+
+    /// The route parses the body, so `Content-Length` is now a message BOUNDARY
+    /// rather than a minimum. A peer whose bytes arrive with anything appended
+    /// used to hand the JSON parser the trailing garbage and turn a valid
+    /// request into an unexplainable 400.
+    func testAnOvershootingBodyIsTruncatedToContentLength() throws {
+        let json = #"{"asset_id":"k1","collection_id":"col-kira-still-life"}"#
+        let raw = "POST /v1/catalog/file HTTP/1.1\r\nContent-Length: \(json.utf8.count)\r\n\r\n"
+            + json + "GET /healthz HTTP/1.1\r\n\r\n"
+        let req = try XCTUnwrap(HTTPKit.parseComplete(Data(raw.utf8)))
+        XCTAssertEqual(req.body.count, json.utf8.count)
+        XCTAssertEqual(String(decoding: req.body, as: UTF8.self), json)
+        XCTAssertNotNil(GalleryServer.fileRequestBody(req.body),
+                        "the trailing request was parsed as part of the body")
+    }
+
+    /// `Content-Length: -1` declares nothing, and a naive truncation on it is a
+    /// `prefix(-1)` precondition failure — one header, process gone.
+    func testANegativeContentLengthDoesNotTrapOrBlock() throws {
+        let raw = "POST /v1/catalog/file HTTP/1.1\r\nContent-Length: -1\r\n\r\n{}"
+        let req = try XCTUnwrap(HTTPKit.parseComplete(Data(raw.utf8)))
+        XCTAssertEqual(String(decoding: req.body, as: UTF8.self), "{}")
+    }
+
     func testQueryParsingHandlesPercentEncodingAndMissingValues() {
         let q = HTTPKit.queryParameters(of: "/v1/catalog/search?q=film%20noir&lane=&limit=10")
         XCTAssertEqual(q["q"], "film noir")

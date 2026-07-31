@@ -249,6 +249,48 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(ceilingRank("explicit"), tierRank("avocado"))
     }
 
+    // MARK: - apple IS neutral
+
+    /// The daemon canonicalizes `apple -> neutral` on write and no conversation
+    /// can produce a ceiling of `apple`, so while the catalog ranked apple ABOVE
+    /// neutral there was no ceiling at all that admitted apple-tier content: 278
+    /// live rows, 164 of them the whole `col-kira-everyday` genre, were countable
+    /// and permanently unopenable. The owner's call was to collapse them here.
+    func testAppleRanksAsNeutralOnBothOperands() {
+        XCTAssertEqual(tierRank("apple"), tierRank("neutral"))
+        XCTAssertEqual(tierRank("  Apple "), tierRank("neutral"), "case and space must not matter")
+        XCTAssertEqual(ceilingRank("apple"), ceilingRank("neutral"))
+        XCTAssertFalse(CATALOG_TIER_ORDER.contains("apple"), "apple is an alias, not a rung")
+        XCTAssertEqual(CATALOG_TIER_ORDER, ["neutral", "banana", "avocado"])
+    }
+
+    /// The rungs still separate, in order — the collapse must not have flattened
+    /// anything else on its way past.
+    func testTheRemainingRungsStillRankStrictly() {
+        XCTAssertEqual(CATALOG_TIER_ORDER.map { tierRank($0) }, [0, 1, 2])
+        XCTAssertTrue(tierRank("banana") > ceilingRank("neutral"))
+        XCTAssertTrue(tierRank("avocado") > ceilingRank("banana"))
+    }
+
+    /// The end-to-end version of the above: this is the 164-asset symptom.
+    func testAnAppleAssetSurfacesAtANeutralCeilingAndABananaOneDoesNot() async throws {
+        try await store.upsert(make("ap", realm: .kira, tier: "apple", prompt: "a bowl of pears"),
+                               explicitCollectionIDs: [])
+        try await store.upsert(make("ba", realm: .kira, tier: "banana", prompt: "a neon bar"),
+                               explicitCollectionIDs: [])
+
+        let rows = try await store.search(CatalogQuery(scope: .kira, ceiling: "neutral"))
+        let apple = try XCTUnwrap(rows.first { $0.id == "ap" })
+        XCTAssertEqual(apple.prompt, "a bowl of pears",
+                       "an apple asset is unopenable at every ceiling anyone can ask for")
+        XCTAssertEqual(apple.absolutePath, "/tmp/ap.png")
+        XCTAssertEqual(apple.contentMode, "apple", "the stored LABEL is untouched; only its rank moved")
+
+        let banana = try XCTUnwrap(rows.first { $0.id == "ba" })
+        XCTAssertNil(banana.prompt, "the collapse must not have opened the tier above")
+        XCTAssertEqual(banana.absolutePath, "")
+    }
+
     func testNoCeilingMeansNoClamp() async throws {
         try await store.upsert(make("a", realm: .kira, tier: "avocado", prompt: "explicit text"),
                                explicitCollectionIDs: [])

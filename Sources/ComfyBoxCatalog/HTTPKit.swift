@@ -70,6 +70,7 @@ public enum HTTPKit {
             switch status {
             case 200: return "OK"
             case 400: return "Bad Request"
+            case 403: return "Forbidden"
             case 404: return "Not Found"
             case 413: return "Payload Too Large"
             case 500: return "Internal Server Error"
@@ -117,9 +118,21 @@ public enum HTTPKit {
             headers[name] = value
         }
 
-        let body = Data(text[headerEnd.upperBound...].utf8)
-        if let declared = headers["content-length"].flatMap(Int.init), body.count < declared {
-            return nil   // still arriving
+        var body = Data(text[headerEnd.upperBound...].utf8)
+        // `declared >= 0`: `Content-Length: -1` is a client that is lying, and
+        // `prefix(-1)` is a precondition failure — a one-header way to kill the
+        // process. A negative length declares nothing, so nothing is enforced.
+        if let declared = headers["content-length"].flatMap(Int.init), declared >= 0 {
+            if body.count < declared { return nil }   // still arriving
+            // …and TRUNCATE an overshoot. Content-Length is the message
+            // boundary, not a minimum: anything past it belongs to whatever the
+            // peer sent next, and while no route read a body it did not matter.
+            // Now that POST /v1/catalog/file parses this as JSON, handing the
+            // parser those trailing bytes turns a perfectly valid request into a
+            // 400 that the caller cannot see the cause of.
+            // Re-based, not merely sliced: a `Data` slice keeps the parent's
+            // indices, and a consumer that reaches for `body[0]` traps.
+            if body.count > declared { body = Data(body.prefix(declared)) }
         }
         return Request(method: String(parts[0]), target: String(parts[1]),
                        headers: headers, body: body)

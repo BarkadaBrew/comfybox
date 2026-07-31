@@ -127,12 +127,60 @@ public enum GalleryServer {
                 }
                 return .json(body)
 
+            // The only WRITE route. `by: scope` is the whole point: it is the
+            // same header-derived realm every GET route is locked to, so her
+            // curation tool can only ever touch her own realm. Passing nil here
+            // would hand every unauthenticated local caller the service's own
+            // unconfined filing rights — the store enforces the rules, but only
+            // against the actor it is TOLD about.
+            case ("POST", "/v1/catalog/file"):
+                guard let (assetID, collectionID) = fileRequestBody(request.body) else {
+                    return .error(400, "expected {\"asset_id\": \"…\", \"collection_id\": \"…\"}")
+                }
+                do {
+                    try await store.file(assetID: assetID, into: collectionID, by: scope)
+                } catch let e as CatalogError {
+                    switch e {
+                    case .notPermitted, .noSuchCollection, .depthCapExceeded:
+                        // A refusal names the collection, its realm and the
+                        // actor's — the same class of detail `internalError`
+                        // keeps off the wire, and here it doubles as an oracle
+                        // for collections a confined caller cannot see. One
+                        // generic body; the reason goes to stderr.
+                        FileHandle.standardError.write(
+                            Data("gallery: file refused: \(e)\n".utf8))
+                        return .error(403, "not permitted")
+                    case .prepareFailed, .stepFailed:
+                        return internalError(e, for: request)
+                    }
+                }
+                return .json(["ok": true])
+
             default:
                 return .error(404, "no such route")
             }
         } catch {
             return internalError(error, for: request)
         }
+    }
+
+    /// The one request body this service reads. Returns nil for anything that is
+    /// not an object carrying two non-empty strings — an absent key, a null, a
+    /// number, an empty string and a JSON array are all the same answer, because
+    /// each of them is a caller that did not say what to file where.
+    static func fileRequestBody(_ data: Data) -> (assetID: String, collectionID: String)? {
+        guard !data.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let body = object as? [String: Any] else { return nil }
+        func string(_ key: String) -> String? {
+            guard let v = (body[key] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty else { return nil }
+            return v
+        }
+        guard let asset = string("asset_id"), let collection = string("collection_id") else {
+            return nil
+        }
+        return (asset, collection)
     }
 
     /// SQLite's errmsg carries table and column names and fragments of the

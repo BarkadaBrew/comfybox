@@ -211,11 +211,18 @@ public enum MetadataReader {
     /// like a hit. Kira's 2741 files happen to have no such collision today
     /// (filenames are timestamp-prefixed), but that is luck, not construction.
     ///
-    /// Derived from `CATALOG_TIER_ORDER`, never re-spelled. A second hand-written
-    /// copy that fell out of sync would silently revert this fallback to the
-    /// strict mirror — i.e. back to the 89%-unfiled, 2-edge failure it exists to
-    /// prevent — and nothing would report an error.
-    public static let contentTiers: Set<String> = Set(CATALOG_TIER_ORDER)
+    /// Derived from `CATALOG_TIER_SPELLINGS`, never re-spelled. A second
+    /// hand-written copy that fell out of sync would silently revert this
+    /// fallback to the strict mirror — i.e. back to the 89%-unfiled, 2-edge
+    /// failure it exists to prevent — and nothing would report an error.
+    ///
+    /// SPELLINGS, not `CATALOG_TIER_ORDER`: these are DIRECTORY NAMES, and
+    /// `apple/` directories exist in the archive. When apple collapsed into
+    /// neutral it left the three-rung order and became an alias, so deriving
+    /// this set from the order would have stopped recognising `apple/` as a tier
+    /// directory and re-opened exactly that 89%-unfiled failure for every asset
+    /// under one.
+    public static let contentTiers: Set<String> = CATALOG_TIER_SPELLINGS
 
     public static func sidecarCandidates(forMedia media: String,
                                          galleryRoot: String,
@@ -351,7 +358,7 @@ public enum MetadataReader {
     static func fruitTier(_ any: Any?) -> String? {
         guard let raw = (any as? String)?.lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-        guard CATALOG_TIER_ORDER.contains(raw) || CATALOG_TIER_ALIASES[raw] != nil else { return nil }
+        guard CATALOG_TIER_SPELLINGS.contains(raw) else { return nil }
         return raw
     }
 
