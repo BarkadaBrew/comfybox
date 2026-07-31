@@ -144,14 +144,17 @@ public final class Krea2Pipeline {
     /// Depth Control-LoRA init image: RGB NHWC in [-1,1] (see QwenImageIO.normalizeForEncoder),
     /// already resized to the target width/height. nil = no depth control.
     public var controlImagePixels: MLXArray?
+    /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
+    public var dyPE: DyPEConfig = .disabled
     public init(prompt: String, width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
-                controlImagePixels: MLXArray? = nil) {
+                controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled) {
       self.prompt = prompt
       self.width = width
       self.height = height
       self.steps = steps
       self.seed = seed
       self.controlImagePixels = controlImagePixels
+      self.dyPE = dyPE
     }
   }
 
@@ -283,6 +286,8 @@ public final class Krea2Pipeline {
 
     var img = Krea2Sampling.patchify(noise, patch: patch)  // (1, hTok*wTok, 64)
     let pos = Krea2Sampling.buildPositions(txtLen: txtLen, h: hTok, w: wTok)
+    let ropeScales = Krea2Sampling.ropeScales(
+      hTok: hTok, wTok: wTok, patch: patch, dyPE: request.dyPE)
     let fullMask = MLX.concatenated([mask, MLX.ones([1, hTok * wTok])], axis: 1)
 
     // Depth Control-LoRA: VAE-encode the (already-resized) depth image once and
@@ -304,7 +309,8 @@ public final class Krea2Pipeline {
     for i in 0..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask, control: controlTokens)
+      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
+                          control: controlTokens, ropeScales: ropeScales)
       img = img + (tp - tc) * v
       MLX.eval(img)
       progress?(i + 1, total)
