@@ -314,7 +314,14 @@ single-pass code; no coordination locks held; `~/Pictures/ComfyBox` → `/Volume
    CausalConv3d; refine verified clean end-to-end at 896x512 x 97f). NOT yet
    deployed: prod plist still has LTX2_TWO_STAGE=0 and enabling it needs the
    daemon to send HALF dims (item 3) or every request doubles.
-2. Build + deploy the two written code fixes (§5) — plus the CausalConv3d fix
+2. ~~Build + deploy the two written code fixes (§5)~~ — DONE, deployed to the
+   daemon 2026-08-01 ~21:20 with `--ltx2-lora <distil>@0.6` in the plist
+   (pinkcherry-v17 alpha requires distil; bare/Kira requests were smearing).
+2a. **Bake distil into pinkcherry-v17 + quantize int8** (Todd approved
+   2026-08-01 night): the v17 swap silently reverted the DiT to 46GB bf16 —
+   a Kira 12s 896x512 render (16.5k tokens) took ~1h denoise with constant
+   memory-pressure warnings. Bake @0.6 → quantize-ltx2 int8 → repoint plist,
+   drop --ltx2-lora. Then re-check render times.
 3. Daemon: send HALF dims when two-stage is on, plus `img_compression: 22`
 4. **NAG** — not implemented in ComfyBox; the author runs CFG 1.0 + NAG, we run CFG 3.0.
    The last un-portable reference ingredient. `LTX2Guidance.swift`
