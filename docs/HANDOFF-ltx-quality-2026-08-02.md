@@ -87,7 +87,7 @@ Adherence visibly improved — the prompt's third beat ("brushes hair from her f
 looks toward the window") actually executes, which cfg 3.5 was meant to buy and
 couldn't. Chroma improved. **But NAG more than doubles the late-clip drift** (§4).
 
-## 4. OPEN — late-clip exposure/desaturation drift
+## 4. Late-clip drift — MITIGATED (symptom fixed; root cause still open)
 
 Todd observed it; confirmed by measurement. On a 97f t2v: **brightness +8.0%,
 saturation −20.2%** from first quarter to last, inflecting at 60–70%.
@@ -104,14 +104,30 @@ anchor drifts; the mode with one doesn't.
 across frames, NAG's extrapolation grows relatively stronger and magnifies the
 existing direction. So the drift fix is now load-bearing, not cosmetic.
 
-**Next tests, in order:**
-1. `LTX2_COLOR_ANCHOR` (`LTX2PostProcess.stabilizeColor`, currently 0) — already
-   built for this exact symptom. Cheapest possible mitigation; A/B it with NAG on.
-2. Root cause discriminator: swap base-pass `euler_ancestral_cfg_pp` →
-   `euler_cfg_pp`. If drift collapses, ancestral noise accumulation is implicated;
-   if not, suspect temporal conditioning decay (same family as the known
-   intra-chunk motion decay).
-3. Matched-seed i2v pair to confirm the anchor hypothesis properly.
+**FIX SHIPPED: `LTX2_COLOR_ANCHOR=1.0`.** Matched seed 4242, NAG on:
+
+| config | drift bri | drift sat | mean sat | blotch |
+|---|---|---|---|---|
+| baseline (no NAG, no anchor) | +8.0% | −20.2% | 69.1 | 0.84% |
+| NAG only | +10.7% | −42.8% | 71.0 | 0.16% |
+| **NAG + anchor 1.0** | **−0.0%** | **+4.1%** | 94.0 | 1.47% |
+
+**Todd judged the NAG + anchor render best** (`ltx2-2708B0FD-…C8308.mp4`). Note this
+overrides a metric of mine: I had flagged mean saturation 94.0 as above the "natural"
+67–79 band, but that band was derived from source stills and i2v renders and does NOT
+transfer to anchored t2v. **Trust the eye over that band.**
+
+Caveats, both real:
+- The anchor is COSMETIC — the base pass still drifts, we renormalise the output.
+  Any non-color degradation (detail, motion decay) is untouched.
+- It forces every frame to frame 0's per-channel statistics, so INTENTIONAL lighting
+  changes (pan to a window, light switching on) get flattened. Fine for single-scene
+  clips; an argument for making it per-request (Tier A, spec #9) rather than global.
+
+**Root cause still open.** Discriminator: swap base-pass `euler_ancestral_cfg_pp` →
+`euler_cfg_pp`. If drift collapses, ancestral noise accumulation is implicated; if
+not, suspect temporal conditioning decay (same family as the known intra-chunk motion
+decay). A matched-seed i2v pair would also confirm the frame-0-anchor hypothesis.
 
 ## 5. Model upgrade — v1.8 (staged, NOT switched)
 
@@ -147,9 +163,17 @@ ComfyBox quantize-ltx2 -i <bf16 baked> -o <int8 dir> --bits 8 --group-size 64
   large bite and the render admission gate needs 40GB; the render fails to admit.
 - `launchctl kickstart -k` does NOT re-read the plist. Use `bootout` + `bootstrap`.
 
-## 7. Roadmap
+## 7. Validated production configuration (2026-08-02)
 
-1. **Drift fix** (§4) — now gating, because NAG doubles it
+```
+cfg 1.0 · NAG 11.0/0.25/2.5 · LTX2_GUIDANCE_RESCALE=0 · LTX2_COLOR_ANCHOR=1.0
+LTX2_TWO_STAGE=1 (request dims = FINAL) · int8 baked-distil v1.7 · single-chunk ≤289f
+```
+First configuration where adherence, chroma and cross-clip stability all hold at once.
+
+## 8. Roadmap
+
+1. ~~Drift fix~~ — MITIGATED; root cause remains (§4)
 2. v1.8 upgrade (§5) against the seed-4242 baseline
 3. Per-pass distil split (0.6 → 0.45 on the refine)
 4. Measure i2v at the daemon's real cfg 3.0
