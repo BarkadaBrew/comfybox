@@ -309,6 +309,12 @@ public final class LTX2TransformerBlock: Module {
   ///   - skipSelfAttn: Skip self-attention (STG perturbation). Default false.
   ///   - promptTimestep: Prompt-conditioned timestep for LTX-2.3 cross-attention.
   /// - Returns: Updated hidden states `(B, T, dim)`.
+  /// - Parameters:
+  ///   - negativeContext: NAG's own negative conditioning. The reference wires
+  ///     this as a model patch (`LTX2_NAG {nag_cond_video}`) separate from the
+  ///     CFG negative, which is inert in that recipe because CFG runs at 1.0.
+  ///     Nil (or a disabled `nag`) leaves the block byte-identical to before.
+  ///   - nag: Guidance strength/blend/clamp. `.disabled` is a true no-op.
   public func callAsFunction(
     _ x: MLXArray,
     context: MLXArray,
@@ -316,8 +322,15 @@ public final class LTX2TransformerBlock: Module {
     timestep: MLXArray,
     pe: (cos: MLXArray, sin: MLXArray)? = nil,
     skipSelfAttn: Bool = false,
-    promptTimestep: MLXArray? = nil
+    promptTimestep: MLXArray? = nil,
+    negativeContext: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled
   ) -> MLXArray {
+    // Cross-attention against the positive context, then — when NAG is on —
+    // the same computation against the negative context, combined by
+    // ltx2ApplyNAG. Modulation is applied to BOTH contexts identically so the
+    // two attention outputs are comparable.
+    let nagActive = nag.isEnabled && negativeContext != nil
     let batchSize = x.dim(0)
     var h = x
 
@@ -371,11 +384,30 @@ public final class LTX2TransformerBlock: Module {
         encoderStates = context * (1 + promptScale) + promptShift
       }
 
-      let crossOut = attn2(attnInput, context: encoderStates, mask: contextMask)
+      var crossOut = attn2(attnInput, context: encoderStates, mask: contextMask)
+      if nagActive, let negCtx = negativeContext {
+        var negStates = negCtx
+        if let promptTS = promptTimestep, let promptTable = promptScaleShiftTable {
+          let p = getAdaValues(
+            table: promptTable, batchSize: batchSize, timestep: promptTS, range: 0..<2)
+          negStates = negCtx * (1 + p[1]) + p[0]
+        }
+        let negOut = attn2(attnInput, context: negStates, mask: contextMask)
+        crossOut = ltx2ApplyNAG(
+          positive: crossOut, negative: negOut,
+          scale: nag.scale, alpha: nag.alpha, tau: nag.tau)
+      }
       h = h + crossOut * gateQ
     } else {
       // LTX-2: simple cross-attention with RMSNorm
-      let crossOut = attn2(weightFreeRMSNorm(h), context: context, mask: contextMask)
+      let normed = weightFreeRMSNorm(h)
+      var crossOut = attn2(normed, context: context, mask: contextMask)
+      if nagActive, let negCtx = negativeContext {
+        let negOut = attn2(normed, context: negCtx, mask: contextMask)
+        crossOut = ltx2ApplyNAG(
+          positive: crossOut, negative: negOut,
+          scale: nag.scale, alpha: nag.alpha, tau: nag.tau)
+      }
       h = h + crossOut
     }
 

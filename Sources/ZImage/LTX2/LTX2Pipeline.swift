@@ -167,6 +167,29 @@ public final class LTX2Pipeline {
       eval(negativeEmbeddings!)
     }
 
+    // NAG conditioning. The reference wires this as a separate model-patch
+    // input (`LTX2_NAG {nag_cond_video}`), NOT as the CFG negative — in that
+    // recipe CFG sits at 1.0 so the CFG negative is inert. With no dedicated
+    // NAG prompt we reuse the negative embeddings (same text in practice),
+    // encoding them here if CFG/CFG++ didn't already.
+    let nagConfig = LTX2NAGConfig.fromEnvironment()
+    var nagEmbeddings: MLXArray? = nil
+    if nagConfig.isEnabled {
+      if let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+        if let already = negativeEmbeddings {
+          nagEmbeddings = already
+        } else {
+          let out = textEncoder.encode(
+            inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false)
+          eval(out.videoEmbeddings)
+          nagEmbeddings = out.videoEmbeddings
+        }
+        logger.info("NAG enabled (scale \(nagConfig.scale), alpha \(nagConfig.alpha), tau \(nagConfig.tau)).")
+      } else {
+        logger.warning("NAG configured but no negative prompt supplied — NAG requires a negative conditioning; skipping.")
+      }
+    }
+
     // Step 2: Compute latent dimensions
     let latH = height / spatialCompression
     let latW = width / spatialCompression
@@ -215,6 +238,7 @@ public final class LTX2Pipeline {
       sigmas: sigmas,
       cfgScale: cfgScale,
       state: nil,
+      nagEmbeddings: nagEmbeddings, nag: nagConfig,
       progressCallback: progressCallback
     )
 
@@ -259,7 +283,7 @@ public final class LTX2Pipeline {
       latents = denoisingLoop(
         latents: refineInit, positions: refinePos, precomputedPE: refinePE,
         textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
-        sigmas: refineSigmas, cfgScale: cfgScale, state: nil,
+        sigmas: refineSigmas, cfgScale: cfgScale, state: nil, nagEmbeddings: nagEmbeddings, nag: nagConfig,
         forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
         progressCallback: progressCallback)
       eval(latents)
@@ -479,6 +503,26 @@ public final class LTX2Pipeline {
       eval(negativeEmbeddings!)
     }
 
+    // NAG conditioning — see generateT2V for the rationale. The reference
+    // recipe is i2v-centric, so this path matters at least as much.
+    let nagConfig = LTX2NAGConfig.fromEnvironment()
+    var nagEmbeddings: MLXArray? = nil
+    if nagConfig.isEnabled {
+      if let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+        if let already = negativeEmbeddings {
+          nagEmbeddings = already
+        } else {
+          let out = textEncoder.encode(
+            inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false)
+          eval(out.videoEmbeddings)
+          nagEmbeddings = out.videoEmbeddings
+        }
+        logger.info("NAG enabled (scale \(nagConfig.scale), alpha \(nagConfig.alpha), tau \(nagConfig.tau)).")
+      } else {
+        logger.warning("NAG configured but no negative prompt supplied — NAG requires a negative conditioning; skipping.")
+      }
+    }
+
     // Step 2: Encode input image via VAE
     logger.info("Encoding input image via VAE...")
     var imageInput = image
@@ -573,6 +617,7 @@ public final class LTX2Pipeline {
       sigmas: sigmas,
       cfgScale: cfgScale,
       state: state,
+      nagEmbeddings: nagEmbeddings, nag: nagConfig,
       progressCallback: progressCallback
     )
 
@@ -684,6 +729,29 @@ public final class LTX2Pipeline {
       eval(negativeEmbeddings!)
     }
 
+    // NAG conditioning. The reference wires this as a separate model-patch
+    // input (`LTX2_NAG {nag_cond_video}`), NOT as the CFG negative — in that
+    // recipe CFG sits at 1.0 so the CFG negative is inert. With no dedicated
+    // NAG prompt we reuse the negative embeddings (same text in practice),
+    // encoding them here if CFG/CFG++ didn't already.
+    let nagConfig = LTX2NAGConfig.fromEnvironment()
+    var nagEmbeddings: MLXArray? = nil
+    if nagConfig.isEnabled {
+      if let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+        if let already = negativeEmbeddings {
+          nagEmbeddings = already
+        } else {
+          let out = textEncoder.encode(
+            inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false)
+          eval(out.videoEmbeddings)
+          nagEmbeddings = out.videoEmbeddings
+        }
+        logger.info("NAG enabled (scale \(nagConfig.scale), alpha \(nagConfig.alpha), tau \(nagConfig.tau)).")
+      } else {
+        logger.warning("NAG configured but no negative prompt supplied — NAG requires a negative conditioning; skipping.")
+      }
+    }
+
     // Step 2: Compute latent dimensions (needed to convert video-frame ->
     // latent-frame indices before encoding each keyframe).
     let latH = height / spatialCompression
@@ -791,6 +859,8 @@ public final class LTX2Pipeline {
     sigmas: [Float],
     cfgScale: Float,
     state: LTX2LatentState?,
+    nagEmbeddings: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled,
     forceDeterministic: Bool = false,
     progressCallback: ((Int, Int) -> Void)?
   ) -> MLXArray {
@@ -903,13 +973,19 @@ public final class LTX2Pipeline {
       // passes `video_timesteps = denoise_mask * sigma` when the mask is
       // non-uniform. For T2V, `timesteps` is a scalar (1,1) → broadcast, so this
       // is a no-op there.
+      // NAG rides ONLY the positive pass: it steers the conditional prediction
+      // away from the negative concept inside cross-attention. Applying it to
+      // the unconditional pass too would guide the baseline that CFG++ steps
+      // along, double-counting the guidance.
       let velocityPos = transformer(
         latent: latentsFlat,
         timestep: timesteps,
         context: textEmbeddings.asType(dtype),
         positions: positions,
         sigma: sigmaArray,
-        precomputedPE: precomputedPE
+        precomputedPE: precomputedPE,
+        nagContext: nagEmbeddings?.asType(dtype),
+        nag: nag
       )
 
       // Compute x0 (denoised) from velocity using per-token timesteps

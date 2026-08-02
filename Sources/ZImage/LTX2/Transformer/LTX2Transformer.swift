@@ -224,6 +224,9 @@ public final class LTX2Transformer: Module {
   ///   - precomputedPE: Optional precomputed RoPE to avoid recomputation.
   ///   - stgBlocks: Block indices where self-attention is skipped (STG).
   /// - Returns: Velocity prediction `(B, numTokens, outChannels)`.
+  ///   - nagContext: NAG's own negative conditioning, projected the same way as
+  ///     `context`. Nil (or a disabled `nag`) leaves the forward pass unchanged.
+  ///   - nag: NAG strength/blend/clamp; `.disabled` is a true no-op.
   public func callAsFunction(
     latent: MLXArray,
     timestep: MLXArray,
@@ -232,7 +235,9 @@ public final class LTX2Transformer: Module {
     contextMask: MLXArray? = nil,
     sigma: MLXArray? = nil,
     precomputedPE: (cos: MLXArray, sin: MLXArray)? = nil,
-    stgBlocks: Set<Int>? = nil
+    stgBlocks: Set<Int>? = nil,
+    nagContext: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled
   ) -> MLXArray {
     let batchSize = latent.dim(0)
 
@@ -255,6 +260,15 @@ public final class LTX2Transformer: Module {
       ctx = captionProj(ctx)
     }
     ctx = ctx.reshaped(batchSize, -1, x.dim(-1))
+
+    // NAG's negative conditioning goes through the SAME caption projection and
+    // reshape as the positive context — otherwise the two cross-attention
+    // outputs live in different spaces and the extrapolation is meaningless.
+    var nagCtx: MLXArray? = nil
+    if nag.isEnabled, var nctx = nagContext {
+      if let captionProj = captionProjection { nctx = captionProj(nctx) }
+      nagCtx = nctx.reshaped(batchSize, -1, x.dim(-1))
+    }
 
     // Prepare attention mask
     var attnMask = contextMask
@@ -300,7 +314,9 @@ public final class LTX2Transformer: Module {
         timestep: tsEmb,
         pe: pe,
         skipSelfAttn: stgSet.contains(idx),
-        promptTimestep: promptTS
+        promptTimestep: promptTS,
+        negativeContext: nagCtx,
+        nag: nag
       )
     }
 
