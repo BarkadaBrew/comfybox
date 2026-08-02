@@ -212,21 +212,31 @@ public final class CausalConv3d: Module {
     input = input.transposed(0, 2, 3, 4, 1)
 
     // --- 3D convolution with temporal chunking ---
-    // MLX convGeneral produces incorrect results for 5D tensors when the
-    // temporal dimension (after padding) exceeds ~64 frames at large spatial
-    // resolution. Work around by processing overlapping temporal chunks.
+    // MLX convGeneral silently corrupts 5D outputs when the implicit-GEMM
+    // virtual matrix M·K = (T·H·W)·(C_in·kt·kh·kw) overflows 32-bit indexing
+    // (~2^32; ml-explore/mlx #3836 family). Measured empirically 2026-08-01:
+    // at H128 W224 C128 k27, T42 (4.16e9) is exact and T44 (4.56e9) corrupts,
+    // and the same M·K boundary holds at other slabs. The old fixed 64-frame
+    // chunk was calibrated on SeedVR2 slabs and silently corrupted the LTX-2
+    // decoder's conv_out at 896x512 (the two-stage refine "bottom band" /
+    // flat-frame bug). Bound each launch to M·K <= 2^31 for headroom.
     //
     // After temporal padding and BTHWC transpose, input is [B, T_padded, H, W, C].
     // With kernel_t=kt and stride_t=1, each output frame i depends on input
     // frames [i, i+1, ..., i+kt-1].  So chunks need (kt-1) frames of overlap
     // and each chunk of size S produces S-(kt-1) valid output frames.
     let temporalFrames = input.dim(1)
-    let maxTemporalChunk = 64  // Safe limit for MLX Metal conv kernels
+    let perFrameMK = input.dim(2) * input.dim(3) * weight.dim(4)
+      * weight.dim(1) * weight.dim(2) * weight.dim(3)
+    let safeMK = 1 << 31
+    // At least kt frames per chunk (the overlap floor); if even that exceeds
+    // the budget the conv would need spatial tiling — not a shape any current
+    // pipeline produces (author-scale 1472x1152 still allows 5-frame chunks).
+    let maxTemporalChunk = max(kt, min(64, safeMK / max(perFrameMK, 1)))
 
     var out: MLXArray
     if temporalFrames > maxTemporalChunk && stride.0 == 1 && kt > 1 {
       let overlap = kt - 1
-      let validPerChunk = maxTemporalChunk - overlap  // Net new output frames per chunk
       var chunks: [MLXArray] = []
       var tStart = 0
 
@@ -263,9 +273,13 @@ public final class CausalConv3d: Module {
           chunks.append(chunkOut)
         }
 
-        // Advance by validPerChunk so the next chunk starts with `overlap`
-        // frames of context from this chunk.
-        tStart += validPerChunk
+        // Done once a chunk consumed the tail. (The old walk advanced by a
+        // fixed validPerChunk here, so an extended final chunk was followed by
+        // a duplicate tail chunk — latent until adaptive chunk sizes made the
+        // extend branch reachable, then it emitted extra frames.)
+        if tEnd == temporalFrames { break }
+        // Next chunk starts with `overlap` frames of context from this one.
+        tStart = tEnd - overlap
       }
 
       out = MLX.concatenated(chunks, axis: 1)
