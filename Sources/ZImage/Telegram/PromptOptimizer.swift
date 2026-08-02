@@ -82,7 +82,9 @@ public final class PromptOptimizer: @unchecked Sendable {
     // Try Ollama first
     if let result = await callLLM(baseURL: config.ollamaBaseURL, systemPrompt: systemPrompt, userMessage: userMessage, contentMode: contentMode) {
       let cleaned = Self.cleanLLMOutput(result)
-      if cleaned.count > 20 {
+      if Self.looksLikeRefusal(cleaned) {
+        logger.warning("Optimizer output looks like a REFUSAL — discarding (a refusal string rendered as the prompt is the author-workflow trap; raw prompt is safer).")
+      } else if cleaned.count > 20 {
         logger.info("Prompt optimized via Ollama (\(cleaned.count) chars)")
         return OptimizeResult(prompt: cleaned, enhanced: true, note: nil)
       }
@@ -92,7 +94,9 @@ public final class PromptOptimizer: @unchecked Sendable {
     if let lmStudioURL = config.lmStudioBaseURL {
       if let result = await callLLM(baseURL: lmStudioURL, systemPrompt: systemPrompt, userMessage: userMessage, contentMode: contentMode) {
         let cleaned = Self.cleanLLMOutput(result)
-        if cleaned.count > 20 {
+        if Self.looksLikeRefusal(cleaned) {
+          logger.warning("Optimizer (LM Studio) output looks like a REFUSAL — discarding.")
+        } else if cleaned.count > 20 {
           logger.info("Prompt optimized via LM Studio (\(cleaned.count) chars)")
           return OptimizeResult(prompt: cleaned, enhanced: true, note: "LM Studio fallback")
         }
@@ -294,6 +298,15 @@ public final class PromptOptimizer: @unchecked Sendable {
      the character AT MOST ONCE, pronouns after.
   7. Longer prompts help on 2.3 — scale length to the clip. Natural prose only. NO
      "YOUR CONTEXT"/"YOUR PHOTO", no markdown, no lists, no preamble.
+  8. ANATOMY GROUNDING (anti-extra-limb — from the reference author's staging style): give
+     every VISIBLE hand and limb an explicit owner and placement, like stage directions —
+     "her left hand slides down her stomach, her right hand grips the sheet" — never an
+     unattributed "hands caress" or "a hand reaches." Ungrounded limbs get hallucinated as
+     extra ones. When two people are in frame, anchor each person's touching hands/limbs
+     to named positions on the other ("his hands on her hips").
+  9. FIGURE COUNT — state it explicitly. Solo scene: say she is ALONE in the frame, no one
+     else visible, and never imply an off-frame person (no POV hands, no "someone"). Multi-
+     person: state the exact count and each person's position relative to the others.
   """
 
   private static let systemPromptVideoNeutral = """
@@ -353,6 +366,22 @@ public final class PromptOptimizer: @unchecked Sendable {
   ## OUTPUT
   Return ONLY the motion description as a single short flowing paragraph.
   """
+
+  /// An optimizer that refuses must NEVER have its refusal rendered as the
+  /// prompt — the author's own workflow shipped a frame where the enhancer's
+  /// "I am programmed to be a safe and ethical AI assistant…" text was the
+  /// conditioning. Heuristic markers; false positives just fall back to the
+  /// raw prompt, which is always safe.
+  static func looksLikeRefusal(_ text: String) -> Bool {
+    let lowered = text.lowercased()
+    let markers = [
+      "i cannot fulfill", "i can't fulfill", "i cannot create", "i can't create",
+      "i cannot assist", "i can't assist", "i'm sorry, but", "i am sorry, but",
+      "i am programmed to be", "safety guidelines", "ethical principles",
+      "i'm not able to participate", "as an ai", "i must decline",
+    ]
+    return markers.contains { lowered.contains($0) }
+  }
 
   static func selectSystemPrompt(contentMode: String, mediaKind: String = "image") -> String {
     let kind = mediaKind.lowercased()

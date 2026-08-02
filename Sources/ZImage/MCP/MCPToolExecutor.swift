@@ -569,6 +569,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let neg = params?.string("negative_prompt") {
       body["negative_prompt"] = neg
     }
+    // Callers that ran their OWN optimizer send enhance:false — a second
+    // server-side rewrite drifts the prompt off concrete staging (limb
+    // placement, figure count) and double-injects the character description.
+    if let enhance = params?.bool("enhance") {
+      body["enhance"] = enhance
+    }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     // Async route for BOTH backends: local renders return 202 + job_id

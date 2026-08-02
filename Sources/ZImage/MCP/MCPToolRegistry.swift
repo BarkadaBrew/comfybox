@@ -468,6 +468,10 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",
         ],
+        "enhance": [
+          "type": "boolean",
+          "description": "Whether the server should optimize the prompt (default true). Send FALSE when the caller has ALREADY run its own prompt optimizer — a second rewrite drifts the prompt away from concrete staging (limb placement, figure count) and double-injects the character description.",
+        ] as [String: Any],
         "output_path": [
           "type": "string",
           "description": "Output file path for the .mp4. Must be within the allowed output directory. Omit to auto-generate.",
