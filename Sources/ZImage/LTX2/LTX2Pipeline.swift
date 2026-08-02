@@ -1273,6 +1273,27 @@ public final class LTX2Pipeline {
     let upDenorm = ups(denorm)
     let upLatent = stats.normalize(upDenorm).asType(.float32)
     eval(upLatent)
+    // --- Refine bisection instrumentation (env-gated, 2026-08-01 band bug) ---
+    // LTX2_REFINE_ROWSTATS=1 logs per-latent-row energy at each refine boundary
+    // so the vertical-truncation fault can be localized (upsample vs re-noise
+    // vs denoise vs decode) from a single short render.
+    // LTX2_REFINE_DUMP_DIR=<dir> additionally saves the boundary latents as
+    // .npy for offline decode/parity tests.
+    let rowStatsOn = ProcessInfo.processInfo.environment["LTX2_REFINE_ROWSTATS"] == "1"
+    let dumpDir = ProcessInfo.processInfo.environment["LTX2_REFINE_DUMP_DIR"]
+    func rowStats(_ name: String, _ x: MLXArray) {
+      guard rowStatsOn else { return }
+      let f32 = x.asType(.float32)
+      let energy = MLX.mean(f32 * f32, axes: [0, 1, 2, 4])  // (H,)
+      eval(energy)
+      let rows = energy.asArray(Float.self).map { String(format: "%.4f", $0) }
+      logger.info("REFINE ROWSTATS \(name) [\(x.dim(3)) rows]: \(rows.joined(separator: " "))")
+      if let dir = dumpDir {
+        try? MLX.save(array: f32, url: URL(fileURLWithPath: dir).appendingPathComponent("\(name).npy"))
+      }
+    }
+    rowStats("base", latents)
+    rowStats("upsampled", upLatent)
     // Refine-volume OOM gate (2026-07-25 23:24 crash): above it, decode the
     // upsampled latent directly — upscaled-but-unrefined beats a dead server.
     let refineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
@@ -1306,6 +1327,7 @@ public final class LTX2Pipeline {
       eval(anchorFrame)
       logger.info("Two-stage refine: frame 0 re-anchored to source re-encoded at \(rLatW * spatialCompression)x\(rLatH * spatialCompression).")
     }
+    rowStats("mixed", mixed)
     let refineInit = MLX.concatenated(
       [anchorFrame, mixed[0..., 0..., 1..<rF, 0..., 0...]], axis: 2)
     let refClean = MLX.concatenated(
@@ -1334,6 +1356,7 @@ public final class LTX2Pipeline {
       forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
       progressCallback: progressCallback)
     eval(refined)
+    rowStats("refined", refined)
     MLX.GPU.clearCache()
     logger.info("Two-stage refine complete.")
     return refined

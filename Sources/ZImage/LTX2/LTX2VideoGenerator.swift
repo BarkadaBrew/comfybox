@@ -467,11 +467,29 @@ public final class LTX2VideoGenerator {
                 }
                 return (key, v)
             }
-            let params = ModuleParameters.unflattened(remapped)
-            try up.update(parameters: params, verify: [.shapeMismatch])
-            MLX.eval(up.parameters())
-            upsampler = up
-            logger.info("LTX-2: two-stage refine upsampler loaded (\(w.count) tensors)")
+            // Count what actually BINDS, not what the file contains. A locally
+            // converted upsampler whose keys carry a `spatial_upscaler_x2_v1_1.`
+            // prefix matches nothing here, so the module silently keeps its random
+            // init and every refined frame comes out a periodic mesh — while the
+            // old log line still cheerfully reported "72 tensors" (2026-08-01).
+            let expected = Set(up.parameters().flattened().map { $0.0 })
+            let bound = remapped.filter { expected.contains($0.0) }.count
+            if bound == expected.count {
+                let params = ModuleParameters.unflattened(remapped)
+                try up.update(parameters: params, verify: [.shapeMismatch])
+                MLX.eval(up.parameters())
+                upsampler = up
+                logger.info("LTX-2: two-stage refine upsampler loaded (bound \(bound)/\(expected.count) parameters)")
+            } else {
+                let sample = remapped.map(\.0).filter { !expected.contains($0) }.prefix(3)
+                logger.error("""
+                    LTX-2: upsampler weights do NOT match the module — bound \(bound)/\(expected.count) \
+                    parameters from \(w.count) file tensors (unmatched e.g. \(Array(sample))). \
+                    Two-stage refine stays OFF; use the official Lightricks \
+                    ltx-2.3-spatial-upscaler-x2-1.1.safetensors (bare keys, PyTorch layout).
+                    """)
+                upsampler = nil
+            }
         }
         // Tiled/chunked VAE decode is OOM-safe on long/large clips but seams on
         // fast motion (spatial-tile mosaic + temporal-window jitter). Plain
