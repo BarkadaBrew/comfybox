@@ -329,6 +329,23 @@ public final class LTX2VideoGenerator {
                 if baseKey.hasPrefix("diffusion_model.") { baseKey = String(baseKey.dropFirst("diffusion_model.".count)) }
                 if baseKey.contains("audio_") || baseKey.contains("av_ca_")
                     || baseKey.contains("video_to_audio_attn") || baseKey.contains("audio_to_video_attn") { continue }
+                // LoRA keys use the RAW checkpoint naming, but `sanitized` keys have
+                // been through sanitizeWeights' renames — without mirroring them here
+                // the lookup below silently skips every renamed projection (to_out,
+                // ff proj_in/out, adaln linear1/2): 196 of 584 pairs in the official
+                // distil LoRA, i.e. runtime LoRAs applied at ~2/3 strength (2026-08-02).
+                // baseKey is a module path (no trailing dot), so map suffixes.
+                let suffixRenames: [(String, String)] = [
+                    (".to_out.0", ".to_out"),
+                    (".ff.net.0.proj", ".ff.proj_in"),
+                    (".ff.net.2", ".ff.proj_out"),
+                    (".linear_1", ".linear1"),
+                    (".linear_2", ".linear2"),
+                ]
+                for (raw, renamed) in suffixRenames where baseKey.hasSuffix(raw) {
+                    baseKey = String(baseKey.dropLast(raw.count)) + renamed
+                    break
+                }
                 let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
                 guard let loraB = loraWeights[bKey] else { continue }
                 let targetKey = baseKey + ".weight"
@@ -807,6 +824,12 @@ public final class LTX2VideoGenerator {
                     inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                     width: request.width, height: request.height,
                     numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                    // Every i2v variant above forwards request.guidance; this call
+                    // omitted it, so the daemon's T2V_GUIDANCE=3.5 (Todd 2026-07-30)
+                    // silently fell back to the distilled default 1.0 — t2v ran
+                    // with CFG OFF in prod for three days (found 2026-08-02 while
+                    // chasing extra limbs; cfg 1.0 under-drives t2v anatomy).
+                    guidance: request.guidance,
                     negativeInputIds: negBatch?.inputIds,
                     negativeAttentionMask: negBatch?.attentionMask,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })

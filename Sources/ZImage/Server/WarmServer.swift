@@ -1875,6 +1875,24 @@ public final class WarmServer {
         renderHeight = snappedH
       }
     }
+    // Two-stage dims convention (2026-08-02): with LTX2_TWO_STAGE=1 the request
+    // dims are the FINAL output size (matching ComfyUI and every caller's
+    // intuition). ComfyBox's pipeline doubles stage-1 dims through the refine,
+    // so hand it the /64-snapped HALF. Without this, enabling two-stage doubled
+    // every clip's output size and the refine-volume gate silently skipped the
+    // refine — the worst of both worlds. Stage-1 /64 keeps the final /128-ish
+    // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
+    if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
+      // snapDim64 floors at 256, so stage 1 never drops below 256/side; a
+      // sub-512 request just gets a slight aspect shift, acceptable for a
+      // size that's degenerate for two-stage anyway.
+      let stage1W = Self.snapDim64(renderWidth / 2)
+      let stage1H = Self.snapDim64(renderHeight / 2)
+      logger.info(
+        "LTX-2 two-stage: request dims \(renderWidth)x\(renderHeight) = FINAL; stage 1 renders \(stage1W)x\(stage1H), refine doubles to \(stage1W * 2)x\(stage1H * 2)")
+      renderWidth = stage1W
+      renderHeight = stage1H
+    }
     if let requestedSteps = req.steps, requestedSteps != 8 {
       logger.warning(
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
@@ -1940,13 +1958,34 @@ public final class WarmServer {
       if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
     }
 
+    // Single-pass fold (2026-08-02): continuation chunks DEGENERATE — chunk 2
+    // collapses into fragments (long-known for i2v, which is why the daemon
+    // sends explicit single-pass frames there; observed for T2V today the
+    // moment two-stage went live: chunk 1 clean, chunk 2 psychedelic). The
+    // daemon's rule only covers i2v, so fold ANY duration that fits the
+    // trained window (289f = 12s) into ONE chunk here, t2v included.
+    var foldedFramesPerChunk = req.frames ?? 97
+    var foldedExtendSeconds = req.extendToSeconds
+      ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
+    if foldedExtendSeconds > 0 {
+      let fps = req.fps ?? 24
+      let targetFrames = Int((foldedExtendSeconds * Float(fps)).rounded())
+      if targetFrames <= 289 {
+        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)  // 1+8k covering target
+        foldedFramesPerChunk = max(foldedFramesPerChunk, singleFrames)
+        logger.info(
+          "LTX-2: folded \(foldedExtendSeconds)s request into a single \(foldedFramesPerChunk)f chunk (continuation chunks degenerate; ≤289f renders single-pass)")
+        foldedExtendSeconds = 0  // 0 = no continuation chunks
+      }
+    }
+
     let videoRequest = LTX2VideoRequest(
       prompt: effectivePrompt,
       negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
       initImagePath: effectiveInitImage,
       width: renderWidth,
       height: renderHeight,
-      framesPerChunk: req.frames ?? 97,
+      framesPerChunk: foldedFramesPerChunk,
       steps: req.steps ?? videoPreset?.steps ?? 8,
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
@@ -1973,8 +2012,7 @@ public final class WarmServer {
                 && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
                ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
       identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
-      extendToSeconds: req.extendToSeconds
-        ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
+      extendToSeconds: foldedExtendSeconds,
       fps: req.fps ?? 24,
       loraPath: req.loraPath,
       loraStrength: req.loraStrength ?? 1.0,
