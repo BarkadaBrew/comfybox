@@ -1679,6 +1679,14 @@ public final class WarmServer {
 
   /// Derive I2V render dims matching the source image aspect within the
   /// requested pixel-area budget, both dims /64. Pure for unit testing.
+  ///
+  /// Rounding each axis to /64 independently compounds error in opposite
+  /// directions: a 1664x896 source (aspect 1.857) at a 448x704 budget produced
+  /// 768x384 (aspect 2.000) — the height's ideal 412.1 sat almost exactly on a
+  /// 64-boundary midpoint and rounded DOWN while the width rounded up, a 7.7%
+  /// distortion that visibly squashes the subject (2026-08-01). Search the /64
+  /// neighbourhood instead and keep the pair whose aspect is closest to the
+  /// source, breaking ties toward the pixel budget.
   static func deriveVideoDims(
     sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int
   ) -> (width: Int, height: Int) {
@@ -1689,7 +1697,44 @@ public final class WarmServer {
     let budget = Double(max(budgetWidth, 64) * max(budgetHeight, 64))
     let idealW = (budget * aspect).squareRoot()
     let idealH = idealW / aspect
-    return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
+
+    let baseW = Int((idealW / 64.0).rounded())
+    let baseH = Int((idealH / 64.0).rounded())
+
+    func search(areaCap: Double) -> (w: Int, h: Int, aspectErr: Double, areaErr: Double)? {
+      var best: (w: Int, h: Int, aspectErr: Double, areaErr: Double)?
+      for dw in -1...1 {
+        for dh in -1...1 {
+          let w = max(256, (baseW + dw) * 64)
+          let h = max(256, (baseH + dh) * 64)
+          let area = Double(w * h)
+          guard area <= budget * areaCap else { continue }
+          let aspectErr = abs(Double(w) / Double(h) - aspect) / aspect
+          let areaErr = abs(area - budget) / budget
+          if let b = best {
+            let better = aspectErr < b.aspectErr - 1e-9
+              || (abs(aspectErr - b.aspectErr) <= 1e-9 && areaErr < b.areaErr)
+            if better { best = (w, h, aspectErr, areaErr) }
+          } else {
+            best = (w, h, aspectErr, areaErr)
+          }
+        }
+      }
+      return best
+    }
+
+    // Prefer staying near the budget; but at small budgets the 256 floor pins one
+    // axis and the tight cap can force a badly stretched pair (a halved two-stage
+    // budget hit 19% that way), so allow a larger clip rather than distort.
+    var pick = search(areaCap: 1.25)
+    if pick == nil || pick!.aspectErr > 0.03, let relaxed = search(areaCap: 1.6),
+       relaxed.aspectErr < (pick?.aspectErr ?? .infinity) - 1e-9 {
+      pick = relaxed
+    }
+    guard let chosen = pick else {
+      return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
+    }
+    return (chosen.w, chosen.h)
   }
 
   /// Pixel dimensions of an image file without decoding the bitmap.
