@@ -1673,6 +1673,33 @@ public final class WarmServer {
   /// LTX-2 renders at dims that are 32-multiples but NOT 64-multiples (e.g.
   /// 480) exhibit progressive haze (#219) — every clean render in the 07-13
   /// bisect used /64 dims, every hazy one used 480.
+  /// Resolve the stage-1 (painted) dims for a two-stage render whose request
+  /// dims mean the FINAL output size. Pure, so it can be tested at the sizes
+  /// callers actually send rather than only the ones convenient to validate.
+  ///
+  /// The refine SHARPENS what stage 1 painted; it cannot invent detail that was
+  /// never generated. Halving a request sized for the old single-pass
+  /// convention therefore degrades output silently — Kira's 704x448 became a
+  /// 384x256 base pass (a third of her previous pixels) and went visibly
+  /// diffuse, while every render validated that day asked for 960x576 and
+  /// halved comfortably to 512x320 (2026-08-02).
+  ///
+  /// Below the floor the request is treated as STAGE-1 dims (pre-halving
+  /// behaviour): the clip finishes at 2x the requested size. A sharp surprise
+  /// beats a soft silent degradation.
+  ///
+  /// - Returns: the dims to paint at, and whether halving was applied.
+  static func stageOneDims(
+    finalWidth: Int, finalHeight: Int, floorPixels: Int = 512 * 320
+  ) -> (width: Int, height: Int, halved: Bool) {
+    let w = snapDim64(finalWidth / 2)
+    let h = snapDim64(finalHeight / 2)
+    guard w * h >= floorPixels else {
+      return (finalWidth, finalHeight, false)
+    }
+    return (w, h, true)
+  }
+
   static func snapDim64(_ value: Int) -> Int {
     max(256, Int((Double(value) / 64.0).rounded()) * 64)
   }
@@ -1883,15 +1910,21 @@ public final class WarmServer {
     // refine — the worst of both worlds. Stage-1 /64 keeps the final /128-ish
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
-      // snapDim64 floors at 256, so stage 1 never drops below 256/side; a
-      // sub-512 request just gets a slight aspect shift, acceptable for a
-      // size that's degenerate for two-stage anyway.
-      let stage1W = Self.snapDim64(renderWidth / 2)
-      let stage1H = Self.snapDim64(renderHeight / 2)
-      logger.info(
-        "LTX-2 two-stage: request dims \(renderWidth)x\(renderHeight) = FINAL; stage 1 renders \(stage1W)x\(stage1H), refine doubles to \(stage1W * 2)x\(stage1H * 2)")
-      renderWidth = stage1W
-      renderHeight = stage1H
+      let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
+      if s1.halved {
+        logger.info(
+          "LTX-2 two-stage: request dims \(renderWidth)x\(renderHeight) = FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles to \(s1.width * 2)x\(s1.height * 2)")
+        renderWidth = s1.width
+        renderHeight = s1.height
+      } else {
+        logger.warning("""
+          LTX-2 two-stage: request \(renderWidth)x\(renderHeight) would paint stage 1 at \
+          \(Self.snapDim64(renderWidth / 2))x\(Self.snapDim64(renderHeight / 2)) — below the \
+          stage-1 floor, which renders SOFT (the refine sharpens, it cannot invent detail). \
+          Treating the request as stage-1 dims instead; output will be \
+          \(renderWidth * 2)x\(renderHeight * 2). Send ~2x larger dims for the intended size.
+          """)
+      }
     }
     if let requestedSteps = req.steps, requestedSteps != 8 {
       logger.warning(
