@@ -118,6 +118,8 @@ struct MotionView: View {
                         .frame(minHeight: 180, maxHeight: 260)
                 }
 
+                EffectiveConfigCard(engine: engine)
+
                 Button(action: generate) {
                     HStack {
                         if isGenerating { ProgressView().controlSize(.small).padding(.trailing, 2) }

@@ -552,6 +552,15 @@ public final class LTX2VideoGenerator {
         try load(loras: request.effectiveLoRAs)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
+        // One greppable line per render: every Tier A/B param + provenance
+        // (task #9 Phase 1). Invalid resolutions log separately and LOUDLY.
+        let resolved = LTX2ConfigResolver.resolveEffective()
+        let summary = resolved.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
+        logger.info("[LTX2] effective-config: \(summary)")
+        for p in resolved where !p.valid {
+            logger.error("[LTX2] CONFIG REJECTED: \(p.name) — \(p.note ?? "invalid") — using \(p.value) (\(p.source.rawValue))")
+        }
+
         let plan = Self.chunkPlan(
             framesPerChunk: request.framesPerChunk,
             extendToSeconds: request.extendToSeconds, fps: request.fps)

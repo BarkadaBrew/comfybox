@@ -1295,6 +1295,22 @@ public final class EngineService {
         }
     }
 
+    /// Effective LTX-2 video config with per-parameter provenance
+    /// (GET /v1/video/config/effective, task #9 Phase 1).
+    public func fetchEffectiveVideoConfig() async -> [EffectiveVideoParam] {
+        guard let client = client, connectionState.isConnected else { return [] }
+        do {
+            let (status, data) = try await client.get("/v1/video/config/effective")
+            guard status == 200 else { return [] }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            struct Wrapper: Decodable { let params: [EffectiveVideoParam] }
+            return try decoder.decode(Wrapper.self, from: data).params
+        } catch {
+            return []
+        }
+    }
+
     /// Create or update a server preset. Sends the full document (camelCase,
     /// tolerated by the server) — upsert replaces the stored preset.
     public func savePreset(_ preset: ServerPreset) async throws {

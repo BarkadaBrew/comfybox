@@ -1145,6 +1145,20 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    case ("GET", "/v1/video/config/effective"):
+      // Task #9 Phase 1: the effective Tier A/B video config with provenance
+      // per parameter (configFile > env > builtin). The missing-rescale
+      // detector: anything the caller expects to be set shows `builtin`.
+      do {
+        let params = LTX2ConfigResolver.resolveEffective()
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(["params": params])
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
     case ("POST", "/v1/video/generate"):
       // Backward-compatible route. LOCAL renders here still block the HTTP
       // connection for the whole (synchronous) render — kept working for
