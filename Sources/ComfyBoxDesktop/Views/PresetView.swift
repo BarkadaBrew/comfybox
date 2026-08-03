@@ -157,7 +157,7 @@ struct PresetView: View {
     private func duplicate(_ preset: ServerPreset) async {
         var copy = preset
         copy.id = UUID().uuidString
-        copy.name = "\(preset.name) Copy"
+        copy.name = "\(preset.name) copy"   // lowercase — matches Save-as-New's " copy" suffix
         await save(copy)
     }
 
