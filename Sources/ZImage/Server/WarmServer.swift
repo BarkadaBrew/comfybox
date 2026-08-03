@@ -1568,6 +1568,9 @@ public final class WarmServer {
     let source: String?
     /// Tier A tuning overrides (snake_case JSON via decoder strategy).
     let tuning: LTX2VideoTuning?
+    /// Server-minted id from /v1/enhance binding this render to its
+    /// optimization lineage (task #19, finding #6).
+    let optimizationAttemptId: String?
     /// Optional preset id resolved from the shared PresetStore (mediaKind
     /// "video"): LoRAs, prompt prefix/suffix, negative prompt, dims budget,
     /// steps, seed. Explicit request fields always override preset values.
@@ -1669,6 +1672,8 @@ public final class WarmServer {
     /// t2v when there's no init image, i2v otherwise.
     let mode: VideoMode
     let source: String
+    /// Lineage reference from /v1/enhance, if the caller optimized first.
+    let optimizationAttemptId: String?
   }
 
   /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
@@ -2084,7 +2089,8 @@ public final class WarmServer {
       generator: generator,
       request: videoRequest,
       mode: (effectiveInitImage?.isEmpty == false) ? .i2v : .t2v,
-      source: req.source ?? "api")
+      source: req.source ?? "api",
+      optimizationAttemptId: req.optimizationAttemptId)
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -2096,12 +2102,17 @@ public final class WarmServer {
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
+      var tracePayload: [String: String] = ["prompt": prep.request.prompt]
+      if let attemptId = prep.optimizationAttemptId {
+        tracePayload["optimization_attempt_id"] = attemptId
+      }
       let status = videoJobTracker.submit(
         source: prep.source, mode: prep.mode, coordinator: coordinator,
         // Snapshot at SUBMIT time (finding #15): the authoritative resolution
         // this render will use, durable on the job status.
         resolvedConfig: LTX2ConfigResolver.resolveTyped(
-          request: prep.request.tuning, preset: prep.request.presetTuning).params
+          request: prep.request.tuning, preset: prep.request.presetTuning).params,
+        tracePayload: tracePayload
       ) { report in
         try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
@@ -2262,11 +2273,34 @@ public final class WarmServer {
       mediaKind: req.mediaKind ?? "image"
     )
 
+    // Task #19 (Codex finding #6): a server-minted attempt id bound to
+    // input, result, template and outcome — render submissions reference
+    // this instead of shipping client-echoed strings. Persisted as a trace
+    // event so the lineage survives the 1h job prune.
+    let attemptId = "opt-" + UUID().uuidString
+    renderTraceStore.append(RenderTraceEvent(
+      renderId: attemptId, event: .terminal, taskKind: .videoRender,
+      payload: [
+        "kind": "optimization_attempt",
+        "intent": req.prompt,
+        "optimized": result.prompt,
+        "outcome": result.outcome,
+        "template_id": result.templateId ?? "",
+        "template_hash": result.templateHash ?? "",
+        "template_source": result.templateSource ?? "",
+        "media_kind": req.mediaKind ?? "image",
+        "content_mode": mode,
+      ]))
+
     var payload: [String: Any] = [
       "success": true,
       "prompt": result.prompt,
       "enhanced": result.enhanced,
+      "optimization_attempt_id": attemptId,
+      "optimizer_outcome": result.outcome,
     ]
+    if let tid = result.templateId { payload["template_id"] = tid }
+    if let th = result.templateHash { payload["template_hash"] = th }
     if let note = result.note { payload["note"] = note }
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return .error(.error(status: 500, message: "Failed to serialize enhance response"))
@@ -4124,9 +4158,12 @@ final class VideoJobTracker: @unchecked Sendable {
     mode: VideoMode,
     coordinator: WarmServerCoordinator,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
+    tracePayload: [String: String] = [:],
     render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
   ) -> VideoJobStatus {
-    let (jobId, queued) = register(source: source, mode: mode, resolvedConfig: resolvedConfig)
+    let (jobId, queued) = register(
+      source: source, mode: mode, resolvedConfig: resolvedConfig,
+      tracePayload: tracePayload)
     Task { [weak self] in
       guard let self else { return }
       self.markProcessing(jobId)

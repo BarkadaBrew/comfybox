@@ -15,6 +15,27 @@ public struct OptimizeResult: Sendable {
   public let prompt: String
   public let enhanced: Bool
   public let note: String?
+  /// Task #19 lineage (Codex findings #4/#7): which template produced this,
+  /// and what actually happened — so traces and training exports are
+  /// attributable. `outcome` ∈ skipped/succeeded/refused/timeout/error/fallback.
+  public let templateId: String?
+  public let templateHash: String?
+  public let templateSource: String?
+  public let outcome: String
+
+  public init(
+    prompt: String, enhanced: Bool, note: String?,
+    templateId: String? = nil, templateHash: String? = nil,
+    templateSource: String? = nil, outcome: String = "succeeded"
+  ) {
+    self.prompt = prompt
+    self.enhanced = enhanced
+    self.note = note
+    self.templateId = templateId
+    self.templateHash = templateHash
+    self.templateSource = templateSource
+    self.outcome = outcome
+  }
 }
 
 // MARK: - PromptOptimizer
@@ -66,9 +87,9 @@ public final class PromptOptimizer: @unchecked Sendable {
     // caller applies its own plain-prompt/character handling.
     let isVideo = mediaKind.lowercased().hasPrefix("video")
     guard config.enabled else {
-      if isVideo { return OptimizeResult(prompt: prompt, enhanced: false, note: "optimizer disabled") }
+      if isVideo { return OptimizeResult(prompt: prompt, enhanced: false, note: "optimizer disabled", outcome: "skipped") }
       let wrapped = Self.wrapInQwen3Format(prompt: prompt, contentMode: contentMode)
-      return OptimizeResult(prompt: wrapped, enhanced: true, note: "Rule-based format (optimizer disabled)")
+      return OptimizeResult(prompt: wrapped, enhanced: true, note: "Rule-based format (optimizer disabled)", outcome: "skipped")
     }
 
     // Task #15: templates resolve through the store (file override > shipped
@@ -92,7 +113,10 @@ public final class PromptOptimizer: @unchecked Sendable {
         logger.warning("Optimizer output looks like a REFUSAL — discarding (a refusal string rendered as the prompt is the author-workflow trap; raw prompt is safer).")
       } else if cleaned.count > 20 {
         logger.info("Prompt optimized via Ollama (\(cleaned.count) chars)")
-        return OptimizeResult(prompt: cleaned, enhanced: true, note: nil)
+        return OptimizeResult(
+          prompt: cleaned, enhanced: true, note: nil,
+          templateId: templateId, templateHash: resolvedTemplate.hash,
+          templateSource: resolvedTemplate.source.rawValue, outcome: "succeeded")
       }
     }
 
@@ -104,7 +128,10 @@ public final class PromptOptimizer: @unchecked Sendable {
           logger.warning("Optimizer (LM Studio) output looks like a REFUSAL — discarding.")
         } else if cleaned.count > 20 {
           logger.info("Prompt optimized via LM Studio (\(cleaned.count) chars)")
-          return OptimizeResult(prompt: cleaned, enhanced: true, note: "LM Studio fallback")
+          return OptimizeResult(
+            prompt: cleaned, enhanced: true, note: "LM Studio fallback",
+            templateId: templateId, templateHash: resolvedTemplate.hash,
+            templateSource: resolvedTemplate.source.rawValue, outcome: "succeeded")
         }
       }
     }
@@ -112,9 +139,17 @@ public final class PromptOptimizer: @unchecked Sendable {
     // Both LLMs failed — video returns enhanced:false (caller handles plain
     // prompt + character); image uses rule-based YOUR CONTEXT/YOUR PHOTO wrap.
     logger.warning("Optimizer unavailable — \(isVideo ? "video: returning raw prompt" : "using rule-based format wrapping")")
-    if isVideo { return OptimizeResult(prompt: prompt, enhanced: false, note: "optimizer unavailable") }
+    if isVideo {
+      return OptimizeResult(
+        prompt: prompt, enhanced: false, note: "optimizer unavailable",
+        templateId: templateId, templateHash: resolvedTemplate.hash,
+        templateSource: resolvedTemplate.source.rawValue, outcome: "error")
+    }
     let wrapped = Self.wrapInQwen3Format(prompt: prompt, contentMode: contentMode)
-    return OptimizeResult(prompt: wrapped, enhanced: true, note: "Rule-based format (LLM unavailable)")
+    return OptimizeResult(
+      prompt: wrapped, enhanced: true, note: "Rule-based format (LLM unavailable)",
+      templateId: templateId, templateHash: resolvedTemplate.hash,
+      templateSource: resolvedTemplate.source.rawValue, outcome: "fallback")
   }
 
   // MARK: - LLM HTTP Call
