@@ -17,7 +17,16 @@
    Application there doesn't seem to be a manageable queue — just the
    current job."
 
-## 1.5 Programming model: broadcast, not batch (Todd, 2026-08-03)
+## 1.5 Programming model: yield management (Todd, 2026-08-03)
+
+**The discipline this is:** yield management. GPU-seconds are PERISHABLE
+inventory — an idle window unsold is gone, like an empty seat at takeoff.
+Demand classes have different value (interactive > scheduled; types differ
+by tier and delivery surface). The objective is YIELD — value delivered per
+GPU-second — not raw utilization: an empty interactive window that catches
+one chat reply out-yields a filler render nobody asked for. Learned
+estCostSec + muse-state demand patterns are the forecasting side.
+
 
 > "This is like programming a TV station or an ad delivery engine. The
 > optimization is to keep it LOSSY — most of the media is generated just in
