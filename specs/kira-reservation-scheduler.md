@@ -209,6 +209,28 @@ contention curve that sizes the lease TTL and decides layer 3.
      push/pull/cancel controls
 - One timeline view = the reservation system made visible.
 
+## 2.5 Open slots, campaigns, and the unbounded horizon (Todd's Q4 answer)
+
+- **Typed holds + OPEN holds.** A lineup mixes reserved MediaType capacity
+  with **open slots** — capacity deliberately left untyped for the Muse to
+  fill in-context (her arc/energy/conversation decides the type and
+  content) or at random for stream variety. Open slots are the JIT
+  principle given a first-class home.
+- **Campaigns as reservation sources.** Muse campaigns (the existing
+  "tonight's beat" system) reserve in two modes: **prepopulated** — the
+  campaign books typed holds across future slots ahead of time (a program
+  special); or **as-avail** — the campaign opportunistically fulfills into
+  open slots and spare capacity as they arise. Campaign id rides the
+  reservation into the trace.
+- **Unbounded horizon.** The ledger is a CALENDAR, not a rolling cycle:
+  reservations may be placed days or weeks out (a weekend arc special, a
+  holiday program). The planner materializes near-term slots from
+  (long-horizon reservations first, then slot template, then open space);
+  far-horizon entries persist untouched until their window approaches.
+  Lossiness still applies at execution: a materialized slot that can't fit
+  its booking pushes/expires per the broadcast rules — a calendar entry is
+  a hold, not a debt.
+
 ## 3. Delivery optimization (Todd's "optimized for delivery")
 
 Per-MediaType delivery rules: target surface (Telegram tier stream, gallery
@@ -227,16 +249,19 @@ looping short; dream.vignette as a full post.
 
 ## 5. Open questions for Todd
 
-1. Slot templates per tier window — who authors the starting set? (Propose:
-   I derive from current behavior — 4 images + 1–2 videos per 30min — and
-   you edit in the tab.)
+1. RESOLVED 2026-08-03: slot templates are authored by **User OR Agent** —
+   Todd edits lineups in the tab; the Muse may also author/adjust her own
+   lineups (an agent-writable policy surface, logged so authorship is
+   visible in the ledger). Starting set derived from current behavior.
 2. ~~Direct chat asks~~ RESOLVED 2026-08-03: they consume the interactive
    reserve (windows between reservations), never the content budget; the
    contiguous-occupancy cap bounds worst-case response latency.
 3. Backlog aging: does a pushed reservation expire after N slots, or
    persist until rendered?
-4. portrait.animated vs animation.action selection: planner-scheduled
-   ratio, or content-driven (the muse/arc state decides)?
+4. RESOLVED 2026-08-03 (Todd): "Defined Media types are the units
+   scheduled. Open slots may be left for Agent (Muse) to use in context or
+   random. Muse campaigns may either be prepopulated or as-avail fulfilled.
+   Scope is wide, not limited to a day, week, hour etc." See §2.5.
 
 ## 6. Non-goals
 
