@@ -31,7 +31,13 @@ public enum LTX2ConfigResolver {
   private enum Kind {
     case float(ClosedRange<Double>)
     case int(ClosedRange<Int>)
-    case bool               // env convention: "1" = true
+    /// Renderer semantics: enabled ONLY when the RAW (untrimmed) value is
+    /// exactly "1". Anything else is false — and flagged, so the readout
+    /// never claims a value the renderer won't act on (Codex finding #17).
+    case boolExactOne
+    /// Renderer semantics: DISABLED only when raw value is exactly "0";
+    /// any other value leaves it enabled.
+    case boolNotZero
     case string
     case floatList
     case path
@@ -55,14 +61,14 @@ public enum LTX2ConfigResolver {
     Entry(name: "cfg_schedule", envKey: "LTX2_CFG_SCHEDULE", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "stage1_sigmas", envKey: "LTX2_STAGE1_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "refine_sigmas", envKey: "LTX2_REFINE_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
-    Entry(name: "two_stage", envKey: "LTX2_TWO_STAGE", tier: "A", kind: .bool, builtin: "false"),
+    Entry(name: "two_stage", envKey: "LTX2_TWO_STAGE", tier: "A", kind: .boolExactOne, builtin: "false"),
     Entry(name: "cond_fps", envKey: "LTX2_COND_FPS", tier: "A", kind: .float(1...120), builtin: "model"),
     Entry(name: "img_compression", envKey: "LTX2_I2V_COMPRESSION", tier: "A", kind: .int(0...100), builtin: "35"),
     Entry(name: "sampler", envKey: "LTX2_SAMPLER", tier: "A", kind: .string, builtin: ""),
     Entry(name: "stg_scale", envKey: "LTX2_STG_SCALE", tier: "A", kind: .float(0...20), builtin: "0"),
     Entry(name: "stg_blocks", envKey: "LTX2_STG_BLOCKS", tier: "A", kind: .string, builtin: ""),
     Entry(name: "face_anchor_strength", envKey: "LTX2_FACE_ANCHOR_STRENGTH", tier: "A", kind: .float(0...1), builtin: "0.5"),
-    Entry(name: "ic_control", envKey: "LTX2_IC_CONTROL", tier: "A", kind: .bool, builtin: "true"),
+    Entry(name: "ic_control", envKey: "LTX2_IC_CONTROL", tier: "A", kind: .boolNotZero, builtin: "true"),
     Entry(name: "color_anchor", envKey: "LTX2_COLOR_ANCHOR", tier: "A", kind: .float(0...1), builtin: "0"),
     Entry(name: "nag_scale", envKey: "LTX2_NAG_SCALE", tier: "A", kind: .float(0...50), builtin: "0"),
     Entry(name: "nag_alpha", envKey: "LTX2_NAG_ALPHA", tier: "A", kind: .float(0...1), builtin: "0.25"),
@@ -109,7 +115,7 @@ public enum LTX2ConfigResolver {
       let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !trimmed.isEmpty else { continue }
 
-      switch validate(trimmed, kind: entry.kind, fileExists: fileExists) {
+      switch validate(trimmed, raw: raw, kind: entry.kind, fileExists: fileExists) {
       case .ok(let canonical):
         return LTX2ResolvedParam(
           name: entry.name, envKey: entry.envKey, tier: entry.tier,
@@ -140,29 +146,40 @@ public enum LTX2ConfigResolver {
     case reject(String)
   }
 
-  private static func validate(_ raw: String, kind: Kind, fileExists: (String) -> Bool) -> Validation {
+  private static func validate(
+    _ trimmed: String, raw: String, kind: Kind, fileExists: (String) -> Bool
+  ) -> Validation {
     switch kind {
     case .float(let range):
-      guard let v = Double(raw), v.isFinite else { return .reject("not a finite number") }
+      guard let v = Double(trimmed), v.isFinite else { return .reject("not a finite number") }
       guard range.contains(v) else { return .reject("outside range \(range)") }
       return .ok(canonicalNumber(v))
     case .int(let range):
-      guard let v = Int(raw) else { return .reject("not an integer") }
+      guard let v = Int(trimmed) else { return .reject("not an integer") }
       guard range.contains(v) else { return .reject("outside range \(range)") }
       return .ok(String(v))
-    case .bool:
-      return .ok(raw == "1" || raw.lowercased() == "true" ? "true" : "false")
+    case .boolExactOne:
+      // Mirror the renderer EXACTLY: it compares the raw env string to "1".
+      if raw == "1" { return .ok("true") }
+      if raw == "0" { return .ok("false") }
+      return .keepButFlag("false",
+        "renderer enables this only for exactly '1' — got '\(raw)', treating as OFF")
+    case .boolNotZero:
+      if raw == "0" { return .ok("false") }
+      if raw == "1" { return .ok("true") }
+      return .keepButFlag("true",
+        "renderer disables this only for exactly '0' — got '\(raw)', treating as ON")
     case .string:
-      return .ok(raw)
+      return .ok(trimmed)
     case .floatList:
-      let parts = raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+      let parts = trimmed.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
       for p in parts where Double(p)?.isFinite != true {
         return .reject("'\(p)' is not a finite number")
       }
       return .ok(parts.joined(separator: ","))
     case .path:
-      guard fileExists(raw) else { return .keepButFlag(raw, "path does not exist") }
-      return .ok(raw)
+      guard fileExists(trimmed) else { return .keepButFlag(trimmed, "path does not exist") }
+      return .ok(trimmed)
     }
   }
 

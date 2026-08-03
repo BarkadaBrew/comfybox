@@ -114,3 +114,26 @@ Ship only on a win in (3) with no regression in (4) or (5).
 - **Base-model licensing** for the intended content domain.
 - **Opportunity cost** — this competes with rendering-quality work that has, to
   date, produced larger visible gains per hour spent.
+
+---
+
+## Rev 2 — Codex findings resolution (2026-08-03, findings #21–25 in reviews/codex-specs-rereview-2026-08-03.md)
+
+21. **Model provenance now (#21):** traces carry `renderer_model` and
+    `optimizer_model` (+ provider/endpoint and immutable revision/digest)
+    from day one — baseline data is already model-dependent.
+22. **Atomic optimizer profiles (#22):** deployment/rollback unit is a
+    versioned profile: model revision, tokenizer, adapter, template/rubric
+    id+hash, generation settings, refusal policy. "Change only the model
+    name" is retracted.
+23. **Reproducible data contract (#23):** training targets `human_final`
+    (never the renderer-augmented prompt); a frozen dataset manifest pins
+    template hashes; near-duplicate intents/variants/A-B batches are grouped
+    into one split BEFORE dedup so they cannot leak across train/held-out.
+24. **Ship gate (#24):** evaluation compares incumbent vs static exemplars
+    vs dynamic retrieval vs SFT vs SFT+DPO; retrieval must be beaten, not
+    skipped. Gate requires explicit rule-adherence improvement, zero
+    refusals on a pre-sized test set, and latency/memory bounds.
+25. **Causal A/B (#25):** no alternating production traffic. Paired or
+    randomized assignment on same intent/config/seed, arm persisted before
+    enqueue, blinded Gallery vote, analysis stratified by mode/content mode.

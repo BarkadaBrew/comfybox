@@ -217,3 +217,56 @@ Steps 1–2 deliver value alone. Step 3 unlocks the dataset. Steps 5–6 close t
   the promotion filter, the cap, and on/off A/B.
 - **Scope creep into training**: explicitly fenced into the PRD.
 - **Plaintext prompt archive**: flagged in §4; a deliberate decision, not a default.
+
+---
+
+## Rev 2 — Codex findings resolution (2026-08-03, findings #1–13 in reviews/codex-specs-rereview-2026-08-03.md)
+
+Accepted design changes, superseding conflicting text above:
+
+1. **Identity (#1):** a stable `render_id` is assigned BEFORE rendering and
+   propagated into trace, artifact metadata, and the catalog (which already
+   supports `render_id` — CatalogSchema). `output_path` is a mutable locator,
+   never a join key.
+2. **Schema future-proofing (#2):** every trace and sidecar carries
+   `schema_version: 1` and `task_kind` (`video_render` | `image_render` |
+   `img2img` | `inpaint` | `storyboard`). `mode` becomes task-specific.
+3. **Lifecycle events, not terminal writes (#3):** traces are append-only
+   events — `submitted` / `started` / `terminal` — sharing a trace ID, one
+   serialized writer. Recovery marks unfinished traces `abandoned`. This is
+   how crashed renders become visible.
+4. **Template provenance rides the result (#4):** `OptimizeResult` gains
+   `templateId`, full digest, and source; traces persist them plus an
+   exemplar-set digest and a content-addressed snapshot of the effective
+   system text.
+5. **Exemplar hook (#5):** exemplars compose AFTER `PromptTemplateStore`
+   resolution (file > builtin), never in dead `selectSystemPrompt`; effective
+   hash is recomputed post-composition. Exemplars are injected as separate
+   few-shot user/assistant messages, not concatenated into the system prompt.
+6. **Attempt lineage (#6):** `/v1/enhance` returns an
+   `optimization_attempt_id` bound server-side to input/result/template/
+   exemplars/model; render submission references the ID instead of shipping
+   client-echoed strings.
+7. **Outcome semantics (#7):** traces carry `optimizer_outcome`
+   (skipped/succeeded/refused/timeout/error/fallback);
+   `edited = optimized != nil && human_final != optimized`.
+8. **Two prompts persisted (#8):** `human_final` (optimizer training target)
+   AND `render_prompt` (post character-prefix/preset-affix conditioning text).
+9. **Caller audit (#9):** every `PromptOptimizer.optimize` caller (Telegram
+   ImageBotCoordinator included) threads the attempt reference through its
+   render request — "one engine hook" is NOT sufficient.
+10. **One privacy value (#10):** a single `persistence_policy` (aligned with
+    the catalog's `sealed`) applies to attempts, traces, artifacts, ratings,
+    exemplars, export, and search — settable at enhance time too.
+11. **Retention (#11):** traces are kept while their artifact exists (or a
+    tombstone keyed by render_id survives pruning). Existing Gallery scalar
+    ratings migrate as `rated (legacy)`; "well-rated" thresholds defined at
+    build time against real counts.
+12. **Causal preference records (#12):** preference rows carry
+    `experiment_kind`, arm metadata, invariant hashes, and varied factors;
+    parameter-sweep wins are excluded from DPO prompt-training exports; the
+    comparison view is blinded until after voting.
+13. **Taxonomy (#13):** `source` splits into `client_surface` / `actor` /
+    `realm` (open strings + well-known values). Desktop-written sidecars are
+    owned by the ENGINE host (server writes them adjacent to outputs);
+    the desktop reads via API.

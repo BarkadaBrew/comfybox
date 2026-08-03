@@ -143,3 +143,48 @@ visible in one glance.
 
 Estimated: Phase 1 ~250 LOC engine + small desktop card; Phase 2 mechanical but
 broad (audit every pipeline call site); Phase 3 is the largest, mostly UI.
+
+---
+
+## Rev 2 — Codex findings resolution (2026-08-03, findings #14–20 in reviews/codex-specs-rereview-2026-08-03.md)
+
+14. **Split-brain readout (#14 — critical, ACCEPTED):** shipped Phase 1
+    reports a resolution the renderer does not consume; point-of-use env
+    reads remain authoritative. Interim mitigation shipped same day: the
+    resolver's bool kinds now mirror renderer semantics EXACTLY
+    (`two_stage` = raw `== "1"`, `ic_control` = raw `!= "0"`), with
+    non-canonical values flagged — the readout can no longer claim a value
+    the renderer won't act on. The full fix IS Phase 2: one typed
+    `ResolvedVideoConfig` built per render and passed through every call
+    site, replacing every inline env read. Phase 2's definition of done is
+    "grep for `environment[\"LTX2_` in render paths returns only Tier C".
+15. **Per-job resolved_config (#15):** `VideoJobStatus` gains
+    `resolved_config`, snapshotted onto the job BEFORE execution; persisted
+    into the render trace (jobs prune after 1h — the trace is the durable
+    record).
+16. **Effective endpoint contract (#16):** the endpoint accepts optional
+    request-shaped params + `preset_id` and returns `requested_config` AND
+    the derived `render_plan` (aspect matching, dim snapping, two-stage
+    halving + stage-1 floor, duration folding) with per-step notes. Existing
+    per-request fields (guidance, strength, frames, dims, fps) join the
+    registry in Phase 2.
+17. **Validation consistency (#17):** bool fix shipped (see #14). Remaining
+    for Phase 2: enum validation for sampler/decode strings from one
+    canonical descriptor table; on invalid high-precedence values, resolution
+    FALLS THROUGH to the next lower source (flagged) instead of jumping to
+    builtin.
+18. **Lifecycle column (#18):** the parameter manifest gains
+    `lifecycle: load-time | per-render`. `two_stage`'s upsampler dependency
+    is load-time today; Phase 2 lazy-loads the upsampler on first enabled
+    request so the param can become per-render truthfully.
+19. **Field matrix (#19):** Phase 2 specifies per parameter: wire name,
+    Swift type, range/enum, units, applicability (t2v/i2v/refine), default,
+    eligible precedence sources, lifecycle, preset serialization, MCP schema
+    fragment, UI control, cross-field constraints. Tier B precedence starts
+    at configFile (no request/preset overrides).
+20. **A/B integrity (#20):** batches resolve ONCE at submission and freeze
+    prompt/template/exemplars, source-image hash, model+LoRA set, preset
+    revision, and full effective config; only the declared factor varies.
+    Arm order randomized; batch/arm IDs persisted before enqueue; metrics
+    named per axis (brightness/saturation drift, cyan-blown fraction of ALL
+    pixels, contrast-normalized sharpness).

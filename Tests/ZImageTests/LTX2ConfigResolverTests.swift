@@ -78,6 +78,30 @@ final class LTX2ConfigResolverTests: XCTestCase {
     XCTAssertEqual(path?.source, .env, "value is kept (it IS what will be used) but flagged")
   }
 
+  func testBoolMirrorsRendererSemanticsExactly() {
+    // Codex finding #17: the renderer enables two_stage ONLY for exact "1"
+    // (WarmServer/generator point-of-use reads). The readout must never
+    // claim a value the renderer won't act on: padded "1" is what the
+    // renderer sees UNTRIMMED, so it must resolve false AND be flagged.
+    let padded = LTX2ConfigResolver.resolveEffective(
+      environment: ["LTX2_TWO_STAGE": " 1 "], configFile: [:])
+    let p = padded.first { $0.name == "two_stage" }
+    XCTAssertEqual(p?.value, "false", "renderer compares == \"1\" on the RAW value")
+    XCTAssertEqual(p?.valid, false, "bool-ish but not exactly '1' — flag it")
+
+    let truthy = LTX2ConfigResolver.resolveEffective(
+      environment: ["LTX2_TWO_STAGE": "true"], configFile: [:])
+    let t = truthy.first { $0.name == "two_stage" }
+    XCTAssertEqual(t?.value, "false", "renderer does not accept 'true'")
+    XCTAssertEqual(t?.valid, false, "flagged so the user learns the renderer's convention")
+
+    let exact = LTX2ConfigResolver.resolveEffective(
+      environment: ["LTX2_TWO_STAGE": "1"], configFile: [:])
+    let e = exact.first { $0.name == "two_stage" }
+    XCTAssertEqual(e?.value, "true")
+    XCTAssertEqual(e?.valid, true)
+  }
+
   func testBoolAndListKindsResolve() {
     let params = LTX2ConfigResolver.resolveEffective(
       environment: ["LTX2_TWO_STAGE": "1", "LTX2_REFINE_SIGMAS": "0.6,0.4,0.2"],
