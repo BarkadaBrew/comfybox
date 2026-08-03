@@ -24,7 +24,10 @@ struct MotionView: View {
     @State private var steps: Double = 8
     @State private var didApplyDefaults = false
     @State private var seedText: String = ""
-    @State private var strength: Double = 1.0
+    // 0.5 is the VALIDATED i2v strength at production config (2026-08-03:
+    // 0.75 collapsed long single passes; 1.0 is the historical frame-0
+    // ghosting zone). Desktop default matches the daemon recipe.
+    @State private var strength: Double = 0.5
     @State private var extendSeconds: Double = 0
     @State private var selectedLoras: [LoRASelection] = []
     @State private var tuningOverrides: [String: Any] = [:]
@@ -112,6 +115,7 @@ struct MotionView: View {
                 NumericSliderField(label: "Steps", value: $steps, range: 1...30, step: 1)
                 if referencePath != nil {
                     NumericSliderField(label: "Strength", value: $strength, range: 0...1, step: 0.05, fractionDigits: 2)
+                        .help("How hard the seed image is held. 0.5 = validated default. Higher loosens the pose lock but risks mid-clip drift/ghosting on long passes; lower holds the frame rigid.")
                     NumericSliderField(label: "Extend (s)", value: $extendSeconds, range: 0...12, step: 1)
                 }
 
