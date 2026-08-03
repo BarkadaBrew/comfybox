@@ -56,15 +56,30 @@ public struct LTX2AudioVAEConfig {
 public final class LTX2AudioConvWrapper: Module {
   @ModuleInfo(key: "conv") var conv: Conv2d
 
+  let kernelSize: Int
+
   public init(_ inChannels: Int, _ outChannels: Int, kernelSize: Int = 3) {
-    let pad = kernelSize / 2
+    self.kernelSize = kernelSize
+    // Padding is applied MANUALLY: causal (front-only) on TIME, symmetric on
+    // FREQ — reference CausalConv2d with causality_axis=HEIGHT, where height
+    // is time. Internal layout: (B, T, F, C).
     self._conv.wrappedValue = Conv2d(
       inputChannels: inChannels, outputChannels: outChannels,
-      kernelSize: IntOrPair(kernelSize), padding: IntOrPair(pad))
+      kernelSize: IntOrPair(kernelSize), padding: IntOrPair(0))
     super.init()
   }
 
-  public func callAsFunction(_ x: MLXArray) -> MLXArray { conv(x) }
+  public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    guard kernelSize > 1 else { return conv(x) }
+    let k = kernelSize - 1
+    let padded = MLX.padded(x, widths: [
+      IntOrPair((0, 0)),          // B
+      IntOrPair((k, 0)),          // T: full pad FRONT (causal)
+      IntOrPair((k / 2, k - k / 2)),  // F: symmetric
+      IntOrPair((0, 0)),          // C
+    ])
+    return conv(padded)
+  }
 }
 
 // MARK: - Resnet block (PixelNorm + SiLU)
@@ -126,9 +141,13 @@ public final class LTX2AudioUpsample: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    var h = MLX.repeated(x, count: 2, axis: 1)   // F
-    h = MLX.repeated(h, count: 2, axis: 2)       // T
-    return conv(h)
+    var h = MLX.repeated(x, count: 2, axis: 1)   // T
+    h = MLX.repeated(h, count: 2, axis: 2)       // F
+    h = conv(h)
+    // Causal: drop the FIRST time element to undo the encoder-side padding
+    // (reference Upsample: x[:, :, 1:, :] on the causal axis). Two decoder
+    // levels turn T latents into 4T-3 mel frames exactly.
+    return h[0..., 1..., 0..., 0...]
   }
 }
 
@@ -384,6 +403,46 @@ extension LTX2AudioVAE {
     let params = ModuleParameters.unflattened(remapped.map { ($0.0, $0.1) })
     try update(parameters: params, verify: [.shapeMismatch])
     return (matched, moduleKeys.count)
+  }
+}
+
+// MARK: - Reference-layout codec APIs (task #21 parity)
+
+extension LTX2AudioVAE {
+  /// Load the standalone reference checkpoint (audio_vae.* + vocoder.* keys)
+  /// and bind the VAE half with the anti-silence coverage guard.
+  public static func load(path: String, logger: Logger = Logger(label: "ltx2.audio-vae")) throws -> LTX2AudioVAE {
+    let tensors = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+    let vae = LTX2AudioVAE()
+    try vae.loadWeightsFromTensors(tensors: tensors.mapValues { $0.asType(.float32) }, logger: logger)
+    eval(vae.parameters())
+    return vae
+  }
+
+  /// Per-channel latent denormalization: `z * std + mean` where the 128-long
+  /// statistics vectors are the FLATTENED (c f) token layout (reference
+  /// AudioPatchifier: b c t f -> b t (c f)). Input/output: (B, C, T, F).
+  public func denormalize(_ z: MLXArray) -> MLXArray {
+    let c = z.dim(1), f = z.dim(3)
+    let std = perChannelStatistics.std.reshaped([1, c, 1, f])
+    let mean = perChannelStatistics.mean.reshaped([1, c, 1, f])
+    return z * std + mean
+  }
+
+  /// Full reference decode contract: normalized latent (B, C, T, F) ->
+  /// denorm -> causal decode -> mel (B, 2, 4T-3, melBins).
+  public func decodeToMel(_ zNormalized: MLXArray) -> MLXArray {
+    let t = zNormalized.dim(2)
+    let zDenorm = denormalize(zNormalized)
+    // Internal layout: (B, T, F, C) — time as the causal height axis.
+    let nhwc = zDenorm.transposed(0, 2, 3, 1)
+    var melNHWC = decoder(nhwc)                       // (B, T', F', 2)
+    // Reference _adjust_output_shape: crop to (2, 4T-3, melBins). The two
+    // causal upsample drops land T' = 4T-3 exactly; freq crops to mel bins.
+    let targetT = 4 * t - 3
+    let melBins = 64
+    melNHWC = melNHWC[0..., 0..<min(melNHWC.dim(1), targetT), 0..<min(melNHWC.dim(2), melBins), 0..<2]
+    return melNHWC.transposed(0, 3, 1, 2)             // (B, 2, T, F)
   }
 }
 
