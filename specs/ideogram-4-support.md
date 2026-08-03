@@ -1,7 +1,8 @@
 # SPEC: Ideogram 4.0 support in ComfyBox
 
-**Status:** draft, 2026-08-03 · **Requested:** Todd ("spec Ideogram 4 for
-ComfyBox support") · **Codex review:** pending (queued behind the audio review)
+**Status:** rev 2, 2026-08-03 — LOCAL-ONLY per Todd ("I don't want a hosted
+API solution"); the hosted-API lane is REMOVED, not deferred.
+**Codex review:** pending (queued behind the audio review)
 
 ## 1. What Ideogram 4.0 is (verified 2026-08-03)
 
@@ -30,34 +31,25 @@ multi-layer text conditioning is the Krea 2 recipe. ComfyBox already has
 `Krea2SingleStreamDiT`, a shared Qwen3 text-encoder loader, q8 quantization,
 the LoRA machinery, and DyPE. A native port reuses most of that skeleton.
 
-## 2. Two lanes
+## 2. Two lanes (both local)
 
-### Lane A — hosted-API provider (ship first, ~1–2 days)
-The evaluation vehicle and immediate capability. Mirrors the existing
-Replicate provider pattern (`provider: "local" | "replicate" | "auto"` in
-presets already):
+### Lane A — local evaluation via ComfyUI on this Mac (days)
+The evaluation vehicle, on our own hardware, unfiltered, offline:
 
-1. `IdeogramClient` in `Sources/ZImage/Providers/` — generate-v4 only for
-   v1 (remix/describe/edit later if the eval earns them).
-2. Key storage: `~/.comfybox/config.json` `providers.ideogram.apiKey`
-   (config file, NOT env — per the #9 doctrine), settable from the desktop
-   Settings view like other provider endpoints.
-3. Routing: `/v1/generate` payload accepts `provider: "ideogram"`; preset
-   field `provider: "ideogram"` works today. Server downloads the returned
-   image (links expire — download-to-retain is mandatory), writes to the
-   normal output dir, records a normal trace (`task_kind: image_render`,
-   provenance notes the remote provider + seed + resolution).
-4. Prompt handling: default `text_prompt` (their magic-prompt replaces our
-   optimizer — do NOT double-optimize; the `enhance` flag stays false on
-   this path). `json_prompt` + `V4StyleDescription` exposed as an optional
-   preset block for the design/typography use cases.
-5. `is_image_safe: false` responses surface as a loud, named error — never a
-   silent blank.
-6. MCP: `generate_image` gains `provider`; a preset like `ideogram-design`
-   makes it one word for the daemon.
-7. Trace + Gallery integration come free (it's the same render path).
+- **Weights:** CivitAI "Ideogram 4 INT8" (~10GB, loads via ComfyUI's native
+  Load Diffusion Model node) + Qwen3-VL-8B text encoder. GGUF Q8 is the
+  fallback route (patched ComfyUI-GGUF has MPS fixes).
+- **Runtime:** the existing ComfyUI validation instance on Bolt, plus the
+  ComfyUI-AppleSilicon-FP8 shim (patches MPS so fp8/int8 checkpoints load).
+  A dedicated Apple Silicon workflow exists on CivitAI (regional bbox +
+  local-LLM prompt processing) as a reference.
+- **Expectations:** minutes per image on MPS (Krea-2-like), community-
+  patched stack so first-run friction is likely. Fine for design elements.
+- **Purpose:** prove output quality on the decoupage/typography use cases
+  and produce golden tensors for Lane B — same role ComfyUI played for
+  Kroma and the LTX recipes.
 
-### Lane B — native MLX port (evaluate first, ~2 weeks if earned)
+### Lane B — native MLX port (the destination, ~2 weeks once A earns it)
 The ComfyBox-native way ([[comfybox-no-python]]) and the only path to
 uncensored/offline/LoRA-capable use:
 
@@ -71,9 +63,10 @@ uncensored/offline/LoRA-capable use:
   pipeline as every other model. nf4 repo is CUDA-packed, ignore it.
 - VAE: whichever they ship (check the repo — likely Qwen-Image-family, which
   we already have for Krea 2).
-- **Gate:** run Lane A for a week first. If Ideogram 4's output at DEFAULT/
-  QUALITY earns a place in the rotation (esp. typography and design work
-  Z-Image/Krea2 can't do), the port is justified; otherwise stop at Lane A.
+- **Gate:** Lane A evaluation. If Ideogram 4's output earns a rotation
+  place (esp. typography/design work Z-Image/Krea2 can't do), the port is
+  justified — and Lane A's ComfyUI setup then supplies the golden tensors
+  for port validation, exactly as it did for Kroma and the LTX recipes.
 
 ## 2.5 Driving use case (Todd, 2026-08-03)
 
@@ -91,30 +84,31 @@ implies:
 - The `ideogram-design` preset defaults to QUALITY speed and a design-biased
   V4StyleDescription.
 
-## 3. Non-goals (v1)
+## 3. Non-goals
 
-Remix/describe/edit endpoints, style-reference images, batch generation,
-the FLASH tier, any commercial-use path (license), local nf4.
+ANY hosted-API integration (Todd 2026-08-03: explicitly rejected — this is
+a local-model household); remix/describe/edit-style features until the port
+exists; any commercial-use path (license); the CUDA-packed nf4 repo.
 
-## 4. Acceptance (Lane A)
+## 4. Acceptance
 
-1. `provider: "ideogram"` render lands in the Gallery with a normal trace,
-   seed and resolution recorded; the file is local (link-expiry proof).
-2. Safety-rejected prompt produces a named error, not a blank.
-3. No double-optimization: enhance path bypassed, magic-prompt noted in the
-   trace as the optimizer.
-4. Preset `ideogram-design` renders a typography test ("a poster that says
-   COFFEE SHOP in art-deco lettering") legibly — the capability that
-   justifies the provider.
-4b. A rendered design element imports into Krita via the bridge and into the
-   Decoupage tab as a layer piece — the actual workflow, not just the API.
-5. Key absent → clean capability-off error at request time, not a crash.
+Lane A (eval): int8 loads and renders on MPS; the typography test ("a
+poster that says COFFEE SHOP in art-deco lettering") is legible; a design
+element works as a Krita/Decoupage layer piece; render time and peak memory
+recorded. Transparency support checked (cut-out-ready elements or the
+flat-background + local-matting fallback documented).
+
+Lane B (port): golden tensors from Lane A's ComfyUI graph match at each
+seam (text-encoder features, DiT block outputs, VAE decode) — the Krea 2
+port discipline; then the same typography/decoupage tests pass natively,
+served from the warm server with traces/Gallery/preset integration free.
 
 ## 5. Risks
 
-- API pricing/rate limits not in the public reference — measure on the real
-  key before wiring the daemon to it.
-- Link expiry: download must be synchronous with the render call.
+- The MPS int8/fp8 path is community-patched (shim + forked nodes) — first-
+  run friction expected; GGUF Q8 is the fallback.
+- Qwen3-VL-8B encoder VRAM on top of the DiT — fine on 128GB, but measure
+  before assuming it coexists with the warm server.
 - Non-commercial license needs a standing note in the model card UI.
 - Lane B scope creep: the gate exists so a 2-week port is a decision, not a
   drift.
