@@ -713,6 +713,79 @@ public final class EngineService {
 
     /// Send a prompt to the server's LLM enhancement endpoint.
     /// Returns the enhanced prompt string on success.
+    /// Full enhance result with lineage (task #19): the optimized prompt plus
+    /// the server-minted attempt id, outcome, and template provenance.
+    public struct EnhanceOutcome: Sendable {
+        public let prompt: String
+        public let enhanced: Bool
+        public let attemptId: String?
+        public let outcome: String?
+        public let templateId: String?
+        public let templateHash: String?
+    }
+
+    public func enhancePromptDetailed(
+        _ prompt: String, contentMode: ContentMode = .neutral, mediaKind: String = "video"
+    ) async throws -> EnhanceOutcome {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        var dict = Self.attachingContentMode(["prompt": prompt], mode: contentMode)
+        dict["media_kind"] = mediaKind
+        let bodyData = try JSONSerialization.data(withJSONObject: dict)
+        let (status, responseData) = try await client.post("/v1/enhance", body: bodyData)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: responseData) ?? "enhance failed")
+        }
+        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let enhanced = json["prompt"] as? String else {
+            throw EngineServiceError.generationFailed("Invalid enhance response")
+        }
+        return EnhanceOutcome(
+            prompt: enhanced,
+            enhanced: json["enhanced"] as? Bool ?? true,
+            attemptId: json["optimization_attempt_id"] as? String,
+            outcome: json["optimizer_outcome"] as? String,
+            templateId: json["template_id"] as? String,
+            templateHash: json["template_hash"] as? String)
+    }
+
+    public struct RenderTraceSummary: Codable, Sendable, Identifiable {
+        public let renderId: String
+        public let taskKind: String
+        public let events: [String]
+        public let submittedAt: Date?
+        public let status: String
+        public let prompt: String?
+        public let outputPath: String?
+        public let optimizationAttemptId: String?
+        public let config: String?
+        public let error: String?
+        public let rating: String?
+        public var id: String { renderId }
+    }
+
+    /// Newest-first render traces (task #19 Prompt Lab feed).
+    public func fetchRenderTraces(limit: Int = 50) async -> [RenderTraceSummary] {
+        guard let client = client, connectionState.isConnected else { return [] }
+        do {
+            let (status, data) = try await client.get("/v1/video/traces?limit=\(limit)")
+            guard status == 200 else { return [] }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            decoder.dateDecodingStrategy = .iso8601
+            struct Wrapper: Decodable { let traces: [RenderTraceSummary] }
+            return try decoder.decode(Wrapper.self, from: data).traces
+        } catch { return [] }
+    }
+
+    /// Append a human verdict to a trace.
+    public func rateRenderTrace(renderId: String, vote: String, axis: String = "overall") async {
+        guard let client = client, connectionState.isConnected else { return }
+        let body = try? JSONSerialization.data(withJSONObject: ["vote": vote, "axis": axis])
+        _ = try? await client.post("/v1/video/traces/\(renderId)/rating", body: body ?? Data())
+    }
+
     public func enhancePrompt(_ prompt: String, contentMode: ContentMode = .neutral) async throws -> String {
         guard let client = client, connectionState.isConnected else {
             throw EngineServiceError.notConnected
@@ -982,13 +1055,19 @@ public final class EngineService {
         /// still work for a single ad-hoc LoRA.
         public var loras: [LoRASelection]
         public var outputPath: String
+        /// Tier A tuning overrides (task #9 Phase 3) — snake_case keys as the
+        /// server's LTX2VideoTuning expects; nil entries omitted.
+        public var tuning: [String: Any]?
+        /// Lineage reference from /v1/enhance (task #19).
+        public var optimizationAttemptId: String?
 
         public init(
             prompt: String, initImagePath: String? = nil,
             width: Int = 704, height: Int = 448, frames: Int = 97,
             steps: Int = 8, seed: UInt64 = 42, strength: Float = 1.0,
             extendToSeconds: Float = 0, loraPath: String? = nil,
-            loraStrength: Float = 1.0, loras: [LoRASelection] = [], outputPath: String
+            loraStrength: Float = 1.0, loras: [LoRASelection] = [], outputPath: String,
+            tuning: [String: Any]? = nil, optimizationAttemptId: String? = nil
         ) {
             self.prompt = prompt; self.initImagePath = initImagePath
             self.width = width; self.height = height; self.frames = frames
@@ -997,6 +1076,8 @@ public final class EngineService {
             self.loraPath = loraPath; self.loraStrength = loraStrength
             self.loras = loras
             self.outputPath = outputPath
+            self.tuning = tuning
+            self.optimizationAttemptId = optimizationAttemptId
         }
     }
 
@@ -1049,6 +1130,12 @@ public final class EngineService {
             // Same convention as image LoRA swap: the server resolves by
             // filename, not the slugified library id.
             body["loras"] = request.loras.map { ["path": $0.filename, "scale": $0.scale] }
+        }
+        if let tuning = request.tuning, !tuning.isEmpty {
+            body["tuning"] = tuning
+        }
+        if let attemptId = request.optimizationAttemptId {
+            body["optimization_attempt_id"] = attemptId
         }
         return body
     }

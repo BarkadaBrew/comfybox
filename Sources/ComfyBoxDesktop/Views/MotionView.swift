@@ -27,6 +27,8 @@ struct MotionView: View {
     @State private var strength: Double = 1.0
     @State private var extendSeconds: Double = 0
     @State private var selectedLoras: [LoRASelection] = []
+    @State private var tuningOverrides: [String: Any] = [:]
+    @State private var optimizationAttemptId: String?
 
     @State private var isGenerating = false
     @State private var statusMessage: String?
@@ -85,6 +87,8 @@ struct MotionView: View {
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: .separatorColor), lineWidth: 1))
                 }
 
+                OptimizeBar(engine: engine, prompt: $prompt, optimizationAttemptId: $optimizationAttemptId)
+
                 referenceControl
 
                 labeled("Resolution") {
@@ -118,7 +122,11 @@ struct MotionView: View {
                         .frame(minHeight: 180, maxHeight: 260)
                 }
 
+                VideoTuningPanel(tuning: $tuningOverrides)
+
                 EffectiveConfigCard(engine: engine)
+
+                PromptLabPanel(engine: engine)
 
                 Button(action: generate) {
                     HStack {
@@ -282,7 +290,9 @@ struct MotionView: View {
             steps: Int(steps), seed: seed, strength: Float(strength),
             extendToSeconds: Float(extendSeconds),
             loras: selectedLoras,
-            outputPath: outputPath
+            outputPath: outputPath,
+            tuning: tuningOverrides.isEmpty ? nil : tuningOverrides,
+            optimizationAttemptId: optimizationAttemptId
         )
 
         Task {

@@ -23,6 +23,9 @@ public enum RenderTaskKind: String, Codable, Sendable {
 
 public enum RenderTraceEventKind: String, Codable, Sendable {
   case submitted, started, terminal, abandoned
+  /// Human quality verdict, appended post-hoc from the Gallery/Prompt Lab
+  /// (task #19). Payload: axis, vote, and optional note.
+  case rated
 }
 
 public struct RenderTraceEvent: Sendable {
@@ -133,6 +136,51 @@ public final class RenderTraceStore: @unchecked Sendable {
       }
     }
     return out
+  }
+
+  /// Newest-first summaries grouped by render_id — the Prompt Lab feed.
+  public struct TraceSummary: Codable, Sendable {
+    public let renderId: String
+    public let taskKind: String
+    public let events: [String]
+    public let submittedAt: Date?
+    public let status: String       // running | succeeded | failed | abandoned | rated:<axis>
+    public let prompt: String?
+    public let outputPath: String?
+    public let optimizationAttemptId: String?
+    public let config: String?
+    public let error: String?
+    public let rating: String?
+  }
+
+  public func recentSummaries(limit: Int = 50) -> [TraceSummary] {
+    var grouped: [String: [RenderTraceEvent]] = [:]
+    for e in allEvents() { grouped[e.renderId, default: []].append(e) }
+    let summaries: [TraceSummary] = grouped.map { id, events in
+      let submitted = events.first { $0.event == .submitted }
+      let terminal = events.last { $0.event == .terminal }
+      let rated = events.last { $0.event == .rated }
+      let status: String
+      if events.contains(where: { $0.event == .abandoned }) { status = "abandoned" }
+      else if let t = terminal { status = t.payload["status"] ?? "succeeded" }
+      else { status = "running" }
+      return TraceSummary(
+        renderId: id,
+        taskKind: events.first?.taskKind.rawValue ?? "video_render",
+        events: events.map(\.event.rawValue),
+        submittedAt: submitted?.ts ?? events.first?.ts,
+        status: status,
+        prompt: submitted?.payload["prompt"] ?? submitted?.payload["intent"],
+        outputPath: terminal?.payload["output_path"],
+        optimizationAttemptId: submitted?.payload["optimization_attempt_id"],
+        config: submitted?.payload["config"],
+        error: terminal?.payload["error"],
+        rating: rated.map { "\($0.payload["axis"] ?? "overall"):\($0.payload["vote"] ?? "?")" }
+      )
+    }
+    return summaries
+      .sorted { ($0.submittedAt ?? .distantPast) > ($1.submittedAt ?? .distantPast) }
+      .prefix(limit).map { $0 }
   }
 
   // MARK: - Recovery

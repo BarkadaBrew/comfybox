@@ -1151,6 +1151,35 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    case ("GET", "/v1/video/traces"):
+      // Task #19: the Prompt Lab feed — newest-first render traces.
+      do {
+        let limit = Int(request.queryParameters["limit"] ?? "") ?? 50
+        let summaries = renderTraceStore.recentSummaries(limit: min(200, max(1, limit)))
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(["traces": summaries])
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("POST", _) where request.path.hasPrefix("/v1/video/traces/") && request.path.hasSuffix("/rating"):
+      // Task #19: post-hoc human verdict, appended as a `rated` event.
+      let id = String(request.path.dropFirst("/v1/video/traces/".count).dropLast("/rating".count))
+      guard !id.isEmpty else { return .error(.error(status: 400, message: "Missing render_id")) }
+      struct RatingBody: Decodable { let vote: String; let axis: String?; let note: String? }
+      guard let body = try? decode(RatingBody.self, from: request.body) else {
+        return .error(.error(status: 400, message: "'vote' is required (up/down or 1-5)"))
+      }
+      var payload = ["vote": body.vote, "axis": body.axis ?? "overall"]
+      if let note = body.note { payload["note"] = note }
+      renderTraceStore.append(RenderTraceEvent(
+        renderId: id, event: .rated, taskKind: .videoRender, payload: payload))
+      renderTraceStore.flush()
+      return .json(status: 200, payload: ["success": true])
+
     case ("GET", "/v1/video/config/effective"):
       // Task #9 Phase 1: the effective Tier A/B video config with provenance
       // per parameter (configFile > env > builtin). The missing-rescale
