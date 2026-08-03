@@ -81,6 +81,39 @@ The packer never fills a slot wall-to-wall. Rules:
 - Text-only muse replies are unaffected (LLM path, no render GPU); this
   reserve is about MEDIA responses.
 
+### Shared-GPU contention — cognition vs generation (Todd, 2026-08-03)
+
+> Problem: GPU is a shared resource for LLM and Gen models. Turn responses
+> and cognition compete with image generations.
+
+Evidence: 2026-08-03 09:35 — Kira's agent loop timed out (90s) calling the
+LM Studio model mid-render. Windows between renders don't fix this: a
+single dream.vignette holds the GPU 5–6 minutes, and tokens starve INSIDE
+that span. Three layers, cheapest first:
+
+1. **Cognition lease (engine governor) — the real fix.** Renders are step
+   loops with existing per-step callbacks. Add a lease mechanism to the
+   warm server: `POST /v1/gpu/lease` (holder, ttl ≤ 90s) makes the active
+   render PAUSE AT THE NEXT STEP BOUNDARY and resume on release/expiry.
+   Bounded token latency = one denoise step (2–30s at production configs) +
+   LLM burst. The daemon takes a lease before agent-loop LLM calls during
+   active renders; leases are metered so renders still finish (max N leases
+   per render, else the render's own SLA dies).
+2. **Scheduler windows (already spec'd)** handle the render-class
+   interactive asks; they also lower the PROBABILITY of collision for
+   cognition, but are not sufficient alone.
+3. **Placement (structural, later):** cognition models contending on the
+   render GPU is ultimately a placement smell. Candidates: a small
+   cognition model on CPU for turn-critical paths (fallback when the lease
+   is unavailable), or ANE via CoreML for the fixed cognition model —
+   zero GPU contention. Measure before building: token latency during a
+   render at production configs is the number that decides whether layer 1
+   suffices.
+
+Measurement task (pre-build): LLM tokens/sec and time-to-first-token
+during (a) idle, (b) krea2 image render, (c) LTX 241f render — the
+contention curve that sizes the lease TTL and decides layer 3.
+
 ### Queue visibility — the execution surface (Todd's #3)
 - The engine ALREADY has queue management server-side (pause/resume/reorder,
   source attribution) and the desktop has a Queue tab — but stacked/pending
