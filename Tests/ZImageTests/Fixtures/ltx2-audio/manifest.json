@@ -1,0 +1,48 @@
+{
+ "seed": 4242,
+ "T": 32,
+ "latent_channels": 8,
+ "latent_frequency_bins": 16,
+ "checkpoint_sha256": "5bc10fa4adecf99dda132d916e23048cbd56797702c5fa50eb5d2079048a38c3",
+ "comfy_rev": "2881e6161081439b1c3fb3b6c1f51b3d272da710",
+ "dtype": "float32",
+ "device": "cpu",
+ "shapes": {
+  "z_normalized": [
+   1,
+   8,
+   32,
+   16
+  ],
+  "z_denorm": [
+   1,
+   8,
+   32,
+   16
+  ],
+  "mel": [
+   1,
+   2,
+   125,
+   64
+  ],
+  "wav_final": [
+   1,
+   2,
+   60000
+  ]
+ },
+ "target_shape": [
+  1,
+  2,
+  125,
+  64
+ ],
+ "sample_rate_internal": "see-metadata",
+ "metadata_keys": [
+  "config",
+  "encrypted_wandb_properties",
+  "license",
+  "model_version"
+ ]
+}
