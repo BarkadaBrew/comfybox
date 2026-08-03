@@ -460,6 +460,14 @@ public enum MCPToolRegistry {
           "type": "number",
           "description": "CFG scale (default 1.0 flat). >1 AMPLIFIES action-prompt execution; 2.0 ~doubles action motion cleanly, 3.0 over-drives into artifacts. Use ~2.0 for action/partnered, 1.0 for solo/portrait fidelity.",
         ] as [String: Any],
+        "tuning": [
+          "type": "object",
+          "description": "Tier A per-render tuning overrides (task #9): guidanceRescale, cfgSchedule [floats], stage1Sigmas, refineSigmas, twoStage (bool), condFps, sampler, stgScale, faceAnchorStrength, icControl, colorAnchor, nagScale/nagAlpha/nagTau. Omitted fields defer to preset > config.json > env > builtin. Full precedence recorded in the job's resolved_config.",
+        ] as [String: Any],
+        "optimization_attempt_id": [
+          "type": "string",
+          "description": "Lineage reference from enhance_prompt binding this render to its optimization attempt (task #19).",
+        ] as [String: Any],
         "frames": [
           "type": "integer",
           "description": "Exact frame count (1+8k: 97, 145, 289...). Forces a SINGLE render pass at this length instead of the chunked `duration` path. Use for action clips <=12s (289f) to hold motion uniform (chunking decays it). Overrides duration.",

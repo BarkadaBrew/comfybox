@@ -563,6 +563,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let cfg = params?.number("guidance") {
       body["guidance"] = cfg
     }
+    if let tuning = params?.dict("tuning") {
+      body["tuning"] = tuning.mapValues { $0.value }
+    }
+    if let attemptId = params?.string("optimization_attempt_id") {
+      body["optimization_attempt_id"] = attemptId
+    }
     if let frames = params?.integer("frames") {
       body["frames"] = frames
     }
