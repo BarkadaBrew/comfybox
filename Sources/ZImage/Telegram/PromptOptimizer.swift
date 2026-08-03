@@ -98,7 +98,8 @@ public final class PromptOptimizer: @unchecked Sendable {
     let templateId = PromptTemplateStore.templateId(contentMode: contentMode, mediaKind: mediaKind)
     let resolvedTemplate = PromptTemplateStore.shared.template(templateId)
     let systemPrompt = resolvedTemplate.text
-    logger.info("prompt template: \(templateId)@\(resolvedTemplate.hash) (\(resolvedTemplate.source.rawValue))")
+    let exemplars = ExemplarStore.shared.matching(mediaKind: mediaKind, contentMode: contentMode)
+    logger.info("prompt template: \(templateId)@\(resolvedTemplate.hash) (\(resolvedTemplate.source.rawValue)) exemplars=\(exemplars.count)@\(ExemplarStore.setDigest(exemplars))")
     let userMessage = Self.buildUserMessage(
       prompt: prompt,
       character: character,
@@ -107,7 +108,7 @@ public final class PromptOptimizer: @unchecked Sendable {
     )
 
     // Try Ollama first
-    if let result = await callLLM(baseURL: config.ollamaBaseURL, systemPrompt: systemPrompt, userMessage: userMessage, contentMode: contentMode) {
+    if let result = await callLLM(baseURL: config.ollamaBaseURL, systemPrompt: systemPrompt, userMessage: userMessage, contentMode: contentMode, exemplars: exemplars) {
       let cleaned = Self.cleanLLMOutput(result)
       if Self.looksLikeRefusal(cleaned) {
         logger.warning("Optimizer output looks like a REFUSAL — discarding (a refusal string rendered as the prompt is the author-workflow trap; raw prompt is safer).")
@@ -122,7 +123,7 @@ public final class PromptOptimizer: @unchecked Sendable {
 
     // Try LM Studio fallback
     if let lmStudioURL = config.lmStudioBaseURL {
-      if let result = await callLLM(baseURL: lmStudioURL, systemPrompt: systemPrompt, userMessage: userMessage, contentMode: contentMode) {
+      if let result = await callLLM(baseURL: lmStudioURL, systemPrompt: systemPrompt, userMessage: userMessage, contentMode: contentMode, exemplars: exemplars) {
         let cleaned = Self.cleanLLMOutput(result)
         if Self.looksLikeRefusal(cleaned) {
           logger.warning("Optimizer (LM Studio) output looks like a REFUSAL — discarding.")
@@ -154,16 +155,25 @@ public final class PromptOptimizer: @unchecked Sendable {
 
   // MARK: - LLM HTTP Call
 
-  private func callLLM(baseURL: String, systemPrompt: String, userMessage: String, contentMode: String) async -> String? {
+  private func callLLM(
+    baseURL: String, systemPrompt: String, userMessage: String, contentMode: String,
+    exemplars: [PromptExemplar] = []
+  ) async -> String? {
     // Higher temperature for avocado — push past the model's "safe" defaults
     let temperature: Double = contentMode == "avocado" ? 0.9 : 0.4
 
+    // Finding #5: exemplars ride as SEPARATE user/assistant few-shot pairs
+    // after the system message — never concatenated into the system prompt.
+    var messages: [[String: String]] = [["role": "system", "content": systemPrompt]]
+    for ex in exemplars {
+      messages.append(["role": "user", "content": ex.intent])
+      messages.append(["role": "assistant", "content": ex.final])
+    }
+    messages.append(["role": "user", "content": userMessage])
+
     let payload: [String: Any] = [
       "model": config.model,
-      "messages": [
-        ["role": "system", "content": systemPrompt],
-        ["role": "user", "content": userMessage]
-      ],
+      "messages": messages,
       "temperature": temperature,
       "max_tokens": 1024,
       "stream": false

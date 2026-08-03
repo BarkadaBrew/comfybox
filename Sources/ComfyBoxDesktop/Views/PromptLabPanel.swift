@@ -217,6 +217,12 @@ struct PromptLabPanel: View {
                 Spacer()
                 if let rating = trace.rating {
                     Text(rating).font(.caption2).foregroundStyle(.blue)
+                    if rating.hasSuffix(":up") {
+                        Button { Task { await promote(trace) } } label: {
+                            Image(systemName: "star")
+                        }.controlSize(.mini).buttonStyle(.borderless)
+                            .help("Promote this prompt pair as a few-shot exemplar for the optimizer")
+                    }
                 } else if trace.status == "succeeded" {
                     Button { Task { await rate(trace, "up") } } label: {
                         Image(systemName: "hand.thumbsup")
@@ -238,6 +244,10 @@ struct PromptLabPanel: View {
     private func rate(_ trace: EngineService.RenderTraceSummary, _ vote: String) async {
         await engine.rateRenderTrace(renderId: trace.renderId, vote: vote)
         await refresh()
+    }
+
+    private func promote(_ trace: EngineService.RenderTraceSummary) async {
+        await engine.promoteTraceExemplar(renderId: trace.renderId)
     }
 
     @ViewBuilder

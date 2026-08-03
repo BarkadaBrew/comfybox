@@ -779,6 +779,12 @@ public final class EngineService {
         } catch { return [] }
     }
 
+    /// Promote a trace's prompt pair into the optimizer exemplar set.
+    public func promoteTraceExemplar(renderId: String) async {
+        guard let client = client, connectionState.isConnected else { return }
+        _ = try? await client.post("/v1/video/traces/\(renderId)/promote", body: Data("{}".utf8))
+    }
+
     /// Append a human verdict to a trace.
     public func rateRenderTrace(renderId: String, vote: String, axis: String = "overall") async {
         guard let client = client, connectionState.isConnected else { return }

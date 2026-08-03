@@ -51,8 +51,10 @@ struct MotionView: View {
         }
     }
 
-    /// LTX-2 requires 1 + 8k frames; offer a few durations at 24fps.
-    private static let frameOptions = [25, 49, 97, 121]
+    /// LTX-2 requires 1 + 8k frames; durations at 24fps. Up to 289f (12s)
+    /// renders SINGLE-PASS — the old 97f ceiling was never real (2026-08-02:
+    /// one 193f pass beat 97+97 chaining, 2x faster, no seam).
+    private static let frameOptions = [25, 49, 97, 121, 145, 193, 241, 289]
 
     var body: some View {
         HSplitView {

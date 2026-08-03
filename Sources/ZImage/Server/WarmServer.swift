@@ -1250,6 +1250,32 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    case ("POST", _) where request.path.hasPrefix("/v1/video/traces/") && request.path.hasSuffix("/promote"):
+      // Task #19 finding #5: promote a rated render's optimization pair into
+      // the exemplar set. Intent comes from the bound attempt record; falls
+      // back to the render prompt when the render skipped optimization.
+      let id = String(request.path.dropFirst("/v1/video/traces/".count).dropLast("/promote".count))
+      guard !id.isEmpty else { return .error(.error(status: 400, message: "Missing render_id")) }
+      let events = renderTraceStore.events(renderId: id)
+      guard let submitted = events.first(where: { $0.event == .submitted }) else {
+        return .error(.error(status: 404, message: "No trace for render \(id)"))
+      }
+      let finalPrompt = submitted.payload["prompt"] ?? ""
+      var intent = finalPrompt
+      var contentMode = ContentModeManager.Mode.neutral.rawValue
+      if let attemptId = submitted.payload["optimization_attempt_id"],
+         let attempt = renderTraceStore.events(renderId: attemptId).last {
+        intent = attempt.payload["intent"] ?? intent
+        contentMode = attempt.payload["content_mode"] ?? contentMode
+      }
+      guard !finalPrompt.isEmpty else {
+        return .error(.error(status: 422, message: "Trace has no prompt to promote"))
+      }
+      ExemplarStore.shared.add(PromptExemplar(
+        intent: intent, final: finalPrompt, mediaKind: "video",
+        contentMode: contentMode, sourceRenderId: id))
+      return .json(status: 200, payload: ["success": true])
+
     case ("POST", _) where request.path.hasPrefix("/v1/video/traces/") && request.path.hasSuffix("/rating"):
       // Task #19: post-hoc human verdict, appended as a `rated` event.
       let id = String(request.path.dropFirst("/v1/video/traces/".count).dropLast("/rating".count))
