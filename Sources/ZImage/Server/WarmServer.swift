@@ -1965,7 +1965,9 @@ public final class WarmServer {
     // every clip's output size and the refine-volume gate silently skipped the
     // refine — the worst of both worlds. Stage-1 /64 keeps the final /128-ish
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
-    if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
+    // Typed resolution honors request/preset tuning overrides (finding #18):
+    // a request can enable two-stage without the plist knowing.
+    if LTX2ConfigResolver.resolveTyped(request: req.tuning, preset: videoPreset?.videoTuning).twoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
       if s1.halved {
         logger.info(

@@ -73,7 +73,7 @@ public final class LTX2Pipeline {
   public let config: LTX2PipelineConfig
 
   /// Optional latent upsampler for two-stage pipeline.
-  public let upsampler: LTX2LatentUpsampler?
+  public var upsampler: LTX2LatentUpsampler?  // var: lazy-loaded on first two_stage request (finding #18)
 
   /// Logger.
   private let logger: Logger
@@ -254,7 +254,7 @@ public final class LTX2Pipeline {
     // i2v refine, minus the frame-0 identity re-anchor (t2v has no source frame,
     // so the refine runs free with state:nil). Upsample x2 -> flow re-noise ->
     // short deterministic refine denoise.
-    if let ups = self.upsampler, ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" {
+    if let ups = self.upsampler, resolvedConfig.twoStage {
       MLX.GPU.clearCache()
       logger.info("T2V two-stage refine: upsampling latents 2x...")
       let stats = vae.decoder.perChannelStatistics
@@ -1341,7 +1341,7 @@ public final class LTX2Pipeline {
     progressCallback: ((Int, Int) -> Void)?
   ) -> MLXArray {
     guard let ups = self.upsampler,
-          ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1" else {
+          resolvedConfig.twoStage else {
       return latents
     }
     logger.info("Two-stage refine: upsampling latents 2x...")

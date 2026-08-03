@@ -475,48 +475,7 @@ public final class LTX2VideoGenerator {
         if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
            let upPath = ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"],
            FileManager.default.fileExists(atPath: upPath) {
-            let up = LTX2LatentUpsampler()
-            let w = try MLX.loadArrays(url: URL(fileURLWithPath: upPath))
-            // Checkpoint stores conv weights in PyTorch layout (out, in, *spatial);
-            // MLX conv layers are channels-last (out, *spatial, in). Permute conv
-            // weights by ndim: 5D Conv3d -> (0,2,3,4,1); 4D Conv2d -> (0,2,3,1).
-            // 1D params (norm weight/bias, conv bias) pass through untouched.
-            let remapped: [(String, MLXArray)] = w.map { (rawKey, v) in
-                // The spatial upsampler is a Sequential(Conv2d, PixelShuffle); the conv
-                // lands at `upsampler.0.*`. Rename to `upsampler.conv.*` to match the
-                // single-child module (avoids array-vs-dict container mismatch).
-                let key = rawKey.hasPrefix("upsampler.0.")
-                    ? "upsampler.conv." + rawKey.dropFirst("upsampler.0.".count)
-                    : rawKey
-                if key.hasSuffix(".weight") {
-                    if v.ndim == 5 { return (key, v.transposed(0, 2, 3, 4, 1)) }
-                    if v.ndim == 4 { return (key, v.transposed(0, 2, 3, 1)) }
-                }
-                return (key, v)
-            }
-            // Count what actually BINDS, not what the file contains. A locally
-            // converted upsampler whose keys carry a `spatial_upscaler_x2_v1_1.`
-            // prefix matches nothing here, so the module silently keeps its random
-            // init and every refined frame comes out a periodic mesh — while the
-            // old log line still cheerfully reported "72 tensors" (2026-08-01).
-            let expected = Set(up.parameters().flattened().map { $0.0 })
-            let bound = remapped.filter { expected.contains($0.0) }.count
-            if bound == expected.count {
-                let params = ModuleParameters.unflattened(remapped)
-                try up.update(parameters: params, verify: [.shapeMismatch])
-                MLX.eval(up.parameters())
-                upsampler = up
-                logger.info("LTX-2: two-stage refine upsampler loaded (bound \(bound)/\(expected.count) parameters)")
-            } else {
-                let sample = remapped.map(\.0).filter { !expected.contains($0) }.prefix(3)
-                logger.error("""
-                    LTX-2: upsampler weights do NOT match the module — bound \(bound)/\(expected.count) \
-                    parameters from \(w.count) file tensors (unmatched e.g. \(Array(sample))). \
-                    Two-stage refine stays OFF; use the official Lightricks \
-                    ltx-2.3-spatial-upscaler-x2-1.1.safetensors (bare keys, PyTorch layout).
-                    """)
-                upsampler = nil
-            }
+            upsampler = Self.loadUpsampler(path: upPath, logger: logger)
         }
         // Tiled/chunked VAE decode is OOM-safe on long/large clips but seams on
         // fast motion (spatial-tile mosaic + temporal-window jitter). Plain
@@ -533,6 +492,54 @@ public final class LTX2VideoGenerator {
         isLoaded = true
         loadedLoraKey = wantKey
         logger.info("LTX-2: models ready.")
+    }
+
+
+    /// Load + validate the spatial latent upsampler. Shared by the load-time
+    /// path (env) and the per-request lazy path (finding #18). Returns nil —
+    /// loudly — when the file's keys do not bind the module completely: a
+    /// partially bound upsampler renders a periodic mesh (2026-08-01).
+    static func loadUpsampler(path: String, logger: Logger) -> LTX2LatentUpsampler? {
+        let up = LTX2LatentUpsampler()
+        guard let w = try? MLX.loadArrays(url: URL(fileURLWithPath: path)) else {
+            logger.error("LTX-2: upsampler file unreadable: \(path)")
+            return nil
+        }
+        // Checkpoint stores conv weights in PyTorch layout (out, in, *spatial);
+        // MLX conv layers are channels-last. Permute conv weights by ndim;
+        // 1D params pass through untouched. Sequential index 0 renames to the
+        // named `conv` child.
+        let remapped: [(String, MLXArray)] = w.map { (rawKey, v) in
+            let key = rawKey.hasPrefix("upsampler.0.")
+                ? "upsampler.conv." + rawKey.dropFirst("upsampler.0.".count)
+                : rawKey
+            if key.hasSuffix(".weight") {
+                if v.ndim == 5 { return (key, v.transposed(0, 2, 3, 4, 1)) }
+                if v.ndim == 4 { return (key, v.transposed(0, 2, 3, 1)) }
+            }
+            return (key, v)
+        }
+        let expected = Set(up.parameters().flattened().map { $0.0 })
+        let bound = remapped.filter { expected.contains($0.0) }.count
+        guard bound == expected.count else {
+            let sample = remapped.map(\.0).filter { !expected.contains($0) }.prefix(3)
+            logger.error("""
+                LTX-2: upsampler weights do NOT match the module — bound \(bound)/\(expected.count) \
+                parameters from \(w.count) file tensors (unmatched e.g. \(Array(sample))). \
+                Two-stage refine stays OFF; use the official Lightricks \
+                ltx-2.3-spatial-upscaler-x2-1.1.safetensors (bare keys, PyTorch layout).
+                """)
+            return nil
+        }
+        do {
+            try up.update(parameters: ModuleParameters.unflattened(remapped), verify: [.shapeMismatch])
+        } catch {
+            logger.error("LTX-2: upsampler update failed: \(error)")
+            return nil
+        }
+        MLX.eval(up.parameters())
+        logger.info("LTX-2: two-stage refine upsampler loaded (bound \(bound)/\(expected.count) parameters)")
+        return up
     }
 
     /// Free the loaded models.
@@ -571,6 +578,14 @@ public final class LTX2VideoGenerator {
         let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
         let resolved = typedConfig.params
+        // Finding #18: two_stage was load-time only — a request could not turn
+        // it on without a server restart. Lazy-load the upsampler on the first
+        // request that resolves twoStage=true.
+        if typedConfig.twoStage, pipeline.upsampler == nil,
+           !typedConfig.upsamplerPath.isEmpty,
+           FileManager.default.fileExists(atPath: typedConfig.upsamplerPath) {
+            pipeline.upsampler = Self.loadUpsampler(path: typedConfig.upsamplerPath, logger: logger)
+        }
         let summary = resolved.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
         logger.info("[LTX2] effective-config: \(summary)")
         for p in resolved where !p.valid {
@@ -690,7 +705,7 @@ public final class LTX2VideoGenerator {
         // at 2x the base resolution, mirroring workflow nodes 19/20 — the
         // refine re-anchors frame 0 to this for native high-res detail.
         let refineAnchorImage: MLXArray? = try {
-            guard ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
+            guard pipeline.resolvedConfig.twoStage,
                   let path = request.initImagePath,
                   let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
                   let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
