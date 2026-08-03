@@ -68,10 +68,12 @@ renders for real use wait for the native port. P0 is therefore prep:
 
 ## 4. Success metrics
 
-- P0: a usable poster/label from a one-line brief in ≤2 tries, ≤15 min
-  wall-clock — Todd's judgment.
-- P1: same result served warm in the Gallery with trace lineage; render
-  ≤ Lane A time at q8; zero regressions to other models' serving.
+- P0: `image-design-json` template emits schema-valid captions from a
+  one-line brief (validated by mflux's caption validator); q8 bake measured
+  (size, quality delta vs fp8 on the eval poster); golden fixtures exported.
+- P1: a usable poster/label from a one-line brief in ≤2 tries, served warm
+  in the Gallery with trace lineage; render ≤ Lane A time at q8; zero
+  regressions to other models' serving — Todd's judgment.
 - P2: brief → cut-out layer in Krita/Decoupage without leaving the flow.
 
 ## 5. Non-goals
