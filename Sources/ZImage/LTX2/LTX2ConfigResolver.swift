@@ -290,6 +290,34 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public var nagConfig: LTX2NAGConfig? {
     nagScale > 0 ? LTX2NAGConfig(scale: nagScale, alpha: nagAlpha, tau: nagTau) : nil
   }
+
+  /// Display string for one parameter's TYPED final value — used to overlay
+  /// request/preset-level values onto the string readout rows.
+  public func valueString(for name: String) -> String? {
+    func fmt(_ v: Float) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
+    switch name {
+    case "guidance_rescale": return fmt(guidanceRescale)
+    case "cfg_schedule": return cfgSchedule.map(fmt).joined(separator: ",")
+    case "stage1_sigmas": return stage1Sigmas.map(fmt).joined(separator: ",")
+    case "refine_sigmas": return refineSigmas.map(fmt).joined(separator: ",")
+    case "two_stage": return twoStage ? "true" : "false"
+    case "cond_fps": return condFps.map(fmt) ?? "model"
+    case "img_compression": return String(imgCompression)
+    case "sampler": return sampler
+    case "stg_scale": return fmt(stgScale)
+    case "stg_blocks": return stgBlocks
+    case "face_anchor_strength": return fmt(faceAnchorStrength)
+    case "ic_control": return icControl ? "true" : "false"
+    case "ic_ref_strength": return fmt(icRefStrength)
+    case "color_anchor": return fmt(colorAnchor)
+    case "nag_scale": return fmt(nagScale)
+    case "nag_alpha": return fmt(nagAlpha)
+    case "nag_tau": return fmt(nagTau)
+    case "reanchor_interval": return String(reanchorInterval)
+    case "reanchor_strength": return fmt(reanchorStrength)
+    default: return nil
+    }
+  }
 }
 
 extension LTX2ConfigResolver {

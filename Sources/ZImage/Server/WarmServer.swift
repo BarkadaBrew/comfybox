@@ -1151,6 +1151,91 @@ public final class WarmServer {
         return .error(response(for: error))
       }
 
+    case ("POST", "/v1/video/config/effective"):
+      // Finding #16: a HYPOTHETICAL resolution — request-shaped context in,
+      // requested_config + derived render_plan out. GET (below) stays as the
+      // no-context readout.
+      do {
+        struct EffectiveQuery: Decodable {
+          let width: Int?
+          let height: Int?
+          let frames: Int?
+          let duration: Float?
+          let fps: Int?
+          let tuning: LTX2VideoTuning?
+          let preset: String?
+        }
+        let q = (try? decode(EffectiveQuery.self, from: request.body)) ?? EffectiveQuery(
+          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil)
+        let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
+        let resolvedTyped = LTX2ConfigResolver.resolveTyped(
+          request: q.tuning, preset: videoPreset?.videoTuning)
+
+        // Derived plan, mirroring prepareLocalVideo's math step by step.
+        var plan: [[String: String]] = []
+        var w = q.width ?? videoPreset?.width ?? 704
+        var h = q.height ?? videoPreset?.height ?? 448
+        let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
+        if snappedW != w || snappedH != h {
+          plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
+          w = snappedW; h = snappedH
+        }
+        if resolvedTyped.twoStage {
+          let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
+          if s1.halved {
+            plan.append(["step": "two_stage_halving",
+                         "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
+          } else {
+            plan.append(["step": "stage1_floor",
+                         "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
+          }
+        }
+        let fps = q.fps ?? 24
+        var framesPerChunk = q.frames ?? 97
+        var extendSeconds = Self.extendSecondsFromDuration(q.duration, framesPerChunk: framesPerChunk, fps: fps)
+        if extendSeconds > 0 {
+          let targetFrames = Int((extendSeconds * Float(fps)).rounded())
+          if targetFrames <= 289 {
+            let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
+            framesPerChunk = max(framesPerChunk, singleFrames)
+            extendSeconds = 0
+            plan.append(["step": "single_pass_fold",
+                         "note": "\(q.duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
+          } else {
+            plan.append(["step": "chunked_continuation",
+                         "note": "\(q.duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
+          }
+        }
+        plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(fps)"])
+        if q.width == nil && q.height == nil {
+          plan.append(["step": "caveat",
+                       "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
+        }
+
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        struct Response: Encodable {
+          let requestedConfig: [LTX2ResolvedParam]
+          let renderPlan: [[String: String]]
+          let presetId: String?
+        }
+        let data = try encoder.encode(Response(
+          requestedConfig: resolvedTyped.params
+            .map { p -> LTX2ResolvedParam in
+              // Overlay request/preset provenance onto the readout rows.
+              guard let src = resolvedTyped.provenance[p.name], src != p.source else { return p }
+              return LTX2ResolvedParam(
+                name: p.name, envKey: p.envKey, tier: p.tier,
+                value: resolvedTyped.valueString(for: p.name) ?? p.value,
+                source: src, valid: p.valid, note: p.note)
+            },
+          renderPlan: plan,
+          presetId: q.preset))
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
     case ("GET", "/v1/video/traces"):
       // Task #19: the Prompt Lab feed — newest-first render traces.
       do {
