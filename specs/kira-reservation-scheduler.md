@@ -29,9 +29,17 @@ Every scheduled asset is an instance of a declared MediaType:
 | `animation.action` | i2v, ACTION | i2v, motion recipe | higher img_compression, action template w/ anatomy grounding, 8–10s |
 | `dream.vignette` | t2v | t2v scene | buildT2VScene prompt, 720p, 8–12s, cfg/NAG per validated recipe |
 
+**FPS is a per-type knob (Todd 2026-08-03):** playback fps rides the
+MediaType (engine accepts per-request fps today; frames = duration x fps
+snapped to the 1+8k grid, so fps directly scales render cost and must feed
+estCostSec). Distinct from `cond_fps` — the temporal-RoPE MOTION dial in the
+tuning block — which stays a recipe knob; the two are set independently
+(e.g. portrait.animated might render 16fps playback for a dreamy cadence
+while conditioning at model fps).
+
 - A MediaType is a **record, not code**: `{id, kind, engineParams (preset id +
-  LTX2VideoTuning block + template id), durationSeconds | dims, estCostSec,
-  deliveryRules, tierEligibility}` — stored in kira config, editable from
+  LTX2VideoTuning block + template id), durationSeconds | dims, fps,
+  estCostSec, deliveryRules, tierEligibility}` — stored in kira config, editable from
   the Kira tab. The engine-side knobs ride the machinery shipped today
   (presets, videoTuning, prompt templates, per-request tuning).
 - "Qualifiable": every rendered asset carries its mediaType id into the
