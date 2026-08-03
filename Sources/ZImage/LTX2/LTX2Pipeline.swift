@@ -163,9 +163,9 @@ public final class LTX2Pipeline {
 
     // Encode negative prompt for CFG, or for CFG++ (needs it every step at cfg=1).
     var negativeEmbeddings: MLXArray? = nil
-    if cfgScale > 1.0 || LTX2PipelineConfig.envCfgPP,
+    if cfgScale > 1.0 || resolvedConfig.samplerIsCfgPP,
        let negIds = negativeInputIds, let negMask = negativeAttentionMask {
-      logger.info("Encoding negative prompt (scale=\(cfgScale), cfgPP=\(LTX2PipelineConfig.envCfgPP))...")
+      logger.info("Encoding negative prompt (scale=\(cfgScale), cfgPP=\(resolvedConfig.samplerIsCfgPP))...")
       let negOutput = textEncoder.encode(
         inputIds: negIds,
         attentionMask: negMask,
@@ -180,7 +180,7 @@ public final class LTX2Pipeline {
     // recipe CFG sits at 1.0 so the CFG negative is inert. With no dedicated
     // NAG prompt we reuse the negative embeddings (same text in practice),
     // encoding them here if CFG/CFG++ didn't already.
-    let nagConfig = LTX2NAGConfig.fromEnvironment()
+    let nagConfig = resolvedConfig.nagConfig ?? .disabled
     var nagEmbeddings: MLXArray? = nil
     if nagConfig.isEnabled {
       if let negIds = negativeInputIds, let negMask = negativeAttentionMask {
@@ -269,10 +269,7 @@ public final class LTX2Pipeline {
         latents = upLatent
       } else {
       let rLatH = latH * 2, rLatW = latW * 2
-      let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
-        let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
-        return v.count >= 2 ? v : nil
-      } ?? [0.85, 0.7250, 0.4219, 0.0]
+      let refineSigmas: [Float] = resolvedConfig.refineSigmasEffective
       if let seed = seed { MLXRandom.seed(seed &+ 1000) }
       let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
       let sigma0 = refineSigmas[0]
@@ -502,7 +499,7 @@ public final class LTX2Pipeline {
 
     var negativeEmbeddings: MLXArray? = nil
     // CFG++ samplers need the negative embeddings every step even at cfg=1.
-    if cfgScale > 1.0 || LTX2PipelineConfig.envCfgPP,
+    if cfgScale > 1.0 || resolvedConfig.samplerIsCfgPP,
        let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       let negOutput = textEncoder.encode(
         inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
@@ -513,7 +510,7 @@ public final class LTX2Pipeline {
 
     // NAG conditioning — see generateT2V for the rationale. The reference
     // recipe is i2v-centric, so this path matters at least as much.
-    let nagConfig = LTX2NAGConfig.fromEnvironment()
+    let nagConfig = resolvedConfig.nagConfig ?? .disabled
     var nagEmbeddings: MLXArray? = nil
     if nagConfig.isEnabled {
       if let negIds = negativeInputIds, let negMask = negativeAttentionMask {
@@ -583,7 +580,7 @@ public final class LTX2Pipeline {
     // IC-control (identity anchor) defaults ON for i2v: without it the subject
     // morphs into a different person over the render. LTX2_IC_CONTROL=0 disables.
     if resolvedConfig.icControl {
-      let refStrength = Float(ProcessInfo.processInfo.environment["LTX2_IC_REF_STRENGTH"] ?? "1.0") ?? 1.0
+      let refStrength = resolvedConfig.icRefStrength
       icRefFrames = imageLatent.dim(2)
       state.latent = MLX.concatenated([state.latent, imageLatent.asType(state.latent.dtype)], axis: 2)
       state.cleanLatent = MLX.concatenated([state.cleanLatent, imageLatent.asType(state.cleanLatent.dtype)], axis: 2)
@@ -729,7 +726,7 @@ public final class LTX2Pipeline {
     eval(textOutput.videoEmbeddings)
 
     var negativeEmbeddings: MLXArray? = nil
-    if cfgScale > 1.0 || LTX2PipelineConfig.envCfgPP, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
+    if cfgScale > 1.0 || resolvedConfig.samplerIsCfgPP, let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       let negOutput = textEncoder.encode(
         inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
       )
@@ -742,7 +739,7 @@ public final class LTX2Pipeline {
     // recipe CFG sits at 1.0 so the CFG negative is inert. With no dedicated
     // NAG prompt we reuse the negative embeddings (same text in practice),
     // encoding them here if CFG/CFG++ didn't already.
-    let nagConfig = LTX2NAGConfig.fromEnvironment()
+    let nagConfig = resolvedConfig.nagConfig ?? .disabled
     var nagEmbeddings: MLXArray? = nil
     if nagConfig.isEnabled {
       if let negIds = negativeInputIds, let negMask = negativeAttentionMask {
@@ -913,10 +910,10 @@ public final class LTX2Pipeline {
     // Refine pass uses the deterministic member of the sampler family (validated
     // PinkCherry recipe: base=euler_ancestral_cfg_pp, refine=euler_cfg_pp), so
     // forceDeterministic drops the ancestral/SDE noise but keeps CFG++ mode.
-    let useSDE = LTX2PipelineConfig.envAncestral && !forceDeterministic
+    let useSDE = resolvedConfig.samplerIsAncestral && !forceDeterministic
     // CFG++ (euler[_ancestral]_cfg_pp): needs an unconditional (negative) pass
     // every step regardless of cfgScale.
-    let useCfgPP = LTX2PipelineConfig.envCfgPP && negativeEmbeddings != nil
+    let useCfgPP = resolvedConfig.samplerIsCfgPP && negativeEmbeddings != nil
 
     for i in 0..<numSteps {
       let sigma = sigmas[i]
@@ -1044,7 +1041,7 @@ public final class LTX2Pipeline {
       // STG: spatiotemporal guidance. A perturbed pass skips self-attention in a
       // block subset; steer away from it to restore high-frequency motion detail.
       // For distilled cfg=1 this is the primary guidance lever (anti-haze).
-      let stgBase = LTX2PipelineConfig.envSTGScale
+      let stgBase = resolvedConfig.stgScale
       if stgBase > 0 {
         let stgScale = LTX2PipelineConfig.stgScaleForStep(i, base: stgBase)
         let velocitySTG = transformer(
@@ -1054,7 +1051,7 @@ public final class LTX2Pipeline {
           positions: positions,
           sigma: sigmaArray,
           precomputedPE: precomputedPE,
-          stgBlocks: LTX2PipelineConfig.envSTGBlocks
+          stgBlocks: resolvedConfig.stgBlockSet
         )
         eval(velocitySTG)
         let x0STGF32 = latentsFlatF32 - timestepsF32 * velocitySTG.asType(.float32)
@@ -1242,7 +1239,7 @@ public final class LTX2Pipeline {
   ) -> [Float] {
     switch config.pipelineType {
     case .distilled:
-      return LTX2PipelineConfig.envStage1Sigmas ?? LTX2PipelineConfig.stage1Sigmas
+      return resolvedConfig.stage1SigmasOrNil ?? LTX2PipelineConfig.stage1Sigmas
     case .dev, .devTwoStage:
       let numTokens = latF * latH * latW
       return LTX2PipelineConfig.devSigmaSchedule(
@@ -1389,10 +1386,7 @@ public final class LTX2Pipeline {
     }
     MLX.GPU.clearCache()
     let rLatH = latH * 2, rLatW = latW * 2
-    let refineSigmas: [Float] = (ProcessInfo.processInfo.environment["LTX2_REFINE_SIGMAS"]).flatMap { s -> [Float]? in
-      let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
-      return v.count >= 2 ? v : nil
-    } ?? [0.85, 0.7250, 0.4219, 0.0]  // PinkCherry v1.5 pass-2 sigmas
+    let refineSigmas: [Float] = resolvedConfig.refineSigmasEffective
     if let seed = seed { MLXRandom.seed(seed &+ 1000) }
     // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (ComfyUI CONST noise_scaling).
     let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)

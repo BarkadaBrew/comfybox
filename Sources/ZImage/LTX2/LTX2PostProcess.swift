@@ -66,9 +66,10 @@ public enum LTX2PostProcess {
 
   public static func extractFrames(
     from decoded: MLXArray,
-    batchIndex: Int = 0
+    batchIndex: Int = 0,
+    colorAnchor: Float? = nil
   ) -> [(width: Int, height: Int, pixels: [UInt8])] {
-    let decoded = stabilizeColor(decoded, strength: colorAnchorStrength())
+    let decoded = stabilizeColor(decoded, strength: colorAnchor ?? colorAnchorStrength())
     // decoded shape: (B, 3, F, H, W)
     let numFrames = decoded.dim(2)
     let height = decoded.dim(3)
@@ -121,9 +122,10 @@ public enum LTX2PostProcess {
   /// - Returns: Array of CGImages, one per frame.
   public static func framesToImages(
     from decoded: MLXArray,
-    batchIndex: Int = 0
+    batchIndex: Int = 0,
+    colorAnchor: Float? = nil
   ) -> [CGImage] {
-    let rawFrames = extractFrames(from: decoded, batchIndex: batchIndex)
+    let rawFrames = extractFrames(from: decoded, batchIndex: batchIndex, colorAnchor: colorAnchor)
     var images: [CGImage] = []
 
     for frame in rawFrames {

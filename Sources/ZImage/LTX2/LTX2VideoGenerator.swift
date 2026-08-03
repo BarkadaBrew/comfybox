@@ -579,7 +579,7 @@ public final class LTX2VideoGenerator {
         // negative pass every step even at cfg=1).
         let negText: String? = {
             if let n = request.negativePrompt, !n.isEmpty { return n }
-            return LTX2PipelineConfig.envCfgPP
+            return pipeline.resolvedConfig.samplerIsCfgPP
                 ? "subtitle, caption, text, text on screen, watermark, logo, timestamp"
                 : nil
         }()
@@ -850,7 +850,7 @@ public final class LTX2VideoGenerator {
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 
-            let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+            let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded, colorAnchor: pipeline.resolvedConfig.colorAnchor)
             allFrames.append(contentsOf: chunk == 0 ? chunkFrames : Array(chunkFrames.dropFirst()))
 
             // Re-feed the last frame as the seed for the next continuation chunk.
@@ -926,7 +926,8 @@ public final class LTX2VideoGenerator {
         let outH = allFrames.first?.height ?? request.height
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
-            fps: request.fps, width: outW, height: outH)
+            fps: request.fps, width: outW, height: outH,
+            bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx)
 
         return LTX2VideoResult(
             outputPath: request.outputPath,

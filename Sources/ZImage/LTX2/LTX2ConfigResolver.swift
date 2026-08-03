@@ -69,6 +69,7 @@ public enum LTX2ConfigResolver {
     Entry(name: "stg_blocks", envKey: "LTX2_STG_BLOCKS", tier: "A", kind: .string, builtin: ""),
     Entry(name: "face_anchor_strength", envKey: "LTX2_FACE_ANCHOR_STRENGTH", tier: "A", kind: .float(0...1), builtin: "0.5"),
     Entry(name: "ic_control", envKey: "LTX2_IC_CONTROL", tier: "A", kind: .boolNotZero, builtin: "true"),
+    Entry(name: "ic_ref_strength", envKey: "LTX2_IC_REF_STRENGTH", tier: "A", kind: .float(0...1), builtin: "1.0"),
     Entry(name: "color_anchor", envKey: "LTX2_COLOR_ANCHOR", tier: "A", kind: .float(0...1), builtin: "0"),
     Entry(name: "nag_scale", envKey: "LTX2_NAG_SCALE", tier: "A", kind: .float(0...50), builtin: "0"),
     Entry(name: "nag_alpha", envKey: "LTX2_NAG_ALPHA", tier: "A", kind: .float(0...1), builtin: "0.25"),
@@ -226,6 +227,7 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var stgBlocks: String?
   public var faceAnchorStrength: Float?
   public var icControl: Bool?
+  public var icRefStrength: Float?
   public var colorAnchor: Float?
   public var nagScale: Float?
   public var nagAlpha: Float?
@@ -253,6 +255,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let stgBlocks: String
   public let faceAnchorStrength: Float
   public let icControl: Bool
+  public let icRefStrength: Float
   public let colorAnchor: Float
   public let nagScale: Float
   public let nagAlpha: Float
@@ -269,6 +272,24 @@ public struct LTX2ResolvedVideoConfig: Sendable {
 
   public let provenance: [String: LTX2ParamSource]
   public let params: [LTX2ResolvedParam]
+
+  // Sampler-family helpers mirroring the legacy env conventions.
+  public var samplerIsAncestral: Bool { sampler.lowercased().contains("ancestral") }
+  public var samplerIsCfgPP: Bool { sampler.lowercased().contains("cfg_pp") }
+  /// STG block subset; legacy default mid-stack triplet when unset.
+  public var stgBlockSet: Set<Int> {
+    let parsed = stgBlocks.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    return parsed.isEmpty ? [14, 15, 16] : Set(parsed)
+  }
+  /// Legacy semantics: sigma overrides need >= 2 entries to be meaningful.
+  public var stage1SigmasOrNil: [Float]? { stage1Sigmas.count >= 2 ? stage1Sigmas : nil }
+  public var refineSigmasEffective: [Float] {
+    refineSigmas.count >= 2 ? refineSigmas : [0.85, 0.7250, 0.4219, 0.0]  // PinkCherry v1.5 pass-2
+  }
+  /// NAG enabled when scale > 0 (mirrors LTX2NAGConfig.fromEnvironment).
+  public var nagConfig: LTX2NAGConfig? {
+    nagScale > 0 ? LTX2NAGConfig(scale: nagScale, alpha: nagAlpha, tau: nagTau) : nil
+  }
 }
 
 extension LTX2ConfigResolver {
@@ -321,6 +342,7 @@ extension LTX2ConfigResolver {
       stgBlocks: pick("stg_blocks", str("stg_blocks"), preset?.stgBlocks, request?.stgBlocks),
       faceAnchorStrength: pick("face_anchor_strength", f("face_anchor_strength"), preset?.faceAnchorStrength, request?.faceAnchorStrength),
       icControl: pick("ic_control", b("ic_control"), preset?.icControl, request?.icControl),
+      icRefStrength: pick("ic_ref_strength", f("ic_ref_strength"), preset?.icRefStrength, request?.icRefStrength),
       colorAnchor: pick("color_anchor", f("color_anchor"), preset?.colorAnchor, request?.colorAnchor),
       nagScale: pick("nag_scale", f("nag_scale"), preset?.nagScale, request?.nagScale),
       nagAlpha: pick("nag_alpha", f("nag_alpha"), preset?.nagAlpha, request?.nagAlpha),
