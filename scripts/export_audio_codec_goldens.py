@@ -62,7 +62,42 @@ with torch.no_grad():
     wav_whole = vae.decode(z_norm)
     assert torch.allclose(wav_final, wav_whole), "staged path diverges from decode()"
 
-fixtures = {'z_normalized': z_norm, 'z_denorm': z_denorm, 'mel': mel, 'wav_final': wav_final}
+    # Vocoder-half bisect fixtures (wire 2b): capture INSIDE VocoderWithBWE.forward.
+    import torch.nn.functional as tnf
+    bwe = vae.vocoder                       # VocoderWithBWE
+    vocoder_input = mel.transpose(2, 3)     # (B,2,F,T) as run_vocoder builds it
+    wav16k_base = bwe.vocoder(vocoder_input)
+    T_low = wav16k_base.shape[-1]
+    rem = T_low % bwe.hop_length
+    padded_base = tnf.pad(wav16k_base, (0, bwe.hop_length - rem)) if rem else wav16k_base
+    mel_of_base = bwe._compute_mel(padded_base)
+    residual = bwe.bwe_generator(mel_of_base)
+    skip = bwe.resampler(padded_base)
+    print("bwe stages:", {k: tuple(v.shape) for k, v in
+        dict(wav16k_base=wav16k_base, mel_of_base=mel_of_base, residual=residual, skip=skip).items()})
+    print("bwe hop_length =", bwe.hop_length, "in_sr =", bwe.input_sample_rate, "out_sr =", bwe.output_sample_rate)
+
+    # Generator micro-bisect (base vocoder internals on the folded stereo input).
+    gen = bwe.vocoder
+    gin = torch.cat((vocoder_input[:, 0], vocoder_input[:, 1]), dim=1)  # (B,128,T)
+    g0 = gen.conv_pre(gin)
+    g1 = gen.ups[0](g0)
+    nk = gen.num_kernels
+    gr = None
+    for j in range(nk):
+        r = gen.resblocks[j](g1)
+        gr = r if gr is None else gr + r
+    gr = gr / nk
+    print("gen micro:", {k: tuple(v.shape) for k, v in dict(gen_in=gin, gen_conv_pre=g0, gen_up0=g1, gen_res0=gr).items()})
+    act0 = gen.resblocks[0].acts1[0](g1)      # anti-aliased snake alone
+    conv0 = gen.resblocks[0].convs1[0](act0)  # + dilated conv
+    print("micro-micro:", tuple(act0.shape), tuple(conv0.shape))
+
+fixtures = {'z_normalized': z_norm, 'z_denorm': z_denorm, 'mel': mel, 'wav_final': wav_final,
+            'wav16k_base': wav16k_base, 'mel_of_base': mel_of_base,
+            'bwe_residual': residual, 'resample_skip': skip,
+            'gen_in': gin, 'gen_conv_pre': g0, 'gen_up0': g1, 'gen_res0': gr,
+            'amp_act0': act0, 'amp_conv0': conv0}
 st.save_file({k: v.contiguous() for k, v in fixtures.items()}, out_dir + '/codec_goldens.safetensors')
 
 comfy_rev = subprocess.run(['git', '-C', COMFY, 'rev-parse', 'HEAD'],

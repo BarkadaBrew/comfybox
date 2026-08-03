@@ -68,6 +68,84 @@ final class LTX2AudioCodecParityTests: XCTestCase {
       "mel relative error must be small (fp32 vs bf16-loaded weights)")
   }
 
+  private func corr(_ a: MLXArray, _ b: MLXArray) -> Float {
+    let x = a.reshaped([-1]).asType(.float32), y = b.reshaped([-1]).asType(.float32)
+    let n = ((x - x.mean()) * (y - y.mean())).mean()
+    let d = MLX.sqrt(((x - x.mean()) * (x - x.mean())).mean()) * MLX.sqrt(((y - y.mean()) * (y - y.mean())).mean())
+    return (n / d).item(Float.self)
+  }
+
+  func testMicro_GeneratorStages() throws {
+    try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath), "weights absent")
+    let g = try goldens()
+    let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
+    let gen = vae.vocoder!.vocoder
+
+    let nlc = g["gen_in"]!.transposed(0, 2, 1)         // [B, T, 128]
+    let g0 = gen.convPre(nlc)                          // [B, T, 1536]
+    XCTAssertGreaterThan(corr(g0.transposed(0, 2, 1), g["gen_conv_pre"]!), 0.999, "conv_pre")
+
+    let refG0 = g["gen_conv_pre"]!.transposed(0, 2, 1) // isolate up0 with ref input
+    let g1 = gen.ups[0](refG0)
+    XCTAssertEqual(g1.transposed(0, 2, 1).shape, g["gen_up0"]!.shape, "up0 shape")
+    XCTAssertGreaterThan(corr(g1.transposed(0, 2, 1), g["gen_up0"]!), 0.999, "ups[0] transpose-conv")
+
+    let refG1 = g["gen_up0"]!.transposed(0, 2, 1)      // isolate resblock group 0
+    var xs = gen.resblocks[0](refG1)
+    for j in 1..<gen.numKernels { xs = xs + gen.resblocks[j](refG1) }
+    xs = xs / MLXArray(Float(gen.numKernels))
+    // micro-micro: isolate activation vs dilated conv inside AMP block 0
+    let act0 = gen.resblocks[0].acts1[0](refG1)
+    XCTAssertGreaterThan(corr(act0.transposed(0, 2, 1), g["amp_act0"]!), 0.999, "anti-aliased snake (Activation1d)")
+    let conv0 = gen.resblocks[0].convs1[0](g["amp_act0"]!.transposed(0, 2, 1))
+    XCTAssertGreaterThan(corr(conv0.transposed(0, 2, 1), g["amp_conv0"]!), 0.999, "dilated conv1")
+
+    XCTAssertGreaterThan(corr(xs.transposed(0, 2, 1), g["gen_res0"]!), 0.999, "resblock group 0 (AMP)")
+  }
+
+  func testBisect_BaseVocoderStage() throws {
+    try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath), "weights absent")
+    let g = try goldens()
+    let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
+    // Reference: vocoder_input = mel.transpose(2,3); stereo fold; base generator.
+    let bft = g["mel"]!.transposed(0, 1, 3, 2)
+    let folded = MLX.concatenated([bft[0..., 0], bft[0..., 1]], axis: 1)
+    let base = vae.vocoder!.synthesize(folded)
+    XCTAssertEqual(base.shape, g["wav16k_base"]!.shape, "base stage shape")
+    XCTAssertGreaterThan(corr(base, g["wav16k_base"]!), 0.99, "BASE generator parity")
+  }
+
+  func testBisect_MelOfBaseStage() throws {
+    try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath), "weights absent")
+    let g = try goldens()
+    let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
+    let base = g["wav16k_base"]!  // reference base as input isolates THIS stage
+    let b = base.dim(0), c = base.dim(1)
+    let mel = vae.vocoder!.melStft.logMel(base.reshaped([b * c, -1]), hopLength: 80)
+      .reshaped([b, c, 64, -1])
+    XCTAssertEqual(mel.shape, g["mel_of_base"]!.shape, "mel-of-base shape")
+    XCTAssertGreaterThan(corr(mel, g["mel_of_base"]!), 0.99, "causal STFT+mel parity")
+  }
+
+  func testBisect_ResampleSkipStage() throws {
+    let g = try goldens()
+    let skip = LTX2HannUpsampler.upsample(g["wav16k_base"]!, ratio: 3)
+    XCTAssertEqual(skip.shape, g["resample_skip"]!.shape, "skip shape")
+    XCTAssertGreaterThan(corr(skip, g["resample_skip"]!), 0.999, "hann resampler parity")
+  }
+
+  func testBisect_BWEResidualStage() throws {
+    try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath), "weights absent")
+    let g = try goldens()
+    let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
+    let melOfBase = g["mel_of_base"]!  // (B,2,64,frames) — reference input isolates BWE
+    let folded = MLX.concatenated([melOfBase[0..., 0], melOfBase[0..., 1]], axis: 1)
+    let nlc = folded.transposed(0, 2, 1)
+    let residual = vae.vocoder!.bweGenerator(nlc).transposed(0, 2, 1)
+    XCTAssertEqual(residual.shape, g["bwe_residual"]!.shape, "residual shape")
+    XCTAssertGreaterThan(corr(residual, g["bwe_residual"]!), 0.99, "BWE generator parity")
+  }
+
   func testFullChainProducesFortyEightKStereo() throws {
     try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath),
       "reference audio VAE weights not on this machine")

@@ -99,38 +99,39 @@ public final class LTX2AntiAliasActivation: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    // EXACT reference math (BigVGAN UpSample1d/DownSample1d kaiser branch,
+    // ratio 2, kernel 12). The previous symmetric-pad + crop-from-zero
+    // version time-shifted the signal (~15 samples) — 0.20 correlation vs
+    // reference; caught by the 2026-08-03 micro-bisect.
     let inDtype = x.dtype
-    let L = x.dim(1)
     let xf = x.asType(.float32)
-    let pad = kernel / 2
+    let ratio = 2
 
-    // 2× upsample (transposed, depthwise) → force length 2L.
+    // UpSample1d: pad = k/ratio − 1 (replicate both sides), transpose-conv
+    // stride 2, scale ×ratio, then slice [padLeft ..< len−padRight] where
+    // padLeft = pad·stride + (k−stride)/2, padRight = pad·stride + (k−stride+1)/2.
+    let upPad = kernel / ratio - 1
+    let upPadLeft = upPad * ratio + (kernel - ratio) / 2
+    let upPadRight = upPad * ratio + (kernel - ratio + 1) / 2
     let upW = depthwiseWeight(upsample.filter)
     var up = MLX.convTransposed1d(
-      MLX.padded(xf, widths: [IntOrPair((0, 0)), IntOrPair((pad, pad)), IntOrPair((0, 0))]),
-      upW, stride: 2, groups: channels)
-    up = 2.0 * up
-    up = matchLength(up, to: 2 * L)
+      MLX.padded(xf, widths: [IntOrPair((0, 0)), IntOrPair((upPad, upPad)), IntOrPair((0, 0))], mode: .edge),
+      upW, stride: ratio, groups: channels)
+    up = Float(ratio) * up
+    up = up[0..., upPadLeft..<(up.dim(1) - upPadRight), 0...]
 
     // SnakeBeta at 2× rate.
     let sn = act(up)
 
-    // 2× downsample (depthwise) → force length L.
+    // DownSample1d → LowPassFilter1d: replicate pad (k/2 − 1, k/2) for even
+    // kernels, conv stride 2. No post-crop — the padding IS the alignment.
+    let dnPadLeft = kernel / 2 - (kernel % 2 == 0 ? 1 : 0)
+    let dnPadRight = kernel / 2
     let dnW = depthwiseWeight(downsample.lowpass.filter)
-    var dn = MLX.conv1d(
-      MLX.padded(sn, widths: [IntOrPair((0, 0)), IntOrPair((pad, pad)), IntOrPair((0, 0))]),
-      dnW, stride: 2, groups: channels)
-    dn = matchLength(dn, to: L)
+    let dn = MLX.conv1d(
+      MLX.padded(sn, widths: [IntOrPair((0, 0)), IntOrPair((dnPadLeft, dnPadRight)), IntOrPair((0, 0))], mode: .edge),
+      dnW, stride: ratio, groups: channels)
     return dn.asType(inDtype)
-  }
-
-  /// Crop or zero-pad the length (axis 1) to exactly `target`.
-  private func matchLength(_ x: MLXArray, to target: Int) -> MLXArray {
-    let cur = x.dim(1)
-    if cur == target { return x }
-    if cur > target { return x[0..., 0..<target, 0...] }
-    return MLX.padded(
-      x, widths: [IntOrPair((0, 0)), IntOrPair((0, target - cur)), IntOrPair((0, 0))])
   }
 }
 

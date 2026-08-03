@@ -183,15 +183,15 @@ final class LTX2AudioVAETests: XCTestCase {
   }
 
   /// Encode compresses 4× on both axes; decode restores the mel shape exactly.
-  func testEncodeDecodeShapeRoundTrip() {
+  func testDecodeToMelCausalShape() {
+    // Reference-parity semantics (2026-08-03, LTX2AudioCodecParityTests is
+    // the authority): latent (B, C=8, T, F=16) decodes to mel
+    // (B, 2, 4T-3, 64) — causal upsample drops make 4T-3 exact.
     let vae = LTX2AudioVAE()
-    let mel = MLXArray.zeros([1, 2, 64, 16])       // (B, 2, F=64, T=16)
-    let z = vae.encode(mel)
-    MLX.eval(z)
-    XCTAssertEqual(z.shape, [1, 8, 16, 4], "latent shape wrong: \(z.shape)")
-    let out = vae.decode(z)
-    MLX.eval(out)
-    XCTAssertEqual(out.shape, [1, 2, 64, 16], "decoded mel shape wrong: \(out.shape)")
+    let z = MLXArray.zeros([1, 8, 16, 16])
+    let mel = vae.decodeToMel(z)
+    MLX.eval(mel)
+    XCTAssertEqual(mel.shape, [1, 2, 4 * 16 - 3, 64], "causal decode shape: \(mel.shape)")
   }
 
   /// A non-trivial decode from random latents is finite and not all-zero
