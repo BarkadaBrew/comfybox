@@ -70,6 +70,12 @@ public struct LTX2VideoRequest: Sendable {
     /// LoRAs merged into the transformer for this render, applied in order.
     public var loras: [LTX2LoRAReference]
     public var outputPath: String
+    /// Tier A tuning overrides (task #9 Phase 2) — nil fields defer to
+    /// preset > configFile > env > builtin. `presetTuning` is the preset's
+    /// block, resolved by the server and carried so the generator can build
+    /// the full five-level resolution.
+    public var tuning: LTX2VideoTuning?
+    public var presetTuning: LTX2VideoTuning?
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -102,7 +108,9 @@ public struct LTX2VideoRequest: Sendable {
         loraPath: String? = nil,
         loraStrength: Float = 1.0,
         loras: [LTX2LoRAReference] = [],
-        outputPath: String
+        outputPath: String,
+        tuning: LTX2VideoTuning? = nil,
+        presetTuning: LTX2VideoTuning? = nil
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -123,6 +131,8 @@ public struct LTX2VideoRequest: Sendable {
         self.loraStrength = loraStrength
         self.loras = loras
         self.outputPath = outputPath
+        self.tuning = tuning
+        self.presetTuning = presetTuning
     }
 }
 
@@ -558,7 +568,7 @@ public final class LTX2VideoGenerator {
         // the pipeline so render code reads it instead of raw env (Codex
         // finding #14). Request/preset tuning joins in the wire-format
         // increment; until then this resolves configFile > env > builtin.
-        let typedConfig = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil)
+        let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
         let resolved = typedConfig.params
         let summary = resolved.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")

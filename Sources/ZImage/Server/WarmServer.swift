@@ -1560,6 +1560,8 @@ public final class WarmServer {
     /// Which client/app submitted this job (desktop, bree, api…) — surfaced in
     /// the async job status and /health, same as image `GeneratePayload.source`.
     let source: String?
+    /// Tier A tuning overrides (snake_case JSON via decoder strategy).
+    let tuning: LTX2VideoTuning?
     /// Optional preset id resolved from the shared PresetStore (mediaKind
     /// "video"): LoRAs, prompt prefix/suffix, negative prompt, dims budget,
     /// steps, seed. Explicit request fields always override preset values.
@@ -2065,6 +2067,9 @@ public final class WarmServer {
       loraStrength: req.loraStrength ?? 1.0,
       loras: resolvedLoRAs,
       outputPath: resolvedOutput
+,
+      tuning: req.tuning,
+      presetTuning: videoPreset?.videoTuning
     )
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)

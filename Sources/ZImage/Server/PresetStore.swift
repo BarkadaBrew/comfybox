@@ -81,6 +81,9 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
 
   // Numeric generation params.
   public var steps: Int?
+  /// Tier A video tuning block (task #9 Phase 2) — preset-level overrides
+  /// resolved between request fields and config.json/env.
+  public var videoTuning: LTX2VideoTuning?
   public var guidance: Double?
   public var seed: Int?
   public var width: Int?
