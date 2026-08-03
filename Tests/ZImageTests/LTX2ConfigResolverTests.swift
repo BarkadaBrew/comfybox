@@ -135,3 +135,64 @@ final class LTX2ConfigResolverTests: XCTestCase {
     }
   }
 }
+
+// MARK: - Phase 2: typed resolution with request/preset levels
+
+extension LTX2ConfigResolverTests {
+
+  func testRequestBeatsPresetBeatsEnvWithProvenance() {
+    var request = LTX2VideoTuning(); request.guidanceRescale = 0.25
+    var preset = LTX2VideoTuning(); preset.guidanceRescale = 0.5; preset.stgScale = 2.0
+
+    let resolved = LTX2ConfigResolver.resolveTyped(
+      request: request, preset: preset,
+      environment: ["LTX2_GUIDANCE_RESCALE": "0.7", "LTX2_STG_SCALE": "4"],
+      configFile: [:])
+
+    XCTAssertEqual(resolved.guidanceRescale, 0.25, "request wins")
+    XCTAssertEqual(resolved.provenance["guidance_rescale"], .request)
+    XCTAssertEqual(resolved.stgScale, 2.0, "preset beats env")
+    XCTAssertEqual(resolved.provenance["stg_scale"], .preset)
+  }
+
+  func testInvalidHighPrecedenceFallsThroughToNextSource() {
+    // Codex finding #17: an invalid configFile value must fall through to a
+    // VALID env value (flagged), not jump to builtin.
+    let params = LTX2ConfigResolver.resolveEffective(
+      environment: ["LTX2_REFINE_MAX_VOL": "9000"],
+      configFile: ["refine_max_vol": "not-a-number"])
+
+    let p = params.first { $0.name == "refine_max_vol" }
+    XCTAssertEqual(p?.value, "9000", "falls through to the valid env value")
+    XCTAssertEqual(p?.source, .env)
+    XCTAssertEqual(p?.valid, false, "flagged because a higher-precedence source was rejected")
+  }
+
+  func testTypedDefaultsMatchRegistryBuiltins() {
+    let resolved = LTX2ConfigResolver.resolveTyped(
+      request: nil, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(resolved.guidanceRescale, 0)
+    XCTAssertEqual(resolved.twoStage, false)
+    XCTAssertEqual(resolved.imgCompression, 35)
+    XCTAssertEqual(resolved.faceAnchorStrength, 0.5)
+    XCTAssertEqual(resolved.plainDecodeMaxVol, 4500)
+    XCTAssertEqual(resolved.provenance["img_compression"], .builtin)
+  }
+
+  func testTypedTwoStageFromRequestBoolNotStringConvention() {
+    var request = LTX2VideoTuning(); request.twoStage = true
+    let resolved = LTX2ConfigResolver.resolveTyped(
+      request: request, preset: nil, environment: [:], configFile: [:])
+    XCTAssertEqual(resolved.twoStage, true)
+    XCTAssertEqual(resolved.provenance["two_stage"], .request)
+  }
+
+  func testTypedSigmasParseAndRequestOverrides() {
+    var preset = LTX2VideoTuning(); preset.refineSigmas = [0.85, 0.725, 0.4219, 0.0]
+    let resolved = LTX2ConfigResolver.resolveTyped(
+      request: nil, preset: preset,
+      environment: ["LTX2_REFINE_SIGMAS": "0.9,0.5,0.0"], configFile: [:])
+    XCTAssertEqual(resolved.refineSigmas, [0.85, 0.725, 0.4219, 0.0])
+    XCTAssertEqual(resolved.provenance["refine_sigmas"], .preset)
+  }
+}
