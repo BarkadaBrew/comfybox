@@ -38,8 +38,11 @@ tuning block — which stays a recipe knob; the two are set independently
 while conditioning at model fps).
 
 - A MediaType is a **record, not code**: `{id, kind, engineParams (preset id +
-  LTX2VideoTuning block + template id), durationSeconds | dims, fps,
-  estCostSec, deliveryRules, tierEligibility}` — stored in kira config, editable from
+  LTX2VideoTuning block + template id), dims (width x height — stills AND
+  video; video dims interact with the two-stage floor and /64 snapping),
+  durationSeconds + fps (video kinds), estCostSec, deliveryRules,
+  tierEligibility}`. Video cost scales with dims x frames — both feed
+  estCostSec. — stored in kira config, editable from
   the Kira tab. The engine-side knobs ride the machinery shipped today
   (presets, videoTuning, prompt templates, per-request tuning).
 - "Qualifiable": every rendered asset carries its mediaType id into the
