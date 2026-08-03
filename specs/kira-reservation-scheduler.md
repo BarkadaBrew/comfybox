@@ -110,13 +110,21 @@ LM Studio model mid-render. Windows between renders don't fix this: a
 single dream.vignette holds the GPU 5–6 minutes, and tokens starve INSIDE
 that span. Three layers, cheapest first:
 
-1. **Cognition lease (engine governor) — the real fix.** Renders are step
+**Generalization (Todd): this holds for ANY model sharing the GPU** —
+vision/captioning (the planned VLM provider), embeddings, face detection,
+future audio models. The governor is therefore generic: every GPU consumer
+declares a class — `render` (long-occupancy, pausable at step boundaries)
+vs `inference` (short-burst, latency-sensitive: LLM turns, VLM captioning,
+embeddings). Leases are the inference class's admission ticket; nothing is
+special-cased to "the chat LLM".
+
+1. **Inference lease (engine governor) — the real fix.** Renders are step
    loops with existing per-step callbacks. Add a lease mechanism to the
    warm server: `POST /v1/gpu/lease` (holder, ttl ≤ 90s) makes the active
    render PAUSE AT THE NEXT STEP BOUNDARY and resume on release/expiry.
    Bounded token latency = one denoise step (2–30s at production configs) +
-   LLM burst. The daemon takes a lease before agent-loop LLM calls during
-   active renders; leases are metered so renders still finish (max N leases
+   LLM burst. The daemon takes a lease before any inference-class call during
+   active renders (LLM turn, VLM caption pass, embedding batch); leases are metered so renders still finish (max N leases
    per render, else the render's own SLA dies).
 2. **Scheduler windows (already spec'd)** handle the render-class
    interactive asks; they also lower the PROBABILITY of collision for
