@@ -152,6 +152,7 @@ public final class WarmServer {
   /// local render never holds an HTTP connection open. The Replicate cloud path
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
+  private let renderTraceStore = RenderTraceStore()
   let comfyBridge: ComfyBridge
 
   /// Imported ComfyUI workflows (#238), file-backed at ~/.comfybox/workflows/.
@@ -335,6 +336,11 @@ public final class WarmServer {
     // Ignore SIGHUP before model loading — prevents SSH disconnect from
     // killing the daemon during the ~40s pipeline initialization phase.
     signal(SIGHUP, SIG_IGN)
+
+    // Task #19: lifecycle traces. Recovery first — any trace left open by a
+    // crash/kill is marked abandoned so failed renders are never invisible.
+    videoJobTracker.traceStore = renderTraceStore
+    renderTraceStore.markAbandonedOpenTraces()
 
     // Merge the legacy Coffee Shop image-service character registry (source of
     // truth for hand-written character text) before serving. Idempotent: only
@@ -4079,6 +4085,9 @@ private final class LocalVideoJob: @unchecked Sendable {
 /// isolation; `submit` is the thin production wrapper that drives it against the
 /// real render queue.
 final class VideoJobTracker: @unchecked Sendable {
+  /// Task #19: append-only lifecycle trace (submitted/started/terminal).
+  /// nil in unit tests that only exercise the state machine.
+  var traceStore: RenderTraceStore?
   private let lock = NSLock()
   private var jobs: [String: LocalVideoJob] = [:]
 
@@ -4087,12 +4096,21 @@ final class VideoJobTracker: @unchecked Sendable {
   @discardableResult
   func register(
     source: String, mode: VideoMode,
-    resolvedConfig: [LTX2ResolvedParam]? = nil
+    resolvedConfig: [LTX2ResolvedParam]? = nil,
+    tracePayload: [String: String] = [:]
   ) -> (jobId: String, status: VideoJobStatus) {
     let jobId = UUID().uuidString
     let job = LocalVideoJob(id: jobId, source: source, mode: mode)
     job.resolvedConfig = resolvedConfig
     lock.lock(); jobs[jobId] = job; lock.unlock()
+    var payload = tracePayload
+    payload["source"] = source
+    payload["mode"] = mode.rawValue
+    if let rc = resolvedConfig {
+      payload["config"] = rc.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
+    }
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .submitted, taskKind: .videoRender, payload: payload))
     return (jobId, job.toStatus())
   }
 
@@ -4163,6 +4181,8 @@ final class VideoJobTracker: @unchecked Sendable {
 
   func markProcessing(_ jobId: String) {
     lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .started, taskKind: .videoRender, payload: [:]))
   }
 
   func setProgress(_ jobId: String, _ percent: Int) {
@@ -4181,6 +4201,14 @@ final class VideoJobTracker: @unchecked Sendable {
       job.completedAt = Date()
     }
     lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .terminal, taskKind: .videoRender,
+      payload: [
+        "status": "succeeded",
+        "output_path": result.outputPath,
+        "frames": String(result.frameCount),
+        "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
+      ]))
   }
 
   func markFailed(_ jobId: String, error: Error) {
@@ -4191,6 +4219,9 @@ final class VideoJobTracker: @unchecked Sendable {
       job.completedAt = Date()
     }
     lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .terminal, taskKind: .videoRender,
+      payload: ["status": "failed", "error": error.localizedDescription]))
   }
 
   /// Drop completed/failed jobs older than `ttl`. Mirrors `ImageJobTracker`.
