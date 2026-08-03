@@ -268,3 +268,105 @@ looping short; dream.vignette as a full post.
 Multi-machine scheduling, external calendar integration, per-asset cost
 billing. The engine's FIFO stays the execution primitive — reservations
 plan ABOVE it, they don't replace it.
+
+---
+
+## Rev 2 — Codex findings resolution (2026-08-03, 14 findings / 6 blockers in reviews/codex-reservation-review-2026-08-03.txt)
+
+Verdict accepted: direction sound, draft guarantees corrected as follows.
+
+1. **Lease mechanism (#1):** NOT a coordinator method (the actor blocks
+   behind the render — the exact failure the health snapshots already dodge).
+   A lock/condition `GPUQuiescenceGate` independent of the actor; lease has
+   `requested → granted` states (granted only at an actual boundary); TTL
+   from GRANT; holder token, monotonic expiry, idempotent release, shutdown
+   wake-up; a DEDICATED boundary hook after each step's eval (not the
+   telemetry callback); per-family hooks required (non-LTX families lack
+   step callbacks today).
+2. **Phase-aware latency contract (#2):** "≤ one denoise step" holds ONLY
+   in the denoising phase. encode/load/refine-transition/decode DEFER or
+   reject leases with retry_after (decode is the 25GB+ danger phase — never
+   overlap it). Consumers declare expected resident+transient memory, and a
+   lease grant requires memory admission, not just quiescence. Engine
+   publishes current phase + max_uninterruptible_sec.
+3. **Deadlock prevention (#3):** lease tokens propagate and are reentrant
+   per holder; batch optimization happens BEFORE render submission and
+   batched renders carry enhance:false (already the daemon's convention);
+   no queued render may synchronously acquire a lease from its execution
+   entry. Fairness = paused-seconds budget + minimum render-run quantum,
+   not lease counts.
+4. **Atomic priority (#4):** priority rides IN the enqueue call
+   (`enqueue(priority, reservationId, jobId)`) — never enqueue-then-reorder
+   (racy, and the tracker/queue IDs differ). ONE externally supplied job id
+   flows reservation → daemon → engine queue → tracker → trace → gallery.
+   Stable FIFO within priority. The existing reorder endpoint is a human
+   tool, not the bump mechanism.
+5. **Honest SLA (#5):** the 10-min cap was unsatisfiable (measured 923s for
+   a 97f two-stage render). The cap becomes a conservative ADMISSION rule:
+   never START a scheduled job whose P95 runtime + setup exceeds the
+   remaining time before the next protected window. Long-form scheduled
+   video runs in declared non-interactive windows; the interactive media
+   SLA states the truth: bounded by the admitted job's P95, which the
+   planner chooses.
+6. **FPS contract (#6):** validate the (clipSeconds, fps) PAIR:
+   `targetFrames = snap1p8k(clipSeconds × fps) ≤ 289`. Send explicit
+   frames + fps + tuning.condFps. Engine work item: MCP generate_video
+   lacks fps and the executor drops frame_rate — must be added before any
+   per-type fps ships. The 12s ceiling is a 24fps fact, not a constant.
+7. **Policy contract (#7): FIXED + SHIPPED** (ad2bd2e): clipSeconds now
+   assigned + persisted + survives unrelated saves; absent-videoMode
+   default unified to 'i2v'. New scheduler state (MediaTypes, templates,
+   ledger) lives in a SEPARATE versioned document
+   (`/v1/kira/schedule/config`, schemaVersion + ETag) — never in the block
+   the legacy writer reconstructs.
+8. **Cost model (#8):** Σ median is rejected. Costs are sequence-dependent
+   (model eviction/reload, drain waits, i2v = seed image + up-to-3 VLM QA +
+   render). Use a normalized execution signature (type, dims, frames,
+   steps, two-stage, decode mode, resident-model state), P95 for admission
+   (median only as UI estimate), explicit transition costs, minimum sample
+   counts + configured floors, estimate-version reset on recipe change.
+   Interactive work doesn't debit the content QUOTA but does consume
+   wall-clock capacity → forces a re-fit.
+9. **Unlimited + backlog (#9):** unlimited mode becomes a lowest-priority
+   FILLER policy (`fillRemainingWith: image.<tier>`, start only when
+   conservativeCost ≤ time-to-next-protected-window). Backlog: bounded
+   size, max age (per §1.5 lossiness: 1–2 slots), max attempts, oversized-
+   reservation quarantine, deficit fairness, overload telemetry.
+10. **Plan-time typing (#10):** the mixed coin-flip moves from execution to
+    PLANNING: a reservation persists its concrete type, immutable recipe
+    revision, mode, duration/fps/frames/dims/tuning, seed/template/
+    suggestion linkage, reservation id + idempotency key. Film/neutral
+    stays stills-only. Suggestion-box picks consumed by scheduled cycles
+    are SCHEDULED — the TRIGGER (who initiated now) defines priority, not
+    the content's source.
+11. **Orthogonal axes (#11):** the two-class model splits into
+    `priority: interactive|userBackground|scheduled` ×
+    `resource: gpuDiffusion|gpuNonPausable|gpuInference|cpuMedia|external` ×
+    `preemption: stepBoundary|phaseBoundary|none` × `shape: atomic|composite`
+    + memory/runtime estimates. Upscale (sync, non-pausable) must join the
+    admission broker before "any model sharing the GPU" is true; desktop
+    face swap stays out of scope until server-brokered; montage is cpuMedia
+    and never consumes diffusion capacity.
+12. **Durability (#12):** reservation state machine
+    `reserved → dispatching → engineQueued → running → terminal|lost`, with
+    the reservation id accepted idempotently by the engine, persisted
+    atomically around submission, reconciled BY ID (not by discovering
+    output files). Per-kind retry policy.
+13. **Migration (#13):** the 8-step shadow cutover is adopted verbatim —
+    contracts first, shadow planner (persists, submits nothing), compare
+    against live ticks, fence the old emitter with a scheduler generation
+    id, drain, activate one slot at a stable boundary, keep a rollback
+    switch. Slot ids anchor to timezone+epoch, not process uptime.
+14. **Four strata (#14):** the daemon's in-process priority queue is the
+    missing stratum — most scheduled work waits THERE, not in the engine.
+    Correction: engine video jobs already appear in /v1/queue (draft's
+    premise was stale); the gaps are the daemon queue, cloud video,
+    storyboard parents, montage/upscale, and reservation metadata. The
+    desktop consumes a versioned aggregate DTO (reservationId/engineJobId/
+    daemonJobId/parent, stratum, priority, resource, MediaType+revision,
+    timestamps, estimates, phase/lease state, per-row allowed actions) with
+    versioned mutation endpoints.
+
+**Build order = the review's fold-in sequence:** lease/phase admission →
+atomic priority + honest SLA → fps/policy contracts → conservative planner
+→ taxonomy/durability → shadow cutover → desktop aggregation.
