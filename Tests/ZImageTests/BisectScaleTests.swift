@@ -5,6 +5,15 @@ import MLXRandom
 @testable import ZImage
 
 final class BisectScaleTests: XCTestCase {
+  // Heavyweight band-bug investigation probe (task #18): allocates tens of GB
+  // and crashes the runner beside the resident warm server. Off by default;
+  // set ZIMAGE_HEAVY_DIAGNOSTICS=1 to run.
+  override func setUpWithError() throws {
+    try XCTSkipUnless(
+      ProcessInfo.processInfo.environment["ZIMAGE_HEAVY_DIAGNOSTICS"] == "1",
+      "heavy diagnostic — set ZIMAGE_HEAVY_DIAGNOSTICS=1 to run")
+  }
+
 
   private func makeDecoder() -> LTX2Decoder3D {
     let decoder = LTX2Decoder3D(config: .v23)

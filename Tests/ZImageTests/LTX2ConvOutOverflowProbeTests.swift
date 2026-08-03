@@ -21,6 +21,15 @@ import MLXRandom
 @testable import ZImage
 
 final class LTX2ConvOutOverflowProbeTests: XCTestCase {
+  // Heavyweight band-bug investigation probe (task #18): allocates tens of GB
+  // and crashes the runner beside the resident warm server. Off by default;
+  // set ZIMAGE_HEAVY_DIAGNOSTICS=1 to run.
+  override func setUpWithError() throws {
+    try XCTSkipUnless(
+      ProcessInfo.processInfo.environment["ZIMAGE_HEAVY_DIAGNOSTICS"] == "1",
+      "heavy diagnostic — set ZIMAGE_HEAVY_DIAGNOSTICS=1 to run")
+  }
+
 
   /// Reference: conv over [B, T, H, W, C] chunked along T by 8 with k-1 halo,
   /// conv padding [0, 1, 1]. Input must already carry its temporal padding.
