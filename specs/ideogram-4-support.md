@@ -1,7 +1,10 @@
 # SPEC: Ideogram 4.0 support in ComfyBox
 
-**Status:** rev 2, 2026-08-03 — LOCAL-ONLY per Todd ("I don't want a hosted
-API solution"); the hosted-API lane is REMOVED, not deferred.
+**Status:** rev 3, 2026-08-03 — LOCAL-ONLY, and the port source is
+**mflux's Ideogram 4 MLX implementation** (Todd's find:
+github.com/filipstrand/mflux, src/mflux/models/ideogram4 — complete:
+transformer, scheduler, Qwen3-VL encoder, JSON-caption validation, fp8
+loading, quantize via mflux-save, LoRA loading).
 **Codex review:** pending (queued behind the audio review)
 
 ## 1. What Ideogram 4.0 is (verified 2026-08-03)
@@ -33,30 +36,31 @@ the LoRA machinery, and DyPE. A native port reuses most of that skeleton.
 
 ## 2. Two lanes (both local)
 
-### Lane A — local evaluation via ComfyUI on this Mac (days)
-The evaluation vehicle, on our own hardware, unfiltered, offline:
+### Lane A — local evaluation via mflux (hours, running 2026-08-03)
+mflux (already installed, household tool) implements ideogram-4-fp8 in
+MLX with a CLI: `mflux-generate-ideogram4 --base-model ideogram4
+--prompt-file caption.json`. No ComfyUI shims needed; the CivitAI/ComfyUI
+route is demoted to fallback.
 
-- **Weights:** CivitAI "Ideogram 4 INT8" (~10GB, loads via ComfyUI's native
-  Load Diffusion Model node) + Qwen3-VL-8B text encoder. GGUF Q8 is the
-  fallback route (patched ComfyUI-GGUF has MPS fixes).
-- **Runtime:** the existing ComfyUI validation instance on Bolt, plus the
-  ComfyUI-AppleSilicon-FP8 shim (patches MPS so fp8/int8 checkpoints load).
-  A dedicated Apple Silicon workflow exists on CivitAI (regional bbox +
-  local-LLM prompt processing) as a reference.
-- **Expectations:** minutes per image on MPS (Krea-2-like), community-
-  patched stack so first-run friction is likely. Fine for design elements.
-- **Purpose:** prove output quality on the decoupage/typography use cases
-  and produce golden tensors for Lane B — same role ComfyUI played for
-  Kroma and the LTX recipes.
+- **Prompting:** the checkpoint wants structured JSON captions —
+  `high_level_description` + `compositional_deconstruction` with per-element
+  `bbox` text placement. This is MADE for the decoupage/Krita use case:
+  text goes where the layer needs it. Plain prompts underperform.
+- **Magic Prompt replacement:** teach the local optimizer (template store —
+  a `image-design-json` template) to emit the caption schema; mflux
+  validates captions on input.
+- **Quantization:** `mflux-save` can produce our own q8/q6 from fp8.
 
-### Lane B — native MLX port (the destination, ~2 weeks once A earns it)
+### Lane B — native Swift-MLX port (the destination, ~1 week once A earns it)
+Port source is mflux's PYTHON-MLX implementation — the lowest-risk path
+(same array semantics, near-mechanical translation; ComfyBox itself began
+as this exact kind of port from mflux's Z-Image work).
 The ComfyBox-native way ([[comfybox-no-python]]) and the only path to
 uncensored/offline/LoRA-capable use:
 
-- Port the 34-layer single-stream DiT to MLX-Swift, modeled on
-  `Krea2SingleStreamDiT` (same family; expect differences in AdaLN layout,
-  RoPE axes, and the 13-layer text-feature stack — port from
-  ideogram-oss/ideogram4 line-by-line like the Krea 2 port).
+- Port the 34-layer single-stream DiT from
+  `mflux/src/mflux/models/ideogram4/` line-by-line (NOT from the PyTorch
+  repo), modeled structurally on `Krea2SingleStreamDiT`.
 - Text encoder: Qwen3-VL-8B via the existing shared Qwen3 loader
   (mlx-community conversion likely exists; else convert).
 - Weights: fp8 repo dequantized → bf16 (~18.6GB) → our q8 (~10GB), same
