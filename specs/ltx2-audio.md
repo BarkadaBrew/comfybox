@@ -117,3 +117,69 @@ Wire 2 + 3: ~1 day (mostly golden-tensor harness). Wire 1: 2–3 days (the
 cross-modal math + denoise integration). Wire 4: hours. Total 4–5 days —
 up from the earlier 3–4 day guess because the cross-modal stub was
 discovered to be a stub, not a port.
+
+---
+
+## Rev 2 — Codex findings resolution (2026-08-03, 16 findings / 5 blockers in reviews/codex-audio-review-2026-08-03.txt)
+
+Superseding corrections — the rev-1 wires understated the work:
+
+1. **Wire 1 targets the WRONG code (blocker #1/#2).** `LTX2CrossModalAttention`
+   is an unused orphan. The operative path is `LTX2TransformerBlock.callDualStream`
+   — half-built and structurally wrong vs reference (`av_model.py:307`):
+   AdaLN row semantics inverted (rows 0–1 = A2V, 2–3 = V2A, 4 = gate), no
+   cross-modal temporal RoPE, and V2A computed from already-updated video
+   (direction contamination). Plus the top-level transformer forward is
+   video-only: it needs a joint (video, audio) contract, four cross-AdaLN
+   parameter generators, audio caption projection/connectors, and the audio
+   output head. This is a replacement, not a completion.
+2. **Conditioning/timesteps are per-modality (blocker #3, finding #4):**
+   shared scalar sigma SCHEDULE, but separate per-token timestep tensors per
+   modality, zero-timestep reference-audio tokens, cross-AdaLN conditioned on
+   the OTHER modality's max timestep, audio 1-D self-RoPE + real-time cross
+   temporal RoPE.
+3. **Two-stage is JOINT (blocker #5, inverts rev-1):** stage two re-noises
+   stage-one audio at the refine sigma and jointly denoises. Acceptance
+   inverted: stage-two audio differs deterministically, never passes through.
+4. **Codec contract (blocker #7/#8):** AudioVAE must denormalize latents
+   per-channel FIRST, use causal temporal padding (not symmetric), causal
+   upsample with leading-sample removal, crop to 4*T−3; output is 2-channel
+   64-bin (adapter needed before the vocoder's 128-mel input). Vocoder chain
+   is base 16kHz → BWE residual → 3x resample → **48kHz stereo**; Swift
+   currently stops at the 16kHz base. Sample rate is metadata to add, not
+   config to read.
+5. **Guidance mapping** from the Python API, not workflow GUI labels (the
+   author's Negative-audio/video nodes are cross-wired): specify audio text
+   connectors for positive AND negative, CFG++/STG modality behavior,
+   independent scales, isolated RNG so audio=false keeps video determinism.
+6. **Chunked/extended renders are a design decision (finding #9):** audio is
+   25 tok/s with no integer 1-frame overlap at 24fps. Chosen approach:
+   single-pass audio for ≤289f (the folded common case); for chunked
+   continuations, carry reference-audio tokens (`ref_audio`, negative
+   temporal positions) across chunks; PCM crossfade as fallback. Global
+   audio positions, not chunk-local.
+7. **Lifecycle is Wire 5 (finding #10):** production constructs the
+   transformer WITHOUT hasAudio and sanitizes audio weights away. Needs
+   conditional construction keyed into the warm-load identity (audio=true
+   after a video-only warm load = rebuild), exact expected-key manifest
+   binding, unload policy.
+8. **Memory truth (finding #15/#16):** audio branch ≈ **+11.3GiB BF16
+   static** (audio DiT 10.92 + codec 0.34; quantizer deliberately excludes
+   audio weights). Either extend quantize-ltx2 to audio blocks (validated
+   separately) or budget the BF16. Admission threshold re-derived from
+   MEASURED peak; the 40GB constant is not evidence.
+9. **Oracle before code (findings #12–14):** ComfyUI's public nodes can't
+   export stage tensors; ltx-2-mlx's T8 parity harness is the right shape
+   but has hardcoded absent paths. First build step = a pinned PyTorch
+   exporter producing deterministic fixtures for: text connectors (pos/neg),
+   positions (self + cross), per-modality timesteps, one dual block, 1-layer
+   E2E transformer, one joint sampler step (fixed RNG), latent denorm +
+   causal decode, base vocoder, BWE residual, final 48kHz. Neither Swift nor
+   ltx-2-mlx is the oracle.
+10. **Mux (finding #11):** AAC config, channel layout, PTS/timebase,
+    two-input backpressure, priming, trim policy. "No audio track + identical
+    frame hashes" replaces byte-identical mp4.
+
+**Revised estimate: 1.5–2 weeks** (was 4–5 days). Ranked order: architecture
+statement → oracle → codec parity → sampler semantics → joint two-stage →
+lifecycle/memory → extended renders → mux → API/registry/trace.
