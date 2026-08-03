@@ -52,6 +52,14 @@ public struct LTX2PipelineOutput {
 /// generation pipeline for T2V and I2V.
 public final class LTX2Pipeline {
 
+  /// The authoritative per-render configuration (task #9 Phase 2, Codex
+  /// finding #14). Refreshed by the generator before each render; defaults
+  /// to a no-request/no-preset resolution so standalone pipeline use behaves
+  /// exactly like the old inline env reads. Single-render server (admission
+  /// gate) — no concurrent mutation.
+  public var resolvedConfig: LTX2ResolvedVideoConfig =
+    LTX2ConfigResolver.resolveTyped(request: nil, preset: nil)
+
   /// The 3D Video VAE (encode/decode).
   public let vae: LTX2VAE
 
@@ -255,7 +263,7 @@ public final class LTX2Pipeline {
       // Refine-volume OOM gate — same guard as the i2v path (Codex review
       // 2026-07-26: t2v could still crash the process at large formats).
       let t2vRefineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
-      let t2vRefineMax = Int(ProcessInfo.processInfo.environment["LTX2_REFINE_MAX_VOL"] ?? "") ?? 12_000
+      let t2vRefineMax = resolvedConfig.refineMaxVol
       if t2vRefineVolume > t2vRefineMax {
         logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (OOM guard).")
         latents = upLatent
@@ -574,7 +582,7 @@ public final class LTX2Pipeline {
     var icRefFrames = 0
     // IC-control (identity anchor) defaults ON for i2v: without it the subject
     // morphs into a different person over the render. LTX2_IC_CONTROL=0 disables.
-    if ProcessInfo.processInfo.environment["LTX2_IC_CONTROL"] != "0" {
+    if resolvedConfig.icControl {
       let refStrength = Float(ProcessInfo.processInfo.environment["LTX2_IC_REF_STRENGTH"] ?? "1.0") ?? 1.0
       icRefFrames = imageLatent.dim(2)
       state.latent = MLX.concatenated([state.latent, imageLatent.asType(state.latent.dtype)], axis: 2)
@@ -869,10 +877,7 @@ public final class LTX2Pipeline {
     // Per-step CFG schedule (community "CFG ramp": e.g. LTX2_CFG_SCHEDULE=3,2,1 —
     // CFG only on the first steps, where broad motion forms, then back to 1;
     // 10Eros per-step guider pattern). Missing entries extend the last value.
-    let cfgSchedule: [Float]? = ProcessInfo.processInfo.environment["LTX2_CFG_SCHEDULE"].flatMap { s in
-      let v = s.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
-      return v.isEmpty ? nil : v
-    }
+    let cfgSchedule: [Float]? = resolvedConfig.cfgSchedule.isEmpty ? nil : resolvedConfig.cfgSchedule
     func cfgAt(_ step: Int) -> Float {
       guard let sch = cfgSchedule else { return cfgScale }
       return sch[min(step, sch.count - 1)]
@@ -1025,8 +1030,8 @@ public final class LTX2Pipeline {
           // color/contrast (measured: cfg2 saturation +19% vs seed). Rescale
           // the guided x0 back toward the CONDITIONAL prediction's std, then
           // blend by phi — keeps the action-motion boost, restores seed color.
-          // env LTX2_GUIDANCE_RESCALE (0 = off); per-request override next.
-          let phi = Float(ProcessInfo.processInfo.environment["LTX2_GUIDANCE_RESCALE"] ?? "") ?? 0
+          // resolvedConfig.guidanceRescale (0 = off) — request/preset capable.
+          let phi = resolvedConfig.guidanceRescale
           if phi > 0 {
             let stdCond = MLX.sqrt(((x0CondF32 - x0CondF32.mean()) * (x0CondF32 - x0CondF32.mean())).mean())
             let stdGuided = MLX.sqrt(((x0GuidedF32 - x0GuidedF32.mean()) * (x0GuidedF32 - x0GuidedF32.mean())).mean())
@@ -1274,7 +1279,7 @@ public final class LTX2Pipeline {
     // ~25GB peak intermediate) SILENTLY CORRUPTS the last ~60% of frames —
     // no error, just garbage — while tiled decode of the same tensor is clean.
     // 4004 (97f @ 448x704) is proven-safe; 4500 keeps margin below the cliff.
-    let plainMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_PLAIN_DECODE_MAX_VOL"] ?? "") ?? 4500
+    let plainMaxVolume = resolvedConfig.plainDecodeMaxVol
     // LTX2_DUMP_LATENT=<path>: save the pre-decode latent for offline decode
     // debugging (real-values reproduction harness, #36).
     if let dumpPath = ProcessInfo.processInfo.environment["LTX2_DUMP_LATENT"] {
@@ -1373,7 +1378,7 @@ public final class LTX2Pipeline {
     // Refine-volume OOM gate (2026-07-25 23:24 crash): above it, decode the
     // upsampled latent directly — upscaled-but-unrefined beats a dead server.
     let refineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
-    let refineMaxVolume = Int(ProcessInfo.processInfo.environment["LTX2_REFINE_MAX_VOL"] ?? "") ?? 12_000
+    let refineMaxVolume = resolvedConfig.refineMaxVol
     if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
       logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
       return upLatent
@@ -1455,7 +1460,7 @@ public final class LTX2Pipeline {
     // decouples this from the OUTPUT/playback fps (config.fps) so we can drive
     // motion from a sharp seed without making the mp4 choppy. Default: match
     // playback fps (temporally-correct). See QA-CAMPAIGN-2026-07-26 motion sweep.
-    let fps = Float(ProcessInfo.processInfo.environment["LTX2_COND_FPS"] ?? "") ?? Float(config.fps)
+    let fps = resolvedConfig.condFps ?? Float(config.fps)
     let totalF = latF + refFrames
     let numPatches = totalF * latH * latW
 

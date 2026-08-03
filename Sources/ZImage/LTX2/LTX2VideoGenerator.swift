@@ -554,7 +554,13 @@ public final class LTX2VideoGenerator {
 
         // One greppable line per render: every Tier A/B param + provenance
         // (task #9 Phase 1). Invalid resolutions log separately and LOUDLY.
-        let resolved = LTX2ConfigResolver.resolveEffective()
+        // Phase 2: the TYPED resolution is authoritative — refresh it onto
+        // the pipeline so render code reads it instead of raw env (Codex
+        // finding #14). Request/preset tuning joins in the wire-format
+        // increment; until then this resolves configFile > env > builtin.
+        let typedConfig = LTX2ConfigResolver.resolveTyped(request: nil, preset: nil)
+        pipeline.resolvedConfig = typedConfig
+        let resolved = typedConfig.params
         let summary = resolved.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
         logger.info("[LTX2] effective-config: \(summary)")
         for p in resolved where !p.valid {
@@ -612,7 +618,7 @@ public final class LTX2VideoGenerator {
         // comp30 chunk1 action-zone 6.11, chunks 2-3 crash to 2.2 because the
         // chained frame was uncompressed). Higher = more motion.
         let conditioningCompression = request.imgCompression
-            ?? Int(ProcessInfo.processInfo.environment["LTX2_I2V_COMPRESSION"] ?? "") ?? 35
+            ?? pipeline.resolvedConfig.imgCompression
 
         // Seed image: the init image for I2V, else nil (T2V first chunk).
         var currentImage: MLXArray? = try request.initImagePath.map { path in
@@ -692,7 +698,7 @@ public final class LTX2VideoGenerator {
         // Face-region anchor defaults 0.5 for i2v — with IC-control it locks the
         // FACE across the render (IC-control alone holds body/scene but the face
         // drifts). Only engages when an init image is present. LTX2_FACE_ANCHOR_STRENGTH=0 disables.
-        let faceAnchorStrength = Float(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_STRENGTH"] ?? "") ?? 0.5
+        let faceAnchorStrength = pipeline.resolvedConfig.faceAnchorStrength
         var faceAnchorMask: MLXArray? = nil
         if faceAnchorStrength > 0, let path = request.initImagePath,
            let isrc = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
