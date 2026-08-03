@@ -57,6 +57,7 @@ public final class LoRAWeightLoader {
         var lokrW2: [String: MLXArray] = [:]
         var moduleAlphas: [String: Float] = [:]
         var networkAlpha: Float?
+        var deltas: [String: DeltaPatch] = [:]
 
         for fileURL in safetensorFiles {
             let partial = try loadSafetensorFile(fileURL)
@@ -64,6 +65,7 @@ public final class LoRAWeightLoader {
             for (k, v) in partial.lokrW1 { lokrW1[k] = v }
             for (k, v) in partial.lokrW2 { lokrW2[k] = v }
             for (k, v) in partial.moduleAlphas { moduleAlphas[k] = v }
+            for (k, v) in partial.deltas { deltas[k] = v }
             if networkAlpha == nil { networkAlpha = partial.networkAlpha }
         }
 
@@ -87,8 +89,8 @@ public final class LoRAWeightLoader {
             }
         }
 
-        guard !loraWeights.isEmpty || !lokrWeights.isEmpty else {
-            throw LoRAError.invalidFormat("No valid LoRA weight pairs found. Expected keys with .lora_down/.lora_up, .lora_A/.lora_B, or LyCORIS LoKr (.lokr_w1/.lokr_w2).")
+        guard !loraWeights.isEmpty || !lokrWeights.isEmpty || !deltas.isEmpty else {
+            throw LoRAError.invalidFormat("No valid LoRA weights found. Expected keys with .lora_down/.lora_up, .lora_A/.lora_B, LyCORIS LoKr (.lokr_w1/.lokr_w2), or bare patches (.diff/.diff_b/.set_weight).")
         }
 
         let rank = inferRank(from: loraWeights)
@@ -99,7 +101,8 @@ public final class LoRAWeightLoader {
             lokrWeights: lokrWeights,
             rank: rank,
             alpha: alpha,
-            layerAlphas: layerAlphas
+            layerAlphas: layerAlphas,
+            deltas: deltas
         )
     }
 
@@ -162,6 +165,13 @@ public final class LoRAWeightLoader {
         }
     }
 
+    /// Bare suffix form used by the ComfyUI ecosystem (e.g. Kroma):
+    /// `...lora_A` / `...lora_B` with no trailing `.weight`.
+    private static let loraSuffixPatterns: [(down: String, up: String)] = [
+        (".lora_down", ".lora_up"),
+        (".lora_A", ".lora_B")
+    ]
+
     private static func resolveKeyPair(_ key: String) -> (downKey: String, upKey: String, baseKey: String)? {
         for (downPattern, upPattern) in loraPatterns {
             if key.contains(downPattern) {
@@ -172,6 +182,15 @@ public final class LoRAWeightLoader {
                 guard let base = extractBaseKey(key, pattern: upPattern) else { return nil }
                 let downKey = key.replacingOccurrences(of: upPattern, with: downPattern)
                 return (downKey, key, base)
+            }
+        }
+        for (downSuffix, upSuffix) in loraSuffixPatterns {
+            if key.hasSuffix(downSuffix) {
+                let base = stripKnownPrefixes(String(key.dropLast(downSuffix.count)))
+                return (key, String(key.dropLast(downSuffix.count)) + upSuffix, base)
+            } else if key.hasSuffix(upSuffix) {
+                let base = stripKnownPrefixes(String(key.dropLast(upSuffix.count)))
+                return (String(key.dropLast(upSuffix.count)) + downSuffix, key, base)
             }
         }
         return nil
@@ -259,20 +278,44 @@ public final class LoRAWeightLoader {
         let moduleAlphas: [String: Float]
         /// Adapter-wide alpha from `ss_network_alpha` file metadata, if any.
         let networkAlpha: Float?
+        /// Bare-parameter patches keyed by target parameter path.
+        let deltas: [String: DeltaPatch]
     }
+
+    /// Adapter features we recognise but deliberately do not support.
+    /// A file carrying one of these must FAIL to load with the feature named
+    /// (spec rev 2, Codex finding 6) — explicit refusal beats silently
+    /// applying a fraction of the adapter.
+    private static let unsupportedSuffixes: [(suffix: String, feature: String)] = [
+        (".dora_scale", "DoRA (dora_scale)"),
+        (".lora_mid.weight", "LoCon mid blocks (lora_mid)"),
+        (".w_norm", "norm-magnitude adapters (w_norm)"),
+        (".b_norm", "norm-magnitude adapters (b_norm)"),
+        (".reshape_weight", "weight reshaping (reshape_weight)"),
+    ]
+
+    /// Text-encoder halves of composite adapters: loadable transformer-side,
+    /// so their keys are skipped (reported via log, never fatal, never bound).
+    private static let outOfScopePrefixes = ["lora_te_", "text_encoder.", "te_"]
 
     private static func loadSafetensorFile(_ url: URL) throws -> PartialLoRAWeights {
         let reader = try SafeTensorsReader(fileURL: url)
         let keys = reader.tensorNames
 
-        var processedKeys = Set<String>()
+        var consumedKeys = Set<String>()
         var loraPairs: [String: (down: MLXArray, up: MLXArray)] = [:]
         var lokrW1: [String: MLXArray] = [:]
         var lokrW2: [String: MLXArray] = [:]
         var moduleAlphas: [String: Float] = [:]
+        var deltas: [String: DeltaPatch] = [:]
 
         for key in keys {
-            if processedKeys.contains(key) { continue }
+            if consumedKeys.contains(key) { continue }
+
+            // Known-but-unsupported features fail loudly, naming the feature.
+            if let match = unsupportedSuffixes.first(where: { key.hasSuffix($0.suffix) }) {
+                throw LoRAError.unsupportedFeature("\(match.feature) — key: \(key)")
+            }
 
             if let (moduleKey, suffix) = mapLoKrModuleKey(key) {
                 switch suffix {
@@ -286,29 +329,77 @@ public final class LoRAWeightLoader {
                         moduleAlphas[moduleKey] = value
                     }
                 }
+                consumedKeys.insert(key)
                 continue
             }
 
-            guard let (downKey, upKey, baseKey) = resolveKeyPair(key) else { continue }
-            guard reader.contains(downKey), reader.contains(upKey) else { continue }
+            // Bare-parameter patches (ComfyUI lora.py semantics). `.diff_b`
+            // maps onto the target's REAL bias parameter path.
+            if key.hasSuffix(".diff_b") {
+                let base = stripKnownPrefixes(String(key.dropLast(".diff_b".count)))
+                deltas[base + ".bias"] = .diffBias(try reader.tensor(named: key))
+                consumedKeys.insert(key)
+                continue
+            }
+            if key.hasSuffix(".diff") {
+                let base = stripKnownPrefixes(String(key.dropLast(".diff".count)))
+                deltas[base] = .diff(try reader.tensor(named: key))
+                consumedKeys.insert(key)
+                continue
+            }
+            if key.hasSuffix(".set_weight") {
+                let base = stripKnownPrefixes(String(key.dropLast(".set_weight".count)))
+                deltas[base] = .setWeight(try reader.tensor(named: key))
+                consumedKeys.insert(key)
+                continue
+            }
 
-            let downWeight = try reader.tensor(named: downKey)
-            let upWeight = try reader.tensor(named: upKey)
+            if let (downKey, upKey, baseKey) = resolveKeyPair(key) {
+                guard reader.contains(downKey), reader.contains(upKey) else {
+                    // Orphan half of a pair: a bindable key that can never
+                    // bind. Silent-skipping this is exactly the partial-
+                    // application family of bug.
+                    throw LoRAError.invalidFormat(
+                        "orphan LoRA pair half '\(key)' — counterpart missing")
+                }
 
-            let mappedKey = LoRAKeyMapper.mapToZImageKey(baseKey)
-            loraPairs[mappedKey] = (down: downWeight, up: upWeight)
+                let downWeight = try reader.tensor(named: downKey)
+                let upWeight = try reader.tensor(named: upKey)
 
-            processedKeys.insert(downKey)
-            processedKeys.insert(upKey)
+                let mappedKey = LoRAKeyMapper.mapToZImageKey(baseKey)
+                loraPairs[mappedKey] = (down: downWeight, up: upWeight)
+
+                consumedKeys.insert(downKey)
+                consumedKeys.insert(upKey)
+                continue
+            }
         }
+
+        // Classify the leftovers: out-of-scope prefixes are skipped
+        // non-fatally; anything else is an unknown key and a load ERROR so a
+        // partial application can never be silent (spec rev 2).
+        var unknown: [String] = []
+        for key in keys where !consumedKeys.contains(key) {
+            if outOfScopePrefixes.contains(where: { key.hasPrefix($0) }) { continue }
+            unknown.append(key)
+        }
+        guard unknown.isEmpty else { throw LoRAError.unknownKeys(unknown) }
 
         return PartialLoRAWeights(
             loraPairs: loraPairs,
             lokrW1: lokrW1,
             lokrW2: lokrW2,
             moduleAlphas: moduleAlphas,
-            networkAlpha: reader.fileMetadata["ss_network_alpha"].flatMap(Float.init)
+            networkAlpha: reader.fileMetadata["ss_network_alpha"].flatMap(Float.init),
+            deltas: deltas
         )
+    }
+
+    private static func stripKnownPrefixes(_ key: String) -> String {
+        for prefix in prefixesToRemove where key.hasPrefix(prefix) {
+            return String(key.dropFirst(prefix.count))
+        }
+        return key
     }
 
     private static func findSafetensorFiles(in directory: URL) throws -> [URL] {
@@ -427,14 +518,19 @@ public final class LoRAWeightLoader {
     let reader = try SafeTensorsReader(fileURL: url)
     let keys = reader.tensorNames
 
-    var processedKeys = Set<String>()
+    var consumedKeys = Set<String>()
     var loraPairs: [String: (down: MLXArray, up: MLXArray)] = [:]
     var lokrW1: [String: MLXArray] = [:]
     var lokrW2: [String: MLXArray] = [:]
     var moduleAlphas: [String: Float] = [:]
+    var deltas: [String: DeltaPatch] = [:]
 
     for key in keys {
-      if processedKeys.contains(key) { continue }
+      if consumedKeys.contains(key) { continue }
+
+      if let match = unsupportedSuffixes.first(where: { key.hasSuffix($0.suffix) }) {
+        throw LoRAError.unsupportedFeature("\(match.feature) — key: \(key)")
+      }
 
       if let (moduleKey, suffix) = mapKrea2LoKrModuleKey(key) {
         switch suffix {
@@ -448,21 +544,58 @@ public final class LoRAWeightLoader {
             moduleAlphas[moduleKey] = value
           }
         }
+        consumedKeys.insert(key)
         continue
       }
 
-      guard let (downKey, upKey, baseKey) = resolveKeyPair(key) else { continue }
-      guard reader.contains(downKey), reader.contains(upKey) else { continue }
+      // Bare-parameter patches — Kroma ships 159 of these on norm/modulation
+      // params. Keys match Krea2SingleStreamDiT paths after the
+      // `diffusion_model.` strip plus the same numeric-index remap the base
+      // weight loader uses (txtmlp.0 → txtmlp.norm0, tmlp.0 → tmlp.lin0, …).
+      if key.hasSuffix(".diff_b") {
+        let base = remapKrea2Base(String(key.dropLast(".diff_b".count)))
+        deltas[base + ".bias"] = .diffBias(try reader.tensor(named: key))
+        consumedKeys.insert(key)
+        continue
+      }
+      if key.hasSuffix(".diff") {
+        let base = remapKrea2Base(String(key.dropLast(".diff".count)))
+        deltas[base] = .diff(try reader.tensor(named: key))
+        consumedKeys.insert(key)
+        continue
+      }
+      if key.hasSuffix(".set_weight") {
+        let base = remapKrea2Base(String(key.dropLast(".set_weight".count)))
+        deltas[base] = .setWeight(try reader.tensor(named: key))
+        consumedKeys.insert(key)
+        continue
+      }
 
-      let downWeight = try reader.tensor(named: downKey)
-      let upWeight = try reader.tensor(named: upKey)
+      if let (downKey, upKey, baseKey) = resolveKeyPair(key) {
+        guard reader.contains(downKey), reader.contains(upKey) else {
+          throw LoRAError.invalidFormat(
+            "orphan LoRA pair half '\(key)' — counterpart missing")
+        }
 
-      processedKeys.insert(downKey)
-      processedKeys.insert(upKey)
+        let downWeight = try reader.tensor(named: downKey)
+        let upWeight = try reader.tensor(named: upKey)
 
-      let targetKey = baseKey.hasSuffix(".weight") ? baseKey : baseKey + ".weight"
-      loraPairs[targetKey] = (down: downWeight, up: upWeight)
+        consumedKeys.insert(downKey)
+        consumedKeys.insert(upKey)
+
+        let mappedBase = remapKrea2Base(baseKey)
+        let targetKey = mappedBase.hasSuffix(".weight") ? mappedBase : mappedBase + ".weight"
+        loraPairs[targetKey] = (down: downWeight, up: upWeight)
+        continue
+      }
     }
+
+    var unknown: [String] = []
+    for key in keys where !consumedKeys.contains(key) {
+      if outOfScopePrefixes.contains(where: { key.hasPrefix($0) }) { continue }
+      unknown.append(key)
+    }
+    guard unknown.isEmpty else { throw LoRAError.unknownKeys(unknown) }
 
     var lokrWeights: [String: LoKrWeights] = [:]
     lokrWeights.reserveCapacity(min(lokrW1.count, lokrW2.count))
@@ -471,18 +604,29 @@ public final class LoRAWeightLoader {
       lokrWeights[key] = LoKrWeights(w1: w1, w2: w2, alpha: moduleAlphas[key])
     }
 
-    guard !loraPairs.isEmpty || !lokrWeights.isEmpty else {
+    guard !loraPairs.isEmpty || !lokrWeights.isEmpty || !deltas.isEmpty else {
       throw LoRAError.invalidFormat(
-        "No valid Krea-2 LoRA weight pairs found in \(url.lastPathComponent). " +
+        "No valid Krea-2 LoRA weights found in \(url.lastPathComponent). " +
         "Expected keys matching diffusion_model.blocks.<n>.<attn|mlp>.<proj> patterns, " +
-        "or LyCORIS LoKr (.lokr_w1/.lokr_w2)."
+        "LyCORIS LoKr (.lokr_w1/.lokr_w2), or bare patches (.diff/.diff_b/.set_weight)."
       )
     }
 
     let rank = inferRank(from: loraPairs)
     let alpha = loadAlpha(from: url.deletingLastPathComponent())
 
-    return LoRAWeights(weights: loraPairs, lokrWeights: lokrWeights, rank: rank, alpha: alpha)
+    return LoRAWeights(
+      weights: loraPairs, lokrWeights: lokrWeights, rank: rank, alpha: alpha,
+      deltas: deltas)
+  }
+
+  /// Strip the `diffusion_model.` prefix and apply the SAME numeric-index
+  /// remap the base weight loader uses (`Krea2WeightLoader.mapTransformerKey`)
+  /// so LoRA targets land on the real Swift module paths — without this,
+  /// `tmlp.0` / `tproj.1` / `txtmlp.{0,1,3}` keys bind nothing.
+  private static func remapKrea2Base(_ raw: String) -> String {
+    let stripped = stripKnownPrefixes(raw)
+    return String(Krea2WeightLoader.mapTransformerKey(stripped + ".").dropLast())
   }
 
   /// Krea-2 analogue of ``mapLoKrModuleKey(_:)``: strips the `diffusion_model.`

@@ -132,6 +132,11 @@ public final class Krea2Pipeline {
   /// Currently applied LoRA configurations (for hot-swap tracking).
   private var appliedLoRAs: [LoRAConfiguration] = []
 
+  /// Bare-parameter patch state (.diff/.diff_b/.set_weight — e.g. Kroma's 159
+  /// norm/modulation deltas). Instance-scoped by construction: owns detached
+  /// first-write-wins snapshots for this transformer only, restored on clear.
+  private lazy var patchSession = LoRAPatchSession(module: transformer)
+
   /// Public accessor for currently loaded LoRA configurations.
   public var loadedLoRAConfigs: [LoRAConfiguration] { appliedLoRAs }
 
@@ -198,18 +203,33 @@ public final class Krea2Pipeline {
   ///
   /// - Parameter configs: LoRA configurations to apply. Pass an empty array to clear all LoRAs.
   public func loadLoRAs(_ configs: [LoRAConfiguration]) async throws {
-    if !appliedLoRAs.isEmpty {
+    if !appliedLoRAs.isEmpty || patchSession.isActive {
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      patchSession.clear()
       appliedLoRAs = []
     }
 
     guard !configs.isEmpty else { return }
 
-    for config in configs {
-      let url = try await LoRAWeightLoader.resolveSource(config.source)
-      let weights = try LoRAWeightLoader.loadForKrea2(from: url)
-      logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), scale=\(config.scale))")
-      LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
+    // Load and preflight-able failures (missing file, bad format, unknown
+    // keys) all surface from loadForKrea2 BEFORE any weight mutation for
+    // that config. If a later config fails after earlier ones applied, roll
+    // the whole stack back so applied weights and `appliedLoRAs` can never
+    // disagree (delta-key spec rev 2, Codex finding 2).
+    do {
+      for config in configs {
+        let url = try await LoRAWeightLoader.resolveSource(config.source)
+        let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+        logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale))")
+        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
+        try patchSession.apply(weights: weights, scale: config.scale)
+      }
+    } catch {
+      logger.error("Krea-2 LoRA stack failed mid-apply — rolling back to base: \(error)")
+      LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      patchSession.clear()
+      appliedLoRAs = []
+      throw error
     }
 
     appliedLoRAs = configs
@@ -236,10 +256,25 @@ public final class Krea2Pipeline {
     // empties every dynamic adapter (identity + any stale control) but leaves the
     // module wrappers in place, so an empty stack behaves exactly like the base.
     LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
-    for cfg in appliedLoRAs {
-      let src = try await LoRAWeightLoader.resolveSource(cfg.source)
-      let weights = try LoRAWeightLoader.loadForKrea2(from: src)
-      LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: cfg.scale, logger: logger)
+    patchSession.clear()
+    do {
+      for cfg in appliedLoRAs {
+        let src = try await LoRAWeightLoader.resolveSource(cfg.source)
+        let weights = try LoRAWeightLoader.loadForKrea2(from: src)
+        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: cfg.scale, logger: logger)
+        try patchSession.apply(weights: weights, scale: cfg.scale)
+      }
+    } catch {
+      // Same transactional posture as loadLoRAs: never leave weights and
+      // tracking in disagreement (control state included).
+      logger.error("identity-stack reapply failed — rolling back to base: \(error)")
+      LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      patchSession.clear()
+      appliedLoRAs = []
+      transformer.controlFirstWeight = nil
+      transformer.controlFirstBias = nil
+      controlLoRAActive = false
+      throw error
     }
 
     guard let url else {
