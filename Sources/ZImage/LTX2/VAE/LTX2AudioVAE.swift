@@ -308,6 +308,9 @@ public final class LTX2AudioVAE: Module {
 
   public let config: LTX2AudioVAEConfig
 
+  /// Bound by `load(path:)` for full-chain decode; nil for VAE-only use.
+  public var vocoder: LTX2Vocoder?
+
   public init(config: LTX2AudioVAEConfig = LTX2AudioVAEConfig()) {
     self.config = config
     self._encoder.wrappedValue = LTX2AudioEncoder(config: config)
@@ -409,14 +412,32 @@ extension LTX2AudioVAE {
 // MARK: - Reference-layout codec APIs (task #21 parity)
 
 extension LTX2AudioVAE {
-  /// Load the standalone reference checkpoint (audio_vae.* + vocoder.* keys)
-  /// and bind the VAE half with the anti-silence coverage guard.
+  /// Load the standalone reference checkpoint (audio_vae.* + vocoder.* keys):
+  /// binds the VAE half AND the vocoder chain, both coverage-guarded.
   public static func load(path: String, logger: Logger = Logger(label: "ltx2.audio-vae")) throws -> LTX2AudioVAE {
-    let tensors = try MLX.loadArrays(url: URL(fileURLWithPath: path))
+    let tensors = try MLX.loadArrays(url: URL(fileURLWithPath: path)).mapValues { $0.asType(.float32) }
     let vae = LTX2AudioVAE()
-    try vae.loadWeightsFromTensors(tensors: tensors.mapValues { $0.asType(.float32) }, logger: logger)
+    try vae.loadWeightsFromTensors(tensors: tensors, logger: logger)
+    let voc = LTX2Vocoder()
+    try voc.loadWeightsFromTensors(tensors: tensors, logger: logger)
+    vae.vocoder = voc
     eval(vae.parameters())
+    eval(voc.parameters())
     return vae
+  }
+
+  /// Full reference decode: normalized latent (B,C,T,F) → mel → base vocoder
+  /// → BWE → 48 kHz stereo waveform (B, 2, samples). Mirrors
+  /// AudioVAE.decode + run_vocoder: mel (B,2,T,F) transposes to (B,2,F,T),
+  /// stereo-folds to [B,128,T], then the full BWE chain.
+  public func decodeToWaveform(_ zNormalized: MLXArray) -> MLXArray {
+    guard let vocoder else {
+      fatalError("decodeToWaveform requires load(path:) — vocoder not bound")
+    }
+    let mel = decodeToMel(zNormalized)                 // (B, 2, T, F)
+    let bft = mel.transposed(0, 1, 3, 2)               // (B, 2, F, T)
+    let folded = MLX.concatenated([bft[0..., 0], bft[0..., 1]], axis: 1)  // [B, 128, T]
+    return vocoder.synthesizeFull(folded)
   }
 
   /// Per-channel latent denormalization: `z * std + mean` where the 128-long

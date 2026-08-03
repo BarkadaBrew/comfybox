@@ -69,13 +69,12 @@ final class LTX2AudioCodecParityTests: XCTestCase {
   }
 
   func testFullChainProducesFortyEightKStereo() throws {
-    throw XCTSkip("BWE chain pending: UpSample1d (3x hann) + synthesizeFull not yet implemented — tests 1-3 gate the VAE half; this gates the vocoder half")
     try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath),
       "reference audio VAE weights not on this machine")
     let g = try goldens()
     let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
 
-    let wav = MLXArray.zeros([1, 2, 60000])  // placeholder past unreachable skip
+    let wav = vae.decodeToWaveform(g["z_normalized"]!)
     XCTAssertEqual(wav.shape, [1, 2, 60000],
       "run_vocoder chain = base 16k + BWE + 3x resample -> 48kHz stereo")
     // Waveform parity is looser (long accumulation): assert correlation, not
