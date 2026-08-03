@@ -56,6 +56,31 @@ Every scheduled asset is an instance of a declared MediaType:
 - The ledger is persisted (survives daemon restarts; the orphan-reconciler
   pattern applies).
 
+### Interactive windows — the responsiveness reserve (Todd, 2026-08-03)
+
+> As a User, I want to ask the Muse a question and have it answer within a
+> reasonable period of time.
+> **AC:** Muse responds when GPU avails; the scheduler leaves windows of
+> opportunity for responses.
+
+The packer never fills a slot wall-to-wall. Rules:
+
+- `capacitySec = cycleLength − overheadReserve − interactiveReserve`.
+- The interactive reserve is distributed as **windows**, not one lump: a
+  configurable cap on CONTIGUOUS GPU occupancy (default: no more than ~10
+  consecutive minutes of scheduled rendering without a gap ≥ one typical
+  chat-render, ~3 min). Long renders (dream.vignette at 12s ≈ 5–6 min) are
+  scheduled so a window follows them.
+- Direct chat/muse asks consume the interactive reserve via the existing
+  fast lane — they do NOT debit the slot's content budget (Q2: resolved).
+  Worst-case wait for a chat media reply = the remaining runtime of the
+  current job, bounded by the contiguous-occupancy cap.
+- Idle windows may be backfilled ONLY by a task that provably fits before
+  the window's end (a short image), else the GPU rests — an empty window is
+  the feature, not waste.
+- Text-only muse replies are unaffected (LLM path, no render GPU); this
+  reserve is about MEDIA responses.
+
 ### Queue visibility — the execution surface (Todd's #3)
 - The engine ALREADY has queue management server-side (pause/resume/reorder,
   source attribution) and the desktop has a Queue tab — but stacked/pending
@@ -92,8 +117,9 @@ looping short; dream.vignette as a full post.
 1. Slot templates per tier window — who authors the starting set? (Propose:
    I derive from current behavior — 4 images + 1–2 videos per 30min — and
    you edit in the tab.)
-2. Should direct chat asks consume the slot budget (honest accounting) or
-   ride free as today?
+2. ~~Direct chat asks~~ RESOLVED 2026-08-03: they consume the interactive
+   reserve (windows between reservations), never the content budget; the
+   contiguous-occupancy cap bounds worst-case response latency.
 3. Backlog aging: does a pushed reservation expire after N slots, or
    persist until rendered?
 4. portrait.animated vs animation.action selection: planner-scheduled
