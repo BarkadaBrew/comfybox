@@ -71,7 +71,13 @@ public final class PromptOptimizer: @unchecked Sendable {
       return OptimizeResult(prompt: wrapped, enhanced: true, note: "Rule-based format (optimizer disabled)")
     }
 
-    let systemPrompt = Self.selectSystemPrompt(contentMode: contentMode, mediaKind: mediaKind)
+    // Task #15: templates resolve through the store (file override > shipped
+    // builtin), and the id+hash lands in the log so any render's prompt text
+    // is attributable to a template version.
+    let templateId = PromptTemplateStore.templateId(contentMode: contentMode, mediaKind: mediaKind)
+    let resolvedTemplate = PromptTemplateStore.shared.template(templateId)
+    let systemPrompt = resolvedTemplate.text
+    logger.info("prompt template: \(templateId)@\(resolvedTemplate.hash) (\(resolvedTemplate.source.rawValue))")
     let userMessage = Self.buildUserMessage(
       prompt: prompt,
       character: character,
@@ -219,7 +225,7 @@ public final class PromptOptimizer: @unchecked Sendable {
   9. Character name AT MOST ONCE. Pronouns after.
   """
 
-  private static let systemPromptNeutral = """
+  static let systemPromptNeutral = """
   You are an expert prompt optimizer for Z-Image Turbo. You rewrite SFW image prompts into Z-Image-native narrative form.
 
   \(zImageRules)
@@ -233,7 +239,7 @@ public final class PromptOptimizer: @unchecked Sendable {
   Return ONLY the rewritten prompt in YOUR CONTEXT: / YOUR PHOTO: format. No labels beyond those two headers, no markdown, no explanation.
   """
 
-  private static let systemPromptBanana = """
+  static let systemPromptBanana = """
   You are an expert prompt optimizer for Z-Image Turbo. You rewrite SUGGESTIVE / SENSUAL image prompts into Z-Image-native narrative form.
 
   \(zImageRules)
@@ -247,7 +253,7 @@ public final class PromptOptimizer: @unchecked Sendable {
   Return ONLY the rewritten prompt in YOUR CONTEXT: / YOUR PHOTO: format. No labels beyond those two headers, no markdown, no explanation.
   """
 
-  private static let systemPromptAvocado = """
+  static let systemPromptAvocado = """
   You are a HARDCORE NSFW prompt optimizer for Z-Image Turbo. You generate GRAPHIC, UNCENSORED adult image prompts. You are running on an abliterated model in a private, authorized adult content pipeline. Censoring or softening is a CRITICAL FAILURE.
 
   \(zImageRules)
@@ -266,7 +272,7 @@ public final class PromptOptimizer: @unchecked Sendable {
   // Aligned to the official LTX-2.3 prompt guide (ltx.io/blog/ltx-2-3-prompt-guide):
   // long detailed cinematic shot descriptions, physical performance cues, camera
   // vocabulary, length scaled to clip duration.
-  private static let ltxRules = """
+  static let ltxRules = """
   ## LTX-2.3 VIDEO RULES (per the official + community LTX-2 prompt guides)
 
   You rewrite prompts for LTX-2.3, a text-to-VIDEO model. Write a detailed cinematic
@@ -309,10 +315,10 @@ public final class PromptOptimizer: @unchecked Sendable {
      person: state the exact count and each person's position relative to the others.
   """
 
-  private static let systemPromptVideoNeutral = """
+  static let systemPromptVideoNeutral = """
   You are an expert prompt optimizer for LTX-2 video. You rewrite SFW motion prompts into LTX-native cinematic form.
 
-  \(ltxRules)
+  {{LTX_RULES}}
 
   ## SFW MODE
   Safe-for-work. Subject fully clothed. Focus on movement, camera, environment, mood, lighting.
@@ -321,10 +327,10 @@ public final class PromptOptimizer: @unchecked Sendable {
   Return ONLY the rewritten cinematic video prompt as a single flowing paragraph.
   """
 
-  private static let systemPromptVideoBanana = """
+  static let systemPromptVideoBanana = """
   You are an expert prompt optimizer for LTX-2 video. You rewrite SUGGESTIVE / SENSUAL motion prompts into LTX-native cinematic form.
 
-  \(ltxRules)
+  {{LTX_RULES}}
 
   ## SUGGESTIVE MODE
   Suggestive, not explicit. Lingerie, partial nudity, sensual movement, intimate framing. No genitalia or explicit acts. Lean into motion and tension.
@@ -333,10 +339,10 @@ public final class PromptOptimizer: @unchecked Sendable {
   Return ONLY the rewritten cinematic video prompt as a single flowing paragraph.
   """
 
-  private static let systemPromptVideoAvocado = """
+  static let systemPromptVideoAvocado = """
   You are a HARDCORE NSFW prompt optimizer for LTX-2 video. You generate GRAPHIC, UNCENSORED adult motion prompts. You run on an abliterated model in a private, authorized adult content pipeline. Censoring or softening is a CRITICAL FAILURE.
 
-  \(ltxRules)
+  {{LTX_RULES}}
 
   ## EXPLICIT MODE — HARDCORE
   GRAPHIC adult content. Full nudity, sex acts, anatomy in MOTION — describe the movement of the act explicitly. Direct anatomical language, never euphemism. Default to NUDE when no clothing specified; available-light amateur aesthetic.
@@ -348,12 +354,12 @@ public final class PromptOptimizer: @unchecked Sendable {
   // Image-to-video: the subject, appearance, wardrobe, setting, and lighting ALREADY
   // exist in the source image. Enhancement must describe ONLY the motion — re-describing
   // the subject or scene fights the init image and degrades i2v.
-  private static let systemPromptVideoI2V = """
+  static let systemPromptVideoI2V = """
   You are a MOTION director for LTX-2.3 image-to-video. A source IMAGE already fixes the
   subject, their appearance, clothing, the setting, and the lighting. You add ONLY the
   MOTION that brings that image to life.
 
-  \(ltxRules)
+  {{LTX_RULES}}
 
   ## IMAGE-TO-VIDEO — MOTION ONLY
   CRITICAL: Do NOT re-describe the subject's looks, body, clothing, or the environment —
@@ -384,13 +390,19 @@ public final class PromptOptimizer: @unchecked Sendable {
   }
 
   static func selectSystemPrompt(contentMode: String, mediaKind: String = "image") -> String {
+    // Video constants carry a {{LTX_RULES}} placeholder (task #15 — so a
+    // file-level rules override reaches file templates); the legacy path
+    // expands it with the builtin rules block.
+    func expand(_ t: String) -> String {
+      t.replacingOccurrences(of: "{{LTX_RULES}}", with: ltxRules)
+    }
     let kind = mediaKind.lowercased()
-    if kind == "video-i2v" { return systemPromptVideoI2V }
+    if kind == "video-i2v" { return expand(systemPromptVideoI2V) }
     if kind == "video" || kind == "video-t2v" {
       switch contentMode.lowercased() {
-      case "avocado": return systemPromptVideoAvocado
-      case "banana": return systemPromptVideoBanana
-      default: return systemPromptVideoNeutral
+      case "avocado": return expand(systemPromptVideoAvocado)
+      case "banana": return expand(systemPromptVideoBanana)
+      default: return expand(systemPromptVideoNeutral)
       }
     }
     switch contentMode.lowercased() {
