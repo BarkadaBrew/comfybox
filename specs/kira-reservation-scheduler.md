@@ -81,6 +81,25 @@ The packer never fills a slot wall-to-wall. Rules:
 - Text-only muse replies are unaffected (LLM path, no render GPU); this
   reserve is about MEDIA responses.
 
+### Priority: on-demand bumps scheduled (Todd, 2026-08-03)
+
+> On-demand requests from User or Muse should bump queue.
+
+Two priority classes, strictly ordered:
+
+- **INTERACTIVE** — User asks (Telegram/chat/desktop) AND Muse-initiated
+  on-demand work (her suggestion-box picks, in-conversation renders).
+- **SCHEDULED** — the slot plan's reservations.
+
+Bump semantics: an INTERACTIVE job enters at the FRONT of the engine queue
+(the server's reorder capability, which already exists, becomes the
+mechanism); queued SCHEDULED jobs slide back and the ledger re-fits — spilled
+reservations go to the backlog per fit-or-push. The RUNNING job is never
+killed (renders aren't resumable): worst-case interactive wait stays
+bounded by the contiguous-occupancy cap. Combined with the cognition lease,
+this gives: text answers ≤ one denoise step; media answers ≤ current job's
+remainder; scheduled content never starves interactivity, only defers to it.
+
 ### Shared-GPU contention — cognition vs generation (Todd, 2026-08-03)
 
 > Problem: GPU is a shared resource for LLM and Gen models. Turn responses
