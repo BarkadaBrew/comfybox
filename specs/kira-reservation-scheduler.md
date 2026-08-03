@@ -17,6 +17,35 @@
    Application there doesn't seem to be a manageable queue — just the
    current job."
 
+## 1.5 Programming model: broadcast, not batch (Todd, 2026-08-03)
+
+> "This is like programming a TV station or an ad delivery engine. The
+> optimization is to keep it LOSSY — most of the media is generated just in
+> time, or scheduled if pre-rendered, while still managing to be reasonably
+> responsive to the User in chat. The Muse has several objective functions
+> for delivery with competing ends."
+
+Design consequences:
+
+- **Lossy by design.** A slot that doesn't fill is dead air, not debt. The
+  backlog is a SHORT grace window, not a work queue: pushed reservations
+  expire after ~1–2 slots (this largely answers §5 Q3) because stale muse
+  content isn't worth rendering later — JIT regeneration from CURRENT muse/
+  arc/conversation state beats replaying an old plan.
+- **JIT-first.** Content decisions (prompt, subject, type selection) happen
+  as close to render time as possible — the slot plan reserves CAPACITY by
+  type; the CONTENT is chosen at execution using live state. Pre-rendered
+  assets (e.g. a film-stream backlog, suggestion-box picks) are the
+  exception and get explicit scheduled slots.
+- **Competing objective functions, satisficed not optimized:** freshness/
+  relevance to muse state · tier stream fill rate · interactive latency
+  (the contract above) · per-type quality (trace ratings) · GPU utilization.
+  The planner uses fixed priority for the hard constraint (interactivity)
+  and weights for the rest — weights in config, visible in the ledger so
+  "why did she render this" is answerable.
+- The Queue's Reserved stratum therefore shows TYPED capacity holds
+  ("dream.vignette @ :15"), not finalized content — like a program guide.
+
 ## 2. Concept model
 
 ### MediaType — the qualifiable unit
