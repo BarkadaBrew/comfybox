@@ -115,7 +115,7 @@ vision/captioning (the planned VLM provider), embeddings, face detection,
 future audio models. The governor is therefore generic: every GPU consumer
 declares a class — `render` (long-occupancy, pausable at step boundaries)
 vs `inference` (short-burst, latency-sensitive: LLM turns, VLM captioning,
-embeddings). Leases are the inference class's admission ticket; nothing is
+embeddings, PROMPT OPTIMIZATION). Leases are the inference class's admission ticket; nothing is
 special-cased to "the chat LLM".
 
 1. **Inference lease (engine governor) — the real fix.** Renders are step
@@ -124,7 +124,11 @@ special-cased to "the chat LLM".
    render PAUSE AT THE NEXT STEP BOUNDARY and resume on release/expiry.
    Bounded token latency = one denoise step (2–30s at production configs) +
    LLM burst. The daemon takes a lease before any inference-class call during
-   active renders (LLM turn, VLM caption pass, embedding batch); leases are metered so renders still finish (max N leases
+   active renders (LLM turn, VLM caption pass, embedding batch, prompt
+   optimization). Note the coupling: every scheduled render is PRECEDED by
+   an optimizer call, so the planner front-loads a slot's optimizer passes
+   into the opening window (batch-optimize, then render) instead of
+   interleaving each optimize against the previous item's render; leases are metered so renders still finish (max N leases
    per render, else the render's own SLA dies).
 2. **Scheduler windows (already spec'd)** handle the render-class
    interactive asks; they also lower the PROBABILITY of collision for
