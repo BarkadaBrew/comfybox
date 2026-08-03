@@ -2091,7 +2091,11 @@ public final class WarmServer {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
       let status = videoJobTracker.submit(
-        source: prep.source, mode: prep.mode, coordinator: coordinator
+        source: prep.source, mode: prep.mode, coordinator: coordinator,
+        // Snapshot at SUBMIT time (finding #15): the authoritative resolution
+        // this render will use, durable on the job status.
+        resolvedConfig: LTX2ConfigResolver.resolveTyped(
+          request: prep.request.tuning, preset: prep.request.presetTuning).params
       ) { report in
         try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
@@ -4029,6 +4033,8 @@ private final class LocalVideoJob: @unchecked Sendable {
   var error: String?
   var progressPercent: Int?
   var completedAt: Date?
+  /// Authoritative config snapshot, set at submit (finding #15).
+  var resolvedConfig: [LTX2ResolvedParam]?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -4053,6 +4059,7 @@ private final class LocalVideoJob: @unchecked Sendable {
       error: error,
       elapsedMs: elapsedMs,
       progressPercent: progressPercent,
+      resolvedConfig: resolvedConfig,
       frameCount: frameCount
     )
   }
@@ -4078,9 +4085,13 @@ final class VideoJobTracker: @unchecked Sendable {
   /// Create a tracked job in `.queued` and return (jobId, its status). Testable
   /// without a coordinator.
   @discardableResult
-  func register(source: String, mode: VideoMode) -> (jobId: String, status: VideoJobStatus) {
+  func register(
+    source: String, mode: VideoMode,
+    resolvedConfig: [LTX2ResolvedParam]? = nil
+  ) -> (jobId: String, status: VideoJobStatus) {
     let jobId = UUID().uuidString
     let job = LocalVideoJob(id: jobId, source: source, mode: mode)
+    job.resolvedConfig = resolvedConfig
     lock.lock(); jobs[jobId] = job; lock.unlock()
     return (jobId, job.toStatus())
   }
@@ -4094,9 +4105,10 @@ final class VideoJobTracker: @unchecked Sendable {
     source: String,
     mode: VideoMode,
     coordinator: WarmServerCoordinator,
+    resolvedConfig: [LTX2ResolvedParam]? = nil,
     render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
   ) -> VideoJobStatus {
-    let (jobId, queued) = register(source: source, mode: mode)
+    let (jobId, queued) = register(source: source, mode: mode, resolvedConfig: resolvedConfig)
     Task { [weak self] in
       guard let self else { return }
       self.markProcessing(jobId)

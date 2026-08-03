@@ -213,6 +213,10 @@ public struct VideoJobStatus: Codable, Sendable {
   /// local LTX-2 backend (which streams a per-chunk/per-step callback); nil for
   /// the Replicate cloud path, which doesn't expose fine-grained progress.
   public let progressPercent: Int?
+  /// Snapshot of the authoritative per-render config taken at SUBMIT time
+  /// (task #9 / Codex finding #15) — what THIS render resolved, with
+  /// provenance. Durable in the trace; jobs themselves prune after 1h.
+  public let resolvedConfig: [LTX2ResolvedParam]?
 
   /// Number of frames written (set on success). Populated by the local LTX-2
   /// backend; nil for the cloud path (which reports duration, not frame count).
@@ -233,6 +237,7 @@ public struct VideoJobStatus: Codable, Sendable {
     elapsedMs: Int? = nil,
     replicatePredictionId: String? = nil,
     progressPercent: Int? = nil,
+    resolvedConfig: [LTX2ResolvedParam]? = nil,
     frameCount: Int? = nil
   ) {
     self.jobId = jobId
@@ -249,6 +254,7 @@ public struct VideoJobStatus: Codable, Sendable {
     self.elapsedMs = elapsedMs
     self.replicatePredictionId = replicatePredictionId
     self.progressPercent = progressPercent
+    self.resolvedConfig = resolvedConfig
     self.frameCount = frameCount
   }
 }
