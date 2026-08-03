@@ -30,15 +30,16 @@ One user (Todd), three jobs:
 
 ## 3. Product phases
 
-### P0 — usable this week (mflux CLI + optimizer template)
-- `image-design-json` template in the PromptTemplateStore: teaches the
-  local LLM to emit valid V4 JSON captions from a plain brief, including
-  the **empty-region rule** learned in eval (unspecified space grows
-  pseudo-text — describe every region, "plain background, no text").
-- A `coffeeshop-design` shell alias wrapping `mflux-generate-ideogram4`
-  (mirrors the existing `coffeeshop` alias pattern).
-- `mflux-save -q 8` bake to shrink the 36.5GB working set; measure.
-- **Not integrated with the server/Gallery yet** — P0 is a power tool.
+### P0 — port preparation (no user-facing surface)
+**Doctrine (Todd 2026-08-03): ComfyUI and mflux are VALIDATION TOOLS ONLY —
+oracles and eval rigs, never a serving path, never a stopgap.** Ideogram
+renders for real use wait for the native port. P0 is therefore prep:
+- `image-design-json` template in the PromptTemplateStore (engine-native,
+  useful from P1 day one): local LLM emits valid V4 JSON captions from a
+  plain brief, including the **empty-region rule** learned in eval
+  (unspecified space grows pseudo-text — describe every region).
+- `mflux-save -q 8` bake + a small mflux golden-tensor eval — measurements
+  and oracle fixtures for the port, not a usage path.
 
 ### P1 — native (the Swift-MLX port, ~1 week)
 - Port from mflux's Python-MLX (`src/mflux/models/ideogram4/`), structural
