@@ -88,6 +88,25 @@ implies:
 - The `ideogram-design` preset defaults to QUALITY speed and a design-biased
   V4StyleDescription.
 
+## 2.6 Lane A eval result (2026-08-03 — PASSED, Lane B earned)
+
+First local render (fp8, mflux, M3 Max): art-deco COFFEE SHOP poster,
+1024x1536, V4_DEFAULT_20.
+
+- **Typography: flawless.** Both requested text elements rendered exactly —
+  display lettering with inline highlights, caption-size serif, bbox
+  placement honored, style description followed (sunburst, corner motifs,
+  letterpress texture). Capability no local model in the house matches.
+- **Failure mode observed:** hallucinated pseudo-text ("K OMF SPOM") in an
+  UNSPECIFIED empty region. Standing rule for the `image-design-json`
+  optimizer template: describe empty regions explicitly ("plain background,
+  no text") — unspecified space gets filled. (Same family as the LTX
+  anatomy-grounding rule.)
+- **Numbers:** 20 steps in 11:06 (28→47 s/step, degrading with memory
+  pressure), peak MLX memory 36.5GB. Cannot coexist with the warm server's
+  LTX renders unmanaged — the admission-gate problem, properly solved by the
+  Lane B port. Interim: try `mflux-save -q 8` for a smaller working set.
+
 ## 3. Non-goals
 
 ANY hosted-API integration (Todd 2026-08-03: explicitly rejected — this is
