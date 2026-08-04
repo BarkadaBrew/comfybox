@@ -137,3 +137,16 @@ served from the warm server with traces/Gallery/preset integration free.
   drift.
 
 Sources: [developer.ideogram.ai generate-v4](https://developer.ideogram.ai/api-reference/api-reference/generate-v4) · [HF ideogram-4-nf4](https://huggingface.co/ideogram-ai/ideogram-4-nf4) · [Ideogram API overview](https://developer.ideogram.ai/ideogram-api/api-overview)
+
+## Isolation requirement (Todd 2026-08-04, confirmed)
+
+Ideogram gets its OWN prompt optimization and LoRA management, separate
+from all other lanes — architectural necessity, not preference:
+- Prompt path: structured JSON captions (bbox/exact-copy/empty-region),
+  dedicated image-design-json template + design-only optimizer path
+  (shipped in P0), own exemplar set when the feedback loop lands. No
+  prose-lane vocabulary or wrappers may leak in.
+- LoRAs: new library family tag; picker filters HARD on family
+  compatibility (dual-DiT + Qwen3-VL + Flux2 VAE — Z-Image/Krea2/LTX
+  LoRAs incompatible at tensor level); separate preset stacks; separate
+  Models-tab grouping.
