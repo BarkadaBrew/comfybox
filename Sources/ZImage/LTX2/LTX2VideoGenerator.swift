@@ -271,18 +271,21 @@ public final class LTX2VideoGenerator {
             throw LTX2VideoError.invalidFrameCount(request.framesPerChunk)
         }
         if request.audio {
-            // v1 audio scope is single-chunk T2V. Silently downgrading (the
+            // Audio scope: single-chunk T2V and I2V. Silently downgrading (the
             // first cut) shipped MP4s whose audio stopped after chunk 0 or
-            // never existed — reject loudly instead (Codex 2026-08-04 #4).
-            if request.initImagePath != nil {
-                throw LTX2VideoError.audioUnsupported("audio is not yet supported for I2V renders (v1 is T2V-only)")
-            }
+            // never existed — reject unsupported shapes loudly instead
+            // (Codex 2026-08-04 #4).
             let plan = Self.chunkPlan(
                 framesPerChunk: request.framesPerChunk,
                 extendToSeconds: request.extendToSeconds, fps: request.fps)
             if plan.totalChunks > 1 {
                 throw LTX2VideoError.audioUnsupported(
                     "audio is not yet supported for chunked renders (\(plan.totalChunks) chunks requested; keep duration within one \(request.framesPerChunk)-frame chunk)")
+            }
+            if request.identityAnchorStrength > 0, request.identityReAnchorInterval > 0,
+               request.framesPerChunk > request.identityReAnchorInterval + 1 {
+                throw LTX2VideoError.audioUnsupported(
+                    "audio is not yet supported with mid-pass identity re-anchoring (multi-keyframe path)")
             }
         }
         guard Self.areValidDimensions(width: request.width, height: request.height) else {
@@ -919,6 +922,8 @@ public final class LTX2VideoGenerator {
                         faceAnchorMask: chunk == 0 ? faceAnchorMask : nil,
                         faceAnchorStrength: faceAnchorStrength,
                         refineAnchorImage: chunk == 0 ? refineAnchorImage : nil,
+                        audioSeconds: wantAudio && chunk == 0
+                            ? Float(request.framesPerChunk) / Float(request.fps) : nil,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 }
             } else {

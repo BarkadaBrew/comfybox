@@ -559,12 +559,6 @@ public final class LTX2Pipeline {
     precondition((numFrames - 1) % 8 == 0, "numFrames must be 1 + 8k (got \(numFrames))")
 
     logger.info("I2V generation: \(width)x\(height), \(numFrames) frames, strength=\(strength)")
-    if audioSeconds != nil {
-      // Audio embeddings are encoded below; the i2v audio denoise stream
-      // (per-token av_ca video timesteps) lands after the t2v path is
-      // e2e-validated — see specs/ltx2-audio.md wire-4 open items.
-      logger.warning("I2V audio requested — audio stream not yet wired on the i2v path (t2v first); rendering video-only.")
-    }
 
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
@@ -690,6 +684,26 @@ public final class LTX2Pipeline {
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
+    // Step 5b: Audio stream (task #21 i2v). Same setup as t2v; the per-token
+    // av_ca video conditioning inside callAV handles the i2v denoise mask
+    // (conditioned tokens at ~0). Cross PEs use the FULL positions grid incl.
+    // IC-control ref frames (they sit at t=0s, matching their video PE).
+    var avState: LTX2AVDenoiseState? = nil
+    if let seconds = audioSeconds, wantAudio {
+      let ta = max(1, Int((seconds * 25).rounded(.up)))
+      let audioKey = seed.map { MLXRandom.key($0 &+ 0xA0D10) }
+      let audioNoise = MLXRandom.normal([1, 8, ta, 16], key: audioKey).asType(.float32)
+      let audioInit = audioNoise * MLXArray(sigmas[0])
+      let (_, audioCoords) = LTX2AudioPatchifier.patchify(audioInit)
+      let avPE = transformer.precomputeAVPositionalEmbeddings(
+        positions: positions, audioCoords: audioCoords)
+      avState = LTX2AVDenoiseState(
+        audioLatents: audioInit,
+        audioContext: textOutput.audioEmbeddings,
+        pe: avPE)
+      logger.info("Audio stream enabled (i2v): \(ta) latent frames (\(seconds)s).")
+    }
+
     // Step 6: Denoising loop with I2V state
     logger.info("Denoising with I2V conditioning...")
     let latentsAll = denoisingLoop(
@@ -702,6 +716,7 @@ public final class LTX2Pipeline {
       cfgScale: cfgScale,
       state: state,
       nagEmbeddings: nagEmbeddings, nag: nagConfig,
+      avState: avState,
       progressCallback: progressCallback
     )
 
@@ -717,6 +732,7 @@ public final class LTX2Pipeline {
       negativeEmbeddings: negativeEmbeddings,
       cfgScale: cfgScale, seed: seed,
       refineAnchorImage: refineAnchorImage,
+      avState: avState,
       progressCallback: progressCallback)
 
     // Step 7: Decode
@@ -731,13 +747,15 @@ public final class LTX2Pipeline {
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("I2V generation complete in \(String(format: "%.1f", elapsed))s")
 
-    return LTX2PipelineOutput(
+    var output = LTX2PipelineOutput(
       decoded: clamped,
       numFrames: numFrames,
       width: width,
       height: height,
       elapsedSeconds: elapsed
     )
+    output.audioLatents = avState?.audioLatents
+    return output
   }
 
   // MARK: - Multi-Keyframe ("tween") Generation
@@ -1441,6 +1459,7 @@ public final class LTX2Pipeline {
     cfgScale: Float,
     seed: UInt64?,
     refineAnchorImage: MLXArray?,
+    avState: LTX2AVDenoiseState? = nil,
     progressCallback: ((Int, Int) -> Void)?
   ) -> MLXArray {
     guard let ups = self.upsampler,
@@ -1495,6 +1514,13 @@ public final class LTX2Pipeline {
     let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
     let sigma0 = refineSigmas[0]
     let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
+    // Joint two-stage (task #21): re-noise AUDIO at the same strength so the
+    // refine denoises both streams together (spec rev 2).
+    if let av = avState {
+      let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
+      let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
+      av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
+    }
     // Frame-0 re-anchor: raw source re-encoded at refine res when available
     // (workflow nodes 19/20); else the upsampled latent's own frame 0.
     let rF = upLatent.dim(2)
@@ -1525,6 +1551,16 @@ public final class LTX2Pipeline {
       ropeMode: transformer.ropeMode,
       doublePrecision: transformer.doublePrecisionRoPE)
     eval(refinePE.cos, refinePE.sin)
+    // Rebuild the AV PE bundle against the refine grid (video token count and
+    // spatial coords change at 2x; audio coords are unchanged).
+    var refineAVState = avState
+    if let av = avState {
+      let (_, aCoords) = LTX2AudioPatchifier.patchify(av.audioLatents)
+      let avPE2 = transformer.precomputeAVPositionalEmbeddings(
+        positions: refinePos, audioCoords: aCoords)
+      refineAVState = LTX2AVDenoiseState(
+        audioLatents: av.audioLatents, audioContext: av.audioContext, pe: avPE2)
+    }
     logger.info("Two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
     // base=euler_ancestral_cfg_pp -> refine=euler_cfg_pp (the author's pairing).
     var refined = denoisingLoop(
@@ -1532,7 +1568,11 @@ public final class LTX2Pipeline {
       textEmbeddings: textEmbeddings, negativeEmbeddings: negativeEmbeddings,
       sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
       forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
+      avState: refineAVState,
       progressCallback: progressCallback)
+    if let av = avState, let refAV = refineAVState {
+      av.audioLatents = refAV.audioLatents  // propagate refined audio back to the caller's state
+    }
     eval(refined)
     rowStats("refined", refined)
     MLX.GPU.clearCache()

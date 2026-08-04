@@ -63,7 +63,9 @@ final class LTX2AVToplevelParityTests: XCTestCase {
   func testConditioningMatchesGoldens() throws {
     let g = try goldens()
     let p = try plumbing()
-    let c = p.prepareAVConditioning(videoSigma: 0.7, audioSigma: 0.35, batchSize: 1)
+    let c = p.prepareAVConditioning(
+      videoTimesteps: MLXArray([Float(0.7)]).reshaped([1, 1]), videoSigmaMax: 0.7,
+      audioSigma: 0.35, batchSize: 1)
 
     XCTAssertEqual(c.audioTimestep.shape, [1, 1, 9 * 2048])
     XCTAssertGreaterThan(corr(c.audioTimestep, g["a_timestep_emb"]!), 0.999, "audio 9-coeff adaln")

@@ -39,15 +39,21 @@ extension LTX2Transformer {
   /// Reference av_ca_timestep_scale_multiplier (v16b config default).
   public static let avCaTimestepScaleMultiplier: Float = 1.0
 
-  /// All audio-side timestep conditioning for one denoise step (scalar
-  /// sigmas per batch). Requires `hasAudio`.
+  /// All audio-side timestep conditioning for one denoise step.
+  /// Requires `hasAudio`.
+  ///
+  /// `videoTimesteps` carries the RAW per-token video sigmas — `(B, Tv)` for
+  /// i2v (conditioned tokens ~0, generated tokens at sigma; the reference
+  /// feeds per-token timestep_flat into av_ca_video_scale_shift) or `(B, 1)`
+  /// / `(1, 1)` for uniform t2v, where the result broadcasts.
   ///
   /// Gate inputs are CROSSED per the reference: the a2v gate (applied on the
   /// video stream) is driven by the max AUDIO sigma, the v2a gate by the max
-  /// VIDEO sigma — both times avCaTimestepScaleMultiplier, NOT the 1000x
-  /// timestep multiplier (av_ca_factor = avCaMult / tsMult cancels it).
+  /// VIDEO sigma (`videoSigmaMax`) — both times avCaTimestepScaleMultiplier,
+  /// NOT the 1000x multiplier (av_ca_factor = avCaMult / tsMult cancels it).
   public func prepareAVConditioning(
-    videoSigma: Float, audioSigma: Float, batchSize: Int,
+    videoTimesteps: MLXArray, videoSigmaMax: Float,
+    audioSigma: Float, batchSize: Int,
     hiddenDtype: DType = .float32
   ) -> LTX2AVConditioning {
     precondition(hasAudio, "prepareAVConditioning requires hasAudio")
@@ -56,23 +62,24 @@ extension LTX2Transformer {
     }
     let avCaMult = Self.avCaTimestepScaleMultiplier
     let aScaled = rep(audioSigma * timestepScaleMultiplier)
-    let vScaled = rep(videoSigma * timestepScaleMultiplier)
+    let vScaledFlat = (videoTimesteps.asType(.float32) * timestepScaleMultiplier).reshaped([-1])
 
     // hiddenDtype follows the joint stream (bf16 in production) — hard-coding
     // float32 here promoted BOTH streams via MLX type promotion (Codex #3).
     let (aTs, aEmbedded) = audioAdaLNSingle!(aScaled, hiddenDtype: hiddenDtype)
     let (aPrompt, _) = audioPromptAdaLNSingle!(aScaled, hiddenDtype: hiddenDtype)
-    let (vSS, _) = avCaVideoScaleShiftAdaLN!(vScaled, hiddenDtype: hiddenDtype)
+    let (vSS, _) = avCaVideoScaleShiftAdaLN!(vScaledFlat, hiddenDtype: hiddenDtype)
     let (aSS, _) = avCaAudioScaleShiftAdaLN!(aScaled, hiddenDtype: hiddenDtype)
     let (a2vGate, _) = avCaA2vGateAdaLN!(rep(audioSigma * avCaMult), hiddenDtype: hiddenDtype)
-    let (v2aGate, _) = avCaV2aGateAdaLN!(rep(videoSigma * avCaMult), hiddenDtype: hiddenDtype)
+    let (v2aGate, _) = avCaV2aGateAdaLN!(rep(videoSigmaMax * avCaMult), hiddenDtype: hiddenDtype)
 
     func shape3(_ x: MLXArray) -> MLXArray { x.reshaped([batchSize, 1, -1]) }
     return LTX2AVConditioning(
       audioTimestep: shape3(aTs),
       audioEmbeddedTimestep: shape3(aEmbedded),
       audioPromptTimestep: shape3(aPrompt),
-      crossScaleShiftTimestep: shape3(vSS),
+      // Per-token rows survive: (B, Tv, 4*dim); uniform inputs give (B, 1, ...).
+      crossScaleShiftTimestep: vSS.reshaped([batchSize, -1, vSS.dim(-1)]),
       audioCrossScaleShiftTimestep: shape3(aSS),
       crossGateTimestep: shape3(a2vGate),
       audioCrossGateTimestep: shape3(v2aGate))
@@ -188,7 +195,8 @@ extension LTX2Transformer {
     var (ax, _) = projectAudioTokens(audioLatents)
     ax = ax.asType(vx.dtype)
     let av = prepareAVConditioning(
-      videoSigma: videoSigmaMax, audioSigma: audioSigma, batchSize: batchSize,
+      videoTimesteps: timestep, videoSigmaMax: videoSigmaMax,
+      audioSigma: audioSigma, batchSize: batchSize,
       hiddenDtype: vx.dtype)
     let aCtx = audioContext.reshaped(batchSize, -1, audioInnerDim).asType(vx.dtype)
 
