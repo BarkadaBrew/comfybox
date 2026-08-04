@@ -2249,7 +2249,11 @@ public final class WarmServer {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
       var tracePayload: [String: String] = ["prompt": prep.request.prompt]
-      if prep.request.audio { tracePayload["has_audio"] = "true" }
+      if prep.request.audio {
+        tracePayload["has_audio"] = "true"
+        tracePayload["audio_seconds"] = String(format: "%.2f",
+          Float(prep.request.framesPerChunk) / Float(prep.request.fps))
+      }
       if let attemptId = prep.optimizationAttemptId {
         tracePayload["optimization_attempt_id"] = attemptId
       }
@@ -2259,7 +2263,8 @@ public final class WarmServer {
         // this render will use, durable on the job status.
         resolvedConfig: LTX2ConfigResolver.resolveTyped(
           request: prep.request.tuning, preset: prep.request.presetTuning).params,
-        tracePayload: tracePayload
+        tracePayload: tracePayload,
+        wantsAudio: prep.request.audio
       ) { report in
         try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
@@ -2291,7 +2296,7 @@ public final class WarmServer {
       let videoRequest = prep.request
 
       logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f)")
-      let result = try await coordinator.enqueueLocalVideo { report in
+      let result = try await coordinator.enqueueLocalVideo(wantsAudio: videoRequest.audio) { report in
         try generator.generate(videoRequest) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
             chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
@@ -4306,6 +4311,7 @@ final class VideoJobTracker: @unchecked Sendable {
     coordinator: WarmServerCoordinator,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
     tracePayload: [String: String] = [:],
+    wantsAudio: Bool = false,
     render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
   ) -> VideoJobStatus {
     let (jobId, queued) = register(
@@ -4315,7 +4321,7 @@ final class VideoJobTracker: @unchecked Sendable {
       guard let self else { return }
       self.markProcessing(jobId)
       do {
-        let result = try await coordinator.enqueueLocalVideo { coordReport in
+        let result = try await coordinator.enqueueLocalVideo(wantsAudio: wantsAudio) { coordReport in
           try render { pct in
             // Fan progress to both the coordinator's health/queue trackers and
             // this job's own status.
@@ -5049,7 +5055,10 @@ private actor WarmServerCoordinator {
   /// per-chunk/per-step progress hook; the coordinator wires it into the
   /// lock-based progress + health trackers so /health and /v1/queue reflect the
   /// live render without an actor hop (mirrors the image render path, #217).
-  func enqueueLocalVideo(_ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult) async throws -> LTX2VideoResult {
+  func enqueueLocalVideo(
+    wantsAudio: Bool = false,
+    _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
+  ) async throws -> LTX2VideoResult {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -5058,7 +5067,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation))))
+      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation), wantsAudio: wantsAudio)))
       startProcessingIfNeeded()
     }
   }
@@ -5196,7 +5205,7 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
       cont.resume(throwing: ServerError.cancelled)
-    case .localVideo(_, let cont):
+    case .localVideo(_, let cont, _):
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
       cont.resume(throwing: ServerError.cancelled)
@@ -5339,7 +5348,7 @@ private actor WarmServerCoordinator {
         } catch {
           continuation.resume(throwing: error)
         }
-      case .localVideo(let body, let continuation):
+      case .localVideo(let body, let continuation, let wantsAudio):
         // Runs on the serial queue so LTX-2 never shares the GPU with a render.
         activeRenderStartedAt = Date()
         // activeJobId is set from job.id at the top of the loop.
@@ -5360,11 +5369,19 @@ private actor WarmServerCoordinator {
         // healthy back-to-back videos (observed 2026-07-25 22:38: 45GB free
         // with the stack warm, admit=false, job bounced). A warm render only
         // needs activation headroom (streamed decode bounds the decode peak).
-        let videoStackWarm = videoHolder.get()?.isLoaded == true
+        // Audio-aware (task #21, Codex #2): an audio-mode mismatch forces a
+        // full transformer rebuild inside body() — the warm discount would
+        // then double-count nothing while the +~12GiB audio branch (bf16) and
+        // fp32 codec load on top of a torn-down stack. Treat mode-mismatch as
+        // COLD and add the audio delta to the cold estimate.
+        let gen = videoHolder.get()
+        let audioModeMatches = (gen?.isAudioLoaded ?? false) == wantsAudio
+        let videoStackWarm = gen?.isLoaded == true && audioModeMatches
+        let audioDelta: UInt64 = wantsAudio ? 13 * 1024 * 1024 * 1024 : 0
         let ltx2Need = videoStackWarm
           ? 24 * 1024 * 1024 * 1024
           : HeavyModelAdmission.ltx2EstimateBytes(
-              forWeightsPath: configuration.ltx2WeightsPath)
+              forWeightsPath: configuration.ltx2WeightsPath) + audioDelta
         // Drain-until-settled (#34): back-to-back renders (e.g. Kira's i2v →
         // multi-keyframe in the same second) start while the previous job's
         // MLX buffer pool + lazy macOS reclaim still hold tens of GB. Admission
@@ -7017,7 +7034,7 @@ private enum QueuedOperation: Sendable {
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
   /// Local LTX-2 video generation, run through the queue so it serializes with
   /// image renders on the shared GPU. The closure captures the generator+request.
-  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>)
+  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>, wantsAudio: Bool)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
 

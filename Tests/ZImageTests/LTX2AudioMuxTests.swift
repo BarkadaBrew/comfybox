@@ -36,7 +36,7 @@ final class LTX2AudioMuxTests: XCTestCase {
       .appendingPathComponent("mux-\(UUID().uuidString).mp4").path
     defer { try? FileManager.default.removeItem(atPath: out) }
 
-    let frames = (0..<48).map { _ in solidFrame(width: 128, height: 128) }  // 2 s @ 24fps
+    let frames = (0..<49).map { _ in solidFrame(width: 128, height: 128) }  // 1+8k contract, ~2 s @ 24fps
     try LTX2PostProcess.writeMP4(
       frames: frames, outputPath: out, fps: 24, width: 128, height: 128,
       audio: LTX2PostProcess.AudioTrack(
@@ -56,7 +56,7 @@ final class LTX2AudioMuxTests: XCTestCase {
     // A/V duration agreement within one video frame (the honest contract).
     let videoDur = CMTimeGetSeconds(videoTracks[0].timeRange.duration)
     let audioDur = CMTimeGetSeconds(audioTracks[0].timeRange.duration)
-    XCTAssertEqual(videoDur, 2.0, accuracy: 1.0 / 24.0 + 0.001)
+    XCTAssertEqual(videoDur, 49.0 / 24.0, accuracy: 0.001)
     XCTAssertEqual(audioDur, 2.0, accuracy: 0.1, "AAC priming/padding tolerance")
   }
 

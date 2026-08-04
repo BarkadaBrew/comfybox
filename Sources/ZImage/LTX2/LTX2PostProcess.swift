@@ -331,7 +331,10 @@ public enum LTX2PostProcess {
     // whole clip fits in memory) so the ready callbacks only append.
     let audioBuffers: [CMSampleBuffer] = try audio.map(makeAudioSampleBuffers) ?? []
 
-    writer.startWriting()
+    guard writer.startWriting() else {
+      throw LTX2PostProcessError.writingFailed(
+        writer.error?.localizedDescription ?? "startWriting failed")
+    }
     writer.startSession(atSourceTime: .zero)
 
     let frameDuration = CMTimeMake(value: 1, timescale: Int32(fps))
@@ -352,25 +355,30 @@ public enum LTX2PostProcess {
     let videoQueue = DispatchQueue(label: "comfybox.mux.video")
     input.requestMediaDataWhenReady(on: videoQueue) {
       if videoDone { return }  // callback queued before markAsFinished landed
-      while input.isReadyForMoreMediaData {
-        if frameIndex >= frames.count {
-          videoDone = true
-          input.markAsFinished()
-          group.leave()
-          return
+      func finish(_ error: LTX2PostProcessError?) {
+        if let error {
+          errorLock.lock(); appendError = appendError ?? error; errorLock.unlock()
         }
+        videoDone = true
+        input.markAsFinished()
+        group.leave()
+      }
+      // A failed writer never flips isReadyForMoreMediaData back on — without
+      // this check both callbacks stall and group.wait() hangs the render
+      // queue forever (Codex 2026-08-04 #5).
+      if writer.status != .writing {
+        return finish(.writingFailed(writer.error?.localizedDescription ?? "writer left .writing during video append"))
+      }
+      while input.isReadyForMoreMediaData {
+        if frameIndex >= frames.count { return finish(nil) }
         let presentationTime = CMTimeMultiply(frameDuration, multiplier: Int32(frameIndex))
         guard let pixelBuffer = createPixelBuffer(
           from: frames[frameIndex], width: width, height: height) else {
-          errorLock.lock()
-          appendError = .pixelBufferCreationFailed(frameIndex: frameIndex)
-          errorLock.unlock()
-          videoDone = true
-          input.markAsFinished()
-          group.leave()
-          return
+          return finish(.pixelBufferCreationFailed(frameIndex: frameIndex))
         }
-        adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
+        guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
+          return finish(.writingFailed(writer.error?.localizedDescription ?? "video append rejected at frame \(frameIndex)"))
+        }
         frameIndex += 1
       }
     }
@@ -382,20 +390,33 @@ public enum LTX2PostProcess {
       let audioQueue = DispatchQueue(label: "comfybox.mux.audio")
       audioInput.requestMediaDataWhenReady(on: audioQueue) {
         if audioDone { return }  // callback queued before markAsFinished landed
-        while audioInput.isReadyForMoreMediaData {
-          if bufferIndex >= audioBuffers.count {
-            audioDone = true
-            audioInput.markAsFinished()
-            group.leave()
-            return
+        func finish(_ error: LTX2PostProcessError?) {
+          if let error {
+            errorLock.lock(); appendError = appendError ?? error; errorLock.unlock()
           }
-          audioInput.append(audioBuffers[bufferIndex])
+          audioDone = true
+          audioInput.markAsFinished()
+          group.leave()
+        }
+        if writer.status != .writing {
+          return finish(.writingFailed(writer.error?.localizedDescription ?? "writer left .writing during audio append"))
+        }
+        while audioInput.isReadyForMoreMediaData {
+          if bufferIndex >= audioBuffers.count { return finish(nil) }
+          guard audioInput.append(audioBuffers[bufferIndex]) else {
+            return finish(.writingFailed(writer.error?.localizedDescription ?? "audio append rejected at buffer \(bufferIndex)"))
+          }
           bufferIndex += 1
         }
       }
     }
 
-    group.wait()
+    // Bounded: a wedged writer surfaces as an error, never a hung render
+    // queue. Generous ceiling — muxing a finished render is seconds of work.
+    if group.wait(timeout: .now() + 600) == .timedOut {
+      writer.cancelWriting()
+      throw LTX2PostProcessError.writingFailed("mux timed out after 600s (writer status \(writer.status.rawValue))")
+    }
 
     // Wait for writing to complete
     let semaphore = DispatchSemaphore(value: 0)

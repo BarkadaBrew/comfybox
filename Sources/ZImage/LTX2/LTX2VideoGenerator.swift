@@ -154,6 +154,7 @@ public enum LTX2VideoError: Error, LocalizedError {
     case weightsMissing(String)
     case imageLoadFailed(String)
     case unsupportedPlatform
+    case audioUnsupported(String)
 
     public var errorDescription: String? {
         switch self {
@@ -167,6 +168,8 @@ public enum LTX2VideoError: Error, LocalizedError {
             return "Failed to load init image: \(path)"
         case .unsupportedPlatform:
             return "LTX-2 video requires CoreGraphics/ImageIO (macOS)."
+        case .audioUnsupported(let why):
+            return "LTX-2 audio: \(why)"
         }
     }
 }
@@ -206,6 +209,9 @@ public final class LTX2VideoGenerator {
     public var loadedTokenizer: LTX2GemmaTokenizer? { tokenizer }
     /// "path@strength" of the LoRA merged into the loaded transformer (nil = base).
     private var loadedLoraKey: String?
+    /// Whether the RESIDENT transformer carries the audio branch — admission
+    /// uses this to spot audio-mode mismatches that force a full rebuild.
+    public var isAudioLoaded: Bool { loadedLoraKey?.contains("+audio") == true }
     /// Audio codec (VAE + vocoder), lazily bound from the monolith on the
     /// first audio render; cheap (mmap subset) and kept for the process life.
     private var audioVAE: LTX2AudioVAE?
@@ -263,6 +269,21 @@ public final class LTX2VideoGenerator {
     public func validate(_ request: LTX2VideoRequest) throws {
         guard Self.isValidFrameCount(request.framesPerChunk) else {
             throw LTX2VideoError.invalidFrameCount(request.framesPerChunk)
+        }
+        if request.audio {
+            // v1 audio scope is single-chunk T2V. Silently downgrading (the
+            // first cut) shipped MP4s whose audio stopped after chunk 0 or
+            // never existed — reject loudly instead (Codex 2026-08-04 #4).
+            if request.initImagePath != nil {
+                throw LTX2VideoError.audioUnsupported("audio is not yet supported for I2V renders (v1 is T2V-only)")
+            }
+            let plan = Self.chunkPlan(
+                framesPerChunk: request.framesPerChunk,
+                extendToSeconds: request.extendToSeconds, fps: request.fps)
+            if plan.totalChunks > 1 {
+                throw LTX2VideoError.audioUnsupported(
+                    "audio is not yet supported for chunked renders (\(plan.totalChunks) chunks requested; keep duration within one \(request.framesPerChunk)-frame chunk)")
+            }
         }
         guard Self.areValidDimensions(width: request.width, height: request.height) else {
             throw LTX2VideoError.invalidDimensions(request.width, request.height)
@@ -422,6 +443,24 @@ public final class LTX2VideoGenerator {
             logger.error("LTX-2: transformer weight remap covered only \(matched)/\(moduleKeys.count) params — checkpoint key format likely unrecognized; output would be noise.")
             throw LTX2VideoError.weightsMissing(
                 "transformer key remap matched only \(matched)/\(moduleKeys.count) module params from \(weightsURL.lastPathComponent) — unrecognized checkpoint key format")
+        }
+        if audio {
+            // Audio-branch coverage guard (Codex #7): the 50% whole-model gate
+            // can pass while the ENTIRE audio branch (2,729 tensors) is absent
+            // or mis-keyed — silence/noise instead of a load error. Require
+            // near-complete audio coverage explicitly.
+            func isAudioKey(_ k: String) -> Bool {
+                k.contains("audio_") || k.contains("av_ca_")
+                    || k.contains("scale_shift_table_a2v")
+                    || k.contains("audio_to_video_attn") || k.contains("video_to_audio_attn")
+            }
+            let audioModuleKeys = moduleKeys.filter(isAudioKey)
+            let audioMatched = sanitized.keys.filter { isAudioKey($0) && moduleKeys.contains($0) }.count
+            if audioMatched < audioModuleKeys.count * 95 / 100 {
+                throw LTX2VideoError.audioUnsupported(
+                    "audio branch weights incomplete: \(audioMatched)/\(audioModuleKeys.count) matched from \(weightsURL.lastPathComponent)")
+            }
+            logger.info("LTX-2 audio: branch coverage \(audioMatched)/\(audioModuleKeys.count).")
         }
         let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
         try transformer.update(parameters: params, verify: [.shapeMismatch])
@@ -585,9 +624,9 @@ public final class LTX2VideoGenerator {
         GPU.clearCache()
         defer { GPU.clearCache() }
         try validate(request)
-        // v1 audio scope: single-chunk T2V. I2V and continuation chunks render
-        // video-only (spec wire-4 open items).
-        let wantAudio = request.audio && request.initImagePath == nil
+        // validate() has already rejected unsupported audio modes (i2v /
+        // multi-chunk), so this is simply the request flag.
+        let wantAudio = request.audio
         try load(loras: request.effectiveLoRAs, audio: wantAudio)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
@@ -897,7 +936,6 @@ public final class LTX2VideoGenerator {
                     negativeAttentionMask: negBatch?.attentionMask,
                     audioSeconds: wantAudio && chunk == 0
                         ? Float(request.framesPerChunk) / Float(request.fps) : nil,
-                    frameRate: Float(request.fps),
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 
@@ -989,7 +1027,14 @@ public final class LTX2VideoGenerator {
                 }
                 if let av = audioVAE {
                     let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N) @48k
-                    let clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
+                    var clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
+                    // Trim to the actual video duration (ceil(s*25) latent
+                    // quantization overshoots; Codex #8). Shorter audio is
+                    // left as-is — AAC tolerates a short tail.
+                    let videoSamples = Int((Double(allFrames.count) / Double(request.fps) * 48000).rounded(.up))
+                    if clamped.dim(1) > videoSamples {
+                        clamped = clamped[0..., 0..<videoSamples]
+                    }
                     eval(clamped)
                     audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: 48000)
                     logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / 48000.0))s stereo).")

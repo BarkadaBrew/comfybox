@@ -47,7 +47,8 @@ extension LTX2Transformer {
   /// VIDEO sigma — both times avCaTimestepScaleMultiplier, NOT the 1000x
   /// timestep multiplier (av_ca_factor = avCaMult / tsMult cancels it).
   public func prepareAVConditioning(
-    videoSigma: Float, audioSigma: Float, batchSize: Int
+    videoSigma: Float, audioSigma: Float, batchSize: Int,
+    hiddenDtype: DType = .float32
   ) -> LTX2AVConditioning {
     precondition(hasAudio, "prepareAVConditioning requires hasAudio")
     func rep(_ value: Float) -> MLXArray {
@@ -57,12 +58,14 @@ extension LTX2Transformer {
     let aScaled = rep(audioSigma * timestepScaleMultiplier)
     let vScaled = rep(videoSigma * timestepScaleMultiplier)
 
-    let (aTs, aEmbedded) = audioAdaLNSingle!(aScaled, hiddenDtype: .float32)
-    let (aPrompt, _) = audioPromptAdaLNSingle!(aScaled, hiddenDtype: .float32)
-    let (vSS, _) = avCaVideoScaleShiftAdaLN!(vScaled, hiddenDtype: .float32)
-    let (aSS, _) = avCaAudioScaleShiftAdaLN!(aScaled, hiddenDtype: .float32)
-    let (a2vGate, _) = avCaA2vGateAdaLN!(rep(audioSigma * avCaMult), hiddenDtype: .float32)
-    let (v2aGate, _) = avCaV2aGateAdaLN!(rep(videoSigma * avCaMult), hiddenDtype: .float32)
+    // hiddenDtype follows the joint stream (bf16 in production) — hard-coding
+    // float32 here promoted BOTH streams via MLX type promotion (Codex #3).
+    let (aTs, aEmbedded) = audioAdaLNSingle!(aScaled, hiddenDtype: hiddenDtype)
+    let (aPrompt, _) = audioPromptAdaLNSingle!(aScaled, hiddenDtype: hiddenDtype)
+    let (vSS, _) = avCaVideoScaleShiftAdaLN!(vScaled, hiddenDtype: hiddenDtype)
+    let (aSS, _) = avCaAudioScaleShiftAdaLN!(aScaled, hiddenDtype: hiddenDtype)
+    let (a2vGate, _) = avCaA2vGateAdaLN!(rep(audioSigma * avCaMult), hiddenDtype: hiddenDtype)
+    let (v2aGate, _) = avCaV2aGateAdaLN!(rep(videoSigma * avCaMult), hiddenDtype: hiddenDtype)
 
     func shape3(_ x: MLXArray) -> MLXArray { x.reshaped([batchSize, 1, -1]) }
     return LTX2AVConditioning(
@@ -84,17 +87,19 @@ extension LTX2Transformer {
   }
 
   /// All four positional-embedding sets for the joint forward, computed once
-  /// per render. `positions` are video pixel coords `(B, 3, Nv, 2)` from
-  /// `makePositionGrid`; `audioCoords` are the seconds-valued start/end
-  /// coords from `projectAudioTokens`.
+  /// per render.
   ///
-  /// Cross-modal PEs run in REAL SECONDS on both sides (video time row ÷
-  /// frameRate; audio coords already in seconds), dim = audioInnerDim,
-  /// audio head count, shared maxPos.
+  /// CONTRACT: `positions` is the pipeline's grid with the time row ALREADY
+  /// in seconds (createPositionGrid divides by condFps — same convention the
+  /// video self PE consumes; Codex 2026-08-04 finding #1: dividing again here
+  /// collapsed 4s of video into ~0.16s for cross-attention). `audioCoords`
+  /// are the seconds-valued start/end coords from `projectAudioTokens`, so
+  /// both cross PEs share one real-time axis. When LTX2_COND_FPS diverges
+  /// from playback fps, video "seconds" follow condFps — the established
+  /// motion-dial tradeoff, now shared by the audio sync axis.
   public func precomputeAVPositionalEmbeddings(
     positions: MLXArray,
-    audioCoords: MLXArray,
-    frameRate: Float
+    audioCoords: MLXArray
   ) -> (videoPE: (cos: MLXArray, sin: MLXArray),
         audioPE: (cos: MLXArray, sin: MLXArray),
         crossVideoPE: (cos: MLXArray, sin: MLXArray),
@@ -109,10 +114,9 @@ extension LTX2Transformer {
       indicesGrid: audioCoords, dim: audioInnerDim, theta: positionalEmbeddingTheta,
       maxPos: [20], useMiddleIndicesGrid: useMiddleIndicesGrid,
       numAttentionHeads: audioHeads, ropeMode: ropeMode, doublePrecision: doublePrecisionRoPE)
-    // Cross PEs: video time row in seconds; middle-grid ALWAYS on (reference
-    // passes use_middle_indices_grid=True explicitly for av cross attention).
-    let posF32 = positions.asType(.float32)
-    let timeSecs = posF32[0..., 0..<1] * (1.0 / frameRate)
+    // Cross PEs: video time row (already seconds); middle-grid ALWAYS on
+    // (reference passes use_middle_indices_grid=True for av cross attention).
+    let timeSecs = positions.asType(.float32)[0..., 0..<1]
     let maxPos = max(positionalEmbeddingMaxPos[0], 20)
     let crossVideoPE = ltx2PrecomputeFreqsCIS(
       indicesGrid: timeSecs, dim: audioInnerDim, theta: positionalEmbeddingTheta,
@@ -184,7 +188,8 @@ extension LTX2Transformer {
     var (ax, _) = projectAudioTokens(audioLatents)
     ax = ax.asType(vx.dtype)
     let av = prepareAVConditioning(
-      videoSigma: videoSigmaMax, audioSigma: audioSigma, batchSize: batchSize)
+      videoSigma: videoSigmaMax, audioSigma: audioSigma, batchSize: batchSize,
+      hiddenDtype: vx.dtype)
     let aCtx = audioContext.reshaped(batchSize, -1, audioInnerDim).asType(vx.dtype)
 
     // ---- Joint block loop ----

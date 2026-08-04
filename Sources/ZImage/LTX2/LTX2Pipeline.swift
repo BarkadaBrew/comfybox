@@ -169,7 +169,6 @@ public final class LTX2Pipeline {
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
     audioSeconds: Float? = nil,
-    frameRate: Float = 25,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -272,12 +271,15 @@ public final class LTX2Pipeline {
     var avState: LTX2AVDenoiseState? = nil
     if let seconds = audioSeconds, wantAudio {
       let ta = max(1, Int((seconds * 25).rounded(.up)))
-      let audioKey = MLXRandom.key((seed ?? 0) &+ 0xA0D10)
+      // Seeded: isolated key (video bit-identical with audio on/off).
+      // Unseeded: global stream, so audio noise varies like everything else
+      // (Codex #9: keying off seed-0 froze unseeded audio noise).
+      let audioKey = seed.map { MLXRandom.key($0 &+ 0xA0D10) }
       let audioNoise = MLXRandom.normal([1, 8, ta, 16], key: audioKey).asType(.float32)
       let audioInit = audioNoise * MLXArray(sigmas[0])
       let (_, audioCoords) = LTX2AudioPatchifier.patchify(audioInit)
       let avPE = transformer.precomputeAVPositionalEmbeddings(
-        positions: positions, audioCoords: audioCoords, frameRate: frameRate)
+        positions: positions, audioCoords: audioCoords)
       avState = LTX2AVDenoiseState(
         audioLatents: audioInit,
         audioContext: textOutput.audioEmbeddings,
@@ -328,7 +330,7 @@ public final class LTX2Pipeline {
       // Joint two-stage: re-noise AUDIO at the same strength (spec rev 2) so
       // the refine pass denoises both streams together.
       if let av = avState {
-        let aKey = MLXRandom.key((seed ?? 0) &+ 0xA0D11)
+        let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
         let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
         av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
       }
@@ -347,7 +349,7 @@ public final class LTX2Pipeline {
       if let av = avState {
         let (_, aCoords) = LTX2AudioPatchifier.patchify(av.audioLatents)
         let avPE2 = transformer.precomputeAVPositionalEmbeddings(
-          positions: refinePos, audioCoords: aCoords, frameRate: frameRate)
+          positions: refinePos, audioCoords: aCoords)
         avState = LTX2AVDenoiseState(
           audioLatents: av.audioLatents, audioContext: av.audioContext, pe: avPE2)
       }
@@ -549,7 +551,6 @@ public final class LTX2Pipeline {
     faceAnchorStrength: Float = 0,
     refineAnchorImage: MLXArray? = nil,
     audioSeconds: Float? = nil,
-    frameRate: Float = 25,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
     let startTime = CFAbsoluteTimeGetCurrent()

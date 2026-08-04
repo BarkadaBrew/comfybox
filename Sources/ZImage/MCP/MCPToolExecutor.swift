@@ -514,6 +514,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let imagePath = params?.string("image_path") {
       body["image_path"] = imagePath
     }
+    if let audio = params?.bool("audio") {
+      body["audio"] = audio
+    }
     if let duration = params?.integer("duration") {
       body["duration"] = duration
     }

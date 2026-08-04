@@ -432,6 +432,10 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "Absolute path to source image for I2V mode. Must be on the Mac filesystem. Omit for T2V mode.",
         ] as [String: Any],
+        "audio": [
+          "type": "boolean",
+          "description": "Generate synchronized audio (native T2V single-chunk only; first audio render reloads the model with the audio branch, adding ~1 min).",
+        ] as [String: Any],
         "duration": [
           "type": "number",
           "description": "Video duration in seconds (default: one ~4s chunk). Longer values render as spliced ~4s chunks, each re-anchored on the previous chunk\u{27}s last frame plus a soft identity anchor to the source \u{2014} budget ~2.5 min per chunk (e.g. 12 \u{2192} 3 chunks).",

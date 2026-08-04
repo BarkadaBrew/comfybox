@@ -162,7 +162,7 @@ final class LTX2CallAVShapeTests: XCTestCase {
     let (_, audioCoords) = LTX2AudioPatchifier.patchify(audioLatents)
 
     let pe = t.precomputeAVPositionalEmbeddings(
-      positions: positions, audioCoords: audioCoords, frameRate: 25)
+      positions: positions, audioCoords: audioCoords)
     let (v, a) = t.callAV(
       latent: latent, audioLatents: audioLatents,
       timestep: MLXArray([Float(0.7)]).reshaped([1, 1]),
