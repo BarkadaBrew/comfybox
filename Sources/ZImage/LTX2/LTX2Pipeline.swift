@@ -27,9 +27,37 @@ import MLXNN
 // MARK: - Pipeline Output
 
 /// Output from the LTX-2 video generation pipeline.
+/// Positional-embedding bundle for the joint A/V forward.
+public typealias LTX2AVPEs = (
+  videoPE: (cos: MLXArray, sin: MLXArray),
+  audioPE: (cos: MLXArray, sin: MLXArray),
+  crossVideoPE: (cos: MLXArray, sin: MLXArray),
+  crossAudioPE: (cos: MLXArray, sin: MLXArray))
+
+/// Audio stream state threaded through the joint denoise (task #21 wire 4).
+/// v1: audio rides the POSITIVE pass only (plain Euler, no SDE/CFG/STG/NAG
+/// on the audio stream); the video stream inside callAV still receives the
+/// a2v cross-modal contribution, so video output with audio enabled is a
+/// different (joint) model than video-only — by design.
+final class LTX2AVDenoiseState {
+  var audioLatents: MLXArray  // (B, 8, Ta, 16) float32
+  let audioContext: MLXArray  // (B, S, 2048)
+  let pe: LTX2AVPEs
+  init(audioLatents: MLXArray, audioContext: MLXArray, pe: LTX2AVPEs) {
+    self.audioLatents = audioLatents
+    self.audioContext = audioContext
+    self.pe = pe
+  }
+}
+
 public struct LTX2PipelineOutput {
   /// Decoded video tensor `(B, 3, F, H, W)` in float32, range [0, 1].
   public let decoded: MLXArray
+
+  /// Final denoised AUDIO latents `(B, 8, Ta, 16)` when audio generation was
+  /// requested (task #21); decode via LTX2AudioVAE.decodeToWaveform. Nil for
+  /// video-only renders.
+  public var audioLatents: MLXArray? = nil
 
   /// Number of generated frames.
   public let numFrames: Int
@@ -140,6 +168,8 @@ public final class LTX2Pipeline {
     guidance: Float? = nil,
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
+    audioSeconds: Float? = nil,
+    frameRate: Float = 25,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -154,10 +184,11 @@ public final class LTX2Pipeline {
 
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
+    let wantAudio = audioSeconds != nil && transformer.hasAudio
     let textOutput = textEncoder.encode(
       inputIds: inputIds,
       attentionMask: attentionMask,
-      returnAudioEmbeddings: false
+      returnAudioEmbeddings: wantAudio
     )
     eval(textOutput.videoEmbeddings)
 
@@ -235,6 +266,25 @@ public final class LTX2Pipeline {
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
+    // Step 5b: Audio stream setup (task #21). Isolated RNG key so video
+    // renders are bit-identical with audio on/off; latent rate 25/s
+    // (sampleRate / (hop * downsample) = 16000/640).
+    var avState: LTX2AVDenoiseState? = nil
+    if let seconds = audioSeconds, wantAudio {
+      let ta = max(1, Int((seconds * 25).rounded(.up)))
+      let audioKey = MLXRandom.key((seed ?? 0) &+ 0xA0D10)
+      let audioNoise = MLXRandom.normal([1, 8, ta, 16], key: audioKey).asType(.float32)
+      let audioInit = audioNoise * MLXArray(sigmas[0])
+      let (_, audioCoords) = LTX2AudioPatchifier.patchify(audioInit)
+      let avPE = transformer.precomputeAVPositionalEmbeddings(
+        positions: positions, audioCoords: audioCoords, frameRate: frameRate)
+      avState = LTX2AVDenoiseState(
+        audioLatents: audioInit,
+        audioContext: textOutput.audioEmbeddings,
+        pe: avPE)
+      logger.info("Audio stream enabled: \(ta) latent frames (\(seconds)s).")
+    }
+
     // Step 6: Denoising loop
     logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
     latents = denoisingLoop(
@@ -247,6 +297,7 @@ public final class LTX2Pipeline {
       cfgScale: cfgScale,
       state: nil,
       nagEmbeddings: nagEmbeddings, nag: nagConfig,
+      avState: avState,
       progressCallback: progressCallback
     )
 
@@ -274,6 +325,13 @@ public final class LTX2Pipeline {
       let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
       let sigma0 = refineSigmas[0]
       let refineInit = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)  // flow re-noise
+      // Joint two-stage: re-noise AUDIO at the same strength (spec rev 2) so
+      // the refine pass denoises both streams together.
+      if let av = avState {
+        let aKey = MLXRandom.key((seed ?? 0) &+ 0xA0D11)
+        let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
+        av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
+      }
       let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
       let refinePE = ltx2PrecomputeFreqsCIS(
         indicesGrid: refinePos, dim: innerDim,
@@ -285,11 +343,20 @@ public final class LTX2Pipeline {
         doublePrecision: transformer.doublePrecisionRoPE)
       eval(refinePE.cos, refinePE.sin)
       logger.info("T2V two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
+      // Refine PEs change with the upsampled grid; rebuild the AV bundle too.
+      if let av = avState {
+        let (_, aCoords) = LTX2AudioPatchifier.patchify(av.audioLatents)
+        let avPE2 = transformer.precomputeAVPositionalEmbeddings(
+          positions: refinePos, audioCoords: aCoords, frameRate: frameRate)
+        avState = LTX2AVDenoiseState(
+          audioLatents: av.audioLatents, audioContext: av.audioContext, pe: avPE2)
+      }
       latents = denoisingLoop(
         latents: refineInit, positions: refinePos, precomputedPE: refinePE,
         textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
         sigmas: refineSigmas, cfgScale: cfgScale, state: nil, nagEmbeddings: nagEmbeddings, nag: nagConfig,
         forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
+        avState: avState,
         progressCallback: progressCallback)
       eval(latents)
       MLX.GPU.clearCache()
@@ -310,13 +377,15 @@ public final class LTX2Pipeline {
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("Generation complete in \(String(format: "%.1f", elapsed))s")
 
-    return LTX2PipelineOutput(
+    var output = LTX2PipelineOutput(
       decoded: clamped,
       numFrames: numFrames,
       width: width,
       height: height,
       elapsedSeconds: elapsed
     )
+    output.audioLatents = avState?.audioLatents
+    return output
   }
 
   // MARK: - Text-to-Video with Pre-computed Embeddings
@@ -479,6 +548,8 @@ public final class LTX2Pipeline {
     faceAnchorMask: MLXArray? = nil,
     faceAnchorStrength: Float = 0,
     refineAnchorImage: MLXArray? = nil,
+    audioSeconds: Float? = nil,
+    frameRate: Float = 25,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -487,13 +558,20 @@ public final class LTX2Pipeline {
     precondition((numFrames - 1) % 8 == 0, "numFrames must be 1 + 8k (got \(numFrames))")
 
     logger.info("I2V generation: \(width)x\(height), \(numFrames) frames, strength=\(strength)")
+    if audioSeconds != nil {
+      // Audio embeddings are encoded below; the i2v audio denoise stream
+      // (per-token av_ca video timesteps) lands after the t2v path is
+      // e2e-validated — see specs/ltx2-audio.md wire-4 open items.
+      logger.warning("I2V audio requested — audio stream not yet wired on the i2v path (t2v first); rendering video-only.")
+    }
 
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
+    let wantAudio = audioSeconds != nil && transformer.hasAudio
     let textOutput = textEncoder.encode(
       inputIds: inputIds,
       attentionMask: attentionMask,
-      returnAudioEmbeddings: false
+      returnAudioEmbeddings: wantAudio
     )
     eval(textOutput.videoEmbeddings)
 
@@ -867,6 +945,7 @@ public final class LTX2Pipeline {
     nagEmbeddings: MLXArray? = nil,
     nag: LTX2NAGConfig = .disabled,
     forceDeterministic: Bool = false,
+    avState: LTX2AVDenoiseState? = nil,
     progressCallback: ((Int, Int) -> Void)?
   ) -> MLXArray {
     let dtype: DType = .bfloat16
@@ -979,16 +1058,39 @@ public final class LTX2Pipeline {
       // away from the negative concept inside cross-attention. Applying it to
       // the unconditional pass too would guide the baseline that CFG++ steps
       // along, double-counting the guidance.
-      let velocityPos = transformer(
-        latent: latentsFlat,
-        timestep: timesteps,
-        context: textEmbeddings.asType(dtype),
-        positions: positions,
-        sigma: sigmaArray,
-        precomputedPE: precomputedPE,
-        nagContext: nagEmbeddings?.asType(dtype),
-        nag: nag
-      )
+      let velocityPos: MLXArray
+      if let av = avState {
+        // Joint A/V pass (task #21): both velocities in one forward. NAG is
+        // not available on this path yet (spec open item) — the joint model's
+        // a2v cross-modal coupling replaces it as the video conditioning
+        // difference. Audio updates HERE (positive pass only, plain Euler,
+        // deterministic): CFG/STG passes below remain video-only and steer
+        // only the video x0.
+        let (vv, va) = transformer.callAV(
+          latent: latentsFlat,
+          audioLatents: av.audioLatents.asType(dtype),
+          timestep: timesteps,
+          videoSigmaMax: sigma,
+          audioSigma: sigma,
+          context: textEmbeddings.asType(dtype),
+          audioContext: av.audioContext.asType(dtype),
+          sigma: sigmaArray,
+          pe: av.pe)
+        velocityPos = vv
+        av.audioLatents = av.audioLatents + MLXArray(sigmaNext - sigma) * va.asType(.float32)
+        eval(av.audioLatents)
+      } else {
+        velocityPos = transformer(
+          latent: latentsFlat,
+          timestep: timesteps,
+          context: textEmbeddings.asType(dtype),
+          positions: positions,
+          sigma: sigmaArray,
+          precomputedPE: precomputedPE,
+          nagContext: nagEmbeddings?.asType(dtype),
+          nag: nag
+        )
+      }
 
       // Compute x0 (denoised) from velocity using per-token timesteps
       let latentsFlatF32 = currentLatents
