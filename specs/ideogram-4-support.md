@@ -150,3 +150,19 @@ from all other lanes — architectural necessity, not preference:
   compatibility (dual-DiT + Qwen3-VL + Flux2 VAE — Z-Image/Krea2/LTX
   LoRAs incompatible at tensor level); separate preset stacks; separate
   Models-tab grouping.
+
+## Optimization flow (Todd 2026-08-04): shared pipeline, reformatted finale
+
+Ideogram uses the SAME Generate optimization flow as other models — one
+prompt box, same enhance toggle, same template-store pipeline — with a
+design-tuned stage-1 enrichment template variant, then a stage-2
+formatter: the P0 image-design-json path converts the enriched brief
+into the strict JSON caption (validation + one bounded repair,
+unchanged). Supersedes P0's brief-verbatim single-step routing.
+
+Hard requirement: EXACT-COPY PROTECTION — quoted/verbatim copy strings
+are extracted before stage-1 enrichment, carried as protected slots,
+reinjected at stage 2; the P0 validation contract (typed failure on
+invented/mutated copy) is the backstop. Lane isolation still holds at
+the caption boundary: stage-2 exemplars stay design-only; no prose-lane
+wrappers in the final caption.
