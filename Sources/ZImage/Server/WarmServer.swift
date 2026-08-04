@@ -2249,6 +2249,7 @@ public final class WarmServer {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
       var tracePayload: [String: String] = ["prompt": prep.request.prompt]
+      if prep.request.audio { tracePayload["has_audio"] = "true" }
       if let attemptId = prep.optimizationAttemptId {
         tracePayload["optimization_attempt_id"] = attemptId
       }
