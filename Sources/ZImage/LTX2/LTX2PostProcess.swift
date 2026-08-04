@@ -185,13 +185,83 @@ public enum LTX2PostProcess {
   ///   - width: Video width in pixels.
   ///   - height: Video height in pixels.
   /// - Throws: If video writing fails.
+  /// Chunk interleaved PCM into 0.5 s CMSampleBuffers (built eagerly — the
+  /// whole clip is small; appending happens in the writer's ready callback).
+  private static func makeAudioSampleBuffers(_ audio: AudioTrack) throws -> [CMSampleBuffer] {
+    let channels = audio.samples.dim(0)
+    let n = audio.samples.dim(1)
+    // Interleave [C, N] -> frame-major [n0c0, n0c1, n1c0, ...] Float32.
+    let interleaved = audio.samples.asType(.float32).transposed(1, 0).asArray(Float.self)
+
+    var asbd = AudioStreamBasicDescription(
+      mSampleRate: Float64(audio.sampleRate),
+      mFormatID: kAudioFormatLinearPCM,
+      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+      mBytesPerPacket: UInt32(4 * channels),
+      mFramesPerPacket: 1,
+      mBytesPerFrame: UInt32(4 * channels),
+      mChannelsPerFrame: UInt32(channels),
+      mBitsPerChannel: 32,
+      mReserved: 0)
+    var format: CMAudioFormatDescription?
+    CMAudioFormatDescriptionCreate(
+      allocator: nil, asbd: &asbd, layoutSize: 0, layout: nil,
+      magicCookieSize: 0, magicCookie: nil, extensions: nil,
+      formatDescriptionOut: &format)
+    guard let format else { throw LTX2PostProcessError.audioFormatCreationFailed }
+
+    let chunkFrames = audio.sampleRate / 2  // 0.5 s per buffer
+    var buffers: [CMSampleBuffer] = []
+    var offset = 0
+    while offset < n {
+      let count = min(chunkFrames, n - offset)
+      let bytes = interleaved.withUnsafeBufferPointer { buf -> Data in
+        Data(bytes: buf.baseAddress! + offset * channels, count: count * channels * 4)
+      }
+      var blockBuffer: CMBlockBuffer?
+      CMBlockBufferCreateWithMemoryBlock(
+        allocator: nil, memoryBlock: nil, blockLength: bytes.count,
+        blockAllocator: nil, customBlockSource: nil, offsetToData: 0,
+        dataLength: bytes.count, flags: 0, blockBufferOut: &blockBuffer)
+      guard let blockBuffer else { throw LTX2PostProcessError.audioBufferCreationFailed }
+      bytes.withUnsafeBytes { raw in
+        _ = CMBlockBufferReplaceDataBytes(
+          with: raw.baseAddress!, blockBuffer: blockBuffer,
+          offsetIntoDestination: 0, dataLength: bytes.count)
+      }
+      var sampleBuffer: CMSampleBuffer?
+      CMAudioSampleBufferCreateWithPacketDescriptions(
+        allocator: nil, dataBuffer: blockBuffer, dataReady: true,
+        makeDataReadyCallback: nil, refcon: nil, formatDescription: format,
+        sampleCount: count,
+        presentationTimeStamp: CMTime(value: Int64(offset), timescale: Int32(audio.sampleRate)),
+        packetDescriptions: nil, sampleBufferOut: &sampleBuffer)
+      guard let sampleBuffer else { throw LTX2PostProcessError.audioBufferCreationFailed }
+      buffers.append(sampleBuffer)
+      offset += count
+    }
+    return buffers
+  }
+
+  /// PCM audio for muxing: `samples` is `[channels, N]` float in [-1, 1]
+  /// (stereo = [2, N]) at `sampleRate` Hz. Encoded as AAC.
+  public struct AudioTrack {
+    public let samples: MLXArray
+    public let sampleRate: Int
+    public init(samples: MLXArray, sampleRate: Int) {
+      self.samples = samples
+      self.sampleRate = sampleRate
+    }
+  }
+
   public static func writeMP4(
     frames: [CGImage],
     outputPath: String,
     fps: Int = 24,
     width: Int,
     height: Int,
-    bitsPerPixelOverride: Double? = nil
+    bitsPerPixelOverride: Double? = nil,
+    audio: AudioTrack? = nil
   ) throws {
     guard !frames.isEmpty else {
       throw LTX2PostProcessError.noFrames
@@ -238,28 +308,94 @@ public enum LTX2PostProcess {
     )
 
     writer.add(input)
+
+    // Optional AAC audio input (task #21 wire 3). PCM is chunked into
+    // sample buffers and appended AFTER video (file-based writer with
+    // expectsMediaDataInRealTime=false tolerates sequential appends; the
+    // muxer interleaves on finish).
+    var audioInput: AVAssetWriterInput?
+    if let audio {
+      let settings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: audio.sampleRate,
+        AVNumberOfChannelsKey: audio.samples.dim(0),
+        AVEncoderBitRateKey: 192_000,
+      ]
+      let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+      ai.expectsMediaDataInRealTime = false
+      writer.add(ai)
+      audioInput = ai
+    }
+
+    // Pre-build audio sample buffers BEFORE starting the writer (cheap; the
+    // whole clip fits in memory) so the ready callbacks only append.
+    let audioBuffers: [CMSampleBuffer] = try audio.map(makeAudioSampleBuffers) ?? []
+
     writer.startWriting()
     writer.startSession(atSourceTime: .zero)
 
     let frameDuration = CMTimeMake(value: 1, timescale: Int32(fps))
 
-    for (index, cgImage) in frames.enumerated() {
-      // Wait for input to be ready
-      while !input.isReadyForMoreMediaData {
-        Thread.sleep(forTimeInterval: 0.01)
+    // With two inputs on one writer, appends MUST be demand-driven: the
+    // writer's interleaving window makes an input's isReadyForMoreMediaData
+    // go false until the OTHER track catches up, so appending all video
+    // before any audio deadlocks both spin-wait loops. Drive each input
+    // with requestMediaDataWhenReady on its own queue (the canonical
+    // multi-track pattern) and join on a group.
+    let group = DispatchGroup()
+    let errorLock = NSLock()
+    var appendError: LTX2PostProcessError?
+
+    group.enter()
+    var frameIndex = 0
+    var videoDone = false
+    let videoQueue = DispatchQueue(label: "comfybox.mux.video")
+    input.requestMediaDataWhenReady(on: videoQueue) {
+      if videoDone { return }  // callback queued before markAsFinished landed
+      while input.isReadyForMoreMediaData {
+        if frameIndex >= frames.count {
+          videoDone = true
+          input.markAsFinished()
+          group.leave()
+          return
+        }
+        let presentationTime = CMTimeMultiply(frameDuration, multiplier: Int32(frameIndex))
+        guard let pixelBuffer = createPixelBuffer(
+          from: frames[frameIndex], width: width, height: height) else {
+          errorLock.lock()
+          appendError = .pixelBufferCreationFailed(frameIndex: frameIndex)
+          errorLock.unlock()
+          videoDone = true
+          input.markAsFinished()
+          group.leave()
+          return
+        }
+        adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
+        frameIndex += 1
       }
-
-      let presentationTime = CMTimeMultiply(frameDuration, multiplier: Int32(index))
-
-      // Create pixel buffer from CGImage
-      guard let pixelBuffer = createPixelBuffer(from: cgImage, width: width, height: height) else {
-        throw LTX2PostProcessError.pixelBufferCreationFailed(frameIndex: index)
-      }
-
-      adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
     }
 
-    input.markAsFinished()
+    if let audioInput {
+      group.enter()
+      var bufferIndex = 0
+      var audioDone = false
+      let audioQueue = DispatchQueue(label: "comfybox.mux.audio")
+      audioInput.requestMediaDataWhenReady(on: audioQueue) {
+        if audioDone { return }  // callback queued before markAsFinished landed
+        while audioInput.isReadyForMoreMediaData {
+          if bufferIndex >= audioBuffers.count {
+            audioDone = true
+            audioInput.markAsFinished()
+            group.leave()
+            return
+          }
+          audioInput.append(audioBuffers[bufferIndex])
+          bufferIndex += 1
+        }
+      }
+    }
+
+    group.wait()
 
     // Wait for writing to complete
     let semaphore = DispatchSemaphore(value: 0)
@@ -268,6 +404,7 @@ public enum LTX2PostProcess {
     }
     semaphore.wait()
 
+    if let appendError { throw appendError }
     if writer.status == .failed {
       throw LTX2PostProcessError.writingFailed(writer.error?.localizedDescription ?? "unknown")
     }
@@ -392,9 +529,13 @@ public enum LTX2PostProcessError: Error, CustomStringConvertible {
   case noFrames
   case pixelBufferCreationFailed(frameIndex: Int)
   case writingFailed(String)
+  case audioFormatCreationFailed
+  case audioBufferCreationFailed
 
   public var description: String {
     switch self {
+    case .audioFormatCreationFailed: return "audio format description creation failed"
+    case .audioBufferCreationFailed: return "audio sample buffer creation failed"
     case .noFrames:
       return "No frames to write"
     case .pixelBufferCreationFailed(let idx):
