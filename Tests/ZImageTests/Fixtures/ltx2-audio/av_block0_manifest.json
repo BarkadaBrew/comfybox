@@ -1,0 +1,90 @@
+{
+ "seed": 31337,
+ "checkpoint": "/Volumes/Bolt/ComfyUI-validate/downloads/SexGod_PinkCherry_dev_bf16_LTX23_v16b.safetensors",
+ "checkpoint_head_sha256": "8522391f343a37f93e1f7cdcda63633985a86f0c7379dd3883e4e65c2f6309c8",
+ "comfy_rev": "2881e6161081439b1c3fb3b6c1f51b3d272da710",
+ "dims": {
+  "v_dim": 4096,
+  "a_dim": 2048,
+  "v_heads": 32,
+  "a_heads": 32,
+  "vd_head": 128,
+  "ad_head": 64,
+  "TV": 64,
+  "TA": 16,
+  "TCTX": 32
+ },
+ "pe": "None (v1 \u2014 RoPE fixtures come from model-level export)",
+ "shapes": {
+  "vx": [
+   1,
+   64,
+   4096
+  ],
+  "ax": [
+   1,
+   16,
+   2048
+  ],
+  "v_context": [
+   1,
+   32,
+   4096
+  ],
+  "a_context": [
+   1,
+   32,
+   2048
+  ],
+  "v_timestep": [
+   1,
+   1,
+   36864
+  ],
+  "a_timestep": [
+   1,
+   1,
+   18432
+  ],
+  "v_cross_scale_shift_timestep": [
+   1,
+   1,
+   16384
+  ],
+  "a_cross_scale_shift_timestep": [
+   1,
+   1,
+   8192
+  ],
+  "v_cross_gate_timestep": [
+   1,
+   1,
+   4096
+  ],
+  "a_cross_gate_timestep": [
+   1,
+   1,
+   2048
+  ],
+  "v_prompt_timestep": [
+   1,
+   1,
+   8192
+  ],
+  "a_prompt_timestep": [
+   1,
+   1,
+   4096
+  ],
+  "vx_out": [
+   1,
+   64,
+   4096
+  ],
+  "ax_out": [
+   1,
+   16,
+   2048
+  ]
+ }
+}
