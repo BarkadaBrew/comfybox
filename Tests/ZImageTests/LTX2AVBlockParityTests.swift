@@ -18,9 +18,11 @@ final class LTX2AVBlockParityTests: XCTestCase {
     .deletingLastPathComponent()
     .appendingPathComponent("Fixtures/ltx2-audio/av_block0_goldens.safetensors")
 
-  static let weightsPath = "/Volumes/Bolt/ComfyUI-validate/downloads/SexGod_PinkCherry_dev_bf16_LTX23_v16b.safetensors"
-  static let localWeights = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".comfybox/reference/SexGod_PinkCherry_dev_bf16_LTX23_v16b.safetensors").path
+  /// Block-0-only extract (773MB; the 43GB monolith cannot stage locally —
+  /// home volume headroom). Produced by the same prefix-strip the oracle
+  /// exporter uses, so keys match the fixture's weight source exactly.
+  static let weightsPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".comfybox/reference/v16b_block0.safetensors").path
 
   private func corr(_ a: MLXArray, _ b: MLXArray) -> Float {
     let x = a.reshaped([-1]).asType(.float32), y = b.reshaped([-1]).asType(.float32)
@@ -30,15 +32,14 @@ final class LTX2AVBlockParityTests: XCTestCase {
   }
 
   func testDualBlockMatchesReferenceFixture() throws {
-    let weights = FileManager.default.fileExists(atPath: Self.localWeights)
-      ? Self.localWeights : Self.weightsPath
+    let weights = Self.weightsPath
     try XCTSkipUnless(FileManager.default.fileExists(atPath: weights),
-      "v16b monolith not present (stage to ~/.comfybox/reference for xctest)")
+      "v16b block-0 extract not present in ~/.comfybox/reference")
     let g = try MLX.loadArrays(url: Self.fixtureURL)
 
     // Target loader API: block 0 with the full A/V + cross + gated layout.
     let block = try LTX2TransformerBlock.loadAVBlock(
-      monolithPath: weights, blockIndex: 0)
+      blockExtractPath: weights)
 
     // Target forward contract — mirrors BasicAVTransformerBlock.forward.
     let (vxOut, axOut) = block.callDualStream(
