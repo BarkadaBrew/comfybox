@@ -76,6 +76,9 @@ public struct LTX2VideoRequest: Sendable {
     /// the full five-level resolution.
     public var tuning: LTX2VideoTuning?
     public var presetTuning: LTX2VideoTuning?
+    /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
+    /// loads the audio branch (+~11GiB) into the transformer on first use.
+    public var audio: Bool
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -110,8 +113,10 @@ public struct LTX2VideoRequest: Sendable {
         loras: [LTX2LoRAReference] = [],
         outputPath: String,
         tuning: LTX2VideoTuning? = nil,
-        presetTuning: LTX2VideoTuning? = nil
+        presetTuning: LTX2VideoTuning? = nil,
+        audio: Bool = false
     ) {
+        self.audio = audio
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.initImagePath = initImagePath
@@ -201,6 +206,9 @@ public final class LTX2VideoGenerator {
     public var loadedTokenizer: LTX2GemmaTokenizer? { tokenizer }
     /// "path@strength" of the LoRA merged into the loaded transformer (nil = base).
     private var loadedLoraKey: String?
+    /// Audio codec (VAE + vocoder), lazily bound from the monolith on the
+    /// first audio render; cheap (mmap subset) and kept for the process life.
+    private var audioVAE: LTX2AudioVAE?
 
     public init(config: Configuration, logger: Logger = Logger(label: "ltx2.video")) {
         self.config = config
@@ -296,21 +304,26 @@ public final class LTX2VideoGenerator {
     /// Construct and load the transformer, VAE, text encoder, and pipeline,
     /// optionally merging one or more LoRAs into the transformer (applied in
     /// order). Idempotent for the same LoRA set; a different set reloads.
-    public func load(loras: [LTX2LoRAReference] = []) throws {
-        let wantKey = loras.isEmpty ? nil : loras.map { "\($0.path)@\($0.scale)" }.joined(separator: "|")
+    public func load(loras: [LTX2LoRAReference] = [], audio: Bool = false) throws {
+        // Audio joins the warm key: an audio render needs the dual-stream
+        // transformer (audio branch +~11GiB); switching either way reloads.
+        let loraPart = loras.isEmpty ? "" : loras.map { "\($0.path)@\($0.scale)" }.joined(separator: "|")
+        let wantKey0 = loraPart + (audio ? "|+audio" : "")
+        let wantKey: String? = wantKey0.isEmpty ? nil : wantKey0
         if isLoaded {
             if wantKey == loadedLoraKey { return }
-            unload()   // LoRA set changed — rebuild the transformer.
+            unload()   // LoRA set or audio mode changed — rebuild the transformer.
         }
         let modelDir = config.weightsDir
 
-        logger.info("LTX-2: creating transformer…")
+        logger.info("LTX-2: creating transformer…\(audio ? " (dual-stream A/V)" : "")")
         let transformer = LTX2Transformer(
             numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
             numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
             normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
             positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
-            useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true
+            useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true,
+            hasAudio: audio, audioInnerDim: 2048, audioInChannels: 128
         )
 
         let weightsURL = resolveWeightsFileURL()
@@ -325,7 +338,13 @@ public final class LTX2VideoGenerator {
         if isMonolith {
             logger.info("LTX-2: JoyAI-Echo monolithic checkpoint detected — prefix-filtered video-only load.")
         }
-        var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+        var sanitized = audio && isMonolith
+            ? LTX2Transformer.sanitizeWeightsWithAudio(rawWeights)
+            : LTX2Transformer.sanitizeWeights(rawWeights)
+        if audio && !isMonolith {
+            throw LTX2VideoError.weightsMissing(
+                "audio render requires a JoyAI-Echo monolithic checkpoint (audio branch tensors) — \(weightsURL.lastPathComponent) is per-component")
+        }
 
         // Merge each LoRA into the base weights in order (skip audio branches),
         // as the CLI does — multiple LoRAs simply accumulate their deltas.
@@ -566,7 +585,10 @@ public final class LTX2VideoGenerator {
         GPU.clearCache()
         defer { GPU.clearCache() }
         try validate(request)
-        try load(loras: request.effectiveLoRAs)
+        // v1 audio scope: single-chunk T2V. I2V and continuation chunks render
+        // video-only (spec wire-4 open items).
+        let wantAudio = request.audio && request.initImagePath == nil
+        try load(loras: request.effectiveLoRAs, audio: wantAudio)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
         // One greppable line per render: every Tier A/B param + provenance
@@ -613,6 +635,7 @@ public final class LTX2VideoGenerator {
 
         let start = CFAbsoluteTimeGetCurrent()
         var allFrames: [CGImage] = []
+        var audioLatents: MLXArray? = nil
 
         // Center-crop a CGImage to the target aspect ratio, matching ComfyUI's
         // ImageScale crop="center" (workflow nodes 7 and 19). Our plain resize
@@ -872,11 +895,15 @@ public final class LTX2VideoGenerator {
                     guidance: request.guidance,
                     negativeInputIds: negBatch?.inputIds,
                     negativeAttentionMask: negBatch?.attentionMask,
+                    audioSeconds: wantAudio && chunk == 0
+                        ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                    frameRate: Float(request.fps),
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 
             let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded, colorAnchor: pipeline.resolvedConfig.colorAnchor)
             allFrames.append(contentsOf: chunk == 0 ? chunkFrames : Array(chunkFrames.dropFirst()))
+            if let al = output.audioLatents { audioLatents = al }
 
             // Re-feed the last frame as the seed for the next continuation chunk.
             if chunk < plan.totalChunks - 1 {
@@ -949,10 +976,34 @@ public final class LTX2VideoGenerator {
         // all the refine detail. framesToImages carries per-frame dims.
         let outW = allFrames.first?.width ?? request.width
         let outH = allFrames.first?.height ?? request.height
+
+        // Audio decode (task #21): final audio latents -> 48kHz stereo via the
+        // reference-parity codec chain, muxed as AAC. Decode failure degrades
+        // to a video-only file rather than failing the render.
+        var audioTrack: LTX2PostProcess.AudioTrack? = nil
+        if let al = audioLatents {
+            do {
+                if audioVAE == nil {
+                    logger.info("LTX-2 audio: binding audio VAE + vocoder from monolith…")
+                    audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
+                }
+                if let av = audioVAE {
+                    let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N) @48k
+                    let clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
+                    eval(clamped)
+                    audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: 48000)
+                    logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / 48000.0))s stereo).")
+                }
+            } catch {
+                logger.error("LTX-2 audio: decode failed (\(error)) — writing video-only output.")
+            }
+        }
+
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
             fps: request.fps, width: outW, height: outH,
-            bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx)
+            bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
+            audio: audioTrack)
 
         return LTX2VideoResult(
             outputPath: request.outputPath,

@@ -1734,6 +1734,9 @@ public final class WarmServer {
     /// Aspect ratio for the resolution budget: "16:9" (default) or "9:16".
     /// For I2V the source image's aspect still wins (budget only).
     let aspectRatio: String?
+    /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
+    /// first audio render reloads the transformer with the audio branch.
+    let audio: Bool?
   }
 
   /// Map a named resolution + aspect to a width x height budget. Dims are
@@ -2222,7 +2225,8 @@ public final class WarmServer {
       outputPath: resolvedOutput
 ,
       tuning: req.tuning,
-      presetTuning: videoPreset?.videoTuning
+      presetTuning: videoPreset?.videoTuning,
+      audio: req.audio ?? false
     )
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
