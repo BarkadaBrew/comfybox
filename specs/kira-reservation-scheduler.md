@@ -570,10 +570,21 @@ cycle); maxContiguousRenderSec 600s (a video + FIFO stacking is what produced th
 62s waits fit); residency `videoToImage` ~65s (krea2 reload) as the dominant
 sequence-dependent cost term.
 
-**Limitations (see report):** no clean idle TTFT baseline (system 99% busy); no
-ISOLATED per-rung render cost (admission = queue+render, dominated by queue) — so
-cost-store floors are reference-seeded and learned in P3, a tighter seed needs a
-brief controlled scheduler pause; image-only hour (no video memory/LLM peaks).
+**Cost-probe (Kira paused, 2026-08-04) — the "~20s image" reference was WRONG.**
+Isolated krea2 image renders measured **200s and 345s** (10-step, ~1MP; plain
+`/v1/generate/async`, warm). Effective image cost is **~200–350s (3–6 min)**,
+an order of magnitude above the retired-mflux "~20s" — the plain-submit path
+includes the polish pass (`polishStrength 0.6`) and/or per-job LoRA reload.
+IMPLICATION: a 30-min slot (~1500s usable) fits only ~5–6 images, yet the live
+config books avocado=6 img+1 vid, banana=3, apple=2 per cycle — and the LIVE
+per-image adds optimizer + up-to-3 VLM QA. **The count-based scheduler is
+already silently over-capacity and spilling** — exactly the lossy-by-accident
+failure this design makes visible. Seed image rungs at median 250s / P95 350s.
+Ask (zimage.swift): expose per-phase render timings on the status endpoint.
+
+**Other limitations:** no clean idle TTFT baseline (system 99% busy); image-only
+hour (no video memory/LLM peaks); video floors stay reference-seeded (~5–6
+min/clip) pending a video cost-probe.
 
 **Finding F-A (spec §2 correction):** §2 assumed "traces already record elapsed"
 — they do NOT (`render-journal.ts` has no duration field, no kira path records

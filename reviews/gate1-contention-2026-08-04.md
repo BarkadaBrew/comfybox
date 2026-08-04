@@ -56,12 +56,51 @@ number decides whether the inference-lease (layer 1) suffices or placement (laye
    two brief idle gaps (~20s each) never coincided with a 45s-cadence LLM probe.
    The ~17 tok/s / ~1.3s TTFT low-load figure is from the smoke run (during video
    decode, near-idle), not a true idle. Not pausing live content to force one.
-2. **No isolated per-rung render cost.** Admission probes measured submit→done
-   (queue wait + render), dominated by FIFO wait — the right number for the SLA,
-   but it does not isolate a warm per-rung render time. Cost-store floors are
-   therefore seeded from documented references (krea2 image ~20s, i2v ~2–3 min,
-   dream.vignette ~5–6 min) and refined by learning (P3). A tighter seed needs a
-   controlled solo-render timing (brief scheduler pause) — available on request.
+2. **Isolated per-rung render cost — measured 2026-08-04 (Kira paused).** See the
+   cost-probe addendum below; the "~20s image" reference was WRONG for this
+   pipeline.
 3. **Image-only hour.** Occupancy was 99% image; no video-phase memory peaks or
    video-condition LLM probes landed. Video VRAM (~65 GB envelope) is from prior
    measurement, not this run.
+
+## Cost-probe addendum — isolated image render cost (2026-08-04, Kira paused)
+
+Todd authorized pausing Kira to measure against an idle engine. With no FIFO
+wait, submit→done IS the render cost. Plain `/v1/generate/async` submits (krea2
+warm from Kira's prior renders):
+
+| Rung | submit→done |
+|---|---|
+| image 10-step 832×1216 | **200s** |
+| image 10-step 1024×1024 | **345s** |
+| image 25-step 832×1216 | inconclusive (poll deadline; Kira resumed mid-probe) |
+
+**The load-bearing correction:** a krea2 image render here is **~200–350s (3–6
+min)**, an order of magnitude above the "~20s" reference (which was the retired
+mflux service). The plain-submit path almost certainly includes the default
+polish/refine pass (config `polishStrength 0.6`, `polishCheckpoint krea2`)
+and/or a per-job LoRA reload — the 200-vs-345s spread at near-equal pixel counts
+points at a variable setup/reload term, not pure denoise. The engine returns no
+per-phase breakdown, so it can't be decomposed client-side (`render_ms` was
+null — the status never surfaced a `rendering` state to poll).
+
+**Why this matters — the current count-based config is already over-capacity.**
+A 30-min slot has ~1500s of usable capacity (30min − overhead − interactive
+reserve). At ~270s/image that is ~5–6 images MAX. The live config schedules
+avocado=6 images + 1 video, banana=3, apple=2 per 30-min cycle — and the LIVE
+per-image cost is HIGHER still (it adds prompt optimization + up-to-3 VLM QA
+passes on top of the raw render). So the count-based scheduler is already
+silently spilling: it books more than a cycle can render, and the overflow just
+vanishes. This is precisely the lossy-by-accident failure the reservation
+scheduler makes visible and manages (fit-or-makegood, never silent drop).
+
+**Actions:**
+- Cost-store floors: seed image rungs at median 250s / P95 350s (conservative,
+  from these anchors) when the default MediaType catalog is built. The unknown-
+  signature defensive default (600/900s) already sits above these, so nothing
+  under-books today.
+- Video floors stay reference-seeded (~5–6 min/clip) pending a video cost-probe.
+- **Engine instrumentation ask (zimage.swift):** expose per-phase render timings
+  (load / denoise / refine / decode) on the status endpoint so cost learning
+  (P3) can attribute cost and the governor can size max_uninterruptible per
+  phase. Without it, floors stay whole-render blobs.
