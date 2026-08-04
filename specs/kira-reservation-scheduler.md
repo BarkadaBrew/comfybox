@@ -373,42 +373,90 @@ atomic priority + honest SLA → fps/policy contracts → conservative planner
 
 ---
 
-## Rev 3 addendum: Variable video size (Todd 2026-08-04)
+## Rev 4: Variable video size — ladders (Todd 2026-08-04; Codex findings 14-22 folded)
 
 **Requirement:** "for the scheduler and for motion and Kira, we need variable
-video size for delivery and production efficiencies."
+video size for delivery and production efficiencies." Size is a range WITHIN
+a MediaType (Todd confirmed: "tied to media types" — yes).
 
-### Mechanism: size ladders, not fixed dims
+### Rung model (Codex #16, #17)
 
-Each video MediaType defines a LADDER of (dims, seconds, steps) rungs with
-measured estCostSec per rung, not a single fixed size. The cost model is
-empirical (fit from RenderTraceStore; see 2026-08-04 analysis): duration is
-LINEAR in cost, resolution ~QUADRATIC, steps linear, two-stage refine a
-large fixed multiplier. So the ladder gives the scheduler a smooth
-cost/quality dial per asset:
+Each MediaType carries an ORDERED ladder of rungs. A rung is a stable,
+versioned, engine-complete signature — never an informal label:
 
-- portrait.animated: 480p/5s ... 720p/8s ... 720p/12s
-- dream.vignette:    512x320/5s ... 720p/8s ... 1080p/12s (idle-only rung)
-- speech clips carry ~2x steps cost (measured 727s for 4s @16 steps).
+- `rungId` (stable), `ladderRevision`, explicit **quality ordering** (the
+  ladder's order IS the ordering; 1080p/5s vs 720p/12s comparisons are
+  resolved by the MediaType author at spec time, not at runtime),
+- `minAcceptable` marker per MediaType (the floor rung),
+- eligibility predicates (`idleOnly`, `overnightOnly`),
+- full engine-valid parameters: nominal dims budget + orientation, seconds,
+  fps, steps, twoStage, audio, guidance profile. Speech and refine variants
+  are DISTINCT rung signatures, not multipliers.
+- **Resolved geometry** (Codex #16): i2v treats dims as an area budget
+  (source aspect + /64 snap decide actuals; two-stage floors apply). A
+  reservation persists nominal budget → resolved stage-1 geometry → final
+  geometry + frames + fps once its source is known; cost, memory, and
+  delivery checks re-run against RESOLVED values.
 
-### Scheduler behavior
+### Selection: global packing, not greedy (Codex #14 — BLOCKER)
 
-- **Fit-to-window**: pick the largest rung whose estCostSec fits the open
-  timeslot (minus interactive-buffer reserve). Tight schedule → smaller
-  clips, never dropped slots. Idle overnight window → top rungs.
-- **Demand-aware**: on-demand bumps shrink in-flight-adjacent reservations
-  to lower rungs rather than cancelling them.
-- **Delivery efficiency**: rung caps respect the Telegram 50MB bot limit
-  (bits/px * dims * fps * seconds) — delivery size is part of the rung
-  definition, not an afterthought.
+Never per-reservation "largest that fits." Planning a window:
+1. Place EVERY mandatory reservation at its `minAcceptable` rung first —
+   if even minima don't fit, apply Rev 2 push/quarantine rules explicitly.
+2. Distribute remaining capacity as UPGRADES by priority × quality-utility
+   (highest-priority reservations climb rungs first).
+This preserves "never dropped slots" as an invariant of step 1, not a hope.
 
-### Pre-#23 quick wins (current system)
+### Admission cost contract (Codex #15 — BLOCKER; #20)
 
-- Kira cycle: clipSeconds is already live-editable; add per-cycle rung
-  variation (e.g. alternate 5s/8s) for immediate throughput gain
-  (5s ≈ 33% cheaper per clip, ~1.5x clips/day).
-- Motion tab: expose the ladder as size presets (S/M/L/XL) instead of raw
-  dims — same rungs the scheduler uses, so manual and scheduled renders
-  share one cost vocabulary.
-- Audio note: audio cost is invariant to rung (~negligible tokens), so
-  sizing decisions don't affect the sound.
+- Fit uses the **full conservative P95 execution signature** per rung:
+  seed generation, VLM/optimizer attempts, model residency transitions
+  (incl. the krea2 ~65s post-video reload), admission drains, denoise,
+  refine, decode, mux. The scalar rung estimate is a UI baseline only.
+- Each rung also carries peak-memory and uninterruptible-phase estimates
+  for the GPU governor. A time-fitted rung failing memory/phase admission
+  at dispatch: atomic downgrade-and-refit → else defer → else quarantine.
+  Never a silent engine-queue entry, never burns a protected window on
+  retries.
+
+### Mutation rules (Codex #18)
+
+A rung may change ONLY while the reservation is reserved/daemon-queued and
+before any dimension-dependent work (seed render, prompt optimization, QA)
+has begun — never after dispatching/engineQueued/running. Changes are
+revision-checked amendments persisting {selectedRung, reason, alternatives}
+atomically. Manual fixed-rung and campaign-minimum reservations are
+non-shrinkable.
+
+### Stability and fairness (Codex #19)
+
+- Freeze horizon: rung selection locks N minutes before dispatch.
+- Downgrade hysteresis + monotonic downgrade within a slot (no A→B→A).
+- Upgrade cutoff: no upgrades inside the freeze horizon.
+- **Quality debt**: reservations repeatedly forced to low rungs accrue
+  age-weighted debt that raises their upgrade priority, so idle-only top
+  rungs eventually win capacity instead of always losing to throughput.
+
+### Delivery budget (Codex #21)
+
+The bits/px formula is an ESTIMATE. Rungs carry a conservative byte budget
+(cap × headroom factor); encoders run with max-rate bounds; POST-ENCODE
+byte validation is mandatory, with a bounded fallback chain (re-encode at
+lower bitrate → delivery-rung transcode) before delivery. The delivered
+encoding is recorded separately from the render rung in the ledger.
+
+### Shared ladder API (Codex #22)
+
+Ladders live in the versioned schedule config, server-owned:
+{ladderId, rungs[], revision, costEstimateVersion, confidence}. Ledger and
+queue DTOs carry {selectedRung, selectionReason, alternatives, mutable}.
+**Motion fetches the same server ladder** and submits `rungId + revision`
+— the S/M/L/XL presets are rendered FROM the ladder, never hard-coded, so
+manual and scheduled renders cannot drift.
+
+### Pre-#23 quick wins (unchanged, now bounded)
+
+- Kira cycle 5s clipSeconds: DONE 2026-08-04 (live).
+- Motion size presets: DEFERRED until the ladder API exists (Codex #22 —
+  hard-coding S/M/L first would create the drift the API prevents).
+- Audio cost is rung-invariant (~negligible tokens).
