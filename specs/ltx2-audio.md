@@ -183,3 +183,44 @@ Superseding corrections — the rev-1 wires understated the work:
 **Revised estimate: 1.5–2 weeks** (was 4–5 days). Ranked order: architecture
 statement → oracle → codec parity → sampler semantics → joint two-stage →
 lifecycle/memory → extended renders → mux → API/registry/trace.
+
+---
+
+## Wire 4 integration plan (pinned 2026-08-04, transformer path complete)
+
+Transformer-side DONE at reference parity: callDualStream (block oracle
+0.999+), AudioPatchifier, prepareAVConditioning / projectAudioTokens /
+processAudioOutput (top-level oracle, crossed gates verified), callAV +
+precomputeAVPositionalEmbeddings (shape-tested). Mux deadlock fixed
+(demand-driven two-track appends). Commits d7e1261, a05186b, 14e4116,
+e4282dd, 191e993.
+
+### Pipeline edit (LTX2Pipeline.swift denoise loop)
+- Audio latent rate: sampleRate/(hop*ds) = 16000/640 = 25 latent frames/s.
+  Ta = ceil(seconds*25). Init noise [B,8,Ta,16] from the ISOLATED audio RNG
+  (spec: separate MLXRandom key so video seeds reproduce with/without audio).
+- Thread an optional AV state through the step loop: {audioLatents,
+  audioContext (textEncoder.audioEmbeddings), av PEs (precomputed once),
+  audioSigma == video sigma schedule}.
+- POSITIVE pass -> callAV; audio x0 = ax - sigma*velA; same Euler update
+  as video. v1: CFG/STG/NAG passes stay VIDEO-ONLY (callAsFunction) and
+  only steer the video x0 — audio rides the conditional prediction.
+  OPEN: verify against ComfyUI whether STG/CFG passes in the AV recipe
+  run run_ax=false (transformer_options) — believed yes for distilled.
+- videoSigmaMax for av_ca = sigma (uniform t2v); i2v per-token av_ca video
+  ss deferred (OPEN — reference uses per-token timestep_flat there).
+- Two-stage refine: re-noise audio JOINTLY at stage-2 strength (spec rev 2).
+- Decode: LTX2AudioVAE.load(~/.comfybox models dir), decodeToWaveform
+  (proven chain) -> writeMP4(audio: AudioTrack(samples, 48000)).
+
+### Lifecycle / API
+- Warm-key gains hasAudio (+11.3GiB gate); registry flag audio=true;
+  RenderTraceStore event field has_audio; /v1/video request param
+  `audio: bool` (default false), server passes through.
+- Weights: monolith already carries audio branch; loadWeights must use
+  sanitizeWeightsWithAudio when hasAudio (exists, branch-tested).
+
+### Acceptance
+- t2v 2s clip with audible, prompt-relevant sound; A/V duration agree
+  within one frame; video-only path byte-identical when audio=false;
+  judge clip vs ComfyUI same-seed render.
