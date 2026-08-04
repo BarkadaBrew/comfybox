@@ -224,3 +224,18 @@ e4282dd, 191e993.
 - t2v 2s clip with audible, prompt-relevant sound; A/V duration agree
   within one frame; video-only path byte-identical when audio=false;
   judge clip vs ComfyUI same-seed render.
+
+### Wire 4 SHIPPED (2026-08-04)
+
+Full path live and listen-validated: `/v1/video/generate {"audio": true}` →
+dual-stream load (audio in warm key, admission audio-aware) → joint denoise →
+codec decode → AAC mux; MCP `generate_video.audio`; `has_audio` +
+`audio_seconds` on traces. First clip: prompt-conditioned ocean audio,
+Todd-validated. Codex review same day — 10/10 findings folded
+(reviews/codex-audio-wire-review-2026-08-04.md), incl. the cross-RoPE double
+fps division (positions grid is already seconds) and audio-aware admission.
+
+**v2 backlog:** i2v audio (per-token av_ca video timesteps), NAG/STG on the
+joint path, chunked audio, desktop toggle, ComfyUI same-seed judge run,
+exact-manifest weight verification (Codex #7 shipped as a 95% audio-branch
+coverage gate; full manifest still open).
