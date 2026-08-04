@@ -78,6 +78,7 @@ public final class LTX2Transformer: Module {
   // ---- Top-level audio branch (JoyAI-Echo, Phase 2) — built when `hasAudio`. ----
   public let hasAudio: Bool
   let audioInnerDim: Int
+  let audioHeads: Int
   @ModuleInfo(key: "audio_patchify_proj") var audioPatchifyProj: Linear?
   @ModuleInfo(key: "audio_proj_out") var audioProjOut: Linear?
   @ModuleInfo(key: "audio_adaln_single") var audioAdaLNSingle: LTX2AdaLayerNormSingle?
@@ -124,10 +125,13 @@ public final class LTX2Transformer: Module {
     doublePrecisionRoPE: Bool = false,
     hasAudio: Bool = false,
     audioInnerDim: Int = 2048,
-    audioInChannels: Int = 128
+    audioInChannels: Int = 128,
+    audioHeads: Int = 32,
+    audioDimHead: Int = 64
   ) {
     self.hasAudio = hasAudio
     self.audioInnerDim = audioInnerDim
+    self.audioHeads = audioHeads
     self.innerDim = numHeads * headDim
     self.numHeads = numHeads
     self.headDim = headDim
@@ -180,7 +184,9 @@ public final class LTX2Transformer: Module {
         ropeMode: ropeMode,
         hasPromptAdaLN: hasPromptAdaLN,
         hasAudio: hasAudio,
-        audioDim: audioInnerDim
+        audioDim: audioInnerDim,
+        audioHeads: audioHeads,
+        audioDimHead: audioDimHead
       ))
     }
     self._transformerBlocks.wrappedValue = blocks
@@ -335,7 +341,7 @@ public final class LTX2Transformer: Module {
   ///   - x: Hidden states `(B, T, innerDim)`.
   ///   - embeddedTimestep: Timestep embedding `(B, 1, innerDim)`.
   /// - Returns: Output `(B, T, outChannels)`.
-  private func processOutput(x: MLXArray, embeddedTimestep: MLXArray) -> MLXArray {
+  func processOutput(x: MLXArray, embeddedTimestep: MLXArray) -> MLXArray {
     // scale_shift_table: (2, dim) -> (1, 1, 2, dim)
     // embedded_timestep: (B, 1, dim) -> (B, 1, 1, dim)
     let tableExpanded = scaleShiftTable.expandedDimensions(axes: [0, 1])

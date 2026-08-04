@@ -139,3 +139,42 @@ final class LTX2AVToplevelParityTests: XCTestCase {
     }
   }
 }
+
+/// Wiring test for the joint forward: tiny-dim hasAudio transformer, both
+/// stream shapes preserved end-to-end (patchify -> 2 blocks -> outputs).
+/// Numeric parity is covered by the block + plumbing oracles above.
+final class LTX2CallAVShapeTests: XCTestCase {
+  func testCallAVProducesBothVelocities() {
+    let t = LTX2Transformer(
+      numHeads: 2, headDim: 32, inChannels: 128, outChannels: 128,
+      numLayers: 2, crossAttentionDim: 64, captionChannels: 64,
+      normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
+      positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
+      useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true,
+      hasAudio: true, audioInnerDim: 32, audioInChannels: 128, audioHeads: 2, audioDimHead: 16)
+
+    let b = 1, frames = 2, hh = 2, ww = 2, ta = 5, s = 4
+    let nv = frames * hh * ww
+    let latent = MLXRandom.normal([b, nv, 128])
+    let audioLatents = MLXRandom.normal([b, 8, ta, 16])
+    let positions = LTX2PatchEmbed.makePositionGrid(
+      frames: frames, height: hh, width: ww, batchSize: b, useMiddleIndicesGrid: true)
+    let (_, audioCoords) = LTX2AudioPatchifier.patchify(audioLatents)
+
+    let pe = t.precomputeAVPositionalEmbeddings(
+      positions: positions, audioCoords: audioCoords, frameRate: 25)
+    let (v, a) = t.callAV(
+      latent: latent, audioLatents: audioLatents,
+      timestep: MLXArray([Float(0.7)]).reshaped([1, 1]),
+      videoSigmaMax: 0.7, audioSigma: 0.7,
+      context: MLXRandom.normal([b, s, 64]),
+      audioContext: MLXRandom.normal([b, s, 32]),
+      sigma: MLXArray([Float(0.7)]),
+      pe: pe)
+    MLX.eval(v, a)
+    XCTAssertEqual(v.shape, [b, nv, 128], "video velocity tokens")
+    XCTAssertEqual(a.shape, [b, 8, ta, 16], "audio velocity latents")
+    XCTAssertTrue(MLX.max(MLX.abs(v)).item(Float.self).isFinite)
+    XCTAssertTrue(MLX.max(MLX.abs(a)).item(Float.self).isFinite)
+  }
+}
