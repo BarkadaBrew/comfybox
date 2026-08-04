@@ -460,3 +460,82 @@ manual and scheduled renders cannot drift.
 - Motion size presets: DEFERRED until the ladder API exists (Codex #22 —
   hard-coding S/M/L first would create the drift the API prevents).
 - Audio cost is rung-invariant (~negligible tokens).
+
+---
+
+## Gate 2 — Todd's ad-server semantics (verbatim, 2026-08-04)
+
+Captured before any policy is encoded (build-brief requirement). Todd was CTO
+of Advertising.com 1999–2004; this framing is the authoritative domain design.
+Questions posed by the build session, answers verbatim.
+
+**Q1 — Priority classes.** Beyond INTERACTIVE vs SCHEDULED, how is demand
+ranked (user asks, Muse on-demand, campaign specials, filler)? Guaranteed vs
+best-effort tiers?
+
+> "User or Muse requests are highest priority"
+
+**Q2 — Underdelivery / makegood.** When a slot can't fit its booking (or a
+campaign underdelivers over a night), what's the behavior — drop-and-forget,
+roll a makegood into future capacity, or in between? How long is a makegood
+owed?
+
+> "User or Muse requests are delivered are never dropped. Displaced units are
+> made good when slot is available."
+
+**Q3 — "Sold out".** What does a fully-booked interactive window mean to a
+User asking in chat — hard reject with a wait estimate, queue-and-warn, or bump
+scheduled content? Where is interactive "sold out"?
+
+> "When sold out or high priority collision, Schedule is moved back to
+> accommodate."
+
+### Design consequences (encode these; they refine, not replace, rev 2/§1.5)
+
+1. **Two-not-four priority, and the top class is guaranteed.** Todd collapses
+   "user asks" and "Muse on-demand" into ONE top class — both are INTERACTIVE
+   and both are **guaranteed-delivery: never dropped**. This confirms the
+   §Priority two-class model (INTERACTIVE > SCHEDULED) and resolves the Q1
+   sub-question: there is no separate "campaign special" or "filler" priority
+   tier ABOVE scheduled — campaigns and filler are SCHEDULED-class demand that
+   competes for slot capacity (campaign id / filler policy ride the reservation
+   as metadata, per §2.5 and rev 2 #9, but do not outrank interactive).
+
+2. **Makegood applies to DISPLACED SCHEDULED units, and the guarantee is
+   asymmetric.** The lossiness of §1.5 ("a slot that doesn't fill is dead air,
+   not debt") is now scoped precisely:
+   - INTERACTIVE (user/Muse) requests are a HARD guarantee — never dropped,
+     never expired. They are not subject to the 1–2-slot backlog aging.
+   - A SCHEDULED unit that an interactive bump DISPLACES is not dead air — it
+     is **owed a makegood** and re-placed "when slot is available" (the next
+     slot with residual capacity that fits it). This is a rolling makegood
+     queue, distinct from the pure-lossy overflow of the draft.
+   - Reconciliation with §1.5 lossiness: the makegood still ages. A displaced
+     scheduled unit rolls forward until a fitting slot opens OR it hits the
+     backlog max age (rev 2 #9), whichever first — because stale JIT muse
+     content still isn't worth rendering days later. So: interactive = owed
+     forever (until rendered); scheduled makegood = owed until a slot avails or
+     it ages out. The makegood is a distinct reservation flag
+     (`makegoodFor: <displacedReservationId>`) so authorship/why is visible in
+     the ledger.
+
+3. **"Sold out" is never a hard reject — the schedule yields.** There is no
+   user-facing "sold out" wait-estimate rejection. On a full interactive
+   window OR a high-priority collision, **SCHEDULED content is moved back
+   (deferred) to accommodate** the interactive request. This is exactly the
+   rev 2 #4 bump (interactive enters at the FRONT; scheduled slides back and
+   the ledger re-fits) bounded by rev 2 #5 (the RUNNING job is never killed —
+   worst-case interactive wait = the running job's remainder, capped by the
+   contiguous-occupancy admission rule). The only real "sold out" surface is
+   the honest SLA: the wait is bounded by the currently-running job's P95
+   remainder, not a refusal. The scheduler's job is to keep that remainder
+   small (the interactive reserve + contiguous-occupancy cap), never to reject.
+
+4. **What this pins for P1 policy encoding.** (a) Reservation priority is the
+   two-class INTERACTIVE/SCHEDULED with interactive guaranteed. (b) A displaced
+   scheduled reservation transitions to a makegood state (not `expired`) and
+   re-enters packing at the next slot, carrying `makegoodFor` + inheriting the
+   displaced unit's quality debt (rev 4 #19) so repeatedly-displaced units
+   climb. (c) The packer's protected interactive windows are a HARD constraint
+   the scheduled plan must yield to — encoded as the fixed-priority hard
+   constraint already in §1.5, now confirmed by Q3.
