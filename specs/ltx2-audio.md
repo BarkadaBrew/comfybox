@@ -239,3 +239,12 @@ fps division (positions grid is already seconds) and audio-aware admission.
 joint path, chunked audio, desktop toggle, ComfyUI same-seed judge run,
 exact-manifest weight verification (Codex #7 shipped as a 95% audio-branch
 coverage gate; full manifest still open).
+
+### i2v audio SHIPPED (2026-08-04, pulled forward)
+
+Per-token av_ca video conditioning (reference timestep_flat semantics),
+joint audio re-noise through applyTwoStageRefine with refine-grid AV PEs,
+single-chunk i2v accepted (chunked + multi-keyframe still reject).
+E2E-validated: i2v surf clip with generated audio. Speech probe underway
+(16 steps, quoted dialogue) — quality tuning tracked separately from
+architecture.
