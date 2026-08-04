@@ -539,3 +539,45 @@ scheduled content? Where is interactive "sold out"?
    climb. (c) The packer's protected interactive windows are a HARD constraint
    the scheduled plan must yield to — encoded as the fixed-priority hard
    constraint already in §1.5, now confirmed by Q3.
+
+---
+
+## Gate 1 — GPU contention measurement (measured, 2026-08-04)
+
+Full report: `reviews/gate1-contention-2026-08-04.md`. 67 min instrumented
+against the live engine + local model while the content-scheduler ran normally.
+
+**Result — the spec's layer-1-vs-layer-3 question is answered: layer 1 (the
+inference lease) is REQUIRED.**
+
+| Signal | Measured |
+|---|---|
+| Engine occupancy | 99% image-busy (GPU saturated by 24/7 content) |
+| Interactive admission (submit→done, under load) | **p50 531s / p95 751s** (8.9–12.5 min FIFO wait) |
+| LLM time-to-first-token under render load | **p50 2.5s / p95 47s / max 62s** |
+| LLM TTFT > 10s | **21% of turns** (14/67) |
+| LLM throughput under load | 3.8–5.4 tok/s (~4× the ~17 tok/s low-load ref) |
+| VRAM, image renders | 33–37 GB (no video peaks this hour) |
+
+The 62s max TTFT + 21%-over-10s reproduce the 2026-08-03 90s agent-loop timeout.
+Windows alone (layer 2) cannot fix it — a render holds the GPU 5–6 min and tokens
+starve INSIDE that span. The lease (pause at next step boundary, TTL ≤ 90s) caps
+token latency at one denoise step vs the 12.5-min FIFO wait.
+
+**Config seeds from this data:** interactiveReserveSec 300s (~17% of a 30-min
+cycle); maxContiguousRenderSec 600s (a video + FIFO stacking is what produced the
+12.5-min wait — the cap forces a following window); lease TTL ≤ 90s (validated —
+62s waits fit); residency `videoToImage` ~65s (krea2 reload) as the dominant
+sequence-dependent cost term.
+
+**Limitations (see report):** no clean idle TTFT baseline (system 99% busy); no
+ISOLATED per-rung render cost (admission = queue+render, dominated by queue) — so
+cost-store floors are reference-seeded and learned in P3, a tighter seed needs a
+brief controlled scheduler pause; image-only hour (no video memory/LLM peaks).
+
+**Finding F-A (spec §2 correction):** §2 assumed "traces already record elapsed"
+— they do NOT (`render-journal.ts` has no duration field, no kira path records
+one). Cost learning (rev 2 #8) has no live data source today. Resolution: the
+signature-keyed `scheduler/cost-store.ts` holds config-seeded floors now; the
+elapsed-capture wiring (source: comfybox async status `durationMs`) lands with
+the cutover (P3), not against live render paths in shadow P1.
