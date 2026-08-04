@@ -370,3 +370,45 @@ Verdict accepted: direction sound, draft guarantees corrected as follows.
 **Build order = the review's fold-in sequence:** lease/phase admission →
 atomic priority + honest SLA → fps/policy contracts → conservative planner
 → taxonomy/durability → shadow cutover → desktop aggregation.
+
+---
+
+## Rev 3 addendum: Variable video size (Todd 2026-08-04)
+
+**Requirement:** "for the scheduler and for motion and Kira, we need variable
+video size for delivery and production efficiencies."
+
+### Mechanism: size ladders, not fixed dims
+
+Each video MediaType defines a LADDER of (dims, seconds, steps) rungs with
+measured estCostSec per rung, not a single fixed size. The cost model is
+empirical (fit from RenderTraceStore; see 2026-08-04 analysis): duration is
+LINEAR in cost, resolution ~QUADRATIC, steps linear, two-stage refine a
+large fixed multiplier. So the ladder gives the scheduler a smooth
+cost/quality dial per asset:
+
+- portrait.animated: 480p/5s ... 720p/8s ... 720p/12s
+- dream.vignette:    512x320/5s ... 720p/8s ... 1080p/12s (idle-only rung)
+- speech clips carry ~2x steps cost (measured 727s for 4s @16 steps).
+
+### Scheduler behavior
+
+- **Fit-to-window**: pick the largest rung whose estCostSec fits the open
+  timeslot (minus interactive-buffer reserve). Tight schedule → smaller
+  clips, never dropped slots. Idle overnight window → top rungs.
+- **Demand-aware**: on-demand bumps shrink in-flight-adjacent reservations
+  to lower rungs rather than cancelling them.
+- **Delivery efficiency**: rung caps respect the Telegram 50MB bot limit
+  (bits/px * dims * fps * seconds) — delivery size is part of the rung
+  definition, not an afterthought.
+
+### Pre-#23 quick wins (current system)
+
+- Kira cycle: clipSeconds is already live-editable; add per-cycle rung
+  variation (e.g. alternate 5s/8s) for immediate throughput gain
+  (5s ≈ 33% cheaper per clip, ~1.5x clips/day).
+- Motion tab: expose the ladder as size presets (S/M/L/XL) instead of raw
+  dims — same rungs the scheduler uses, so manual and scheduled renders
+  share one cost vocabulary.
+- Audio note: audio cost is invariant to rung (~negligible tokens), so
+  sizing decisions don't affect the sound.
