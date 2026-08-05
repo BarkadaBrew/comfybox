@@ -603,8 +603,15 @@ Direction, verbatim:
 > "Its requests are treated as priority yield orders. Tier 2 subnet. Todd and Bree are tier 1. Network traffic tier 3."
 > "Todd wins. Content stream is network traffic."
 
-### The campaign manager IS the broker — the single front door
-The campaign manager is the shared GPU **resource-and-delivery broker**. It is the
+### Delivery IS the broker — the single front door
+**Naming (Todd 2026-08-05):** the manager/tab is **Delivery** — it manages all GPU
+traffic and its routing, so it is named for its job, not for one of its inputs. A
+**campaign** is a first-class demand-source object *within* Delivery (a themed,
+authored lineup — Kira's or the user's — that books reservations), one input
+alongside create-tab asks, Bree/User asks, and the stream. Delivery is the
+manager; a campaign is one of the things it delivers.
+
+Delivery is the shared GPU **resource-and-delivery broker**. It is the
 SOLE admission point to the engine — no render reaches the GPU without going
 through it. Three principals are clients: **User (Todd), Bree, Kira**. It does two
 jobs at once: allocate the scarce GPU (yield management) and manage delivery
