@@ -327,9 +327,14 @@ public final class LTX2Pipeline {
       let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
       let sigma0 = refineSigmas[0]
       let refineInit = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)  // flow re-noise
-      // Joint two-stage: re-noise AUDIO at the same strength (spec rev 2) so
-      // the refine pass denoises both streams together.
-      if let av = avState {
+      // AUDIO BYPASSES PASS 2 (2026-08-05): re-noising audio at stage-2
+      // strength and re-denoising with 3-4 video-tuned steps audibly wipes
+      // pass-1 ambience ("much more sedate" — PinkCherry HF discussion #8,
+      // independently matching our ambient-distortion reports). Audio gains
+      // nothing from a SPATIAL upsample; keep the fully-denoised stage-1
+      // track. LTX2_AUDIO_REFINE=1 re-enables the joint refine for A/B.
+      let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
+      if refineAudio, let av = avState {
         let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
         let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
         av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
@@ -345,12 +350,14 @@ public final class LTX2Pipeline {
         doublePrecision: transformer.doublePrecisionRoPE)
       eval(refinePE.cos, refinePE.sin)
       logger.info("T2V two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
-      // Refine PEs change with the upsampled grid; rebuild the AV bundle too.
-      if let av = avState {
+      // Refine PEs change with the upsampled grid; rebuild the AV bundle too
+      // (audio-refine A/B path only — default keeps stage-1 audio untouched).
+      var refineAVState: LTX2AVDenoiseState? = nil
+      if refineAudio, let av = avState {
         let (_, aCoords) = LTX2AudioPatchifier.patchify(av.audioLatents)
         let avPE2 = transformer.precomputeAVPositionalEmbeddings(
           positions: refinePos, audioCoords: aCoords)
-        avState = LTX2AVDenoiseState(
+        refineAVState = LTX2AVDenoiseState(
           audioLatents: av.audioLatents, audioContext: av.audioContext, pe: avPE2)
       }
       latents = denoisingLoop(
@@ -358,8 +365,11 @@ public final class LTX2Pipeline {
         textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
         sigmas: refineSigmas, cfgScale: cfgScale, state: nil, nagEmbeddings: nagEmbeddings, nag: nagConfig,
         forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
-        avState: avState,
+        avState: refineAVState,
         progressCallback: progressCallback)
+      if refineAudio, let av = avState, let rav = refineAVState {
+        av.audioLatents = rav.audioLatents
+      }
       eval(latents)
       MLX.GPU.clearCache()
       logger.info("T2V two-stage refine complete.")
@@ -1514,9 +1524,10 @@ public final class LTX2Pipeline {
     let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
     let sigma0 = refineSigmas[0]
     let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
-    // Joint two-stage (task #21): re-noise AUDIO at the same strength so the
-    // refine denoises both streams together (spec rev 2).
-    if let av = avState {
+    // AUDIO BYPASSES PASS 2 by default (2026-08-05) — see the t2v refine
+    // block comment: joint refine audibly wipes pass-1 ambience.
+    let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
+    if refineAudio, let av = avState {
       let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
       let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
       av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
@@ -1553,8 +1564,8 @@ public final class LTX2Pipeline {
     eval(refinePE.cos, refinePE.sin)
     // Rebuild the AV PE bundle against the refine grid (video token count and
     // spatial coords change at 2x; audio coords are unchanged).
-    var refineAVState = avState
-    if let av = avState {
+    var refineAVState: LTX2AVDenoiseState? = nil
+    if refineAudio, let av = avState {
       let (_, aCoords) = LTX2AudioPatchifier.patchify(av.audioLatents)
       let avPE2 = transformer.precomputeAVPositionalEmbeddings(
         positions: refinePos, audioCoords: aCoords)
