@@ -1040,6 +1040,13 @@ public final class LTX2VideoGenerator {
                     if clamped.dim(1) > videoSamples {
                         clamped = clamped[0..., 0..<videoSamples]
                     }
+                    // In-engine mastering (task #26): rumble cut, BWE de-harsh,
+                    // loudness raise with soft ceiling. LTX2_AUDIO_ENHANCE=0
+                    // keeps the raw track (A/B + training-data use).
+                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" {
+                        clamped = LTX2AudioEnhance.process(clamped, sampleRate: 48000)
+                        logger.info("LTX-2 audio: enhancement chain applied (hp50 + dip7.5k + loudnorm).")
+                    }
                     eval(clamped)
                     audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: 48000)
                     logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / 48000.0))s stereo).")
