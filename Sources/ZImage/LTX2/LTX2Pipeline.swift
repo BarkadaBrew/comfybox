@@ -322,16 +322,21 @@ public final class LTX2Pipeline {
     // short deterministic refine denoise.
     if let ups = self.upsampler, resolvedConfig.twoStage {
       MLX.GPU.clearCache()
+      // Gate-skip decode fix (2026-08-05): check BEFORE upsampling — see
+      // applyTwoStageRefine. Above the gate, keep base latents (native size).
+      let t2vPreVolume = latents.dim(2) * (latH * 2) * (latW * 2)
+      let t2vRefineMax = resolvedConfig.refineMaxVol
+      if t2vPreVolume > t2vRefineMax,
+         ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1" {
+        logger.info("T2V two-stage refine: SKIPPED entirely (volume \(t2vPreVolume) > \(t2vRefineMax)) — native-size decode (gate-skip fix 2026-08-05).")
+      } else {
       logger.info("T2V two-stage refine: upsampling latents 2x...")
       let stats = vae.decoder.perChannelStatistics
       let upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
       eval(upLatent)
-      // Refine-volume OOM gate — same guard as the i2v path (Codex review
-      // 2026-07-26: t2v could still crash the process at large formats).
       let t2vRefineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
-      let t2vRefineMax = resolvedConfig.refineMaxVol
       if t2vRefineVolume > t2vRefineMax {
-        logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (OOM guard).")
+        logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (LTX2_REFINE_UPSCALE_ON_SKIP path).")
         latents = upLatent
       } else {
       let rLatH = latH * 2, rLatW = latW * 2
@@ -386,6 +391,7 @@ public final class LTX2Pipeline {
       eval(latents)
       MLX.GPU.clearCache()
       logger.info("T2V two-stage refine complete.")
+      }
       }
     }
 
@@ -1537,6 +1543,21 @@ public final class LTX2Pipeline {
   ) -> MLXArray {
     guard let ups = self.upsampler,
           resolvedConfig.twoStage else {
+      return latents
+    }
+    // Gate-skip decode fix (Todd 2026-08-05): the volume is knowable from
+    // dims BEFORE upsampling. Above the gate the refine denoise never runs,
+    // so the old path paid the upsampler + a 4x-pixel decode for a soft
+    // unrefined upscale — at current production formats (5s 480p = 24,960 >
+    // 20,000) that was EVERY Kira clip, ~30% of each render wasted. Skip
+    // early and decode base latents at the requested size.
+    // LTX2_REFINE_UPSCALE_ON_SKIP=1 restores the soft-upscale path for A/B.
+    let preVolume = latents.dim(2) * (latH * 2) * (latW * 2)
+    let preMaxVolume = resolvedConfig.refineMaxVol
+    if preVolume > preMaxVolume,
+       ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1",
+       ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] != "1" {
+      logger.info("Two-stage refine: SKIPPED entirely (volume \(preVolume) > \(preMaxVolume)) — native-size decode (gate-skip fix 2026-08-05).")
       return latents
     }
     logger.info("Two-stage refine: upsampling latents 2x...")
