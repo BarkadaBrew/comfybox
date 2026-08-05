@@ -327,12 +327,13 @@ public final class LTX2Pipeline {
       let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
       let sigma0 = refineSigmas[0]
       let refineInit = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)  // flow re-noise
-      // JOINT AUDIO REFINE is DEFAULT-ON (Todd's listen verdict 2026-08-05:
-      // "the refined one picks up and enhances ambient" — overrides the
-      // PinkCherry HF #8 community report and our grit metric; matched-seed
-      // A/B pairs audio-ab-t2v-* / audio-ab-speech-*). LTX2_AUDIO_REFINE=0
-      // bypasses pass 2 for audio (keeps the stage-1 track) for future A/B.
-      let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] != "0"
+      // AUDIO BYPASSES PASS 2 (final listen verdict, Todd 2026-08-05:
+      // "refined is not better — it picks up and enhances ambient [noise]",
+      // agreeing with PinkCherry HF #8 and the grit metric; matched-seed
+      // pairs audio-ab-t2v-* / audio-ab-speech-*). Audio keeps its fully
+      // denoised stage-1 track; video still refines. LTX2_AUDIO_REFINE=1
+      // re-enables the joint refine for A/B.
+      let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
       if refineAudio, let av = avState {
         let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
         let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
@@ -1523,9 +1524,9 @@ public final class LTX2Pipeline {
     let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
     let sigma0 = refineSigmas[0]
     let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
-    // Joint audio refine default-ON — see the t2v refine block comment
-    // (Todd's listen verdict 2026-08-05). LTX2_AUDIO_REFINE=0 bypasses.
-    let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] != "0"
+    // Audio bypasses pass 2 by default — see the t2v refine block comment
+    // (final listen verdict 2026-08-05). LTX2_AUDIO_REFINE=1 re-enables.
+    let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
     if refineAudio, let av = avState {
       let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
       let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
