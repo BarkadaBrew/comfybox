@@ -85,6 +85,50 @@ health. Daemon: branch → push → `ssh todd@10.0.100.232` (fish! use
 retry once) → pull + `node build.mjs` + `systemctl --user restart
 bree-daemon kira-daemon`.
 
+## Work plan — spec'd, in order
+
+**P0 · Discriminator (~10 min, do FIRST).** Two 4s i2v renders, same
+seed, her exact request shape (512x832, her cfg, character-length
+prompt, audio:true), NEUTRAL subject:
+  A) prompt WITH one quoted English line in the audio clause
+  B) prompt with the current fallback ("natural ambient sounds")
+Judge by ear + `voice/floor` and zero-crossing-rate stats (script
+pattern in this session's history; good reference = 5.9x / ~2500 zcr,
+bad Kira clip = 1.9x / ~1073 zcr). Outcome decides everything below:
+A-clean/B-bad ⇒ prompt-side, go to P1. Both bad ⇒ request-path bug,
+go to P3 first (bisect her request field-by-field against the known-
+good reference request until the fault appears).
+
+**P1 · Prompt-side fix (if P0 says prompt).** Two parts:
+  a) t2v: authored `audio` fields per scene in `content-scheduler.ts`
+     (apple/banana already authored as examples; avocado fields are
+     TODD'S to write — ask him, don't invent explicit copy).
+  b) i2v: verify the VLM voice line actually reaches the prompt —
+     grep daemon logs for `enriched intent`; if the VOICE line is
+     missing/`none` on person-visible frames, fix the vision question
+     or parse (`src/kira/vision/i2v-voice-enrichment.ts`).
+  Acceptance: a Kira-shaped neutral clip with a quoted line renders
+  intelligible English; Todd confirms on a real cycle clip.
+
+**P2 · Duration plumbing (do regardless — it poisons every sample).**
+Trace `duration` from `content-scheduler.ts` → `video-tools.ts` →
+`/v1/video/generate`; suspect the #1440 default-duration logic.
+Acceptance: daemon logs "(4s)" and the engine logs "queued (WxH, 97f)"
+for the same job; add a unit test asserting the submitted `duration`
+survives to the request body.
+
+**P3 · Request-path bisect (only if P0 says both arms bad).** Start
+from the known-good reference request (t2v, 480x832, no character
+injection, quoted line, no preset) and add ONE Kira attribute per
+render until sound breaks: preset id → character injection → cfg 3.5 →
+i2v seed path → her dims. The first render that breaks names the cause.
+
+**P4 · Known regressions to fold once sound is good.**
+  - NAG dropped on the audio path (lead 3 above) — restore or document.
+  - Codex Mediums 1-3 (ancestral noise, unseeded sigmaDown, refineAVState
+    context loss).
+  - Sigma-density A/B (lead 4).
+
 ## Reference material
 
 specs/ltx2-audio.md (rev 2 + wire-4 shipped notes), the good clip
