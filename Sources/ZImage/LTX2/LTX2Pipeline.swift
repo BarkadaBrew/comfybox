@@ -1426,7 +1426,14 @@ public final class LTX2Pipeline {
   ) -> [Float] {
     switch config.pipelineType {
     case .distilled:
-      return resolvedConfig.stage1SigmasOrNil ?? LTX2PipelineConfig.stage1Sigmas
+      // NOTE (2026-08-05): the pinned schedule IGNORES `steps` by design (the
+      // author's recipe pins sigmas). Log loudly so a steps override never
+      // silently no-ops again (the vocal-16 mechanism was a placebo for a day).
+      let pinned = resolvedConfig.stage1SigmasOrNil ?? LTX2PipelineConfig.stage1Sigmas
+      if steps != pinned.count - 1 {
+        logger.warning("Distilled pipeline: requested steps=\(steps) IGNORED — pinned sigma schedule (\(pinned.count - 1) steps) governs. Use tuning.stage1_sigmas to change step density.")
+      }
+      return pinned
     case .dev, .devTwoStage:
       let numTokens = latF * latH * latW
       return LTX2PipelineConfig.devSigmaSchedule(

@@ -83,14 +83,27 @@ public enum LTX2AudioEnhance {
     // than a touch — already-loud tracks pass ~unity into the soft ceiling.
     let gain = min(max(targetRMS / max(rms, 1e-6), 1.0), 10.0)
 
+    // Limiter with a REAL knee (2026-08-05 fix): the first version ran tanh
+    // over the whole signal — ~10% compression at half-scale = audible
+    // harmonic distortion on every voice peak. Correct shape: bit-exact
+    // LINEAR below the knee; only the region above the knee compresses
+    // smoothly into the ceiling.
     let ceiling: Float = 0.85
+    let knee: Float = 0.6 * ceiling
+    let range = ceiling - knee
     var flat = [Float]()
     flat.reserveCapacity(channels * n)
     for ch in outChannels {
       for v in ch {
-        // Soft-knee: linear below ~60% of ceiling, tanh into the ceiling.
         let g = v * gain
-        flat.append(ceiling * tanh(g / ceiling))
+        let a = abs(g)
+        if a <= knee {
+          flat.append(g)  // transparent
+        } else {
+          let over = (a - knee) / range
+          let out = knee + range * tanh(over)
+          flat.append(g < 0 ? -out : out)
+        }
       }
     }
     return MLXArray(flat).reshaped([channels, n])

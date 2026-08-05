@@ -117,3 +117,28 @@ final class LTX2AudioStepTests: XCTestCase {
       "cfg>1 extrapolates beyond the conditional, away from the negative")
   }
 }
+
+extension LTX2AudioEnhanceTests {
+  /// 2026-08-05 limiter fix: content below the knee must pass BIT-LINEAR
+  /// (the tanh-everywhere v1 added ~10% compression at half-scale —
+  /// audible harmonic distortion on every voice peak).
+  func testBelowKneeIsPerfectlyLinear() {
+    // Loud enough that gain stays ~1 (no loudness boost confound), peaks at 0.4 < knee 0.51.
+    let tone = (0..<48000).map { Float(0.4) * sin(2 * .pi * 440 * Float($0) / 48000) }
+    let st = MLXArray(tone + tone).reshaped([2, tone.count])
+    // RMS of 0.4 sine = 0.283 (-11dB) > -18dB target -> gain clamps to 1.0.
+    let out = LTX2AudioEnhance.process(st, sampleRate: 48000)[0].asArray(Float.self)
+    // Compare against the filtered-but-unlimited signal: THD proxy — the
+    // 3rd harmonic (1320Hz) must be negligible relative to the fundamental.
+    func mag(_ x: [Float], _ hz: Float) -> Float {
+      var re: Float = 0, im: Float = 0
+      for (i, v) in x.enumerated() {
+        let p = 2 * Float.pi * hz * Float(i) / 48000
+        re += v * cos(p); im += v * sin(p)
+      }
+      return sqrt(re * re + im * im)
+    }
+    let h3 = mag(out, 1320) / mag(out, 440)
+    XCTAssertLessThan(h3, 0.005, "sub-knee content must not gain harmonics (was ~3% with tanh-everywhere)")
+  }
+}
