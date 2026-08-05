@@ -31,6 +31,15 @@ campaigns (Kroma integration, i2v strength A/B, NAG, stage floors, audio).
    with all params + provenance. ALWAYS verify your override actually won
    (request > preset > configFile > env > builtin) before judging results.
 
+7. **Iterate at 4–6s; reference at 12s.** (Todd 2026-08-05.) Audio/recipe
+   iteration uses 97–145-frame clips (~5–12 min each) — duration is the
+   linear cost axis, and a 4s clip exposes the same artifact classes as a
+   12s one. The 12s/289f format (~45–55 min) is reserved for FINAL
+   reference renders after the lever has already won at short length.
+   Also remember: `steps` is a NO-OP on the distilled pipeline (pinned
+   sigma schedule governs; engine warns since 2026-08-05) — the density
+   lever is `tuning.stage1_sigmas`.
+
 ## The levers
 
 | lever | where | notes |
