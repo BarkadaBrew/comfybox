@@ -1317,9 +1317,15 @@ public final class LTX2Pipeline {
           av.audioNoiseKey = keys.0
           aNoise = MLXRandom.normal(av.audioLatents.shape, key: keys.1).asType(.float32)
         }
+        // Audio guidance is DECOUPLED from video cfg (2026-08-05): Kira's
+        // video cfg 3.5 over-guided the audio stream — dragged, slow-motion
+        // sound on otherwise-correct 5s clips; the author's recipes never
+        // run audio above cfg 1. Negatives still steer via CFG++ stepping.
+        // LTX2_AUDIO_CFG overrides (default 1.0).
+        let audioCfg = Float(ProcessInfo.processInfo.environment["LTX2_AUDIO_CFG"] ?? "") ?? 1.0
         av.audioLatents = ltx2AudioStep(
           audio: av.audioLatents, velocityPos: velA, velocityNeg: avVelocityNeg,
-          sigma: sigma, sigmaNext: sigmaNext, cfgScale: cfgAt(i),
+          sigma: sigma, sigmaNext: sigmaNext, cfgScale: min(cfgAt(i), audioCfg),
           useCfgPP: useCfgPP, useSDE: useSDE && !forceDeterministic,
           ancestralNoise: aNoise)
         eval(av.audioLatents)
