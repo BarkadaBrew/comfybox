@@ -592,3 +592,58 @@ one). Cost learning (rev 2 #8) has no live data source today. Resolution: the
 signature-keyed `scheduler/cost-store.ts` holds config-seeded floors now; the
 elapsed-capture wiring (source: comfybox async status `durationMs`) lands with
 the cutover (P3), not against live render paths in shadow P1.
+
+---
+
+## Yield policy + broker architecture (Todd, verbatim, 2026-08-05)
+
+Direction, verbatim:
+> "Kira's create tab has to route through the campaign mgr."
+> "It uses resources and manages delivery. Kira can use it. Bree can use it. User can use it."
+> "Its requests are treated as priority yield orders. Tier 2 subnet. Todd and Bree are tier 1. Network traffic tier 3."
+> "Todd wins. Content stream is network traffic."
+
+### The campaign manager IS the broker — the single front door
+The campaign manager is the shared GPU **resource-and-delivery broker**. It is the
+SOLE admission point to the engine — no render reaches the GPU without going
+through it. Three principals are clients: **User (Todd), Bree, Kira**. It does two
+jobs at once: allocate the scarce GPU (yield management) and manage delivery
+(surface routing, encode budget, caption behavior).
+
+### Priority tiers — a QoS stack (supersedes Gate 2 "user OR Muse = highest")
+Strict ranking; higher bumps lower via the reservation fast lane; the RUNNING
+render is never killed (bounded wait, sized by the interactive reserve):
+
+- **Tier 1 — Todd (absolute) > Bree.** Human + PM-agent. Todd wins ties within
+  the tier. Bumps everything.
+- **Tier 2 — Kira's create-tab requests** ("priority yield orders"). Real orders,
+  yield-managed in, but defer to Tier 1.
+- **Tier 3 — the 24/7 content stream ("network traffic").** Background filler.
+  Yields to Tier 1 and Tier 2. Starts a render only when its conservative cost
+  fits before the next protected window (the existing filler rule).
+
+This REVISES §Priority / Gate 2: Kira's create work is no longer co-top with the
+user — it sits below Todd+Bree at Tier 2.
+
+### Kira's create tab routes THROUGH the broker (mandatory)
+The create surface (scene-creator, storyboard, gallery Motion/Repair/HQ, direct
+generate) submits **Tier-2 reservations** to the broker; it never calls the engine
+directly. The broker owns dispatch, ABOVE the existing render-queue (still the
+execution primitive, spec §6). This makes the broker load-bearing for the create
+surface — not shadow-only there. The broker is thus the one place where every
+GPU consumer (all three principals + the stream) is admitted, prioritized,
+leased, and delivered.
+
+### Consequences for the build (additive to what's built)
+1. Reservation `priority` becomes the three tiers; each reservation carries a
+   **principal tag** (todd | bree | kira | stream) → tier. The built
+   priority×resource×preemption axes already express this; it's a relabel + tag.
+2. **Per-principal fairness** so Tier-1/2 traffic can't be starved; Tier-3 is pure
+   filler (lowest, opportunistic).
+3. The **content stream (the current count-based tick) formally becomes Tier 3** —
+   the lowest traffic class, routed through the broker like everything else. This
+   reframes the migration: the old tick's output is simply the bottom subnet, not
+   a peer scheduler to "cut over" from.
+4. **Bree is a client → the engine-side lease (#1479) is load-bearing.** Bree and
+   Kira are separate processes; only an engine-side broker can arbitrate the GPU
+   between them. Cross-process admission is required for true multi-tenancy.
