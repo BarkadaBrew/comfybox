@@ -42,10 +42,19 @@ public typealias LTX2AVPEs = (
 final class LTX2AVDenoiseState {
   var audioLatents: MLXArray  // (B, 8, Ta, 16) float32
   let audioContext: MLXArray  // (B, S, 2048)
+  /// Negative audio embeddings (task #26): when present, the CFG/CFG++
+  /// negative pass runs dual-stream and the audio step is guided.
+  var negativeAudioContext: MLXArray?
+  /// Keyed noise chain for audio ancestral steps — keeps the GLOBAL RNG
+  /// stream untouched so video renders stay bit-identical with audio on/off.
+  var audioNoiseKey: MLXArray?
   let pe: LTX2AVPEs
-  init(audioLatents: MLXArray, audioContext: MLXArray, pe: LTX2AVPEs) {
+  init(audioLatents: MLXArray, audioContext: MLXArray, pe: LTX2AVPEs,
+       negativeAudioContext: MLXArray? = nil, audioNoiseKey: MLXArray? = nil) {
     self.audioLatents = audioLatents
     self.audioContext = audioContext
+    self.negativeAudioContext = negativeAudioContext
+    self.audioNoiseKey = audioNoiseKey
     self.pe = pe
   }
 }
@@ -193,15 +202,17 @@ public final class LTX2Pipeline {
 
     // Encode negative prompt for CFG, or for CFG++ (needs it every step at cfg=1).
     var negativeEmbeddings: MLXArray? = nil
+    var negativeAudioEmbeddings: MLXArray? = nil
     if cfgScale > 1.0 || resolvedConfig.samplerIsCfgPP,
        let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       logger.info("Encoding negative prompt (scale=\(cfgScale), cfgPP=\(resolvedConfig.samplerIsCfgPP))...")
       let negOutput = textEncoder.encode(
         inputIds: negIds,
         attentionMask: negMask,
-        returnAudioEmbeddings: false
+        returnAudioEmbeddings: wantAudio
       )
       negativeEmbeddings = negOutput.videoEmbeddings
+      if wantAudio { negativeAudioEmbeddings = negOutput.audioEmbeddings }
       eval(negativeEmbeddings!)
     }
 
@@ -283,8 +294,10 @@ public final class LTX2Pipeline {
       avState = LTX2AVDenoiseState(
         audioLatents: audioInit,
         audioContext: textOutput.audioEmbeddings,
-        pe: avPE)
-      logger.info("Audio stream enabled: \(ta) latent frames (\(seconds)s).")
+        pe: avPE,
+        negativeAudioContext: negativeAudioEmbeddings,
+        audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
+      logger.info("Audio stream enabled: \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 
     // Step 6: Denoising loop
@@ -581,13 +594,15 @@ public final class LTX2Pipeline {
     eval(textOutput.videoEmbeddings)
 
     var negativeEmbeddings: MLXArray? = nil
+    var negativeAudioEmbeddings: MLXArray? = nil
     // CFG++ samplers need the negative embeddings every step even at cfg=1.
     if cfgScale > 1.0 || resolvedConfig.samplerIsCfgPP,
        let negIds = negativeInputIds, let negMask = negativeAttentionMask {
       let negOutput = textEncoder.encode(
-        inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: false
+        inputIds: negIds, attentionMask: negMask, returnAudioEmbeddings: wantAudio
       )
       negativeEmbeddings = negOutput.videoEmbeddings
+      if wantAudio { negativeAudioEmbeddings = negOutput.audioEmbeddings }
       eval(negativeEmbeddings!)
     }
 
@@ -710,8 +725,10 @@ public final class LTX2Pipeline {
       avState = LTX2AVDenoiseState(
         audioLatents: audioInit,
         audioContext: textOutput.audioEmbeddings,
-        pe: avPE)
-      logger.info("Audio stream enabled (i2v): \(ta) latent frames (\(seconds)s).")
+        pe: avPE,
+        negativeAudioContext: negativeAudioEmbeddings,
+        audioNoiseKey: seed.map { MLXRandom.key($0 &+ 0xA0D12) })
+      logger.info("Audio stream enabled (i2v): \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 
     // Step 6: Denoising loop with I2V state
@@ -1088,6 +1105,8 @@ public final class LTX2Pipeline {
       // the unconditional pass too would guide the baseline that CFG++ steps
       // along, double-counting the guidance.
       let velocityPos: MLXArray
+      var avVelocityPos: MLXArray? = nil
+      var avVelocityNeg: MLXArray? = nil
       if let av = avState {
         // Joint A/V pass (task #21): both velocities in one forward. NAG is
         // not available on this path yet (spec open item) — the joint model's
@@ -1106,8 +1125,7 @@ public final class LTX2Pipeline {
           sigma: sigmaArray,
           pe: av.pe)
         velocityPos = vv
-        av.audioLatents = av.audioLatents + MLXArray(sigmaNext - sigma) * va.asType(.float32)
-        eval(av.audioLatents)
+        avVelocityPos = va
       } else {
         velocityPos = transformer(
           latent: latentsFlat,
@@ -1135,14 +1153,35 @@ public final class LTX2Pipeline {
       // disable_cfg1_optimization=True for exactly this reason).
       var x0UncondF32: MLXArray? = nil
       if useCFG || useCfgPP, let negEmb = negativeEmbeddings {
-        let velocityNeg = transformer(
-          latent: latentsFlat,
-          timestep: timesteps,
-          context: negEmb.asType(dtype),
-          positions: positions,
-          sigma: sigmaArray,
-          precomputedPE: precomputedPE
-        )
+        let velocityNeg: MLXArray
+        if let av = avState, let negACtx = av.negativeAudioContext {
+          // Audio joins the negative pass (task #26): the reference recipe's
+          // negative ("...distorted sound, saturated sound, loud") flows
+          // through BOTH streams; ours never steered audio until now. The
+          // dual negative also makes the video-side negative prediction
+          // reference-faithful (it carries a2v cross-modal contributions).
+          let (vv, va) = transformer.callAV(
+            latent: latentsFlat,
+            audioLatents: av.audioLatents.asType(dtype),
+            timestep: timesteps,
+            videoSigmaMax: sigma,
+            audioSigma: sigma,
+            context: negEmb.asType(dtype),
+            audioContext: negACtx.asType(dtype),
+            sigma: sigmaArray,
+            pe: av.pe)
+          velocityNeg = vv
+          avVelocityNeg = va
+        } else {
+          velocityNeg = transformer(
+            latent: latentsFlat,
+            timestep: timesteps,
+            context: negEmb.asType(dtype),
+            positions: positions,
+            sigma: sigmaArray,
+            precomputedPE: precomputedPE
+          )
+        }
         eval(velocityNeg)
 
         let x0NegF32 = latentsFlatF32 - timestepsF32 * velocityNeg.asType(.float32)
@@ -1261,6 +1300,23 @@ public final class LTX2Pipeline {
         }
       } else {
         currentLatents = denoised
+      }
+      // Audio step (task #26): guided when the negative pass ran dual-stream,
+      // plain Euler otherwise. Ancestral noise comes from the state's keyed
+      // chain so the global RNG (video noise sequence) is untouched.
+      if let av = avState, let velA = avVelocityPos {
+        var aNoise: MLXArray? = nil
+        if useSDE, avVelocityNeg != nil, let key = av.audioNoiseKey {
+          let keys = MLXRandom.split(key: key)
+          av.audioNoiseKey = keys.0
+          aNoise = MLXRandom.normal(av.audioLatents.shape, key: keys.1).asType(.float32)
+        }
+        av.audioLatents = ltx2AudioStep(
+          audio: av.audioLatents, velocityPos: velA, velocityNeg: avVelocityNeg,
+          sigma: sigma, sigmaNext: sigmaNext, cfgScale: cfgAt(i),
+          useCfgPP: useCfgPP, useSDE: useSDE && !forceDeterministic,
+          ancestralNoise: aNoise)
+        eval(av.audioLatents)
       }
       // CFG++ steps along the uncond direction, which drifts frames the denoise
       // mask pins at timestep 0 (I2V conditioning / refine re-inject); re-snap

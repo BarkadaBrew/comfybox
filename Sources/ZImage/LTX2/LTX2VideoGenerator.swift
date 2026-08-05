@@ -669,7 +669,7 @@ public final class LTX2VideoGenerator {
         let negText: String? = {
             if let n = request.negativePrompt, !n.isEmpty { return n }
             return pipeline.resolvedConfig.samplerIsCfgPP
-                ? "subtitle, caption, text, text on screen, watermark, logo, timestamp"
+                ? "subtitle, caption, text, text on screen, watermark, logo, timestamp, distorted sound, saturated sound, loud noises, static"
                 : nil
         }()
         let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: 128) }

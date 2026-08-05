@@ -77,3 +77,43 @@ final class LTX2AudioEnhanceTests: XCTestCase {
     XCTAssertEqual(MLX.abs(a - b).max().item(Float.self), 0, "pure function")
   }
 }
+
+/// Audio sampler-step contract (task #26 negatives build).
+final class LTX2AudioStepTests: XCTestCase {
+  func testNoNegativeEqualsPlainEuler() {
+    let ax = MLXRandom.normal([1, 8, 4, 16], key: MLXRandom.key(1))
+    let v = MLXRandom.normal([1, 8, 4, 16], key: MLXRandom.key(2))
+    let stepped = ltx2AudioStep(audio: ax, velocityPos: v, velocityNeg: nil,
+      sigma: 0.5, sigmaNext: 0.3, cfgScale: 3.5, useCfgPP: true, useSDE: true, ancestralNoise: nil)
+    let plain = ax + MLXArray(Float(0.3 - 0.5)) * v
+    XCTAssertLessThan(MLX.abs(stepped - plain).max().item(Float.self), 1e-5,
+      "no negative context -> byte-equal to v1 plain Euler")
+  }
+
+  func testCfgPPStepMatchesClosedForm() {
+    let ax = MLXRandom.normal([1, 8, 4, 16], key: MLXRandom.key(3))
+    let vp = MLXRandom.normal([1, 8, 4, 16], key: MLXRandom.key(4))
+    let vn = MLXRandom.normal([1, 8, 4, 16], key: MLXRandom.key(5))
+    let (sigma, sigmaNext): (Float, Float) = (0.6, 0.4)
+    let out = ltx2AudioStep(audio: ax, velocityPos: vp, velocityNeg: vn,
+      sigma: sigma, sigmaNext: sigmaNext, cfgScale: 1.0, useCfgPP: true, useSDE: false, ancestralNoise: nil)
+    let x0c = ax - MLXArray(sigma) * vp
+    let x0n = ax - MLXArray(sigma) * vn
+    let d = (ax - MLXArray(1 - sigma) * x0n) / MLXArray(sigma)
+    let expect = MLXArray(1 - sigmaNext) * x0c + MLXArray(sigmaNext) * d
+    XCTAssertLessThan(MLX.abs(out - expect).max().item(Float.self), 1e-5, "CFG++ closed form")
+  }
+
+  func testCfgAboveOneMovesAwayFromNegative() {
+    let ax = MLXArray.zeros([1, 8, 2, 16])
+    let vp = MLXArray.ones([1, 8, 2, 16]) * MLXArray(Float(0.1))
+    let vn = MLXArray.ones([1, 8, 2, 16]) * MLXArray(Float(0.5))
+    let g1 = ltx2AudioStep(audio: ax, velocityPos: vp, velocityNeg: vn,
+      sigma: 0.5, sigmaNext: 0, cfgScale: 1.0, useCfgPP: false, useSDE: false, ancestralNoise: nil)
+    let g35 = ltx2AudioStep(audio: ax, velocityPos: vp, velocityNeg: vn,
+      sigma: 0.5, sigmaNext: 0, cfgScale: 3.5, useCfgPP: false, useSDE: false, ancestralNoise: nil)
+    // vp<vn: cond x0 > neg x0; scale>1 pushes further above cond.
+    XCTAssertGreaterThan(g35.mean().item(Float.self), g1.mean().item(Float.self),
+      "cfg>1 extrapolates beyond the conditional, away from the negative")
+  }
+}

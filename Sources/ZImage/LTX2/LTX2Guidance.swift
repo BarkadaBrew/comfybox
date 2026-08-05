@@ -140,3 +140,69 @@ public enum LTX2Guidance {
     return guided * vFactor
   }
 }
+
+/// Audio-stream sampler step (task #26 — audio joins the negative pass).
+///
+/// Mirrors the video Euler/CFG++/ancestral update in `denoisingLoop` for the
+/// audio latents `(B, 8, T, F)`, in flow-matching CONST-model terms:
+///   x0_cond = ax − σ·v_pos;  x0_uncond = ax − σ·v_neg
+///   CFG (scale>1): x0_guided = applyCFG(x0_cond, x0_uncond, scale)
+///   CFG++: d = (ax − alphaS·x0_uncond)/σ; ax' = alphaT·x0_guided + σ_down·d
+///          (+ alphaT·σ_up·noise, ancestral)
+///   plain: ax' = x0 + σ_next·(ax − x0)/σ
+/// With no negative velocity the step degrades to plain Euler on v_pos —
+/// byte-identical to the pre-negatives behavior.
+public func ltx2AudioStep(
+  audio ax: MLXArray,
+  velocityPos: MLXArray,
+  velocityNeg: MLXArray?,
+  sigma: Float,
+  sigmaNext: Float,
+  cfgScale: Float,
+  useCfgPP: Bool,
+  useSDE: Bool,
+  ancestralNoise: MLXArray?
+) -> MLXArray {
+  let sig = MLXArray(sigma)
+  let x0Cond = ax - sig * velocityPos.asType(.float32)
+  guard sigmaNext > 0 else {
+    if let vn = velocityNeg, cfgScale > 1.0 {
+      let x0Neg = ax - sig * vn.asType(.float32)
+      return LTX2Guidance.applyCFG(conditioned: x0Cond, unconditioned: x0Neg, scale: cfgScale)
+    }
+    return x0Cond
+  }
+
+  guard let vn = velocityNeg else {
+    // No negative context: plain Euler on the positive velocity (v1 behavior).
+    return ax + MLXArray(sigmaNext - sigma) * velocityPos.asType(.float32)
+  }
+  let x0Neg = ax - sig * vn.asType(.float32)
+  var x0Guided = x0Cond
+  if cfgScale > 1.0 {
+    x0Guided = LTX2Guidance.applyCFG(conditioned: x0Cond, unconditioned: x0Neg, scale: cfgScale)
+  }
+
+  if useCfgPP {
+    let alphaS = max(1.0 - sigma, Float(1e-4))
+    let alphaT = 1.0 - sigmaNext
+    let d = (ax - MLXArray(alphaS) * x0Neg) / sig
+    var sigmaDown = sigmaNext
+    var sigmaUp: Float = 0
+    if useSDE {
+      let sf = sigma / alphaS
+      let st = sigmaNext / alphaT
+      let inner = st * st * (sf * sf - st * st) / (sf * sf)
+      let up = min(st, (inner > 0 ? inner : 0).squareRoot())
+      sigmaDown = alphaT * (max(st * st - up * up, 0)).squareRoot()
+      sigmaUp = up
+    }
+    var next = MLXArray(alphaT) * x0Guided + MLXArray(sigmaDown) * d
+    if useSDE, sigmaUp > 0, let noise = ancestralNoise {
+      next = next + MLXArray(alphaT) * noise * MLXArray(sigmaUp)
+    }
+    return next
+  }
+  // Classic CFG without cfg_pp: Euler toward the guided x0.
+  return x0Guided + MLXArray(sigmaNext) * (ax - x0Guided) / sig
+}
