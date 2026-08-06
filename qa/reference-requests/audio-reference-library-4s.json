@@ -1,0 +1,14 @@
+{
+  "_comment": "4-second iteration variant of the known-good reference (single beat). Use THIS for A/B work — ~5 min vs ~55 min. Renders as audio-ab-speech-*.mp4 in the 2026-08-05 pairs.",
+  "prompt": "a woman sits in a quiet library reading nook, closes her book and says softly \"the next chapter is my favorite\", hushed silent room, gentle page turn, no music",
+  "width": 384,
+  "height": 512,
+  "frames": 97,
+  "steps": 16,
+  "seed": 2718,
+  "fps": 24,
+  "audio": true,
+  "enhance": false,
+  "source": "audio-diag",
+  "output_path": "/Users/toddwalderman/Pictures/ComfyBox/audio-ref-4s.mp4"
+}
