@@ -5,6 +5,10 @@ description: Use when tuning Kira's LTX video quality — presets, LoRA stacks, 
 
 # Kira LTX Tuning
 
+> **ACTIVE WORK ORDER (2026-08-05):** audio quality is mid-investigation —
+> read `specs/prepared/ltx-audio-tuning-handoff.md` FIRST; it carries the
+> current problem statement, verified dead ends, and an ordered P0–P4 plan.
+
 Fine-tune what Kira's video renders look and sound like: preset recipes
 (LoRA stacks + strengths), Tier A/B tuning params, motion levers, and the
 audio recipe. This skill is the distillation of the 2026-07/08 tuning
@@ -49,7 +53,7 @@ campaigns (Kroma integration, i2v strength A/B, NAG, stage floors, audio).
 | i2v strength | request | HIGHER = closer to source (denoise = 1-strength); 0.5 is the validated default |
 | motion | imgCompression (higher = more motion), cfg, prompt action verbs | pristine stills freeze i2v — compression preprocess is load-bearing |
 | duration/size | Kira config clipSeconds (live-editable, currently 5), resolution gate | duration linear cost, dims quadratic |
-| audio | request `audio` (Kira default ON), steps (speech wants ~16 vs foley 8) | audio-mode flips reload the transformer (~1-2 min) — batch same-mode experiments |
+| audio | request `audio` (default ON for Kira AND Bree), `tuning.stage1_sigmas` (density — the REAL lever; `steps` is a distilled no-op), quoted English line in the prompt = speech vs vocalization | audio guidance is capped at cfg 1.0 (`LTX2_AUDIO_CFG`); audio bypasses refine pass 2; mastering chain runs at mux (`LTX2_AUDIO_ENHANCE=0` for raw) |
 | identity | seed image + kroma preset; face-anchor env (partnered only — solo anchoring ghosts) | char LoRA future work |
 
 ## Render commands
@@ -83,15 +87,20 @@ curl -s -X POST http://127.0.0.1:7870/v1/video/generate -H 'Content-Type: applic
 7. Record the outcome in the relevant spec or qa/ notes — recipes without
    provenance get re-litigated.
 
-## Current canon (2026-08-04 — verify against presets.json before trusting)
+## Current canon (2026-08-05 — verify against presets.json before trusting)
 
 - Presets: krea-kira identity = kroma 1.0 + sea 0.6 + content 0.4 by fruit
   tier; apple = kroma + sea only. Distill-1.1 LoRA in the video stack.
 - t2v cfg 3.5 / i2v cfg 2.0; sampler euler_ancestral_cfg_pp base +
   euler_cfg_pp refine; two-stage ON with refine-volume gate.
-- clipSeconds 5, videoAudio ON, videoMode i2v-default, ≤289f single-pass.
-- Known open items: t2v oversaturation (#25), speech-step recipe (#26),
-  audio enhance chain not yet in-engine (#26).
+- clipSeconds 4 (iteration cadence), videoAudio ON, videoMode mixed,
+  ≤289f single-pass; rates apple 2 / banana 2 / avocado 4 clips per hour.
+- Video LoRA presets are EMPTY (kira-video-*); kroma/SEAsian/content are
+  KREA2 IMAGE LoRAs (seed frames only — they never enter LTX).
+- Known open items: audio quality investigation (handoff above),
+  duration plumbing bug (daemon 4s -> engine 241f), NAG dropped on the
+  audio path, t2v oversaturation (#25), IC-Ingredients + skin-hair LoRA
+  evals (#27).
 
 ## Escalation
 
