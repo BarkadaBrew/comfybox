@@ -182,6 +182,12 @@ public final class LTX2GemmaTokenizer {
     return GemmaTokenBatch(inputIds: inputIds, attentionMask: attentionMask)
   }
 
+  /// Token IDs before padding or truncation. Prompt guards and diagnostics use
+  /// this exact production tokenizer view to prove what survives `maxLength`.
+  public func untruncatedTokenIds(prompt: String) -> [Int] {
+    encodeFunction(prompt)
+  }
+
   /// Decode token IDs back to text.
   public func decode(tokens: [Int]) -> String {
     tokenizer.decode(tokens: tokens)

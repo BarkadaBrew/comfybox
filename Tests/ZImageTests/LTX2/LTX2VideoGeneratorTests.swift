@@ -5,6 +5,10 @@ import XCTest
 /// validation). The heavy model load/generate is exercised only in a live run.
 final class LTX2VideoGeneratorTests: XCTestCase {
 
+    private func wordTokens(_ text: String) -> [Int] {
+        text.split(whereSeparator: { $0.isWhitespace }).indices.map { $0 }
+    }
+
     func testFrameCountValidation() {
         // Valid: 1 + 8k, at least 9.
         for n in [9, 17, 25, 33, 97, 121] {
@@ -62,5 +66,106 @@ final class LTX2VideoGeneratorTests: XCTestCase {
                 return XCTFail("expected weightsMissing, got \(error)")
             }
         }
+    }
+
+    func testAudioPromptGuardMovesTrailingAudioSectionAheadOfLongVisualPrompt() throws {
+        let visual = Array(repeating: "neutral-detail", count: 132).joined(separator: " ")
+        let audio = #"audio: quiet room tone, an adult speaker says "the kettle is ready"."#
+        let original = visual + " " + audio
+
+        let guarded = try LTX2AudioPromptGuard.prepare(
+            prompt: original, audio: true, maxLength: 128, tokenize: wordTokens)
+
+        XCTAssertTrue(guarded.reordered)
+        XCTAssertTrue(guarded.effectivePrompt.hasPrefix(audio + " Visual: "))
+        XCTAssertTrue(guarded.effectivePrompt.hasSuffix(visual))
+        XCTAssertEqual(guarded.audioMarkerTokenIndex, 0)
+        XCTAssertTrue(guarded.quotedLineSurvived)
+        XCTAssertEqual(guarded.preTruncationTokenCount, wordTokens(guarded.effectivePrompt).count)
+        XCTAssertEqual(guarded.effectivePromptHash.count, 12)
+    }
+
+    func testAudioPromptGuardMakesMatchedInsideAndBeyondPromptsByteIdentical() throws {
+        let visual = Array(repeating: "neutral-detail", count: 132).joined(separator: " ")
+        let audio = #"Audio: quiet room tone, an adult speaker says "the kettle is ready"."#
+        let inside = audio + " Visual: " + visual
+        let beyond = "Visual: " + visual + " " + audio
+
+        let guardedInside = try LTX2AudioPromptGuard.prepare(
+            prompt: inside, audio: true, maxLength: 128, tokenize: wordTokens)
+        let guardedBeyond = try LTX2AudioPromptGuard.prepare(
+            prompt: beyond, audio: true, maxLength: 128, tokenize: wordTokens)
+
+        XCTAssertFalse(guardedInside.reordered)
+        XCTAssertTrue(guardedBeyond.reordered)
+        XCTAssertEqual(guardedBeyond.effectivePrompt, guardedInside.effectivePrompt)
+        XCTAssertEqual(guardedBeyond.effectivePromptHash, guardedInside.effectivePromptHash)
+    }
+
+    func testAudioPromptGuardLeavesBoundedLeadingAudioSectionInPlace() throws {
+        let visual = Array(repeating: "neutral-detail", count: 140).joined(separator: " ")
+        let prompt = #"Audio: soft rain, an adult speaker says "welcome home". Visual: "# + visual
+
+        let guarded = try LTX2AudioPromptGuard.prepare(
+            prompt: prompt, audio: true, maxLength: 128, tokenize: wordTokens)
+
+        XCTAssertFalse(guarded.reordered)
+        XCTAssertEqual(guarded.effectivePrompt, prompt)
+        XCTAssertEqual(guarded.audioMarkerTokenIndex, 0)
+        XCTAssertTrue(guarded.quotedLineSurvived)
+        XCTAssertGreaterThan(guarded.preTruncationTokenCount, 128)
+    }
+
+    func testAudioPromptGuardLeavesSafeTrailingAudioSectionInPlace() throws {
+        let prompt = #"An adult potter finishes a cup at a quiet studio table. audio: soft rain, the potter says "the glaze is ready"."#
+
+        let guarded = try LTX2AudioPromptGuard.prepare(
+            prompt: prompt, audio: true, maxLength: 128, tokenize: wordTokens)
+
+        XCTAssertFalse(guarded.reordered)
+        XCTAssertEqual(guarded.effectivePrompt, prompt)
+        XCTAssertLessThan(guarded.audioMarkerTokenIndex ?? 128, 128)
+        XCTAssertTrue(guarded.quotedLineSurvived)
+    }
+
+    func testAudioPromptGuardRejectsAudioSectionThatCannotFit() {
+        let overlongAudio = "audio: "
+            + Array(repeating: "sound-detail", count: 130).joined(separator: " ")
+            + #" an adult speaker says "this line cannot survive"."#
+        let prompt = overlongAudio + " Visual: a neutral studio scene."
+
+        XCTAssertThrowsError(try LTX2AudioPromptGuard.prepare(
+            prompt: prompt, audio: true, maxLength: 128, tokenize: wordTokens)) { error in
+            guard case LTX2VideoError.audioUnsupported(let reason) = error else {
+                return XCTFail("expected audioUnsupported, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("128-token"), reason)
+        }
+    }
+
+    func testAudioPromptGuardRejectsUnmarkedDialogueBeyondLimit() {
+        let visual = Array(repeating: "neutral-detail", count: 130).joined(separator: " ")
+        let prompt = visual + #" An adult speaker says "this dialogue is beyond the boundary"."#
+
+        XCTAssertThrowsError(try LTX2AudioPromptGuard.prepare(
+            prompt: prompt, audio: true, maxLength: 128, tokenize: wordTokens)) { error in
+            guard case LTX2VideoError.audioUnsupported(let reason) = error else {
+                return XCTFail("expected audioUnsupported, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("audio:"), reason)
+        }
+    }
+
+    func testAudioPromptGuardDoesNotRewriteVideoOnlyPrompt() throws {
+        let visual = Array(repeating: "neutral-detail", count: 132).joined(separator: " ")
+        let prompt = visual + " audio: quiet room tone."
+
+        let guarded = try LTX2AudioPromptGuard.prepare(
+            prompt: prompt, audio: false, maxLength: 128, tokenize: wordTokens)
+
+        XCTAssertFalse(guarded.reordered)
+        XCTAssertEqual(guarded.effectivePrompt, prompt)
+        XCTAssertFalse(guarded.quotedLineSurvived)
+        XCTAssertGreaterThan(guarded.audioMarkerTokenIndex ?? -1, 127)
     }
 }

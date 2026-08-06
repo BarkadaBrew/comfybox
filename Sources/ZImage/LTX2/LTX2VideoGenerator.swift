@@ -660,7 +660,29 @@ public final class LTX2VideoGenerator {
             framesPerChunk: request.framesPerChunk,
             extendToSeconds: request.extendToSeconds, fps: request.fps)
 
-        let batch = tokenizer.encode(prompt: request.prompt, maxLength: 128)
+        // Prompt-conditioned audio used to disappear silently when callers
+        // appended `audio:` after a long character/scene description: Gemma
+        // keeps tokens 0...127 and drops the tail. Keep the trained 128-token
+        // recipe, but move the complete audio section ahead of visual prose
+        // when needed and fail loudly if even that section cannot fit.
+        let guardedPrompt = try LTX2AudioPromptGuard.prepare(
+            prompt: request.prompt,
+            audio: wantAudio,
+            maxLength: tokenizer.maxLength,
+            tokenize: { tokenizer.untruncatedTokenIds(prompt: $0) })
+        let audioMarkerIndex = guardedPrompt.audioMarkerTokenIndex.map(String.init) ?? "null"
+        let promptFacts = [
+            "[LTX2] prompt-truncation:",
+            "pre_truncation_token_count=\(guardedPrompt.preTruncationTokenCount)",
+            "audio_marker_token_index=\(audioMarkerIndex)",
+            "quoted_line_present=\(guardedPrompt.quotedLinePresent)",
+            "quoted_line_survived=\(guardedPrompt.quotedLineSurvived)",
+            "effective_prompt_hash=\(guardedPrompt.effectivePromptHash)",
+            "reordered=\(guardedPrompt.reordered)",
+        ].joined(separator: " ")
+        logger.info("\(promptFacts)")
+
+        let batch = tokenizer.encode(prompt: guardedPrompt.effectivePrompt, maxLength: tokenizer.maxLength)
         MLX.eval(batch.inputIds, batch.attentionMask)
 
         // Negative prompt: tokenize when provided, or default to the PinkCherry
@@ -672,7 +694,7 @@ public final class LTX2VideoGenerator {
                 ? "subtitle, caption, text, text on screen, watermark, logo, timestamp, distorted sound, saturated sound, loud noises, static"
                 : nil
         }()
-        let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: 128) }
+        let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: tokenizer.maxLength) }
         if let negBatch { MLX.eval(negBatch.inputIds, negBatch.attentionMask) }
 
         let start = CFAbsoluteTimeGetCurrent()
