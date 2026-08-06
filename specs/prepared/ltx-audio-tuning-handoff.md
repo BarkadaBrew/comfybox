@@ -27,33 +27,75 @@ Find and fix the difference.
 - Container timing on her clips is exact (video dur == audio dur,
   48kHz) — this is NOT a clock/mux bug.
 
-## Open leads, most promising first
+## ROOT CAUSE — CONFIRMED by Codex 2026-08-05 (read this first)
 
-1. **Prompt-side (strongest).** The reference had an explicit quoted
-   ENGLISH line ('she says "the next chapter is my favorite"'). Her
-   avocado t2v scenes have EMPTY `audio` fields (fallback: "natural
-   ambient sounds of the scene"); i2v voice lines come from the VLM and
-   may be absent/garbled. Hypothesis: no quoted line → LTX emits
-   non-verbal vocalization → reads as "not English", and the vocoder
-   renders those poorly → reads as distortion.
-   **DISCRIMINATOR (run this first, ~5 min):** her exact request shape
-   (i2v, 512x832, her cfg, character-length prompt) with a NEUTRAL
-   subject + one English quoted line. Clean ⇒ prompt-side. Distorted ⇒
-   request-path bug still unfound.
-2. **Duration plumbing BUG (real, unfixed).** Daemon logs "(16:9, 5s)"
-   / config `clipSeconds: 4`, engine queues 241–289 frames (10–12s).
-   Duration is lost between `content-scheduler.ts` → `video-tools.ts`
-   (suspect the #1440 default-duration logic) → `/v1/video/generate`.
-   Fix + prove with a log pair: daemon "4s" → engine "97f". This also
-   poisons sound: one beat of action stretched over 10s produces the
-   measured wash (voice/floor 1.9x vs 5.9x on the good reference).
-3. **NAG is silently DROPPED on the audio path.** `callAV` takes no NAG
-   params, so when audio is on, the video stream loses NAG too
-   (`nag_scale=11` in her effective config). Quality regression for
-   video, and a real difference vs pre-audio renders.
-4. Sigma-density A/B (`stage1_sigmas`): community (PinkCherry HF #8,
-   tarn1) reports a SHORTER first-pass schedule gives "better modulated,
-   less tinny" sound. Never tested here.
+**The engine deletes the audio clause from every Kira prompt.**
+
+- `LTX2VideoGenerator` hardcodes `maxLength: 128` for both positive and
+  negative encoding ([LTX2VideoGenerator.swift:552, :663]); the tokenizer
+  truncates with `tokens.prefix(128)` — it keeps the HEAD and drops the
+  TAIL ([LTX2GemmaTokenizer.swift:152]).
+- Kira's prompts are character-injected and long, and the audio clause is
+  appended LAST. Codex measured her actual t2v scene pool:
+  **audio clauses surviving the 128-token cap: 0 of 16.**
+- So the model never sees the requested sound or dialogue. It invents
+  non-verbal vocalization ⇒ "not English"; the vocoder renders that badly
+  ⇒ "distortion". The clean reference clip was SHORT, so its quoted line
+  survived. One mechanism explains both symptoms and the difference
+  between the two clip families.
+
+**Fix direction (validate before committing):**
+1. Make the audio clause truncation-proof: reorder it ahead of the
+   character description, and/or raise `maxLength` (the connector tiles
+   128 registers across any divisible length — [LTX2Connector1D.swift:442]
+   — so >128 is architecturally allowed but MUST be validated against the
+   trained recipe before shipping).
+2. Add an invariant: when `audio:true`, reject or reorder any request
+   whose audio clause would fall beyond the cap.
+3. Log structured truncation facts per render: pre-truncation token
+   count, audio-marker token index, whether a quoted line survived,
+   effective-prompt hash. (Codex #8: the current log line cannot prove
+   dialogue reached the engine.)
+
+## Corrections to my original analysis (all from the same review)
+
+- **My P0 discriminator was NOT discriminating** — it changed modality,
+  audio semantics, prompt length, negative conditioning, duration policy
+  and dims at once. Replaced by the token probe below.
+- **i2v is not a valid proxy** for the known-good t2v path; settle t2v
+  first.
+- **"Empty LoRA arrays" does NOT make her presets inert** — they still
+  carry negative prompts, tuning, and dims policy. My "LoRAs ruled out"
+  claim was too broad: LoRA *weights* are ruled out, preset *effects*
+  are not.
+- **The daemon's logged request shape is not the engine's** — verify at
+  the engine, never from daemon logs.
+- **"Duration plumbing bug" was wrong**: the 10-12s renders are an
+  INTENTIONAL server-side policy (the ≤289f single-pass fold in
+  `prepareLocalVideo`), not lost plumbing. Decide whether that policy
+  should still apply to short audio clips — it is a policy question, not
+  a bug hunt. (Ticket 1491 updated accordingly.)
+
+## Work plan (revised — Codex ordering)
+
+**P0 · Token probe. NO GPU, minutes.** Take her real t2v scene strings
+(and a real i2v enriched intent), tokenize WITHOUT truncation, and report:
+total tokens, index of the `audio:` marker, whether any quoted line
+survives tokens 0-127, and the decoded first 128 tokens. This proves or
+kills the root cause on the desk, not on the GPU.
+
+**P1 · Fix + prove.** Reorder/raise per the fix direction, add the
+`audio:true` invariant + structured truncation logging, then ONE matched
+4s t2v pair: identical prompt with the audio clause INSIDE vs BEYOND the
+128-token boundary. A-good/B-bad isolates truncation.
+
+**P2 · Only after t2v is clean:** re-test i2v, then swap in the Kira
+preset negative as a single variable (Codex flagged the preset negative
+as the next most likely contributor once truncation is fixed).
+
+**P3 · Then the known regressions:** NAG dropped on the audio path
+(ticket 1497), Codex Mediums 1-3 from the earlier review, sigma-density
+A/B (tarn1's shorter schedule).
 
 ## Codex review — 6 findings, 3 unfixed Mediums
 
