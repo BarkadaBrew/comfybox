@@ -129,6 +129,67 @@ i2v seed path → her dims. The first render that breaks names the cause.
     context loss).
   - Sigma-density A/B (lead 4).
 
+## External references (community + upstream)
+
+- **PinkCherry checkpoint discussions** (the checkpoint Kira renders on —
+  SexGod1979/PinkCherry_NSFW_LTX23). Discussion #8 "feedback on version
+  1.7" is the load-bearing one: user tarn1 reports (a) a SHORTER first-
+  pass sigma schedule — `1.000, 0.955, 0.893, 0.812, 0.715, 0.603,
+  0.482, 0.241, 0.121, 0.0` — gave "better modulated sound... less
+  impactful/tinny than the longer sigma"; (b) "pass 2 was wiping out the
+  sound version from pass 1... made it much more sedate, wiped out much
+  of the background noise" (independent corroboration of our
+  audio-bypasses-refine finding); (c) their fix routes pass-1 audio
+  directly into the combine node, bypassing the second sampler.
+  https://huggingface.co/SexGod1979/PinkCherry_NSFW_LTX23/discussions/8
+  Check for NEWER discussions — this community reports audio issues
+  first and in production terms.
+- **Author workflows on disk** (ground truth for the recipe, incl. the
+  audio negative terms we adopted):
+  /Volumes/Bolt/ComfyUI-validate/author-samples/*.workflow.json —
+  `back_in_black.workflow.json`, `taking_it_from_the_side.workflow.json`.
+  Their standard negative ends "...distorted sound, saturated sound,
+  loud". They run CFG 1.0 + NAG, never high cfg on audio.
+- **Reference implementation** (parity oracle, VALIDATION ONLY — never a
+  serving path): /Volumes/Bolt/ComfyUI-validate/ComfyUI/comfy/ldm/
+  lightricks/{av_model.py, model.py, symmetric_patchifier.py}. The
+  golden-tensor exporters we used live in scripts/export_*_goldens.py;
+  that bisect method (chain -> stage -> op) found two single-op bugs and
+  is the escalation path if a lever sweep fails.
+- **IC-LoRA "Ingredients" character consistency** (task #27, t2v identity
+  without training): https://aistudynow.com/how-to-keep-characters-
+  consistent-in-ltx-2-3-ic-lora-ingredients/ — stack distilled 0.6 +
+  Ingredients 1.4 + VBVR 0.7, CFG 1 + NAG, dual-section prompt
+  ("reference:" sheet description + "Generated video:" action).
+- **Skin/hair quality LoRA** (task #27, downloaded, unevaluated):
+  https://huggingface.co/TheBurgstall/LTX-2.3-skin-hair — local copy at
+  /Volumes/Bolt/Models/loras/ltx-quality/skin-LTXLora-step00004000.comfy.safetensors
+  (strength 0.75-0.9; note the author's repo also ships LTX-2 AUDIO demo
+  clips — same stack, worth listening to as a quality bar).
+- **LTX Director / timeline audio** (task #24): ~/Projects/WhatDreamsCost-
+  ComfyUI — `ltx_director.py` (PromptRelay temporal attention masking),
+  `speech_length_calculator.py` (text -> frames at fps — the sizing math
+  for spoken lines), `example_workflows/`. Relevant here because
+  prose cannot place a sound in time (the 12s reference's rain never
+  arrived); segment-scoped audio is the structural fix.
+
+## Guidance for the next session
+
+- **Ask Todd for the avocado `audio` clauses** — the t2v scene list has
+  the field wired with apple/banana authored as examples. Do not invent
+  explicit copy; it is his to write (persona-content division).
+- **Listen to the author's own audio demos** (skin-hair repo, PinkCherry
+  discussion attachments) before deciding what "good" sounds like on
+  this checkpoint — they set the achievable bar for this model.
+- **Community first, code second.** Both audio insights that mattered
+  (refine wiping ambience; the shorter sigma schedule) came from the
+  checkpoint's discussion page, not from our code. Check it before
+  starting a deep bisect.
+- **The engine is not obviously broken.** A neutral t2v request produces
+  perfect audio on the same binary. Bias the search toward what the
+  DAEMON sends (prompt assembly, truncation, duration, enhance path)
+  before suspecting the pipeline.
+
 ## Reference material
 
 specs/ltx2-audio.md (rev 2 + wire-4 shipped notes), the good clip
