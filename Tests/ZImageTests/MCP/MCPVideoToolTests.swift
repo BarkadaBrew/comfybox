@@ -62,6 +62,19 @@ final class MCPVideoToolTests: XCTestCase {
     XCTAssertEqual(required, ["prompt"], "Only 'prompt' should be required")
   }
 
+  func testGenerateVideoPromptGuidanceMatchesLTX23Contract() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as! [String: Any]
+    let prompt = properties["prompt"] as! [String: Any]
+    let description = prompt["description"] as! String
+
+    XCTAssertTrue(description.contains("4-8"))
+    XCTAssertTrue(description.contains("45-90"))
+    XCTAssertTrue(description.localizedCaseInsensitiveContains("source image is ground truth"))
+    XCTAssertFalse(description.localizedCaseInsensitiveContains("longer is better"))
+    XCTAssertFalse(description.contains("80-120"))
+  }
+
   // MARK: - video_status Schema (Story A1)
 
   func testVideoStatusSchemaHasJobIdRequired() {

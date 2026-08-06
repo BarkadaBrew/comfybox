@@ -420,13 +420,13 @@ public enum MCPToolRegistry {
 
   static let generateVideo = MCPToolDefinition(
     name: "generate_video",
-    description: "Generate a video clip. Supports text-to-video (T2V) and image-to-video (I2V). T2V uses LTX 2.3; I2V uses Wan 2.2. Returns a job_id for async polling via video_status. In proxy mode, generation runs on Replicate; in native mode, it runs locally on the Mac GPU.",
+    description: "Generate a video clip. Supports LTX 2.3 text-to-video (T2V) and image-to-video (I2V) in native mode. Returns a job_id for async polling via video_status. In proxy mode, generation runs on Replicate; in native mode, it runs locally on the Mac GPU.",
     inputSchema: [
       "type": "object",
       "properties": [
         "prompt": [
           "type": "string",
-          "description": "For T2V: detailed cinematic scene description (longer is better). For I2V: motion description only (camera + subject + atmosphere, 80-120 words). The source image provides the scene for I2V.",
+          "description": "LTX 2.3: use one dominant shot in one flowing present-tense paragraph. T2V uses 4-8 descriptive sentences, roughly 45-90 words, ordered subject -> action -> camera -> mood. For I2V, the source image is ground truth: use 4-6 concise sentences describing only explicit subject, camera, and environmental motion; do not redescribe or contradict the frame. Send enhance:false when the prompt is already optimized.",
         ] as [String: Any],
         "image_path": [
           "type": "string",
