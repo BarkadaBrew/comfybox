@@ -173,6 +173,17 @@ i2v seed path → her dims. The first render that breaks names the cause.
 
 ## External references (community + upstream)
 
+- **Prompting guide (primary):**
+  https://docs.ltx.io/open-source-model/usage-guides/prompting-guide — one
+  flowing paragraph, present-tense actions, 4–8 sentences, explicit camera
+  movement, quoted dialogue, and language/accent when needed. The project
+  distillation and audio-probe rules live at
+  `.claude/skills/kira-ltx-tuning/references/ltx-2.3-prompting.md`.
+- **LTX-2.3 practical guide (secondary, unaffiliated):**
+  https://ltxworkflow.com/resources/tutorials/ltx-23-prompting-guide — useful
+  LTX-2.3 details: subject -> action -> camera -> mood, one dominant shot,
+  verb-heavy I2V prompting, explicit audio intensity, and native portrait
+  composition. Prefer the primary source if guidance diverges.
 - **PinkCherry checkpoint discussions** (the checkpoint Kira renders on —
   SexGod1979/PinkCherry_NSFW_LTX23). Discussion #8 "feedback on version
   1.7" is the load-bearing one: user tarn1 reports (a) a SHORTER first-

@@ -44,3 +44,29 @@ The beyond-budget variant normalizes byte-for-byte to the inside-budget variant:
 - Duplicate leading `Visual:` marker: no
 
 This reproduces the truncation mechanism with production tokenization and verifies that section reordering removes order as a variable while retaining the 128-token model limit.
+
+## Live follow-up — 2026-08-06
+
+The deployed guard produced byte-identical decoded A/V streams for a matched
+4-second pair where the same audio clause was originally inside vs beyond the
+128-token boundary. This verifies prompt-order normalization in the live
+production path; it does not establish subjective audio quality.
+
+The first 6-second English probe was not a valid quality discriminator. It put
+28 spoken words plus a pause into six seconds (about 280 words per minute), and
+Todd judged the resulting voice illegible and undesirable. The prompt itself
+was overconstrained even though telemetry proved the quoted text survived.
+
+A corrected probe follows the LTX-2.3 guidance distilled in
+`.claude/skills/kira-ltx-tuning/references/ltx-2.3-prompting.md`: one adult
+speaker, one ten-word quoted English sentence, an explicit natural voice and
+conversational volume, and otherwise silence. It keeps the same seed, request
+shape, production configuration, and six-second duration.
+
+- Output: `~/Pictures/ComfyBox/EXP_audio_english_short_line_seed424242_6s.mp4`
+- Prompt telemetry: 114 tokens, audio marker index 1, quoted line present and
+  surviving, effective hash `b57d491605f9`, no reordering
+- Container: H.264 1024x640 + AAC 48 kHz stereo, both 6.041667 seconds
+- File SHA-256: `48edbb9d45a359b893443d56234b81d69883f41e0f9f3d90455df0c374ba9c2e`
+- Status: render and plumbing verified; subjective intelligibility and voice
+  quality are pending Todd's listening verdict

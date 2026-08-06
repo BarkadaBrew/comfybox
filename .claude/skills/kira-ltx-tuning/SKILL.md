@@ -8,6 +8,9 @@ description: Use when tuning Kira's LTX video quality — presets, LoRA stacks, 
 > **ACTIVE WORK ORDER (2026-08-05):** audio quality is mid-investigation —
 > read `specs/prepared/ltx-audio-tuning-handoff.md` FIRST; it carries the
 > current problem statement, verified dead ends, and an ordered P0–P4 plan.
+> Before authoring an LTX prompt, read
+> `references/ltx-2.3-prompting.md`; it captures the current official and
+> practical LTX-2.3 shot, motion, camera, and audio guidance.
 
 Fine-tune what Kira's video renders look and sound like: preset recipes
 (LoRA stacks + strengths), Tier A/B tuning params, motion levers, and the
@@ -44,6 +47,17 @@ campaigns (Kroma integration, i2v strength A/B, NAG, stage floors, audio).
    sigma schedule governs; engine warns since 2026-08-05) — the density
    lever is `tuning.stage1_sigmas`.
 
+8. **Prompt like a shot, not a tag cloud.** One flowing 4–8 sentence
+   paragraph, one dominant event, present-tense named motion, explicit camera
+   intent, then mood/lighting. For I2V, let the image carry static appearance
+   and spend words on verbs. See `references/ltx-2.3-prompting.md`.
+
+9. **Do not overload speech probes.** Use one adult speaker, one short quoted
+   line that fits the clip at a natural pace, explicit language/voice/volume,
+   and no competing ambience. An ambience test is a separate render. Start
+   audio-enabled prompts with `Audio:` and follow with `Visual:` so the engine's
+   truncation invariant is observable.
+
 ## The levers
 
 | lever | where | notes |
@@ -53,7 +67,7 @@ campaigns (Kroma integration, i2v strength A/B, NAG, stage floors, audio).
 | i2v strength | request | HIGHER = closer to source (denoise = 1-strength); 0.5 is the validated default |
 | motion | imgCompression (higher = more motion), cfg, prompt action verbs | pristine stills freeze i2v — compression preprocess is load-bearing |
 | duration/size | Kira config clipSeconds (live-editable, currently 5), resolution gate | duration linear cost, dims quadratic |
-| audio | request `audio` (default ON for Kira AND Bree), `tuning.stage1_sigmas` (density — the REAL lever; `steps` is a distilled no-op), quoted English line in the prompt = speech vs vocalization | audio guidance is capped at cfg 1.0 (`LTX2_AUDIO_CFG`); audio bypasses refine pass 2; mastering chain runs at mux (`LTX2_AUDIO_ENHANCE=0` for raw) |
+| audio | request `audio` (default ON for Kira AND Bree), `tuning.stage1_sigmas` (density — the REAL lever; `steps` is a distilled no-op), explicit `Audio:` clause with one duration-fit quoted line + language/voice/volume | audio guidance is capped at cfg 1.0 (`LTX2_AUDIO_CFG`); audio bypasses refine pass 2; mastering chain runs at mux (`LTX2_AUDIO_ENHANCE=0` for raw); separate speech and ambience probes |
 | identity | seed image + kroma preset; face-anchor env (partnered only — solo anchoring ghosts) | char LoRA future work |
 
 ## Render commands
@@ -76,18 +90,21 @@ curl -s -X POST http://127.0.0.1:7870/v1/video/generate -H 'Content-Type: applic
 ## The loop
 
 1. State the hypothesis and the ONE lever. Pick production-config dims/preset.
-2. Render matched-seed pair(s) in an idle window.
-3. Verify effective-config lines show the intended values.
-4. Deliver clips to Todd with a one-line "what to look for".
-5. On his verdict: fold the winner into the preset (backup first), redeploy
+2. Validate the prompt against `references/ltx-2.3-prompting.md`; for speech,
+   calculate whether the quoted line fits the clip at a natural pace.
+3. Render matched-seed pair(s) in an idle window.
+4. Verify effective-config and `prompt-truncation` lines show the intended
+   values and that the quoted line survived.
+5. Deliver clips to Todd with a one-line "what to listen/look for".
+6. On his verdict: fold the winner into the preset (backup first), redeploy
    preset (hot: presets.json is read per-render; engine restart NOT needed
    for preset changes — only for code).
-6. If it changes Kira's defaults: confirm the change appears in her next
+7. If it changes Kira's defaults: confirm the change appears in her next
    scheduled render's trace (`~/.comfybox/traces/`, has_audio / config line).
-7. Record the outcome in the relevant spec or qa/ notes — recipes without
+8. Record the outcome in the relevant spec or qa/ notes — recipes without
    provenance get re-litigated.
 
-## Current canon (2026-08-05 — verify against presets.json before trusting)
+## Current canon (2026-08-06 — verify against presets.json before trusting)
 
 - Presets: krea-kira identity = kroma 1.0 + sea 0.6 + content 0.4 by fruit
   tier; apple = kroma + sea only. Distill-1.1 LoRA in the video stack.
