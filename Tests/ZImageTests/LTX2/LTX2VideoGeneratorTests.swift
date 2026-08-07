@@ -169,3 +169,30 @@ final class LTX2VideoGeneratorTests: XCTestCase {
         XCTAssertGreaterThan(guarded.audioMarkerTokenIndex ?? -1, 127)
     }
 }
+
+  // MARK: - Gemma max length (2026-08-07)
+
+  /// 128 was a port artifact, not the trained recipe: the official Lightricks
+  /// pipeline tokenizes at max_length 1024 (LTX2_GEMMA_MAX_LENGTH default), the
+  /// ComfyUI Gemma loader defaults to 1024, and Todd's reference PinkCherry
+  /// workflow feeds enhancer output up to 256 tokens through this encoder. The
+  /// connector tiles 128 learnable registers via integer division, so the value
+  /// must stay a positive multiple of 128.
+  func testGemmaMaxLengthDefaultsToUpstream1024() {
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: nil), 1024)
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: ""), 1024)
+  }
+
+  func testGemmaMaxLengthHonorsValidOverride() {
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "128"), 128)
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "256"), 256)
+  }
+
+  func testGemmaMaxLengthRejectsNonMultipleOf128() {
+    // Register tiling is seqLen / 128 by integer division — a non-multiple
+    // silently drops register coverage, so fall back to the default instead.
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "200"), 1024)
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "0"), 1024)
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "-128"), 1024)
+    XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "abc"), 1024)
+  }

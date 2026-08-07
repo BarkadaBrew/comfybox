@@ -228,6 +228,23 @@ public final class LTX2VideoGenerator {
         n >= 9 && (n - 1) % 8 == 0
     }
 
+    /// Resolve the Gemma tokenizer max length (LTX2_GEMMA_MAX_LENGTH).
+    ///
+    /// Default 1024 = the official Lightricks recipe (their tokenizer call and
+    /// the ComfyUI Gemma loader both default to 1024). Our former hardcoded 128
+    /// was a port artifact that silently truncated every long prompt.
+    ///
+    /// The connector tiles its 128 learnable registers with integer division
+    /// (`numTiles = seqLen / 128`), so the value must be a positive multiple of
+    /// 128 — anything else silently under-covers the sequence with registers.
+    /// Invalid overrides fall back to the default rather than half-applying.
+    public static func resolveGemmaMaxLength(env: String?) -> Int {
+        let fallback = 1024
+        guard let raw = env?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return fallback }
+        guard let n = Int(raw), n > 0, n % 128 == 0 else { return fallback }
+        return n
+    }
+
     /// fps must be positive and sane (chunk planning divides by it; the RoPE
     /// temporal coords divide by it too).
     public static func isValidFPS(_ fps: Int) -> Bool {
@@ -549,7 +566,15 @@ public final class LTX2VideoGenerator {
         // controlled per-render via LTX2_COND_FPS (read fresh in createPositionGrid).
         let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: tiled)
         self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
-        self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
+        // 128 was a port artifact, NOT the trained recipe (discovered 2026-08-07):
+        // the official Lightricks pipeline tokenizes at max_length 1024, the
+        // ComfyUI Gemma loader defaults to 1024, and the reference PinkCherry
+        // workflow feeds 256-token enhancer output through this same encoder.
+        // The artifact silently truncated every long prompt for weeks — scene,
+        // camera and identity fell off the tail. Mirror upstream's env knob.
+        self.tokenizer = try LTX2GemmaTokenizer.load(
+          from: URL(fileURLWithPath: config.gemmaPath),
+          maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
         isLoaded = true
         loadedLoraKey = wantKey
         logger.info("LTX-2: models ready.")
@@ -661,10 +686,12 @@ public final class LTX2VideoGenerator {
             extendToSeconds: request.extendToSeconds, fps: request.fps)
 
         // Prompt-conditioned audio used to disappear silently when callers
-        // appended `audio:` after a long character/scene description: Gemma
-        // keeps tokens 0...127 and drops the tail. Keep the trained 128-token
-        // recipe, but move the complete audio section ahead of visual prose
-        // when needed and fail loudly if even that section cannot fit.
+        // appended `audio:` after a long character/scene description: the
+        // tokenizer keeps the head and drops the tail. (The 128 cap that made
+        // this bite constantly was a port artifact, corrected to upstream's
+        // 1024 on 2026-08-07 — the guard remains as the backstop for prompts
+        // that exceed even the real cap, and for LTX2_GEMMA_MAX_LENGTH=128
+        // rollback runs.)
         let guardedPrompt = try LTX2AudioPromptGuard.prepare(
             prompt: request.prompt,
             audio: wantAudio,
