@@ -56,6 +56,19 @@ final class MCPVideoToolTests: XCTestCase {
     }
   }
 
+  /// The daemon weaves the character description into the prompt itself; the
+  /// server must be told to stand down or it prepends ~110 tokens and blows the
+  /// 128-token cap, truncating scene + camera off the end (Todd 2026-08-07).
+  /// This key was dropped silently once already: `executeGenerateVideo` builds
+  /// its body from an explicit whitelist, so an unforwarded key vanishes.
+  func testGenerateVideoSchemaExposesSkipCharacterInjection() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    let skip = properties?["skip_character_injection"] as? [String: Any]
+    XCTAssertNotNil(skip, "generate_video must expose skip_character_injection")
+    XCTAssertEqual(skip?["type"] as? String, "boolean")
+  }
+
   func testGenerateVideoSchemaOnlyPromptRequired() {
     let tool = MCPToolRegistry.tool(named: "generate_video")!
     let required = tool.inputSchema["required"] as? [String]

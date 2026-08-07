@@ -554,6 +554,13 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let preset = params?.string("preset") {
       body["preset"] = preset
     }
+    // Caller already wove the character description into the prompt, so tell
+    // WarmServer not to prepend its own (Todd 2026-08-07). This body is an
+    // explicit whitelist — an unforwarded key is silently dropped here, which
+    // is exactly what happened on the first attempt at this fix.
+    if let skipChar = params?.bool("skip_character_injection") {
+      body["skip_character_injection"] = skipChar
+    }
     // Motion vs fidelity per content type (#40): the daemon sends a high
     // img_compression + lower strength for partnered-action prompts (motion)
     // and low compression + strength 1.0 for solo/portrait (fidelity).

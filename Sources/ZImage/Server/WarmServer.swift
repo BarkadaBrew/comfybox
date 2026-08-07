@@ -1737,6 +1737,21 @@ public final class WarmServer {
     /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
     /// first audio render reloads the transformer with the audio branch.
     let audio: Bool?
+    /// Suppress the manual character prepend when the CALLER has already woven
+    /// the description into the prompt (Todd 2026-08-07). Mirrors the image
+    /// path's `skip_character_injection`, which the video path never had.
+    ///
+    /// Without this the description is injected twice — once by the caller,
+    /// once here — and at ~110 tokens each that alone overruns the 128-token
+    /// tokenizer cap, truncating the scene and the camera direction off the
+    /// end of the prompt. The idempotency check below cannot be relied on:
+    /// it compares the first four words of THIS host's description against a
+    /// prompt composed from a DIFFERENT character record on the daemon host,
+    /// at a different framing, so it silently misses.
+    ///
+    /// `character` still applies — it drives preset resolution, the output
+    /// directory and gallery attribution. Only the prompt prepend is skipped.
+    let skipCharacterInjection: Bool?
   }
 
   /// Map a named resolution + aspect to a width x height budget. Dims are
@@ -2147,7 +2162,14 @@ public final class WarmServer {
     }
 
     // Fallback: manual character prepend when enhancement didn't run/apply.
-    if !enhancedApplied, let name = characterName, let desc = characterDesc, !desc.isEmpty {
+    // Skipped outright when the caller says it already wove the description in
+    // — see `skipCharacterInjection` on the request for why the idempotency
+    // check below is not sufficient on its own.
+    if req.skipCharacterInjection == true, characterName != nil {
+      logger.info("Video: character injection skipped — caller composed identity.")
+    }
+    if req.skipCharacterInjection != true,
+       !enhancedApplied, let name = characterName, let desc = characterDesc, !desc.isEmpty {
       // Idempotency: skip if the caller already wrote the description in.
       let alreadyPresent = desc.split(separator: " ").prefix(4).allSatisfy {
         effectivePrompt.localizedCaseInsensitiveContains($0)

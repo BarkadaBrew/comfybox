@@ -480,6 +480,10 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",
         ],
+        "skip_character_injection": [
+          "type": "boolean",
+          "description": "Skip the server-side character description prepend. Send TRUE when the caller has already woven the description into the prompt. Note `enhance:false` is NOT sufficient — it only stops the optimizer's injection, and on t2v the server still defaults the character to \u{22}kira\u{22} and prepends ~110 tokens, which overruns the 128-token cap and truncates the scene and camera direction off the end.",
+        ] as [String: Any],
         "enhance": [
           "type": "boolean",
           "description": "Whether the server should optimize the prompt (default true). Send FALSE when the caller has ALREADY run its own prompt optimizer — a second rewrite drifts the prompt away from concrete staging (limb placement, figure count) and double-injects the character description.",
