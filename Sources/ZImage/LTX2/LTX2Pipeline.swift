@@ -324,7 +324,11 @@ public final class LTX2Pipeline {
       MLX.GPU.clearCache()
       // Gate-skip decode fix (2026-08-05): check BEFORE upsampling — see
       // applyTwoStageRefine. Above the gate, keep base latents (native size).
-      let t2vPreVolume = latents.dim(2) * (latH * 2) * (latW * 2)
+      // Same 1.5x refine logic as applyTwoStageRefine (Todd 2026-08-07).
+      let rScale = max(1.0, min(2.0, resolvedConfig.refineScale))
+      let sLatH = max(1, Int((Float(latH) * rScale).rounded()))
+      let sLatW = max(1, Int((Float(latW) * rScale).rounded()))
+      let t2vPreVolume = latents.dim(2) * sLatH * sLatW
       let t2vRefineMax = resolvedConfig.refineMaxVol
       if t2vPreVolume > t2vRefineMax,
          ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1" {
@@ -332,14 +336,18 @@ public final class LTX2Pipeline {
       } else {
       logger.info("T2V two-stage refine: upsampling latents 2x...")
       let stats = vae.decoder.perChannelStatistics
-      let upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
+      var upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
+      if sLatH < latH * 2 || sLatW < latW * 2 {
+        logger.info("T2V two-stage refine: resizing 2x latent to \(rScale)x (\(sLatH)x\(sLatW) latent) before denoise.")
+        upLatent = LTX2Conditioning.resizeLatentBilinear(upLatent, height: sLatH, width: sLatW)
+      }
       eval(upLatent)
-      let t2vRefineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
+      let t2vRefineVolume = upLatent.dim(2) * sLatH * sLatW
       if t2vRefineVolume > t2vRefineMax {
         logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (LTX2_REFINE_UPSCALE_ON_SKIP path).")
         latents = upLatent
       } else {
-      let rLatH = latH * 2, rLatW = latW * 2
+      let rLatH = sLatH, rLatW = sLatW
       let refineSigmas: [Float] = resolvedConfig.refineSigmasEffective
       if let seed = seed { MLXRandom.seed(seed &+ 1000) }
       let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
@@ -1558,7 +1566,16 @@ public final class LTX2Pipeline {
     // 20,000) that was EVERY Kira clip, ~30% of each render wasted. Skip
     // early and decode base latents at the requested size.
     // LTX2_REFINE_UPSCALE_ON_SKIP=1 restores the soft-upscale path for A/B.
-    let preVolume = latents.dim(2) * (latH * 2) * (latW * 2)
+    // Refine scale (Todd 2026-08-07: "1.5 is enough" / "render times are
+    // already too long"): the learned upsampler is fixed 2x, but the refine
+    // denoise — the expensive stage on long clips — runs at rScale. Below 2
+    // the upsampled latent is bilinearly resized down first: refine area
+    // drops to (rScale/2)^2 (56% at 1.5) and the volume gates reflect the
+    // REAL refine size, so more clips refine instead of skipping.
+    let rScale = max(1.0, min(2.0, resolvedConfig.refineScale))
+    let sLatH = max(1, Int((Float(latH) * rScale).rounded()))
+    let sLatW = max(1, Int((Float(latW) * rScale).rounded()))
+    let preVolume = latents.dim(2) * sLatH * sLatW
     let preMaxVolume = resolvedConfig.refineMaxVol
     if preVolume > preMaxVolume,
        ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1",
@@ -1571,7 +1588,11 @@ public final class LTX2Pipeline {
     let stats = vae.decoder.perChannelStatistics
     let denorm = stats.unNormalize(latents.asType(.float32))
     let upDenorm = ups(denorm)
-    let upLatent = stats.normalize(upDenorm).asType(.float32)
+    var upLatent = stats.normalize(upDenorm).asType(.float32)
+    if sLatH < latH * 2 || sLatW < latW * 2 {
+      logger.info("Two-stage refine: resizing 2x latent to \(rScale)x (\(sLatH)x\(sLatW) latent) before denoise.")
+      upLatent = LTX2Conditioning.resizeLatentBilinear(upLatent, height: sLatH, width: sLatW)
+    }
     eval(upLatent)
     // --- Refine bisection instrumentation (env-gated, 2026-08-01 band bug) ---
     // LTX2_REFINE_ROWSTATS=1 logs per-latent-row energy at each refine boundary
@@ -1596,7 +1617,7 @@ public final class LTX2Pipeline {
     rowStats("upsampled", upLatent)
     // Refine-volume OOM gate (2026-07-25 23:24 crash): above it, decode the
     // upsampled latent directly — upscaled-but-unrefined beats a dead server.
-    let refineVolume = upLatent.dim(2) * (latH * 2) * (latW * 2)
+    let refineVolume = upLatent.dim(2) * sLatH * sLatW
     let refineMaxVolume = resolvedConfig.refineMaxVol
     if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
       logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")

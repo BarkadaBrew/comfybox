@@ -278,4 +278,22 @@ final class PresetStoreTests: XCTestCase {
       from: URL(fileURLWithPath: "/nope/presets")), 0)
     XCTAssertTrue(store.list().isEmpty)
   }
+  // MARK: - videoTuning round-trip (2026-08-07)
+
+  /// `videoTuning` existed on the struct but was MISSING from CodingKeys, so
+  /// the custom decoder and the synthesized encoder both dropped it: every
+  /// preset-level Tier-A tuning write since task #9 Phase 2 silently vanished
+  /// on the JSON/API path. The desktop tuning UI wrote values nothing read.
+  func testVideoTuningSurvivesJSONRoundTrip() throws {
+    let json = """
+    {"id":"t","name":"T","videoTuning":{"imgCompression":22,"condFps":18}}
+    """.data(using: .utf8)!
+    let decoded = try JSONDecoder().decode(ImagePreset.self, from: json)
+    XCTAssertEqual(decoded.videoTuning?.imgCompression, 22, "decode must carry videoTuning")
+    XCTAssertEqual(decoded.videoTuning?.condFps, 18)
+    let encoded = try JSONEncoder().encode(decoded)
+    let redecoded = try JSONDecoder().decode(ImagePreset.self, from: encoded)
+    XCTAssertEqual(redecoded.videoTuning?.imgCompression, 22, "encode must carry videoTuning")
+  }
+
 }

@@ -150,6 +150,11 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
     case steps, guidance, seed, width, height
     case loras, scheduler, upscale
+    // Missing until 2026-08-07: with it absent, BOTH the custom decoder and
+    // the synthesized encoder dropped videoTuning — every preset-level Tier-A
+    // tuning write since task #9 Phase 2 silently vanished on the JSON/API
+    // path. The desktop tuning UI was writing values nothing ever read.
+    case videoTuning
   }
 
   public init(from decoder: Decoder) throws {
@@ -178,6 +183,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     loras = ((try? c.decodeIfPresent([LoraReference].self, forKey: .loras)) ?? nil) ?? []
     scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
     upscale = try c.decodeIfPresent(PresetUpscale.self, forKey: .upscale)
+    videoTuning = try c.decodeIfPresent(LTX2VideoTuning.self, forKey: .videoTuning)
   }
 }
 

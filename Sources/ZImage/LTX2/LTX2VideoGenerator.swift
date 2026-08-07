@@ -1109,7 +1109,8 @@ public final class LTX2VideoGenerator {
             frames: allFrames, outputPath: request.outputPath,
             fps: request.fps, width: outW, height: outH,
             bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
-            audio: audioTrack)
+            audio: audioTrack,
+            deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge)
 
         return LTX2VideoResult(
             outputPath: request.outputPath,

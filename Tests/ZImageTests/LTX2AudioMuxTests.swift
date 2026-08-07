@@ -72,4 +72,29 @@ final class LTX2AudioMuxTests: XCTestCase {
     XCTAssertEqual(asset.tracks(withMediaType: .audio).count, 0, "no audio param -> no audio track")
     XCTAssertEqual(asset.tracks(withMediaType: .video).count, 1)
   }
+  // MARK: - Delivery downscale (2026-08-07, Todd: "480p is enough for telegram")
+
+  /// Render at the full recipe (2x refine), DELIVER at mobile size: the encoder
+  /// scales appended buffers to the output dims, so a smaller output is a
+  /// supersampled 480p — crisper than a native 480p stage-1 and a smaller file.
+  func testDeliveryDimsScaleToShortEdgePreservingAspect() {
+    // Portrait 896x1664 -> short edge 480 -> 480x892 rounded even.
+    let p = LTX2PostProcess.deliveryDims(width: 896, height: 1664, shortEdge: 480)
+    XCTAssertEqual(p.width, 480)
+    XCTAssertEqual(p.height, 892)
+    // Landscape 1408x896 -> 754x480.
+    let l = LTX2PostProcess.deliveryDims(width: 1408, height: 896, shortEdge: 480)
+    XCTAssertEqual(l.width, 754)
+    XCTAssertEqual(l.height, 480)
+  }
+
+  func testDeliveryDimsNeverUpscaleAndZeroIsOff() {
+    let small = LTX2PostProcess.deliveryDims(width: 448, height: 832, shortEdge: 480)
+    XCTAssertEqual(small.width, 448, "already under target — deliver as-is")
+    XCTAssertEqual(small.height, 832)
+    let off = LTX2PostProcess.deliveryDims(width: 896, height: 1664, shortEdge: 0)
+    XCTAssertEqual(off.width, 896, "0 = feature off")
+    XCTAssertEqual(off.height, 1664)
+  }
+
 }

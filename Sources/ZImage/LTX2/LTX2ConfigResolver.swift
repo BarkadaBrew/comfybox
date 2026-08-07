@@ -63,6 +63,8 @@ public enum LTX2ConfigResolver {
     Entry(name: "refine_sigmas", envKey: "LTX2_REFINE_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "two_stage", envKey: "LTX2_TWO_STAGE", tier: "A", kind: .boolExactOne, builtin: "false"),
     Entry(name: "cond_fps", envKey: "LTX2_COND_FPS", tier: "A", kind: .float(1...120), builtin: "model"),
+    Entry(name: "delivery_short_edge", envKey: "LTX2_DELIVERY_SHORT_EDGE", tier: "A", kind: .int(0...4320), builtin: "0"),
+    Entry(name: "refine_scale", envKey: "LTX2_REFINE_SCALE", tier: "A", kind: .float(1...2), builtin: "1.5"),
     Entry(name: "img_compression", envKey: "LTX2_I2V_COMPRESSION", tier: "A", kind: .int(0...100), builtin: "35"),
     Entry(name: "sampler", envKey: "LTX2_SAMPLER", tier: "A", kind: .string, builtin: ""),
     Entry(name: "stg_scale", envKey: "LTX2_STG_SCALE", tier: "A", kind: .float(0...20), builtin: "0"),
@@ -222,6 +224,12 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var twoStage: Bool?
   public var condFps: Float?
   public var imgCompression: Int?
+  /// Delivery downscale: mux output short edge (0 = off). Render runs the
+  /// full recipe; only the encoded file is scaled — supersampled delivery.
+  public var deliveryShortEdge: Int?
+  /// Refine target scale (1...2). The upsampler is fixed 2x; below 2 the
+  /// upsampled latent is bilinearly resized down before the refine denoise.
+  public var refineScale: Float?
   public var sampler: String?
   public var stgScale: Float?
   public var stgBlocks: String?
@@ -250,6 +258,8 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let twoStage: Bool
   public let condFps: Float?          // nil = model default fps
   public let imgCompression: Int
+  public let deliveryShortEdge: Int
+  public let refineScale: Float
   public let sampler: String
   public let stgScale: Float
   public let stgBlocks: String
@@ -303,6 +313,8 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "two_stage": return twoStage ? "true" : "false"
     case "cond_fps": return condFps.map(fmt) ?? "model"
     case "img_compression": return String(imgCompression)
+    case "delivery_short_edge": return String(deliveryShortEdge)
+    case "refine_scale": return fmt(refineScale)
     case "sampler": return sampler
     case "stg_scale": return fmt(stgScale)
     case "stg_blocks": return stgBlocks
@@ -365,6 +377,8 @@ extension LTX2ConfigResolver {
       twoStage: pick("two_stage", b("two_stage"), preset?.twoStage, request?.twoStage),
       condFps: pick("cond_fps", condFpsBase, preset?.condFps, request?.condFps),
       imgCompression: pick("img_compression", i("img_compression"), preset?.imgCompression, request?.imgCompression),
+      deliveryShortEdge: pick("delivery_short_edge", i("delivery_short_edge"), preset?.deliveryShortEdge, request?.deliveryShortEdge),
+      refineScale: pick("refine_scale", f("refine_scale"), preset?.refineScale, request?.refineScale),
       sampler: pick("sampler", str("sampler"), preset?.sampler, request?.sampler),
       stgScale: pick("stg_scale", f("stg_scale"), preset?.stgScale, request?.stgScale),
       stgBlocks: pick("stg_blocks", str("stg_blocks"), preset?.stgBlocks, request?.stgBlocks),

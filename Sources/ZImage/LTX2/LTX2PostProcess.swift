@@ -254,6 +254,23 @@ public enum LTX2PostProcess {
     }
   }
 
+  /// Delivery dims for a target short edge (0 = off). Aspect preserved, both
+  /// axes rounded to EVEN (h264 requirement); never upscales. The render keeps
+  /// the full two-stage recipe — only the encoded output shrinks, so a 480p
+  /// delivery is supersampled from the 2x refine rather than rendered soft
+  /// (Todd 2026-08-07: "480p is enough for telegram", "2x scale is overkill
+  /// for mobile").
+  public static func deliveryDims(width: Int, height: Int, shortEdge: Int) -> (width: Int, height: Int) {
+    guard shortEdge > 0 else { return (width, height) }
+    let short = min(width, height)
+    guard short > shortEdge else { return (width, height) }
+    let scale = Double(shortEdge) / Double(short)
+    func even(_ v: Double) -> Int { max(2, Int((v / 2.0).rounded()) * 2) }
+    return width <= height
+      ? (even(Double(width) * scale), even(Double(height) * scale))
+      : (even(Double(width) * scale), even(Double(height) * scale))
+  }
+
   public static func writeMP4(
     frames: [CGImage],
     outputPath: String,
@@ -261,7 +278,8 @@ public enum LTX2PostProcess {
     width: Int,
     height: Int,
     bitsPerPixelOverride: Double? = nil,
-    audio: AudioTrack? = nil
+    audio: AudioTrack? = nil,
+    deliveryShortEdge: Int = 0
   ) throws {
     guard !frames.isEmpty else {
       throw LTX2PostProcessError.noFrames
@@ -281,12 +299,16 @@ public enum LTX2PostProcess {
     // Telegram's 50MB bot upload cap. Env-tunable via LTX2_VIDEO_BITS_PER_PX.
     let bitsPerPixel = bitsPerPixelOverride
       ?? Double(ProcessInfo.processInfo.environment["LTX2_VIDEO_BITS_PER_PX"] ?? "") ?? 0.5
+    // Delivery downscale: the AVAssetWriterInput scales appended buffers to
+    // the output dims, so shrinking here supersamples the encoded file from
+    // the full-res render — no extra pass, smaller files, crisper 480p.
+    let (outW, outH) = deliveryDims(width: width, height: height, shortEdge: deliveryShortEdge)
     let videoSettings: [String: Any] = [
       AVVideoCodecKey: AVVideoCodecType.h264,
-      AVVideoWidthKey: width,
-      AVVideoHeightKey: height,
+      AVVideoWidthKey: outW,
+      AVVideoHeightKey: outH,
       AVVideoCompressionPropertiesKey: [
-        AVVideoAverageBitRateKey: Int(Double(width * height * fps) * bitsPerPixel),
+        AVVideoAverageBitRateKey: Int(Double(outW * outH * fps) * bitsPerPixel),
         AVVideoMaxKeyFrameIntervalKey: fps,
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
       ] as [String: Any],

@@ -57,7 +57,16 @@ public enum LTX2AudioEnhance {
   }
 
   /// `(channels, N)` float in [-1, 1] -> mastered, same shape/dtype domain.
-  public static func process(_ samples: MLXArray, sampleRate: Int) -> MLXArray {
+  /// Resolve the loudness target: explicit param > LTX2_AUDIO_TARGET_DB env >
+  /// -18 dBFS default (#1517 — render-time knob, no rebuild to change level).
+  static func resolveTargetDB(_ explicit: Float?) -> Float {
+    if let t = explicit { return min(max(t, -40), -6) }
+    if let raw = ProcessInfo.processInfo.environment["LTX2_AUDIO_TARGET_DB"],
+       let t = Float(raw) { return min(max(t, -40), -6) }
+    return -18
+  }
+
+  public static func process(_ samples: MLXArray, sampleRate: Int, targetDB: Float? = nil) -> MLXArray {
     let channels = samples.dim(0)
     let n = samples.dim(1)
     guard n > 0 else { return samples }
@@ -78,10 +87,15 @@ public enum LTX2AudioEnhance {
     var sumSq: Float = 0
     for ch in outChannels { for v in ch { sumSq += v * v } }
     let rms = sqrt(sumSq / Float(channels * n))
-    let targetRMS: Float = pow(10, -18.0 / 20.0)  // -18 dBFS
-    // Raise quiet content, cap the boost (+20dB), and never attenuate more
-    // than a touch — already-loud tracks pass ~unity into the soft ceiling.
-    let gain = min(max(targetRMS / max(rms, 1e-6), 1.0), 10.0)
+    let targetRMS: Float = pow(10, resolveTargetDB(targetDB) / 20.0)
+    // BIDIRECTIONAL normalization (#1517, 2026-08-07). The original floor of
+    // 1.0 meant this stage could only BOOST: quiet room tone took up to +20dB
+    // toward a speech target and ambience arrived at dialogue level ("ambient
+    // noise is a bit loud" — and the preset audio negatives were already
+    // maxed, so the level has to be governed here). Loud content now comes
+    // DOWN toward target too; the 0.25 floor stops a hot clip from being
+    // crushed, and the soft-knee limiter below still guards the ceiling.
+    let gain = min(max(targetRMS / max(rms, 1e-6), 0.25), 10.0)
 
     // Limiter with a REAL knee (2026-08-05 fix): the first version ran tanh
     // over the whole signal — ~10% compression at half-scale = audible

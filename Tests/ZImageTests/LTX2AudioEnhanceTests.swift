@@ -141,4 +141,39 @@ extension LTX2AudioEnhanceTests {
     let h3 = mag(out, 1320) / mag(out, 440)
     XCTAssertLessThan(h3, 0.005, "sub-knee content must not gain harmonics (was ~3% with tanh-everywhere)")
   }
+  // MARK: - Bidirectional normalization (#1517, 2026-08-07)
+
+  /// The gain was floored at 1.0, so the stage could only BOOST — quiet room
+  /// tone got up to +20dB toward a speech target and ambience arrived at
+  /// dialogue level (Todd: "ambient noise is a bit loud"). The preset audio
+  /// negatives were already maxed, so the level must be governed here.
+  func testLoudTrackIsAttenuatedTowardTarget() {
+    // ~-3.5 dBFS tone: well ABOVE the -18 dBFS target. Pre-fix this passed
+    // through at unity into the limiter; now it must come DOWN.
+    let hot = sine(440, seconds: 1.0, rate: 48000, amp: 0.65)
+    let stereo = MLXArray(hot + hot).reshaped([2, hot.count])
+    let out = LTX2AudioEnhance.process(stereo, sampleRate: 48000)
+    let ch = out[0].asArray(Float.self)
+    XCTAssertLessThan(rms(ch), rms(hot) * 0.6, "hot content must be pulled toward target, not passed at unity")
+  }
+
+  func testAttenuationIsFloored() {
+    // Absurdly hot input must not be crushed to silence: attenuation floor 0.25.
+    let blast = sine(440, seconds: 0.5, rate: 48000, amp: 0.95)
+    let stereo = MLXArray(blast + blast).reshaped([2, blast.count])
+    let out = LTX2AudioEnhance.process(stereo, sampleRate: 48000)
+    let ch = out[0].asArray(Float.self)
+    XCTAssertGreaterThan(rms(ch), rms(blast) * 0.2, "attenuation floor must hold")
+  }
+
+  func testTargetIsTunable() {
+    // The target is a render-time knob (LTX2_AUDIO_TARGET_DB), not a rebuild.
+    let tone = sine(440, seconds: 0.5, rate: 48000, amp: 0.1)
+    let stereo = MLXArray(tone + tone).reshaped([2, tone.count])
+    let quietTarget = LTX2AudioEnhance.process(stereo, sampleRate: 48000, targetDB: -30)
+    let loudTarget = LTX2AudioEnhance.process(stereo, sampleRate: 48000, targetDB: -12)
+    let qr = rms(quietTarget[0].asArray(Float.self))
+    let lr = rms(loudTarget[0].asArray(Float.self))
+    XCTAssertLessThan(qr, lr, "a lower target must yield a quieter master")
+  }
 }
