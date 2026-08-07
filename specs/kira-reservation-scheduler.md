@@ -654,3 +654,42 @@ leased, and delivered.
 4. **Bree is a client → the engine-side lease (#1479) is load-bearing.** Bree and
    Kira are separate processes; only an engine-side broker can arbitrate the GPU
    between them. Cross-process admission is required for true multi-tenancy.
+
+---
+
+## GPU-actions reserve + swap padding (Todd, verbatim, 2026-08-07)
+
+> "we will need padding for swaps and reserved slots for GPU actions stored in a
+> message queue. Not sure what they might be but there is always something."
+
+Two capacity reserves BEYOND content, both conservative-by-design:
+
+### 1. Swap padding
+Residency/swap costs (model reload, LoRA swap, the audio-mode transformer reload)
+are point estimates that vary with cold cache, disk, and contention. The planner
+PADS them (a `swapPaddingFactor` / headroom) so a slot never packs to the line
+and then blows its budget when a swap runs long. Same spirit as rev 4 #15's
+"full conservative P95", applied specifically to swaps — the residency term is
+the least predictable cost in the system.
+
+### 2. GPU-actions reserve (message-queue intake)
+A reserved capacity slice — like the interactive reserve — for ad-hoc/ops GPU
+work that is NOT content (images/videos/campaigns):
+
+`capacitySec = cycleLength − overheadReserve − interactiveReserve − gpuActionsReserve`
+
+- **Intake:** a message queue the broker drains into the reserve. **Generic by
+  design** — a GPU action = `{id, estCostSec, resource, priority, payload}`, so a
+  new action type needs no schema change ("not sure what they might be").
+- **Known members today** (validating the class — they currently steal GPU time
+  ad-hoc): upscale (gpuNonPausable — already flagged rev 2 #11 to join the
+  broker), model warmup, LoRA scan/quarantine, VLM caption/QA passes, embeddings,
+  face detection. The reserve + queue gives them a GOVERNED lane instead of
+  colliding with content.
+- **Priority/lane:** ops get their own reserve so they neither starve content nor
+  are starved. Prerequisite actions (a warmup before a render) schedule
+  just-in-time; maintenance actions are opportunistic filler within the reserve.
+
+**Design principle:** reserve capacity you can't yet name. A scheduler packed to
+100% of KNOWN work chokes on the first unplanned GPU action; the reserve + the
+generic queue are the slack that keeps it robust. "There is always something."
