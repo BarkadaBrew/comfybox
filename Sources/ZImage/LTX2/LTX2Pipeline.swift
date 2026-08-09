@@ -1628,7 +1628,11 @@ public final class LTX2Pipeline {
       return upLatent
     }
     MLX.GPU.clearCache()
-    let rLatH = latH * 2, rLatW = latW * 2
+    // The refine denoise runs at the RESIZED dims (rScale, 1.5x default), not
+    // the upsampler fixed 2x. The T2V refine block already uses sLat*; this
+    // shared path (i2v + continuation chunks) was missed, so the position
+    // grid was built for a different token count than the latent.
+    let rLatH = sLatH, rLatW = sLatW
     let refineSigmas: [Float] = resolvedConfig.refineSigmasEffective
     if let seed = seed { MLXRandom.seed(seed &+ 1000) }
     // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (ComfyUI CONST noise_scaling).
@@ -1650,6 +1654,16 @@ public final class LTX2Pipeline {
     if var refImg = refineAnchorImage {
       if refImg.ndim == 4 { refImg = refImg.expandedDimensions(axis: 2) }
       anchorFrame = vae.encode(refImg).asType(.float32)
+      // The re-encoded anchor lands at the source image own resolution (the
+      // learned upsampler fixed 2x); upLatent may have been resized down to
+      // rScale (1.5x default). Match it, or the frame-axis concat below traps:
+      // "[concatenate] All the input array dimensions must match exactly except
+      // for the concatenation axis" — this killed EVERY i2v refine and took the
+      // server down with it (36 restarts, 2026-08-09).
+      if anchorFrame.dim(3) != upLatent.dim(3) || anchorFrame.dim(4) != upLatent.dim(4) {
+        anchorFrame = LTX2Conditioning.resizeLatentBilinear(
+          anchorFrame, height: upLatent.dim(3), width: upLatent.dim(4))
+      }
       eval(anchorFrame)
       logger.info("Two-stage refine: frame 0 re-anchored to source re-encoded at \(rLatW * spatialCompression)x\(rLatH * spatialCompression).")
     }
