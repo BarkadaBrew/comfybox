@@ -693,3 +693,36 @@ work that is NOT content (images/videos/campaigns):
 **Design principle:** reserve capacity you can't yet name. A scheduler packed to
 100% of KNOWN work chokes on the first unplanned GPU action; the reserve + the
 generic queue are the slack that keeps it robust. "There is always something."
+
+---
+
+## Studio — one product, two views (Todd 2026-08-08)
+
+**Decision:** Delivery and composition are ONE product — **the Studio** — presented
+as TWO purpose-built views joined by the reservation contract. Not one crammed
+surface; not two disconnected tools.
+
+- **Compose view** (Motion Timeline / scene builder): deep-focus AUTHORING — keyframes,
+  continuous scenes, extend, directed motion, one clip at a time. It PRODUCES
+  reservations.
+- **Delivery view** (broker console / program guide): ambient OPERATIONS — the whole
+  pipeline at a glance: running / queued / reserved across tiers, fill rate,
+  makegoods, dry-run. It SCHEDULES and SHOWS.
+- **Seam = the reservation contract.** Composition routes THROUGH Delivery (already
+  decided): Compose submits Tier-2 reservations; Delivery is the single front door +
+  broker. The reservation API is the clean boundary so each view evolves independently.
+  UX flow: compose a scene → reserve → it appears in Delivery's Reserved lane → render
+  → deliver.
+
+**Why two views, not one surface:** they answer different questions and support
+different modes (deep-focus create vs ambient monitor). And their "timelines" are
+DIFFERENT AXES — Delivery's is the SCHEDULE (cycles/slots across the pipeline);
+Compose's is ONE CLIP's internal seconds (keyframes). Same metaphor, different objects
+and scales — merging them would blur the pipeline schedule with a clip's frames.
+
+**Why one product, not two apps:** the value flow (describe → compose → reserve →
+render → deliver) crosses both; a clean handoff makes it read as one Studio.
+
+**Design-session implication:** design the Delivery tab (`delivery-console` mockup) and
+the Motion Timeline (continuous-scene FDD) as TWO VIEWS OF ONE STUDIO — shared shell,
+one design language, the reservation as the object flowing between them.
