@@ -277,25 +277,84 @@ public final class AssetIngestor {
     /// removes the cached thumbnail, and deletes the database row. The path
     /// is un-tracked so a future file with the same name is re-ingested.
     public func deleteAsset(_ asset: DAMAsset) async throws {
-        trashOrRemove(atPath: asset.absolutePath)
+        // The media file FIRST, and its failure aborts the whole deletion. The
+        // catalog-backed grid now lists rows whose bytes live on the server
+        // (roughly 1,300 of 2,994 in the live database, under an smbfs mount at
+        // /Volumes/todd). `trashItem` does not work on smbfs, and the old
+        // fallback answered that by calling `removeItem` — a permanent,
+        // unrecoverable delete of production media, from a dialog whose button
+        // says "Move to Trash". Leaving the row in place when the file survives
+        // is the only honest outcome.
+        try Self.trashOrRemove(atPath: asset.absolutePath)
         let sidecarPath = ((asset.absolutePath as NSString).deletingPathExtension) + ".json"
-        trashOrRemove(atPath: sidecarPath)
+        try Self.trashOrRemove(atPath: sidecarPath)
         try? FileManager.default.removeItem(atPath: thumbnailPath(for: asset.id))
 
         try await store.deleteAsset(id: asset.id)
         knownPaths.remove(asset.absolutePath)
     }
 
-    /// Move a file to the Trash, or remove it outright if trashing fails
-    /// (e.g. sandboxed test environments). Missing files are ignored.
-    private func trashOrRemove(atPath path: String) {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: path) else { return }
-        do {
-            try fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
-        } catch {
-            try? fm.removeItem(atPath: path)
+    /// Why a deletion stopped without touching the file.
+    public enum DeletionRefusal: Error, LocalizedError, Equatable {
+        /// The file is not on this Mac and could not be trashed. Escalating to a
+        /// permanent removal would destroy another host's copy for good.
+        case notOnThisMac(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notOnThisMac(let path):
+                return "\(path) is on the server, not this Mac. macOS cannot move it "
+                    + "to the Trash, and it will not be deleted permanently. Nothing was removed."
+            }
         }
+    }
+
+    /// Move a file to the Trash. Missing files are ignored.
+    ///
+    /// A failed trash may be escalated to a permanent `removeItem` ONLY for a
+    /// file on a local volume — that is the sandboxed-test / no-Trash-here case
+    /// the fallback was written for. On a network volume a failed trash is the
+    /// NORMAL outcome, so the same fallback there is an unattended permanent
+    /// delete of a file this Mac does not own. Refuse instead.
+    ///
+    /// The filesystem operations are injectable so both branches are testable
+    /// without an smbfs mount.
+    nonisolated static func trashOrRemove(
+        atPath path: String,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) },
+        trash: (String) throws -> Void = {
+            try FileManager.default.trashItem(at: URL(fileURLWithPath: $0), resultingItemURL: nil)
+        },
+        remove: (String) throws -> Void = { try FileManager.default.removeItem(atPath: $0) },
+        isLocal: (String) -> Bool = { AssetIngestor.isOnThisMac($0) }
+    ) throws {
+        guard fileExists(path) else { return }
+        do {
+            try trash(path)
+        } catch {
+            guard isLocal(path) else { throw DeletionRefusal.notOnThisMac(path) }
+            try? remove(path)
+        }
+    }
+
+    /// Whether a path's bytes live on a volume attached to this Mac.
+    ///
+    /// Fails CLOSED: when the volume cannot be interrogated at all (an
+    /// unmounted share, a revoked permission) the answer is "not this Mac", so
+    /// the refusal above stands rather than a hard delete proceeding on a guess.
+    nonisolated public static func isOnThisMac(_ path: String) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        if let values = try? url.resourceValues(forKeys: [.volumeIsLocalKey]),
+           let local = values.volumeIsLocal {
+            return local
+        }
+        // No answer from the volume. Anything under a mount point other than the
+        // root filesystem is assumed to be someone else's disk.
+        if let values = try? url.resourceValues(forKeys: [.volumeURLKey]),
+           let volume = values.volume {
+            return volume.path == "/"
+        }
+        return !path.hasPrefix("/Volumes/")
     }
 
     // MARK: - Polling

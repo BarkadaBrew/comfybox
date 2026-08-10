@@ -97,6 +97,20 @@ public final class LTX2VAE: Module {
     return decoder(latent, timestep: timestep)
   }
 
+  /// Exact streamed decode (#36): chunks the frame axis with per-conv temporal
+  /// state carried between chunks — numerically identical to plain `decode`,
+  /// peak memory bounded by chunk size, zero seams. See
+  /// `LTX2Decoder3D.decodeStreamed`.
+  public func decodeStreamed(
+    _ z: MLXArray, timestep: MLXArray? = nil
+  ) -> MLXArray {
+    var latent = z
+    if latent.ndim == 4 {
+      latent = latent.expandedDimensions(axis: 2)
+    }
+    return decoder.decodeStreamed(latent, timestep: timestep)
+  }
+
   /// Decodes latents using spatial tiling to reduce memory usage.
   ///
   /// Splits the latent tensor into overlapping tiles, decodes each independently,
@@ -115,11 +129,26 @@ public final class LTX2VAE: Module {
     tileSize: Int = 16,
     tileStride: Int = 14,
     rampSize: Int = 2,
-    timestep: MLXArray? = nil
+    timestep: MLXArray? = nil,
+    frameWindow explicitFrameWindow: Int? = nil
   ) -> MLXArray {
     var latent = z
     if latent.ndim == 4 {
       latent = latent.expandedDimensions(axis: 2)
+    }
+
+    // Temporal chunking (12s/289f keystone): the spatial tiler below feeds the
+    // decoder the ENTIRE frame stack per tile, so peak activation memory grows
+    // with clip length and long clips OOM mid-decode. When the latent frame
+    // count exceeds the window, decode in overlapping frame windows instead —
+    // peak memory becomes O(window), independent of clip length.
+    let frameWindow = explicitFrameWindow
+      ?? Int(ProcessInfo.processInfo.environment["LTX2_DECODE_FRAME_WINDOW"] ?? "") ?? 16
+    if latent.dim(2) > frameWindow {
+      return decodeTemporalChunked(
+        latent, frameWindow: frameWindow,
+        tileSize: tileSize, tileStride: tileStride, rampSize: rampSize,
+        timestep: timestep)
     }
 
     let hLat = latent.dim(3)
@@ -197,6 +226,79 @@ public final class LTX2VAE: Module {
     let safeWeights = MLX.maximum(weights, MLXArray(Float(1e-8)))
     output = output / safeWeights
 
+    return output.asType(latent.dtype)
+  }
+
+  /// Temporal-chunked decode: iterate the latent FRAME axis in overlapping
+  /// windows, spatially-tile-decode each window, and cosine-blend the seams on
+  /// the frame axis. Peak activation memory is bounded by the window size,
+  /// independent of clip length (FDD 2026-07-22-ltx2-temporal-chunked-vae-decode).
+  ///
+  /// Causal-VAE alignment: latent frame 0 decodes to 1 output frame; every
+  /// later latent frame decodes to `temporalCompression` frames. A window
+  /// starting at latent frame s>0 re-runs the causal start, so its local
+  /// frame 0 is DISCARDED and local output frame t (t>=1) maps to global
+  /// output frame `t + temporalCompression*s`. With overlap O latent frames,
+  /// consecutive windows share `(O-1)*temporalCompression` output frames,
+  /// blended with the same cosine ramp used spatially.
+  private func decodeTemporalChunked(
+    _ latent: MLXArray,
+    frameWindow: Int,
+    tileSize: Int,
+    tileStride: Int,
+    rampSize: Int,
+    timestep: MLXArray?
+  ) -> MLXArray {
+    let fLat = latent.dim(2)
+    let overlap = max(1, Int(ProcessInfo.processInfo.environment["LTX2_DECODE_FRAME_OVERLAP"] ?? "") ?? 2)
+    let stride = max(1, frameWindow - overlap)
+    let tc = temporalCompression
+
+    let outH = latent.dim(3) * spatialCompression
+    let outW = latent.dim(4) * spatialCompression
+    let outF = 1 + (fLat - 1) * tc
+
+    var output = MLXArray.zeros([latent.dim(0), 3, outF, outH, outW])
+    let weights = MLXArray.zeros([latent.dim(0), 1, outF, 1, 1])
+    let blendF = (overlap - 1) * tc  // shared output frames between windows
+
+    var s = 0
+    while s < fLat {
+      let e = min(s + frameWindow, fLat)
+      let window = latent[0..., 0..., s..<e, 0..., 0...]
+      var decoded = decodeTiled(
+        window, tileSize: tileSize, tileStride: tileStride,
+        rampSize: rampSize, timestep: timestep
+      ).asType(.float32)
+      eval(decoded)
+
+      // Drop the re-run causal start frame for non-initial windows.
+      var gStart = 0
+      if s > 0 {
+        decoded = decoded[0..., 0..., 1..<decoded.dim(2), 0..., 0...]
+        gStart = 1 + tc * s
+      }
+      let n = decoded.dim(2)
+      let gEnd = gStart + n
+
+      let fMask = Self.buildRamp1D(
+        length: n,
+        rampLeft: s > 0 ? min(blendF, n) : 0,
+        rampRight: e < fLat ? min(blendF, n) : 0
+      ).reshaped(1, 1, -1, 1, 1)
+
+      output[0..., 0..., gStart..<gEnd, 0..., 0...] =
+        output[0..., 0..., gStart..<gEnd, 0..., 0...] + decoded * fMask
+      weights[0..., 0..., gStart..<gEnd, 0..., 0...] =
+        weights[0..., 0..., gStart..<gEnd, 0..., 0...] + fMask
+      eval(output, weights)
+      MLX.GPU.clearCache()
+
+      if e >= fLat { break }
+      s += stride
+    }
+
+    output = output / MLX.maximum(weights, MLXArray(Float(1e-8)))
     return output.asType(latent.dtype)
   }
 

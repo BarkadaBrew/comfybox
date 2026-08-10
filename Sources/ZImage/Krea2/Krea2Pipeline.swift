@@ -81,6 +81,20 @@ enum Krea2Sampling {
     return MLXArray(pos, [txtLen + h * w, 3])
   }
 
+  /// Per-axis NTK scale factors for DyPE, as [axis0, height, width].
+  ///
+  /// Axis 0 is the text/frame axis and always stays at 1.0. Height and width
+  /// scale by how far the current token grid exceeds the grid the model trained
+  /// at: baseResolution / (spatialScale * patch), which is 1024/16 = 64 tokens.
+  static func ropeScales(
+    hTok: Int, wTok: Int, patch: Int, dyPE: DyPEConfig
+  ) -> [Float] {
+    guard dyPE.enabled, dyPE.method != .none else { return [1, 1, 1] }
+    let baseTokens = Float(dyPE.baseResolution / (Krea2VAE.spatialScale * patch))
+    guard baseTokens > 0 else { return [1, 1, 1] }
+    return [1, Float(hTok) / baseTokens, Float(wTok) / baseTokens]
+  }
+
   /// Resolution-shifted timestep schedule (exp/sigmoid warp), 1 → 0 inclusive.
   static func timesteps(
     seqLen: Int, steps: Int, x1: Float, x2: Float,
@@ -118,6 +132,11 @@ public final class Krea2Pipeline {
   /// Currently applied LoRA configurations (for hot-swap tracking).
   private var appliedLoRAs: [LoRAConfiguration] = []
 
+  /// Bare-parameter patch state (.diff/.diff_b/.set_weight — e.g. Kroma's 159
+  /// norm/modulation deltas). Instance-scoped by construction: owns detached
+  /// first-write-wins snapshots for this transformer only, restored on clear.
+  private lazy var patchSession = LoRAPatchSession(module: transformer)
+
   /// Public accessor for currently loaded LoRA configurations.
   public var loadedLoRAConfigs: [LoRAConfiguration] { appliedLoRAs }
 
@@ -127,14 +146,25 @@ public final class Krea2Pipeline {
     public var height: Int
     public var steps: Int
     public var seed: UInt64
-    public init(prompt: String, width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0) {
+    /// Depth Control-LoRA init image: RGB NHWC in [-1,1] (see QwenImageIO.normalizeForEncoder),
+    /// already resized to the target width/height. nil = no depth control.
+    public var controlImagePixels: MLXArray?
+    /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
+    public var dyPE: DyPEConfig = .disabled
+    public init(prompt: String, width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
+                controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled) {
       self.prompt = prompt
       self.width = width
       self.height = height
       self.steps = steps
       self.seed = seed
+      self.controlImagePixels = controlImagePixels
+      self.dyPE = dyPE
     }
   }
+
+  /// Whether a depth Control-LoRA is currently loaded (controlFirst set + A/B applied).
+  public private(set) var controlLoRAActive = false
 
   public init(paths: Krea2ModelPaths, quantizeTransformer: Int? = nil) throws {
     self.config = Krea2Config()
@@ -173,21 +203,96 @@ public final class Krea2Pipeline {
   ///
   /// - Parameter configs: LoRA configurations to apply. Pass an empty array to clear all LoRAs.
   public func loadLoRAs(_ configs: [LoRAConfiguration]) async throws {
-    if !appliedLoRAs.isEmpty {
+    if !appliedLoRAs.isEmpty || patchSession.isActive {
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      patchSession.clear()
       appliedLoRAs = []
     }
 
     guard !configs.isEmpty else { return }
 
-    for config in configs {
-      let url = try await LoRAWeightLoader.resolveSource(config.source)
-      let weights = try LoRAWeightLoader.loadForKrea2(from: url)
-      logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), scale=\(config.scale))")
-      LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
+    // Load and preflight-able failures (missing file, bad format, unknown
+    // keys) all surface from loadForKrea2 BEFORE any weight mutation for
+    // that config. If a later config fails after earlier ones applied, roll
+    // the whole stack back so applied weights and `appliedLoRAs` can never
+    // disagree (delta-key spec rev 2, Codex finding 2).
+    do {
+      for config in configs {
+        let url = try await LoRAWeightLoader.resolveSource(config.source)
+        let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+        logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale))")
+        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
+        try patchSession.apply(weights: weights, scale: config.scale)
+      }
+    } catch {
+      logger.error("Krea-2 LoRA stack failed mid-apply — rolling back to base: \(error)")
+      LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      patchSession.clear()
+      appliedLoRAs = []
+      throw error
     }
 
     appliedLoRAs = configs
+  }
+
+  /// Load (or clear) the depth Control-LoRA. Sets the expanded input projection
+  /// (`controlFirst*`) on the transformer and applies the rank-64 A/B adapters to
+  /// the 28 blocks. MUST be called AFTER `loadLoRAs(identity)` because `loadLoRAs`
+  /// clears all dynamic LoRAs first — the control A/B ride on top of the identity
+  /// stack and are re-applied per control render. Pass nil to clear.
+  ///
+  /// - Parameters:
+  ///   - url: path to `depth-control-lora.safetensors`, or nil to clear.
+  ///   - scale: control strength → LoRA α (latent gain stays 1.0).
+  public func setControlLoRA(_ url: URL?, scale: Float = 1.0) async throws {
+    // Reset to the identity-only LoRA baseline before (re)applying control.
+    // `applyDynamically` APPENDS adapters onto the existing dynamic-LoRA stack,
+    // so without this reset (a) a second consecutive control render stacks a
+    // DUPLICATE control adapter (escalating "crystalline melt"), and (b) clearing
+    // (url == nil) would leave the 224 control adapters resident, corrupting the
+    // next NON-control render (control-OFF must be byte-identical — FDD crit
+    // #1/#7). Re-running the tracked identity configs (`appliedLoRAs`, e.g.
+    // Krea-Kira KNPV+Pinay) restores a clean, idempotent baseline. clearDynamicLoRA
+    // empties every dynamic adapter (identity + any stale control) but leaves the
+    // module wrappers in place, so an empty stack behaves exactly like the base.
+    LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+    patchSession.clear()
+    do {
+      for cfg in appliedLoRAs {
+        let src = try await LoRAWeightLoader.resolveSource(cfg.source)
+        let weights = try LoRAWeightLoader.loadForKrea2(from: src)
+        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: cfg.scale, logger: logger)
+        try patchSession.apply(weights: weights, scale: cfg.scale)
+      }
+    } catch {
+      // Same transactional posture as loadLoRAs: never leave weights and
+      // tracking in disagreement (control state included).
+      logger.error("identity-stack reapply failed — rolling back to base: \(error)")
+      LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
+      patchSession.clear()
+      appliedLoRAs = []
+      transformer.controlFirstWeight = nil
+      transformer.controlFirstBias = nil
+      controlLoRAActive = false
+      throw error
+    }
+
+    guard let url else {
+      transformer.controlFirstWeight = nil
+      transformer.controlFirstBias = nil
+      controlLoRAActive = false
+      return
+    }
+    let cl = try Krea2ControlLoRA.load(from: url, layers: config.layers)
+    // assertBaseHalfMatches skipped: transformer.first is q8-quantized (weight access unsafe on QuantizedLinear)
+    let cw = cl.firstWeight
+    let cb = cl.firstBias
+    MLX.eval(cw, cb)
+    transformer.controlFirstWeight = cw
+    transformer.controlFirstBias = cb
+    LoRAApplicator.applyDynamically(to: transformer, loraWeights: cl.loraWeights, scale: scale, logger: logger)
+    controlLoRAActive = true
+    logger.info("Krea-2 depth Control-LoRA active (scale=\(scale))")
   }
 
   /// Generate one image. Returns RGB float array (H, W, 3) in [0,1].
@@ -216,7 +321,20 @@ public final class Krea2Pipeline {
 
     var img = Krea2Sampling.patchify(noise, patch: patch)  // (1, hTok*wTok, 64)
     let pos = Krea2Sampling.buildPositions(txtLen: txtLen, h: hTok, w: wTok)
+    let ropeScales = Krea2Sampling.ropeScales(
+      hTok: hTok, wTok: wTok, patch: patch, dyPE: request.dyPE)
     let fullMask = MLX.concatenated([mask, MLX.ones([1, hTok * wTok])], axis: 1)
+
+    // Depth Control-LoRA: VAE-encode the (already-resized) depth image once and
+    // patchify to control tokens aligned with the image-token grid. Constant
+    // across denoising steps (deterministic encode → cache-safe).
+    var controlTokens: MLXArray? = nil
+    if let ctrlPixels = request.controlImagePixels, transformer.controlFirstWeight != nil {
+      let ctrlLatentNHWC = vae.encode(ctrlPixels.asType(dtype))               // (1, latH, latW, 16)
+      let ctrlLatentNCHW = ctrlLatentNHWC.transposed(0, 3, 1, 2).asType(dtype) // (1, 16, latH, latW)
+      controlTokens = Krea2Sampling.patchify(ctrlLatentNCHW, patch: patch)     // (1, hTok*wTok, 64)
+      MLX.eval(controlTokens!)
+    }
 
     let x1 = Float((256 / align) * (256 / align))
     let x2 = Float((1280 / align) * (1280 / align))
@@ -226,7 +344,8 @@ public final class Krea2Pipeline {
     for i in 0..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask)
+      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
+                          control: controlTokens, ropeScales: ropeScales)
       img = img + (tp - tc) * v
       MLX.eval(img)
       progress?(i + 1, total)

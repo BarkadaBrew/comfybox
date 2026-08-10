@@ -20,6 +20,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
       switch name {
       case "generate_image":
         return try await executeGenerateImage(arguments)
+      case "repair_image":
+        return try await executeRepairImage(arguments)
       case "swap_loras":
         return try await executeSwapLoras(arguments)
       case "list_models":
@@ -32,6 +34,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeGet("/queue")
       case "clear_queue":
         return try await executeClearQueue()
+      case "pause_queue":
+        return try await executeQueuePause(true)
+      case "resume_queue":
+        return try await executeQueuePause(false)
       case "list_loras":
         return try await executeListLoras()
       case "shutdown_server":
@@ -110,6 +116,111 @@ public final class MCPToolExecutor: @unchecked Sendable {
   // MARK: - Tool Implementations
 
   /// generate_image -> POST /v1/generate
+  /// Ask the local vision model (LM Studio / OpenAI-compatible /chat/completions
+  /// on the Mac) to diagnose RENDER defects in an image. Fully on-device — no
+  /// coffeeshop-server reliance. Returns a concise defect description, "CLEAN",
+  /// or nil if vision is unreachable.
+  private func diagnoseDefects(imagePath: String) async -> String? {
+    let visionURL = ProcessInfo.processInfo.environment["COMFYBOX_VISION_URL"] ?? "http://127.0.0.1:1234/v1"
+    var model = ProcessInfo.processInfo.environment["COMFYBOX_VISION_MODEL"] ?? ""
+    if model.isEmpty, let mu = URL(string: visionURL + "/models"),
+       let (md, _) = try? await URLSession.shared.data(from: mu),
+       let mo = try? JSONSerialization.jsonObject(with: md) as? [String: Any],
+       let arr = mo["data"] as? [[String: Any]] {
+      let ids = arr.compactMap { $0["id"] as? String }
+      model = ids.first(where: { $0.lowercased().contains("vl") || $0.lowercased().contains("vision") }) ?? ids.first ?? "local-model"
+    }
+    if model.isEmpty { model = "local-model" }
+    let resolved = (imagePath as NSString).expandingTildeInPath
+    guard let imgData = try? Data(contentsOf: URL(fileURLWithPath: resolved)),
+          let url = URL(string: visionURL + "/chat/completions") else { return nil }
+    let b64 = imgData.base64EncodedString()
+    let question = "You are inspecting an AI-generated adult photo for RENDER defects only (not content or subject matter). List concise, concrete defects and WHERE each is located. Look for: mottled/blotchy/damaged skin, disfigured or deformed anatomy, extra/missing/fused fingers or limbs, warped or melted face, mesh/cross-hatch texture artifacts, color banding. Report locations using: face, hands, torso, legs, background. If there are NO render defects, reply with exactly the single word CLEAN."
+    let payload: [String: Any] = [
+      "model": model,
+      "messages": [["role": "user", "content": [
+        ["type": "text", "text": question],
+        ["type": "image_url", "image_url": ["url": "data:image/png;base64,\(b64)"]],
+      ] as [Any]] as [String: Any]],
+      "max_tokens": 300, "temperature": 0.2,
+    ]
+    guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+    var req = URLRequest(url: url); req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = body; req.timeoutInterval = 90
+    guard let (data, resp) = try? await URLSession.shared.data(for: req),
+          let http = resp as? HTTPURLResponse, http.statusCode == 200,
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let choices = obj["choices"] as? [[String: Any]],
+          let msg = choices.first?["message"] as? [String: Any],
+          let content = msg["content"] as? String else { return nil }
+    return content.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  /// Repair a defective image on-device: local VLM diagnoses -> targeted img2img
+  /// re-render (defect negatives + optional region inpaint), preserving composition
+  /// and identity. No coffeeshop-server reliance.
+  private func executeRepairImage(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let imagePath = params?.string("image_path"), !imagePath.isEmpty else {
+      return MCPToolResult(error: "Error: 'image_path' is required")
+    }
+    // 1. Diagnose (local VLM) unless the caller supplied a note describing the defect.
+    let userNote = params?.string("note")
+    let diagnosis = await diagnoseDefects(imagePath: imagePath)
+    FileHandle.standardError.write(Data("[repair_image] diagnosis: \(diagnosis ?? "(vision unreachable)")\n".utf8))
+
+    // 2. Targeted negative = defect baseline + the VLM's findings + the user note.
+    var negParts = ["mottled skin", "damaged skin", "blotchy skin", "discolored skin",
+      "disfigured", "deformed anatomy", "distorted anatomy", "extra fingers", "fused fingers",
+      "extra limbs", "missing limbs", "mutated", "malformed", "bad anatomy",
+      "mesh artifacts", "cross-hatch texture", "blurry", "noise", "artifacts"]
+    if let d = diagnosis, d.uppercased() != "CLEAN", !d.isEmpty { negParts.append(d) }
+    if let n = userNote, !n.isEmpty { negParts.append(n) }
+    let negative = negParts.joined(separator: ", ")
+
+    // 3. Localize an inpaint region from the diagnosis/note keywords.
+    let hay = ((diagnosis ?? "") + " " + (userNote ?? "")).lowercased()
+    var maskRegion: String? = nil
+    if hay.contains("face") || hay.contains("eye") || hay.contains("head") {
+      maskRegion = "face"
+    } else if hay.contains("hand") || hay.contains("finger") || hay.contains("arm")
+              || hay.contains("chest") || hay.contains("torso") || hay.contains("breast") {
+      maskRegion = "upper"
+    } else if hay.contains("leg") || hay.contains("thigh") || hay.contains("foot")
+              || hay.contains("hip") || hay.contains("genital") || hay.contains("vagina") {
+      maskRegion = "lower"
+    }
+
+    // 4. img2img repair render (source-preserving strength keeps composition + identity).
+    var body: [String: Any] = [
+      "prompt": "smooth even skin, flawless skin, correct anatomy, natural proportions, photorealistic, sharp detail, Pinay",
+      "negative_prompt": negative,
+      "image_path": imagePath,
+      "image_strength": params?.number("image_strength") ?? 0.6,
+    ]
+    if let mr = maskRegion { body["mask_region"] = mr }
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/generate", body: jsonData)
+    guard status == 200, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return mapHTTPResponse(status: status, data: data)
+    }
+    // Mark the rerender (Todd) + base64-encode so the caller delivers WITHOUT
+    // server file access — fully on-device product.
+    var outPath = (obj["image_path"] as? String) ?? (obj["local_path"] as? String) ?? (obj["output_path"] as? String)
+    if let p = outPath {
+      let ns = p as NSString
+      let renamed = "\(ns.deletingPathExtension)-rerender.\(ns.pathExtension)"
+      if (try? FileManager.default.moveItem(atPath: p, toPath: renamed)) != nil {
+        try? FileManager.default.moveItem(atPath: "\((p as NSString).deletingPathExtension).json", toPath: "\((renamed as NSString).deletingPathExtension).json")
+        outPath = renamed
+      }
+    }
+    let b64 = outPath.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }?.base64EncodedString() ?? ""
+    let out: [String: Any] = ["image_path": outPath ?? "", "image_base64": b64, "diagnosis": diagnosis ?? "", "mask_region": maskRegion ?? ""]
+    let outData = (try? JSONSerialization.data(withJSONObject: out)) ?? Data("{}".utf8)
+    return MCPToolResult(text: String(data: outData, encoding: .utf8) ?? "{}")
+  }
+
   private func executeGenerateImage(_ params: MCPParams?) async throws -> MCPToolResult {
     guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
       return MCPToolResult(error: "Error: 'prompt' is required")
@@ -202,6 +313,13 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["clear": true]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/queue", body: jsonData)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// pause_queue / resume_queue -> POST /v1/queue/pause | /v1/queue/resume
+  /// (the same persistent gate the desktop toolbar and HTTP API use).
+  private func executeQueuePause(_ pause: Bool) async throws -> MCPToolResult {
+    let (status, data) = try await client.post(pause ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
     return mapHTTPResponse(status: status, data: data)
   }
 
@@ -407,6 +525,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let imagePath = params?.string("image_path") {
       body["image_path"] = imagePath
     }
+    if let audio = params?.bool("audio") {
+      body["audio"] = audio
+    }
     if let duration = params?.integer("duration") {
       body["duration"] = duration
     }
@@ -416,6 +537,25 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let aspectRatio = params?.string("aspect_ratio") {
       body["aspect_ratio"] = aspectRatio
     }
+    // T2V has no source frame, so translate aspect_ratio into explicit
+    // width/height here: WarmServer's video request decodes width/height, NOT
+    // aspect_ratio, so otherwise every t2v render fell back to the 704x448
+    // landscape default regardless of the requested orientation. Portrait
+    // ("9:16") swaps to 448x704 (both /64). I2V leaves dims unset so WarmServer
+    // keeps matching the source image aspect.
+    if params?.string("image_path") == nil {
+      // Respect caller-supplied dims; otherwise orient the standard t2v dims by
+      // aspect_ratio. WarmServer reads width/height (not aspect_ratio/resolution),
+      // so without this every t2v fell back to the 704x448 landscape default.
+      if let w = params?.integer("width"), let h = params?.integer("height") {
+        body["width"] = w
+        body["height"] = h
+      } else {
+        let portrait = (params?.string("aspect_ratio") ?? "16:9") == "9:16"
+        body["width"] = portrait ? 448 : 704
+        body["height"] = portrait ? 704 : 448
+      }
+    }
     if let seed = params?.integer("seed") {
       body["seed"] = seed
     }
@@ -424,6 +564,43 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     if let preset = params?.string("preset") {
       body["preset"] = preset
+    }
+    // Caller already wove the character description into the prompt, so tell
+    // WarmServer not to prepend its own (Todd 2026-08-07). This body is an
+    // explicit whitelist — an unforwarded key is silently dropped here, which
+    // is exactly what happened on the first attempt at this fix.
+    if let skipChar = params?.bool("skip_character_injection") {
+      body["skip_character_injection"] = skipChar
+    }
+    // Motion vs fidelity per content type (#40): the daemon sends a high
+    // img_compression + lower strength for partnered-action prompts (motion)
+    // and low compression + strength 1.0 for solo/portrait (fidelity).
+    if let strength = params?.number("strength") {
+      body["strength"] = strength
+    }
+    if let comp = params?.integer("img_compression") {
+      body["img_compression"] = comp
+    }
+    if let cfg = params?.number("guidance") {
+      body["guidance"] = cfg
+    }
+    if let tuning = params?.dict("tuning") {
+      body["tuning"] = tuning.mapValues { $0.value }
+    }
+    if let attemptId = params?.string("optimization_attempt_id") {
+      body["optimization_attempt_id"] = attemptId
+    }
+    if let frames = params?.integer("frames") {
+      body["frames"] = frames
+    }
+    if let neg = params?.string("negative_prompt") {
+      body["negative_prompt"] = neg
+    }
+    // Callers that ran their OWN optimizer send enhance:false — a second
+    // server-side rewrite drifts the prompt off concrete staging (limb
+    // placement, figure count) and double-injects the character description.
+    if let enhance = params?.bool("enhance") {
+      body["enhance"] = enhance
     }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)

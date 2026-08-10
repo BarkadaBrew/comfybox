@@ -31,10 +31,13 @@ extension Krea2Pipeline {
     /// Same convention as Z-Image's img2img (ImageToImagePipeline.swift):
     /// 0.3 = heavy rework (default), 0.7 = light touch. Range (0, 1].
     public var strength: Float
+    /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
+    public var dyPE: DyPEConfig = .disabled
 
     public init(
       prompt: String, sourceImage: MLXArray, width: Int = 1024, height: Int = 1024,
-      steps: Int = 9, seed: UInt64 = 0, strength: Float = 0.3
+      steps: Int = 9, seed: UInt64 = 0, strength: Float = 0.3,
+      dyPE: DyPEConfig = .disabled
     ) {
       self.prompt = prompt
       self.sourceImage = sourceImage
@@ -43,6 +46,7 @@ extension Krea2Pipeline {
       self.steps = steps
       self.seed = seed
       self.strength = strength
+      self.dyPE = dyPE
     }
   }
 
@@ -75,6 +79,8 @@ extension Krea2Pipeline {
     let txtLen = ctx.dim(1)
 
     let pos = Krea2Sampling.buildPositions(txtLen: txtLen, h: hTok, w: wTok)
+    let ropeScales = Krea2Sampling.ropeScales(
+      hTok: hTok, wTok: wTok, patch: patch, dyPE: request.dyPE)
     let fullMask = MLX.concatenated([mask, MLX.ones([1, hTok * wTok])], axis: 1)
 
     let x1 = Float((256 / align) * (256 / align))
@@ -101,7 +107,8 @@ extension Krea2Pipeline {
     for i in startIndex..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask)
+      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
+                          ropeScales: ropeScales)
       img = img + (tp - tc) * v
       MLX.eval(img)
       progress?(i + 1, total)

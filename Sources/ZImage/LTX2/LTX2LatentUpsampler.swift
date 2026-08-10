@@ -138,6 +138,8 @@ final class LTX2PixelShuffle2D: Module {
 
 /// 2x spatial upsampler: Conv2d -> PixelShuffle(2).
 final class LTX2SpatialUpsampler2x: Module {
+  // Checkpoint stores the conv as Sequential index 0 (`upsampler.0.weight`); the
+  // loader remaps `upsampler.0.*` -> `upsampler.conv.*` so this dict key matches.
   @ModuleInfo(key: "conv") var conv: Conv2d
   let pixelShuffle: LTX2PixelShuffle2D
 
@@ -212,9 +214,9 @@ final class LTX2UpsamplerResBlock: Module {
 public final class LTX2LatentUpsampler: Module {
   @ModuleInfo(key: "initial_conv") var initialConv: LTX2UpsamplerConv3d
   @ModuleInfo(key: "initial_norm") var initialNorm: LTX2GroupNorm3d
-  @ModuleInfo(key: "res_blocks") var resBlocks: [Int: LTX2UpsamplerResBlock]
+  @ModuleInfo(key: "res_blocks") var resBlocks: [LTX2UpsamplerResBlock]
   @ModuleInfo(key: "upsampler") var upsampler: LTX2SpatialUpsampler2x
-  @ModuleInfo(key: "post_upsample_res_blocks") var postResBlocks: [Int: LTX2UpsamplerResBlock]
+  @ModuleInfo(key: "post_upsample_res_blocks") var postResBlocks: [LTX2UpsamplerResBlock]
   @ModuleInfo(key: "final_conv") var finalConv: LTX2UpsamplerConv3d
 
   public let inChannels: Int
@@ -232,19 +234,15 @@ public final class LTX2LatentUpsampler: Module {
       inChannels: inChannels, outChannels: midChannels, kernelSize: 3, padding: 1)
     self._initialNorm.wrappedValue = LTX2GroupNorm3d(numGroups: 32, numChannels: midChannels)
 
-    var pre: [Int: LTX2UpsamplerResBlock] = [:]
-    for i in 0..<numBlocksPerStage {
-      pre[i] = LTX2UpsamplerResBlock(channels: midChannels)
+    self._resBlocks.wrappedValue = (0..<numBlocksPerStage).map { _ in
+      LTX2UpsamplerResBlock(channels: midChannels)
     }
-    self._resBlocks.wrappedValue = pre
 
     self._upsampler.wrappedValue = LTX2SpatialUpsampler2x(midChannels: midChannels)
 
-    var post: [Int: LTX2UpsamplerResBlock] = [:]
-    for i in 0..<numBlocksPerStage {
-      post[i] = LTX2UpsamplerResBlock(channels: midChannels)
+    self._postResBlocks.wrappedValue = (0..<numBlocksPerStage).map { _ in
+      LTX2UpsamplerResBlock(channels: midChannels)
     }
-    self._postResBlocks.wrappedValue = post
 
     self._finalConv.wrappedValue = LTX2UpsamplerConv3d(
       inChannels: midChannels, outChannels: inChannels, kernelSize: 3, padding: 1)
@@ -264,14 +262,14 @@ public final class LTX2LatentUpsampler: Module {
     x = initialNorm(x)
     x = silu(x)
 
-    for i in resBlocks.keys.sorted() {
-      x = resBlocks[i]!(x)
+    for block in resBlocks {
+      x = block(x)
     }
 
     x = upsampler(x)
 
-    for i in postResBlocks.keys.sorted() {
-      x = postResBlocks[i]!(x)
+    for block in postResBlocks {
+      x = block(x)
     }
 
     x = finalConv(x)

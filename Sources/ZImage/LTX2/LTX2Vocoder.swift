@@ -99,38 +99,39 @@ public final class LTX2AntiAliasActivation: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    // EXACT reference math (BigVGAN UpSample1d/DownSample1d kaiser branch,
+    // ratio 2, kernel 12). The previous symmetric-pad + crop-from-zero
+    // version time-shifted the signal (~15 samples) — 0.20 correlation vs
+    // reference; caught by the 2026-08-03 micro-bisect.
     let inDtype = x.dtype
-    let L = x.dim(1)
     let xf = x.asType(.float32)
-    let pad = kernel / 2
+    let ratio = 2
 
-    // 2× upsample (transposed, depthwise) → force length 2L.
+    // UpSample1d: pad = k/ratio − 1 (replicate both sides), transpose-conv
+    // stride 2, scale ×ratio, then slice [padLeft ..< len−padRight] where
+    // padLeft = pad·stride + (k−stride)/2, padRight = pad·stride + (k−stride+1)/2.
+    let upPad = kernel / ratio - 1
+    let upPadLeft = upPad * ratio + (kernel - ratio) / 2
+    let upPadRight = upPad * ratio + (kernel - ratio + 1) / 2
     let upW = depthwiseWeight(upsample.filter)
     var up = MLX.convTransposed1d(
-      MLX.padded(xf, widths: [IntOrPair((0, 0)), IntOrPair((pad, pad)), IntOrPair((0, 0))]),
-      upW, stride: 2, groups: channels)
-    up = 2.0 * up
-    up = matchLength(up, to: 2 * L)
+      MLX.padded(xf, widths: [IntOrPair((0, 0)), IntOrPair((upPad, upPad)), IntOrPair((0, 0))], mode: .edge),
+      upW, stride: ratio, groups: channels)
+    up = Float(ratio) * up
+    up = up[0..., upPadLeft..<(up.dim(1) - upPadRight), 0...]
 
     // SnakeBeta at 2× rate.
     let sn = act(up)
 
-    // 2× downsample (depthwise) → force length L.
+    // DownSample1d → LowPassFilter1d: replicate pad (k/2 − 1, k/2) for even
+    // kernels, conv stride 2. No post-crop — the padding IS the alignment.
+    let dnPadLeft = kernel / 2 - (kernel % 2 == 0 ? 1 : 0)
+    let dnPadRight = kernel / 2
     let dnW = depthwiseWeight(downsample.lowpass.filter)
-    var dn = MLX.conv1d(
-      MLX.padded(sn, widths: [IntOrPair((0, 0)), IntOrPair((pad, pad)), IntOrPair((0, 0))]),
-      dnW, stride: 2, groups: channels)
-    dn = matchLength(dn, to: L)
+    let dn = MLX.conv1d(
+      MLX.padded(sn, widths: [IntOrPair((0, 0)), IntOrPair((dnPadLeft, dnPadRight)), IntOrPair((0, 0))], mode: .edge),
+      dnW, stride: ratio, groups: channels)
     return dn.asType(inDtype)
-  }
-
-  /// Crop or zero-pad the length (axis 1) to exactly `target`.
-  private func matchLength(_ x: MLXArray, to target: Int) -> MLXArray {
-    let cur = x.dim(1)
-    if cur == target { return x }
-    if cur > target { return x[0..., 0..<target, 0...] }
-    return MLX.padded(
-      x, widths: [IntOrPair((0, 0)), IntOrPair((0, target - cur)), IntOrPair((0, 0))])
   }
 }
 
@@ -180,11 +181,15 @@ public struct LTX2BigVGANConfig {
   public var upsampleKernels: [Int]
   public var resblockKernels: [Int]
   public var resblockDilations: [Int]
+  /// false for the BWE head: it predicts an UNBOUNDED residual (reference
+  /// apply_final_activation=False); tanh there would clip the correction.
+  public var applyFinalActivation: Bool
 
   public init(
     melChannels: Int, upsampleInitialChannels: Int,
     upsampleRates: [Int], upsampleKernels: [Int],
-    resblockKernels: [Int] = [3, 7, 11], resblockDilations: [Int] = [1, 3, 5]
+    resblockKernels: [Int] = [3, 7, 11], resblockDilations: [Int] = [1, 3, 5],
+    applyFinalActivation: Bool = true
   ) {
     self.melChannels = melChannels
     self.upsampleInitialChannels = upsampleInitialChannels
@@ -192,6 +197,7 @@ public struct LTX2BigVGANConfig {
     self.upsampleKernels = upsampleKernels
     self.resblockKernels = resblockKernels
     self.resblockDilations = resblockDilations
+    self.applyFinalActivation = applyFinalActivation
   }
 
   /// Main BigVGAN generator (rates 5,2,2,2,2,2; ch 1536).
@@ -202,7 +208,8 @@ public struct LTX2BigVGANConfig {
   /// Bandwidth-extension generator (rates 6,5,2,2,2; ch 512).
   public static let bwe = LTX2BigVGANConfig(
     melChannels: 128, upsampleInitialChannels: 512,
-    upsampleRates: [6, 5, 2, 2, 2], upsampleKernels: [12, 11, 4, 4, 4])
+    upsampleRates: [6, 5, 2, 2, 2], upsampleKernels: [12, 11, 4, 4, 4],
+    applyFinalActivation: false)
 }
 
 public final class LTX2BigVGANGenerator: Module {
@@ -213,8 +220,10 @@ public final class LTX2BigVGANGenerator: Module {
   @ModuleInfo(key: "conv_post") var convPost: Conv1d
 
   let numKernels: Int
+  let applyFinalActivation: Bool
 
   public init(config: LTX2BigVGANConfig) {
+    self.applyFinalActivation = config.applyFinalActivation
     self.numKernels = config.resblockKernels.count
 
     self._convPre.wrappedValue = Conv1d(
@@ -259,7 +268,7 @@ public final class LTX2BigVGANGenerator: Module {
     }
     x = actPost(x)
     x = convPost(x)
-    return MLX.tanh(x)
+    return applyFinalActivation ? MLX.tanh(x) : x
   }
 }
 
@@ -374,5 +383,108 @@ public enum LTX2VocoderError: Error, CustomStringConvertible {
     case .weightCoverageTooLow(let matched, let total):
       return "vocoder weight remap matched only \(matched)/\(total) module params — unrecognized key format; audio would be silence"
     }
+  }
+}
+
+// MARK: - Full BWE chain (task #21 wire 2b — reference VocoderWithBWE.forward)
+
+extension LTX2STFTBasis {
+  /// Causal STFT magnitude: waveform `[N, T]` → `[N, nFreqs, frames]`.
+  /// Left-only padding (win − hop) so frames never see the future; conv with
+  /// the checkpoint's exact bf16 forward basis (stored `[2·nFreqs, 1, K]`).
+  func magnitude(_ y: MLXArray, hopLength: Int) -> MLXArray {
+    let basis = forwardBasis            // [2F, 1, K]
+    let k = basis.dim(2)
+    let winMinusHop = max(0, k - hopLength)
+    let padded = MLX.padded(y, widths: [IntOrPair((0, 0)), IntOrPair((winMinusHop, 0))])
+    let nlc = padded.expandedDimensions(axis: 2)              // [N, T, 1]
+    let w = basis.transposed(0, 2, 1)                         // [O, K, I]
+    let spec = MLX.conv1d(nlc, w, stride: hopLength)          // [N, frames, 2F]
+    let twoF = spec.dim(2)
+    let re = spec[0..., 0..., 0..<(twoF / 2)]
+    let im = spec[0..., 0..., (twoF / 2)...]
+    return MLX.sqrt(re * re + im * im).transposed(0, 2, 1)    // [N, F, frames]
+  }
+}
+
+extension LTX2MelSTFT {
+  /// `log(clamp(melBasis · |STFT|, 1e-5))` — waveform `[N, T]` → `[N, mels, frames]`.
+  func logMel(_ y: MLXArray, hopLength: Int) -> MLXArray {
+    let mag = stftFn.magnitude(y, hopLength: hopLength)       // [N, F, frames]
+    let mel = MLX.matmul(melBasis, mag)                       // [N, mels, frames]
+    return MLX.log(MLX.maximum(mel, MLXArray(Float(1e-5))))
+  }
+}
+
+/// Hann-windowed sinc 1-D upsampler — exact port of the reference resampler
+/// (torchaudio defaults: rolloff 0.99, width 6, replicate edge padding).
+/// Filter is COMPUTED, not loaded (persistent=False in the reference).
+enum LTX2HannUpsampler {
+  static func upsample(_ x: MLXArray, ratio: Int) -> MLXArray {
+    let rolloff: Float = 0.99
+    let lowpassWidth: Float = 6
+    let width = Int(ceil(lowpassWidth / rolloff))
+    let kernelSize = 2 * width * ratio + 1
+    let padLeft = 2 * width * ratio
+    let padRight = kernelSize - ratio
+
+    var taps = [Float]()
+    taps.reserveCapacity(kernelSize)
+    for i in 0..<kernelSize {
+      let t = (Float(i) / Float(ratio) - Float(width)) * rolloff
+      let tc = min(max(t, -lowpassWidth), lowpassWidth)
+      let window = pow(cos(tc * .pi / lowpassWidth / 2), 2)
+      let sinc: Float = t == 0 ? 1 : sin(.pi * t) / (.pi * t)
+      taps.append(sinc * window * rolloff / Float(ratio))
+    }
+    let filter = MLXArray(taps)                                // [K]
+
+    // x: [B, C, T] → per-channel grouped transpose-conv, replicate edges.
+    let b = x.dim(0), c = x.dim(1)
+    let flat = x.reshaped([b * c, -1])
+    let padded = MLX.padded(
+      flat, widths: [IntOrPair((0, 0)), IntOrPair((width, width))], mode: .edge)
+    let nlc = padded.expandedDimensions(axis: 2)               // [BC, T', 1]
+    let w = filter.reshaped([1, kernelSize, 1])                // [O, K, I]
+    var out = MLX.convTransposed1d(nlc, w, stride: ratio)      // [BC, L, 1]
+    out = out.squeezed(axis: 2) * Float(ratio)
+    out = out[0..., padLeft..<(out.dim(1) - padRight)]
+    return out.reshaped([b, c, -1])
+  }
+}
+
+extension LTX2Vocoder {
+  /// The COMPLETE reference chain (VocoderWithBWE.forward): mel `[B,128,T]` →
+  /// base 16 kHz stereo → pad-to-hop → per-channel causal log-mel → BWE
+  /// residual (no final activation) → 3× hann resample skip → clamp → crop.
+  /// Returns `[B, 2, T·160·3]` — 48 kHz stereo.
+  public func synthesizeFull(_ mel: MLXArray, hopLength: Int = 80, ratio: Int = 3) -> MLXArray {
+    var base = synthesize(mel)                                 // [B, 2, T·160] @16k
+    let tLow = base.dim(2)
+    let tOut = tLow * ratio
+
+    let remainder = tLow % hopLength
+    if remainder != 0 {
+      base = MLX.padded(base, widths: [
+        IntOrPair((0, 0)), IntOrPair((0, 0)), IntOrPair((0, hopLength - remainder)),
+      ])
+    }
+
+    let b = base.dim(0), c = base.dim(1)
+    let melOfBase = melStft.logMel(base.reshaped([b * c, -1]), hopLength: hopLength)
+      .reshaped([b, c, 64, -1])                                // [B, 2, mels, frames]
+    // Stereo fold (reference Vocoder.forward 4D path): concat channels → 128.
+    let folded = MLX.concatenated([melOfBase[0..., 0], melOfBase[0..., 1]], axis: 1) // [B,128,frames]
+    let residual = bweSynthesize(folded)                       // [B, 2, L] @48k
+    let skip = LTX2HannUpsampler.upsample(base, ratio: ratio)  // [B, 2, L]
+    let sum = MLX.clip(residual + skip, min: -1, max: 1)
+    return sum[0..., 0..., 0..<tOut]
+  }
+
+  /// BWE generator pass (final activation OFF — it predicts a residual).
+  private func bweSynthesize(_ mel: MLXArray) -> MLXArray {
+    let nlc = mel.transposed(0, 2, 1)                          // [B, frames, 128]
+    let wave = bweGenerator(nlc)                               // [B, L, 2]
+    return wave.transposed(0, 2, 1)
   }
 }

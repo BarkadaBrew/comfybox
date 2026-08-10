@@ -78,6 +78,7 @@ public final class LTX2Transformer: Module {
   // ---- Top-level audio branch (JoyAI-Echo, Phase 2) — built when `hasAudio`. ----
   public let hasAudio: Bool
   let audioInnerDim: Int
+  let audioHeads: Int
   @ModuleInfo(key: "audio_patchify_proj") var audioPatchifyProj: Linear?
   @ModuleInfo(key: "audio_proj_out") var audioProjOut: Linear?
   @ModuleInfo(key: "audio_adaln_single") var audioAdaLNSingle: LTX2AdaLayerNormSingle?
@@ -124,10 +125,13 @@ public final class LTX2Transformer: Module {
     doublePrecisionRoPE: Bool = false,
     hasAudio: Bool = false,
     audioInnerDim: Int = 2048,
-    audioInChannels: Int = 128
+    audioInChannels: Int = 128,
+    audioHeads: Int = 32,
+    audioDimHead: Int = 64
   ) {
     self.hasAudio = hasAudio
     self.audioInnerDim = audioInnerDim
+    self.audioHeads = audioHeads
     self.innerDim = numHeads * headDim
     self.numHeads = numHeads
     self.headDim = headDim
@@ -180,7 +184,9 @@ public final class LTX2Transformer: Module {
         ropeMode: ropeMode,
         hasPromptAdaLN: hasPromptAdaLN,
         hasAudio: hasAudio,
-        audioDim: audioInnerDim
+        audioDim: audioInnerDim,
+        audioHeads: audioHeads,
+        audioDimHead: audioDimHead
       ))
     }
     self._transformerBlocks.wrappedValue = blocks
@@ -224,6 +230,9 @@ public final class LTX2Transformer: Module {
   ///   - precomputedPE: Optional precomputed RoPE to avoid recomputation.
   ///   - stgBlocks: Block indices where self-attention is skipped (STG).
   /// - Returns: Velocity prediction `(B, numTokens, outChannels)`.
+  ///   - nagContext: NAG's own negative conditioning, projected the same way as
+  ///     `context`. Nil (or a disabled `nag`) leaves the forward pass unchanged.
+  ///   - nag: NAG strength/blend/clamp; `.disabled` is a true no-op.
   public func callAsFunction(
     latent: MLXArray,
     timestep: MLXArray,
@@ -232,7 +241,9 @@ public final class LTX2Transformer: Module {
     contextMask: MLXArray? = nil,
     sigma: MLXArray? = nil,
     precomputedPE: (cos: MLXArray, sin: MLXArray)? = nil,
-    stgBlocks: Set<Int>? = nil
+    stgBlocks: Set<Int>? = nil,
+    nagContext: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled
   ) -> MLXArray {
     let batchSize = latent.dim(0)
 
@@ -255,6 +266,15 @@ public final class LTX2Transformer: Module {
       ctx = captionProj(ctx)
     }
     ctx = ctx.reshaped(batchSize, -1, x.dim(-1))
+
+    // NAG's negative conditioning goes through the SAME caption projection and
+    // reshape as the positive context — otherwise the two cross-attention
+    // outputs live in different spaces and the extrapolation is meaningless.
+    var nagCtx: MLXArray? = nil
+    if nag.isEnabled, var nctx = nagContext {
+      if let captionProj = captionProjection { nctx = captionProj(nctx) }
+      nagCtx = nctx.reshaped(batchSize, -1, x.dim(-1))
+    }
 
     // Prepare attention mask
     var attnMask = contextMask
@@ -300,7 +320,9 @@ public final class LTX2Transformer: Module {
         timestep: tsEmb,
         pe: pe,
         skipSelfAttn: stgSet.contains(idx),
-        promptTimestep: promptTS
+        promptTimestep: promptTS,
+        negativeContext: nagCtx,
+        nag: nag
       )
     }
 
@@ -319,7 +341,7 @@ public final class LTX2Transformer: Module {
   ///   - x: Hidden states `(B, T, innerDim)`.
   ///   - embeddedTimestep: Timestep embedding `(B, 1, innerDim)`.
   /// - Returns: Output `(B, T, outChannels)`.
-  private func processOutput(x: MLXArray, embeddedTimestep: MLXArray) -> MLXArray {
+  func processOutput(x: MLXArray, embeddedTimestep: MLXArray) -> MLXArray {
     // scale_shift_table: (2, dim) -> (1, 1, 2, dim)
     // embedded_timestep: (B, 1, dim) -> (B, 1, 1, dim)
     let tableExpanded = scaleShiftTable.expandedDimensions(axes: [0, 1])

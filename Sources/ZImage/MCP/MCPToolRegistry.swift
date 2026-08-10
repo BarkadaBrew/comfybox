@@ -12,12 +12,15 @@ public enum MCPToolRegistry {
   /// All registered tool definitions.
   public static let tools: [MCPToolDefinition] = [
     generateImage,
+    repairImage,
     swapLoras,
     listModels,
     listStyles,
     serverHealth,
     queueStatus,
     clearQueue,
+    pauseQueue,
+    resumeQueue,
     listLoras,
     shutdownServer,
     systemStats,
@@ -52,6 +55,29 @@ public enum MCPToolRegistry {
   ]
 
   // MARK: - Tool Definitions
+
+  static let repairImage = MCPToolDefinition(
+    name: "repair_image",
+    description: "Repair a DEFECTIVE image entirely on-device: a local vision model diagnoses render defects (mottled/damaged skin, disfigured anatomy, extra/fused fingers, mesh artifacts) and where they are, then img2img re-renders with a targeted negative prompt + optional region inpaint. Preserves composition and identity. Returns the repaired image path.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "image_path": [
+          "type": "string",
+          "description": "Path to the defective image to repair (Mac-local).",
+        ] as [String: Any],
+        "note": [
+          "type": "string",
+          "description": "Optional user description of the defect to steer the repair (e.g. 'left hand has extra fingers'). If omitted, the local vision model auto-diagnoses.",
+        ] as [String: Any],
+        "image_strength": [
+          "type": "number",
+          "description": "img2img source-preservation strength 0-1 (default 0.6; higher = closer to the source).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["image_path"],
+    ]
+  )
 
   static let generateImage = MCPToolDefinition(
     name: "generate_image",
@@ -205,6 +231,24 @@ public enum MCPToolRegistry {
   static let clearQueue = MCPToolDefinition(
     name: "clear_queue",
     description: "Cancel all pending generation jobs in the queue. Does not affect the currently running job.",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let pauseQueue = MCPToolDefinition(
+    name: "pause_queue",
+    description: "Pause ALL creation: the current job finishes, then no queued or new jobs start until resume_queue. The pause persists across engine restarts. Gates every initiator — schedulers, chat tools, gallery actions, direct API callers.",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let resumeQueue = MCPToolDefinition(
+    name: "resume_queue",
+    description: "Resume creation after pause_queue: queued jobs start processing again.",
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
@@ -396,17 +440,21 @@ public enum MCPToolRegistry {
 
   static let generateVideo = MCPToolDefinition(
     name: "generate_video",
-    description: "Generate a video clip. Supports text-to-video (T2V) and image-to-video (I2V). T2V uses LTX 2.3; I2V uses Wan 2.2. Returns a job_id for async polling via video_status. In proxy mode, generation runs on Replicate; in native mode, it runs locally on the Mac GPU.",
+    description: "Generate a video clip. Supports LTX 2.3 text-to-video (T2V) and image-to-video (I2V) in native mode. Returns a job_id for async polling via video_status. In proxy mode, generation runs on Replicate; in native mode, it runs locally on the Mac GPU.",
     inputSchema: [
       "type": "object",
       "properties": [
         "prompt": [
           "type": "string",
-          "description": "For T2V: detailed cinematic scene description (longer is better). For I2V: motion description only (camera + subject + atmosphere, 80-120 words). The source image provides the scene for I2V.",
+          "description": "LTX 2.3: use one dominant shot in one flowing present-tense paragraph. T2V uses 4-8 descriptive sentences, roughly 45-90 words, ordered subject -> action -> camera -> mood. For I2V, the source image is ground truth: use 4-6 concise sentences describing only explicit subject, camera, and environmental motion; do not redescribe or contradict the frame. Send enhance:false when the prompt is already optimized.",
         ] as [String: Any],
         "image_path": [
           "type": "string",
           "description": "Absolute path to source image for I2V mode. Must be on the Mac filesystem. Omit for T2V mode.",
+        ] as [String: Any],
+        "audio": [
+          "type": "boolean",
+          "description": "Generate synchronized audio (native T2V single-chunk only; first audio render reloads the model with the audio branch, adding ~1 min).",
         ] as [String: Any],
         "duration": [
           "type": "number",
@@ -424,10 +472,42 @@ public enum MCPToolRegistry {
           "type": "integer",
           "description": "Random seed for reproducibility. Omit for random.",
         ] as [String: Any],
+        "strength": [
+          "type": "number",
+          "description": "I2V conditioning strength 0-1 (default 1.0). Lower loosens the frame-0 pose lock; weak motion lever.",
+        ] as [String: Any],
+        "img_compression": [
+          "type": "integer",
+          "description": "Conditioning compression (libx264 CRF, 0-51). PRIMARY motion lever: low (0-2) = max fidelity but freezes motion; ~30 = strong motion for action/partnered scenes; default 35. Use low for solo/portrait, high for action.",
+        ] as [String: Any],
+        "guidance": [
+          "type": "number",
+          "description": "CFG scale (default 1.0 flat). >1 AMPLIFIES action-prompt execution; 2.0 ~doubles action motion cleanly, 3.0 over-drives into artifacts. Use ~2.0 for action/partnered, 1.0 for solo/portrait fidelity.",
+        ] as [String: Any],
+        "tuning": [
+          "type": "object",
+          "description": "Tier A per-render tuning overrides (task #9): guidanceRescale, cfgSchedule [floats], stage1Sigmas, refineSigmas, twoStage (bool), condFps, sampler, stgScale, faceAnchorStrength, icControl, colorAnchor, nagScale/nagAlpha/nagTau. Omitted fields defer to preset > config.json > env > builtin. Full precedence recorded in the job's resolved_config.",
+        ] as [String: Any],
+        "optimization_attempt_id": [
+          "type": "string",
+          "description": "Lineage reference from enhance_prompt binding this render to its optimization attempt (task #19).",
+        ] as [String: Any],
+        "frames": [
+          "type": "integer",
+          "description": "Exact frame count (1+8k: 97, 145, 289...). Forces a SINGLE render pass at this length instead of the chunked `duration` path. Use for action clips <=12s (289f) to hold motion uniform (chunking decays it). Overrides duration.",
+        ] as [String: Any],
         "preset": [
           "type": "string",
           "description": "Optional preset id (see list_presets, mediaKind \"video\"): applies the preset\u{27}s LoRAs, prompt prefix/suffix, negative prompt, and dims budget. Explicit params override it.",
         ],
+        "skip_character_injection": [
+          "type": "boolean",
+          "description": "Skip the server-side character description prepend. Send TRUE when the caller has already woven the description into the prompt. Note `enhance:false` is NOT sufficient — it only stops the optimizer's injection, and on t2v the server still defaults the character to \u{22}kira\u{22} and prepends ~110 tokens, which overruns the 128-token cap and truncates the scene and camera direction off the end.",
+        ] as [String: Any],
+        "enhance": [
+          "type": "boolean",
+          "description": "Whether the server should optimize the prompt (default true). Send FALSE when the caller has ALREADY run its own prompt optimizer — a second rewrite drifts the prompt away from concrete staging (limb placement, figure count) and double-injects the character description.",
+        ] as [String: Any],
         "output_path": [
           "type": "string",
           "description": "Output file path for the .mp4. Must be within the allowed output directory. Omit to auto-generate.",

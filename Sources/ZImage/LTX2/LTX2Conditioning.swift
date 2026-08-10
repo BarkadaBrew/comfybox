@@ -28,6 +28,15 @@ public struct LTX2LatentState {
   /// 1.0 = full denoise, 0.0 = keep clean.
   public var denoiseMask: MLXArray
 
+  /// Face-region latent mask `(1,1,1,H,W)` (1 inside face boxes) + the source
+  /// face reference latent `(1,C,1,H,W)` + pull strength. When set, the denoise
+  /// loop softly pulls ONLY the masked face latents (all frames) toward the
+  /// source face — holds every detected face (esp. a stationary partner) over a
+  /// long pass without touching body/motion latents. #partnered
+  public var faceMask: MLXArray? = nil
+  public var faceRef: MLXArray? = nil
+  public var faceAnchorStrength: Float = 0
+
   public init(latent: MLXArray, cleanLatent: MLXArray, denoiseMask: MLXArray) {
     self.latent = latent
     self.cleanLatent = cleanLatent
@@ -36,11 +45,13 @@ public struct LTX2LatentState {
 
   /// Create a copy of this state.
   public func copy() -> LTX2LatentState {
-    return LTX2LatentState(
+    var c = LTX2LatentState(
       latent: latent,
       cleanLatent: cleanLatent,
       denoiseMask: denoiseMask
     )
+    c.faceMask = faceMask; c.faceRef = faceRef; c.faceAnchorStrength = faceAnchorStrength
+    return c
   }
 }
 
@@ -178,5 +189,65 @@ public enum LTX2Conditioning {
     let effectiveScale = MLXArray(noiseScale) * result.denoiseMask
     result.latent = noise * effectiveScale + result.latent * (1.0 - effectiveScale)
     return result
+  }
+}
+
+extension LTX2Conditioning {
+
+  /// Bilinear spatial resize of a 5D latent [B, C, T, H, W].
+  ///
+  /// Exists for the 1.5x refine (Todd 2026-08-07: "1.5 is enough" / "render
+  /// times are already too long"): the learned spatial upsampler is fixed 2x,
+  /// so the refine denoise ran on 4x the stage-1 area. Downscaling the
+  /// upsampled latent to 1.5x cuts refine area to 56% and refine attention to
+  /// roughly a third, at a delivery quality that still supersamples 480p.
+  ///
+  /// align_corners=false convention (matches PyTorch/ComfyUI LatentUpscale):
+  /// src = (dst + 0.5) * (srcSize / dstSize) - 0.5, clamped, lerped.
+  public static func resizeLatentBilinear(_ x: MLXArray, height: Int, width: Int) -> MLXArray {
+    let (srcH, srcW) = (x.dim(3), x.dim(4))
+    if srcH == height && srcW == width { return x }
+    let dtype = x.dtype
+    var out = x.asType(.float32)
+
+    func axisCoords(src: Int, dst: Int) -> (lo: MLXArray, hi: MLXArray, w: MLXArray) {
+      let scale = Float(src) / Float(dst)
+      var coords = [Float]()
+      coords.reserveCapacity(dst)
+      for d in 0..<dst {
+        let c = (Float(d) + 0.5) * scale - 0.5
+        coords.append(Swift.max(Float(0), Swift.min(Float(src - 1), c)))
+      }
+      let lo: [Int] = coords.map { Int($0.rounded(.down)) }
+      let hi: [Int] = lo.map { Swift.min($0 + 1, src - 1) }
+      var w = [Float]()
+      w.reserveCapacity(dst)
+      for i in 0..<dst { w.append(coords[i] - Float(lo[i])) }
+      return (MLXArray(lo.map(Int32.init)), MLXArray(hi.map(Int32.init)), MLXArray(w))
+    }
+
+    let one = MLXArray(Float(1))
+
+    // Height axis (3): gather rows at lo/hi and lerp.
+    let (hLo, hHi, hW) = axisCoords(src: srcH, dst: height)
+    let rowsLo = MLX.take(out, hLo, axis: 3)
+    let rowsHi = MLX.take(out, hHi, axis: 3)
+    let hw = hW.reshaped([1, 1, 1, height, 1])
+    let hInv: MLXArray = one - hw
+    let hTermLo: MLXArray = rowsLo * hInv
+    let hTermHi: MLXArray = rowsHi * hw
+    out = hTermLo + hTermHi
+
+    // Width axis (4).
+    let (wLo, wHi, wW) = axisCoords(src: srcW, dst: width)
+    let colsLo = MLX.take(out, wLo, axis: 4)
+    let colsHi = MLX.take(out, wHi, axis: 4)
+    let ww = wW.reshaped([1, 1, 1, 1, width])
+    let wInv: MLXArray = one - ww
+    let wTermLo: MLXArray = colsLo * wInv
+    let wTermHi: MLXArray = colsHi * ww
+    out = wTermLo + wTermHi
+
+    return out.asType(dtype)
   }
 }

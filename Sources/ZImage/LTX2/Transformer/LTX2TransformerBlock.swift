@@ -172,10 +172,14 @@ public final class LTX2TransformerBlock: Module {
   /// FF) alongside the audio sub-steps and the bidirectional a2v/v2a cross-modal
   /// attention, returning updated `(video, audio)`.
   ///
-  /// PARITY DEFERRED: the module *structure* (and thus weight loading) is exact,
-  /// but the precise interleaving / AdaLN composition of the reference dual-stream
-  /// block is not numerically validated here (no reference on-box). The video-only
-  /// `callAsFunction` above is unchanged and remains the verified path.
+  /// Mirrors `BasicAVTransformerBlock.forward` (av_model.py):
+  /// - Cross-modal AdaLN uses the [5, dim] `scale_shift_table_a2v_ca_*` tables
+  ///   with SCALE-FIRST row order: rows 0/1 = a2v scale/shift, rows 2/3 = v2a
+  ///   scale/shift, row 4 = gate. (The main 9-row table is shift-first.)
+  /// - Both cross-modal attention inputs are norm+modulated; the norms are
+  ///   taken ONCE before a2v and reused for v2a (the reference computes
+  ///   vx_norm3/ax_norm3 before either update).
+  /// - a2v runs with `pe: crossPE, kPE: audioCrossPE`; v2a with the mirror.
   ///
   /// - Parameters:
   ///   - video: Video hidden states `(B, T_v, dim)`.
@@ -186,6 +190,13 @@ public final class LTX2TransformerBlock: Module {
   ///   - audioTimestep: Audio timestep embedding `(B, 1, 9*audioDim)`.
   ///   - pe: Video RoPE.
   ///   - audioPE: Audio RoPE.
+  ///   - crossPE: Video-side RoPE for the cross-modal attentions.
+  ///   - audioCrossPE: Audio-side RoPE for the cross-modal attentions.
+  ///   - crossScaleShiftTimestep: Video av_ca scale-shift timestep `(B, 1, 4*dim)`.
+  ///   - audioCrossScaleShiftTimestep: Audio av_ca scale-shift timestep `(B, 1, 4*audioDim)`.
+  ///   - crossGateTimestep: Video av_ca gate timestep `(B, 1, dim)`.
+  ///   - audioCrossGateTimestep: Audio av_ca gate timestep `(B, 1, audioDim)`.
+  ///     Nil cross timesteps degrade to table-rows-only modulation.
   public func callDualStream(
     video: MLXArray,
     audio: MLXArray,
@@ -197,6 +208,12 @@ public final class LTX2TransformerBlock: Module {
     audioTimestep: MLXArray,
     pe: (cos: MLXArray, sin: MLXArray)? = nil,
     audioPE: (cos: MLXArray, sin: MLXArray)? = nil,
+    crossPE: (cos: MLXArray, sin: MLXArray)? = nil,
+    audioCrossPE: (cos: MLXArray, sin: MLXArray)? = nil,
+    crossScaleShiftTimestep: MLXArray? = nil,
+    audioCrossScaleShiftTimestep: MLXArray? = nil,
+    crossGateTimestep: MLXArray? = nil,
+    audioCrossGateTimestep: MLXArray? = nil,
     promptTimestep: MLXArray? = nil,
     audioPromptTimestep: MLXArray? = nil
   ) -> (video: MLXArray, audio: MLXArray) {
@@ -206,7 +223,7 @@ public final class LTX2TransformerBlock: Module {
     // ---- Video stream: self-attn, text cross-attn (reuse video sub-logic) ----
     var v = video
     let vMSA = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 0..<3)
-    var vNorm = weightFreeRMSNorm(v) * (1 + vMSA[1]) + vMSA[0]
+    let vNorm = weightFreeRMSNorm(v) * (1 + vMSA[1]) + vMSA[0]
     v = v + attn1(vNorm, pe: pe) * vMSA[2]
 
     let vCross = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 6..<9)
@@ -233,21 +250,27 @@ public final class LTX2TransformerBlock: Module {
                         context: aCtx, mask: audioContextMask) * aCross[2]
 
     // ---- Cross-modal: A2V (update video from audio) + V2A (update audio) ----
-    // NOTE (parity deferred): the reference conditions this gating on the
-    // top-level av_ca_*_adaln_single timestep modules; here we use the per-block
-    // scale_shift_table_a2v_ca_* rows directly (shift/scale/gate = rows 0/1/2 of
-    // the [5, dim] table). Shape-correct and runs; timestep-conditioned av_ca is
-    // wired in the generateAV pipeline step (not yet landed).
-    let vShift = scaleShiftTableA2VCaVideo![0].reshaped(1, 1, -1)
-    let vScale = scaleShiftTableA2VCaVideo![1].reshaped(1, 1, -1)
-    let vGate = scaleShiftTableA2VCaVideo![2].reshaped(1, 1, -1)
-    v = v + audioToVideoAttn!(weightFreeRMSNorm(v) * (1 + vScale) + vShift,
-                              context: audioRMSNorm(a)) * vGate
-    let aShift = scaleShiftTableA2VCaAudio![0].reshaped(1, 1, -1)
-    let aScale = scaleShiftTableA2VCaAudio![1].reshaped(1, 1, -1)
-    let aGate = scaleShiftTableA2VCaAudio![2].reshaped(1, 1, -1)
-    a = a + videoToAudioAttn!(audioRMSNorm(a) * (1 + aScale) + aShift,
-                              context: weightFreeRMSNorm(v)) * aGate
+    // Norms taken once, BEFORE either update (reference vx_norm3/ax_norm3).
+    let vxNorm3 = weightFreeRMSNorm(v)
+    let axNorm3 = audioRMSNorm(a)
+    let (vCA, vGateCA) = avCrossAdaValues(
+      table: scaleShiftTableA2VCaVideo!, batchSize: b,
+      scaleShiftTimestep: crossScaleShiftTimestep, gateTimestep: crossGateTimestep)
+    let (aCA, aGateCA) = avCrossAdaValues(
+      table: scaleShiftTableA2VCaAudio!, batchSize: b,
+      scaleShiftTimestep: audioCrossScaleShiftTimestep, gateTimestep: audioCrossGateTimestep)
+
+    // a2v: Q = modulated video, KV = modulated audio (scale row 0, shift row 1).
+    let vxScaledA2V = vxNorm3 * (1 + vCA[0]) + vCA[1]
+    let axScaledA2V = axNorm3 * (1 + aCA[0]) + aCA[1]
+    v = v + audioToVideoAttn!(vxScaledA2V, context: axScaledA2V,
+                              pe: crossPE, kPE: audioCrossPE) * vGateCA
+
+    // v2a: Q = modulated audio, KV = modulated video (scale row 2, shift row 3).
+    let axScaledV2A = axNorm3 * (1 + aCA[2]) + aCA[3]
+    let vxScaledV2A = vxNorm3 * (1 + vCA[2]) + vCA[3]
+    a = a + videoToAudioAttn!(axScaledV2A, context: vxScaledV2A,
+                              pe: audioCrossPE, kPE: crossPE) * aGateCA
 
     // ---- Feed-forward on both streams ----
     let vMLP = getAdaValues(table: scaleShiftTable, batchSize: b, timestep: timestep, range: 3..<6)
@@ -256,6 +279,54 @@ public final class LTX2TransformerBlock: Module {
     a = a + audioFF!(audioRMSNorm(a) * (1 + aMLP[1]) + aMLP[0]) * aMLP[2]
 
     return (v, a)
+  }
+
+  /// AdaLN values for a cross-modal [5, dim] table: rows 0..3 combined with
+  /// the 4-row scale-shift timestep, row 4 with the 1-row gate timestep
+  /// (reference `get_av_ca_ada_values`). Nil timesteps contribute zero.
+  private func avCrossAdaValues(
+    table: MLXArray,
+    batchSize: Int,
+    scaleShiftTimestep: MLXArray?,
+    gateTimestep: MLXArray?
+  ) -> (values: [MLXArray], gate: MLXArray) {
+    let dim = table.dim(1)
+    var ss = table[0..<4].expandedDimensions(axes: [0, 1])  // (1, 1, 4, dim)
+    if let ts = scaleShiftTimestep {
+      ss = ss + ts.reshaped(batchSize, ts.dim(1), 4, dim)
+    }
+    var values: [MLXArray] = []
+    for i in 0..<4 { values.append(ss[0..., 0..., i]) }
+    var g = table[4..<5].expandedDimensions(axes: [0, 1])  // (1, 1, 1, dim)
+    if let ts = gateTimestep {
+      g = g + ts.reshaped(batchSize, ts.dim(1), 1, dim)
+    }
+    return (values, g[0..., 0..., 0])
+  }
+
+  /// Load a single dual-stream (audio+video) block from a block-local extract
+  /// (keys already stripped of `model.diffusion_model.transformer_blocks.N.`).
+  /// Applies the standard key remaps (`to_out.0` → `to_out`, GEGLU
+  /// `ff.net.0.proj`/`ff.net.2` → `ff.proj_in`/`ff.proj_out` — the substring
+  /// replace also covers `audio_ff.*`). LTX-2.3 A/V dims are fixed by the
+  /// architecture: video 4096/32×128, audio 2048/32×64.
+  public static func loadAVBlock(blockExtractPath: String) throws -> LTX2TransformerBlock {
+    let raw = try MLX.loadArrays(url: URL(fileURLWithPath: blockExtractPath))
+    var weights: [String: MLXArray] = [:]
+    for (key, value) in raw {
+      var k = key
+      k = k.replacingOccurrences(of: "to_out.0.", with: "to_out.")
+      k = k.replacingOccurrences(of: "ff.net.0.proj.", with: "ff.proj_in.")
+      k = k.replacingOccurrences(of: "ff.net.2.", with: "ff.proj_out.")
+      weights[k] = value
+    }
+    let block = LTX2TransformerBlock(
+      dim: 4096, contextDim: 4096, heads: 32, dimHead: 128,
+      hasPromptAdaLN: true, hasAudio: true,
+      audioDim: 2048, audioHeads: 32, audioDimHead: 64)
+    let params = ModuleParameters.unflattened(weights.map { ($0.key, $0.value) })
+    try block.update(parameters: params, verify: [.shapeMismatch])
+    return block
   }
 
   /// Extract adaptive normalization values from the scale-shift table.
@@ -309,6 +380,12 @@ public final class LTX2TransformerBlock: Module {
   ///   - skipSelfAttn: Skip self-attention (STG perturbation). Default false.
   ///   - promptTimestep: Prompt-conditioned timestep for LTX-2.3 cross-attention.
   /// - Returns: Updated hidden states `(B, T, dim)`.
+  /// - Parameters:
+  ///   - negativeContext: NAG's own negative conditioning. The reference wires
+  ///     this as a model patch (`LTX2_NAG {nag_cond_video}`) separate from the
+  ///     CFG negative, which is inert in that recipe because CFG runs at 1.0.
+  ///     Nil (or a disabled `nag`) leaves the block byte-identical to before.
+  ///   - nag: Guidance strength/blend/clamp. `.disabled` is a true no-op.
   public func callAsFunction(
     _ x: MLXArray,
     context: MLXArray,
@@ -316,8 +393,15 @@ public final class LTX2TransformerBlock: Module {
     timestep: MLXArray,
     pe: (cos: MLXArray, sin: MLXArray)? = nil,
     skipSelfAttn: Bool = false,
-    promptTimestep: MLXArray? = nil
+    promptTimestep: MLXArray? = nil,
+    negativeContext: MLXArray? = nil,
+    nag: LTX2NAGConfig = .disabled
   ) -> MLXArray {
+    // Cross-attention against the positive context, then — when NAG is on —
+    // the same computation against the negative context, combined by
+    // ltx2ApplyNAG. Modulation is applied to BOTH contexts identically so the
+    // two attention outputs are comparable.
+    let nagActive = nag.isEnabled && negativeContext != nil
     let batchSize = x.dim(0)
     var h = x
 
@@ -371,11 +455,30 @@ public final class LTX2TransformerBlock: Module {
         encoderStates = context * (1 + promptScale) + promptShift
       }
 
-      let crossOut = attn2(attnInput, context: encoderStates, mask: contextMask)
+      var crossOut = attn2(attnInput, context: encoderStates, mask: contextMask)
+      if nagActive, let negCtx = negativeContext {
+        var negStates = negCtx
+        if let promptTS = promptTimestep, let promptTable = promptScaleShiftTable {
+          let p = getAdaValues(
+            table: promptTable, batchSize: batchSize, timestep: promptTS, range: 0..<2)
+          negStates = negCtx * (1 + p[1]) + p[0]
+        }
+        let negOut = attn2(attnInput, context: negStates, mask: contextMask)
+        crossOut = ltx2ApplyNAG(
+          positive: crossOut, negative: negOut,
+          scale: nag.scale, alpha: nag.alpha, tau: nag.tau)
+      }
       h = h + crossOut * gateQ
     } else {
       // LTX-2: simple cross-attention with RMSNorm
-      let crossOut = attn2(weightFreeRMSNorm(h), context: context, mask: contextMask)
+      let normed = weightFreeRMSNorm(h)
+      var crossOut = attn2(normed, context: context, mask: contextMask)
+      if nagActive, let negCtx = negativeContext {
+        let negOut = attn2(normed, context: negCtx, mask: contextMask)
+        crossOut = ltx2ApplyNAG(
+          positive: crossOut, negative: negOut,
+          scale: nag.scale, alpha: nag.alpha, tau: nag.tau)
+      }
       h = h + crossOut
     }
 

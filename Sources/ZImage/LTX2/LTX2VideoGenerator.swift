@@ -42,12 +42,24 @@ public struct LTX2VideoRequest: Sendable {
     public var seed: UInt64
     /// I2V conditioning strength (0–1).
     public var strength: Float
+    /// Conditioning compression (libx264 CRF) override; nil = env/default.
+    /// Higher = more motion (frozen-still regime at 0-2), lower = more fidelity.
+    public var imgCompression: Int?
+    /// CFG guidance override; nil = env/config default. >1 amplifies the
+    /// action-prompt direction (primary motion lever, Codex 2026-07-26).
+    public var guidance: Float?
     /// Identity re-anchor strength for CONTINUATION chunks (0 = off). Each
     /// continuation chunk conditions on the previous chunk\u{27}s last frame at
     /// frame 0 (hard continuity) AND the ORIGINAL source image at the chunk\u{27}s
     /// last frame at this strength (soft identity pull) \u{2014} counters the
     /// cumulative subject/scene drift of tail-to-head chaining (#219).
     public var identityAnchorStrength: Float
+
+    /// Frames between mid-pass identity re-anchors for a LONG single/first pass
+    /// (0 = off). With only a frame-0 anchor, peripheral subjects (e.g. a
+    /// partner's face) drift and melt over a long pass; re-splicing the source
+    /// at this interval at `identityAnchorStrength` holds EVERY face. #partnered
+    public var identityReAnchorInterval: Int
     /// Target duration; >0 generates continuation chunks (I2V only).
     public var extendToSeconds: Float
     public var fps: Int
@@ -58,6 +70,15 @@ public struct LTX2VideoRequest: Sendable {
     /// LoRAs merged into the transformer for this render, applied in order.
     public var loras: [LTX2LoRAReference]
     public var outputPath: String
+    /// Tier A tuning overrides (task #9 Phase 2) — nil fields defer to
+    /// preset > configFile > env > builtin. `presetTuning` is the preset's
+    /// block, resolved by the server and carried so the generator can build
+    /// the full five-level resolution.
+    public var tuning: LTX2VideoTuning?
+    public var presetTuning: LTX2VideoTuning?
+    /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
+    /// loads the audio branch (+~11GiB) into the transformer on first use.
+    public var audio: Bool
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -81,14 +102,21 @@ public struct LTX2VideoRequest: Sendable {
         steps: Int = 8,
         seed: UInt64 = 42,
         strength: Float = 1.0,
+        imgCompression: Int? = nil,
+        guidance: Float? = nil,
         identityAnchorStrength: Float = 0,
+        identityReAnchorInterval: Int = 0,
         extendToSeconds: Float = 0,
         fps: Int = 24,
         loraPath: String? = nil,
         loraStrength: Float = 1.0,
         loras: [LTX2LoRAReference] = [],
-        outputPath: String
+        outputPath: String,
+        tuning: LTX2VideoTuning? = nil,
+        presetTuning: LTX2VideoTuning? = nil,
+        audio: Bool = false
     ) {
+        self.audio = audio
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.initImagePath = initImagePath
@@ -98,13 +126,18 @@ public struct LTX2VideoRequest: Sendable {
         self.steps = steps
         self.seed = seed
         self.strength = strength
+        self.imgCompression = imgCompression
+        self.guidance = guidance
         self.identityAnchorStrength = identityAnchorStrength
+        self.identityReAnchorInterval = identityReAnchorInterval
         self.extendToSeconds = extendToSeconds
         self.fps = fps
         self.loraPath = loraPath
         self.loraStrength = loraStrength
         self.loras = loras
         self.outputPath = outputPath
+        self.tuning = tuning
+        self.presetTuning = presetTuning
     }
 }
 
@@ -121,6 +154,7 @@ public enum LTX2VideoError: Error, LocalizedError {
     case weightsMissing(String)
     case imageLoadFailed(String)
     case unsupportedPlatform
+    case audioUnsupported(String)
 
     public var errorDescription: String? {
         switch self {
@@ -134,6 +168,8 @@ public enum LTX2VideoError: Error, LocalizedError {
             return "Failed to load init image: \(path)"
         case .unsupportedPlatform:
             return "LTX-2 video requires CoreGraphics/ImageIO (macOS)."
+        case .audioUnsupported(let why):
+            return "LTX-2 audio: \(why)"
         }
     }
 }
@@ -173,6 +209,12 @@ public final class LTX2VideoGenerator {
     public var loadedTokenizer: LTX2GemmaTokenizer? { tokenizer }
     /// "path@strength" of the LoRA merged into the loaded transformer (nil = base).
     private var loadedLoraKey: String?
+    /// Whether the RESIDENT transformer carries the audio branch — admission
+    /// uses this to spot audio-mode mismatches that force a full rebuild.
+    public var isAudioLoaded: Bool { loadedLoraKey?.contains("+audio") == true }
+    /// Audio codec (VAE + vocoder), lazily bound from the monolith on the
+    /// first audio render; cheap (mmap subset) and kept for the process life.
+    private var audioVAE: LTX2AudioVAE?
 
     public init(config: Configuration, logger: Logger = Logger(label: "ltx2.video")) {
         self.config = config
@@ -184,6 +226,29 @@ public final class LTX2VideoGenerator {
     /// A frame count is valid when it's 1 + 8k and ≥ 9.
     public static func isValidFrameCount(_ n: Int) -> Bool {
         n >= 9 && (n - 1) % 8 == 0
+    }
+
+    /// Resolve the Gemma tokenizer max length (LTX2_GEMMA_MAX_LENGTH).
+    ///
+    /// Default 1024 = the official Lightricks recipe (their tokenizer call and
+    /// the ComfyUI Gemma loader both default to 1024). Our former hardcoded 128
+    /// was a port artifact that silently truncated every long prompt.
+    ///
+    /// The connector tiles its 128 learnable registers with integer division
+    /// (`numTiles = seqLen / 128`), so the value must be a positive multiple of
+    /// 128 — anything else silently under-covers the sequence with registers.
+    /// Invalid overrides fall back to the default rather than half-applying.
+    public static func resolveGemmaMaxLength(env: String?) -> Int {
+        let fallback = 1024
+        guard let raw = env?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return fallback }
+        guard let n = Int(raw), n > 0, n % 128 == 0 else { return fallback }
+        return n
+    }
+
+    /// fps must be positive and sane (chunk planning divides by it; the RoPE
+    /// temporal coords divide by it too).
+    public static func isValidFPS(_ fps: Int) -> Bool {
+        fps >= 1 && fps <= 120
     }
 
     /// Dimensions must be positive multiples of 32.
@@ -221,6 +286,24 @@ public final class LTX2VideoGenerator {
     public func validate(_ request: LTX2VideoRequest) throws {
         guard Self.isValidFrameCount(request.framesPerChunk) else {
             throw LTX2VideoError.invalidFrameCount(request.framesPerChunk)
+        }
+        if request.audio {
+            // Audio scope: single-chunk T2V and I2V. Silently downgrading (the
+            // first cut) shipped MP4s whose audio stopped after chunk 0 or
+            // never existed — reject unsupported shapes loudly instead
+            // (Codex 2026-08-04 #4).
+            let plan = Self.chunkPlan(
+                framesPerChunk: request.framesPerChunk,
+                extendToSeconds: request.extendToSeconds, fps: request.fps)
+            if plan.totalChunks > 1 {
+                throw LTX2VideoError.audioUnsupported(
+                    "audio is not yet supported for chunked renders (\(plan.totalChunks) chunks requested; keep duration within one \(request.framesPerChunk)-frame chunk)")
+            }
+            if request.identityAnchorStrength > 0, request.identityReAnchorInterval > 0,
+               request.framesPerChunk > request.identityReAnchorInterval + 1 {
+                throw LTX2VideoError.audioUnsupported(
+                    "audio is not yet supported with mid-pass identity re-anchoring (multi-keyframe path)")
+            }
         }
         guard Self.areValidDimensions(width: request.width, height: request.height) else {
             throw LTX2VideoError.invalidDimensions(request.width, request.height)
@@ -262,21 +345,26 @@ public final class LTX2VideoGenerator {
     /// Construct and load the transformer, VAE, text encoder, and pipeline,
     /// optionally merging one or more LoRAs into the transformer (applied in
     /// order). Idempotent for the same LoRA set; a different set reloads.
-    public func load(loras: [LTX2LoRAReference] = []) throws {
-        let wantKey = loras.isEmpty ? nil : loras.map { "\($0.path)@\($0.scale)" }.joined(separator: "|")
+    public func load(loras: [LTX2LoRAReference] = [], audio: Bool = false) throws {
+        // Audio joins the warm key: an audio render needs the dual-stream
+        // transformer (audio branch +~11GiB); switching either way reloads.
+        let loraPart = loras.isEmpty ? "" : loras.map { "\($0.path)@\($0.scale)" }.joined(separator: "|")
+        let wantKey0 = loraPart + (audio ? "|+audio" : "")
+        let wantKey: String? = wantKey0.isEmpty ? nil : wantKey0
         if isLoaded {
             if wantKey == loadedLoraKey { return }
-            unload()   // LoRA set changed — rebuild the transformer.
+            unload()   // LoRA set or audio mode changed — rebuild the transformer.
         }
         let modelDir = config.weightsDir
 
-        logger.info("LTX-2: creating transformer…")
+        logger.info("LTX-2: creating transformer…\(audio ? " (dual-stream A/V)" : "")")
         let transformer = LTX2Transformer(
             numHeads: 32, headDim: 128, inChannels: 128, outChannels: 128,
             numLayers: 48, crossAttentionDim: 4096, captionChannels: 3840,
             normEps: 1e-6, hasPromptAdaLN: true, timestepScaleMultiplier: 1000,
             positionalEmbeddingTheta: 10000, positionalEmbeddingMaxPos: [20, 2048, 2048],
-            useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true
+            useMiddleIndicesGrid: true, ropeMode: .split, doublePrecisionRoPE: true,
+            hasAudio: audio, audioInnerDim: 2048, audioInChannels: 128
         )
 
         let weightsURL = resolveWeightsFileURL()
@@ -291,7 +379,13 @@ public final class LTX2VideoGenerator {
         if isMonolith {
             logger.info("LTX-2: JoyAI-Echo monolithic checkpoint detected — prefix-filtered video-only load.")
         }
-        var sanitized = LTX2Transformer.sanitizeWeights(rawWeights)
+        var sanitized = audio && isMonolith
+            ? LTX2Transformer.sanitizeWeightsWithAudio(rawWeights)
+            : LTX2Transformer.sanitizeWeights(rawWeights)
+        if audio && !isMonolith {
+            throw LTX2VideoError.weightsMissing(
+                "audio render requires a JoyAI-Echo monolithic checkpoint (audio branch tensors) — \(weightsURL.lastPathComponent) is per-component")
+        }
 
         // Merge each LoRA into the base weights in order (skip audio branches),
         // as the CLI does — multiple LoRAs simply accumulate their deltas.
@@ -305,6 +399,23 @@ public final class LTX2VideoGenerator {
                 if baseKey.hasPrefix("diffusion_model.") { baseKey = String(baseKey.dropFirst("diffusion_model.".count)) }
                 if baseKey.contains("audio_") || baseKey.contains("av_ca_")
                     || baseKey.contains("video_to_audio_attn") || baseKey.contains("audio_to_video_attn") { continue }
+                // LoRA keys use the RAW checkpoint naming, but `sanitized` keys have
+                // been through sanitizeWeights' renames — without mirroring them here
+                // the lookup below silently skips every renamed projection (to_out,
+                // ff proj_in/out, adaln linear1/2): 196 of 584 pairs in the official
+                // distil LoRA, i.e. runtime LoRAs applied at ~2/3 strength (2026-08-02).
+                // baseKey is a module path (no trailing dot), so map suffixes.
+                let suffixRenames: [(String, String)] = [
+                    (".to_out.0", ".to_out"),
+                    (".ff.net.0.proj", ".ff.proj_in"),
+                    (".ff.net.2", ".ff.proj_out"),
+                    (".linear_1", ".linear1"),
+                    (".linear_2", ".linear2"),
+                ]
+                for (raw, renamed) in suffixRenames where baseKey.hasSuffix(raw) {
+                    baseKey = String(baseKey.dropLast(raw.count)) + renamed
+                    break
+                }
                 let bKey = key.replacingOccurrences(of: ".lora_A.weight", with: ".lora_B.weight")
                 guard let loraB = loraWeights[bKey] else { continue }
                 let targetKey = baseKey + ".weight"
@@ -352,6 +463,24 @@ public final class LTX2VideoGenerator {
             logger.error("LTX-2: transformer weight remap covered only \(matched)/\(moduleKeys.count) params — checkpoint key format likely unrecognized; output would be noise.")
             throw LTX2VideoError.weightsMissing(
                 "transformer key remap matched only \(matched)/\(moduleKeys.count) module params from \(weightsURL.lastPathComponent) — unrecognized checkpoint key format")
+        }
+        if audio {
+            // Audio-branch coverage guard (Codex #7): the 50% whole-model gate
+            // can pass while the ENTIRE audio branch (2,729 tensors) is absent
+            // or mis-keyed — silence/noise instead of a load error. Require
+            // near-complete audio coverage explicitly.
+            func isAudioKey(_ k: String) -> Bool {
+                k.contains("audio_") || k.contains("av_ca_")
+                    || k.contains("scale_shift_table_a2v")
+                    || k.contains("audio_to_video_attn") || k.contains("video_to_audio_attn")
+            }
+            let audioModuleKeys = moduleKeys.filter(isAudioKey)
+            let audioMatched = sanitized.keys.filter { isAudioKey($0) && moduleKeys.contains($0) }.count
+            if audioMatched < audioModuleKeys.count * 95 / 100 {
+                throw LTX2VideoError.audioUnsupported(
+                    "audio branch weights incomplete: \(audioMatched)/\(audioModuleKeys.count) matched from \(weightsURL.lastPathComponent)")
+            }
+            logger.info("LTX-2 audio: branch coverage \(audioMatched)/\(audioModuleKeys.count).")
         }
         let params = ModuleParameters.unflattened(sanitized.map { ($0.key, $0.value) })
         try transformer.update(parameters: params, verify: [.shapeMismatch])
@@ -418,12 +547,85 @@ public final class LTX2VideoGenerator {
         // implemented, just never enabled) tiled path is designed for.
         // Running it as one giant pass is the leading suspect for the
         // uniform grid/mesh artifact seen in every local I2V test tonight.
-        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: true)
-        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig)
-        self.tokenizer = try LTX2GemmaTokenizer.load(from: URL(fileURLWithPath: config.gemmaPath), maxLength: 128)
+        // Two-stage refine (Phase 3): load the spatial latent upsampler if enabled.
+        // ltx-2.3-spatial-upscaler-x2-1.1 keys map 1:1 to LTX2LatentUpsampler.
+        var upsampler: LTX2LatentUpsampler? = nil
+        if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
+           let upPath = ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"],
+           FileManager.default.fileExists(atPath: upPath) {
+            upsampler = Self.loadUpsampler(path: upPath, logger: logger)
+        }
+        // Tiled/chunked VAE decode is OOM-safe on long/large clips but seams on
+        // fast motion (spatial-tile mosaic + temporal-window jitter). Plain
+        // single-pass decode (as ComfyUI does) is clean but memory-heavier.
+        // LTX2_TILED_DECODE=0 selects plain decode. Default stays tiled.
+        let tiled = ProcessInfo.processInfo.environment["LTX2_TILED_DECODE"] != "0"
+        // NOTE: the warm pipeline is built ONCE here, so per-request fps cannot
+        // flow through config.fps (it would bake in the first request's value).
+        // The temporal-RoPE conditioning fps (the motion dial) is therefore
+        // controlled per-render via LTX2_COND_FPS (read fresh in createPositionGrid).
+        let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: tiled)
+        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
+        // 128 was a port artifact, NOT the trained recipe (discovered 2026-08-07):
+        // the official Lightricks pipeline tokenizes at max_length 1024, the
+        // ComfyUI Gemma loader defaults to 1024, and the reference PinkCherry
+        // workflow feeds 256-token enhancer output through this same encoder.
+        // The artifact silently truncated every long prompt for weeks — scene,
+        // camera and identity fell off the tail. Mirror upstream's env knob.
+        self.tokenizer = try LTX2GemmaTokenizer.load(
+          from: URL(fileURLWithPath: config.gemmaPath),
+          maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
         isLoaded = true
         loadedLoraKey = wantKey
         logger.info("LTX-2: models ready.")
+    }
+
+
+    /// Load + validate the spatial latent upsampler. Shared by the load-time
+    /// path (env) and the per-request lazy path (finding #18). Returns nil —
+    /// loudly — when the file's keys do not bind the module completely: a
+    /// partially bound upsampler renders a periodic mesh (2026-08-01).
+    static func loadUpsampler(path: String, logger: Logger) -> LTX2LatentUpsampler? {
+        let up = LTX2LatentUpsampler()
+        guard let w = try? MLX.loadArrays(url: URL(fileURLWithPath: path)) else {
+            logger.error("LTX-2: upsampler file unreadable: \(path)")
+            return nil
+        }
+        // Checkpoint stores conv weights in PyTorch layout (out, in, *spatial);
+        // MLX conv layers are channels-last. Permute conv weights by ndim;
+        // 1D params pass through untouched. Sequential index 0 renames to the
+        // named `conv` child.
+        let remapped: [(String, MLXArray)] = w.map { (rawKey, v) in
+            let key = rawKey.hasPrefix("upsampler.0.")
+                ? "upsampler.conv." + rawKey.dropFirst("upsampler.0.".count)
+                : rawKey
+            if key.hasSuffix(".weight") {
+                if v.ndim == 5 { return (key, v.transposed(0, 2, 3, 4, 1)) }
+                if v.ndim == 4 { return (key, v.transposed(0, 2, 3, 1)) }
+            }
+            return (key, v)
+        }
+        let expected = Set(up.parameters().flattened().map { $0.0 })
+        let bound = remapped.filter { expected.contains($0.0) }.count
+        guard bound == expected.count else {
+            let sample = remapped.map(\.0).filter { !expected.contains($0) }.prefix(3)
+            logger.error("""
+                LTX-2: upsampler weights do NOT match the module — bound \(bound)/\(expected.count) \
+                parameters from \(w.count) file tensors (unmatched e.g. \(Array(sample))). \
+                Two-stage refine stays OFF; use the official Lightricks \
+                ltx-2.3-spatial-upscaler-x2-1.1.safetensors (bare keys, PyTorch layout).
+                """)
+            return nil
+        }
+        do {
+            try up.update(parameters: ModuleParameters.unflattened(remapped), verify: [.shapeMismatch])
+        } catch {
+            logger.error("LTX-2: upsampler update failed: \(error)")
+            return nil
+        }
+        MLX.eval(up.parameters())
+        logger.info("LTX-2: two-stage refine upsampler loaded (bound \(bound)/\(expected.count) parameters)")
+        return up
     }
 
     /// Free the loaded models.
@@ -441,30 +643,170 @@ public final class LTX2VideoGenerator {
         progress: ((Int, Int, Int, Int) -> Void)? = nil   // (chunk, totalChunks, step, totalSteps)
     ) throws -> LTX2VideoResult {
         #if canImport(CoreGraphics) && canImport(ImageIO)
+        // Memory-leak fix (2026-07-18): the video render path never freed MLX
+        // activation buffers, so idle mem climbed ~20GB -> 110GB+ across renders
+        // until every render hit `Memory pressure` mid-flight and the shedding
+        // corrupted the output into rainbow noise. Clear the MLX cache before
+        // (drop leftover image-gen buffers, freeing headroom) and after (this
+        // render's activations, via defer) EVERY render.
+        GPU.clearCache()
+        defer { GPU.clearCache() }
         try validate(request)
-        try load(loras: request.effectiveLoRAs)
+        // validate() has already rejected unsupported audio modes (i2v /
+        // multi-chunk), so this is simply the request flag.
+        let wantAudio = request.audio
+        try load(loras: request.effectiveLoRAs, audio: wantAudio)
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
+
+        // One greppable line per render: every Tier A/B param + provenance
+        // (task #9 Phase 1). Invalid resolutions log separately and LOUDLY.
+        // Phase 2: the TYPED resolution is authoritative — refresh it onto
+        // the pipeline so render code reads it instead of raw env (Codex
+        // finding #14). Request/preset tuning joins in the wire-format
+        // increment; until then this resolves configFile > env > builtin.
+        let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
+        pipeline.resolvedConfig = typedConfig
+        let resolved = typedConfig.params
+        // Finding #18: two_stage was load-time only — a request could not turn
+        // it on without a server restart. Lazy-load the upsampler on the first
+        // request that resolves twoStage=true.
+        if typedConfig.twoStage, pipeline.upsampler == nil,
+           !typedConfig.upsamplerPath.isEmpty,
+           FileManager.default.fileExists(atPath: typedConfig.upsamplerPath) {
+            pipeline.upsampler = Self.loadUpsampler(path: typedConfig.upsamplerPath, logger: logger)
+        }
+        let summary = resolved.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
+        logger.info("[LTX2] effective-config: \(summary)")
+        for p in resolved where !p.valid {
+            logger.error("[LTX2] CONFIG REJECTED: \(p.name) — \(p.note ?? "invalid") — using \(p.value) (\(p.source.rawValue))")
+        }
 
         let plan = Self.chunkPlan(
             framesPerChunk: request.framesPerChunk,
             extendToSeconds: request.extendToSeconds, fps: request.fps)
 
-        let batch = tokenizer.encode(prompt: request.prompt, maxLength: 128)
+        // Prompt-conditioned audio used to disappear silently when callers
+        // appended `audio:` after a long character/scene description: the
+        // tokenizer keeps the head and drops the tail. (The 128 cap that made
+        // this bite constantly was a port artifact, corrected to upstream's
+        // 1024 on 2026-08-07 — the guard remains as the backstop for prompts
+        // that exceed even the real cap, and for LTX2_GEMMA_MAX_LENGTH=128
+        // rollback runs.)
+        let guardedPrompt = try LTX2AudioPromptGuard.prepare(
+            prompt: request.prompt,
+            audio: wantAudio,
+            maxLength: tokenizer.maxLength,
+            tokenize: { tokenizer.untruncatedTokenIds(prompt: $0) })
+        let audioMarkerIndex = guardedPrompt.audioMarkerTokenIndex.map(String.init) ?? "null"
+        let promptFacts = [
+            "[LTX2] prompt-truncation:",
+            "pre_truncation_token_count=\(guardedPrompt.preTruncationTokenCount)",
+            "audio_marker_token_index=\(audioMarkerIndex)",
+            "quoted_line_present=\(guardedPrompt.quotedLinePresent)",
+            "quoted_line_survived=\(guardedPrompt.quotedLineSurvived)",
+            "effective_prompt_hash=\(guardedPrompt.effectivePromptHash)",
+            "reordered=\(guardedPrompt.reordered)",
+        ].joined(separator: " ")
+        logger.info("\(promptFacts)")
+
+        let batch = tokenizer.encode(prompt: guardedPrompt.effectivePrompt, maxLength: tokenizer.maxLength)
         MLX.eval(batch.inputIds, batch.attentionMask)
+
+        // Negative prompt: tokenize when provided, or default to the PinkCherry
+        // workflow negative when a CFG++ sampler is active (CFG++ requires a
+        // negative pass every step even at cfg=1).
+        let negText: String? = {
+            if let n = request.negativePrompt, !n.isEmpty { return n }
+            return pipeline.resolvedConfig.samplerIsCfgPP
+                ? "subtitle, caption, text, text on screen, watermark, logo, timestamp, distorted sound, saturated sound, loud noises, static"
+                : nil
+        }()
+        let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: tokenizer.maxLength) }
+        if let negBatch { MLX.eval(negBatch.inputIds, negBatch.attentionMask) }
 
         let start = CFAbsoluteTimeGetCurrent()
         var allFrames: [CGImage] = []
+        var audioLatents: MLXArray? = nil
+
+        // Center-crop a CGImage to the target aspect ratio, matching ComfyUI's
+        // ImageScale crop="center" (workflow nodes 7 and 19). Our plain resize
+        // STRETCHES on aspect mismatch — seed stills are often 9:16 (0.5625)
+        // against 384x640 (0.6), a ~7% vertical squash that distorts the
+        // conditioning content vs the workflow's crop.
+        func centerCropped(_ cg: CGImage, targetW: Int, targetH: Int) -> CGImage {
+            let srcW = Double(cg.width), srcH = Double(cg.height)
+            let targetAspect = Double(targetW) / Double(targetH)
+            let srcAspect = srcW / srcH
+            var cropW = srcW, cropH = srcH
+            if srcAspect > targetAspect {
+                cropW = srcH * targetAspect
+            } else {
+                cropH = srcW / targetAspect
+            }
+            let rect = CGRect(
+                x: ((srcW - cropW) / 2).rounded(.down),
+                y: ((srcH - cropH) / 2).rounded(.down),
+                width: cropW.rounded(), height: cropH.rounded())
+            return cg.cropping(to: rect) ?? cg
+        }
+
+        // Conditioning compression (libx264 CRF), function-scoped so BOTH the
+        // initial seed AND the chained continuation-chunk seeds get it. Chained
+        // seeds that skip it condition on a PRISTINE generated frame = the
+        // frozen-image regime → motion collapses across chunks (2026-07-26:
+        // comp30 chunk1 action-zone 6.11, chunks 2-3 crash to 2.2 because the
+        // chained frame was uncompressed). Higher = more motion.
+        let conditioningCompression = request.imgCompression
+            ?? pipeline.resolvedConfig.imgCompression
 
         // Seed image: the init image for I2V, else nil (T2V first chunk).
         var currentImage: MLXArray? = try request.initImagePath.map { path in
             let url = URL(fileURLWithPath: path)
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                  let rawImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 throw LTX2VideoError.imageLoadFailed(path)
             }
-            let pixels = try QwenImageIO.resizedPixelArray(
-                from: cgImage, width: request.width, height: request.height,
-                addBatchDimension: true, dtype: .float32)
+            // Workflow order (nodes 7 -> 8): center-crop + scale to the render
+            // size FIRST, then compression-preprocess at that size. Compressing
+            // at native resolution and downscaling after (the old order)
+            // changes the artifact character and stretches on aspect mismatch.
+            var cgImage = try QwenImageIO.resizedCGImage(
+                from: centerCropped(rawImage, targetW: request.width, targetH: request.height),
+                width: request.width, height: request.height)
+            // LTX conditioning preprocess (ComfyUI LTXVPreprocess, img_compression
+            // = libx264 CRF): round-trip the still through lossy compression so
+            // it carries codec-like artifacts. LTX is trained on VIDEO frames — a
+            // pristine still is out-of-distribution and the model freezes it
+            // (mannequin i2v, no locomotion). Measured on the same source/prompt/
+            // seed: ComfyUI (with preprocess) motion 2.24 vs ours (raw PNG) 1.07.
+            // LTX2_I2V_COMPRESSION=0 disables.
+            let compression = conditioningCompression
+            if compression > 0 {
+                // Prefer a REAL H.264 round-trip (matches ComfyUI's libx264
+                // preprocess artifact character); fall back to JPEG if the
+                // encode fails for any reason.
+                if let rt = try? LTX2PostProcess.h264RoundTrip(cgImage, compression: compression) {
+                    cgImage = rt
+                    logger.info("LTX-2 I2V: conditioning preprocess — H.264 round-trip (compression \(compression)).")
+                } else {
+                    let quality = max(0.05, 1.0 - Double(compression) / 100.0 * 1.4)
+                    let jpeg = NSMutableData()
+                    if let dest = CGImageDestinationCreateWithData(
+                        jpeg as CFMutableData, "public.jpeg" as CFString, 1, nil) {
+                        CGImageDestinationAddImage(dest, cgImage, [
+                            kCGImageDestinationLossyCompressionQuality: quality
+                        ] as CFDictionary)
+                        if CGImageDestinationFinalize(dest),
+                           let rtSource = CGImageSourceCreateWithData(jpeg as CFData, nil),
+                           let rtImage = CGImageSourceCreateImageAtIndex(rtSource, 0, nil) {
+                            cgImage = rtImage
+                            logger.info("LTX-2 I2V: conditioning preprocess — JPEG fallback q=\(String(format: "%.2f", quality)) (compression \(compression)).")
+                        }
+                    }
+                }
+            }
+            let pixels = try QwenImageIO.array(
+                from: cgImage, addBatchDimension: true, dtype: .float32)
             return QwenImageIO.normalizeForEncoder(pixels)
         }
 
@@ -472,6 +814,99 @@ public final class LTX2VideoGenerator {
         // continuation chunks (currentImage is overwritten with each
         // chunk\u{27}s last frame).
         let sourceImage: MLXArray? = currentImage
+
+        // Two-stage refine anchor: the RAW source (no compression preprocess)
+        // at 2x the base resolution, mirroring workflow nodes 19/20 — the
+        // refine re-anchors frame 0 to this for native high-res detail.
+        let refineAnchorImage: MLXArray? = try {
+            guard pipeline.resolvedConfig.twoStage,
+                  let path = request.initImagePath,
+                  let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            // Workflow node 19: center-crop + lanczos to 2x, RAW (no preprocess).
+            let pixels = try QwenImageIO.resizedPixelArray(
+                from: centerCropped(cgImage, targetW: request.width * 2, targetH: request.height * 2),
+                width: request.width * 2, height: request.height * 2,
+                addBatchDimension: true, dtype: .float32)
+            return QwenImageIO.normalizeForEncoder(pixels)
+        }()
+
+        // Face-anchor (#partnered): detect faces on the source once, build a
+        // latent-space mask so the denoise loop can hold EVERY face (esp. a
+        // stationary partner) across a long pass. Env-gated: LTX2_FACE_ANCHOR_STRENGTH.
+        // Face-region anchor defaults 0.5 for i2v — with IC-control it locks the
+        // FACE across the render (IC-control alone holds body/scene but the face
+        // drifts). Only engages when an init image is present. LTX2_FACE_ANCHOR_STRENGTH=0 disables.
+        let faceAnchorStrength = pipeline.resolvedConfig.faceAnchorStrength
+        var faceAnchorMask: MLXArray? = nil
+        if faceAnchorStrength > 0, let path = request.initImagePath,
+           let isrc = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+           let cg = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
+            var rects = (try? RegionMaskUtilities.detectFaceRects(in: cg)) ?? []
+            // Male-only anchor (LTX2_FACE_ANCHOR_MALE_ONLY=1, default on): the
+            // FEMALE subject (Kira) is already identity-held by her seed + LoRA,
+            // so anchoring her face is pure downside — it seams her skin at the
+            // mask boundary and damps her action motion. Only the MALE partner
+            // has no identity source and drifts. Heuristic: the largest face is
+            // the foreground female subject; drop it, anchor the rest (the
+            // peripheral male). Falls back to all-faces if only one detected.
+            if (ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_MALE_ONLY"] ?? "1") != "0" {
+                if rects.count > 1 {
+                    let largest = rects.max(by: { $0.width * $0.height < $1.width * $1.height })!
+                    rects = rects.filter { $0 != largest }
+                    logger.info("Face-anchor: male-only — anchoring \(rects.count) peripheral face(s), skipping primary subject.")
+                } else if rects.count == 1 {
+                    // Solo clip: the ONE detected face IS the primary subject. Anchoring
+                    // it pins the seed frame's features as a static ghost overlay while
+                    // the head moves (doubled nose/mouth — matched-seed A/B 2026-07-29:
+                    // anchor-off arm was clean AND livelier) and damps facial animation.
+                    // Identity is already held by the seed + LoRA; anchor nothing.
+                    // Partnered clips (2+ faces) keep the peripheral-face anchor above.
+                    rects = []
+                    logger.info("Face-anchor: single face = primary subject; anchoring nothing (solo ghost fix 2026-07-29).")
+                }
+            }
+            let latH = request.height / pipeline.spatialCompression
+            let latW = request.width / pipeline.spatialCompression
+            if !rects.isEmpty && latH > 0 && latW > 0 {
+                var mask = [Float](repeating: 0, count: latH * latW)
+                let pad: CGFloat = 0.35
+                for r in rects {
+                    let p = r.insetBy(dx: -r.width * pad, dy: -r.height * pad)
+                    let x0 = max(0, Int(p.minX * CGFloat(latW)))
+                    let x1 = min(latW, Int((p.minX + p.width) * CGFloat(latW) + 1))
+                    // Vision rects are bottom-left origin; latent rows are top-origin -> flip Y.
+                    let rowTop = max(0, Int((1.0 - (p.minY + p.height)) * CGFloat(latH)))
+                    let rowBot = min(latH, Int((1.0 - p.minY) * CGFloat(latH) + 1))
+                    if x1 > x0 && rowBot > rowTop {
+                        for row in rowTop..<rowBot { for col in x0..<x1 { mask[row * latW + col] = 1 } }
+                    }
+                }
+                // FEATHER the mask (LTX2_FACE_ANCHOR_FEATHER, default 2 cells):
+                // the hard 0->1 binary edge created a visible skin-tone SEAM at
+                // the mask boundary (the anchored region holds while the body
+                // diverges, meeting at a line). Box-blur the mask to a smooth
+                // falloff so anchoring fades gradually — no seam. Multiple 3-tap
+                // passes approximate a Gaussian over the small latent grid.
+                let feather = Int(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_FEATHER"] ?? "") ?? 2
+                for _ in 0..<max(0, feather) {
+                    var blurred = mask
+                    for row in 0..<latH {
+                        for col in 0..<latW {
+                            var acc: Float = 0; var cnt: Float = 0
+                            for dr in -1...1 { for dc in -1...1 {
+                                let rr = row+dr, cc = col+dc
+                                if rr>=0 && rr<latH && cc>=0 && cc<latW { acc += mask[rr*latW+cc]; cnt += 1 }
+                            }}
+                            blurred[row*latW+col] = acc/cnt
+                        }
+                    }
+                    mask = blurred
+                }
+                faceAnchorMask = MLXArray(mask, [1, 1, 1, latH, latW])
+                logger.info("Face-anchor: \(rects.count) face(s) detected, strength \(faceAnchorStrength)")
+            }
+        }
 
         for chunk in 0..<plan.totalChunks {
             let chunkSeed = request.seed + UInt64(chunk)
@@ -493,6 +928,36 @@ public final class LTX2VideoGenerator {
                         ],
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        guidance: request.guidance,
+                        negativeInputIds: negBatch?.inputIds,
+                        negativeAttentionMask: negBatch?.attentionMask,
+                        progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
+                } else if request.identityAnchorStrength > 0,
+                          request.identityReAnchorInterval > 0,
+                          request.framesPerChunk > request.identityReAnchorInterval + 1,
+                          let src = sourceImage {
+                    // Single/long first pass: with only a frame-0 anchor, peripheral
+                    // subjects (a partner's face) drift and melt over the pass. Re-splice
+                    // the ORIGINAL source at fixed intervals at reduced strength — soft
+                    // identity pulls that hold EVERY face across the whole pass without
+                    // freezing motion. Same primitive as the continuation-chunk anchor.
+                    var keyframes: [LTX2Pipeline.Keyframe] = [
+                        .init(image: image, videoFrameIndex: 0, strength: request.strength)
+                    ]
+                    var f = request.identityReAnchorInterval
+                    while f < request.framesPerChunk - 1 {
+                        keyframes.append(.init(image: src, videoFrameIndex: f,
+                                               strength: request.identityAnchorStrength))
+                        f += request.identityReAnchorInterval
+                    }
+                    output = pipeline.generateMultiKeyframe(
+                        inputIds: batch.inputIds, attentionMask: batch.attentionMask,
+                        keyframes: keyframes,
+                        width: request.width, height: request.height,
+                        numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        guidance: request.guidance,
+                        negativeInputIds: negBatch?.inputIds,
+                        negativeAttentionMask: negBatch?.attentionMask,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 } else {
                     output = pipeline.generateI2V(
@@ -500,6 +965,14 @@ public final class LTX2VideoGenerator {
                         image: image, strength: request.strength,
                         width: request.width, height: request.height,
                         numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                        guidance: request.guidance,
+                        negativeInputIds: negBatch?.inputIds,
+                        negativeAttentionMask: negBatch?.attentionMask,
+                        faceAnchorMask: chunk == 0 ? faceAnchorMask : nil,
+                        faceAnchorStrength: faceAnchorStrength,
+                        refineAnchorImage: chunk == 0 ? refineAnchorImage : nil,
+                        audioSeconds: wantAudio && chunk == 0
+                            ? Float(request.framesPerChunk) / Float(request.fps) : nil,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 }
             } else {
@@ -507,24 +980,137 @@ public final class LTX2VideoGenerator {
                     inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                     width: request.width, height: request.height,
                     numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
+                    // Every i2v variant above forwards request.guidance; this call
+                    // omitted it, so the daemon's T2V_GUIDANCE=3.5 (Todd 2026-07-30)
+                    // silently fell back to the distilled default 1.0 — t2v ran
+                    // with CFG OFF in prod for three days (found 2026-08-02 while
+                    // chasing extra limbs; cfg 1.0 under-drives t2v anatomy).
+                    guidance: request.guidance,
+                    negativeInputIds: negBatch?.inputIds,
+                    negativeAttentionMask: negBatch?.attentionMask,
+                    audioSeconds: wantAudio && chunk == 0
+                        ? Float(request.framesPerChunk) / Float(request.fps) : nil,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 
-            let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded)
+            let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded, colorAnchor: pipeline.resolvedConfig.colorAnchor)
             allFrames.append(contentsOf: chunk == 0 ? chunkFrames : Array(chunkFrames.dropFirst()))
+            if let al = output.audioLatents { audioLatents = al }
 
             // Re-feed the last frame as the seed for the next continuation chunk.
             if chunk < plan.totalChunks - 1 {
                 let t = output.decoded.dim(2)
-                let lastFrame = output.decoded[0..., 0..., (t - 1)..<t, 0..., 0...].squeezed(axis: 2)
+                var lastFrame = output.decoded[0..., 0..., (t - 1)..<t, 0..., 0...].squeezed(axis: 2)
+                // Two-stage refine decodes at 2x the base resolution. The
+                // chained seed MUST be at base resolution: feeding the 2x frame
+                // VAE-encodes to a conditioning latent at 2x latent dims and
+                // applyConditioning fatalErrors on the shape mismatch —
+                // instant process death, no log. EVERY multi-chunk crash of
+                // 2026-07-25/26 (10:48, 01:28, 02:57, 03:16) died exactly here,
+                // seconds after "Encoding N keyframe image(s)".
+                if lastFrame.dim(2) != request.height || lastFrame.dim(3) != request.width {
+                    let squeezed = lastFrame.squeezed(axis: 0)
+                    let resized = try QwenImageIO.resize(
+                        rgbArray: squeezed,
+                        targetHeight: request.height, targetWidth: request.width)
+                    // Lanczos overshoot can leave values outside [0,1]; the
+                    // *2-1 normalization below would push them out of the
+                    // VAE's expected range (Codex review 2026-07-26).
+                    lastFrame = MLX.clip(resized.expandedDimensions(axis: 0), min: MLXArray(Float(0)), max: MLXArray(Float(1)))
+                    logger.info("Chunk seed downscaled from refine resolution to \(request.width)x\(request.height) for chaining")
+                }
+                // Apply the SAME conditioning compression the initial seed got,
+                // so continuation chunks read the chained frame as mid-motion
+                // video (not a pristine still that freezes). Round-trip the
+                // [0,1] frame through H.264; fall back to the raw frame if the
+                // codec path fails (never block a render on the preprocess).
+                if conditioningCompression > 0,
+                   let cg = try? QwenImageIO.image(from: lastFrame),
+                   let rt = try? LTX2PostProcess.h264RoundTrip(cg, compression: conditioningCompression),
+                   let arr = try? QwenImageIO.array(from: rt, addBatchDimension: true, dtype: .float32) {
+                    // array(from:) yields [1,3,H,W] in [0,1]; match lastFrame layout.
+                    lastFrame = MLX.clip(arr, min: MLXArray(Float(0)), max: MLXArray(Float(1)))
+                    logger.info("Chunk seed: conditioning compression \(conditioningCompression) applied for chaining")
+                }
                 currentImage = lastFrame * 2.0 - 1.0
                 MLX.eval(currentImage!)
+
+                // Chunk-boundary drain (#34): the next chunk starts with the
+                // previous chunk's decode intermediates (up to ~35GB at the
+                // large formats) still in the MLX pool + lazily-reclaimed by
+                // macOS. The per-JOB admission drain never sees this boundary.
+                // A FIXED 3s settle proved insufficient at 12s/9:16 scale
+                // (2026-07-26 01:28: chunk 1's 18,928-volume decode -> chunk 2
+                // Metal-aborted 5s in). Drain adaptively like admission: drop
+                // the pool and re-probe until real headroom exists, up to ~24s.
+                // The free-memory probe LIES right after a large decode
+                // (lazy reclaim): 2026-07-26 02:57 it reported 47GB free at
+                // round 0, the threshold check passed with zero settling, and
+                // chunk 2 Metal-aborted 7s later. Settle a minimum number of
+                // rounds unconditionally, then keep going until real headroom.
+                MLX.GPU.clearCache()
+                var chunkFree = MemoryProbe.systemAvailableMemoryBytes()
+                let chunkHeadroom: UInt64 = 40 * 1024 * 1024 * 1024
+                var settleRounds = 0
+                while settleRounds < 3 || (chunkFree < chunkHeadroom && settleRounds < 10) {
+                    Thread.sleep(forTimeInterval: 3.0)
+                    MLX.GPU.clearCache()
+                    chunkFree = MemoryProbe.systemAvailableMemoryBytes()
+                    settleRounds += 1
+                }
+                logger.info("Chunk-boundary drain: \(chunkFree >> 20)MB free after \(settleRounds) settle round(s) (#34)")
+            }
+        }
+
+        // Use the ACTUAL decoded frame dimensions, not the request dims. With
+        // two-stage refine on, frames come back at 2x (e.g. 448x768 -> 896x1536);
+        // passing request.width/height here would downscale them and throw away
+        // all the refine detail. framesToImages carries per-frame dims.
+        let outW = allFrames.first?.width ?? request.width
+        let outH = allFrames.first?.height ?? request.height
+
+        // Audio decode (task #21): final audio latents -> 48kHz stereo via the
+        // reference-parity codec chain, muxed as AAC. Decode failure degrades
+        // to a video-only file rather than failing the render.
+        var audioTrack: LTX2PostProcess.AudioTrack? = nil
+        if let al = audioLatents {
+            do {
+                if audioVAE == nil {
+                    logger.info("LTX-2 audio: binding audio VAE + vocoder from monolith…")
+                    audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
+                }
+                if let av = audioVAE {
+                    let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N) @48k
+                    var clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
+                    // Trim to the actual video duration (ceil(s*25) latent
+                    // quantization overshoots; Codex #8). Shorter audio is
+                    // left as-is — AAC tolerates a short tail.
+                    let videoSamples = Int((Double(allFrames.count) / Double(request.fps) * 48000).rounded(.up))
+                    if clamped.dim(1) > videoSamples {
+                        clamped = clamped[0..., 0..<videoSamples]
+                    }
+                    // In-engine mastering (task #26): rumble cut, BWE de-harsh,
+                    // loudness raise with soft ceiling. LTX2_AUDIO_ENHANCE=0
+                    // keeps the raw track (A/B + training-data use).
+                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" {
+                        clamped = LTX2AudioEnhance.process(clamped, sampleRate: 48000)
+                        logger.info("LTX-2 audio: enhancement chain applied (hp50 + dip7.5k + loudnorm).")
+                    }
+                    eval(clamped)
+                    audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: 48000)
+                    logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / 48000.0))s stereo).")
+                }
+            } catch {
+                logger.error("LTX-2 audio: decode failed (\(error)) — writing video-only output.")
             }
         }
 
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
-            fps: request.fps, width: request.width, height: request.height)
+            fps: request.fps, width: outW, height: outH,
+            bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
+            audio: audioTrack,
+            deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge)
 
         return LTX2VideoResult(
             outputPath: request.outputPath,

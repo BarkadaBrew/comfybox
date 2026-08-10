@@ -7,7 +7,8 @@ let package = Package(
   products: [
     .library(name: "ZImage", targets: ["ZImage"]),
     .executable(name: "ComfyBox", targets: ["ComfyBox"]),
-    .executable(name: "ComfyBoxDesktop", targets: ["ComfyBoxDesktop"])
+    .executable(name: "ComfyBoxDesktop", targets: ["ComfyBoxDesktop"]),
+    .executable(name: "ComfyBoxGallery", targets: ["ComfyBoxGallery"])
   ],
   dependencies: [
     .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.29.1")),
@@ -37,8 +38,18 @@ let package = Package(
     ),
     .executableTarget(
       name: "ComfyBoxDesktop",
-      dependencies: ["ZImage"],
+      dependencies: ["ZImage", "ComfyBoxCatalog"],
       path: "Sources/ComfyBoxDesktop"
+    ),
+    .target(
+      name: "ComfyBoxCatalog",
+      dependencies: [],
+      path: "Sources/ComfyBoxCatalog"
+    ),
+    .executableTarget(
+      name: "ComfyBoxGallery",
+      dependencies: ["ComfyBoxCatalog"],
+      path: "Sources/ComfyBoxGallery"
     ),
     .testTarget(
       name: "ZImageTests",
@@ -71,6 +82,11 @@ let package = Package(
       name: "ComfyBoxDesktopTests",
       dependencies: ["ComfyBoxDesktop"],
       path: "Tests/ComfyBoxDesktopTests"
+    ),
+    .testTarget(
+      name: "ComfyBoxCatalogTests",
+      dependencies: ["ComfyBoxCatalog"],
+      path: "Tests/ComfyBoxCatalogTests"
     )
   ]
 )

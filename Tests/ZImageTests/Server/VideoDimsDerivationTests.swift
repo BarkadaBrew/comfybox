@@ -93,4 +93,43 @@ extension VideoDimsDerivationTests {
     XCTAssertEqual(WarmServer.extendSecondsFromDuration(12, framesPerChunk: 97, fps: 24), 12)
     XCTAssertEqual(WarmServer.extendSecondsFromDuration(20, framesPerChunk: 97, fps: 24), 20)
   }
+
+  // MARK: two-stage stage-1 resolution (2026-08-02 regression)
+  //
+  // The refine only SHARPENS what stage 1 painted. Halving a request sized for
+  // the old single-pass convention silently dropped Kira's painted resolution
+  // from 704x448 to 384x256 and her output went diffuse. Every render validated
+  // that day asked for 960x576 — which halves comfortably — so the regression
+  // was invisible in testing. These pin the behaviour at HER size first.
+
+  func testKiraSizedRequestIsNotHalvedBelowTheFloor() {
+    // 704x448 -> would paint 384x256 (98k px), under the 512x320 floor.
+    let r = WarmServer.stageOneDims(finalWidth: 704, finalHeight: 448)
+    XCTAssertFalse(r.halved, "704x448 must NOT be halved — it paints too small")
+    XCTAssertEqual(r.width, 704)
+    XCTAssertEqual(r.height, 448)
+  }
+
+  func testValidatedSizeStillHalves() {
+    // 960x576 -> 512x320 (164k px), at/above the floor: the size validated
+    // against the render Todd approved, which must keep behaving as before.
+    let r = WarmServer.stageOneDims(finalWidth: 960, finalHeight: 576)
+    XCTAssertTrue(r.halved)
+    XCTAssertEqual(r.width, 512)
+    XCTAssertEqual(r.height, 320)
+  }
+
+  func testAuthorScaleRequestHalves() {
+    // The reference setup: 1536 longer edge, stage 1 lands near 768x432.
+    let r = WarmServer.stageOneDims(finalWidth: 1536, finalHeight: 896)
+    XCTAssertTrue(r.halved)
+    XCTAssertEqual(r.width, 768)
+    XCTAssertEqual(r.height, 448)
+  }
+
+  func testFloorBoundaryIsInclusive() {
+    // Exactly 1024x640 -> 512x320 = the floor itself; must still halve.
+    let r = WarmServer.stageOneDims(finalWidth: 1024, finalHeight: 640)
+    XCTAssertTrue(r.halved, "a request landing exactly on the floor should halve")
+  }
 }

@@ -91,6 +91,7 @@ struct ServerHealthResponse: Decodable {
     let modelFamily: String?
     let loaded: Bool?
     let isRendering: Bool?
+    let isPaused: Bool?
     let pendingCount: Int?
     let renderCount: Int?
     let uptimeSeconds: Int?
@@ -105,6 +106,7 @@ struct ServerHealthResponse: Decodable {
         case status, model, loaded, loras
         case modelFamily = "model_family"
         case isRendering = "is_rendering"
+        case isPaused = "is_paused"
         case pendingCount = "pending_count"
         case renderCount = "render_count"
         case uptimeSeconds = "uptime_seconds"
@@ -216,6 +218,10 @@ public final class EngineService {
     public var currentModel: String?
     public var currentModelFamily: String?
     public var queueCount: Int = 0
+    /// Engine-level creation gate, mirrored from /health `is_paused` every
+    /// poll — so a pause toggled from ANY surface (toolbar, HTTP API, MCP)
+    /// shows truthfully here within one poll cycle.
+    public var queuePaused: Bool = false
     /// Counter rather than a bool so a queued/background generate() running
     /// alongside the foreground one doesn't clear this out from under it —
     /// isGenerating stays true until the LAST concurrent call finishes.
@@ -233,6 +239,12 @@ public final class EngineService {
     // LoRA state
     public var availableLoras: [LoRAInfo] = []
     public var activeLoraIds: [String] = []
+    /// Why the LoRA catalog is empty, WHEN it is empty because the fetch failed
+    /// rather than because there are genuinely no LoRAs. Every failure path in
+    /// refreshLoras() used to return silently, so a server-side fault (e.g.
+    /// /v1/loras hanging) presented as a permanently empty list with no
+    /// explanation and no retry (observed 2026-08-10).
+    public var loraLoadError: String?
     public var isSwappingLoras: Bool = false
 
     // Queue state
@@ -289,10 +301,21 @@ public final class EngineService {
             }
 
             // Poll every 3 seconds.
+            var sinceLoraRetry = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3))
                 if Task.isCancelled { break }
                 await self?.pollHealth()
+                // Self-heal the catalog. refreshLoras() ran ONCE on connect, so a
+                // failure there left the list empty until the app was restarted.
+                // Retry ~every 30s while it is empty or errored; a healthy,
+                // populated catalog costs nothing.
+                sinceLoraRetry += 1
+                if sinceLoraRetry >= 10, let self = self, self.connectionState.isConnected,
+                   self.availableLoras.isEmpty || self.loraLoadError != nil {
+                    sinceLoraRetry = 0
+                    await self.refreshLoras()
+                }
             }
         }
     }
@@ -574,6 +597,42 @@ public final class EngineService {
         await refreshPool()
     }
 
+    // MARK: - Creation controls (pause / purge)
+
+    /// Pause or resume ALL creation at the engine. The gate is engine-side and
+    /// persistent, so it stops every initiator — schedulers on the server,
+    /// chat tools, gallery buttons, direct API/MCP callers — and survives an
+    /// engine restart. The current job finishes; nothing new starts.
+    public func setCreationPaused(_ paused: Bool) async throws {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (status, responseData) = try await client.post(paused ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
+        guard status == 200 else {
+            let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
+            throw EngineServiceError.serverError(status, errorMessage)
+        }
+        queuePaused = paused   // optimistic; the next health poll confirms
+    }
+
+    /// Purge the queue: drop every pending job AND interrupt the in-flight
+    /// render. Interrupt-after-clear order matters — clearing first means the
+    /// interrupted job cannot be followed by the next pending one.
+    public func purgeQueue() async throws {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (clearStatus, clearData) = try await client.post("/v1/queue/clear", body: Data())
+        guard clearStatus == 200 else {
+            let errorMessage = parseErrorMessage(from: clearData) ?? "Server returned status \(clearStatus)"
+            throw EngineServiceError.serverError(clearStatus, errorMessage)
+        }
+        // Best-effort: no job may be running, and an interrupt on an idle
+        // engine is not an error worth surfacing.
+        _ = try? await client.post("/v1/queue/interrupt", body: Data())
+        queueCount = 0
+    }
+
     // MARK: - LoRA Management
 
     /// Fetch the list of available LoRAs from the server's library.
@@ -582,11 +641,18 @@ public final class EngineService {
 
         do {
             let (status, data) = try await client.get("/v1/loras")
-            guard status == 200 else { return }
+            guard status == 200 else {
+                loraLoadError = "LoRA list failed: server returned \(status)"
+                return
+            }
 
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let loras = json["loras"] as? [[String: Any]],
-                  let activeLoras = json["active_loras"] as? [String] else { return }
+                  let activeLoras = json["active_loras"] as? [String] else {
+                loraLoadError = "LoRA list failed: unreadable response"
+                return
+            }
+            loraLoadError = nil
 
             activeLoraIds = activeLoras
 
@@ -597,7 +663,11 @@ public final class EngineService {
                 return LoRAInfo(
                     id: id,
                     filename: filename,
-                    modelCompatibility: (dict["model_compatibility"] as? String) ?? "unknown",
+                    // The server sends an ARRAY (e.g. ["ltx"]); the String cast alone
+                    // failed for every entry, so all 195 LoRAs fell into "Uncategorized".
+                    modelCompatibility: (dict["model_compatibility"] as? String)
+                        ?? (dict["model_compatibility"] as? [String])?.joined(separator: ", ")
+                        ?? "unknown",
                     format: (dict["format"] as? String) ?? "unknown",
                     rank: (dict["rank"] as? Int) ?? 0,
                     sizeBytes: (dict["size_bytes"] as? Int) ?? 0,
@@ -610,7 +680,10 @@ public final class EngineService {
                 )
             }
         } catch {
-            // Non-fatal.
+            // Non-fatal for rendering, but the user must not be shown a silently
+            // empty catalog — record it so the UI can say so and the poll loop
+            // can retry.
+            loraLoadError = "LoRA list failed: \(error.localizedDescription)"
         }
     }
 
@@ -662,6 +735,7 @@ public final class EngineService {
             connectionState = .connected
             currentModel = health.model
             currentModelFamily = health.modelFamily
+            queuePaused = health.isPaused ?? false
             let pending = health.pendingCount ?? 0
             let rendering = (health.isRendering ?? false) ? 1 : 0
             queueCount = pending + rendering
@@ -713,6 +787,85 @@ public final class EngineService {
 
     /// Send a prompt to the server's LLM enhancement endpoint.
     /// Returns the enhanced prompt string on success.
+    /// Full enhance result with lineage (task #19): the optimized prompt plus
+    /// the server-minted attempt id, outcome, and template provenance.
+    public struct EnhanceOutcome: Sendable {
+        public let prompt: String
+        public let enhanced: Bool
+        public let attemptId: String?
+        public let outcome: String?
+        public let templateId: String?
+        public let templateHash: String?
+    }
+
+    public func enhancePromptDetailed(
+        _ prompt: String, contentMode: ContentMode = .neutral, mediaKind: String = "video"
+    ) async throws -> EnhanceOutcome {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        var dict = Self.attachingContentMode(["prompt": prompt], mode: contentMode)
+        dict["media_kind"] = mediaKind
+        let bodyData = try JSONSerialization.data(withJSONObject: dict)
+        let (status, responseData) = try await client.post("/v1/enhance", body: bodyData)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: responseData) ?? "enhance failed")
+        }
+        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let enhanced = json["prompt"] as? String else {
+            throw EngineServiceError.generationFailed("Invalid enhance response")
+        }
+        return EnhanceOutcome(
+            prompt: enhanced,
+            enhanced: json["enhanced"] as? Bool ?? true,
+            attemptId: json["optimization_attempt_id"] as? String,
+            outcome: json["optimizer_outcome"] as? String,
+            templateId: json["template_id"] as? String,
+            templateHash: json["template_hash"] as? String)
+    }
+
+    public struct RenderTraceSummary: Codable, Sendable, Identifiable {
+        public let renderId: String
+        public let taskKind: String
+        public let events: [String]
+        public let submittedAt: Date?
+        public let status: String
+        public let prompt: String?
+        public let outputPath: String?
+        public let optimizationAttemptId: String?
+        public let config: String?
+        public let error: String?
+        public let rating: String?
+        public var id: String { renderId }
+    }
+
+    /// Newest-first render traces (task #19 Prompt Lab feed).
+    public func fetchRenderTraces(limit: Int = 50) async -> [RenderTraceSummary] {
+        guard let client = client, connectionState.isConnected else { return [] }
+        do {
+            let (status, data) = try await client.get("/v1/video/traces?limit=\(limit)")
+            guard status == 200 else { return [] }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            decoder.dateDecodingStrategy = .iso8601
+            struct Wrapper: Decodable { let traces: [RenderTraceSummary] }
+            return try decoder.decode(Wrapper.self, from: data).traces
+        } catch { return [] }
+    }
+
+    /// Promote a trace's prompt pair into the optimizer exemplar set.
+    public func promoteTraceExemplar(renderId: String) async {
+        guard let client = client, connectionState.isConnected else { return }
+        _ = try? await client.post("/v1/video/traces/\(renderId)/promote", body: Data("{}".utf8))
+    }
+
+    /// Append a human verdict to a trace.
+    public func rateRenderTrace(renderId: String, vote: String, axis: String = "overall") async {
+        guard let client = client, connectionState.isConnected else { return }
+        let body = try? JSONSerialization.data(withJSONObject: ["vote": vote, "axis": axis])
+        _ = try? await client.post("/v1/video/traces/\(renderId)/rating", body: body ?? Data())
+    }
+
     public func enhancePrompt(_ prompt: String, contentMode: ContentMode = .neutral) async throws -> String {
         guard let client = client, connectionState.isConnected else {
             throw EngineServiceError.notConnected
@@ -982,13 +1135,19 @@ public final class EngineService {
         /// still work for a single ad-hoc LoRA.
         public var loras: [LoRASelection]
         public var outputPath: String
+        /// Tier A tuning overrides (task #9 Phase 3) — snake_case keys as the
+        /// server's LTX2VideoTuning expects; nil entries omitted.
+        public var tuning: [String: Any]?
+        /// Lineage reference from /v1/enhance (task #19).
+        public var optimizationAttemptId: String?
 
         public init(
             prompt: String, initImagePath: String? = nil,
             width: Int = 704, height: Int = 448, frames: Int = 97,
             steps: Int = 8, seed: UInt64 = 42, strength: Float = 1.0,
             extendToSeconds: Float = 0, loraPath: String? = nil,
-            loraStrength: Float = 1.0, loras: [LoRASelection] = [], outputPath: String
+            loraStrength: Float = 1.0, loras: [LoRASelection] = [], outputPath: String,
+            tuning: [String: Any]? = nil, optimizationAttemptId: String? = nil
         ) {
             self.prompt = prompt; self.initImagePath = initImagePath
             self.width = width; self.height = height; self.frames = frames
@@ -997,6 +1156,8 @@ public final class EngineService {
             self.loraPath = loraPath; self.loraStrength = loraStrength
             self.loras = loras
             self.outputPath = outputPath
+            self.tuning = tuning
+            self.optimizationAttemptId = optimizationAttemptId
         }
     }
 
@@ -1049,6 +1210,12 @@ public final class EngineService {
             // Same convention as image LoRA swap: the server resolves by
             // filename, not the slugified library id.
             body["loras"] = request.loras.map { ["path": $0.filename, "scale": $0.scale] }
+        }
+        if let tuning = request.tuning, !tuning.isEmpty {
+            body["tuning"] = tuning
+        }
+        if let attemptId = request.optimizationAttemptId {
+            body["optimization_attempt_id"] = attemptId
         }
         return body
     }
@@ -1290,6 +1457,22 @@ public final class EngineService {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             return try decoder.decode([ServerPreset].self, from: data)
+        } catch {
+            return []
+        }
+    }
+
+    /// Effective LTX-2 video config with per-parameter provenance
+    /// (GET /v1/video/config/effective, task #9 Phase 1).
+    public func fetchEffectiveVideoConfig() async -> [EffectiveVideoParam] {
+        guard let client = client, connectionState.isConnected else { return [] }
+        do {
+            let (status, data) = try await client.get("/v1/video/config/effective")
+            guard status == 200 else { return [] }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            struct Wrapper: Decodable { let params: [EffectiveVideoParam] }
+            return try decoder.decode(Wrapper.self, from: data).params
         } catch {
             return []
         }

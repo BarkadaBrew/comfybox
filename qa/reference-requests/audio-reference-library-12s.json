@@ -1,0 +1,14 @@
+{
+  "_comment": "KNOWN-GOOD audio reference request (Todd's verdict 2026-08-05: 'audio is perfect'). Output: ~/Pictures/ComfyBox/audio-REFERENCE-v2-cleanlimiter.mp4. ~60 prompt tokens — safely inside the 128-token cap, which is WHY its quoted lines reach the model while Kira's (character-injected, clause appended last) do not. Note: 'rain begin' produced NO rain — prose cannot place a sound in time (see task #24 Director timeline audio). 12s renders take ~55 min; use the 4s variant below for iteration.",
+  "prompt": "a woman sits in a quiet library reading nook. she closes her book, looks up and says softly \"the next chapter is my favorite\", pauses in the silence listening to the rain begin outside the window, then whispers \"you should read it too\" and smiles. hushed room, gentle rain against glass, a single page turn, no music",
+  "width": 480,
+  "height": 832,
+  "frames": 289,
+  "steps": 16,
+  "seed": 2718,
+  "fps": 24,
+  "audio": true,
+  "enhance": false,
+  "source": "audio-diag",
+  "output_path": "/Users/toddwalderman/Pictures/ComfyBox/audio-REFERENCE-v2-cleanlimiter.mp4"
+}

@@ -56,15 +56,30 @@ public struct LTX2AudioVAEConfig {
 public final class LTX2AudioConvWrapper: Module {
   @ModuleInfo(key: "conv") var conv: Conv2d
 
+  let kernelSize: Int
+
   public init(_ inChannels: Int, _ outChannels: Int, kernelSize: Int = 3) {
-    let pad = kernelSize / 2
+    self.kernelSize = kernelSize
+    // Padding is applied MANUALLY: causal (front-only) on TIME, symmetric on
+    // FREQ — reference CausalConv2d with causality_axis=HEIGHT, where height
+    // is time. Internal layout: (B, T, F, C).
     self._conv.wrappedValue = Conv2d(
       inputChannels: inChannels, outputChannels: outChannels,
-      kernelSize: IntOrPair(kernelSize), padding: IntOrPair(pad))
+      kernelSize: IntOrPair(kernelSize), padding: IntOrPair(0))
     super.init()
   }
 
-  public func callAsFunction(_ x: MLXArray) -> MLXArray { conv(x) }
+  public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    guard kernelSize > 1 else { return conv(x) }
+    let k = kernelSize - 1
+    let padded = MLX.padded(x, widths: [
+      IntOrPair((0, 0)),          // B
+      IntOrPair((k, 0)),          // T: full pad FRONT (causal)
+      IntOrPair((k / 2, k - k / 2)),  // F: symmetric
+      IntOrPair((0, 0)),          // C
+    ])
+    return conv(padded)
+  }
 }
 
 // MARK: - Resnet block (PixelNorm + SiLU)
@@ -126,9 +141,13 @@ public final class LTX2AudioUpsample: Module {
   }
 
   public func callAsFunction(_ x: MLXArray) -> MLXArray {
-    var h = MLX.repeated(x, count: 2, axis: 1)   // F
-    h = MLX.repeated(h, count: 2, axis: 2)       // T
-    return conv(h)
+    var h = MLX.repeated(x, count: 2, axis: 1)   // T
+    h = MLX.repeated(h, count: 2, axis: 2)       // F
+    h = conv(h)
+    // Causal: drop the FIRST time element to undo the encoder-side padding
+    // (reference Upsample: x[:, :, 1:, :] on the causal axis). Two decoder
+    // levels turn T latents into 4T-3 mel frames exactly.
+    return h[0..., 1..., 0..., 0...]
   }
 }
 
@@ -289,6 +308,9 @@ public final class LTX2AudioVAE: Module {
 
   public let config: LTX2AudioVAEConfig
 
+  /// Bound by `load(path:)` for full-chain decode; nil for VAE-only use.
+  public var vocoder: LTX2Vocoder?
+
   public init(config: LTX2AudioVAEConfig = LTX2AudioVAEConfig()) {
     self.config = config
     self._encoder.wrappedValue = LTX2AudioEncoder(config: config)
@@ -384,6 +406,64 @@ extension LTX2AudioVAE {
     let params = ModuleParameters.unflattened(remapped.map { ($0.0, $0.1) })
     try update(parameters: params, verify: [.shapeMismatch])
     return (matched, moduleKeys.count)
+  }
+}
+
+// MARK: - Reference-layout codec APIs (task #21 parity)
+
+extension LTX2AudioVAE {
+  /// Load the standalone reference checkpoint (audio_vae.* + vocoder.* keys):
+  /// binds the VAE half AND the vocoder chain, both coverage-guarded.
+  public static func load(path: String, logger: Logger = Logger(label: "ltx2.audio-vae")) throws -> LTX2AudioVAE {
+    let tensors = try MLX.loadArrays(url: URL(fileURLWithPath: path)).mapValues { $0.asType(.float32) }
+    let vae = LTX2AudioVAE()
+    try vae.loadWeightsFromTensors(tensors: tensors, logger: logger)
+    let voc = LTX2Vocoder()
+    try voc.loadWeightsFromTensors(tensors: tensors, logger: logger)
+    vae.vocoder = voc
+    eval(vae.parameters())
+    eval(voc.parameters())
+    return vae
+  }
+
+  /// Full reference decode: normalized latent (B,C,T,F) → mel → base vocoder
+  /// → BWE → 48 kHz stereo waveform (B, 2, samples). Mirrors
+  /// AudioVAE.decode + run_vocoder: mel (B,2,T,F) transposes to (B,2,F,T),
+  /// stereo-folds to [B,128,T], then the full BWE chain.
+  public func decodeToWaveform(_ zNormalized: MLXArray) -> MLXArray {
+    guard let vocoder else {
+      fatalError("decodeToWaveform requires load(path:) — vocoder not bound")
+    }
+    let mel = decodeToMel(zNormalized)                 // (B, 2, T, F)
+    let bft = mel.transposed(0, 1, 3, 2)               // (B, 2, F, T)
+    let folded = MLX.concatenated([bft[0..., 0], bft[0..., 1]], axis: 1)  // [B, 128, T]
+    return vocoder.synthesizeFull(folded)
+  }
+
+  /// Per-channel latent denormalization: `z * std + mean` where the 128-long
+  /// statistics vectors are the FLATTENED (c f) token layout (reference
+  /// AudioPatchifier: b c t f -> b t (c f)). Input/output: (B, C, T, F).
+  public func denormalize(_ z: MLXArray) -> MLXArray {
+    let c = z.dim(1), f = z.dim(3)
+    let std = perChannelStatistics.std.reshaped([1, c, 1, f])
+    let mean = perChannelStatistics.mean.reshaped([1, c, 1, f])
+    return z * std + mean
+  }
+
+  /// Full reference decode contract: normalized latent (B, C, T, F) ->
+  /// denorm -> causal decode -> mel (B, 2, 4T-3, melBins).
+  public func decodeToMel(_ zNormalized: MLXArray) -> MLXArray {
+    let t = zNormalized.dim(2)
+    let zDenorm = denormalize(zNormalized)
+    // Internal layout: (B, T, F, C) — time as the causal height axis.
+    let nhwc = zDenorm.transposed(0, 2, 3, 1)
+    var melNHWC = decoder(nhwc)                       // (B, T', F', 2)
+    // Reference _adjust_output_shape: crop to (2, 4T-3, melBins). The two
+    // causal upsample drops land T' = 4T-3 exactly; freq crops to mel bins.
+    let targetT = 4 * t - 3
+    let melBins = 64
+    melNHWC = melNHWC[0..., 0..<min(melNHWC.dim(1), targetT), 0..<min(melNHWC.dim(2), melBins), 0..<2]
+    return melNHWC.transposed(0, 3, 1, 2)             // (B, 2, T, F)
   }
 }
 

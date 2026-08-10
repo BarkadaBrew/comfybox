@@ -54,12 +54,18 @@ public struct LoRAWeights: @unchecked Sendable {
     /// `alpha` was defaulted to `rank` (effective scale 1.0).
     private let explicitAlpha: Float?
 
+    /// Bare-parameter patches (.diff / .diff_b / .set_weight) keyed by the
+    /// target parameter path in the model (diff_b keys already end in
+    /// ".bias"). Applied via ``LoRAPatchSession``, never alpha/rank scaled.
+    public let deltas: [String: DeltaPatch]
+
     public init(
         weights: [String: (down: MLXArray, up: MLXArray)],
         lokrWeights: [String: LoKrWeights] = [:],
         rank: Int,
         alpha: Float? = nil,
-        layerAlphas: [String: Float] = [:]
+        layerAlphas: [String: Float] = [:],
+        deltas: [String: DeltaPatch] = [:]
     ) {
         self.weights = weights
         self.lokrWeights = lokrWeights
@@ -67,6 +73,7 @@ public struct LoRAWeights: @unchecked Sendable {
         self.explicitAlpha = alpha
         self.alpha = alpha ?? Float(rank)
         self.layerAlphas = layerAlphas
+        self.deltas = deltas
     }
 
     public var effectiveScale: Float {
@@ -107,6 +114,23 @@ public struct LoRAWeights: @unchecked Sendable {
     }
 }
 
+/// A bare-parameter patch shipped inside a LoRA file (ComfyUI comfy/lora.py
+/// semantics). Unlike low-rank pairs these have no rank structure: `.diff`
+/// adds `userScale × delta` to the target parameter, `.diff_b` does the same
+/// on the target's real `.bias`, and `.set_weight` replaces the parameter
+/// outright, ignoring userScale entirely. Deltas are NEVER alpha/rank scaled.
+public enum DeltaPatch: @unchecked Sendable {
+    case diff(MLXArray)
+    case diffBias(MLXArray)
+    case setWeight(MLXArray)
+
+    public var tensor: MLXArray {
+        switch self {
+        case .diff(let t), .diffBias(let t), .setWeight(let t): return t
+        }
+    }
+}
+
 public struct LoKrWeights: @unchecked Sendable {
     public let w1: MLXArray
     public let w2: MLXArray
@@ -125,6 +149,16 @@ public enum LoRAError: Error, LocalizedError {
     case incompatibleWeights(String)
     case downloadFailed(String, Error)
     case noSafetensorsFound(URL)
+    /// The file uses a recognised adapter feature we deliberately do not
+    /// support yet (DoRA, LoCon mid blocks, …). Explicit refusal beats
+    /// silently applying a fraction of the adapter.
+    case unsupportedFeature(String)
+    /// Tensor keys matching no known suffix. Listed so an update to the
+    /// loader can be scoped precisely instead of guessed at.
+    case unknownKeys([String])
+    /// Some bindable keys resolved to no target parameter. Thrown by
+    /// preflight BEFORE any mutation.
+    case partialApplication(missing: [String])
 
     public var errorDescription: String? {
         switch self {
@@ -138,6 +172,12 @@ public enum LoRAError: Error, LocalizedError {
             return "Failed to download LoRA '\(modelId)': \(error.localizedDescription)"
         case .noSafetensorsFound(let url):
             return "No .safetensors files found in \(url.path)"
+        case .unsupportedFeature(let feature):
+            return "LoRA uses an unsupported adapter feature: \(feature)"
+        case .unknownKeys(let keys):
+            return "LoRA contains unrecognised tensor keys: \(keys.sorted().joined(separator: ", "))"
+        case .partialApplication(let missing):
+            return "LoRA patch preflight failed — no target parameter for: \(missing.sorted().joined(separator: ", "))"
         }
     }
 }

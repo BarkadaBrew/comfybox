@@ -24,9 +24,14 @@ struct MotionView: View {
     @State private var steps: Double = 8
     @State private var didApplyDefaults = false
     @State private var seedText: String = ""
-    @State private var strength: Double = 1.0
+    // 0.5 is the VALIDATED i2v strength at production config (2026-08-03:
+    // 0.75 collapsed long single passes; 1.0 is the historical frame-0
+    // ghosting zone). Desktop default matches the daemon recipe.
+    @State private var strength: Double = 0.5
     @State private var extendSeconds: Double = 0
     @State private var selectedLoras: [LoRASelection] = []
+    @State private var tuningOverrides: [String: Any] = [:]
+    @State private var optimizationAttemptId: String?
 
     @State private var isGenerating = false
     @State private var statusMessage: String?
@@ -49,8 +54,10 @@ struct MotionView: View {
         }
     }
 
-    /// LTX-2 requires 1 + 8k frames; offer a few durations at 24fps.
-    private static let frameOptions = [25, 49, 97, 121]
+    /// LTX-2 requires 1 + 8k frames; durations at 24fps. Up to 289f (12s)
+    /// renders SINGLE-PASS — the old 97f ceiling was never real (2026-08-02:
+    /// one 193f pass beat 97+97 chaining, 2x faster, no seam).
+    private static let frameOptions = [25, 49, 97, 121, 145, 193, 241, 289]
 
     var body: some View {
         HSplitView {
@@ -85,6 +92,8 @@ struct MotionView: View {
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(nsColor: .separatorColor), lineWidth: 1))
                 }
 
+                OptimizeBar(engine: engine, prompt: $prompt, optimizationAttemptId: $optimizationAttemptId)
+
                 referenceControl
 
                 labeled("Resolution") {
@@ -106,6 +115,7 @@ struct MotionView: View {
                 NumericSliderField(label: "Steps", value: $steps, range: 1...30, step: 1)
                 if referencePath != nil {
                     NumericSliderField(label: "Strength", value: $strength, range: 0...1, step: 0.05, fractionDigits: 2)
+                        .help("How hard the seed image is held. 0.5 = validated default. Higher loosens the pose lock but risks mid-clip drift/ghosting on long passes; lower holds the frame rigid.")
                     NumericSliderField(label: "Extend (s)", value: $extendSeconds, range: 0...12, step: 1)
                 }
 
@@ -117,6 +127,12 @@ struct MotionView: View {
                     LoRAPicker(engine: engine, selectedLoras: $selectedLoras, familyOverride: "ltx")
                         .frame(minHeight: 180, maxHeight: 260)
                 }
+
+                VideoTuningPanel(tuning: $tuningOverrides)
+
+                EffectiveConfigCard(engine: engine)
+
+                PromptLabPanel(engine: engine)
 
                 Button(action: generate) {
                     HStack {
@@ -280,7 +296,9 @@ struct MotionView: View {
             steps: Int(steps), seed: seed, strength: Float(strength),
             extendToSeconds: Float(extendSeconds),
             loras: selectedLoras,
-            outputPath: outputPath
+            outputPath: outputPath,
+            tuning: tuningOverrides.isEmpty ? nil : tuningOverrides,
+            optimizationAttemptId: optimizationAttemptId
         )
 
         Task {

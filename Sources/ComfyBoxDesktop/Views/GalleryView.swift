@@ -1,15 +1,29 @@
 // GalleryView.swift — Asset gallery with grid, search, and filtering
 //
-// Displays DAMStore assets as a grid of thumbnails with sorting,
-// filtering by favorite/content mode/character, and FTS5 search.
-// Clicking a cell opens the AssetDetailView for full metadata
-// display and editing. Phase 4: Added drag-and-drop, comparison
-// selection, Quick Look via Space bar.
+// Displays assets as a grid of thumbnails with sorting, filtering by
+// favorite/content mode/character, and search. Clicking a cell opens the
+// AssetDetailView for full metadata display and editing. Phase 4: Added
+// drag-and-drop, comparison selection, Quick Look via Space bar.
+//
+// ONE GALLERY (2026-07-31). The rows now come from the CATALOG via
+// `CatalogBrowser` — one query over every realm — instead of from a local-only
+// DAMStore fetch, and a row's `asset_locations` decide whether its bytes open
+// from disk or stream from the engine's /v1/gallery/file. That retires the
+// split between this view and RemoteGalleryView, which read a bare directory
+// listing with no metadata. DAMStore is unchanged and still owns ingest,
+// ratings, favourites, folders and the secure vault; only browsing moved.
+//
+// The catalog and the DAM share ONE `assets` table (dam.sqlite3 was migrated in
+// place), so ids are one id space and everything keyed by an id still matches.
+// When the catalog cannot be opened this view falls back to the DAMStore fetch
+// it always used, so a broken catalog degrades to the old gallery rather than
+// to an empty one.
 
 import SwiftUI
 import AVKit
 import AppKit
 import LocalAuthentication
+import ComfyBoxCatalog
 
 /// Sort options for the gallery.
 enum GallerySortOrder: String, CaseIterable {
@@ -47,12 +61,23 @@ struct GalleryView: View {
     @State private var lightboxIndex: Int? = nil
     @State private var isLoading: Bool = false
     @State private var errorMessage: String?
+    /// Separate from `errorMessage`, which a successful load clears: a refused
+    /// orphan sweep is the one thing the user must still see afterwards.
+    @State private var pruneWarning: String?
 
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
     @State private var isSelectMode: Bool = false
     @State private var mediaTools = MediaToolsService()
     @State private var sidecar = SidecarService()
+
+    // The one reader. nil until the catalog opens (and permanently nil if it
+    // cannot), in which case the DAMStore fetch below still serves the grid.
+    @State private var browser: CatalogBrowser?
+    @State private var selectedCollectionID: String?
+    @State private var selectedLane: String?
+    /// Engine URLs for rows whose bytes are not on this Mac, keyed by asset id.
+    @State private var remoteURLs: [String: URL] = [:]
     @State private var pendingDelete: [DAMAsset] = []
     @State private var showDeleteConfirmation: Bool = false
 
@@ -90,7 +115,12 @@ struct GalleryView: View {
     @State private var personaFilter: String?
 
     /// Sources that belong to the main gallery, not a persona section.
-    static let mainSources: Set<String> = ["", "desktop", "comfyui"]
+    ///
+    /// "comfybox" is in here because it is the APP's own name, not a persona:
+    /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
+    /// database, so leaving it out filed almost the whole library into a
+    /// "Comfybox" persona section and left the main gallery showing 87 images.
+    static let mainSources: Set<String> = ["", "desktop", "comfyui", "comfybox"]
     static func isMainSource(_ source: String?) -> Bool {
         mainSources.contains((source ?? "").lowercased())
     }
@@ -132,8 +162,28 @@ struct GalleryView: View {
     /// Target masonry column width; the size control steps it.
     @State private var cellTargetWidth: CGFloat = 210
 
+    /// Whether the collection / lane rail is on screen.
+    ///
+    /// The rail names bodies of work, and in the live catalog those names are
+    /// "Adult", "Adult Scenes", "Erotic Portraiture", "Nightlife". They are
+    /// exactly what the Rated-G-by-default gate exists to keep off the screen,
+    /// so the rail is hidden with the grid rather than left standing beside the
+    /// lock wall. A fresh gate is hidden, so this is false on every launch.
+    static func showsCatalogRail(revealed: Bool, hasBrowser: Bool) -> Bool {
+        revealed && hasBrowser
+    }
+
     var body: some View {
         HStack(spacing: 0) {
+            // NO TEST GUARDS THIS LINE. `showsCatalogRail` is unit-tested, but
+            // nothing checks that the rail actually consults it (no ViewInspector
+            // in this repo) — delete the `if` and every test still passes while
+            // the gate is wide open. Change it by hand, carefully.
+            if Self.showsCatalogRail(revealed: contentGate.revealed, hasBrowser: browser != nil) {
+                catalogRail
+                    .frame(width: 210)
+                Divider()
+            }
             folderSidebar
                 .frame(width: 190)
             Divider()
@@ -151,6 +201,9 @@ struct GalleryView: View {
 
                 if let message = errorMessage {
                     errorBanner(message)
+                }
+                if let warning = pruneWarning {
+                    errorBanner(warning) { pruneWarning = nil }
                 }
 
                 // Gallery grid
@@ -233,6 +286,7 @@ struct GalleryView: View {
                 assets: filteredAssets,
                 index: filteredAssets.firstIndex(where: { $0.id == asset.id }) ?? 0,
                 thumbnailProvider: { ingestor.thumbnailPath(for: $0.id) },
+                mediaLocationProvider: { mediaLocation(for: $0) },
                 onUpdate: { updated in
                     Task { await updateAsset(updated) }
                 },
@@ -274,6 +328,7 @@ struct GalleryView: View {
                     onCopy: { copyAssets([$0]) },
                     onReveal: { revealInFinder($0) },
                     onSendToGenerate: onSendToGenerate,
+                    mediaLocationProvider: { mediaLocation(for: $0) },
                     onIndexChange: { lightboxIndex = $0 },
                     onClose: { lightboxIndex = nil }
                 )
@@ -290,6 +345,16 @@ struct GalleryView: View {
         }
         .onChange(of: ingestor.ingestedCount) { _, _ in
             Task { await loadAssets() }
+        }
+        .task {
+            // Open the catalog once. A failure here is not an error banner: the
+            // DAMStore path below still fills the grid, so the gallery degrades
+            // to its old (Mac-only) self instead of to nothing.
+            guard browser == nil else { return }
+            guard let catalog = try? await CatalogStore.open() else { return }
+            let b = CatalogBrowser(store: catalog, engineBaseURL: engineBaseURL)
+            browser = b
+            await loadAssets()
         }
         .onAppear {
             consumeSearchFocusRequest()
@@ -332,8 +397,25 @@ struct GalleryView: View {
                 pendingDelete = []
             }
         } message: {
-            Text("The image files and their metadata are moved to the Trash.")
+            Text(deleteConfirmationMessage)
         }
+    }
+
+    /// What the dialog promises, told truthfully for a mixed selection.
+    ///
+    /// The grid is catalog-backed now, so a selection can include rows whose
+    /// bytes live on the server rather than on this Mac. Those cannot be moved
+    /// to this Mac's Trash, and they will NOT be deleted permanently instead —
+    /// the dialog has to say so before the button is pressed, not afterwards in
+    /// an error banner.
+    private var deleteConfirmationMessage: String {
+        let base = "The image files and their metadata are moved to the Trash."
+        let remote = pendingDelete.filter { !AssetIngestor.isOnThisMac($0.absolutePath) }
+        guard !remote.isEmpty else { return base }
+        let noun = remote.count == 1 ? "file is" : "files are"
+        return base + "\n\n\(remote.count) selected \(noun) hosted on the server, not on this "
+            + "Mac. macOS cannot move those to the Trash, so they are left in place and their "
+            + "catalog entries are kept."
     }
 
     // MARK: - Toolbar
@@ -714,6 +796,7 @@ struct GalleryView: View {
         GalleryCellView(
             asset: asset,
             thumbnailPath: ingestor.thumbnailPath(for: asset.id),
+            remoteURL: mediaLocation(for: asset).remoteURL,
             cellWidth: width,
             aspectRatio: aspectRatio(asset),
             isComparisonSelected: isSelectMode ? isSelected : nil
@@ -865,6 +948,12 @@ struct GalleryView: View {
                                 isSelectMode = true
                             }
                         }
+                        if remoteURLs[asset.id] != nil {
+                            Divider()
+                            Button("Save to this Mac") {
+                                Task { await pullRemote(asset) }
+                            }
+                        }
                         Divider()
                         Button("Delete…", role: .destructive) {
                             requestDelete([asset])
@@ -873,7 +962,69 @@ struct GalleryView: View {
                     .draggable(DraggableAsset(path: asset.absolutePath))
     }
 
-    private func errorBanner(_ message: String) -> some View {
+    /// A path in `directory` that no file occupies: `name.png`, then
+    /// `name-1.png`, `name-2.png`, …
+    ///
+    /// A server file and a local file can share a basename, and the download
+    /// below is an unattended write — without this it would silently overwrite
+    /// the local original with the remote one. Uniquing rather than prompting:
+    /// the answer is always "keep both".
+    static func uniqueDestination(inDirectory directory: String, filename: String) -> String {
+        let fm = FileManager.default
+        let base = (filename as NSString).deletingPathExtension
+        let ext = (filename as NSString).pathExtension
+        func candidate(_ suffix: String) -> String {
+            let name = ext.isEmpty ? base + suffix : "\(base)\(suffix).\(ext)"
+            return (directory as NSString).appendingPathComponent(name)
+        }
+        var path = candidate("")
+        var n = 1
+        while fm.fileExists(atPath: path) {
+            path = candidate("-\(n)")
+            n += 1
+        }
+        return path
+    }
+
+    /// Where one row's bytes are, as THIS surface decided it.
+    ///
+    /// The single accessor every surface goes through — grid cell, detail pane,
+    /// lightbox — so they cannot disagree about whether a row is remote. The
+    /// local half prefers the path `CatalogBrowser` resolved for the page (an
+    /// asset's `mac` location can spell a different path than its primary
+    /// `absolutePath`); the remote half is the stream URL the browser built for
+    /// exactly the rows it found no local file for.
+    func mediaLocation(for asset: DAMAsset) -> AssetMediaLocation {
+        AssetMediaLocation(
+            localPath: browser?.localPath(forID: asset.id) ?? asset.absolutePath,
+            remoteURL: remoteURLs[asset.id])
+    }
+
+    /// Download a row whose bytes are on a server into the local output folder
+    /// and ingest it — the one thing the retired Remote Gallery could do that
+    /// browsing the catalog cannot.
+    private func pullRemote(_ asset: DAMAsset) async {
+        guard let url = remoteURLs[asset.id] else { return }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                errorMessage = "Server returned \(http.statusCode)"
+                return
+            }
+            let dir = DesktopSettings.load().outputDirectory
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let dest = Self.uniqueDestination(inDirectory: dir, filename: asset.filename)
+            try data.write(to: URL(fileURLWithPath: dest))
+            _ = try? await ingestor.ingestFile(at: dest)
+            errorMessage = nil
+            await loadAssets()
+        } catch {
+            errorMessage = "Save failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func errorBanner(_ message: String,
+                             dismiss: (() -> Void)? = nil) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -881,7 +1032,7 @@ struct GalleryView: View {
                 .font(.callout)
                 .lineLimit(2)
             Spacer()
-            Button(action: { errorMessage = nil }) {
+            Button(action: { if let dismiss { dismiss() } else { errorMessage = nil } }) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)
             }
@@ -926,6 +1077,105 @@ struct GalleryView: View {
     }
 
     // MARK: - Folder sidebar
+
+    /// The engine this Mac's gallery streams server-side bytes from.
+    private var engineBaseURL: String {
+        guard let engine else { return "http://127.0.0.1:7870" }
+        return "http://\(engine.serverHost):\(engine.serverPort)"
+    }
+
+    /// Collection + lane rail over the whole catalog. Collections come first
+    /// because they are the bodies of work; lanes below them are the finer cut.
+    ///
+    /// Only rendered when the content gate is revealed — see `showsCatalogRail`.
+    @ViewBuilder
+    private var catalogRail: some View {
+        if let browser {
+            VStack(alignment: .leading, spacing: 0) {
+                List {
+                    Section {
+                        railRow(title: "Everything",
+                                icon: "square.grid.2x2",
+                                count: browser.facets.kind.values.reduce(0, +),
+                                isSelected: selectedCollectionID == nil && selectedLane == nil) {
+                            selectedCollectionID = nil
+                            selectedLane = nil
+                            Task { await applyCatalogFilter() }
+                        }
+                    }
+                    Section("Collections") {
+                        ForEach(browser.rootCollections(), id: \.id) { root in
+                            DisclosureGroup {
+                                ForEach(browser.children(of: root), id: \.id) { child in
+                                    railRow(title: child.name, icon: "folder",
+                                            count: browser.count(of: child),
+                                            isSelected: selectedCollectionID == child.id) {
+                                        selectedCollectionID = child.id
+                                        selectedLane = nil
+                                        Task { await applyCatalogFilter() }
+                                    }
+                                }
+                            } label: {
+                                railRow(title: root.name, icon: "folder.fill",
+                                        count: browser.count(of: root),
+                                        isSelected: selectedCollectionID == root.id) {
+                                    selectedCollectionID = root.id
+                                    selectedLane = nil
+                                    Task { await applyCatalogFilter() }
+                                }
+                            }
+                        }
+                    }
+                    Section("Lane") {
+                        ForEach(browser.facets.lane.sorted(by: { $0.key < $1.key }), id: \.key) { lane, count in
+                            railRow(title: lane, icon: "line.3.horizontal.decrease",
+                                    count: count, isSelected: selectedLane == lane) {
+                                selectedLane = lane
+                                selectedCollectionID = nil
+                                Task { await applyCatalogFilter() }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+
+                if browser.isLoading {
+                    ProgressView().controlSize(.small).padding(8)
+                }
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private func railRow(title: String, icon: String, count: Int,
+                         isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                Text(title).lineLimit(1)
+                Spacer()
+                Text("\(count)").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(isSelected ? Color.accentColor.opacity(0.18) : nil)
+    }
+
+    /// The catalog query the rail currently describes. Unscoped and unclamped:
+    /// this is the owner's own surface, and it is the content gate — not the
+    /// mode ceiling — that governs what reaches the screen here.
+    private func catalogQuery() -> CatalogQuery {
+        CatalogQuery(text: searchText.isEmpty ? nil : searchText,
+                     collectionID: selectedCollectionID,
+                     lane: selectedLane,
+                     limit: 500)
+    }
+
+    private func applyCatalogFilter() async {
+        guard browser != nil else { return }
+        await loadAssets()
+    }
 
     private var folderSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1190,8 +1440,11 @@ struct GalleryView: View {
             results = results.filter { $0.characterName == character }
         }
 
-        // Apply search — client-side for immediate feedback, FTS for big datasets.
-        if !searchText.isEmpty {
+        // Apply search. When the catalog is driving, the text has ALREADY been
+        // matched against the whole catalog's FTS index (prompt, injected
+        // prompt, caption, filename) — re-filtering here by substring would
+        // throw away real hits on the fields this loop does not look at.
+        if !searchText.isEmpty, browser == nil {
             let query = searchText.lowercased()
             results = results.filter { asset in
                 (asset.prompt?.lowercased().contains(query) ?? false)
@@ -1224,28 +1477,85 @@ struct GalleryView: View {
         do {
             // Self-heal: drop rows whose file was deleted out from under the
             // DAM before presenting (only worth it on a full, unfiltered load).
+            // This is an unattended destructive sweep, so its refusal is SHOWN,
+            // not swallowed: a circuit breaker trip means a volume is probably
+            // unmounted, and silently skipping it would leave the gallery
+            // looking half-empty with no explanation.
             if searchText.isEmpty {
-                _ = try? await ingestor.pruneOrphans()
-            }
-            if !searchText.isEmpty {
-                let ftsResults = try await store.searchPrompts(query: searchText, limit: 200)
-                assets = ftsResults
-            } else {
-                assets = try await store.fetchAssets(limit: 500)
-                // Self-heal: backfill any thumbnail that's missing or was
-                // left as a 0-byte file by a previously-interrupted write.
-                await ingestor.regenerateMissingThumbnails(for: assets)
+                do { _ = try await ingestor.pruneOrphans() }
+                catch let error as DAMStoreError {
+                    if case .pruneRefused = error { pruneWarning = error.localizedDescription }
+                } catch { /* a prune failure must never block browsing */ }
             }
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()
             folderAssignments = try await store.folderAssignments()
             securedIds = try await store.securedAssetIds()
+
+            if let browser {
+                try await loadFromCatalog(browser)
+            } else {
+                try await loadFromLocalStore()
+            }
             refreshColorLabels()
             extractFilterValues()
         } catch {
             errorMessage = error.localizedDescription
         }
         isLoading = false
+    }
+
+    /// THE converged read: one query over the whole catalog, both realms, every
+    /// host. Rows keep their DAM record where the shared `assets` table has one
+    /// (so ratings, favourites, folders and dates are the real ones) and only
+    /// fall back to the catalog's own view for anything the DAM columns are
+    /// empty for. Rows whose bytes are not on this Mac get an engine URL.
+    private func loadFromCatalog(_ browser: CatalogBrowser) async throws {
+        // The vault carve-out. A secured asset's row survives in the shared
+        // table and very often still has a streamable twin on a server, so the
+        // reader has to be told about it or converging on the catalog would
+        // quietly undo every vault move. `filteredAssets` filters by the same
+        // set again — this is deliberately belt AND braces.
+        // NO TEST GUARDS THIS LINE. The withholding itself is tested on
+        // CatalogBrowser, but nothing checks that this view actually feeds it the
+        // secured set — delete this line and every test still passes while every
+        // vaulted asset comes back. Change it by hand, carefully.
+        browser.hiddenAssetIDs = revealSecured ? [] : securedIds
+        await browser.apply(filter: catalogQuery())
+        if let message = browser.error { errorMessage = message } else { errorMessage = nil }
+
+        var damByID: [String: DAMAsset] = [:]
+        for row in try await store.fetchAssets(limit: 20_000) { damByID[row.id] = row }
+
+        var rows: [DAMAsset] = []
+        var urls: [String: URL] = [:]
+        rows.reserveCapacity(browser.items.count)
+        for item in browser.items {
+            rows.append(damByID[item.id] ?? browser.damAsset(for: item))
+            if browser.localPath(forID: item.id) == nil,
+               let url = browser.resolvedStreamURL(forID: item.id) {
+                urls[item.id] = url
+            }
+        }
+        assets = rows
+        remoteURLs = urls
+        // Only for rows whose bytes are actually here — regenerating a thumbnail
+        // for a file that lives on another machine is a guaranteed miss.
+        await ingestor.regenerateMissingThumbnails(for: rows.filter { urls[$0.id] == nil })
+    }
+
+    /// Fallback for when the catalog could not be opened: the Mac-only reader
+    /// this view used before the two galleries converged.
+    private func loadFromLocalStore() async throws {
+        remoteURLs = [:]
+        if !searchText.isEmpty {
+            assets = try await store.searchPrompts(query: searchText, limit: 200)
+        } else {
+            assets = try await store.fetchAssets(limit: 500)
+            // Self-heal: backfill any thumbnail that's missing or was
+            // left as a 0-byte file by a previously-interrupted write.
+            await ingestor.regenerateMissingThumbnails(for: assets)
+        }
     }
 
     private func extractFilterValues() {
@@ -1612,16 +1922,29 @@ struct GalleryView: View {
     /// but do not stop the remaining deletions.
     private func deleteAssets(_ toDelete: [DAMAsset]) async {
         var failures: [String] = []
+        var refused: [String] = []
         for asset in toDelete {
             do {
                 try await ingestor.deleteAsset(asset)
                 selectedIds.remove(asset.id)
+            } catch AssetIngestor.DeletionRefusal.notOnThisMac {
+                // Not a failure to report as one: the file is on the server and
+                // was deliberately left alone rather than permanently destroyed.
+                refused.append(asset.filename)
             } catch {
                 failures.append(asset.filename)
             }
         }
+        var notes: [String] = []
+        if !refused.isEmpty {
+            notes.append("Left on the server (macOS cannot trash a network file): "
+                + refused.joined(separator: ", "))
+        }
         if !failures.isEmpty {
-            errorMessage = "Failed to delete: \(failures.joined(separator: ", "))"
+            notes.append("Failed to delete: \(failures.joined(separator: ", "))")
+        }
+        if !notes.isEmpty {
+            errorMessage = notes.joined(separator: " — ")
         }
         lightboxIndex = nil
         await loadAssets()
@@ -1651,6 +1974,9 @@ struct DraggableAsset: Transferable {
 struct GalleryCellView: View {
     let asset: DAMAsset
     let thumbnailPath: String
+    /// Engine URL for a row whose bytes are NOT on this Mac (the catalog knows
+    /// the asset, `asset_locations` puts it on another host). nil for local rows.
+    var remoteURL: URL?
     /// Column width in the masonry layout; nil = legacy fixed 160px height.
     var cellWidth: CGFloat?
     /// Image aspect ratio (w/h) used to size the cell to the true shape.
@@ -1753,12 +2079,20 @@ struct GalleryCellView: View {
     private func loadThumbnail() async {
         let path = thumbnailPath
         let fullPath = asset.absolutePath
-        let image: NSImage? = await Task.detached {
+        let local: NSImage? = await Task.detached {
             NSImage(contentsOfFile: path) ?? NSImage(contentsOfFile: fullPath)
         }.value
-        await MainActor.run {
-            thumbnail = image
+        if let local {
+            thumbnail = local
+            return
         }
+        // Nothing on disk. If the catalog placed this row on another host, its
+        // bytes come from the engine's /v1/gallery/file — the same route the
+        // Remote Gallery used, now reached through the one converged reader.
+        guard let remoteURL else { return }
+        guard let (data, response) = try? await URLSession.shared.data(from: remoteURL),
+              (response as? HTTPURLResponse)?.statusCode ?? 200 == 200 else { return }
+        thumbnail = NSImage(data: data)
     }
 }
 
@@ -1776,6 +2110,11 @@ private struct GalleryLightbox: View {
     var onReveal: (DAMAsset) -> Void = { _ in }
     /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
     var onSendToGenerate: ((DAMAsset) -> Void)?
+    /// Where the gallery decided each row's bytes are — the SAME answer the grid
+    /// cell uses, so a cell that streamed its thumbnail never opens empty here.
+    var mediaLocationProvider: (DAMAsset) -> AssetMediaLocation = {
+        AssetMediaLocation(localPath: $0.absolutePath, remoteURL: nil)
+    }
     let onIndexChange: (Int) -> Void
     let onClose: () -> Void
 
@@ -1784,9 +2123,20 @@ private struct GalleryLightbox: View {
     @State private var zoom: CGFloat = 1
     @State private var baseZoom: CGFloat = 1
     @State private var offset: CGSize = .zero
+    /// Why there is nothing on screen (server unreachable, file gone). Beats a
+    /// ProgressView that spins forever.
+    @State private var loadError: String?
     @FocusState private var focused: Bool
+    @Environment(AppContentGate.self) private var contentGate
 
     private var asset: DAMAsset? { assets.indices.contains(index) ? assets[index] : nil }
+
+    /// Where the current asset's bytes come from — gate first, then disk, then
+    /// the engine.
+    private var source: AssetMediaSource {
+        guard let asset else { return .missing }
+        return AssetMediaSource.resolve(mediaLocationProvider(asset), gateRevealed: contentGate.revealed)
+    }
 
     var body: some View {
         ZStack {
@@ -1820,8 +2170,24 @@ private struct GalleryLightbox: View {
                                 offset = .zero
                             }
                         }
+                } else if let loadError {
+                    VStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 34)).foregroundStyle(.white.opacity(0.7))
+                        Text(loadError)
+                            .font(.callout).foregroundStyle(.white.opacity(0.85))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 460)
+                    }
                 } else {
-                    ProgressView().controlSize(.large).tint(.white)
+                    VStack(spacing: 10) {
+                        ProgressView().controlSize(.large).tint(.white)
+                        if source.isRemote {
+                            Text(asset?.kind == "video"
+                                 ? "Fetching video from server..." : "Loading from server...")
+                                .font(.caption).foregroundStyle(.white.opacity(0.7))
+                        }
+                    }
                 }
             }
             .padding(40)
@@ -1844,7 +2210,9 @@ private struct GalleryLightbox: View {
 
                     // Photo Mechanic-style color classes: click a swatch or
                     // press 1-7 (0 clears). Mirrors the file's Finder tag.
-                    if let asset {
+                    // Colour classes write a Finder tag to the file itself, so
+                    // they only exist for a row whose file is on this Mac.
+                    if let asset, source.isLocal {
                         let current = labelForAsset(asset)
                         HStack(spacing: 7) {
                             ForEach(Array(FinderColor.keyboardOrder.enumerated()), id: \.element) { i, color in
@@ -1881,16 +2249,27 @@ private struct GalleryLightbox: View {
                     Spacer()
 
                     if let asset {
+                        if source.isRemote {
+                            Image(systemName: "externaldrive.connected.to.line.below")
+                                .font(.title3).foregroundStyle(.white.opacity(0.6))
+                                .help("Streamed from the engine — no copy of this file on this Mac.")
+                        }
+                        // Copy and Reveal need a file on this disk; for a
+                        // server-side row they would quietly do nothing.
                         Button { onCopy(asset) } label: {
                             Image(systemName: "doc.on.doc").font(.title3)
                         }
-                        .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
-                        .help("Copy image (⌘C)")
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(source.isLocal ? 0.85 : 0.3))
+                        .disabled(!source.isLocal)
+                        .help(source.localOnlyReason ?? "Copy image (⌘C)")
                         Button { onReveal(asset) } label: {
                             Image(systemName: "magnifyingglass.circle").font(.title3)
                         }
-                        .buttonStyle(.plain).foregroundStyle(.white.opacity(0.85))
-                        .help("Reveal in Finder")
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(source.isLocal ? 0.85 : 0.3))
+                        .disabled(!source.isLocal)
+                        .help(source.localOnlyReason ?? "Reveal in Finder")
                         if let onSendToGenerate {
                             Button { onSendToGenerate(asset) } label: {
                                 Image(systemName: "wand.and.stars.inverse").font(.title3)
@@ -1924,19 +2303,24 @@ private struct GalleryLightbox: View {
         .onKeyPress(.rightArrow) { step(1); return .handled }
         .onKeyPress(.escape) { onClose(); return .handled }
         .onKeyPress(keys: ["c"]) { press in
-            guard press.modifiers.contains(.command), let asset else { return .ignored }
+            // Same local-file rule as the button: ⌘C on a server-side row would
+            // put nothing on the pasteboard.
+            guard press.modifiers.contains(.command), let asset, source.isLocal else { return .ignored }
             onCopy(asset)
             return .handled
         }
         .onKeyPress(characters: CharacterSet(charactersIn: "01234567")) { press in
             // The lightbox owns keyboard focus, so it must handle the color
             // classes itself — the gallery-level handler never sees these.
-            guard let asset, let character = press.characters.first,
+            // Tagging writes to the file, so it needs one on this Mac.
+            guard let asset, source.isLocal, let character = press.characters.first,
                   let digit = character.wholeNumberValue else { return .ignored }
             onSetLabel(asset, digit == 0 ? nil : FinderColor.keyboardOrder[digit - 1])
             return .handled
         }
-        .task(id: index) { await load() }
+        // Keyed on the gate too: closing it mid-session must stop a playing
+        // video and drop the loaded bytes, not just blur them.
+        .task(id: "\(index)|\(contentGate.revealed)") { await load() }
         .onAppear { focused = true }
     }
 
@@ -1967,12 +2351,50 @@ private struct GalleryLightbox: View {
         player?.pause()
         player = nil
         image = nil
+        loadError = nil
         guard let asset else { return }
-        if asset.kind == "video" {
-            player = AVPlayer(url: URL(fileURLWithPath: asset.absolutePath))
-        } else {
-            let path = asset.absolutePath
-            image = await Task.detached { NSImage(contentsOfFile: path) }.value
+        let isVideo = asset.kind == "video"
+
+        switch source {
+        case .gated:
+            // Rated G: read nothing, from disk or network. The lightbox can
+            // only be opened from a revealed grid, but the load path itself
+            // refuses rather than relying on that.
+            loadError = "Locked."
+
+        case .local(let path):
+            if isVideo {
+                player = AVPlayer(url: URL(fileURLWithPath: path))
+            } else {
+                image = await Task.detached { NSImage(contentsOfFile: path) }.value
+                if image == nil { loadError = "Couldn't open \((path as NSString).lastPathComponent)." }
+            }
+
+        case .remote(let url):
+            if isVideo {
+                // The engine serves whole bodies with no Range support and
+                // AVPlayer needs ranges over HTTP, so fetch the file once and
+                // play the copy.
+                do {
+                    let file = try await RemoteMediaCache.localCopy(of: url, filename: asset.filename)
+                    guard !Task.isCancelled else { return }
+                    player = AVPlayer(url: file)
+                } catch {
+                    loadError = "Couldn't fetch this video from the server: \(error.localizedDescription)"
+                }
+            } else {
+                guard let (data, response) = try? await URLSession.shared.data(from: url),
+                      (response as? HTTPURLResponse)?.statusCode ?? 200 == 200,
+                      let fetched = NSImage(data: data) else {
+                    loadError = "Couldn't fetch this image from the server."
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                image = fetched
+            }
+
+        case .missing:
+            loadError = "This asset's file isn't on this Mac, and no server copy is known."
         }
     }
 }

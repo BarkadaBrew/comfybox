@@ -32,8 +32,9 @@ final class MCPVideoToolTests: XCTestCase {
     // (enhance_prompt, list_characters, list_presets, import_legacy_presets,
     // queue_list, interrupt_render, cancel_job, nearline_{list,scan,stage,evict})
     // added 2026-07 = 32; + compose_montage (#232) + render_storyboard (#237)
-    // + import/list/run_workflow + workflow_run_status (#238) = 38.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 38, "Expected 38 registered MCP tools")
+    // + import/list/run_workflow + workflow_run_status (#238) = 38;
+    // + lora_quarantine (model-pool work, 90e6f38) = 39.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 39, "Expected 39 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)
@@ -55,10 +56,36 @@ final class MCPVideoToolTests: XCTestCase {
     }
   }
 
+  /// The daemon weaves the character description into the prompt itself; the
+  /// server must be told to stand down or it prepends ~110 tokens and blows the
+  /// 128-token cap, truncating scene + camera off the end (Todd 2026-08-07).
+  /// This key was dropped silently once already: `executeGenerateVideo` builds
+  /// its body from an explicit whitelist, so an unforwarded key vanishes.
+  func testGenerateVideoSchemaExposesSkipCharacterInjection() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    let skip = properties?["skip_character_injection"] as? [String: Any]
+    XCTAssertNotNil(skip, "generate_video must expose skip_character_injection")
+    XCTAssertEqual(skip?["type"] as? String, "boolean")
+  }
+
   func testGenerateVideoSchemaOnlyPromptRequired() {
     let tool = MCPToolRegistry.tool(named: "generate_video")!
     let required = tool.inputSchema["required"] as? [String]
     XCTAssertEqual(required, ["prompt"], "Only 'prompt' should be required")
+  }
+
+  func testGenerateVideoPromptGuidanceMatchesLTX23Contract() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as! [String: Any]
+    let prompt = properties["prompt"] as! [String: Any]
+    let description = prompt["description"] as! String
+
+    XCTAssertTrue(description.contains("4-8"))
+    XCTAssertTrue(description.contains("45-90"))
+    XCTAssertTrue(description.localizedCaseInsensitiveContains("source image is ground truth"))
+    XCTAssertFalse(description.localizedCaseInsensitiveContains("longer is better"))
+    XCTAssertFalse(description.contains("80-120"))
   }
 
   // MARK: - video_status Schema (Story A1)

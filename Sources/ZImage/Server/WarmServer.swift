@@ -152,6 +152,7 @@ public final class WarmServer {
   /// local render never holds an HTTP connection open. The Replicate cloud path
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
+  private let renderTraceStore = RenderTraceStore()
   let comfyBridge: ComfyBridge
 
   /// Imported ComfyUI workflows (#238), file-backed at ~/.comfybox/workflows/.
@@ -335,6 +336,11 @@ public final class WarmServer {
     // Ignore SIGHUP before model loading — prevents SSH disconnect from
     // killing the daemon during the ~40s pipeline initialization phase.
     signal(SIGHUP, SIG_IGN)
+
+    // Task #19: lifecycle traces. Recovery first — any trace left open by a
+    // crash/kill is marked abandoned so failed renders are never invisible.
+    videoJobTracker.traceStore = renderTraceStore
+    renderTraceStore.markAbandonedOpenTraces()
 
     // Merge the legacy Coffee Shop image-service character registry (source of
     // truth for hand-written character text) before serving. Idempotent: only
@@ -827,7 +833,16 @@ public final class WarmServer {
         return .error(.error(status: 503, message: "LoRA Library not initialized"))
       }
       let allEntries = library.list(includeQuarantined: true)
-      let activeLoRANames = await coordinator.activeLoRAIdentifiers
+      // #217 pattern applied here too: `await coordinator.activeLoRAIdentifiers`
+      // hopped onto the coordinator ACTOR, which stays occupied for the whole of
+      // a synchronous render — so listing the LoRA library hung with HTTP 000
+      // until the render finished, and any UI listing from this route rendered
+      // an EMPTY list (observed 2026-08-10). The catalog is static data and must
+      // never depend on GPU state; only the "currently loaded" decoration did.
+      // Read that from the same lock-based snapshot /health uses.
+      let activeLoRANames = liveHealth.read().0.loras.map { st in
+        ((st.source as NSString).lastPathComponent as NSString).deletingPathExtension
+      }
       let quarantinedCount = allEntries.filter { $0.quarantined }.count
 
       var loraList: [[String: Any]] = []
@@ -1141,6 +1156,160 @@ public final class WarmServer {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try encoder.encode(status)
         return .json(.rawJSON(status: 202, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("POST", "/v1/video/config/effective"):
+      // Finding #16: a HYPOTHETICAL resolution — request-shaped context in,
+      // requested_config + derived render_plan out. GET (below) stays as the
+      // no-context readout.
+      do {
+        struct EffectiveQuery: Decodable {
+          let width: Int?
+          let height: Int?
+          let frames: Int?
+          let duration: Float?
+          let fps: Int?
+          let tuning: LTX2VideoTuning?
+          let preset: String?
+        }
+        let q = (try? decode(EffectiveQuery.self, from: request.body)) ?? EffectiveQuery(
+          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil)
+        let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
+        let resolvedTyped = LTX2ConfigResolver.resolveTyped(
+          request: q.tuning, preset: videoPreset?.videoTuning)
+
+        // Derived plan, mirroring prepareLocalVideo's math step by step.
+        var plan: [[String: String]] = []
+        var w = q.width ?? videoPreset?.width ?? 704
+        var h = q.height ?? videoPreset?.height ?? 448
+        let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
+        if snappedW != w || snappedH != h {
+          plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
+          w = snappedW; h = snappedH
+        }
+        if resolvedTyped.twoStage {
+          let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
+          if s1.halved {
+            plan.append(["step": "two_stage_halving",
+                         "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
+          } else {
+            plan.append(["step": "stage1_floor",
+                         "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
+          }
+        }
+        let fps = q.fps ?? 24
+        var framesPerChunk = q.frames ?? 97
+        var extendSeconds = Self.extendSecondsFromDuration(q.duration, framesPerChunk: framesPerChunk, fps: fps)
+        if extendSeconds > 0 {
+          let targetFrames = Int((extendSeconds * Float(fps)).rounded())
+          if targetFrames <= 289 {
+            let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
+            framesPerChunk = max(framesPerChunk, singleFrames)
+            extendSeconds = 0
+            plan.append(["step": "single_pass_fold",
+                         "note": "\(q.duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
+          } else {
+            plan.append(["step": "chunked_continuation",
+                         "note": "\(q.duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
+          }
+        }
+        plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(fps)"])
+        if q.width == nil && q.height == nil {
+          plan.append(["step": "caveat",
+                       "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
+        }
+
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        struct Response: Encodable {
+          let requestedConfig: [LTX2ResolvedParam]
+          let renderPlan: [[String: String]]
+          let presetId: String?
+        }
+        let data = try encoder.encode(Response(
+          requestedConfig: resolvedTyped.params
+            .map { p -> LTX2ResolvedParam in
+              // Overlay request/preset provenance onto the readout rows.
+              guard let src = resolvedTyped.provenance[p.name], src != p.source else { return p }
+              return LTX2ResolvedParam(
+                name: p.name, envKey: p.envKey, tier: p.tier,
+                value: resolvedTyped.valueString(for: p.name) ?? p.value,
+                source: src, valid: p.valid, note: p.note)
+            },
+          renderPlan: plan,
+          presetId: q.preset))
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("GET", "/v1/video/traces"):
+      // Task #19: the Prompt Lab feed — newest-first render traces.
+      do {
+        let limit = Int(request.queryParameters["limit"] ?? "") ?? 50
+        let summaries = renderTraceStore.recentSummaries(limit: min(200, max(1, limit)))
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(["traces": summaries])
+        return .json(.rawJSON(status: 200, data: data))
+      } catch {
+        return .error(response(for: error))
+      }
+
+    case ("POST", _) where request.path.hasPrefix("/v1/video/traces/") && request.path.hasSuffix("/promote"):
+      // Task #19 finding #5: promote a rated render's optimization pair into
+      // the exemplar set. Intent comes from the bound attempt record; falls
+      // back to the render prompt when the render skipped optimization.
+      let id = String(request.path.dropFirst("/v1/video/traces/".count).dropLast("/promote".count))
+      guard !id.isEmpty else { return .error(.error(status: 400, message: "Missing render_id")) }
+      let events = renderTraceStore.events(renderId: id)
+      guard let submitted = events.first(where: { $0.event == .submitted }) else {
+        return .error(.error(status: 404, message: "No trace for render \(id)"))
+      }
+      let finalPrompt = submitted.payload["prompt"] ?? ""
+      var intent = finalPrompt
+      var contentMode = ContentModeManager.Mode.neutral.rawValue
+      if let attemptId = submitted.payload["optimization_attempt_id"],
+         let attempt = renderTraceStore.events(renderId: attemptId).last {
+        intent = attempt.payload["intent"] ?? intent
+        contentMode = attempt.payload["content_mode"] ?? contentMode
+      }
+      guard !finalPrompt.isEmpty else {
+        return .error(.error(status: 422, message: "Trace has no prompt to promote"))
+      }
+      ExemplarStore.shared.add(PromptExemplar(
+        intent: intent, final: finalPrompt, mediaKind: "video",
+        contentMode: contentMode, sourceRenderId: id))
+      return .json(status: 200, payload: ["success": true])
+
+    case ("POST", _) where request.path.hasPrefix("/v1/video/traces/") && request.path.hasSuffix("/rating"):
+      // Task #19: post-hoc human verdict, appended as a `rated` event.
+      let id = String(request.path.dropFirst("/v1/video/traces/".count).dropLast("/rating".count))
+      guard !id.isEmpty else { return .error(.error(status: 400, message: "Missing render_id")) }
+      struct RatingBody: Decodable { let vote: String; let axis: String?; let note: String? }
+      guard let body = try? decode(RatingBody.self, from: request.body) else {
+        return .error(.error(status: 400, message: "'vote' is required (up/down or 1-5)"))
+      }
+      var payload = ["vote": body.vote, "axis": body.axis ?? "overall"]
+      if let note = body.note { payload["note"] = note }
+      renderTraceStore.append(RenderTraceEvent(
+        renderId: id, event: .rated, taskKind: .videoRender, payload: payload))
+      renderTraceStore.flush()
+      return .json(status: 200, payload: ["success": true])
+
+    case ("GET", "/v1/video/config/effective"):
+      // Task #9 Phase 1: the effective Tier A/B video config with provenance
+      // per parameter (configFile > env > builtin). The missing-rescale
+      // detector: anything the caller expects to be set shows `builtin`.
+      do {
+        let params = LTX2ConfigResolver.resolveEffective()
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(["params": params])
+        return .json(.rawJSON(status: 200, data: data))
       } catch {
         return .error(response(for: error))
       }
@@ -1520,6 +1689,13 @@ public final class WarmServer {
     let steps: Int?
     let seed: UInt64?
     let strength: Float?
+    /// Conditioning compression (libx264 CRF) override for THIS render — the
+    /// daemon sends a higher value (more motion) for partnered-action prompts
+    /// and a low value (fidelity) for solo/portrait. nil = env default.
+    let imgCompression: Int?
+    /// CFG guidance override (>1 amplifies action; motion recipe sends 2.0 for
+    /// partnered-action, omits for solo=fidelity). nil = env/config default.
+    let guidance: Float?
     let extendToSeconds: Float?
     /// Target duration in seconds — the daemon/MCP vocabulary. For local
     /// renders this maps onto `extendToSeconds` (chunked continuation, each
@@ -1539,10 +1715,68 @@ public final class WarmServer {
     /// Which client/app submitted this job (desktop, bree, api…) — surfaced in
     /// the async job status and /health, same as image `GeneratePayload.source`.
     let source: String?
+    /// Tier A tuning overrides (snake_case JSON via decoder strategy).
+    let tuning: LTX2VideoTuning?
+    /// Server-minted id from /v1/enhance binding this render to its
+    /// optimization lineage (task #19, finding #6).
+    let optimizationAttemptId: String?
     /// Optional preset id resolved from the shared PresetStore (mediaKind
     /// "video"): LoRAs, prompt prefix/suffix, negative prompt, dims budget,
     /// steps, seed. Explicit request fields always override preset values.
     let preset: String?
+    /// Character whose canonical description is prepended to the prompt so the
+    /// subject renders on-model. For T2V (no init image) this is the ONLY
+    /// identity source; defaults to "kira" when unset. For I2V the init image
+    /// already carries identity, so it's injected only when explicitly named.
+    let character: String?
+    /// Content mode (neutral/apple/banana/avocado) gating the character's
+    /// mode-specific description addendum. Defaults to the server's current mode.
+    let contentMode: String?
+    /// Auto-enhance the prompt through the configured prompt-optimization
+    /// provider (Dan's-PE via LM Studio) before encoding. Default on when a
+    /// provider is configured; set false to send the raw prompt.
+    let enhance: Bool?
+    /// Named resolution budget: "480p" | "720p" | "1080p". Maps to a
+    /// width x height pixel budget when explicit width/height are absent
+    /// (previously this key was silently DROPPED on the local path).
+    let resolution: String?
+    /// Aspect ratio for the resolution budget: "16:9" (default) or "9:16".
+    /// For I2V the source image's aspect still wins (budget only).
+    let aspectRatio: String?
+    /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
+    /// first audio render reloads the transformer with the audio branch.
+    let audio: Bool?
+    /// Suppress the manual character prepend when the CALLER has already woven
+    /// the description into the prompt (Todd 2026-08-07). Mirrors the image
+    /// path's `skip_character_injection`, which the video path never had.
+    ///
+    /// Without this the description is injected twice — once by the caller,
+    /// once here — and at ~110 tokens each that alone overruns the 128-token
+    /// tokenizer cap, truncating the scene and the camera direction off the
+    /// end of the prompt. The idempotency check below cannot be relied on:
+    /// it compares the first four words of THIS host's description against a
+    /// prompt composed from a DIFFERENT character record on the daemon host,
+    /// at a different framing, so it silently misses.
+    ///
+    /// `character` still applies — it drives preset resolution, the output
+    /// directory and gallery attribution. Only the prompt prepend is skipped.
+    let skipCharacterInjection: Bool?
+  }
+
+  /// Map a named resolution + aspect to a width x height budget. Dims are
+  /// budgets, not finals — the existing /64 snapping and I2V source-aspect
+  /// derivation still apply downstream.
+  private static func videoDims(resolution: String?, aspectRatio: String?) -> (width: Int, height: Int)? {
+    guard let res = resolution?.lowercased() else { return nil }
+    let landscape: (Int, Int)
+    switch res {
+    case "480p": landscape = (832, 480)
+    case "720p": landscape = (1280, 720)
+    case "1080p": landscape = (1920, 1080)
+    default: return nil
+    }
+    let portrait = (aspectRatio ?? "16:9") == "9:16"
+    return portrait ? (landscape.1, landscape.0) : landscape
   }
 
   private struct LocalVideoResponse: Encodable {
@@ -1605,6 +1839,8 @@ public final class WarmServer {
     /// t2v when there's no init image, i2v otherwise.
     let mode: VideoMode
     let source: String
+    /// Lineage reference from /v1/enhance, if the caller optimized first.
+    let optimizationAttemptId: String?
   }
 
   /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
@@ -1631,12 +1867,47 @@ public final class WarmServer {
   /// LTX-2 renders at dims that are 32-multiples but NOT 64-multiples (e.g.
   /// 480) exhibit progressive haze (#219) — every clean render in the 07-13
   /// bisect used /64 dims, every hazy one used 480.
+  /// Resolve the stage-1 (painted) dims for a two-stage render whose request
+  /// dims mean the FINAL output size. Pure, so it can be tested at the sizes
+  /// callers actually send rather than only the ones convenient to validate.
+  ///
+  /// The refine SHARPENS what stage 1 painted; it cannot invent detail that was
+  /// never generated. Halving a request sized for the old single-pass
+  /// convention therefore degrades output silently — Kira's 704x448 became a
+  /// 384x256 base pass (a third of her previous pixels) and went visibly
+  /// diffuse, while every render validated that day asked for 960x576 and
+  /// halved comfortably to 512x320 (2026-08-02).
+  ///
+  /// Below the floor the request is treated as STAGE-1 dims (pre-halving
+  /// behaviour): the clip finishes at 2x the requested size. A sharp surprise
+  /// beats a soft silent degradation.
+  ///
+  /// - Returns: the dims to paint at, and whether halving was applied.
+  static func stageOneDims(
+    finalWidth: Int, finalHeight: Int, floorPixels: Int = 512 * 320
+  ) -> (width: Int, height: Int, halved: Bool) {
+    let w = snapDim64(finalWidth / 2)
+    let h = snapDim64(finalHeight / 2)
+    guard w * h >= floorPixels else {
+      return (finalWidth, finalHeight, false)
+    }
+    return (w, h, true)
+  }
+
   static func snapDim64(_ value: Int) -> Int {
     max(256, Int((Double(value) / 64.0).rounded()) * 64)
   }
 
   /// Derive I2V render dims matching the source image aspect within the
   /// requested pixel-area budget, both dims /64. Pure for unit testing.
+  ///
+  /// Rounding each axis to /64 independently compounds error in opposite
+  /// directions: a 1664x896 source (aspect 1.857) at a 448x704 budget produced
+  /// 768x384 (aspect 2.000) — the height's ideal 412.1 sat almost exactly on a
+  /// 64-boundary midpoint and rounded DOWN while the width rounded up, a 7.7%
+  /// distortion that visibly squashes the subject (2026-08-01). Search the /64
+  /// neighbourhood instead and keep the pair whose aspect is closest to the
+  /// source, breaking ties toward the pixel budget.
   static func deriveVideoDims(
     sourceWidth: Int, sourceHeight: Int, budgetWidth: Int, budgetHeight: Int
   ) -> (width: Int, height: Int) {
@@ -1647,7 +1918,44 @@ public final class WarmServer {
     let budget = Double(max(budgetWidth, 64) * max(budgetHeight, 64))
     let idealW = (budget * aspect).squareRoot()
     let idealH = idealW / aspect
-    return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
+
+    let baseW = Int((idealW / 64.0).rounded())
+    let baseH = Int((idealH / 64.0).rounded())
+
+    func search(areaCap: Double) -> (w: Int, h: Int, aspectErr: Double, areaErr: Double)? {
+      var best: (w: Int, h: Int, aspectErr: Double, areaErr: Double)?
+      for dw in -1...1 {
+        for dh in -1...1 {
+          let w = max(256, (baseW + dw) * 64)
+          let h = max(256, (baseH + dh) * 64)
+          let area = Double(w * h)
+          guard area <= budget * areaCap else { continue }
+          let aspectErr = abs(Double(w) / Double(h) - aspect) / aspect
+          let areaErr = abs(area - budget) / budget
+          if let b = best {
+            let better = aspectErr < b.aspectErr - 1e-9
+              || (abs(aspectErr - b.aspectErr) <= 1e-9 && areaErr < b.areaErr)
+            if better { best = (w, h, aspectErr, areaErr) }
+          } else {
+            best = (w, h, aspectErr, areaErr)
+          }
+        }
+      }
+      return best
+    }
+
+    // Prefer staying near the budget; but at small budgets the 256 floor pins one
+    // axis and the tight cap can force a badly stretched pair (a halved two-stage
+    // budget hit 19% that way), so allow a larger clip rather than distort.
+    var pick = search(areaCap: 1.25)
+    if pick == nil || pick!.aspectErr > 0.03, let relaxed = search(areaCap: 1.6),
+       relaxed.aspectErr < (pick?.aspectErr ?? .infinity) - 1e-9 {
+      pick = relaxed
+    }
+    guard let chosen = pick else {
+      return (snapDim64(Int(idealW.rounded())), snapDim64(Int(idealH.rounded())))
+    }
+    return (chosen.w, chosen.h)
   }
 
   /// Pixel dimensions of an image file without decoding the bitmap.
@@ -1760,8 +2068,14 @@ public final class WarmServer {
     // preset like 704x448 applied to a portrait source distorts the
     // conditioning frame and the render drifts off the image. The requested
     // width x height is kept only as a pixel-area budget for I2V.
-    var renderWidth = req.width ?? videoPreset?.width ?? 704
-    var renderHeight = req.height ?? videoPreset?.height ?? 448
+    // Priority: explicit width/height > named resolution ("720p" etc., FIXED:
+    // previously silently dropped) > preset dims > 704x448 default.
+    let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
+    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? 704
+    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? 448
+    if req.width == nil, let nd = namedDims {
+      logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
+    }
     if let initPath = effectiveInitImage,
        let sourceSize = Self.imagePixelSize(atPath: initPath) {
       let derived = Self.deriveVideoDims(
@@ -1782,15 +2096,123 @@ public final class WarmServer {
         renderHeight = snappedH
       }
     }
+    // Two-stage dims convention (2026-08-02): with LTX2_TWO_STAGE=1 the request
+    // dims are the FINAL output size (matching ComfyUI and every caller's
+    // intuition). ComfyBox's pipeline doubles stage-1 dims through the refine,
+    // so hand it the /64-snapped HALF. Without this, enabling two-stage doubled
+    // every clip's output size and the refine-volume gate silently skipped the
+    // refine — the worst of both worlds. Stage-1 /64 keeps the final /128-ish
+    // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
+    // Typed resolution honors request/preset tuning overrides (finding #18):
+    // a request can enable two-stage without the plist knowing.
+    if LTX2ConfigResolver.resolveTyped(request: req.tuning, preset: videoPreset?.videoTuning).twoStage {
+      let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
+      if s1.halved {
+        logger.info(
+          "LTX-2 two-stage: request dims \(renderWidth)x\(renderHeight) = FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles to \(s1.width * 2)x\(s1.height * 2)")
+        renderWidth = s1.width
+        renderHeight = s1.height
+      } else {
+        logger.warning("""
+          LTX-2 two-stage: request \(renderWidth)x\(renderHeight) would paint stage 1 at \
+          \(Self.snapDim64(renderWidth / 2))x\(Self.snapDim64(renderHeight / 2)) — below the \
+          stage-1 floor, which renders SOFT (the refine sharpens, it cannot invent detail). \
+          Treating the request as stage-1 dims instead; output will be \
+          \(renderWidth * 2)x\(renderHeight * 2). Send ~2x larger dims for the intended size.
+          """)
+      }
+    }
     if let requestedSteps = req.steps, requestedSteps != 8 {
       logger.warning(
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
     }
 
     var effectivePrompt = req.prompt
+
+    // Character identity + optional prompt enhancement. For T2V (no init image)
+    // there is no other identity source, so default to "kira" when the caller
+    // names no character. For I2V the init image already carries identity.
+    let isT2V = (effectiveInitImage == nil)
+    let characterName = req.character ?? (isT2V ? "kira" : nil)
+    let charMode = req.contentMode.flatMap { ContentModeManager.Mode(rawValue: $0) } ?? .neutral
+    var characterDesc: String? = nil
+    if let name = characterName,
+       let entry = await characterStore.get(CharacterEntry.slug(name)) {
+      characterDesc = entry.resolvedDescription(for: charMode)
+    }
+
+    // Auto-enhance the video prompt through the configured prompt-optimization
+    // provider (Dan's-PE via LM Studio). The optimizer weaves in the character
+    // description AND enriches the scene, so it replaces the manual character
+    // prepend. Opt out per request with enhance:false; falls back to the manual
+    // prepend when no provider is configured or enhancement fails.
+    var enhancedApplied = false
+    let aiProviderConfig = ComfyBoxServerConfig.loadOrMigrate()
+    if req.enhance != false, let endpoint = aiProviderConfig.providers.promptOptimization {
+      var base = endpoint.baseUrl
+      while base.hasSuffix("/") { base.removeLast() }
+      if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+      while base.hasSuffix("/") { base.removeLast() }
+      let optimizer = PromptOptimizer(
+        configuration: PromptOptimizer.Configuration(
+          ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
+          timeoutSeconds: 90, enabled: true),
+        logger: logger)
+      // i2v: motion-only enhancement (the init image fixes subject/scene); t2v: full scene.
+      let result = await optimizer.optimize(
+        prompt: req.prompt, character: characterName,
+        characterDescription: characterDesc, contentMode: charMode.rawValue,
+        mediaKind: isT2V ? "video" : "video-i2v")
+      if result.enhanced {
+        effectivePrompt = result.prompt
+        enhancedApplied = true
+        logger.info("Video: enhanced prompt via \(endpoint.model)\(characterName.map { " (character \($0))" } ?? "").")
+      }
+    }
+
+    // Fallback: manual character prepend when enhancement didn't run/apply.
+    // Skipped outright when the caller says it already wove the description in
+    // — see `skipCharacterInjection` on the request for why the idempotency
+    // check below is not sufficient on its own.
+    if req.skipCharacterInjection == true, characterName != nil {
+      logger.info("Video: character injection skipped — caller composed identity.")
+    }
+    if req.skipCharacterInjection != true,
+       !enhancedApplied, let name = characterName, let desc = characterDesc, !desc.isEmpty {
+      // Idempotency: skip if the caller already wrote the description in.
+      let alreadyPresent = desc.split(separator: " ").prefix(4).allSatisfy {
+        effectivePrompt.localizedCaseInsensitiveContains($0)
+      }
+      if !alreadyPresent {
+        effectivePrompt = desc + " " + effectivePrompt
+        logger.info("Video: prepended character '\(name)' (mode \(charMode.rawValue)) to prompt.")
+      }
+    }
+
     if let preset = videoPreset {
       if let prefix = preset.promptPrefix, !prefix.isEmpty { effectivePrompt = prefix + ", " + effectivePrompt }
       if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
+    }
+
+    // Single-pass fold (2026-08-02): continuation chunks DEGENERATE — chunk 2
+    // collapses into fragments (long-known for i2v, which is why the daemon
+    // sends explicit single-pass frames there; observed for T2V today the
+    // moment two-stage went live: chunk 1 clean, chunk 2 psychedelic). The
+    // daemon's rule only covers i2v, so fold ANY duration that fits the
+    // trained window (289f = 12s) into ONE chunk here, t2v included.
+    var foldedFramesPerChunk = req.frames ?? 97
+    var foldedExtendSeconds = req.extendToSeconds
+      ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
+    if foldedExtendSeconds > 0 {
+      let fps = req.fps ?? 24
+      let targetFrames = Int((foldedExtendSeconds * Float(fps)).rounded())
+      if targetFrames <= 289 {
+        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)  // 1+8k covering target
+        foldedFramesPerChunk = max(foldedFramesPerChunk, singleFrames)
+        logger.info(
+          "LTX-2: folded \(foldedExtendSeconds)s request into a single \(foldedFramesPerChunk)f chunk (continuation chunks degenerate; ≤289f renders single-pass)")
+        foldedExtendSeconds = 0  // 0 = no continuation chunks
+      }
     }
 
     let videoRequest = LTX2VideoRequest(
@@ -1799,26 +2221,43 @@ public final class WarmServer {
       initImagePath: effectiveInitImage,
       width: renderWidth,
       height: renderHeight,
-      framesPerChunk: req.frames ?? 97,
+      framesPerChunk: foldedFramesPerChunk,
       steps: req.steps ?? videoPreset?.steps ?? 8,
       seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
       strength: req.strength ?? 1.0,
+      imgCompression: req.imgCompression,
+      guidance: req.guidance,
       // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
       // 2026-07-13 MLX mutex crash on this path was memory pressure — with
       // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
       // (289f, no crash). Single-chunk renders don't anchor (nothing to
       // drift); callers can still pass 0 to disable.
+      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
+      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
+      // faces without the multi-keyframe gap-collapse. Enable explicitly via
+      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
+      // it unless the interval is set below the frame count. Only the pre-existing
+      // extended/chunked anchor stays on by default (unchanged behavior).
       identityAnchorStrength: req.identityAnchorStrength
         ?? (Self.isExtendedRender(
               extendToSeconds: req.extendToSeconds, duration: req.duration,
-              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24) ? 0.5 : 0),
-      extendToSeconds: req.extendToSeconds
-        ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24),
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
+            ? 0.5
+            : ((effectiveInitImage != nil
+                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
+                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
+               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
+      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
+      extendToSeconds: foldedExtendSeconds,
       fps: req.fps ?? 24,
       loraPath: req.loraPath,
       loraStrength: req.loraStrength ?? 1.0,
       loras: resolvedLoRAs,
       outputPath: resolvedOutput
+,
+      tuning: req.tuning,
+      presetTuning: videoPreset?.videoTuning,
+      audio: req.audio ?? false
     )
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
@@ -1827,7 +2266,8 @@ public final class WarmServer {
       generator: generator,
       request: videoRequest,
       mode: (effectiveInitImage?.isEmpty == false) ? .i2v : .t2v,
-      source: req.source ?? "api")
+      source: req.source ?? "api",
+      optimizationAttemptId: req.optimizationAttemptId)
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -1839,8 +2279,23 @@ public final class WarmServer {
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
+      var tracePayload: [String: String] = ["prompt": prep.request.prompt]
+      if prep.request.audio {
+        tracePayload["has_audio"] = "true"
+        tracePayload["audio_seconds"] = String(format: "%.2f",
+          Float(prep.request.framesPerChunk) / Float(prep.request.fps))
+      }
+      if let attemptId = prep.optimizationAttemptId {
+        tracePayload["optimization_attempt_id"] = attemptId
+      }
       let status = videoJobTracker.submit(
-        source: prep.source, mode: prep.mode, coordinator: coordinator
+        source: prep.source, mode: prep.mode, coordinator: coordinator,
+        // Snapshot at SUBMIT time (finding #15): the authoritative resolution
+        // this render will use, durable on the job status.
+        resolvedConfig: LTX2ConfigResolver.resolveTyped(
+          request: prep.request.tuning, preset: prep.request.presetTuning).params,
+        tracePayload: tracePayload,
+        wantsAudio: prep.request.audio
       ) { report in
         try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
@@ -1872,7 +2327,7 @@ public final class WarmServer {
       let videoRequest = prep.request
 
       logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f)")
-      let result = try await coordinator.enqueueLocalVideo { report in
+      let result = try await coordinator.enqueueLocalVideo(wantsAudio: videoRequest.audio) { report in
         try generator.generate(videoRequest) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
             chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
@@ -1941,6 +2396,10 @@ public final class WarmServer {
     let character: String?
     let characterDescription: String?
     let contentMode: String?
+    /// Target model family: "image" (Z-Image, default) or "video" (LTX). Selects
+    /// the prompt FORMAT — image uses YOUR CONTEXT/YOUR PHOTO, video uses LTX-2.3
+    /// cinematic prose.
+    let mediaKind: String?
   }
 
   /// Enhance a prompt through the configured prompt-optimization provider
@@ -1993,14 +2452,38 @@ public final class WarmServer {
       prompt: req.prompt,
       character: req.character,
       characterDescription: characterDescription,
-      contentMode: mode
+      contentMode: mode,
+      mediaKind: req.mediaKind ?? "image"
     )
+
+    // Task #19 (Codex finding #6): a server-minted attempt id bound to
+    // input, result, template and outcome — render submissions reference
+    // this instead of shipping client-echoed strings. Persisted as a trace
+    // event so the lineage survives the 1h job prune.
+    let attemptId = "opt-" + UUID().uuidString
+    renderTraceStore.append(RenderTraceEvent(
+      renderId: attemptId, event: .terminal, taskKind: .videoRender,
+      payload: [
+        "kind": "optimization_attempt",
+        "intent": req.prompt,
+        "optimized": result.prompt,
+        "outcome": result.outcome,
+        "template_id": result.templateId ?? "",
+        "template_hash": result.templateHash ?? "",
+        "template_source": result.templateSource ?? "",
+        "media_kind": req.mediaKind ?? "image",
+        "content_mode": mode,
+      ]))
 
     var payload: [String: Any] = [
       "success": true,
       "prompt": result.prompt,
       "enhanced": result.enhanced,
+      "optimization_attempt_id": attemptId,
+      "optimizer_outcome": result.outcome,
     ]
+    if let tid = result.templateId { payload["template_id"] = tid }
+    if let th = result.templateHash { payload["template_hash"] = th }
     if let note = result.note { payload["note"] = note }
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return .error(.error(status: 500, message: "Failed to serialize enhance response"))
@@ -2184,6 +2667,7 @@ public final class WarmServer {
 
   /// Default ControlNet directory path — matches ComfyBridgeObjectInfo discovery path.
   private static let controlnetDirectoryPath = ("~/bin/zimage/controlnet" as NSString).expandingTildeInPath
+  private static let krea2ControlLoRAPath = "/Volumes/Bolt/Models/krea2-controlnet/depth-control-lora.safetensors"
 
   private func bridgeGenerate(_ request: ComfyBridgeGenerateRequest, progressCallback: ComfyBridgeProgressHandler?, latentPreviewCallback: ComfyBridgeLatentPreviewHandler? = nil) async throws -> ComfyBridgeGenerateResult {
     // --- Phase 4: Dynamic LoRA swap ---
@@ -3488,6 +3972,7 @@ public final class WarmServer {
       pendingCount: snap.pendingCount,
       maxPending: configuration.maxPendingRequests,
       isRendering: snap.isRendering,
+      isPaused: snap.isPaused,
       activeRequestAgeMs: activeAgeMs,
       currentJobId: snap.activeJobId,
       progressPercent: progress,
@@ -3772,6 +4257,8 @@ private final class LocalVideoJob: @unchecked Sendable {
   var error: String?
   var progressPercent: Int?
   var completedAt: Date?
+  /// Authoritative config snapshot, set at submit (finding #15).
+  var resolvedConfig: [LTX2ResolvedParam]?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -3796,6 +4283,7 @@ private final class LocalVideoJob: @unchecked Sendable {
       error: error,
       elapsedMs: elapsedMs,
       progressPercent: progressPercent,
+      resolvedConfig: resolvedConfig,
       frameCount: frameCount
     )
   }
@@ -3815,16 +4303,32 @@ private final class LocalVideoJob: @unchecked Sendable {
 /// isolation; `submit` is the thin production wrapper that drives it against the
 /// real render queue.
 final class VideoJobTracker: @unchecked Sendable {
+  /// Task #19: append-only lifecycle trace (submitted/started/terminal).
+  /// nil in unit tests that only exercise the state machine.
+  var traceStore: RenderTraceStore?
   private let lock = NSLock()
   private var jobs: [String: LocalVideoJob] = [:]
 
   /// Create a tracked job in `.queued` and return (jobId, its status). Testable
   /// without a coordinator.
   @discardableResult
-  func register(source: String, mode: VideoMode) -> (jobId: String, status: VideoJobStatus) {
+  func register(
+    source: String, mode: VideoMode,
+    resolvedConfig: [LTX2ResolvedParam]? = nil,
+    tracePayload: [String: String] = [:]
+  ) -> (jobId: String, status: VideoJobStatus) {
     let jobId = UUID().uuidString
     let job = LocalVideoJob(id: jobId, source: source, mode: mode)
+    job.resolvedConfig = resolvedConfig
     lock.lock(); jobs[jobId] = job; lock.unlock()
+    var payload = tracePayload
+    payload["source"] = source
+    payload["mode"] = mode.rawValue
+    if let rc = resolvedConfig {
+      payload["config"] = rc.map { "\($0.name)=\($0.value)(\($0.source.rawValue))" }.joined(separator: " ")
+    }
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .submitted, taskKind: .videoRender, payload: payload))
     return (jobId, job.toStatus())
   }
 
@@ -3837,14 +4341,19 @@ final class VideoJobTracker: @unchecked Sendable {
     source: String,
     mode: VideoMode,
     coordinator: WarmServerCoordinator,
+    resolvedConfig: [LTX2ResolvedParam]? = nil,
+    tracePayload: [String: String] = [:],
+    wantsAudio: Bool = false,
     render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
   ) -> VideoJobStatus {
-    let (jobId, queued) = register(source: source, mode: mode)
+    let (jobId, queued) = register(
+      source: source, mode: mode, resolvedConfig: resolvedConfig,
+      tracePayload: tracePayload)
     Task { [weak self] in
       guard let self else { return }
       self.markProcessing(jobId)
       do {
-        let result = try await coordinator.enqueueLocalVideo { coordReport in
+        let result = try await coordinator.enqueueLocalVideo(wantsAudio: wantsAudio) { coordReport in
           try render { pct in
             // Fan progress to both the coordinator's health/queue trackers and
             // this job's own status.
@@ -3894,6 +4403,8 @@ final class VideoJobTracker: @unchecked Sendable {
 
   func markProcessing(_ jobId: String) {
     lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .started, taskKind: .videoRender, payload: [:]))
   }
 
   func setProgress(_ jobId: String, _ percent: Int) {
@@ -3912,6 +4423,14 @@ final class VideoJobTracker: @unchecked Sendable {
       job.completedAt = Date()
     }
     lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .terminal, taskKind: .videoRender,
+      payload: [
+        "status": "succeeded",
+        "output_path": result.outputPath,
+        "frames": String(result.frameCount),
+        "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
+      ]))
   }
 
   func markFailed(_ jobId: String, error: Error) {
@@ -3922,6 +4441,9 @@ final class VideoJobTracker: @unchecked Sendable {
       job.completedAt = Date()
     }
     lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .terminal, taskKind: .videoRender,
+      payload: ["status": "failed", "error": error.localizedDescription]))
   }
 
   /// Drop completed/failed jobs older than `ttl`. Mirrors `ImageJobTracker`.
@@ -3993,7 +4515,15 @@ private actor WarmServerCoordinator {
   private var isProcessing = false
   /// When paused, the process loop finishes the current job (if any) but does
   /// not start pending ones until resumed.
-  private var isPaused = false
+  ///
+  /// PERSISTED across restarts via a sentinel file (2026-08-10): the flag was
+  /// in-memory only, so any engine restart — watchdog kickstart, crash,
+  /// deploy — silently resumed creation. "Paused" that un-pauses itself is
+  /// how the July mystery-GPU-usage class of incident happens.
+  private var isPaused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
+
+  /// Sentinel marking the queue paused; survives engine restarts.
+  static let pauseSentinelPath = NSString(string: "~/.comfybox/queue-paused").expandingTildeInPath
   private var shuttingDown = false
   private var successfulRenderCount = 0
   private var failedRenderCount = 0
@@ -4565,7 +5095,10 @@ private actor WarmServerCoordinator {
   /// per-chunk/per-step progress hook; the coordinator wires it into the
   /// lock-based progress + health trackers so /health and /v1/queue reflect the
   /// live render without an actor hop (mirrors the image render path, #217).
-  func enqueueLocalVideo(_ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult) async throws -> LTX2VideoResult {
+  func enqueueLocalVideo(
+    wantsAudio: Bool = false,
+    _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
+  ) async throws -> LTX2VideoResult {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -4574,7 +5107,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation))))
+      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation), wantsAudio: wantsAudio)))
       startProcessingIfNeeded()
     }
   }
@@ -4712,7 +5245,7 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
       cont.resume(throwing: ServerError.cancelled)
-    case .localVideo(_, let cont):
+    case .localVideo(_, let cont, _):
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
       cont.resume(throwing: ServerError.cancelled)
@@ -4761,6 +5294,13 @@ private actor WarmServerCoordinator {
 
   func setPaused(_ paused: Bool) {
     isPaused = paused
+    // Persist so a watchdog kickstart / crash / deploy cannot silently
+    // resume creation the user paused (see isPaused declaration).
+    if paused {
+      FileManager.default.createFile(atPath: Self.pauseSentinelPath, contents: Data("paused \(Date())\n".utf8))
+    } else {
+      try? FileManager.default.removeItem(atPath: Self.pauseSentinelPath)
+    }
     if !paused { startProcessingIfNeeded() }
     publishHealth()
   }
@@ -4855,7 +5395,7 @@ private actor WarmServerCoordinator {
         } catch {
           continuation.resume(throwing: error)
         }
-      case .localVideo(let body, let continuation):
+      case .localVideo(let body, let continuation, let wantsAudio):
         // Runs on the serial queue so LTX-2 never shares the GPU with a render.
         activeRenderStartedAt = Date()
         // activeJobId is set from job.id at the top of the loop.
@@ -4867,14 +5407,49 @@ private actor WarmServerCoordinator {
         // on the serial render queue guarantees no image render can re-load
         // between the eviction and the video load.
         let freedForVideoMB = await releaseImageModelsForVideo()
-        let availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+        var availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
         // Precision-keyed (#230): an int8-quantized checkpoint dir gates at
         // 40GB instead of the bf16 65GB, so video coexists with LM Studio.
-        let ltx2Need = HeavyModelAdmission.ltx2EstimateBytes(
-          forWeightsPath: configuration.ltx2WeightsPath)
+        // Warm-stack discount: when the LTX-2 generator is ALREADY loaded, its
+        // ~46-65GB of weights are resident and counted AGAINST free memory —
+        // demanding the full cold-load estimate double-counts them and refuses
+        // healthy back-to-back videos (observed 2026-07-25 22:38: 45GB free
+        // with the stack warm, admit=false, job bounced). A warm render only
+        // needs activation headroom (streamed decode bounds the decode peak).
+        // Audio-aware (task #21, Codex #2): an audio-mode mismatch forces a
+        // full transformer rebuild inside body() — the warm discount would
+        // then double-count nothing while the +~12GiB audio branch (bf16) and
+        // fp32 codec load on top of a torn-down stack. Treat mode-mismatch as
+        // COLD and add the audio delta to the cold estimate.
+        let gen = videoHolder.get()
+        let audioModeMatches = (gen?.isAudioLoaded ?? false) == wantsAudio
+        let videoStackWarm = gen?.isLoaded == true && audioModeMatches
+        let audioDelta: UInt64 = wantsAudio ? 13 * 1024 * 1024 * 1024 : 0
+        let ltx2Need = videoStackWarm
+          ? 24 * 1024 * 1024 * 1024
+          : HeavyModelAdmission.ltx2EstimateBytes(
+              forWeightsPath: configuration.ltx2WeightsPath) + audioDelta
+        // Drain-until-settled (#34): back-to-back renders (e.g. Kira's i2v →
+        // multi-keyframe in the same second) start while the previous job's
+        // MLX buffer pool + lazy macOS reclaim still hold tens of GB. Admission
+        // then either refuses spuriously OR passes on memory that isn't really
+        // reclaimed yet — and the render dies ~60s in on a Metal allocation
+        // abort (SIGKILL, no app error; 3x reproduced 2026-07-25). Actively
+        // drain and re-probe until free ≥ need + margin, up to ~18s, before
+        // deciding. clearCache() returns pooled buffers; the settle sleep gives
+        // the OS time to actually reclaim them.
+        let drainMargin: UInt64 = 6 * 1024 * 1024 * 1024
+        var drainAttempts = 0
+        while availableForVideo < ltx2Need + drainMargin && drainAttempts < 6 {
+          GPU.clearCache()
+          try? await Task.sleep(nanoseconds: 3_000_000_000)
+          availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
+          drainAttempts += 1
+          logger.info("LTX-2 admission drain #\(drainAttempts): \(availableForVideo >> 20)MB free (target \((ltx2Need + drainMargin) >> 20)MB)")
+        }
         let admitVideo = heavyAdmission.admitsAfterEvict(
           needBytes: ltx2Need, freeBytes: availableForVideo)
-        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free, need ~\(ltx2Need >> 20)MB → admit=\(admitVideo) (#218)")
+        logger.info("LTX-2 admission: freed ~\(freedForVideoMB)MB image, \(availableForVideo >> 20)MB free after \(drainAttempts) drain(s), need ~\(ltx2Need >> 20)MB\(videoStackWarm ? " (warm stack)" : "") → admit=\(admitVideo) (#218/#34)")
         if !admitVideo {
           continuation.resume(throwing: WarmServerError.invalidRequest(
             message: "Insufficient memory for LTX-2 video: only \(availableForVideo >> 20)MB free after evicting image models (need ~\(ltx2Need >> 20)MB)"))
@@ -5215,11 +5790,58 @@ private actor WarmServerCoordinator {
       let steps = payload.steps ?? 9
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
+      // Krea-2 builds its requests straight from the payload rather than going
+      // through makePipelineRequest, so resolve DyPE explicitly here.
+      let krea2DyPE = payload.resolvedDyPEConfig(width: width, height: height)
 
-      let image = k2.generate(
-        .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed)
-      ) { [logger] step, total in
-        logger.info("Krea2: step \(step)/\(total)")
+      // img2img fix (2026-07-19): Krea2Pipeline.generateImg2Img already
+      // implements VAE-encode + partial-denoise; runKrea2Generate simply never
+      // wired it, so an init image was silently ignored (txt2img). When an init
+      // image is present, load+normalize it to NHWC [-1,1] and run img2img.
+      // strength = 1 - denoise, matching flux1 makeImg2ImgRequest's convention.
+      // Depth Control-LoRA: load control weights + encode control tokens when a control image is supplied.
+      var controlPixels: MLXArray? = nil
+      let resolvedControlData: Data? = payload.controlImageData ?? payload.controlImage.flatMap { try? Data(contentsOf: URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)) }
+      if let controlData = resolvedControlData {
+        let ccg = try InpaintUtilities.loadCGImage(from: controlData)
+        let cpix = try QwenImageIO.resizedPixelArray(from: ccg, width: width, height: height)
+        controlPixels = QwenImageIO.normalizeForEncoder(cpix).transposed(0, 2, 3, 1)
+        let loraURL = URL(fileURLWithPath: "/Volumes/Bolt/Models/krea2-controlnet/depth-control-lora.safetensors")
+        try await k2.setControlLoRA(loraURL, scale: payload.controlnetStrength ?? 1.0)
+        logger.info("Krea2: depth Control-LoRA active (strength=\(payload.controlnetStrength ?? 1.0))")
+      } else if k2.controlLoRAActive {
+        try await k2.setControlLoRA(nil)
+      }
+      let image: MLXArray
+      if let initPath = payload.imagePath {
+        let imageData = try Data(contentsOf: URL(fileURLWithPath: initPath))
+        let cg = try InpaintUtilities.loadCGImage(from: imageData)
+        let pixNCHW = try QwenImageIO.resizedPixelArray(from: cg, width: width, height: height)
+        let sourceNHWC = QwenImageIO.normalizeForEncoder(pixNCHW).transposed(0, 2, 3, 1)
+        let strength: Float
+        if let c = payload.creativity {
+          strength = 1.0 - max(0.01, min(0.99, c))
+        } else if let sVal = payload.imageStrength {
+          strength = max(0.01, min(0.99, sVal))
+        } else if let d = payload.denoise {
+          strength = 1.0 - max(0.01, min(0.99, d))
+        } else {
+          strength = 0.3
+        }
+        logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
+        image = k2.generateImg2Img(
+          .init(prompt: payload.prompt, sourceImage: sourceNHWC, width: width, height: height,
+                steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE)
+        ) { [logger] step, total in
+          logger.info("Krea2 img2img: step \(step)/\(total)")
+        }
+      } else {
+        image = k2.generate(
+          .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed,
+                controlImagePixels: controlPixels, dyPE: krea2DyPE)
+        ) { [logger] step, total in
+          logger.info("Krea2: step \(step)/\(total)")
+        }
       }
       let metadata = QwenImageIO.ImageMetadata.generation(
         prompt: payload.prompt,
@@ -5916,6 +6538,10 @@ struct GeneratePayload: Sendable {
   let model: String?
   /// Per-job LoRA override, applied the same way as `model` at dequeue time.
   let loras: [LoRAEntry]?
+  // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
+  let controlImageData: Data?
+  let controlnetStrength: Float?
+  let controlImage: String?  // Mac-side control map path (e.g. depth), read in place
 
   /// Default memberwise init for bridge-created payloads.
   init(
@@ -5931,13 +6557,15 @@ struct GeneratePayload: Sendable {
     imagePath: String? = nil, imageStrength: Float? = nil, creativity: Float? = nil,
     maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
-    model: String? = nil, loras: [LoRAEntry]? = nil
+    model: String? = nil, loras: [LoRAEntry]? = nil,
+    controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil
   ) {
     self.source = source
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
     self.loras = loras
+    self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength; self.controlImage = controlImage
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
@@ -5976,6 +6604,9 @@ extension GeneratePayload: Decodable {
     // Wire key init_image_base64 arrives as this camelCase form after
     // .convertFromSnakeCase (same gotcha as the inpaint keys).
     case initImageData = "initImageBase64"
+    case controlImageData
+    case controlnetStrength
+    case controlImage
     case model, loras
   }
 
@@ -6019,6 +6650,29 @@ extension GeneratePayload: Decodable {
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
+    controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
+    controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
+    controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
+  }
+
+  /// The DyPE configuration this payload implies at the given resolution.
+  ///
+  /// An explicit `dype` always wins, including "none". Otherwise DyPE
+  /// auto-enables above the model's base resolution — the branch that matters
+  /// most, since the callers that need it (Kira's HQ 2K rerender, the Krita
+  /// bridge) send no `dype` at all.
+  ///
+  /// `.ntk` is deliberately the ceiling: `.yarn` is an unimplemented stub that
+  /// warns and falls back to NTK, so selecting it would only add log noise.
+  func resolvedDyPEConfig(width resolvedWidth: Int, height resolvedHeight: Int) -> DyPEConfig {
+    if let raw = dype?.lowercased() {
+      switch raw {
+      case "ntk": return .ntk
+      case "yarn": return .yarn
+      default: return .disabled
+      }
+    }
+    return max(resolvedWidth, resolvedHeight) > 1024 ? .ntk : .disabled
   }
 
   func makePipelineRequest(
@@ -6036,19 +6690,7 @@ extension GeneratePayload: Decodable {
     // Build DyPE config — auto-enable for high-res requests
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
-    let dyPEConfig: DyPEConfig
-    if let dypeRaw = dype?.lowercased() {
-      switch dypeRaw {
-      case "ntk": dyPEConfig = .ntk
-      case "yarn": dyPEConfig = .yarn
-      case "none", "off": dyPEConfig = .disabled
-      default: dyPEConfig = .disabled
-      }
-    } else if max(resolvedWidth, resolvedHeight) > 1024 {
-      dyPEConfig = .ntk  // Auto-enable for high-res
-    } else {
-      dyPEConfig = .disabled
-    }
+    let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     return ZImageGenerationRequest(
       prompt: prompt,
@@ -6117,18 +6759,7 @@ extension GeneratePayload: Decodable {
 
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
-    let dyPEConfig: DyPEConfig
-    if let dypeRaw = dype?.lowercased() {
-      switch dypeRaw {
-      case "ntk": dyPEConfig = .ntk
-      case "yarn": dyPEConfig = .yarn
-      default: dyPEConfig = .disabled
-      }
-    } else if max(resolvedWidth, resolvedHeight) > 1024 {
-      dyPEConfig = .ntk
-    } else {
-      dyPEConfig = .disabled
-    }
+    let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
@@ -6412,6 +7043,10 @@ private struct HealthResponse: Encodable, Sendable {
   let pendingCount: Int
   let maxPending: Int
   let isRendering: Bool
+  /// Queue pause gate (`is_paused` on the wire) — surfaced in /health so every
+  /// client (desktop toolbar, daemons, MCP) sees the same creation state
+  /// without an extra request.
+  let isPaused: Bool
   let activeRequestAgeMs: Int?
   /// Synthetic id of the currently-rendering job — `current_job_id` on the wire.
   let currentJobId: String?
@@ -6450,7 +7085,7 @@ private enum QueuedOperation: Sendable {
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
   /// Local LTX-2 video generation, run through the queue so it serializes with
   /// image renders on the shared GPU. The closure captures the generator+request.
-  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>)
+  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>, wantsAudio: Bool)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
 
