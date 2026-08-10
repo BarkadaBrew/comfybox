@@ -33,8 +33,9 @@ final class MCPVideoToolTests: XCTestCase {
     // queue_list, interrupt_render, cancel_job, nearline_{list,scan,stage,evict})
     // added 2026-07 = 32; + compose_montage (#232) + render_storyboard (#237)
     // + import/list/run_workflow + workflow_run_status (#238) = 38;
-    // + lora_quarantine (model-pool work, 90e6f38) = 39.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 39, "Expected 39 registered MCP tools")
+    // + lora_quarantine (model-pool work, 90e6f38) = 39;
+    // + pause_queue/resume_queue (creation Pause, 13e1c41) = 41.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 41, "Expected 41 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)

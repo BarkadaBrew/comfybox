@@ -1353,6 +1353,17 @@ public final class WarmServer {
       }
       return await submitReplicateVideo(body: request.body)
 
+    case ("POST", "/v1/video/rerender"):
+      // Winner action: replay a rendered clip's exact request at a higher
+      // resolution budget (default 720p). Same seed + stored effective prompt
+      // = the same clip, larger. Async job like /v1/video/generate/async.
+      return await videoRerenderResponse(body: request.body)
+
+    case ("POST", "/v1/video/extend"):
+      // Winner action: chain a fresh continuation from a clip's last frame at
+      // the 4s/480p standard (storyboard-style anchoring, new seed).
+      return await videoExtendResponse(body: request.body)
+
     case ("GET", _) where request.path.hasPrefix("/v1/video/status/"):
       let jobId = String(request.path.dropFirst("/v1/video/status/".count))
       guard !jobId.isEmpty else {
@@ -2288,6 +2299,20 @@ public final class WarmServer {
       if let attemptId = prep.optimizationAttemptId {
         tracePayload["optimization_attempt_id"] = attemptId
       }
+      // Winner actions (2026-08-10): store the sanitized request + the
+      // resolved seed/dims so this render_id is replayable — /v1/video/rerender
+      // replays it at 720p, /v1/video/extend chains a continuation.
+      if let requestJSON = VideoWinnerActions.sanitizedRequestJSON(fromBody: body) {
+        tracePayload["request_json"] = requestJSON
+      }
+      tracePayload["seed"] = String(prep.request.seed)
+      tracePayload["width"] = String(prep.request.width)
+      tracePayload["height"] = String(prep.request.height)
+      tracePayload["frames"] = String(prep.request.framesPerChunk)
+      tracePayload["fps"] = String(prep.request.fps)
+      if let initImage = prep.request.initImagePath {
+        tracePayload["image_path"] = initImage
+      }
       let status = videoJobTracker.submit(
         source: prep.source, mode: prep.mode, coordinator: coordinator,
         // Snapshot at SUBMIT time (finding #15): the authoritative resolution
@@ -2308,6 +2333,118 @@ public final class WarmServer {
       return .json(.rawJSON(status: 202, data: data))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
+    } catch {
+      return .error(response(for: error))
+    }
+  }
+
+  // MARK: - Winner actions (2026-08-10: 480p/4s standard, improve the keepers)
+
+  private struct VideoRerenderBody: Decodable {
+    let renderId: String?
+    let path: String?
+    let resolution: String?
+  }
+
+  private struct VideoExtendBody: Decodable {
+    let renderId: String?
+    let path: String?
+    let seconds: Int?
+    let prompt: String?
+  }
+
+  /// Locate the trace behind a winner action: by render_id directly, or by
+  /// matching a gallery clip's path/filename against recent terminal outputs.
+  private func findVideoTrace(
+    renderId: String?, path: String?
+  ) -> (renderId: String, submitted: [String: String], outputPath: String?)? {
+    if let id = renderId, !id.isEmpty {
+      let events = renderTraceStore.events(renderId: id)
+      guard let submitted = events.first(where: { $0.event == .submitted }) else { return nil }
+      let terminal = events.last { $0.event == .terminal }
+      return (id, submitted.payload, terminal?.payload["output_path"])
+    }
+    if let path, !path.isEmpty {
+      let filename = (path as NSString).lastPathComponent
+      for summary in renderTraceStore.recentSummaries(limit: 500) {
+        guard let out = summary.outputPath,
+          out == path || (out as NSString).lastPathComponent == filename
+        else { continue }
+        let events = renderTraceStore.events(renderId: summary.renderId)
+        let submitted = events.first { $0.event == .submitted }
+        return (summary.renderId, submitted?.payload ?? [:], out)
+      }
+    }
+    return nil
+  }
+
+  private func videoRerenderResponse(body: Data) async -> RoutedResponse {
+    guard let req = try? decode(VideoRerenderBody.self, from: body),
+      req.renderId != nil || req.path != nil
+    else {
+      return .error(.error(status: 400, message: "Body must include 'render_id' or 'path'"))
+    }
+    let resolution = req.resolution ?? "720p"
+    if let validationError = VideoGenerateRequest.validateResolution(resolution) {
+      return .error(.error(status: 400, message: validationError))
+    }
+    guard let trace = findVideoTrace(renderId: req.renderId, path: req.path) else {
+      return .error(.error(status: 404, message: "No render trace matches that render_id/path"))
+    }
+    guard let requestJSON = trace.submitted["request_json"] else {
+      return .error(.error(
+        status: 422,
+        message:
+          "Trace \(trace.renderId) predates replay support (no stored request) — re-render works for clips rendered after this deploy"))
+    }
+    do {
+      let newBody = try VideoWinnerActions.rerenderBody(
+        requestJSON: requestJSON,
+        resolvedSeed: trace.submitted["seed"],
+        effectivePrompt: trace.submitted["prompt"],
+        resolution: resolution)
+      if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
+        logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
+        return routed
+      }
+      return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights)"))
+    } catch {
+      return .error(.error(status: 422, message: "\(error)"))
+    }
+  }
+
+  private func videoExtendResponse(body: Data) async -> RoutedResponse {
+    guard let req = try? decode(VideoExtendBody.self, from: body),
+      req.renderId != nil || req.path != nil
+    else {
+      return .error(.error(status: 400, message: "Body must include 'render_id' or 'path'"))
+    }
+    let trace = findVideoTrace(renderId: req.renderId, path: req.path)
+    // Source clip: the caller's path when it exists, else the trace's output.
+    let clipPath = [req.path, trace?.outputPath].compactMap { $0 }
+      .first { FileManager.default.fileExists(atPath: $0) }
+    guard let clipPath else {
+      return .error(.error(
+        status: 404,
+        message: "Source clip not found on disk — pass 'path' or a 'render_id' whose output still exists"))
+    }
+    do {
+      // Same containment rule as /v1/video/output: only gallery clips.
+      _ = try WarmServerOutputPathValidator.resolveOutputPath(
+        clipPath, allowedOutputDirectory: configuration.allowedOutputDirectory)
+      let framePath = NSTemporaryDirectory() + "winner-extend-\(UUID().uuidString).png"
+      try LastFrameExtractor.extractLastFrame(from: clipPath, to: framePath)
+      let newBody = try VideoWinnerActions.extendBody(
+        requestJSON: trace?.submitted["request_json"],
+        framePath: framePath,
+        seconds: req.seconds ?? 4,
+        prompt: req.prompt,
+        effectivePrompt: trace?.submitted["prompt"])
+      if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
+        logger.info("video: winner extend of \((clipPath as NSString).lastPathComponent) (+\(req.seconds ?? 4)s)")
+        return routed
+      }
+      return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights)"))
     } catch {
       return .error(response(for: error))
     }
