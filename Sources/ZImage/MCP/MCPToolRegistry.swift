@@ -36,6 +36,8 @@ public enum MCPToolRegistry {
     videoStatus,
     composeMontage,
     renderStoryboard,
+    rerenderVideo,
+    extendVideo,
     importWorkflow,
     listWorkflows,
     runWorkflow,
@@ -543,6 +545,58 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["segments"] as [String],
+    ] as [String: Any]
+  )
+
+  static let rerenderVideo = MCPToolDefinition(
+    name: "rerender_video",
+    description:
+      "Winner action: replay an already-rendered clip's EXACT request (same seed, same effective prompt, same init image) at a higher resolution budget — the standard flow is cheap 480p exploration, then this on clips worth keeping. Identify the clip by render_id (from video traces) or by its output path/filename. Async: returns 202 + job_id; poll video_status. A 720p re-render takes roughly 4x the original render time.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "render_id": [
+          "type": "string",
+          "description": "Trace render_id of the clip (preferred — exact).",
+        ] as [String: Any],
+        "path": [
+          "type": "string",
+          "description": "Output path or filename of the clip, matched against recent render traces.",
+        ] as [String: Any],
+        "resolution": [
+          "type": "string",
+          "description": "Named budget: '720p' (default) or '1080p'.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": [] as [String],
+    ] as [String: Any]
+  )
+
+  static let extendVideo = MCPToolDefinition(
+    name: "extend_video",
+    description:
+      "Winner action: chain a fresh continuation clip from an existing clip's last frame (i2v, new seed, 480p/4s standard). The source clip's stored prompt carries the scene forward unless a new motion prompt is given. Identify the clip by render_id or output path. Async: returns 202 + job_id; poll video_status. Join the pieces afterwards with compose_montage if a single file is wanted.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "render_id": [
+          "type": "string",
+          "description": "Trace render_id of the source clip.",
+        ] as [String: Any],
+        "path": [
+          "type": "string",
+          "description": "Output path or filename of the source clip.",
+        ] as [String: Any],
+        "seconds": [
+          "type": "integer",
+          "description": "Continuation length in seconds (default 4; snapped to the trained frame grid, max 12).",
+        ] as [String: Any],
+        "prompt": [
+          "type": "string",
+          "description": "Optional new motion prompt for the continuation (raw text — preset trigger words are applied automatically).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": [] as [String],
     ] as [String: Any]
   )
 

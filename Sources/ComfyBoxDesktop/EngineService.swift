@@ -1369,6 +1369,36 @@ public final class EngineService {
             triggerwords: (json["triggerwords"] as? [String]) ?? [])
     }
 
+    // MARK: - Video winner actions (spec 2026-08-10)
+
+    /// Replay a rendered clip's exact request at a higher resolution budget.
+    /// Returns the async job id (poll /v1/video/status or watch the Queue tab).
+    public func rerenderVideo(path: String, resolution: String = "720p") async throws -> String {
+        try await submitWinnerAction(
+            route: "/v1/video/rerender", body: ["path": path, "resolution": resolution])
+    }
+
+    /// Chain a fresh continuation from a clip's last frame at the 4s standard.
+    public func extendVideo(path: String, seconds: Int = 4, prompt: String? = nil) async throws -> String {
+        var body: [String: Any] = ["path": path, "seconds": seconds]
+        if let prompt, !prompt.isEmpty { body["prompt"] = prompt }
+        return try await submitWinnerAction(route: "/v1/video/extend", body: body)
+    }
+
+    private func submitWinnerAction(route: String, body: [String: Any]) async throws -> String {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let data = try JSONSerialization.data(withJSONObject: body)
+        let (status, response) = try await client.post(route, body: data)
+        guard status == 202 || status == 200,
+              let json = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+              let jobId = json["job_id"] as? String
+        else {
+            throw EngineServiceError.serverError(
+                status, parseErrorMessage(from: response) ?? "Video action failed")
+        }
+        return jobId
+    }
+
     // MARK: - Queue management (/v1/queue)
 
     /// One pending job in the server render queue.
