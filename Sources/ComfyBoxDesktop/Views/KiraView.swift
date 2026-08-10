@@ -16,6 +16,9 @@ struct KiraView: View {
     @State private var suggestionDraft: String = ""
     @State private var suggestionKind: String = "image"
     @State private var suggestionTier: String = "any"
+    /// Local slider value while dragging the i2v share — the PUT fires on
+    /// release, not per drag tick. nil = mirror the server value.
+    @State private var pendingI2vRatio: Double?
     /// Which cards are expanded. Empty by default → every card starts collapsed
     /// on launch (Todd 2026-07-17). Expansion is per-session, not persisted.
     @State private var expandedCards: Set<String> = []
@@ -310,6 +313,44 @@ struct KiraView: View {
                         .frame(maxWidth: 240)
                         .disabled(client.actionInFlight)
                         .help("Your sticky override — pins every cycle to a tier, all hours, until Auto. Kira's own choice and the schedule take over when cleared.")
+                    }
+                }
+                // Video mix (Todd 2026-08-10): videoMode + the i2v share of a
+                // mixed cycle. The ratio is a dial for "mixed" only — a pinned
+                // mode ignores it, and merely setting a ratio never unpins.
+                HStack(spacing: 10) {
+                    Text("Video:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.videoMode ?? "i2v" },
+                        set: { v in Task { await client.updateSchedulerPolicy(["videoMode": v]) } })) {
+                        Text("i2v").tag("i2v")
+                        Text("Mixed").tag("mixed")
+                        Text("t2v").tag("t2v")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 210)
+                    .disabled(client.actionInFlight)
+                    .help("i2v animates a rendered seed frame (anchored identity); t2v renders the whole clip from text; Mixed draws each clip by the share slider.")
+                    if (scheduler.videoMode ?? "i2v") == "mixed" {
+                        let live = pendingI2vRatio ?? scheduler.videoI2vRatio ?? 0.5
+                        Slider(value: Binding(
+                            get: { live },
+                            set: { pendingI2vRatio = $0 }
+                        ), in: 0...1, step: 0.05) { editing in
+                            if !editing {
+                                let v = pendingI2vRatio ?? live
+                                Task {
+                                    await client.updateSchedulerPolicy(["videoI2vRatio": v])
+                                    pendingI2vRatio = nil   // back to mirroring the server
+                                }
+                            }
+                        }
+                        .frame(maxWidth: 180)
+                        .disabled(client.actionInFlight)
+                        Text("\(Int((live * 100).rounded()))% i2v / \(100 - Int((live * 100).rounded()))% t2v")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .frame(width: 120, alignment: .leading)
                     }
                 }
                 // Per-tier schedule + pacing. Editing writes the FULL tiers
