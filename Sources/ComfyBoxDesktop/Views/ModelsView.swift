@@ -20,6 +20,10 @@ struct ModelsView: View {
     // LoRA library
     @State private var loraFilter: String = ""
     @State private var loraBusy: String?
+    // Folded LoRA families, persisted across launches (comma-joined — family
+    // tokens never contain commas). An active search overrides folds so a
+    // match is never hidden inside a collapsed group.
+    @AppStorage("modelsView.collapsedLoraFamilies") private var collapsedLoraCSV: String = ""
 
     var body: some View {
         ScrollView {
@@ -157,14 +161,27 @@ struct ModelsView: View {
 
     private var loraLibrarySection: some View {
         let loras = filteredLoras()
+        let groups = groupedLoras(loras)
         let totalGB = engine.availableLoras.reduce(0.0) { $0 + Double($1.sizeBytes) } / 1_073_741_824
+        let searching = !loraFilter.isEmpty
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("LoRA Library").font(.headline)
                 Text("\(engine.availableLoras.count) · \(String(format: "%.1f GB", totalGB))")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                TextField("Filter…", text: $loraFilter).textFieldStyle(.roundedBorder).frame(width: 150)
+                // Searches filename, category, and trigger words — typing
+                // "krea2" surfaces the whole family.
+                TextField("Search name or category…", text: $loraFilter)
+                    .textFieldStyle(.roundedBorder).frame(width: 190)
+                if !groups.isEmpty && !searching {
+                    // One-click fold state for the whole library. Hidden while
+                    // searching (search force-expands, the buttons would lie).
+                    let allCollapsed = groups.allSatisfy { collapsedLoraFamilies.contains($0.family) }
+                    Button(allCollapsed ? "Expand all" : "Collapse all") {
+                        collapsedLoraCSV = allCollapsed ? "" : groups.map(\.family).joined(separator: ",")
+                    }.controlSize(.small)
+                }
                 Button { Task { try? await engine.scanLoras(); await engine.refreshLoras() } } label: {
                     Label("Scan", systemImage: "arrow.clockwise")
                 }.controlSize(.small).disabled(!engine.connectionState.isConnected)
@@ -173,29 +190,57 @@ struct ModelsView: View {
                 // An empty list must say WHY. A failed fetch used to look
                 // identical to "there are no LoRAs" (2026-08-10).
                 Text(engine.loraLoadError
-                     ?? (engine.connectionState.isConnected ? "No LoRAs match." : "Connect to browse the LoRA library."))
+                     ?? (engine.connectionState.isConnected
+                         ? (searching ? "Nothing matches “\(loraFilter)”." : "No LoRAs match.")
+                         : "Connect to browse the LoRA library."))
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 // LoRAs are subordinate to their requisite model — group under
-                // the model family they're designed for.
-                ForEach(groupedLoras(loras), id: \.family) { group in
+                // the model family they're designed for. Groups fold; an
+                // active search force-expands so a hit is never hidden.
+                ForEach(groups, id: \.family) { group in
+                    let expanded = searching || !collapsedLoraFamilies.contains(group.family)
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "cube.fill").font(.caption2).foregroundStyle(.secondary)
-                            Text(group.title).font(.subheadline.weight(.semibold))
-                            Text("\(group.loras.count) · \(group.sizeLabel)")
-                                .font(.caption2).foregroundStyle(.tertiary)
+                        Button {
+                            toggleLoraGroup(group.family)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                                Image(systemName: "cube.fill").font(.caption2).foregroundStyle(.secondary)
+                                Text(group.title).font(.subheadline.weight(.semibold))
+                                Text("\(group.loras.count) · \(group.sizeLabel)")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .disabled(searching)   // folds are meaningless mid-search
                         .padding(.top, 4)
-                        ForEach(group.loras.prefix(40)) { lora in loraRow(lora) }
-                        if group.loras.count > 40 {
-                            Text("+\(group.loras.count - 40) more — filter to narrow.")
-                                .font(.caption2).foregroundStyle(.tertiary)
+                        if expanded {
+                            ForEach(group.loras.prefix(40)) { lora in loraRow(lora) }
+                            if group.loras.count > 40 {
+                                Text("+\(group.loras.count - 40) more — search to narrow.")
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    private var collapsedLoraFamilies: Set<String> {
+        Set(collapsedLoraCSV.split(separator: ",").map(String.init))
+    }
+
+    private func toggleLoraGroup(_ family: String) {
+        var set = collapsedLoraFamilies
+        if set.contains(family) { set.remove(family) } else { set.insert(family) }
+        collapsedLoraCSV = set.sorted().joined(separator: ",")
     }
 
     private struct LoRAGroup { let family: String; let title: String; let loras: [LoRAInfo]; let sizeLabel: String }
@@ -256,10 +301,21 @@ struct ModelsView: View {
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
     }
 
+    /// Search matches filename, family/category (both raw and display label,
+    /// so "Krea 2" and "krea2" both hit), server category, and trigger words —
+    /// the things you actually remember about a LoRA.
     private func filteredLoras() -> [LoRAInfo] {
-        let base = loraFilter.isEmpty
+        let q = loraFilter.lowercased()
+        let base = q.isEmpty
             ? engine.availableLoras
-            : engine.availableLoras.filter { $0.filename.lowercased().contains(loraFilter.lowercased()) }
+            : engine.availableLoras.filter { lora in
+                if lora.filename.lowercased().contains(q) { return true }
+                if lora.category.lowercased().contains(q) { return true }
+                if lora.modelCompatibility.lowercased().contains(q) { return true }
+                let fam = LoRACompatibility.family(from: lora.modelCompatibility)
+                if !fam.isEmpty, fam.contains(q) || LoRACompatibility.label(for: fam).lowercased().contains(q) { return true }
+                return lora.triggerwords.contains { $0.lowercased().contains(q) }
+            }
         return base.sorted { $0.sizeBytes > $1.sizeBytes }
     }
 
