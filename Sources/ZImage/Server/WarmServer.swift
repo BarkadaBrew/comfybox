@@ -3972,6 +3972,7 @@ public final class WarmServer {
       pendingCount: snap.pendingCount,
       maxPending: configuration.maxPendingRequests,
       isRendering: snap.isRendering,
+      isPaused: snap.isPaused,
       activeRequestAgeMs: activeAgeMs,
       currentJobId: snap.activeJobId,
       progressPercent: progress,
@@ -4514,7 +4515,15 @@ private actor WarmServerCoordinator {
   private var isProcessing = false
   /// When paused, the process loop finishes the current job (if any) but does
   /// not start pending ones until resumed.
-  private var isPaused = false
+  ///
+  /// PERSISTED across restarts via a sentinel file (2026-08-10): the flag was
+  /// in-memory only, so any engine restart — watchdog kickstart, crash,
+  /// deploy — silently resumed creation. "Paused" that un-pauses itself is
+  /// how the July mystery-GPU-usage class of incident happens.
+  private var isPaused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
+
+  /// Sentinel marking the queue paused; survives engine restarts.
+  static let pauseSentinelPath = NSString(string: "~/.comfybox/queue-paused").expandingTildeInPath
   private var shuttingDown = false
   private var successfulRenderCount = 0
   private var failedRenderCount = 0
@@ -5285,6 +5294,13 @@ private actor WarmServerCoordinator {
 
   func setPaused(_ paused: Bool) {
     isPaused = paused
+    // Persist so a watchdog kickstart / crash / deploy cannot silently
+    // resume creation the user paused (see isPaused declaration).
+    if paused {
+      FileManager.default.createFile(atPath: Self.pauseSentinelPath, contents: Data("paused \(Date())\n".utf8))
+    } else {
+      try? FileManager.default.removeItem(atPath: Self.pauseSentinelPath)
+    }
     if !paused { startProcessingIfNeeded() }
     publishHealth()
   }
@@ -7027,6 +7043,10 @@ private struct HealthResponse: Encodable, Sendable {
   let pendingCount: Int
   let maxPending: Int
   let isRendering: Bool
+  /// Queue pause gate (`is_paused` on the wire) — surfaced in /health so every
+  /// client (desktop toolbar, daemons, MCP) sees the same creation state
+  /// without an extra request.
+  let isPaused: Bool
   let activeRequestAgeMs: Int?
   /// Synthetic id of the currently-rendering job — `current_job_id` on the wire.
   let currentJobId: String?

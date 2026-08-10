@@ -19,6 +19,8 @@ public enum MCPToolRegistry {
     serverHealth,
     queueStatus,
     clearQueue,
+    pauseQueue,
+    resumeQueue,
     listLoras,
     shutdownServer,
     systemStats,
@@ -229,6 +231,24 @@ public enum MCPToolRegistry {
   static let clearQueue = MCPToolDefinition(
     name: "clear_queue",
     description: "Cancel all pending generation jobs in the queue. Does not affect the currently running job.",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let pauseQueue = MCPToolDefinition(
+    name: "pause_queue",
+    description: "Pause ALL creation: the current job finishes, then no queued or new jobs start until resume_queue. The pause persists across engine restarts. Gates every initiator — schedulers, chat tools, gallery actions, direct API callers.",
+    inputSchema: [
+      "type": "object",
+      "properties": [:] as [String: Any],
+    ] as [String: Any]
+  )
+
+  static let resumeQueue = MCPToolDefinition(
+    name: "resume_queue",
+    description: "Resume creation after pause_queue: queued jobs start processing again.",
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],

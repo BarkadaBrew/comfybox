@@ -34,6 +34,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeGet("/queue")
       case "clear_queue":
         return try await executeClearQueue()
+      case "pause_queue":
+        return try await executeQueuePause(true)
+      case "resume_queue":
+        return try await executeQueuePause(false)
       case "list_loras":
         return try await executeListLoras()
       case "shutdown_server":
@@ -309,6 +313,13 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["clear": true]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/queue", body: jsonData)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// pause_queue / resume_queue -> POST /v1/queue/pause | /v1/queue/resume
+  /// (the same persistent gate the desktop toolbar and HTTP API use).
+  private func executeQueuePause(_ pause: Bool) async throws -> MCPToolResult {
+    let (status, data) = try await client.post(pause ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
     return mapHTTPResponse(status: status, data: data)
   }
 

@@ -196,6 +196,19 @@ struct ComfyBoxDesktopApp: App {
                     connectionButton
                 }
 
+                // Creation controls (Todd 2026-08-10): one gate for ALL
+                // creation. Pause is engine-side and persistent — it stops
+                // every initiator (server schedulers, chat tools, gallery
+                // buttons, MCP callers), not just this app, and survives an
+                // engine restart. Purge drops the pending queue and
+                // interrupts the in-flight render.
+                ToolbarItem(placement: .automatic) {
+                    creationPauseButton
+                }
+                ToolbarItem(placement: .automatic) {
+                    purgeQueueButton
+                }
+
                 if let ingestor = ingestor {
                     ToolbarItem(placement: .automatic) {
                         ingestorStatus(ingestor)
@@ -598,6 +611,42 @@ struct ComfyBoxDesktopApp: App {
         } else {
             nsfwPasswordError = true
         }
+    }
+
+    /// Pause/resume ALL creation — engine-level, persistent, every initiator.
+    /// State mirrors /health `is_paused`, so a pause set via API or MCP shows
+    /// here truthfully within one poll.
+    private var creationPauseButton: some View {
+        Button {
+            let target = !engine.queuePaused
+            Task { try? await engine.setCreationPaused(target) }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: engine.queuePaused ? "play.fill" : "pause.fill")
+                Text(engine.queuePaused ? "Paused" : "Pause")
+                    .font(.caption)
+            }
+            .foregroundStyle(engine.queuePaused ? .orange : .primary)
+        }
+        .disabled(!engine.connectionState.isConnected)
+        .help(engine.queuePaused
+              ? "Creation is paused engine-wide (persists across restarts). Click to resume."
+              : "Pause ALL creation — schedulers, chat, gallery, API and MCP callers. The current render finishes; nothing new starts.")
+    }
+
+    /// Drop every pending job and interrupt the in-flight render.
+    private var purgeQueueButton: some View {
+        Button {
+            Task { try? await engine.purgeQueue() }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "xmark.bin.fill")
+                Text(engine.queueCount > 0 ? "Purge (\(engine.queueCount))" : "Purge")
+                    .font(.caption)
+            }
+        }
+        .disabled(!engine.connectionState.isConnected || engine.queueCount == 0)
+        .help("Clear the queue now: drops all pending jobs and interrupts the current render.")
     }
 
     private var connectionButton: some View {

@@ -91,6 +91,7 @@ struct ServerHealthResponse: Decodable {
     let modelFamily: String?
     let loaded: Bool?
     let isRendering: Bool?
+    let isPaused: Bool?
     let pendingCount: Int?
     let renderCount: Int?
     let uptimeSeconds: Int?
@@ -105,6 +106,7 @@ struct ServerHealthResponse: Decodable {
         case status, model, loaded, loras
         case modelFamily = "model_family"
         case isRendering = "is_rendering"
+        case isPaused = "is_paused"
         case pendingCount = "pending_count"
         case renderCount = "render_count"
         case uptimeSeconds = "uptime_seconds"
@@ -216,6 +218,10 @@ public final class EngineService {
     public var currentModel: String?
     public var currentModelFamily: String?
     public var queueCount: Int = 0
+    /// Engine-level creation gate, mirrored from /health `is_paused` every
+    /// poll — so a pause toggled from ANY surface (toolbar, HTTP API, MCP)
+    /// shows truthfully here within one poll cycle.
+    public var queuePaused: Bool = false
     /// Counter rather than a bool so a queued/background generate() running
     /// alongside the foreground one doesn't clear this out from under it —
     /// isGenerating stays true until the LAST concurrent call finishes.
@@ -591,6 +597,42 @@ public final class EngineService {
         await refreshPool()
     }
 
+    // MARK: - Creation controls (pause / purge)
+
+    /// Pause or resume ALL creation at the engine. The gate is engine-side and
+    /// persistent, so it stops every initiator — schedulers on the server,
+    /// chat tools, gallery buttons, direct API/MCP callers — and survives an
+    /// engine restart. The current job finishes; nothing new starts.
+    public func setCreationPaused(_ paused: Bool) async throws {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (status, responseData) = try await client.post(paused ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
+        guard status == 200 else {
+            let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
+            throw EngineServiceError.serverError(status, errorMessage)
+        }
+        queuePaused = paused   // optimistic; the next health poll confirms
+    }
+
+    /// Purge the queue: drop every pending job AND interrupt the in-flight
+    /// render. Interrupt-after-clear order matters — clearing first means the
+    /// interrupted job cannot be followed by the next pending one.
+    public func purgeQueue() async throws {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let (clearStatus, clearData) = try await client.post("/v1/queue/clear", body: Data())
+        guard clearStatus == 200 else {
+            let errorMessage = parseErrorMessage(from: clearData) ?? "Server returned status \(clearStatus)"
+            throw EngineServiceError.serverError(clearStatus, errorMessage)
+        }
+        // Best-effort: no job may be running, and an interrupt on an idle
+        // engine is not an error worth surfacing.
+        _ = try? await client.post("/v1/queue/interrupt", body: Data())
+        queueCount = 0
+    }
+
     // MARK: - LoRA Management
 
     /// Fetch the list of available LoRAs from the server's library.
@@ -693,6 +735,7 @@ public final class EngineService {
             connectionState = .connected
             currentModel = health.model
             currentModelFamily = health.modelFamily
+            queuePaused = health.isPaused ?? false
             let pending = health.pendingCount ?? 0
             let rendering = (health.isRendering ?? false) ? 1 : 0
             queueCount = pending + rendering
