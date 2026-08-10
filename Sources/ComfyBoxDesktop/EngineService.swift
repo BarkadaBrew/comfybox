@@ -621,7 +621,11 @@ public final class EngineService {
                 return LoRAInfo(
                     id: id,
                     filename: filename,
-                    modelCompatibility: (dict["model_compatibility"] as? String) ?? "unknown",
+                    // The server sends an ARRAY (e.g. ["ltx"]); the String cast alone
+                    // failed for every entry, so all 195 LoRAs fell into "Uncategorized".
+                    modelCompatibility: (dict["model_compatibility"] as? String)
+                        ?? (dict["model_compatibility"] as? [String])?.joined(separator: ", ")
+                        ?? "unknown",
                     format: (dict["format"] as? String) ?? "unknown",
                     rank: (dict["rank"] as? Int) ?? 0,
                     sizeBytes: (dict["size_bytes"] as? Int) ?? 0,
