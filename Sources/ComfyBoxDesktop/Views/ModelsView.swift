@@ -5,6 +5,7 @@
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ModelsView: View {
     @Bindable var engine: EngineService
@@ -20,6 +21,8 @@ struct ModelsView: View {
     // LoRA library
     @State private var loraFilter: String = ""
     @State private var loraBusy: String?
+    // Import LoRA… flow (spec 2026-08-10): nil = sheet closed.
+    @State private var loraImportExpansion: LoRAImportPlanner.Expansion?
     // Folded LoRA families, persisted across launches (comma-joined — family
     // tokens never contain commas). An active search overrides folds so a
     // match is never hidden inside a collapsed group.
@@ -46,6 +49,39 @@ struct ModelsView: View {
             await engine.refreshLoras()
             nearline = await engine.fetchNearline()
         }
+        .sheet(isPresented: Binding(
+            get: { loraImportExpansion != nil },
+            set: { if !$0 { loraImportExpansion = nil } }
+        )) {
+            if let expansion = loraImportExpansion {
+                LoRAImportSheet(engine: engine, expansion: expansion) {
+                    Task { await engine.refreshLoras() }
+                }
+            }
+        }
+    }
+
+    // MARK: - Import LoRA… (spec 2026-08-10)
+
+    /// The /v1/loras/import route copies from a path on the ENGINE's disk.
+    private var engineIsLocal: Bool {
+        ["127.0.0.1", "localhost", "::1"].contains(engine.serverHost)
+    }
+
+    private func pickLorasToImport() {
+        let panel = NSOpenPanel()
+        panel.title = "Import LoRAs"
+        panel.message = "Choose .safetensors files, or folders to import every LoRA inside"
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        // Filter files to .safetensors (folders stay selectable); the planner
+        // re-filters anyway, so a failed UTType lookup just means no dimming.
+        if let type = UTType(filenameExtension: "safetensors") {
+            panel.allowedContentTypes = [type]
+        }
+        guard panel.runModal() == .OK else { return }
+        loraImportExpansion = LoRAImportPlanner.expand(urls: panel.urls)
     }
 
     // MARK: - Featured art models (Zeta-Chroma, CoffeeShop)
@@ -185,6 +221,16 @@ struct ModelsView: View {
                 Button { Task { try? await engine.scanLoras(); await engine.refreshLoras() } } label: {
                     Label("Scan", systemImage: "arrow.clockwise")
                 }.controlSize(.small).disabled(!engine.connectionState.isConnected)
+                // Import passes a server-LOCAL path — only offered when the
+                // engine runs on this machine (spec 2026-08-10).
+                Button { pickLorasToImport() } label: {
+                    Label("Import LoRA…", systemImage: "square.and.arrow.down")
+                }
+                .controlSize(.small)
+                .disabled(!engine.connectionState.isConnected || !engineIsLocal)
+                .help(engineIsLocal
+                      ? "Copy .safetensors files or folders into the library"
+                      : "Import needs the engine on this machine (it copies from a local path)")
             }
             if loras.isEmpty {
                 // An empty list must say WHY. A failed fetch used to look

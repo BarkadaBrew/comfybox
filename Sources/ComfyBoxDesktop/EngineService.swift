@@ -1339,6 +1339,36 @@ public final class EngineService {
         }
     }
 
+    /// One imported entry as returned by POST /v1/loras/import.
+    public struct ImportedLoRA: Sendable {
+        public let id: String
+        public let filename: String
+        public let modelCompatibility: [String]
+        public let triggerwords: [String]
+    }
+
+    /// Import a LoRA file from a server-local path into the library under the
+    /// given category folder (spec 2026-08-10). The route copies, rescans and
+    /// returns the indexed entry; an already-known filename returns the
+    /// existing entry rather than erroring.
+    public func importLora(path: String, category: String) async throws -> ImportedLoRA {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONSerialization.data(withJSONObject: ["path": path, "category": category])
+        let (status, data) = try await client.post("/v1/loras/import", body: body)
+        guard status == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = json["id"] as? String,
+              let filename = json["filename"] as? String
+        else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "LoRA import failed")
+        }
+        return ImportedLoRA(
+            id: id,
+            filename: filename,
+            modelCompatibility: (json["model_compatibility"] as? [String]) ?? [],
+            triggerwords: (json["triggerwords"] as? [String]) ?? [])
+    }
+
     // MARK: - Queue management (/v1/queue)
 
     /// One pending job in the server render queue.
