@@ -68,6 +68,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeComposeMontage(arguments)
       case "render_storyboard":
         return try await executeRenderStoryboard(arguments)
+      case "rerender_video":
+        return try await executeWinnerAction(arguments, route: "/v1/video/rerender")
+      case "extend_video":
+        return try await executeWinnerAction(arguments, route: "/v1/video/extend")
       case "import_workflow":
         return try await executeImportWorkflow(arguments)
       case "list_workflows":
@@ -612,6 +616,21 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if status == 200 || status == 202 {
       let text = String(data: data, encoding: .utf8) ?? "{}"
       return MCPToolResult(text: text)
+    }
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// rerender_video / extend_video -> POST /v1/video/{rerender,extend}
+  /// (202 + job id; poll video_status). Params forward verbatim — the route
+  /// resolves render_id/path against the trace store server-side.
+  private func executeWinnerAction(_ params: MCPParams?, route: String) async throws -> MCPToolResult {
+    guard let params, params.raw["render_id"] != nil || params.raw["path"] != nil else {
+      return MCPToolResult(error: "Error: 'render_id' or 'path' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post(route, body: jsonData)
+    if status == 200 || status == 202 {
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
     return mapHTTPResponse(status: status, data: data)
   }

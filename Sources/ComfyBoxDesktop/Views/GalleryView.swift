@@ -901,6 +901,13 @@ struct GalleryView: View {
                                 Button("to 4096px (long side)") { Task { await upscaleAsset(asset, to: 4096) } }
                             }
                         }
+                        // Winner actions (spec 2026-08-10): the scheduler
+                        // renders cheap 480p/4s — clips worth keeping get
+                        // improved here instead.
+                        if engine != nil, asset.kind == "video" {
+                            Button("Re-render at 720p") { Task { await rerenderVideoAsset(asset) } }
+                            Button("Extend +4s") { Task { await extendVideoAsset(asset) } }
+                        }
                         if engine != nil {
                             Button("Auto-caption & Tag") {
                                 let targets = isSelectMode && selectedIds.contains(asset.id)
@@ -1713,6 +1720,30 @@ struct GalleryView: View {
     }
 
     /// Upscale an asset via SeedVR2 and ingest the result into the gallery.
+    /// Winner action: replay this clip's exact render at 720p (same seed +
+    /// prompt — the same clip, larger). Queued async on the engine; the
+    /// result lands in the gallery like any render.
+    private func rerenderVideoAsset(_ asset: DAMAsset) async {
+        guard let engine else { return }
+        do {
+            let jobId = try await engine.rerenderVideo(path: asset.absolutePath)
+            errorMessage = "720p re-render queued (job \(jobId.prefix(8))…) — takes ~4x the original render; watch the Queue tab."
+        } catch {
+            errorMessage = "Re-render failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Winner action: chain a fresh 4s continuation from this clip's last frame.
+    private func extendVideoAsset(_ asset: DAMAsset) async {
+        guard let engine else { return }
+        do {
+            let jobId = try await engine.extendVideo(path: asset.absolutePath)
+            errorMessage = "Extend queued (job \(jobId.prefix(8))…) — a new 4s clip chained from the last frame; watch the Queue tab."
+        } catch {
+            errorMessage = "Extend failed: \(error.localizedDescription)"
+        }
+    }
+
     private func upscaleAsset(_ asset: DAMAsset, to target: Int) async {
         guard let engine else { return }
         errorMessage = "Upscaling \(asset.filename) to \(target)px… (this runs on the server and may take a while)"
