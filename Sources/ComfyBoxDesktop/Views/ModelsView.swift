@@ -170,7 +170,10 @@ struct ModelsView: View {
                 }.controlSize(.small).disabled(!engine.connectionState.isConnected)
             }
             if loras.isEmpty {
-                Text(engine.connectionState.isConnected ? "No LoRAs match." : "Connect to browse the LoRA library.")
+                // An empty list must say WHY. A failed fetch used to look
+                // identical to "there are no LoRAs" (2026-08-10).
+                Text(engine.loraLoadError
+                     ?? (engine.connectionState.isConnected ? "No LoRAs match." : "Connect to browse the LoRA library."))
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 // LoRAs are subordinate to their requisite model — group under

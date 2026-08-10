@@ -833,7 +833,16 @@ public final class WarmServer {
         return .error(.error(status: 503, message: "LoRA Library not initialized"))
       }
       let allEntries = library.list(includeQuarantined: true)
-      let activeLoRANames = await coordinator.activeLoRAIdentifiers
+      // #217 pattern applied here too: `await coordinator.activeLoRAIdentifiers`
+      // hopped onto the coordinator ACTOR, which stays occupied for the whole of
+      // a synchronous render — so listing the LoRA library hung with HTTP 000
+      // until the render finished, and any UI listing from this route rendered
+      // an EMPTY list (observed 2026-08-10). The catalog is static data and must
+      // never depend on GPU state; only the "currently loaded" decoration did.
+      // Read that from the same lock-based snapshot /health uses.
+      let activeLoRANames = liveHealth.read().0.loras.map { st in
+        ((st.source as NSString).lastPathComponent as NSString).deletingPathExtension
+      }
       let quarantinedCount = allEntries.filter { $0.quarantined }.count
 
       var loraList: [[String: Any]] = []

@@ -233,6 +233,12 @@ public final class EngineService {
     // LoRA state
     public var availableLoras: [LoRAInfo] = []
     public var activeLoraIds: [String] = []
+    /// Why the LoRA catalog is empty, WHEN it is empty because the fetch failed
+    /// rather than because there are genuinely no LoRAs. Every failure path in
+    /// refreshLoras() used to return silently, so a server-side fault (e.g.
+    /// /v1/loras hanging) presented as a permanently empty list with no
+    /// explanation and no retry (observed 2026-08-10).
+    public var loraLoadError: String?
     public var isSwappingLoras: Bool = false
 
     // Queue state
@@ -289,10 +295,21 @@ public final class EngineService {
             }
 
             // Poll every 3 seconds.
+            var sinceLoraRetry = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3))
                 if Task.isCancelled { break }
                 await self?.pollHealth()
+                // Self-heal the catalog. refreshLoras() ran ONCE on connect, so a
+                // failure there left the list empty until the app was restarted.
+                // Retry ~every 30s while it is empty or errored; a healthy,
+                // populated catalog costs nothing.
+                sinceLoraRetry += 1
+                if sinceLoraRetry >= 10, let self = self, self.connectionState.isConnected,
+                   self.availableLoras.isEmpty || self.loraLoadError != nil {
+                    sinceLoraRetry = 0
+                    await self.refreshLoras()
+                }
             }
         }
     }
@@ -582,11 +599,18 @@ public final class EngineService {
 
         do {
             let (status, data) = try await client.get("/v1/loras")
-            guard status == 200 else { return }
+            guard status == 200 else {
+                loraLoadError = "LoRA list failed: server returned \(status)"
+                return
+            }
 
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let loras = json["loras"] as? [[String: Any]],
-                  let activeLoras = json["active_loras"] as? [String] else { return }
+                  let activeLoras = json["active_loras"] as? [String] else {
+                loraLoadError = "LoRA list failed: unreadable response"
+                return
+            }
+            loraLoadError = nil
 
             activeLoraIds = activeLoras
 
@@ -610,7 +634,10 @@ public final class EngineService {
                 )
             }
         } catch {
-            // Non-fatal.
+            // Non-fatal for rendering, but the user must not be shown a silently
+            // empty catalog — record it so the UI can say so and the poll loop
+            // can retry.
+            loraLoadError = "LoRA list failed: \(error.localizedDescription)"
         }
     }
 
