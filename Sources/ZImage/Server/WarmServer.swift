@@ -1772,6 +1772,12 @@ public final class WarmServer {
     /// `character` still applies — it drives preset resolution, the output
     /// directory and gallery attribution. Only the prompt prepend is skipped.
     let skipCharacterInjection: Bool?
+    /// Suppress the preset promptPrefix/promptSuffix wrap when the caller's
+    /// prompt is a stored EFFECTIVE prompt that already carries them (winner
+    /// re-render/extend replay a trace's composed prompt — re-wrapping would
+    /// condition on "prefix, prefix, …"). The preset's LoRAs, negatives, dims
+    /// and steps still apply; only the prompt wrap is skipped.
+    let skipPresetPrompt: Bool?
   }
 
   /// Map a named resolution + aspect to a width x height budget. Dims are
@@ -2200,7 +2206,7 @@ public final class WarmServer {
       }
     }
 
-    if let preset = videoPreset {
+    if let preset = videoPreset, req.skipPresetPrompt != true {
       if let prefix = preset.promptPrefix, !prefix.isEmpty { effectivePrompt = prefix + ", " + effectivePrompt }
       if let suffix = preset.promptSuffix, !suffix.isEmpty { effectivePrompt = effectivePrompt + ", " + suffix }
     }
@@ -2365,14 +2371,17 @@ public final class WarmServer {
       return (id, submitted.payload, terminal?.payload["output_path"])
     }
     if let path, !path.isEmpty {
+      let summaries = renderTraceStore.recentSummaries(limit: 500)
       let filename = (path as NSString).lastPathComponent
-      for summary in renderTraceStore.recentSummaries(limit: 500) {
-        guard let out = summary.outputPath,
-          out == path || (out as NSString).lastPathComponent == filename
-        else { continue }
-        let events = renderTraceStore.events(renderId: summary.renderId)
+      // Exact full-path match first — a newer clip that merely shares a
+      // basename must not shadow the clip the caller actually named.
+      let match =
+        summaries.first { $0.outputPath == path }
+        ?? summaries.first { $0.outputPath.map { ($0 as NSString).lastPathComponent } == filename }
+      if let match, let out = match.outputPath {
+        let events = renderTraceStore.events(renderId: match.renderId)
         let submitted = events.first { $0.event == .submitted }
-        return (summary.renderId, submitted?.payload ?? [:], out)
+        return (match.renderId, submitted?.payload ?? [:], out)
       }
     }
     return nil
@@ -2402,7 +2411,8 @@ public final class WarmServer {
         requestJSON: requestJSON,
         resolvedSeed: trace.submitted["seed"],
         effectivePrompt: trace.submitted["prompt"],
-        resolution: resolution)
+        resolution: resolution,
+        initImagePath: trace.submitted["image_path"])
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
         logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
         return routed
@@ -2428,24 +2438,31 @@ public final class WarmServer {
         status: 404,
         message: "Source clip not found on disk — pass 'path' or a 'render_id' whose output still exists"))
     }
+    var framePath: String?
     do {
       // Same containment rule as /v1/video/output: only gallery clips.
       _ = try WarmServerOutputPathValidator.resolveOutputPath(
         clipPath, allowedOutputDirectory: configuration.allowedOutputDirectory)
-      let framePath = NSTemporaryDirectory() + "winner-extend-\(UUID().uuidString).png"
-      try LastFrameExtractor.extractLastFrame(from: clipPath, to: framePath)
+      let extracted = NSTemporaryDirectory() + "winner-extend-\(UUID().uuidString).png"
+      try LastFrameExtractor.extractLastFrame(from: clipPath, to: extracted)
+      framePath = extracted
       let newBody = try VideoWinnerActions.extendBody(
         requestJSON: trace?.submitted["request_json"],
-        framePath: framePath,
+        framePath: extracted,
         seconds: req.seconds ?? 4,
         prompt: req.prompt,
         effectivePrompt: trace?.submitted["prompt"])
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
+        // The frame must OUTLIVE this request — the queued render reads it
+        // when its GPU turn comes. tmp is system-cleaned between boots.
         logger.info("video: winner extend of \((clipPath as NSString).lastPathComponent) (+\(req.seconds ?? 4)s)")
         return routed
       }
+      if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
       return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights)"))
     } catch {
+      // No render was queued — the extracted frame would be orphaned.
+      if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
       return .error(response(for: error))
     }
   }

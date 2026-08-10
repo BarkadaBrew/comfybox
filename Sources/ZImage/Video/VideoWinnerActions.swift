@@ -52,31 +52,55 @@ public enum VideoWinnerActions {
     return json
   }
 
+  /// Read an Int-ish value under any of the given key variants.
+  private static func intValue(_ keys: [String], in body: [String: Any]) -> Int? {
+    for key in keys {
+      if let n = body[key] as? Int { return n }
+      if let n = body[key] as? Double { return Int(n) }
+    }
+    return nil
+  }
+
   /// Rebuild the winner's request at a named resolution budget. The trace's
   /// resolved seed and effective (post-enhancement, post-injection) prompt are
   /// pinned so the replay is deterministic; explicit dims are dropped so the
-  /// new budget actually applies.
+  /// new budget actually applies, with their orientation preserved as an
+  /// aspect_ratio (dims without one would silently default to 16:9 landscape).
   public static func rerenderBody(
     requestJSON: String,
     resolvedSeed: String?,
     effectivePrompt: String?,
-    resolution: String
+    resolution: String,
+    initImagePath: String? = nil
   ) throws -> Data {
     guard var body = (try? JSONSerialization.jsonObject(with: Data(requestJSON.utf8))) as? [String: Any]
     else { throw ActionError.malformedRequestJSON }
 
     body["resolution"] = resolution
+    if body["aspect_ratio"] == nil, body["aspectRatio"] == nil,
+      let width = intValue(["width"], in: body), let height = intValue(["height"], in: body)
+    {
+      body["aspect_ratio"] = height > width ? "9:16" : "16:9"
+    }
     remove(["width", "height", "output_path", "outputPath", "image_base64", "imageBase64"], from: &body)
+    // An i2v winner submitted via image_base64 has no image_path left after
+    // sanitizing — restore the trace's resolved init image or the replay
+    // silently flips to t2v.
+    if body["image_path"] == nil, body["imagePath"] == nil, let initImagePath {
+      body["image_path"] = initImagePath
+    }
     if let seed = resolvedSeed.flatMap({ Int($0) }) {
       body["seed"] = seed
     }
     if let prompt = effectivePrompt, !prompt.isEmpty {
       body["prompt"] = prompt
     }
-    // The stored prompt is already enhanced and identity-composed — running
-    // either pass again would double-inject and truncate.
+    // The stored prompt is already enhanced, identity-composed AND preset-
+    // wrapped — running any of those passes again would double-compose and
+    // push the scene text past the tokenizer cap.
     body["enhance"] = false
     body["skip_character_injection"] = true
+    body["skip_preset_prompt"] = true
     body["source"] = "winner-rerender"
     return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
   }
@@ -97,7 +121,8 @@ public enum VideoWinnerActions {
     framePath: String,
     seconds: Int,
     prompt: String?,
-    effectivePrompt: String?
+    effectivePrompt: String?,
+    freshSeed: UInt64? = nil
   ) throws -> Data {
     var body: [String: Any] = [:]
     if let json = requestJSON {
@@ -106,21 +131,32 @@ public enum VideoWinnerActions {
       body = obj
     }
 
-    guard let effective = [prompt, effectivePrompt, body["prompt"] as? String]
+    let callerPrompt = prompt.flatMap { $0.isEmpty ? nil : $0 }
+    guard let effective = [callerPrompt, effectivePrompt, body["prompt"] as? String]
       .compactMap({ $0 }).first(where: { !$0.isEmpty })
     else { throw ActionError.missingPrompt }
 
     let fps = (body["fps"] as? Int) ?? 24
     remove(
       ["seed", "duration", "extend_to_seconds", "extendToSeconds",
-       "width", "height", "output_path", "outputPath", "image_base64", "imageBase64"],
+       "width", "height", "output_path", "outputPath", "image_base64", "imageBase64",
+       "skip_preset_prompt", "skipPresetPrompt"],
       from: &body)
     body["prompt"] = effective
     body["image_path"] = framePath
     body["frames"] = snappedFrames(seconds: seconds, fps: fps)
     body["resolution"] = "480p"
+    // The local video path defaults a missing seed to a CONSTANT (42 or the
+    // preset seed) — mint one or every extend of a clip renders identically.
+    body["seed"] = Int(truncatingIfNeeded: freshSeed ?? UInt64.random(in: 0...0xFFFF_FFFF))
     body["enhance"] = false
     body["skip_character_injection"] = true
+    // A stored effective prompt is already preset-wrapped; a caller's fresh
+    // motion prompt is raw text and should pick up the preset trigger words
+    // exactly as the original render did.
+    if callerPrompt == nil {
+      body["skip_preset_prompt"] = true
+    }
     body["source"] = "winner-extend"
     return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
   }

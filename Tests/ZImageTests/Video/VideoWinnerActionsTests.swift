@@ -94,6 +94,70 @@ final class VideoWinnerActionsTests: XCTestCase {
     XCTAssertEqual(body["image_path"] as? String, "/tmp/seed.png")
   }
 
+  func testRerenderBodyRestoresInitImageStrippedFromBase64Submissions() throws {
+    // An i2v winner submitted via image_base64 has no image_path in the
+    // sanitized request — without the trace's resolved init image the replay
+    // silently flips to t2v (review finding 1).
+    var original = originalBody
+    original.removeValue(forKey: "image_path")
+    let json = String(
+      data: try JSONSerialization.data(withJSONObject: original), encoding: .utf8)!
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: json, resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p", initImagePath: "/tmp/resolved-init.png"))
+    XCTAssertEqual(body["image_path"] as? String, "/tmp/resolved-init.png")
+  }
+
+  func testRerenderBodyPrefersTheRequestsOwnImagePath() throws {
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: originalJSON(), resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p", initImagePath: "/tmp/resolved-init.png"))
+    XCTAssertEqual(body["image_path"] as? String, "/tmp/seed.png")
+  }
+
+  func testRerenderBodySuppressesPresetPromptRewrap() throws {
+    // The stored effective prompt already carries the preset prefix/suffix —
+    // re-wrapping would condition on "prefix, prefix, …" (review finding 2).
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: originalJSON(), resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p"))
+    XCTAssertEqual(body["skip_preset_prompt"] as? Bool, true)
+  }
+
+  func testRerenderBodySynthesizesAspectRatioFromStoredDims() throws {
+    // Portrait winner (480x832) with no aspect_ratio key: stripping dims
+    // without recording orientation replays landscape (review finding 3).
+    let portrait = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: originalJSON(), resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p"))
+    XCTAssertEqual(portrait["aspect_ratio"] as? String, "9:16")
+
+    var landscapeBody = originalBody
+    landscapeBody["width"] = 832
+    landscapeBody["height"] = 480
+    let json = String(
+      data: try JSONSerialization.data(withJSONObject: landscapeBody), encoding: .utf8)!
+    let landscape = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: json, resolvedSeed: "1", effectivePrompt: "p", resolution: "720p"))
+    XCTAssertEqual(landscape["aspect_ratio"] as? String, "16:9")
+  }
+
+  func testRerenderBodyKeepsAnExplicitAspectRatio() throws {
+    var original = originalBody
+    original["aspect_ratio"] = "16:9"  // explicit wins over dims inference
+    let json = String(
+      data: try JSONSerialization.data(withJSONObject: original), encoding: .utf8)!
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: json, resolvedSeed: "1", effectivePrompt: "p", resolution: "720p"))
+    XCTAssertEqual(body["aspect_ratio"] as? String, "16:9")
+  }
+
   func testRerenderBodyRejectsGarbage() {
     XCTAssertThrowsError(try VideoWinnerActions.rerenderBody(
       requestJSON: "not json", resolvedSeed: nil, effectivePrompt: nil, resolution: "720p"))
@@ -117,16 +181,49 @@ final class VideoWinnerActionsTests: XCTestCase {
 
   func testExtendBodySnapsFramesToTrainedGrid() throws {
     for (seconds, frames) in [(4, 97), (5, 121), (8, 193), (12, 289)] {
-      let data = try VideoWinnerActions.extendBody(
-        requestJSON: originalJSON(), framePath: "/tmp/f.png",
-        seconds: seconds, prompt: nil, effectivePrompt: "p")
-      _ = data
       let body = try obj(
         try VideoWinnerActions.extendBody(
           requestJSON: originalJSON(), framePath: "/tmp/f.png",
           seconds: seconds, prompt: nil, effectivePrompt: "p"))
       XCTAssertEqual(body["frames"] as? Int, frames, "\(seconds)s")
     }
+  }
+
+  func testExtendBodyMintsAFreshSeed() throws {
+    // The local video path defaults a missing seed to a CONSTANT (42 or the
+    // preset seed) — merely stripping the key is not fresh sampling (review
+    // finding 4). The mint is injectable so this stays deterministic.
+    let body = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: originalJSON(), framePath: "/tmp/f.png",
+        seconds: 4, prompt: nil, effectivePrompt: "p", freshSeed: 987_654))
+    XCTAssertEqual(body["seed"] as? Int, 987_654)
+    XCTAssertNotEqual(body["seed"] as? Int, 4242)
+
+    // Un-injected, the mint must still replace the winner's seed.
+    let minted = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: originalJSON(), framePath: "/tmp/f.png",
+        seconds: 4, prompt: nil, effectivePrompt: "p"))
+    XCTAssertNotNil(minted["seed"])
+    XCTAssertNotEqual(minted["seed"] as? Int, 4242)
+  }
+
+  func testExtendBodyPresetWrapFollowsThePromptSource() throws {
+    // Stored effective prompt: already wrapped → suppress the re-wrap.
+    let stored = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: originalJSON(), framePath: "/tmp/f.png",
+        seconds: 4, prompt: nil, effectivePrompt: "p"))
+    XCTAssertEqual(stored["skip_preset_prompt"] as? Bool, true)
+
+    // Caller-supplied prompt: raw text → the preset prefix/suffix (trigger
+    // words) should compose exactly as they did for the original render.
+    let fresh = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: originalJSON(), framePath: "/tmp/f.png",
+        seconds: 4, prompt: "she turns away", effectivePrompt: "p"))
+    XCTAssertNil(fresh["skip_preset_prompt"])
   }
 
   func testExtendBodyPromptOverrideWins() throws {
@@ -149,7 +246,7 @@ final class VideoWinnerActionsTests: XCTestCase {
         seconds: 4, prompt: nil, effectivePrompt: "p"))
     // A continuation is NEW content — reusing the winner's seed would bias
     // the sampler toward replaying the same motion from the new anchor.
-    XCTAssertNil(body["seed"])
+    XCTAssertNotEqual(body["seed"] as? Int, 4242)
     XCTAssertNil(body["duration"])
     XCTAssertNil(body["extend_to_seconds"])
     XCTAssertNil(body["width"])
