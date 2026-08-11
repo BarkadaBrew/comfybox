@@ -534,10 +534,16 @@ public final class EngineService {
         isLoadingModel = true
         defer { isLoadingModel = false }
 
+        // Submit with wait:false + poll (2026-08-11): a big-model switch takes
+        // ~70s and the old wait:true request died to SwiftUI task cancellation
+        // ("Network error: cancelled") whenever the initiating view churned —
+        // while the engine finished the switch anyway and the UI showed a
+        // false failure. The 202 submit returns in milliseconds; polling is
+        // cheap and each iteration is individually cancellation-safe.
         var payloadDict: [String: Any] = [
             "model": id,
             "activate": activate,
-            "wait": true
+            "wait": false
         ]
         if let q = quantization {
             payloadDict["quantization"] = q
@@ -546,12 +552,33 @@ public final class EngineService {
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
         let (status, responseData) = try await client.post("/v1/model/load", body: bodyData)
 
-        guard status == 200 else {
+        guard status == 200 || status == 202 else {
             let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
             throw EngineServiceError.serverError(status, errorMessage)
         }
 
-        await refreshPool()
+        // Poll the pool until the load lands (activate also flips /health's
+        // model). Budget generously: 25GB load + 8-bit quantization ≈ 70-80s.
+        let deadline = Date().addingTimeInterval(300)
+        // The pool may key the entry by a resolved local DIRECTORY rather than
+        // the catalog id (e.g. id "kroma-v0.2-turbo" → pool model
+        // "/Users/…/LocalModels/kroma-v0.2"), so match leniently in both
+        // directions, including against the path's last component.
+        let wantedLower = id.lowercased()
+        func poolHasModel() -> Bool {
+            poolModels.contains { entry in
+                let modelLower = entry.model.lowercased()
+                let lastComponent = (entry.model as NSString).lastPathComponent.lowercased()
+                return modelLower == wantedLower
+                    || modelLower.contains(wantedLower)
+                    || wantedLower.contains(lastComponent)
+            }
+        }
+        while Date() < deadline {
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            await refreshPool()
+            if poolHasModel() { break }
+        }
         // currentModel/currentModelFamily otherwise only update on the next
         // 3-second health poll — refreshing immediately closes the window
         // where a caller (preset apply, model selector) reads a stale active

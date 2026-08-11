@@ -5830,14 +5830,18 @@ private actor WarmServerCoordinator {
         }
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
         image = k2.generateImg2Img(
-          .init(prompt: payload.prompt, sourceImage: sourceNHWC, width: width, height: height,
+          .init(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+                guidance: payload.guidance ?? 1.0,
+                sourceImage: sourceNHWC, width: width, height: height,
                 steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE)
         ) { [logger] step, total in
           logger.info("Krea2 img2img: step \(step)/\(total)")
         }
       } else {
         image = k2.generate(
-          .init(prompt: payload.prompt, width: width, height: height, steps: steps, seed: seed,
+          .init(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+                guidance: payload.guidance ?? 1.0,
+                width: width, height: height, steps: steps, seed: seed,
                 controlImagePixels: controlPixels, dyPE: krea2DyPE)
         ) { [logger] step, total in
           logger.info("Krea2: step \(step)/\(total)")
@@ -5847,7 +5851,7 @@ private actor WarmServerCoordinator {
         prompt: payload.prompt,
         seed: seed,
         steps: steps,
-        guidance: 0,
+        guidance: payload.guidance ?? 1.0,
         width: width,
         height: height,
         model: "krea-2-turbo",
