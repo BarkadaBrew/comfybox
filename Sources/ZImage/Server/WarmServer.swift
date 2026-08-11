@@ -5073,7 +5073,11 @@ private actor WarmServerCoordinator {
     let entry = try await modelPool.load(
       modelSpec: modelSpec,
       quantization: quantization,
-      initialLoRAs: activeLoRAs
+      initialLoRAs: activeLoRAs,
+      // A load that intends to activate is a HANDOFF — the pool may evict the
+      // current active model to make room (two ~22GB krea2-family models
+      // cannot co-reside; without this a switch 507s, 2026-08-11).
+      allowActiveEviction: activate
     )
     let loadTimeMs = Int(Date().timeIntervalSince(start) * 1000.0)
 
