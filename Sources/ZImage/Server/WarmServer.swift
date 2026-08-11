@@ -1688,7 +1688,7 @@ public final class WarmServer {
     return (try? data.write(to: URL(fileURLWithPath: path))) != nil ? path : nil
   }
 
-  private struct LocalVideoRequest: Decodable {
+  struct LocalVideoRequest: Decodable {
     let prompt: String
     let negativePrompt: String?
     let imagePath: String?
