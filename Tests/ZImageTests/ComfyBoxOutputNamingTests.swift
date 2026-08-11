@@ -34,6 +34,20 @@ final class ComfyBoxOutputNamingTests: XCTestCase {
     XCTAssertEqual(ComfyBoxOutputNaming.shortModelName("~/Models/My Model@8bit"), "my-model-8bit")
   }
 
+  func testPresetAndSourceSegments() {
+    // Preset = the recipe name; source only when informative.
+    let kira = ComfyBoxOutputNaming.defaultFilename(
+      modelSpec: "kroma-v0.2-turbo", presetId: "krea-kira",
+      contentMode: "avocado", source: "api", date: fixedDate)
+    XCTAssertTrue(kira.hasPrefix("comfybox-kroma-v0.2-turbo-krea-kira-avocado-"), kira)
+    XCTAssertFalse(kira.contains("-api-"), "bare api adds nothing")
+
+    let bree = ComfyBoxOutputNaming.defaultFilename(
+      modelSpec: "kroma-v0.2-turbo", presetId: nil,
+      contentMode: nil, source: "bree", date: fixedDate)
+    XCTAssertTrue(bree.hasPrefix("comfybox-kroma-v0.2-turbo-manual-bree-"), bree)
+  }
+
   func testSaltVariesAcrossCalls() {
     let names = Set((0..<8).map {
       _ in ComfyBoxOutputNaming.defaultFilename(

@@ -15,23 +15,39 @@ import Foundation
 
 public enum ComfyBoxOutputNaming {
 
-  /// Build a default gallery filename. `date` is injectable for tests;
+  /// Sources that carry no information worth a filename segment.
+  private static let uninformativeSources: Set<String> = ["", "api", "manual"]
+
+  /// Build a default gallery filename:
+  /// comfybox-<model>[-<preset>]-<tier>[-<source>]-<stamp>-<salt>.<ext>
+  /// The preset segment appears when a preset produced the render (the recipe
+  /// name — tier→preset mappings drift, the filename shouldn't); the source
+  /// segment only when it says something a segment hasn't (bree, desktop,
+  /// winner-rerender — never bare "api"). `date` is injectable for tests;
   /// the 4-hex salt guards same-second collisions.
   public static func defaultFilename(
     modelSpec: String?,
+    presetId: String? = nil,
     contentMode: String?,
+    source: String? = nil,
     date: Date = Date(),
     ext: String = "png"
   ) -> String {
     let model = shortModelName(modelSpec)
     let tier = sanitize(contentMode ?? "").isEmpty ? "manual" : sanitize(contentMode!)
+    var segments = ["comfybox", model]
+    let preset = sanitize(presetId ?? "")
+    if !preset.isEmpty { segments.append(preset) }
+    segments.append(tier)
+    let src = sanitize(source ?? "")
+    if !uninformativeSources.contains(src) && src != tier { segments.append(src) }
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyyMMdd-HHmmss"
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone.current
-    let stamp = formatter.string(from: date)
-    let salt = String(format: "%04x", UInt16.random(in: 0...UInt16.max))
-    return "comfybox-\(model)-\(tier)-\(stamp)-\(salt).\(ext)"
+    segments.append(formatter.string(from: date))
+    segments.append(String(format: "%04x", UInt16.random(in: 0...UInt16.max)))
+    return segments.joined(separator: "-") + ".\(ext)"
   }
 
   /// "…/LocalModels/kroma-v0.2" → "kroma-v0.2"; "krea2" → "krea2";

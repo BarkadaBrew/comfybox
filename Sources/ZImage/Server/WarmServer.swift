@@ -5857,7 +5857,8 @@ private actor WarmServerCoordinator {
       outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
         defaultFilename: ComfyBoxOutputNaming.defaultFilename(
-          modelSpec: activePoolModelSpec ?? "flux2", contentMode: payload.contentMode)
+          modelSpec: activePoolModelSpec ?? "flux2", presetId: payload.preset,
+          contentMode: payload.contentMode, source: payload.source)
       )
 
       // Map GeneratePayload fields to Flux2GenerationRequest.
@@ -5949,7 +5950,8 @@ private actor WarmServerCoordinator {
       let outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
         defaultFilename: ComfyBoxOutputNaming.defaultFilename(
-          modelSpec: activePoolModelSpec ?? configuration.modelSpec ?? "krea2", contentMode: payload.contentMode)
+          modelSpec: activePoolModelSpec ?? configuration.modelSpec ?? "krea2", presetId: payload.preset,
+          contentMode: payload.contentMode, source: payload.source)
       )
 
       let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
@@ -6068,7 +6070,8 @@ private actor WarmServerCoordinator {
       outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
         defaultFilename: ComfyBoxOutputNaming.defaultFilename(
-          modelSpec: activePoolModelSpec ?? "fibo", contentMode: payload.contentMode)
+          modelSpec: activePoolModelSpec ?? "fibo", presetId: payload.preset,
+          contentMode: payload.contentMode, source: payload.source)
       )
 
       let fiboRequest = FiboGenerationRequest(
@@ -6696,6 +6699,11 @@ struct GeneratePayload: Sendable {
   /// Submitting client/app (desktop, bree, api…) — for queue attribution.
   let source: String?
 
+  /// Preset id that produced this request, when one was resolved — a LABEL
+  /// only (image presets resolve DAEMON-side; the engine never expands it).
+  /// Carried into the gallery filename + PNG metadata (Todd 2026-08-11).
+  let preset: String?
+
   /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
   let contentMode: String?
 
@@ -6732,6 +6740,7 @@ struct GeneratePayload: Sendable {
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil
   ) {
     self.source = source
+    self.preset = nil
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
@@ -6758,6 +6767,7 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
+    case preset
     case denoise, maskGrow, maskFeather
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
     // incoming keys to camelCase BEFORE matching CodingKey stringValues. So the
@@ -6818,6 +6828,7 @@ extension GeneratePayload: Decodable {
     maskRegion = try c.decodeIfPresent(String.self, forKey: .maskRegion)
     maskInvert = try c.decodeIfPresent(Bool.self, forKey: .maskInvert)
     source = try c.decodeIfPresent(String.self, forKey: .source)
+    preset = try c.decodeIfPresent(String.self, forKey: .preset)
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
@@ -6853,7 +6864,8 @@ extension GeneratePayload: Decodable {
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
       defaultFilename: ComfyBoxOutputNaming.defaultFilename(
-        modelSpec: configuration.modelSpec ?? "z-image", contentMode: contentMode)
+        modelSpec: configuration.modelSpec ?? "z-image", presetId: preset,
+        contentMode: contentMode, source: source)
     )
 
     let schedulerKind = Self.parseSchedulerKind(scheduler)
@@ -6936,7 +6948,8 @@ extension GeneratePayload: Decodable {
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
       defaultFilename: ComfyBoxOutputNaming.defaultFilename(
-        modelSpec: configuration.modelSpec ?? "z-image", contentMode: contentMode)
+        modelSpec: configuration.modelSpec ?? "z-image", presetId: preset,
+        contentMode: contentMode, source: source)
     )
 
     return Img2ImgRequest(
