@@ -5856,7 +5856,8 @@ private actor WarmServerCoordinator {
       let outputURL: URL
       outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
-        defaultFilename: "zimage-flux2-\(UUID().uuidString).png"
+        defaultFilename: ComfyBoxOutputNaming.defaultFilename(
+          modelSpec: activePoolModelSpec ?? "flux2", contentMode: payload.contentMode)
       )
 
       // Map GeneratePayload fields to Flux2GenerationRequest.
@@ -5947,7 +5948,8 @@ private actor WarmServerCoordinator {
       }
       let outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
-        defaultFilename: "zimage-krea2-\(UUID().uuidString).png"
+        defaultFilename: ComfyBoxOutputNaming.defaultFilename(
+          modelSpec: activePoolModelSpec ?? configuration.modelSpec ?? "krea2", contentMode: payload.contentMode)
       )
 
       let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
@@ -6018,7 +6020,7 @@ private actor WarmServerCoordinator {
         guidance: payload.guidance ?? 1.0,
         width: width,
         height: height,
-        model: "krea-2-turbo",
+        model: ComfyBoxOutputNaming.shortModelName(activePoolModelSpec ?? configuration.modelSpec),
         generatedBy: payload.source,
         contentMode: payload.contentMode,
         loras: k2.loadedLoRAConfigs
@@ -6065,7 +6067,8 @@ private actor WarmServerCoordinator {
       let outputURL: URL
       outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
-        defaultFilename: "zimage-fibo-\(UUID().uuidString).png"
+        defaultFilename: ComfyBoxOutputNaming.defaultFilename(
+          modelSpec: activePoolModelSpec ?? "fibo", contentMode: payload.contentMode)
       )
 
       let fiboRequest = FiboGenerationRequest(
@@ -6849,7 +6852,8 @@ extension GeneratePayload: Decodable {
   ) throws -> ZImageGenerationRequest {
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
-      defaultFilename: "zimage-\(UUID().uuidString).png"
+      defaultFilename: ComfyBoxOutputNaming.defaultFilename(
+        modelSpec: configuration.modelSpec ?? "z-image", contentMode: contentMode)
     )
 
     let schedulerKind = Self.parseSchedulerKind(scheduler)
@@ -6931,7 +6935,8 @@ extension GeneratePayload: Decodable {
 
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
-      defaultFilename: "zimage-img2img-\(UUID().uuidString).png"
+      defaultFilename: ComfyBoxOutputNaming.defaultFilename(
+        modelSpec: configuration.modelSpec ?? "z-image", contentMode: contentMode)
     )
 
     return Img2ImgRequest(
