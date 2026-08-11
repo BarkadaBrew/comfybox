@@ -2359,6 +2359,15 @@ public final class WarmServer {
     let prompt: String?
   }
 
+  /// "1786475197556_ltx2-ABC.mp4" → "ltx2-ABC.mp4" (daemon temp prefix).
+  static func stripTimestampPrefix(_ filename: String) -> String {
+    guard let underscore = filename.firstIndex(of: "_"),
+      filename[filename.startIndex..<underscore].allSatisfy({ $0.isNumber }),
+      filename.distance(from: filename.startIndex, to: underscore) >= 10
+    else { return filename }
+    return String(filename[filename.index(after: underscore)...])
+  }
+
   /// Locate the trace behind a winner action: by render_id directly, or by
   /// matching a gallery clip's path/filename against recent terminal outputs.
   private func findVideoTrace(
@@ -2373,11 +2382,19 @@ public final class WarmServer {
     if let path, !path.isEmpty {
       let summaries = renderTraceStore.recentSummaries(limit: 500)
       let filename = (path as NSString).lastPathComponent
+      // Daemon-side copies carry a `<epoch-ms>_` temp prefix on the engine's
+      // original basename (fetch-before-save path, 2026-08-11) — the sidecar
+      // join key recorded that prefixed name for existing clips, so strip a
+      // leading digit run before comparing.
+      let normalized = Self.stripTimestampPrefix(filename)
       // Exact full-path match first — a newer clip that merely shares a
       // basename must not shadow the clip the caller actually named.
       let match =
         summaries.first { $0.outputPath == path }
-        ?? summaries.first { $0.outputPath.map { ($0 as NSString).lastPathComponent } == filename }
+        ?? summaries.first {
+          guard let base = $0.outputPath.map({ ($0 as NSString).lastPathComponent }) else { return false }
+          return base == filename || base == normalized
+        }
       if let match, let out = match.outputPath {
         let events = renderTraceStore.events(renderId: match.renderId)
         let submitted = events.first { $0.event == .submitted }

@@ -31,3 +31,19 @@ final class KromaModelTests: XCTestCase {
     XCTAssertNotNil(Krea2ModelDetection.detect(at: root), "assembled root must detect as Krea-2")
   }
 }
+
+/// Winner-action basename matching must tolerate the daemon's temp prefix
+/// (sidecars recorded "1786475197556_ltx2-….mp4" — 2026-08-11 extend 404).
+final class TimestampPrefixTests: XCTestCase {
+  func testStripsEpochPrefix() {
+    XCTAssertEqual(
+      WarmServer.stripTimestampPrefix("1786475197556_ltx2-BCC184B2.mp4"),
+      "ltx2-BCC184B2.mp4")
+  }
+  func testLeavesCleanNamesAndShortPrefixesAlone() {
+    XCTAssertEqual(WarmServer.stripTimestampPrefix("ltx2-ABC.mp4"), "ltx2-ABC.mp4")
+    XCTAssertEqual(WarmServer.stripTimestampPrefix("97_clip.mp4"), "97_clip.mp4")
+    XCTAssertEqual(WarmServer.stripTimestampPrefix("comfybox-kroma-v0.2-avocado.png"),
+                   "comfybox-kroma-v0.2-avocado.png")
+  }
+}
