@@ -243,6 +243,7 @@ public final class WarmServer {
     do {
       let library = try LoRALibrary(logger: logger)
       self.loraLibrary = library
+      Task { await coordinator.setLoraLibrary(library) }
 
       // Auto-scan if no library.json exists yet (first run).
       if library.count == 0 {
@@ -4654,6 +4655,9 @@ private actor WarmServerCoordinator {
 
   /// Krea-2-Turbo pipeline (native port), loaded when the model spec is Krea-2.
   private var krea2Pipeline: Krea2Pipeline?
+  /// Trigger lookups for the rewriter-proof guard (set by WarmServer.run()).
+  var loraLibrary: LoRALibrary?
+  func setLoraLibrary(_ library: LoRALibrary) { loraLibrary = library }
   /// Chroma tokenizer — loaded alongside the Chroma pipeline.
   private var chromaTokenizer: ChromaTokenizer?
   /// Which model family is loaded — determines generation routing.
@@ -5997,6 +6001,15 @@ private actor WarmServerCoordinator {
       } else if k2.controlLoRAActive {
         try await k2.setControlLoRA(nil)
       }
+      // Rewriter-proof trigger guarantee (Todd 2026-08-11): re-assert every
+      // applied LoRA's library trigger on the FINAL prompt — the sealed
+      // rewrite happens upstream and can drop activation tokens.
+      let loraTriggers: [String] = (payload.loras ?? []).compactMap { entry in
+        let filename = (entry.path as NSString).lastPathComponent
+        return loraLibrary?.entry(for: filename)?.triggerwords.first
+      }
+      let guardedPrompt = LoRATriggerGuard.ensure(prompt: payload.prompt, triggers: loraTriggers)
+
       let image: MLXArray
       if let initPath = payload.imagePath {
         let imageData = try Data(contentsOf: URL(fileURLWithPath: initPath))
@@ -6015,7 +6028,7 @@ private actor WarmServerCoordinator {
         }
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
         image = k2.generateImg2Img(
-          .init(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+          .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
                 guidance: payload.guidance ?? 1.0,
                 sourceImage: sourceNHWC, width: width, height: height,
                 steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE)
@@ -6024,7 +6037,7 @@ private actor WarmServerCoordinator {
         }
       } else {
         image = k2.generate(
-          .init(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+          .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
                 guidance: payload.guidance ?? 1.0,
                 width: width, height: height, steps: steps, seed: seed,
                 controlImagePixels: controlPixels, dyPE: krea2DyPE)
@@ -6033,7 +6046,7 @@ private actor WarmServerCoordinator {
         }
       }
       let metadata = QwenImageIO.ImageMetadata.generation(
-        prompt: payload.prompt,
+        prompt: guardedPrompt,
         seed: seed,
         steps: steps,
         guidance: payload.guidance ?? 1.0,
