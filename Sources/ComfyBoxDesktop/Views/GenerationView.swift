@@ -1694,8 +1694,18 @@ struct GenerationView: View {
                     // Not in the pool yet — try loading (and activating) it.
                     do {
                         try await engine.loadModel(id: resolvedId)
+                    } catch is CancellationError {
+                        // View churn cancelled OUR wait — the engine keeps
+                        // loading and the health poll will pick it up. Not a
+                        // failure; a big switch takes ~70s (2026-08-11).
+                        engine.lastError = "Model switch to \(resolvedId) continues in the background (~70s) — watch the toolbar model chip."
                     } catch {
-                        engine.lastError = "Failed to activate preset model \(resolvedId): \(error.localizedDescription)"
+                        let ns = error as NSError
+                        if ns.code == NSURLErrorCancelled {
+                            engine.lastError = "Model switch to \(resolvedId) continues in the background (~70s) — watch the toolbar model chip."
+                        } else {
+                            engine.lastError = "Failed to activate preset model \(resolvedId): \(error.localizedDescription)"
+                        }
                     }
                 }
             case .unresolved:

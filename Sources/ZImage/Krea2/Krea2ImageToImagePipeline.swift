@@ -16,6 +16,11 @@ extension Krea2Pipeline {
 
   public struct Img2ImgRequest {
     public var prompt: String
+    /// Negative prompt for the CFG branch — only consulted when guidance > 1.
+    public var negativePrompt: String?
+    /// CFG scale; 1.0 (default) = distilled single-pass, no negative. See
+    /// Krea2Pipeline.Request.guidance.
+    public var guidance: Float = 1.0
     /// Source image, NHWC (1, H, W, 3), RGB in [-1, 1], already resized to
     /// the request's width/height. NOTE: `QwenImageIO.resizedPixelArray` +
     /// `normalizeForEncoder` (the usual way to load+normalize an image in
@@ -35,11 +40,14 @@ extension Krea2Pipeline {
     public var dyPE: DyPEConfig = .disabled
 
     public init(
-      prompt: String, sourceImage: MLXArray, width: Int = 1024, height: Int = 1024,
+      prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
+      sourceImage: MLXArray, width: Int = 1024, height: Int = 1024,
       steps: Int = 9, seed: UInt64 = 0, strength: Float = 0.3,
       dyPE: DyPEConfig = .disabled
     ) {
       self.prompt = prompt
+      self.negativePrompt = negativePrompt
+      self.guidance = guidance
       self.sourceImage = sourceImage
       self.width = width
       self.height = height
@@ -83,6 +91,18 @@ extension Krea2Pipeline {
       hTok: hTok, wTok: wTok, patch: patch, dyPE: request.dyPE)
     let fullMask = MLX.concatenated([mask, MLX.ones([1, hTok * wTok])], axis: 1)
 
+    // CFG branch — mirrors generate() (opt-in via guidance > 1, sequential).
+    let useCFG = request.guidance > 1.0
+    var negCtx: MLXArray? = nil
+    var negPos: MLXArray? = nil
+    var negFullMask: MLXArray? = nil
+    if useCFG {
+      let (nRaw, nMask) = conditioner.encode([request.negativePrompt ?? ""])
+      negCtx = nRaw.asType(dtype)
+      negPos = Krea2Sampling.buildPositions(txtLen: negCtx!.dim(1), h: hTok, w: wTok)
+      negFullMask = MLX.concatenated([nMask, MLX.ones([1, hTok * wTok])], axis: 1)
+    }
+
     let x1 = Float((256 / align) * (256 / align))
     let x2 = Float((1280 / align) * (1280 / align))
     let seqLen = hTok * wTok
@@ -107,8 +127,16 @@ extension Krea2Pipeline {
     for i in startIndex..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
-                          ropeScales: ropeScales)
+      let vCond = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
+                              ropeScales: ropeScales)
+      let v: MLXArray
+      if useCFG, let negCtx, let negPos, let negFullMask {
+        let vUncond = transformer(img: img, context: negCtx, t: t, pos: negPos, mask: negFullMask,
+                                  ropeScales: ropeScales)
+        v = Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
+      } else {
+        v = vCond
+      }
       img = img + (tp - tc) * v
       MLX.eval(img)
       progress?(i + 1, total)

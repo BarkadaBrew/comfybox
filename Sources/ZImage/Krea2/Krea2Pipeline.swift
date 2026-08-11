@@ -47,6 +47,12 @@ public struct Krea2ModelPaths {
 // MARK: - Sampling math (port of sampling.py)
 
 enum Krea2Sampling {
+  /// Classifier-free guidance combine: uncond + scale * (cond - uncond).
+  /// scale 1.0 returns cond exactly (the guidance-free distill recipe).
+  static func applyCFG(cond: MLXArray, uncond: MLXArray, scale: Float) -> MLXArray {
+    uncond + scale * (cond - uncond)
+  }
+
   static func roundUp(_ value: Int, multiple: Int) -> Int {
     ((value + multiple - 1) / multiple) * multiple
   }
@@ -142,6 +148,12 @@ public final class Krea2Pipeline {
 
   public struct Request {
     public var prompt: String
+    /// Negative prompt for the CFG branch — only consulted when guidance > 1.
+    public var negativePrompt: String?
+    /// Classifier-free guidance scale. 1.0 (default) = the distilled
+    /// single-pass recipe (no CFG, no negative). >1.0 runs a second
+    /// unconditioned pass per step (~2x time; Kroma's card blesses up to 1.5).
+    public var guidance: Float
     public var width: Int
     public var height: Int
     public var steps: Int
@@ -151,9 +163,12 @@ public final class Krea2Pipeline {
     public var controlImagePixels: MLXArray?
     /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
     public var dyPE: DyPEConfig = .disabled
-    public init(prompt: String, width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
+    public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
+                width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled) {
       self.prompt = prompt
+      self.negativePrompt = negativePrompt
+      self.guidance = guidance
       self.width = width
       self.height = height
       self.steps = steps
@@ -325,6 +340,20 @@ public final class Krea2Pipeline {
       hTok: hTok, wTok: wTok, patch: patch, dyPE: request.dyPE)
     let fullMask = MLX.concatenated([mask, MLX.ones([1, hTok * wTok])], axis: 1)
 
+    // CFG branch (opt-in, Todd 2026-08-11): guidance > 1 encodes the negative
+    // (or empty) prompt and runs a second unconditioned pass per step —
+    // sequential, not batched, to keep peak memory flat on the shared box.
+    let useCFG = request.guidance > 1.0
+    var negCtx: MLXArray? = nil
+    var negPos: MLXArray? = nil
+    var negFullMask: MLXArray? = nil
+    if useCFG {
+      let (nRaw, nMask) = conditioner.encode([request.negativePrompt ?? ""])
+      negCtx = nRaw.asType(dtype)
+      negPos = Krea2Sampling.buildPositions(txtLen: negCtx!.dim(1), h: hTok, w: wTok)
+      negFullMask = MLX.concatenated([nMask, MLX.ones([1, hTok * wTok])], axis: 1)
+    }
+
     // Depth Control-LoRA: VAE-encode the (already-resized) depth image once and
     // patchify to control tokens aligned with the image-token grid. Constant
     // across denoising steps (deterministic encode → cache-safe).
@@ -344,8 +373,16 @@ public final class Krea2Pipeline {
     for i in 0..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let v = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
-                          control: controlTokens, ropeScales: ropeScales)
+      let vCond = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
+                              control: controlTokens, ropeScales: ropeScales)
+      let v: MLXArray
+      if useCFG, let negCtx, let negPos, let negFullMask {
+        let vUncond = transformer(img: img, context: negCtx, t: t, pos: negPos, mask: negFullMask,
+                                  control: controlTokens, ropeScales: ropeScales)
+        v = Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
+      } else {
+        v = vCond
+      }
       img = img + (tp - tc) * v
       MLX.eval(img)
       progress?(i + 1, total)
