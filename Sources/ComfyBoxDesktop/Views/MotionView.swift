@@ -37,6 +37,9 @@ struct MotionView: View {
     @State private var statusMessage: String?
     @State private var errorMessage: String?
     @State private var resultURL: URL?
+    /// Owned here, built once when a result lands — never inline in the view
+    /// body. See SafeVideoPlayer.swift / issue #257.
+    @State private var player: AVPlayer?
 
     enum VideoResolution: String, CaseIterable, Identifiable {
         case landscape = "704 × 448 (16:10)"
@@ -200,9 +203,9 @@ struct MotionView: View {
     private var preview: some View {
         ZStack {
             Color(nsColor: .controlBackgroundColor)
-            if let url = resultURL {
+            if let url = resultURL, let player {
                 VStack(spacing: 8) {
-                    VideoPlayer(player: AVPlayer(url: url))
+                    SafeVideoPlayer(player: player)
                         .frame(minHeight: 300)
                     HStack {
                         Button { NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "") } label: {
@@ -286,6 +289,8 @@ struct MotionView: View {
 
         isGenerating = true
         errorMessage = nil
+        player?.pause()
+        player = nil
         resultURL = nil
         statusMessage = "Loading LTX-2 and generating \(frames) frames…"
 
@@ -317,7 +322,9 @@ struct MotionView: View {
                 }
                 statusMessage = String(format: "Done — %d frames, %.1fs video in %.0fs",
                                        result.frameCount, result.durationSeconds, result.elapsedSeconds)
-                resultURL = URL(fileURLWithPath: result.outputPath)
+                let url = URL(fileURLWithPath: result.outputPath)
+                player = AVPlayer(url: url)
+                resultURL = url
             } catch {
                 errorMessage = error.localizedDescription
                 statusMessage = nil

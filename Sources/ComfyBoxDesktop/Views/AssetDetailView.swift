@@ -213,7 +213,7 @@ struct AssetDetailView: View {
             Color(nsColor: .controlBackgroundColor)
 
             if let player {
-                VideoPlayer(player: player)
+                SafeVideoPlayer(player: player)
                     .aspectRatio(contentMode: .fit)
                     .padding(8)
             } else if let image = fullImage {
