@@ -264,6 +264,25 @@ public actor DAMStore {
         return paths
     }
 
+    /// All known asset ids, including secured ones. Used to detect orphaned
+    /// thumbnails (a thumbnail whose id is no longer tracked).
+    public func allAssetIds() throws -> Set<String> {
+        let sql = "SELECT id FROM assets"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var ids = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let id = columnText(stmt, 0) {
+                ids.insert(id)
+            }
+        }
+        return ids
+    }
+
     /// Total number of assets in the database.
     public func assetCount() throws -> Int {
         let sql = "SELECT COUNT(*) FROM assets"
@@ -285,7 +304,7 @@ public actor DAMStore {
             SELECT a.id, a.kind, a.filename, a.absolute_path, a.file_size, a.sha256,
                    a.width, a.height, a.created_at, a.modified_at, a.ingested_at, a.orphaned,
                    a.prompt, a.negative_prompt, a.seed, a.steps, a.guidance,
-                   a.model_family, a.rating, a.favorite, a.content_mode, a.character_name
+                   a.model_family, a.rating, a.favorite, a.content_mode, a.character_name, a.source
             FROM assets_fts fts
             JOIN assets a ON a.id = fts.id
             WHERE assets_fts MATCH ?1
