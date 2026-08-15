@@ -76,18 +76,55 @@ final class LTX2PreemptionResumeTests: XCTestCase {
   // a path under `/Volumes/Bolt` -- there is no local-disk original.
   //
   // Fixing the TCC grant needs an interactive System Settings approval,
-  // which this task must not trigger without warning Todd first. Instead:
-  // Bash (which DOES have Bolt access) copies the one 34GB file this suite
-  // needs to local disk before the run; `weightsDir` below points at that
-  // local copy so `resolveWeightsFileURL()` never touches Bolt. See the
-  // task report for the exact copy command and cleanup.
-  static let weightsDir = "/tmp/ltx2-local-weights"
+  // which this task must not trigger without warning Todd first. Instead,
+  // `weightsDir` resolves in priority order (fix-review 2026-08-15, same
+  // env-override convention as LTX2_VIDEO_BITS_PER_PX in
+  // LTX2PostProcess.swift):
+  //   1. LTX2_TEST_WEIGHTS_DIR env var -- explicit override, e.g. pointing
+  //      at a from-scratch local copy on a different machine.
+  //   2. /tmp/ltx2-local-weights -- the local-copy path this suite's task
+  //      report documents reproducing with:
+  //        mkdir -p /tmp/ltx2-local-weights && cp \
+  //          /Volumes/Bolt/Models/pinkcherry-v18-distill06-int8/pinkcherry_v18_distill06_int8.safetensors \
+  //          /tmp/ltx2-local-weights/
+  //      (not present by default -- the 34GB copy used for Task 6's run was
+  //      deleted afterward to free disk).
+  //   3. The real production Bolt path -- works whenever the process running
+  //      xcodebuild has been granted Full Disk Access (or the TCC gate is
+  //      otherwise not in play), so this suite is not permanently pinned to
+  //      a hand-copied local file once that grant exists.
+  // `fileExists` (stat) succeeds for all three even under the TCC gate this
+  // suite hit (only `contentsOfDirectory`/`open` were denied -- see the task
+  // report), so `weightsAvailable` below correctly resolves for every case
+  // without itself tripping the enumeration gate.
   static let transformerFile = "pinkcherry_v18_distill06_int8.safetensors"
   static let gemmaPath = "/Users/toddwalderman/LocalModels/gemma-3-12b-heretic-q8"
 
+  private static func resolveWeightsDir() -> String {
+    if let override = ProcessInfo.processInfo.environment["LTX2_TEST_WEIGHTS_DIR"], !override.isEmpty {
+      return override
+    }
+    let localCopy = "/tmp/ltx2-local-weights"
+    if FileManager.default.fileExists(atPath: (localCopy as NSString).appendingPathComponent(transformerFile)) {
+      return localCopy
+    }
+    return "/Volumes/Bolt/Models/pinkcherry-v18-distill06-int8"
+  }
+
+  static let weightsDir = resolveWeightsDir()
+
+  /// `fileExists` (stat) is NOT sufficient here: the TCC gate this suite hit
+  /// against `/Volumes/Bolt` lets `stat` see the file while `open` is denied
+  /// (confirmed empirically -- see the task report), so a stat-only check
+  /// would report the Bolt fallback "available" and the suite would then
+  /// hard-FAIL inside `MLX.loadArrays` instead of skipping cleanly. Actually
+  /// attempt (and immediately release) an open to catch that case.
   static var weightsAvailable: Bool {
-    FileManager.default.fileExists(atPath: (weightsDir as NSString).appendingPathComponent(transformerFile)) &&
-    FileManager.default.fileExists(atPath: gemmaPath)
+    let file = (weightsDir as NSString).appendingPathComponent(transformerFile)
+    guard FileManager.default.fileExists(atPath: file) else { return false }
+    guard let fh = FileHandle(forReadingAtPath: file) else { return false }
+    fh.closeFile()
+    return FileManager.default.fileExists(atPath: gemmaPath)
   }
 
   static let config = LTX2VideoGenerator.Configuration(
@@ -98,17 +135,23 @@ final class LTX2PreemptionResumeTests: XCTestCase {
   /// `load()` is idempotent for the same LoRA/audio key (see
   /// `LTX2VideoGenerator.load`), so reusing one instance means the real
   /// weight load happens exactly ONCE for every test that does not
-  /// deliberately test eviction. The eviction-survival test builds its own
-  /// dedicated instance and releases it -- that is the one place a second
-  /// full load is paid for, on purpose.
+  /// deliberately test eviction. The eviction-survival test additionally
+  /// constructs TWO of its own dedicated instances (`evictable`, then
+  /// `freshGen` after releasing it) -- each is a full weight load, so that
+  /// test alone pays for three loads total (warmGenerator's + its own two).
   static let warmGenerator = LTX2VideoGenerator(config: config)
 
   private func skipIfWeightsMissing() throws {
     guard Self.weightsAvailable else {
+      let file = (Self.weightsDir as NSString).appendingPathComponent(Self.transformerFile)
       throw XCTSkip("""
-        LTX-2 weights or Gemma text encoder not found on disk \
-        (\(Self.weightsDir) / \(Self.gemmaPath)) -- skipping #1479 preemption \
-        integration tests.
+        LTX-2 weights not found at \(file) (or Gemma text encoder missing at \
+        \(Self.gemmaPath)) -- skipping #1479 preemption integration tests. \
+        Set LTX2_TEST_WEIGHTS_DIR to a directory containing \(Self.transformerFile), \
+        or reproduce the local copy this suite defaults to: \
+        mkdir -p /tmp/ltx2-local-weights && cp \
+        /Volumes/Bolt/Models/pinkcherry-v18-distill06-int8/\(Self.transformerFile) \
+        /tmp/ltx2-local-weights/
         """)
     }
   }
@@ -302,6 +345,13 @@ final class LTX2PreemptionResumeTests: XCTestCase {
 
     let resumedDigest = try mediaDigest(path: out.outputPath)
 
+    // Non-emptiness guards: SHA-256 of zero bytes is a fixed constant, so an
+    // empty-but-present track would pass the equality checks below trivially.
+    XCTAssertGreaterThan(refDigest.frameCount, 0, "reference video track decoded zero frames -- hash equality below would be vacuous")
+    XCTAssertGreaterThan(resumedDigest.frameCount, 0, "resumed video track decoded zero frames -- hash equality below would be vacuous")
+    XCTAssertGreaterThan(refDigest.audioByteCount, 0, "reference audio track decoded zero bytes -- hash equality below would be vacuous")
+    XCTAssertGreaterThan(resumedDigest.audioByteCount, 0, "resumed audio track decoded zero bytes -- hash equality below would be vacuous")
+
     XCTAssertEqual(ref.frameCount, out.frameCount, "generator-reported frame count diverged")
     XCTAssertEqual(refDigest.frameCount, resumedDigest.frameCount, "decoded frame count diverged")
     XCTAssertEqual(refDigest.videoHashHex, resumedDigest.videoHashHex,
@@ -398,6 +448,14 @@ final class LTX2PreemptionResumeTests: XCTestCase {
     }
 
     let resumedDigest = try mediaDigest(path: out.outputPath)
+
+    // Non-emptiness guards: SHA-256 of zero bytes is a fixed constant, so an
+    // empty-but-present track would pass the equality checks below trivially.
+    XCTAssertGreaterThan(refDigest.frameCount, 0, "reference video track decoded zero frames -- hash equality below would be vacuous")
+    XCTAssertGreaterThan(resumedDigest.frameCount, 0, "resumed video track decoded zero frames -- hash equality below would be vacuous")
+    XCTAssertGreaterThan(refDigest.audioByteCount, 0, "reference audio track decoded zero bytes -- hash equality below would be vacuous")
+    XCTAssertGreaterThan(resumedDigest.audioByteCount, 0, "resumed audio track decoded zero bytes -- hash equality below would be vacuous")
+
     XCTAssertEqual(refDigest.frameCount, resumedDigest.frameCount, "decoded frame count diverged")
     XCTAssertEqual(refDigest.videoHashHex, resumedDigest.videoHashHex,
       "video frames are NOT bit-identical after a double-preempt + eviction round trip")
