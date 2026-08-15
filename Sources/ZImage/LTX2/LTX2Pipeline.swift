@@ -675,7 +675,30 @@ public final class LTX2Pipeline {
     )
     state = LTX2Conditioning.applyConditioning(state: state, conditions: [condition])
     if let fm = faceAnchorMask, faceAnchorStrength > 0 {
-      state.faceMask = fm
+      // Temporal decay (2026-08-15, "stuck/floating face" reports on partnered
+      // action clips): fm was a single spatial mask (frame-dim 1), broadcast
+      // identically across all latF frames — every frame got pulled toward the
+      // EXACT SAME static source-frame latent, at every step, for the whole
+      // clip. Frame 0 matching the source is correct (that's the actual
+      // condition frame); holding every LATER frame to that same static
+      // appearance fights any real motion under the mask once the anchored
+      // subject moves even slightly — reads as the face freezing (no temporal
+      // variation at all inside the mask) and detaching from a body that keeps
+      // moving under it ("floating"). Ramp the effective strength down across
+      // the frame axis instead of applying it flat; a floor keeps SOME identity
+      // hold late in the clip (the reason this exists — an unanchored partner
+      // drifts into a different person) without pinning motion the whole way.
+      let decayFloor = Float(ProcessInfo.processInfo.environment["LTX2_FACE_ANCHOR_DECAY_FLOOR"] ?? "") ?? 0.3
+      var temporalFm = fm
+      if latF > 1 {
+        let decay = (0..<latF).map { t -> Float in
+          let frac = Float(t) / Float(latF - 1)
+          return 1.0 - (1.0 - decayFloor) * frac
+        }
+        let decayArray = MLXArray(decay, [1, 1, latF, 1, 1])
+        temporalFm = MLX.broadcast(fm, to: [1, 1, latF, latH, latW]) * decayArray
+      }
+      state.faceMask = temporalFm
       state.faceRef = imageLatent  // source-encoded latent = the face identity reference
       state.faceAnchorStrength = faceAnchorStrength
     }
