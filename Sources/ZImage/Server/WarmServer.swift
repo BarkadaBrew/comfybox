@@ -5256,23 +5256,46 @@ private actor WarmServerCoordinator {
   // SAME Task that was blocked inside the video's synchronous render, so no
   // further actor hop is needed to reach `pipeline`/`runGenerate`/etc.
 
+  /// #1479/#230/#218/#34: the LTX-2 stack's memory need assuming it stays
+  /// WARM (resident) — the same warm-stack-discount / audio-mode-mismatch
+  /// logic `vacateImageModelsAndAdmitVideo`'s admission gate uses, factored
+  /// out so the fast-path decision below and that gate can never disagree
+  /// (review round 2, finding 3 — they previously used two independent
+  /// numbers, and a checkpointed render that would have completed under the
+  /// gate got needlessly destroyed by a fast-path decision that admitted too
+  /// eagerly).
+  private func ltx2WarmNeedBytes(wantsAudio: Bool) -> UInt64 {
+    let gen = videoHolder.get()
+    let audioModeMatches = (gen?.isAudioLoaded ?? false) == wantsAudio
+    let videoStackWarm = gen?.isLoaded == true && audioModeMatches
+    let audioDelta: UInt64 = wantsAudio ? 13 * 1024 * 1024 * 1024 : 0
+    return videoStackWarm
+      ? 24 * 1024 * 1024 * 1024
+      : HeavyModelAdmission.ltx2EstimateBytes(forWeightsPath: configuration.ltx2WeightsPath) + audioDelta
+  }
+
   /// Does the preempting image job's memory footprint fit alongside the
   /// resident (now-idle, checkpointed) video weights, letting the fast path
   /// skip the evict+reload round trip entirely (spec: "fast path performs no
   /// weight reload")? The image family isn't resolved until deep inside
-  /// `runGenerate` -> `poolLoad`, so this is a conservative floor rather than
-  /// an exact fit check — wrongly evicting costs a reload; wrongly NOT
-  /// evicting risks an OOM mid-preemption, so the floor errs conservative
-  /// (12GB comfortably covers any single quantized Z-Image/Krea/Flux family
-  /// checkpoint this server loads). This decides ONLY whether the video
-  /// generator is torn down; it does NOT replace the admission gate below —
-  /// `vacateImageModelsAndAdmitVideo` still runs before resume regardless
-  /// (review C2), because "does the image job fit" and "is there still
-  /// enough memory to resume the video, now that the image job actually
-  /// loaded its weights" are different questions asked at different times.
-  private func imageFitsAlongsideVideo() -> Bool {
-    let floor: UInt64 = 12 * 1024 * 1024 * 1024
-    return MemoryProbe.systemAvailableMemoryBytes() > floor
+  /// `runGenerate` -> `poolLoad`, so `imageEstimateBytes` is a conservative
+  /// ceiling rather than an exact fit check, not a per-family lookup (a real
+  /// one lives in `ModelPool.swift`'s private `VRAMEstimates`, out of scope
+  /// for this file-only round).
+  ///
+  /// Review round 2, finding 3: this MUST ask the exact question the resume
+  /// gate will ask afterward — "if the video stays resident and the image
+  /// loads too, will `vacateImageModelsAndAdmitVideo` still admit?" — using
+  /// `ltx2WarmNeedBytes` + the SAME drain margin, not a disconnected flat
+  /// floor. Wrongly evicting costs an unnecessary reload; wrongly NOT
+  /// evicting means the resume gate refuses afterward and the video job
+  /// fails loudly for a render that would otherwise have completed — so this
+  /// errs toward evicting on a close call.
+  private func imageFitsAlongsideVideo(wantsAudio: Bool) -> Bool {
+    let drainMargin: UInt64 = 6 * 1024 * 1024 * 1024
+    let imageEstimateBytes: UInt64 = 12 * 1024 * 1024 * 1024
+    let need = ltx2WarmNeedBytes(wantsAudio: wantsAudio) + drainMargin + imageEstimateBytes
+    return MemoryProbe.systemAvailableMemoryBytes() >= need
   }
 
   /// Rebuild the LTX-2 generator after an eviction. After `videoHolder
@@ -5317,27 +5340,13 @@ private actor WarmServerCoordinator {
   ) async -> (admitted: Bool, availableMB: Int, neededMB: Int) {
     let freedForVideoMB = await releaseImageModelsForVideo()
     var availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
-    // Precision-keyed (#230): an int8-quantized checkpoint dir gates at
-    // 40GB instead of the bf16 65GB, so video coexists with LM Studio.
-    // Warm-stack discount: when the LTX-2 generator is ALREADY loaded, its
-    // ~46-65GB of weights are resident and counted AGAINST free memory —
-    // demanding the full cold-load estimate double-counts them and refuses
-    // healthy back-to-back videos (observed 2026-07-25 22:38: 45GB free
-    // with the stack warm, admit=false, job bounced). A warm render only
-    // needs activation headroom (streamed decode bounds the decode peak).
-    // Audio-aware (task #21, Codex #2): an audio-mode mismatch forces a
-    // full transformer rebuild inside body() — the warm discount would
-    // then double-count nothing while the +~12GiB audio branch (bf16) and
-    // fp32 codec load on top of a torn-down stack. Treat mode-mismatch as
-    // COLD and add the audio delta to the cold estimate.
-    let gen = videoHolder.get()
-    let audioModeMatches = (gen?.isAudioLoaded ?? false) == wantsAudio
-    let videoStackWarm = gen?.isLoaded == true && audioModeMatches
-    let audioDelta: UInt64 = wantsAudio ? 13 * 1024 * 1024 * 1024 : 0
-    let ltx2Need = videoStackWarm
-      ? 24 * 1024 * 1024 * 1024
-      : HeavyModelAdmission.ltx2EstimateBytes(
-          forWeightsPath: configuration.ltx2WeightsPath) + audioDelta
+    // Precision-keyed (#230), warm-stack discount, audio-mode-mismatch cold
+    // fallback (task #21, Codex #2) — factored into `ltx2WarmNeedBytes` so
+    // this gate and the fast-path decision above can never disagree (review
+    // round 2, finding 3).
+    let genForLog = videoHolder.get()
+    let videoStackWarm = genForLog?.isLoaded == true && (genForLog?.isAudioLoaded ?? false) == wantsAudio
+    let ltx2Need = ltx2WarmNeedBytes(wantsAudio: wantsAudio)
     // Drain-until-settled (#34): back-to-back renders (e.g. Kira's i2v →
     // multi-keyframe in the same second) start while the previous job's
     // MLX buffer pool + lazy macOS reclaim still hold tens of GB. Admission
@@ -5368,12 +5377,18 @@ private actor WarmServerCoordinator {
   /// on BOTH branches (review C2) before touching the generator — see that
   /// method's doc comment for why the fast path needs it too.
   ///
-  /// Two binding constraints from Task 4's reviews, enforced HERE so no call
-  /// site can get them wrong: (1) a fresh post-eviction instance has no
-  /// signal/telemetry wired (`VideoGeneratorHolder.release()` deallocates the
-  /// old one) — re-wired unconditionally below; (2) the signal MUST be
-  /// cleared before `resume(from:)` — resuming with it still raised yields a
-  /// zero-progress spin by design.
+  /// Binding constraint from Task 4's reviews, enforced HERE so no call site
+  /// can get it wrong: a fresh post-eviction instance has no signal/telemetry
+  /// wired (`VideoGeneratorHolder.release()` deallocates the old one) —
+  /// re-wired unconditionally below. The OTHER Task 4 constraint — the
+  /// signal must be cleared before `resume(from:)` — is enforced by
+  /// `runPreemptionEpisode`'s caller instead (review round 2, finding 2):
+  /// clearing it HERE, after this function's own admission gate can `await`
+  /// for up to ~18s in the drain loop, left a window where a SECOND
+  /// preemptor could raise a NEW signal during that wait, which this clear
+  /// would then erase — stranding the second preemptor behind its own 120s
+  /// watchdog. `runPreemptionEpisode` clears while `preemptionInFlight` is
+  /// still held, before anything here can run, so no such window exists.
   ///
   /// Throws on failure (config drift, missing generator, admission refused)
   /// — the caller's `continuation` then resumes with the error, i.e. the
@@ -5401,10 +5416,24 @@ private actor WarmServerCoordinator {
     }
     gen.setPreemptionSignal(ltx2PreemptionSignal)
     gen.setTelemetry(ltx2Telemetry)
-    ltx2PreemptionSignal.clear()
     return try gen.resume(from: state) { chunk, totalChunks, step, totalSteps in
       report(WarmServer.localVideoProgressPercent(chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
     }
+  }
+
+  /// Sum of observed `modelLoad` phase durations (`meanSec x samples`) —
+  /// the real instrument for "how long does a weight reload take" (review
+  /// round 2, finding 1). The load itself is bracketed by
+  /// `telemetry?.begin(.modelLoad)`/`.end(.modelLoad)` inside
+  /// `LTX2VideoGenerator`'s `render()`, around the actual `load(...)` call —
+  /// snapshotting this before/after a resume and recording the DELTA (only
+  /// when it grew, i.e. a load actually happened) is accurate regardless of
+  /// how long the REST of the resumed render takes, unlike wall-clocking the
+  /// resume call itself (which the previous fix for I1 got wrong — see the
+  /// call site below).
+  private func ltx2ModelLoadTotalSec() -> Double {
+    guard let p = ltx2Telemetry.view().phases["modelLoad"] else { return 0 }
+    return p.meanSec * Double(p.samples)
   }
 
   /// The full preemption episode: checkpoint received -> run the preempting
@@ -5430,9 +5459,24 @@ private actor WarmServerCoordinator {
   /// exactly once, and a throw before either path reaches its own clearing
   /// (e.g. `pendingPreemptorBox.claim()` itself can't throw, but future edits
   /// might add one) still cleans up via the `defer`.
+  ///
+  /// `ltx2PreemptionSignal.clear()` happens FIRST, before anything else
+  /// (review round 2, finding 2): this runs while `preemptionInFlight` is
+  /// STILL held (it isn't released until `clearEpisodeState()` below), so no
+  /// other caller can have raised a competing signal in between — clearing
+  /// it any later (previously done inside `resumeCheckpointedVideo`, after
+  /// its own admission gate could `await` up to ~18s in the drain loop) left
+  /// a window where a second preemptor could raise, get its raise erased by
+  /// this render's stale clear, and be stranded behind its own 120s
+  /// watchdog. `checkpointedVideo` is read once, right after, as a
+  /// single-checkpoint sanity check (spec: hold exactly one at a time) —
+  /// this function must never be reentered while a checkpoint is already
+  /// held.
   private func runPreemptionEpisode(
     state: LTX2ResumeState, videoJobId: String?, wantsAudio: Bool, report: @escaping @Sendable (Int) -> Void
   ) async throws -> LTX2RenderOutcome {
+    ltx2PreemptionSignal.clear()
+    assert(checkpointedVideo == nil, "#1479: hold exactly one checkpoint at a time (spec) — runPreemptionEpisode entered with one already held")
     checkpointedVideo = state
     if let videoJobId { videoJobTracker.markPausedForPreemption(videoJobId) }
     publishHealth()
@@ -5460,7 +5504,7 @@ private actor WarmServerCoordinator {
     logger.info("#1479: video checkpointed at chunk \(state.chunkIndex), phase \(state.phase.rawValue), step \(state.stepIndex) — running preempting image job (source=\(claimed.source))")
 
     let originalActiveJobId = activeJobId
-    let evicted = !imageFitsAlongsideVideo()
+    let evicted = !imageFitsAlongsideVideo(wantsAudio: wantsAudio)
     if evicted {
       let t0 = Date()
       videoHolder.release()
@@ -5491,19 +5535,18 @@ private actor WarmServerCoordinator {
     // Clear BEFORE the resume, not in the defer (review I2) — see doc comment.
     clearEpisodeState()
 
-    let reloadT0 = Date()
+    // Review round 2, finding 1: snapshot the REAL instrument (modelLoad
+    // phase telemetry), not a wall clock around the whole resume call — the
+    // resume call's return time includes the rest of the render (15-60min),
+    // which would poison a cumulative rolling mean into a de facto refuse-
+    // everything kill switch. Record only the delta, and only when it grew
+    // (a reload actually happened) — the fast path (not evicted) normally
+    // reloads nothing, so it correctly contributes no sample.
+    let modelLoadBefore = ltx2ModelLoadTotalSec()
     let outcome = try await resumeCheckpointedVideo(state: state, evicted: evicted, wantsAudio: wantsAudio, report: report)
-    if evicted {
-      // Review I1: the actual multi-GB weight load is lazy inside
-      // `resume(from:)`, so timing only `reloadVideoGeneratorAfterEviction()`
-      // (path resolution + object construction) measured near-zero seconds —
-      // the guard's roundTrip then never refused. This brackets the whole
-      // resume call instead; it overshoots by including the resumed render's
-      // OWN denoise time, not just the load, but that overshoot is safe
-      // (biases the guard toward refusing more often, i.e. toward the
-      // spec's "inert until real data, never refuse on a guess" default of
-      // favoring finishing over preempting) rather than the opposite.
-      ltx2ReloadMean.record(Date().timeIntervalSince(reloadT0))
+    let modelLoadDelta = ltx2ModelLoadTotalSec() - modelLoadBefore
+    if modelLoadDelta > 0 {
+      ltx2ReloadMean.record(modelLoadDelta)
     }
     return outcome
   }
