@@ -139,4 +139,85 @@ struct AssetIngestorTests {
         let count = try await env.store.assetCount()
         #expect(count == 2)
     }
+
+    // MARK: - regenerateAllThumbnails
+
+    @Test("regenerateAllThumbnails overwrites an existing (stale) thumbnail")
+    @MainActor
+    func regenerateAllThumbnailsOverwritesStale() async throws {
+        let env = try await makeEnvironment()
+        let imagePath = (env.watchDir as NSString).appendingPathComponent("real.png")
+        #expect(TestData.writeRealPNG(at: imagePath, width: 32, height: 32))
+
+        let stored = try await env.ingestor.ingestFile(at: imagePath)
+        let thumbPath = env.ingestor.thumbnailPath(for: stored.id)
+
+        // Overwrite whatever ingestFile produced with a sentinel that a
+        // fixed implementation must clear before regenerating — this is
+        // the @testable guard on the generateThumbnail early-return trap.
+        let sentinel = Data("stale".utf8)
+        try sentinel.write(to: URL(fileURLWithPath: thumbPath))
+        #expect(FileManager.default.contents(atPath: thumbPath) == sentinel)
+
+        let summary = await env.ingestor.regenerateAllThumbnails(for: [stored])
+
+        #expect(summary.total == 1)
+        #expect(summary.regenerated == 1)
+        #expect(summary.missingSource == 0)
+        #expect(summary.failed == 0)
+
+        let finalContents = FileManager.default.contents(atPath: thumbPath)
+        #expect(finalContents != sentinel)
+        #expect((finalContents?.count ?? 0) > 0)
+    }
+
+    @Test("regenerateAllThumbnails counts a missing source without throwing and keeps processing others")
+    @MainActor
+    func regenerateAllThumbnailsMissingSource() async throws {
+        let env = try await makeEnvironment()
+
+        let goodPath = (env.watchDir as NSString).appendingPathComponent("good.png")
+        #expect(TestData.writeRealPNG(at: goodPath, width: 16, height: 16))
+        let goodAsset = try await env.ingestor.ingestFile(at: goodPath)
+
+        let missingPath = (env.watchDir as NSString).appendingPathComponent("missing.png")
+        #expect(TestData.writeRealPNG(at: missingPath, width: 16, height: 16))
+        let missingAsset = try await env.ingestor.ingestFile(at: missingPath)
+        try FileManager.default.removeItem(atPath: missingPath)
+
+        let summary = await env.ingestor.regenerateAllThumbnails(for: [goodAsset, missingAsset])
+
+        #expect(summary.total == 2)
+        #expect(summary.missingSource == 1)
+        #expect(summary.regenerated == 1)
+        #expect(summary.failed == 0)
+
+        let goodThumb = env.ingestor.thumbnailPath(for: goodAsset.id)
+        let goodSize = (try? FileManager.default.attributesOfItem(atPath: goodThumb)[.size] as? Int) ?? 0
+        #expect((goodSize ?? 0) > 0)
+    }
+
+    @Test("regenerateAllThumbnails reports progress ending at done == total")
+    @MainActor
+    func regenerateAllThumbnailsProgress() async throws {
+        let env = try await makeEnvironment()
+
+        var assets: [DAMAsset] = []
+        for i in 0..<5 {
+            let path = (env.watchDir as NSString).appendingPathComponent("img\(i).png")
+            #expect(TestData.writeRealPNG(at: path, width: 8, height: 8))
+            assets.append(try await env.ingestor.ingestFile(at: path))
+        }
+
+        var doneValues: [Int] = []
+        let summary = await env.ingestor.regenerateAllThumbnails(for: assets) { done, total in
+            doneValues.append(done)
+            #expect(total == 5)
+        }
+
+        #expect(summary.total == 5)
+        #expect(doneValues.count == 5)
+        #expect(doneValues.sorted() == [1, 2, 3, 4, 5])
+        #expect(doneValues.last == 5)
+    }
 }
