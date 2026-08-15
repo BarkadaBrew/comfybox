@@ -5539,13 +5539,28 @@ private actor WarmServerCoordinator {
     // phase telemetry), not a wall clock around the whole resume call — the
     // resume call's return time includes the rest of the render (15-60min),
     // which would poison a cumulative rolling mean into a de facto refuse-
-    // everything kill switch. Record only the delta, and only when it grew
-    // (a reload actually happened) — the fast path (not evicted) normally
-    // reloads nothing, so it correctly contributes no sample.
+    // everything kill switch. Record only the delta, and gate on `evicted`
+    // (review round 3, finding 1): `load()`'s idempotent early-return still
+    // sits INSIDE the telemetry bracket on the fast path
+    // (`LTX2VideoGenerator.swift:840-842`/`:424-425`), so a fast-path resume
+    // emits its own microseconds-scale `modelLoad` sample — `modelLoadDelta
+    // > 0` alone is true there too, and a near-zero sample decays the
+    // rolling mean toward zero over repeated fast-path resumes, degrading
+    // the guard to never-refuse (the opposite failure this metric exists to
+    // avoid). `evicted` is the actual "did a reload happen" signal; the
+    // delta is only for accuracy of ITS duration, not for detecting whether
+    // it occurred. This also swallows the ~1e-13 float round-trip noise the
+    // mean*samples sum reconstruction can produce.
+    //
+    // Single-flight assumption: this snapshot/delta is only correct because
+    // exactly one video render is ever in flight at a time (the coordinator
+    // serializes video on the same queue as image renders); a future
+    // concurrent-video path would let a second render's modelLoad samples
+    // land inside this window and silently corrupt the delta.
     let modelLoadBefore = ltx2ModelLoadTotalSec()
     let outcome = try await resumeCheckpointedVideo(state: state, evicted: evicted, wantsAudio: wantsAudio, report: report)
     let modelLoadDelta = ltx2ModelLoadTotalSec() - modelLoadBefore
-    if modelLoadDelta > 0 {
+    if evicted, modelLoadDelta > 0 {
       ltx2ReloadMean.record(modelLoadDelta)
     }
     return outcome
