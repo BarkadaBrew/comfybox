@@ -33,4 +33,13 @@ final class LTX2PhaseTelemetryTests: XCTestCase {
     t.recordStep(seconds: 2.0); t.recordStep(seconds: 4.0)
     XCTAssertEqual(t.view().meanStepSec!, 3.0, accuracy: 0.001)
   }
+
+  func testWallClockSkewClamp() {
+    let t = LTX2PhaseTelemetry()
+    t.begin(.vaeDecode, nowMs: 1_000)
+    t.end(.vaeDecode, nowMs: 500)  // NTP step-back: end before begin
+    let v = t.view()
+    XCTAssertEqual(v.phases["vaeDecode"]?.samples, 1)
+    XCTAssertEqual(v.phases["vaeDecode"]!.meanSec, 0.0, accuracy: 0.001)
+  }
 }

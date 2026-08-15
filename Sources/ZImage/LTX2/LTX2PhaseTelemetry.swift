@@ -33,7 +33,8 @@ public final class LTX2PhaseTelemetry: @unchecked Sendable {
     lock.lock(); defer { lock.unlock() }
     guard let started = open.removeValue(forKey: phase) else { return }
     let prev = totals[phase] ?? (0, 0)
-    totals[phase] = (prev.sumSec + (nowMs - started) / 1000.0, prev.samples + 1)
+    let durationSec = max(0, (nowMs - started) / 1000.0)
+    totals[phase] = (prev.sumSec + durationSec, prev.samples + 1)
     if current == phase { current = nil }
   }
 
