@@ -6,9 +6,12 @@
 // §5.1 of the FDD task brief), so a crash or thrown error at any earlier
 // point leaves the live gallery completely untouched.
 //
-// Restore (`restore`, `RestoreRequest`, `resumePendingRemovals`) is a later
-// task — this file implements `archive` only. The `Phase` enum already
-// carries `.restoring` so that work can be added without reshaping this type.
+// Restore (`restore`, `RestoreRequest`) reverses the process: stream
+// `entries.jsonl`, resolve the four id-collision cases against a live
+// snapshot, copy files back atomically, and re-file folders. It is
+// idempotent — re-running a restore reports everything as `skipped`.
+// `resumePendingRemovals` (crash-recovery for an interrupted archive) is a
+// later task (T7) and is not implemented here.
 
 import Foundation
 
@@ -19,6 +22,8 @@ public enum GalleryArchiverError: Error, LocalizedError, Equatable {
     case alreadyRunning
     /// `entries.jsonl` could not be created for writing.
     case cannotCreateEntriesFile(String)
+    /// A restore entry's file could not be copied back to the destination.
+    case restoreCopyFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +31,8 @@ public enum GalleryArchiverError: Error, LocalizedError, Equatable {
             return "An archive operation is already in progress."
         case .cannotCreateEntriesFile(let path):
             return "Could not create \(path) for writing."
+        case .restoreCopyFailed(let path):
+            return "Could not restore \(path)."
         }
     }
 }
@@ -259,6 +266,351 @@ public final class GalleryArchiver {
             failed: failedFilenames,
             totalBytes: totalBytes
         )
+    }
+
+    // MARK: - Restore
+
+    public struct RestoreRequest: Sendable {
+        public var bundlePath: String
+        public var assetIds: Set<String>?          // nil = restore all
+        public var restoreToOriginalLocations: Bool
+        public var overwriteExistingMetadata: Bool
+
+        public init(
+            bundlePath: String,
+            assetIds: Set<String>? = nil,
+            restoreToOriginalLocations: Bool = false,
+            overwriteExistingMetadata: Bool = false
+        ) {
+            self.bundlePath = bundlePath
+            self.assetIds = assetIds
+            self.restoreToOriginalLocations = restoreToOriginalLocations
+            self.overwriteExistingMetadata = overwriteExistingMetadata
+        }
+    }
+
+    public struct RestoreResult: Sendable {
+        public var restored: Int
+        public var skipped: Int            // already present, untouched
+        public var reIdentified: Int       // id was taken by a different asset
+        public var renamed: Int            // filename collided at the destination
+        public var failed: [String]
+
+        public init(restored: Int = 0, skipped: Int = 0, reIdentified: Int = 0, renamed: Int = 0, failed: [String] = []) {
+            self.restored = restored
+            self.skipped = skipped
+            self.reIdentified = reIdentified
+            self.renamed = renamed
+            self.failed = failed
+        }
+    }
+
+    /// Executes the FDD §5.2 restore sequence: version-checked manifest read,
+    /// streamed (id-filtered) `entries.jsonl` read, per-entry id-collision
+    /// resolution against a live snapshot, atomic copy-back, thumbnail
+    /// restore/regenerate, and — after the asset loop — folder re-creation
+    /// with one batched `assignAssets` per folder.
+    @discardableResult
+    public func restore(
+        _ request: RestoreRequest,
+        progress: (@MainActor (_ done: Int, _ total: Int) -> Void)? = nil
+    ) async throws -> RestoreResult {
+        guard !isRunning else {
+            throw GalleryArchiverError.alreadyRunning
+        }
+        lastError = nil
+        phase = .restoring
+        self.progress = nil
+        defer {
+            phase = .idle
+            self.progress = nil
+        }
+
+        do {
+            return try await performRestore(request, progress: progress)
+        } catch {
+            lastError = error.localizedDescription
+            throw error
+        }
+    }
+
+    private func performRestore(
+        _ request: RestoreRequest,
+        progress: (@MainActor (_ done: Int, _ total: Int) -> Void)?
+    ) async throws -> RestoreResult {
+        // Version policy is enforced before any work happens.
+        let manifestPath = (request.bundlePath as NSString).appendingPathComponent("manifest.json")
+        let manifestData = try Data(contentsOf: URL(fileURLWithPath: manifestPath))
+        let manifest = try ArchiveManifest.decode(manifestData)
+
+        let bundleRoot = URL(fileURLWithPath: request.bundlePath)
+        let entriesPath = (request.bundlePath as NSString).appendingPathComponent("entries.jsonl")
+
+        // Stream entries.jsonl, materializing only the selected subset — a
+        // partial restore never holds the other entries in memory.
+        var selected: [ArchivedAsset] = []
+        _ = try ArchiveJSONL.read(at: entriesPath) { entry in
+            if let ids = request.assetIds, !ids.contains(entry.id) { return }
+            selected.append(entry)
+        }
+
+        let total = selected.count
+        var done = 0
+        var result = RestoreResult()
+
+        // One-shot live snapshot (keyed by id) — never re-queried per entry.
+        let liveCount = try await store.assetCount()
+        let liveAssets = try await store.fetchAssets(limit: liveCount, offset: 0)
+        let liveById = Dictionary(uniqueKeysWithValues: liveAssets.map { ($0.id, $0) })
+
+        let watchDirectory = ingestor.watchDirectory
+        var folderMembers: [String: [String]] = [:]   // archived folderId -> resolved asset ids
+
+        var batchStart = 0
+        while batchStart < selected.count {
+            let batchEnd = min(batchStart + 25, selected.count)
+            for entry in selected[batchStart..<batchEnd] {
+                do {
+                    if let outcome = try await restoreOne(
+                        entry: entry,
+                        bundleRoot: bundleRoot,
+                        liveById: liveById,
+                        watchDirectory: watchDirectory,
+                        request: request
+                    ) {
+                        switch outcome.kind {
+                        case .restored: result.restored += 1
+                        case .reIdentified: result.reIdentified += 1
+                        }
+                        if outcome.renamed { result.renamed += 1 }
+                        if let folderId = entry.folderId {
+                            folderMembers[folderId, default: []].append(outcome.resolvedId)
+                        }
+                    } else {
+                        result.skipped += 1
+                    }
+                } catch {
+                    result.failed.append(entry.filename)
+                }
+                done += 1
+                progress?(done, total)
+                self.progress = (done, total)
+            }
+            batchStart = batchEnd
+        }
+
+        // Folder re-creation, after the asset loop, one batched assignAssets
+        // call per distinct archived folder.
+        if !folderMembers.isEmpty {
+            var liveFolders = try await store.listFolders()
+            for archivedFolder in manifest.folders {
+                guard let ids = folderMembers[archivedFolder.id], !ids.isEmpty else { continue }
+                let resolvedFolderId = try await resolveFolderId(archived: archivedFolder, liveFolders: &liveFolders)
+                try await store.assignAssets(ids: ids, toFolder: resolvedFolderId)
+            }
+        }
+
+        return result
+    }
+
+    private struct RestoreOutcome {
+        enum Kind { case restored, reIdentified }
+        var kind: Kind
+        var resolvedId: String
+        var renamed: Bool
+    }
+
+    /// Resolves the id-collision table from §5.2 for a single entry and, for
+    /// every outcome except the "skip entirely" case, performs the copy /
+    /// insert / thumbnail sequence. Returns `nil` for the skip case (no copy,
+    /// no DB write).
+    private func restoreOne(
+        entry: ArchivedAsset,
+        bundleRoot: URL,
+        liveById: [String: DAMAsset],
+        watchDirectory: String,
+        request: RestoreRequest
+    ) async throws -> RestoreOutcome? {
+        let destDir = Self.destinationDirectory(
+            for: entry, watchDirectory: watchDirectory, useOriginal: request.restoreToOriginalLocations
+        )
+        let destPathCandidate = (destDir as NSString).appendingPathComponent(entry.filename)
+
+        if let liveAsset = liveById[entry.id] {
+            if liveAsset.absolutePath == destPathCandidate {
+                // Same id, same location — this is the live asset itself.
+                guard request.overwriteExistingMetadata else {
+                    return nil
+                }
+                let stored = try await store.insertAsset(
+                    entry.toDAMAsset(absolutePath: liveAsset.absolutePath, id: entry.id)
+                )
+                await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
+                return RestoreOutcome(kind: .restored, resolvedId: stored.id, renamed: false)
+            } else {
+                // The id is taken by an unrelated asset — mint a fresh id so
+                // both rows survive.
+                let (finalPath, skipCopy, renamed) = try await resolveDestinationPath(destDir: destDir, entry: entry)
+                if !skipCopy {
+                    try await copyEntry(entry: entry, bundleRoot: bundleRoot, destPath: finalPath)
+                }
+                let stored = try await store.insertAsset(
+                    entry.toDAMAsset(absolutePath: finalPath, id: UUID().uuidString)
+                )
+                await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
+                return RestoreOutcome(kind: .reIdentified, resolvedId: stored.id, renamed: renamed)
+            }
+        } else {
+            let (finalPath, skipCopy, renamed) = try await resolveDestinationPath(destDir: destDir, entry: entry)
+            if !skipCopy {
+                try await copyEntry(entry: entry, bundleRoot: bundleRoot, destPath: finalPath)
+            }
+            let stored = try await store.insertAsset(
+                entry.toDAMAsset(absolutePath: finalPath, id: entry.id)
+            )
+            await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
+            return RestoreOutcome(kind: .restored, resolvedId: stored.id, renamed: renamed)
+        }
+    }
+
+    /// `restoreToOriginalLocations` targets the archived original path's
+    /// directory when it still exists and is writable, falling back to the
+    /// watch directory per-asset otherwise (§5.2 destination policy).
+    private static func destinationDirectory(for entry: ArchivedAsset, watchDirectory: String, useOriginal: Bool) -> String {
+        guard useOriginal, let original = entry.originalPath else { return watchDirectory }
+        let expanded = (original as NSString).expandingTildeInPath
+        let dir = (expanded as NSString).deletingLastPathComponent
+        var isDir: ObjCBool = false
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue, fm.isWritableFile(atPath: dir) else {
+            return watchDirectory
+        }
+        return dir
+    }
+
+    /// Resolves a filename collision at the destination: same size (and,
+    /// when both are known, same sha256) is treated as the same file and the
+    /// copy is skipped in favor of the existing path; otherwise `" (restored)"`,
+    /// `" (restored 2)"`, … is appended until a free name is found.
+    private func resolveDestinationPath(
+        destDir: String, entry: ArchivedAsset
+    ) async throws -> (path: String, skipCopy: Bool, renamed: Bool) {
+        let fm = FileManager.default
+        let candidatePath = (destDir as NSString).appendingPathComponent(entry.filename)
+        guard fm.fileExists(atPath: candidatePath) else {
+            return (candidatePath, false, false)
+        }
+
+        if let attrs = try? fm.attributesOfItem(atPath: candidatePath),
+           let existingSize = attrs[.size] as? Int64,
+           existingSize == entry.fileSize {
+            var treatAsSameFile = true
+            if let entrySha = entry.sha256,
+               let existingAsset = try? await store.fetchAsset(byPath: candidatePath),
+               let existingSha = existingAsset.sha256 {
+                treatAsSameFile = existingSha == entrySha
+            }
+            if treatAsSameFile {
+                return (candidatePath, true, false)
+            }
+        }
+
+        let base = (entry.filename as NSString).deletingPathExtension
+        let ext = (entry.filename as NSString).pathExtension
+        var suffixIndex = 1
+        var renamedPath: String
+        repeat {
+            let label = suffixIndex == 1 ? " (restored)" : " (restored \(suffixIndex))"
+            let candidateName = ext.isEmpty ? "\(base)\(label)" : "\(base)\(label).\(ext)"
+            renamedPath = (destDir as NSString).appendingPathComponent(candidateName)
+            suffixIndex += 1
+        } while fm.fileExists(atPath: renamedPath)
+        return (renamedPath, false, true)
+    }
+
+    /// Copies the entry's source file (and sidecar, if present) from the
+    /// bundle to `destPath`, atomically: `<destPath>.partial` then a rename.
+    /// A stale `.partial` left by a crashed prior restore is deleted on
+    /// sight before the new copy starts.
+    private func copyEntry(entry: ArchivedAsset, bundleRoot: URL, destPath: String) async throws {
+        let sourceURL = try ArchivePaths.resolveEntryPath(entry.relativePath, in: bundleRoot)
+        var sidecarPath: String?
+        if let sidecarRel = entry.sidecarRelativePath {
+            let sidecarURL = try ArchivePaths.resolveEntryPath(sidecarRel, in: bundleRoot)
+            if FileManager.default.fileExists(atPath: sidecarURL.path) {
+                sidecarPath = sidecarURL.path
+            }
+        }
+        let sourcePath = sourceURL.path
+        let success = await Task.detached(priority: .utility) {
+            Self.copyEntryFiles(sourceFilePath: sourcePath, sourceSidecarPath: sidecarPath, destPath: destPath)
+        }.value
+        guard success else {
+            throw GalleryArchiverError.restoreCopyFailed(destPath)
+        }
+    }
+
+    private nonisolated static func copyEntryFiles(
+        sourceFilePath: String, sourceSidecarPath: String?, destPath: String
+    ) -> Bool {
+        let fm = FileManager.default
+        let partialPath = destPath + ".partial"
+        if fm.fileExists(atPath: partialPath) {
+            try? fm.removeItem(atPath: partialPath)
+        }
+        do {
+            try fm.copyItem(atPath: sourceFilePath, toPath: partialPath)
+            try fm.moveItem(atPath: partialPath, toPath: destPath)
+        } catch {
+            try? fm.removeItem(atPath: partialPath)
+            return false
+        }
+        if let sidecarSrc = sourceSidecarPath {
+            let destSidecar = ((destPath as NSString).deletingPathExtension) + ".json"
+            try? fm.copyItem(atPath: sidecarSrc, toPath: destSidecar)
+        }
+        return true
+    }
+
+    /// §5.2 step 5: copy the bundle's cached thumbnail into place when one
+    /// exists and is non-empty; otherwise fall back to the existing backfill
+    /// path. Always keyed off `stored.id` — never the id read from the
+    /// manifest — per §0.3(a) (`insertAsset` may hand back a different id).
+    private func handleThumbnail(entry: ArchivedAsset, stored: DAMAsset, bundleRoot: URL) async {
+        if let thumbRel = entry.thumbnailRelativePath,
+           let thumbURL = try? ArchivePaths.resolveEntryPath(thumbRel, in: bundleRoot),
+           let attrs = try? FileManager.default.attributesOfItem(atPath: thumbURL.path),
+           let size = attrs[.size] as? Int64, size > 0 {
+            let destThumbPath = ingestor.thumbnailPath(for: stored.id)
+            // generateThumbnail refuses to overwrite a non-empty file
+            // (§0.3(b)); we copy directly, so clear any stale thumbnail first.
+            try? FileManager.default.removeItem(atPath: destThumbPath)
+            try? FileManager.default.copyItem(atPath: thumbURL.path, toPath: destThumbPath)
+        } else {
+            await ingestor.regenerateMissingThumbnails(for: [stored])
+        }
+    }
+
+    /// Folder re-creation order (§5.2): same id → reuse; same name
+    /// case-insensitively → reuse; else create with the archived id; if that
+    /// id is unexpectedly taken by a different-named folder, fall back to a
+    /// fresh id.
+    private func resolveFolderId(archived: ArchivedFolder, liveFolders: inout [DAMFolder]) async throws -> String {
+        if let match = liveFolders.first(where: { $0.id == archived.id }) {
+            return match.id
+        }
+        if let match = liveFolders.first(where: { $0.name.caseInsensitiveCompare(archived.name) == .orderedSame }) {
+            return match.id
+        }
+        do {
+            let created = try await store.createFolder(name: archived.name, id: archived.id)
+            liveFolders.append(created)
+            return created.id
+        } catch {
+            let created = try await store.createFolder(name: archived.name)
+            liveFolders.append(created)
+            return created.id
+        }
     }
 
     // MARK: - Off-main per-asset file work

@@ -1,6 +1,9 @@
 // TestHelpers.swift — Shared test utilities and data factories
 
 import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 @testable import ComfyBoxDesktop
 
 // MARK: - Sample Data Factories
@@ -174,5 +177,31 @@ enum TestData {
         scale: Float = 1.0
     ) -> LoRASelection {
         LoRASelection(id: id, filename: filename, scale: scale)
+    }
+
+    /// Writes a real, decodable PNG to `path` — needed wherever a test
+    /// depends on `AssetIngestor.generateThumbnail`, which no-ops on fake
+    /// (non-image) bytes because `CGImageSourceCreateWithURL` can't decode
+    /// them.
+    @discardableResult
+    static func writeRealPNG(at path: String, width: Int = 32, height: Int = 32) -> Bool {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+        context.setFillColor(CGColor(red: 0.3, green: 0.6, blue: 0.9, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let cgImage = context.makeImage() else { return false }
+        guard let destination = CGImageDestinationCreateWithURL(
+            URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil
+        ) else { return false }
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        return CGImageDestinationFinalize(destination)
     }
 }

@@ -1,8 +1,12 @@
-// GalleryArchiverTests.swift — Tests for GalleryArchiver.archive (T3)
+// GalleryArchiverTests.swift — Tests for GalleryArchiver.archive (T3) and
+// GalleryArchiver.restore (T4).
 //
-// Archive-only per the FDD task brief for T3: bundle well-formedness,
-// sidecar/folder/secured handling, and crash-safety (nothing destroyed
-// before the commit point). Restore / resumePendingRemovals are later tasks.
+// Archive: bundle well-formedness, sidecar/folder/secured handling, and
+// crash-safety (nothing destroyed before the commit point).
+// Restore: full round-trip field equality, the four id-collision cases,
+// filename-collision renaming, folder re-creation, partial restore,
+// idempotence, and progress reporting. `resumePendingRemovals` is T7 and is
+// not implemented here.
 
 import Testing
 import Foundation
@@ -237,5 +241,403 @@ struct GalleryArchiverTests {
         #expect(FileManager.default.fileExists(atPath: stored.absolutePath))
         #expect(env.archiver.lastError != nil)
         #expect(!env.archiver.isRunning)
+    }
+
+    // MARK: - Restore: full round-trip
+
+    @Test("restore full round-trip: every field matches and the id is preserved when free")
+    @MainActor
+    func restoreFullRoundTrip() async throws {
+        let env = try await makeEnvironment()
+        var assets: [DAMAsset] = []
+        for i in 1...3 {
+            let contents = "image-\(i)"
+            let path = writeFile("render\(i).png", in: env.watchDir, contents: contents)
+            let asset = DAMAsset(
+                id: "asset-\(i)",
+                kind: "image",
+                filename: "render\(i).png",
+                absolutePath: path,
+                fileSize: Int64(contents.utf8.count),
+                sha256: "sha-\(i)",
+                width: 1024,
+                height: 1536,
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000 + Double(i)),
+                modifiedAt: Date(timeIntervalSince1970: 1_700_000_100 + Double(i)),
+                ingestedAt: Date(timeIntervalSince1970: 1_700_000_200 + Double(i)),
+                orphaned: false,
+                prompt: "prompt \(i)",
+                negativePrompt: "negative \(i)",
+                seed: 1000 + i,
+                steps: 20 + i,
+                guidance: 3.5,
+                modelFamily: "z-image-turbo",
+                rating: i,
+                favorite: i.isMultiple(of: 2),
+                contentMode: "apple",
+                characterName: "kira",
+                source: "kira"
+            )
+            let stored = try await env.store.insertAsset(asset)
+            makeThumbnail(for: stored.id, ingestor: env.ingestor)
+            assets.append(stored)
+        }
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "RoundTrip", destinationRoot: env.archiveRoot, assets: assets)
+        )
+
+        let restoreResult = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(restoreResult.restored == 3)
+        #expect(restoreResult.skipped == 0)
+        #expect(restoreResult.reIdentified == 0)
+        #expect(restoreResult.renamed == 0)
+        #expect(restoreResult.failed.isEmpty)
+
+        for original in assets {
+            let restoredPath = (env.watchDir as NSString).appendingPathComponent(original.filename)
+            #expect(FileManager.default.fileExists(atPath: restoredPath))
+            let restored = try await env.store.fetchAsset(byPath: restoredPath)
+            let restoredAsset = try #require(restored)
+            #expect(restoredAsset.id == original.id)
+            #expect(restoredAsset.rating == original.rating)
+            #expect(restoredAsset.favorite == original.favorite)
+            #expect(restoredAsset.prompt == original.prompt)
+            #expect(restoredAsset.negativePrompt == original.negativePrompt)
+            #expect(restoredAsset.seed == original.seed)
+            #expect(restoredAsset.steps == original.steps)
+            #expect(restoredAsset.guidance == original.guidance)
+            #expect(restoredAsset.modelFamily == original.modelFamily)
+            #expect(restoredAsset.contentMode == original.contentMode)
+            #expect(restoredAsset.characterName == original.characterName)
+            #expect(restoredAsset.source == original.source)
+            #expect(restoredAsset.width == original.width)
+            #expect(restoredAsset.height == original.height)
+            #expect(restoredAsset.createdAt.timeIntervalSince1970 == original.createdAt.timeIntervalSince1970)
+        }
+    }
+
+    // MARK: - Restore: version policy
+
+    @Test("restore rejects a manifest written by a newer schema version before doing any work")
+    @MainActor
+    func restoreRejectsUnsupportedSchemaVersion() async throws {
+        let env = try await makeEnvironment()
+        let bundlePath = (env.archiveRoot as NSString).appendingPathComponent("Future.cbarchive")
+        try FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+        let futureManifest: [String: Any] = [
+            "schemaVersion": 99, "archiveId": "x", "name": "Future", "createdAt": 0,
+            "producer": "test", "assetCount": 0, "totalBytes": 0, "folders": [],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: futureManifest)
+        try data.write(to: URL(fileURLWithPath: (bundlePath as NSString).appendingPathComponent("manifest.json")))
+        FileManager.default.createFile(
+            atPath: (bundlePath as NSString).appendingPathComponent("entries.jsonl"), contents: nil
+        )
+
+        await #expect(throws: ArchiveError.unsupportedSchemaVersion(99)) {
+            try await env.archiver.restore(.init(bundlePath: bundlePath))
+        }
+        let count = try await env.store.assetCount()
+        #expect(count == 0)
+    }
+
+    // MARK: - Restore: id collision — skip
+
+    @Test("restore skips entirely when the live asset already occupies the archived id and path, preserving its rating")
+    @MainActor
+    func restoreSkipsWhenAlreadyPresent() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "SkipTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+
+        // Live asset reappears at the same id and the same destination path
+        // (as if it was never removed), with a rating the user bumped since.
+        let destPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        writeFile("render.png", in: env.watchDir, contents: "render-bytes-again")
+        let bumped = DAMAsset(id: asset.id, filename: "render.png", absolutePath: destPath, fileSize: 999, rating: 5)
+        try await env.store.insertAsset(bumped)
+
+        let restoreResult = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(restoreResult.skipped == 1)
+        #expect(restoreResult.restored == 0)
+        #expect(restoreResult.reIdentified == 0)
+        #expect(restoreResult.failed.isEmpty)
+
+        let live = try await env.store.fetchAsset(byPath: destPath)
+        #expect(live?.rating == 5)
+        let assetCount = try await env.store.assetCount()
+        #expect(assetCount == 1)
+    }
+
+    // MARK: - Restore: id collision — overwrite
+
+    @Test("overwriteExistingMetadata reverts the live rating to the archived value")
+    @MainActor
+    func restoreOverwriteRevertsRating() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        let ratedAsset = DAMAsset(
+            id: asset.id, filename: asset.filename, absolutePath: asset.absolutePath,
+            fileSize: asset.fileSize, rating: 2
+        )
+        let stored = try await env.store.insertAsset(ratedAsset)
+        makeThumbnail(for: stored.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "OverwriteTest", destinationRoot: env.archiveRoot, assets: [stored])
+        )
+
+        let destPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        writeFile("render.png", in: env.watchDir, contents: "render-bytes-again")
+        let bumped = DAMAsset(id: asset.id, filename: "render.png", absolutePath: destPath, fileSize: 999, rating: 5)
+        try await env.store.insertAsset(bumped)
+
+        let restoreResult = try await env.archiver.restore(
+            .init(bundlePath: archiveResult.bundlePath, overwriteExistingMetadata: true)
+        )
+        #expect(restoreResult.restored == 1)
+        #expect(restoreResult.skipped == 0)
+
+        let live = try await env.store.fetchAsset(byPath: destPath)
+        #expect(live?.rating == 2)
+        let assetCount = try await env.store.assetCount()
+        #expect(assetCount == 1)
+    }
+
+    // MARK: - Restore: id collision — re-ID
+
+    @Test("restore mints a fresh id when the archived id is taken by an asset at a different path; both rows survive")
+    @MainActor
+    func restoreReIdentifiesOnDifferentPath() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "ReIDTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+
+        let otherPath = writeFile("unrelated.png", in: env.watchDir, contents: "unrelated-bytes")
+        let collidingAsset = DAMAsset(id: asset.id, filename: "unrelated.png", absolutePath: otherPath)
+        try await env.store.insertAsset(collidingAsset)
+
+        let restoreResult = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(restoreResult.reIdentified == 1)
+        #expect(restoreResult.restored == 0)
+        #expect(restoreResult.skipped == 0)
+
+        let count = try await env.store.assetCount()
+        #expect(count == 2)
+
+        let restoredPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        #expect(FileManager.default.fileExists(atPath: restoredPath))
+        #expect(FileManager.default.fileExists(atPath: otherPath))
+        let restoredRow = try await env.store.fetchAsset(byPath: restoredPath)
+        #expect(restoredRow != nil)
+        #expect(restoredRow?.id != asset.id)
+    }
+
+    // MARK: - Restore: filename collision
+
+    @Test("a different, DB-tracked file already at the destination filename is renamed, not overwritten")
+    @MainActor
+    func restoreRenamesOnFilenameCollision() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "CollisionTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+
+        // A different, unrelated, DB-tracked file now occupies render.png.
+        let unrelatedPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        let unrelatedContents = "a-totally-different-file-of-a-different-size"
+        FileManager.default.createFile(atPath: unrelatedPath, contents: Data(unrelatedContents.utf8))
+        let unrelatedAsset = DAMAsset(
+            id: "unrelated-id", filename: "render.png", absolutePath: unrelatedPath,
+            fileSize: Int64(unrelatedContents.utf8.count)
+        )
+        try await env.store.insertAsset(unrelatedAsset)
+
+        let restoreResult = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(restoreResult.renamed == 1)
+        #expect(restoreResult.restored == 1)
+
+        let originalPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        let renamedPath = (env.watchDir as NSString).appendingPathComponent("render (restored).png")
+        #expect(FileManager.default.fileExists(atPath: originalPath))
+        #expect(FileManager.default.fileExists(atPath: renamedPath))
+
+        let count = try await env.store.assetCount()
+        #expect(count == 2)
+    }
+
+    // MARK: - Restore: folder re-creation
+
+    @Test("folder re-creation: an absent folder is created with the archived id")
+    @MainActor
+    func restoreRecreatesAbsentFolderWithArchivedId() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("pick.png", in: env.watchDir, contents: "pick")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        let folder = try await env.store.createFolder(name: "Picks", id: "folder-fixed-id")
+        try await env.store.assignAssets(ids: [asset.id], toFolder: folder.id)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "FolderCreate", destinationRoot: env.archiveRoot, assets: [asset], folder: folder)
+        )
+        let foldersAfterArchive = try await env.store.listFolders()
+        #expect(!foldersAfterArchive.contains(where: { $0.id == folder.id }))
+
+        _ = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+
+        let folders = try await env.store.listFolders()
+        let restoredFolder = try #require(folders.first(where: { $0.id == "folder-fixed-id" }))
+        #expect(restoredFolder.name == "Picks")
+
+        let assignments = try await env.store.folderAssignments()
+        let restoredAssetRow = try await env.store.fetchAsset(
+            byPath: (env.watchDir as NSString).appendingPathComponent("pick.png")
+        )
+        let resolved = try #require(restoredAssetRow)
+        #expect(assignments[resolved.id] == "folder-fixed-id")
+    }
+
+    @Test("folder re-creation: a folder present with the same name but a different id is reused, not duplicated")
+    @MainActor
+    func restoreReusesFolderBySameName() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("pick.png", in: env.watchDir, contents: "pick")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        let folder = try await env.store.createFolder(name: "Picks", id: "archived-folder-id")
+        try await env.store.assignAssets(ids: [asset.id], toFolder: folder.id)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "FolderReuse", destinationRoot: env.archiveRoot, assets: [asset], folder: folder)
+        )
+
+        // The user re-created "Picks" by hand before restoring; it got a new id.
+        let handMadeFolder = try await env.store.createFolder(name: "Picks")
+        #expect(handMadeFolder.id != "archived-folder-id")
+
+        _ = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+
+        let folders = try await env.store.listFolders()
+        #expect(folders.filter { $0.name.caseInsensitiveCompare("Picks") == .orderedSame }.count == 1)
+        #expect(folders.contains(where: { $0.id == handMadeFolder.id }))
+        #expect(!folders.contains(where: { $0.id == "archived-folder-id" }))
+
+        let assignments = try await env.store.folderAssignments()
+        let restoredAssetRow = try await env.store.fetchAsset(
+            byPath: (env.watchDir as NSString).appendingPathComponent("pick.png")
+        )
+        let resolved = try #require(restoredAssetRow)
+        #expect(assignments[resolved.id] == handMadeFolder.id)
+    }
+
+    // MARK: - Restore: partial restore
+
+    @Test("partial restore: a one-id subset restores exactly one row and one file")
+    @MainActor
+    func restorePartialSubset() async throws {
+        let env = try await makeEnvironment()
+        var assets: [DAMAsset] = []
+        for i in 1...3 {
+            let path = writeFile("pick\(i).png", in: env.watchDir, contents: "pick-\(i)")
+            let stored = try await env.ingestor.ingestFile(at: path)
+            makeThumbnail(for: stored.id, ingestor: env.ingestor)
+            assets.append(stored)
+        }
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "PartialTest", destinationRoot: env.archiveRoot, assets: assets)
+        )
+
+        let target = assets[1]
+        let result = try await env.archiver.restore(
+            .init(bundlePath: archiveResult.bundlePath, assetIds: [target.id])
+        )
+        #expect(result.restored == 1)
+        #expect(result.skipped == 0)
+        #expect(result.failed.isEmpty)
+
+        let count = try await env.store.assetCount()
+        #expect(count == 1)
+
+        let restoredPath = (env.watchDir as NSString).appendingPathComponent(target.filename)
+        #expect(FileManager.default.fileExists(atPath: restoredPath))
+        for other in assets where other.id != target.id {
+            let otherPath = (env.watchDir as NSString).appendingPathComponent(other.filename)
+            #expect(!FileManager.default.fileExists(atPath: otherPath))
+        }
+    }
+
+    // MARK: - Restore: idempotence
+
+    @Test("restoring twice reports everything skipped on the second run and leaves assetCount unchanged")
+    @MainActor
+    func restoreIsIdempotent() async throws {
+        let env = try await makeEnvironment()
+        var assets: [DAMAsset] = []
+        for i in 1...2 {
+            let path = writeFile("dup\(i).png", in: env.watchDir, contents: "dup-\(i)")
+            let stored = try await env.ingestor.ingestFile(at: path)
+            makeThumbnail(for: stored.id, ingestor: env.ingestor)
+            assets.append(stored)
+        }
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "IdempotenceTest", destinationRoot: env.archiveRoot, assets: assets)
+        )
+
+        let first = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(first.restored == 2)
+        let countAfterFirst = try await env.store.assetCount()
+
+        let second = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(second.skipped == 2)
+        #expect(second.restored == 0)
+        #expect(second.reIdentified == 0)
+        #expect(second.renamed == 0)
+
+        let countAfterSecond = try await env.store.assetCount()
+        #expect(countAfterSecond == countAfterFirst)
+    }
+
+    // MARK: - Restore: progress callback
+
+    @Test("progress callback fires per asset with the entry-count total and ends at done == total")
+    @MainActor
+    func restoreProgressCallback() async throws {
+        let env = try await makeEnvironment()
+        var assets: [DAMAsset] = []
+        for i in 1...3 {
+            let path = writeFile("prog\(i).png", in: env.watchDir, contents: "prog-\(i)")
+            let stored = try await env.ingestor.ingestFile(at: path)
+            makeThumbnail(for: stored.id, ingestor: env.ingestor)
+            assets.append(stored)
+        }
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "ProgressTest", destinationRoot: env.archiveRoot, assets: assets)
+        )
+
+        var calls: [(done: Int, total: Int)] = []
+        let result = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath)) { done, total in
+            calls.append((done, total))
+        }
+        #expect(!calls.isEmpty)
+        #expect(calls.allSatisfy { $0.total == 3 })
+        #expect(calls.last?.done == 3)
+        #expect(result.restored == 3)
     }
 }
