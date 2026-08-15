@@ -214,7 +214,7 @@ struct AssetDetailView: View {
 
             if let player {
                 SafeVideoPlayer(player: player)
-                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(8)
             } else if let image = fullImage {
                 Image(nsImage: image)

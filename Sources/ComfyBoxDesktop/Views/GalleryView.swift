@@ -2146,7 +2146,7 @@ private struct GalleryLightbox: View {
             Group {
                 if asset?.kind == "video", let player {
                     SafeVideoPlayer(player: player)
-                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .padding(24)
                 } else if let image {
                     Image(nsImage: image)

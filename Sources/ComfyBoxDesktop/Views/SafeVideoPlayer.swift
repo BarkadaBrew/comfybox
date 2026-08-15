@@ -27,6 +27,7 @@ struct SafeVideoPlayer: NSViewRepresentable {
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = controlsStyle
+        view.videoGravity = .resizeAspect
         view.player = player
         return view
     }
@@ -35,5 +36,19 @@ struct SafeVideoPlayer: NSViewRepresentable {
         if nsView.player !== player {
             nsView.player = player
         }
+    }
+
+    /// Without this, SwiftUI sizes the view from AVPlayerView's own fitting
+    /// size — undefined/tiny before it has laid out its content — instead of
+    /// the space callers actually give it via .frame()/.padding(). That's
+    /// what rendered the player as a postage stamp inside a big black box.
+    /// Fill whatever's proposed; videoGravity (.resizeAspect, set above)
+    /// handles the actual aspect-fit letterboxing internally, the same way
+    /// SwiftUI's VideoPlayer does.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: AVPlayerView, context: Context) -> CGSize? {
+        CGSize(
+            width: proposal.width ?? nsView.bounds.width,
+            height: proposal.height ?? nsView.bounds.height
+        )
     }
 }

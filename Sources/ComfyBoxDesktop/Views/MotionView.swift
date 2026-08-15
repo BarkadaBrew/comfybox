@@ -206,7 +206,7 @@ struct MotionView: View {
             if let url = resultURL, let player {
                 VStack(spacing: 8) {
                     SafeVideoPlayer(player: player)
-                        .frame(minHeight: 300)
+                        .frame(maxWidth: .infinity, minHeight: 300)
                     HStack {
                         Button { NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "") } label: {
                             Label("Reveal", systemImage: "magnifyingglass")
