@@ -488,7 +488,7 @@ struct ArchiveBrowserView: View {
     private func exportAsZip(_ bundle: ArchiveStore.Summary) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.zip]
-        panel.nameFieldStringValue = "\(bundle.manifest.name).zip"
+        panel.nameFieldStringValue = "\(((bundle.bundlePath as NSString).lastPathComponent as NSString).deletingPathExtension).zip"
         panel.prompt = "Export"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 

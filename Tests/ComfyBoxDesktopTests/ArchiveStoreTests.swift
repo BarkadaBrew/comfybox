@@ -238,21 +238,44 @@ struct ArchiveStoreTests {
         ])
     }
 
-    @Test("exportAsZip shells ditto and produces a real zip of the bundle directory")
+    /// Shells the real `/usr/bin/unzip -l <zip>` and returns its stdout+stderr
+    /// listing — deterministic, `unzip` ships on every macOS.
+    private static func unzipListing(at zipPath: String) throws -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        proc.arguments = ["-l", zipPath]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        proc.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    @Test("exportAsZip shells ditto and produces a real, non-empty zip containing the bundle's manifest.json")
     @MainActor
     func exportAsZipProducesRealZip() async throws {
         let root = makeTempDir("export-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
         let bundlePath = try makeBundle(
             in: root, dirName: "export-me-20260101-000000.cbarchive",
             manifest: manifest(name: "Export Me", createdAt: 100)
         )
         let destDir = makeTempDir("export-dest")
+        defer { try? FileManager.default.removeItem(atPath: destDir) }
         let destination = (destDir as NSString).appendingPathComponent("out.zip")
 
         let store = ArchiveStore(roots: [root])
         try await store.exportAsZip(bundlePath: bundlePath, destination: destination)
 
         #expect(FileManager.default.fileExists(atPath: destination))
+        let attrs = try FileManager.default.attributesOfItem(atPath: destination)
+        let size = attrs[.size] as? Int ?? 0
+        #expect(size > 0)
+
+        let listing = try Self.unzipListing(at: destination)
+        #expect(listing.contains("manifest.json"))
     }
 
     @Test("exportAsZip throws ExportError.failed when ditto exits non-zero")
