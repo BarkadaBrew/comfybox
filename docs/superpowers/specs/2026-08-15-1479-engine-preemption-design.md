@@ -85,7 +85,14 @@ distinct from the audio path's `0xA0D10/11/12` so the two streams cannot
 collide — following the convention this
 file already uses for audio (`:288`, `:299`, `:364`:
 `MLXRandom.key(seed &+ 0xA0D10 / 11 / 12)`, a pattern with a codex-review note
-attached at `:286`). Unseeded runs keep the global stream, which the code
+attached at `:286`). This is stronger than a naming convention: the audio step
+at `:1322` already draws **keyed ancestral noise inside the loop**, commented
+"so the global RNG (video noise sequence) is untouched," coexisting with the
+global-stream video draw. The video-side change applies a mechanism the same
+loop already proves out. Verified: there is exactly ONE global draw per step
+in either SDE branch (`:1300`, `:1310`), so a per-step derived key maps 1:1;
+and the sampler carries no cross-step momentum — latents plus RNG discipline
+is the entire loop-carried state. Unseeded runs keep the global stream, which the code
 keeps deliberately so unseeded noise varies; a render with no seed makes no
 reproducibility promise, so a fresh draw on resume is fine.
 
@@ -115,9 +122,28 @@ Rejected: suspend-in-place (incompatible with eviction); subprocess +
   boundary safely without an actor hop on every denoising step"). This is
   load-bearing: `WarmServerCoordinator` (`:4638`) is blocked for the full
   duration of a synchronous GPU render, so the signal cannot be an actor read.
-- **`LTX2ResumeState`** — latents, step index, sigma position, seed, phase,
-  and a config fingerprint. In-memory only; it dies with the process,
-  deliberately unlike the `isPaused` pause sentinel (`:4704`).
+- **`LTX2ResumeState`** — everything the loop references *except* model
+  weights. The governing rule: **checkpoint = all non-weight tensors; evict =
+  weights only.** Enumerated as of today (Fable review, from the loop body at
+  `LTX2Pipeline.swift:1057-1330`):
+  - `currentLatents`, step index, sigma position, seed, phase, config
+    fingerprint (the original list);
+  - **`avState.audioLatents`** — audio latents evolve every step alongside
+    video, and Kira's production renders have audio ON; dropping them resumes
+    video while silently restarting audio;
+  - **`avState.audioNoiseKey`** — the audio ancestral chain head, split each
+    step (`:1322`); loop-carried state;
+  - the i2v conditioning tensors (`denoiseMask`, `cleanLatent`, `faceMask`,
+    `faceRef`, `faceAnchorStrength`) — re-applied every step; keeping them
+    avoids a VAE re-encode on resume;
+  - `textEmbeddings`, `negativeEmbeddings`, `nagEmbeddings`,
+    `av.audioContext`, `av.negativeAudioContext` — Gemma outputs referenced
+    every step; megabytes, keep them so the text encoder can stay evicted.
+  - `positions`/`precomputedPE`/`av.pe` are NOT checkpointed — they are
+    deterministic functions of the dims and are recomputed at resume.
+
+  In-memory only; it dies with the process, deliberately unlike the
+  `isPaused` pause sentinel (`:4704`).
 - **Resumable sampler entry** — `LTX2Pipeline`'s loop (`:1057`,
   `for i in 0..<numSteps`) gains the ability to start at step N with supplied
   latents. The loop already carries `currentLatents` and an explicit `sigmas`
@@ -157,10 +183,14 @@ re-enters at step N → render completes as if uninterrupted.
 
 ## Testing
 
-- **Bit-identity (the decisive test):** render a seeded clip uninterrupted and
-  hash it; render the same seed preempting at step 12; assert the hashes
-  match. This test can genuinely fail — which is the point. (Contrast the
+- **Bit-identity (the decisive test):** render a seeded clip uninterrupted;
+  render the same seed preempting at step 12; assert equality **on the final
+  latent tensor (or decoded frames), not the MP4** — container encode is not
+  bit-stable, so hashing the file would flake for reasons unrelated to the
+  sampler. This test can genuinely fail — which is the point. (Contrast the
   #1485 governor-throw test that passed without ever entering its catch.)
+  The A/V case is part of this test, not a variant: audio latents must match
+  too, or the checkpoint dropped `avState`.
 - Refusal guard fires when projected remaining is below threshold, and the
   reported ETA is sane.
 - A failing preemptor still resumes the original render.
