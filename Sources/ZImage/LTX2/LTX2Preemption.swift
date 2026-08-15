@@ -49,6 +49,87 @@ public enum LTX2DenoiseResult {
   case yielded(LTX2ResumeState)
 }
 
+/// Opaque generator-level continuation attached to a checkpoint.
+///
+/// #1479 Task 4 location decision: `VideoGeneratorHolder.release()`
+/// (`Sources/ZImage/Server/VideoGeneratorHolder.swift`) does
+/// `generator?.unload(); generator = nil` — it drops the holder's only strong
+/// reference, so the `LTX2VideoGenerator` INSTANCE is deallocated by the very
+/// eviction preemption performs. Anything parked in a `private var
+/// pendingResumeContext` on the generator would die with it. The continuation
+/// therefore travels WITH the checkpoint, which the coordinator holds, and a
+/// freshly constructed generator can resume from it.
+///
+/// Deliberately opaque: this file is the preemption vocabulary and stays free
+/// of CoreGraphics and request types. The coordinator only has to carry it
+/// back; the generator that created it downcasts.
+public protocol LTX2ResumeContext: AnyObject {}
+
+/// Fingerprint stamped on a checkpoint taken BEFORE any denoise loop began —
+/// a chunk boundary, or a raised signal observed before the model even loads.
+/// There is nothing to validate against: the phase restarts from its own
+/// deterministic beginning under whatever config is current, exactly as a
+/// fresh render would. Loop-internal and phase-boundary checkpoints always
+/// carry a real fingerprint and ARE validated.
+public let ltx2NotStartedFingerprint = "#1479-not-started"
+
+/// Why a resume was refused. Never silently restart from step 0 (spec, Error
+/// handling): a config that drifted between checkpoint and resume is a real
+/// bug, and hiding it costs a 15-minute render's worth of wrong output.
+public enum LTX2ResumeError: Error, LocalizedError, Equatable {
+  case configFingerprintMismatch(checkpoint: String, current: String)
+  case sigmaScheduleMismatch(checkpoint: [Float], current: [Float], firstDifferingIndex: Int?)
+  case stepOutOfRange(step: Int, steps: Int)
+
+  public var errorDescription: String? {
+    switch self {
+    case .configFingerprintMismatch(let checkpoint, let current):
+      return "LTX-2 resume refused: render config changed between checkpoint and resume — checkpoint '\(checkpoint)' vs current '\(current)'."
+    case .sigmaScheduleMismatch(let checkpoint, let current, let idx):
+      let at = idx.map { " (first difference at index \($0): \(checkpoint[$0]) vs \(current[$0]))" } ?? ""
+      return "LTX-2 resume refused: sigma schedule changed between checkpoint and resume — \(checkpoint.count) vs \(current.count) sigmas\(at)."
+    case .stepOutOfRange(let step, let steps):
+      return "LTX-2 resume refused: checkpoint step \(step) is outside the current schedule's 0..<\(steps) range."
+    }
+  }
+}
+
+/// Pure resume-admissibility check. Separated from the pipeline so it is unit
+/// testable without model weights (Task 4 step 3); the render-level behaviour
+/// is Task 6's integration test.
+///
+/// The fingerprint alone is NOT sufficient: `denoiseConfigFingerprint` covers
+/// dims/steps/sampler/cfg but omits `cfgSchedule`, `forceDeterministic` and the
+/// sigma VALUES — and a sigma-schedule change (e.g. the tarn1 schedule adopted
+/// in 46217ef) silently re-times every remaining step. So the sigmas are
+/// compared array-wise against the freshly resolved schedule as well.
+/// Exact equality is intended: both sides come from the same deterministic
+/// schedule function, so any difference at all IS a config change.
+public enum LTX2ResumeValidator {
+  public static func validate(
+    checkpointFingerprint: String,
+    currentFingerprint: String,
+    checkpointSigmas: [Float],
+    currentSigmas: [Float],
+    stepIndex: Int
+  ) throws {
+    guard checkpointFingerprint == currentFingerprint else {
+      throw LTX2ResumeError.configFingerprintMismatch(
+        checkpoint: checkpointFingerprint, current: currentFingerprint)
+    }
+    if checkpointSigmas != currentSigmas {
+      let idx = (0..<min(checkpointSigmas.count, currentSigmas.count))
+        .first { checkpointSigmas[$0] != currentSigmas[$0] }
+      throw LTX2ResumeError.sigmaScheduleMismatch(
+        checkpoint: checkpointSigmas, current: currentSigmas, firstDifferingIndex: idx)
+    }
+    let numSteps = max(0, currentSigmas.count - 1)
+    guard stepIndex >= 0, stepIndex < numSteps || (stepIndex == 0 && numSteps == 0) else {
+      throw LTX2ResumeError.stepOutOfRange(step: stepIndex, steps: numSteps)
+    }
+  }
+}
+
 /// Checkpoint = ALL non-weight tensors (spec rule). In-memory only —
 /// deliberately dies with the process, unlike the isPaused sentinel.
 ///
@@ -70,6 +151,20 @@ public struct LTX2ResumeState {
   public var audioNoiseKey: MLXArray?
   public var configFingerprint: String
 
+  /// The two-stage refine's CLEAN base latent (the upsampled, pre-re-noise
+  /// `upLatent`). Non-nil ONLY for a checkpoint taken INSIDE the refine loop:
+  /// that loop's denoise mask re-injects this every step, and it cannot be
+  /// recovered from the partially-refined latents. nil means "the refine has
+  /// not started" — for `phase == .refineDenoise` that is the free unwind
+  /// point between base and refine, where `videoLatents` are the finished BASE
+  /// latents and the refine runs from its own beginning.
+  public var refineCleanLatents: MLXArray?
+
+  /// Generator-level continuation (request, chunk position, frames already
+  /// rendered, conditioning images). Held here rather than on the generator
+  /// because eviction deallocates the generator — see `LTX2ResumeContext`.
+  public var context: LTX2ResumeContext?
+
   /// Initialize a resume state, materializing all array fields to ensure
   /// the checkpoint is a concrete snapshot independent of future mutations.
   public init(
@@ -81,7 +176,9 @@ public struct LTX2ResumeState {
     seed: UInt64?,
     audioLatents: MLXArray?,
     audioNoiseKey: MLXArray?,
-    configFingerprint: String
+    configFingerprint: String,
+    refineCleanLatents: MLXArray? = nil,
+    context: LTX2ResumeContext? = nil
   ) {
     eval(videoLatents)
     self.videoLatents = videoLatents
@@ -103,5 +200,12 @@ public struct LTX2ResumeState {
       self.audioNoiseKey = nil
     }
     self.configFingerprint = configFingerprint
+    if let refineCleanLatents {
+      eval(refineCleanLatents)
+      self.refineCleanLatents = refineCleanLatents
+    } else {
+      self.refineCleanLatents = nil
+    }
+    self.context = context
   }
 }

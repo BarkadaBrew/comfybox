@@ -81,6 +81,22 @@ public struct LTX2PipelineOutput {
   public let elapsedSeconds: Double
 }
 
+/// #1479: what one pipeline-level render produced — a finished clip, or a
+/// checkpoint because a preemption signal was raised. Only the `*Resumable`
+/// entry points can yield; the legacy entry points pass `preemption: nil` and
+/// keep returning `LTX2PipelineOutput` so existing call sites are untouched.
+public enum LTX2PipelineOutcome {
+  case completed(LTX2PipelineOutput)
+  case yielded(LTX2ResumeState)
+}
+
+/// Outcome of the shared two-stage refine: refined latents, or a checkpoint
+/// taken inside the refine loop.
+enum LTX2RefineOutcome {
+  case completed(MLXArray)
+  case yielded(LTX2ResumeState)
+}
+
 // MARK: - Pipeline
 
 /// Main LTX-2 video generation pipeline.
@@ -149,6 +165,95 @@ public final class LTX2Pipeline {
     self.logger = logger
   }
 
+  // MARK: - #1479 non-preemptible bridge
+
+  /// Run a render that supplied NEITHER a preemption signal NOR a resume
+  /// state, and unwrap its outcome.
+  ///
+  /// Both non-completed results are structurally unreachable here:
+  /// `denoisingLoop` yields only when a signal is supplied AND raised (and the
+  /// callers below pass no signal at all), and the resume validation that
+  /// throws only runs when a checkpoint is supplied. Reaching either arm means
+  /// the render genuinely did not finish, so there is no clip to hand back —
+  /// fail loudly rather than dress half-denoised latents up as a result
+  /// (spec, Error handling: never hide a real bug behind a plausible output).
+  private func nonPreemptible(
+    _ site: String, _ body: () throws -> LTX2PipelineOutcome
+  ) -> LTX2PipelineOutput {
+    let outcome: LTX2PipelineOutcome
+    do {
+      outcome = try body()
+    } catch {
+      logger.error("\(site): non-preemptible render threw \(error) — impossible without a resume state.")
+      preconditionFailure("\(site): non-preemptible render threw \(error)")
+    }
+    switch outcome {
+    case .completed(let output):
+      return output
+    case .yielded(let s):
+      logger.error("\(site): non-preemptible render yielded at step \(s.stepIndex) — no preemption signal was supplied.")
+      preconditionFailure("\(site): yielded with no preemption signal supplied")
+    }
+  }
+
+  /// Checkpoint taken at a FREE unwind point (a phase or chunk boundary), not
+  /// inside a loop. `stepIndex: 0` plus `phase` = "this phase has not started";
+  /// `videoLatents` are whatever the next phase consumes.
+  private func boundaryCheckpoint(
+    phase: LTX2Phase, latents: MLXArray, sigmas: [Float], fingerprint: String,
+    chunkIndex: Int, seed: UInt64?, avState: LTX2AVDenoiseState?
+  ) -> LTX2ResumeState {
+    LTX2ResumeState(
+      videoLatents: latents, stepIndex: 0, sigmas: sigmas, phase: phase,
+      chunkIndex: chunkIndex, seed: seed,
+      audioLatents: avState?.audioLatents, audioNoiseKey: avState?.audioNoiseKey,
+      configFingerprint: fingerprint)
+  }
+
+  /// Re-stamp a checkpoint taken INSIDE a refine loop with the two things the
+  /// loop cannot know: the clean (upsampled, pre-re-noise) base latent its
+  /// denoise mask re-injects every step, and — when audio bypassed the refine
+  /// (the default) so the loop had no AV state — the BASE pass's finished
+  /// audio track. Without that fallback a resume would rebuild the audio from
+  /// fresh noise and never denoise it: a silent-noise track on every preempted
+  /// A/V render.
+  private func refineCheckpoint(
+    _ s: LTX2ResumeState, cleanBase: MLXArray, baseAV: LTX2AVDenoiseState?
+  ) -> LTX2ResumeState {
+    LTX2ResumeState(
+      videoLatents: s.videoLatents, stepIndex: s.stepIndex, sigmas: s.sigmas,
+      phase: s.phase, chunkIndex: s.chunkIndex, seed: s.seed,
+      audioLatents: s.audioLatents ?? baseAV?.audioLatents,
+      audioNoiseKey: s.audioNoiseKey ?? baseAV?.audioNoiseKey,
+      configFingerprint: s.configFingerprint,
+      refineCleanLatents: cleanBase,
+      context: s.context)
+  }
+
+  /// Restore a checkpoint's audio latents + ancestral chain head into the
+  /// freshly rebuilt AV state. Reassignment only — never subscript-assignment,
+  /// which would mutate the checkpoint's own tensors through the shared handle.
+  private func restoreAudio(_ r: LTX2ResumeState, into av: LTX2AVDenoiseState?) {
+    guard let av else { return }
+    if let al = r.audioLatents { av.audioLatents = al }
+    if let key = r.audioNoiseKey { av.audioNoiseKey = key }
+  }
+
+  /// Validate a checkpoint against the freshly resolved BASE basis, unless it
+  /// was taken inside the refine loop — that loop resolves its own fingerprint
+  /// and sigma schedule and validates there.
+  private func validateResumeUnlessRefineOwned(
+    _ r: LTX2ResumeState, fingerprint: String, sigmas: [Float]
+  ) throws {
+    if r.phase == .refineDenoise, r.refineCleanLatents != nil { return }
+    // A checkpoint taken before any loop started restarts that phase from its
+    // deterministic beginning — there is no in-flight trajectory to protect.
+    if r.configFingerprint == ltx2NotStartedFingerprint { return }
+    try LTX2ResumeValidator.validate(
+      checkpointFingerprint: r.configFingerprint, currentFingerprint: fingerprint,
+      checkpointSigmas: r.sigmas, currentSigmas: sigmas, stepIndex: r.stepIndex)
+  }
+
   // MARK: - Text-to-Video
 
   /// Generate a video from a text prompt.
@@ -180,6 +285,36 @@ public final class LTX2Pipeline {
     audioSeconds: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
+    nonPreemptible("generateT2V") {
+      try generateT2VResumable(
+        inputIds: inputIds, attentionMask: attentionMask,
+        width: width, height: height, numFrames: numFrames, steps: steps,
+        seed: seed, guidance: guidance,
+        negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
+        audioSeconds: audioSeconds, progressCallback: progressCallback)
+    }
+  }
+
+  /// #1479: `generateT2V` with preemption/resume plumbing. Defaults reproduce
+  /// the legacy call exactly — no signal, no checkpoint, no telemetry.
+  func generateT2VResumable(
+    inputIds: MLXArray,
+    attentionMask: MLXArray,
+    width: Int,
+    height: Int,
+    numFrames: Int,
+    steps: Int,
+    seed: UInt64? = nil,
+    guidance: Float? = nil,
+    negativeInputIds: MLXArray? = nil,
+    negativeAttentionMask: MLXArray? = nil,
+    audioSeconds: Float? = nil,
+    preemption: PreemptionSignal? = nil,
+    telemetry: LTX2PhaseTelemetry? = nil,
+    resume: LTX2ResumeState? = nil,
+    chunkIndex: Int = 0,
+    progressCallback: ((Int, Int) -> Void)? = nil
+  ) throws -> LTX2PipelineOutcome {
     let startTime = CFAbsoluteTimeGetCurrent()
     let cfgScale = guidance ?? config.guidance
 
@@ -192,6 +327,7 @@ public final class LTX2Pipeline {
 
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
+    telemetry?.begin(.textEncode)
     let wantAudio = audioSeconds != nil && transformer.hasAudio
     let textOutput = textEncoder.encode(
       inputIds: inputIds,
@@ -238,6 +374,7 @@ public final class LTX2Pipeline {
         logger.warning("NAG configured but no negative prompt supplied — NAG requires a negative conditioning; skipping.")
       }
     }
+    telemetry?.end(.textEncode)
 
     // Step 2: Compute latent dimensions
     let latH = height / spatialCompression
@@ -300,38 +437,83 @@ public final class LTX2Pipeline {
       logger.info("Audio stream enabled: \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 
+    // #1479 resume dispatch. Everything above is deterministic given the seed
+    // (`MLXRandom.seed(seed)` precedes the initial draw, the text encoder and
+    // the VAE carry no RNG), so re-running setup reproduces the pre-loop state
+    // bit-for-bit — only the loop position and its latents come from the
+    // checkpoint. A checkpoint whose config drifted is REFUSED here, loudly.
+    let baseFingerprint = denoiseConfigFingerprint(
+      width: latW * spatialCompression, height: latH * spatialCompression,
+      frames: latF, steps: sigmas.count - 1, cfg: cfgScale)
+    var baseStartStep = 0
+    var skipBaseLoop = false
+    if let r = resume {
+      try validateResumeUnlessRefineOwned(r, fingerprint: baseFingerprint, sigmas: sigmas)
+      restoreAudio(r, into: avState)
+      if r.phase == .baseDenoise {
+        // stepIndex 0 = the phase never started (a free unwind point between
+        // chunks/phases stamps a placeholder latent); rebuild from the
+        // deterministic initial noise already computed above.
+        if r.stepIndex > 0 {
+          latents = r.videoLatents
+          baseStartStep = r.stepIndex
+        }
+      } else {
+        skipBaseLoop = true
+        latents = r.videoLatents
+      }
+      logger.info("#1479 resume: T2V re-entering \(r.phase.rawValue) at step \(r.stepIndex) (chunk \(r.chunkIndex)).")
+    }
+
     // Step 6: Denoising loop
-    logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
-    switch denoisingLoop(
-      latents: latents,
-      positions: positions,
-      precomputedPE: precomputedPE,
-      textEmbeddings: textOutput.videoEmbeddings,
-      negativeEmbeddings: negativeEmbeddings,
-      sigmas: sigmas,
-      cfgScale: cfgScale,
-      state: nil,
-      nagEmbeddings: nagEmbeddings, nag: nagConfig,
-      avState: avState,
-      seed: seed,
-      progressCallback: progressCallback
-    ) {
-    case .completed(let l): latents = l
-    case .yielded(let s):
-      // #1479: unreachable while `preemption` stays nil (Task 4 wires the
-      // real signal into this call site) — handled rather than fatalError
-      // so a future wiring slip degrades to "resume with last latents"
-      // instead of crashing a live render.
-      logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
-      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
-      latents = s.videoLatents
+    if !skipBaseLoop {
+      logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
+      switch denoisingLoop(
+        latents: latents,
+        positions: positions,
+        precomputedPE: precomputedPE,
+        textEmbeddings: textOutput.videoEmbeddings,
+        negativeEmbeddings: negativeEmbeddings,
+        sigmas: sigmas,
+        cfgScale: cfgScale,
+        state: nil,
+        nagEmbeddings: nagEmbeddings, nag: nagConfig,
+        avState: avState,
+        startStep: baseStartStep,
+        seed: seed,
+        preemption: preemption,
+        telemetry: telemetry,
+        chunkIndex: chunkIndex,
+        progressCallback: progressCallback
+      ) {
+      case .completed(let l): latents = l
+      case .yielded(let s): return .yielded(s)
+      }
+    }
+
+    // #1479 free unwind point: the base→refine boundary. Yielding here costs
+    // nothing and keeps a raised signal from buying a whole refine pass.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .refineDenoise, latents: latents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
     }
 
     // Step 6b: Two-stage refine (env LTX2_TWO_STAGE) — identical machinery to the
     // i2v refine, minus the frame-0 identity re-anchor (t2v has no source frame,
     // so the refine runs free with state:nil). Upsample x2 -> flow re-noise ->
     // short deterministic refine denoise.
-    if let ups = self.upsampler, resolvedConfig.twoStage {
+    // #1479: `.refineDenoise` WITH a clean base latent = a checkpoint taken
+    // inside this loop; the upsample/re-noise already happened, so re-doing it
+    // would restart the pass. Without one it is the base→refine boundary and
+    // the refine runs normally from the (finished) base latents.
+    let resumeRefine: LTX2ResumeState? = {
+      guard let r = resume, r.phase == .refineDenoise, r.refineCleanLatents != nil else { return nil }
+      return r
+    }()
+    // A `.vaeDecode` checkpoint means base AND refine already finished — the
+    // checkpointed latents are final, so the refine must not run again.
+    if resume?.phase != .vaeDecode, let ups = self.upsampler, resolvedConfig.twoStage {
       MLX.GPU.clearCache()
       // Gate-skip decode fix (2026-08-05): check BEFORE upsampling — see
       // applyTwoStageRefine. Above the gate, keep base latents (native size).
@@ -341,29 +523,31 @@ public final class LTX2Pipeline {
       let sLatW = max(1, Int((Float(latW) * rScale).rounded()))
       let t2vPreVolume = latents.dim(2) * sLatH * sLatW
       let t2vRefineMax = resolvedConfig.refineMaxVol
-      if t2vPreVolume > t2vRefineMax,
+      if resumeRefine == nil, t2vPreVolume > t2vRefineMax,
          ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1" {
         logger.info("T2V two-stage refine: SKIPPED entirely (volume \(t2vPreVolume) > \(t2vRefineMax)) — native-size decode (gate-skip fix 2026-08-05).")
       } else {
+      var upLatent: MLXArray
+      if let rr = resumeRefine, let clean = rr.refineCleanLatents {
+        upLatent = clean
+        logger.info("#1479 resume: T2V refine re-entering at step \(rr.stepIndex) from the checkpointed clean base latent.")
+      } else {
       logger.info("T2V two-stage refine: upsampling latents 2x...")
       let stats = vae.decoder.perChannelStatistics
-      var upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
+      upLatent = stats.normalize(ups(stats.unNormalize(latents.asType(.float32)))).asType(.float32)
       if sLatH < latH * 2 || sLatW < latW * 2 {
         logger.info("T2V two-stage refine: resizing 2x latent to \(rScale)x (\(sLatH)x\(sLatW) latent) before denoise.")
         upLatent = LTX2Conditioning.resizeLatentBilinear(upLatent, height: sLatH, width: sLatW)
       }
       eval(upLatent)
+      }
       let t2vRefineVolume = upLatent.dim(2) * sLatH * sLatW
-      if t2vRefineVolume > t2vRefineMax {
+      if resumeRefine == nil, t2vRefineVolume > t2vRefineMax {
         logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (LTX2_REFINE_UPSCALE_ON_SKIP path).")
         latents = upLatent
       } else {
       let rLatH = sLatH, rLatW = sLatW
       let refineSigmas: [Float] = resolvedConfig.refineSigmasEffective
-      if let seed = seed { MLXRandom.seed(seed &+ 1000) }
-      let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
-      let sigma0 = refineSigmas[0]
-      let refineInit = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)  // flow re-noise
       // AUDIO BYPASSES PASS 2 (final listen verdict, Todd 2026-08-05:
       // "refined is not better — it picks up and enhances ambient [noise]",
       // agreeing with PinkCherry HF #8 and the grit metric; matched-seed
@@ -371,10 +555,29 @@ public final class LTX2Pipeline {
       // denoised stage-1 track; video still refines. LTX2_AUDIO_REFINE=1
       // re-enables the joint refine for A/B.
       let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
+      // #1479: the refine loop owns its own validation basis — its fingerprint
+      // and sigmas are the REFINE pass's, not the base pass's.
+      let refineFingerprint = denoiseConfigFingerprint(
+        width: rLatW * spatialCompression, height: rLatH * spatialCompression,
+        frames: upLatent.dim(2), steps: refineSigmas.count - 1, cfg: cfgScale)
+      var refineStartStep = 0
+      let refineInit: MLXArray
+      if let rr = resumeRefine {
+        try LTX2ResumeValidator.validate(
+          checkpointFingerprint: rr.configFingerprint, currentFingerprint: refineFingerprint,
+          checkpointSigmas: rr.sigmas, currentSigmas: refineSigmas, stepIndex: rr.stepIndex)
+        refineInit = rr.videoLatents
+        refineStartStep = rr.stepIndex
+      } else {
+      if let seed = seed { MLXRandom.seed(seed &+ 1000) }
+      let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
+      let sigma0 = refineSigmas[0]
+      refineInit = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)  // flow re-noise
       if refineAudio, let av = avState {
         let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
         let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
         av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
+      }
       }
       let refinePos = createPositionGrid(batchSize: 1, latF: latF, latH: rLatH, latW: rLatW)
       let refinePE = ltx2PrecomputeFreqsCIS(
@@ -408,22 +611,23 @@ public final class LTX2Pipeline {
         // `seed &+ 1000` (see the `MLXRandom.seed(seed &+ 1000)` reseed just
         // above, for `refNoise`) — keeps refine's per-step video noise on a
         // distinct key sequence from base's, deterministic and resume-safe.
+        startStep: refineStartStep,
         seed: seed.map { $0 &+ 1000 },
+        preemption: preemption,
+        telemetry: telemetry,
         loopPhase: .refineDenoise,
+        chunkIndex: chunkIndex,
         progressCallback: progressCallback) {
       case .completed(let l):
         latents = l
         // #1479 codex review: same fix as applyTwoStageRefine — only commit
         // the refined audio writeback on genuine completion, never past a
-        // (currently unreachable) .yielded arm's already-captured snapshot.
+        // .yielded arm's already-captured snapshot.
         if refineAudio, let av = avState, let rav = refineAVState {
           av.audioLatents = rav.audioLatents
         }
       case .yielded(let s):
-        // #1479: unreachable while `preemption` stays nil — see base-pass comment.
-        logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
-        assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
-        latents = s.videoLatents
+        return .yielded(refineCheckpoint(s, cleanBase: upLatent, baseAV: avState))
       }
       eval(latents)
       MLX.GPU.clearCache()
@@ -432,8 +636,18 @@ public final class LTX2Pipeline {
       }
     }
 
+    // #1479 free unwind point: the refine→decode boundary. The VAE decode is
+    // the longest uninterruptible op in the render, so never start one with a
+    // preemption already pending.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .vaeDecode, latents: latents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
+    }
+
     // Step 7: Decode latents via VAE
     logger.info("Decoding latents via VAE...")
+    telemetry?.begin(.vaeDecode)
     let decoded = decodeAdaptive(latents)
     eval(decoded)
 
@@ -441,6 +655,7 @@ public final class LTX2Pipeline {
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
     let clamped = MLX.clip(rescaled, min: 0, max: 1)
     eval(clamped)
+    telemetry?.end(.vaeDecode)
 
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("Generation complete in \(String(format: "%.1f", elapsed))s")
@@ -453,7 +668,7 @@ public final class LTX2Pipeline {
       elapsedSeconds: elapsed
     )
     output.audioLatents = avState?.audioLatents
-    return output
+    return .completed(output)
   }
 
   // MARK: - Text-to-Video with Pre-computed Embeddings
@@ -486,6 +701,30 @@ public final class LTX2Pipeline {
     guidance: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
+    nonPreemptible("generateT2VWithEmbeddings") {
+      try generateT2VWithEmbeddingsResumable(
+        videoEmbeddings: videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
+        width: width, height: height, numFrames: numFrames, steps: steps,
+        seed: seed, guidance: guidance, progressCallback: progressCallback)
+    }
+  }
+
+  /// #1479: `generateT2VWithEmbeddings` with preemption/resume plumbing.
+  func generateT2VWithEmbeddingsResumable(
+    videoEmbeddings: MLXArray,
+    negativeEmbeddings: MLXArray? = nil,
+    width: Int,
+    height: Int,
+    numFrames: Int,
+    steps: Int,
+    seed: UInt64? = nil,
+    guidance: Float? = nil,
+    preemption: PreemptionSignal? = nil,
+    telemetry: LTX2PhaseTelemetry? = nil,
+    resume: LTX2ResumeState? = nil,
+    chunkIndex: Int = 0,
+    progressCallback: ((Int, Int) -> Void)? = nil
+  ) throws -> LTX2PipelineOutcome {
     let startTime = CFAbsoluteTimeGetCurrent()
     let cfgScale = guidance ?? config.guidance
 
@@ -542,30 +781,62 @@ public final class LTX2Pipeline {
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
+    // #1479 resume dispatch — see generateT2VResumable. This path has no
+    // refine and no audio, so the only re-entry is the base loop (or, at the
+    // free unwind point below, the decode).
+    let baseFingerprint = denoiseConfigFingerprint(
+      width: latW * spatialCompression, height: latH * spatialCompression,
+      frames: latF, steps: sigmas.count - 1, cfg: cfgScale)
+    var baseStartStep = 0
+    var skipBaseLoop = false
+    if let r = resume {
+      try validateResumeUnlessRefineOwned(r, fingerprint: baseFingerprint, sigmas: sigmas)
+      if r.phase == .baseDenoise {
+        if r.stepIndex > 0 {
+          latents = r.videoLatents
+          baseStartStep = r.stepIndex
+        }
+      } else {
+        skipBaseLoop = true
+        latents = r.videoLatents
+      }
+      logger.info("#1479 resume: T2V(embeddings) re-entering \(r.phase.rawValue) at step \(r.stepIndex).")
+    }
+
     // Denoising loop
-    logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
-    switch denoisingLoop(
-      latents: latents,
-      positions: positions,
-      precomputedPE: precomputedPE,
-      textEmbeddings: videoEmbeddings,
-      negativeEmbeddings: negEmb,
-      sigmas: sigmas,
-      cfgScale: cfgScale,
-      state: nil,
-      seed: seed,
-      progressCallback: progressCallback
-    ) {
-    case .completed(let l): latents = l
-    case .yielded(let s):
-      // #1479: unreachable while `preemption` stays nil — see generateT2V.
-      logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
-      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
-      latents = s.videoLatents
+    if !skipBaseLoop {
+      logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
+      switch denoisingLoop(
+        latents: latents,
+        positions: positions,
+        precomputedPE: precomputedPE,
+        textEmbeddings: videoEmbeddings,
+        negativeEmbeddings: negEmb,
+        sigmas: sigmas,
+        cfgScale: cfgScale,
+        state: nil,
+        startStep: baseStartStep,
+        seed: seed,
+        preemption: preemption,
+        telemetry: telemetry,
+        chunkIndex: chunkIndex,
+        progressCallback: progressCallback
+      ) {
+      case .completed(let l): latents = l
+      case .yielded(let s): return .yielded(s)
+      }
+    }
+
+    // #1479 free unwind point: never start the decode with a pending preemption.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .vaeDecode, latents: latents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
     }
 
     // Decode latents via VAE
     logger.info("Decoding latents via VAE...")
+    telemetry?.begin(.vaeDecode)
     let decoded = decodeAdaptive(latents)
     eval(decoded)
 
@@ -573,17 +844,18 @@ public final class LTX2Pipeline {
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
     let clamped = MLX.clip(rescaled, min: 0, max: 1)
     eval(clamped)
+    telemetry?.end(.vaeDecode)
 
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("Generation complete in \(String(format: "%.1f", elapsed))s")
 
-    return LTX2PipelineOutput(
+    return .completed(LTX2PipelineOutput(
       decoded: clamped,
       numFrames: numFrames,
       width: width,
       height: height,
       elapsedSeconds: elapsed
-    )
+    ))
   }
 
   // MARK: - Image-to-Video
@@ -627,6 +899,42 @@ public final class LTX2Pipeline {
     audioSeconds: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
+    nonPreemptible("generateI2V") {
+      try generateI2VResumable(
+        inputIds: inputIds, attentionMask: attentionMask, image: image, strength: strength,
+        width: width, height: height, numFrames: numFrames, steps: steps,
+        seed: seed, guidance: guidance,
+        negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
+        faceAnchorMask: faceAnchorMask, faceAnchorStrength: faceAnchorStrength,
+        refineAnchorImage: refineAnchorImage, audioSeconds: audioSeconds,
+        progressCallback: progressCallback)
+    }
+  }
+
+  /// #1479: `generateI2V` with preemption/resume plumbing.
+  func generateI2VResumable(
+    inputIds: MLXArray,
+    attentionMask: MLXArray,
+    image: MLXArray,
+    strength: Float = 1.0,
+    width: Int,
+    height: Int,
+    numFrames: Int,
+    steps: Int,
+    seed: UInt64? = nil,
+    guidance: Float? = nil,
+    negativeInputIds: MLXArray? = nil,
+    negativeAttentionMask: MLXArray? = nil,
+    faceAnchorMask: MLXArray? = nil,
+    faceAnchorStrength: Float = 0,
+    refineAnchorImage: MLXArray? = nil,
+    audioSeconds: Float? = nil,
+    preemption: PreemptionSignal? = nil,
+    telemetry: LTX2PhaseTelemetry? = nil,
+    resume: LTX2ResumeState? = nil,
+    chunkIndex: Int = 0,
+    progressCallback: ((Int, Int) -> Void)? = nil
+  ) throws -> LTX2PipelineOutcome {
     let startTime = CFAbsoluteTimeGetCurrent()
     let cfgScale = guidance ?? config.guidance
 
@@ -636,6 +944,7 @@ public final class LTX2Pipeline {
 
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
+    telemetry?.begin(.textEncode)
     let wantAudio = audioSeconds != nil && transformer.hasAudio
     let textOutput = textEncoder.encode(
       inputIds: inputIds,
@@ -676,6 +985,8 @@ public final class LTX2Pipeline {
         logger.warning("NAG configured but no negative prompt supplied — NAG requires a negative conditioning; skipping.")
       }
     }
+
+    telemetry?.end(.textEncode)
 
     // Step 2: Encode input image via VAE
     logger.info("Encoding input image via VAE...")
@@ -782,54 +1093,111 @@ public final class LTX2Pipeline {
       logger.info("Audio stream enabled (i2v): \(ta) latent frames (\(seconds)s, negatives \(negativeAudioEmbeddings != nil ? "on" : "off")).")
     }
 
+    // #1479 resume dispatch. The whole setup above is deterministic given the
+    // seed (`MLXRandom.seed` precedes `createInitialState`'s draw; the text
+    // encoder and the VAE encode carry no RNG), so a resume reproduces the
+    // conditioning state bit-for-bit and only the loop position is restored.
+    // NOTE the fingerprint's frame count is the FULL grid — IC-control's
+    // appended reference frames included — matching what `denoisingLoop`
+    // stamps from `latents.dim(2)`.
+    let baseFingerprint = denoiseConfigFingerprint(
+      width: latW * spatialCompression, height: latH * spatialCompression,
+      frames: latF + icRefFrames, steps: sigmas.count - 1, cfg: cfgScale)
+    var baseStartStep = 0
+    var skipBaseLoop = false
+    var resumedLatents: MLXArray? = nil
+    if let r = resume {
+      try validateResumeUnlessRefineOwned(r, fingerprint: baseFingerprint, sigmas: sigmas)
+      restoreAudio(r, into: avState)
+      if r.phase == .baseDenoise {
+        if r.stepIndex > 0 {
+          resumedLatents = r.videoLatents
+          baseStartStep = r.stepIndex
+        }
+      } else {
+        skipBaseLoop = true
+        resumedLatents = r.videoLatents
+      }
+      logger.info("#1479 resume: I2V re-entering \(r.phase.rawValue) at step \(r.stepIndex) (chunk \(r.chunkIndex)).")
+    }
+
     // Step 6: Denoising loop with I2V state
-    logger.info("Denoising with I2V conditioning...")
     let latentsAll: MLXArray
-    switch denoisingLoop(
-      latents: state.latent,
-      positions: positions,
-      precomputedPE: precomputedPE,
-      textEmbeddings: textOutput.videoEmbeddings,
-      negativeEmbeddings: negativeEmbeddings,
-      sigmas: sigmas,
-      cfgScale: cfgScale,
-      state: state,
-      nagEmbeddings: nagEmbeddings, nag: nagConfig,
-      avState: avState,
-      seed: seed,
-      progressCallback: progressCallback
-    ) {
-    case .completed(let l): latentsAll = l
-    case .yielded(let s):
-      // #1479: unreachable while `preemption` stays nil — see generateT2V.
-      logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
-      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
-      latentsAll = s.videoLatents
+    if skipBaseLoop, let resumed = resumedLatents {
+      latentsAll = resumed
+    } else {
+      logger.info("Denoising with I2V conditioning...")
+      switch denoisingLoop(
+        latents: resumedLatents ?? state.latent,
+        positions: positions,
+        precomputedPE: precomputedPE,
+        textEmbeddings: textOutput.videoEmbeddings,
+        negativeEmbeddings: negativeEmbeddings,
+        sigmas: sigmas,
+        cfgScale: cfgScale,
+        state: state,
+        nagEmbeddings: nagEmbeddings, nag: nagConfig,
+        avState: avState,
+        startStep: baseStartStep,
+        seed: seed,
+        preemption: preemption,
+        telemetry: telemetry,
+        chunkIndex: chunkIndex,
+        progressCallback: progressCallback
+      ) {
+      case .completed(let l): latentsAll = l
+      case .yielded(let s): return .yielded(s)
+      }
     }
 
     // Drop the appended IC-control reference frames before decode (keep latF).
-    var latents = icRefFrames > 0
+    // A post-base checkpoint (.refineDenoise / .vaeDecode) was taken AFTER this
+    // slice, so it is already at latF frames — slicing again would over-trim.
+    var latents = (icRefFrames > 0 && !skipBaseLoop)
       ? latentsAll[0..., 0..., 0..<latF, 0..., 0...]
       : latentsAll
 
+    // #1479 free unwind point: the base→refine boundary.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .refineDenoise, latents: latents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
+    }
+
     // Two-stage refine — shared with continuation chunks (applyTwoStageRefine).
-    latents = applyTwoStageRefine(
-      latents, latF: latF, latH: latH, latW: latW,
-      textEmbeddings: textOutput.videoEmbeddings,
-      negativeEmbeddings: negativeEmbeddings,
-      cfgScale: cfgScale, seed: seed,
-      refineAnchorImage: refineAnchorImage,
-      avState: avState,
-      progressCallback: progressCallback)
+    if resume?.phase != .vaeDecode {
+      switch try applyTwoStageRefine(
+        latents, latF: latF, latH: latH, latW: latW,
+        textEmbeddings: textOutput.videoEmbeddings,
+        negativeEmbeddings: negativeEmbeddings,
+        cfgScale: cfgScale, seed: seed,
+        refineAnchorImage: refineAnchorImage,
+        avState: avState,
+        preemption: preemption, telemetry: telemetry,
+        resume: resume, chunkIndex: chunkIndex,
+        progressCallback: progressCallback) {
+      case .completed(let l): latents = l
+      case .yielded(let s): return .yielded(s)
+      }
+    }
+
+    // #1479 free unwind point: never start the decode with a pending preemption.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .vaeDecode, latents: latents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
+    }
 
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
+    telemetry?.begin(.vaeDecode)
     let decoded = decodeAdaptive(latents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
     let clamped = MLX.clip(rescaled, min: 0, max: 1)
     eval(clamped)
+    telemetry?.end(.vaeDecode)
 
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("I2V generation complete in \(String(format: "%.1f", elapsed))s")
@@ -842,7 +1210,7 @@ public final class LTX2Pipeline {
       elapsedSeconds: elapsed
     )
     output.audioLatents = avState?.audioLatents
-    return output
+    return .completed(output)
   }
 
   // MARK: - Multi-Keyframe ("tween") Generation
@@ -894,6 +1262,35 @@ public final class LTX2Pipeline {
     negativeAttentionMask: MLXArray? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
   ) -> LTX2PipelineOutput {
+    nonPreemptible("generateMultiKeyframe") {
+      try generateMultiKeyframeResumable(
+        inputIds: inputIds, attentionMask: attentionMask, keyframes: keyframes,
+        width: width, height: height, numFrames: numFrames, steps: steps,
+        seed: seed, guidance: guidance,
+        negativeInputIds: negativeInputIds, negativeAttentionMask: negativeAttentionMask,
+        progressCallback: progressCallback)
+    }
+  }
+
+  /// #1479: `generateMultiKeyframe` with preemption/resume plumbing.
+  func generateMultiKeyframeResumable(
+    inputIds: MLXArray,
+    attentionMask: MLXArray,
+    keyframes: [Keyframe],
+    width: Int,
+    height: Int,
+    numFrames: Int,
+    steps: Int,
+    seed: UInt64? = nil,
+    guidance: Float? = nil,
+    negativeInputIds: MLXArray? = nil,
+    negativeAttentionMask: MLXArray? = nil,
+    preemption: PreemptionSignal? = nil,
+    telemetry: LTX2PhaseTelemetry? = nil,
+    resume: LTX2ResumeState? = nil,
+    chunkIndex: Int = 0,
+    progressCallback: ((Int, Int) -> Void)? = nil
+  ) throws -> LTX2PipelineOutcome {
     precondition(!keyframes.isEmpty, "generateMultiKeyframe requires at least one keyframe")
     precondition((numFrames - 1) % 8 == 0, "numFrames must be 1 + 8k (got \(numFrames))")
 
@@ -904,6 +1301,7 @@ public final class LTX2Pipeline {
 
     // Step 1: Encode prompt
     logger.info("Encoding prompt...")
+    telemetry?.begin(.textEncode)
     let textOutput = textEncoder.encode(
       inputIds: inputIds, attentionMask: attentionMask, returnAudioEmbeddings: false
     )
@@ -940,6 +1338,8 @@ public final class LTX2Pipeline {
         logger.warning("NAG configured but no negative prompt supplied — NAG requires a negative conditioning; skipping.")
       }
     }
+
+    telemetry?.end(.textEncode)
 
     // Step 2: Compute latent dimensions (needed to convert video-frame ->
     // latent-frame indices before encoding each keyframe).
@@ -988,27 +1388,59 @@ public final class LTX2Pipeline {
     )
     eval(precomputedPE.cos, precomputedPE.sin)
 
+    // #1479 resume dispatch — see generateI2VResumable.
+    let baseFingerprint = denoiseConfigFingerprint(
+      width: latW * spatialCompression, height: latH * spatialCompression,
+      frames: latF, steps: sigmas.count - 1, cfg: cfgScale)
+    var baseStartStep = 0
+    var skipBaseLoop = false
+    var resumedLatents: MLXArray? = nil
+    if let r = resume {
+      try validateResumeUnlessRefineOwned(r, fingerprint: baseFingerprint, sigmas: sigmas)
+      if r.phase == .baseDenoise {
+        if r.stepIndex > 0 {
+          resumedLatents = r.videoLatents
+          baseStartStep = r.stepIndex
+        }
+      } else {
+        skipBaseLoop = true
+        resumedLatents = r.videoLatents
+      }
+      logger.info("#1479 resume: multi-keyframe re-entering \(r.phase.rawValue) at step \(r.stepIndex) (chunk \(r.chunkIndex)).")
+    }
+
     // Step 6: Denoise
-    logger.info("Denoising with \(keyframes.count)-keyframe conditioning...")
     let latents: MLXArray
-    switch denoisingLoop(
-      latents: state.latent,
-      positions: positions,
-      precomputedPE: precomputedPE,
-      textEmbeddings: textOutput.videoEmbeddings,
-      negativeEmbeddings: negativeEmbeddings,
-      sigmas: sigmas,
-      cfgScale: cfgScale,
-      state: state,
-      seed: seed,
-      progressCallback: progressCallback
-    ) {
-    case .completed(let l): latents = l
-    case .yielded(let s):
-      // #1479: unreachable while `preemption` stays nil — see generateT2V.
-      logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
-      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
-      latents = s.videoLatents
+    if skipBaseLoop, let resumed = resumedLatents {
+      latents = resumed
+    } else {
+      logger.info("Denoising with \(keyframes.count)-keyframe conditioning...")
+      switch denoisingLoop(
+        latents: resumedLatents ?? state.latent,
+        positions: positions,
+        precomputedPE: precomputedPE,
+        textEmbeddings: textOutput.videoEmbeddings,
+        negativeEmbeddings: negativeEmbeddings,
+        sigmas: sigmas,
+        cfgScale: cfgScale,
+        state: state,
+        startStep: baseStartStep,
+        seed: seed,
+        preemption: preemption,
+        telemetry: telemetry,
+        chunkIndex: chunkIndex,
+        progressCallback: progressCallback
+      ) {
+      case .completed(let l): latents = l
+      case .yielded(let s): return .yielded(s)
+      }
+    }
+
+    // #1479 free unwind point: the base→refine boundary.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .refineDenoise, latents: latents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
     }
 
     // Step 6b: Two-stage refine — SAME treatment as generateI2V. Continuation
@@ -1016,33 +1448,50 @@ public final class LTX2Pipeline {
     // multi-chunk render were base-resolution decodes upscaled by the muxer
     // (visible quality cliff at each chunk boundary; blockiness rose 1.14 ->
     // 1.43 across the 2026-07-26 03:59 filed video).
-    let refinedLatents = applyTwoStageRefine(
-      latents, latF: latF, latH: latH, latW: latW,
-      textEmbeddings: textOutput.videoEmbeddings,
-      negativeEmbeddings: negativeEmbeddings,
-      cfgScale: cfgScale, seed: seed,
-      refineAnchorImage: nil,
-      progressCallback: progressCallback)
+    var refinedLatents = latents
+    if resume?.phase != .vaeDecode {
+      switch try applyTwoStageRefine(
+        latents, latF: latF, latH: latH, latW: latW,
+        textEmbeddings: textOutput.videoEmbeddings,
+        negativeEmbeddings: negativeEmbeddings,
+        cfgScale: cfgScale, seed: seed,
+        refineAnchorImage: nil,
+        preemption: preemption, telemetry: telemetry,
+        resume: resume, chunkIndex: chunkIndex,
+        progressCallback: progressCallback) {
+      case .completed(let l): refinedLatents = l
+      case .yielded(let s): return .yielded(s)
+      }
+    }
+
+    // #1479 free unwind point: never start the decode with a pending preemption.
+    if preemption?.isRaised == true {
+      return .yielded(boundaryCheckpoint(
+        phase: .vaeDecode, latents: refinedLatents, sigmas: sigmas,
+        fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
+    }
 
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
+    telemetry?.begin(.vaeDecode)
     let decoded = decodeAdaptive(refinedLatents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
     let clamped = MLX.clip(rescaled, min: 0, max: 1)
     eval(clamped)
+    telemetry?.end(.vaeDecode)
 
     let elapsed = CFAbsoluteTimeGetCurrent() - startTime
     logger.info("Multi-keyframe generation complete in \(String(format: "%.1f", elapsed))s")
 
-    return LTX2PipelineOutput(
+    return .completed(LTX2PipelineOutput(
       decoded: clamped,
       numFrames: numFrames,
       width: width,
       height: height,
       elapsedSeconds: elapsed
-    )
+    ))
   }
 
   // MARK: - Internal: Denoising Loop
@@ -1054,7 +1503,7 @@ public final class LTX2Pipeline {
   /// method taking them as parameters rather than a zero-arg stored property.
   /// Its only job is making a config-changed-between-pause-and-resume resumption
   /// detectable (compared by Task 4); the exact string format is not a contract.
-  private func denoiseConfigFingerprint(
+  func denoiseConfigFingerprint(
     width: Int, height: Int, frames: Int, steps: Int, cfg: Float
   ) -> String {
     "\(width)x\(height)f\(frames)s\(steps)-\(resolvedConfig.sampler)-cfg\(cfg)"
@@ -1085,6 +1534,12 @@ public final class LTX2Pipeline {
     chunkIndex: Int = 0,
     progressCallback: ((Int, Int) -> Void)?
   ) -> LTX2DenoiseResult {
+    // #1479 phase timing. `defer` so a yield closes the phase too: a preempted
+    // pass then contributes two partial samples that sum to the true duration,
+    // which is why the refusal guard reads `meanStepSec` (exact per step) for
+    // the denoise phases and only uses phase means for the uninterruptible ones.
+    telemetry?.begin(loopPhase)
+    defer { telemetry?.end(loopPhase) }
     let dtype: DType = .bfloat16
     let numSteps = sigmas.count - 1
     // Per-step CFG schedule (community "CFG ramp": e.g. LTX2_CFG_SCHEDULE=3,2,1 —
@@ -1661,11 +2116,22 @@ public final class LTX2Pipeline {
     seed: UInt64?,
     refineAnchorImage: MLXArray?,
     avState: LTX2AVDenoiseState? = nil,
+    preemption: PreemptionSignal? = nil,
+    telemetry: LTX2PhaseTelemetry? = nil,
+    resume: LTX2ResumeState? = nil,
+    chunkIndex: Int = 0,
     progressCallback: ((Int, Int) -> Void)?
-  ) -> MLXArray {
+  ) throws -> LTX2RefineOutcome {
+    // #1479: a checkpoint taken INSIDE this loop carries the clean (upsampled,
+    // pre-re-noise) base latent; the upsample and flow re-noise already ran, so
+    // redoing them would restart the pass rather than continue it.
+    let resumeRefine: LTX2ResumeState? = {
+      guard let r = resume, r.phase == .refineDenoise, r.refineCleanLatents != nil else { return nil }
+      return r
+    }()
     guard let ups = self.upsampler,
           resolvedConfig.twoStage else {
-      return latents
+      return .completed(latents)
     }
     // Gate-skip decode fix (Todd 2026-08-05): the volume is knowable from
     // dims BEFORE upsampling. Above the gate the refine denoise never runs,
@@ -1685,23 +2151,29 @@ public final class LTX2Pipeline {
     let sLatW = max(1, Int((Float(latW) * rScale).rounded()))
     let preVolume = latents.dim(2) * sLatH * sLatW
     let preMaxVolume = resolvedConfig.refineMaxVol
-    if preVolume > preMaxVolume,
+    if resumeRefine == nil, preVolume > preMaxVolume,
        ProcessInfo.processInfo.environment["LTX2_REFINE_UPSCALE_ON_SKIP"] != "1",
        ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] != "1" {
       logger.info("Two-stage refine: SKIPPED entirely (volume \(preVolume) > \(preMaxVolume)) — native-size decode (gate-skip fix 2026-08-05).")
-      return latents
+      return .completed(latents)
     }
+    var upLatent: MLXArray
+    if let rr = resumeRefine, let clean = rr.refineCleanLatents {
+      upLatent = clean
+      logger.info("#1479 resume: refine re-entering at step \(rr.stepIndex) from the checkpointed clean base latent.")
+    } else {
     logger.info("Two-stage refine: upsampling latents 2x...")
     // The latent upsampler is trained on UN-normalized (VAE-scale) latents.
     let stats = vae.decoder.perChannelStatistics
     let denorm = stats.unNormalize(latents.asType(.float32))
     let upDenorm = ups(denorm)
-    var upLatent = stats.normalize(upDenorm).asType(.float32)
+    upLatent = stats.normalize(upDenorm).asType(.float32)
     if sLatH < latH * 2 || sLatW < latW * 2 {
       logger.info("Two-stage refine: resizing 2x latent to \(rScale)x (\(sLatH)x\(sLatW) latent) before denoise.")
       upLatent = LTX2Conditioning.resizeLatentBilinear(upLatent, height: sLatH, width: sLatW)
     }
     eval(upLatent)
+    }
     // --- Refine bisection instrumentation (env-gated, 2026-08-01 band bug) ---
     // LTX2_REFINE_ROWSTATS=1 logs per-latent-row energy at each refine boundary
     // so the vertical-truncation fault can be localized (upsample vs re-noise
@@ -1727,13 +2199,13 @@ public final class LTX2Pipeline {
     // upsampled latent directly — upscaled-but-unrefined beats a dead server.
     let refineVolume = upLatent.dim(2) * sLatH * sLatW
     let refineMaxVolume = resolvedConfig.refineMaxVol
-    if ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
+    if resumeRefine == nil, ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
       logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
-      return upLatent
+      return .completed(upLatent)
     }
-    if refineVolume > refineMaxVolume {
+    if resumeRefine == nil, refineVolume > refineMaxVolume {
       logger.info("Two-stage refine: SKIPPED denoise (refine latent volume \(refineVolume) > \(refineMaxVolume)) — decoding upsampled latent directly (OOM guard).")
-      return upLatent
+      return .completed(upLatent)
     }
     MLX.GPU.clearCache()
     // The refine denoise runs at the RESIZED dims (rScale, 1.5x default), not
@@ -1742,18 +2214,23 @@ public final class LTX2Pipeline {
     // grid was built for a different token count than the latent.
     let rLatH = sLatH, rLatW = sLatW
     let refineSigmas: [Float] = resolvedConfig.refineSigmasEffective
-    if let seed = seed { MLXRandom.seed(seed &+ 1000) }
-    // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (ComfyUI CONST noise_scaling).
-    let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
     let sigma0 = refineSigmas[0]
-    let mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
     // Audio bypasses pass 2 by default — see the t2v refine block comment
     // (final listen verdict 2026-08-05). LTX2_AUDIO_REFINE=1 re-enables.
     let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
-    if refineAudio, let av = avState {
-      let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
-      let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
-      av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
+    // #1479: the re-noise and the audio re-noise already happened before the
+    // checkpoint — running them again would restart the pass.
+    var mixed = upLatent
+    if resumeRefine == nil {
+      if let seed = seed { MLXRandom.seed(seed &+ 1000) }
+      // Flow-matching re-noise: x_σ = (1-σ)·x0 + σ·ε (ComfyUI CONST noise_scaling).
+      let refNoise = MLXRandom.normal(upLatent.shape).asType(.float32)
+      mixed = MLXArray(1 - sigma0) * upLatent + refNoise * MLXArray(sigma0)
+      if refineAudio, let av = avState {
+        let aKey = seed.map { MLXRandom.key($0 &+ 0xA0D11) }
+        let aNoise = MLXRandom.normal(av.audioLatents.shape, key: aKey).asType(.float32)
+        av.audioLatents = MLXArray(1 - sigma0) * av.audioLatents + aNoise * MLXArray(sigma0)
+      }
     }
     // Frame-0 re-anchor: raw source re-encoded at refine res when available
     // (workflow nodes 19/20); else the upsampled latent's own frame 0.
@@ -1776,7 +2253,9 @@ public final class LTX2Pipeline {
       logger.info("Two-stage refine: frame 0 re-anchored to source re-encoded at \(rLatW * spatialCompression)x\(rLatH * spatialCompression).")
     }
     rowStats("mixed", mixed)
-    let refineInit = MLX.concatenated(
+    // #1479: on resume the refine loop re-enters from its checkpointed
+    // latents; `mixed` (the fresh flow re-noise) is bypassed entirely.
+    let refineInit = resumeRefine?.videoLatents ?? MLX.concatenated(
       [anchorFrame, mixed[0..., 0..., 1..<rF, 0..., 0...]], axis: 2)
     let refClean = MLX.concatenated(
       [anchorFrame, upLatent[0..., 0..., 1..<rF, 0..., 0...]], axis: 2)
@@ -1806,6 +2285,19 @@ public final class LTX2Pipeline {
         audioLatents: av.audioLatents, audioContext: av.audioContext, pe: avPE2)
     }
     logger.info("Two-stage refine: denoising at \(rLatW * spatialCompression)x\(rLatH * spatialCompression), \(refineSigmas.count - 1) steps...")
+    // #1479: the refine loop owns its validation basis — its fingerprint and
+    // sigma schedule are the REFINE pass's, not the base pass's.
+    let refineFingerprint = denoiseConfigFingerprint(
+      width: rLatW * spatialCompression, height: rLatH * spatialCompression,
+      frames: refineInit.dim(2), steps: refineSigmas.count - 1, cfg: cfgScale)
+    var refineStartStep = 0
+    if let rr = resumeRefine {
+      try LTX2ResumeValidator.validate(
+        checkpointFingerprint: rr.configFingerprint, currentFingerprint: refineFingerprint,
+        checkpointSigmas: rr.sigmas, currentSigmas: refineSigmas, stepIndex: rr.stepIndex)
+      refineStartStep = rr.stepIndex
+      restoreAudio(rr, into: refineAVState)
+    }
     // base=euler_ancestral_cfg_pp -> refine=euler_cfg_pp (the author's pairing).
     var refined: MLXArray
     switch denoisingLoop(
@@ -1818,30 +2310,29 @@ public final class LTX2Pipeline {
       // matches this file's existing `seed &+ 1000` refine-decorrelation
       // convention (the `MLXRandom.seed(seed &+ 1000)` reseed above, for
       // `refNoise`).
-      seed: seed.map { $0 &+ 1000 },
+      startStep: refineStartStep, seed: seed.map { $0 &+ 1000 },
+      preemption: preemption,
+      telemetry: telemetry,
       loopPhase: .refineDenoise,
+      chunkIndex: chunkIndex,
       progressCallback: progressCallback) {
     case .completed(let l):
       refined = l
       // #1479 codex review: this writeback must only happen on a genuine
-      // completion. Moved inside .completed so a (currently unreachable)
-      // .yielded arm never commits partially-stepped refine audio into the
-      // caller's AV state past the point the LTX2ResumeState snapshot
-      // already captured it.
+      // completion. Kept inside .completed so the .yielded arm never commits
+      // partially-stepped refine audio into the caller's AV state past the
+      // point the LTX2ResumeState snapshot already captured it.
       if let av = avState, let refAV = refineAVState {
         av.audioLatents = refAV.audioLatents  // propagate refined audio back to the caller's state
       }
     case .yielded(let s):
-      // #1479: unreachable while `preemption` stays nil — see generateT2V.
-      logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
-      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
-      refined = s.videoLatents
+      return .yielded(refineCheckpoint(s, cleanBase: upLatent, baseAV: avState))
     }
     eval(refined)
     rowStats("refined", refined)
     MLX.GPU.clearCache()
     logger.info("Two-stage refine complete.")
-    return refined
+    return .completed(refined)
   }
 
   private func createPositionGrid(
