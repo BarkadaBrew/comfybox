@@ -414,6 +414,20 @@ public enum ComfyBoxModelRegistry {
       description: "Krea's distilled turbo model. Native Swift port — 8-step, guidance-free."
     ),
 
+    ComfyBoxModel(
+      id: "kroma-v0.2-turbo",
+      family: .krea2, variant: .turbo, quantization: .q8,
+      huggingFaceId: "lodestones/Kroma",
+      parametersBillions: 13.5, latentChannels: 16,
+      defaultSteps: 10, defaultGuidance: 0.0,
+      supportsGuidance: false, supportsLoRA: true,
+      supportsControlNet: false, supportsImg2Img: false,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 22.0,
+      displayName: "Kroma v0.2",
+      description: "lodestones' Kroma — a Krea-2 fine-tune with the Turbo delta baked in (rank-512). Distilled for 8-12 steps. MIT. Successor to the kroma-v0.1 LoRA-delta packaging."
+    ),
+
     // ─── ESRGAN Family ───────────────────────────────────────────────
     // RRDBNet-based 4× upscalers. Various community weights.
 

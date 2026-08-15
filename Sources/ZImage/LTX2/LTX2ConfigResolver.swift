@@ -281,7 +281,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let videoBitsPerPx: Double
 
   public let provenance: [String: LTX2ParamSource]
-  public let params: [LTX2ResolvedParam]
+  public var params: [LTX2ResolvedParam]
 
   // Sampler-family helpers mirroring the legacy env conventions.
   public var samplerIsAncestral: Bool { sampler.lowercased().contains("ancestral") }
@@ -369,7 +369,7 @@ extension LTX2ConfigResolver {
 
     let condFpsBase: Float? = str("cond_fps") == "model" ? nil : Float(str("cond_fps"))
 
-    return LTX2ResolvedVideoConfig(
+    var config = LTX2ResolvedVideoConfig(
       guidanceRescale: pick("guidance_rescale", f("guidance_rescale"), preset?.guidanceRescale, request?.guidanceRescale),
       cfgSchedule: pick("cfg_schedule", list("cfg_schedule"), preset?.cfgSchedule, request?.cfgSchedule),
       stage1Sigmas: pick("stage1_sigmas", list("stage1_sigmas"), preset?.stage1Sigmas, request?.stage1Sigmas),
@@ -400,5 +400,18 @@ extension LTX2ConfigResolver {
       provenance: provenance,
       params: base
     )
+    // Overlay typed request/preset picks onto the string readout (2026-08-11):
+    // `base` alone showed env values/provenance even when a request override
+    // WON — the effective-config log lied, silently defeating the
+    // "verify your override landed" discipline (found via the tarn1 sigma
+    // A/B: renders were correct, the log said env).
+    config.params = base.map { row in
+      guard let src = provenance[row.name] else { return row }
+      return LTX2ResolvedParam(
+        name: row.name, envKey: row.envKey, tier: row.tier,
+        value: config.valueString(for: row.name) ?? row.value,
+        source: src, valid: row.valid, note: row.note)
+    }
+    return config
   }
 }

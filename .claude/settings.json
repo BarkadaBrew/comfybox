@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(launchctl print *)",
+      "mcp__computer-use__screenshot",
+      "mcp__bree-daemon__get_current_time",
+      "mcp__comfybox__server_health",
+      "mcp__bree-daemon__find_tools"
+    ]
+  }
+}
