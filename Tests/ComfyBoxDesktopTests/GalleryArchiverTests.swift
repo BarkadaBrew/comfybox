@@ -12,6 +12,7 @@
 
 import Testing
 import Foundation
+import SQLite3
 @testable import ComfyBoxDesktop
 
 @Suite("GalleryArchiver")
@@ -25,7 +26,8 @@ struct GalleryArchiverTests {
         store: DAMStore,
         watchDir: String,
         thumbDir: String,
-        archiveRoot: String
+        archiveRoot: String,
+        dbPath: String
     ) {
         let base = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("archiver-test-\(UUID().uuidString)")
@@ -39,7 +41,7 @@ struct GalleryArchiverTests {
         let store = try await DAMStore.open(path: dbPath)
         let ingestor = AssetIngestor(store: store, watchDirectory: watchDir, thumbnailDirectory: thumbDir)
         let archiver = GalleryArchiver(store: store, ingestor: ingestor)
-        return (archiver, ingestor, store, watchDir, thumbDir, archiveRoot)
+        return (archiver, ingestor, store, watchDir, thumbDir, archiveRoot, dbPath)
     }
 
     /// Write a minimal file with the given name into the directory.
@@ -789,5 +791,67 @@ struct GalleryArchiverTests {
         let pendingRemovalPath = (bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
         #expect(FileManager.default.fileExists(atPath: pendingRemovalPath))
         #expect(FileManager.default.fileExists(atPath: incompletePath))
+    }
+
+    @Test("resumePendingRemovals leaves the marker in place when the removal fails, and a later clean pass finishes the job")
+    @MainActor
+    func resumePendingRemovalsLeavesMarkerOnDeleteFailure() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "FailureTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+        // Reconstruct the interrupted-removal state, as in the happy-path test above.
+        try await env.store.insertAsset(asset)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        try writePendingRemovalMarker(ids: [asset.id], in: archiveResult.bundlePath)
+        let pendingRemovalPath = (archiveResult.bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+
+        // Force the row DELETE inside `ingestor.deleteAsset` to fail
+        // deterministically, without racing and without touching
+        // `DAMStore.swift`: a second raw connection to the same on-disk
+        // database (opened directly via the system SQLite3 module — the
+        // same one `DAMStore` itself imports, available to any target on
+        // the SDK with no extra package wiring) takes the single WAL writer
+        // lock with `BEGIN EXCLUSIVE` and holds it. `DAMStore` never sets a
+        // busy_timeout, so the store's own write attempt hits SQLITE_BUSY
+        // immediately rather than blocking. WAL mode's whole point is that
+        // readers are never blocked by a pending writer, so
+        // `allAssetIds`/`assetCount`/`fetchAssets` — the snapshot reads —
+        // are unaffected; only the DELETE fails. (An attempt at the same
+        // thing via the "user immutable" file flag on the `-wal` file did
+        // not reproduce a failure in practice — SQLite apparently satisfies
+        // that particular write from data already resident in its own
+        // in-process cache/mapping rather than re-touching the file in a
+        // way the flag intercepts — so this lock-based construction is used
+        // instead.)
+        var blocker: OpaquePointer?
+        #expect(sqlite3_open_v2(env.dbPath, &blocker, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(blocker, "BEGIN EXCLUSIVE", nil, nil, nil) == SQLITE_OK)
+
+        await env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+
+        // Failed pass: marker survives, and the DB row (the thing whose
+        // removal actually failed) is still there. The pre-DB-write file
+        // and thumbnail removals in `ingestor.deleteAsset` already ran by
+        // this point regardless — that partial-file-cleanup ordering is
+        // `ingestor.deleteAsset`'s own behavior, reused as-is, not
+        // something T7 introduces or is responsible for making atomic.
+        #expect(FileManager.default.fileExists(atPath: pendingRemovalPath))
+        let idsAfterFailedResume = try await env.store.allAssetIds()
+        #expect(idsAfterFailedResume.contains(asset.id))
+
+        // Release the lock and re-run: idempotent recovery finishes the job.
+        sqlite3_exec(blocker, "ROLLBACK", nil, nil, nil)
+        sqlite3_close(blocker)
+
+        await env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+
+        let idsAfterCleanResume = try await env.store.allAssetIds()
+        #expect(!idsAfterCleanResume.contains(asset.id))
+        #expect(!FileManager.default.fileExists(atPath: pendingRemovalPath))
     }
 }

@@ -287,9 +287,11 @@ public final class GalleryArchiver {
     /// "Discard Incomplete Archives").
     ///
     /// Idempotent: once a bundle's ids are gone and its marker is deleted,
-    /// re-running this is a no-op. Per-id and per-bundle failures are
-    /// logged and skipped rather than thrown, so one bad bundle never stops
-    /// the rest of the sweep.
+    /// re-running this is a no-op. The marker is cleared only after a fully
+    /// clean pass — every id in it ended up either already absent or
+    /// successfully removed; any failure leaves it in place for the next
+    /// launch to retry. Per-id and per-bundle failures are logged rather
+    /// than thrown, so one bad bundle never stops the rest of the sweep.
     public func resumePendingRemovals(in roots: [String]) async {
         let fm = FileManager.default
         for root in roots {
@@ -317,9 +319,15 @@ public final class GalleryArchiver {
         }
     }
 
-    /// Finishes removal for every id still present in the store, then
-    /// unconditionally clears the marker — matching `archive`'s own step 9
-    /// (remove sources) → step 10 (clear PENDING_REMOVAL.json) sequence.
+    /// Finishes removal for every id still present in the store and clears
+    /// the marker **only if every one of them ended the pass either already
+    /// absent or successfully removed**. Any failure — the live-id snapshot
+    /// itself failing to read, the row-fetch failing, a live id missing from
+    /// the fetched rows, or `ingestor.deleteAsset` throwing — is logged and
+    /// leaves `PENDING_REMOVAL.json` in place. This is safe and idempotent
+    /// by construction: whatever *did* get removed this pass has already
+    /// dropped out of `store.allAssetIds()`, so the next sweep only retries
+    /// the ids that are still actually live — no marker rewriting needed.
     private func finishPendingRemoval(assetIds: [String], pendingRemovalPath: String) async {
         guard let liveIds = try? await store.allAssetIds() else {
             print("[GalleryArchiver] resumePendingRemovals: could not read live asset ids, leaving \(pendingRemovalPath) for the next launch")
@@ -327,22 +335,38 @@ public final class GalleryArchiver {
         }
         let idsToRemove = assetIds.filter { liveIds.contains($0) }
 
-        if !idsToRemove.isEmpty {
-            let count = (try? await store.assetCount()) ?? 0
-            let liveAssets = (try? await store.fetchAssets(limit: count, offset: 0)) ?? []
-            let byId = Dictionary(uniqueKeysWithValues: liveAssets.map { ($0.id, $0) })
+        guard !idsToRemove.isEmpty else {
+            // Every id in the marker is already gone — a fully clean pass.
+            try? FileManager.default.removeItem(atPath: pendingRemovalPath)
+            return
+        }
 
-            for id in idsToRemove {
-                guard let asset = byId[id] else { continue }
-                do {
-                    try await ingestor.deleteAsset(asset)
-                } catch {
-                    print("[GalleryArchiver] resumePendingRemovals: failed to remove asset \(id): \(error)")
-                }
+        guard let count = try? await store.assetCount(),
+              let liveAssets = try? await store.fetchAssets(limit: count, offset: 0)
+        else {
+            print("[GalleryArchiver] resumePendingRemovals: could not fetch live asset rows, leaving \(pendingRemovalPath) for the next launch")
+            return
+        }
+        let byId = Dictionary(uniqueKeysWithValues: liveAssets.map { ($0.id, $0) })
+
+        var allSucceeded = true
+        for id in idsToRemove {
+            guard let asset = byId[id] else {
+                print("[GalleryArchiver] resumePendingRemovals: id \(id) is live but missing from the fetched snapshot, leaving \(pendingRemovalPath) for the next launch")
+                allSucceeded = false
+                continue
+            }
+            do {
+                try await ingestor.deleteAsset(asset)
+            } catch {
+                print("[GalleryArchiver] resumePendingRemovals: failed to remove asset \(id): \(error)")
+                allSucceeded = false
             }
         }
 
-        try? FileManager.default.removeItem(atPath: pendingRemovalPath)
+        if allSucceeded {
+            try? FileManager.default.removeItem(atPath: pendingRemovalPath)
+        }
     }
 
     // MARK: - Restore
