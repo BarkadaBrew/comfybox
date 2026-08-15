@@ -249,3 +249,29 @@ specs/ltx2-audio.md (rev 2 + wire-4 shipped notes), the good clip
 (`audio-REFERENCE-v2-cleanlimiter.mp4`), A/B pairs `audio-ab-*.mp4`,
 memory: ltx2-audio-wire1-progress, ltx-quality-over-speed,
 dont-generalize-validate-at-production-config.
+
+## ADDENDUM 2026-08-11 — post-tarn1 state (fresh-session entry point)
+
+Todd's ear on `ltx2-1BEE2C62` (production t2v, composed VOICE clause, tarn1
+schedule, audio track verified -13dB peak): **"tinny ambient and no voices."**
+
+What is now TRUE (all verified, don't re-derive):
+- The tarn1 shorter stage1 schedule is production env (plist). It won a
+  matched-seed A/B on ambience character but did NOT fix tinny, and did not
+  make composed quoted lines render as SPEECH.
+- **Voices do not render on the production t2v path** — composed clauses
+  with quoted lines produce non-speech audio. Also true of a manual t2v
+  probe at preset cfg. The 2026-08-05 root cause (truncation) is FIXED —
+  clauses reach the engine (verify via prompt-truncation logs) — so this is
+  a MODEL-CONDITIONING failure: prime suspects, in order: (1) NAG dropped on
+  the audio path (ticket 1497) — NAG is how the author recipe gets prompt
+  adherence at cfg 1.0, and audio without it may simply ignore the text;
+  (2) the three Codex mediums (ancestral noise handling); (3) cfg/vocal
+  recipe for t2v (the old 'vocal, 16 steps' lever is a distilled no-op).
+- effective-config now tells the TRUTH about request/preset overrides
+  (engine 46217ef) — pre-2026-08-11 "verified" tuning experiments using
+  request/preset tuning may have been misjudged; re-run anything critical.
+- No-ambient policy shipped: audio:true only travels with composed/authored
+  sound direction. Gallery Motion composes via PersonaModule.composeSceneAudio.
+- Iterate with the audio-track stats loop: ffmpeg astats + ear; a clip can
+  have a healthy track and still be wrong (tinny/babble ≠ silence).

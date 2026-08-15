@@ -148,6 +148,57 @@ public struct LTX2VideoResult: Sendable {
     public let elapsedSeconds: Double
 }
 
+/// #1479: what one generator-level render produced. The completed payload is
+/// `LTX2VideoResult` — the generator's own output (written MP4 + frame/duration
+/// accounting), NOT the pipeline's per-chunk `LTX2PipelineOutput`, which never
+/// reaches a caller of `generate`.
+public enum LTX2RenderOutcome {
+    case completed(LTX2VideoResult)
+    case yielded(LTX2ResumeState)
+}
+
+#if canImport(CoreGraphics) && canImport(ImageIO)
+/// #1479: the generator-level continuation a checkpoint needs — the request,
+/// where the chunk loop got to, the frames already rendered, and the chained
+/// seed frame that only exists as a function of the previous chunk's output.
+///
+/// This lives in a box travelling WITH the checkpoint rather than in a
+/// `pendingResumeContext` on the generator, because `VideoGeneratorHolder
+/// .release()` does `generator?.unload(); generator = nil` — the eviction
+/// preemption performs deallocates the generator instance, taking any
+/// instance-stored context with it. A checkpoint that outlives its generator
+/// is the whole point (spec: evict weights, keep latents).
+///
+/// Everything else the resume needs is either in `LTX2ResumeState` or is
+/// deterministically recomputed: text embeddings (the encoder has no RNG), the
+/// i2v conditioning state (`MLXRandom.seed` precedes its noise draw), the
+/// source/anchor/face-mask images (pure functions of the request), and
+/// positions/PE (pure functions of the dims — spec).
+public final class LTX2RenderContext: LTX2ResumeContext {
+    /// The original request. `resume(from:)` needs no request parameter
+    /// because of this.
+    public let request: LTX2VideoRequest
+    /// Chunk the checkpoint belongs to.
+    var chunkIndex: Int = 0
+    /// Frames from chunks that already finished.
+    var frames: [CGImage] = []
+    /// Audio latents from the chunk that produced them.
+    var audioLatents: MLXArray?
+    /// The chained conditioning frame for a CONTINUATION chunk (nil for chunk
+    /// 0, whose seed image is re-derived from the request). Already
+    /// compression-preprocessed and normalized, exactly as the chunk loop
+    /// handed it on.
+    var chunkSeedImage: MLXArray?
+    /// GPU time already spent on this render, across all segments — wall clock
+    /// would otherwise bill the preemptor's runtime to this render.
+    var accumulatedSeconds: Double = 0
+
+    init(request: LTX2VideoRequest) {
+        self.request = request
+    }
+}
+#endif
+
 public enum LTX2VideoError: Error, LocalizedError {
     case invalidFrameCount(Int)
     case invalidDimensions(Int, Int)
@@ -155,6 +206,7 @@ public enum LTX2VideoError: Error, LocalizedError {
     case imageLoadFailed(String)
     case unsupportedPlatform
     case audioUnsupported(String)
+    case resumeContextMissing
 
     public var errorDescription: String? {
         switch self {
@@ -170,6 +222,8 @@ public enum LTX2VideoError: Error, LocalizedError {
             return "LTX-2 video requires CoreGraphics/ImageIO (macOS)."
         case .audioUnsupported(let why):
             return "LTX-2 audio: \(why)"
+        case .resumeContextMissing:
+            return "LTX-2 resume: the checkpoint carries no render context — it cannot name the request to resume (#1479)."
         }
     }
 }
@@ -216,10 +270,26 @@ public final class LTX2VideoGenerator {
     /// first audio render; cheap (mmap subset) and kept for the process life.
     private var audioVAE: LTX2AudioVAE?
 
+    /// #1479: raised by the coordinator to ask the in-flight render to
+    /// check point and unwind. Read (never written) inside the render, with no
+    /// actor hop — see `PreemptionSignal`.
+    private var preemption: PreemptionSignal?
+    /// #1479: per-phase timings feeding the refusal guard and /v1/queue.
+    private var telemetry: LTX2PhaseTelemetry?
+
     public init(config: Configuration, logger: Logger = Logger(label: "ltx2.video")) {
         self.config = config
         self.logger = logger
     }
+
+    /// Arm (or disarm) preemption. Honoured by `generatePreemptible` and
+    /// `resume(from:)`; the legacy `generate` entry deliberately passes no
+    /// signal so its behaviour is byte-for-byte what it always was.
+    public func setPreemptionSignal(_ s: PreemptionSignal?) { preemption = s }
+
+    /// Install (or clear) the phase-timing sink. nil = zero cost: every
+    /// recording site is optional-chained.
+    public func setTelemetry(_ t: LTX2PhaseTelemetry?) { telemetry = t }
 
     // MARK: - Pure planning helpers (testable without the model)
 
@@ -638,10 +708,64 @@ public final class LTX2VideoGenerator {
 
     // MARK: - Generate
 
+    /// Render to completion. Non-preemptible by construction: it passes NO
+    /// signal down, so behaviour is exactly what it was before #1479 even when
+    /// a signal is armed on the generator. Callers that want preemption use
+    /// `generatePreemptible`.
     public func generate(
         _ request: LTX2VideoRequest,
         progress: ((Int, Int, Int, Int) -> Void)? = nil   // (chunk, totalChunks, step, totalSteps)
     ) throws -> LTX2VideoResult {
+        switch try render(request, progress: progress, preemption: nil, resume: nil) {
+        case .completed(let result):
+            return result
+        case .yielded(let s):
+            // Unreachable: `preemption: nil` above, and nothing yields without
+            // a raised signal. There is no finished clip to return here, so
+            // fail loudly rather than invent one.
+            logger.error("LTX-2: non-preemptible generate() yielded at step \(s.stepIndex) — no signal was passed.")
+            preconditionFailure("LTX2VideoGenerator.generate yielded with no preemption signal passed")
+        }
+    }
+
+    /// #1479: render, honouring the armed preemption signal. Returns either the
+    /// finished clip or a checkpoint the coordinator hands back to
+    /// `resume(from:)` once the preempting job is done.
+    public func generatePreemptible(
+        _ request: LTX2VideoRequest,
+        progress: ((Int, Int, Int, Int) -> Void)? = nil
+    ) throws -> LTX2RenderOutcome {
+        try render(request, progress: progress, preemption: preemption, resume: nil)
+    }
+
+    /// #1479: continue a checkpointed render.
+    ///
+    /// Takes no request parameter: the request travels in the checkpoint's
+    /// `LTX2RenderContext`, because the generator that produced the checkpoint
+    /// may already have been deallocated by the eviction (see
+    /// `LTX2RenderContext`). THROWS on a config-fingerprint or sigma-schedule
+    /// mismatch — never silently restarts from step 0 (spec, Error handling).
+    public func resume(
+        from state: LTX2ResumeState,
+        progress: ((Int, Int, Int, Int) -> Void)? = nil
+    ) throws -> LTX2RenderOutcome {
+        #if canImport(CoreGraphics) && canImport(ImageIO)
+        guard let ctx = state.context as? LTX2RenderContext else {
+            throw LTX2VideoError.resumeContextMissing
+        }
+        logger.info("LTX-2 #1479: resuming render at chunk \(state.chunkIndex), phase \(state.phase.rawValue), step \(state.stepIndex).")
+        return try render(ctx.request, progress: progress, preemption: preemption, resume: state)
+        #else
+        throw LTX2VideoError.unsupportedPlatform
+        #endif
+    }
+
+    private func render(
+        _ request: LTX2VideoRequest,
+        progress: ((Int, Int, Int, Int) -> Void)?,   // (chunk, totalChunks, step, totalSteps)
+        preemption: PreemptionSignal?,
+        resume: LTX2ResumeState?
+    ) throws -> LTX2RenderOutcome {
         #if canImport(CoreGraphics) && canImport(ImageIO)
         // Memory-leak fix (2026-07-18): the video render path never freed MLX
         // activation buffers, so idle mem climbed ~20GB -> 110GB+ across renders
@@ -652,10 +776,80 @@ public final class LTX2VideoGenerator {
         GPU.clearCache()
         defer { GPU.clearCache() }
         try validate(request)
+
+        // #1479: the continuation the resume came in with, READ-ONLY from here
+        // on. Each checkpoint gets its own fresh box (below), so a render that
+        // yields twice never rewrites a checkpoint the coordinator still holds.
+        let ctx = (resume?.context as? LTX2RenderContext) ?? LTX2RenderContext(request: request)
+        // Start of THIS render segment. Re-stamped below at the point the
+        // pre-#1479 code took its `start`, so a normal render's reported
+        // `elapsedSeconds` keeps its old meaning exactly.
+        var segmentStart = CFAbsoluteTimeGetCurrent()
+        /// Close out this render segment and hand the checkpoint up with its
+        /// own snapshot of the generator-level continuation.
+        ///
+        /// The box is COPIED, never mutated in place: `LTX2ResumeState` is a
+        /// materialized snapshot by contract (Task 2), and a shared mutable
+        /// context would quietly break that — a later yield would rewrite the
+        /// chunk index, banked frames and chained seed frame of an earlier
+        /// checkpoint the coordinator is still holding.
+        func checkpoint(
+            _ s: LTX2ResumeState, chunk: Int, frames: [CGImage],
+            audio: MLXArray?, seedImage: MLXArray?
+        ) -> LTX2RenderOutcome {
+            let snapshot = LTX2RenderContext(request: ctx.request)
+            snapshot.chunkIndex = chunk
+            snapshot.frames = frames
+            // Materialize on capture, same contract as LTX2ResumeState's own
+            // tensors — a cheap no-op when they are already evaluated, and the
+            // guarantee stops depending on what upstream call sites happen to do.
+            if let audio { eval(audio) }
+            snapshot.audioLatents = audio
+            let chained = chunk > 0 ? seedImage : nil
+            if let chained { eval(chained) }
+            snapshot.chunkSeedImage = chained
+            snapshot.accumulatedSeconds =
+                ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            var stamped = s
+            stamped.context = snapshot
+            logger.info("LTX-2 #1479: yielded at chunk \(chunk), phase \(s.phase.rawValue), step \(s.stepIndex) (\(frames.count) frame(s) banked).")
+            return .yielded(stamped)
+        }
+        /// A checkpoint taken at a free unwind point where no denoise loop has
+        /// started — nothing to restore but the position (see
+        /// `ltx2NotStartedFingerprint`).
+        func notStartedCheckpoint(chunk: Int) -> LTX2ResumeState {
+            LTX2ResumeState(
+                videoLatents: MLXArray.zeros([1]), stepIndex: 0, sigmas: [],
+                phase: .baseDenoise, chunkIndex: chunk,
+                seed: request.seed &+ UInt64(chunk),
+                audioLatents: nil, audioNoiseKey: nil,
+                configFingerprint: ltx2NotStartedFingerprint)
+        }
+
+        // #1479 free unwind point: before the model load, the single most
+        // expensive non-denoise phase. Nothing has been computed yet.
+        if resume == nil, preemption?.isRaised == true {
+            return checkpoint(notStartedCheckpoint(chunk: 0), chunk: 0,
+                              frames: [], audio: nil, seedImage: nil)
+        }
+
         // validate() has already rejected unsupported audio modes (i2v /
         // multi-chunk), so this is simply the request flag.
         let wantAudio = request.audio
-        try load(loras: request.effectiveLoRAs, audio: wantAudio)
+        // #1479 (final review, minor 6): the end MUST be a `defer` scoped to
+        // the load itself. With a plain trailing call, a throwing `load()`
+        // (missing weights, OOM, a bad LoRA) left the `modelLoad` phase open
+        // forever: `/v1/queue` then reported `phase: modelLoad` on an idle
+        // server, and the preemption refusal guard projected remaining time
+        // against a phantom phase. `LTX2PhaseTelemetry.end` removes the open
+        // entry, so it is safe to call once per `begin` and a no-op after —
+        // the `do` block scopes this one to exactly the load.
+        telemetry?.begin(.modelLoad)
+        do {
+            defer { telemetry?.end(.modelLoad) }
+            try load(loras: request.effectiveLoRAs, audio: wantAudio)
+        }
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
         // One greppable line per render: every Tier A/B param + provenance
@@ -724,9 +918,11 @@ public final class LTX2VideoGenerator {
         let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: tokenizer.maxLength) }
         if let negBatch { MLX.eval(negBatch.inputIds, negBatch.attentionMask) }
 
-        let start = CFAbsoluteTimeGetCurrent()
-        var allFrames: [CGImage] = []
-        var audioLatents: MLXArray? = nil
+        segmentStart = CFAbsoluteTimeGetCurrent()
+        // #1479: frames and audio banked by chunks that finished before an
+        // earlier preemption. Empty on a fresh render.
+        var allFrames: [CGImage] = ctx.frames
+        var audioLatents: MLXArray? = ctx.audioLatents
 
         // Center-crop a CGImage to the target aspect ratio, matching ComfyUI's
         // ImageScale crop="center" (workflow nodes 7 and 19). Our plain resize
@@ -908,9 +1104,30 @@ public final class LTX2VideoGenerator {
             }
         }
 
-        for chunk in 0..<plan.totalChunks {
+        // #1479: a continuation chunk's seed frame is a function of the PREVIOUS
+        // chunk's decoded output, so it cannot be recomputed — it rides in the
+        // context. Everything else above is a deterministic function of the
+        // request and has just been rebuilt identically.
+        if resume != nil, let chained = ctx.chunkSeedImage {
+            currentImage = chained
+        }
+        let startChunk = resume != nil ? ctx.chunkIndex : 0
+
+        for chunk in startChunk..<plan.totalChunks {
+            // The checkpoint being resumed belongs to `startChunk`; later chunks
+            // start clean.
+            let chunkResume: LTX2ResumeState? = (chunk == startChunk) ? resume : nil
+
+            // #1479 free unwind point: between chunks. Skipped for the chunk we
+            // are resuming INTO — re-checkpointing it here would throw away the
+            // step progress the checkpoint we are holding already paid for.
+            if chunkResume == nil, preemption?.isRaised == true {
+                return checkpoint(notStartedCheckpoint(chunk: chunk), chunk: chunk,
+                                  frames: allFrames, audio: audioLatents, seedImage: currentImage)
+            }
+
             let chunkSeed = request.seed + UInt64(chunk)
-            let output: LTX2PipelineOutput
+            let outcome: LTX2PipelineOutcome
             if let image = currentImage {
                 if chunk > 0, request.identityAnchorStrength > 0, let anchor = sourceImage {
                     // Continuation chunks drift chunk-by-chunk (each only sees
@@ -919,7 +1136,7 @@ public final class LTX2VideoGenerator {
                     // back toward the subject \u{2014} while frame 0 stays the hard
                     // continuity anchor. First real caller of
                     // generateMultiKeyframe (see docs/ltx2-multi-keyframe-fdd.md).
-                    output = pipeline.generateMultiKeyframe(
+                    outcome = try pipeline.generateMultiKeyframeResumable(
                         inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                         keyframes: [
                             .init(image: image, videoFrameIndex: 0, strength: request.strength),
@@ -931,6 +1148,8 @@ public final class LTX2VideoGenerator {
                         guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
+                        preemption: preemption, telemetry: telemetry,
+                        resume: chunkResume, chunkIndex: chunk,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 } else if request.identityAnchorStrength > 0,
                           request.identityReAnchorInterval > 0,
@@ -950,7 +1169,7 @@ public final class LTX2VideoGenerator {
                                                strength: request.identityAnchorStrength))
                         f += request.identityReAnchorInterval
                     }
-                    output = pipeline.generateMultiKeyframe(
+                    outcome = try pipeline.generateMultiKeyframeResumable(
                         inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                         keyframes: keyframes,
                         width: request.width, height: request.height,
@@ -958,9 +1177,11 @@ public final class LTX2VideoGenerator {
                         guidance: request.guidance,
                         negativeInputIds: negBatch?.inputIds,
                         negativeAttentionMask: negBatch?.attentionMask,
+                        preemption: preemption, telemetry: telemetry,
+                        resume: chunkResume, chunkIndex: chunk,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 } else {
-                    output = pipeline.generateI2V(
+                    outcome = try pipeline.generateI2VResumable(
                         inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                         image: image, strength: request.strength,
                         width: request.width, height: request.height,
@@ -973,10 +1194,12 @@ public final class LTX2VideoGenerator {
                         refineAnchorImage: chunk == 0 ? refineAnchorImage : nil,
                         audioSeconds: wantAudio && chunk == 0
                             ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                        preemption: preemption, telemetry: telemetry,
+                        resume: chunkResume, chunkIndex: chunk,
                         progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
                 }
             } else {
-                output = pipeline.generateT2V(
+                outcome = try pipeline.generateT2VResumable(
                     inputIds: batch.inputIds, attentionMask: batch.attentionMask,
                     width: request.width, height: request.height,
                     numFrames: request.framesPerChunk, steps: request.steps, seed: chunkSeed,
@@ -990,10 +1213,25 @@ public final class LTX2VideoGenerator {
                     negativeAttentionMask: negBatch?.attentionMask,
                     audioSeconds: wantAudio && chunk == 0
                         ? Float(request.framesPerChunk) / Float(request.fps) : nil,
+                    preemption: preemption, telemetry: telemetry,
+                    resume: chunkResume, chunkIndex: chunk,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 
+            let output: LTX2PipelineOutput
+            switch outcome {
+            case .completed(let o):
+                output = o
+            case .yielded(let s):
+                // #1479: propagate. Frames banked by EARLIER chunks ride in the
+                // context; this chunk's own progress is in the checkpoint.
+                return checkpoint(s, chunk: chunk, frames: allFrames,
+                                  audio: audioLatents, seedImage: currentImage)
+            }
+
+            telemetry?.begin(.postProcess)
             let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded, colorAnchor: pipeline.resolvedConfig.colorAnchor)
+            telemetry?.end(.postProcess)
             allFrames.append(contentsOf: chunk == 0 ? chunkFrames : Array(chunkFrames.dropFirst()))
             if let al = output.audioLatents { audioLatents = al }
 
@@ -1080,6 +1318,8 @@ public final class LTX2VideoGenerator {
                     audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
                 }
                 if let av = audioVAE {
+                    telemetry?.begin(.vocoder)
+                    defer { telemetry?.end(.vocoder) }
                     let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N) @48k
                     var clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
                     // Trim to the actual video duration (ceil(s*25) latent
@@ -1105,19 +1345,23 @@ public final class LTX2VideoGenerator {
             }
         }
 
+        telemetry?.begin(.postProcess)
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
             fps: request.fps, width: outW, height: outH,
             bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
             audio: audioTrack,
             deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+        telemetry?.end(.postProcess)
 
-        return LTX2VideoResult(
+        return .completed(LTX2VideoResult(
             outputPath: request.outputPath,
             frameCount: allFrames.count,
             durationSeconds: Float(allFrames.count) / Float(request.fps),
-            elapsedSeconds: CFAbsoluteTimeGetCurrent() - start
-        )
+            // #1479: RENDER time, summed across segments — wall clock from a
+            // single start would bill the preemptor's runtime to this render.
+            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+        ))
         #else
         throw LTX2VideoError.unsupportedPlatform
         #endif

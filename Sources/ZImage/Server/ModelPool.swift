@@ -263,7 +263,8 @@ actor ModelPool {
   func load(
     modelSpec: String,
     quantization: String? = nil,
-    initialLoRAs: [LoRAConfiguration] = []
+    initialLoRAs: [LoRAConfiguration] = [],
+    allowActiveEviction: Bool = false
   ) async throws -> PoolEntry {
     let poolKey = Self.poolKey(for: modelSpec, quantization: quantization)
 
@@ -286,7 +287,8 @@ actor ModelPool {
           poolKey: poolKey,
           modelSpec: modelSpec,
           quantization: quantization,
-          initialLoRAs: initialLoRAs
+          initialLoRAs: initialLoRAs,
+          allowActiveEviction: allowActiveEviction
         )
       }
       inFlightLoads[poolKey] = task
@@ -311,14 +313,15 @@ actor ModelPool {
     poolKey: String,
     modelSpec: String,
     quantization: String?,
-    initialLoRAs: [LoRAConfiguration]
+    initialLoRAs: [LoRAConfiguration],
+    allowActiveEviction: Bool = false
   ) async throws {
     // Detect model family.
     let family = try await detectFamily(modelSpec: modelSpec)
     let vramEstimate = VRAMEstimates.estimate(for: modelSpec, family: family, quantization: quantization)
 
     // Evict if needed to stay within budget.
-    try evictIfNeeded(neededMB: vramEstimate)
+    try evictIfNeeded(neededMB: vramEstimate, allowActiveEviction: allowActiveEviction)
 
     // Load the pipeline.
     logger.info("ModelPool: loading '\(poolKey)' (family=\(family.rawValue), vram=\(vramEstimate)MB)...")
@@ -652,8 +655,16 @@ actor ModelPool {
     }
   }
 
-  /// Evict least-recently-used non-active models until there is room for `neededMB`.
-  private func evictIfNeeded(neededMB: Int) throws {
+  /// Evict least-recently-used non-active models until there is room for
+  /// `neededMB`. With `allowActiveEviction` (a load that intends to ACTIVATE
+  /// the incoming model — i.e. a handoff), the active model itself is fair
+  /// game once every other entry is gone: switching between two models that
+  /// each nearly fill the budget (e.g. two 22.5GB krea2-family checkpoints)
+  /// was otherwise impossible — the pool refused to evict the active model
+  /// and the load refused to fit (2026-08-11, Kroma v0.2 switch 507).
+  /// Callers are serialized with renders on the coordinator queue, so no
+  /// render is ever in flight when the active model is released here.
+  func evictIfNeeded(neededMB: Int, allowActiveEviction: Bool = false) throws {
     var currentTotal = totalVramMB()
     while currentTotal + neededMB > budgetMB {
       // Find LRU non-active entry.
@@ -665,6 +676,16 @@ actor ModelPool {
         if pool.isEmpty {
           logger.warning("ModelPool: budget exceeded but pool is empty — allowing load anyway")
           return
+        }
+        if allowActiveEviction, let activeId, let active = pool[activeId] {
+          logger.info(
+            "ModelPool: evicting ACTIVE '\(active.id)' (~\(active.vramEstimateMB)MB) — handoff to incoming model")
+          active.box.release()
+          pool.removeValue(forKey: active.id)
+          self.activeId = nil
+          GPU.clearCache()
+          currentTotal = totalVramMB()
+          continue
         }
         throw ModelPoolError.budgetExceeded(needed: neededMB, available: budgetMB - currentTotal)
       }
