@@ -1,12 +1,14 @@
-// GalleryArchiverTests.swift — Tests for GalleryArchiver.archive (T3) and
-// GalleryArchiver.restore (T4).
+// GalleryArchiverTests.swift — Tests for GalleryArchiver.archive (T3),
+// GalleryArchiver.restore (T4), and GalleryArchiver.resumePendingRemovals (T7).
 //
 // Archive: bundle well-formedness, sidecar/folder/secured handling, and
 // crash-safety (nothing destroyed before the commit point).
 // Restore: full round-trip field equality, the four id-collision cases,
 // filename-collision renaming, folder re-creation, partial restore,
-// idempotence, and progress reporting. `resumePendingRemovals` is T7 and is
-// not implemented here.
+// idempotence, and progress reporting.
+// resumePendingRemovals: finishes an interrupted removal (crash between
+// steps 8 and 10 of §5.1), is idempotent, and leaves incomplete bundles
+// (which never committed) entirely untouched.
 
 import Testing
 import Foundation
@@ -714,5 +716,78 @@ struct GalleryArchiverTests {
         #expect(calls.allSatisfy { $0.total == 3 })
         #expect(calls.last?.done == 3)
         #expect(result.restored == 3)
+    }
+
+    // MARK: - resumePendingRemovals
+
+    /// Writes `{"assetIds": ids}` to `PENDING_REMOVAL.json` in `bundleRoot`,
+    /// matching the (file-private) marker format `GalleryArchiver.archive`
+    /// itself writes at step 7.
+    private func writePendingRemovalMarker(ids: [String], in bundleRoot: String) throws {
+        let path = (bundleRoot as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+        let json = try JSONSerialization.data(withJSONObject: ["assetIds": ids])
+        try json.write(to: URL(fileURLWithPath: path))
+    }
+
+    @Test("resumePendingRemovals finishes an interrupted removal: live id removed, thumbnail gone, marker deleted")
+    @MainActor
+    func resumePendingRemovalsFinishesInterruptedRemoval() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        // A normal archive fully commits: source + thumbnail removed, marker
+        // gone. Reconstruct the "crash between step 8 and step 10" state on
+        // top of that genuinely valid, committed bundle: the asset row and
+        // its thumbnail reappear (as if source removal never finished) and
+        // PENDING_REMOVAL.json is rewritten to list it.
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "ResumeTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+        let incompletePath = (archiveResult.bundlePath as NSString).appendingPathComponent("INCOMPLETE.json")
+        #expect(!FileManager.default.fileExists(atPath: incompletePath))
+
+        try await env.store.insertAsset(asset)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        try writePendingRemovalMarker(ids: [asset.id], in: archiveResult.bundlePath)
+
+        await env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+
+        let idsAfterFirstResume = try await env.store.allAssetIds()
+        #expect(!idsAfterFirstResume.contains(asset.id))
+        #expect(!FileManager.default.fileExists(atPath: env.ingestor.thumbnailPath(for: asset.id)))
+        let pendingRemovalPath = (archiveResult.bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+        #expect(!FileManager.default.fileExists(atPath: pendingRemovalPath))
+
+        // Idempotent: running again with the marker (and the asset) already
+        // gone is a no-op, and does not throw.
+        await env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+        let idsAfterSecondResume = try await env.store.allAssetIds()
+        #expect(idsAfterSecondResume.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: pendingRemovalPath))
+    }
+
+    @Test("resumePendingRemovals leaves a bundle with INCOMPLETE.json untouched, even if PENDING_REMOVAL.json is also present")
+    @MainActor
+    func resumePendingRemovalsSkipsIncompleteBundle() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+
+        let bundlePath = (env.archiveRoot as NSString).appendingPathComponent("Doomed.cbarchive")
+        try FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+        let incompletePath = (bundlePath as NSString).appendingPathComponent("INCOMPLETE.json")
+        FileManager.default.createFile(atPath: incompletePath, contents: Data("{}".utf8))
+        try writePendingRemovalMarker(ids: [asset.id], in: bundlePath)
+
+        await env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+
+        let idsAfterResume = try await env.store.allAssetIds()
+        #expect(idsAfterResume.contains(asset.id))
+        #expect(FileManager.default.fileExists(atPath: asset.absolutePath))
+        let pendingRemovalPath = (bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+        #expect(FileManager.default.fileExists(atPath: pendingRemovalPath))
+        #expect(FileManager.default.fileExists(atPath: incompletePath))
     }
 }

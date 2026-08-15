@@ -10,8 +10,11 @@
 // `entries.jsonl`, resolve the four id-collision cases against a live
 // snapshot, copy files back atomically, and re-file folders. It is
 // idempotent — re-running a restore reports everything as `skipped`.
-// `resumePendingRemovals` (crash-recovery for an interrupted archive) is a
-// later task (T7) and is not implemented here.
+//
+// `resumePendingRemovals` is crash-recovery for the window between step 8
+// (commit: INCOMPLETE.json removed) and step 10 (PENDING_REMOVAL.json
+// removed) of the archive sequence below: a bundle that committed but whose
+// source removal didn't finish. It is meant to run once at app launch.
 
 import Foundation
 
@@ -266,6 +269,80 @@ public final class GalleryArchiver {
             failed: failedFilenames,
             totalBytes: totalBytes
         )
+    }
+
+    // MARK: - Crash recovery (T7)
+
+    /// Scans `roots` one level deep for `.cbarchive` bundles and finishes
+    /// any interrupted source removal: a bundle with `PENDING_REMOVAL.json`
+    /// but **no** `INCOMPLETE.json` committed successfully (step 8) but
+    /// crashed before source removal finished (steps 9-10). For every id in
+    /// the marker still present in `store.allAssetIds()`, this removes the
+    /// source via the same path `archive` uses at step 9
+    /// (`ingestor.deleteAsset`), then deletes the marker.
+    ///
+    /// A bundle carrying `INCOMPLETE.json` is skipped entirely — it never
+    /// committed, so its assets legitimately still live in the gallery and
+    /// must not be touched (see `ArchiveStore` / the maintenance sheet's
+    /// "Discard Incomplete Archives").
+    ///
+    /// Idempotent: once a bundle's ids are gone and its marker is deleted,
+    /// re-running this is a no-op. Per-id and per-bundle failures are
+    /// logged and skipped rather than thrown, so one bad bundle never stops
+    /// the rest of the sweep.
+    public func resumePendingRemovals(in roots: [String]) async {
+        let fm = FileManager.default
+        for root in roots {
+            guard let entries = try? fm.contentsOfDirectory(atPath: root) else { continue }
+            for entry in entries.sorted() where entry.hasSuffix(".cbarchive") {
+                let bundlePath = (root as NSString).appendingPathComponent(entry)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: bundlePath, isDirectory: &isDir), isDir.boolValue else { continue }
+
+                let incompletePath = (bundlePath as NSString).appendingPathComponent("INCOMPLETE.json")
+                let pendingRemovalPath = (bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+                guard fm.fileExists(atPath: pendingRemovalPath), !fm.fileExists(atPath: incompletePath) else {
+                    continue
+                }
+
+                guard let data = fm.contents(atPath: pendingRemovalPath),
+                      let marker = try? JSONDecoder().decode(PendingRemovalMarker.self, from: data)
+                else {
+                    print("[GalleryArchiver] resumePendingRemovals: unreadable marker at \(pendingRemovalPath), skipping")
+                    continue
+                }
+
+                await finishPendingRemoval(assetIds: marker.assetIds, pendingRemovalPath: pendingRemovalPath)
+            }
+        }
+    }
+
+    /// Finishes removal for every id still present in the store, then
+    /// unconditionally clears the marker — matching `archive`'s own step 9
+    /// (remove sources) → step 10 (clear PENDING_REMOVAL.json) sequence.
+    private func finishPendingRemoval(assetIds: [String], pendingRemovalPath: String) async {
+        guard let liveIds = try? await store.allAssetIds() else {
+            print("[GalleryArchiver] resumePendingRemovals: could not read live asset ids, leaving \(pendingRemovalPath) for the next launch")
+            return
+        }
+        let idsToRemove = assetIds.filter { liveIds.contains($0) }
+
+        if !idsToRemove.isEmpty {
+            let count = (try? await store.assetCount()) ?? 0
+            let liveAssets = (try? await store.fetchAssets(limit: count, offset: 0)) ?? []
+            let byId = Dictionary(uniqueKeysWithValues: liveAssets.map { ($0.id, $0) })
+
+            for id in idsToRemove {
+                guard let asset = byId[id] else { continue }
+                do {
+                    try await ingestor.deleteAsset(asset)
+                } catch {
+                    print("[GalleryArchiver] resumePendingRemovals: failed to remove asset \(id): \(error)")
+                }
+            }
+        }
+
+        try? FileManager.default.removeItem(atPath: pendingRemovalPath)
     }
 
     // MARK: - Restore

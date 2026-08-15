@@ -13,6 +13,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var engine: EngineService
     @State private var store: DAMStore?
     @State private var ingestor: AssetIngestor?
+    @State private var archiver: GalleryArchiver?
     @State private var presetManager = PresetManager()
     @State private var healthMonitor = HealthMonitor()
     @State private var promptLibrary = PromptLibraryStore()
@@ -644,9 +645,19 @@ struct ComfyBoxDesktopApp: App {
                 store: damStore,
                 watchDirectory: engine.outputDirectory
             )
+            let galleryArchiver = GalleryArchiver(store: damStore, ingestor: assetIngestor)
             store = damStore
             ingestor = assetIngestor
+            archiver = galleryArchiver
             await assetIngestor.startWatching()
+
+            // Crash recovery (T7): finish any archive whose source removal
+            // was interrupted by a crash between commit and cleanup.
+            // Fire-and-forget — must not block app launch.
+            let archiveRoots = DesktopSettings.load().archiveRoots ?? [DesktopSettings.defaultArchiveRoot]
+            Task {
+                await galleryArchiver.resumePendingRemovals(in: archiveRoots)
+            }
         } catch {
             initError = error.localizedDescription
         }
