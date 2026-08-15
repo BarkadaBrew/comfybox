@@ -488,6 +488,7 @@ struct ComfyBoxDesktopApp: App {
                 GalleryView(
                     store: store,
                     ingestor: ingestor,
+                    archiver: archiver,
                     engine: engine,
                     onCompare: { assets in
                         comparisonAssets = assets
