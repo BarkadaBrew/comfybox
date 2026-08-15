@@ -33,10 +33,27 @@ verified before design:
 
 ## Decisions (Todd, 2026-08-15)
 
-1. **Pause-and-evict**, with pause-in-place as a fast path. The model pool
-   budget blocks a 2×22GB swap, so a paused video render that keeps its
-   weights would refuse most preemptions — failing in exactly the headline
-   case. Latents are small; weights are fat. Evict weights, keep latents.
+1. **Pause-and-evict — v1 ALWAYS evicts.** The model pool budget blocks a
+   2×22GB swap, so a paused video render that keeps its weights would refuse
+   most preemptions — failing in exactly the headline case. Latents are small;
+   weights are fat. Evict weights, keep latents.
+
+   *Amended 2026-08-15 (final whole-branch review, finding C1 + controller
+   ruling — reviewed deviation).* This decision originally read "with
+   pause-in-place as a fast path": keep the video weights resident when the
+   preemptor demonstrably fits alongside them, and skip the evict+reload round
+   trip. **That fast path is removed; v1 always evicts.** Two reasons.
+   (a) Pause-in-place is *unhonourable at the pool layer*: any image load runs
+   `reloadImageModelIfEvicted` → `poolLoad`, whose first statement is
+   `videoHolder.release()` — the #218 invariant that a video must vacate
+   before any image load, and `imageModelsEvicted` is always true while a video
+   is resident, so that reload always runs. The layer below released the very
+   weights the fast path was preserving, and the resume then found nothing
+   resident and failed the video job outright. (b) Making it honourable would
+   mean a preemption-aware carve-out in `poolLoad` that lets both heavy stacks
+   co-reside — which is precisely the 2×22GB pool-budget hazard this decision
+   exists to avoid. A carve-out remains possible later, behind its own memory
+   accounting; it is out of scope for v1.
 2. **LTX-2 video only in v1.** Video is where the pain is. Image renders
    finish in ~5 minutes, so preempting them buys little.
 3. **Job-scoped `preempt: true` flag, not a standalone lease.** The broker
@@ -115,9 +132,15 @@ Because we evict, the render must **unwind** to release weights — you cannot
 drop 22GB while suspended mid-function. So this is
 checkpoint-and-restart-from-checkpoint, not suspend/resume.
 
-Simplification that follows: **always unwind, conditionally evict.** Unwinding
-is cheap; eviction is the expensive part. One code path with eviction as a
-decision inside it, rather than separate in-place and evicting paths.
+Simplification that follows: **always unwind, always evict** (v1 — amended
+2026-08-15, see Decision 1). This was written as "conditionally evict", with
+eviction as a decision inside one code path; the final review found the
+conditional could not be honoured below the coordinator (`poolLoad` releases
+the video stack under any image load, #218), so the condition is gone and the
+single code path always evicts. Residency — not the caller's belief about what
+it evicted — is the authority on whether the resume must rebuild the
+generator; a generator found absent is rebuilt, never treated as a fatal
+error.
 
 Rejected: suspend-in-place (incompatible with eviction); subprocess +
 `SIGSTOP` (a stopped process keeps its VRAM, and ComfyBox is in-process).
@@ -156,7 +179,9 @@ Rejected: suspend-in-place (incompatible with eviction); subprocess +
   `for i in 0..<numSteps`) gains the ability to start at step N with supplied
   latents. The loop already carries `currentLatents` and an explicit `sigmas`
   array, so re-entry is natural.
-- **Eviction hook** — conditional weight release via the existing `ModelPool`.
+- **Eviction hook** — weight release via `VideoGeneratorHolder`/`ModelPool`,
+  taken on every episode (v1, amended — see Decision 1) and timed so the
+  refusal guard's round-trip estimate measures the real thing.
 - **Refusal guard** — declines when projected remaining < evict+reload round
   trip, returning an ETA. Both sides are computed from the phase telemetry,
   not guessed: *projected remaining* = `stepsRemaining × observedMeanStepSec`
@@ -171,9 +196,11 @@ Rejected: suspend-in-place (incompatible with eviction); subprocess +
 
 Broker submits a job with `preempt: true` → coordinator raises
 `PreemptionSignal` → sampler observes it at its next step boundary and returns
-`.yielded(LTX2ResumeState)` → coordinator evicts **only if** the preemptor
-will not fit alongside → preemptor runs → weights reload if evicted → sampler
-re-enters at step N → render completes as if uninterrupted.
+`.yielded(LTX2ResumeState)` → coordinator **evicts** the video weights (always,
+v1 — amended; see Decision 1) → preemptor runs, owning the active-job identity
+and the durable queue slot for its duration → coordinator restores the video's
+identity, rebuilds the generator if nothing is resident → sampler re-enters at
+step N → render completes as if uninterrupted.
 
 ## Error handling
 
@@ -181,9 +208,12 @@ re-enters at step N → render completes as if uninterrupted.
   must never cost a video.
 - **Checkpoint fails** → refuse the preemption, keep rendering. Never lose
   work to a bookkeeping error.
-- **Resume fails** (model reload, config drift) → surface as a render failure.
-  Do **not** silently restart from step 0; that hides a real bug behind a
-  15-minute cost.
+- **Resume fails** (model reload, config drift, admission refused) → surface as
+  a render failure. Do **not** silently restart from step 0; that hides a real
+  bug behind a 15-minute cost. A *missing generator* is not in this class —
+  after an eviction, absence is the expected state, so the resume rebuilds it
+  and continues from the checkpoint (amended 2026-08-15; a missing generator
+  used to throw here, which is what finding C1 turned into a lost render).
 - **Engine restarts holding a checkpoint** → the checkpoint is gone and the
   job requeues. In-memory is the intended behaviour.
 - **Nested preemption** → refused. A preemptor cannot itself be preempted;
@@ -202,8 +232,11 @@ re-enters at step N → render completes as if uninterrupted.
 - Refusal guard fires when projected remaining is below threshold, and the
   reported ETA is sane.
 - A failing preemptor still resumes the original render.
-- Eviction path and fast path both resume correctly; the fast path performs no
-  weight reload.
+- The eviction path resumes correctly. (The fast-path test — "the fast path
+  performs no weight reload" — is retired with the fast path itself, amended
+  2026-08-15; what remains is that a resume finding the generator already
+  resident reuses it rather than reloading, and does not record a bogus reload
+  sample.)
 - Phase timings recorded; `max_uninterruptible_sec` published per family.
 - **No-preemption path is unchanged** — no measurable per-step cost added to
   normal renders.

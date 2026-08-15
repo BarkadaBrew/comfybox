@@ -2701,11 +2701,20 @@ public final class WarmServer {
 
     do {
       let response: GenerateResponse = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GenerateResponse, Error>) in
-        pendingPreemptorBox.set(.init(payload: payload, source: source, rawBody: rawBody, continuation: ContinuationBox(cont)))
+        // #1479 (review I1): the token minted here is what makes this
+        // episode's watchdog harmless once the episode is over. Without it a
+        // watchdog that wakes late — after its own episode completed and a
+        // LATER image job armed the box and raised a fresh signal — would
+        // claim the NEXT preemptor, clear its raise and its
+        // `preemptionInFlight` flag, and quietly run it unpreempted while its
+        // continuation was still outstanding. `claim(matching:)` below only
+        // succeeds against the entry this very call parked.
+        let episodeToken = pendingPreemptorBox.set(
+          .init(payload: payload, source: source, rawBody: rawBody, continuation: ContinuationBox(cont)))
         ltx2PreemptionSignal.raise()
         Task { [weak self] in
           try? await Task.sleep(nanoseconds: UInt64(max(0, windowSec) * 1_000_000_000))
-          guard let self, let claimed = self.pendingPreemptorBox.claim() else { return }
+          guard let self, let claimed = self.pendingPreemptorBox.claim(matching: episodeToken) else { return }
           self.logger.error("#1479: checkpoint fallback — video render did not yield within \(windowSec)s; running image job without preemption")
           self.ltx2PreemptionSignal.clear()
           self.preemptionInFlight.clear()
@@ -4556,37 +4565,77 @@ final class LockedFlag: @unchecked Sendable {
   func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
-/// The preempting image job, parked here between the HTTP route handler
-/// raising `PreemptionSignal` and whichever side observes the render yield
-/// first — the coordinator's `.localVideo` case (the normal path) or the
-/// checkpoint-failure watchdog Task (the render never yielded in time, or
-/// finished on its own before the signal was observed). `claim()` is
-/// exactly-once: whichever side calls it first gets the payload; the other
-/// gets nil and does nothing, so the image job is handled by exactly one path.
-final class PendingPreemptorBox: @unchecked Sendable {
-  struct Entry {
-    fileprivate let payload: GeneratePayload
-    fileprivate let source: String
-    fileprivate let rawBody: Data?
-    fileprivate let continuation: ContinuationBox<GenerateResponse>
-
-    fileprivate init(payload: GeneratePayload, source: String, rawBody: Data?, continuation: ContinuationBox<GenerateResponse>) {
-      self.payload = payload
-      self.source = source
-      self.rawBody = rawBody
-      self.continuation = continuation
-    }
-  }
+/// A lock-protected, exactly-once single-slot handoff whose occupant carries
+/// an *episode token* — a monotonically increasing stamp minted by `set`.
+///
+/// The token exists because a slot can be re-armed by a LATER episode while an
+/// EARLIER episode's timeout watchdog is still asleep (#1479 review I1): the
+/// stale watchdog would otherwise wake up, take an unqualified `claim()`, and
+/// hijack the *next* episode's occupant — silently degrading a preemption that
+/// was about to be honoured and releasing its in-flight flag out from under a
+/// live continuation. `claim(matching:)` gives a holder a way to claim only the
+/// occupant it armed itself; `claim()` (unqualified) is for the authoritative
+/// consumer that always wants whatever is currently parked.
+///
+/// Generic purely so the claim semantics are unit-testable without building a
+/// live `GeneratePayload`/continuation pair (see `PendingPreemptorBoxTests`).
+final class TokenedSlot<Value>: @unchecked Sendable {
   private let lock = NSLock()
-  private var entry: Entry?
-  fileprivate func set(_ e: Entry) { lock.lock(); entry = e; lock.unlock() }
-  fileprivate func claim() -> Entry? {
+  private var value: Value?
+  private var token: UInt64 = 0
+
+  /// Park `v`, evicting anything already there, and return the episode token
+  /// that identifies THIS occupant. Tokens never repeat within a process.
+  @discardableResult
+  func set(_ v: Value) -> UInt64 {
     lock.lock(); defer { lock.unlock() }
-    let e = entry
-    entry = nil
-    return e
+    token &+= 1
+    value = v
+    return token
+  }
+
+  /// Unconditional, exactly-once claim: whoever calls first gets the occupant,
+  /// everyone else gets nil.
+  func claim() -> Value? {
+    lock.lock(); defer { lock.unlock() }
+    let v = value
+    value = nil
+    return v
+  }
+
+  /// Token-qualified claim: succeeds only if the slot still holds the exact
+  /// occupant `t` was minted for. Returns nil if it was already claimed, or if
+  /// the slot has since been re-armed by a later episode.
+  func claim(matching t: UInt64) -> Value? {
+    lock.lock(); defer { lock.unlock() }
+    guard token == t, let v = value else { return nil }
+    value = nil
+    return v
   }
 }
+
+/// The preempting image job, parked between the HTTP route handler raising
+/// `PreemptionSignal` and whichever side observes the render yield first — the
+/// coordinator's `.localVideo` case (the normal path, which takes the
+/// unqualified `claim()`) or the checkpoint-failure watchdog Task (the render
+/// never yielded in time, or finished on its own before the signal was
+/// observed; it takes `claim(matching:)` with its own episode's token, so a
+/// stale watchdog can never hijack a later preemptor — #1479 review I1).
+struct PendingPreemptor {
+  fileprivate let payload: GeneratePayload
+  fileprivate let source: String
+  fileprivate let rawBody: Data?
+  fileprivate let continuation: ContinuationBox<GenerateResponse>
+
+  fileprivate init(payload: GeneratePayload, source: String, rawBody: Data?, continuation: ContinuationBox<GenerateResponse>) {
+    self.payload = payload
+    self.source = source
+    self.rawBody = rawBody
+    self.continuation = continuation
+  }
+}
+
+typealias PendingPreemptorBox = TokenedSlot<PendingPreemptor>
 
 /// Holds the latest live-denoising preview JPEG for polling clients (the
 /// Desktop app, which already polls /health for progress_percent — see
@@ -5257,13 +5306,11 @@ private actor WarmServerCoordinator {
   // further actor hop is needed to reach `pipeline`/`runGenerate`/etc.
 
   /// #1479/#230/#218/#34: the LTX-2 stack's memory need assuming it stays
-  /// WARM (resident) — the same warm-stack-discount / audio-mode-mismatch
-  /// logic `vacateImageModelsAndAdmitVideo`'s admission gate uses, factored
-  /// out so the fast-path decision below and that gate can never disagree
-  /// (review round 2, finding 3 — they previously used two independent
-  /// numbers, and a checkpointed render that would have completed under the
-  /// gate got needlessly destroyed by a fast-path decision that admitted too
-  /// eagerly).
+  /// WARM (resident) — the warm-stack-discount / audio-mode-mismatch logic
+  /// `vacateImageModelsAndAdmitVideo`'s admission gate uses. (Until the final
+  /// review this was also consulted by a no-eviction "fast path" decision in
+  /// `runPreemptionEpisode`; that path is gone — see `runPreemptionEpisode`'s
+  /// doc comment — so this now has exactly one caller.)
   private func ltx2WarmNeedBytes(wantsAudio: Bool) -> UInt64 {
     let gen = videoHolder.get()
     let audioModeMatches = (gen?.isAudioLoaded ?? false) == wantsAudio
@@ -5272,30 +5319,6 @@ private actor WarmServerCoordinator {
     return videoStackWarm
       ? 24 * 1024 * 1024 * 1024
       : HeavyModelAdmission.ltx2EstimateBytes(forWeightsPath: configuration.ltx2WeightsPath) + audioDelta
-  }
-
-  /// Does the preempting image job's memory footprint fit alongside the
-  /// resident (now-idle, checkpointed) video weights, letting the fast path
-  /// skip the evict+reload round trip entirely (spec: "fast path performs no
-  /// weight reload")? The image family isn't resolved until deep inside
-  /// `runGenerate` -> `poolLoad`, so `imageEstimateBytes` is a conservative
-  /// ceiling rather than an exact fit check, not a per-family lookup (a real
-  /// one lives in `ModelPool.swift`'s private `VRAMEstimates`, out of scope
-  /// for this file-only round).
-  ///
-  /// Review round 2, finding 3: this MUST ask the exact question the resume
-  /// gate will ask afterward — "if the video stays resident and the image
-  /// loads too, will `vacateImageModelsAndAdmitVideo` still admit?" — using
-  /// `ltx2WarmNeedBytes` + the SAME drain margin, not a disconnected flat
-  /// floor. Wrongly evicting costs an unnecessary reload; wrongly NOT
-  /// evicting means the resume gate refuses afterward and the video job
-  /// fails loudly for a render that would otherwise have completed — so this
-  /// errs toward evicting on a close call.
-  private func imageFitsAlongsideVideo(wantsAudio: Bool) -> Bool {
-    let drainMargin: UInt64 = 6 * 1024 * 1024 * 1024
-    let imageEstimateBytes: UInt64 = 12 * 1024 * 1024 * 1024
-    let need = ltx2WarmNeedBytes(wantsAudio: wantsAudio) + drainMargin + imageEstimateBytes
-    return MemoryProbe.systemAvailableMemoryBytes() >= need
   }
 
   /// Rebuild the LTX-2 generator after an eviction. After `videoHolder
@@ -5328,22 +5351,21 @@ private actor WarmServerCoordinator {
 
   /// #1479 (review C2): the SAME admission gate a cold video start runs
   /// (`.localVideo`'s admission block, now just a thin wrapper around this),
-  /// extracted so a preemption resume can run it too — on BOTH the evicted
-  /// and fast (no-eviction) branches. The fast path skips the VIDEO reload,
-  /// but the preempting image job still loaded ITS OWN weights alongside the
-  /// resident video stack; resuming into whatever memory is left over
-  /// without re-vacating image models and re-checking the drain/admission
-  /// gate is the documented #218/#34 SIGKILL condition — "a failed tap must
-  /// never cost a video" includes never costing it an OOM kill.
+  /// extracted so a preemption resume can run it too. The preempting image
+  /// job loaded ITS OWN weights while the video was away; resuming into
+  /// whatever memory is left over without re-vacating image models and
+  /// re-checking the drain/admission gate is the documented #218/#34 SIGKILL
+  /// condition — "a failed tap must never cost a video" includes never
+  /// costing it an OOM kill.
   private func vacateImageModelsAndAdmitVideo(
     wantsAudio: Bool
   ) async -> (admitted: Bool, availableMB: Int, neededMB: Int) {
     let freedForVideoMB = await releaseImageModelsForVideo()
     var availableForVideo = MemoryProbe.systemAvailableMemoryBytes()
     // Precision-keyed (#230), warm-stack discount, audio-mode-mismatch cold
-    // fallback (task #21, Codex #2) — factored into `ltx2WarmNeedBytes` so
-    // this gate and the fast-path decision above can never disagree (review
-    // round 2, finding 3).
+    // fallback (task #21, Codex #2) — factored into `ltx2WarmNeedBytes`, which
+    // is now this gate's only consumer, so no second, independent estimate can
+    // disagree with it (review round 2, finding 3).
     let genForLog = videoHolder.get()
     let videoStackWarm = genForLog?.isLoaded == true && (genForLog?.isAudioLoaded ?? false) == wantsAudio
     let ltx2Need = ltx2WarmNeedBytes(wantsAudio: wantsAudio)
@@ -5371,11 +5393,21 @@ private actor WarmServerCoordinator {
     return (admitVideo, Int(availableForVideo >> 20), Int(ltx2Need >> 20))
   }
 
-  /// Reload (if evicted) and resume the checkpointed video render.
+  /// Reload (if needed) and resume the checkpointed video render.
   ///
   /// Runs the full #218/#34 admission gate (`vacateImageModelsAndAdmitVideo`)
-  /// on BOTH branches (review C2) before touching the generator — see that
-  /// method's doc comment for why the fast path needs it too.
+  /// before touching the generator (review C2).
+  ///
+  /// **Residency is the authority** (final review, C1): there is no `evicted`
+  /// parameter any more. The caller's belief about whether it evicted the
+  /// video is not trustworthy — `#218` makes ANY image load release the video
+  /// stack underneath it (`poolLoad`'s first statement is
+  /// `videoHolder.release()`), and the memory-pressure guard can release it
+  /// too — so this asks `videoHolder` what is actually resident and rebuilds
+  /// when nothing is. Absence is recoverable (a cold rebuild costs a reload,
+  /// which is exactly what the always-evict episode already budgets for);
+  /// throwing on it, as the previous `evicted: false` branch did, destroyed
+  /// the checkpoint and failed the video job outright.
   ///
   /// Binding constraint from Task 4's reviews, enforced HERE so no call site
   /// can get it wrong: a fresh post-eviction instance has no signal/telemetry
@@ -5395,7 +5427,7 @@ private actor WarmServerCoordinator {
   /// video job fails loudly. No silent restart from step 0 (spec, Error
   /// handling).
   private func resumeCheckpointedVideo(
-    state: LTX2ResumeState, evicted: Bool, wantsAudio: Bool, report: @escaping @Sendable (Int) -> Void
+    state: LTX2ResumeState, wantsAudio: Bool, report: @escaping @Sendable (Int) -> Void
   ) async throws -> LTX2RenderOutcome {
     let admission = await vacateImageModelsAndAdmitVideo(wantsAudio: wantsAudio)
     guard admission.admitted else {
@@ -5403,16 +5435,19 @@ private actor WarmServerCoordinator {
         message: "#1479: insufficient memory to resume LTX-2 video after preemption: only \(admission.availableMB)MB free (need ~\(admission.neededMB)MB)")
     }
     let gen: LTX2VideoGenerator
-    if evicted {
-      gen = try await reloadVideoGeneratorAfterEviction()
-    } else if let existing = videoHolder.get() {
+    if let existing = videoHolder.get() {
+      // Still resident — nothing released it while the preemptor ran. Reuse
+      // it; the checkpoint resumes with no weight reload at all.
+      logger.info("#1479: resuming LTX-2 video — generator still resident, no reload needed")
       gen = existing
     } else {
-      // Not evicted by this episode, yet nothing is resident — something
-      // else released it out from under the checkpoint (e.g. the memory-
-      // pressure guard). Fail loudly rather than silently restart.
-      throw WarmServerError.invalidRequest(
-        message: "#1479: LTX-2 generator missing on resume — no eviction was recorded for this episode, but nothing is resident")
+      // Nothing resident: the expected state after an episode's eviction, and
+      // also the recovery path if something ELSE released it out from under
+      // the checkpoint (#218's release-before-image-load, the memory-pressure
+      // guard). Either way this is recoverable — rebuild cold and resume from
+      // the checkpoint rather than throwing the render away.
+      logger.info("#1479: resuming LTX-2 video — no generator resident, rebuilding cold before resume")
+      gen = try await reloadVideoGeneratorAfterEviction()
     }
     gen.setPreemptionSignal(ltx2PreemptionSignal)
     gen.setTelemetry(ltx2Telemetry)
@@ -5436,8 +5471,27 @@ private actor WarmServerCoordinator {
     return p.meanSec * Double(p.samples)
   }
 
-  /// The full preemption episode: checkpoint received -> run the preempting
-  /// image job -> ALWAYS resume the video.
+  /// The full preemption episode: checkpoint received -> evict the video
+  /// weights -> run the preempting image job -> ALWAYS resume the video.
+  ///
+  /// **v1 always evicts** (final review C1 + controller ruling, 2026-08-15;
+  /// the spec's Decision 1 has been amended to match). The original design had
+  /// a "fits alongside" fast path that kept the video weights resident and
+  /// skipped the evict/reload round trip. That path was not merely an
+  /// optimisation that sometimes failed to pay off — it was actively
+  /// destructive: `runGenerate` begins with `reloadImageModelIfEvicted` ->
+  /// `poolLoad`, whose FIRST statement is `videoHolder.release()` (#218's
+  /// invariant that video must vacate before any image load, and
+  /// `imageModelsEvicted` is always true while a video is resident, so that
+  /// reload always runs). The layer below therefore released the very weights
+  /// the fast path was preserving, and the resume then found nothing resident
+  /// and threw — losing the checkpoint and failing the video job. On a 128GB
+  /// box the fast path was the LIKELY branch. Honouring pause-in-place would
+  /// require a preemption-aware carve-out in `poolLoad` that lets both heavy
+  /// stacks co-reside — the exact 2x22GB pool-budget hazard the spec's
+  /// Decision 1 exists to avoid — so v1 simply always evicts, and
+  /// `resumeCheckpointedVideo` treats live residency (not a caller's belief)
+  /// as the authority on whether a rebuild is needed.
   ///
   /// Always-resume is enforced two ways: structurally, the image-job call
   /// sits in its own `do`/`catch` (review I4) so that even if `runGenerate`
@@ -5498,21 +5552,44 @@ private actor WarmServerCoordinator {
       // the signal was observed) — nothing left to run. Resume immediately.
       logger.warning("#1479: video yielded but no preemptor was waiting (checkpoint-fallback watchdog already handled it) — resuming immediately")
       clearEpisodeState()
-      return try await resumeCheckpointedVideo(state: state, evicted: false, wantsAudio: wantsAudio, report: report)
+      return try await resumeCheckpointedVideo(state: state, wantsAudio: wantsAudio, report: report)
     }
 
     logger.info("#1479: video checkpointed at chunk \(state.chunkIndex), phase \(state.phase.rawValue), step \(state.stepIndex) — running preempting image job (source=\(claimed.source))")
 
-    let originalActiveJobId = activeJobId
-    let evicted = !imageFitsAlongsideVideo(wantsAudio: wantsAudio)
-    if evicted {
-      let t0 = Date()
-      videoHolder.release()
-      ltx2EvictMean.record(Date().timeIntervalSince(t0))
-      logger.info("#1479: evicted LTX-2 video weights to admit the preempting image job")
-    } else {
-      logger.info("#1479: preempting image job fits alongside resident video weights — fast path, no eviction")
-    }
+    // Always evict (see doc comment): the image load below would release these
+    // weights anyway, one layer down and without timing it. Doing it here
+    // explicitly keeps `ltx2EvictMean` — half of the refusal guard's
+    // round-trip estimate — measuring the real thing.
+    let t0 = Date()
+    videoHolder.release()
+    ltx2EvictMean.record(Date().timeIntervalSince(t0))
+    logger.info("#1479: evicted LTX-2 video weights to admit the preempting image job")
+
+    // #1479 (final review I2/M13): the preemptor is a REAL render — it just
+    // didn't arrive through `pending`. Swap the entire active-job identity
+    // over to it (id, summary, source, start time) and, critically, the
+    // persistence pair (rawBody + kind) so the durable queue snapshot names
+    // the image job while the image job is what's actually running. Without
+    // this, a crash during the preemptor lost it outright (the persisted
+    // "active" slot still described the paused video, whose own rawBody is
+    // nil and therefore unrecoverable), and /health + /v1/queue reported the
+    // video as active for the whole image render. Persist AFTER each swap so
+    // the on-disk snapshot is never behind the in-memory truth.
+    let videoIdentity = (
+      id: activeJobId, summary: activeJobSummary, source: activeJobSource,
+      rawBody: activeJobRawBody, kind: activeJobKindForPersistence,
+      startedAt: currentJobStartedAt, renderStartedAt: activeRenderStartedAt
+    )
+    activeJobId = UUID().uuidString
+    activeJobSummary = "Render (preempting): \(claimed.payload.prompt.prefix(100))"
+    activeJobSource = claimed.source
+    activeJobRawBody = claimed.rawBody
+    activeJobKindForPersistence = "generate"
+    currentJobStartedAt = Date()
+    activeRenderStartedAt = nil
+    publishHealth()
+    persistQueueState()
 
     // Run the image job exactly as a normal render — the same actor method
     // every non-preempting `.generate` job runs, including its own
@@ -5526,11 +5603,20 @@ private actor WarmServerCoordinator {
       logger.error("#1479: preempting image job threw past runGenerate's own boundary (\(error)) — resuming the video anyway")
     }
 
-    // runGenerate's own defer clears activeJobId/progress/preview — restore
-    // the video's identity before its (possibly long, synchronous) resume so
-    // /health and /v1/queue keep reporting the video job while it resumes.
-    activeJobId = originalActiveJobId
+    // Restore the video's identity — symmetric with the swap above, and done
+    // BEFORE its (possibly long, synchronous) resume so /health, /v1/queue and
+    // the persisted snapshot all go back to describing the video job. The
+    // preemptor is finished by now, so leaving it in the persisted active slot
+    // would replay a completed image job on the next restart.
+    activeJobId = videoIdentity.id
+    activeJobSummary = videoIdentity.summary
+    activeJobSource = videoIdentity.source
+    activeJobRawBody = videoIdentity.rawBody
+    activeJobKindForPersistence = videoIdentity.kind
+    currentJobStartedAt = videoIdentity.startedAt
+    activeRenderStartedAt = videoIdentity.renderStartedAt
     publishHealth()
+    persistQueueState()
 
     // Clear BEFORE the resume, not in the defer (review I2) — see doc comment.
     clearEpisodeState()
@@ -5539,28 +5625,33 @@ private actor WarmServerCoordinator {
     // phase telemetry), not a wall clock around the whole resume call — the
     // resume call's return time includes the rest of the render (15-60min),
     // which would poison a cumulative rolling mean into a de facto refuse-
-    // everything kill switch. Record only the delta, and gate on `evicted`
-    // (review round 3, finding 1): `load()`'s idempotent early-return still
-    // sits INSIDE the telemetry bracket on the fast path
-    // (`LTX2VideoGenerator.swift:840-842`/`:424-425`), so a fast-path resume
-    // emits its own microseconds-scale `modelLoad` sample — `modelLoadDelta
-    // > 0` alone is true there too, and a near-zero sample decays the
-    // rolling mean toward zero over repeated fast-path resumes, degrading
-    // the guard to never-refuse (the opposite failure this metric exists to
-    // avoid). `evicted` is the actual "did a reload happen" signal; the
-    // delta is only for accuracy of ITS duration, not for detecting whether
+    // everything kill switch. Record only the delta, and gate it on a real
+    // reload having happened (review round 3, finding 1): `load()`'s
+    // idempotent early-return still sits INSIDE the telemetry bracket
+    // (`LTX2VideoGenerator.swift`), so a resume that reuses a resident
+    // generator emits its own microseconds-scale `modelLoad` sample —
+    // `modelLoadDelta > 0` alone is true there too, and a near-zero sample
+    // decays the rolling mean toward zero, degrading the refusal guard to
+    // never-refuse (the opposite failure this metric exists to avoid). The
+    // gate is therefore "was the generator absent going in", read from the
+    // same authority `resumeCheckpointedVideo` uses and evaluated on the
+    // actor with nothing able to change residency in between; the delta is
+    // only for accuracy of the reload's DURATION, not for detecting whether
     // it occurred. This also swallows the ~1e-13 float round-trip noise the
-    // mean*samples sum reconstruction can produce.
+    // mean*samples sum reconstruction can produce. Under the always-evict
+    // rule this is normally true — it stays a check rather than a constant so
+    // a future preemption-aware carve-out cannot silently poison the metric.
     //
     // Single-flight assumption: this snapshot/delta is only correct because
     // exactly one video render is ever in flight at a time (the coordinator
     // serializes video on the same queue as image renders); a future
     // concurrent-video path would let a second render's modelLoad samples
     // land inside this window and silently corrupt the delta.
+    let willReload = videoHolder.get() == nil
     let modelLoadBefore = ltx2ModelLoadTotalSec()
-    let outcome = try await resumeCheckpointedVideo(state: state, evicted: evicted, wantsAudio: wantsAudio, report: report)
+    let outcome = try await resumeCheckpointedVideo(state: state, wantsAudio: wantsAudio, report: report)
     let modelLoadDelta = ltx2ModelLoadTotalSec() - modelLoadBefore
-    if evicted, modelLoadDelta > 0 {
+    if willReload, modelLoadDelta > 0 {
       ltx2ReloadMean.record(modelLoadDelta)
     }
     return outcome
@@ -6338,11 +6429,10 @@ private actor WarmServerCoordinator {
         // on the serial render queue guarantees no image render can re-load
         // between the eviction and the video load. Extracted into
         // `vacateImageModelsAndAdmitVideo` (#1479, review C2) so a preemption
-        // resume can run the EXACT SAME gate before resuming — the fast path
-        // (no video eviction) still lets the preempting image job's weights
-        // load alongside the resident video stack, and resuming into whatever
-        // memory is left without re-checking is the documented SIGKILL
-        // condition this gate exists to prevent.
+        // resume can run the EXACT SAME gate before resuming — the preempting
+        // image job loaded its own weights while the video was evicted, and
+        // resuming into whatever memory is left without re-checking is the
+        // documented SIGKILL condition this gate exists to prevent.
         let admission = await vacateImageModelsAndAdmitVideo(wantsAudio: wantsAudio)
         if !admission.admitted {
           continuation.resume(throwing: WarmServerError.invalidRequest(

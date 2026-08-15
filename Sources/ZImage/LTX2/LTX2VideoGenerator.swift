@@ -837,9 +837,19 @@ public final class LTX2VideoGenerator {
         // validate() has already rejected unsupported audio modes (i2v /
         // multi-chunk), so this is simply the request flag.
         let wantAudio = request.audio
+        // #1479 (final review, minor 6): the end MUST be a `defer` scoped to
+        // the load itself. With a plain trailing call, a throwing `load()`
+        // (missing weights, OOM, a bad LoRA) left the `modelLoad` phase open
+        // forever: `/v1/queue` then reported `phase: modelLoad` on an idle
+        // server, and the preemption refusal guard projected remaining time
+        // against a phantom phase. `LTX2PhaseTelemetry.end` removes the open
+        // entry, so it is safe to call once per `begin` and a no-op after —
+        // the `do` block scopes this one to exactly the load.
         telemetry?.begin(.modelLoad)
-        try load(loras: request.effectiveLoRAs, audio: wantAudio)
-        telemetry?.end(.modelLoad)
+        do {
+            defer { telemetry?.end(.modelLoad) }
+            try load(loras: request.effectiveLoRAs, audio: wantAudio)
+        }
         guard let pipeline, let tokenizer else { throw LTX2VideoError.weightsMissing(config.weightsDir) }
 
         // One greppable line per render: every Tier A/B param + provenance
