@@ -37,6 +37,11 @@ struct GalleryMaintenanceView: View {
     /// purge and regenerate must wait it out.
     private var actionsLocked: Bool { archiver?.isRunning ?? false }
 
+    /// Surfaced when a mutation-point re-check of `actionsLocked` catches an
+    /// archive operation that started after the button was enabled/dialog
+    /// opened (the button's own `.disabled` is a courtesy, not the guard).
+    private static let lockedMessage = "Archive operation in progress — try again when it finishes."
+
     // MARK: - Orphan thumbnails
 
     @State private var orphanReport: ThumbnailOrphanReport?
@@ -165,6 +170,13 @@ struct GalleryMaintenanceView: View {
 
     private func purgeOrphans() async {
         guard let report = orphanReport else { return }
+        // Re-check at the mutation point, not just when the confirmation
+        // dialog was opened — a restore can start while the dialog is open,
+        // and the button closure alone can't catch that race.
+        guard !actionsLocked else {
+            orphanError = Self.lockedMessage
+            return
+        }
         orphanPurging = true
         defer { orphanPurging = false }
         let result = await maintenance.purgeOrphanThumbnails(report)
@@ -347,7 +359,8 @@ struct GalleryMaintenanceView: View {
 
                 if incompleteScanned, incompleteDiscardResult == nil, !incompleteArchives.isEmpty {
                     Button("Discard") { showIncompleteConfirm = true }
-                        .disabled(incompleteDiscarding)
+                        .disabled(incompleteDiscarding || actionsLocked)
+                        .help(actionsLocked ? "A restore is in progress — try again once it finishes." : "")
                 }
 
                 if incompleteScanning || incompleteDiscarding {
@@ -366,6 +379,15 @@ struct GalleryMaintenanceView: View {
     }
 
     private func discardIncomplete() async {
+        // Re-check at the mutation point, not just when the button was
+        // enabled — an archive operation in progress has INCOMPLETE.json
+        // present by design, so an in-flight bundle is indistinguishable
+        // from a crashed one by marker alone; discarding it mid-write would
+        // delete a bundle the archiver is actively populating.
+        guard !actionsLocked else {
+            incompleteError = Self.lockedMessage
+            return
+        }
         incompleteDiscarding = true
         defer { incompleteDiscarding = false }
         var discarded = 0
