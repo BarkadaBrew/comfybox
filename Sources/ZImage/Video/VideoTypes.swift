@@ -26,6 +26,11 @@ public enum VideoJobState: String, Codable, Sendable {
   case processing
   case succeeded
   case failed
+  /// #1479: checkpointed mid-render to let a `preempt: true` image job run;
+  /// the render resumes automatically once that job finishes (success or
+  /// failure) — NOT a terminal state, and polling clients that don't
+  /// recognize it should keep polling rather than treat it as done.
+  case pausedForPreemption
 }
 
 // MARK: - VideoGenerateRequest

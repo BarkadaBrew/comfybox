@@ -7,6 +7,26 @@ import MLX
 import CoreGraphics
 import ImageIO
 
+/// #1479: refuse a preemption when finishing beats preempting. INERT until
+/// telemetry has samples for both `meanStepSec` AND `evictReloadRoundTripSec`
+/// — it never refuses on a guess (spec: "until telemetry has samples for a
+/// family, the guard is inert rather than refusing"). `remainingPhaseMeansSec`
+/// is the observed mean duration of each phase still ahead of the render's
+/// current position (e.g. decode/vocoder/postProcess when mid-denoise) —
+/// phases with no samples yet are simply omitted by the caller, not zeroed.
+///
+/// Returns nil to allow the preemption; a non-nil value is the projected
+/// remaining seconds (the ETA a refused caller can report).
+func preemptionRefusalETA(
+  stepsRemaining: Int, meanStepSec: Double?,
+  remainingPhaseMeansSec: [Double],
+  evictReloadRoundTripSec: Double?
+) -> Double? {
+  guard let stepSec = meanStepSec, let roundTrip = evictReloadRoundTripSec else { return nil }
+  let projected = Double(stepsRemaining) * stepSec + remainingPhaseMeansSec.reduce(0, +)
+  return projected < roundTrip ? projected : nil
+}
+
 public struct WarmServerConfiguration: Sendable {
   public var port: UInt16
   public var modelSpec: String?
@@ -203,6 +223,36 @@ public final class WarmServer {
   /// Held in a shared, lock-based box so the coordinator can evict it before an
   /// image load — image + video cannot co-reside in unified memory (#218).
   let videoHolder = VideoGeneratorHolder()
+
+  // MARK: - #1479 preemption support
+  //
+  // Lock-based (see the block comment above `RollingMeanSec`), installed on
+  // every LTX-2 generator instance (fresh or reused) in `prepareLocalVideo`,
+  // so a video render is ALWAYS preemptible-capable but never actually
+  // preempted unless a job raises `ltx2PreemptionSignal`.
+
+  /// Per-phase render timings feeding the refusal guard and `/v1/queue`.
+  let ltx2Telemetry = LTX2PhaseTelemetry()
+  /// Raised by an image job's route handler to checkpoint the in-flight video
+  /// render; read inside the render loop with no actor hop.
+  let ltx2PreemptionSignal = PreemptionSignal()
+  /// Live steps-remaining of the in-flight video render (fed from its
+  /// progress callback) — the refusal guard's `stepsRemaining` input.
+  let ltx2StepPosition = LTX2StepPosition()
+  /// Observed evict/reload durations from past preemption episodes — the
+  /// refusal guard's `evictReloadRoundTripSec` input (nil until both have a
+  /// sample).
+  let ltx2EvictMean = RollingMeanSec()
+  let ltx2ReloadMean = RollingMeanSec()
+  /// Exactly one preemption in flight at a time — a preemptor cannot itself
+  /// be preempted (spec).
+  let preemptionInFlight = LockedFlag()
+  /// Single-slot mailbox bridging the route handler (raises the signal, then
+  /// awaits a continuation) to the coordinator's `.localVideo` case (observes
+  /// the yield, runs the image job, resumes the video) — see the mechanism
+  /// note above `RollingMeanSec`.
+  let pendingPreemptorBox = PendingPreemptorBox()
+
   /// Unified-memory pressure monitor (#218). On warning/critical it sheds the
   /// MLX buffer cache and any idle heavy model to stay clear of jetsam.
   private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -232,7 +282,12 @@ public final class WarmServer {
     self.configuration = configuration
     self.host = host
     self.logger = logger
-    self.coordinator = WarmServerCoordinator(configuration: configuration, logger: logger, videoHolder: self.videoHolder, liveHealth: self.liveHealth)
+    self.coordinator = WarmServerCoordinator(
+      configuration: configuration, logger: logger, videoHolder: self.videoHolder, liveHealth: self.liveHealth,
+      videoJobTracker: self.videoJobTracker, ltx2Telemetry: self.ltx2Telemetry,
+      ltx2PreemptionSignal: self.ltx2PreemptionSignal, ltx2StepPosition: self.ltx2StepPosition,
+      ltx2EvictMean: self.ltx2EvictMean, ltx2ReloadMean: self.ltx2ReloadMean,
+      preemptionInFlight: self.preemptionInFlight, pendingPreemptorBox: self.pendingPreemptorBox)
     self.seedvr2WeightsPath = configuration.seedvr2WeightsPath
 
     self.comfyBridge = ComfyBridge(logger: logger)
@@ -574,8 +629,24 @@ public final class WarmServer {
     case ("POST", "/v1/generate"):
       do {
         let payload = try decodedGeneratePayload(from: request.body)
-        let result = try await coordinator.enqueueGenerate(payload, source: payload.source ?? "api", rawBody: request.body)
-        return .json(status: 200, payload: result)
+        let source = payload.source ?? "api"
+        // #1479: absent/false `preempt` (or no video rendering, or a nested
+        // attempt) is `.notApplicable` — same call as before this feature.
+        switch await attemptPreemption(payload, source: source, rawBody: request.body) {
+        case .notApplicable:
+          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
+          return .json(status: 200, payload: result)
+        case .ran(let result):
+          return .json(status: 200, payload: result)
+        case .ranFailed(let error):
+          return .error(response(for: error))
+        case .refused(let eta):
+          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
+          let stamped = GenerateResponse(
+            success: result.success, outputPath: result.outputPath, durationMs: result.durationMs,
+            preemptRefused: true, etaSec: eta)
+          return .json(status: 200, payload: stamped)
+        }
       } catch {
         return .error(response(for: error))
       }
@@ -588,7 +659,16 @@ public final class WarmServer {
     case ("POST", "/v1/generate/async"):
       do {
         let payload = try decodedGeneratePayload(from: request.body)
-        let status = imageJobTracker.submit(payload, source: payload.source ?? "api", coordinator: coordinator, rawBody: request.body)
+        let source = payload.source ?? "api"
+        // #1479: `submitPreempting` runs the SAME `attemptPreemption` check
+        // inside the job's own detached Task, so a `preempt`-absent/false
+        // submit takes the exact same `coordinator.enqueueGenerate` path as
+        // before this feature.
+        let status = imageJobTracker.submitPreempting(
+          payload, source: source, coordinator: coordinator, rawBody: request.body,
+          preemptor: { [weak self] in
+            await self?.attemptPreemption(payload, source: source, rawBody: request.body) ?? .notApplicable
+          })
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try encoder.encode(status)
@@ -2055,6 +2135,14 @@ public final class WarmServer {
     // image load, and so the render queue evicts image models before this one
     // actually loads its ~65GB of weights inside generate() (#218).
     videoHolder.set(generator)
+    // #1479: wire telemetry + the (normally never-raised) preemption signal
+    // on EVERY generator instance — fresh or reused — so the video path is
+    // always preemptible-capable while staying byte-identical unless a job
+    // actually raises the signal. Also covers the fresh instance a preemption
+    // eviction produces (`VideoGeneratorHolder.release()` deallocates the old
+    // one), since this is the same function a post-eviction cold reload runs.
+    generator.setTelemetry(ltx2Telemetry)
+    generator.setPreemptionSignal(ltx2PreemptionSignal)
 
     // Accept an init image as bytes (image_base64) when no server path is given.
     let effectiveInitImage = req.imagePath ?? Self.writeTempImage(base64: req.imageBase64)
@@ -2329,9 +2417,13 @@ public final class WarmServer {
         tracePayload: tracePayload,
         wantsAudio: prep.request.audio
       ) { report in
-        try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
+        // #1479: the preemptible entry — a no-op unless a `preempt: true`
+        // image job raises `ltx2PreemptionSignal` while this render is
+        // in-flight; otherwise behaves exactly like `.generate`.
+        try prep.generator.generatePreemptible(prep.request) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
             chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+          self.ltx2StepPosition.update(step: step, totalSteps: totalSteps)
         }
       }
       let encoder = JSONEncoder()
@@ -2500,9 +2592,11 @@ public final class WarmServer {
 
       logger.info("LTX-2: local video request queued (\(videoRequest.width)x\(videoRequest.height), \(videoRequest.framesPerChunk)f)")
       let result = try await coordinator.enqueueLocalVideo(wantsAudio: videoRequest.audio) { report in
-        try generator.generate(videoRequest) { chunk, totalChunks, step, totalSteps in
+        // #1479: preemptible entry — see the async path's doc comment above.
+        try generator.generatePreemptible(videoRequest) { chunk, totalChunks, step, totalSteps in
           report(Self.localVideoProgressPercent(
             chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+          self.ltx2StepPosition.update(step: step, totalSteps: totalSteps)
         }
       }
       auditLog.append(kind: "video.local", message: "LTX-2 video \(result.frameCount)f -> \(result.outputPath)")
@@ -2518,6 +2612,101 @@ public final class WarmServer {
       return .error(.error(status: 400, message: error.localizedDescription))
     } catch {
       return .error(.error(status: 500, message: "LTX-2 video failed: \(error.localizedDescription)"))
+    }
+  }
+
+  // MARK: - #1479 preemption entry point
+  //
+  // Called from BOTH `/v1/generate` and `/v1/generate/async` route handlers,
+  // BEFORE either calls into `coordinator` — see the block comment above
+  // `RollingMeanSec` for why this cannot itself be an actor method. Returns
+  // `.notApplicable` when the flag is absent/false, no video is rendering, or
+  // a preemption is already in flight (nested preemption refused, spec) — the
+  // caller then falls through to its normal enqueue, unmodified, which is
+  // exactly pre-#1479 behaviour.
+
+  /// Result of an `attemptPreemption` call. `fileprivate` (not `private`)
+  /// because `ImageJobTracker.submitPreempting`, a sibling top-level type in
+  /// this same file, needs to name it in its own parameter type.
+  fileprivate enum PreemptionOutcome {
+    /// Nothing to do — caller enqueues normally, unmodified.
+    case notApplicable
+    /// The refusal guard declined (finishing beats preempting). `eta` is the
+    /// projected remaining seconds — callers stamp it onto the normal queued
+    /// response/status as `preempt_refused`/`eta_sec`.
+    case refused(eta: Double)
+    /// The preemption ran end-to-end and the image job completed.
+    case ran(GenerateResponse)
+    /// The preemption ran end-to-end and the image job itself failed (the
+    /// video still resumed — that failure is independent of this one).
+    case ranFailed(Error)
+  }
+
+  /// `evictReloadRoundTripSec` for the refusal guard: sum of the two observed
+  /// rolling means, nil until BOTH have at least one sample (spec: never
+  /// refuse on a guess).
+  private func combinedEvictReloadRoundTripSec() -> Double? {
+    guard let evictMean = ltx2EvictMean.mean(), let reloadMean = ltx2ReloadMean.mean() else { return nil }
+    return evictMean + reloadMean
+  }
+
+  private func attemptPreemption(
+    _ payload: GeneratePayload, source: String, rawBody: Data?
+  ) async -> PreemptionOutcome {
+    guard payload.preempt == true, videoHolder.isRendering() else { return .notApplicable }
+    guard preemptionInFlight.trySet() else {
+      // Nested preemption refused (spec) — a preemptor cannot itself be
+      // preempted. Falls through as a normal enqueue.
+      return .notApplicable
+    }
+
+    let tv = ltx2Telemetry.view()
+    let stepsRemaining = ltx2StepPosition.read() ?? 0
+    var remainingPhaseMeans: [Double] = []
+    if let currentPhase = tv.currentPhase.flatMap(LTX2Phase.init(rawValue:)) {
+      for phase in LTX2Phase.allCases where LTX2UnwindGuard.rank(phase) > LTX2UnwindGuard.rank(currentPhase) {
+        if let m = tv.phases[phase.rawValue]?.meanSec { remainingPhaseMeans.append(m) }
+      }
+    }
+    if let eta = preemptionRefusalETA(
+      stepsRemaining: stepsRemaining, meanStepSec: tv.meanStepSec,
+      remainingPhaseMeansSec: remainingPhaseMeans, evictReloadRoundTripSec: combinedEvictReloadRoundTripSec()
+    ) {
+      preemptionInFlight.clear()
+      return .refused(eta: eta)
+    }
+
+    logger.info("#1479: preempting in-flight video render for image job (source=\(source))")
+
+    // Checkpoint-failure fallback window (spec, Error handling: "Checkpoint
+    // fails -> refuse the preemption, keep rendering"): if the render doesn't
+    // observe the signal and yield within this window — it may be deep in an
+    // uninterruptible phase, or may simply finish on its own first — clear
+    // the signal and run the image job WITHOUT preemption rather than lose it
+    // or hang forever waiting for a yield that may never come.
+    let windowSec = tv.meanStepSec.map { $0 * 2 + 30 } ?? 120
+
+    do {
+      let response: GenerateResponse = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<GenerateResponse, Error>) in
+        pendingPreemptorBox.set(.init(payload: payload, source: source, rawBody: rawBody, continuation: ContinuationBox(cont)))
+        ltx2PreemptionSignal.raise()
+        Task { [weak self] in
+          try? await Task.sleep(nanoseconds: UInt64(max(0, windowSec) * 1_000_000_000))
+          guard let self, let claimed = self.pendingPreemptorBox.claim() else { return }
+          self.logger.error("#1479: checkpoint fallback — video render did not yield within \(windowSec)s; running image job without preemption")
+          self.ltx2PreemptionSignal.clear()
+          self.preemptionInFlight.clear()
+          do {
+            let result = try await self.coordinator.enqueueGenerate(claimed.payload, source: claimed.source, rawBody: claimed.rawBody)
+            claimed.continuation.resume(returning: result)
+          } catch {
+            claimed.continuation.resume(throwing: error)
+          }
+        }
+      }
+      return .ran(response)
+    } catch {
+      return .ranFailed(error)
     }
   }
 
@@ -2554,6 +2743,12 @@ public final class WarmServer {
     if let source = snap.activeSource { payload["active_source"] = source }
     if let started = snap.activeRenderStartedAt { payload["active_started_at"] = iso.string(from: started) }
     if let pct = progress { payload["progress_percent"] = pct }
+    // #1479: LTX-2 phase telemetry — additive, lock-based (no actor hop), so
+    // this stays as responsive during a render as the rest of this route.
+    let tv = ltx2Telemetry.view()
+    if let phase = tv.currentPhase { payload["phase"] = phase }
+    if let m = tv.maxUninterruptibleSec { payload["max_uninterruptible_sec"] = m }
+    payload["phase_timings"] = tv.phases.mapValues { ["mean_sec": $0.meanSec, "samples": $0.samples] }
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
     }
@@ -3778,12 +3973,18 @@ public final class WarmServer {
         }
         let base = Double(i) * shotWeight
         shotResult = try await coordinator.enqueueLocalVideo { coordReport in
-          try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
+          // #1479: storyboard shots stay on the legacy, non-preemptible
+          // entry — the checkpoint's generator-level context travels with a
+          // single request, and a multi-shot orchestration issues its own
+          // per-shot coordinator enqueues (see `submitOrchestrated`'s doc
+          // comment), which the preemption episode does not model. `.generate`
+          // never yields, so this is always `.completed`.
+          .completed(try prep.generator.generate(prep.request) { chunk, totalChunks, step, totalSteps in
             let pct = Self.localVideoProgressPercent(
               chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps)
             coordReport(pct)
             report(Int(base + Double(pct) * shotWeight / 100.0))
-          }
+          })
         }
       } catch let error as StoryboardError {
         throw error
@@ -4279,6 +4480,91 @@ private final class RenderProgressTracker: @unchecked Sendable {
   func get() -> Int? { lock.lock(); defer { lock.unlock() }; return percent }
 }
 
+// MARK: - #1479 preemption support (lock-based, no actor hop)
+//
+// The coordinator actor is synchronously blocked for the whole duration of an
+// in-flight LTX-2 render (`WarmServerCoordinator.processLoop`'s `.localVideo`
+// case calls `body(report)` with no internal `await`), so a preempt decision
+// that needs to run WHILE that render is in flight cannot itself be an actor
+// call — it would simply queue behind the render and only run once the render
+// already finished on its own, defeating the whole feature (see the #217
+// PreemptionSignal precedent this mirrors). Everything below is therefore
+// lock-protected, exactly like `PreemptionSignal`/`LTX2PhaseTelemetry`, and
+// lives on `WarmServer` (not the actor) so the `/v1/generate` route handler
+// can read/raise it before ever calling into the coordinator.
+
+/// Rolling mean of an observed duration (evict, reload). Recorded by the
+/// coordinator when it actually performs the operation during a preemption
+/// episode; read with no actor hop by the pre-raise refusal guard.
+final class RollingMeanSec: @unchecked Sendable {
+  private let lock = NSLock()
+  private var sumSec: Double = 0
+  private var samples: Int = 0
+  func record(_ seconds: Double) { lock.lock(); sumSec += seconds; samples += 1; lock.unlock() }
+  func mean() -> Double? { lock.lock(); defer { lock.unlock() }; return samples > 0 ? sumSec / Double(samples) : nil }
+}
+
+/// Live "steps remaining" of the in-flight video render, fed from the same
+/// per-chunk/per-step progress callback the video path already reports
+/// through. Read (no actor hop) by the pre-raise refusal guard; cleared when
+/// the render ends (completed or failed).
+final class LTX2StepPosition: @unchecked Sendable {
+  private let lock = NSLock()
+  private var remaining: Int?
+  func update(step: Int, totalSteps: Int) { lock.lock(); remaining = max(0, totalSteps - step); lock.unlock() }
+  func clear() { lock.lock(); remaining = nil; lock.unlock() }
+  func read() -> Int? { lock.lock(); defer { lock.unlock() }; return remaining }
+}
+
+/// Single-owner lock flag: `trySet()` succeeds for exactly one caller until
+/// `clear()`. Used to refuse nested preemption (spec: "a preemptor cannot
+/// itself be preempted") without an actor hop.
+final class LockedFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value = false
+  @discardableResult
+  func trySet() -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    if value { return false }
+    value = true
+    return true
+  }
+  func clear() { lock.lock(); value = false; lock.unlock() }
+  func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+/// The preempting image job, parked here between the HTTP route handler
+/// raising `PreemptionSignal` and whichever side observes the render yield
+/// first — the coordinator's `.localVideo` case (the normal path) or the
+/// checkpoint-failure watchdog Task (the render never yielded in time, or
+/// finished on its own before the signal was observed). `claim()` is
+/// exactly-once: whichever side calls it first gets the payload; the other
+/// gets nil and does nothing, so the image job is handled by exactly one path.
+final class PendingPreemptorBox: @unchecked Sendable {
+  struct Entry {
+    fileprivate let payload: GeneratePayload
+    fileprivate let source: String
+    fileprivate let rawBody: Data?
+    fileprivate let continuation: ContinuationBox<GenerateResponse>
+
+    fileprivate init(payload: GeneratePayload, source: String, rawBody: Data?, continuation: ContinuationBox<GenerateResponse>) {
+      self.payload = payload
+      self.source = source
+      self.rawBody = rawBody
+      self.continuation = continuation
+    }
+  }
+  private let lock = NSLock()
+  private var entry: Entry?
+  fileprivate func set(_ e: Entry) { lock.lock(); entry = e; lock.unlock() }
+  fileprivate func claim() -> Entry? {
+    lock.lock(); defer { lock.unlock() }
+    let e = entry
+    entry = nil
+    return e
+  }
+}
+
 /// Holds the latest live-denoising preview JPEG for polling clients (the
 /// Desktop app, which already polls /health for progress_percent — see
 /// GH #216). Krita/ComfyUI get previews pushed over their own WebSocket;
@@ -4308,6 +4594,13 @@ public struct ImageJobStatus: Codable, Sendable {
   public let durationMs: Int?
   public let error: String?
   public let elapsedMs: Int
+  /// #1479: set when this job asked to preempt an in-flight video render but
+  /// the refusal guard declined — the job still ran normally (just queued),
+  /// `etaSec` is the guard's projected remaining seconds. Both Optional (not
+  /// merely defaulted) so `Codable`'s synthesized decode tolerates JSON that
+  /// predates this field.
+  public let preemptRefused: Bool?
+  public let etaSec: Double?
 }
 
 /// Internal mutable state for a tracked async image generation job.
@@ -4320,6 +4613,10 @@ private final class ImageJob: @unchecked Sendable {
   var durationMs: Int?
   var error: String?
   var completedAt: Date?
+  /// #1479: set once, before the job is enqueued, if `attemptPreemption`
+  /// refused it.
+  var preemptRefused: Bool?
+  var etaSec: Double?
 
   init(id: String, source: String) {
     self.id = id
@@ -4334,7 +4631,8 @@ private final class ImageJob: @unchecked Sendable {
   func toStatus() -> ImageJobStatus {
     ImageJobStatus(
       jobId: id, status: state, source: source, outputPath: outputPath,
-      durationMs: durationMs, error: error, elapsedMs: elapsedMs
+      durationMs: durationMs, error: error, elapsedMs: elapsedMs,
+      preemptRefused: preemptRefused, etaSec: etaSec
     )
   }
 }
@@ -4375,6 +4673,47 @@ final class ImageJobTracker: @unchecked Sendable {
     return job.toStatus()
   }
 
+  /// #1479: submit-and-poll with a preemption attempt tried FIRST, inside
+  /// this job's own detached Task. `preemptor` is `WarmServer.attemptPreemption`
+  /// bound to this payload — kept as a closure (rather than a direct
+  /// dependency on `WarmServer`) so `ImageJobTracker`'s state machine stays
+  /// unit-testable in isolation, matching the file's existing convention.
+  /// `.notApplicable` (flag absent/false, no video rendering, nested
+  /// preemption) takes the EXACT SAME `coordinator.enqueueGenerate` path
+  /// `submit` above does.
+  fileprivate func submitPreempting(
+    _ payload: GeneratePayload, source: String, coordinator: WarmServerCoordinator, rawBody: Data? = nil,
+    preemptor: @escaping @Sendable () async -> WarmServer.PreemptionOutcome
+  ) -> ImageJobStatus {
+    let jobId = UUID().uuidString
+    let job = ImageJob(id: jobId, source: source)
+    lock.lock(); jobs[jobId] = job; lock.unlock()
+
+    Task { [weak self] in
+      guard let self else { return }
+      switch await preemptor() {
+      case .ran(let result):
+        self.markSucceeded(jobId, result: result)
+        return
+      case .ranFailed(let error):
+        self.markFailed(jobId, error: error)
+        return
+      case .refused(let eta):
+        self.markPreemptRefused(jobId, eta: eta)
+      case .notApplicable:
+        break
+      }
+      self.markProcessing(jobId)
+      do {
+        let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
+        self.markSucceeded(jobId, result: result)
+      } catch {
+        self.markFailed(jobId, error: error)
+      }
+    }
+    return job.toStatus()
+  }
+
   func status(jobId: String) -> ImageJobStatus? {
     lock.lock(); defer { lock.unlock() }
     return jobs[jobId]?.toStatus()
@@ -4382,6 +4721,15 @@ final class ImageJobTracker: @unchecked Sendable {
 
   private func markProcessing(_ jobId: String) {
     lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
+  }
+
+  /// #1479: the refusal guard declined — this job still queues normally
+  /// right after (see `submitPreempting`), just annotated.
+  private func markPreemptRefused(_ jobId: String, eta: Double) {
+    lock.lock()
+    jobs[jobId]?.preemptRefused = true
+    jobs[jobId]?.etaSec = eta
+    lock.unlock()
   }
 
   private func markSucceeded(_ jobId: String, result: GenerateResponse) {
@@ -4522,7 +4870,7 @@ final class VideoJobTracker: @unchecked Sendable {
     resolvedConfig: [LTX2ResolvedParam]? = nil,
     tracePayload: [String: String] = [:],
     wantsAudio: Bool = false,
-    render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
+    render: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome
   ) -> VideoJobStatus {
     let (jobId, queued) = register(
       source: source, mode: mode, resolvedConfig: resolvedConfig,
@@ -4531,7 +4879,9 @@ final class VideoJobTracker: @unchecked Sendable {
       guard let self else { return }
       self.markProcessing(jobId)
       do {
-        let result = try await coordinator.enqueueLocalVideo(wantsAudio: wantsAudio) { coordReport in
+        // #1479: pass this job's tracker id so the coordinator can mark it
+        // paused-for-preemption / resumed by id (see `enqueueLocalVideo`).
+        let result = try await coordinator.enqueueLocalVideo(wantsAudio: wantsAudio, videoJobId: jobId) { coordReport in
           try render { pct in
             // Fan progress to both the coordinator's health/queue trackers and
             // this job's own status.
@@ -4583,6 +4933,20 @@ final class VideoJobTracker: @unchecked Sendable {
     lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
     traceStore?.append(RenderTraceEvent(
       renderId: jobId, event: .started, taskKind: .videoRender, payload: [:]))
+  }
+
+  /// #1479: checkpointed for an in-flight preemption — not terminal, no trace
+  /// event (the trace store's `.terminal` kind means "done"; this isn't).
+  func markPausedForPreemption(_ jobId: String) {
+    lock.lock(); jobs[jobId]?.state = .pausedForPreemption; lock.unlock()
+  }
+
+  /// #1479: the preempting image job finished (success or failure) and the
+  /// video render resumed. Reuses `.processing` — this job was never
+  /// "finished" from the tracker's point of view, so there is no distinct
+  /// "resumed" state to model.
+  func markResumedFromPreemption(_ jobId: String) {
+    lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
   }
 
   func setProgress(_ jobId: String, _ percent: Int) {
@@ -4758,11 +5122,48 @@ private actor WarmServerCoordinator {
   /// image render can restore exactly that model.
   private var lastActiveImageSpec: String?
 
-  init(configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder, liveHealth: LiveHealthState) {
+  // MARK: - #1479 preemption
+
+  /// Async-video job tracker, so the coordinator can mark the render
+  /// paused-for-preemption / resumed by job id (nil for the synchronous
+  /// `/v1/video/generate` path, which has no tracker entry).
+  private let videoJobTracker: VideoJobTracker
+  /// Installed on every LTX-2 generator instance (`prepareLocalVideo` wires
+  /// the initial one; re-wired here on a fresh post-eviction instance).
+  private let ltx2Telemetry: LTX2PhaseTelemetry
+  private let ltx2PreemptionSignal: PreemptionSignal
+  private let ltx2StepPosition: LTX2StepPosition
+  private let ltx2EvictMean: RollingMeanSec
+  private let ltx2ReloadMean: RollingMeanSec
+  /// Cleared unconditionally once a preemption episode is fully resolved
+  /// (resumed or handed to the checkpoint-fallback watchdog) — see
+  /// `runPreemptionEpisode`'s defer.
+  private let preemptionInFlight: LockedFlag
+  private let pendingPreemptorBox: PendingPreemptorBox
+  /// The one checkpoint this coordinator may hold at a time (spec: hold
+  /// exactly one checkpoint; nested preemption refused separately via
+  /// `preemptionInFlight`). Non-nil only for the span between the video
+  /// render yielding and the video being resumed.
+  private var checkpointedVideo: LTX2ResumeState?
+
+  init(
+    configuration: WarmServerConfiguration, logger: Logger, videoHolder: VideoGeneratorHolder, liveHealth: LiveHealthState,
+    videoJobTracker: VideoJobTracker, ltx2Telemetry: LTX2PhaseTelemetry, ltx2PreemptionSignal: PreemptionSignal,
+    ltx2StepPosition: LTX2StepPosition, ltx2EvictMean: RollingMeanSec, ltx2ReloadMean: RollingMeanSec,
+    preemptionInFlight: LockedFlag, pendingPreemptorBox: PendingPreemptorBox
+  ) {
     self.configuration = configuration
     self.logger = logger
     self.videoHolder = videoHolder
     self.liveHealth = liveHealth
+    self.videoJobTracker = videoJobTracker
+    self.ltx2Telemetry = ltx2Telemetry
+    self.ltx2PreemptionSignal = ltx2PreemptionSignal
+    self.ltx2StepPosition = ltx2StepPosition
+    self.ltx2EvictMean = ltx2EvictMean
+    self.ltx2ReloadMean = ltx2ReloadMean
+    self.preemptionInFlight = preemptionInFlight
+    self.pendingPreemptorBox = pendingPreemptorBox
     self.pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
     self.activeLoRAs = configuration.initialLoRAs
     self.modelPool = ModelPool(
@@ -4819,6 +5220,157 @@ private actor WarmServerCoordinator {
   @discardableResult
   func shedInactivePoolModelUnderPressure() async -> Int {
     await modelPool.releaseLRUInactive()
+  }
+
+  // MARK: - #1479 preemption orchestration
+  //
+  // Entered from the `.localVideo` case in `processLoop` when
+  // `body(report)` (or a prior `resume(from:)`) returns `.yielded` — i.e.
+  // `ltx2PreemptionSignal` was raised by an image job's route handler
+  // (`WarmServer.attemptPreemption`, which runs BEFORE any actor call — see
+  // the block comment above `RollingMeanSec`) and the render loop observed
+  // it at a step boundary. Everything from here on runs on the actor, in the
+  // SAME Task that was blocked inside the video's synchronous render, so no
+  // further actor hop is needed to reach `pipeline`/`runGenerate`/etc.
+
+  /// Does the preempting image job's memory footprint fit alongside the
+  /// resident (now-idle, checkpointed) video weights, letting the fast path
+  /// skip the evict+reload round trip entirely (spec: "fast path performs no
+  /// weight reload")? The image family isn't resolved until deep inside
+  /// `runGenerate` -> `poolLoad`, so this is a conservative floor rather than
+  /// an exact fit check — wrongly evicting costs a reload; wrongly NOT
+  /// evicting risks an OOM mid-preemption, so the floor errs conservative
+  /// (12GB comfortably covers any single quantized Z-Image/Krea/Flux family
+  /// checkpoint this server loads).
+  private func imageFitsAlongsideVideo() -> Bool {
+    let floor: UInt64 = 12 * 1024 * 1024 * 1024
+    return MemoryProbe.systemAvailableMemoryBytes() > floor
+  }
+
+  /// Rebuild the LTX-2 generator after an eviction. After `videoHolder
+  /// .release()` the previous instance (and anything it had wired) is gone —
+  /// this is a cold start by the exact same resolution `prepareLocalVideo`
+  /// uses, publishing the fresh instance into `videoHolder` so the rest of
+  /// the codebase (admission, `/health`, later renders) sees it immediately.
+  private func reloadVideoGeneratorAfterEviction() async throws -> LTX2VideoGenerator {
+    guard let weights = configuration.ltx2WeightsPath, let gemma = configuration.ltx2GemmaPath else {
+      throw WarmServerError.invalidRequest(
+        message: "#1479: LTX-2 not configured — cannot reload after a preemption eviction")
+    }
+    let weightsURL = try await ModelResolution.resolve(
+      modelSpec: weights,
+      filePatterns: ["transformer-distilled.safetensors", "connector.safetensors",
+                      "vae_decoder.safetensors", "vae_encoder.safetensors", "config.json"]
+    )
+    let gemmaURL = try await ModelResolution.resolve(
+      modelSpec: gemma,
+      filePatterns: ["*.safetensors", "*.json", "tokenizer/*", "*.model"]
+    )
+    let gen = LTX2VideoGenerator(
+      config: .init(weightsDir: weightsURL.path, gemmaPath: gemmaURL.path), logger: logger)
+    videoHolder.set(gen)
+    return gen
+  }
+
+  /// Reload (if evicted) and resume the checkpointed video render.
+  ///
+  /// Two binding constraints from Task 4's reviews, enforced HERE so no call
+  /// site can get them wrong: (1) a fresh post-eviction instance has no
+  /// signal/telemetry wired (`VideoGeneratorHolder.release()` deallocates the
+  /// old one) — re-wired unconditionally below; (2) the signal MUST be
+  /// cleared before `resume(from:)` — resuming with it still raised yields a
+  /// zero-progress spin by design.
+  ///
+  /// Throws on failure (config drift, missing generator) — the caller's
+  /// `continuation` then resumes with the error, i.e. the video job fails
+  /// loudly. No silent restart from step 0 (spec, Error handling).
+  private func resumeCheckpointedVideo(
+    state: LTX2ResumeState, evicted: Bool, report: @escaping @Sendable (Int) -> Void
+  ) async throws -> LTX2RenderOutcome {
+    let gen: LTX2VideoGenerator
+    if evicted {
+      // Mirror a cold video start: vacate image models first (single-heavy-
+      // model residency, #218) before the ~65GB video stack reloads.
+      _ = await releaseImageModelsForVideo()
+      let t0 = Date()
+      gen = try await reloadVideoGeneratorAfterEviction()
+      ltx2ReloadMean.record(Date().timeIntervalSince(t0))
+    } else if let existing = videoHolder.get() {
+      gen = existing
+    } else {
+      // Not evicted by this episode, yet nothing is resident — something
+      // else released it out from under the checkpoint (e.g. the memory-
+      // pressure guard). Fail loudly rather than silently restart.
+      throw WarmServerError.invalidRequest(
+        message: "#1479: LTX-2 generator missing on resume — no eviction was recorded for this episode, but nothing is resident")
+    }
+    gen.setPreemptionSignal(ltx2PreemptionSignal)
+    gen.setTelemetry(ltx2Telemetry)
+    ltx2PreemptionSignal.clear()
+    return try gen.resume(from: state) { chunk, totalChunks, step, totalSteps in
+      report(WarmServer.localVideoProgressPercent(chunk: chunk, totalChunks: totalChunks, step: step, totalSteps: totalSteps))
+    }
+  }
+
+  /// The full preemption episode: checkpoint received -> run the preempting
+  /// image job -> ALWAYS resume the video.
+  ///
+  /// The always-resume guarantee is the `defer` below: `runGenerate` never
+  /// throws past its own boundary (every internal failure already resolves
+  /// `claimed.continuation` via `continuation.resume(throwing:)`), so control
+  /// always reaches the `defer`, whether the image job succeeded, failed, or
+  /// (via the `guard let claimed` branch) was never claimed at all. A failed
+  /// preemptor therefore costs the video nothing but the wall-clock time it
+  /// ran (spec, Error handling).
+  private func runPreemptionEpisode(
+    state: LTX2ResumeState, videoJobId: String?, report: @escaping @Sendable (Int) -> Void
+  ) async throws -> LTX2RenderOutcome {
+    checkpointedVideo = state
+    if let videoJobId { videoJobTracker.markPausedForPreemption(videoJobId) }
+    publishHealth()
+
+    defer {
+      checkpointedVideo = nil
+      if let videoJobId { videoJobTracker.markResumedFromPreemption(videoJobId) }
+      // Idempotent: the checkpoint-fallback watchdog may have already
+      // cleared this if it raced ahead of the yield.
+      preemptionInFlight.clear()
+    }
+
+    guard let claimed = pendingPreemptorBox.claim() else {
+      // The checkpoint-fallback watchdog already handled this preemptor (it
+      // raced ahead of the yield, or the render finished on its own before
+      // the signal was observed) — nothing left to run. Resume immediately.
+      logger.warning("#1479: video yielded but no preemptor was waiting (checkpoint-fallback watchdog already handled it) — resuming immediately")
+      return try await resumeCheckpointedVideo(state: state, evicted: false, report: report)
+    }
+
+    logger.info("#1479: video checkpointed at chunk \(state.chunkIndex), phase \(state.phase.rawValue), step \(state.stepIndex) — running preempting image job (source=\(claimed.source))")
+
+    let originalActiveJobId = activeJobId
+    let evicted = !imageFitsAlongsideVideo()
+    if evicted {
+      let t0 = Date()
+      videoHolder.release()
+      ltx2EvictMean.record(Date().timeIntervalSince(t0))
+      logger.info("#1479: evicted LTX-2 video weights to admit the preempting image job")
+    } else {
+      logger.info("#1479: preempting image job fits alongside resident video weights — fast path, no eviction")
+    }
+
+    // Run the image job exactly as a normal render — the same actor method
+    // every non-preempting `.generate` job runs, including its own
+    // model/LoRA application and (since `imageModelsEvicted` is already true
+    // whenever a video is resident, #218) its own image-model reload.
+    await runGenerate(claimed.payload, continuation: claimed.continuation)
+
+    // runGenerate's own defer clears activeJobId/progress/preview — restore
+    // the video's identity before its (possibly long, synchronous) resume so
+    // /health and /v1/queue keep reporting the video job while it resumes.
+    activeJobId = originalActiveJobId
+    publishHealth()
+
+    return try await resumeCheckpointedVideo(state: state, evicted: evicted, report: report)
   }
 
   func prepare() async throws {
@@ -5282,7 +5834,8 @@ private actor WarmServerCoordinator {
   /// live render without an actor hop (mirrors the image render path, #217).
   func enqueueLocalVideo(
     wantsAudio: Bool = false,
-    _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult
+    videoJobId: String? = nil,
+    _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome
   ) async throws -> LTX2VideoResult {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -5292,7 +5845,7 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation), wantsAudio: wantsAudio)))
+      pending.append(PendingJob(operation: .localVideo(body, ContinuationBox(continuation), wantsAudio: wantsAudio, videoJobId: videoJobId)))
       startProcessingIfNeeded()
     }
   }
@@ -5430,7 +5983,7 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
       cont.resume(throwing: ServerError.cancelled)
-    case .localVideo(_, let cont, _):
+    case .localVideo(_, let cont, _, _):
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
       cont.resume(throwing: ServerError.cancelled)
@@ -5580,7 +6133,7 @@ private actor WarmServerCoordinator {
         } catch {
           continuation.resume(throwing: error)
         }
-      case .localVideo(let body, let continuation, let wantsAudio):
+      case .localVideo(let body, let continuation, let wantsAudio, let videoJobId):
         // Runs on the serial queue so LTX-2 never shares the GPU with a render.
         activeRenderStartedAt = Date()
         // activeJobId is set from job.id at the top of the loop.
@@ -5656,9 +6209,20 @@ private actor WarmServerCoordinator {
             videoHolder.endRender()
             progress.set(nil)
             health.setProgress(nil)
+            ltx2StepPosition.clear()
           }
           do {
-            continuation.resume(returning: try body(report))
+            // #1479: body() may hand back a checkpoint instead of a finished
+            // clip (a `preempt: true` image job raised the signal). Loop
+            // rather than recurse: a resume can itself yield again (a second,
+            // later preemption), and each iteration is handled identically.
+            var outcome = try body(report)
+            while case .yielded(let state) = outcome {
+              outcome = try await runPreemptionEpisode(state: state, videoJobId: videoJobId, report: report)
+            }
+            if case .completed(let result) = outcome {
+              continuation.resume(returning: result)
+            }
           } catch {
             continuation.resume(throwing: error)
           }
@@ -6752,6 +7316,11 @@ struct GeneratePayload: Sendable {
   let controlnetStrength: Float?
   let controlImage: String?  // Mac-side control map path (e.g. depth), read in place
 
+  /// #1479: request an in-flight LTX-2 video render be checkpointed so this
+  /// image job can run immediately, resuming the video afterward. Additive,
+  /// default absent/false — omitting it is byte-identical to today.
+  let preempt: Bool?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -6767,8 +7336,10 @@ struct GeneratePayload: Sendable {
     maskPath: String? = nil, maskRegion: String? = nil, maskInvert: Bool? = nil,
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil,
-    controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil
+    controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
+    preempt: Bool? = nil
   ) {
+    self.preempt = preempt
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -6819,6 +7390,7 @@ extension GeneratePayload: Decodable {
     case controlnetStrength
     case controlImage
     case model, loras
+    case preempt
   }
 
   init(from decoder: Decoder) throws {
@@ -6865,6 +7437,7 @@ extension GeneratePayload: Decodable {
     controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
+    preempt = try c.decodeIfPresent(Bool.self, forKey: .preempt)
   }
 
   /// The DyPE configuration this payload implies at the given resolution.
@@ -7087,6 +7660,23 @@ private struct GenerateResponse: Encodable, Sendable {
   let success: Bool
   let outputPath: String
   let durationMs: Int
+  /// #1479: set on the SYNC `/v1/generate` path when this job asked to
+  /// preempt an in-flight video but the refusal guard declined (finishing
+  /// beats preempting) — the job still ran normally, just not preempting.
+  /// Additive: defaulted in this explicit init (a property-level default
+  /// would DROP the parameter from the synthesized memberwise init entirely,
+  /// making it impossible to ever construct a `true`/non-nil one), so every
+  /// pre-#1479 construction site is unaffected.
+  let preemptRefused: Bool
+  let etaSec: Double?
+
+  init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil) {
+    self.success = success
+    self.outputPath = outputPath
+    self.durationMs = durationMs
+    self.preemptRefused = preemptRefused
+    self.etaSec = etaSec
+  }
 }
 
 // MARK: - Upscale Payload & Response
@@ -7301,7 +7891,13 @@ private enum QueuedOperation: Sendable {
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
   /// Local LTX-2 video generation, run through the queue so it serializes with
   /// image renders on the shared GPU. The closure captures the generator+request.
-  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2VideoResult, ContinuationBox<LTX2VideoResult>, wantsAudio: Bool)
+  /// #1479: the closure returns `LTX2RenderOutcome` (not the bare result) so
+  /// the process loop can observe a `.yielded` checkpoint and run a
+  /// preemption episode before finally resolving `continuation` with the
+  /// completed `LTX2VideoResult`. `videoJobId` is the async tracker's id
+  /// (nil for the synchronous `/v1/video/generate` path), used to mark the
+  /// job paused-for-preemption / resumed in `VideoJobTracker`.
+  case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome, ContinuationBox<LTX2VideoResult>, wantsAudio: Bool, videoJobId: String?)
   case shutdown(ContinuationBox<ShutdownResponse>)
 }
 
