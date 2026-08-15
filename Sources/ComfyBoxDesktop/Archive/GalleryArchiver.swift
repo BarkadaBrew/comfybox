@@ -437,8 +437,10 @@ public final class GalleryArchiver {
         let destPathCandidate = (destDir as NSString).appendingPathComponent(entry.filename)
 
         if let liveAsset = liveById[entry.id] {
-            if liveAsset.absolutePath == destPathCandidate {
-                // Same id, same location — this is the live asset itself.
+            let sameLocation = liveAsset.absolutePath == destPathCandidate
+            if sameLocation && FileManager.default.fileExists(atPath: liveAsset.absolutePath) {
+                // Same id, same location, and the file is genuinely still
+                // there — this is the live asset itself.
                 guard request.overwriteExistingMetadata else {
                     return nil
                 }
@@ -447,30 +449,47 @@ public final class GalleryArchiver {
                 )
                 await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
                 return RestoreOutcome(kind: .restored, resolvedId: stored.id, renamed: false)
+            } else if sameLocation {
+                // Same id, same recorded path, but the file is gone — an
+                // orphaned row (pruneOrphans() exists precisely because this
+                // happens). The archived id is a dead reference to the same
+                // asset and is legitimately reclaimable: restore it for
+                // real rather than reporting a false "skipped", regardless
+                // of overwriteExistingMetadata.
+                return try await performCopyAndInsert(
+                    entry: entry, bundleRoot: bundleRoot, destDir: destDir, id: entry.id, kind: .restored
+                )
             } else {
                 // The id is taken by an unrelated asset — mint a fresh id so
                 // both rows survive.
-                let (finalPath, skipCopy, renamed) = try await resolveDestinationPath(destDir: destDir, entry: entry)
-                if !skipCopy {
-                    try await copyEntry(entry: entry, bundleRoot: bundleRoot, destPath: finalPath)
-                }
-                let stored = try await store.insertAsset(
-                    entry.toDAMAsset(absolutePath: finalPath, id: UUID().uuidString)
+                return try await performCopyAndInsert(
+                    entry: entry, bundleRoot: bundleRoot, destDir: destDir, id: UUID().uuidString, kind: .reIdentified
                 )
-                await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
-                return RestoreOutcome(kind: .reIdentified, resolvedId: stored.id, renamed: renamed)
             }
         } else {
-            let (finalPath, skipCopy, renamed) = try await resolveDestinationPath(destDir: destDir, entry: entry)
-            if !skipCopy {
-                try await copyEntry(entry: entry, bundleRoot: bundleRoot, destPath: finalPath)
-            }
-            let stored = try await store.insertAsset(
-                entry.toDAMAsset(absolutePath: finalPath, id: entry.id)
+            return try await performCopyAndInsert(
+                entry: entry, bundleRoot: bundleRoot, destDir: destDir, id: entry.id, kind: .restored
             )
-            await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
-            return RestoreOutcome(kind: .restored, resolvedId: stored.id, renamed: renamed)
         }
+    }
+
+    /// Resolves the destination filename collision, copies the entry's file
+    /// (unless it's already there under a different name and content-equal),
+    /// inserts the DAM row under `id`, and restores/regenerates the
+    /// thumbnail. Shared by the free, orphaned-same-path, and re-ID cases —
+    /// they differ only in which id to insert under and how to count it.
+    private func performCopyAndInsert(
+        entry: ArchivedAsset, bundleRoot: URL, destDir: String, id: String, kind: RestoreOutcome.Kind
+    ) async throws -> RestoreOutcome {
+        let (finalPath, skipCopy, renamed) = try await resolveDestinationPath(destDir: destDir, entry: entry)
+        if !skipCopy {
+            try await copyEntry(entry: entry, bundleRoot: bundleRoot, destPath: finalPath)
+        }
+        let stored = try await store.insertAsset(
+            entry.toDAMAsset(absolutePath: finalPath, id: id)
+        )
+        await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
+        return RestoreOutcome(kind: kind, resolvedId: stored.id, renamed: renamed)
     }
 
     /// `restoreToOriginalLocations` targets the archived original path's

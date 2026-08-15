@@ -411,6 +411,81 @@ struct GalleryArchiverTests {
         #expect(assetCount == 1)
     }
 
+    // MARK: - Restore: id collision — orphaned row (same id/path, file missing)
+
+    @Test("orphaned row (same id, same recorded path, file missing): the skip branch still restores the file for real")
+    @MainActor
+    func restoreReclaimsOrphanedRowOnSkipBranch() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "OrphanSkipTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+
+        // A live row re-appears at the archived id and the same recorded
+        // path, but the backing file was deleted out from under the DB
+        // (e.g. removed from Finder — the exact state pruneOrphans() exists
+        // to clean up).
+        let destPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        let orphan = DAMAsset(id: asset.id, filename: "render.png", absolutePath: destPath, fileSize: 999, rating: 5)
+        try await env.store.insertAsset(orphan)
+        #expect(!FileManager.default.fileExists(atPath: destPath))
+
+        let restoreResult = try await env.archiver.restore(
+            .init(bundlePath: archiveResult.bundlePath, overwriteExistingMetadata: false)
+        )
+        #expect(restoreResult.restored == 1)
+        #expect(restoreResult.skipped == 0)
+        #expect(restoreResult.reIdentified == 0)
+        #expect(restoreResult.failed.isEmpty)
+
+        #expect(FileManager.default.fileExists(atPath: destPath))
+        let live = try await env.store.fetchAsset(byPath: destPath)
+        #expect(live?.id == asset.id)
+        let assetCount = try await env.store.assetCount()
+        #expect(assetCount == 1)
+    }
+
+    @Test("orphaned row (same id, same recorded path, file missing): the overwrite branch restores the file and reverts metadata")
+    @MainActor
+    func restoreReclaimsOrphanedRowOnOverwriteBranch() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        let ratedAsset = DAMAsset(
+            id: asset.id, filename: asset.filename, absolutePath: asset.absolutePath,
+            fileSize: asset.fileSize, rating: 2
+        )
+        let stored = try await env.store.insertAsset(ratedAsset)
+        makeThumbnail(for: stored.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "OrphanOverwriteTest", destinationRoot: env.archiveRoot, assets: [stored])
+        )
+
+        let destPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        let orphan = DAMAsset(id: asset.id, filename: "render.png", absolutePath: destPath, fileSize: 999, rating: 5)
+        try await env.store.insertAsset(orphan)
+        #expect(!FileManager.default.fileExists(atPath: destPath))
+
+        let restoreResult = try await env.archiver.restore(
+            .init(bundlePath: archiveResult.bundlePath, overwriteExistingMetadata: true)
+        )
+        #expect(restoreResult.restored == 1)
+        #expect(restoreResult.skipped == 0)
+        #expect(restoreResult.reIdentified == 0)
+        #expect(restoreResult.failed.isEmpty)
+
+        #expect(FileManager.default.fileExists(atPath: destPath))
+        let live = try await env.store.fetchAsset(byPath: destPath)
+        #expect(live?.rating == 2)
+        let assetCount = try await env.store.assetCount()
+        #expect(assetCount == 1)
+    }
+
     // MARK: - Restore: id collision — re-ID
 
     @Test("restore mints a fresh id when the archived id is taken by an asset at a different path; both rows survive")
