@@ -323,6 +323,7 @@ public final class LTX2Pipeline {
       // so a future wiring slip degrades to "resume with last latents"
       // instead of crashing a live render.
       logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
+      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
       latents = s.videoLatents
     }
 
@@ -402,17 +403,27 @@ public final class LTX2Pipeline {
         sigmas: refineSigmas, cfgScale: cfgScale, state: nil, nagEmbeddings: nagEmbeddings, nag: nagConfig,
         forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
         avState: refineAVState,
-        seed: seed,
+        // #1479 codex review: matches the file's existing convention of
+        // decorrelating the refine pass's RNG from the base pass via
+        // `seed &+ 1000` (see the `MLXRandom.seed(seed &+ 1000)` reseed just
+        // above, for `refNoise`) — keeps refine's per-step video noise on a
+        // distinct key sequence from base's, deterministic and resume-safe.
+        seed: seed.map { $0 &+ 1000 },
         loopPhase: .refineDenoise,
         progressCallback: progressCallback) {
-      case .completed(let l): latents = l
+      case .completed(let l):
+        latents = l
+        // #1479 codex review: same fix as applyTwoStageRefine — only commit
+        // the refined audio writeback on genuine completion, never past a
+        // (currently unreachable) .yielded arm's already-captured snapshot.
+        if refineAudio, let av = avState, let rav = refineAVState {
+          av.audioLatents = rav.audioLatents
+        }
       case .yielded(let s):
         // #1479: unreachable while `preemption` stays nil — see base-pass comment.
         logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
+        assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
         latents = s.videoLatents
-      }
-      if refineAudio, let av = avState, let rav = refineAVState {
-        av.audioLatents = rav.audioLatents
       }
       eval(latents)
       MLX.GPU.clearCache()
@@ -549,6 +560,7 @@ public final class LTX2Pipeline {
     case .yielded(let s):
       // #1479: unreachable while `preemption` stays nil — see generateT2V.
       logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
+      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
       latents = s.videoLatents
     }
 
@@ -791,6 +803,7 @@ public final class LTX2Pipeline {
     case .yielded(let s):
       // #1479: unreachable while `preemption` stays nil — see generateT2V.
       logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
+      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
       latentsAll = s.videoLatents
     }
 
@@ -994,6 +1007,7 @@ public final class LTX2Pipeline {
     case .yielded(let s):
       // #1479: unreachable while `preemption` stays nil — see generateT2V.
       logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
+      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
       latents = s.videoLatents
     }
 
@@ -1800,17 +1814,28 @@ public final class LTX2Pipeline {
       sigmas: refineSigmas, cfgScale: cfgScale, state: refState,
       forceDeterministic: ProcessInfo.processInfo.environment["LTX2_REFINE_DETERMINISTIC"] != "0",
       avState: refineAVState,
-      seed: seed,
+      // #1479 codex review: see the T2V inline refine call site's comment —
+      // matches this file's existing `seed &+ 1000` refine-decorrelation
+      // convention (the `MLXRandom.seed(seed &+ 1000)` reseed above, for
+      // `refNoise`).
+      seed: seed.map { $0 &+ 1000 },
       loopPhase: .refineDenoise,
       progressCallback: progressCallback) {
-    case .completed(let l): refined = l
+    case .completed(let l):
+      refined = l
+      // #1479 codex review: this writeback must only happen on a genuine
+      // completion. Moved inside .completed so a (currently unreachable)
+      // .yielded arm never commits partially-stepped refine audio into the
+      // caller's AV state past the point the LTX2ResumeState snapshot
+      // already captured it.
+      if let av = avState, let refAV = refineAVState {
+        av.audioLatents = refAV.audioLatents  // propagate refined audio back to the caller's state
+      }
     case .yielded(let s):
       // #1479: unreachable while `preemption` stays nil — see generateT2V.
       logger.warning("denoisingLoop yielded unexpectedly at step \(s.stepIndex) with no preemption signal wired; continuing with last-known latents.")
+      assertionFailure("denoisingLoop yielded with no preemption wired — Task 4 must reshape this site")
       refined = s.videoLatents
-    }
-    if let av = avState, let refAV = refineAVState {
-      av.audioLatents = refAV.audioLatents  // propagate refined audio back to the caller's state
     }
     eval(refined)
     rowStats("refined", refined)

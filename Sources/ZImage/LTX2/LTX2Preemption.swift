@@ -24,9 +24,21 @@ public let ltx2VideoNoiseKeyBase: UInt64 = 0xD0D10
 /// Seeded: per-step derived key -> independent of global stream position,
 /// which is exactly what makes bit-identical resume possible.
 /// Unseeded: plain global stream, byte-for-byte the pre-#1479 behaviour.
+///
+/// The step term is multiplied by a large odd constant (golden-ratio-derived,
+/// same one MLX/xxhash-style mixers use) before folding into the key. Do NOT
+/// simplify this back to a bare `&+ UInt64(step)` — the production chunk
+/// scheduler derives each chunk's seed as `request.seed + UInt64(chunk)`
+/// (`LTX2VideoGenerator.swift`), so with a bare step offset, chunk `c` step
+/// `i` and chunk `c+1` step `i-1` fold to the identical key
+/// (`seed + c + i == seed + (c+1) + (i-1)`) — every multi-chunk render was
+/// silently reusing bit-identical noise tensors across chunk/step pairs
+/// (codex review, 2026-08-15). Multiplying the step by a constant that isn't
+/// 1 makes `chunk_delta == step_delta` impossible to satisfy for any nonzero
+/// chunk/step deltas actually produced by the scheduler.
 public func ancestralVideoNoise(shape: [Int], seed: UInt64?, step: Int) -> MLXArray {
   if let seed {
-    let key = MLXRandom.key(seed &+ ltx2VideoNoiseKeyBase &+ UInt64(step))
+    let key = MLXRandom.key(seed &+ ltx2VideoNoiseKeyBase &+ (UInt64(step) &* 0x9E37_79B9_7F4A_7C15))
     return MLXRandom.normal(shape, key: key).asType(.float32)
   }
   return MLXRandom.normal(shape, dtype: .float32)

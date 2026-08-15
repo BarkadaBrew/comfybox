@@ -80,9 +80,10 @@ destroys the stream position.
 save/restore**, so snapshotting the RNG is not available.
 
 **Resolution:** derive per-step keys when a seed is supplied —
-`MLXRandom.key(seed &+ 0xD0D10 &+ UInt64(step))`, using a base constant
-distinct from the audio path's `0xA0D10/11/12` so the two streams cannot
-collide — following the convention this
+`MLXRandom.key(seed &+ 0xD0D10 &+ (UInt64(step) &* 0x9E37_79B9_7F4A_7C15))`,
+using a base constant distinct from the audio path's `0xA0D10/11/12` so the
+two streams cannot collide, and the step multiplied by a large odd constant
+before folding in — following the convention this
 file already uses for audio (`:288`, `:299`, `:364`:
 `MLXRandom.key(seed &+ 0xA0D10 / 11 / 12)`, a pattern with a codex-review note
 attached at `:286`). This is stronger than a naming convention: the audio step
@@ -92,7 +93,14 @@ global-stream video draw. The video-side change applies a mechanism the same
 loop already proves out. Verified: there is exactly ONE global draw per step
 in either SDE branch (`:1300`, `:1310`), so a per-step derived key maps 1:1;
 and the sampler carries no cross-step momentum — latents plus RNG discipline
-is the entire loop-carried state. Unseeded runs keep the global stream, which the code
+is the entire loop-carried state. The step multiplier is not cosmetic: the
+production chunk scheduler derives each chunk's seed as
+`request.seed + UInt64(chunk)` (`LTX2VideoGenerator.swift`), so a bare
+`&+ UInt64(step)` term makes chunk `c` step `i` and chunk `c+1` step `i-1`
+fold to the identical key — every multi-chunk ancestral render was reusing
+bit-identical noise tensors across chunk/step pairs (codex review,
+2026-08-15) — the large odd multiplier makes that collision unreachable.
+Unseeded runs keep the global stream, which the code
 keeps deliberately so unseeded noise varies; a render with no seed makes no
 reproducibility promise, so a fresh draw on resume is fine.
 
