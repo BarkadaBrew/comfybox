@@ -39,6 +39,9 @@ struct GalleryView: View {
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
     @Binding var searchFocusRequests: Int
+    /// Incremented by the "Gallery Health" palette command; consumed to open
+    /// the maintenance sheet. Same counter-binding trick as `searchFocusRequests`.
+    @Binding var maintenanceRequests: Int
 
     @State private var assets: [DAMAsset] = []
     @State private var searchText: String = ""
@@ -128,6 +131,9 @@ struct GalleryView: View {
     // Folder import (Photo Mechanic-style "add existing folder")
     @State private var importProgress: (done: Int, total: Int)?
     @State private var importSummary: String?
+
+    // Gallery Health / maintenance sheet (T11)
+    @State private var showMaintenance: Bool = false
 
     // Archiving (moves assets to a .cbarchive bundle)
     @State private var showArchiveSheet: Bool = false
@@ -315,9 +321,14 @@ struct GalleryView: View {
         }
         .onAppear {
             consumeSearchFocusRequest()
+            consumeMaintenanceRequest()
             smartTabs = SmartTabStore.load()
         }
         .onChange(of: searchFocusRequests) { _, _ in consumeSearchFocusRequest() }
+        .onChange(of: maintenanceRequests) { _, _ in consumeMaintenanceRequest() }
+        .sheet(isPresented: $showMaintenance) {
+            GalleryMaintenanceView(store: store, ingestor: ingestor, archiver: archiver)
+        }
         .onKeyPress(.space) {
             if let asset = selectedAsset {
                 quickLookAsset(asset)
@@ -571,6 +582,13 @@ struct GalleryView: View {
                 Image(systemName: "arrow.clockwise")
             }
             .help("Refresh gallery")
+
+            // Gallery Health (orphan thumbnails, missing assets, regenerate,
+            // incomplete archives)
+            Button { showMaintenance = true } label: {
+                Image(systemName: "stethoscope")
+            }
+            .help("Gallery health & maintenance")
 
             // Asset count
             Text("\(filteredAssets.count) images")
@@ -1324,6 +1342,14 @@ struct GalleryView: View {
         searchFocusRequests = 0
         // Defer a tick so the field is in the hierarchy before focusing.
         Task { focusSearch() }
+    }
+
+    /// Consume a pending "Gallery Health" palette request by opening the
+    /// maintenance sheet.
+    private func consumeMaintenanceRequest() {
+        guard maintenanceRequests > 0 else { return }
+        maintenanceRequests = 0
+        showMaintenance = true
     }
 
     private func updateAsset(_ asset: DAMAsset) async {

@@ -488,6 +488,10 @@ struct SettingsView: View {
                     .frame(width: 160)
                     .onChange(of: settings.gallerySortDefault) { _, _ in hasUnsavedChanges = true }
                 }
+
+                Text("Thumbnail cleanup and regeneration live in the Gallery toolbar (stethoscope icon).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

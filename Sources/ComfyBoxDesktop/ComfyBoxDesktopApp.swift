@@ -50,6 +50,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var comparisonAssets: [DAMAsset]?
     @State private var pendingPreset: GenerationPreset?
     @State private var gallerySearchFocusRequests: Int = 0
+    @State private var galleryMaintenanceRequests: Int = 0
     @State private var showCommandPalette = false
     @State private var showSplash = true
 
@@ -384,6 +385,10 @@ struct ComfyBoxDesktopApp: App {
                 title: "Find in Gallery", subtitle: "Gallery", systemImage: "magnifyingglass",
                 keywords: ["search"], action: { selectedTab = .gallery; gallerySearchFocusRequests += 1 }),
             PaletteCommand(
+                title: "Gallery Health", subtitle: "Maintenance", systemImage: "stethoscope",
+                keywords: ["thumbnails", "orphans", "cleanup"],
+                action: { selectedTab = .gallery; galleryMaintenanceRequests += 1 }),
+            PaletteCommand(
                 title: "Open Settings", subtitle: "Preferences", systemImage: "gearshape",
                 keywords: ["preferences", "config", "keys"],
                 action: {
@@ -517,7 +522,8 @@ struct ComfyBoxDesktopApp: App {
                         selectedTab = .inpaint
                     },
                     canvasStore: canvasStore,
-                    searchFocusRequests: $gallerySearchFocusRequests
+                    searchFocusRequests: $gallerySearchFocusRequests,
+                    maintenanceRequests: $galleryMaintenanceRequests
                 )
             } else if let error = initError {
                 errorView(error)
