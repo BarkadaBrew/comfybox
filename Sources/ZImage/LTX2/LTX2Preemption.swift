@@ -39,6 +39,14 @@ public enum LTX2DenoiseResult {
 
 /// Checkpoint = ALL non-weight tensors (spec rule). In-memory only —
 /// deliberately dies with the process, unlike the isPaused sentinel.
+///
+/// CRITICAL: `MLXArray` is a reference type wrapping a lazily-evaluated compute graph.
+/// This initializer **materializes on capture** by calling `eval()` on `videoLatents`,
+/// `audioLatents`, and `audioNoiseKey` before assignment. This enforces the invariant
+/// that a resume state is always a concrete snapshot, never a live graph handle, so
+/// downstream code cannot accidentally alias the checkpoint through in-place mutation.
+/// Note: `eval()` on an already-evaluated array is a cheap no-op (the yield point sits
+/// between steps, where latents are already evaluated).
 public struct LTX2ResumeState {
   public var videoLatents: MLXArray
   public var stepIndex: Int
@@ -49,4 +57,39 @@ public struct LTX2ResumeState {
   public var audioLatents: MLXArray?
   public var audioNoiseKey: MLXArray?
   public var configFingerprint: String
+
+  /// Initialize a resume state, materializing all array fields to ensure
+  /// the checkpoint is a concrete snapshot independent of future mutations.
+  public init(
+    videoLatents: MLXArray,
+    stepIndex: Int,
+    sigmas: [Float],
+    phase: LTX2Phase,
+    chunkIndex: Int,
+    seed: UInt64?,
+    audioLatents: MLXArray?,
+    audioNoiseKey: MLXArray?,
+    configFingerprint: String
+  ) {
+    eval(videoLatents)
+    self.videoLatents = videoLatents
+    self.stepIndex = stepIndex
+    self.sigmas = sigmas
+    self.phase = phase
+    self.chunkIndex = chunkIndex
+    self.seed = seed
+    if let audioLatents {
+      eval(audioLatents)
+      self.audioLatents = audioLatents
+    } else {
+      self.audioLatents = nil
+    }
+    if let audioNoiseKey {
+      eval(audioNoiseKey)
+      self.audioNoiseKey = audioNoiseKey
+    } else {
+      self.audioNoiseKey = nil
+    }
+    self.configFingerprint = configFingerprint
+  }
 }
