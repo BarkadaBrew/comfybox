@@ -158,6 +158,56 @@ final class LTX2PreemptionTests: XCTestCase {
     XCTAssertNotNil(midRefine.refineCleanLatents)
   }
 
+  // MARK: - Forward-only unwind points (review fix, Critical 1)
+
+  /// A boundary the resumed checkpoint has already passed must NOT
+  /// re-checkpoint: doing so regresses a refined render to "refine not
+  /// started" (next resume double-refines) or relabels partially refined
+  /// latents as finished base latents (next resume refines from scratch).
+  func testUnwindPointRefusesToRegressAResumedRender() {
+    // base→refine while resuming a mid-refine or finished-refine checkpoint.
+    XCTAssertFalse(LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: .refineDenoise))
+    XCTAssertFalse(LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: .vaeDecode))
+    // refine→decode while resuming a checkpoint that already reached decode.
+    XCTAssertFalse(LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: .vaeDecode))
+  }
+
+  func testUnwindPointAllowsForwardProgress() {
+    // Fresh render: every boundary is fair game.
+    XCTAssertTrue(LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: nil))
+    XCTAssertTrue(LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: nil))
+    // Resumed mid-base: both later boundaries are real progress.
+    XCTAssertTrue(LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: .baseDenoise))
+    XCTAssertTrue(LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: .baseDenoise))
+    // Resumed mid-refine: the refine actually ran, so refine→decode is forward.
+    XCTAssertTrue(LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: .refineDenoise))
+  }
+
+  func testUnwindRankIsStrictlyOrderedAlongTheRenderPipeline() {
+    let pipelineOrder: [LTX2Phase] = [
+      .modelLoad, .textEncode, .baseDenoise, .refineDenoise, .vaeDecode, .vocoder, .postProcess,
+    ]
+    let ranks = pipelineOrder.map(LTX2UnwindGuard.rank)
+    XCTAssertEqual(ranks, ranks.sorted(), "rank must follow the render's phase order")
+    XCTAssertEqual(Set(ranks).count, ranks.count, "ranks must be distinct or the guard cannot compare")
+  }
+
+  // MARK: - Refine machinery drift (review fix, Important 2)
+
+  /// Two-stage/upsampler config is re-resolved every render. If it drifted off
+  /// while a refine checkpoint was parked, continuing would send a partially
+  /// denoised REFINE-resolution tensor to the decoder as finished work.
+  func testRefineUnavailableOnResumeDescribesTheDrift() {
+    let error = LTX2ResumeError.refineUnavailableOnResume(twoStage: false, upsamplerLoaded: true)
+    let described = error.errorDescription ?? ""
+    XCTAssertTrue(described.contains("two_stage=false"), described)
+    XCTAssertTrue(described.contains("upsampler_loaded=true"), described)
+    XCTAssertNotEqual(
+      error,
+      LTX2ResumeError.refineUnavailableOnResume(twoStage: true, upsamplerLoaded: false),
+      "the two drift modes must be distinguishable")
+  }
+
   /// The checkpoint materializes every array field it stores (Task 2's
   /// invariant) — including the field added for the refine pass.
   func testRefineCleanLatentsAreMaterializedOnCapture() throws {

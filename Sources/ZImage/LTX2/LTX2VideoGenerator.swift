@@ -777,27 +777,41 @@ public final class LTX2VideoGenerator {
         defer { GPU.clearCache() }
         try validate(request)
 
-        // #1479: the continuation box — reused across resumes so the frames
-        // already rendered, the chained seed frame and the accrued render time
-        // survive an eviction that deallocates this generator.
+        // #1479: the continuation the resume came in with, READ-ONLY from here
+        // on. Each checkpoint gets its own fresh box (below), so a render that
+        // yields twice never rewrites a checkpoint the coordinator still holds.
         let ctx = (resume?.context as? LTX2RenderContext) ?? LTX2RenderContext(request: request)
         // Start of THIS render segment. Re-stamped below at the point the
         // pre-#1479 code took its `start`, so a normal render's reported
         // `elapsedSeconds` keeps its old meaning exactly.
         var segmentStart = CFAbsoluteTimeGetCurrent()
-        /// Close out this render segment and hand the checkpoint up, stamping
-        /// the generator-level continuation onto it.
+        /// Close out this render segment and hand the checkpoint up with its
+        /// own snapshot of the generator-level continuation.
+        ///
+        /// The box is COPIED, never mutated in place: `LTX2ResumeState` is a
+        /// materialized snapshot by contract (Task 2), and a shared mutable
+        /// context would quietly break that — a later yield would rewrite the
+        /// chunk index, banked frames and chained seed frame of an earlier
+        /// checkpoint the coordinator is still holding.
         func checkpoint(
             _ s: LTX2ResumeState, chunk: Int, frames: [CGImage],
             audio: MLXArray?, seedImage: MLXArray?
         ) -> LTX2RenderOutcome {
-            ctx.chunkIndex = chunk
-            ctx.frames = frames
-            ctx.audioLatents = audio
-            ctx.chunkSeedImage = chunk > 0 ? seedImage : nil
-            ctx.accumulatedSeconds += max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            let snapshot = LTX2RenderContext(request: ctx.request)
+            snapshot.chunkIndex = chunk
+            snapshot.frames = frames
+            // Materialize on capture, same contract as LTX2ResumeState's own
+            // tensors — a cheap no-op when they are already evaluated, and the
+            // guarantee stops depending on what upstream call sites happen to do.
+            if let audio { eval(audio) }
+            snapshot.audioLatents = audio
+            let chained = chunk > 0 ? seedImage : nil
+            if let chained { eval(chained) }
+            snapshot.chunkSeedImage = chained
+            snapshot.accumulatedSeconds =
+                ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
             var stamped = s
-            stamped.context = ctx
+            stamped.context = snapshot
             logger.info("LTX-2 #1479: yielded at chunk \(chunk), phase \(s.phase.rawValue), step \(s.stepIndex) (\(frames.count) frame(s) banked).")
             return .yielded(stamped)
         }

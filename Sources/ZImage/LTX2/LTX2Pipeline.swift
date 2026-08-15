@@ -492,8 +492,10 @@ public final class LTX2Pipeline {
     }
 
     // #1479 free unwind point: the base→refine boundary. Yielding here costs
-    // nothing and keeps a raised signal from buying a whole refine pass.
-    if preemption?.isRaised == true {
+    // nothing and keeps a raised signal from buying a whole refine pass —
+    // but ONLY when it moves this render forward (see LTX2UnwindGuard).
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .refineDenoise, latents: latents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
@@ -511,6 +513,15 @@ public final class LTX2Pipeline {
       guard let r = resume, r.phase == .refineDenoise, r.refineCleanLatents != nil else { return nil }
       return r
     }()
+    // #1479: the config is re-resolved every render, so two-stage can be off
+    // (or the upsampler absent) by the time a refine checkpoint comes back.
+    // Skipping the refine then would send a partially denoised, REFINE-
+    // resolution tensor straight to the decoder as if it were finished. Refuse
+    // loudly instead (spec, Error handling).
+    if resume?.phase == .refineDenoise, self.upsampler == nil || !resolvedConfig.twoStage {
+      throw LTX2ResumeError.refineUnavailableOnResume(
+        twoStage: resolvedConfig.twoStage, upsamplerLoaded: self.upsampler != nil)
+    }
     // A `.vaeDecode` checkpoint means base AND refine already finished — the
     // checkpointed latents are final, so the refine must not run again.
     if resume?.phase != .vaeDecode, let ups = self.upsampler, resolvedConfig.twoStage {
@@ -639,7 +650,8 @@ public final class LTX2Pipeline {
     // #1479 free unwind point: the refine→decode boundary. The VAE decode is
     // the longest uninterruptible op in the render, so never start one with a
     // preemption already pending.
-    if preemption?.isRaised == true {
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .vaeDecode, latents: latents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
@@ -828,7 +840,8 @@ public final class LTX2Pipeline {
     }
 
     // #1479 free unwind point: never start the decode with a pending preemption.
-    if preemption?.isRaised == true {
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .vaeDecode, latents: latents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
@@ -1158,7 +1171,8 @@ public final class LTX2Pipeline {
       : latentsAll
 
     // #1479 free unwind point: the base→refine boundary.
-    if preemption?.isRaised == true {
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .refineDenoise, latents: latents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
@@ -1182,7 +1196,8 @@ public final class LTX2Pipeline {
     }
 
     // #1479 free unwind point: never start the decode with a pending preemption.
-    if preemption?.isRaised == true {
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .vaeDecode, latents: latents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: avState))
@@ -1437,7 +1452,8 @@ public final class LTX2Pipeline {
     }
 
     // #1479 free unwind point: the base→refine boundary.
-    if preemption?.isRaised == true {
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .refineDenoise, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .refineDenoise, latents: latents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
@@ -1465,7 +1481,8 @@ public final class LTX2Pipeline {
     }
 
     // #1479 free unwind point: never start the decode with a pending preemption.
-    if preemption?.isRaised == true {
+    if preemption?.isRaised == true,
+       LTX2UnwindGuard.mayCheckpoint(at: .vaeDecode, whileResuming: resume?.phase) {
       return .yielded(boundaryCheckpoint(
         phase: .vaeDecode, latents: refinedLatents, sigmas: sigmas,
         fingerprint: baseFingerprint, chunkIndex: chunkIndex, seed: seed, avState: nil))
@@ -2129,6 +2146,15 @@ public final class LTX2Pipeline {
       guard let r = resume, r.phase == .refineDenoise, r.refineCleanLatents != nil else { return nil }
       return r
     }()
+    // #1479: this availability guard sits ABOVE the resume validation, so a
+    // two-stage/upsampler config drift between checkpoint and resume would
+    // otherwise return the checkpoint's partially denoised, REFINE-resolution
+    // latents to the caller as finished work — a silently degraded decode.
+    // Refuse loudly instead (spec, Error handling).
+    if resume?.phase == .refineDenoise, self.upsampler == nil || !resolvedConfig.twoStage {
+      throw LTX2ResumeError.refineUnavailableOnResume(
+        twoStage: resolvedConfig.twoStage, upsamplerLoaded: self.upsampler != nil)
+    }
     guard let ups = self.upsampler,
           resolvedConfig.twoStage else {
       return .completed(latents)

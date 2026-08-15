@@ -73,6 +73,44 @@ public protocol LTX2ResumeContext: AnyObject {}
 /// carry a real fingerprint and ARE validated.
 public let ltx2NotStartedFingerprint = "#1479-not-started"
 
+/// #1479: a free unwind point may only ever move a checkpoint FORWARD.
+///
+/// Only the PREEMPTOR is un-preemptible; a resumed render is not, so a second
+/// signal can arrive at any boundary of a render that is already resuming. If
+/// a boundary the resumed checkpoint has ALREADY passed were allowed to
+/// re-checkpoint, it would regress the render silently:
+///   - resuming `.vaeDecode` (base + refine finished) and re-checkpointing at
+///     base→refine relabels REFINED latents as "refine not started" — the next
+///     resume re-upsamples and re-refines them, decoding ~2.25x the intended
+///     latent area while still reporting the request's dims;
+///   - resuming mid-refine and re-checkpointing at base→refine relabels
+///     PARTIALLY refined latents as finished base latents, stamps the base
+///     fingerprint/sigmas over the refine's, and drops `refineCleanLatents` —
+///     the next resume validates cleanly and refines from scratch.
+/// Both are silent. Hence: a boundary may only checkpoint when it sits strictly
+/// after the phase being resumed into.
+public enum LTX2UnwindGuard {
+  /// Monotonic position of a phase within one chunk's render.
+  static func rank(_ p: LTX2Phase) -> Int {
+    switch p {
+    case .modelLoad: return 0
+    case .textEncode: return 1
+    case .baseDenoise: return 2
+    case .refineDenoise: return 3
+    case .vaeDecode: return 4
+    case .vocoder: return 5
+    case .postProcess: return 6
+    }
+  }
+
+  /// May a checkpoint be taken at the boundary in front of `boundary`, given
+  /// that this render re-entered at `resumedPhase` (nil = a fresh render)?
+  public static func mayCheckpoint(at boundary: LTX2Phase, whileResuming resumedPhase: LTX2Phase?) -> Bool {
+    guard let resumedPhase else { return true }
+    return rank(boundary) > rank(resumedPhase)
+  }
+}
+
 /// Why a resume was refused. Never silently restart from step 0 (spec, Error
 /// handling): a config that drifted between checkpoint and resume is a real
 /// bug, and hiding it costs a 15-minute render's worth of wrong output.
@@ -80,6 +118,12 @@ public enum LTX2ResumeError: Error, LocalizedError, Equatable {
   case configFingerprintMismatch(checkpoint: String, current: String)
   case sigmaScheduleMismatch(checkpoint: [Float], current: [Float], firstDifferingIndex: Int?)
   case stepOutOfRange(step: Int, steps: Int)
+  /// The checkpoint re-enters the two-stage refine, but the refine machinery
+  /// is no longer available (two-stage turned off, or the upsampler failed to
+  /// load / was never loaded). Config is re-resolved per render, so this drift
+  /// is real. Continuing would hand a partially denoised, refine-RESOLUTION
+  /// tensor straight to the decoder as if it were finished.
+  case refineUnavailableOnResume(twoStage: Bool, upsamplerLoaded: Bool)
 
   public var errorDescription: String? {
     switch self {
@@ -90,6 +134,8 @@ public enum LTX2ResumeError: Error, LocalizedError, Equatable {
       return "LTX-2 resume refused: sigma schedule changed between checkpoint and resume — \(checkpoint.count) vs \(current.count) sigmas\(at)."
     case .stepOutOfRange(let step, let steps):
       return "LTX-2 resume refused: checkpoint step \(step) is outside the current schedule's 0..<\(steps) range."
+    case .refineUnavailableOnResume(let twoStage, let upsamplerLoaded):
+      return "LTX-2 resume refused: the checkpoint re-enters the two-stage refine, but the refine machinery is unavailable now (two_stage=\(twoStage), upsampler_loaded=\(upsamplerLoaded)) — config drifted between checkpoint and resume."
     }
   }
 }
