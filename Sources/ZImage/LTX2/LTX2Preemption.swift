@@ -111,6 +111,33 @@ public enum LTX2UnwindGuard {
   }
 }
 
+/// #1479: when a resume must be refused because the two-stage refine machinery
+/// is no longer there.
+///
+/// The discriminator is `refineCleanLatents`, exactly as the pipeline's own
+/// `resumeRefine` dispatch uses it — NOT the phase alone:
+///   - `.refineDenoise` WITH a clean base latent = taken INSIDE the refine
+///     loop. `videoLatents` is a partially denoised, REFINE-resolution tensor.
+///     Skipping the refine would hand that to the decoder as finished work, so
+///     the machinery going missing is a genuine drift and must fail loudly.
+///   - `.refineDenoise` WITHOUT one = the base→refine boundary. `videoLatents`
+///     is the clean, finished, BASE-resolution latent. Skipping the refine
+///     produces exactly what a fresh render under the currently resolved
+///     config produces — nothing has drifted, and refusing here would make
+///     every preempted render unresumable under `two_stage=false`, which is
+///     the built-in default (LTX2ConfigResolver). That is the opposite of what
+///     this feature is for.
+public enum LTX2RefineAvailability {
+  public static func mustRefuse(
+    resume: LTX2ResumeState?, twoStage: Bool, upsamplerLoaded: Bool
+  ) -> Bool {
+    guard let r = resume, r.phase == .refineDenoise, r.refineCleanLatents != nil else {
+      return false
+    }
+    return !twoStage || !upsamplerLoaded
+  }
+}
+
 /// Why a resume was refused. Never silently restart from step 0 (spec, Error
 /// handling): a config that drifted between checkpoint and resume is a real
 /// bug, and hiding it costs a 15-minute render's worth of wrong output.

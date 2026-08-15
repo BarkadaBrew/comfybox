@@ -195,8 +195,47 @@ final class LTX2PreemptionTests: XCTestCase {
   // MARK: - Refine machinery drift (review fix, Important 2)
 
   /// Two-stage/upsampler config is re-resolved every render. If it drifted off
-  /// while a refine checkpoint was parked, continuing would send a partially
-  /// denoised REFINE-resolution tensor to the decoder as finished work.
+  /// while a MID-REFINE checkpoint was parked, continuing would send a
+  /// partially denoised REFINE-resolution tensor to the decoder as finished
+  /// work — refuse.
+  func testMidRefineResumeIsRefusedWhenTheRefineMachineryIsGone() {
+    let midRefine = state(phase: .refineDenoise, refineClean: MLXArray.zeros([1, 2]))
+    XCTAssertTrue(LTX2RefineAvailability.mustRefuse(
+      resume: midRefine, twoStage: false, upsamplerLoaded: true),
+      "two-stage turned off under a mid-refine checkpoint is real drift")
+    XCTAssertTrue(LTX2RefineAvailability.mustRefuse(
+      resume: midRefine, twoStage: true, upsamplerLoaded: false),
+      "a missing upsampler under a mid-refine checkpoint is real drift")
+    XCTAssertFalse(LTX2RefineAvailability.mustRefuse(
+      resume: midRefine, twoStage: true, upsamplerLoaded: true),
+      "machinery present — nothing to refuse")
+  }
+
+  /// Regression for the round-2 review: a base→refine BOUNDARY checkpoint
+  /// holds clean, finished, BASE-resolution latents, so skipping the refine
+  /// gives exactly what a fresh render under the current config gives. The
+  /// built-in default is `two_stage=false`, so refusing here would make EVERY
+  /// preempted render unresumable on an unremarkable config.
+  func testBoundaryRefineCheckpointResumesWithTwoStageOff() {
+    let boundary = state(phase: .refineDenoise, refineClean: nil)
+    XCTAssertFalse(LTX2RefineAvailability.mustRefuse(
+      resume: boundary, twoStage: false, upsamplerLoaded: false),
+      "a boundary checkpoint must resume under two_stage=false — the default")
+    XCTAssertFalse(LTX2RefineAvailability.mustRefuse(
+      resume: boundary, twoStage: true, upsamplerLoaded: false),
+      "a boundary checkpoint must resume with the upsampler absent")
+  }
+
+  func testNonRefinePhasesAndFreshRendersAreNeverRefused() {
+    XCTAssertFalse(LTX2RefineAvailability.mustRefuse(
+      resume: nil, twoStage: false, upsamplerLoaded: false), "a fresh render is never refused")
+    XCTAssertFalse(LTX2RefineAvailability.mustRefuse(
+      resume: state(phase: .baseDenoise), twoStage: false, upsamplerLoaded: false))
+    XCTAssertFalse(LTX2RefineAvailability.mustRefuse(
+      resume: state(phase: .vaeDecode, refineClean: nil), twoStage: false, upsamplerLoaded: false),
+      "a .vaeDecode checkpoint skips the refine by design")
+  }
+
   func testRefineUnavailableOnResumeDescribesTheDrift() {
     let error = LTX2ResumeError.refineUnavailableOnResume(twoStage: false, upsamplerLoaded: true)
     let described = error.errorDescription ?? ""

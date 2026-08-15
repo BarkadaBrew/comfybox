@@ -515,10 +515,13 @@ public final class LTX2Pipeline {
     }()
     // #1479: the config is re-resolved every render, so two-stage can be off
     // (or the upsampler absent) by the time a refine checkpoint comes back.
-    // Skipping the refine then would send a partially denoised, REFINE-
-    // resolution tensor straight to the decoder as if it were finished. Refuse
-    // loudly instead (spec, Error handling).
-    if resume?.phase == .refineDenoise, self.upsampler == nil || !resolvedConfig.twoStage {
+    // Skipping the refine for a MID-REFINE checkpoint would send a partially
+    // denoised, REFINE-resolution tensor straight to the decoder as if it were
+    // finished. Refuse loudly instead (spec, Error handling). A base→refine
+    // BOUNDARY checkpoint is not affected — see LTX2RefineAvailability.
+    if LTX2RefineAvailability.mustRefuse(
+        resume: resume, twoStage: resolvedConfig.twoStage,
+        upsamplerLoaded: self.upsampler != nil) {
       throw LTX2ResumeError.refineUnavailableOnResume(
         twoStage: resolvedConfig.twoStage, upsamplerLoaded: self.upsampler != nil)
     }
@@ -2148,10 +2151,14 @@ public final class LTX2Pipeline {
     }()
     // #1479: this availability guard sits ABOVE the resume validation, so a
     // two-stage/upsampler config drift between checkpoint and resume would
-    // otherwise return the checkpoint's partially denoised, REFINE-resolution
-    // latents to the caller as finished work — a silently degraded decode.
-    // Refuse loudly instead (spec, Error handling).
-    if resume?.phase == .refineDenoise, self.upsampler == nil || !resolvedConfig.twoStage {
+    // otherwise return a MID-REFINE checkpoint's partially denoised,
+    // REFINE-resolution latents to the caller as finished work — a silently
+    // degraded decode. Refuse loudly instead (spec, Error handling). A
+    // base→refine BOUNDARY checkpoint carries clean base-resolution latents
+    // and resumes fine through the `guard` below — see LTX2RefineAvailability.
+    if LTX2RefineAvailability.mustRefuse(
+        resume: resume, twoStage: resolvedConfig.twoStage,
+        upsamplerLoaded: self.upsampler != nil) {
       throw LTX2ResumeError.refineUnavailableOnResume(
         twoStage: resolvedConfig.twoStage, upsamplerLoaded: self.upsampler != nil)
     }
