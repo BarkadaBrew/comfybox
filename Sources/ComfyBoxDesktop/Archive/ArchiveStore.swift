@@ -126,4 +126,49 @@ public final class ArchiveStore {
             folders: []
         )
     }
+
+    // MARK: - Export as Zip (T12)
+
+    public enum ExportError: Error, LocalizedError {
+        case failed(Int32, String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .failed(let code, let output):
+                let tail = output.split(separator: "\n").last.map(String.init) ?? ""
+                return "ditto failed (\(code))\(tail.isEmpty ? "" : ": \(tail)")"
+            }
+        }
+    }
+
+    /// `ditto -c -k --sequesterRsrc --keepParent <bundlePath> <destination>` —
+    /// pure argument builder, unit-tested against the exact vector.
+    nonisolated static func dittoArguments(bundlePath: String, destination: String) -> [String] {
+        ["-c", "-k", "--sequesterRsrc", "--keepParent", bundlePath, destination]
+    }
+
+    /// Shells `/usr/bin/ditto` to zip `bundlePath` to `destination` (a full
+    /// `.zip` path). Runs off the main actor; throws `ExportError.failed` on
+    /// a non-zero exit.
+    public func exportAsZip(bundlePath: String, destination: String) async throws {
+        try await Task.detached(priority: .utility) {
+            try Self.runDitto(bundlePath: bundlePath, destination: destination)
+        }.value
+    }
+
+    private nonisolated static func runDitto(bundlePath: String, destination: String) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        proc.arguments = dittoArguments(bundlePath: bundlePath, destination: destination)
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            throw ExportError.failed(proc.terminationStatus, output)
+        }
+    }
 }

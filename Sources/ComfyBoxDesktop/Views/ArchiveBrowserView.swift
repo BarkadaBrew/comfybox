@@ -7,11 +7,13 @@
 // file eagerly) via `loadEntriesPage`. Restore Selected/Restore All run
 // through the shared GalleryArchiver the app already owns; Delete Archive
 // trashes the bundle directory outright (it's a plain folder on disk, not a
-// DAMStore-tracked asset). Export as Zip is T11/T12 — deliberately not
-// implemented here; the context menu has no placeholder for it.
+// DAMStore-tracked asset). Export as Zip (T12) shells `ditto` via
+// ArchiveStore.exportAsZip — destination chosen with an NSSavePanel on
+// the main actor, the Process work off it.
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ArchiveBrowserView: View {
     let store: DAMStore
@@ -37,6 +39,9 @@ struct ArchiveBrowserView: View {
 
     @State private var pendingDeleteBundle: ArchiveStore.Summary?
     @State private var showDeleteConfirmation = false
+
+    @State private var exportingBundleIds: Set<String> = []
+    @State private var exportSummary: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -160,6 +165,8 @@ struct ArchiveBrowserView: View {
             }
             .disabled(bundle.isIncomplete)
             Button("Reveal in Finder") { revealInFinder(bundle) }
+            Button("Export as Zip…") { exportAsZip(bundle) }
+                .disabled(exportingBundleIds.contains(bundle.id))
             Divider()
             Button("Delete Archive…", role: .destructive) { requestDeleteBundle(bundle) }
         }
@@ -186,6 +193,12 @@ struct ArchiveBrowserView: View {
                     restoreProgressStrip(restoreProgress)
                 } else if let restoreSummary {
                     Text(restoreSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.top, 6)
+                } else if let exportSummary {
+                    Text(exportSummary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 10)
@@ -350,6 +363,7 @@ struct ArchiveBrowserView: View {
         hasMoreEntries = false
         selectedAssetIds = []
         restoreSummary = nil
+        exportSummary = nil
         errorMessage = nil
         guard !bundle.isIncomplete else { return }
         Task { await loadNextPage() }
@@ -463,6 +477,33 @@ struct ArchiveBrowserView: View {
         if result.renamed > 0 { parts.append("\(result.renamed) renamed") }
         if !result.failed.isEmpty { parts.append("\(result.failed.count) failed") }
         return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Export as Zip (T12)
+
+    /// Prompts for a destination with an `NSSavePanel` (main actor), then
+    /// shells `ditto` off the main actor via `ArchiveStore.exportAsZip`.
+    /// Selects the bundle first (mirroring "Restore All…") so the summary/
+    /// error lands somewhere visible even when invoked on a non-selected row.
+    private func exportAsZip(_ bundle: ArchiveStore.Summary) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.zip]
+        panel.nameFieldStringValue = "\(bundle.manifest.name).zip"
+        panel.prompt = "Export"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        selectedBundleId = bundle.id
+        selectBundle(bundle)
+        exportingBundleIds.insert(bundle.id)
+        Task {
+            do {
+                try await archives.exportAsZip(bundlePath: bundle.bundlePath, destination: url.path)
+                exportSummary = "Exported to \(url.path)"
+            } catch {
+                errorMessage = "Export failed: \(error.localizedDescription)"
+            }
+            exportingBundleIds.remove(bundle.id)
+        }
     }
 
     // MARK: - Reveal / delete bundle

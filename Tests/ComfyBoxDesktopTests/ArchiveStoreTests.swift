@@ -222,4 +222,50 @@ struct ArchiveStoreTests {
         let store = ArchiveStore()
         #expect(!store.roots.isEmpty)
     }
+
+    // MARK: - Export as Zip (T12)
+
+    @Test("dittoArguments builds the exact ditto invocation vector")
+    func dittoArgumentsExactVector() {
+        let args = ArchiveStore.dittoArguments(
+            bundlePath: "/Volumes/Bolt/ComfyBox/foo-20260101-000000.cbarchive",
+            destination: "/Users/todd/Desktop/foo-20260101-000000.zip"
+        )
+        #expect(args == [
+            "-c", "-k", "--sequesterRsrc", "--keepParent",
+            "/Volumes/Bolt/ComfyBox/foo-20260101-000000.cbarchive",
+            "/Users/todd/Desktop/foo-20260101-000000.zip",
+        ])
+    }
+
+    @Test("exportAsZip shells ditto and produces a real zip of the bundle directory")
+    @MainActor
+    func exportAsZipProducesRealZip() async throws {
+        let root = makeTempDir("export-root")
+        let bundlePath = try makeBundle(
+            in: root, dirName: "export-me-20260101-000000.cbarchive",
+            manifest: manifest(name: "Export Me", createdAt: 100)
+        )
+        let destDir = makeTempDir("export-dest")
+        let destination = (destDir as NSString).appendingPathComponent("out.zip")
+
+        let store = ArchiveStore(roots: [root])
+        try await store.exportAsZip(bundlePath: bundlePath, destination: destination)
+
+        #expect(FileManager.default.fileExists(atPath: destination))
+    }
+
+    @Test("exportAsZip throws ExportError.failed when ditto exits non-zero")
+    @MainActor
+    func exportAsZipThrowsOnFailure() async {
+        let store = ArchiveStore(roots: [])
+        let missingBundle = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("does-not-exist-\(UUID().uuidString).cbarchive")
+        let destination = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("wont-be-written-\(UUID().uuidString).zip")
+
+        await #expect(throws: ArchiveStore.ExportError.self) {
+            try await store.exportAsZip(bundlePath: missingBundle, destination: destination)
+        }
+    }
 }
