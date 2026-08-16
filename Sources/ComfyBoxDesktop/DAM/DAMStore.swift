@@ -590,7 +590,8 @@ public actor DAMStore {
             rating: existing.rating,
             favorite: existing.favorite,
             contentMode: asset.contentMode ?? existing.contentMode,
-            characterName: asset.characterName ?? existing.characterName
+            characterName: asset.characterName ?? existing.characterName,
+            source: asset.source ?? existing.source
         )
     }
 

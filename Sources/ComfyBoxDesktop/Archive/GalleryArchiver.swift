@@ -292,7 +292,20 @@ public final class GalleryArchiver {
     /// successfully removed; any failure leaves it in place for the next
     /// launch to retry. Per-id and per-bundle failures are logged rather
     /// than thrown, so one bad bundle never stops the rest of the sweep.
+    ///
+    /// Takes the same `isRunning` lock `archive`/`restore` use (via
+    /// `phase`), so a concurrent Restore All (or another sweep) can't race
+    /// `ingestor.deleteAsset` against this. If the archiver is already busy,
+    /// the sweep is skipped outright and logged — safe because the marker
+    /// is left untouched and the next app launch retries it.
     public func resumePendingRemovals(in roots: [String]) async {
+        guard !isRunning else {
+            print("[GalleryArchiver] resumePendingRemovals: archiver already running, skipping sweep — will retry next launch")
+            return
+        }
+        phase = .removingSources
+        defer { phase = .idle }
+
         let fm = FileManager.default
         for root in roots {
             guard let entries = try? fm.contentsOfDirectory(atPath: root) else { continue }
@@ -525,6 +538,19 @@ public final class GalleryArchiver {
     /// every outcome except the "skip entirely" case, performs the copy /
     /// insert / thumbnail sequence. Returns `nil` for the skip case (no copy,
     /// no DB write).
+    ///
+    /// An entry whose archived id matches a live row is the *same* asset
+    /// whenever the live row's file still exists at its own recorded path,
+    /// even when that path no longer matches `destPathCandidate` (a rename,
+    /// or a watch-directory/output-dir move since the archive was made,
+    /// must not defeat idempotence). When the path is unchanged (the
+    /// unambiguous case), a live file at that exact path is the archived
+    /// asset, full stop. When the path *has* changed, re-ID is reserved for
+    /// a genuinely different asset squatting on the id — distinguished from
+    /// "same asset, just moved/renamed" by comparing size (and sha256 when
+    /// both sides have it) against the archived entry: any known field
+    /// differing marks it a different file; everything matching (or nothing
+    /// comparable being known beyond size) is treated as the same asset.
     private func restoreOne(
         entry: ArchivedAsset,
         bundleRoot: URL,
@@ -538,10 +564,24 @@ public final class GalleryArchiver {
         let destPathCandidate = (destDir as NSString).appendingPathComponent(entry.filename)
 
         if let liveAsset = liveById[entry.id] {
-            let sameLocation = liveAsset.absolutePath == destPathCandidate
-            if sameLocation && FileManager.default.fileExists(atPath: liveAsset.absolutePath) {
-                // Same id, same location, and the file is genuinely still
-                // there — this is the live asset itself.
+            if FileManager.default.fileExists(atPath: liveAsset.absolutePath) {
+                let sameLocation = liveAsset.absolutePath == destPathCandidate
+                var isDifferentAsset = false
+                if !sameLocation {
+                    isDifferentAsset = liveAsset.fileSize != entry.fileSize
+                    if isDifferentAsset, let entrySha = entry.sha256, let liveSha = liveAsset.sha256 {
+                        isDifferentAsset = liveSha != entrySha
+                    }
+                }
+                if isDifferentAsset {
+                    // The id is taken by a demonstrably different file —
+                    // mint a fresh id so both rows survive.
+                    return try await performCopyAndInsert(
+                        entry: entry, bundleRoot: bundleRoot, destDir: destDir, id: UUID().uuidString, kind: .reIdentified
+                    )
+                }
+                // Same id, and its file is genuinely still there — this is
+                // the live asset itself, wherever it now lives.
                 guard request.overwriteExistingMetadata else {
                     return nil
                 }
@@ -550,21 +590,15 @@ public final class GalleryArchiver {
                 )
                 await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
                 return RestoreOutcome(kind: .restored, resolvedId: stored.id, renamed: false)
-            } else if sameLocation {
-                // Same id, same recorded path, but the file is gone — an
-                // orphaned row (pruneOrphans() exists precisely because this
-                // happens). The archived id is a dead reference to the same
-                // asset and is legitimately reclaimable: restore it for
+            } else {
+                // Same id, but the file at its own recorded path is gone —
+                // an orphaned row (pruneOrphans() exists precisely because
+                // this happens). The archived id is a dead reference to the
+                // same asset and is legitimately reclaimable: restore it for
                 // real rather than reporting a false "skipped", regardless
                 // of overwriteExistingMetadata.
                 return try await performCopyAndInsert(
                     entry: entry, bundleRoot: bundleRoot, destDir: destDir, id: entry.id, kind: .restored
-                )
-            } else {
-                // The id is taken by an unrelated asset — mint a fresh id so
-                // both rows survive.
-                return try await performCopyAndInsert(
-                    entry: entry, bundleRoot: bundleRoot, destDir: destDir, id: UUID().uuidString, kind: .reIdentified
                 )
             }
         } else {
@@ -589,6 +623,12 @@ public final class GalleryArchiver {
         let stored = try await store.insertAsset(
             entry.toDAMAsset(absolutePath: finalPath, id: id)
         )
+        // Register with the ingestor so the poller's next scan doesn't treat
+        // this file as new and re-ingest it under a fresh id, clobbering the
+        // row (and its `source`) that was just inserted — covers both the
+        // fresh-copy path and the skip-copy/content-identical adoption path,
+        // since both flow through here.
+        ingestor.markKnown(finalPath)
         await handleThumbnail(entry: entry, stored: stored, bundleRoot: bundleRoot)
         return RestoreOutcome(kind: kind, resolvedId: stored.id, renamed: renamed)
     }

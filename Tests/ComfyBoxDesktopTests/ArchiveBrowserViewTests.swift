@@ -123,3 +123,87 @@ struct ArchiveBrowserViewRestoreSummaryTests {
         #expect(line == "Restored 0 · 3 failed")
     }
 }
+
+@Suite("ArchiveBrowserView delete-bundle guard (C2b)")
+struct ArchiveBrowserViewDeleteGuardTests {
+    @Test("trashOrRemoveBundle removes the bundle directory")
+    func trashOrRemoveBundleRemovesDirectory() throws {
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("trash-test-\(UUID().uuidString).cbarchive")
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        let success = ArchiveBrowserView.trashOrRemoveBundle(atPath: path)
+        #expect(success)
+        #expect(!FileManager.default.fileExists(atPath: path))
+    }
+
+    @Test("archiveInProgressMessage is the stable text the mutation-point re-check surfaces")
+    func archiveInProgressMessageIsStable() {
+        #expect(ArchiveBrowserView.archiveInProgressMessage == "Archive operation in progress — try again when it finishes.")
+    }
+}
+
+@Suite("ArchiveBrowserView.resolveImagePaths (I3: traversal guard)")
+struct ArchiveBrowserViewResolveImagePathsTests {
+    @Test("a well-formed entry resolves both the thumbnail and full-image paths inside the bundle")
+    func resolvesWellFormedEntry() {
+        let asset = TestData.makeAsset(id: "entry-1", filename: "render.png")
+        let entry = ArchivedAsset(from: asset, folderId: nil, relativeRoot: "assets/entry-1")
+        let bundleRoot = URL(fileURLWithPath: "/tmp/some.cbarchive")
+
+        let (thumbPath, fullPath) = ArchiveBrowserView.resolveImagePaths(for: entry, bundleRoot: bundleRoot)
+
+        #expect(thumbPath == "/tmp/some.cbarchive/assets/entry-1/thumb.jpg")
+        #expect(fullPath == "/tmp/some.cbarchive/assets/entry-1/render.png")
+    }
+
+    @Test("a nil thumbnailRelativePath yields a nil thumb path, not a fallback to some other file")
+    func nilThumbnailRelativePathYieldsNilThumbPath() {
+        let asset = TestData.makeAsset(id: "entry-1", filename: "render.png")
+        var entry = ArchivedAsset(from: asset, folderId: nil, relativeRoot: "assets/entry-1")
+        entry.thumbnailRelativePath = nil
+        let bundleRoot = URL(fileURLWithPath: "/tmp/some.cbarchive")
+
+        let (thumbPath, fullPath) = ArchiveBrowserView.resolveImagePaths(for: entry, bundleRoot: bundleRoot)
+
+        #expect(thumbPath == nil)
+        #expect(fullPath != nil)
+    }
+
+    @Test("a thumbnailRelativePath that escapes the bundle root is rejected — resolves to nil, not the escaped path")
+    func rejectsTraversalInThumbnailRelativePath() {
+        let asset = TestData.makeAsset(id: "entry-1", filename: "render.png")
+        var entry = ArchivedAsset(from: asset, folderId: nil, relativeRoot: "assets/entry-1")
+        entry.thumbnailRelativePath = "../../../../etc/passwd"
+        let bundleRoot = URL(fileURLWithPath: "/tmp/some.cbarchive")
+
+        let (thumbPath, fullPath) = ArchiveBrowserView.resolveImagePaths(for: entry, bundleRoot: bundleRoot)
+
+        #expect(thumbPath == nil)
+        #expect(fullPath != nil)   // the (untampered) full-image path still resolves
+    }
+
+    @Test("a relativePath that escapes the bundle root is rejected — resolves to nil, not the escaped path")
+    func rejectsTraversalInRelativePath() {
+        let asset = TestData.makeAsset(id: "entry-1", filename: "render.png")
+        var entry = ArchivedAsset(from: asset, folderId: nil, relativeRoot: "assets/entry-1")
+        entry.relativePath = "../../../../etc/passwd"
+        let bundleRoot = URL(fileURLWithPath: "/tmp/some.cbarchive")
+
+        let (thumbPath, fullPath) = ArchiveBrowserView.resolveImagePaths(for: entry, bundleRoot: bundleRoot)
+
+        #expect(fullPath == nil)
+        #expect(thumbPath != nil)  // the (untampered) thumbnail path still resolves
+    }
+
+    @Test("an absolute thumbnailRelativePath is rejected")
+    func rejectsAbsoluteThumbnailPath() {
+        let asset = TestData.makeAsset(id: "entry-1", filename: "render.png")
+        var entry = ArchivedAsset(from: asset, folderId: nil, relativeRoot: "assets/entry-1")
+        entry.thumbnailRelativePath = "/etc/passwd"
+        let bundleRoot = URL(fileURLWithPath: "/tmp/some.cbarchive")
+
+        let (thumbPath, _) = ArchiveBrowserView.resolveImagePaths(for: entry, bundleRoot: bundleRoot)
+
+        #expect(thumbPath == nil)
+    }
+}

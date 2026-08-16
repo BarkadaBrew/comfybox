@@ -106,6 +106,85 @@ struct GalleryMaintenanceViewFormattingTests {
         #expect(GalleryMaintenanceView.incompleteConfirmTitle(count: 1) == "Discard 1 incomplete archive?")
         #expect(GalleryMaintenanceView.incompleteConfirmTitle(count: 3) == "Discard 3 incomplete archives?")
     }
+
+    @Test("incomplete skipped line reports the count")
+    func incompleteSkippedLine() {
+        #expect(GalleryMaintenanceView.incompleteSkippedLine(count: 2) == "Skipped 2 no-longer-incomplete")
+        #expect(GalleryMaintenanceView.incompleteSkippedLine(count: 0) == "Skipped 0 no-longer-incomplete")
+    }
+}
+
+@Suite("GalleryMaintenanceView.discardIncompleteArchives")
+struct GalleryMaintenanceViewDiscardIncompleteTests {
+    private func makeManifest(name: String) -> ArchiveManifest {
+        ArchiveManifest(
+            archiveId: UUID().uuidString, name: name, createdAt: 0,
+            producer: "test", assetCount: 0, totalBytes: 0, folders: []
+        )
+    }
+
+    /// A `.cbarchive` bundle directory, with or without `INCOMPLETE.json`.
+    private func makeBundle(named name: String, in root: String, incomplete: Bool) -> ArchiveStore.Summary {
+        let bundlePath = (root as NSString).appendingPathComponent("\(name).cbarchive")
+        try? FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+        if incomplete {
+            let markerPath = (bundlePath as NSString).appendingPathComponent("INCOMPLETE.json")
+            FileManager.default.createFile(atPath: markerPath, contents: Data("{}".utf8))
+        }
+        return ArchiveStore.Summary(
+            id: bundlePath, bundlePath: bundlePath, manifest: makeManifest(name: name),
+            isIncomplete: incomplete, hasPendingRemoval: false
+        )
+    }
+
+    @Test("deletes bundles that are still incomplete at the mutation point")
+    func deletesGenuinelyIncompleteBundles() {
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("discard-incomplete-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let summary = makeBundle(named: "Doomed", in: root, incomplete: true)
+
+        let result = GalleryMaintenanceView.discardIncompleteArchives([summary])
+        #expect(result.discarded == 1)
+        #expect(result.skipped == 0)
+        #expect(!FileManager.default.fileExists(atPath: summary.bundlePath))
+    }
+
+    @Test("skips (does not delete) a bundle whose INCOMPLETE.json marker is gone at the mutation point — C2(a)")
+    func skipsBundleThatCompletedSinceTheSnapshot() {
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("discard-incomplete-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        // Summary claims incomplete (a stale scan snapshot), but the marker
+        // on disk has already been removed — as if an in-flight archive
+        // committed between the scan and the discard action.
+        let summary = makeBundle(named: "JustCommitted", in: root, incomplete: false)
+        let staleSummary = ArchiveStore.Summary(
+            id: summary.id, bundlePath: summary.bundlePath, manifest: summary.manifest,
+            isIncomplete: true, hasPendingRemoval: false
+        )
+
+        let result = GalleryMaintenanceView.discardIncompleteArchives([staleSummary])
+        #expect(result.discarded == 0)
+        #expect(result.skipped == 1)
+        // The bundle — a normal, committed archive now — must survive.
+        #expect(FileManager.default.fileExists(atPath: staleSummary.bundlePath))
+    }
+
+    @Test("a mixed batch discards the genuinely-incomplete ones and skips the rest")
+    func mixedBatch() {
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("discard-incomplete-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        let stillIncomplete = makeBundle(named: "StillIncomplete", in: root, incomplete: true)
+        let noLongerIncomplete = makeBundle(named: "Committed", in: root, incomplete: false)
+
+        let result = GalleryMaintenanceView.discardIncompleteArchives([stillIncomplete, noLongerIncomplete])
+        #expect(result.discarded == 1)
+        #expect(result.skipped == 1)
+        #expect(!FileManager.default.fileExists(atPath: stillIncomplete.bundlePath))
+        #expect(FileManager.default.fileExists(atPath: noLongerIncomplete.bundlePath))
+    }
 }
 
 @Suite("GalleryMaintenanceView.countMissingAssets")

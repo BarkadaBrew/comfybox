@@ -92,6 +92,15 @@ public final class AssetIngestor {
         isWatching = false
     }
 
+    /// Register a path as already tracked without ingesting it — for callers
+    /// (e.g. `GalleryArchiver` restore) that insert a DAM row for a file
+    /// directly rather than through `ingestFile`. Without this, the poller's
+    /// `scanForNewFiles` treats the file as new on its next pass, re-ingests
+    /// it under a fresh id, and clobbers the row that already exists.
+    public func markKnown(_ path: String) {
+        knownPaths.insert(path)
+    }
+
     /// Manually ingest a single file at the given path. Returns the stored
     /// asset (which keeps its original id if the path was already tracked).
     @discardableResult
@@ -399,7 +408,9 @@ public final class AssetIngestor {
 
     // MARK: - Polling
 
-    private func scanForNewFiles() async {
+    // internal (not private) so tests can drive a poll pass directly via
+    // `@testable import` without waiting on the real 5s poll interval.
+    func scanForNewFiles() async {
         let fm = FileManager.default
         guard let contents = try? fm.contentsOfDirectory(atPath: watchDirectory) else {
             return

@@ -662,7 +662,106 @@ struct GalleryArchiverTests {
         }
     }
 
+    // MARK: - Restore: poller registration (C1)
+
+    @Test("a restored file is registered with the ingestor so the next poller scan does not re-ingest it, losing source")
+    @MainActor
+    func restoreRegistersWithIngestorPoller() async throws {
+        let env = try await makeEnvironment()
+        let sourced = DAMAsset(
+            id: "kira-asset", filename: "kira-render.png",
+            absolutePath: writeFile("kira-render.png", in: env.watchDir, contents: "kira-bytes"),
+            source: "kira"
+        )
+        let stored = try await env.store.insertAsset(sourced)
+        makeThumbnail(for: stored.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "PollerTest", destinationRoot: env.archiveRoot, assets: [stored])
+        )
+        #expect(try await env.store.assetCount() == 0)
+
+        _ = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+
+        let restoredPath = (env.watchDir as NSString).appendingPathComponent("kira-render.png")
+        #expect(FileManager.default.fileExists(atPath: restoredPath))
+
+        // Back-date the file so `isFileStable`'s "at least 1 second old"
+        // gate can't itself hide a missing markKnown call.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-5)], ofItemAtPath: restoredPath
+        )
+
+        let ingestedCountBefore = env.ingestor.ingestedCount
+        await env.ingestor.scanForNewFiles()
+
+        // No spurious re-ingest happened: `markKnown` (called from
+        // `performCopyAndInsert` with the restore's final destination path)
+        // kept the poller from treating the restored file as new.
+        #expect(env.ingestor.ingestedCount == ingestedCountBefore)
+
+        let count = try await env.store.assetCount()
+        #expect(count == 1)
+        let row = try await env.store.fetchAsset(byPath: restoredPath)
+        #expect(row?.id == "kira-asset")
+        #expect(row?.source == "kira")
+    }
+
     // MARK: - Restore: idempotence
+
+    @Test("restore idempotence survives a rename: restoring twice after a planted filename collision reports skipped, not reIdentified, on the second run")
+    @MainActor
+    func restoreIdempotentAfterRename() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "RenameIdempotenceTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+
+        // Plant a different, unrelated, DB-tracked file at the destination
+        // filename so the first restore is forced to rename — reproducing
+        // "restore lands under a different name than it was archived under".
+        let collisionPath = (env.watchDir as NSString).appendingPathComponent("render.png")
+        let unrelatedContents = "a-totally-different-file-of-a-different-size"
+        FileManager.default.createFile(atPath: collisionPath, contents: Data(unrelatedContents.utf8))
+        let unrelatedAsset = DAMAsset(
+            id: "unrelated-id", filename: "render.png", absolutePath: collisionPath,
+            fileSize: Int64(unrelatedContents.utf8.count)
+        )
+        try await env.store.insertAsset(unrelatedAsset)
+
+        let first = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(first.restored == 1)
+        #expect(first.renamed == 1)
+        #expect(first.reIdentified == 0)
+        let renamedPath = (env.watchDir as NSString).appendingPathComponent("render (restored).png")
+        #expect(FileManager.default.fileExists(atPath: renamedPath))
+        let countAfterFirst = try await env.store.assetCount()
+        #expect(countAfterFirst == 2)   // the unrelated asset + the restored one
+
+        // Second restore: the archived id now lives at "render (restored).png",
+        // which no longer matches the freshly-recomputed destination candidate
+        // ("render.png", still occupied by the unrelated asset) — the exact
+        // path mismatch that used to be misread as "id taken by someone else".
+        let second = try await env.archiver.restore(.init(bundlePath: archiveResult.bundlePath))
+        #expect(second.skipped == 1)
+        #expect(second.restored == 0)
+        #expect(second.reIdentified == 0)
+        #expect(second.renamed == 0)
+        #expect(second.failed.isEmpty)
+
+        let countAfterSecond = try await env.store.assetCount()
+        #expect(countAfterSecond == countAfterFirst)
+
+        // No third file (e.g. "render (restored 2).png") appears.
+        let doubleRenamedPath = (env.watchDir as NSString).appendingPathComponent("render (restored 2).png")
+        #expect(!FileManager.default.fileExists(atPath: doubleRenamedPath))
+        let contents = try FileManager.default.contentsOfDirectory(atPath: env.watchDir)
+        #expect(Set(contents) == ["render.png", "render (restored).png"])
+    }
 
     @Test("restoring twice reports everything skipped on the second run and leaves assetCount unchanged")
     @MainActor
@@ -853,5 +952,89 @@ struct GalleryArchiverTests {
         let idsAfterCleanResume = try await env.store.allAssetIds()
         #expect(!idsAfterCleanResume.contains(asset.id))
         #expect(!FileManager.default.fileExists(atPath: pendingRemovalPath))
+    }
+
+    // MARK: - resumePendingRemovals: isRunning lock (I1)
+
+    /// Polls `archiver.phase` (up to ~200 cooperative yields) until it
+    /// matches `expected`, then reports whether it was observed. Used to
+    /// catch a genuinely in-flight async operation without a fixed sleep.
+    @MainActor
+    private func waitForPhase(_ expected: GalleryArchiver.Phase, on archiver: GalleryArchiver) async -> Bool {
+        for _ in 0..<200 {
+            if archiver.phase == expected { return true }
+            await Task.yield()
+        }
+        return false
+    }
+
+    @Test("resumePendingRemovals holds the same isRunning lock as archive/restore: phase is .removingSources while the sweep is in flight, back to .idle after")
+    @MainActor
+    func resumePendingRemovalsSetsPhase() async throws {
+        let env = try await makeEnvironment()
+        let path = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let asset = try await env.ingestor.ingestFile(at: path)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "PhaseTest", destinationRoot: env.archiveRoot, assets: [asset])
+        )
+        try await env.store.insertAsset(asset)
+        makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        try writePendingRemovalMarker(ids: [asset.id], in: archiveResult.bundlePath)
+
+        #expect(env.archiver.phase == .idle)
+        #expect(!env.archiver.isRunning)
+
+        async let sweep: Void = env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+
+        let observedRemoving = await waitForPhase(.removingSources, on: env.archiver)
+        #expect(observedRemoving)
+
+        await sweep
+        #expect(env.archiver.phase == .idle)
+        #expect(!env.archiver.isRunning)
+    }
+
+    @Test("a sweep skipped while the archiver is already running (concurrent restore) leaves PENDING_REMOVAL.json intact")
+    @MainActor
+    func resumePendingRemovalsSkippedWhileArchiverBusy() async throws {
+        let env = try await makeEnvironment()
+
+        // Bundle A: reconstruct the "interrupted removal" state the sweep would finish.
+        let pathA = writeFile("render.png", in: env.watchDir, contents: "render-bytes")
+        let assetA = try await env.ingestor.ingestFile(at: pathA)
+        makeThumbnail(for: assetA.id, ingestor: env.ingestor)
+        let archiveResultA = try await env.archiver.archive(
+            .init(name: "BusyTest", destinationRoot: env.archiveRoot, assets: [assetA])
+        )
+        try await env.store.insertAsset(assetA)
+        makeThumbnail(for: assetA.id, ingestor: env.ingestor)
+        try writePendingRemovalMarker(ids: [assetA.id], in: archiveResultA.bundlePath)
+        let pendingRemovalPathA = (archiveResultA.bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+
+        // Bundle B: archived separately so a restore of it can be kept
+        // genuinely in flight (a real suspension on the store actor)
+        // concurrently with the sweep call below.
+        let pathB = writeFile("other.png", in: env.watchDir, contents: "other-bytes")
+        let assetB = try await env.ingestor.ingestFile(at: pathB)
+        makeThumbnail(for: assetB.id, ingestor: env.ingestor)
+        let archiveResultB = try await env.archiver.archive(
+            .init(name: "BusyTestOther", destinationRoot: env.archiveRoot, assets: [assetB])
+        )
+
+        async let busyRestore = env.archiver.restore(.init(bundlePath: archiveResultB.bundlePath))
+
+        let observedRestoring = await waitForPhase(.restoring, on: env.archiver)
+        #expect(observedRestoring)
+
+        // The sweep must not race restore()'s in-flight work — it should
+        // see isRunning and skip entirely, leaving the marker untouched.
+        await env.archiver.resumePendingRemovals(in: [env.archiveRoot])
+
+        #expect(FileManager.default.fileExists(atPath: pendingRemovalPathA))
+        let idsWhileSkipped = try await env.store.allAssetIds()
+        #expect(idsWhileSkipped.contains(assetA.id))
+
+        _ = try await busyRestore
     }
 }

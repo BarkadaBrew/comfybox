@@ -169,6 +169,7 @@ struct ArchiveBrowserView: View {
                 .disabled(exportingBundleIds.contains(bundle.id))
             Divider()
             Button("Delete Archive…", role: .destructive) { requestDeleteBundle(bundle) }
+                .disabled(archiver.isRunning)
         }
     }
 
@@ -517,7 +518,20 @@ struct ArchiveBrowserView: View {
         showDeleteConfirmation = true
     }
 
+    /// Message shown when a delete is blocked by an archive/restore already
+    /// in flight — the mutation-point re-check below uses this exact text.
+    static let archiveInProgressMessage = "Archive operation in progress — try again when it finishes."
+
     private func deleteBundle(_ bundle: ArchiveStore.Summary) async {
+        // Re-check at the mutation point, not just when the menu item was
+        // shown — an archive/restore operation could have started between
+        // the click and the confirm dialog's "Move to Trash" tap. Deleting
+        // the bundle out from under an in-flight restore (reading
+        // entries.jsonl, copying thumbnails) would fail it mid-flight.
+        guard !archiver.isRunning else {
+            errorMessage = Self.archiveInProgressMessage
+            return
+        }
         let path = bundle.bundlePath
         let success = await Task.detached(priority: .utility) {
             Self.trashOrRemoveBundle(atPath: path)
@@ -536,7 +550,27 @@ struct ArchiveBrowserView: View {
 
     /// Trash the bundle directory, falling back to permanent removal where
     /// trashing is unavailable — same fallback AssetIngestor.trashOrRemove uses.
-    private nonisolated static func trashOrRemoveBundle(atPath path: String) -> Bool {
+    /// Pure and side-effect-isolated to a single path, so it's directly
+    /// unit-testable independent of the view's `@State`.
+    /// Resolves the thumbnail and full-image paths for an archived entry
+    /// through the bundle-traversal guard (`ArchivePaths.resolveEntryPath`)
+    /// rather than string-joining `"assets/<id>/…"` onto the bundle root
+    /// directly — entries are untrusted input the moment archives are
+    /// shareable. A `nil` `thumbnailRelativePath` yields a `nil` thumb
+    /// path (no thumbnail to try), never a fallback to some other file; a
+    /// path that fails the traversal guard also resolves to `nil`, same as
+    /// a missing one. A pure, directly unit-testable helper.
+    nonisolated static func resolveImagePaths(
+        for entry: ArchivedAsset, bundleRoot: URL
+    ) -> (thumbPath: String?, fullPath: String?) {
+        let thumbPath = entry.thumbnailRelativePath.flatMap {
+            try? ArchivePaths.resolveEntryPath($0, in: bundleRoot).path
+        }
+        let fullPath = try? ArchivePaths.resolveEntryPath(entry.relativePath, in: bundleRoot).path
+        return (thumbPath, fullPath)
+    }
+
+    nonisolated static func trashOrRemoveBundle(atPath path: String) -> Bool {
         let fm = FileManager.default
         do {
             try fm.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: nil)
@@ -607,10 +641,11 @@ private struct ArchivedAssetCell: View {
     }
 
     private func loadThumbnail() async {
-        let thumbPath = (bundlePath as NSString).appendingPathComponent("assets/\(entry.id)/thumb.jpg")
-        let fullPath = (bundlePath as NSString).appendingPathComponent("assets/\(entry.id)/\(entry.filename)")
+        let bundleRoot = URL(fileURLWithPath: bundlePath)
+        let (thumbPath, fullPath) = ArchiveBrowserView.resolveImagePaths(for: entry, bundleRoot: bundleRoot)
         let image: NSImage? = await Task.detached {
-            NSImage(contentsOfFile: thumbPath) ?? NSImage(contentsOfFile: fullPath)
+            thumbPath.flatMap(NSImage.init(contentsOfFile:))
+                ?? fullPath.flatMap(NSImage.init(contentsOfFile:))
         }.value
         await MainActor.run {
             thumbnail = image

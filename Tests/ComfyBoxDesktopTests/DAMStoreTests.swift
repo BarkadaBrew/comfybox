@@ -175,6 +175,34 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    @Test("re-ingesting a path with nil source preserves the existing row's source")
+    func reingestPreservesSource() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let original = DAMAsset(
+            id: "original-id", filename: "sourced.png",
+            absolutePath: "/tmp/test-images/sourced.png",
+            source: "kira"
+        )
+        try await store.insertAsset(original)
+
+        // Colliding path, fresh id, no source — as a poller re-ingest would produce.
+        let reingested = DAMAsset(
+            filename: "sourced.png",
+            absolutePath: original.absolutePath,
+            fileSize: 999
+        )
+        let stored = try await store.insertAsset(reingested)
+        #expect(stored.id == "original-id")
+        #expect(stored.source == "kira")
+
+        let fetched = try await store.fetchAssets()
+        #expect(fetched.count == 1)
+        #expect(fetched[0].source == "kira")
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("fetchAsset(byPath:) returns tracked asset or nil")
     func fetchByPath() async throws {
         let tmpDir = NSTemporaryDirectory()

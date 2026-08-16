@@ -998,8 +998,8 @@ struct GalleryView: View {
                                         renamingFolder = folder
                                     }
                                     Button("Archive Folder…") {
-                                        let ids = folderAssignments.filter { $0.value == folder.id }.map(\.key)
-                                        requestArchive(assets.filter { ids.contains($0.id) }, folder: folder)
+                                        let ids = Set(folderAssignments.filter { $0.value == folder.id }.keys)
+                                        Task { await requestArchiveFolder(ids: ids, folder: folder) }
                                     }
                                     Button("Delete Folder", role: .destructive) {
                                         Task { await deleteFolder(folder) }
@@ -1720,6 +1720,30 @@ struct GalleryView: View {
         archiveTargets = toArchive
         archiveFolder = folder
         showArchiveSheet = true
+    }
+
+    /// "Archive Folder…" must include every asset filed in the folder, not
+    /// just whichever page happens to be sitting in the view's own `assets`
+    /// array (capped at `fetchAssets(limit: 500)`) — fetch the full asset
+    /// set from the store and filter by id instead, so folders larger than
+    /// the page size still archive completely.
+    private func requestArchiveFolder(ids: Set<String>, folder: DAMFolder) async {
+        guard !ids.isEmpty else { return }
+        do {
+            let total = try await store.assetCount()
+            let allAssets = try await store.fetchAssets(limit: total, offset: 0)
+            requestArchive(Self.folderMembers(ids: ids, from: allAssets), folder: folder)
+        } catch {
+            errorMessage = "Failed to load folder assets: \(error.localizedDescription)"
+        }
+    }
+
+    /// Given a folder's asset id set (from `folderAssignments()`) and the
+    /// full, unpaged asset list, returns exactly the assets that belong to
+    /// the folder. A pure, directly unit-testable helper isolating the
+    /// membership filter from the store fetch above it.
+    static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
+        allAssets.filter { ids.contains($0.id) }
     }
 
     /// Runs the archive via `GalleryArchiver`, mirroring the import strip's

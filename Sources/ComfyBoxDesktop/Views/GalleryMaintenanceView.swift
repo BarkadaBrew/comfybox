@@ -75,6 +75,7 @@ struct GalleryMaintenanceView: View {
     @State private var incompleteScanning = false
     @State private var incompleteDiscarding = false
     @State private var incompleteDiscardResult: Int?
+    @State private var incompleteSkippedResult: Int?
     @State private var incompleteError: String?
     @State private var showIncompleteConfirm = false
 
@@ -348,6 +349,11 @@ struct GalleryMaintenanceView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if let incompleteSkippedResult {
+                Text(Self.incompleteSkippedLine(count: incompleteSkippedResult))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let incompleteError {
                 Text(incompleteError).font(.caption).foregroundStyle(.red)
             }
@@ -374,6 +380,7 @@ struct GalleryMaintenanceView: View {
         incompleteScanning = true
         incompleteError = nil
         incompleteDiscardResult = nil
+        incompleteSkippedResult = nil
         defer { incompleteScanning = false; incompleteScanned = true }
         await archiveStore.reload()
     }
@@ -390,17 +397,38 @@ struct GalleryMaintenanceView: View {
         }
         incompleteDiscarding = true
         defer { incompleteDiscarding = false }
+        let (discarded, skipped) = Self.discardIncompleteArchives(incompleteArchives)
+        incompleteDiscardResult = discarded
+        incompleteSkippedResult = skipped > 0 ? skipped : nil
+        await archiveStore.reload()
+    }
+
+    /// Deletes every bundle in `summaries` that is still incomplete *right
+    /// now* — re-checked here rather than trusting `summaries` itself,
+    /// which is a snapshot that may be stale: an archive in flight when the
+    /// snapshot was taken can have committed since (removing its own
+    /// `INCOMPLETE.json` at the commit point), turning it into a normal,
+    /// valid archive that must not be permanently deleted. Returns how many
+    /// were discarded vs. skipped for no longer being incomplete. A pure,
+    /// synchronous helper (no `@State`) so it's directly unit-testable.
+    static func discardIncompleteArchives(_ summaries: [ArchiveStore.Summary]) -> (discarded: Int, skipped: Int) {
+        let fm = FileManager.default
         var discarded = 0
-        for summary in incompleteArchives {
+        var skipped = 0
+        for summary in summaries {
             // Belt and suspenders: only ever remove a directory that is
             // itself a `.cbarchive` bundle — never anything else on disk.
             guard summary.bundlePath.hasSuffix(".cbarchive") else { continue }
-            if (try? FileManager.default.removeItem(atPath: summary.bundlePath)) != nil {
+            let markerPath = (summary.bundlePath as NSString).appendingPathComponent("INCOMPLETE.json")
+            guard fm.fileExists(atPath: markerPath) else {
+                skipped += 1
+                continue
+            }
+            if (try? fm.removeItem(atPath: summary.bundlePath)) != nil {
                 discarded += 1
             }
         }
-        incompleteDiscardResult = discarded
-        await archiveStore.reload()
+        return (discarded, skipped)
     }
 
     // MARK: - Pure formatting helpers (unit-tested)
@@ -451,6 +479,10 @@ struct GalleryMaintenanceView: View {
 
     static func incompleteDiscardedLine(count: Int) -> String {
         "Discarded \(count)"
+    }
+
+    static func incompleteSkippedLine(count: Int) -> String {
+        "Skipped \(count) no-longer-incomplete"
     }
 
     static func incompleteConfirmTitle(count: Int) -> String {
