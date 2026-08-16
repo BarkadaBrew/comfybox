@@ -86,6 +86,8 @@ struct DesktopSettings: Codable {
     var falApiKey: String?
     /// Littleroundbox get_server_health endpoint (MCP tools/execute).
     var serverHealthEndpoint: String?
+    /// Directories scanned for .cbarchive bundles. nil = [~/.comfybox/archives].
+    var archiveRoots: [String]?
 
     /// Starter set for the health board when nothing is configured yet:
     /// the coffeeshop stack (Bree's server web UI, the legacy image service)
@@ -118,8 +120,15 @@ struct DesktopSettings: Codable {
         videoSteps: nil,
         replicateApiKey: nil,
         falApiKey: nil,
-        serverHealthEndpoint: nil
+        serverHealthEndpoint: nil,
+        archiveRoots: nil
     )
+
+    /// Directory scanned for .cbarchive bundles when `archiveRoots` is nil.
+    static var defaultArchiveRoot: String {
+        (NSString(string: "~/.comfybox").expandingTildeInPath as NSString)
+            .appendingPathComponent("archives")
+    }
 
     /// Map the persisted scale step to SwiftUI's type-size ladder.
     static func dynamicTypeSize(for scale: String?) -> DynamicTypeSize {
@@ -479,6 +488,10 @@ struct SettingsView: View {
                     .frame(width: 160)
                     .onChange(of: settings.gallerySortDefault) { _, _ in hasUnsavedChanges = true }
                 }
+
+                Text("Thumbnail cleanup and regeneration live in the Gallery toolbar (stethoscope icon).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

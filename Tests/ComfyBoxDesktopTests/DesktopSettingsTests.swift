@@ -66,4 +66,36 @@ struct DesktopSettingsTests {
         #expect(DesktopSettings.dynamicTypeSize(for: "xxlarge") == .xxxLarge)
         #expect(DesktopSettings.dynamicTypeSize(for: "garbage") == .large)
     }
+
+    @Test("archiveRoots defaults to nil, defaultArchiveRoot expands the tilde")
+    func archiveRootsDefaults() {
+        #expect(DesktopSettings.defaultSettings.archiveRoots == nil)
+        let expected = NSString(string: "~/.comfybox/archives").expandingTildeInPath
+        #expect(DesktopSettings.defaultArchiveRoot == expected)
+        #expect(!DesktopSettings.defaultArchiveRoot.hasPrefix("~"))
+    }
+
+    @Test("an old config JSON written before archiveRoots existed still decodes")
+    func decodesOldConfigWithoutArchiveRoots() throws {
+        // Deliberately omits "archiveRoots" (and other optionals added over
+        // time) to simulate a desktop-config.json written by an older build.
+        let json = """
+        {
+            "serverHost": "127.0.0.1",
+            "serverPort": 7870,
+            "autoConnect": true,
+            "outputDirectory": "/tmp/output",
+            "defaultSteps": 9,
+            "defaultGuidance": 3.5,
+            "defaultWidth": 1024,
+            "defaultHeight": 1024,
+            "thumbnailSize": 180,
+            "gallerySortDefault": "date"
+        }
+        """
+        let decoded = try JSONDecoder().decode(DesktopSettings.self, from: Data(json.utf8))
+        #expect(decoded.archiveRoots == nil)
+        #expect(decoded.serverHost == "127.0.0.1")
+        #expect(decoded.watchedServices == nil)
+    }
 }

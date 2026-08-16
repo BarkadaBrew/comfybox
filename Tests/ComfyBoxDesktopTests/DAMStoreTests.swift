@@ -176,6 +176,34 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    @Test("re-ingesting a path with nil source preserves the existing row's source")
+    func reingestPreservesSource() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let original = DAMAsset(
+            id: "original-id", filename: "sourced.png",
+            absolutePath: "/tmp/test-images/sourced.png",
+            source: "kira"
+        )
+        try await store.insertAsset(original)
+
+        // Colliding path, fresh id, no source — as a poller re-ingest would produce.
+        let reingested = DAMAsset(
+            filename: "sourced.png",
+            absolutePath: original.absolutePath,
+            fileSize: 999
+        )
+        let stored = try await store.insertAsset(reingested)
+        #expect(stored.id == "original-id")
+        #expect(stored.source == "kira")
+
+        let fetched = try await store.fetchAssets()
+        #expect(fetched.count == 1)
+        #expect(fetched[0].source == "kira")
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("fetchAsset(byPath:) returns tracked asset or nil")
     func fetchByPath() async throws {
         let tmpDir = NSTemporaryDirectory()
@@ -444,6 +472,51 @@ struct DAMStoreTests {
         try await store.deleteAsset(id: "doomed")
         #expect(try await catalog.locations(of: "doomed", scope: nil).isEmpty)
         #expect(try await catalog.collectionCounts(scope: nil)["col-photography"] == 0)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("searchPrompts preserves source (regression: SELECT was missing a.source)")
+    func searchPromptsPreservesSource() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let asset = DAMAsset(
+            id: "source-test", filename: "source-test.png",
+            absolutePath: "/tmp/source-test.png",
+            prompt: "a kira render of a sunlit meadow",
+            source: "kira"
+        )
+        try await store.insertAsset(asset)
+        let results = try await store.searchPrompts(query: "meadow")
+        #expect(results.count == 1)
+        #expect(results[0].source == "kira")
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("allAssetIds returns every id, including secured ones")
+    func allAssetIds() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let securedPath = (tmpDir as NSString).appendingPathComponent("secured-\(UUID().uuidString).png")
+        try Data([0x89]).write(to: URL(fileURLWithPath: securedPath))
+        try await store.insertAsset(DAMAsset(id: "plain-1", filename: "plain.png", absolutePath: "/tmp/plain.png"))
+        try await store.insertAsset(DAMAsset(id: "sec-1", filename: "sec.png", absolutePath: securedPath))
+        try await store.secureAsset(id: "sec-1", securedPath: securedPath, originalPath: "/tmp/orig.png")
+
+        let ids = try await store.allAssetIds()
+        #expect(ids == ["plain-1", "sec-1"])
+        try? FileManager.default.removeItem(atPath: securedPath)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("allAssetIds returns an empty set on a fresh DB")
+    func allAssetIdsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let ids = try await store.allAssetIds()
+        #expect(ids.isEmpty)
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 

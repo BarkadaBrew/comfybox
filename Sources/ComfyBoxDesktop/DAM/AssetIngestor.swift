@@ -92,6 +92,15 @@ public final class AssetIngestor {
         isWatching = false
     }
 
+    /// Register a path as already tracked without ingesting it — for callers
+    /// (e.g. `GalleryArchiver` restore) that insert a DAM row for a file
+    /// directly rather than through `ingestFile`. Without this, the poller's
+    /// `scanForNewFiles` treats the file as new on its next pass, re-ingests
+    /// it under a fresh id, and clobbers the row that already exists.
+    public func markKnown(_ path: String) {
+        knownPaths.insert(path)
+    }
+
     /// Manually ingest a single file at the given path. Returns the stored
     /// asset (which keeps its original id if the path was already tracked).
     @discardableResult
@@ -134,6 +143,105 @@ public final class AssetIngestor {
                 )
             }.value
         }
+    }
+
+    /// Outcome of `regenerateAllThumbnails`.
+    public struct ThumbnailRegenSummary: Sendable {
+        public var total: Int
+        public var regenerated: Int
+        public var missingSource: Int
+        public var failed: Int
+    }
+
+    /// Force-regenerate the thumbnail for every given asset, overwriting
+    /// whatever is already cached. Unlike `regenerateMissingThumbnails`
+    /// (which only fills in gaps and is safe to call on every gallery
+    /// load), this always deletes the existing thumbnail first — required
+    /// because `generateThumbnail` early-returns whenever the destination
+    /// already exists with size > 0. Fans generation out across up to
+    /// `min(4, activeProcessorCount)` concurrent tasks since serial
+    /// per-asset generation (the shape `regenerateMissingThumbnails` uses)
+    /// would take minutes over thousands of assets.
+    @discardableResult
+    public func regenerateAllThumbnails(
+        for assets: [DAMAsset],
+        progress: (@MainActor (_ done: Int, _ total: Int) -> Void)? = nil
+    ) async -> ThumbnailRegenSummary {
+        let maxDimension = thumbnailMaxDimension
+        let quality = thumbnailJPEGQuality
+        let total = assets.count
+        let fm = FileManager.default
+
+        var missingSource = 0
+        var regenerated = 0
+        var failed = 0
+        var done = 0
+
+        // Assets whose source file is gone are counted, not fanned out —
+        // there is nothing to generate a thumbnail from.
+        var eligible: [DAMAsset] = []
+        eligible.reserveCapacity(assets.count)
+        for asset in assets {
+            if fm.fileExists(atPath: asset.absolutePath) {
+                eligible.append(asset)
+            } else {
+                missingSource += 1
+                done += 1
+                progress?(done, total)
+            }
+        }
+
+        // Pre-resolve thumbnail destinations (requires main-actor access to
+        // `thumbnailPath(for:)`) so the task-group body below — which Swift
+        // treats as a nonisolated context — never has to call back into
+        // main-actor-isolated state.
+        let jobs: [(sourcePath: String, thumbPath: String)] = eligible.map {
+            (sourcePath: $0.absolutePath, thumbPath: thumbnailPath(for: $0.id))
+        }
+
+        let concurrency = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+        var nextIndex = 0
+
+        await withTaskGroup(of: Bool.self) { group in
+            func submitNext() {
+                guard nextIndex < jobs.count else { return }
+                let job = jobs[nextIndex]
+                nextIndex += 1
+
+                // Mandatory: generateThumbnail early-returns on any
+                // existing non-empty file, so force-regenerate is a no-op
+                // without this delete first.
+                try? FileManager.default.removeItem(atPath: job.thumbPath)
+
+                group.addTask {
+                    await Task.detached(priority: .utility) {
+                        Self.generateThumbnail(
+                            from: job.sourcePath, to: job.thumbPath,
+                            maxDimension: maxDimension, jpegQuality: quality
+                        )
+                    }.value
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: job.thumbPath)
+                    let size = (attrs?[.size] as? Int) ?? 0
+                    return size > 0
+                }
+            }
+
+            for _ in 0..<min(concurrency, jobs.count) {
+                submitNext()
+            }
+
+            while let ok = await group.next() {
+                if ok { regenerated += 1 } else { failed += 1 }
+                done += 1
+                progress?(done, total)
+                submitNext()
+            }
+        }
+
+        return ThumbnailRegenSummary(
+            total: total, regenerated: regenerated,
+            missingSource: missingSource, failed: failed
+        )
     }
 
     /// Remove DAM rows whose file was deleted out from under us, dropping
@@ -359,7 +467,9 @@ public final class AssetIngestor {
 
     // MARK: - Polling
 
-    private func scanForNewFiles() async {
+    // internal (not private) so tests can drive a poll pass directly via
+    // `@testable import` without waiting on the real 5s poll interval.
+    func scanForNewFiles() async {
         let fm = FileManager.default
         guard let contents = try? fm.contentsOfDirectory(atPath: watchDirectory) else {
             return

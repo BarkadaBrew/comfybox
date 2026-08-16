@@ -35,6 +35,9 @@ enum GallerySortOrder: String, CaseIterable {
 struct GalleryView: View {
     let store: DAMStore
     let ingestor: AssetIngestor
+    /// Archive engine (moves assets to a `.cbarchive` bundle). Optional so
+    /// previews/tests can omit it.
+    var archiver: GalleryArchiver?
     /// For server-backed actions (upscale). Optional so previews/tests can omit.
     var engine: EngineService?
     var onCompare: (([DAMAsset]) -> Void)?
@@ -50,6 +53,9 @@ struct GalleryView: View {
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
     @Binding var searchFocusRequests: Int
+    /// Incremented by the "Gallery Health" palette command; consumed to open
+    /// the maintenance sheet. Same counter-binding trick as `searchFocusRequests`.
+    @Binding var maintenanceRequests: Int
 
     @State private var assets: [DAMAsset] = []
     @State private var searchText: String = ""
@@ -155,6 +161,16 @@ struct GalleryView: View {
     // Folder import (Photo Mechanic-style "add existing folder")
     @State private var importProgress: (done: Int, total: Int)?
     @State private var importSummary: String?
+
+    // Gallery Health / maintenance sheet (T11)
+    @State private var showMaintenance: Bool = false
+
+    // Archiving (moves assets to a .cbarchive bundle)
+    @State private var showArchiveSheet: Bool = false
+    @State private var archiveTargets: [DAMAsset] = []
+    @State private var archiveFolder: DAMFolder?
+    @State private var archiveProgress: (done: Int, total: Int)?
+    @State private var archiveSummary: String?
 
     // Search field focus
     @FocusState private var searchFieldFocused: Bool
@@ -318,6 +334,18 @@ struct GalleryView: View {
             }
             .padding(18).frame(width: 360)
         }
+        .sheet(isPresented: $showArchiveSheet) {
+            ArchiveSheet(
+                assets: archiveTargets,
+                folder: archiveFolder,
+                store: store,
+                isPresented: $showArchiveSheet,
+                onArchive: { name, destinationRoot in
+                    performArchive(name: name, destinationRoot: destinationRoot,
+                                   assets: archiveTargets, folder: archiveFolder)
+                }
+            )
+        }
         .overlay {
             if let idx = lightboxIndex {
                 GalleryLightbox(
@@ -358,9 +386,14 @@ struct GalleryView: View {
         }
         .onAppear {
             consumeSearchFocusRequest()
+            consumeMaintenanceRequest()
             smartTabs = SmartTabStore.load()
         }
         .onChange(of: searchFocusRequests) { _, _ in consumeSearchFocusRequest() }
+        .onChange(of: maintenanceRequests) { _, _ in consumeMaintenanceRequest() }
+        .sheet(isPresented: $showMaintenance) {
+            GalleryMaintenanceView(store: store, ingestor: ingestor, archiver: archiver)
+        }
         .onKeyPress(.space) {
             if let asset = selectedAsset {
                 quickLookAsset(asset)
@@ -504,6 +537,14 @@ struct GalleryView: View {
                     .fixedSize()
                 }
 
+                // Archive selection
+                if !selectedIds.isEmpty {
+                    Button { requestArchive(selectedAssetsList, folder: nil) } label: {
+                        Label("Archive \(selectedIds.count)", systemImage: "archivebox")
+                    }
+                    .controlSize(.small)
+                }
+
                 // Bulk delete
                 if !selectedIds.isEmpty {
                     Button(role: .destructive, action: { requestDelete(selectedAssetsList) }) {
@@ -623,6 +664,13 @@ struct GalleryView: View {
                 Image(systemName: "arrow.clockwise")
             }
             .help("Refresh gallery")
+
+            // Gallery Health (orphan thumbnails, missing assets, regenerate,
+            // incomplete archives)
+            Button { showMaintenance = true } label: {
+                Image(systemName: "stethoscope")
+            }
+            .help("Gallery health & maintenance")
 
             // Asset count
             Text("\(filteredAssets.count) images")
@@ -962,6 +1010,11 @@ struct GalleryView: View {
                             }
                         }
                         Divider()
+                        Button("Archive…") {
+                            requestArchive(isSelectMode && selectedIds.contains(asset.id)
+                                ? selectedAssetsList : [asset], folder: nil)
+                        }
+                        Divider()
                         Button("Delete…", role: .destructive) {
                             requestDelete([asset])
                         }
@@ -1201,6 +1254,10 @@ struct GalleryView: View {
                                         renameText = folder.name
                                         renamingFolder = folder
                                     }
+                                    Button("Archive Folder…") {
+                                        let ids = Set(folderAssignments.filter { $0.value == folder.id }.keys)
+                                        Task { await requestArchiveFolder(ids: ids, folder: folder) }
+                                    }
                                     Button("Delete Folder", role: .destructive) {
                                         Task { await deleteFolder(folder) }
                                     }
@@ -1247,6 +1304,25 @@ struct GalleryView: View {
                 .padding(.vertical, 6)
             } else if let importSummary {
                 Text(importSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 6)
+            }
+
+            if let archiveProgress {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Archiving \(archiveProgress.done) / \(archiveProgress.total)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ProgressView(value: Double(archiveProgress.done),
+                                 total: Double(max(archiveProgress.total, 1)))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            } else if let archiveSummary {
+                Text(archiveSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -1583,6 +1659,14 @@ struct GalleryView: View {
         searchFocusRequests = 0
         // Defer a tick so the field is in the hierarchy before focusing.
         Task { focusSearch() }
+    }
+
+    /// Consume a pending "Gallery Health" palette request by opening the
+    /// maintenance sheet.
+    private func consumeMaintenanceRequest() {
+        guard maintenanceRequests > 0 else { return }
+        maintenanceRequests = 0
+        showMaintenance = true
     }
 
     private func updateAsset(_ asset: DAMAsset) async {
@@ -1979,6 +2063,71 @@ struct GalleryView: View {
         }
         lightboxIndex = nil
         await loadAssets()
+    }
+
+    // MARK: - Archiving
+
+    /// Stage assets (and, for a folder archive, the folder itself) and show
+    /// the archive sheet.
+    private func requestArchive(_ toArchive: [DAMAsset], folder: DAMFolder?) {
+        guard !toArchive.isEmpty else { return }
+        archiveTargets = toArchive
+        archiveFolder = folder
+        showArchiveSheet = true
+    }
+
+    /// "Archive Folder…" must include every asset filed in the folder, not
+    /// just whichever page happens to be sitting in the view's own `assets`
+    /// array (capped at `fetchAssets(limit: 500)`) — fetch the full asset
+    /// set from the store and filter by id instead, so folders larger than
+    /// the page size still archive completely.
+    private func requestArchiveFolder(ids: Set<String>, folder: DAMFolder) async {
+        guard !ids.isEmpty else { return }
+        do {
+            let total = try await store.assetCount()
+            let allAssets = try await store.fetchAssets(limit: total, offset: 0)
+            requestArchive(Self.folderMembers(ids: ids, from: allAssets), folder: folder)
+        } catch {
+            errorMessage = "Failed to load folder assets: \(error.localizedDescription)"
+        }
+    }
+
+    /// Given a folder's asset id set (from `folderAssignments()`) and the
+    /// full, unpaged asset list, returns exactly the assets that belong to
+    /// the folder. A pure, directly unit-testable helper isolating the
+    /// membership filter from the store fetch above it.
+    static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
+        allAssets.filter { ids.contains($0.id) }
+    }
+
+    /// Runs the archive via `GalleryArchiver`, mirroring the import strip's
+    /// progress reporting. On completion: clear selection, refresh the grid
+    /// (the same reload `deleteAssets` uses), show a one-line summary.
+    /// Failures land in the existing `errorMessage` banner.
+    private func performArchive(name: String, destinationRoot: String, assets toArchive: [DAMAsset], folder: DAMFolder?) {
+        guard let archiver else { return }
+        archiveSummary = nil
+        archiveProgress = (0, toArchive.count)
+        let request = GalleryArchiver.ArchiveRequest(
+            name: name, destinationRoot: destinationRoot, assets: toArchive, folder: folder
+        )
+        Task {
+            do {
+                let result = try await archiver.archive(request) { done, total in
+                    archiveProgress = (done, total)
+                }
+                archiveProgress = nil
+                var parts = ["Archived \(result.archived)"]
+                if result.skippedSecured > 0 { parts.append("\(result.skippedSecured) secured skipped") }
+                if !result.failed.isEmpty { parts.append("\(result.failed.count) failed") }
+                archiveSummary = parts.joined(separator: " · ")
+                selectedIds.subtract(toArchive.map(\.id))
+                await loadAssets()
+            } catch {
+                archiveProgress = nil
+                errorMessage = "Archive failed: \(error.localizedDescription)"
+            }
+        }
     }
 
     /// Open Quick Look for an asset using macOS native preview.

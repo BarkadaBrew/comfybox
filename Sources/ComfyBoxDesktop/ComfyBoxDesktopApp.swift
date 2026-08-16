@@ -13,6 +13,8 @@ struct ComfyBoxDesktopApp: App {
     @State private var engine: EngineService
     @State private var store: DAMStore?
     @State private var ingestor: AssetIngestor?
+    @State private var archiver: GalleryArchiver?
+    @State private var archiveStore = ArchiveStore()
     @State private var presetManager = PresetManager()
     @State private var healthMonitor = HealthMonitor()
     @State private var promptLibrary = PromptLibraryStore()
@@ -48,6 +50,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var comparisonAssets: [DAMAsset]?
     @State private var pendingPreset: GenerationPreset?
     @State private var gallerySearchFocusRequests: Int = 0
+    @State private var galleryMaintenanceRequests: Int = 0
     @State private var showCommandPalette = false
     @State private var showSplash = true
 
@@ -73,6 +76,7 @@ struct ComfyBoxDesktopApp: App {
         case applications = "Applications"
         case queue = "Queue"
         case remoteGallery = "Remote Gallery"
+        case archives = "Archives"
 
         /// Sidebar grouping for the hub.
         enum Section: String, CaseIterable, Identifiable {
@@ -86,7 +90,7 @@ struct ComfyBoxDesktopApp: App {
         var section: Section {
             switch self {
             case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
-            case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery: return .library
+            case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery, .archives: return .library
             case .dashboard, .applications, .queue: return .operate
             case .bree, .kira: return .suite
             }
@@ -119,6 +123,7 @@ struct ComfyBoxDesktopApp: App {
             case .applications: return "square.grid.3x3.square"
             case .queue: return "list.bullet.rectangle"
             case .remoteGallery: return "photo.stack"
+            case .archives: return "archivebox"
             }
         }
 
@@ -145,6 +150,7 @@ struct ComfyBoxDesktopApp: App {
             case .remoteGallery: return "r"
             case .face: return "f"
             case .inpaint: return "e"
+            case .archives: return "7"
             }
         }
     }
@@ -392,6 +398,10 @@ struct ComfyBoxDesktopApp: App {
                 title: "Find in Gallery", subtitle: "Gallery", systemImage: "magnifyingglass",
                 keywords: ["search"], action: { selectedTab = .gallery; gallerySearchFocusRequests += 1 }),
             PaletteCommand(
+                title: "Gallery Health", subtitle: "Maintenance", systemImage: "stethoscope",
+                keywords: ["thumbnails", "orphans", "cleanup"],
+                action: { selectedTab = .gallery; galleryMaintenanceRequests += 1 }),
+            PaletteCommand(
                 title: "Open Settings", subtitle: "Preferences", systemImage: "gearshape",
                 keywords: ["preferences", "config", "keys"],
                 action: {
@@ -414,6 +424,7 @@ struct ComfyBoxDesktopApp: App {
             GalleryView(
                 store: store,
                 ingestor: ingestor,
+                archiver: archiver,
                 engine: engine,
                 onCompare: { assets in
                     comparisonAssets = assets
@@ -438,7 +449,8 @@ struct ComfyBoxDesktopApp: App {
                     selectedTab = .inpaint
                 },
                 canvasStore: canvasStore,
-                searchFocusRequests: $gallerySearchFocusRequests
+                searchFocusRequests: $gallerySearchFocusRequests,
+                maintenanceRequests: $galleryMaintenanceRequests
             )
         } else if let error = initError {
             errorView(error)
@@ -546,6 +558,17 @@ struct ComfyBoxDesktopApp: App {
 
         case .gallery:
             galleryDetail
+
+        case .archives:
+            if let store, let ingestor, let archiver {
+                ArchiveBrowserView(store: store, ingestor: ingestor,
+                                    archiver: archiver, archives: archiveStore)
+            } else if let error = initError {
+                errorView(error)
+            } else {
+                ProgressView("Initializing database...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
 
         case .compare:
             if let store = store, let ingestor = ingestor {
@@ -707,9 +730,26 @@ struct ComfyBoxDesktopApp: App {
                 store: damStore,
                 watchDirectory: engine.outputDirectory
             )
+            let galleryArchiver = GalleryArchiver(store: damStore, ingestor: assetIngestor)
             store = damStore
             ingestor = assetIngestor
+            archiver = galleryArchiver
             await assetIngestor.startWatching()
+
+            // Crash recovery (T7): finish any archive whose source removal
+            // was interrupted by a crash between commit and cleanup.
+            // Fire-and-forget — must not block app launch.
+            let archiveRoots = DesktopSettings.load().archiveRoots ?? [DesktopSettings.defaultArchiveRoot]
+            Task {
+                await galleryArchiver.resumePendingRemovals(in: archiveRoots)
+            }
+
+            // Archive browser (T10): same roots resumePendingRemovals just
+            // used, kept in sync so both agree on where bundles live.
+            archiveStore.roots = archiveRoots
+            Task {
+                await archiveStore.reload()
+            }
         } catch {
             initError = error.localizedDescription
         }
