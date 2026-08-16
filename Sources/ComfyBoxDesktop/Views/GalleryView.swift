@@ -74,6 +74,10 @@ struct GalleryView: View {
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
     @State private var isSelectMode: Bool = false
+    // Grid page size. Select All raises it to the full scope for the rest of
+    // the session so the selection is truthful, not capped at one page.
+    @State private var loadLimit = 500
+    private static let fullScopeLimit = 20_000
     @State private var mediaTools = MediaToolsService()
     @State private var sidecar = SidecarService()
 
@@ -494,9 +498,10 @@ struct GalleryView: View {
             }
 
             if isSelectMode {
-                Button("All") { selectedIds = Set(filteredAssets.map(\.id)) }
+                Button("All") { Task { await selectAll() } }
+                    .keyboardShortcut("a", modifiers: .command)
                     .controlSize(.small)
-                    .help("Select all visible images")
+                    .help("Select every image in the current view (⌘A)")
 
                 if !selectedIds.isEmpty {
                     Button("None") { selectedIds.removeAll() }
@@ -1229,7 +1234,7 @@ struct GalleryView: View {
         CatalogQuery(text: searchText.isEmpty ? nil : searchText,
                      collectionID: selectedCollectionID,
                      lane: selectedLane,
-                     limit: 500)
+                     limit: loadLimit)
     }
 
     private func applyCatalogFilter() async {
@@ -1632,9 +1637,10 @@ struct GalleryView: View {
     private func loadFromLocalStore() async throws {
         remoteURLs = [:]
         if !searchText.isEmpty {
-            assets = try await store.searchPrompts(query: searchText, limit: 200)
+            assets = try await store.searchPrompts(query: searchText,
+                                                   limit: loadLimit == Self.fullScopeLimit ? loadLimit : 200)
         } else {
-            assets = try await store.fetchAssets(limit: 500)
+            assets = try await store.fetchAssets(limit: loadLimit)
             // Self-heal: backfill any thumbnail that's missing or was
             // left as a 0-byte file by a previously-interrupted write.
             await ingestor.regenerateMissingThumbnails(for: assets)
@@ -1862,6 +1868,19 @@ struct GalleryView: View {
     /// Assets for the current selection, in display order.
     private var selectedAssetsList: [DAMAsset] {
         filteredAssets.filter { selectedIds.contains($0.id) }
+    }
+
+    /// Select every asset in the current view. The grid normally loads one
+    /// page (`loadLimit`); if that page is full there may be more rows in
+    /// scope, so raise the limit to the full scope and reload first — a
+    /// "select all" that silently stops at the page boundary selects an
+    /// arbitrary 500 of a 3,000-image gallery.
+    private func selectAll() async {
+        if loadLimit < Self.fullScopeLimit && assets.count >= loadLimit {
+            loadLimit = Self.fullScopeLimit
+            await loadAssets()
+        }
+        selectedIds = Set(filteredAssets.map(\.id))
     }
 
     private func toggleSelection(_ asset: DAMAsset) {
