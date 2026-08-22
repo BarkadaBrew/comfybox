@@ -144,38 +144,34 @@ public final class RES4LYFBongMath: BongMath {
       return 0
     }
 
-    // `rk_sampler_beta.py:1971` — `if sigma > 0.03`.
-    let sigma = Double(sigmas[timestepIndex])
-    guard sigma > Self.minimumSigma else {
-      refusals += 1
-      return 0
-    }
-
-    // `rk_sampler_beta.py:1967` — `NS.h < RK.sigma_max/2`. `h` is the FRAME's
-    // step size, so a scheduler that cannot report one cannot be bongmathed:
-    // guessing `σ' − σ` for an exponential sampler would refuse the wrong
-    // steps, which is exactly the silent substitution D18 forbids.
+    // The two things this hook cannot proceed without come FIRST, so that a
+    // scheduler it does not know how to interrogate fails loudly on every
+    // call rather than only on the steps whose guards would have passed.
+    //
+    // `h` is the FRAME's step size (`NS.h`), not `σ' − σ`: guessing the linear
+    // form for an exponential sampler is off by a factor of 20 at the tail and
+    // would refuse the wrong steps — the silent substitution D18 forbids.
     guard let framed = scheduler as? RES4LYFFrameScheduler else {
       preconditionFailure(
         "bongmath needs the frame step size `h` for step \(timestepIndex), and this scheduler "
           + "is not a RES4LYFFrameScheduler; σ' − σ is not a valid substitute for the "
           + "exponential frame (§3.13)")
     }
-    let h = Double(framed.frameStepSize(timestepIndex: timestepIndex))
-    guard h < sigmaMax / 2 else {
-      refusals += 1
-      return 0
-    }
-
-    // `rk_sampler_beta.py:1967` — `NS.s_[row] > RK.sigma_min`, the sigma the
-    // row that is being rebased was evaluated at.
-    guard let rowSigma = Self.rowSigma(scheduler, timestepIndex: timestepIndex, row: row, grid: sigmas)
+    // `NS.s_[row]` — the sigma the row being rebased was evaluated at.
+    guard let rowSigma = Self.rowSigma(
+      scheduler, timestepIndex: timestepIndex, row: row, grid: sigmas)
     else {
       preconditionFailure(
         "bongmath needs the substep sigma for row \(row) of step \(timestepIndex), and this "
           + "scheduler reports none")
     }
-    guard Double(rowSigma) > sigmaMin else {
+
+    // Upstream's three guards, all of which must hold
+    // (`rk_sampler_beta.py:1967` and `:1971`):
+    //     NS.s_[row] > RK.sigma_min      NS.h < RK.sigma_max/2      sigma > 0.03
+    let sigma = Double(sigmas[timestepIndex])
+    let h = Double(framed.frameStepSize(timestepIndex: timestepIndex))
+    guard Double(rowSigma) > sigmaMin, h < sigmaMax / 2, sigma > Self.minimumSigma else {
       refusals += 1
       return 0
     }

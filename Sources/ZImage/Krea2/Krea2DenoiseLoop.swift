@@ -31,8 +31,9 @@ import MLX
 ///     on it (`rk_sampler_beta.py:1874`) — so the row's evaluation sees the
 ///     re-noised sample. `res_2s` reproduces its T2 trace only with this.
 ///   * ``inject(sample:x0:timestepIndex:scheduler:)`` runs once per step,
-///     after the step's commit and before the T3 hook
-///     (`rk_sampler_beta.py:2027`).
+///     after the step's commit (`rk_sampler_beta.py:2029`). The `x0` it is
+///     handed is the one T3 may have re-derived during the row loop, because
+///     that is the `x_0` upstream's `swap_noise_step` reads.
 ///
 /// Both are handed the step's own `x0` — the sample the step started from —
 /// because upstream's swap is written in `eps' = (x₀ − x)/(σ − σ_target)` and
