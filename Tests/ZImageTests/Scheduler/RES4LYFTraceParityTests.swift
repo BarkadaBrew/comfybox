@@ -267,20 +267,48 @@ final class RES4LYFTraceParityTests: XCTestCase {
     }
   }
 
-  // MARK: - AC-26, T1, res_2s: the existing scheduler against the oracle
+  // MARK: - AC-26, T1, res_2s: the PRODUCTION scheduler against the oracle
 
-  /// Drives `RES2sScheduler` with the trace's own sigma grid and the trace's
-  /// recorded data predictions, and checks the intermediate sample, the
-  /// intermediate sigma and the step result against RES4LYF after every step.
+  /// The published stage-1 recipe as `Krea2Pipeline.makeScheduler` builds it:
+  /// `res_2s` + `beta` at 6 steps under Krea 2's `ModelSamplingFlux(1.15)`,
+  /// with RES4LYF sigma preparation on. Nothing is read from the trace to
+  /// construct it (Addendum A.1: the grid must be ours).
+  static let tracedMu: Float = 1.15
+
+  static func productionRES2sScheduler(steps: Int = 6) throws -> any ZImageScheduler {
+    try SchedulerFactory.create(
+      kind: .res2s,
+      sigmaSchedule: .beta,
+      numInferenceSteps: steps,
+      config: Krea2Sampling.schedulerConfig(),
+      mu: tracedMu,
+      c2: 0.5,
+      res4lyfSigmaPreparation: true)
+  }
+
+  /// The factory's own grid IS `sigmas_run` without its zero sentinel: `beta`
+  /// at 6 steps over the Flux table, then `prepare_sigmas` inserting σ_min.
+  func testProductionRES2sGridIsTheOraclePreparedGrid() throws {
+    let m = try RES4LYFTraceFixture.load("res2s_beta6_T1").manifest
+    let scheduler = try Self.productionRES2sScheduler()
+    let grid = scheduler.sigmas.asArray(Float.self)
+
+    XCTAssertEqual(scheduler.numInferenceSteps, m.steps.count, "6 solver steps, as upstream runs")
+    XCTAssertEqual(grid.count, m.sigmasRun.count - 1, "the trailing 0 is the conversion's, not a step's")
+    for (i, (g, w)) in zip(grid, m.sigmasRun).enumerated() {
+      XCTAssertEqual(Double(g), w, accuracy: 1e-6, "sigmas_run[\(i)]")
+    }
+    XCTAssertEqual(Double(try XCTUnwrap(scheduler.finalConversionSigma)), m.sigmaMin, accuracy: 1e-9)
+  }
+
+  /// Drives the PRODUCTION `RES2sScheduler` — factory-built, prepared grid, no
+  /// surgery here — with the trace's recorded data predictions, and checks the
+  /// intermediate sample, the intermediate sigma and the step result against
+  /// RES4LYF after every step.
   func testRES2sSchedulerMatchesT1TraceStepByStep() throws {
     let trace = try RES4LYFTraceFixture.load("res2s_beta6_T1")
     let m = trace.manifest
-    // The loop grid: every sigma but the trailing 0 — the last step lands on
-    // σ_min and the σ_min → 0 tail is linear, not a sampler step.
-    let grid = Array(m.sigmasRun.dropLast()).map { Float($0) }
-    XCTAssertEqual(grid.count, m.steps.count + 1)
-    var scheduler = RES2sScheduler(
-      numInferenceSteps: m.steps.count, sigmaValues: grid, c2: 0.5)
+    var scheduler = try XCTUnwrap(try Self.productionRES2sScheduler() as? RES2sScheduler)
     XCTAssertEqual(scheduler.modelOutputConvention, .dataPrediction)
 
     var x = try trace.tensor(m.xInit)
@@ -310,5 +338,38 @@ final class RES4LYFTraceParityTests: XCTestCase {
     let epsLast = (try trace.tensor(last.x0) - x) / Float(last.sigma - last.sigmaNext)
     let final = x - Float(m.sigmaMin) * epsLast
     XCTAssertTraceClose(final, try trace.tensor(m.final.x), rtol: 1e-4, "final x after the σ_min tail")
+  }
+
+  /// S-FIX-1's gate for `res_2s`: a FACTORY-created scheduler driven by the
+  /// PRODUCTION `Krea2DenoiseLoop` against the scripted denoiser reproduces the
+  /// trace's FINAL tensor — after the σ_min → 0 conversion, which the loop
+  /// applies and this test does not. Fails on `final/x` if either the σ_min
+  /// preparation or the model-free tail is missing from production.
+  func testRES2sThroughTheDenoiseLoopReproducesTheTraceFinalTensor() throws {
+    let trace = try RES4LYFTraceFixture.load("res2s_beta6_T1")
+    let m = trace.manifest
+    var scheduler = try Self.productionRES2sScheduler()
+
+    let (x, stats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler, initialSample: try trace.tensor(m.xInit)
+    ) { latent, sigma in
+      RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma)
+    }
+
+    XCTAssertEqual(stats.stepsRun, 6)
+    XCTAssertEqual(stats.rowsAtStart, 2)
+    XCTAssertEqual(stats.evaluateCalls, 12, "2 rows × 6 steps")
+    XCTAssertEqual(stats.modelEvals, m.modelCallsTotal, "the σ_min conversion costs no model call")
+    XCTAssertEqual(Double(try XCTUnwrap(stats.finalConversionSigma)), m.sigmaMin, accuracy: 1e-9)
+
+    // `floor: 1.0` makes this an ABSOLUTE 1e-4 on a latent whose trajectory
+    // runs at |x| ≈ 3. The final latent is the data prediction at σ_min, so its
+    // own magnitude has collapsed to ~5e-3; measured relative to THAT, the
+    // float32 round-off this driver accumulates — a flat ~6e-7 absolute at
+    // every step, never growing — would read as 1e-4 "relative". The gate keeps
+    // all of its power: without the σ_min preparation and the model-free tail
+    // the same difference is 5.7e-2, 570× over this threshold.
+    XCTAssertTraceClose(
+      x, try trace.tensor(m.final.x), rtol: 1e-4, floor: 1.0, "final x after the σ_min tail")
   }
 }
