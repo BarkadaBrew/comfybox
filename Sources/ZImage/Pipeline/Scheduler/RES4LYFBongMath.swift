@@ -91,9 +91,17 @@ public final class RES4LYFBongMath: BongMath {
   /// Grid indices the fixed point ran on, in order, de-duplicated. The shape
   /// of E18's per-step `bongmath` array.
   public private(set) var rebasedSteps: [Int] = []
-  /// Model evaluations this hook made: 0, always. Kept as a counter rather
-  /// than a constant so the number reported is the number that happened.
-  public private(set) var extraModelEvals = 0
+  /// Model evaluations one rebase makes: **none** — `bong_iter` reads only the
+  /// `data_` the rows already produced. This is the single place that number
+  /// lives: ``iterate`` returns it to the loop (which adds it to
+  /// `Stats.evaluateCalls`) and ``extraModelEvals`` reports it, so the count
+  /// and the record cannot disagree.
+  public static let modelEvalsPerRebase = 0
+
+  /// Extra model evaluations this hook made — what ``iterate`` returned,
+  /// summed. Derived rather than stored: a counter incremented beside the
+  /// return is a second source of the same number.
+  public var extraModelEvals: Int { rebases * Self.modelEvalsPerRebase }
 
   /// The scheduler's grid, read once — the same reason
   /// ``RES4LYFSDENoiseInjector`` caches it.
@@ -128,7 +136,7 @@ public final class RES4LYFBongMath: BongMath {
   ///     the sample.
   ///   - evaluate: unused. The seam carries it because ``BongMath`` promises a
   ///     conformer MAY evaluate and must then say so; RES4LYF's never does.
-  /// - Returns: extra model evaluations made — 0.
+  /// - Returns: extra model evaluations made — ``modelEvalsPerRebase``, 0.
   public func iterate(
     x0: inout MLXArray,
     rowSample: MLXArray,
@@ -141,7 +149,7 @@ public final class RES4LYFBongMath: BongMath {
     let sigmas = gridValues(scheduler)
     guard timestepIndex >= 0, timestepIndex + 1 < sigmas.count else {
       refusals += 1
-      return 0
+      return Self.modelEvalsPerRebase
     }
 
     // The two things this hook cannot proceed without come FIRST, so that a
@@ -173,14 +181,33 @@ public final class RES4LYFBongMath: BongMath {
     let h = Double(framed.frameStepSize(timestepIndex: timestepIndex))
     guard Double(rowSigma) > sigmaMin, h < sigmaMax / 2, sigma > Self.minimumSigma else {
       refusals += 1
-      return 0
+      return Self.modelEvalsPerRebase
     }
 
-    // The iteration itself, in float32 — upstream's `work_dtype`, and the same
+    // The iteration runs in float32 — upstream's `work_dtype`, and the same
     // reason ``RES4LYFSDENoiseInjector.swap`` uses it: the production latent is
-    // bfloat16 and 8 mantissa bits will not carry a contraction to its fixed
-    // point. The anchor is handed back in the sample's own dtype, so the loop's
-    // latent stays exactly as wide as it was.
+    // bfloat16, and 8 mantissa bits are not enough to carry a contraction to
+    // its fixed point.
+    //
+    // THE DEVIATION, stated exactly, because it is real. Upstream holds `x_0`
+    // in float32 for the whole step; this hook hands the anchor back in the
+    // SAMPLE's dtype, so on a 3+-row tableau the second rebase of a step
+    // receives a bf16-rounded anchor. What that does and does not cost:
+    //
+    //   * The rebase's RESULT is unaffected. The fixed point of
+    //     `x₀ ↦ target − h·Σⱼaᵢⱼεⱼ(x₀)` is determined by `target`, the row
+    //     data predictions, `h` and the tableau — NOT by the starting iterate,
+    //     which 100 rounds of a contraction erase. Measured, not asserted:
+    //     `testTheFixedPointsLimitDoesNotDependOnTheStartingAnchor` runs it
+    //     from deliberately corrupted starts and gets the same limit.
+    //   * The next row's SAMPLE is unaffected, because the driver builds it at
+    //     the loop's own width either way: `rowSample(x0:)` would be handed
+    //     `bf16(x₀)` whether the rounding happened here or there.
+    //   * What DOES follow the loop's width rather than upstream's is the
+    //     model-free tail's epsilon, which S-FIX-1 already computes from the
+    //     recorded `(x₀, x_next)` in the loop's dtype at T1 and T2. Widening
+    //     it is that task's call, not this one's: doing it here would make the
+    //     final latent float32 on the bongmath path alone.
     let dtype = x0.dtype
     let target = rowSample.asType(.float32)
     var candidate = x0.asType(.float32)
@@ -196,7 +223,7 @@ public final class RES4LYFBongMath: BongMath {
 
     rebases += 1
     if rebasedSteps.last != timestepIndex { rebasedSteps.append(timestepIndex) }
-    return 0
+    return Self.modelEvalsPerRebase
   }
 
   // MARK: - Internals

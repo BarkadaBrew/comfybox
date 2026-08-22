@@ -297,10 +297,16 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
   case invalidShift(Float)
 
   /// A request field whose behaviour belongs to a parity tier the loop does
-  /// not implement yet (FDD-krea2-raw-recipe D18, §3.13): `eta` is T2
-  /// (WP-E15), `bongmath` is T3 (WP-E16). Refused at the pipeline so a
-  /// non-server caller cannot get a silent downgrade either — "fail loud,
-  /// never silently substitute".
+  /// not implement yet (FDD-krea2-raw-recipe D18, §3.13). Refused at the
+  /// pipeline so a non-server caller cannot get a silent downgrade either —
+  /// "fail loud, never silently substitute".
+  ///
+  /// **It currently has no throw site, by intent.** `eta` was T2 and
+  /// `bongmath` was T3; both landed (WP-E15, WP-E16) and each is now honoured
+  /// or refused BY SAMPLER at its own factory. The case and
+  /// ``Krea2Pipeline/validateTiers(eta:bongmath:)`` are kept as the matched
+  /// pair the NEXT such field uses, so a tier gate is never invented under
+  /// time pressure at a fresh call site. Delete both together or neither.
   case tierNotImplemented(field: String, value: String, tier: String)
 
   /// `eta != 0` was asked for with a sampler RES4LYF's SDE is not defined

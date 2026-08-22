@@ -84,6 +84,7 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(s.guidance, 1.0)
     XCTAssertEqual(s.eta, 0)
     XCTAssertFalse(s.bongmath)
+    XCTAssertNil(s.bongmathRebases, "a render with no T3 records no rebase count")
     // WP-E14: forwarded from the trace, not hard-coded. `euler` does not ramp,
     // so the trace it produced carries none and the record says none — which is
     // a DIFFERENT statement from "the record always says none", and
@@ -170,6 +171,30 @@ final class RenderRecipeTests: XCTestCase {
       trace: RenderRecipeFixture.trace(sampler: .res2s, sigmaSchedule: .beta57)))
     XCTAssertEqual(r.stages[0].sampler, SchedulerKind.res2s.rawValue)
     XCTAssertEqual(r.stages[0].sigmaSchedule, SigmaScheduleKind.beta57.rawValue)
+  }
+
+  /// WP-E16: `bongmathRebases` is FORWARDED from the trace, which is the only
+  /// witness — the hook counted its own rebases while it ran. It is what keeps
+  /// the record from reading as "the fixed point ran on every step" when
+  /// upstream's guards refused two of six: `bongmath: true` is the request,
+  /// this is what happened.
+  func testBongmathRebaseCountIsForwardedFromTheTrace() {
+    let ran = Krea2RunTrace.BongMathParameters(
+      iterations: 100, rebases: 4, steps: [0, 1, 2, 3], refusals: 2, extraModelEvals: 0)
+    let r = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(
+        steps: 6, sampler: .res2s, eta: 0.5, bongmath: true, bong: ran)))
+    XCTAssertTrue(r.stages[0].bongmath, "the request")
+    XCTAssertEqual(r.stages[0].bongmathRebases, 4, "what happened")
+    XCTAssertEqual(
+      r.stages[0].stepsRun, 6, "…over six steps, so two of them were refused")
+
+    // A `bongmath: true` render whose hook is absent records no count rather
+    // than an invented zero — the same discipline `warmupSampler` follows.
+    let none = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(steps: 6, sampler: .res2s, bongmath: true)))
+    XCTAssertTrue(none.stages[0].bongmath)
+    XCTAssertNil(none.stages[0].bongmathRebases)
   }
 
   /// `eta` and `bongmath` come off the trace, not a constant: when the loop

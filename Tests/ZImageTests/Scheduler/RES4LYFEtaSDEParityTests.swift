@@ -58,6 +58,14 @@ final class RES4LYFEtaSDEParityTests: XCTestCase {
     var exhausted: Bool { drawn == tensors.count }
   }
 
+  /// Hands back the SAME tensor every draw, so a test can vary one thing about
+  /// it (its dtype) and hold everything else fixed.
+  final class FixedNoiseStream: RES4LYFNoiseStream {
+    private let tensor: MLXArray
+    init(_ tensor: MLXArray) { self.tensor = tensor }
+    func next(like sample: MLXArray) -> MLXArray { tensor }
+  }
+
   /// Counts draws and returns zeros: proves eta 0 draws nothing at all.
   final class CountingNoiseStream: RES4LYFNoiseStream {
     private(set) var drawn = 0
@@ -508,6 +516,72 @@ final class RES4LYFEtaSDEParityTests: XCTestCase {
     // z-score is not 1 (the fixtures' recorded noise reads 0.9926 the same way).
     XCTAssertNotEqual(
       MLX.std(nchw, axes: Array(0..<nchw.ndim), ddof: 1).item(Float.self), 1, accuracy: 1e-6)
+  }
+
+  // MARK: - Who owns the cast (E15 review, item 1)
+
+  /// **The stream must NOT pre-round to the sample's dtype.** Upstream keeps
+  /// noise in `work_dtype` right through the `σ_up · noise` multiply and
+  /// rounds once, at the end of the swap.
+  ///
+  /// Every other test here probes with a float32 sample, where the two
+  /// spellings are indistinguishable — so this is the ONLY thing standing
+  /// between the production bfloat16 path and a silent revert to
+  /// `.asType(sample.dtype)`.
+  func testTheStreamDrawsFloat32WhateverTheSampleDtype() {
+    let stream = RES4LYFGaussianNoiseStream(seed: 11, layout: .channelsAtAxis1)
+    let shape = [1, 16, 8, 8]
+
+    let fromBF16 = stream.next(like: MLXArray.zeros(shape, dtype: .bfloat16))
+    XCTAssertEqual(
+      fromBF16.dtype, .float32,
+      "a bfloat16 sample must not narrow the draw — swap owns the single cast")
+    XCTAssertEqual(fromBF16.shape, shape)
+
+    let fromF32 = stream.next(like: MLXArray.zeros(shape, dtype: .float32))
+    XCTAssertEqual(fromF32.dtype, .float32)
+
+    // …and the narrowing this prevents is not cosmetic: bfloat16 keeps 8
+    // mantissa bits, so rounding the draw first genuinely loses the value.
+    let narrowed = fromBF16.asType(.bfloat16).asType(.float32)
+    XCTAssertGreaterThan(
+      MLX.abs(fromBF16 - narrowed).max().item(Float.self), 1e-4,
+      "if this is 0 the draw was already bfloat16 and the test proves nothing")
+  }
+
+  /// …and the sibling half: `swap` casts back to the SAMPLE's dtype, once, so
+  /// a bfloat16 latent stays bfloat16 and the float32 noise never widens it.
+  func testTheSwapCastsBackToTheSampleDtypeExactlyOnce() {
+    let sigmas: [Float] = [1.0, 0.6, 0.3, 3.157_511_5e-4]
+    let scheduler: any ZImageScheduler = RES2sScheduler(
+      numInferenceSteps: 3, sigmaValues: sigmas)
+    let shape = [1, 16, 8, 8]
+    let noise = RES4LYFGaussianNoiseStream(seed: 5, layout: .channelsAtAxis1)
+      .next(like: MLXArray.zeros(shape, dtype: .float32))
+    let x0 = MLXRandom.normal(shape).asType(.bfloat16)
+    let xNext = (x0 * MLXArray(Float(0.6)).asType(.bfloat16)).asType(.bfloat16)
+
+    func swapped(with draw: MLXArray) -> MLXArray {
+      var x = xNext
+      let injector = RES4LYFSDENoiseInjector(
+        eta: 0.5, etaSubstep: 0.5, sNoise: 1.0, sNoiseSubstep: 1.0, sigmaMax: 1.0,
+        stepNoise: FixedNoiseStream(draw), substepNoise: FixedNoiseStream(draw))
+      injector.inject(sample: &x, x0: x0, timestepIndex: 0, scheduler: scheduler)
+      return x
+    }
+
+    let fromFloat32 = swapped(with: noise)
+    XCTAssertEqual(
+      fromFloat32.dtype, .bfloat16, "the swap must hand the loop back its own width")
+    XCTAssertEqual(x0.dtype, .bfloat16, "…without having widened the sample it read")
+
+    // The cast's PLACEMENT is observable at the output, which is what makes
+    // this a regression gate rather than a type annotation.
+    let fromPreRounded = swapped(with: noise.asType(.bfloat16))
+    XCTAssertNotEqual(
+      fromFloat32.asType(.float32).asArray(Float.self),
+      fromPreRounded.asType(.float32).asArray(Float.self),
+      "rounding the draw before the σ_up multiply changes the result")
   }
 
   /// The production stream seeds mirror upstream's: `SharkSampler` hands

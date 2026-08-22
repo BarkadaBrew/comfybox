@@ -349,6 +349,58 @@ final class RES4LYFBongMathParityTests: XCTestCase {
     }
   }
 
+  /// **Evidence for the one deviation from upstream** (`RES4LYFBongMath`'s
+  /// dtype note): the hook hands the anchor back in the SAMPLE's dtype, so on
+  /// a 3+-row tableau a later rebase starts from a bfloat16-rounded anchor,
+  /// where upstream would have kept float32.
+  ///
+  /// That is harmless because the fixed point's LIMIT does not depend on the
+  /// starting iterate — it is determined by the target, the row data
+  /// predictions, `h` and the tableau, and 100 rounds of a contraction erase
+  /// the start. Measured here rather than argued: the same rebase is run from
+  /// the true anchor, from a bfloat16 round-trip of it, and from a badly
+  /// corrupted one, and all three land on the same answer.
+  func testTheFixedPointsLimitDoesNotDependOnTheStartingAnchor() throws {
+    let trace = try RES4LYFTraceFixture.load("res2s_beta6_T3")
+    let m = trace.manifest
+    var scheduler = try XCTUnwrap(
+      try RES4LYFTraceParityTests.productionRES2sScheduler() as? RES2sScheduler)
+    let step = m.steps[0]
+    let x = try trace.tensor(m.xInit)
+    let k1 = RES4LYFScriptedDenoiser.denoised(x, sigma: Float(step.sigma))
+    let mid = try trace.tensor(try XCTUnwrap(step.substeps.first?.xPost))
+    let snapshot = scheduler
+
+    func rebase(from start: MLXArray) -> MLXArray {
+      var anchor = start
+      _ = bongMath(m).iterate(
+        x0: &anchor, rowSample: mid, timestepIndex: step.index, row: 0,
+        scheduler: snapshot as any ZImageScheduler,
+        buildRowSample: { candidate in
+          var s = snapshot
+          return s.intermediateStep(
+            modelOutput: k1, timestepIndex: step.index, sample: candidate)!
+        },
+        evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) })
+      return anchor.asType(.float32)
+    }
+
+    let truth = try trace.tensor(try XCTUnwrap(step.bongmath.first).x0).asType(.float32)
+    let fromTrue = rebase(from: x)
+    // The bfloat16 round-trip a later rebase would actually receive…
+    let fromRounded = rebase(from: x.asType(.bfloat16).asType(.float32))
+    // …and a start with no relationship to the answer at all.
+    let fromGarbage = rebase(from: MLXArray.zeros(like: x.asType(.float32)))
+
+    for (name, got) in [("true", fromTrue), ("bf16 round-trip", fromRounded),
+                        ("zeros", fromGarbage)] {
+      XCTAssertTraceClose(got, truth, rtol: 1e-6, "started from \(name)")
+      XCTAssertEqual(
+        MLX.abs(got - fromTrue).max().item(Float.self), 0, accuracy: 1e-6,
+        "the limit must not depend on the start (\(name))")
+    }
+  }
+
   // MARK: - The gate has power
 
   /// **`bongmath` is load-bearing, and this is the measurement that says so.**
@@ -400,11 +452,22 @@ final class RES4LYFBongMathParityTests: XCTestCase {
 
   // MARK: - `bongmath = false` is a provable no-op
 
-  /// **The `bongmath = false` proof.** The pipeline builds NO hook at all for
-  /// a false request, and the loop it then drives is bit-identical — not
-  /// close — to the loop driven with the argument omitted, at equal `Stats`
-  /// and with zero extra evaluations. And it is still the **T2** trace, so
-  /// this is not two identical wrong answers.
+  /// **The `bongmath = false` proof**, in the two halves it actually has.
+  ///
+  /// 1. The pipeline builds NO hook at all for a false request, on every
+  ///    sampler — so `bongmath: false` and "no T3 argument" are the same call
+  ///    into `Krea2DenoiseLoop`. That is the load-bearing half.
+  /// 2. Driving the loop both ways is then bit-identical at equal `Stats` and
+  ///    zero extra evaluations. **This half witnesses determinism, not
+  ///    equivalence to pre-E16** — both runs pass `nil` for the hook, so it
+  ///    cannot see a change to the driver itself.
+  ///
+  /// What witnesses equivalence to pre-E16 is the T1 and T2 trace gates, which
+  /// are exact oracle fixtures and are unchanged by this WP
+  /// (`RES4LYFTraceParityTests`, `RES4LYFEtaSDEParityTests`,
+  /// `RalstonTraceParityTests`). The last assertion here ties this test to
+  /// them: the answer is still the **T2** trace, so it is not two identical
+  /// wrong answers.
   func testBongmathFalseBuildsNoHookAndIsBitIdenticalAtEqualCost() throws {
     for sampler in SchedulerKind.allCases {
       XCTAssertNil(
