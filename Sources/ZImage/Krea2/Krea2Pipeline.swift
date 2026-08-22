@@ -464,7 +464,8 @@ public final class Krea2Pipeline {
                 shift: Float? = nil,
                 sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
                 sigmaScheduleRequested: String? = nil,
-                eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5) {
+                eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
+                stage2: Stage2? = nil) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
       self.guidance = guidance
@@ -481,6 +482,7 @@ public final class Krea2Pipeline {
       self.eta = eta
       self.bongmath = bongmath
       self.c2 = c2
+      self.stage2 = stage2
     }
   }
 
@@ -856,6 +858,11 @@ public final class Krea2Pipeline {
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
       layout: Krea2Pipeline.sdeNoiseLayout)
+    // WP-E17 (§3.14, D18): the SECOND stage's own gates, here — before the
+    // noise draw and before the first transformer forward. A `stage2` field
+    // that is going to be a 400 must not cost a stage-1 render first.
+    let stage2 = request.stage2?.resolved(against: request)
+    if let stage2 { try Krea2StagedRender.preflight(stage: stage2, shift: scheduleShift) }
 
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
@@ -888,7 +895,6 @@ public final class Krea2Pipeline {
     // true when `stage2` is present, so a single-stage render encodes exactly
     // what it encoded before — and a stage 2 that asks for CFG gets it rather
     // than a silent single-pass downgrade.
-    let stage2 = request.stage2?.resolved(against: request)
     let needsNegative = useCFG || (stage2.map { $0.guidance > 1.0 } ?? false)
     var negCtx: MLXArray? = nil
     var negPos: MLXArray? = nil

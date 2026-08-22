@@ -3359,6 +3359,12 @@ public final class WarmServer {
     if let error = GeneratePayload.validateFamilyRecipe(recipeNames, family: family) {
       throw error
     }
+    // WP-E17: the bridge builds its payload directly too, so it runs the same
+    // stage-2 gate. It never SETS `stage2` today; the gate is here so that
+    // adding it later cannot skip the family check.
+    if let error = GeneratePayload.stage2Gate(payload, family: family) {
+      throw error
+    }
     if family == .krea2 {
       try payload.validateKrea2TierGates(recipeNames)
     }
@@ -4377,7 +4383,7 @@ public final class WarmServer {
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
-           .unsupportedSampler:
+           .unsupportedSampler, .orphanField:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -7096,6 +7102,15 @@ private actor WarmServerCoordinator {
       continuation.resume(throwing: error)
       return
     }
+    // WP-E17 (§3.14, D4): `stage2` on a family with no second-stage seam, an
+    // out-of-range `stage2.denoise`, and the tool schema's `detail_pass` /
+    // `detail_denoise` spelling — all 400 here, never a silently single-stage
+    // render.
+    if let error = GeneratePayload.stage2Gate(payload, family: currentModelFamily) {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
+      return
+    }
 
     // I5: the family capability gate. The name resolved at decode (unknown
     // names are already 400 by then); whether THIS family's loop can honour
@@ -7317,6 +7332,10 @@ private actor WarmServerCoordinator {
       // WP-E3 (§3.3, D11, D25): the sampler, the sigma schedule and the shift
       // the caller asked for, forwarded into the request the loop dispatches on.
       let recipe = try payload.krea2RecipeFields()
+      // WP-E17 (§3.14, D4): the second stage, resolved fail-loud — an unknown
+      // sampler/schedule name on the STAGE throws here, before any model work,
+      // exactly as it does for the render's own recipe.
+      let stage2 = try payload.krea2Stage2Fields()
       let samplerAsked: String = recipe.samplerRequested ?? "-"
       let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
       let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
@@ -7325,6 +7344,13 @@ private actor WarmServerCoordinator {
         + "sigma_schedule=\(recipe.sigmaSchedule.rawValue) (requested \(scheduleAsked)) "
         + "shift=\(shiftLabel) eta=\(recipe.eta)"
       logger.info("\(recipeLine)")
+      if let stage2 {
+        let stage2Line: String =
+          "Krea2 stage 2: sampler=\(stage2.sampler?.rawValue ?? recipe.sampler.rawValue) "
+          + "sigma_schedule=\(stage2.sigmaSchedule?.rawValue ?? recipe.sigmaSchedule.rawValue) "
+          + "steps=\(stage2.steps) denoise=\(stage2.denoise)"
+        logger.info("\(stage2Line)")
+      }
       // WP-E9 (§3.9, D16, D17): VAE selection — payload.vae → model dir. A
       // named file that is not on disk fails the render here (AC-56); a
       // different file than the resident one reloads the decoder IN PLACE on
@@ -7391,7 +7417,9 @@ private actor WarmServerCoordinator {
       }
 
       let image: MLXArray
-      let trace: Krea2RunTrace
+      // WP-E17: one trace per stage that ran, in order. `traces[0]` is the
+      // render's own — the geometry, seed and schedule shift every sink reads.
+      let traces: [Krea2RunTrace]
       if let initPath = payload.imagePath {
         let imageData = try Data(contentsOf: URL(fileURLWithPath: initPath))
         let cg = try InpaintUtilities.loadCGImage(from: imageData)
@@ -7408,7 +7436,20 @@ private actor WarmServerCoordinator {
           strength = 0.3
         }
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
-        (image, trace) = try k2.generateImg2ImgWithRecipe(
+        // §3.14 leaves img2img alone on purpose: its `strength → startIndex`
+        // rule is the established contract on this path, and stage 2 is a
+        // different, differently-specified mechanism (AC-30 keeps them
+        // distinguishable). Composing the two is unspecified, so it is refused
+        // rather than silently resolved one way.
+        guard stage2 == nil else {
+          throw WarmServerError.mutuallyExclusive(
+            "stage2 and image_path cannot be combined: the second stage re-noises the LATENT to "
+              + "the stretched tail's first sigma (WP-E17), while img2img starts partway down the "
+              + "grid from `strength` — two different mechanisms with no defined composition. "
+              + "Send one of them")
+        }
+        let trace1: Krea2RunTrace
+        (image, trace1) = try k2.generateImg2ImgWithRecipe(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
                 guidance: guidance,
                 sourceImage: sourceNHWC, width: width, height: height,
@@ -7418,8 +7459,13 @@ private actor WarmServerCoordinator {
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
                 eta: recipe.eta),
           progress: publishProgress)
+        traces = [trace1]
       } else {
-        (image, trace) = try k2.generateWithRecipe(
+        // WP-E17: `generateStaged` IS `generateWithRecipe`'s body. Without
+        // `stage2` it executes the same statements it did before this WP —
+        // which is what makes the byte-identity gates hold by construction —
+        // and with it, the second stage runs before the one `vae.decode`.
+        (image, traces) = try k2.generateStaged(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
                 guidance: guidance,
                 width: width, height: height, steps: steps, seed: seed,
@@ -7427,9 +7473,10 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta),
+                eta: recipe.eta, stage2: stage2),
           progress: publishProgress)
       }
+      let trace = traces[0]
       // WP-E10 (FDD §3.10, AC-60): the provenance record is READ BACK from
       // the pipeline — the variant and transformer file it loaded, the
       // quantization it applied, the VAE resident in its slot, its loaded
@@ -7460,7 +7507,10 @@ private actor WarmServerCoordinator {
           textEncoderFile: k2.paths.textEncoderFile,
           loras: readBacks,
           control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
-          trace: trace))
+          // D4 / WP-E17: every stage that ran, so `applied.stages[]` and
+          // `model_evals_total` describe the whole render rather than its
+          // first half.
+          traces: traces))
       }
       // Sink 2 — the PNG. The negative comes from the TRACE (K-FIX-1 / I4):
       // absent when CFG never ran (AC-61), and an applied `""` is written as
@@ -8137,6 +8187,78 @@ enum RoutedResponse {
   }
 }
 
+/// WP-E17 (FDD-krea2-raw-recipe §3.14, D4, D25): the `stage2` object on
+/// `/v1/generate` — the detail pass, inside ONE render.
+///
+/// Additive: a payload without it is byte-identical to today. `steps` and
+/// `denoise` are REQUIRED because they are the two fields that decide the
+/// stretched grid, and a default for either would be an engine-invented recipe;
+/// everything else absent means "the render's own value" (see
+/// ``Krea2Pipeline/Stage2``). The family's published pairing lives in the
+/// client's policy table (WP-C8) and arrives here spelled out.
+struct Stage2Payload: Sendable, Decodable, Equatable {
+  let steps: Int
+  /// **`Double`** — every other float on `GeneratePayload` decodes as `Float`
+  /// and this one must not: `total = int(steps/denoise)` is sensitive to which
+  /// side of the integer the division lands on (§3.14, AC-31).
+  let denoise: Double
+  /// D25: the wire key is `scheduler`, with `sampler` as an accepted alias;
+  /// both present and different is a 400, exactly as at the top level.
+  let scheduler: String?
+  let sigmaSchedule: String?
+  let guidance: Float?
+  let eta: Float?
+  let bongmath: Bool?
+  /// `null`/absent → the stage-1 seed `&+ 1`, recorded either way.
+  let seed: UInt64?
+
+  private enum CodingKeys: String, CodingKey {
+    case steps, denoise, scheduler, sampler, sigmaSchedule, guidance, eta, bongmath, seed
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    guard let steps = try c.decodeIfPresent(Int.self, forKey: .steps) else {
+      throw WarmServerError.invalidRequest(
+        message: "stage2.steps is required — it decides the stretched grid and has no default")
+    }
+    guard let denoise = try c.decodeIfPresent(Double.self, forKey: .denoise) else {
+      throw WarmServerError.invalidRequest(
+        message: "stage2.denoise is required — it decides the stretched grid and has no default")
+    }
+    self.steps = steps
+    self.denoise = denoise
+    let schedulerRaw = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    let samplerRaw = try c.decodeIfPresent(String.self, forKey: .sampler)
+    if let schedulerRaw, let samplerRaw, schedulerRaw != samplerRaw {
+      throw WarmServerError.mutuallyExclusive(
+        "stage2.scheduler='\(schedulerRaw)' and stage2.sampler='\(samplerRaw)' disagree — "
+          + "'sampler' is an alias of 'scheduler'; send one, or the same value in both")
+    }
+    self.scheduler = schedulerRaw ?? samplerRaw
+    self.sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
+    self.guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
+    self.eta = try c.decodeIfPresent(Float.self, forKey: .eta)
+    self.bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
+    self.seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
+  }
+
+  /// For bridge/test construction; the wire always goes through `init(from:)`.
+  init(
+    steps: Int, denoise: Double, scheduler: String? = nil, sigmaSchedule: String? = nil,
+    guidance: Float? = nil, eta: Float? = nil, bongmath: Bool? = nil, seed: UInt64? = nil
+  ) {
+    self.steps = steps
+    self.denoise = denoise
+    self.scheduler = scheduler
+    self.sigmaSchedule = sigmaSchedule
+    self.guidance = guidance
+    self.eta = eta
+    self.bongmath = bongmath
+    self.seed = seed
+  }
+}
+
 struct GeneratePayload: Sendable {
   let prompt: String
   let negativePrompt: String?
@@ -8228,6 +8350,20 @@ struct GeneratePayload: Sendable {
   /// Krea 2 only today (the other families ignore it).
   let vae: String?
 
+  /// WP-E17 (§3.14, D4): the second stage of this render. Krea 2 only —
+  /// refused, never ignored, on any other family (``stage2Gate(_:family:)``).
+  let stage2: Stage2Payload?
+
+  /// The MCP tool schema's spelling of a detail pass (§3.17, AC-68a): the
+  /// CLIENT expands `detail_pass` into `stage2` from its family policy table.
+  /// Decoded here so the engine can REFUSE them by name — it has no policy
+  /// table to expand a bare boolean into a sampler/schedule/step recipe, and
+  /// inventing one is the silent substitution this programme exists to kill.
+  let detailPass: Bool?
+  /// `detail_denoise` without `detail_pass` is an orphan (Addendum A.2 → C3),
+  /// NaN included. `Double` for the same reason `stage2.denoise` is.
+  let detailDenoise: Double?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -8245,10 +8381,14 @@ struct GeneratePayload: Sendable {
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil,
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
-    preempt: Bool? = nil, vae: String? = nil
+    preempt: Bool? = nil, vae: String? = nil,
+    stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil
   ) {
     self.preempt = preempt
     self.vae = vae
+    self.stage2 = stage2
+    self.detailPass = detailPass
+    self.detailDenoise = detailDenoise
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -8307,6 +8447,11 @@ extension GeneratePayload: Decodable {
     case model, loras
     case preempt
     case vae
+    // WP-E17. `stage2` has no underscore, so `.convertFromSnakeCase` leaves it
+    // alone; `detail_pass` / `detail_denoise` arrive as these camelCase forms.
+    case stage2
+    case detailPass
+    case detailDenoise
   }
 
   init(from decoder: Decoder) throws {
@@ -8362,6 +8507,9 @@ extension GeneratePayload: Decodable {
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
     preempt = try c.decodeIfPresent(Bool.self, forKey: .preempt)
     vae = try c.decodeIfPresent(String.self, forKey: .vae)
+    stage2 = try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
+    detailPass = try c.decodeIfPresent(Bool.self, forKey: .detailPass)
+    detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.
@@ -8637,6 +8785,92 @@ extension GeneratePayload: Decodable {
       eta: eta ?? 0,
       samplerRequested: names.schedulerRequested,
       sigmaScheduleRequested: names.sigmaScheduleRequested)
+  }
+
+  /// WP-E17 (§3.14, D4, D22, D25): the second stage, resolved into what the
+  /// pipeline runs — or `nil` when the request has no second stage.
+  ///
+  /// Pure, like `krea2RecipeFields()`, so the forwarding is asserted without a
+  /// server or weights. An unknown sampler / schedule name THROWS here (it does
+  /// not become euler), and an unstated field stays `nil` so
+  /// `Krea2Pipeline.Stage2.resolved(against:)` fills it from the render's own
+  /// recipe rather than from an engine default.
+  func krea2Stage2Fields() throws -> Krea2Pipeline.Stage2? {
+    guard let stage2 else { return nil }
+    let names = try RecipeNameResolver.resolve(
+      scheduler: stage2.scheduler, sigmaSchedule: stage2.sigmaSchedule)
+    return Krea2Pipeline.Stage2(
+      steps: stage2.steps,
+      denoise: stage2.denoise,
+      sampler: names.scheduler,
+      sigmaSchedule: names.sigmaSchedule,
+      sigmaScheduleRequested: names.sigmaScheduleRequested,
+      guidance: stage2.guidance,
+      eta: stage2.eta,
+      bongmath: stage2.bongmath,
+      seed: stage2.seed)
+  }
+
+  /// WP-E17 (§3.14, D18; Addendum A.2 → C3): the `stage2` family + range gate,
+  /// and the refusal of the tool schema's `detail_pass` / `detail_denoise`
+  /// spelling. Returns the 400 to throw, or `nil`.
+  ///
+  /// Runs at the same dispatch point as `vaeGate` and `validateFamilyRecipe`
+  /// (D18: family gates live at dispatch, not at the decoder), for EVERY
+  /// family — the detail-pass keys are wrong everywhere, and `stage2` is a
+  /// Krea 2 field that no other family's loop could honour.
+  static func stage2Gate(_ payload: GeneratePayload, family: WarmModelFamily) -> WarmServerError? {
+    // The tool-schema keys first: they are wrong on every family, and a request
+    // carrying both them and `stage2` should be told about the spelling rather
+    // than about the family.
+    if payload.detailPass != nil {
+      return .unsupportedRecipeField(
+        field: "detail_pass", value: "\(payload.detailPass ?? false)", family: family.rawValue,
+        reason: "`detail_pass` is the MCP tool schema's spelling; the client expands it into the "
+          + "engine's `stage2` object from its family policy table (AC-68a). The engine holds no "
+          + "such table and will not invent a sampler, schedule or step count — send "
+          + "`stage2: {steps, denoise, scheduler, sigma_schedule, …}`")
+    }
+    if let detailDenoise = payload.detailDenoise {
+      return .orphanField(
+        field: "detail_denoise", requires: "detail_pass",
+        reason: "`detail_denoise` = \(detailDenoise) names the denoise of a detail pass that was "
+          + "never requested. It used to be dropped silently; send `stage2.denoise` instead")
+    }
+
+    guard let stage2 = payload.stage2 else { return nil }
+
+    guard family == .krea2 else {
+      return .unsupportedRecipeField(
+        field: "stage2", value: "{steps: \(stage2.steps), denoise: \(stage2.denoise)}",
+        family: family.rawValue,
+        reason: "a second stage inside one render is a Krea 2 mechanism (WP-E17): it re-noises the "
+          + "LATENT to the stretched tail's first sigma and solves again with no VAE round-trip. "
+          + "This family's loop has no such seam and would have rendered one stage under a "
+          + "two-stage record — load a krea2 model, or remove `stage2`")
+    }
+
+    guard stage2.steps > 0 else {
+      return .unsupportedRecipeField(
+        field: "stage2.steps", value: "\(stage2.steps)", family: family.rawValue,
+        reason: "stage2.steps must be positive")
+    }
+    guard stage2.denoise.isFinite, stage2.denoise > 0, stage2.denoise <= 1 else {
+      return .unsupportedRecipeField(
+        field: "stage2.denoise", value: "\(stage2.denoise)", family: family.rawValue,
+        reason: "stage2.denoise is the fraction of the schedule the stage runs and must be in "
+          + "(0, 1]; `denoise <= 0` has no schedule to stretch and there is nothing to "
+          + "substitute (§3.14)")
+    }
+
+    // The stage's own sampler / schedule against the family's capability
+    // matrix — the same gate the render's own recipe goes through. Unknown
+    // NAMES already threw at `krea2Stage2Fields()`; this is whether the family
+    // can honour a known one.
+    guard let names = try? RecipeNameResolver.resolve(
+      scheduler: stage2.scheduler, sigmaSchedule: stage2.sigmaSchedule)
+    else { return nil }
+    return FamilyRecipeMatrix.validate(names, family: family)
   }
 
   /// What `krea2RecipeFields()` resolved: the kinds the pipeline runs, plus
@@ -9081,6 +9315,10 @@ public enum WarmServerError: Error, LocalizedError {
   /// on a family whose denoise loop takes one model evaluation per step. It
   /// would render first-order Euler under the sampler's name, so it is a 400.
   case unsupportedSampler(name: String, family: String, reason: String)
+  /// WP-E17 / Addendum A.2 → C3: a field that only means something beside
+  /// another field, sent without it. Silently dropping it made a request that
+  /// asked for something render as if it had not.
+  case orphanField(field: String, requires: String, reason: String)
 
   public var errorDescription: String? {
     switch self {
@@ -9120,6 +9358,8 @@ public enum WarmServerError: Error, LocalizedError {
       return "'\(field)' = '\(value)' is not supported on the \(family) family: \(reason)"
     case .unsupportedSampler(let name, let family, let reason):
       return "sampler '\(name)' is not supported on the \(family) family: \(reason)"
+    case .orphanField(let field, let requires, let reason):
+      return "'\(field)' has no meaning without '\(requires)': \(reason)"
     }
   }
 }

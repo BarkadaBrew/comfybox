@@ -363,6 +363,26 @@ public enum Krea2StagedRender {
     }
   }
 
+  /// Everything about the stage that can be refused WITHOUT model work (D18):
+  /// its tier fields, its `eta`/sampler pairing, and whether its stretched grid
+  /// exists at all.
+  ///
+  /// Called at the top of ``Krea2Pipeline/generateStaged(_:progress:)``, before
+  /// the noise draw and before the first transformer forward — a stage-2 field
+  /// that is going to be a 400 must not cost a stage-1 render first.
+  /// Deterministic and side-effect free (scheduler construction touches no
+  /// global RNG state), so running it here and again in ``runStage2(...)``
+  /// changes nothing but the moment of the refusal.
+  static func preflight(stage: Krea2ResolvedStage, shift: Krea2Sampling.ScheduleShift) throws {
+    try Krea2Pipeline.validateTiers(eta: stage.eta, bongmath: stage.bongmath)
+    _ = try Krea2Pipeline.makeSDEInjector(
+      eta: stage.eta, sampler: stage.sampler, stageSeed: stage.seed,
+      layout: Krea2Pipeline.sdeNoiseLayout)
+    _ = try makeScheduler(
+      sampler: stage.sampler, sigmaSchedule: stage.sigmaSchedule, steps: stage.steps,
+      denoise: stage.denoise, shift: shift, seed: stage.seed, c2: stage.c2)
+  }
+
   // MARK: The re-noise (§3.14 step 3)
 
   /// `x₂ = σ₂[0]·ε + (1 − σ₂[0])·x₁`, applied to the LATENT — no VAE

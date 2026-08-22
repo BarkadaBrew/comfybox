@@ -344,6 +344,108 @@ final class Krea2StagedRenderTests: XCTestCase {
     XCTAssertEqual(resolved.denoise, 0.5)
   }
 
+  // MARK: - AC-29: the published recipe is ONE payload
+
+  /// The reference recipe, end to end without weights: one `/v1/generate` body
+  /// decodes into one render whose `applied` names both stages and every
+  /// published default around them.
+  ///
+  /// KNOWN GAP, deliberate: the "what loaded" half (`vae`, `base_variant`, the
+  /// turbo LoRA at 0.6, the bypass entry) is supplied here by
+  /// `RenderRecipeFixture` rather than by a live pipeline — no weights are in
+  /// the default gate. The live half is the controller's integration batch;
+  /// what this pins is that the request SHAPE reaches the render and that the
+  /// record has room for all of it.
+  func testReferenceRecipeRoundTrip() throws {
+    let json = """
+      {"prompt":"x","scheduler":"res_2s","sigma_schedule":"beta","shift":1.15,
+       "steps":6,"guidance":1.0,"eta":0.5,
+       "stage2":{"scheduler":"deis_3m","sigma_schedule":"bong_tangent",
+                 "steps":2,"denoise":0.2,"guidance":1.0,"eta":0.5,"seed":null}}
+      """
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let payload = try decoder.decode(GeneratePayload.self, from: Data(json.utf8))
+    let recipe = try payload.krea2RecipeFields()
+    let stage2 = try XCTUnwrap(try payload.krea2Stage2Fields())
+
+    var request = Krea2Pipeline.Request(
+      prompt: payload.prompt, guidance: payload.guidance ?? 1.0,
+      width: 1024, height: 1024, steps: payload.steps ?? 9, seed: 44821,
+      shift: recipe.shift, sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
+      sigmaScheduleRequested: recipe.sigmaScheduleRequested, eta: recipe.eta,
+      stage2: stage2)
+    // T3 (`bongmath`) is WP-E16's and is still refused at the pipeline, so the
+    // recipe's `bongmath: true` is asserted as a REQUEST shape below rather
+    // than run here.
+    request.bongmath = false
+
+    let shift = try Krea2Sampling.resolveShift(
+      explicit: recipe.shift, seqLen: Self.seqLen1024, align: Self.align)
+    XCTAssertEqual(shift.source, .explicit)
+    XCTAssertEqual(shift.mu, 1.15)
+
+    let (x1, trace1) = try Self.runStageOne(
+      request: request, shift: shift, initial: Self.patchedNoise(seed: request.seed),
+      evaluate: Self.nonlinear)
+    let stage = try XCTUnwrap(request.stage2).resolved(against: request)
+    XCTAssertEqual(stage.seed, 44822, "null stage seed → stage1 &+ 1")
+    XCTAssertEqual(stage.eta, 0.5, "stated on the stage, not inherited by accident")
+    let (_, trace2) = try Self.runStageTwo(stage, shift: shift, stageOne: x1) { x, s in
+      Self.nonlinear(x, s)
+    }
+
+    // The published read-backs around the two stages.
+    var accel = LoRAConfiguration.local("/models/krea2-turbo-lora.safetensors", scale: 0.6)
+    accel.role = "accel"
+    var bypass = LoRAConfiguration.local("/models/\(Krea2BypassPolicy.workflowFile)", scale: 1.0)
+    bypass.role = "bypass"
+    let record = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      traces: [trace1, trace2],
+      loras: [
+        RenderRecipe.LoRAReadBack(
+          configuration: accel,
+          report: RenderRecipeFixture.report(offered: 256, bound: 256),
+          resolvedRelativeTo: .turbo),
+        RenderRecipe.LoRAReadBack(
+          configuration: bypass,
+          report: RenderRecipeFixture.report(offered: 0, bound: 0, deltasApplied: 1),
+          resolvedRelativeTo: nil),
+      ]))
+
+    XCTAssertEqual(record.stages.count, 2)
+    XCTAssertEqual(record.stages[0].sampler, "res_2s")
+    XCTAssertEqual(record.stages[0].sigmaSchedule, "beta")
+    XCTAssertEqual(record.stages[0].eta, 0.5)
+    XCTAssertEqual(record.stages[1].sampler, "deis_3m")
+    XCTAssertEqual(record.stages[1].sigmaSchedule, "bong_tangent")
+    XCTAssertEqual(record.stages[1].eta, 0.5)
+    XCTAssertEqual(record.stages[1].seed, 44822)
+    XCTAssertEqual(record.modelEvalsTotal, trace1.modelEvals + trace2.modelEvals)
+    XCTAssertEqual(try XCTUnwrap(record.shift), Foundation.exp(Float(1.15)), accuracy: 1e-5)
+    XCTAssertEqual(record.mu, 1.15)
+    XCTAssertEqual(record.shiftSource, "explicit")
+    // D16 / §3.14's "every published default appears in `applied`".
+    XCTAssertEqual(record.baseVariant, "raw")
+    XCTAssertTrue(record.vae.hasSuffix("Wan2_1_VAE_fp32.safetensors"))
+    XCTAssertEqual(record.vaeLayout, "wanNative")
+    XCTAssertEqual(record.loras[0].scaleApplied, 0.6)
+    XCTAssertEqual(record.loras[0].role, "accel")
+    XCTAssertEqual(record.loras[0].relativeTo, "turbo")
+    XCTAssertEqual(record.loras[1].role, "bypass")
+    XCTAssertTrue(record.loras[1].file.hasSuffix(Krea2BypassPolicy.workflowFile))
+
+    // The whole record survives the wire encoder every sink uses.
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let wire = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: try encoder.encode(record)) as? [String: Any])
+    let stages = try XCTUnwrap(wire["stages"] as? [[String: Any]])
+    XCTAssertEqual(stages.count, 2)
+    XCTAssertEqual(stages[1]["sampler"] as? String, "deis_3m")
+    XCTAssertEqual(wire["model_evals_total"] as? Int, record.modelEvalsTotal)
+  }
+
   // MARK: - Fail-loud
 
   func testStageTwoRefusesAnOutOfRangeDenoise() throws {
