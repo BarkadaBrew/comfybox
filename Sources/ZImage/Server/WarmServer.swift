@@ -6214,6 +6214,10 @@ private actor WarmServerCoordinator {
       // The pipeline is the physical fact; the pool entry carries the same
       // value back from loadPipeline (WP-E5).
       krea2Variant = krea2Pipeline?.variant ?? (entry.detectedInfo as? Krea2Variant)
+      if krea2Pipeline == nil {
+        logger.warning(
+          "ModelPool: activated krea2 entry '\(entry.id)' but its pipeline could not be read back — publishing an EMPTY LoRA stack (I1)")
+      }
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -6238,6 +6242,20 @@ private actor WarmServerCoordinator {
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }
+    // K-FIX-1 / Codex I1: the activated pipeline is the authority on what is
+    // applied. Reconciling here — BEFORE `publishHealth()` — is what stops
+    // `/health.loras` (and the next render's default stack) from describing
+    // the model that just left.
+    let reconciledLoRAs = PoolAdapterState.reconciled(
+      family: entry.family, activated: krea2Pipeline, coordinator: activeLoRAs)
+    if reconciledLoRAs.map(\.source.displayName) != activeLoRAs.map(\.source.displayName) {
+      let names = reconciledLoRAs.map { $0.source.displayName }.joined(separator: ", ")
+      let line = "ModelPool: activation reconciled the LoRA stack from the pipeline read-back — "
+        + "\(activeLoRAs.count) advertised → \(reconciledLoRAs.count) applied [\(names)]"
+      logger.info("\(line)")
+    }
+    activeLoRAs = reconciledLoRAs
+
     revalidateLastRecipe()
     pipelinePrepared = true
     // Model/family/variant just changed — refresh the health snapshot (#217).

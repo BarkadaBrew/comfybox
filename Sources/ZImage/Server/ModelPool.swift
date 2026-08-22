@@ -565,6 +565,18 @@ actor ModelPool {
         "ModelPool: krea2 spec '\(modelSpec)' → variant=\(paths.variant.rawValue) file=\(paths.transformerFile.path)")
       let bits: Int? = (quantization?.lowercased() == "bf16") ? nil : 8
       let pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: bits)
+      // K-FIX-1 / Codex I1: the adapter stack is part of the pool entry. Only
+      // the flux1 branch below forwarded `initialLoRAs` (into
+      // `ZImagePipeline.prepare`); krea2 built the pipeline and returned, so
+      // a Raw↔Turbo handoff produced a BARE checkpoint while the coordinator
+      // and `/health.loras` still advertised the stack. Applied HERE, before
+      // the entry exists, so a relativity refusal (AC-41) or a strict partial
+      // bind (AC-42) fails the LOAD instead of degrading it.
+      if !initialLoRAs.isEmpty {
+        logger.info(
+          "ModelPool: applying \(initialLoRAs.count) LoRA(s) to incoming krea2 '\(modelSpec)' before it is activatable")
+      }
+      try await PoolAdapterState.applyInitial(initialLoRAs, to: pipeline)
       return (PipelineBox(pipeline: pipeline as AnyObject), paths.variant)
     }
     let resolved = try await ModelResolution.resolveOrDefault(
