@@ -6928,6 +6928,17 @@ private actor WarmServerCoordinator {
       }
       // WP-E4 (D18): krea2-only tier gates — a 400, never a silent downgrade.
       try payload.validateKrea2TierGates(try payload.validateRecipeNames())
+      // WP-E3 (§3.3, D11, D25): the sampler, the sigma schedule and the shift
+      // the caller asked for, forwarded into the request the loop dispatches on.
+      let recipe = try payload.krea2RecipeFields()
+      let samplerAsked: String = recipe.samplerRequested ?? "-"
+      let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
+      let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
+      let recipeLine: String =
+        "Krea2 recipe: sampler=\(recipe.sampler.rawValue) (requested \(samplerAsked)) "
+        + "sigma_schedule=\(recipe.sigmaSchedule.rawValue) (requested \(scheduleAsked)) "
+        + "shift=\(shiftLabel) eta=\(recipe.eta)"
+      logger.info("\(recipeLine)")
       // WP-E9 (§3.9, D16, D17): VAE selection — payload.vae → model dir. A
       // named file that is not on disk fails the render here (AC-56); a
       // different file than the resident one reloads the decoder IN PLACE on
@@ -7003,7 +7014,10 @@ private actor WarmServerCoordinator {
                 guidance: guidance,
                 sourceImage: sourceNHWC, width: width, height: height,
                 steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE,
-                shift: payload.shift)
+                shift: recipe.shift,
+                sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
+                sigmaScheduleRequested: recipe.sigmaScheduleRequested,
+                eta: recipe.eta)
         ) { [logger] step, total in
           logger.info("Krea2 img2img: step \(step)/\(total)")
         }
@@ -7013,7 +7027,10 @@ private actor WarmServerCoordinator {
                 guidance: guidance,
                 width: width, height: height, steps: steps, seed: seed,
                 controlImagePixels: controlPixels, dyPE: krea2DyPE,
-                shift: payload.shift)
+                shift: recipe.shift,
+                sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
+                sigmaScheduleRequested: recipe.sigmaScheduleRequested,
+                eta: recipe.eta)
         ) { [logger] step, total in
           logger.info("Krea2: step \(step)/\(total)")
         }
@@ -8080,26 +8097,52 @@ extension GeneratePayload: Decodable {
   /// and keeps working (AC-28).
   ///
   /// - `eta != 0`: RES4LYF SDE eta is tier T2 (WP-E15) — refused until it lands.
-  /// - a sampler other than euler, or a schedule other than flow (incl. its
-  ///   ComfyUI aliases): the Krea 2 loop does not take a sampler yet (WP-E3).
-  ///   Before this gate such a request rendered euler / native warp silently;
-  ///   WP-E3 replaces this arm with real dispatch when it plumbs the fields.
+  ///
+  /// The sampler and the sigma-schedule arms are GONE as of WP-E3: the Krea 2
+  /// loop now dispatches on both, so every name `RecipeNameResolver` accepts
+  /// is honoured rather than refused. `names` is still taken — the unknown-name
+  /// failure happens in `validateRecipeNames()`, which the caller runs to
+  /// produce it, and the parameter keeps that ordering explicit at every call
+  /// site. `bongmath` has no wire key and is refused at the pipeline
+  /// (`Krea2Pipeline.validateTiers`).
   func validateKrea2TierGates(_ names: ResolvedRecipeNames) throws {
     if let eta, eta != 0 {
       throw WarmServerError.unsupportedRecipeField(
         field: "eta", value: "\(eta)", family: "krea2",
         reason: "RES4LYF SDE eta (parity tier T2, WP-E15) is not implemented yet; send eta 0 or omit it")
     }
-    if let kind = names.scheduler, kind != .euler {
-      throw WarmServerError.unsupportedRecipeField(
-        field: "scheduler", value: names.schedulerRequested ?? kind.rawValue, family: "krea2",
-        reason: "the Krea 2 denoise loop does not take a sampler yet (WP-E3); only euler is honoured")
-    }
-    if let kind = names.sigmaSchedule, kind != .flow {
-      throw WarmServerError.unsupportedRecipeField(
-        field: "sigma_schedule", value: names.sigmaScheduleRequested ?? kind.rawValue, family: "krea2",
-        reason: "the Krea 2 denoise loop runs its native warp only (WP-E1/E3); only flow and its aliases are accepted")
-    }
+  }
+
+  /// WP-E3 (§3.3, D11, D22, D25): the recipe fields a Krea 2 request carries,
+  /// resolved. A pure function of the payload, so the forwarding is asserted
+  /// without a server or weights (`Krea2RecipeForwardingTests`).
+  ///
+  /// The defaults ARE today's render: euler over the family's native `krea2`
+  /// warp, no explicit shift, no SDE. An unknown name throws (it does not
+  /// become euler) because `validateRecipeNames()` throws.
+  func krea2RecipeFields() throws -> Krea2RecipeFields {
+    let names = try validateRecipeNames()
+    return Krea2RecipeFields(
+      sampler: names.scheduler ?? .euler,
+      sigmaSchedule: names.sigmaSchedule ?? .krea2,
+      shift: shift,
+      eta: eta ?? 0,
+      samplerRequested: names.schedulerRequested,
+      sigmaScheduleRequested: names.sigmaScheduleRequested)
+  }
+
+  /// What `krea2RecipeFields()` resolved: the kinds the pipeline runs, plus
+  /// the raw names the caller sent so an alias is visible in the record and
+  /// the log rather than silently applied (D22).
+  struct Krea2RecipeFields: Sendable, Equatable {
+    let sampler: SchedulerKind
+    let sigmaSchedule: SigmaScheduleKind
+    /// `nil` = the resolution-dependent mu (D3/A.1); a value IS mu.
+    let shift: Float?
+    /// RES4LYF SDE eta — gated to 0 before T2 by `validateKrea2TierGates`.
+    let eta: Float
+    let samplerRequested: String?
+    let sigmaScheduleRequested: String?
   }
 
   func validateOutputPath(configuration: WarmServerConfiguration) throws {
