@@ -14,9 +14,11 @@ final class RenderRecipeTests: XCTestCase {
   // sink test assert against the same record (AC-62).
 
   private func trace(steps: Int = 30, guidance: Float = 1.0, startIndex: Int = 0,
-                     sigmaScheduleRequested: String? = nil) -> Krea2RunTrace {
+                     sigmaScheduleRequested: String? = nil,
+                     negativePrompt: String? = nil) -> Krea2RunTrace {
     RenderRecipeFixture.trace(steps: steps, guidance: guidance, startIndex: startIndex,
-                              sigmaScheduleRequested: sigmaScheduleRequested)
+                              sigmaScheduleRequested: sigmaScheduleRequested,
+                              negativePrompt: negativePrompt)
   }
 
   private func inputs(
@@ -24,8 +26,9 @@ final class RenderRecipeTests: XCTestCase {
     loras: [RenderRecipe.LoRAReadBack] = [], control: RenderRecipe.ControlReadBack? = nil
   ) -> RenderRecipe.Krea2Inputs {
     RenderRecipeFixture.inputs(
-      trace: trace(guidance: guidance, sigmaScheduleRequested: requestedSigmaSchedule),
-      negativePrompt: negativePrompt, loras: loras, control: control)
+      trace: trace(guidance: guidance, sigmaScheduleRequested: requestedSigmaSchedule,
+                   negativePrompt: negativePrompt),
+      loras: loras, control: control)
   }
 
   private func kromaReadBack(scale: Float = 0.3) -> RenderRecipe.LoRAReadBack {
@@ -162,6 +165,42 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(on.stages[0].guidance, 2.0)
     XCTAssertEqual(on.stages[0].modelEvals, 60, "CFG cost is visible")
     XCTAssertEqual(on.modelEvalsTotal, 60)
+  }
+
+  /// K-FIX-1 / Codex I4: with guidance > 1 and NO `negative_prompt` in the
+  /// request, both Krea 2 pipelines encode `request.negativePrompt ?? ""` and
+  /// run a full second model pass against it. The record used to be built
+  /// from the PAYLOAD, so it said `nil` — describing the request, not the
+  /// render, and hiding a doubling of model evaluations behind an absent
+  /// field. The trace now carries what the pipeline resolved, and every sink
+  /// reads THAT.
+  func testOmittedNegativeUnderCFGRecordsTheEmptyStringThatWasEncoded() {
+    let r = RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: nil))
+    XCTAssertEqual(r.stages[0].negativePrompt, "",
+                   "CFG ran against the empty string — the record says so")
+    XCTAssertEqual(r.stages[0].modelEvals, 60, "and the doubled cost is visible beside it")
+  }
+
+  /// The two meanings are distinct and both load-bearing: `nil` means CFG did
+  /// not run at all; `""` means it ran against an empty negative.
+  func testNilMeansCFGInactiveAndEmptyStringMeansCFGRanEmpty() {
+    XCTAssertNil(RenderRecipe.krea2(inputs(guidance: 1.0, negativePrompt: nil)).stages[0].negativePrompt)
+    XCTAssertNil(RenderRecipe.krea2(inputs(guidance: 1.0, negativePrompt: "")).stages[0].negativePrompt)
+    XCTAssertEqual(RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: "")).stages[0].negativePrompt, "")
+    XCTAssertEqual(RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: nil)).stages[0].negativePrompt, "")
+  }
+
+  /// The trace is the single witness — `Krea2RunTrace.negativePromptApplied`
+  /// and `cfgActive` never disagree.
+  func testTraceNegativeAppliedAgreesWithCFGActive() {
+    for guidance: Float in [0.0, 1.0, 1.0001, 2.0, 3.5] {
+      for requested in [nil, "", "blurry"] as [String?] {
+        let t = RenderRecipeFixture.trace(guidance: guidance, negativePrompt: requested)
+        XCTAssertEqual(t.cfgActive, t.negativePromptApplied != nil,
+                       "guidance \(guidance), requested \(String(describing: requested))")
+        if t.cfgActive { XCTAssertEqual(t.negativePromptApplied, requested ?? "") }
+      }
+    }
   }
 
   // MARK: - LoRAs are the loaded configs joined with their bind reports
@@ -409,6 +448,30 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertNil(offJSON["negative_prompt"])
     let offStage = try XCTUnwrap(((offJSON["applied"] as? [String: Any])?["stages"] as? [[String: Any]])?.first)
     XCTAssertTrue(offStage["negative_prompt"] == nil || offStage["negative_prompt"] is NSNull)
+  }
+
+  /// I4, sink 2: an APPLIED empty negative must survive into the PNG.
+  /// `ImageMetadata.generation` used to drop every empty string, so a
+  /// `guidance: 2` render with no negative wrote a file that read as if CFG
+  /// had never run. `nil` still means "did not apply" and is still omitted.
+  func testPNGKeepsAnAppliedEmptyNegativePrompt() throws {
+    let r = RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: nil))
+    XCTAssertEqual(r.stages[0].negativePrompt, "")
+    let meta = QwenImageIO.ImageMetadata.generation(
+      prompt: "p", negativePrompt: r.stages[0].negativePrompt, seed: 44821, steps: 30,
+      guidance: 2.0, width: 1024, height: 1024, model: "krea2-raw", applied: r)
+    let json = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(try XCTUnwrap(meta.parametersJSON).utf8)) as? [String: Any])
+    XCTAssertEqual(json["negative_prompt"] as? String, "",
+                   "an applied empty negative is written, not dropped")
+    let stage = try XCTUnwrap((json["applied"] as? [String: Any]).flatMap { ($0["stages"] as? [[String: Any]])?.first })
+    XCTAssertEqual(stage["negative_prompt"] as? String, "")
+
+    // nil (CFG inactive) is still absent — the two are not the same fact.
+    let off = QwenImageIO.ImageMetadata.generation(prompt: "p", negativePrompt: nil, guidance: 1.0)
+    let offJSON = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(try XCTUnwrap(off.parametersJSON).utf8)) as? [String: Any])
+    XCTAssertNil(offJSON["negative_prompt"])
   }
 
   /// D12: no record for another family — `applied` is absent, never a

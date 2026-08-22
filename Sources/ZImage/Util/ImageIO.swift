@@ -236,7 +236,14 @@ public enum QwenImageIO {
       if let height { params["height"] = height }
       if let steps { params["steps"] = steps }
       if let guidance { params["guidance"] = Self.cleanNumber(guidance) }
-      if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
+      // K-FIX-1 / Codex I4: `nil` means the field does not apply; a non-nil
+      // value — INCLUDING `""` — is a fact the caller resolved and is written
+      // verbatim. Krea 2 passes `trace.negativePromptApplied`, where `""`
+      // means CFG ran against an empty negative and a second model pass was
+      // paid for it; dropping it wrote a file that read as if CFG never ran.
+      // Callers that hold a raw payload normalise an empty string to nil
+      // themselves, so no other family's metadata changes.
+      if let negativePrompt { params["negative_prompt"] = negativePrompt }
       if let seed { params["seed"] = seed }
       // Which app/persona generated it — placed persona renders in the gallery.
       if let generatedBy, !generatedBy.isEmpty { params["source"] = generatedBy }

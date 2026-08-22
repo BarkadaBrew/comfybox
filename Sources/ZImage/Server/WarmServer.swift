@@ -7214,14 +7214,15 @@ private actor WarmServerCoordinator {
           textEncoderFile: k2.paths.textEncoderFile,
           loras: readBacks,
           control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
-          trace: trace,
-          negativePrompt: payload.negativePrompt))
+          trace: trace))
       }
-      // Sink 2 — the PNG. `negativePrompt` is passed only when the CFG branch
-      // ran (AC-61: at guidance ≤ 1 it did not apply and is absent).
+      // Sink 2 — the PNG. The negative comes from the TRACE (K-FIX-1 / I4):
+      // absent when CFG never ran (AC-61), and an applied `""` is written as
+      // `""` rather than dropped, so the file records the second model pass
+      // an omitted negative still paid for.
       let metadata = QwenImageIO.ImageMetadata.generation(
         prompt: guardedPrompt,
-        negativePrompt: trace.cfgActive ? payload.negativePrompt : nil,
+        negativePrompt: trace.negativePromptApplied,
         seed: trace.seed,
         steps: trace.stepsRequested,
         guidance: trace.guidance,
@@ -7438,7 +7439,12 @@ private actor WarmServerCoordinator {
 
     // Save image (with embedded, Finder-readable generation metadata)
     try QwenImageIO.saveImage(array: imageArray, to: outputURL,
-      metadata: .generation(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+      // Non-Krea 2 families still hand `ImageMetadata` a raw payload value,
+      // where `""` means "not given" — normalised here so the I4 change to
+      // `ImageMetadata.generation` (an explicit `""` is written) cannot add a
+      // `negative_prompt: ""` key to any other family's PNG.
+      metadata: .generation(prompt: payload.prompt,
+        negativePrompt: (payload.negativePrompt?.isEmpty ?? true) ? nil : payload.negativePrompt,
         seed: seed, steps: steps, guidance: guidance, width: width, height: height,
         generatedBy: payload.source, contentMode: payload.contentMode, loras: loras))
   }

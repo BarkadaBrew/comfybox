@@ -135,6 +135,13 @@ extension Krea2Pipeline {
 
     // CFG branch — mirrors generate() (opt-in via guidance > 1, sequential).
     let useCFG = request.guidance > 1.0
+    // K-FIX-1 / Codex I4: what the CFG branch ACTUALLY conditions on,
+    // resolved here — beside the encode, from the same `useCFG` predicate —
+    // and carried in the trace so every provenance sink records the render
+    // rather than the request. An omitted negative under CFG is `""`, not
+    // "no negative prompt": the second model pass ran either way.
+    let negativePromptApplied = Krea2RunTrace.negativePromptApplied(
+      cfgActive: useCFG, requested: request.negativePrompt)
     var negCtx: MLXArray? = nil
     var negPos: MLXArray? = nil
     var negFullMask: MLXArray? = nil
@@ -190,7 +197,8 @@ extension Krea2Pipeline {
 
     let trace = Krea2RunTrace(
       request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
-      startIndex: startIndex, denoise: denoise, width: width, height: height)
+      startIndex: startIndex, denoise: denoise, width: width, height: height,
+      negativePromptApplied: negativePromptApplied)
     return (decoded[0], trace)
   }
 }

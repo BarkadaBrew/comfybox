@@ -89,7 +89,9 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     public let modelEvals: Int
     public let denoise: Float
     public let guidance: Float
-    /// nil when guidance <= 1 — it did not apply (AC-61).
+    /// What the CFG pass was conditioned on, from the trace (K-FIX-1 / I4):
+    /// `nil` = guidance <= 1, CFG never ran (AC-61); `""` = CFG ran against
+    /// the empty negative the caller omitted; text = CFG ran against it.
     public let negativePrompt: String?
     public let eta: Float
     public let bongmath: Bool
@@ -228,8 +230,10 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
 
   /// Everything the record needs, each value taken from the PIPELINE (or the
   /// coordinator's pool state), never from the request — except
-  /// `requestedSigmaSchedule` and `negativePrompt`, which are recorded as
-  /// what the caller sent only in contrast to / gated by what ran (D22, AC-61).
+  /// `requestedSigmaSchedule`, which is recorded as what the caller sent only
+  /// in contrast to what ran (D22). The negative prompt is NOT here at all —
+  /// I4 moved it onto the trace, because only the pipeline knows what it
+  /// encoded.
   public struct Krea2Inputs: Sendable {
     public var baseModel: String
     public var variant: Krea2Variant
@@ -243,13 +247,12 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     public var loras: [LoRAReadBack]
     public var control: ControlReadBack?
     public var trace: Krea2RunTrace
-    public var negativePrompt: String?
 
     public init(
       baseModel: String, variant: Krea2Variant, transformerFile: URL, quantizationBits: Int?,
       vae: Krea2VAESelection, textEncoderFile: URL,
       loras: [LoRAReadBack], control: ControlReadBack?,
-      trace: Krea2RunTrace, negativePrompt: String?
+      trace: Krea2RunTrace
     ) {
       self.baseModel = baseModel
       self.variant = variant
@@ -260,7 +263,6 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       self.loras = loras
       self.control = control
       self.trace = trace
-      self.negativePrompt = negativePrompt
     }
   }
 
@@ -285,7 +287,11 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       modelEvals: t.modelEvals,
       denoise: t.denoise,
       guidance: t.guidance,
-      negativePrompt: t.cfgActive ? i.negativePrompt : nil,
+      // I4: the negative the PIPELINE encoded — `nil` = CFG never ran, `""` =
+      // CFG ran against an empty negative. Built from the trace, never from
+      // the payload, so an omitted negative under CFG is not recorded as
+      // "no negative prompt" while a second model pass was paid for it.
+      negativePrompt: t.negativePromptApplied,
       eta: t.eta,
       bongmath: t.bongmath,
       // T2/T3 warm-up (`deis_3m` below order → `ralston_3s`) lands with

@@ -37,7 +37,9 @@ final class Krea2RunTraceTests: XCTestCase {
     let trace = Krea2RunTrace(
       request: request, shift: shift, scheduler: scheduler,
       stats: Self.stats(stepsRun: 9, modelEvals: 9),
-      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+      negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+        cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
 
     XCTAssertEqual(trace.sampler, .euler)
     XCTAssertEqual(trace.sigmaSchedule, .krea2)
@@ -67,10 +69,14 @@ final class Krea2RunTraceTests: XCTestCase {
     for (shift, expectedSource) in [(dynamic, "dynamic"), (explicit, "explicit")] {
       let scheduler = try Krea2Pipeline.makeScheduler(
         sampler: .euler, sigmaSchedule: .krea2, steps: 9, shift: shift, seed: 1, c2: 0.5)
+      let request = Krea2Pipeline.Request(
+        prompt: "x", steps: 9, shift: shift.source == .explicit ? 1.15 : nil)
       let trace = Krea2RunTrace(
-        request: Krea2Pipeline.Request(prompt: "x", steps: 9, shift: shift.source == .explicit ? 1.15 : nil),
+        request: request,
         shift: shift, scheduler: scheduler, stats: Self.stats(stepsRun: 9, modelEvals: 9),
-        startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+        startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+        negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+          cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
       XCTAssertEqual(trace.shiftSource, expectedSource)
       XCTAssertEqual(trace.mu, shift.mu)
       XCTAssertEqual(trace.shift, Foundation.exp(shift.mu), accuracy: 1e-6)
@@ -91,7 +97,9 @@ final class Krea2RunTraceTests: XCTestCase {
     let trace = Krea2RunTrace(
       request: request, shift: shift, scheduler: scheduler,
       stats: Self.stats(stepsRun: 9, modelEvals: 9),
-      startIndex: 0, denoise: 1.0, width: rounded, height: 1024)
+      startIndex: 0, denoise: 1.0, width: rounded, height: 1024,
+      negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+        cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
     XCTAssertEqual(trace.width, 1040)
   }
 
@@ -102,11 +110,14 @@ final class Krea2RunTraceTests: XCTestCase {
     let scheduler = try Krea2Pipeline.makeScheduler(
       sampler: .euler, sigmaSchedule: .flow, steps: 9, shift: shift, seed: 1, c2: 0.5)
     func trace(requested: String?) -> Krea2RunTrace {
-      Krea2RunTrace(
-        request: Krea2Pipeline.Request(
-          prompt: "x", steps: 9, sigmaSchedule: .flow, sigmaScheduleRequested: requested),
+      let request = Krea2Pipeline.Request(
+        prompt: "x", steps: 9, sigmaSchedule: .flow, sigmaScheduleRequested: requested)
+      return Krea2RunTrace(
+        request: request,
         shift: shift, scheduler: scheduler, stats: Self.stats(stepsRun: 9, modelEvals: 9),
-        startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+        startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+        negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+          cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
     }
     // Krita's default style sends "normal", which resolves to flow.
     XCTAssertEqual(trace(requested: "normal").sigmaScheduleRequested, "normal")
@@ -131,11 +142,14 @@ final class Krea2RunTraceTests: XCTestCase {
       kind: .euler, sigmaSchedule: .beta57, numInferenceSteps: 97, config: config)
     XCTAssertEqual(scheduler.numInferenceSteps, 96, "precondition: this grid de-dups")
 
+    let request = Krea2Pipeline.Request(prompt: "x", steps: 97, sigmaSchedule: .beta57)
     let trace = Krea2RunTrace(
-      request: Krea2Pipeline.Request(prompt: "x", steps: 97, sigmaSchedule: .beta57),
+      request: request,
       shift: try Self.shift(), scheduler: scheduler,
       stats: Self.stats(stepsRun: 96, modelEvals: 96),
-      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+      negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+        cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
     XCTAssertEqual(trace.stepsRequested, 97)
     XCTAssertEqual(trace.stepsEffective, 96)
     XCTAssertEqual(trace.stepsRun, 96)
@@ -160,7 +174,9 @@ final class Krea2RunTraceTests: XCTestCase {
     let trace = Krea2RunTrace(
       request: request, shift: shift, scheduler: scheduler,
       stats: Self.stats(stepsRun: 9 - startIndex, modelEvals: 9 - startIndex),
-      startIndex: startIndex, denoise: denoise, width: 1024, height: 1024)
+      startIndex: startIndex, denoise: denoise, width: 1024, height: 1024,
+      negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+        cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
 
     XCTAssertEqual(trace.startIndex, 2)
     XCTAssertEqual(trace.denoise, denoise)
@@ -183,11 +199,14 @@ final class Krea2RunTraceTests: XCTestCase {
     let shift = try Self.shift()
     let scheduler = try Krea2Pipeline.makeScheduler(
       sampler: .res2s, sigmaSchedule: .krea2, steps: 6, shift: shift, seed: 1, c2: 0.5)
+    let request = Krea2Pipeline.Request(prompt: "x", guidance: 2.0, steps: 6, sampler: .res2s)
     let trace = Krea2RunTrace(
-      request: Krea2Pipeline.Request(prompt: "x", guidance: 2.0, steps: 6, sampler: .res2s),
+      request: request,
       shift: shift, scheduler: scheduler,
       stats: Self.stats(stepsRun: 6, rowsAtStart: 2, modelEvals: 6 * 2 * 2),
-      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+      negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+        cfgActive: request.guidance > 1.0, requested: request.negativePrompt))
     XCTAssertEqual(trace.modelEvals, 24)
     XCTAssertEqual(trace.guidance, 2.0)
     XCTAssertEqual(trace.sampler, .res2s)

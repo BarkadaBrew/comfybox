@@ -773,6 +773,13 @@ public final class Krea2Pipeline {
     // (or empty) prompt and runs a second unconditioned pass per step —
     // sequential, not batched, to keep peak memory flat on the shared box.
     let useCFG = request.guidance > 1.0
+    // K-FIX-1 / Codex I4: what the CFG branch ACTUALLY conditions on,
+    // resolved here — beside the encode, from the same `useCFG` predicate —
+    // and carried in the trace so every provenance sink records the render
+    // rather than the request. An omitted negative under CFG is `""`, not
+    // "no negative prompt": the second model pass ran either way.
+    let negativePromptApplied = Krea2RunTrace.negativePromptApplied(
+      cfgActive: useCFG, requested: request.negativePrompt)
     var negCtx: MLXArray? = nil
     var negPos: MLXArray? = nil
     var negFullMask: MLXArray? = nil
@@ -826,7 +833,8 @@ public final class Krea2Pipeline {
 
     let trace = Krea2RunTrace(
       request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
-      startIndex: 0, denoise: 1.0, width: width, height: height)
+      startIndex: 0, denoise: 1.0, width: width, height: height,
+      negativePromptApplied: negativePromptApplied)
     return (decoded[0], trace)
   }
 }
