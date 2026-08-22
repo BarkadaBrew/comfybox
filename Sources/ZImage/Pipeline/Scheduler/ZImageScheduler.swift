@@ -1,5 +1,21 @@
 import MLX
 
+/// The quantity a scheduler expects in `modelOutput`.
+///
+/// The pipelines always obtain a flow **velocity** `v = dx/dσ = ε − x₀` from
+/// the transformer (for Z-Image the raw prediction is `x₀ − ε`, negated at
+/// the call site) and convert it once per evaluation, after CFG combination,
+/// through ``ZImageScheduler/modelInput(velocity:sample:sigma:)``. A solver
+/// that integrates in the wrong quantity is dimensionally wrong, not merely
+/// inaccurate — the `res_2s` correction in FDD-krea2-raw-recipe D2/§3.2.
+public enum ModelOutputConvention: Sendable, Equatable {
+  /// Linear-frame solvers integrate `dx/dσ = v` and take the velocity as-is.
+  case velocity
+  /// Exponential-frame solvers (`res_*`) integrate in `h = −log(σ'/σ)` and
+  /// take the data prediction `x₀ = x − σ·v`.
+  case dataPrediction
+}
+
 /// A scheduler that advances latent samples through a denoising diffusion process.
 ///
 /// Schedulers implement the ODE/SDE integration step for flow-matching models.
@@ -7,7 +23,17 @@ import MLX
 /// ``intermediateStep(modelOutput:timestepIndex:sample:)``, while
 /// multi-evaluation schedulers (Heun, RES) return an intermediate latent
 /// that requires a second model forward pass.
+///
+/// Every `modelOutput` argument below carries the quantity named by
+/// ``modelOutputConvention`` — a velocity for every scheduler except the
+/// exponential-frame RES family, which takes the data prediction.
 public protocol ZImageScheduler {
+  /// What quantity `step` / `intermediateStep` / `finalizeStep` expect in
+  /// `modelOutput`. Linear-frame solvers integrate `dx/dσ = v` and take a
+  /// velocity. Exponential-frame solvers (`res_2s`, later `res_3s`) integrate
+  /// in `h = −log(σ'/σ)` and take the data prediction `x₀ = x − σ·v`.
+  var modelOutputConvention: ModelOutputConvention { get }
+
   /// Sigma values for each step plus a trailing zero: shape `[numInferenceSteps + 1]`.
   var sigmas: MLXArray { get }
 
@@ -29,7 +55,8 @@ public protocol ZImageScheduler {
   /// with both predictions.
   ///
   /// - Parameters:
-  ///   - modelOutput: The model's velocity prediction for the current sample.
+  ///   - modelOutput: The model's prediction for the current sample, in the
+  ///     quantity named by ``modelOutputConvention`` (velocity by default).
   ///   - timestepIndex: The current step index in `[0, numInferenceSteps)`.
   ///   - sample: The current latent sample.
   /// - Returns: The updated latent sample.
@@ -78,6 +105,28 @@ public protocol ZImageScheduler {
 // MARK: - Default implementations for single-evaluation schedulers
 
 public extension ZImageScheduler {
+  /// Every existing scheduler takes a velocity; only the RES family overrides.
+  var modelOutputConvention: ModelOutputConvention { .velocity }
+
+  /// Convert the transformer's flow velocity into what this scheduler expects
+  /// in `modelOutput`. Call once per model evaluation, **after** CFG
+  /// combination (CFG is linear in `v`, so the order is safe), with the sigma
+  /// the evaluation was made at (the grid sigma for the first evaluation,
+  /// ``intermediateSigma(timestepIndex:)`` for the second).
+  ///
+  /// For `.velocity` this returns `velocity` itself — no new ops, so the
+  /// default euler/flow path is byte-identical (AC-6). For `.dataPrediction`
+  /// it returns `x₀ = sample − σ·velocity` in the sample's dtype (`Float *
+  /// MLXArray` casts the scalar to the array's dtype).
+  func modelInput(velocity: MLXArray, sample: MLXArray, sigma: Float) -> MLXArray {
+    switch modelOutputConvention {
+    case .velocity:
+      return velocity
+    case .dataPrediction:
+      return sample - sigma * velocity
+    }
+  }
+
   var requiresIntermediateEvaluation: Bool { false }
 
   mutating func intermediateStep(

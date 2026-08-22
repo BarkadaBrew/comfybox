@@ -1030,6 +1030,7 @@ public class ZImageControlPipeline {
       eta: request.eta
     )
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
+    let sigmasArray = scheduler.sigmas.asArray(Float.self)
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
     if self.transformer == nil {
       logger.info("Reloading transformer after prompt encoding...")
@@ -1102,10 +1103,19 @@ public class ZImageControlPipeline {
         } else {
           guidedNoise = noisePred
         }
-        // Multi-evaluation schedulers (e.g. Heun) need a second model forward pass
+        // The transformer emits x₀ − ε; the flow velocity dx/dσ = ε − x₀ is its
+        // negation. Convert once per evaluation, after CFG, into the quantity the
+        // scheduler integrates: the velocity itself (identity, byte-identical
+        // default path) or x₀ = x − σ·v for the exponential-frame res_2s
+        // (FDD-krea2-raw-recipe D2 / §3.2).
+        let velocity = -guidedNoise
+        let modelOutput = scheduler.modelInput(
+          velocity: velocity, sample: latents, sigma: sigmasArray[stepIndex]
+        )
+        // Multi-evaluation schedulers (e.g. Heun, RES 2s) need a second model forward pass
         if scheduler.requiresIntermediateEvaluation,
            let intermediateSample = scheduler.intermediateStep(
-             modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
+             modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents
            ) {
           let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
             ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
@@ -1136,14 +1146,17 @@ public class ZImageControlPipeline {
           } else {
             intermediateGuidedNoise = intermediateNoisePred
           }
+          let intermediateOutput = scheduler.modelInput(
+            velocity: -intermediateGuidedNoise, sample: intermediateSample, sigma: intermediateSigma
+          )
           latents = scheduler.finalizeStep(
-            originalOutput: -guidedNoise,
-            intermediateOutput: -intermediateGuidedNoise,
+            originalOutput: modelOutput,
+            intermediateOutput: intermediateOutput,
             timestepIndex: stepIndex,
             sample: latents
           )
         } else {
-          latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+          latents = scheduler.step(modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents)
         }
         MLX.eval(latents)
       }
@@ -1343,6 +1356,7 @@ public class ZImageControlPipeline {
       eta: request.eta
     )
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
+    let sigmasArray = scheduler.sigmas.asArray(Float.self)
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
     if self.transformer == nil {
       logger.info("Reloading transformer after prompt encoding...")
@@ -1415,10 +1429,19 @@ public class ZImageControlPipeline {
         } else {
           guidedNoise = noisePred
         }
-        // Multi-evaluation schedulers (e.g. Heun) need a second model forward pass
+        // The transformer emits x₀ − ε; the flow velocity dx/dσ = ε − x₀ is its
+        // negation. Convert once per evaluation, after CFG, into the quantity the
+        // scheduler integrates: the velocity itself (identity, byte-identical
+        // default path) or x₀ = x − σ·v for the exponential-frame res_2s
+        // (FDD-krea2-raw-recipe D2 / §3.2).
+        let velocity = -guidedNoise
+        let modelOutput = scheduler.modelInput(
+          velocity: velocity, sample: latents, sigma: sigmasArray[stepIndex]
+        )
+        // Multi-evaluation schedulers (e.g. Heun, RES 2s) need a second model forward pass
         if scheduler.requiresIntermediateEvaluation,
            let intermediateSample = scheduler.intermediateStep(
-             modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
+             modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents
            ) {
           let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
             ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
@@ -1449,14 +1472,17 @@ public class ZImageControlPipeline {
           } else {
             intermediateGuidedNoise = intermediateNoisePred
           }
+          let intermediateOutput = scheduler.modelInput(
+            velocity: -intermediateGuidedNoise, sample: intermediateSample, sigma: intermediateSigma
+          )
           latents = scheduler.finalizeStep(
-            originalOutput: -guidedNoise,
-            intermediateOutput: -intermediateGuidedNoise,
+            originalOutput: modelOutput,
+            intermediateOutput: intermediateOutput,
             timestepIndex: stepIndex,
             sample: latents
           )
         } else {
-          latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+          latents = scheduler.step(modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents)
         }
         MLX.eval(latents)
       }
