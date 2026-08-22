@@ -71,6 +71,41 @@ final class Krea2RecipeForwardingTests: XCTestCase {
     XCTAssertNoThrow(try res2s.validateKrea2TierGates(try res2s.validateRecipeNames()))
   }
 
+  /// WP-E16: `bongmath` is the eta arm's twin on the wire — forwarded whatever
+  /// the sampler, gated by SAMPLER, and absent means `false` (a bare payload
+  /// is byte-identical to before the key existed).
+  func testBongmathForwardsAndIsGatedBySampler() throws {
+    let bare = try decode(#"{"prompt":"x"}"#)
+    XCTAssertFalse(try bare.krea2RecipeFields().bongmath, "absent is false, not nil")
+    XCTAssertNoThrow(try bare.validateKrea2TierGates(try bare.validateRecipeNames()))
+
+    let euler = try decode(#"{"prompt":"x","bongmath":true}"#)
+    XCTAssertTrue(try euler.krea2RecipeFields().bongmath)
+    XCTAssertEqual(try euler.krea2RecipeFields().sampler, .euler)
+    XCTAssertThrowsError(
+      try euler.validateKrea2TierGates(try euler.validateRecipeNames())
+    ) { error in
+      guard case WarmServerError.unsupportedRecipeField(let field, let value, let family, let why) =
+        error
+      else { return XCTFail("\(error)") }
+      XCTAssertEqual(field, "bongmath")
+      XCTAssertEqual(value, "true")
+      XCTAssertEqual(family, "krea2")
+      XCTAssertTrue(why.contains("euler"), "the refusal must name the sampler: \(why)")
+    }
+
+    // Explicit false is not a refusal on any sampler.
+    let off = try decode(#"{"prompt":"x","bongmath":false}"#)
+    XCTAssertFalse(try off.krea2RecipeFields().bongmath)
+    XCTAssertNoThrow(try off.validateKrea2TierGates(try off.validateRecipeNames()))
+
+    let res2s = try decode(#"{"prompt":"x","scheduler":"res_2s","bongmath":true,"eta":0.5}"#)
+    let fields = try res2s.krea2RecipeFields()
+    XCTAssertTrue(fields.bongmath)
+    XCTAssertEqual(fields.eta, 0.5, "T3 composes with T2 on one payload")
+    XCTAssertNoThrow(try res2s.validateKrea2TierGates(try res2s.validateRecipeNames()))
+  }
+
   func testUnknownNamesStillThrow() throws {
     XCTAssertThrowsError(try decode(#"{"prompt":"x","scheduler":"uni_pc"}"#).krea2RecipeFields())
     XCTAssertThrowsError(try decode(#"{"prompt":"x","sigma_schedule":"ays"}"#).krea2RecipeFields())

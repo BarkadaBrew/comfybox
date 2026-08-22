@@ -57,6 +57,7 @@ final class Krea2RunTraceTests: XCTestCase {
     XCTAssertEqual(trace.eta, 0)
     XCTAssertNil(trace.sde, "eta 0 renders carry no SDE block (WP-E15)")
     XCTAssertFalse(trace.bongmath)
+    XCTAssertNil(trace.bong, "bongmath-off renders carry no T3 block (WP-E16)")
     XCTAssertEqual(trace.seed, 44821)
     XCTAssertEqual(trace.width, 1024)
     XCTAssertEqual(trace.height, 1024)
@@ -242,5 +243,43 @@ final class Krea2RunTraceTests: XCTestCase {
     XCTAssertEqual(trace.modelEvals, 24)
     XCTAssertEqual(trace.guidance, 2.0)
     XCTAssertEqual(trace.sampler, .res2s)
+  }
+
+  /// WP-E16 (§3.13, scope 1/4): a render that ran the T3 fixed point records
+  /// what it DID — the rounds, the rebases, the steps it ran on, the rows
+  /// upstream's guards refused, and the extra model evaluations it made.
+  ///
+  /// The counts are the hook's own, so the record cannot claim a fixed point
+  /// that never ran: `bongmath: true` in the request is a request, and
+  /// upstream's guards refuse two of a 6-step `res_2s` grid's steps outright.
+  func testTraceRecordsWhatTheT3FixedPointDid() throws {
+    let hook = RES4LYFBongMath(sigmaMin: 3.1575115281157196e-4, sigmaMax: 1.0)
+    XCTAssertNil(
+      Krea2RunTrace.BongMathParameters.forRun(nil), "no hook, no block")
+
+    var grid: any ZImageScheduler = try RES4LYFTraceParityTests.productionRES2sScheduler()
+    let trace = try RES4LYFTraceFixture.load("res2s_beta6_T3")
+    let m = trace.manifest
+    let stepNoise = try m.steps.compactMap { $0.noiseStep }.map { try trace.tensor($0) }
+    let substepNoise = try m.steps.flatMap { $0.substeps }.compactMap { $0.noise }
+      .map { try trace.tensor($0) }
+    _ = Krea2DenoiseLoop.run(
+      scheduler: &grid, initialSample: try trace.tensor(m.xInit),
+      evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
+      noise: RES4LYFSDENoiseInjector(
+        eta: m.recipe.eta, etaSubstep: m.recipe.etaSubstep, sNoise: 1.0, sNoiseSubstep: 1.0,
+        sigmaMax: m.sigmaMax,
+        stepNoise: RES4LYFEtaSDEParityTests.RecordedNoiseStream(
+          name: "step", tensors: stepNoise),
+        substepNoise: RES4LYFEtaSDEParityTests.RecordedNoiseStream(
+          name: "substep", tensors: substepNoise)),
+      bongmath: hook)
+
+    let record = try XCTUnwrap(Krea2RunTrace.BongMathParameters.forRun(hook))
+    XCTAssertEqual(record.iterations, 100, "upstream's `for i in range(100)`")
+    XCTAssertEqual(record.rebases, 4)
+    XCTAssertEqual(record.steps, [0, 1, 2, 3], "steps 4 and 5 are refused by h ≥ σ_max/2")
+    XCTAssertEqual(record.refusals, 2)
+    XCTAssertEqual(record.extraModelEvals, 0, "the fixed point is algebraic")
   }
 }

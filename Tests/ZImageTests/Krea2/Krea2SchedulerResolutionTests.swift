@@ -130,14 +130,29 @@ final class Krea2SchedulerResolutionTests: XCTestCase {
         eta: 0.5, sampler: .res2s, stageSeed: 0, layout: .channelsAtAxis1))
   }
 
-  func testBongmathIsRefusedBeforeT3() {
-    XCTAssertThrowsError(try Krea2Pipeline.validateTiers(eta: 0, bongmath: true)) { error in
-      guard case Krea2ScheduleError.tierNotImplemented(let field, _, let tier) = error else {
+  /// WP-E16: `bongmath` is no longer a tier refusal — it is a SAMPLER
+  /// refusal, exactly as `eta` became one at WP-E15. Asked for with `euler`
+  /// (the Krea 2 default) it is a 400 that names the sampler; asked for with a
+  /// RES4LYF port it is honoured; not asked for it builds nothing at all.
+  func testBongmathIsRefusedBySamplerNotByTier() throws {
+    let shift = try Krea2Sampling.resolveShift(explicit: 1.15, seqLen: 4096, align: 16)
+    XCTAssertNoThrow(try Krea2Pipeline.validateTiers(eta: 0, bongmath: true))
+    XCTAssertThrowsError(
+      try Krea2Pipeline.makeBongMath(
+        bongmath: true, sampler: .euler, sigmaSchedule: .beta, shift: shift)
+    ) { error in
+      guard case Krea2ScheduleError.bongmathUnsupportedSampler(let sampler) = error else {
         return XCTFail("\(error)")
       }
-      XCTAssertEqual(field, "bongmath"); XCTAssertEqual(tier, "T3")
-      XCTAssertTrue("\(error)".contains("WP-E16"), "\(error)")
+      XCTAssertEqual(sampler, "euler")
+      XCTAssertTrue("\(error)".contains("euler"), "\(error)")
     }
+    XCTAssertNotNil(
+      try Krea2Pipeline.makeBongMath(
+        bongmath: true, sampler: .res2s, sigmaSchedule: .beta, shift: shift))
+    XCTAssertNil(
+      try Krea2Pipeline.makeBongMath(
+        bongmath: false, sampler: .euler, sigmaSchedule: .beta, shift: shift))
   }
 
   func testDefaultTiersPass() {

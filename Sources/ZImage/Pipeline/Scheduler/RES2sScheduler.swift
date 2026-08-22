@@ -18,9 +18,12 @@ import MLX
 ///
 /// Reference: "Improved Order Analysis and Design of Exponential Integrator
 /// for Diffusion Models Sampling" (arXiv:2308.02157).
-public struct RES2sScheduler: ZImageScheduler {
+public struct RES2sScheduler: ZImageScheduler, RES4LYFFrameScheduler {
   /// Exponential frame: every `modelOutput` here is `x₀ = x − σ·v`.
   public let modelOutputConvention: ModelOutputConvention = .dataPrediction
+
+  /// `h = −log(σ'/σ)`, `ε = denoised − x₀` (WP-E16's T3 guards read this).
+  public var frame: TableauFrame { .exponential }
 
   public let sigmas: MLXArray
   public let timesteps: MLXArray
@@ -179,6 +182,11 @@ public struct RES2sScheduler: ZImageScheduler {
   }
 
   // MARK: - Helpers
+
+  /// ``RES4LYFFrameScheduler``: `NS.h`, the exponential frame's step size.
+  public func frameStepSize(timestepIndex: Int) -> Float {
+    stepSize(timestepIndex: timestepIndex)
+  }
 
   private func stepSize(timestepIndex: Int) -> Float {
     let sigma = max(sigmas[timestepIndex].item(Float.self), 1e-8)

@@ -24,6 +24,8 @@ enum RenderRecipeFixture {
     negativePrompt: String? = nil,
     eta: Float = 0,
     bongmath: Bool = false,
+    /// WP-E16: what a T3 hook counted, when the render had one.
+    bong: Krea2RunTrace.BongMathParameters? = nil,
     mu: Float = 0.9062,
     seed: UInt64 = 44821,
     // WP-E14: the DEIS order ramp, as the loop reported it. Defaults are the
@@ -53,6 +55,7 @@ enum RenderRecipeFixture {
       guidance: guidance,
       eta: eta,
       bongmath: bongmath,
+      bong: bong,
       seed: seed,
       width: 1024,
       height: 1024,

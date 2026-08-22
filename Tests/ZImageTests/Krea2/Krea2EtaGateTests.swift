@@ -47,17 +47,17 @@ final class Krea2EtaGateTests: XCTestCase {
     }
   }
 
-  /// T2 has landed, so the pipeline's tier gate no longer refuses `eta`; T3's
-  /// `bongmath` is still refused (D18: an unimplemented tier is a 400).
-  func testTierGateNoLongerRefusesEtaButStillRefusesBongmath() {
-    XCTAssertNoThrow(try Krea2Pipeline.validateTiers(eta: 0.5, bongmath: false))
-    XCTAssertNoThrow(try Krea2Pipeline.validateTiers(eta: 0, bongmath: false))
-    XCTAssertThrowsError(try Krea2Pipeline.validateTiers(eta: 0.5, bongmath: true)) { error in
-      guard case Krea2ScheduleError.tierNotImplemented(let field, _, let tier) = error else {
-        return XCTFail("wrong error \(error)")
+  /// T2 landed with WP-E15 and **T3 landed with WP-E16**, so the pipeline's
+  /// tier gate refuses neither field any more. Neither is ignored either: each
+  /// is now refused BY SAMPLER at its own factory, which is what
+  /// `Krea2SchedulerResolutionTests` and `RES4LYFBongMathParityTests` assert.
+  func testTierGateRefusesNeitherEtaNorBongmath() {
+    for eta in [Float(0), 0.5] {
+      for bongmath in [false, true] {
+        XCTAssertNoThrow(
+          try Krea2Pipeline.validateTiers(eta: eta, bongmath: bongmath),
+          "eta \(eta) bongmath \(bongmath)")
       }
-      XCTAssertEqual(field, "bongmath")
-      XCTAssertEqual(tier, "T3")
     }
   }
 }

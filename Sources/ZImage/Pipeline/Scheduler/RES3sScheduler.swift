@@ -24,7 +24,7 @@ import MLX
 ///
 /// The tableau is `h`-dependent, so it is recomputed per step (a handful of
 /// `Double` operations) rather than cached at init.
-public struct RES3sScheduler: TableauScheduler {
+public struct RES3sScheduler: TableauScheduler, RES4LYFFrameScheduler {
 
   /// Exponential frame: every `modelOutput` here is `x₀ = x − σ·v`.
   public let modelOutputConvention: ModelOutputConvention = .dataPrediction
@@ -202,6 +202,11 @@ public struct RES3sScheduler: TableauScheduler {
   }
 
   // MARK: - Helpers
+
+  /// ``RES4LYFFrameScheduler``: `NS.h` for this step.
+  public func frameStepSize(timestepIndex: Int) -> Float {
+    stepSize(timestepIndex: timestepIndex)
+  }
 
   private func stepSize(timestepIndex: Int) -> Float {
     let i = checked(timestepIndex)

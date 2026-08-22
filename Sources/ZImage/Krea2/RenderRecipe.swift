@@ -95,6 +95,17 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     public let negativePrompt: String?
     public let eta: Float
     public let bongmath: Bool
+    /// WP-E16: how many tableau ROWS the T3 fixed point actually rebased, or
+    /// `nil` when this render ran none.
+    ///
+    /// Additive and optional because `bongmath: true` alone is a REQUEST, not
+    /// a record: upstream's guards refuse the fixed point below `σ = 0.03` and
+    /// above `h = σ_max/2`, and on the published stage-1 recipe (`res_2s`,
+    /// 6 steps) that is two of the six steps. A reader with `stepsRun` and
+    /// `modelEvals` beside it can see which — 4 rebases over 6 steps at 2 rows
+    /// a step is 4 of 6 steps rebased — where `bongmath: true` on its own
+    /// reads as "all of them".
+    public let bongmathRebases: Int?
     /// `"ralston_3s"` for `deis_3m` below order.
     public let warmupSampler: String?
     public let warmupSteps: Int
@@ -321,6 +332,9 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       negativePrompt: t.negativePromptApplied,
       eta: t.eta,
       bongmath: t.bongmath,
+      // WP-E16: forwarded from the trace, which is the only witness — the hook
+      // counted its own rebases while it ran. `nil` for a render with no T3.
+      bongmathRebases: t.bong?.rebases,
       // WP-E14: the DEIS order ramp. The loop's trace is the only witness to
       // it (`Krea2RunTrace.warmUpSampler(of:)` reads the conformer after the
       // run), so the record FORWARDS what ran and never re-derives it — a
