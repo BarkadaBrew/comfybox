@@ -194,7 +194,7 @@ final class Krea2StagedRenderTests: XCTestCase {
   func testRenoiseIsTheFloat32MixAtTheStageTwoStartSigma() throws {
     let shift = try Self.shift()
     let stage = Krea2ResolvedStage(
-      index: 1, sampler: .deis3m, sigmaSchedule: .bongTangent, sigmaScheduleRequested: nil,
+      sampler: .deis3m, sigmaSchedule: .bongTangent, sigmaScheduleRequested: nil,
       steps: 2, denoise: 0.2, guidance: 1.0, eta: 0, bongmath: false, c2: 0.5, seed: 900)
     let scheduler = try Krea2StagedRender.makeScheduler(
       sampler: stage.sampler, sigmaSchedule: stage.sigmaSchedule, steps: stage.steps,

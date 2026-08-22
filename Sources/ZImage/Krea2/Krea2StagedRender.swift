@@ -138,7 +138,6 @@ extension Krea2Pipeline {
     /// derive the stage seed. Pure — asserted without weights.
     public func resolved(against request: Krea2Pipeline.Request) -> Krea2ResolvedStage {
       Krea2ResolvedStage(
-        index: 1,
         sampler: sampler ?? request.sampler,
         sigmaSchedule: sigmaSchedule ?? request.sigmaSchedule,
         sigmaScheduleRequested: sigmaScheduleRequested,
@@ -157,9 +156,11 @@ extension Krea2Pipeline {
 
 /// One stage's recipe with nothing left to resolve — what the run and the
 /// record both read.
+///
+/// Carries no stage INDEX on purpose: `RenderRecipe.krea2` numbers
+/// `applied.stages[]` from the order of the traces it is handed, so a second
+/// copy of that number here could only ever disagree with it.
 public struct Krea2ResolvedStage: Sendable, Equatable {
-  /// 0-based position in `applied.stages[]`.
-  public let index: Int
   public let sampler: SchedulerKind
   public let sigmaSchedule: SigmaScheduleKind
   public let sigmaScheduleRequested: String?
@@ -172,11 +173,10 @@ public struct Krea2ResolvedStage: Sendable, Equatable {
   public let seed: UInt64
 
   public init(
-    index: Int, sampler: SchedulerKind, sigmaSchedule: SigmaScheduleKind,
+    sampler: SchedulerKind, sigmaSchedule: SigmaScheduleKind,
     sigmaScheduleRequested: String?, steps: Int, denoise: Double,
     guidance: Float, eta: Float, bongmath: Bool, c2: Float, seed: UInt64
   ) {
-    self.index = index
     self.sampler = sampler
     self.sigmaSchedule = sigmaSchedule
     self.sigmaScheduleRequested = sigmaScheduleRequested
