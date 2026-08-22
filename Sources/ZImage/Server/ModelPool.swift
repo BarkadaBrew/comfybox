@@ -46,6 +46,10 @@ struct ModelLoadResponse: Encodable, Sendable {
   let vramEstimateMB: Int
   let poolSize: Int
   let poolBudgetMB: Int
+  /// K-FIX-1 / Codex C2: the FIFO job id of an asynchronous (`wait: false`)
+  /// load, so a fire-and-forget caller can find its operation in `/v1/queue`
+  /// and cancel it. Absent on a synchronous load, which has already run.
+  var jobId: String? = nil
 
   enum CodingKeys: String, CodingKey {
     case status, model, family
@@ -53,7 +57,50 @@ struct ModelLoadResponse: Encodable, Sendable {
     case vramEstimateMB = "vram_estimate_mb"
     case poolSize = "pool_size"
     case poolBudgetMB = "pool_budget_mb"
+    case jobId = "job_id"
   }
+}
+
+/// A MUTATING model-pool operation, queued on the same FIFO as renders
+/// (K-FIX-1 / Codex C2).
+///
+/// `/v1/model/load|activate|unload` used to call the coordinator's pool
+/// methods directly. Actor isolation does NOT serialize an async method
+/// across its awaits: while `poolLoad` awaited `ModelPool.load`, the
+/// coordinator was free to start a queued render, and the load could then
+/// allocate another 22 GB transformer, evict `active.box` and call
+/// `GPU.clearCache()` UNDER that render — use-after-release, corrupted
+/// output, Metal failure or OOM. `ModelPool.evictIfNeeded`'s own comment
+/// asserts callers are serialized with renders; these three routes were the
+/// callers that were not.
+enum ModelOperation: Sendable {
+  case load(modelSpec: String, quantization: String?, activate: Bool)
+  case activate(modelId: String)
+  case unload(modelId: String)
+
+  var summary: String {
+    switch self {
+    case .load(let spec, _, let activate):
+      return "Model load: \(spec)\(activate ? " (+activate)" : "")"
+    case .activate(let modelId): return "Model activate: \(modelId)"
+    case .unload(let modelId): return "Model unload: \(modelId)"
+    }
+  }
+
+  var kind: String {
+    switch self {
+    case .load: return "model_load"
+    case .activate: return "model_activate"
+    case .unload: return "model_unload"
+    }
+  }
+}
+
+/// The typed result of a queued ``ModelOperation``.
+enum ModelOperationResult: Sendable {
+  case load(ModelLoadResponse)
+  case activate(ModelActivateResponse)
+  case unload(ModelUnloadResponse)
 }
 
 /// Response for model activate endpoint.

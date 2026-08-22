@@ -835,34 +835,34 @@ public final class WarmServer {
         let resolvedSpec = Self.parseModelSpec(from: payload.model)
         let resolvedQuantization = payload.quantization ?? Self.parseQuantization(from: payload.model)
 
+        // K-FIX-1 / Codex C2: every MUTATING pool operation goes through the
+        // same FIFO as renders, LoRA swaps and the ComfyBridge model switch.
+        // Calling `coordinator.poolLoad` here was not serialized: actor
+        // isolation does not hold across an await, so the load's eviction and
+        // `GPU.clearCache()` could run under an in-flight render.
+        let operation = ModelOperation.load(
+          modelSpec: resolvedSpec, quantization: resolvedQuantization, activate: shouldActivate)
         if shouldWait {
-          let result = try await coordinator.poolLoad(
-            modelSpec: resolvedSpec,
-            quantization: resolvedQuantization,
-            activate: shouldActivate
-          )
+          guard case .load(let result) = try await coordinator.enqueueModelOperation(operation) else {
+            return .error(.error(status: 500, message: "Model load returned the wrong result kind"))
+          }
           return .json(status: 200, payload: result)
         } else {
-          // Fire-and-forget: start loading in background, return immediately.
-          Task {
-            do {
-              try await coordinator.poolLoad(
-                modelSpec: resolvedSpec,
-                quantization: resolvedQuantization,
-                activate: shouldActivate
-              )
-            } catch {
-              logger.error("ModelPool: background load failed for '\(payload.model)': \(error.localizedDescription)")
-            }
-          }
+          // Fire-and-forget is now a TRACKED queue job, not a detached Task:
+          // it is listed in /v1/queue under the id returned here, it can be
+          // cancelled, and it still cannot begin under a render.
+          let jobId = try await coordinator.enqueueModelOperationDetached(operation)
           let ack = ModelLoadResponse(
+            // "loading" is kept verbatim: an out-of-repo client (the daemons)
+            // may branch on it, and C2's wire change is the ADDED `job_id`.
             status: "loading",
             model: payload.model,
             family: "pending",
             loadTimeMs: 0,
             vramEstimateMB: 0,
             poolSize: await coordinator.modelPool.count(),
-            poolBudgetMB: await coordinator.modelPool.budget()
+            poolBudgetMB: await coordinator.modelPool.budget(),
+            jobId: jobId
           )
           return .json(status: 202, payload: ack)
         }
@@ -873,7 +873,13 @@ public final class WarmServer {
     case ("POST", "/v1/model/activate"):
       do {
         let payload = try decode(ModelActivateRequest.self, from: request.body)
-        let result = try await coordinator.poolActivate(modelId: payload.model)
+        // C2: activation swaps the resident pipeline out from under whatever
+        // is rendering unless it is queued behind it.
+        guard case .activate(let result) =
+          try await coordinator.enqueueModelOperation(.activate(modelId: payload.model))
+        else {
+          return .error(.error(status: 500, message: "Model activate returned the wrong result kind"))
+        }
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -886,7 +892,13 @@ public final class WarmServer {
     case ("POST", "/v1/model/unload"):
       do {
         let payload = try decode(ModelUnloadRequest.self, from: request.body)
-        let result = try await coordinator.poolUnload(modelId: payload.model)
+        // C2: an unload releases the pipeline's weights — the same
+        // use-after-release hazard as an eviction.
+        guard case .unload(let result) =
+          try await coordinator.enqueueModelOperation(.unload(modelId: payload.model))
+        else {
+          return .error(.error(status: 500, message: "Model unload returned the wrong result kind"))
+        }
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -5326,8 +5338,13 @@ private actor WarmServerCoordinator {
   /// how the July mystery-GPU-usage class of incident happens.
   private var isPaused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
 
-  /// Sentinel marking the queue paused; survives engine restarts.
-  static let pauseSentinelPath = NSString(string: "~/.comfybox/queue-paused").expandingTildeInPath
+  /// Sentinel marking the queue paused; survives engine restarts. Computed
+  /// from `QueueStateStore.stateDirectory` so it follows `COMFYBOX_STATE_DIR`
+  /// (K-FIX-1: a test driving a real coordinator must not read — or clear —
+  /// the LIVE engine's pause flag).
+  static var pauseSentinelPath: String {
+    QueueStateStore.stateDirectory.appendingPathComponent("queue-paused").path
+  }
   private var shuttingDown = false
   private var successfulRenderCount = 0
   private var failedRenderCount = 0
@@ -6142,6 +6159,13 @@ private actor WarmServerCoordinator {
   // MARK: - Model Pool Operations
 
   /// Load a model into the pool, optionally activating it.
+  /// QUEUE-INTERNAL (K-FIX-1 / Codex C2). Call this ONLY from inside the
+  /// process loop — a queued `.modelOperation`, the ComfyBridge switch's
+  /// `enqueueModelSwitch` body, or a render's own #218 reload. A route or
+  /// handler that reaches it directly reintroduces the race: actor isolation
+  /// does not hold across an await, so the pool's eviction and
+  /// `GPU.clearCache()` would be free to run under an active render. From
+  /// outside the loop use `enqueueModelOperation` / `enqueueModelOperationDetached`.
   func poolLoad(modelSpec: String, quantization: String?, activate: Bool) async throws -> ModelLoadResponse {
     // #218: an image load must vacate a resident LTX-2 video stack first — the
     // two heavy models can't co-reside on a 128GB box. Safe here because
@@ -6191,6 +6215,13 @@ private actor WarmServerCoordinator {
 
   /// Activate a model that is already in the pool.
   @discardableResult
+  /// QUEUE-INTERNAL (K-FIX-1 / Codex C2). Call this ONLY from inside the
+  /// process loop — a queued `.modelOperation`, the ComfyBridge switch's
+  /// `enqueueModelSwitch` body, or a render's own #218 reload. A route or
+  /// handler that reaches it directly reintroduces the race: actor isolation
+  /// does not hold across an await, so the pool's eviction and
+  /// `GPU.clearCache()` would be free to run under an active render. From
+  /// outside the loop use `enqueueModelOperation` / `enqueueModelOperationDetached`.
   func poolActivate(modelId: String) async throws -> ModelActivateResponse {
     // Try by pool key first, then by model spec.
     let entry: PoolEntry
@@ -6269,6 +6300,13 @@ private actor WarmServerCoordinator {
   }
 
   /// Unload a model from the pool.
+  /// QUEUE-INTERNAL (K-FIX-1 / Codex C2). Call this ONLY from inside the
+  /// process loop — a queued `.modelOperation`, the ComfyBridge switch's
+  /// `enqueueModelSwitch` body, or a render's own #218 reload. A route or
+  /// handler that reaches it directly reintroduces the race: actor isolation
+  /// does not hold across an await, so the pool's eviction and
+  /// `GPU.clearCache()` would be free to run under an active render. From
+  /// outside the loop use `enqueueModelOperation` / `enqueueModelOperationDetached`.
   func poolUnload(modelId: String) async throws -> ModelUnloadResponse {
     // Find the entry to get the model spec before unloading.
     guard let entry = await modelPool.findEntry(for: modelId) else {
@@ -6356,6 +6394,66 @@ private actor WarmServerCoordinator {
       pending.append(PendingJob(operation: .controlGenerate(request, ContinuationBox(continuation))))
       startProcessingIfNeeded()
     }
+  }
+
+  /// Execute one ``ModelOperation`` — called ONLY from the process loop, so
+  /// the whole mutation (including `ModelPool.load`'s eviction and
+  /// `GPU.clearCache()`) is serialized against renders (K-FIX-1 / C2).
+  ///
+  /// The `poolLoad`/`poolActivate`/`poolUnload` methods stay as the internal
+  /// implementation because the loop's OWN jobs call them (a render that must
+  /// restore an image model after a video eviction, #218): re-entering the
+  /// queue from inside the queue would deadlock. What changed is that no
+  /// route reaches them except through here.
+  private func runModelOperation(_ op: ModelOperation) async throws -> ModelOperationResult {
+    switch op {
+    case .load(let modelSpec, let quantization, let activate):
+      return .load(try await poolLoad(
+        modelSpec: modelSpec, quantization: quantization, activate: activate))
+    case .activate(let modelId):
+      return .activate(try await poolActivate(modelId: modelId))
+    case .unload(let modelId):
+      return .unload(try await poolUnload(modelId: modelId))
+    }
+  }
+
+  /// Enqueue a mutating pool operation and wait for it (K-FIX-1 / C2).
+  ///
+  /// MUST NOT be called from inside the process loop — see `runModelOperation`.
+  func enqueueModelOperation(_ op: ModelOperation) async throws -> ModelOperationResult {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(PendingJob(operation: .modelOperation(op, ContinuationBox(continuation))))
+      startProcessingIfNeeded()
+    }
+  }
+
+  /// Enqueue a mutating pool operation WITHOUT waiting, returning its FIFO job
+  /// id (K-FIX-1 / C2).
+  ///
+  /// This replaces `/v1/model/load`'s `wait: false` arm, which used to start a
+  /// detached `Task` that ran `poolLoad` outside the queue entirely — the
+  /// worst version of the race, because nothing in the system knew it was
+  /// running. Now it is an ordinary queue job: it appears in `/v1/queue`, it
+  /// can be cancelled, and it cannot begin under a render.
+  @discardableResult
+  func enqueueModelOperationDetached(_ op: ModelOperation) throws -> String {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+    let job = PendingJob(operation: .modelOperation(op, nil))
+    pending.append(job)
+    startProcessingIfNeeded()
+    return job.id
   }
 
   /// Run a Krita model auto-switch through the FIFO render queue so the pool
@@ -6547,6 +6645,10 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
       cont.resume(throwing: ServerError.cancelled)
+    case .modelOperation(_, let cont):
+      // A `wait: false` load has no waiting caller — cancelling it is simply
+      // dropping the job (C2).
+      cont?.resume(throwing: ServerError.cancelled)
     case .localVideo(_, let cont, _, _):
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
@@ -6565,6 +6667,8 @@ private actor WarmServerCoordinator {
       return "LoRA swap (\(payload.loras.count))"
     case .modelSwitch:
       return "Model switch"
+    case .modelOperation(let op, _):
+      return op.summary
     case .localVideo:
       return "LTX-2 video"
     case .shutdown:
@@ -6578,6 +6682,7 @@ private actor WarmServerCoordinator {
     case .controlGenerate: return "controlnet"
     case .swap: return "lora_swap"
     case .modelSwitch: return "model_switch"
+    case .modelOperation(let op, _): return op.kind
     case .localVideo: return "video"
     case .shutdown: return "shutdown"
     }
@@ -6696,6 +6801,24 @@ private actor WarmServerCoordinator {
           continuation.resume(returning: try await body())
         } catch {
           continuation.resume(throwing: error)
+        }
+      case .modelOperation(let op, let continuation):
+        // C2: the pool mutation runs HERE, with the loop holding the queue —
+        // no render can be dequeued until it returns.
+        do {
+          let result = try await runModelOperation(op)
+          continuation?.resume(returning: result)
+        } catch {
+          if let continuation {
+            continuation.resume(throwing: error)
+          } else {
+            // A `wait: false` load has no caller left to throw to; it is
+            // recorded the same way a failed render is, so /health's
+            // last_error names it instead of it vanishing into a log line.
+            failedRenderCount += 1
+            lastError = "\(op.summary) failed: \(error.localizedDescription)"
+            logger.error("Queued model operation failed — \(op.summary): \(error.localizedDescription)")
+          }
         }
       case .localVideo(let body, let continuation, let wantsAudio, let videoJobId):
         // Runs on the serial queue so LTX-2 never shares the GPU with a render.
@@ -8729,6 +8852,13 @@ private enum QueuedOperation: Sendable {
   case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
+  /// K-FIX-1 / Codex C2: a MUTATING pool operation (`/v1/model/load`,
+  /// `/v1/model/activate`, `/v1/model/unload`) run on the SAME FIFO as
+  /// renders, LoRA swaps and the ComfyBridge model switch — so a load,
+  /// eviction or `GPU.clearCache()` can never begin under an active render.
+  /// The continuation is nil for a `wait: false` load, which is tracked by
+  /// its queue job id instead of by a waiting caller (never a detached Task).
+  case modelOperation(ModelOperation, ContinuationBox<ModelOperationResult>?)
   /// Local LTX-2 video generation, run through the queue so it serializes with
   /// image renders on the shared GPU. The closure captures the generator+request.
   /// #1479: the closure returns `LTX2RenderOutcome` (not the bare result) so
@@ -8861,3 +8991,64 @@ public enum WarmServerError: Error, LocalizedError {
     }
   }
 }
+
+#if DEBUG
+/// K-FIX-1 / Codex C2 test seam — drives the coordinator's FIFO directly.
+///
+/// `WarmServerCoordinator` and the queue types are file-private (deliberately:
+/// nothing outside this file should hold the queue), so the barrier test that
+/// proves "no pool load or eviction begins until an active render exits" gets
+/// this narrow probe instead of a widened actor. It exposes exactly three
+/// things: a way to occupy the queue with a controllable job, the two model
+/// operation enqueue seams the REST routes now use, and the pending count.
+///
+/// Construct it with `COMFYBOX_STATE_DIR` pointed at a temp directory — the
+/// coordinator persists its queue snapshot and reads its pause sentinel from
+/// that directory, and the LIVE engine's are not the test's to touch.
+final class WarmServerQueueProbe: @unchecked Sendable {
+  private let coordinator: WarmServerCoordinator
+  private let liveHealth = LiveHealthState()
+  private var liveHealthSnapshot: HealthSnapshot { liveHealth.read().0 }
+
+  init(maxPendingRequests: Int = 10) {
+    self.coordinator = WarmServerCoordinator(
+      configuration: WarmServerConfiguration(maxPendingRequests: maxPendingRequests),
+      logger: Logger(label: "z-image.queue-probe"),
+      videoHolder: VideoGeneratorHolder(),
+      liveHealth: liveHealth,
+      videoJobTracker: VideoJobTracker(),
+      ltx2Telemetry: LTX2PhaseTelemetry(),
+      ltx2PreemptionSignal: PreemptionSignal(),
+      ltx2StepPosition: LTX2StepPosition(),
+      ltx2EvictMean: RollingMeanSec(),
+      ltx2ReloadMean: RollingMeanSec(),
+      preemptionInFlight: LockedFlag(),
+      pendingPreemptorBox: PendingPreemptorBox())
+  }
+
+  /// Occupy the queue with an arbitrary body — the stand-in for a render.
+  /// `.modelSwitch` is used because it is the one existing queue kind whose
+  /// work is a caller-supplied closure; the loop treats it exactly like any
+  /// other job, one at a time.
+  func enqueueFakeRender(_ body: @escaping @Sendable () async throws -> Bool) async throws -> Bool {
+    try await coordinator.enqueueModelSwitch(body)
+  }
+
+  /// The seam `/v1/model/load` (wait: true), `/v1/model/activate` and
+  /// `/v1/model/unload` use.
+  func enqueueModelOperation(_ op: ModelOperation) async throws -> ModelOperationResult {
+    try await coordinator.enqueueModelOperation(op)
+  }
+
+  /// The seam `/v1/model/load` (wait: false) uses — returns the queue job id.
+  func enqueueModelOperationDetached(_ op: ModelOperation) async throws -> String {
+    try await coordinator.enqueueModelOperationDetached(op)
+  }
+
+  /// The kinds of the jobs still waiting, read through the same
+  /// lock-based snapshot `/health` and `/v1/queue` publish.
+  func pendingJobKinds() -> [String] {
+    liveHealthSnapshot.pending.map { $0.kind }
+  }
+}
+#endif
