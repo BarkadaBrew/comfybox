@@ -1088,6 +1088,17 @@ public final class LTX2Pipeline {
         to: [1, 1, icRefFrames, 1, 1])
       state.denoiseMask = MLX.concatenated([state.denoiseMask, refMask], axis: 2)
       logger.info("IC-control: appended \(icRefFrames) reference frame(s) @ strength \(refStrength)")
+      // Face-anchor mask covers only the latF video frames, but the ref-frame
+      // append above extends the latent frame axis to latF+icRefFrames. Pad the
+      // mask with zeros over the ref frames (frozen references — nothing to
+      // anchor) or the identity-hold multiply in the denoising loop hits an MLX
+      // broadcast fatal: (1,1,latF,H,W) vs (1,128,latF+ref,H,W). Regression
+      // from the 2026-08-15 temporal-decay expansion (mask was frame-dim 1 and
+      // broadcast fine before); crash-looped every face-anchored i2v 2026-08-18.
+      if let fmT = state.faceMask {
+        let pad = MLX.zeros([1, 1, icRefFrames, fmT.dim(3), fmT.dim(4)]).asType(fmT.dtype)
+        state.faceMask = MLX.concatenated([fmT, pad], axis: 2)
+      }
     }
     eval(state.latent, state.cleanLatent, state.denoiseMask)
 

@@ -45,6 +45,11 @@ struct ComfyBoxDesktopApp: App {
     }
     @State private var uiScale: String? = DesktopSettings.load().uiScale
     @State private var selectedTab: AppTab = .gallery
+    /// Sidebar section collapse state. Owned by the app (not AppKit's internal
+    /// outline state) so a collapsed section can always be re-expanded and
+    /// every launch starts fully expanded — AppKit-managed collapse could get
+    /// stuck with no working "Show" affordance (Todd 2026-08-19).
+    @State private var collapsedSidebarSections: Set<AppTab.Section> = []
     @State private var initError: String?
     @State private var characters: [CharacterEntry] = []
     @State private var comparisonAssets: [DAMAsset]?
@@ -160,10 +165,12 @@ struct ComfyBoxDesktopApp: App {
             NavigationSplitView {
                 List(selection: $selectedTab) {
                     ForEach(AppTab.Section.allCases) { section in
-                        Section(section.rawValue) {
+                        Section(isExpanded: sidebarSectionExpanded(section)) {
                             ForEach(AppTab.tabs(in: section), id: \.self) { tab in
                                 Label(tab.rawValue, systemImage: tab.icon).tag(tab)
                             }
+                        } header: {
+                            Text(section.rawValue)
                         }
                     }
                 }
@@ -256,6 +263,12 @@ struct ComfyBoxDesktopApp: App {
                 applySettings()
                 await initializeDAM()
                 await loadCharacters()
+            }
+            // Navigating to a tab (⌘-shortcut, command palette, menu bar)
+            // force-opens its sidebar section so the selection is never
+            // invisible inside a collapsed group.
+            .onChange(of: selectedTab) { _, tab in
+                collapsedSidebarSections.remove(tab.section)
             }
         }
         .defaultSize(width: 1200, height: 800)
@@ -608,6 +621,22 @@ struct ComfyBoxDesktopApp: App {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// App-owned expansion binding for a sidebar section. Collapse still works
+    /// (click the section header's chevron), but the state lives here, so it
+    /// resets to expanded on launch and navigation can force a section open.
+    private func sidebarSectionExpanded(_ section: AppTab.Section) -> Binding<Bool> {
+        Binding(
+            get: { !collapsedSidebarSections.contains(section) },
+            set: { expanded in
+                if expanded {
+                    collapsedSidebarSections.remove(section)
+                } else {
+                    collapsedSidebarSections.insert(section)
+                }
+            }
+        )
     }
 
     /// Reveal/hide toggle, invoked ONLY by the hidden ⌃⌥⌘U keyboard shortcut —
