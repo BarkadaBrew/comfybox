@@ -69,6 +69,105 @@ public struct KromaPolicy: Codable, Equatable, Sendable {
   }
 }
 
+// MARK: - Bypass policy (WP-E8, D10, FDD §3.8, ledger ruling 17:35)
+
+/// The censorship-bypass `.diff` LoRA as a FIRST-CLASS preset dial, mirroring
+/// ``KromaPolicy`` exactly: `strength: 0` is a declaration ("no bypass"), and
+/// `file` nil means the workflow's own artifact
+/// (``Krea2BypassPolicy/workflowFile``) rather than "whatever is around".
+///
+/// Unlike `kroma`, an ABSENT `bypass` is not a configuration error: the
+/// family default is DERIVED from kroma (17:35 — kroma already unlocks, so
+/// the bypass is wanted only on a kroma-free preset). See
+/// ``Krea2BypassPolicy/resolve(bypass:kroma:requestStrength:)``.
+public struct BypassPolicy: Codable, Equatable, Sendable {
+  public var strength: Double
+  public var file: String?
+
+  public init(strength: Double, file: String? = nil) {
+    self.strength = strength
+    self.file = file
+  }
+
+  /// Whether anything is applied at all. `strength == 0` is a declaration,
+  /// not a request to load a file.
+  public var isActive: Bool { strength > 0 }
+}
+
+/// The bypass strength policy (D10 + the 17:35 ledger ruling), in one place —
+/// the engine half of the dial whose family table lives on the daemon (C8).
+///
+/// **The engine invents no strength.** The only number here is the one the
+/// reference workflow declares, and it is quoted, not chosen: FDD §3.8
+/// ("the preset default is **1.0** — the workflow author's figure, and the
+/// figure the reference recipe is defined by") and §3.15's `krea2-reference`
+/// stack line, `{ "filename": "krea2filterbypass_2vector.safetensors",
+/// "scale": 1.0 }`. The Fedor artifact's own `__metadata__` recommends
+/// 3.0–5.0; that is RECORDED (``fedorRecommendedStrength``) and not adopted
+/// (§9 Q4).
+public enum Krea2BypassPolicy {
+
+  /// The workflow's declared strength (FDD §3.8 / §3.15). Not a guess.
+  public static let workflowStrength: Double = 1.0
+
+  /// The workflow's own artifact — what `krea2-reference` names.
+  public static let workflowFile = "krea2_filter_bypass_2vector.safetensors"
+
+  /// The substitute (civitai 2746817). Selectable by naming it in
+  /// `bypass.file`; never the default.
+  public static let fedorFile = "krea2_filter_bypass_fedor.safetensors"
+
+  /// Fedor's author's divergent guidance, recorded so the 5× gap stays
+  /// visible in the code that does not adopt it (§9 Q4).
+  public static let fedorRecommendedStrength: ClosedRange<Double> = 3.0...5.0
+
+  /// The one rule, in precedence order:
+  ///
+  /// 1. a per-render override (`bypass_strength` on the request) wins;
+  /// 2. an explicit preset `bypass` wins next;
+  /// 3. otherwise it is DERIVED from kroma — `kroma.strength > 0` ⇒ **0**
+  ///    (kroma already unlocks), `kroma.strength == 0` ⇒ the workflow's
+  ///    strength.
+  ///
+  /// The returned policy always names the effective `file`, so provenance can
+  /// never be ambiguous about which of the two artifacts applied — even when
+  /// the preset left it to the default. `strength == 0` means nothing is
+  /// loaded and the file is not consulted.
+  public static func resolve(
+    bypass: BypassPolicy?, kroma: KromaPolicy?, requestStrength: Double? = nil
+  ) -> BypassPolicy {
+    let file = bypass?.file ?? workflowFile
+    if let requestStrength {
+      return BypassPolicy(strength: requestStrength, file: file)
+    }
+    if let bypass {
+      return BypassPolicy(strength: bypass.strength, file: file)
+    }
+    // Derived. A krea2-family image preset must declare `kroma` (O4a), so
+    // `nil` here is only reachable for a preset that has no kroma dial at
+    // all — treated as "no kroma", the same as `strength: 0`.
+    let kromaStrength = kroma?.strength ?? 0
+    return BypassPolicy(strength: kromaStrength > 0 ? 0 : workflowStrength, file: file)
+  }
+
+  /// The preset-level entry point. Fail-closed for anything that is not a
+  /// krea2-family image preset: the derived default never turns a bypass on
+  /// for a `zimage-*` preset that has no kroma dial (the resolver's `nil`
+  /// kroma case would otherwise read as "no kroma ⇒ bypass on").
+  public static func resolve(
+    for preset: ImagePreset, requestStrength: Double? = nil
+  ) -> BypassPolicy {
+    let isKrea2 = PresetStore.isImagePreset(preset) && PresetStore.resolvesToKrea2Family(preset)
+    guard isKrea2 else {
+      let file = preset.bypass?.file ?? workflowFile
+      if let requestStrength { return BypassPolicy(strength: requestStrength, file: file) }
+      if let declared = preset.bypass { return BypassPolicy(strength: declared.strength, file: file) }
+      return BypassPolicy(strength: 0, file: file)
+    }
+    return resolve(bypass: preset.bypass, kroma: preset.kroma, requestStrength: requestStrength)
+  }
+}
+
 // MARK: - Second-stage recipe (WP-E20, D4)
 
 /// The optional second stage of a two-stage recipe (O5), as a preset declares
@@ -157,6 +256,10 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   public var checkpointFamily: String?
   /// Required of krea2-family image presets (O4a, D14).
   public var kroma: KromaPolicy?
+  /// WP-E8 (§3.8, D10): the bypass `.diff` LoRA as a declared dial. ABSENT is
+  /// legal and means the kroma-derived default —
+  /// ``Krea2BypassPolicy/resolve(for:requestStrength:)``.
+  public var bypass: BypassPolicy?
   /// Sampler name, as `/v1/generate` accepts it (`res_2s`, `dpmpp_2m`, …).
   public var sampler: String?
   /// Sigma-schedule name (`beta`, `karras`, `flow`, …).
@@ -197,6 +300,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     vae: String? = nil,
     checkpointFamily: String? = nil,
     kroma: KromaPolicy? = nil,
+    bypass: BypassPolicy? = nil,
     sampler: String? = nil,
     sigmaSchedule: String? = nil,
     shift: Double? = nil,
@@ -230,6 +334,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.vae = vae
     self.checkpointFamily = checkpointFamily
     self.kroma = kroma
+    self.bypass = bypass
     self.sampler = sampler
     self.sigmaSchedule = sigmaSchedule
     self.shift = shift
@@ -254,6 +359,8 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     case vae
     // WP-E20: the nine recipe/policy fields (AC-58 round-trips every one).
     case checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
+    // WP-E8: the tenth. Same regression class — listed here AND decoded below.
+    case bypass
   }
 
   public init(from decoder: Decoder) throws {
@@ -286,6 +393,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     vae = try c.decodeIfPresent(String.self, forKey: .vae)
     checkpointFamily = try c.decodeIfPresent(String.self, forKey: .checkpointFamily)
     kroma = try c.decodeIfPresent(KromaPolicy.self, forKey: .kroma)
+    bypass = try c.decodeIfPresent(BypassPolicy.self, forKey: .bypass)
     sampler = try c.decodeIfPresent(String.self, forKey: .sampler)
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     shift = try c.decodeIfPresent(Double.self, forKey: .shift)
@@ -369,6 +477,9 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
   // which the record (RenderRecipe, WP-E10) then names.
   public var checkpointFamily: String?
   public var kroma: KromaPolicy?
+  /// WP-E8: nil = the kroma-derived default (§3.8), which the record then
+  /// names as applied.
+  public var bypass: BypassPolicy?
   public var sampler: String?
   public var sigmaSchedule: String?
   public var shift: Double?
@@ -403,6 +514,7 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
     vae = preset.vae
     checkpointFamily = preset.checkpointFamily
     kroma = preset.kroma
+    bypass = preset.bypass
     sampler = preset.sampler
     sigmaSchedule = preset.sigmaSchedule
     shift = preset.shift
@@ -812,6 +924,20 @@ public final class PresetStore: @unchecked Sendable {
       }
       if let file = kroma.file, file.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         throw PresetStoreError.validation("preset \"\(preset.id)\": kroma.file is empty — omit it for the family default")
+      }
+    }
+    // WP-E8 (§3.8, D10): the same ranges as kroma. Note what is NOT here —
+    // an absent `bypass` is legal and means the kroma-derived default
+    // (ledger 17:35), where an absent `kroma` is a configuration error.
+    if let bypass = preset.bypass {
+      if !bypass.strength.isFinite || bypass.strength < 0 {
+        throw PresetStoreError.validation(
+          "preset \"\(preset.id)\": bypass.strength must be a finite number >= 0 (got \(bypass.strength))")
+      }
+      if let file = bypass.file, file.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        throw PresetStoreError.validation(
+          "preset \"\(preset.id)\": bypass.file is empty — omit it for the default "
+            + "(\(Krea2BypassPolicy.workflowFile))")
       }
     }
     if isImagePreset(preset), resolvesToKrea2Family(preset), preset.kroma == nil {
