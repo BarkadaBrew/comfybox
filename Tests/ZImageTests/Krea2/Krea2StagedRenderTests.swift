@@ -446,6 +446,23 @@ final class Krea2StagedRenderTests: XCTestCase {
     XCTAssertEqual(wire["model_evals_total"] as? Int, record.modelEvalsTotal)
   }
 
+  // MARK: - Progress across both stages
+
+  /// The published recipe's bar runs 1…8, never 6/6 then 1/2 (WP-E10 wired
+  /// `/health.progress_percent` to this callback, and a bar that goes backwards
+  /// halfway through every staged render is a defect users see).
+  func testProgressIsOneMonotonicBarOverBothStages() {
+    let bar = Krea2StagedRender.Progress(stage1Steps: 6, stage2Steps: 2)
+    XCTAssertEqual(bar.total, 8)
+    let reported = (1...6).map { bar.stage1($0) } + (1...2).map { bar.stage2($0) }
+    XCTAssertEqual(reported.map(\.0), [1, 2, 3, 4, 5, 6, 7, 8])
+    XCTAssertEqual(Set(reported.map(\.1)), [8])
+    XCTAssertEqual(
+      reported.map { RenderProgressPercent.of(step: $0.0, total: $0.1) }.sorted(),
+      reported.map { RenderProgressPercent.of(step: $0.0, total: $0.1) },
+      "the percentage must never go backwards")
+  }
+
   // MARK: - Fail-loud
 
   func testStageTwoRefusesAnOutOfRangeDenoise() throws {

@@ -373,14 +373,39 @@ public enum Krea2StagedRender {
   /// Deterministic and side-effect free (scheduler construction touches no
   /// global RNG state), so running it here and again in ``runStage2(...)``
   /// changes nothing but the moment of the refusal.
-  static func preflight(stage: Krea2ResolvedStage, shift: Krea2Sampling.ScheduleShift) throws {
+  /// - Returns: the steps the stage will actually take — its EFFECTIVE count,
+  ///   which `beta` de-duplication and the `sigma_min` insertion can both move
+  ///   (D5/AC-22). The caller uses it to report progress over the whole render
+  ///   instead of restarting the bar at the second stage.
+  @discardableResult
+  static func preflight(
+    stage: Krea2ResolvedStage, shift: Krea2Sampling.ScheduleShift
+  ) throws -> Int {
     try Krea2Pipeline.validateTiers(eta: stage.eta, bongmath: stage.bongmath)
     _ = try Krea2Pipeline.makeSDEInjector(
       eta: stage.eta, sampler: stage.sampler, stageSeed: stage.seed,
       layout: Krea2Pipeline.sdeNoiseLayout)
-    _ = try makeScheduler(
+    return try makeScheduler(
       sampler: stage.sampler, sigmaSchedule: stage.sigmaSchedule, steps: stage.steps,
-      denoise: stage.denoise, shift: shift, seed: stage.seed, c2: stage.c2)
+      denoise: stage.denoise, shift: shift, seed: stage.seed, c2: stage.c2
+    ).numInferenceSteps
+  }
+
+  /// One progress bar over both stages.
+  ///
+  /// The loop reports `(i + 1, total)` against the grid IT is walking, so a
+  /// two-stage render would otherwise publish 6/6 (100%) and then 1/2 (50%)
+  /// — a bar that goes backwards halfway through every published render
+  /// (WP-E10 wired `/health.progress_percent` to exactly this callback).
+  /// Pure and separate so the monotonicity is asserted without weights.
+  struct Progress: Equatable {
+    let stage1Steps: Int
+    let stage2Steps: Int
+    var total: Int { stage1Steps + stage2Steps }
+    /// Stage 1's `(step, total)` rewritten against the whole render.
+    func stage1(_ step: Int) -> (Int, Int) { (step, total) }
+    /// Stage 2's, offset past stage 1.
+    func stage2(_ step: Int) -> (Int, Int) { (stage1Steps + step, total) }
   }
 
   // MARK: The re-noise (§3.14 step 3)

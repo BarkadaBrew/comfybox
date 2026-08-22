@@ -862,7 +862,11 @@ public final class Krea2Pipeline {
     // noise draw and before the first transformer forward. A `stage2` field
     // that is going to be a 400 must not cost a stage-1 render first.
     let stage2 = request.stage2?.resolved(against: request)
-    if let stage2 { try Krea2StagedRender.preflight(stage: stage2, shift: scheduleShift) }
+    // The stage's effective step count comes back from the preflight so the
+    // progress this render publishes runs 1…(stage1 + stage2) instead of
+    // restarting the bar at 100% → 50% halfway through (WP-E10's
+    // `/health.progress_percent`).
+    let stage2Steps = try stage2.map { try Krea2StagedRender.preflight(stage: $0, shift: scheduleShift) }
 
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
@@ -923,6 +927,15 @@ public final class Krea2Pipeline {
       sampler: request.sampler, sigmaSchedule: request.sigmaSchedule,
       steps: request.steps, shift: scheduleShift, seed: request.seed, c2: request.c2)
 
+    // Progress across the WHOLE render. `nil` stage 2 → `progress` is passed
+    // through untouched, so a single-stage render reports exactly what it
+    // reported before (`(i + 1, total)` from the loop).
+    let bar = stage2Steps.map {
+      Krea2StagedRender.Progress(stage1Steps: scheduler.numInferenceSteps, stage2Steps: $0)
+    }
+    let stage1Progress: ((Int, Int) -> Void)? =
+      bar.map { bar in { step, _ in progress?(bar.stage1(step).0, bar.stage1(step).1) } } ?? progress
+
     let (denoised, stats) = Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: img,
@@ -940,7 +953,7 @@ public final class Krea2Pipeline {
         return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       },
       noise: sdeNoise,
-      progress: progress)
+      progress: stage1Progress)
 
     var traces = [
       Krea2RunTrace(
@@ -975,7 +988,10 @@ public final class Krea2Pipeline {
                                     ropeScales: ropeScales)
           return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: guidance)
         },
-        progress: progress)
+        progress: { step, _ in
+          guard let bar else { return }
+          progress?(bar.stage2(step).0, bar.stage2(step).1)
+        })
       latent = staged
       traces.append(stage2Trace)
     }
