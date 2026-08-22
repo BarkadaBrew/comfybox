@@ -280,7 +280,12 @@ extension Krea2RunTrace {
   }
 
   /// The shared body: everything the loop and the scheduler are the witnesses to.
-  private init(
+  ///
+  /// `internal` rather than `private` since WP-E17: the stage-2 run
+  /// (`Krea2StagedRender.runStage2`) builds its trace through this same body so
+  /// the two stages of one render cannot be described by two different rules —
+  /// it has a resolved stage rather than a `Request`, and nothing else differs.
+  init(
     sampler: SchedulerKind,
     sigmaSchedule: SigmaScheduleKind,
     sigmaScheduleRequested: String?,

@@ -452,6 +452,12 @@ public final class Krea2Pipeline {
     /// `res_2s` / `res_3s` substep location in log-sigma space. Not on the
     /// wire (D23) — a pipeline-level knob the reference recipe pins at 0.5.
     public var c2: Float = 0.5
+    /// WP-E17 (§3.14, D4): the optional second stage of ONE render — the
+    /// detail pass, which re-noises the latent to the stretched tail's first
+    /// sigma and solves again with its own sampler, schedule, eta, bongmath
+    /// and seed. `nil` (the default) is today's single-stage render, statement
+    /// for statement. See ``Krea2Pipeline/Stage2``.
+    public var stage2: Stage2? = nil
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled,
@@ -801,10 +807,34 @@ public final class Krea2Pipeline {
   /// Returns the RGB array `generate` returns, plus the ``Krea2RunTrace`` the
   /// caller maps into `RenderRecipe` — the loop's own numbers, read back
   /// rather than predicted.
+  ///
+  /// Single-stage only. A request carrying `stage2` has TWO traces to hand
+  /// back and is refused here rather than silently losing the second one; call
+  /// ``generateStaged(_:progress:)``, which is the same body.
   public func generateWithRecipe(
     _ request: Request,
     progress: ((Int, Int) -> Void)? = nil
   ) throws -> (image: MLXArray, trace: Krea2RunTrace) {
+    let (image, traces) = try generateStaged(request, progress: progress)
+    guard traces.count == 1, let trace = traces.first else {
+      throw Krea2StageError.stagedRequestNeedsStagedCall(stages: traces.count)
+    }
+    return (image, trace)
+  }
+
+  /// Generate one image and the record of every stage that ran (WP-E17,
+  /// §3.14, D4).
+  ///
+  /// This IS `generateWithRecipe`'s body. A request without `stage2` executes
+  /// exactly the statements it executed before WP-E17 — the stage-2 block is
+  /// skipped whole, so the byte-identity gates (AC-1/AC-2/AC-5) hold by
+  /// construction rather than by measurement. With `stage2`, the second stage
+  /// runs on the SAME latent, between the loop and the one `vae.decode`:
+  /// exactly one decode and zero encodes, whatever the stage count (AC-30).
+  public func generateStaged(
+    _ request: Request,
+    progress: ((Int, Int) -> Void)? = nil
+  ) throws -> (image: MLXArray, traces: [Krea2RunTrace]) {
     let dtype = DType.bfloat16
     let patch = config.patch
     let comp = Krea2VAE.spatialScale  // 8
@@ -853,10 +883,17 @@ public final class Krea2Pipeline {
     // "no negative prompt": the second model pass ran either way.
     let negativePromptApplied = Krea2RunTrace.negativePromptApplied(
       cfgActive: useCFG, requested: request.negativePrompt)
+    // WP-E17: stage 2 carries its OWN guidance, so the negative may be needed
+    // by the second stage and not the first. The extra `||` term can only be
+    // true when `stage2` is present, so a single-stage render encodes exactly
+    // what it encoded before — and a stage 2 that asks for CFG gets it rather
+    // than a silent single-pass downgrade.
+    let stage2 = request.stage2?.resolved(against: request)
+    let needsNegative = useCFG || (stage2.map { $0.guidance > 1.0 } ?? false)
     var negCtx: MLXArray? = nil
     var negPos: MLXArray? = nil
     var negFullMask: MLXArray? = nil
-    if useCFG {
+    if needsNegative {
       let (nRaw, nMask) = conditioner.encode([request.negativePrompt ?? ""])
       negCtx = nRaw.asType(dtype)
       negPos = Krea2Sampling.buildPositions(txtLen: negCtx!.dim(1), h: hTok, w: wTok)
@@ -899,16 +936,50 @@ public final class Krea2Pipeline {
       noise: sdeNoise,
       progress: progress)
 
+    var traces = [
+      Krea2RunTrace(
+        request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
+        startIndex: 0, denoise: 1.0, width: width, height: height,
+        negativePromptApplied: negativePromptApplied)
+    ]
+
+    // WP-E17 (§3.14): the second stage, on the LATENT. No `vae.decode` and no
+    // `vae.encode` between the stages — the re-noise is a rectified-flow mix at
+    // the stretched tail's first sigma, and the decode below is still the one
+    // and only decode of this render (AC-30).
+    var latent = denoised
+    if let stage2 {
+      let (staged, stage2Trace) = try Krea2StagedRender.runStage2(
+        stage: stage2,
+        shift: scheduleShift,
+        stageOneLatent: latent,
+        patch: patch, hTok: hTok, wTok: wTok,
+        latentHeight: latH, latentWidth: latW,
+        dtype: dtype,
+        width: width, height: height,
+        negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+          cfgActive: stage2.guidance > 1.0, requested: request.negativePrompt),
+        evaluate: { [transformer] latent, sigma, guidance in
+          let t = MLX.full([1], values: MLXArray(sigma)).asType(dtype)
+          let vCond = transformer(img: latent, context: ctx, t: t, pos: pos, mask: fullMask,
+                                  control: controlTokens, ropeScales: ropeScales)
+          guard guidance > 1.0, let negCtx, let negPos, let negFullMask else { return vCond }
+          let vUncond = transformer(img: latent, context: negCtx, t: t, pos: negPos,
+                                    mask: negFullMask, control: controlTokens,
+                                    ropeScales: ropeScales)
+          return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: guidance)
+        },
+        progress: progress)
+      latent = staged
+      traces.append(stage2Trace)
+    }
+
     let latentNCHW = Krea2Sampling.unpatchify(
-      denoised, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
+      latent, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
     let latentNHWC = latentNCHW.transposed(0, 2, 3, 1).asType(.float32)
     let decoded = vae.decode(latentNHWC)  // (1, H, W, 3) in [0,1]
     MLX.eval(decoded)
 
-    let trace = Krea2RunTrace(
-      request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
-      startIndex: 0, denoise: 1.0, width: width, height: height,
-      negativePromptApplied: negativePromptApplied)
-    return (decoded[0], trace)
+    return (decoded[0], traces)
   }
 }

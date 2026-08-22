@@ -246,14 +246,39 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     public var textEncoderFile: URL
     public var loras: [LoRAReadBack]
     public var control: ControlReadBack?
-    public var trace: Krea2RunTrace
+    /// One trace per stage that RAN, in order (WP-E17, D4). A single-stage
+    /// render has one; the published two-stage recipe has two, and
+    /// `model_evals_total` is their sum rather than either one.
+    ///
+    /// Never empty: a render that took no stage has no record to emit, and an
+    /// empty array here would silently produce a record with no `stages[]` and
+    /// a zero eval count, which reads as a completed render that cost nothing.
+    public var traces: [Krea2RunTrace]
 
+    /// The first stage's trace — the one the record's render-wide fields
+    /// (geometry, seed, the schedule shift) come from.
+    public var trace: Krea2RunTrace { traces[0] }
+
+    /// Single-stage convenience: the shape every pre-WP-E17 caller uses.
     public init(
       baseModel: String, variant: Krea2Variant, transformerFile: URL, quantizationBits: Int?,
       vae: Krea2VAESelection, textEncoderFile: URL,
       loras: [LoRAReadBack], control: ControlReadBack?,
       trace: Krea2RunTrace
     ) {
+      self.init(
+        baseModel: baseModel, variant: variant, transformerFile: transformerFile,
+        quantizationBits: quantizationBits, vae: vae, textEncoderFile: textEncoderFile,
+        loras: loras, control: control, traces: [trace])
+    }
+
+    public init(
+      baseModel: String, variant: Krea2Variant, transformerFile: URL, quantizationBits: Int?,
+      vae: Krea2VAESelection, textEncoderFile: URL,
+      loras: [LoRAReadBack], control: ControlReadBack?,
+      traces: [Krea2RunTrace]
+    ) {
+      precondition(!traces.isEmpty, "a RenderRecipe needs at least one stage trace (D4)")
       self.baseModel = baseModel
       self.variant = variant
       self.transformerFile = transformerFile
@@ -262,7 +287,7 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       self.textEncoderFile = textEncoderFile
       self.loras = loras
       self.control = control
-      self.trace = trace
+      self.traces = traces
     }
   }
 
@@ -271,10 +296,12 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     bits.map { "q\($0)" } ?? "bf16"
   }
 
-  public static func krea2(_ i: Krea2Inputs) -> RenderRecipe {
-    let t = i.trace
-    let stage = Stage(
-      index: 0,
+  /// One `Stage` from one trace. WP-E17: called once per stage that ran, so
+  /// there is ONE mapping from "what the loop did" to "what the record says",
+  /// whether a render has one stage or two.
+  private static func stage(index: Int, trace t: Krea2RunTrace) -> Stage {
+    Stage(
+      index: index,
       sampler: t.sampler.rawValue,
       sigmaSchedule: t.sigmaSchedule.rawValue,
       // D22: the loop already decided whether the caller's raw name is worth
@@ -303,6 +330,14 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       sigmaHead: t.sigmaHead,
       sigmaTail: t.sigmaTail,
       seed: t.seed)
+  }
+
+  public static func krea2(_ i: Krea2Inputs) -> RenderRecipe {
+    // The render-wide fields (geometry, seed, the schedule shift) come from
+    // stage 1: they describe the RENDER, and stage 2 shares them by
+    // construction — it re-noises stage 1's own latent (§3.14).
+    let t = i.trace
+    let stages = i.traces.enumerated().map { stage(index: $0.offset, trace: $0.element) }
     let loras = i.loras.map { rb -> Applied in
       Applied(
         file: rb.configuration.source.recordPath,
@@ -342,8 +377,11 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       mu: t.mu,
       shift: t.shift,
       shiftSource: t.shiftSource,
-      stages: [stage],
-      modelEvalsTotal: stage.modelEvals)
+      stages: stages,
+      // D4 / WP-E17: the SUM over every stage that ran. Never `stages[0]`'s
+      // count — a two-stage render costs both, and the published recipe's
+      // stage 2 is 6 evaluations of the 18 it takes.
+      modelEvalsTotal: stages.reduce(0) { $0 + $1.modelEvals })
   }
 }
 

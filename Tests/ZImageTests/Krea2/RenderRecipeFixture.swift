@@ -70,6 +70,20 @@ enum RenderRecipeFixture {
     vaeLayout: VAELayout = .wanNative,
     vaeSource: Krea2VAESelection.Source = .payload
   ) -> RenderRecipe.Krea2Inputs {
+    inputs(
+      traces: [trace], quantizationBits: quantizationBits, loras: loras, control: control,
+      vaeLayout: vaeLayout, vaeSource: vaeSource)
+  }
+
+  /// WP-E17: the same read-backs around N stage traces.
+  static func inputs(
+    traces: [Krea2RunTrace],
+    quantizationBits: Int? = 8,
+    loras: [RenderRecipe.LoRAReadBack] = [],
+    control: RenderRecipe.ControlReadBack? = nil,
+    vaeLayout: VAELayout = .wanNative,
+    vaeSource: Krea2VAESelection.Source = .payload
+  ) -> RenderRecipe.Krea2Inputs {
     RenderRecipe.Krea2Inputs(
       baseModel: "krea2-raw",
       variant: .raw,
@@ -81,7 +95,7 @@ enum RenderRecipeFixture {
       textEncoderFile: URL(fileURLWithPath: "/Users/me/LocalModels/krea2-raw/text_encoder/model.safetensors"),
       loras: loras,
       control: control,
-      trace: trace)
+      traces: traces)
   }
 
   static func recipe(
