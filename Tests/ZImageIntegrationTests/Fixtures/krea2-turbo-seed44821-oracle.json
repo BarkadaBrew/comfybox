@@ -1,0 +1,25 @@
+{
+  "purpose": "AC-1 byte-identity oracle: pre-E3 Krea 2 turbo render on the LIVE engine (binary built 2026-08-18 from fix/face-anchor-icref-broadcast; Krea2 sources identical to origin/main at that date)",
+  "engine_model": "/Users/toddwalderman/LocalModels/kroma-v0.2",
+  "model_family": "krea2",
+  "loras_active_after": [],
+  "request": {
+    "prompt": "a woman sitting on the edge of a bed in a bedroom, warm lamplight",
+    "seed": 44821,
+    "steps": 9,
+    "guidance": 1.0,
+    "width": 1024,
+    "height": 1024,
+    "loras": [],
+    "quantization": "q8 (server default)"
+  },
+  "output_path": "/Users/toddwalderman/Pictures/ComfyBox/comfybox-kroma-v0.2-manual-krea2raw-oracle-20260822-123609-aea0.png",
+  "sha256": "6bb6eed75a39a0aed78fbcd64b52904f224298d3a85ecb26b43c8dd1dcfc9160",
+  "duration_s": 120,
+  "response": {
+    "preempt_refused": false,
+    "success": true,
+    "output_path": "/Users/toddwalderman/Pictures/ComfyBox/comfybox-kroma-v0.2-manual-krea2raw-oracle-20260822-123609-aea0.png",
+    "duration_ms": 120462
+  }
+}
