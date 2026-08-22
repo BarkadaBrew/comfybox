@@ -6439,9 +6439,14 @@ private actor WarmServerCoordinator {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
-    if pending.count >= configuration.maxPendingRequests {
-      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
-    }
+    // NO capacity gate (WP-E8 hygiene). The gate exists to bound RENDER
+    // backlog; applied to model operations it reproduced the pause wedge one
+    // layer up — a paused queue holding `maxPendingRequests` parked renders
+    // answered `/v1/model/unload` with `queueFull`, so the operator could not
+    // free the GPU precisely when they needed to. Model operations are
+    // operator actions (three routes, bounded in number, not client traffic),
+    // and the FIFO still serialises them against any in-flight render, which
+    // is C2's actual guarantee.
 
     return try await withCheckedThrowingContinuation { continuation in
       pending.append(PendingJob(operation: .modelOperation(op, ContinuationBox(continuation))))
@@ -6462,9 +6467,7 @@ private actor WarmServerCoordinator {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
-    if pending.count >= configuration.maxPendingRequests {
-      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
-    }
+    // Same reasoning as `enqueueModelOperation` — no capacity gate.
     let job = PendingJob(operation: .modelOperation(op, nil))
     pending.append(job)
     startProcessingIfNeeded()
@@ -6771,11 +6774,20 @@ private actor WarmServerCoordinator {
   /// does — the loop runs one job at a time either way.
   ///
   /// Exhaustive on purpose (no `default`): a new queue kind must decide.
+  ///
+  /// `.shutdown` joins them (WP-E8 hygiene). `enqueueShutdown` sets
+  /// `shuttingDown = true` BEFORE appending, so a shutdown parked behind the
+  /// pause gate wedged the engine permanently: the caller's continuation
+  /// never resumed and every later enqueue threw `.shuttingDown`, leaving
+  /// SIGKILL as the only recovery — on exactly the paused engine an operator
+  /// is trying to shut down. Its handler is a bare continuation resume with
+  /// no GPU work, so nothing about "pause means no RENDERS" argues for
+  /// parking it.
   private static func runsWhilePaused(_ operation: QueuedOperation) -> Bool {
     switch operation {
-    case .modelOperation:
+    case .modelOperation, .shutdown:
       return true
-    case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo, .shutdown:
+    case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo:
       return false
     }
   }
@@ -9105,6 +9117,22 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// The seam `/v1/model/load` (wait: false) uses — returns the queue job id.
   func enqueueModelOperationDetached(_ op: ModelOperation) async throws -> String {
     try await coordinator.enqueueModelOperationDetached(op)
+  }
+
+  /// `ServerError` is nested in the file-private coordinator, so a test
+  /// cannot pattern-match it. This is the one predicate the WP-E8 hygiene
+  /// tests need: was this refusal the capacity gate?
+  static func isQueueFull(_ error: Error) -> Bool {
+    if case WarmServerCoordinator.ServerError.queueFull = error { return true }
+    return false
+  }
+
+  /// The seam `/v1/shutdown` uses. Returns the response's `success` flag —
+  /// the response type is file-private, and the only thing a test needs to
+  /// know is that the call RETURNED rather than parking forever under a
+  /// pause (WP-E8 hygiene).
+  func enqueueShutdown() async throws -> Bool {
+    try await coordinator.enqueueShutdown().success
   }
 
   /// The kinds of the jobs still waiting, read through the same
