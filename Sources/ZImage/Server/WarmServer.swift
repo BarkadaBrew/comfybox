@@ -3295,6 +3295,14 @@ public final class WarmServer {
       maskCropX: request.maskCropX,
       maskCropY: request.maskCropY
     )
+    // WP-E4 (§3.4): the bridge builds its payload directly, so it runs the
+    // same fail-loud name resolution the /v1/generate decoder does — a Krita
+    // style whose sampler we do not implement is refused by name, never
+    // rendered as euler. The krea2 tier gates run here too (D18).
+    let recipeNames = try payload.validateRecipeNames()
+    if family == .krea2 {
+      try payload.validateKrea2TierGates(recipeNames)
+    }
 
     // Convert bridge progress callback to pipeline progress handler.
     let pipelineProgress: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = progressCallback.map { callback in
@@ -4200,6 +4208,13 @@ public final class WarmServer {
       payload.imagePath = tempPath
     }
     try payload.validateOutputPath(configuration: configuration)
+    // WP-E4 (D22): name resolution + structural checks happen ONCE, here, for
+    // /v1/generate, /v1/generate/async and persisted-queue replay alike. An
+    // unknown sampler/schedule name is a 400 before anything is enqueued —
+    // never euler/flow by coercion. Family-specific tier gates (eta on krea2,
+    // …) live in runKrea2Generate, NOT here: the family is unknown at this
+    // point and Z-Image `eta` is a shipped parameter (D18, AC-28).
+    _ = try payload.validateRecipeNames()
     return payload
   }
 
@@ -4233,13 +4248,29 @@ public final class WarmServer {
             logger.warning("Queue recovery: unknown job kind '\(job.kind)' for \(job.id), skipping")
           }
         } catch {
+          // WP-E4 (D22, AC-18): a persisted job that fails replay is marked
+          // FAILED with the reason on its own id (GET /v1/generate/status/{id})
+          // and in the audit log — never rendered, never silently dropped.
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
+          if job.kind == "generate" {
+            imageJobTracker.recordFailedReplay(jobId: job.id, source: job.source, error: error)
+          }
+          auditLog.append(
+            kind: "queue.recovery_failed",
+            message: "job \(job.id) (\(job.kind)) failed replay: \(error.localizedDescription)",
+            metadata: ["job_id": job.id, "kind": job.kind, "source": job.source])
         }
       }
     }
   }
 
   private func response(for error: Error) -> HTTPResponse {
+    Self.errorResponse(for: error)
+  }
+
+  /// Error → HTTP mapping, static so the 400/500 split is unit-testable
+  /// without a listening server (WP-E4 `WarmServerRejectionTests`).
+  static func errorResponse(for error: Error) -> HTTPResponse {
     switch error {
     case let error as WarmServerCoordinator.ServerError:
       switch error {
@@ -4269,6 +4300,10 @@ public final class WarmServer {
       case .loraSwapNotSupported, .controlNetNotSupported:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
+      // caller's error, named in full (AC-15, AC-28).
+      case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded:
@@ -4313,7 +4348,7 @@ public final class WarmServer {
     }
   }
 
-  private func describe(decodingError: DecodingError) -> String {
+  private static func describe(decodingError: DecodingError) -> String {
     switch decodingError {
     case .dataCorrupted(let context):
       return context.debugDescription
@@ -4790,6 +4825,18 @@ final class ImageJobTracker: @unchecked Sendable {
   func status(jobId: String) -> ImageJobStatus? {
     lock.lock(); defer { lock.unlock() }
     return jobs[jobId]?.toStatus()
+  }
+
+  /// WP-E4 (D22, AC-18): register a persisted-queue job that failed replay
+  /// validation as FAILED under its original id, with the reason, so a client
+  /// polling `GET /v1/generate/status/{id}` across a restart sees why it never
+  /// rendered instead of a 404.
+  func recordFailedReplay(jobId: String, source: String, error: Error) {
+    let job = ImageJob(id: jobId, source: source)
+    job.state = .failed
+    job.error = error.localizedDescription
+    job.completedAt = Date()
+    lock.lock(); jobs[jobId] = job; lock.unlock()
   }
 
   private func markProcessing(_ jobId: String) {
@@ -6822,6 +6869,8 @@ private actor WarmServerCoordinator {
       guard let k2 = krea2Pipeline else {
         throw WarmServerError.krea2NotLoaded
       }
+      // WP-E4 (D18): krea2-only tier gates — a 400, never a silent downgrade.
+      try payload.validateKrea2TierGates(try payload.validateRecipeNames())
       let outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
         defaultFilename: ComfyBoxOutputNaming.defaultFilename(
@@ -7661,6 +7710,12 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
+    /// D25: `sampler` is an accepted ALIAS of the wire key `scheduler` (so a
+    /// value pasted out of a ComfyUI/RES4LYF UI works). The request key stays
+    /// `scheduler` — two live senders post that spelling — while the response
+    /// record reports `applied.stages[].sampler` (WP-E10); the asymmetry is
+    /// deliberate. Both present and different → `mutuallyExclusive` (400).
+    case sampler
     case preset
     case denoise, maskGrow, maskFeather
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
@@ -7698,7 +7753,13 @@ extension GeneratePayload: Decodable {
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
     levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
     levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
-    scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    let schedulerRaw = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    let samplerRaw = try c.decodeIfPresent(String.self, forKey: .sampler)
+    if let schedulerRaw, let samplerRaw, schedulerRaw != samplerRaw {
+      throw WarmServerError.mutuallyExclusive(
+        "scheduler='\(schedulerRaw)' and sampler='\(samplerRaw)' disagree — 'sampler' is an alias of 'scheduler'; send one, or the same value in both")
+    }
+    scheduler = schedulerRaw ?? samplerRaw
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
@@ -7764,8 +7825,9 @@ extension GeneratePayload: Decodable {
         contentMode: contentMode, source: source)
     )
 
-    let schedulerKind = Self.parseSchedulerKind(scheduler)
-    let sigmaScheduleKind = Self.parseSigmaScheduleKind(sigmaSchedule)
+    let names = try validateRecipeNames()
+    let schedulerKind = names.scheduler ?? .euler
+    let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
     // Build DyPE config — auto-enable for high-res requests
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
@@ -7834,8 +7896,9 @@ extension GeneratePayload: Decodable {
       specifiedAs = .strength
     }
 
-    let schedulerKind = Self.parseSchedulerKind(scheduler)
-    let sigmaScheduleKind = Self.parseSigmaScheduleKind(sigmaSchedule)
+    let names = try validateRecipeNames()
+    let schedulerKind = names.scheduler ?? .euler
+    let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
@@ -7890,30 +7953,40 @@ extension GeneratePayload: Decodable {
     }
   }
 
-  private static func parseSchedulerKind(_ rawValue: String?) -> SchedulerKind {
-    guard let rawValue else { return .euler }
-    switch rawValue {
-    case "res_2s":
-      return .res2s
-    case "dpmpp_2m":
-      return .dpmplusplus2m
-    case "dpmpp_2s_ancestral":
-      return .dpmplusplus2sa
-    default:
-      return SchedulerKind(rawValue: rawValue) ?? .euler
-    }
+  /// WP-E4 (FDD-krea2-raw-recipe §3.4, D22, D25): resolve the sampler and
+  /// sigma-schedule names fail-loud. Returns the resolved kinds AND the raw
+  /// strings so the record can carry `sigma_schedule_requested`. Absent names
+  /// come back nil — the request builders apply euler / flow as today.
+  /// Family-agnostic; safe before the family is known.
+  func validateRecipeNames() throws -> ResolvedRecipeNames {
+    try RecipeNameResolver.resolve(scheduler: scheduler, sigmaSchedule: sigmaSchedule)
   }
 
-  private static func parseSigmaScheduleKind(_ rawValue: String?) -> SigmaScheduleKind {
-    guard let rawValue else { return .flow }
-    switch rawValue {
-    case "beta57":
-      return .beta57
-    case "normal", "simple", "sgm_uniform", "ddim_uniform":
-      // ComfyUI schedule names that map to the model's native flow-matching schedule.
-      return .flow
-    default:
-      return SigmaScheduleKind(rawValue: rawValue) ?? .flow
+  /// WP-E4 (D18, §3.4): Krea 2 tier / capability gates. Runs inside the
+  /// Krea 2 generate path and the bridge's `.krea2` arm ONLY — `eta` on the
+  /// Z-Image path is a different, shipped parameter (DDIM η / DPM++ 2S-A η)
+  /// and keeps working (AC-28).
+  ///
+  /// - `eta != 0`: RES4LYF SDE eta is tier T2 (WP-E15) — refused until it lands.
+  /// - a sampler other than euler, or a schedule other than flow (incl. its
+  ///   ComfyUI aliases): the Krea 2 loop does not take a sampler yet (WP-E3).
+  ///   Before this gate such a request rendered euler / native warp silently;
+  ///   WP-E3 replaces this arm with real dispatch when it plumbs the fields.
+  func validateKrea2TierGates(_ names: ResolvedRecipeNames) throws {
+    if let eta, eta != 0 {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "eta", value: "\(eta)", family: "krea2",
+        reason: "RES4LYF SDE eta (parity tier T2, WP-E15) is not implemented yet; send eta 0 or omit it")
+    }
+    if let kind = names.scheduler, kind != .euler {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "scheduler", value: names.schedulerRequested ?? kind.rawValue, family: "krea2",
+        reason: "the Krea 2 denoise loop does not take a sampler yet (WP-E3); only euler is honoured")
+    }
+    if let kind = names.sigmaSchedule, kind != .flow {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "sigma_schedule", value: names.sigmaScheduleRequested ?? kind.rawValue, family: "krea2",
+        reason: "the Krea 2 denoise loop runs its native warp only (WP-E1/E3); only flow and its aliases are accepted")
     }
   }
 
@@ -8252,6 +8325,19 @@ public enum WarmServerError: Error, LocalizedError {
   case krea2NotLoaded
   case loraSwapNotSupported
   case controlNetNotSupported
+  // WP-E4 (FDD-krea2-raw-recipe §3.4, D22, D25, D18): fail-loud recipe names.
+  /// A sampler name that is neither a `SchedulerKind` raw value nor a declared
+  /// alias. `valid` is the full accepted set, listed in the message.
+  case unknownSampler(name: String, valid: [String])
+  /// A sigma-schedule name that is neither a `SigmaScheduleKind` raw value nor
+  /// a declared alias (`normal`/`simple`/`sgm_uniform`/`ddim_uniform`/`beta57`).
+  case unknownSigmaSchedule(name: String, valid: [String])
+  /// Two request keys that name the same thing carry different values
+  /// (`scheduler` vs its `sampler` alias, D25).
+  case mutuallyExclusive(String)
+  /// A recipe field the named family cannot honour yet — an unimplemented
+  /// tier is a 400, never a downgrade (D18).
+  case unsupportedRecipeField(field: String, value: String, family: String, reason: String)
 
   public var errorDescription: String? {
     switch self {
@@ -8279,6 +8365,14 @@ public enum WarmServerError: Error, LocalizedError {
       return "LoRA swap is not supported for this model family"
     case .controlNetNotSupported:
       return "ControlNet is not supported for this model family"
+    case .unknownSampler(let name, let valid):
+      return "Unknown sampler '\(name)'. Valid samplers: \(valid.joined(separator: ", "))"
+    case .unknownSigmaSchedule(let name, let valid):
+      return "Unknown sigma schedule '\(name)'. Valid schedules: \(valid.joined(separator: ", "))"
+    case .mutuallyExclusive(let message):
+      return message
+    case .unsupportedRecipeField(let field, let value, let family, let reason):
+      return "'\(field)' = '\(value)' is not supported on the \(family) family: \(reason)"
     }
   }
 }
