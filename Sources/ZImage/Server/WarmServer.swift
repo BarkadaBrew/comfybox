@@ -7676,9 +7676,10 @@ struct GeneratePayload: Sendable {
   let scheduler: String?
   let sigmaSchedule: String?
   let eta: Float?
-  /// Explicit schedule shift (FDD-krea2-raw-recipe D3). Krea 2 only: nil =
-  /// the resolution-dependent default; a value overrides `mu` with
-  /// `log(shift)`. Validated by `validateShift(_:family:)` → 400, never clamped.
+  /// Explicit schedule shift (FDD-krea2-raw-recipe D3, Addendum A.1). Krea 2
+  /// only: nil = the resolution-dependent default; a value IS `mu` (ComfyUI's
+  /// `ModelSamplingFlux(shift=…)` parameterisation — `1.15` reproduces the
+  /// published grid). Validated by `validateShift(_:family:)` → 400, never clamped.
   let shift: Float?
   let dype: String?
   // Phase 3: Inpainting data (set by bridge, not by HTTP API)

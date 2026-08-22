@@ -156,8 +156,9 @@ enum Krea2Sampling {
   /// Krea 2's constants: base 256 tokens / 0.5, max 6400 tokens / 1.15.
   ///
   /// Effective shift is `exp(mu)`: ~2.475 at 1024². ComfyUI registers Krea 2
-  /// with a *fixed* shift 1.15 instead; an explicit request `shift` overrides
-  /// this value with `log(shift)` (FDD D3).
+  /// as `ModelSamplingFlux(shift=1.15)` — a *fixed* mu of 1.15 (effective
+  /// `e^1.15` ≈ 3.158) — and an explicit request `shift` replaces this value
+  /// **as mu** (FDD D3 as amended by Addendum A.1).
   static func mu(seqLen: Int, align: Int) -> Float {
     let baseSeqLen = (256 / align) * (256 / align)      // 256 at align 16
     let maxSeqLen = (1280 / align) * (1280 / align)     // 6400 at align 16
@@ -170,48 +171,58 @@ enum Krea2Sampling {
     )
   }
 
+  /// ComfyUI's `ModelSamplingFlux` table size for Krea 2 (`timesteps=10000`).
+  static let fluxTableSize = 10000
+
   /// Synthetic scheduler config for Krea 2, which ships no `scheduler_config.json`.
   ///
   /// Carries the constants baked into `timesteps` so `SchedulerFactory` can
   /// build any `SigmaScheduleKind` for this family. Values are specified, not
-  /// implicit (FDD-krea2-raw-recipe §3.1; pinned by
+  /// implicit (FDD-krea2-raw-recipe §3.1, Addendum A.1; pinned by
   /// `Krea2SigmaScheduleTests.testSchedulerConfigPinnedValues`):
   ///
-  /// - `numTrainTimesteps: 1000` — sigma ↔ timestep scale, and the
-  ///   `flowMatchingSigmaBounds` floor for karras/exponential/beta.
-  /// - `shift: shift ?? 1.0` — D3: an explicit shift moves the karras/beta
-  ///   bounds with it; `nil` leaves the bounds at `(0.001, 1.0)`.
+  /// - `numTrainTimesteps: 1000` — sigma ↔ timestep scale.
+  /// - `shift: 1.0` — **not** where Krea 2's shift lives. The shift is `mu`,
+  ///   resolved per render by `resolveShift` and handed to the factory beside
+  ///   this config; `.flow`'s base grid reads this value and stays unshifted.
   /// - `useDynamicShifting: true` — so `.flow` and `.krea2` both take the `mu` warp.
   /// - `baseShift 0.5 / maxShift 1.15 / baseImageSeqLen 256 / maxImageSeqLen 6400`
   ///   — the `mu(seqLen:align:)` line.
-  static func schedulerConfig(shift: Float? = nil) -> ZImageSchedulerConfig {
+  /// - `modelSampling: .flux(tableSize: 10000)` — ComfyUI registers Krea 2 as
+  ///   `ModelSamplingFlux`, so `beta`/`beta57` index the 10 000-entry Flux
+  ///   table built from `mu`, and `karras`/`exponential` take its bounds —
+  ///   never the 1000-entry DiscreteFlow table (A.1).
+  static func schedulerConfig() -> ZImageSchedulerConfig {
     ZImageSchedulerConfig(
       numTrainTimesteps: 1000,
-      shift: shift ?? 1.0,
+      shift: 1.0,
       useDynamicShifting: true,
       baseShift: 0.5,
       maxShift: 1.15,
       baseImageSeqLen: 256,
-      maxImageSeqLen: 6400
+      maxImageSeqLen: 6400,
+      modelSampling: .flux(tableSize: fluxTableSize)
     )
   }
 
-  // MARK: Schedule shift (FDD-krea2-raw-recipe D3)
+  // MARK: Schedule shift (FDD-krea2-raw-recipe D3, as amended by Addendum A.1)
 
   /// Where the schedule's shift came from — recorded by provenance (WP-E10).
   enum ShiftSource: String, Sendable {
     /// The resolution-dependent `mu` from `mu(seqLen:align:)` (the default).
     case dynamic
-    /// A request-stated `shift`; `mu = log(shift)`.
+    /// A request-stated `shift`; `mu = shift` (shift IS mu, A.1).
     case explicit
   }
 
   /// Everything a schedule needs to know about the shift, resolved once per
-  /// render: the log-shift `mu` the warp-by-`mu` schedules (`.krea2`, `.flow`)
-  /// take, the effective linear `shift` (`e^mu`), its source, and the
-  /// `ZImageSchedulerConfig` the table-backed schedules (`beta`, `beta57`,
-  /// `karras`, `exponential`) read `shift`/`numTrainTimesteps` from. Hand
-  /// `config` and `mu` to `SchedulerFactory` together so they cannot disagree.
+  /// render: the log-shift `mu` — which the warp-by-`mu` schedules (`.krea2`,
+  /// `.flow`) take directly and the table-backed schedules (`beta`, `beta57`,
+  /// `karras`, `exponential`) build the `ModelSamplingFlux` table from — the
+  /// effective linear `shift` (`e^mu`, for the record), its source, and the
+  /// family's `ZImageSchedulerConfig`. Hand `config` and `mu` to
+  /// `SchedulerFactory` together; the factory refuses the table-backed
+  /// schedules without `mu`.
   struct ScheduleShift {
     let mu: Float
     let shift: Float
@@ -219,33 +230,39 @@ enum Krea2Sampling {
     let config: ZImageSchedulerConfig
   }
 
-  /// Resolve the schedule shift for a render (D3).
+  /// Resolve the schedule shift for a render (D3 as amended by A.1).
   ///
   /// - `explicit == nil` → today's resolution-dependent `mu` (every existing
-  ///   render is unmoved) and `schedulerConfig()` (non-flow bounds `(0.001, 1.0)`).
-  /// - `explicit == s` → `mu = log(s)` and `schedulerConfig(shift: s)`, so the
-  ///   warp and the table move together. At `s = 1.15` the `.krea2` grid is
-  ///   exactly ComfyUI's `ModelSamplingDiscreteFlow(shift=1.15)` warp on the
-  ///   native `linspace(1 → 0)` grid.
+  ///   render is unmoved).
+  /// - `explicit == s` → **`mu = s`**. ComfyUI registers Krea 2 as
+  ///   `ModelSamplingFlux(shift=1.15)`, whose `flux_time_shift(mu=shift, t) =
+  ///   e^mu / (e^mu + 1/t − 1)` is the same function as `SigmaSchedule.krea2`'s
+  ///   warp — so the wire's `shift` is mu directly and the effective linear
+  ///   shift is `e^s` (≈ 3.158 at 1.15). The earlier `mu = log(s)` mapping is
+  ///   withdrawn: it would have rendered the published `shift: 1.15` as a
+  ///   linear 1.15 (mu 0.14), nowhere near the workflow's grid.
+  ///
+  /// Either way the config is `schedulerConfig()` — the same Flux family
+  /// object; only `mu` moves.
   ///
   /// - Throws: ``Krea2ScheduleError/invalidShift(_:)`` for a shift that is not
   ///   a positive finite number. There is no clamp and no fallback.
   static func resolveShift(explicit: Float?, seqLen: Int, align: Int) throws -> ScheduleShift {
+    let config = schedulerConfig()
     guard let explicit else {
       let mu = mu(seqLen: seqLen, align: align)
-      return ScheduleShift(mu: mu, shift: Foundation.exp(mu), source: .dynamic, config: schedulerConfig())
+      return ScheduleShift(mu: mu, shift: Foundation.exp(mu), source: .dynamic, config: config)
     }
     guard explicit.isFinite, explicit > 0 else { throw Krea2ScheduleError.invalidShift(explicit) }
-    return ScheduleShift(
-      mu: Foundation.log(explicit), shift: explicit, source: .explicit,
-      config: schedulerConfig(shift: explicit))
+    return ScheduleShift(mu: explicit, shift: Foundation.exp(explicit), source: .explicit, config: config)
   }
 }
 
 /// Errors raised while resolving a Krea 2 schedule from a request.
 public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
-  /// The request's `shift` is not a positive finite number. The schedule warp
-  /// takes `log(shift)`; there is no value to substitute (FDD-krea2-raw-recipe D3).
+  /// The request's `shift` is not a positive finite number. `shift` is the
+  /// schedule's mu and there is no value to substitute (FDD-krea2-raw-recipe
+  /// D3, Addendum A.1).
   case invalidShift(Float)
 
   public var description: String {
@@ -314,11 +331,13 @@ public final class Krea2Pipeline {
     public var controlImagePixels: MLXArray?
     /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
     public var dyPE: DyPEConfig = .disabled
-    /// Explicit schedule shift (FDD-krea2-raw-recipe D3). `nil` (default) keeps
-    /// the resolution-dependent `mu` every existing render uses; a value
-    /// overrides `mu` with `log(shift)` for schedule construction — the
-    /// `krea2-reference` preset states `1.15`, ComfyUI's registered shift.
-    /// Must be > 0; `generate` throws ``Krea2ScheduleError/invalidShift(_:)``.
+    /// Explicit schedule shift (FDD-krea2-raw-recipe D3, Addendum A.1). `nil`
+    /// (default) keeps the resolution-dependent `mu` every existing render
+    /// uses; a value **is** `mu` for schedule construction (ComfyUI's
+    /// `ModelSamplingFlux(shift=…)` parameterisation; effective linear shift
+    /// `e^shift`) — the `krea2-reference` preset states `1.15`, ComfyUI's
+    /// registered shift. Must be > 0; `generate` throws
+    /// ``Krea2ScheduleError/invalidShift(_:)``.
     public var shift: Float? = nil
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
@@ -539,7 +558,7 @@ public final class Krea2Pipeline {
 
     let latH = height / comp, latW = width / comp
     let hTok = latH / patch, wTok = latW / patch
-    // D3: nil → resolution-dependent mu (unchanged); explicit → log(shift). Fails before any model work.
+    // D3/A.1: nil → resolution-dependent mu (unchanged); explicit → mu = shift. Fails before any model work.
     let scheduleShift = try Krea2Sampling.resolveShift(
       explicit: request.shift, seqLen: hTok * wTok, align: align)
 

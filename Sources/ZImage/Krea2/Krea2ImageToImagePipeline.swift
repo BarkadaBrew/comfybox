@@ -79,7 +79,7 @@ extension Krea2Pipeline {
 
     let latH = height / comp, latW = width / comp
     let hTok = latH / patch, wTok = latW / patch
-    // D3: nil → resolution-dependent mu (unchanged); explicit → log(shift). Fails before any model work.
+    // D3/A.1: nil → resolution-dependent mu (unchanged); explicit → mu = shift. Fails before any model work.
     let scheduleShift = try Krea2Sampling.resolveShift(
       explicit: request.shift, seqLen: hTok * wTok, align: align)
 

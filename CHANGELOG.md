@@ -8,6 +8,29 @@ decided them.
 
 ### Changed
 
+- **Krea 2 `shift` is mu, and Krea 2's `beta`/`beta57`/`karras`/`exponential`
+  are built on ComfyUI's `ModelSamplingFlux` table (deliberate behaviour
+  change; supersedes the two WP-E12 entries below).** ComfyUI registers Krea 2
+  as `ModelSamplingFlux(shift=1.15, timesteps=10000)`, whose
+  `flux_time_shift(mu=shift, t)` is the same function as Krea 2's native warp —
+  so a request `shift` now **is** `mu` (effective linear shift `e^shift`;
+  `shift: 1.15` reproduces the published workflow's grid) instead of
+  `mu = log(shift)`. Under the Krea 2 family the table-backed schedules index
+  the 10 000-entry Flux table built from that `mu` — `beta(6)` at `shift 1.15`
+  is now `[1.0, 0.969095, 0.892582, 0.759584, 0.545649, 0.241540, 0.0]`, not the
+  1000-entry DiscreteFlow grid (`σ₁ 0.919919`) — and `karras`/`exponential`
+  take their bounds from the same table (`σ_min 3.1575e-4` at 1.15). With
+  `shift` omitted the same table is built at the resolution-derived `mu`, so
+  Krea 2 `beta`/`beta57`/`karras`/`exponential` renders **without** `shift`
+  also move (they previously indexed an unshifted 1000-entry table).
+  `SchedulerFactory` refuses those schedules for Krea 2 without `mu`
+  (`missingMu`), never defaults. Z-Image and every family that decodes a
+  `scheduler_config.json` stay on the DiscreteFlow table, `mu`-free and
+  bit-unchanged (`ZImageSchedulerConfig.modelSampling` defaults to
+  `.discreteFlow`). `Krea2Sampling.schedulerConfig(shift:)` lost its parameter.
+  `deis_3m` warm-up is documented as 4 steps (`order + 1`), not 3.
+  FDD-krea2-raw-recipe Addendum A.1, WP-E12b, AC-21 (re-pinned) / AC-24.
+
 - **`beta` / `beta57` sigma schedules replaced, in place, with ComfyUI's
   algorithm (deliberate behaviour change).** The previous `SigmaSchedule.beta`
   integrated the beta CDF and interpolated in log-sigma space; it was not the
