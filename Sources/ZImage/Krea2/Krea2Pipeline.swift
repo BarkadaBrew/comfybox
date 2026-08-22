@@ -322,6 +322,12 @@ public final class Krea2Pipeline {
   public let paths: Krea2ModelPaths
   /// The physical checkpoint variant this pipeline loaded (WP-E5, D7).
   public var variant: Krea2Variant { paths.variant }
+  /// Group-wise quantization bits applied to the transformer at load, or nil
+  /// when it stayed at full precision (WP-E3 §3.3; feeds
+  /// `RenderRecipe.quantization`, WP-E10). Stored once from what `init`
+  /// actually applied — never re-derived from the module tree, which cannot
+  /// tell "loaded bf16" from "loaded quantized then restored".
+  public let transformerQuantBits: Int?
   public let transformer: Krea2SingleStreamDiT
   public let textEncoder: Qwen3TextEncoder
   public let conditioner: Krea2TextConditioner
@@ -435,6 +441,7 @@ public final class Krea2Pipeline {
   public init(paths: Krea2ModelPaths, quantizeTransformer: Int? = nil) throws {
     self.config = Krea2Config()
     self.paths = paths
+    self.transformerQuantBits = quantizeTransformer
 
     let transformer = Krea2SingleStreamDiT(cfg: config)
     logger.info("Krea2: loading \(paths.variant.rawValue) transformer from \(paths.transformerFile.path)")

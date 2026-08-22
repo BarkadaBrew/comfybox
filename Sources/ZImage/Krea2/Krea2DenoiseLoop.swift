@@ -41,17 +41,39 @@ public protocol BongMath: AnyObject {
 public enum Krea2DenoiseLoop {
 
   /// What the loop did — the numbers `RenderRecipe` (WP-E10) reports.
+  ///
+  /// `modelEvals` is the counted truth. `rowsAtStart` is a label, and the two
+  /// are only related by `stepsRun × rowsAtStart × cfg` for a scheduler whose
+  /// row count is CONSTANT across the run — which is every scheduler that
+  /// exists today, and deliberately not every scheduler that will. See
+  /// ``Stats/rowsAtStart``.
   public struct Stats: Equatable, Sendable {
     /// Steps actually taken: `numInferenceSteps − startIndex`.
     public let stepsRun: Int
-    /// Model evaluations per step for the scheduler that ran (1, 2, or the
-    /// tableau's `rows`).
-    public let rows: Int
-    /// Calls made to `evaluate` (one per row per step, plus any a T3 hook made).
+
+    /// Model evaluations the scheduler asked for at the FIRST step of this run
+    /// (step `startIndex`): 1, 2, or a `TableauScheduler`'s `rows`.
+    ///
+    /// It is sampled once, on purpose, because it is a description of the
+    /// sampler and not an accounting quantity. The driver re-reads
+    /// `tableau.rows` on every step, so a scheduler that changes its row count
+    /// mid-run is dispatched correctly — but this field will still say what
+    /// the first step wanted. `deis_3m` is exactly that case (AC-24: a
+    /// `ralston_3s` warm-up over steps 0…3, then multistep at 1 row), and for
+    /// it `stepsRun × rowsAtStart` would OVERCOUNT by a wide margin.
+    ///
+    /// Never multiply this to obtain a cost. ``modelEvals`` is counted.
+    public let rowsAtStart: Int
+
+    /// Calls actually made to `evaluate` — one per row per step, whatever the
+    /// rows were on that step, plus any a T3 hook reported making.
     public let evaluateCalls: Int
-    /// Transformer forwards: `evaluateCalls × modelEvalsPerEvaluate` — the
-    /// CFG multiplier lives in the caller, which knows whether `evaluate`
-    /// runs one pass or two (§3.3: `stepsRun × rows × (guidance > 1 ? 2 : 1)`).
+
+    /// Transformer forwards: `evaluateCalls × modelEvalsPerEvaluate`. The CFG
+    /// multiplier lives in the caller, which is the only party that knows
+    /// whether one `evaluate` is one pass or two. This is the number §3.3
+    /// requires be reported rather than discovered, and it is a count, not a
+    /// product of labels.
     public let modelEvals: Int
   }
 
@@ -94,13 +116,15 @@ public enum Krea2DenoiseLoop {
     // float32 values (`ts[i]` before this WP), with no per-step GPU sync.
     let sigmas = scheduler.sigmas.asArray(Float.self)
 
-    let rows: Int
+    // The row count at the first step of this run. Dispatch below re-reads
+    // `tableau.rows` every step; this is the label, not the multiplier.
+    let rowsAtStart: Int
     if let tableau = scheduler as? TableauScheduler {
-      rows = tableau.rows
+      rowsAtStart = tableau.rows
     } else if scheduler.requiresIntermediateEvaluation {
-      rows = 2
+      rowsAtStart = 2
     } else {
-      rows = 1
+      rowsAtStart = 1
     }
 
     var x = initialSample
@@ -132,7 +156,14 @@ public enum Krea2DenoiseLoop {
            let mid = scheduler.intermediateStep(modelOutput: out, timestepIndex: i, sample: x) {
           // 4. 2-row: the second evaluation at the scheduler's own substep
           //    (res_2s: σ·e^{−c₂h}, a genuine substep — not σ_{i+1}).
-          let midSigma = scheduler.intermediateSigma(timestepIndex: i) ?? sigmas[i + 1]
+          // Fail loud: σ_{i+1} is the WRONG substep (§3.3), so there is no
+          // fallback to substitute. A scheduler that says it needs a second
+          // evaluation and then will not say where owes the caller an answer.
+          guard let midSigma = scheduler.intermediateSigma(timestepIndex: i) else {
+            preconditionFailure(
+              "scheduler requires an intermediate evaluation at step \(i) but returned no "
+                + "intermediateSigma; σ_{i+1} is not a valid substitute (§3.3)")
+          }
           let vMid = evaluate(mid, midSigma)
           evaluateCalls += 1
           let outMid = scheduler.modelInput(velocity: vMid, sample: mid, sigma: midSigma)
@@ -158,7 +189,7 @@ public enum Krea2DenoiseLoop {
 
     let stats = Stats(
       stepsRun: total - startIndex,
-      rows: rows,
+      rowsAtStart: rowsAtStart,
       evaluateCalls: evaluateCalls,
       modelEvals: evaluateCalls * modelEvalsPerEvaluate)
     return (x, stats)

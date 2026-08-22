@@ -19,9 +19,12 @@ final class Krea2RunTraceTests: XCTestCase {
     try Krea2Sampling.resolveShift(explicit: explicit, seqLen: seqLen, align: align)
   }
 
-  static func stats(stepsRun: Int, rows: Int = 1, modelEvals: Int) -> Krea2DenoiseLoop.Stats {
+  static func stats(stepsRun: Int, rowsAtStart: Int = 1, modelEvals: Int)
+    -> Krea2DenoiseLoop.Stats
+  {
     Krea2DenoiseLoop.Stats(
-      stepsRun: stepsRun, rows: rows, evaluateCalls: stepsRun * rows, modelEvals: modelEvals)
+      stepsRun: stepsRun, rowsAtStart: rowsAtStart,
+      evaluateCalls: stepsRun * rowsAtStart, modelEvals: modelEvals)
   }
 
   // MARK: - Text-to-image
@@ -168,9 +171,14 @@ final class Krea2RunTraceTests: XCTestCase {
     XCTAssertEqual(trace.seed, 7)
   }
 
-  /// §3.3: `modelEvals = stepsRun × rows × (guidance > 1 ? 2 : 1)` — the loop
-  /// counts it and the trace carries the number, so a res_2s + CFG render
-  /// reports its 4× cost rather than leaving it to be discovered.
+  /// §3.3's cost line: a `res_2s` + CFG render is 4x a plain euler one, and
+  /// the trace carries that number so it is reported rather than discovered.
+  ///
+  /// The number itself comes from `Stats.modelEvals`, which the loop COUNTS.
+  /// `stepsRun × rowsAtStart × cfg` happens to equal it here only because
+  /// `res_2s` takes 2 rows on every step; `Krea2DenoiseLoopTests`'
+  /// `testRowsMayChangeMidRunAndModelEvalsCountsTheActualCalls` pins the case
+  /// where it does not.
   func testTraceCarriesTheMultiplicativeEvalCost() throws {
     let shift = try Self.shift()
     let scheduler = try Krea2Pipeline.makeScheduler(
@@ -178,7 +186,7 @@ final class Krea2RunTraceTests: XCTestCase {
     let trace = Krea2RunTrace(
       request: Krea2Pipeline.Request(prompt: "x", guidance: 2.0, steps: 6, sampler: .res2s),
       shift: shift, scheduler: scheduler,
-      stats: Self.stats(stepsRun: 6, rows: 2, modelEvals: 6 * 2 * 2),
+      stats: Self.stats(stepsRun: 6, rowsAtStart: 2, modelEvals: 6 * 2 * 2),
       startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
     XCTAssertEqual(trace.modelEvals, 24)
     XCTAssertEqual(trace.guidance, 2.0)

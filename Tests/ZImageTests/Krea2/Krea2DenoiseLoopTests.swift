@@ -93,7 +93,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
         XCTAssertEqual(new.dtype, .bfloat16)
         XCTAssertEqual(Self.bits(new), Self.bits(old), "steps \(steps) seed \(seed): latents moved")
         XCTAssertEqual(stats.stepsRun, steps)
-        XCTAssertEqual(stats.rows, 1)
+        XCTAssertEqual(stats.rowsAtStart, 1)
         XCTAssertEqual(stats.modelEvals, steps)
         XCTAssertFalse(MLX.any(MLX.isNaN(new)).item(Bool.self))
       }
@@ -193,10 +193,17 @@ final class Krea2DenoiseLoopTests: XCTestCase {
         return field.velocity(x, sigma)
       }
       let rows = scheduler.requiresIntermediateEvaluation ? 2 : 1
-      XCTAssertEqual(stats.rows, rows, kind.rawValue)
+      XCTAssertEqual(stats.rowsAtStart, rows, kind.rawValue)
       XCTAssertEqual(stats.stepsRun, steps, kind.rawValue)
       XCTAssertEqual(calls, steps * rows, kind.rawValue)
-      XCTAssertEqual(stats.modelEvals, stats.stepsRun * stats.rows * 2, kind.rawValue)
+      // The counted truth, which holds for every scheduler.
+      XCTAssertEqual(stats.modelEvals, calls * 2, kind.rawValue)
+      XCTAssertEqual(stats.evaluateCalls, calls, kind.rawValue)
+      // The product identity holds only BECAUSE every `SchedulerKind` shipping
+      // today has a constant row count. It is asserted here as a property of
+      // these samplers, not as a law of the driver — `testRowsMayChangeMidRun`
+      // pins the general contract.
+      XCTAssertEqual(stats.modelEvals, stats.stepsRun * stats.rowsAtStart * 2, kind.rawValue)
       XCTAssertFalse(MLX.any(MLX.isNaN(x)).item(Bool.self), kind.rawValue)
     }
   }
@@ -233,7 +240,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       if !grid.contains(sigma) { midSigmas.append(sigma) }
       return field.velocity(x, sigma)
     }
-    XCTAssertEqual(stats.rows, 2)
+    XCTAssertEqual(stats.rowsAtStart, 2)
     XCTAssertEqual(stats.modelEvals, 18)
     let err = ModelOutputConventionTests.relativeError(x, field.x0)
     XCTAssertLessThanOrEqual(err, 1e-5, "res_2s through the driver must reconstruct x₀; got \(err)")
@@ -321,7 +328,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       seen.append(sigma)
       return field.velocity(x, sigma)
     }
-    XCTAssertEqual(stats.rows, 3)
+    XCTAssertEqual(stats.rowsAtStart, 3)
     XCTAssertEqual(stats.stepsRun, steps)
     XCTAssertEqual(stats.modelEvals, steps * 3)
     XCTAssertEqual(seen.count, steps * 3)
@@ -354,8 +361,96 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var tableau: any ZImageScheduler = TestTableau(sigmaValues: grid, a: [[0]], b: [1], c: [0])
     let (viaTableau, stats) = Krea2DenoiseLoop.run(
       scheduler: &tableau, initialSample: initial, startIndex: 0, evaluate: Self.syntheticTransformer)
-    XCTAssertEqual(stats.rows, 1)
+    XCTAssertEqual(stats.rowsAtStart, 1)
     XCTAssertEqual(Self.bits(viaTableau), Self.bits(viaEuler))
+  }
+
+  // MARK: - rowsAtStart is a label; modelEvals is the count (AC-24's shape)
+
+  /// A tableau whose row count DROPS after a warm-up — the shape `deis_3m`
+  /// takes (RES4LYF `multistep_extra_initial_steps = 1`: `ralston_3s` over
+  /// steps 0…3, then multistep at one row, AC-24 as corrected by A.1).
+  ///
+  /// The driver must dispatch the actual row count on every step, and
+  /// `modelEvals` must be the number of calls that really happened — NOT
+  /// `stepsRun × rowsAtStart`, which for this scheduler overcounts by more
+  /// than 2x. `rowsAtStart` reports the warm-up's 3 and is a description of
+  /// where the run started, nothing more.
+  struct WarmUpTableau: TableauScheduler {
+    let sigmas: MLXArray
+    let timesteps: MLXArray
+    let numInferenceSteps: Int
+    /// Steps `0 ..< warmUpSteps` take 3 rows; every later step takes 1.
+    let warmUpSteps: Int
+    /// The step the driver is dispatching, tracked so `rows` can change with it.
+    var currentStep = 0
+    var rowsPerStep: [Int: Int] = [:]
+
+    init(sigmaValues: [Float], warmUpSteps: Int) {
+      self.sigmas = MLXArray(sigmaValues, [sigmaValues.count])
+      self.timesteps = MLXArray(sigmaValues.dropLast().map { $0 * 1000 }, [sigmaValues.count - 1])
+      self.numInferenceSteps = sigmaValues.count - 1
+      self.warmUpSteps = warmUpSteps
+    }
+
+    var rows: Int { currentStep < warmUpSteps ? 3 : 1 }
+
+    private func dt(_ i: Int) -> Float {
+      sigmas[i + 1].item(Float.self) - sigmas[i].item(Float.self)
+    }
+
+    func rowSigma(timestepIndex: Int, row: Int) -> Float {
+      sigmas[timestepIndex].item(Float.self) + Float(row) / 3.0 * dt(timestepIndex)
+    }
+
+    mutating func rowSample(timestepIndex: Int, row: Int, x0: MLXArray, k: [MLXArray]) -> MLXArray {
+      x0 + (Float(row) / 3.0 * dt(timestepIndex)) * k[row - 1]
+    }
+
+    mutating func commit(timestepIndex: Int, x0: MLXArray, k: [MLXArray]) -> MLXArray {
+      rowsPerStep[timestepIndex] = k.count
+      // Euler on the last row, whatever the row count — the arithmetic is not
+      // what this test is about.
+      let out = x0 + dt(timestepIndex) * k[k.count - 1]
+      currentStep = timestepIndex + 1
+      return out
+    }
+
+    mutating func step(modelOutput: MLXArray, timestepIndex: Int, sample: MLXArray) -> MLXArray {
+      XCTFail("the driver must route a TableauScheduler through rows/commit, never step()")
+      return sample
+    }
+  }
+
+  func testRowsMayChangeMidRunAndModelEvalsCountsTheActualCalls() throws {
+    let steps = 9, warmUp = 4
+    let grid = try Self.defaultScheduler(steps: steps).sigmas.asArray(Float.self)
+    var scheduler: any ZImageScheduler = WarmUpTableau(sigmaValues: grid, warmUpSteps: warmUp)
+    var calls = 0
+    let (_, stats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 41), startIndex: 0,
+      modelEvalsPerEvaluate: 2
+    ) { x, sigma in
+      calls += 1
+      return Self.syntheticTransformer(x, sigma)
+    }
+
+    // The driver re-read `rows` every step: 3 for the warm-up, 1 after.
+    let tableau = scheduler as! WarmUpTableau
+    XCTAssertEqual(tableau.rowsPerStep, [0: 3, 1: 3, 2: 3, 3: 3, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1])
+
+    let expectedCalls = warmUp * 3 + (steps - warmUp) * 1  // 12 + 5 = 17
+    XCTAssertEqual(calls, expectedCalls)
+    XCTAssertEqual(stats.evaluateCalls, expectedCalls)
+    XCTAssertEqual(stats.modelEvals, expectedCalls * 2, "modelEvals is counted, not multiplied")
+
+    // `rowsAtStart` is the warm-up's row count and nothing more. The product
+    // would claim 9 x 3 x 2 = 54 forwards for a run that made 34.
+    XCTAssertEqual(stats.rowsAtStart, 3)
+    XCTAssertEqual(stats.stepsRun, steps)
+    XCTAssertNotEqual(
+      stats.modelEvals, stats.stepsRun * stats.rowsAtStart * 2,
+      "stepsRun x rowsAtStart is NOT the cost for a scheduler whose rows change")
   }
 
   // MARK: - T2 / T3 seams: nil is the default path; a hook runs once per step after the commit
