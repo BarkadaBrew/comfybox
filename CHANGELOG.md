@@ -27,8 +27,10 @@ decided them.
   by `scripts/gen-build-info.sh` (`"unknown"` for an unstamped build), so a
   clobbered or wrong-branch binary is detectable from outside. `model_alias`
   restores the declared alias (`krea2-raw`) beside the resolved directory that
-  `model` carries. `last_recipe` is dropped the moment a different base is
-  activated — a record whose checkpoint is no longer resident is not
+  `model` carries. `last_recipe` is dropped the moment the checkpoint that
+  produced it stops being resident — a different base activated, a different
+  family prepared, or the whole image stack evicted for an LTX-2 render
+  (#218). A record whose checkpoint is no longer in memory is not
   provenance. WP-E10, AC-34b.
 - **PNG generation metadata is byte-stable.** `parametersJSON` is now written
   with sorted keys; it previously followed Swift's per-process dictionary hash

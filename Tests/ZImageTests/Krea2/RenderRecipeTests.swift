@@ -188,6 +188,28 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(kroma.pairsBound, 256)
   }
 
+  /// Fail CLOSED: if the pipeline's configs and bind reports ever disagree in
+  /// length, `zip` would truncate `applied.loras` and the record would read as
+  /// complete while naming fewer adapters than actually applied. No pairing →
+  /// the caller emits no `applied` block at all.
+  func testAnIncompleteReadBackYieldsNoPairingAtAll() throws {
+    let configs = [
+      LoRAConfiguration.local("/vault/a.safetensors", scale: 0.6),
+      LoRAConfiguration.local("/vault/b.safetensors", scale: 0.3),
+    ]
+    let one = [RenderRecipeFixture.report(offered: 10, bound: 10)]
+    XCTAssertNil(
+      RenderRecipe.loRAReadBacks(configs: configs, reports: one),
+      "two adapters applied, one report — a two-thirds record is not provenance")
+    XCTAssertNil(RenderRecipe.loRAReadBacks(configs: [configs[0]], reports: one + one))
+
+    let paired = try XCTUnwrap(RenderRecipe.loRAReadBacks(configs: configs, reports: one + one))
+    XCTAssertEqual(paired.count, 2)
+    XCTAssertEqual(paired[1].configuration.scale, 0.3)
+    XCTAssertEqual(RenderRecipe.loRAReadBacks(configs: [], reports: [])?.count, 0,
+                   "no LoRAs is a complete read-back, not a failure")
+  }
+
   func testUndeclaredRoleAndRelativityAreNull() {
     let cfg = LoRAConfiguration.local("/vault/some-style.safetensors", scale: 0.8)
     let r = RenderRecipe.krea2(inputs(loras: [.init(configuration: cfg, report: RenderRecipeFixture.report(offered: 10, bound: 10))]))

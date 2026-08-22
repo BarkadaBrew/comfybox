@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import MLX
 
 #if canImport(CoreGraphics)
@@ -11,7 +12,16 @@ public enum QwenImageIOError: Error {
   case invalidArrayShape
   case resizeFailed
   case writeFailed
+  /// The WP-E10 `applied` record could not be turned into JSON for the PNG's
+  /// EXIF `UserComment`. The image is still written; the record is not. Never
+  /// thrown out of `saveImage` — it exists so the omission has a reason to log.
+  case appliedRecordNotEncodable(reason: String)
 }
+
+/// The image writer has no injected logger and is called from every family's
+/// render path; one file-scoped logger keeps a dropped provenance record from
+/// being silent (WP-E10).
+private let metadataLogger = Logger(label: "z-image.image-metadata")
 
 public enum QwenImageIO {
   static func resizedCGImage(
@@ -202,12 +212,24 @@ public enum QwenImageIO {
       // WP-E10 sink 2: the provenance record rides in the PNG under `applied`
       // (snake_case, the same bytes the /v1/generate response carries).
       // Krea 2 only today (D12) — other families pass nil and emit no key.
+      //
+      // The omission is kept (a PNG without its record is still the image the
+      // caller asked for) but it is never SILENT: `JSONEncoder` throws on a
+      // non-conforming float, so a NaN sigma would otherwise drop the whole
+      // block with nothing to explain the gap between the response and the file.
       if let applied {
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        if let data = try? encoder.encode(applied),
-           let object = try? JSONSerialization.jsonObject(with: data) {
+        do {
+          let encoder = JSONEncoder()
+          encoder.keyEncodingStrategy = .convertToSnakeCase
+          let data = try encoder.encode(applied)
+          guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            throw QwenImageIOError.appliedRecordNotEncodable(
+              reason: "the encoded record is not a JSON object")
+          }
           params["applied"] = object
+        } catch {
+          metadataLogger.error(
+            "PNG metadata: the `applied` provenance record could not be encoded — writing the image WITHOUT it (\(error))")
         }
       }
       if let width { params["width"] = width }

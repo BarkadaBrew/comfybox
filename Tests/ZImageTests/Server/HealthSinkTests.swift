@@ -101,4 +101,42 @@ final class LastRecipeRetentionTests: XCTestCase {
   func testNoRecordStaysNoRecord() {
     XCTAssertNil(RenderRecipe.retained(nil, activeTransformerFile: "/x/raw.safetensors"))
   }
+
+  // MARK: - The rule as every call site states it: (family, resident file)
+
+  /// A re-activation of the same Krea 2 checkpoint keeps the record.
+  func testSameFamilySameFileKeepsTheRecord() {
+    XCTAssertEqual(
+      RenderRecipe.retained(recipe, family: .krea2, krea2TransformerFile: recipe.baseModelFile),
+      recipe)
+  }
+
+  /// **The #218 eviction path.** `releaseImageModelsForVideo()` nils
+  /// `krea2Pipeline` to vacate ~22 GB for the LTX-2 stack; the family is still
+  /// `.krea2` but nothing is resident. `/health` used to publish a full
+  /// provenance block beside `loaded: false` for the whole video render — tens
+  /// of minutes of a record for a checkpoint that is not in memory.
+  func testAFullImageStackEvictionDropsTheRecord() {
+    XCTAssertNil(
+      RenderRecipe.retained(recipe, family: .krea2, krea2TransformerFile: nil),
+      "no resident Krea 2 pipeline → no record, even though the family has not changed")
+  }
+
+  /// A base handoff inside the family: a different checkpoint, so a different
+  /// record — never the old one.
+  func testAHandoffToAnotherKrea2CheckpointDropsTheRecord() {
+    XCTAssertNil(RenderRecipe.retained(
+      recipe, family: .krea2,
+      krea2TransformerFile: "/Users/me/LocalModels/kroma-v0.2/turbo.safetensors"))
+  }
+
+  /// Every non-Krea-2 family drops it, whatever happens to be resident —
+  /// `prepare()`'s other arms and `poolActivate`'s other cases both land here.
+  func testEveryOtherFamilyDropsTheRecord() {
+    for family in WarmModelFamily.allCases where family != .krea2 {
+      XCTAssertNil(
+        RenderRecipe.retained(recipe, family: family, krea2TransformerFile: recipe.baseModelFile),
+        "\(family) must not publish a Krea 2 record")
+    }
+  }
 }

@@ -5329,6 +5329,25 @@ private actor WarmServerCoordinator {
   /// published into /health as `last_recipe`. Set only from a completed
   /// render (a failed one writes no record), never from a request.
   private var lastRecipe: RenderRecipe?
+
+  /// Re-decide whether `lastRecipe` may still be published, from what is
+  /// resident RIGHT NOW (WP-E10 sink 3).
+  ///
+  /// `/health` prints `model`, `loaded`, `model_variant` and `last_recipe`
+  /// side by side. A record that outlived its checkpoint reads as provenance
+  /// and is not — most starkly during an LTX-2 render, where the whole image
+  /// stack is evicted (#218) and `/health` would otherwise show a full Krea 2
+  /// provenance block beside `loaded: false` for tens of minutes.
+  ///
+  /// EVERY writer of `krea2Pipeline` calls this immediately after: pool
+  /// activation, `prepare()`, and `releaseImageModelsForVideo()`. Adding a
+  /// fourth writer without this call is the bug this comment exists to catch.
+  private func revalidateLastRecipe() {
+    lastRecipe = RenderRecipe.retained(
+      lastRecipe,
+      family: currentModelFamily,
+      krea2TransformerFile: krea2Pipeline?.paths.transformerFile.path)
+  }
   private var activeRenderStartedAt: Date?
   /// Synthetic id for the currently-rendering job — surfaced as `current_job_id`.
   private var activeJobId: String?
@@ -5444,6 +5463,7 @@ private actor WarmServerCoordinator {
     fiboPipeline = nil
     chromaPipeline = nil
     krea2Pipeline = nil
+    revalidateLastRecipe()  // WP-E10: no checkpoint, no record (#218)
     chromaTokenizer = nil
     controlPipeline = nil
     pipelinePrepared = false
@@ -6023,6 +6043,10 @@ private actor WarmServerCoordinator {
         logger.warning("Failed to pre-load full VAE encoder: \(error). First img2img request will attempt lazy load.")
       }
     }
+    // WP-E10 sink 3: `prepare()` is the third writer of `krea2Pipeline`, and
+    // its non-Krea-2 arms replace the ACTIVE family out from under a record.
+    // Placed after the whole chain so every arm is covered by the one rule.
+    revalidateLastRecipe()
 
     // Register the initial model in the pool so it appears in pool listings
     // and can be managed alongside hot-swapped models.
@@ -6182,9 +6206,6 @@ private actor WarmServerCoordinator {
       // The pipeline is the physical fact; the pool entry carries the same
       // value back from loadPipeline (WP-E5).
       krea2Variant = krea2Pipeline?.variant ?? (entry.detectedInfo as? Krea2Variant)
-      // WP-E10 sink 3: a record whose base is no longer resident is not
-      // provenance. Kept only when THIS transformer file produced it.
-      lastRecipe = RenderRecipe.retained(lastRecipe, activeTransformerFile: krea2Pipeline?.paths.transformerFile.path)
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -6209,11 +6230,7 @@ private actor WarmServerCoordinator {
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }
-    if entry.family != .krea2 {
-      // Same rule from the other side: no krea2 base is resident, so there is
-      // no record for /health to publish (D12).
-      lastRecipe = nil
-    }
+    revalidateLastRecipe()
     pipelinePrepared = true
     // Model/family/variant just changed — refresh the health snapshot (#217).
     publishHealth()
@@ -7161,30 +7178,31 @@ private actor WarmServerCoordinator {
       // quantization it applied, the VAE resident in its slot, its loaded
       // LoRA configs joined with their bind reports, and the run trace the
       // loop just counted. `steps`/`guidance` above are NOT consulted here.
-      // `loadedLoRAConfigs` and `loadedLoRAReports` are written in one
-      // statement pair on every path through `loadLoRAs`, so the zip below
-      // is total. If that invariant ever breaks the zip would silently SHORTEN
-      // the record, which is the one failure mode this whole work package
-      // exists to prevent — say so loudly rather than under-report.
-      if k2.loadedLoRAConfigs.count != k2.loadedLoRAReports.count {
+      // Fail CLOSED on an incomplete read-back: a record naming two of three
+      // adapters is worse than no record, because it reads as complete.
+      let loraReadBacks = RenderRecipe.loRAReadBacks(
+        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports)
+      if loraReadBacks == nil {
         let mismatch = "Krea2 provenance: \(k2.loadedLoRAConfigs.count) loaded LoRA configs but "
-          + "\(k2.loadedLoRAReports.count) bind reports — applied.loras is UNDER-REPORTING this render"
+          + "\(k2.loadedLoRAReports.count) bind reports — refusing to emit a partial `applied` for this render"
         logger.error("\(mismatch)")
       }
       // `base_model` is the declared alias when the active spec is one (or
       // resolves to one's directory — AC-34b), else the spec as loaded.
       let activeSpec = activePoolModelSpec ?? configuration.modelSpec ?? "krea2"
-      let applied = RenderRecipe.krea2(.init(
-        baseModel: Krea2ModelDetection.alias(forSpec: activeSpec) ?? activeSpec,
-        variant: k2.variant,
-        transformerFile: k2.paths.transformerFile,
-        quantizationBits: k2.transformerQuantBits,
-        vae: k2.currentVAE,
-        textEncoderFile: k2.paths.textEncoderFile,
-        loras: zip(k2.loadedLoRAConfigs, k2.loadedLoRAReports).map { .init(configuration: $0, report: $1) },
-        control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
-        trace: trace,
-        negativePrompt: payload.negativePrompt))
+      let applied: RenderRecipe? = loraReadBacks.map { readBacks in
+        RenderRecipe.krea2(.init(
+          baseModel: Krea2ModelDetection.alias(forSpec: activeSpec) ?? activeSpec,
+          variant: k2.variant,
+          transformerFile: k2.paths.transformerFile,
+          quantizationBits: k2.transformerQuantBits,
+          vae: k2.currentVAE,
+          textEncoderFile: k2.paths.textEncoderFile,
+          loras: readBacks,
+          control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
+          trace: trace,
+          negativePrompt: payload.negativePrompt))
+      }
       // Sink 2 — the PNG. `negativePrompt` is passed only when the CFG branch
       // ran (AC-61: at guidance ≤ 1 it did not apply and is absent).
       let metadata = QwenImageIO.ImageMetadata.generation(

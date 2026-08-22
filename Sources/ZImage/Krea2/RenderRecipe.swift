@@ -137,6 +137,22 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     return record
   }
 
+  /// The same rule stated over the two facts every call site actually holds:
+  /// the family that is active, and the transformer file of the resident Krea 2
+  /// pipeline (`nil` when there is none — because it was never loaded, or
+  /// because the image stack was RELEASED to make room for the video model).
+  ///
+  /// Every writer of `krea2Pipeline` goes through this — pool activation,
+  /// `prepare()`, and the #218 video eviction — so there is one rule and no
+  /// path that quietly keeps a record for a checkpoint that is no longer in
+  /// memory.
+  static func retained(
+    _ record: RenderRecipe?, family: WarmModelFamily, krea2TransformerFile: String?
+  ) -> RenderRecipe? {
+    guard family == .krea2 else { return nil }
+    return retained(record, activeTransformerFile: krea2TransformerFile)
+  }
+
   // MARK: - Builder: Krea 2 read-backs → record
 
   /// One loaded adapter: the configuration the pipeline holds in
@@ -148,6 +164,21 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       self.configuration = configuration
       self.report = report
     }
+  }
+
+  /// Pair `Krea2Pipeline.loadedLoRAConfigs` with `loadedLoRAReports`, or `nil`
+  /// when the two disagree in length.
+  ///
+  /// The pipeline writes (and rolls back) both in one statement pair, so this
+  /// is total today. `zip` would quietly TRUNCATE if that ever broke, and a
+  /// record naming two of three adapters is worse than no record at all —
+  /// it reads as complete. Returning `nil` makes the caller emit no `applied`
+  /// block, which the client already reads honestly as `provenance: 'request'`.
+  public static func loRAReadBacks(
+    configs: [LoRAConfiguration], reports: [LoRAApplicationReport]
+  ) -> [LoRAReadBack]? {
+    guard configs.count == reports.count else { return nil }
+    return zip(configs, reports).map { LoRAReadBack(configuration: $0, report: $1) }
   }
 
   /// The depth Control-LoRA as the pipeline applied it.

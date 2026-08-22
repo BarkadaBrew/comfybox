@@ -94,6 +94,26 @@ final class ImageMetadataDeterminismTests: XCTestCase {
     XCTAssertEqual(Data(a.utf8), Data(b.utf8))
   }
 
+  /// Minor 4: a record that cannot be turned into JSON is OMITTED, not fatal —
+  /// and never silent (the writer logs the reason). `JSONEncoder` throws on a
+  /// non-conforming float by default, so a NaN anywhere in the grid drops the
+  /// whole block; the image itself is still the one the caller asked for.
+  func testANonEncodableRecordIsOmittedAndTheRestOfTheSidecarSurvives() throws {
+    let broken = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(mu: .nan)))
+    XCTAssertThrowsError(try {
+      let e = JSONEncoder(); e.keyEncodingStrategy = .convertToSnakeCase
+      return try e.encode(broken)
+    }(), "precondition: this record really is non-encodable")
+
+    let json = try XCTUnwrap(metadata(applied: broken).parametersJSON)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+    XCTAssertNil(object["applied"], "the block is dropped rather than half-written")
+    XCTAssertEqual(object["prompt"] as? String, "a wooden table by a window")
+    XCTAssertEqual(object["seed"] as? UInt64, 44821)
+    XCTAssertEqual(try topLevelKeys(json), try topLevelKeys(json).sorted())
+  }
+
   /// The values survive the sort — this is an ordering change, not a
   /// re-shaping of the sidecar.
   func testSortingDoesNotChangeTheContent() throws {
