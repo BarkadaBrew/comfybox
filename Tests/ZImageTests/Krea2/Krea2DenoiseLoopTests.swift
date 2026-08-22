@@ -192,7 +192,10 @@ final class Krea2DenoiseLoopTests: XCTestCase {
         calls += 1
         return field.velocity(x, sigma)
       }
-      let rows = scheduler.requiresIntermediateEvaluation ? 2 : 1
+      // WP-E13 added N-row conformers; the row count is the tableau's when
+      // there is one, and otherwise the 2-row / 1-row protocol's.
+      let rows = (scheduler as? TableauScheduler)?.rows
+        ?? (scheduler.requiresIntermediateEvaluation ? 2 : 1)
       XCTAssertEqual(stats.rowsAtStart, rows, kind.rawValue)
       XCTAssertEqual(stats.stepsRun, steps, kind.rawValue)
       XCTAssertEqual(calls, steps * rows, kind.rawValue)

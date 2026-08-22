@@ -1211,7 +1211,7 @@ struct ZImageCLI {
       --lora-scale           LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths           Comma-separated LoRA paths or HuggingFace IDs (quoted commas unsupported)
       --lora-scales          Comma-separated LoRA scale overrides (default: 1.0)
-      --scheduler, --sampler  Sampler algorithm: euler, heun, res_2s, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
+      --scheduler, --sampler  Sampler algorithm: euler, heun, res_2s, res_3s, ralston_2s/3s/4s, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
       --sigma-schedule       Sigma schedule: flow, karras, exponential, beta, beta57 (default: flow)
       --eta                  Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
       --dype <method>        DyPE high-res mode: ntk, yarn, none (auto-enables for >1024px)
@@ -2027,7 +2027,7 @@ struct ZImageCLI {
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs (quoted commas unsupported)
       --lora-scales             Comma-separated LoRA scale overrides (default: 1.0)
-      --scheduler, --sampler    Sampler algorithm: euler, heun, res_2s, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
+      --scheduler, --sampler    Sampler algorithm: euler, heun, res_2s, res_3s, ralston_2s/3s/4s, dpmpp-2m, dpmpp-2s-a, deis, ddim (default: euler)
       --sigma-schedule          Sigma schedule: flow, karras, exponential, beta, beta57 (default: flow)
       --eta                     Stochasticity for DDIM/DPM++ 2S-A (0=deterministic, 1=DDPM; default: 0)
       --no-progress             Disable progress output
