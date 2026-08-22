@@ -191,7 +191,15 @@ final class Krea2StagedSigmaTests: XCTestCase {
   func testSeamAgreesWithFactoryAtDenoiseOne() throws {
     let shift = try Self.shift()
     for kind in SchedulerKind.allCases {
-      for schedule in [SigmaScheduleKind.bongTangent, .krea2, .beta] {
+      // EVERY schedule the family can build, `.flow` included: it is the one
+      // where the seam and the factory differ STRUCTURALLY (the factory has a
+      // special `(.euler, .flow)` branch that rebuilds the grid from the
+      // config; the seam always takes the explicit-grid init), and `.flow` —
+      // spelled `normal` / `simple` / `sgm_uniform` / `ddim_uniform` — is
+      // wire-reachable for a stage whose sampler defaults to euler. They agree
+      // today because both delegate to `SigmaSchedule.flow`; this is what keeps
+      // that true. (E17 review, Important 2.)
+      for schedule in SigmaScheduleKind.allCases {
         let steps = 6
         let viaFactory = try Krea2Pipeline.makeScheduler(
           sampler: kind, sigmaSchedule: schedule, steps: steps, shift: shift, seed: 11, c2: 0.5)

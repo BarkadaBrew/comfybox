@@ -120,6 +120,19 @@ public struct Krea2RunTrace: Sendable, Equatable {
   /// RES4LYF bongmath (T3). `false` until WP-E16.
   public let bongmath: Bool
   public let seed: UInt64
+
+  /// WP-E17: the seed of the key this stage's RE-NOISE drew from, or `nil` for
+  /// a stage that did not re-noise (stage 1 of every render, and every
+  /// single-stage render).
+  ///
+  /// It is `Krea2StagedRender.renoiseSeed(stageSeed: seed)` — a documented,
+  /// re-derivable function of ``seed`` — and it is carried explicitly because
+  /// it is the one part of a staged render's realisation that is NOT visible in
+  /// the request, exactly as ``SDEParameters``' two seeds are. Deliberately not
+  /// a `RenderRecipe.Stage` field yet: `applied.stages[]`'s key set is sealed
+  /// by a client fixture (AC-45), so promoting it to the wire is a lane-client
+  /// change, not an engine one.
+  public let renoiseSeed: UInt64?
   /// Width/height AFTER the alignment round-up — what was rendered, not what
   /// was asked for.
   public let width: Int
@@ -196,8 +209,10 @@ public struct Krea2RunTrace: Sendable, Equatable {
     seed: UInt64,
     width: Int,
     height: Int,
-    negativePromptApplied: String? = nil
+    negativePromptApplied: String? = nil,
+    renoiseSeed: UInt64? = nil
   ) {
+    self.renoiseSeed = renoiseSeed
     self.sampler = sampler
     self.sigmaSchedule = sigmaSchedule
     self.sigmaScheduleRequested = sigmaScheduleRequested
@@ -301,7 +316,8 @@ extension Krea2RunTrace {
     seed: UInt64,
     width: Int,
     height: Int,
-    negativePromptApplied: String?
+    negativePromptApplied: String?,
+    renoiseSeed: UInt64? = nil
   ) {
     self.init(
       sampler: sampler,
@@ -328,7 +344,8 @@ extension Krea2RunTrace {
       seed: seed,
       width: width,
       height: height,
-      negativePromptApplied: negativePromptApplied)
+      negativePromptApplied: negativePromptApplied,
+      renoiseSeed: renoiseSeed)
   }
 
   /// The grid as walked: the scheduler's own sigmas, plus the `0.0` a

@@ -7540,7 +7540,10 @@ private actor WarmServerCoordinator {
         prompt: guardedPrompt,
         negativePrompt: trace.negativePromptApplied,
         seed: trace.seed,
-        steps: trace.stepsRequested,
+        // WP-E17: the flat scalar a human reads names the WHOLE render, not its
+        // first stage — `applied.stages[]` is where the split lives. Identical
+        // to `trace.stepsRequested` for a single-stage render.
+        steps: traces.reduce(0) { $0 + $1.stepsRequested },
         guidance: trace.guidance,
         width: trace.width,
         height: trace.height,

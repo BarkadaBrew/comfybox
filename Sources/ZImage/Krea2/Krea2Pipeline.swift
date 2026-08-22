@@ -934,7 +934,12 @@ public final class Krea2Pipeline {
       Krea2StagedRender.Progress(stage1Steps: scheduler.numInferenceSteps, stage2Steps: $0)
     }
     let stage1Progress: ((Int, Int) -> Void)? =
-      bar.map { bar in { step, _ in progress?(bar.stage1(step).0, bar.stage1(step).1) } } ?? progress
+      bar.map { bar in
+        { step, _ in
+          let (done, total) = bar.stage1(step)
+          progress?(done, total)
+        }
+      } ?? progress
 
     let (denoised, stats) = Krea2DenoiseLoop.run(
       scheduler: &scheduler,
@@ -990,7 +995,8 @@ public final class Krea2Pipeline {
         },
         progress: { step, _ in
           guard let bar else { return }
-          progress?(bar.stage2(step).0, bar.stage2(step).1)
+          let (done, total) = bar.stage2(step)
+          progress?(done, total)
         })
       latent = staged
       traces.append(stage2Trace)

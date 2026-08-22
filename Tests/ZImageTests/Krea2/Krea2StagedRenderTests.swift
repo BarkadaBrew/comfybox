@@ -206,14 +206,16 @@ final class Krea2StagedRenderTests: XCTestCase {
 
     let stageOne = Self.patchedNoise(seed: 5)
     let mixed = Krea2StagedRender.renoise(
-      stageOneLatent: stageOne, sigma: sigma, seed: stage.seed,
+      stageOneLatent: stageOne, sigma: sigma, stageSeed: stage.seed,
       patch: Self.patch, hTok: Self.hTok, wTok: Self.wTok,
       latentHeight: Self.latH, latentWidth: Self.latW, dtype: .bfloat16)
 
-    // The reference: the same NCHW mix, computed here, in float32.
-    MLXRandom.seed(stage.seed)
-    let eps = MLXRandom.normal([1, Krea2VAE.latentChannels, Self.latH, Self.latW])
-      .asType(.bfloat16)
+    // The reference: the same NCHW mix, computed here, in float32, from the
+    // re-noise stream's OWN explicit key (never the global generator).
+    let eps = MLXRandom.normal(
+      [1, Krea2VAE.latentChannels, Self.latH, Self.latW], dtype: .float32,
+      key: MLXRandom.key(Krea2StagedRender.renoiseSeed(stageSeed: stage.seed))
+    ).asType(.bfloat16)
     let source = Krea2Sampling.unpatchify(
       stageOne, patch: Self.patch, h: Self.hTok, w: Self.wTok, c: Krea2VAE.latentChannels)
     let want = Krea2Sampling.patchify(
@@ -256,7 +258,7 @@ final class Krea2StagedRenderTests: XCTestCase {
     XCTAssertEqual(sigma0, 0.11746056, accuracy: 1e-6)
 
     let start = Krea2StagedRender.renoise(
-      stageOneLatent: x1, sigma: scheduler.sigmas[0], seed: stage.seed,
+      stageOneLatent: x1, sigma: scheduler.sigmas[0], stageSeed: stage.seed,
       patch: Self.patch, hTok: Self.hTok, wTok: Self.wTok,
       latentHeight: Self.latH, latentWidth: Self.latW, dtype: .bfloat16)
     let v = field.eps - field.x0
@@ -444,6 +446,103 @@ final class Krea2StagedRenderTests: XCTestCase {
     XCTAssertEqual(stages.count, 2)
     XCTAssertEqual(stages[1]["sampler"] as? String, "deis_3m")
     XCTAssertEqual(wire["model_evals_total"] as? Int, record.modelEvalsTotal)
+  }
+
+  // MARK: - The re-noise stream is nobody else's (E17 review, Important 1)
+
+  /// §3.14's literal `MLXRandom.seed(stage2Seed)` collided with stage 1's SDE.
+  ///
+  /// The stage seed defaults to `seed &+ 1`;
+  /// `RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed:)` is *also* `&+ 1`, so
+  /// for stage 1 it is the SAME NUMBER — and the same KEY, because MLX's global
+  /// `KeySequence::next()` returns `split(key).second`, which is exactly what
+  /// `RES4LYFGaussianNoiseStream.next(like:)` takes on its first draw. This
+  /// test holds BOTH halves: the collision is real (so nobody "simplifies" the
+  /// derivation back), and the shipped re-noise is not on that stream.
+  func testRenoiseDoesNotShareStageOnesSDEStream() {
+    let seed: UInt64 = 44821
+    let stageSeed = seed &+ 1  // the §3.14 default
+    let shape = [1, Krea2VAE.latentChannels, Self.latH, Self.latW]
+    let like = MLX.zeros(shape).asType(.float32)
+
+    // Stage 1's SDE step stream, exactly as the injector builds it.
+    let stage1Stream = RES4LYFGaussianNoiseStream(
+      seed: RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed: seed),
+      layout: .channelsAtAxis1)
+    XCTAssertEqual(
+      RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed: seed), stageSeed,
+      "the seeds really are the same number — that is the whole finding")
+    let sdeDraw = stage1Stream.next(like: like)
+
+    // What §3.14 said literally: the global stream at the stage seed.
+    MLXRandom.seed(stageSeed)
+    let globalDraw = MLXRandom.normal(shape, dtype: .float32)
+    XCTAssertEqual(
+      Self.bits(RES4LYFNoiseNormalization.zscore(globalDraw, layout: .channelsAtAxis1)),
+      Self.bits(sdeDraw),
+      "REGRESSION PIN: the global stream at the stage seed IS stage 1's SDE draw")
+
+    // What ships: its own key, its own offset, a different realisation.
+    let renoiseDraw = MLXRandom.normal(
+      shape, dtype: .float32,
+      key: MLXRandom.key(Krea2StagedRender.renoiseSeed(stageSeed: stageSeed)))
+    XCTAssertNotEqual(Self.bits(renoiseDraw), Self.bits(globalDraw))
+    XCTAssertNotEqual(
+      Self.bits(RES4LYFNoiseNormalization.zscore(renoiseDraw, layout: .channelsAtAxis1)),
+      Self.bits(sdeDraw))
+
+    // And the three derivations of one render are three distinct seeds.
+    XCTAssertEqual(
+      Set([
+        RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed: stageSeed),
+        RES4LYFSDENoiseInjector.substepNoiseSeed(stageSeed: stageSeed),
+        Krea2StagedRender.renoiseSeed(stageSeed: stageSeed),
+      ]).count, 3)
+  }
+
+  /// The re-noise consumes NOTHING from MLX's global generator, so turning
+  /// stage 2 on cannot move the initial latent (or anything else drawn from it)
+  /// as a side effect — the invariant `RES4LYFGaussianNoiseStream`'s own design
+  /// note states for `eta`, now true for the stage too.
+  func testRenoiseLeavesTheGlobalStreamUntouched() {
+    let seed: UInt64 = 44821
+    func latents(renoising: Bool) -> ([Float], [Float]) {
+      MLXRandom.seed(seed)
+      let initial = MLXRandom.normal([1, Krea2VAE.latentChannels, Self.latH, Self.latW])
+        .asType(.bfloat16)
+      MLX.eval(initial)
+      if renoising {
+        _ = Krea2StagedRender.renoise(
+          stageOneLatent: Krea2Sampling.patchify(initial, patch: Self.patch),
+          sigma: MLXArray(Float(0.11746056)), stageSeed: seed &+ 1,
+          patch: Self.patch, hTok: Self.hTok, wTok: Self.wTok,
+          latentHeight: Self.latH, latentWidth: Self.latW, dtype: .bfloat16)
+      }
+      let next = MLXRandom.normal([1, Krea2VAE.latentChannels, Self.latH, Self.latW])
+        .asType(.bfloat16)
+      MLX.eval(next)
+      return (Self.bits(initial), Self.bits(next))
+    }
+    let without = latents(renoising: false)
+    let with = latents(renoising: true)
+    XCTAssertEqual(with.0, without.0, "the initial latent must not move")
+    XCTAssertEqual(with.1, without.1, "nor may anything drawn after the re-noise")
+  }
+
+  /// The derivation is RECORDED, not left to be rediscovered (`stages[].seed`
+  /// stays the stage seed, as the review requires).
+  func testTraceCarriesTheRenoiseSeed() throws {
+    let shift = try Self.shift()
+    let request = Self.baseRequest(stage2: Self.publishedStage2(seed: 900))
+    let (x1, trace1) = try Self.runStageOne(
+      request: request, shift: shift, initial: Self.patchedNoise(seed: request.seed),
+      evaluate: Self.nonlinear)
+    XCTAssertNil(trace1.renoiseSeed, "stage 1 does not re-noise")
+    let stage = try Self.resolvedPublishedStage2(request: request)
+    let (_, trace2) = try Self.runStageTwo(stage, shift: shift, stageOne: x1, evaluate: Self.nonlinear)
+    XCTAssertEqual(trace2.seed, 900)
+    XCTAssertEqual(trace2.renoiseSeed, Krea2StagedRender.renoiseSeed(stageSeed: 900))
+    XCTAssertNotEqual(trace2.renoiseSeed, trace2.seed)
   }
 
   // MARK: - Progress across both stages

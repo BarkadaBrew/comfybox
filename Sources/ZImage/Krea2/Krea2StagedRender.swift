@@ -305,9 +305,12 @@ public enum Krea2StagedRender {
     case .euler:
       // Always the explicit-grid init. The factory's `(.euler, .flow)` branch
       // uses `FlowMatchEulerScheduler(numInferenceSteps:config:mu:)`, which
-      // REBUILDS the flow grid from the config and would discard the tail.
-      // The two agree whenever the grid is the whole schedule, which is what
-      // the parity test asserts.
+      // REBUILDS the flow grid from the config — at `denoise == 1.0` that is
+      // the same grid (both delegate to `SigmaSchedule.flow`, and the parity
+      // test asserts it over every schedule), and at `denoise < 1` it would
+      // discard the stretched tail and silently render the whole schedule.
+      // That one case is the only structural divergence between this seam and
+      // the factory, and it is why the branch is not reproduced here.
       return FlowMatchEulerScheduler(
         numInferenceSteps: effectiveSteps, sigmaValues: sigmaValues,
         numTrainTimesteps: trainSteps)
@@ -422,26 +425,70 @@ public enum Krea2StagedRender {
   /// whose precondition makes that a crash rather than a drift — the same body
   /// the img2img path uses, so the two cannot diverge.
   ///
-  /// `ε` is drawn NCHW at the stage-1 latent shape, from
-  /// `MLXRandom.seed(stage seed)` — the same stream shape and the same global
-  /// seeding the t2i path uses for its initial noise, so "same payload, same
-  /// pixels" (AC-27) covers the stage-2 draw too.
+  /// `ε` is drawn NCHW at the stage-1 latent shape from an **explicit key**
+  /// (``renoiseSeed(stageSeed:)``), never from MLX's global stream.
+  ///
+  /// **§3.14's literal `MLXRandom.seed(stage2Seed)` is superseded** (E17 review,
+  /// Important 1; Addendum B carries the note). Written literally, the stage-2
+  /// re-noise drew the SAME FLOATS as stage 1's SDE step stream on the published
+  /// recipe:
+  ///
+  ///   * the stage seed defaults to `request.seed &+ 1`;
+  ///   * `RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed:)` is *also*
+  ///     `stageSeed &+ 1` — the same number for stage 1;
+  ///   * and it is the same KEY, not merely the same seed: MLX's global
+  ///     `KeySequence::next()` returns `split(key).second`, which is exactly
+  ///     what ``RES4LYFGaussianNoiseStream/next(like:)`` takes on its first
+  ///     draw. Equal element counts ⇒ the identical float sequence.
+  ///
+  /// That is live in the published recipe (stage 1 `res_2s` at `eta 0.5`), where
+  /// the detail pass would have re-noised with a correlated realisation of the
+  /// noise stage 1 had already injected. So the re-noise gets its OWN derivation
+  /// and its own key, and it consumes nothing from the global generator — which
+  /// keeps `RES4LYFGaussianNoiseStream`'s own design note true: the global RNG
+  /// seeds the initial latent, and turning a stage or an `eta` on must not move
+  /// it as a side effect.
   static func renoise(
     stageOneLatent: MLXArray,
     sigma: MLXArray,
-    seed: UInt64,
+    stageSeed: UInt64,
     patch: Int, hTok: Int, wTok: Int,
     latentHeight: Int, latentWidth: Int,
     dtype: DType
   ) -> MLXArray {
     let source = Krea2Sampling.unpatchify(
       stageOneLatent, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
-    MLXRandom.seed(seed)
-    let eps = MLXRandom.normal([1, Krea2VAE.latentChannels, latentHeight, latentWidth])
-      .asType(dtype)
+    let eps = MLXRandom.normal(
+      [1, Krea2VAE.latentChannels, latentHeight, latentWidth],
+      dtype: .float32,
+      key: MLXRandom.key(renoiseSeed(stageSeed: stageSeed))
+    ).asType(dtype)
     let mixed = Krea2Sampling.mixSourceLatent(
       noise: eps, source: source, sigma: sigma, dtype: dtype)
     return Krea2Sampling.patchify(mixed, patch: patch)
+  }
+
+  /// The offset the re-noise stream's seed is derived by, chosen to be disjoint
+  /// from the SDE's own two offsets for the SAME stage seed:
+  ///
+  /// | stream | seed |
+  /// |---|---|
+  /// | SDE step (`stepNoiseSeed`) | `stageSeed &+ 1` |
+  /// | SDE substep (`substepNoiseSeed`) | `stageSeed &+ 10_001` |
+  /// | stage re-noise (this) | `stageSeed &+ 50_000` |
+  ///
+  /// Additive derivation cannot make two DIFFERENT stage seeds collide-proof
+  /// (a render seeded `s` and one seeded `s + 49_999` share a number), and
+  /// upstream's own scheme has the same property; what this guarantees is that
+  /// the three streams of ONE render are three streams. It has no upstream
+  /// counterpart to match — RES4LYF composes the detail pass as a separate
+  /// sampler node with its own `noise_seed` — so it is ours, and it is recorded
+  /// (``Krea2RunTrace/renoiseSeed``) rather than left to be re-derived.
+  public static let renoiseSeedOffset: UInt64 = 50_000
+
+  /// The seed of the key the stage's re-noise draws from.
+  public static func renoiseSeed(stageSeed: UInt64) -> UInt64 {
+    stageSeed &+ renoiseSeedOffset
   }
 
   // MARK: The run (§3.14 steps 3–4)
@@ -485,7 +532,7 @@ public enum Krea2StagedRender {
     // published recipe, which is what "stretch-and-tail" buys over reading
     // `denoise` as a starting sigma (that would be 0.2).
     let start = renoise(
-      stageOneLatent: stageOneLatent, sigma: scheduler.sigmas[0], seed: stage.seed,
+      stageOneLatent: stageOneLatent, sigma: scheduler.sigmas[0], stageSeed: stage.seed,
       patch: patch, hTok: hTok, wTok: wTok,
       latentHeight: latentHeight, latentWidth: latentWidth, dtype: dtype)
 
@@ -518,7 +565,8 @@ public enum Krea2StagedRender {
       seed: stage.seed,
       width: width,
       height: height,
-      negativePromptApplied: negativePromptApplied)
+      negativePromptApplied: negativePromptApplied,
+      renoiseSeed: renoiseSeed(stageSeed: stage.seed))
     return (denoised, trace)
   }
 }
