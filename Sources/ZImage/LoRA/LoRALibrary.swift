@@ -361,6 +361,9 @@ public final class LoRALibrary: @unchecked Sendable {
         preserved.id = id
         preserved.relativePath = relativePath
         preserved.filename = filename
+        if preserved.krea2Relative == nil {
+          preserved.krea2Relative = Krea2LoRARelativity.seeded(forFilename: filename)
+        }
         newEntries[id] = preserved
         unchangedCount += 1
         continue
@@ -399,6 +402,10 @@ public final class LoRALibrary: @unchecked Sendable {
         updated.safetensorsMetadata = scanResult.safetensorsMetadata
         updated.category = category
         updated.quarantined = isQuarantined
+        // Relativity is declared, never inferred: seed only when unset.
+        if updated.krea2Relative == nil {
+          updated.krea2Relative = Krea2LoRARelativity.seeded(forFilename: filename)
+        }
         // Only backfill auto-extracted trigger words when the entry has none
         // yet — never clobber a user's manually-curated keywords on rescan.
         if updated.triggerwords.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) {
@@ -420,6 +427,7 @@ public final class LoRALibrary: @unchecked Sendable {
           alpha: scanResult.alpha,
           keyCount: scanResult.keyCount,
           layerTargets: scanResult.layerTargets,
+          krea2Relative: Krea2LoRARelativity.seeded(forFilename: filename),
           triggerwords: scanResult.triggerWords,
           recommendedScale: 1.0,
           scaleRange: [0.0, 2.0],
@@ -493,6 +501,7 @@ public final class LoRALibrary: @unchecked Sendable {
     if let notes = patch.notes { entry.notes = notes }
     if let url = patch.sourceURL { entry.sourceURL = url }
     if let civitaiId = patch.civitaiModelId { entry.civitaiModelId = civitaiId }
+    if let relative = patch.krea2Relative { entry.krea2Relative = relative }
 
     entries[id] = entry
     try saveIndex()

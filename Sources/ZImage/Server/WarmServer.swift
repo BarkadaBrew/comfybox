@@ -1114,6 +1114,17 @@ public final class WarmServer {
       guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
         return .error(.error(status: 400, message: "Invalid request body"))
       }
+      // WP-E6: `krea2_relative` is declared by the user — an unknown value
+      // is a 400, never silently dropped.
+      var krea2Relative: Krea2Variant?
+      if let raw = json["krea2_relative"] {
+        guard let str = raw as? String, let parsed = Krea2Variant(rawValue: str) else {
+          return .error(.error(
+            status: 400,
+            message: "Invalid krea2_relative '\(raw)': expected one of \(Krea2Variant.allCases.map(\.rawValue))"))
+        }
+        krea2Relative = parsed
+      }
       let patch = LoRAEntryPatch(
         triggerwords: json["triggerwords"] as? [String],
         recommendedScale: (json["recommended_scale"] as? NSNumber)?.floatValue,
@@ -1121,7 +1132,8 @@ public final class WarmServer {
         tags: json["tags"] as? [String],
         notes: json["notes"] as? String,
         sourceURL: json["source_url"] as? String,
-        civitaiModelId: json["civitai_model_id"] as? Int
+        civitaiModelId: json["civitai_model_id"] as? Int,
+        krea2Relative: krea2Relative
       )
       do {
         try library.update(id, patch: patch)
@@ -7242,8 +7254,19 @@ private actor WarmServerCoordinator {
       activeLoRAs = newLoRAs
     } else if currentModelFamily == .krea2 {
       guard let k2 = krea2Pipeline else { throw WarmServerError.krea2NotLoaded }
-      try await k2.loadLoRAs(newLoRAs)
-      activeLoRAs = newLoRAs
+      // WP-E6: fold the library's declared relativity into any config that
+      // did not declare one itself (request > library > seed — never inferred).
+      let declared = newLoRAs.map { cfg -> LoRAConfiguration in
+        guard cfg.requiresBase == nil, case .local(let url) = cfg.source,
+              let entry = loraLibrary?.entry(for: url.lastPathComponent),
+              let relative = entry.krea2Relative
+        else { return cfg }
+        var out = cfg
+        out.requiresBase = relative
+        return out
+      }
+      try await k2.loadLoRAs(declared)
+      activeLoRAs = declared
     } else {
       try await pipeline.swapLoRAs(newLoRAs)
       activeLoRAs = newLoRAs

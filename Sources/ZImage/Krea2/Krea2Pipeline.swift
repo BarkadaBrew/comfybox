@@ -173,6 +173,12 @@ public final class Krea2Pipeline {
   /// Public accessor for currently loaded LoRA configurations.
   public var loadedLoRAConfigs: [LoRAConfiguration] { appliedLoRAs }
 
+  /// One report per entry of `loadedLoRAConfigs`, same order (WP-E6). Every
+  /// report here is complete (`bound == offered`, `unbound.isEmpty`) because
+  /// Krea-2 applies strictly — a partial bind never survives `loadLoRAs`.
+  /// `deltasApplied` feeds `RenderRecipe.loras[].deltas_applied` (D15).
+  public private(set) var loadedLoRAReports: [LoRAApplicationReport] = []
+
   public struct Request {
     public var prompt: String
     /// Negative prompt for the CFG branch — only consulted when guidance > 1.
@@ -251,32 +257,46 @@ public final class Krea2Pipeline {
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
       patchSession.clear()
       appliedLoRAs = []
+      loadedLoRAReports = []
     }
 
     guard !configs.isEmpty else { return }
 
     // Load and preflight-able failures (missing file, bad format, unknown
-    // keys) all surface from loadForKrea2 BEFORE any weight mutation for
-    // that config. If a later config fails after earlier ones applied, roll
-    // the whole stack back so applied weights and `appliedLoRAs` can never
-    // disagree (delta-key spec rev 2, Codex finding 2).
+    // keys, wrong-base relativity, strict partial bind) all surface BEFORE
+    // any weight mutation for that config. If a later config fails after
+    // earlier ones applied, roll the whole stack back so applied weights and
+    // `appliedLoRAs` can never disagree (delta-key spec rev 2, Codex finding 2).
+    var reports: [LoRAApplicationReport] = []
     do {
       for config in configs {
         let url = try await LoRAWeightLoader.resolveSource(config.source)
+        let name = config.source.displayName
+        // WP-E6 / AC-41 relativity guard — before the file is even read.
+        try Krea2LoRARelativity.check(
+          lora: name,
+          required: Krea2LoRARelativity.required(for: config, resolvedURL: url),
+          loaded: variant)
         let weights = try LoRAWeightLoader.loadForKrea2(from: url)
-        logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale))")
-        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
-        try patchSession.apply(weights: weights, scale: config.scale)
+        logger.info("Applying Krea-2 LoRA: \(name) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale), base=\(variant.rawValue))")
+        let report = try LoRAApplicator.applyDynamically(
+          to: transformer, loraWeights: weights, scale: config.scale,
+          strict: true, name: name, logger: logger)
+        let deltas = try patchSession.apply(weights: weights, scale: config.scale)
+        reports.append(report.withDeltasApplied(deltas))
+        logger.info("Krea-2 LoRA \(name): bound \(report.bound)/\(report.offered) (\(report.quantizedBound) quantized), deltas=\(deltas)")
       }
     } catch {
       logger.error("Krea-2 LoRA stack failed mid-apply — rolling back to base: \(error)")
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
       patchSession.clear()
       appliedLoRAs = []
+      loadedLoRAReports = []
       throw error
     }
 
     appliedLoRAs = configs
+    loadedLoRAReports = reports
   }
 
   /// Load (or clear) the depth Control-LoRA. Sets the expanded input projection
@@ -305,7 +325,9 @@ public final class Krea2Pipeline {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
         let weights = try LoRAWeightLoader.loadForKrea2(from: src)
-        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: cfg.scale, logger: logger)
+        try LoRAApplicator.applyDynamically(
+          to: transformer, loraWeights: weights, scale: cfg.scale,
+          strict: true, name: cfg.source.displayName, logger: logger)
         try patchSession.apply(weights: weights, scale: cfg.scale)
       }
     } catch {
@@ -315,6 +337,7 @@ public final class Krea2Pipeline {
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
       patchSession.clear()
       appliedLoRAs = []
+      loadedLoRAReports = []
       transformer.controlFirstWeight = nil
       transformer.controlFirstBias = nil
       controlLoRAActive = false
@@ -334,7 +357,17 @@ public final class Krea2Pipeline {
     MLX.eval(cw, cb)
     transformer.controlFirstWeight = cw
     transformer.controlFirstBias = cb
-    LoRAApplicator.applyDynamically(to: transformer, loraWeights: cl.loraWeights, scale: scale, logger: logger)
+    // Strict: the 224 control adapters must ALL bind or none do (WP-E6).
+    do {
+      try LoRAApplicator.applyDynamically(
+        to: transformer, loraWeights: cl.loraWeights, scale: scale,
+        strict: true, name: url.lastPathComponent, logger: logger)
+    } catch {
+      transformer.controlFirstWeight = nil
+      transformer.controlFirstBias = nil
+      controlLoRAActive = false
+      throw error
+    }
     controlLoRAActive = true
     logger.info("Krea-2 depth Control-LoRA active (scale=\(scale))")
   }

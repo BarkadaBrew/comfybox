@@ -62,6 +62,13 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
   /// Which layer types are targeted (e.g. ["attention", "feed_forward", "adaLN_modulation"]).
   public var layerTargets: [String]
 
+  /// Krea-2 relativity (WP-E6, FDD §3.6 / AC-41): the physical base this
+  /// adapter was extracted against (`raw` | `turbo`). Declared — seeded from
+  /// ``Krea2LoRARelativity/seeded`` on first scan for the files we know, set
+  /// by the user otherwise, never inferred from tensors. Decoded tolerantly:
+  /// absent or unrecognised on the wire ⇒ nil, never a library load failure.
+  public var krea2Relative: Krea2Variant?
+
   // MARK: User-Configurable
 
   /// Activation/trigger words needed in the prompt.
@@ -140,6 +147,7 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
     case format, rank, alpha
     case keyCount = "key_count"
     case layerTargets = "layer_targets"
+    case krea2Relative = "krea2_relative"
     case triggerwords
     case recommendedScale = "recommended_scale"
     case scaleRange = "scale_range"
@@ -150,6 +158,40 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
     case quarantined
     case quarantineReason = "quarantine_reason"
     case safetensorsMetadata = "safetensors_metadata"
+  }
+}
+
+// MARK: - Tolerant decode
+
+extension LoRALibraryEntry {
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decode(String.self, forKey: .id)
+    filename = try c.decode(String.self, forKey: .filename)
+    relativePath = try c.decode(String.self, forKey: .relativePath)
+    sizeBytes = try c.decode(UInt64.self, forKey: .sizeBytes)
+    sha256 = try c.decodeIfPresent(String.self, forKey: .sha256)
+    modelCompatibility = try c.decode([String].self, forKey: .modelCompatibility)
+    format = try c.decode(LoRAFormat.self, forKey: .format)
+    rank = try c.decode(Int.self, forKey: .rank)
+    alpha = try c.decodeIfPresent(Float.self, forKey: .alpha)
+    keyCount = try c.decode(Int.self, forKey: .keyCount)
+    layerTargets = try c.decode([String].self, forKey: .layerTargets)
+    // Tolerant: a value this build does not know must not poison library.json.
+    krea2Relative = (try? c.decodeIfPresent(String.self, forKey: .krea2Relative))
+      .flatMap { $0 }.flatMap(Krea2Variant.init(rawValue:))
+    triggerwords = try c.decode([String].self, forKey: .triggerwords)
+    recommendedScale = try c.decode(Float.self, forKey: .recommendedScale)
+    scaleRange = try c.decode([Float].self, forKey: .scaleRange)
+    tags = try c.decode([String].self, forKey: .tags)
+    category = try c.decode(String.self, forKey: .category)
+    notes = try c.decode(String.self, forKey: .notes)
+    sourceURL = try c.decodeIfPresent(String.self, forKey: .sourceURL)
+    civitaiModelId = try c.decodeIfPresent(Int.self, forKey: .civitaiModelId)
+    dateAdded = try c.decode(String.self, forKey: .dateAdded)
+    quarantined = try c.decode(Bool.self, forKey: .quarantined)
+    quarantineReason = try c.decodeIfPresent(String.self, forKey: .quarantineReason)
+    safetensorsMetadata = try c.decodeIfPresent([String: String].self, forKey: .safetensorsMetadata)
   }
 }
 
@@ -185,6 +227,8 @@ public struct LoRAEntryPatch: Sendable {
   public var notes: String?
   public var sourceURL: String?
   public var civitaiModelId: Int?
+  /// WP-E6: declare the Krea-2 base this adapter is relative to.
+  public var krea2Relative: Krea2Variant?
 
   public init(
     triggerwords: [String]? = nil,
@@ -193,7 +237,8 @@ public struct LoRAEntryPatch: Sendable {
     tags: [String]? = nil,
     notes: String? = nil,
     sourceURL: String? = nil,
-    civitaiModelId: Int? = nil
+    civitaiModelId: Int? = nil,
+    krea2Relative: Krea2Variant? = nil
   ) {
     self.triggerwords = triggerwords
     self.recommendedScale = recommendedScale
@@ -202,5 +247,6 @@ public struct LoRAEntryPatch: Sendable {
     self.notes = notes
     self.sourceURL = sourceURL
     self.civitaiModelId = civitaiModelId
+    self.krea2Relative = krea2Relative
   }
 }

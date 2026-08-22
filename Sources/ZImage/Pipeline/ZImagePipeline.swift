@@ -930,7 +930,7 @@ public final class ZImagePipeline {
         logger.info("Loaded LoRA: rank=\(loraWeights.rank), alpha=\(loraWeights.alpha), layers=\(loraWeights.layerCount)")
 
         useDynamicLoRA = true
-        LoRAApplicator.applyDynamically(to: trans, loraWeights: loraWeights, scale: config.scale, logger: logger)
+        try LoRAApplicator.applyDynamically(to: trans, loraWeights: loraWeights, scale: config.scale, logger: logger)
         currentLoRAs.append(AppliedLoRA(weights: loraWeights, configuration: config))
         logger.info("LoRA applied successfully with scale=\(config.scale)")
       }
