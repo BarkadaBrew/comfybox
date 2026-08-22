@@ -34,6 +34,10 @@ final class Krea2LoRARelativityTests: XCTestCase {
     XCTAssertEqual(Krea2LoRARelativity.seeded(forFilename: "krea2_turbo_lora_rank_64_bf16.safetensors"), .raw)
     XCTAssertEqual(Krea2LoRARelativity.seeded(forFilename: "kroma-v0.2-base-lora-rank-384-fro-0985.safetensors"), .raw)
     XCTAssertEqual(Krea2LoRARelativity.seeded(forFilename: "kroma-lora-v0.3.safetensors"), .turbo)
+    XCTAssertEqual(
+      Krea2LoRARelativity.seeded(forFilename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"), .raw,
+      "WP-E7: the second Raw-relative kroma extraction. Seeded BY NAME before the file lands so "
+        + "its first load is guarded, and so it is never confused with the turbo-relative kroma-lora-v0.3.")
     XCTAssertEqual(Krea2LoRARelativity.seeded(forFilename: "kroma-v0.1.safetensors"), .turbo,
                    "v2 addition — the three live krea-film-* presets carry kroma-v0.1")
     // Stem match, not a substring match, and extension-insensitive.
@@ -41,6 +45,23 @@ final class Krea2LoRARelativityTests: XCTestCase {
     XCTAssertNil(Krea2LoRARelativity.seeded(forFilename: "kroma-lora-v0.3-extra.safetensors"))
     XCTAssertNil(Krea2LoRARelativity.seeded(forFilename: "purelens_krea2.safetensors"),
                  "an unseeded LoRA declares nothing — never inferred")
+  }
+
+  /// WP-E7: the two files whose names both say "v0.3" are relative to
+  /// OPPOSITE bases — `kroma-lora-v0.3` is the Turbo delta (170 `.diff`
+  /// keys authored against Turbo's norms), `kroma-v0.3-base-lora-…` is the
+  /// Raw-relative extraction. A substring match would collapse them and
+  /// silently let the Turbo one onto Raw, so pin the discrimination.
+  func testTheTwoV03KromaFilesResolveToOppositeBases() {
+    XCTAssertEqual(Krea2LoRARelativity.seeded(forFilename: "kroma-lora-v0.3.safetensors"), .turbo)
+    XCTAssertEqual(
+      Krea2LoRARelativity.seeded(forFilename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"), .raw)
+    // Full paths resolve on the last component, and the match is case-insensitive.
+    let url = URL(fileURLWithPath: "/x/y/KROMA-V0.3-BASE-LORA-RANK-384-FRO-0985.SAFETENSORS")
+    XCTAssertEqual(
+      Krea2LoRARelativity.required(for: LoRAConfiguration(source: .local(url)), resolvedURL: url), .raw)
+    // …and the Raw seed does not leak onto a differently-ranked sibling.
+    XCTAssertNil(Krea2LoRARelativity.seeded(forFilename: "kroma-v0.3-base-lora-rank-128-fro-0985.safetensors"))
   }
 
   // MARK: - The guard

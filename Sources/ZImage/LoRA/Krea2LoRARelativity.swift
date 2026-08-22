@@ -18,9 +18,17 @@ public enum Krea2LoRARelativity {
 
   /// Seeded relativities, keyed by filename stem (§3.6 — `kroma-v0.1` added
   /// in v2: it is what the three live `krea-film-*` presets carry).
+  ///
+  /// WP-E7 adds `kroma-v0.3-base-lora-rank-384-fro-0985`, the second
+  /// Raw-relative kroma extraction. It is seeded BY NAME ahead of the file
+  /// so its very first load is guarded, and because the two "v0.3" kroma
+  /// files are relative to OPPOSITE bases: `kroma-lora-v0.3` is the Turbo
+  /// delta (`L = v0.3base − v0.2base + v0.2turbo − krea2turbo`, 170 `.diff`
+  /// keys) and must keep being refused on Raw.
   public static let seeded: [String: Krea2Variant] = [
     "krea2_turbo_lora_rank_64_bf16": .raw,
     "kroma-v0.2-base-lora-rank-384-fro-0985": .raw,
+    "kroma-v0.3-base-lora-rank-384-fro-0985": .raw,
     "kroma-lora-v0.3": .turbo,
     "kroma-v0.1": .turbo,
   ]
