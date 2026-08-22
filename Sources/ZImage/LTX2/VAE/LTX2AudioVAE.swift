@@ -311,6 +311,12 @@ public final class LTX2AudioVAE: Module {
   /// Bound by `load(path:)` for full-chain decode; nil for VAE-only use.
   public var vocoder: LTX2Vocoder?
 
+  /// OFFICIAL LTX-2.3 HiFi-GAN vocoder (Todd 2026-08-17). When bound (via
+  /// LTX2_VOCODER_PATH), `decodeToWaveform` routes through THIS matched vocoder
+  /// instead of the foreign JoyAI BigVGAN — the fix for the metallic audio.
+  /// It decodes mel [B,128,T] → 24 kHz stereo directly (no BWE chain).
+  public var officialVocoder: LTX2HiFiGANVocoder?
+
   public init(config: LTX2AudioVAEConfig = LTX2AudioVAEConfig()) {
     self.config = config
     self._encoder.wrappedValue = LTX2AudioEncoder(config: config)
@@ -431,12 +437,17 @@ extension LTX2AudioVAE {
   /// AudioVAE.decode + run_vocoder: mel (B,2,T,F) transposes to (B,2,F,T),
   /// stereo-folds to [B,128,T], then the full BWE chain.
   public func decodeToWaveform(_ zNormalized: MLXArray) -> MLXArray {
-    guard let vocoder else {
-      fatalError("decodeToWaveform requires load(path:) — vocoder not bound")
-    }
     let mel = decodeToMel(zNormalized)                 // (B, 2, T, F)
     let bft = mel.transposed(0, 1, 3, 2)               // (B, 2, F, T)
     let folded = MLX.concatenated([bft[0..., 0], bft[0..., 1]], axis: 1)  // [B, 128, T]
+    // Prefer the OFFICIAL matched HiFi-GAN vocoder when bound (metallic fix):
+    // it decodes mel → 24 kHz stereo directly, no BWE chain.
+    if let officialVocoder {
+      return officialVocoder.synthesize(folded)        // [B, 2, T·120] @24k
+    }
+    guard let vocoder else {
+      fatalError("decodeToWaveform requires load(path:) — vocoder not bound")
+    }
     return vocoder.synthesizeFull(folded)
   }
 
