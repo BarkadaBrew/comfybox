@@ -160,10 +160,29 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
   public struct LoRAReadBack: Sendable {
     public let configuration: LoRAConfiguration
     public let report: LoRAApplicationReport
-    public init(configuration: LoRAConfiguration, report: LoRAApplicationReport) {
+    /// The relativity the pipeline RESOLVED and enforced for this adapter —
+    /// `config.requiresBase ?? Krea2LoRARelativity.seeded(forFilename:)` —
+    /// carried beside the report in `Krea2Pipeline.loadedLoRARelativities`
+    /// (K-FIX-1 / Codex I6, E7's deferred provenance defect). `nil` means
+    /// nothing was declared for the file and nothing was enforced.
+    public let resolvedRelativeTo: Krea2Variant?
+
+    public init(
+      configuration: LoRAConfiguration, report: LoRAApplicationReport,
+      resolvedRelativeTo: Krea2Variant? = nil
+    ) {
       self.configuration = configuration
       self.report = report
+      self.resolvedRelativeTo = resolvedRelativeTo
     }
+
+    /// What `applied.loras[].relative_to` records: the ENFORCED relativity.
+    ///
+    /// The resolved value is a superset of the request's — it is
+    /// `requiresBase` when the request declared one and the seed table's
+    /// answer otherwise — so the fallback only covers a caller that built a
+    /// read-back by hand without one.
+    public var relativeTo: Krea2Variant? { resolvedRelativeTo ?? configuration.requiresBase }
   }
 
   /// Pair `Krea2Pipeline.loadedLoRAConfigs` with `loadedLoRAReports`, or `nil`
@@ -174,11 +193,21 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
   /// record naming two of three adapters is worse than no record at all —
   /// it reads as complete. Returning `nil` makes the caller emit no `applied`
   /// block, which the client already reads honestly as `provenance: 'request'`.
+  /// `relativities` is `Krea2Pipeline.loadedLoRARelativities` — the variant
+  /// the relativity guard actually enforced for each entry (I6). Pass `nil`
+  /// only where no pipeline resolved one; a list of the WRONG length is the
+  /// same desync as a report-count mismatch and yields no pairing.
   public static func loRAReadBacks(
-    configs: [LoRAConfiguration], reports: [LoRAApplicationReport]
+    configs: [LoRAConfiguration], reports: [LoRAApplicationReport],
+    relativities: [Krea2Variant?]? = nil
   ) -> [LoRAReadBack]? {
     guard configs.count == reports.count else { return nil }
-    return zip(configs, reports).map { LoRAReadBack(configuration: $0, report: $1) }
+    if let relativities, relativities.count != configs.count { return nil }
+    return configs.indices.map { i in
+      LoRAReadBack(
+        configuration: configs[i], report: reports[i],
+        resolvedRelativeTo: relativities?[i])
+    }
   }
 
   /// The depth Control-LoRA as the pipeline applied it.
@@ -271,7 +300,10 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       Applied(
         file: rb.configuration.source.recordPath,
         scaleApplied: rb.configuration.scale,
-        relativeTo: rb.configuration.requiresBase?.rawValue,
+        // I6: the relativity ENFORCED (request ?? seed table), not the
+        // request's own field — a seeded file declared nothing and was still
+        // guarded, and a record saying `null` there describes the request.
+        relativeTo: rb.relativeTo?.rawValue,
         pairsOffered: rb.report.offered,
         pairsBound: rb.report.bound,
         shapeRejected: rb.report.shapeRejected,

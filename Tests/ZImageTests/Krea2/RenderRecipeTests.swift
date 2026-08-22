@@ -210,6 +210,84 @@ final class RenderRecipeTests: XCTestCase {
                    "no LoRAs is a complete read-back, not a failure")
   }
 
+  // MARK: - `relative_to` is the relativity ENFORCED (K-FIX-1 / Codex I6)
+
+  /// The E7 report's deferred defect: `Krea2Pipeline.loadLoRAs` resolves
+  /// `config.requiresBase ?? Krea2LoRARelativity.seeded(forFilename:)` and
+  /// ENFORCES it, then discarded the resolved value — and the record read
+  /// `configuration.requiresBase` alone. A file whose relativity came from
+  /// the SEED table (the ordinary case: no preset declares one) refused the
+  /// wrong base correctly and then reported `relative_to: null`.
+  ///
+  /// The pipeline now carries the resolved variant beside each report, and
+  /// the record reads THAT.
+  func testSeededRelativityIsRecordedEvenWhenTheRequestDeclaredNothing() throws {
+    // Exactly what a preset sends today: a path, a scale, no `requiresBase`.
+    var cfg = LoRAConfiguration.local(
+      "/vault/krea2_turbo_lora_rank_64_bf16.safetensors", scale: 0.6)
+    cfg.role = "accel"
+    XCTAssertNil(cfg.requiresBase, "the REQUEST declared nothing — that is the point")
+
+    // …and this is what the pipeline resolved and enforced for it.
+    let resolved = Krea2LoRARelativity.required(
+      for: cfg, resolvedURL: URL(fileURLWithPath: "/vault/krea2_turbo_lora_rank_64_bf16.safetensors"))
+    XCTAssertEqual(resolved, .raw, "the seed table is the source here")
+
+    let readBacks = try XCTUnwrap(
+      RenderRecipe.loRAReadBacks(
+        configs: [cfg],
+        reports: [RenderRecipeFixture.report(offered: 264, bound: 264, deltasApplied: 7)],
+        relativities: [resolved]))
+    let r = RenderRecipe.krea2(inputs(loras: readBacks))
+    XCTAssertEqual(r.loras[0].relativeTo, "raw",
+                   "the record names the relativity the guard ENFORCED, not the request's silence")
+  }
+
+  /// A library-derived declaration reaches the pipeline folded into
+  /// `requiresBase` (the server does that before the config leaves it), so
+  /// the resolved value and the config agree — and the record still reads the
+  /// resolved one.
+  func testDeclaredRelativityIsRecordedFromTheResolvedValue() throws {
+    var cfg = LoRAConfiguration.local("/vault/kroma-lora-v0.3.safetensors", scale: 0.6)
+    cfg.requiresBase = .turbo
+    let resolved = Krea2LoRARelativity.required(
+      for: cfg, resolvedURL: URL(fileURLWithPath: "/vault/kroma-lora-v0.3.safetensors"))
+    XCTAssertEqual(resolved, .turbo)
+
+    let readBacks = try XCTUnwrap(
+      RenderRecipe.loRAReadBacks(
+        configs: [cfg], reports: [RenderRecipeFixture.report(offered: 170, bound: 170)],
+        relativities: [resolved]))
+    XCTAssertEqual(RenderRecipe.krea2(inputs(loras: readBacks)).loras[0].relativeTo, "turbo")
+  }
+
+  /// An UNDECLARED, unseeded file ("others" are allowed on Raw — ledger
+  /// ruling) still records `null`: nothing was enforced, so nothing is named.
+  func testAnUndeclaredUnseededFileStillRecordsNull() throws {
+    let cfg = LoRAConfiguration.local("/vault/some-style.safetensors", scale: 0.8)
+    let resolved = Krea2LoRARelativity.required(
+      for: cfg, resolvedURL: URL(fileURLWithPath: "/vault/some-style.safetensors"))
+    XCTAssertNil(resolved)
+    let readBacks = try XCTUnwrap(
+      RenderRecipe.loRAReadBacks(
+        configs: [cfg], reports: [RenderRecipeFixture.report(offered: 10, bound: 10)],
+        relativities: [resolved]))
+    XCTAssertNil(RenderRecipe.krea2(inputs(loras: readBacks)).loras[0].relativeTo)
+  }
+
+  /// Same fail-closed posture as the config/report pairing: a relativity list
+  /// of the wrong length is a desync, not something to zip-truncate.
+  func testARelativityListOfTheWrongLengthYieldsNoPairing() {
+    let cfg = LoRAConfiguration.local("/vault/a.safetensors", scale: 0.6)
+    let one = [RenderRecipeFixture.report(offered: 10, bound: 10)]
+    XCTAssertNil(
+      RenderRecipe.loRAReadBacks(configs: [cfg], reports: one, relativities: []))
+    XCTAssertNil(
+      RenderRecipe.loRAReadBacks(configs: [cfg], reports: one, relativities: [.raw, .raw]))
+    XCTAssertNotNil(
+      RenderRecipe.loRAReadBacks(configs: [cfg], reports: one, relativities: [.raw]))
+  }
+
   func testUndeclaredRoleAndRelativityAreNull() {
     let cfg = LoRAConfiguration.local("/vault/some-style.safetensors", scale: 0.8)
     let r = RenderRecipe.krea2(inputs(loras: [.init(configuration: cfg, report: RenderRecipeFixture.report(offered: 10, bound: 10))]))

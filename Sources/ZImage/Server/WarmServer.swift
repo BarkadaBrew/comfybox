@@ -7192,7 +7192,10 @@ private actor WarmServerCoordinator {
       // Fail CLOSED on an incomplete read-back: a record naming two of three
       // adapters is worse than no record, because it reads as complete.
       let loraReadBacks = RenderRecipe.loRAReadBacks(
-        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports)
+        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports,
+        // I6: the relativity the guard ENFORCED, so `relative_to` names what
+        // was applied rather than what the request happened to declare.
+        relativities: k2.loadedLoRARelativities)
       if loraReadBacks == nil {
         let mismatch = "Krea2 provenance: \(k2.loadedLoRAConfigs.count) loaded LoRA configs but "
           + "\(k2.loadedLoRAReports.count) bind reports — refusing to emit a partial `applied` for this render"
