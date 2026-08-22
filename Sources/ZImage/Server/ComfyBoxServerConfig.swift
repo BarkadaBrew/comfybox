@@ -88,6 +88,11 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   /// Content mode (rawValue, e.g. "neutral"/"banana"/"avocado") → default
   /// preset id, applied automatically when Generate's content mode changes.
   public var contentModeDefaultPresets: [String: String]
+  /// Declared Krea-2 spec → model directory (e.g. `"krea2-raw": "~/LocalModels/krea2-raw"`).
+  /// Merged over `Krea2ModelDetection.defaultSpecDirectories` at server start
+  /// (WP-E5). An alias that is in neither table fails the load loudly rather
+  /// than falling back to the Krea-2-Turbo snapshot.
+  public var krea2Models: [String: String]
 
   /// The one true ComfyBox HTTP port.
   public static let canonicalPort: UInt16 = 7870
@@ -103,7 +108,8 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     seedvr2WeightsPath: String? = nil,
     providers: AIProviderRegistry = AIProviderRegistry(promptOptimization: AIProviderRegistry.lmStudioPromptDefault),
     replicate: ReplicateProviderConfig? = nil,
-    contentModeDefaultPresets: [String: String] = [:]
+    contentModeDefaultPresets: [String: String] = [:],
+    krea2Models: [String: String] = [:]
   ) {
     self.port = port
     self.host = host
@@ -113,11 +119,13 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     self.providers = providers
     self.replicate = replicate
     self.contentModeDefaultPresets = contentModeDefaultPresets
+    self.krea2Models = krea2Models
   }
 
   private enum CodingKeys: String, CodingKey {
     case port, host, modelSpec, allowedOutputDirectory, seedvr2WeightsPath, providers, replicate
     case contentModeDefaultPresets
+    case krea2Models
     // Legacy keys written by the desktop AppConfig (read-only, for smooth upgrade).
     case serverPort, serverHost, outputDirectory
   }
@@ -140,6 +148,7 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
       ?? AIProviderRegistry(promptOptimization: AIProviderRegistry.lmStudioPromptDefault)
     replicate = try c.decodeIfPresent(ReplicateProviderConfig.self, forKey: .replicate)
     contentModeDefaultPresets = try c.decodeIfPresent([String: String].self, forKey: .contentModeDefaultPresets) ?? [:]
+    krea2Models = try c.decodeIfPresent([String: String].self, forKey: .krea2Models) ?? [:]
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -153,6 +162,9 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     try c.encodeIfPresent(replicate, forKey: .replicate)
     if !contentModeDefaultPresets.isEmpty {
       try c.encode(contentModeDefaultPresets, forKey: .contentModeDefaultPresets)
+    }
+    if !krea2Models.isEmpty {
+      try c.encode(krea2Models, forKey: .krea2Models)
     }
   }
 

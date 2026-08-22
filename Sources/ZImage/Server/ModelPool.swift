@@ -192,6 +192,7 @@ struct PoolEntry {
   /// Detected model info, stored per-family for generation routing.
   /// For flux2: Flux2DetectedModel. For fibo: FiboDetectedModel.
   /// For flux1: ZImageVariant. For chroma: ChromaConfig.
+  /// For krea2: Krea2Variant (the physical variant read off disk, WP-E5).
   var detectedInfo: Any?
 
   func toStatus(isActive: Bool) -> ModelPoolStatus {
@@ -533,7 +534,7 @@ actor ModelPool {
       filePatterns: ["*.safetensors", "*.json", "tokenizer/*"]
     )
 
-    if Krea2ModelDetection.detect(at: resolved) != nil {
+    if Krea2ModelDetection.isKrea2ModelDirectory(resolved) {
       return .krea2
     } else if ChromaModelDetection.detect(at: resolved) != nil {
       return .chroma
@@ -556,12 +557,15 @@ actor ModelPool {
     initialLoRAs: [LoRAConfiguration]
   ) async throws -> (PipelineBox, Any?) {
     if family == .krea2 {
-      // Krea-2 resolves its own weights (HF cache snapshot or explicit dir) —
-      // skip the generic snapshot resolution.
+      // Krea-2 resolves its own weights (explicit dir, declared alias, or the
+      // Turbo HF snapshot — fail-closed, WP-E5) — skip the generic snapshot
+      // resolution. An undeclared alias throws here instead of loading Turbo.
       let paths = try Krea2ModelDetection.resolve(spec: modelSpec)
+      logger.info(
+        "ModelPool: krea2 spec '\(modelSpec)' → variant=\(paths.variant.rawValue) file=\(paths.transformerFile.path)")
       let bits: Int? = (quantization?.lowercased() == "bf16") ? nil : 8
       let pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: bits)
-      return (PipelineBox(pipeline: pipeline as AnyObject), nil)
+      return (PipelineBox(pipeline: pipeline as AnyObject), paths.variant)
     }
     let resolved = try await ModelResolution.resolveOrDefault(
       modelSpec: modelSpec,

@@ -15,18 +15,41 @@ import Logging
 
 public struct Krea2ModelPaths {
   public let root: URL
-  public var transformerFile: URL { root.appending(path: "turbo.safetensors") }
+  /// The physical variant read from the checkpoint file present in `root`
+  /// (WP-E5, D7). Reported, never requested.
+  public let variant: Krea2Variant
+  /// Stored, not derived: a `model_index.json` escape hatch may name a third
+  /// filename (FDD §3.5), and provenance records exactly what loaded.
+  public let transformerFile: URL
   public var textEncoderFile: URL { root.appending(path: "text_encoder/model.safetensors") }
   public var vaeFile: URL { root.appending(path: "vae/diffusion_pytorch_model.safetensors") }
   public var tokenizerDirectory: URL { root.appending(path: "tokenizer") }
 
-  public init(root: URL) { self.root = root }
+  /// A root whose transformer is `variant.transformerFilename`. Use
+  /// `Krea2ModelDetection.detect(at:)` to read the variant off disk.
+  public init(root: URL, variant: Krea2Variant = .turbo) {
+    self.init(root: root, variant: variant, transformerFile: root.appending(path: variant.transformerFilename))
+  }
 
-  /// Locate the newest HF-cache snapshot of krea/Krea-2-Turbo, or use an explicit dir.
+  public init(root: URL, variant: Krea2Variant, transformerFile: URL) {
+    self.root = root
+    self.variant = variant
+    self.transformerFile = transformerFile
+  }
+
+  /// An explicit dir is detected fail-closed (variant read from disk, throws
+  /// on a non-Krea-2 dir); nil → the newest HF-cache snapshot of krea/Krea-2-Turbo.
   public static func resolve(modelDir: String? = nil) throws -> Krea2ModelPaths {
     if let modelDir {
-      return Krea2ModelPaths(root: URL(fileURLWithPath: (modelDir as NSString).expandingTildeInPath))
+      return try Krea2ModelDetection.detect(
+        at: URL(fileURLWithPath: (modelDir as NSString).expandingTildeInPath, isDirectory: true))
     }
+    return try turboSnapshot()
+  }
+
+  /// The newest HF-cache snapshot of krea/Krea-2-Turbo. Reached ONLY through
+  /// the four declared turbo aliases (`Krea2ModelDetection.turboAliases`).
+  public static func turboSnapshot() throws -> Krea2ModelPaths {
     let snapshots = ("~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots" as NSString)
       .expandingTildeInPath
     let fm = FileManager.default
@@ -37,7 +60,7 @@ public struct Krea2ModelPaths {
     for entry in entries.sorted(by: >) {
       let candidate = URL(fileURLWithPath: snapshots).appending(path: entry)
       if fm.fileExists(atPath: candidate.appending(path: "turbo.safetensors").path) {
-        return Krea2ModelPaths(root: candidate)
+        return Krea2ModelPaths(root: candidate, variant: .turbo)
       }
     }
     throw Krea2WeightLoaderError.missingFile("\(snapshots)/*/turbo.safetensors")
@@ -128,6 +151,10 @@ enum Krea2Sampling {
 
 public final class Krea2Pipeline {
   public let config: Krea2Config
+  /// Where the weights came from — root, physical variant, transformer file.
+  public let paths: Krea2ModelPaths
+  /// The physical checkpoint variant this pipeline loaded (WP-E5, D7).
+  public var variant: Krea2Variant { paths.variant }
   public let transformer: Krea2SingleStreamDiT
   public let textEncoder: Qwen3TextEncoder
   public let conditioner: Krea2TextConditioner
@@ -183,8 +210,10 @@ public final class Krea2Pipeline {
 
   public init(paths: Krea2ModelPaths, quantizeTransformer: Int? = nil) throws {
     self.config = Krea2Config()
+    self.paths = paths
 
     let transformer = Krea2SingleStreamDiT(cfg: config)
+    logger.info("Krea2: loading \(paths.variant.rawValue) transformer from \(paths.transformerFile.path)")
     try Krea2WeightLoader.loadTransformer(transformer, from: paths.transformerFile)
     if let bits = quantizeTransformer {
       quantize(model: transformer, groupSize: 64, bits: bits) { path, module in

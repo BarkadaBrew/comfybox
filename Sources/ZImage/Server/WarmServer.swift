@@ -4411,21 +4411,22 @@ public final class WarmServer {
       "moody-wild-v4-fp8": "~/Models-working/moody-wild-mix/moody-wild-v4-fp8.safetensors",
       "moody-real-v6": "~/Models-working/moody-real-v6/moody-real-v6.safetensors",
       "cyberrealistic-v5": "~/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors",
-      // Kroma v0.2 (lodestones) — a Krea-2 fine-tune shipped as a full turbo
-      // checkpoint. The dir holds the Kroma transformer as turbo.safetensors
-      // with text_encoder/vae/tokenizer symlinked from the Krea-2 snapshot
-      // (Kroma reuses them unchanged). Krea2ModelDetection treats an explicit
-      // dir as a model root, so this resolves like any Krea-2 install.
-      "kroma-v0.2-turbo": "~/LocalModels/kroma-v0.2",
     ]
     if let path = civitaiPaths[modelId] {
       return NSString(string: path).expandingTildeInPath
+    }
+    // Krea-2 family installs (kroma-v0.2-turbo, krea2-raw, …) live in ONE
+    // declared spec→directory table (WP-E5) — seeded from config.json
+    // `krea2Models` over the built-in defaults — so this function never grows
+    // a second one. The directory is then detected fail-closed.
+    if let dir = Krea2ModelDetection.specDirectory(modelId) {
+      return dir.path
     }
 
     let suffixes = ["-q4", "-q8", "-bf16"]
     for suffix in suffixes {
       if modelId.lowercased().hasSuffix(suffix) {
-        return String(modelId.dropLast(suffix.count))
+        return parseModelSpec(from: String(modelId.dropLast(suffix.count)))
       }
     }
     return modelId
@@ -5089,8 +5090,11 @@ private actor WarmServerCoordinator {
   /// Chroma pipeline — created when the model is detected as Chroma.
   private var chromaPipeline: ChromaPipeline?
 
-  /// Krea-2-Turbo pipeline (native port), loaded when the model spec is Krea-2.
+  /// Krea-2 pipeline (native port), loaded when the model spec is Krea-2.
   private var krea2Pipeline: Krea2Pipeline?
+  /// The physical Krea-2 variant the resident pipeline loaded (WP-E5, D7) —
+  /// beside `zimageVariant`. nil when no Krea-2 model is resident.
+  private var krea2Variant: Krea2Variant?
   /// Trigger lookups for the rewriter-proof guard (set by WarmServer.run()).
   var loraLibrary: LoRALibrary?
   func setLoraLibrary(_ library: LoRALibrary) { loraLibrary = library }
@@ -5689,7 +5693,7 @@ private actor WarmServerCoordinator {
 
         // If not already detected by name, check the snapshot directory
         if !isFibo && !isFlux2 && !isChroma {
-          if Krea2ModelDetection.detect(at: resolved) != nil {
+          if Krea2ModelDetection.isKrea2ModelDirectory(resolved) {
             isKrea2 = true
           } else if ChromaModelDetection.detect(at: resolved) != nil {
             isChroma = true
@@ -5703,13 +5707,15 @@ private actor WarmServerCoordinator {
     }
 
     if isKrea2, let spec = modelSpec {
-      // --- Krea-2-Turbo path (native port) ---
+      // --- Krea-2 path (native port) — variant read off disk, fail-closed (WP-E5) ---
       currentModelFamily = .krea2
       let paths = try Krea2ModelDetection.resolve(spec: spec)
-      logger.info("Detected Krea-2-Turbo — 8-bit transformer, estimated GPU memory: ~22GB")
+      logger.info(
+        "Detected Krea-2 \(paths.variant.rawValue) (\(paths.transformerFile.path)) — 8-bit transformer, estimated GPU memory: ~22GB")
       krea2Pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: 8)
+      krea2Variant = paths.variant
       pipelinePrepared = true
-      logger.info("Warm server pipeline ready (Krea-2-Turbo)")
+      logger.info("Warm server pipeline ready (Krea-2 \(paths.variant.rawValue))")
     } else if isChroma, let snapshot = snapshotURL {
       // --- Chroma path ---
       currentModelFamily = .chroma
@@ -5866,7 +5872,7 @@ private actor WarmServerCoordinator {
         vramMB = 12288
       case .krea2:
         box = PipelineBox(pipeline: krea2Pipeline! as AnyObject)
-        detectedInfo = nil
+        detectedInfo = krea2Pipeline!.variant
         vramMB = 22528
       }
       let poolKey = ModelPool.poolKey(for: spec)
@@ -5915,6 +5921,13 @@ private actor WarmServerCoordinator {
     zimageVariant
   }
 
+  /// The physical Krea-2 variant of the resident pipeline (WP-E5). nil when
+  /// the active family is not krea2 — callers on the krea2 arm must treat nil
+  /// as a fault, never as "turbo".
+  var currentKrea2Variant: Krea2Variant? {
+    currentModelFamily == .krea2 ? krea2Variant : nil
+  }
+
   // MARK: - Model Pool Operations
 
   /// Load a model into the pool, optionally activating it.
@@ -5926,6 +5939,11 @@ private actor WarmServerCoordinator {
     if videoHolder.release() {
       logger.info("Released resident LTX-2 video stack before image load (#218)")
     }
+    // D17: every base handoff that touches the krea2 family logs outgoing and
+    // incoming spec/variant, so a slow A/B is attributable, not mysterious.
+    let outgoing = "\(activePoolModelSpec ?? configuration.modelSpec ?? "none")/"
+      + (currentModelFamily == .krea2 ? (krea2Variant?.rawValue ?? "unknown") : currentModelFamily.rawValue)
+    let outgoingIsKrea2 = currentModelFamily == .krea2 && pipelinePrepared
     let start = Date()
     let entry = try await modelPool.load(
       modelSpec: modelSpec,
@@ -5940,6 +5958,11 @@ private actor WarmServerCoordinator {
 
     if activate {
       try await poolActivate(modelId: entry.id)
+      if entry.family == .krea2 || outgoingIsKrea2 {
+        let incoming = "\(entry.modelSpec)/"
+          + (entry.family == .krea2 ? (krea2Variant?.rawValue ?? "unknown") : entry.family.rawValue)
+        logger.info("krea2 handoff: \(outgoing) → \(incoming) (loadTimeMs=\(loadTimeMs))")
+      }
     }
 
     return ModelLoadResponse(
@@ -5975,6 +5998,9 @@ private actor WarmServerCoordinator {
     switch entry.family {
     case .krea2:
       krea2Pipeline = entry.box.pipeline as? Krea2Pipeline
+      // The pipeline is the physical fact; the pool entry carries the same
+      // value back from loadPipeline (WP-E5).
+      krea2Variant = krea2Pipeline?.variant ?? (entry.detectedInfo as? Krea2Variant)
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -6160,7 +6186,15 @@ private actor WarmServerCoordinator {
       shuttingDown: shuttingDown,
       model: activePoolModelSpec ?? configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
-      modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
+      modelVariant: {
+        switch currentModelFamily {
+        case .fibo: return "fibo"
+        case .flux1: return zimageVariant.rawValue
+        case .flux2: return detectedFlux2Model?.variant
+        case .krea2: return krea2Variant?.rawValue  // "turbo" | "raw" (WP-E5, AC-34b)
+        case .chroma: return nil
+        }
+      }(),
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),
       renderCount: successfulRenderCount,
@@ -6796,7 +6830,10 @@ private actor WarmServerCoordinator {
       )
 
       let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
-      let steps = payload.steps ?? 9
+      // Variant defaults (WP-E5, AC-5b): turbo 9 / 1.0, raw 30 / 1.0 — never 3.5.
+      let variant = k2.variant
+      let steps = variant.resolvedSteps(payload.steps)
+      let guidance = variant.resolvedGuidance(payload.guidance)
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
       // Krea-2 builds its requests straight from the payload rather than going
@@ -6849,7 +6886,7 @@ private actor WarmServerCoordinator {
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
         image = k2.generateImg2Img(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
-                guidance: payload.guidance ?? 1.0,
+                guidance: guidance,
                 sourceImage: sourceNHWC, width: width, height: height,
                 steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE)
         ) { [logger] step, total in
@@ -6858,7 +6895,7 @@ private actor WarmServerCoordinator {
       } else {
         image = k2.generate(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
-                guidance: payload.guidance ?? 1.0,
+                guidance: guidance,
                 width: width, height: height, steps: steps, seed: seed,
                 controlImagePixels: controlPixels, dyPE: krea2DyPE)
         ) { [logger] step, total in
@@ -6869,7 +6906,7 @@ private actor WarmServerCoordinator {
         prompt: guardedPrompt,
         seed: seed,
         steps: steps,
-        guidance: payload.guidance ?? 1.0,
+        guidance: guidance,
         width: width,
         height: height,
         model: ComfyBoxOutputNaming.shortModelName(activePoolModelSpec ?? configuration.modelSpec),
