@@ -4340,7 +4340,8 @@ public final class WarmServer {
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
-      case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField:
+      case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
+           .unsupportedSampler:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -6850,6 +6851,16 @@ private actor WarmServerCoordinator {
       return
     }
 
+    // WP-E13: an N-row tableau sampler only runs under the Krea 2 loop. The
+    // name resolved at decode (unknown names are already 400 by then); this is
+    // the family gate, so it lives here rather than at the decoder (D18).
+    if let names = try? payload.validateRecipeNames(),
+       let error = GeneratePayload.validateTableauSampler(names, family: currentModelFamily) {
+      lastError = error.localizedDescription ?? "unsupported sampler"
+      continuation.resume(throwing: error)
+      return
+    }
+
     switch currentModelFamily {
     case .chroma:
       await runChromaGenerate(payload, continuation: continuation)
@@ -8110,6 +8121,34 @@ extension GeneratePayload: Decodable {
       reason: "VAE selection is a Krea 2 request field (WP-E9); this family decodes through its own VAE and does not honour it — remove it")
   }
 
+  /// WP-E13: refuse an N-row tableau sampler on a family that cannot drive one.
+  ///
+  /// `ralston_2s/3s/4s` and `res_3s` take `rows` model evaluations per step
+  /// through `TableauScheduler`. Only `Krea2DenoiseLoop` dispatches that
+  /// protocol; every other family's loop calls `ZImageScheduler.step`, which
+  /// for these conformers is a `preconditionFailure` — and before WP-E13's
+  /// review was a first-order Euler render carrying the tableau's name. The
+  /// names stay accepted and advertised (E4: advertised == accepted); what is
+  /// family-scoped is whether the render can honour them.
+  ///
+  /// Returns the 400 to throw, or nil. Runs at the one dispatch point in
+  /// `generate`, beside `validateShift(_:family:)` (D18: family gates live at
+  /// dispatch, not at the decoder).
+  static func validateTableauSampler(
+    _ names: ResolvedRecipeNames, family: WarmModelFamily
+  ) -> WarmServerError? {
+    guard let sampler = names.scheduler, sampler.isNRowTableau else { return nil }
+    guard family != .krea2 else { return nil }
+    return .unsupportedSampler(
+      name: names.schedulerRequested ?? sampler.rawValue,
+      family: family.rawValue,
+      reason: "it is an N-row tableau sampler (\(sampler.rawValue)) dispatched only by the "
+        + "Krea 2 denoise loop; this family takes one model evaluation per step and would "
+        + "render first-order Euler under that name. Load a krea2 model, or use one of: "
+        + SchedulerKind.allCases.filter { !$0.isNRowTableau }.map(\.rawValue)
+          .joined(separator: ", "))
+  }
+
   /// The DyPE configuration this payload implies at the given resolution.
   ///
   /// An explicit `dype` always wins, including "none". Otherwise DyPE
@@ -8738,6 +8777,10 @@ public enum WarmServerError: Error, LocalizedError {
   /// A recipe field the named family cannot honour yet — an unimplemented
   /// tier is a 400, never a downgrade (D18).
   case unsupportedRecipeField(field: String, value: String, family: String, reason: String)
+  /// WP-E13: an N-row tableau sampler (`ralston_2s/3s/4s`, `res_3s`) asked for
+  /// on a family whose denoise loop takes one model evaluation per step. It
+  /// would render first-order Euler under the sampler's name, so it is a 400.
+  case unsupportedSampler(name: String, family: String, reason: String)
 
   public var errorDescription: String? {
     switch self {
@@ -8775,6 +8818,8 @@ public enum WarmServerError: Error, LocalizedError {
       return message
     case .unsupportedRecipeField(let field, let value, let family, let reason):
       return "'\(field)' = '\(value)' is not supported on the \(family) family: \(reason)"
+    case .unsupportedSampler(let name, let family, let reason):
+      return "sampler '\(name)' is not supported on the \(family) family: \(reason)"
     }
   }
 }

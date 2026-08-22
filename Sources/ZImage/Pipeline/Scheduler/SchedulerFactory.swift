@@ -11,6 +11,33 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   case deis = "deis"
   case ddim = "ddim"
   case res2s = "res_2s"
+  // WP-E13 (§3.12, D20): the N-row tableau conformers. `ralston_*` are also
+  // the DEIS warm-up samplers (AC-24); `res_3s` is the exponential 3-row.
+  case ralston2s = "ralston_2s"
+  case ralston3s = "ralston_3s"
+  case ralston4s = "ralston_4s"
+  case res3s = "res_3s"
+
+  /// Whether this kind builds a ``TableauScheduler`` — an N-row conformer that
+  /// takes `rows` model evaluations per step and can ONLY be driven by a loop
+  /// that dispatches `rowSigma` / `rowSample` / `commit`.
+  ///
+  /// Today that is `Krea2DenoiseLoop` and nothing else: the Z-Image pipelines
+  /// drive `step` directly, which for these samplers is a hard failure rather
+  /// than a quiet first-order Euler (WP-E13 review finding 1). Callers on a
+  /// non-Krea 2 path must refuse the name up front — see
+  /// `GeneratePayload.validateTableauSampler(_:family:)` and the CLI's
+  /// `--scheduler` parsing.
+  ///
+  /// Exhaustive on purpose (no `default`): a new kind must declare itself.
+  public var isNRowTableau: Bool {
+    switch self {
+    case .ralston2s, .ralston3s, .ralston4s, .res3s:
+      return true
+    case .euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .deis, .ddim, .res2s:
+      return false
+    }
+  }
 }
 
 /// Errors raised while resolving a sigma schedule.
@@ -54,7 +81,7 @@ public enum SchedulerFactory {
   ///     ``SchedulerFactoryError/missingMu(_:)`` rather than defaulting it.
   ///   - seed: Random seed for stochastic samplers (DPM++ 2S-A, DDIM with eta > 0).
   ///   - eta: DDIM stochasticity parameter (0 = deterministic, 1 = full DDPM).
-  ///   - c2: RES 2s second-stage substep location in log-sigma space.
+  ///   - c2: `res_2s` / `res_3s` substep location in log-sigma space (D23).
   /// - Returns: A type-erased ``ZImageScheduler``.
   /// - Throws: ``SchedulerFactoryError`` when the schedule cannot be resolved.
   public static func create(
@@ -139,6 +166,27 @@ public enum SchedulerFactory {
 
     case .res2s:
       return RES2sScheduler(
+        numInferenceSteps: effectiveSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps,
+        c2: c2
+      )
+
+    // WP-E13: the N-row tableau conformers. Both families take the data
+    // prediction (RES4LYF anchors every row at the step's x₀ and sigma), and
+    // both are dispatched by `Krea2DenoiseLoop` through `TableauScheduler`.
+    case .ralston2s, .ralston3s, .ralston4s:
+      let stages: RalstonScheduler.Stages =
+        kind == .ralston2s ? .two : (kind == .ralston3s ? .three : .four)
+      return RalstonScheduler(
+        stages: stages,
+        numInferenceSteps: effectiveSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps
+      )
+
+    case .res3s:
+      return RES3sScheduler(
         numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,

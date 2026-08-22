@@ -55,8 +55,9 @@ enum RecipeNameResolver {
   ]
 
   /// RES4LYF's sampler dropdown groups names under UI prefixes; stripping them
-  /// lets a workflow value paste verbatim (`exponential/res_2s` → `res_2s`).
-  static let res4lyfPrefixes: [String] = ["exponential/", "multistep/"]
+  /// lets a workflow value paste verbatim (`exponential/res_2s` → `res_2s`,
+  /// `linear/ralston_3s` → `ralston_3s`).
+  static let res4lyfPrefixes: [String] = ["exponential/", "multistep/", "linear/"]
 
   // MARK: - Valid sets (what the error message lists)
 

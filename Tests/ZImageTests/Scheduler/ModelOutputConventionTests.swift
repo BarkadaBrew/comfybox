@@ -12,8 +12,10 @@ import MLXRandom
 ///   * AC-10 `res_2s` fed the data prediction x₀ = x − σ·v reconstructs x₀ to
 ///           ≤1e-5 relative over the krea2 schedule; fed velocity (the
 ///           pre-change behaviour) it misses by >1.0 relative.
-///   * AC-11 every `SchedulerKind` reports a convention; only `res_2s`
-///           (and later `res_3s`) is `.dataPrediction`.
+///   * AC-11 every `SchedulerKind` reports a convention; `res_2s`, `res_3s`
+///           and the WP-E13 tableau conformers (`ralston_2s/3s/4s` — RES4LYF
+///           anchors their rows at the step's x₀ too) are `.dataPrediction`,
+///           everything else is `.velocity`.
 final class ModelOutputConventionTests: XCTestCase {
 
   // MARK: - AC-11
@@ -28,6 +30,12 @@ final class ModelOutputConventionTests: XCTestCase {
       .deis: .velocity,
       .ddim: .velocity,
       .res2s: .dataPrediction,
+      // WP-E13: RES4LYF anchors every tableau row at the step's x₀ and sigma,
+      // so the linear-frame ralstons consume the data prediction too.
+      .ralston2s: .dataPrediction,
+      .ralston3s: .dataPrediction,
+      .ralston4s: .dataPrediction,
+      .res3s: .dataPrediction,
     ]
     // Every kind must be in the table — a new kind without a declared
     // convention is the silent-default hazard D2 exists to close.
@@ -41,13 +49,14 @@ final class ModelOutputConventionTests: XCTestCase {
         "\(kind.rawValue) reports \(scheduler.modelOutputConvention)")
     }
 
-    // Only the exponential-frame RES family takes x₀.
+    // The RES family and the WP-E13 tableau conformers take x₀; everything
+    // else takes the velocity.
     let dataPrediction = SchedulerKind.allCases.filter { kind in
       (try? SchedulerFactory.create(
         kind: kind, sigmaSchedule: .flow, numInferenceSteps: 9, config: config, seed: 1))?
         .modelOutputConvention == .dataPrediction
     }
-    XCTAssertEqual(dataPrediction, [.res2s])
+    XCTAssertEqual(dataPrediction, [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s])
   }
 
   /// The conversion helper the pipelines call: identity for velocity
@@ -176,7 +185,10 @@ final class ModelOutputConventionTests: XCTestCase {
   func testVelocitySchedulersUnchangedByConversion() throws {
     let field = Self.makeField(seed: 3)
     let config = FlowMatchSchedulerTests.makeConfig()
-    for kind in SchedulerKind.allCases where kind != .res2s {
+    for kind in SchedulerKind.allCases
+    where (try? SchedulerFactory.create(
+      kind: kind, sigmaSchedule: .flow, numInferenceSteps: 9, config: config, seed: 5))?
+      .modelOutputConvention != .dataPrediction {
       let scheduler = try SchedulerFactory.create(
         kind: kind, sigmaSchedule: .flow, numInferenceSteps: 9, config: config, seed: 5)
       let a = Self.run(scheduler: scheduler, field: field, convert: true)
