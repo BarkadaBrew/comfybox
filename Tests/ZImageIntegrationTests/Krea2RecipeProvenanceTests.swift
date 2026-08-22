@@ -114,9 +114,11 @@ final class Krea2RecipeProvenanceTests: XCTestCase {
     let recipe = RenderRecipe.krea2(.init(
       baseModel: "krea2-raw", variant: k2.variant, transformerFile: k2.paths.transformerFile,
       quantizationBits: k2.transformerQuantBits, vae: k2.currentVAE, textEncoderFile: k2.paths.textEncoderFile,
-      loras: zip(k2.loadedLoRAConfigs, k2.loadedLoRAReports).map { .init(configuration: $0, report: $1) },
+      loras: RenderRecipe.loRAReadBacks(
+        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports,
+        relativities: k2.loadedLoRARelativities) ?? [],
       control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
-      trace: trace, negativePrompt: request.negativePrompt))
+      trace: trace))
     XCTAssertEqual(recipe.baseVariant, "raw")
     XCTAssertTrue(recipe.baseModelFile.hasSuffix("/raw.safetensors"), recipe.baseModelFile)
     XCTAssertEqual(recipe.quantization, "q8")
@@ -125,6 +127,7 @@ final class Krea2RecipeProvenanceTests: XCTestCase {
     XCTAssertEqual(recipe.stages[0].stepsRequested, steps)
     XCTAssertEqual(recipe.stages[0].stepsRun, steps)
     XCTAssertNil(recipe.stages[0].negativePrompt, "guidance 1 → the negative did not apply")
+    XCTAssertNil(trace.negativePromptApplied, "…and the trace is where that fact comes from (I4)")
     XCTAssertEqual(recipe.loras.count, stack.count)
     for (applied, cfg) in zip(recipe.loras, stack) {
       XCTAssertEqual(applied.scaleApplied, cfg.scale)

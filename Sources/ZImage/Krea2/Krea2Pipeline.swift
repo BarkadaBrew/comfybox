@@ -375,6 +375,15 @@ public final class Krea2Pipeline {
   /// `deltasApplied` feeds `RenderRecipe.loras[].deltas_applied` (D15).
   public private(set) var loadedLoRAReports: [LoRAApplicationReport] = []
 
+  /// The relativity the guard ENFORCED for each entry of
+  /// `loadedLoRAConfigs`, same order — `config.requiresBase ??
+  /// Krea2LoRARelativity.seeded(forFilename:)` (K-FIX-1 / Codex I6). Kept
+  /// beside the reports because the resolved value is what `applied.loras[]
+  /// .relative_to` must name: the seed table supplies it for every file no
+  /// preset declares, and discarding it made a guarded render read as
+  /// unguarded. `nil` at an index means nothing was declared for that file.
+  public private(set) var loadedLoRARelativities: [Krea2Variant?] = []
+
   public struct Request {
     public var prompt: String
     /// Negative prompt for the CFG branch — only consulted when guidance > 1.
@@ -521,6 +530,7 @@ public final class Krea2Pipeline {
       patchSession.clear()
       appliedLoRAs = []
       loadedLoRAReports = []
+      loadedLoRARelativities = []
     }
 
     guard !configs.isEmpty else { return }
@@ -531,22 +541,31 @@ public final class Krea2Pipeline {
     // earlier ones applied, roll the whole stack back so applied weights and
     // `appliedLoRAs` can never disagree (delta-key spec rev 2, Codex finding 2).
     var reports: [LoRAApplicationReport] = []
+    var relativities: [Krea2Variant?] = []
     do {
       for config in configs {
         let url = try await LoRAWeightLoader.resolveSource(config.source)
         let name = config.source.displayName
         // WP-E6 / AC-41 relativity guard — before the file is even read.
-        try Krea2LoRARelativity.check(
-          lora: name,
-          required: Krea2LoRARelativity.required(for: config, resolvedURL: url),
-          loaded: variant)
+        // I6: the RESOLVED value is kept, not just checked and dropped — it
+        // is what provenance records as `relative_to`.
+        let required = Krea2LoRARelativity.required(for: config, resolvedURL: url)
+        try Krea2LoRARelativity.check(lora: name, required: required, loaded: variant)
         let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+        // K-FIX-1 / Codex C1 — the second half of the transactional contract,
+        // and like the relativity guard it fires BEFORE any weight mutation:
+        // LoKr rewrites base parameters and `clearDynamicLoRA` (this block's
+        // rollback) cannot restore them, so the stack would accumulate across
+        // renders while `appliedLoRAs` reported none. Refuse instead.
+        try Krea2AdapterSupport.checkTransactional(
+          lokrLayerCount: weights.lokrLayerCount, lora: name)
         logger.info("Applying Krea-2 LoRA: \(name) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale), base=\(variant.rawValue))")
         let report = try LoRAApplicator.applyDynamically(
           to: transformer, loraWeights: weights, scale: config.scale,
           strict: true, name: name, logger: logger)
         let deltas = try patchSession.apply(weights: weights, scale: config.scale)
         reports.append(report.withDeltasApplied(deltas))
+        relativities.append(required)
         logger.info("Krea-2 LoRA \(name): bound \(report.bound)/\(report.offered) (\(report.quantizedBound) quantized), deltas=\(deltas)")
       }
     } catch {
@@ -555,11 +574,13 @@ public final class Krea2Pipeline {
       patchSession.clear()
       appliedLoRAs = []
       loadedLoRAReports = []
+      loadedLoRARelativities = []
       throw error
     }
 
     appliedLoRAs = configs
     loadedLoRAReports = reports
+    loadedLoRARelativities = relativities
   }
 
   /// Load (or clear) the depth Control-LoRA. Sets the expanded input projection
@@ -588,6 +609,12 @@ public final class Krea2Pipeline {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
         let weights = try LoRAWeightLoader.loadForKrea2(from: src)
+        // Belt and braces: nothing carrying LoKr can be in `appliedLoRAs`
+        // (loadLoRAs refuses it), but this loop re-reads the files from disk,
+        // so a file swapped underneath us is refused here too rather than
+        // mutating the base on a control toggle (C1's compounding path).
+        try Krea2AdapterSupport.checkTransactional(
+          lokrLayerCount: weights.lokrLayerCount, lora: cfg.source.displayName)
         try LoRAApplicator.applyDynamically(
           to: transformer, loraWeights: weights, scale: cfg.scale,
           strict: true, name: cfg.source.displayName, logger: logger)
@@ -601,6 +628,7 @@ public final class Krea2Pipeline {
       patchSession.clear()
       appliedLoRAs = []
       loadedLoRAReports = []
+      loadedLoRARelativities = []
       transformer.controlFirstWeight = nil
       transformer.controlFirstBias = nil
       controlLoRAActive = false
@@ -750,6 +778,13 @@ public final class Krea2Pipeline {
     // (or empty) prompt and runs a second unconditioned pass per step —
     // sequential, not batched, to keep peak memory flat on the shared box.
     let useCFG = request.guidance > 1.0
+    // K-FIX-1 / Codex I4: what the CFG branch ACTUALLY conditions on,
+    // resolved here — beside the encode, from the same `useCFG` predicate —
+    // and carried in the trace so every provenance sink records the render
+    // rather than the request. An omitted negative under CFG is `""`, not
+    // "no negative prompt": the second model pass ran either way.
+    let negativePromptApplied = Krea2RunTrace.negativePromptApplied(
+      cfgActive: useCFG, requested: request.negativePrompt)
     var negCtx: MLXArray? = nil
     var negPos: MLXArray? = nil
     var negFullMask: MLXArray? = nil
@@ -803,7 +838,8 @@ public final class Krea2Pipeline {
 
     let trace = Krea2RunTrace(
       request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
-      startIndex: 0, denoise: 1.0, width: width, height: height)
+      startIndex: 0, denoise: 1.0, width: width, height: height,
+      negativePromptApplied: negativePromptApplied)
     return (decoded[0], trace)
   }
 }

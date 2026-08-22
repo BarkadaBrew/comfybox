@@ -125,7 +125,7 @@ public struct RES3sScheduler: TableauScheduler {
   /// N-row conformer was dispatched by a 1-row loop, which would render
   /// first-order exponential Euler under the name `res_3s` — a silent
   /// downgrade, so it fails hard. The reachable paths refuse the name first
-  /// (`GeneratePayload.validateTableauSampler(_:family:)`, the CLI's
+  /// (`GeneratePayload.validateFamilyRecipe(_:family:)`, the CLI's
   /// `--scheduler`). See ``RalstonScheduler/step(modelOutput:timestepIndex:sample:)``.
   public mutating func step(
     modelOutput: MLXArray, timestepIndex: Int, sample: MLXArray

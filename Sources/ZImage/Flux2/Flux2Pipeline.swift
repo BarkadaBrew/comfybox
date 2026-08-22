@@ -306,7 +306,8 @@ public final class Flux2Pipeline {
 
     progressHandler?(GenerationProgress(stage: .saving, stepIndex: request.steps, totalSteps: request.steps))
     try QwenImageIO.saveImage(array: decoded, to: request.outputPath,
-      metadata: .generation(prompt: request.prompt, negativePrompt: request.negativePrompt,
+      metadata: .generation(prompt: request.prompt,
+        negativePrompt: QwenImageIO.ImageMetadata.requestNegative(request.negativePrompt),
         seed: request.seed, steps: request.steps, guidance: request.guidanceScale,
         width: request.width, height: request.height, contentMode: request.contentMode, loras: loadedLoRAConfigs))
     logger.info("Wrote image to \(request.outputPath.path)")

@@ -181,6 +181,11 @@ public enum LoRAError: Error, LocalizedError {
     /// Krea-2 base and a different one is loaded. Thrown before any weight
     /// is touched.
     case incompatibleBase(lora: String, requires: Krea2Variant, loaded: Krea2Variant)
+    /// K-FIX-1 / Codex C1: the adapter's FORMAT is one this path refuses —
+    /// not a parse failure and not a feature gap, but a format whose
+    /// application cannot be rolled back here (LoKr rewrites base weights;
+    /// see ``Krea2AdapterSupport``). Thrown before any weight is touched.
+    case unsupportedAdapter(lora: String, format: String, reason: String)
     /// WP-E6 B4a / AC-49: the file is JSON (an HTTP error page saved under a
     /// `.safetensors` name — the 99-byte civitai early-access body in
     /// `fetch.log`) AND the safetensors header failed to parse. Never a size
@@ -211,6 +216,8 @@ public enum LoRAError: Error, LocalizedError {
             return "\(who) did not bind completely — \(shown.count) key(s) matched nothing: \(listed)\(more)"
         case .incompatibleBase(let lora, let requires, let loaded):
             return "LoRA '\(lora)' is extracted against Krea-2 \(requires.rawValue) but the loaded base is \(loaded.rawValue) — refusing to apply a \(requires.rawValue)-relative adapter on \(loaded.rawValue)"
+        case .unsupportedAdapter(let lora, let format, let reason):
+            return "LoRA '\(lora)' is a \(format) adapter, which this model path refuses: \(reason)"
         case .notASafetensorsFile(let path, let firstBytes):
             return "'\(path)' is not a safetensors file — it is JSON (an HTTP error page saved under the wrong name?): \(firstBytes)"
         }

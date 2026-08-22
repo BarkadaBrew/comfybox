@@ -14,9 +14,11 @@ final class RenderRecipeTests: XCTestCase {
   // sink test assert against the same record (AC-62).
 
   private func trace(steps: Int = 30, guidance: Float = 1.0, startIndex: Int = 0,
-                     sigmaScheduleRequested: String? = nil) -> Krea2RunTrace {
+                     sigmaScheduleRequested: String? = nil,
+                     negativePrompt: String? = nil) -> Krea2RunTrace {
     RenderRecipeFixture.trace(steps: steps, guidance: guidance, startIndex: startIndex,
-                              sigmaScheduleRequested: sigmaScheduleRequested)
+                              sigmaScheduleRequested: sigmaScheduleRequested,
+                              negativePrompt: negativePrompt)
   }
 
   private func inputs(
@@ -24,8 +26,9 @@ final class RenderRecipeTests: XCTestCase {
     loras: [RenderRecipe.LoRAReadBack] = [], control: RenderRecipe.ControlReadBack? = nil
   ) -> RenderRecipe.Krea2Inputs {
     RenderRecipeFixture.inputs(
-      trace: trace(guidance: guidance, sigmaScheduleRequested: requestedSigmaSchedule),
-      negativePrompt: negativePrompt, loras: loras, control: control)
+      trace: trace(guidance: guidance, sigmaScheduleRequested: requestedSigmaSchedule,
+                   negativePrompt: negativePrompt),
+      loras: loras, control: control)
   }
 
   private func kromaReadBack(scale: Float = 0.3) -> RenderRecipe.LoRAReadBack {
@@ -164,6 +167,42 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(on.modelEvalsTotal, 60)
   }
 
+  /// K-FIX-1 / Codex I4: with guidance > 1 and NO `negative_prompt` in the
+  /// request, both Krea 2 pipelines encode `request.negativePrompt ?? ""` and
+  /// run a full second model pass against it. The record used to be built
+  /// from the PAYLOAD, so it said `nil` — describing the request, not the
+  /// render, and hiding a doubling of model evaluations behind an absent
+  /// field. The trace now carries what the pipeline resolved, and every sink
+  /// reads THAT.
+  func testOmittedNegativeUnderCFGRecordsTheEmptyStringThatWasEncoded() {
+    let r = RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: nil))
+    XCTAssertEqual(r.stages[0].negativePrompt, "",
+                   "CFG ran against the empty string — the record says so")
+    XCTAssertEqual(r.stages[0].modelEvals, 60, "and the doubled cost is visible beside it")
+  }
+
+  /// The two meanings are distinct and both load-bearing: `nil` means CFG did
+  /// not run at all; `""` means it ran against an empty negative.
+  func testNilMeansCFGInactiveAndEmptyStringMeansCFGRanEmpty() {
+    XCTAssertNil(RenderRecipe.krea2(inputs(guidance: 1.0, negativePrompt: nil)).stages[0].negativePrompt)
+    XCTAssertNil(RenderRecipe.krea2(inputs(guidance: 1.0, negativePrompt: "")).stages[0].negativePrompt)
+    XCTAssertEqual(RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: "")).stages[0].negativePrompt, "")
+    XCTAssertEqual(RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: nil)).stages[0].negativePrompt, "")
+  }
+
+  /// The trace is the single witness — `Krea2RunTrace.negativePromptApplied`
+  /// and `cfgActive` never disagree.
+  func testTraceNegativeAppliedAgreesWithCFGActive() {
+    for guidance: Float in [0.0, 1.0, 1.0001, 2.0, 3.5] {
+      for requested in [nil, "", "blurry"] as [String?] {
+        let t = RenderRecipeFixture.trace(guidance: guidance, negativePrompt: requested)
+        XCTAssertEqual(t.cfgActive, t.negativePromptApplied != nil,
+                       "guidance \(guidance), requested \(String(describing: requested))")
+        if t.cfgActive { XCTAssertEqual(t.negativePromptApplied, requested ?? "") }
+      }
+    }
+  }
+
   // MARK: - LoRAs are the loaded configs joined with their bind reports
 
   func testLoRAsAreJoinedFromLoadedConfigsAndReports() throws {
@@ -208,6 +247,84 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(paired[1].configuration.scale, 0.3)
     XCTAssertEqual(RenderRecipe.loRAReadBacks(configs: [], reports: [])?.count, 0,
                    "no LoRAs is a complete read-back, not a failure")
+  }
+
+  // MARK: - `relative_to` is the relativity ENFORCED (K-FIX-1 / Codex I6)
+
+  /// The E7 report's deferred defect: `Krea2Pipeline.loadLoRAs` resolves
+  /// `config.requiresBase ?? Krea2LoRARelativity.seeded(forFilename:)` and
+  /// ENFORCES it, then discarded the resolved value — and the record read
+  /// `configuration.requiresBase` alone. A file whose relativity came from
+  /// the SEED table (the ordinary case: no preset declares one) refused the
+  /// wrong base correctly and then reported `relative_to: null`.
+  ///
+  /// The pipeline now carries the resolved variant beside each report, and
+  /// the record reads THAT.
+  func testSeededRelativityIsRecordedEvenWhenTheRequestDeclaredNothing() throws {
+    // Exactly what a preset sends today: a path, a scale, no `requiresBase`.
+    var cfg = LoRAConfiguration.local(
+      "/vault/krea2_turbo_lora_rank_64_bf16.safetensors", scale: 0.6)
+    cfg.role = "accel"
+    XCTAssertNil(cfg.requiresBase, "the REQUEST declared nothing — that is the point")
+
+    // …and this is what the pipeline resolved and enforced for it.
+    let resolved = Krea2LoRARelativity.required(
+      for: cfg, resolvedURL: URL(fileURLWithPath: "/vault/krea2_turbo_lora_rank_64_bf16.safetensors"))
+    XCTAssertEqual(resolved, .raw, "the seed table is the source here")
+
+    let readBacks = try XCTUnwrap(
+      RenderRecipe.loRAReadBacks(
+        configs: [cfg],
+        reports: [RenderRecipeFixture.report(offered: 264, bound: 264, deltasApplied: 7)],
+        relativities: [resolved]))
+    let r = RenderRecipe.krea2(inputs(loras: readBacks))
+    XCTAssertEqual(r.loras[0].relativeTo, "raw",
+                   "the record names the relativity the guard ENFORCED, not the request's silence")
+  }
+
+  /// A library-derived declaration reaches the pipeline folded into
+  /// `requiresBase` (the server does that before the config leaves it), so
+  /// the resolved value and the config agree — and the record still reads the
+  /// resolved one.
+  func testDeclaredRelativityIsRecordedFromTheResolvedValue() throws {
+    var cfg = LoRAConfiguration.local("/vault/kroma-lora-v0.3.safetensors", scale: 0.6)
+    cfg.requiresBase = .turbo
+    let resolved = Krea2LoRARelativity.required(
+      for: cfg, resolvedURL: URL(fileURLWithPath: "/vault/kroma-lora-v0.3.safetensors"))
+    XCTAssertEqual(resolved, .turbo)
+
+    let readBacks = try XCTUnwrap(
+      RenderRecipe.loRAReadBacks(
+        configs: [cfg], reports: [RenderRecipeFixture.report(offered: 170, bound: 170)],
+        relativities: [resolved]))
+    XCTAssertEqual(RenderRecipe.krea2(inputs(loras: readBacks)).loras[0].relativeTo, "turbo")
+  }
+
+  /// An UNDECLARED, unseeded file ("others" are allowed on Raw — ledger
+  /// ruling) still records `null`: nothing was enforced, so nothing is named.
+  func testAnUndeclaredUnseededFileStillRecordsNull() throws {
+    let cfg = LoRAConfiguration.local("/vault/some-style.safetensors", scale: 0.8)
+    let resolved = Krea2LoRARelativity.required(
+      for: cfg, resolvedURL: URL(fileURLWithPath: "/vault/some-style.safetensors"))
+    XCTAssertNil(resolved)
+    let readBacks = try XCTUnwrap(
+      RenderRecipe.loRAReadBacks(
+        configs: [cfg], reports: [RenderRecipeFixture.report(offered: 10, bound: 10)],
+        relativities: [resolved]))
+    XCTAssertNil(RenderRecipe.krea2(inputs(loras: readBacks)).loras[0].relativeTo)
+  }
+
+  /// Same fail-closed posture as the config/report pairing: a relativity list
+  /// of the wrong length is a desync, not something to zip-truncate.
+  func testARelativityListOfTheWrongLengthYieldsNoPairing() {
+    let cfg = LoRAConfiguration.local("/vault/a.safetensors", scale: 0.6)
+    let one = [RenderRecipeFixture.report(offered: 10, bound: 10)]
+    XCTAssertNil(
+      RenderRecipe.loRAReadBacks(configs: [cfg], reports: one, relativities: []))
+    XCTAssertNil(
+      RenderRecipe.loRAReadBacks(configs: [cfg], reports: one, relativities: [.raw, .raw]))
+    XCTAssertNotNil(
+      RenderRecipe.loRAReadBacks(configs: [cfg], reports: one, relativities: [.raw]))
   }
 
   func testUndeclaredRoleAndRelativityAreNull() {
@@ -291,13 +408,13 @@ final class RenderRecipeTests: XCTestCase {
     let r = RenderRecipe.krea2(inputs())
     let status = ImageJobStatus(
       jobId: "j2", status: .succeeded, source: "api", outputPath: "/y.png", durationMs: 5, error: nil,
-      elapsedMs: 6, preemptRefused: nil, etaSec: nil, applied: r)
+      elapsedMs: 6, preemptRefused: nil, etaSec: nil, applied: AppliedRecordSlot(record: r))
     let e = JSONEncoder(); e.keyEncodingStrategy = .convertToSnakeCase
     let json = try XCTUnwrap(JSONSerialization.jsonObject(with: e.encode(status)) as? [String: Any])
     let applied = try XCTUnwrap(json["applied"] as? [String: Any])
     XCTAssertEqual(applied["base_variant"] as? String, "raw")
     let back = try d.decode(ImageJobStatus.self, from: e.encode(status))
-    XCTAssertEqual(back.applied, r)
+    XCTAssertEqual(back.appliedRecord, r)
   }
 
   /// Sink 2: the PNG's EXIF `UserComment` JSON carries the same record under
@@ -331,6 +448,30 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertNil(offJSON["negative_prompt"])
     let offStage = try XCTUnwrap(((offJSON["applied"] as? [String: Any])?["stages"] as? [[String: Any]])?.first)
     XCTAssertTrue(offStage["negative_prompt"] == nil || offStage["negative_prompt"] is NSNull)
+  }
+
+  /// I4, sink 2: an APPLIED empty negative must survive into the PNG.
+  /// `ImageMetadata.generation` used to drop every empty string, so a
+  /// `guidance: 2` render with no negative wrote a file that read as if CFG
+  /// had never run. `nil` still means "did not apply" and is still omitted.
+  func testPNGKeepsAnAppliedEmptyNegativePrompt() throws {
+    let r = RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: nil))
+    XCTAssertEqual(r.stages[0].negativePrompt, "")
+    let meta = QwenImageIO.ImageMetadata.generation(
+      prompt: "p", negativePrompt: r.stages[0].negativePrompt, seed: 44821, steps: 30,
+      guidance: 2.0, width: 1024, height: 1024, model: "krea2-raw", applied: r)
+    let json = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(try XCTUnwrap(meta.parametersJSON).utf8)) as? [String: Any])
+    XCTAssertEqual(json["negative_prompt"] as? String, "",
+                   "an applied empty negative is written, not dropped")
+    let stage = try XCTUnwrap((json["applied"] as? [String: Any]).flatMap { ($0["stages"] as? [[String: Any]])?.first })
+    XCTAssertEqual(stage["negative_prompt"] as? String, "")
+
+    // nil (CFG inactive) is still absent — the two are not the same fact.
+    let off = QwenImageIO.ImageMetadata.generation(prompt: "p", negativePrompt: nil, guidance: 1.0)
+    let offJSON = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(try XCTUnwrap(off.parametersJSON).utf8)) as? [String: Any])
+    XCTAssertNil(offJSON["negative_prompt"])
   }
 
   /// D12: no record for another family — `applied` is absent, never a

@@ -835,34 +835,34 @@ public final class WarmServer {
         let resolvedSpec = Self.parseModelSpec(from: payload.model)
         let resolvedQuantization = payload.quantization ?? Self.parseQuantization(from: payload.model)
 
+        // K-FIX-1 / Codex C2: every MUTATING pool operation goes through the
+        // same FIFO as renders, LoRA swaps and the ComfyBridge model switch.
+        // Calling `coordinator.poolLoad` here was not serialized: actor
+        // isolation does not hold across an await, so the load's eviction and
+        // `GPU.clearCache()` could run under an in-flight render.
+        let operation = ModelOperation.load(
+          modelSpec: resolvedSpec, quantization: resolvedQuantization, activate: shouldActivate)
         if shouldWait {
-          let result = try await coordinator.poolLoad(
-            modelSpec: resolvedSpec,
-            quantization: resolvedQuantization,
-            activate: shouldActivate
-          )
+          guard case .load(let result) = try await coordinator.enqueueModelOperation(operation) else {
+            return .error(.error(status: 500, message: "Model load returned the wrong result kind"))
+          }
           return .json(status: 200, payload: result)
         } else {
-          // Fire-and-forget: start loading in background, return immediately.
-          Task {
-            do {
-              try await coordinator.poolLoad(
-                modelSpec: resolvedSpec,
-                quantization: resolvedQuantization,
-                activate: shouldActivate
-              )
-            } catch {
-              logger.error("ModelPool: background load failed for '\(payload.model)': \(error.localizedDescription)")
-            }
-          }
+          // Fire-and-forget is now a TRACKED queue job, not a detached Task:
+          // it is listed in /v1/queue under the id returned here, it can be
+          // cancelled, and it still cannot begin under a render.
+          let jobId = try await coordinator.enqueueModelOperationDetached(operation)
           let ack = ModelLoadResponse(
+            // "loading" is kept verbatim: an out-of-repo client (the daemons)
+            // may branch on it, and C2's wire change is the ADDED `job_id`.
             status: "loading",
             model: payload.model,
             family: "pending",
             loadTimeMs: 0,
             vramEstimateMB: 0,
             poolSize: await coordinator.modelPool.count(),
-            poolBudgetMB: await coordinator.modelPool.budget()
+            poolBudgetMB: await coordinator.modelPool.budget(),
+            jobId: jobId
           )
           return .json(status: 202, payload: ack)
         }
@@ -873,7 +873,13 @@ public final class WarmServer {
     case ("POST", "/v1/model/activate"):
       do {
         let payload = try decode(ModelActivateRequest.self, from: request.body)
-        let result = try await coordinator.poolActivate(modelId: payload.model)
+        // C2: activation swaps the resident pipeline out from under whatever
+        // is rendering unless it is queued behind it.
+        guard case .activate(let result) =
+          try await coordinator.enqueueModelOperation(.activate(modelId: payload.model))
+        else {
+          return .error(.error(status: 500, message: "Model activate returned the wrong result kind"))
+        }
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -886,7 +892,13 @@ public final class WarmServer {
     case ("POST", "/v1/model/unload"):
       do {
         let payload = try decode(ModelUnloadRequest.self, from: request.body)
-        let result = try await coordinator.poolUnload(modelId: payload.model)
+        // C2: an unload releases the pipeline's weights — the same
+        // use-after-release hazard as an eviction.
+        guard case .unload(let result) =
+          try await coordinator.enqueueModelOperation(.unload(modelId: payload.model))
+        else {
+          return .error(.error(status: 500, message: "Model unload returned the wrong result kind"))
+        }
         return .json(status: 200, payload: result)
       } catch {
         return .error(response(for: error))
@@ -3327,6 +3339,13 @@ public final class WarmServer {
     // style whose sampler we do not implement is refused by name, never
     // rendered as euler. The krea2 tier gates run here too (D18).
     let recipeNames = try payload.validateRecipeNames()
+    // I5: the bridge builds its payload directly and forwards the request's
+    // sampler on every family arm, so it runs the same family capability gate
+    // the REST dispatch does — a Krita style naming a sampler this family
+    // cannot drive is refused, never rendered as euler under that name.
+    if let error = GeneratePayload.validateFamilyRecipe(recipeNames, family: family) {
+      throw error
+    }
     if family == .krea2 {
       try payload.validateKrea2TierGates(recipeNames)
     }
@@ -4553,7 +4572,7 @@ private struct HealthSnapshot: Sendable {
   /// the resolved directory path once `parseModelSpec` has expanded it.
   var modelAlias: String? = nil
   /// WP-E10 sink 3: the record of the last successful Krea 2 render.
-  var lastRecipe: RenderRecipe? = nil
+  var lastRecipe: AppliedRecordSlot? = nil
   var loaded: Bool
   var loras: [LoRAState]
   var renderCount: Int
@@ -4789,11 +4808,15 @@ public struct ImageJobStatus: Codable, Sendable {
   /// job — the same `applied` the sync response carries. Optional so
   /// persisted pre-upgrade JSON still decodes (AC-64); null for other
   /// families (D12) and until the job succeeds.
-  public let applied: RenderRecipe?
+  public let applied: AppliedRecordSlot?
+
+  /// The record itself; see ``AppliedRecordSlot`` for absent-vs-null.
+  public var appliedRecord: RenderRecipe? { applied?.record }
 
   public init(
     jobId: String, status: ImageJobState, source: String, outputPath: String?, durationMs: Int?,
-    error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?, applied: RenderRecipe? = nil
+    error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?,
+    applied: AppliedRecordSlot? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -4822,8 +4845,8 @@ private final class ImageJob: @unchecked Sendable {
   /// refused it.
   var preemptRefused: Bool?
   var etaSec: Double?
-  /// WP-E10: set with the result on success.
-  var applied: RenderRecipe?
+  /// WP-E10: set with the result on success (tri-state, see AppliedRecordSlot).
+  var applied: AppliedRecordSlot?
 
   init(id: String, source: String) {
     self.id = id
@@ -5319,8 +5342,13 @@ private actor WarmServerCoordinator {
   /// how the July mystery-GPU-usage class of incident happens.
   private var isPaused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
 
-  /// Sentinel marking the queue paused; survives engine restarts.
-  static let pauseSentinelPath = NSString(string: "~/.comfybox/queue-paused").expandingTildeInPath
+  /// Sentinel marking the queue paused; survives engine restarts. Computed
+  /// from `QueueStateStore.stateDirectory` so it follows `COMFYBOX_STATE_DIR`
+  /// (K-FIX-1: a test driving a real coordinator must not read — or clear —
+  /// the LIVE engine's pause flag).
+  static var pauseSentinelPath: String {
+    QueueStateStore.stateDirectory.appendingPathComponent("queue-paused").path
+  }
   private var shuttingDown = false
   private var successfulRenderCount = 0
   private var failedRenderCount = 0
@@ -5329,7 +5357,7 @@ private actor WarmServerCoordinator {
   /// WP-E10 sink 3: the record of the last successful Krea 2 render,
   /// published into /health as `last_recipe`. Set only from a completed
   /// render (a failed one writes no record), never from a request.
-  private var lastRecipe: RenderRecipe?
+  private var lastRecipe: AppliedRecordSlot?
 
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
@@ -5343,11 +5371,22 @@ private actor WarmServerCoordinator {
   /// EVERY writer of `krea2Pipeline` calls this immediately after: pool
   /// activation, `prepare()`, and `releaseImageModelsForVideo()`. Adding a
   /// fourth writer without this call is the bug this comment exists to catch.
+  /// A record that no longer describes what is resident is dropped ENTIRELY
+  /// (the key goes absent), not turned into a `null` — `null` means "a Krea 2
+  /// render just refused its record", which is a different statement.
   private func revalidateLastRecipe() {
+    guard let slot = lastRecipe else { return }
+    guard let record = slot.record else {
+      // A refused record describes a render, not a checkpoint; once the
+      // resident model may have changed there is nothing left to say.
+      lastRecipe = currentModelFamily == .krea2 ? slot : nil
+      return
+    }
     lastRecipe = RenderRecipe.retained(
-      lastRecipe,
+      record,
       family: currentModelFamily,
-      krea2TransformerFile: krea2Pipeline?.paths.transformerFile.path)
+      krea2TransformerFile: krea2Pipeline?.paths.transformerFile.path
+    ).map(AppliedRecordSlot.init(record:))
   }
   private var activeRenderStartedAt: Date?
   /// Synthetic id for the currently-rendering job — surfaced as `current_job_id`.
@@ -6135,6 +6174,13 @@ private actor WarmServerCoordinator {
   // MARK: - Model Pool Operations
 
   /// Load a model into the pool, optionally activating it.
+  /// QUEUE-INTERNAL (K-FIX-1 / Codex C2). Call this ONLY from inside the
+  /// process loop — a queued `.modelOperation`, the ComfyBridge switch's
+  /// `enqueueModelSwitch` body, or a render's own #218 reload. A route or
+  /// handler that reaches it directly reintroduces the race: actor isolation
+  /// does not hold across an await, so the pool's eviction and
+  /// `GPU.clearCache()` would be free to run under an active render. From
+  /// outside the loop use `enqueueModelOperation` / `enqueueModelOperationDetached`.
   func poolLoad(modelSpec: String, quantization: String?, activate: Bool) async throws -> ModelLoadResponse {
     // #218: an image load must vacate a resident LTX-2 video stack first — the
     // two heavy models can't co-reside on a 128GB box. Safe here because
@@ -6184,6 +6230,13 @@ private actor WarmServerCoordinator {
 
   /// Activate a model that is already in the pool.
   @discardableResult
+  /// QUEUE-INTERNAL (K-FIX-1 / Codex C2). Call this ONLY from inside the
+  /// process loop — a queued `.modelOperation`, the ComfyBridge switch's
+  /// `enqueueModelSwitch` body, or a render's own #218 reload. A route or
+  /// handler that reaches it directly reintroduces the race: actor isolation
+  /// does not hold across an await, so the pool's eviction and
+  /// `GPU.clearCache()` would be free to run under an active render. From
+  /// outside the loop use `enqueueModelOperation` / `enqueueModelOperationDetached`.
   func poolActivate(modelId: String) async throws -> ModelActivateResponse {
     // Try by pool key first, then by model spec.
     let entry: PoolEntry
@@ -6207,6 +6260,10 @@ private actor WarmServerCoordinator {
       // The pipeline is the physical fact; the pool entry carries the same
       // value back from loadPipeline (WP-E5).
       krea2Variant = krea2Pipeline?.variant ?? (entry.detectedInfo as? Krea2Variant)
+      if krea2Pipeline == nil {
+        logger.warning(
+          "ModelPool: activated krea2 entry '\(entry.id)' but its pipeline could not be read back — publishing an EMPTY LoRA stack (I1)")
+      }
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -6231,6 +6288,20 @@ private actor WarmServerCoordinator {
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
     }
+    // K-FIX-1 / Codex I1: the activated pipeline is the authority on what is
+    // applied. Reconciling here — BEFORE `publishHealth()` — is what stops
+    // `/health.loras` (and the next render's default stack) from describing
+    // the model that just left.
+    let reconciledLoRAs = PoolAdapterState.reconciled(
+      family: entry.family, activated: krea2Pipeline, coordinator: activeLoRAs)
+    if reconciledLoRAs.map(\.source.displayName) != activeLoRAs.map(\.source.displayName) {
+      let names = reconciledLoRAs.map { $0.source.displayName }.joined(separator: ", ")
+      let line = "ModelPool: activation reconciled the LoRA stack from the pipeline read-back — "
+        + "\(activeLoRAs.count) advertised → \(reconciledLoRAs.count) applied [\(names)]"
+      logger.info("\(line)")
+    }
+    activeLoRAs = reconciledLoRAs
+
     revalidateLastRecipe()
     pipelinePrepared = true
     // Model/family/variant just changed — refresh the health snapshot (#217).
@@ -6244,6 +6315,13 @@ private actor WarmServerCoordinator {
   }
 
   /// Unload a model from the pool.
+  /// QUEUE-INTERNAL (K-FIX-1 / Codex C2). Call this ONLY from inside the
+  /// process loop — a queued `.modelOperation`, the ComfyBridge switch's
+  /// `enqueueModelSwitch` body, or a render's own #218 reload. A route or
+  /// handler that reaches it directly reintroduces the race: actor isolation
+  /// does not hold across an await, so the pool's eviction and
+  /// `GPU.clearCache()` would be free to run under an active render. From
+  /// outside the loop use `enqueueModelOperation` / `enqueueModelOperationDetached`.
   func poolUnload(modelId: String) async throws -> ModelUnloadResponse {
     // Find the entry to get the model spec before unloading.
     guard let entry = await modelPool.findEntry(for: modelId) else {
@@ -6331,6 +6409,66 @@ private actor WarmServerCoordinator {
       pending.append(PendingJob(operation: .controlGenerate(request, ContinuationBox(continuation))))
       startProcessingIfNeeded()
     }
+  }
+
+  /// Execute one ``ModelOperation`` — called ONLY from the process loop, so
+  /// the whole mutation (including `ModelPool.load`'s eviction and
+  /// `GPU.clearCache()`) is serialized against renders (K-FIX-1 / C2).
+  ///
+  /// The `poolLoad`/`poolActivate`/`poolUnload` methods stay as the internal
+  /// implementation because the loop's OWN jobs call them (a render that must
+  /// restore an image model after a video eviction, #218): re-entering the
+  /// queue from inside the queue would deadlock. What changed is that no
+  /// route reaches them except through here.
+  private func runModelOperation(_ op: ModelOperation) async throws -> ModelOperationResult {
+    switch op {
+    case .load(let modelSpec, let quantization, let activate):
+      return .load(try await poolLoad(
+        modelSpec: modelSpec, quantization: quantization, activate: activate))
+    case .activate(let modelId):
+      return .activate(try await poolActivate(modelId: modelId))
+    case .unload(let modelId):
+      return .unload(try await poolUnload(modelId: modelId))
+    }
+  }
+
+  /// Enqueue a mutating pool operation and wait for it (K-FIX-1 / C2).
+  ///
+  /// MUST NOT be called from inside the process loop — see `runModelOperation`.
+  func enqueueModelOperation(_ op: ModelOperation) async throws -> ModelOperationResult {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(PendingJob(operation: .modelOperation(op, ContinuationBox(continuation))))
+      startProcessingIfNeeded()
+    }
+  }
+
+  /// Enqueue a mutating pool operation WITHOUT waiting, returning its FIFO job
+  /// id (K-FIX-1 / C2).
+  ///
+  /// This replaces `/v1/model/load`'s `wait: false` arm, which used to start a
+  /// detached `Task` that ran `poolLoad` outside the queue entirely — the
+  /// worst version of the race, because nothing in the system knew it was
+  /// running. Now it is an ordinary queue job: it appears in `/v1/queue`, it
+  /// can be cancelled, and it cannot begin under a render.
+  @discardableResult
+  func enqueueModelOperationDetached(_ op: ModelOperation) throws -> String {
+    if shuttingDown {
+      throw ServerError.shuttingDown
+    }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+    let job = PendingJob(operation: .modelOperation(op, nil))
+    pending.append(job)
+    startProcessingIfNeeded()
+    return job.id
   }
 
   /// Run a Krita model auto-switch through the FIFO render queue so the pool
@@ -6522,6 +6660,10 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
       cont.resume(throwing: ServerError.cancelled)
+    case .modelOperation(_, let cont):
+      // A `wait: false` load has no waiting caller — cancelling it is simply
+      // dropping the job (C2).
+      cont?.resume(throwing: ServerError.cancelled)
     case .localVideo(_, let cont, _, _):
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
@@ -6540,6 +6682,8 @@ private actor WarmServerCoordinator {
       return "LoRA swap (\(payload.loras.count))"
     case .modelSwitch:
       return "Model switch"
+    case .modelOperation(let op, _):
+      return op.summary
     case .localVideo:
       return "LTX-2 video"
     case .shutdown:
@@ -6553,6 +6697,7 @@ private actor WarmServerCoordinator {
     case .controlGenerate: return "controlnet"
     case .swap: return "lora_swap"
     case .modelSwitch: return "model_switch"
+    case .modelOperation(let op, _): return op.kind
     case .localVideo: return "video"
     case .shutdown: return "shutdown"
     }
@@ -6613,19 +6758,50 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Whether a queued operation may run while the queue is PAUSED
+  /// (K-FIX-1 round 2, New-1).
+  ///
+  /// "Pause" means *no renders* — it is what Todd uses to free the GPU for a
+  /// deploy, and it persists across restarts via the sentinel. Mutating model
+  /// operations are exactly what an operator needs during that window
+  /// (swap the resident checkpoint, unload to free memory), and they were
+  /// available before this wave because the routes called the pool directly.
+  /// Routing them through the FIFO (C2) must not take that away: the FIFO's
+  /// job is to serialise them against an in-flight render, which it still
+  /// does — the loop runs one job at a time either way.
+  ///
+  /// Exhaustive on purpose (no `default`): a new queue kind must decide.
+  private static func runsWhilePaused(_ operation: QueuedOperation) -> Bool {
+    switch operation {
+    case .modelOperation:
+      return true
+    case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo, .shutdown:
+      return false
+    }
+  }
+
   private func processLoop() async {
     while true {
-      // Paused: stop pulling new jobs until resumed (setPaused restarts the loop).
+      // Paused: renders stay parked, but a model operation still runs (New-1).
+      // Picking it out of the middle does not reorder anything that runs: the
+      // jobs it passes are parked until resume, and they keep their relative
+      // order for when it comes.
+      let index: Int
       if isPaused {
-        isProcessing = false
-        return
-      }
-      guard !pending.isEmpty else {
-        isProcessing = false
-        return
+        guard let next = pending.firstIndex(where: { Self.runsWhilePaused($0.operation) }) else {
+          isProcessing = false
+          return
+        }
+        index = next
+      } else {
+        guard !pending.isEmpty else {
+          isProcessing = false
+          return
+        }
+        index = 0
       }
 
-      let job = pending.removeFirst()
+      let job = pending.remove(at: index)
       activeJobSummary = Self.describe(job.operation)
       activeJobSource = job.source
       // Keep the same id the job had while pending, so clients can correlate.
@@ -6671,6 +6847,24 @@ private actor WarmServerCoordinator {
           continuation.resume(returning: try await body())
         } catch {
           continuation.resume(throwing: error)
+        }
+      case .modelOperation(let op, let continuation):
+        // C2: the pool mutation runs HERE, with the loop holding the queue —
+        // no render can be dequeued until it returns.
+        do {
+          let result = try await runModelOperation(op)
+          continuation?.resume(returning: result)
+        } catch {
+          if let continuation {
+            continuation.resume(throwing: error)
+          } else {
+            // A `wait: false` load has no caller left to throw to; it is
+            // recorded the same way a failed render is, so /health's
+            // last_error names it instead of it vanishing into a log line.
+            failedRenderCount += 1
+            lastError = "\(op.summary) failed: \(error.localizedDescription)"
+            logger.error("Queued model operation failed — \(op.summary): \(error.localizedDescription)")
+          }
         }
       case .localVideo(let body, let continuation, let wantsAudio, let videoJobId):
         // Runs on the serial queue so LTX-2 never shares the GPU with a render.
@@ -6851,11 +7045,11 @@ private actor WarmServerCoordinator {
       return
     }
 
-    // WP-E13: an N-row tableau sampler only runs under the Krea 2 loop. The
-    // name resolved at decode (unknown names are already 400 by then); this is
-    // the family gate, so it lives here rather than at the decoder (D18).
+    // I5: the family capability gate. The name resolved at decode (unknown
+    // names are already 400 by then); whether THIS family's loop can honour
+    // it is decided here, from the one matrix (D18: family gates at dispatch).
     if let names = try? payload.validateRecipeNames(),
-       let error = GeneratePayload.validateTableauSampler(names, family: currentModelFamily) {
+       let error = GeneratePayload.validateFamilyRecipe(names, family: currentModelFamily) {
       lastError = error.localizedDescription ?? "unsupported sampler"
       continuation.resume(throwing: error)
       return
@@ -7192,7 +7386,10 @@ private actor WarmServerCoordinator {
       // Fail CLOSED on an incomplete read-back: a record naming two of three
       // adapters is worse than no record, because it reads as complete.
       let loraReadBacks = RenderRecipe.loRAReadBacks(
-        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports)
+        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports,
+        // I6: the relativity the guard ENFORCED, so `relative_to` names what
+        // was applied rather than what the request happened to declare.
+        relativities: k2.loadedLoRARelativities)
       if loraReadBacks == nil {
         let mismatch = "Krea2 provenance: \(k2.loadedLoRAConfigs.count) loaded LoRA configs but "
           + "\(k2.loadedLoRAReports.count) bind reports — refusing to emit a partial `applied` for this render"
@@ -7201,7 +7398,7 @@ private actor WarmServerCoordinator {
       // `base_model` is the declared alias when the active spec is one (or
       // resolves to one's directory — AC-34b), else the spec as loaded.
       let activeSpec = activePoolModelSpec ?? configuration.modelSpec ?? "krea2"
-      let applied: RenderRecipe? = loraReadBacks.map { readBacks in
+      let record: RenderRecipe? = loraReadBacks.map { readBacks in
         RenderRecipe.krea2(.init(
           baseModel: Krea2ModelDetection.alias(forSpec: activeSpec) ?? activeSpec,
           variant: k2.variant,
@@ -7211,14 +7408,15 @@ private actor WarmServerCoordinator {
           textEncoderFile: k2.paths.textEncoderFile,
           loras: readBacks,
           control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
-          trace: trace,
-          negativePrompt: payload.negativePrompt))
+          trace: trace))
       }
-      // Sink 2 — the PNG. `negativePrompt` is passed only when the CFG branch
-      // ran (AC-61: at guidance ≤ 1 it did not apply and is absent).
+      // Sink 2 — the PNG. The negative comes from the TRACE (K-FIX-1 / I4):
+      // absent when CFG never ran (AC-61), and an applied `""` is written as
+      // `""` rather than dropped, so the file records the second model pass
+      // an omitted negative still paid for.
       let metadata = QwenImageIO.ImageMetadata.generation(
         prompt: guardedPrompt,
-        negativePrompt: trace.cfgActive ? payload.negativePrompt : nil,
+        negativePrompt: trace.negativePromptApplied,
         seed: trace.seed,
         steps: trace.stepsRequested,
         guidance: trace.guidance,
@@ -7228,7 +7426,9 @@ private actor WarmServerCoordinator {
         generatedBy: payload.source,
         contentMode: payload.contentMode,
         loras: k2.loadedLoRAConfigs,
-        applied: applied
+        // The SLOT, so a refused record writes `"applied": null` in the file
+        // rather than looking like a family that has no record (round 2, C4).
+        appliedSlot: AppliedRecordSlot(record: record)
       )
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
@@ -7236,6 +7436,10 @@ private actor WarmServerCoordinator {
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
       lastError = nil
+      // Round 2 (C4): THIS render is Krea 2, so the slot is always present —
+      // it carries the record, or a literal `null` when `loraReadBacks` refused
+      // it above. An absent key must never be able to mean "engine-incomplete".
+      let applied = AppliedRecordSlot(record: record)
       lastRecipe = applied  // sink 3 — /health.last_recipe
       activeRenderStartedAt = nil
       resumed = true
@@ -7414,6 +7618,15 @@ private actor WarmServerCoordinator {
     let cfgScale = payload.cfg ?? 4.0
     let cfgWarmup = payload.firstNStepsWithoutCFG ?? 0
 
+    // K-FIX-1 / Codex I5: Chroma HAS native heun and beta and this call used
+    // to pass neither, so `scheduler: "heun"` rendered Euler pixels under the
+    // name "heun". The pair is mapped through the one family matrix — which
+    // has already refused (400) any pair it cannot map, so the fallback here
+    // is the unreachable default, not a silent substitution.
+    let names = try payload.validateRecipeNames()
+    let chromaScheduler = FamilyRecipeMatrix.chromaSchedulerType(
+      sampler: names.scheduler, schedule: names.sigmaSchedule) ?? .euler
+
     // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
     let result = pipeline.generate(
       tokenIds: tokenIds,
@@ -7424,6 +7637,7 @@ private actor WarmServerCoordinator {
       guidance: guidance,
       cfg: cfgScale,
       firstNStepsWithoutCFG: cfgWarmup,
+      schedulerType: chromaScheduler,
       seed: seed,
       progressCallback: { step, total in
         // Progress logging
@@ -7435,7 +7649,13 @@ private actor WarmServerCoordinator {
 
     // Save image (with embedded, Finder-readable generation metadata)
     try QwenImageIO.saveImage(array: imageArray, to: outputURL,
-      metadata: .generation(prompt: payload.prompt, negativePrompt: payload.negativePrompt,
+      // Non-Krea 2 families hand `ImageMetadata` a RAW payload value, where
+      // `""` means "not given" — normalised through the one shared helper so
+      // the I4 change to `ImageMetadata.generation` (an explicit `""` is
+      // written) cannot add a `negative_prompt: ""` key to any other family's
+      // PNG. Krea 2's APPLIED value deliberately does not go through it.
+      metadata: .generation(prompt: payload.prompt,
+        negativePrompt: QwenImageIO.ImageMetadata.requestNegative(payload.negativePrompt),
         seed: seed, steps: steps, guidance: guidance, width: width, height: height,
         generatedBy: payload.source, contentMode: payload.contentMode, loras: loras))
   }
@@ -8121,32 +8341,26 @@ extension GeneratePayload: Decodable {
       reason: "VAE selection is a Krea 2 request field (WP-E9); this family decodes through its own VAE and does not honour it — remove it")
   }
 
-  /// WP-E13: refuse an N-row tableau sampler on a family that cannot drive one.
+  /// K-FIX-1 / Codex I5: refuse a sampler / sigma schedule the ACTIVE FAMILY
+  /// cannot honour, from the one family capability matrix
+  /// (``FamilyRecipeMatrix``).
   ///
-  /// `ralston_2s/3s/4s` and `res_3s` take `rows` model evaluations per step
-  /// through `TableauScheduler`. Only `Krea2DenoiseLoop` dispatches that
-  /// protocol; every other family's loop calls `ZImageScheduler.step`, which
-  /// for these conformers is a `preconditionFailure` — and before WP-E13's
-  /// review was a first-order Euler render carrying the tableau's name. The
-  /// names stay accepted and advertised (E4: advertised == accepted); what is
-  /// family-scoped is whether the render can honour them.
+  /// Supersedes WP-E13's `validateTableauSampler`, which is now one row of
+  /// that table: N-row tableaus (`ralston_2s/3s/4s`, `res_3s`) are dispatched
+  /// only by `Krea2DenoiseLoop`. The table also closes the silences E13's
+  /// single row left open — Chroma ignoring its own native `heun`/`beta`, and
+  /// Flux 2 / FIBO accepting any name into a fixed Euler loop.
   ///
+  /// Names stay accepted and advertised globally (E4: advertised == accepted
+  /// as a NAME); what is family-scoped is whether the render can honour them.
   /// Returns the 400 to throw, or nil. Runs at the one dispatch point in
-  /// `generate`, beside `validateShift(_:family:)` (D18: family gates live at
-  /// dispatch, not at the decoder).
-  static func validateTableauSampler(
+  /// `generate` and in the bridge's family arm, beside
+  /// `validateShift(_:family:)` (D18: family gates live at dispatch, not at
+  /// the decoder).
+  static func validateFamilyRecipe(
     _ names: ResolvedRecipeNames, family: WarmModelFamily
   ) -> WarmServerError? {
-    guard let sampler = names.scheduler, sampler.isNRowTableau else { return nil }
-    guard family != .krea2 else { return nil }
-    return .unsupportedSampler(
-      name: names.schedulerRequested ?? sampler.rawValue,
-      family: family.rawValue,
-      reason: "it is an N-row tableau sampler (\(sampler.rawValue)) dispatched only by the "
-        + "Krea 2 denoise loop; this family takes one model evaluation per step and would "
-        + "render first-order Euler under that name. Load a krea2 model, or use one of: "
-        + SchedulerKind.allCases.filter { !$0.isNRowTableau }.map(\.rawValue)
-          .joined(separator: ", "))
+    FamilyRecipeMatrix.validate(names, family: family)
   }
 
   /// The DyPE configuration this payload implies at the given resolution.
@@ -8419,14 +8633,21 @@ struct GenerateResponse: Encodable, Sendable {
   let preemptRefused: Bool
   let etaSec: Double?
   /// WP-E10 sink 1 (FDD §3.10, D8): the provenance record — what APPLIED,
-  /// read back from the pipeline. Krea 2 only (D12); other families emit
-  /// null. Defaulted in this explicit init for the same reason as
-  /// `preemptRefused`: a property-level default would drop it from the
-  /// synthesized memberwise init.
-  let applied: RenderRecipe?
+  /// read back from the pipeline. Krea 2 only (D12).
+  ///
+  /// Tri-state via ``AppliedRecordSlot`` (round 2, C4): key ABSENT for another
+  /// family, literal `null` for a Krea 2 render whose record was refused
+  /// (engine-incomplete), the object otherwise. Defaulted in this explicit init
+  /// for the same reason as `preemptRefused`: a property-level default would
+  /// drop it from the synthesized memberwise init.
+  let applied: AppliedRecordSlot?
+
+  /// The record itself, for Swift readers that do not care about the
+  /// absent-vs-null distinction.
+  var appliedRecord: RenderRecipe? { applied?.record }
 
   init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
-       applied: RenderRecipe? = nil) {
+       applied: AppliedRecordSlot? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
@@ -8661,9 +8882,11 @@ struct HealthResponse: Encodable, Sendable {
   let lastRenderDurationMs: Int?
   let lastError: String?
   /// WP-E10 sink 3: `last_recipe` — the record of the last successful Krea 2
-  /// render, identical to that render's `applied` (AC-62). Null until one
-  /// has run, and for other families (D12).
-  let lastRecipe: RenderRecipe?
+  /// render, identical to that render's `applied` (AC-62). Tri-state via
+  /// ``AppliedRecordSlot`` (round 2, C4): ABSENT until a Krea 2 render has run
+  /// (and for other families, D12), literal `null` when the last Krea 2
+  /// render's record was refused, the object otherwise.
+  let lastRecipe: AppliedRecordSlot?
 }
 
 struct LoRAState: Encodable, Sendable {
@@ -8691,6 +8914,13 @@ private enum QueuedOperation: Sendable {
   case controlGenerate(ZImageControlGenerationRequest, ContinuationBox<GenerateResponse>)
   case swap(LoRASwapPayload, ContinuationBox<LoRASwapResponse>)
   case modelSwitch(@Sendable () async throws -> Bool, ContinuationBox<Bool>)
+  /// K-FIX-1 / Codex C2: a MUTATING pool operation (`/v1/model/load`,
+  /// `/v1/model/activate`, `/v1/model/unload`) run on the SAME FIFO as
+  /// renders, LoRA swaps and the ComfyBridge model switch — so a load,
+  /// eviction or `GPU.clearCache()` can never begin under an active render.
+  /// The continuation is nil for a `wait: false` load, which is tracked by
+  /// its queue job id instead of by a waiting caller (never a detached Task).
+  case modelOperation(ModelOperation, ContinuationBox<ModelOperationResult>?)
   /// Local LTX-2 video generation, run through the queue so it serializes with
   /// image renders on the shared GPU. The closure captures the generator+request.
   /// #1479: the closure returns `LTX2RenderOutcome` (not the bare result) so
@@ -8823,3 +9053,92 @@ public enum WarmServerError: Error, LocalizedError {
     }
   }
 }
+
+#if DEBUG
+/// K-FIX-1 / Codex C2 test seam — drives the coordinator's FIFO directly.
+///
+/// `WarmServerCoordinator` and the queue types are file-private (deliberately:
+/// nothing outside this file should hold the queue), so the barrier test that
+/// proves "no pool load or eviction begins until an active render exits" gets
+/// this narrow probe instead of a widened actor. It exposes exactly three
+/// things: a way to occupy the queue with a controllable job, the two model
+/// operation enqueue seams the REST routes now use, and the pending count.
+///
+/// Construct it with `COMFYBOX_STATE_DIR` pointed at a temp directory — the
+/// coordinator persists its queue snapshot and reads its pause sentinel from
+/// that directory, and the LIVE engine's are not the test's to touch.
+final class WarmServerQueueProbe: @unchecked Sendable {
+  private let coordinator: WarmServerCoordinator
+  private let liveHealth = LiveHealthState()
+  private var liveHealthSnapshot: HealthSnapshot { liveHealth.read().0 }
+
+  init(maxPendingRequests: Int = 10) {
+    self.coordinator = WarmServerCoordinator(
+      configuration: WarmServerConfiguration(maxPendingRequests: maxPendingRequests),
+      logger: Logger(label: "z-image.queue-probe"),
+      videoHolder: VideoGeneratorHolder(),
+      liveHealth: liveHealth,
+      videoJobTracker: VideoJobTracker(),
+      ltx2Telemetry: LTX2PhaseTelemetry(),
+      ltx2PreemptionSignal: PreemptionSignal(),
+      ltx2StepPosition: LTX2StepPosition(),
+      ltx2EvictMean: RollingMeanSec(),
+      ltx2ReloadMean: RollingMeanSec(),
+      preemptionInFlight: LockedFlag(),
+      pendingPreemptorBox: PendingPreemptorBox())
+  }
+
+  /// Occupy the queue with an arbitrary body — the stand-in for a render.
+  /// `.modelSwitch` is used because it is the one existing queue kind whose
+  /// work is a caller-supplied closure; the loop treats it exactly like any
+  /// other job, one at a time.
+  func enqueueFakeRender(_ body: @escaping @Sendable () async throws -> Bool) async throws -> Bool {
+    try await coordinator.enqueueModelSwitch(body)
+  }
+
+  /// The seam `/v1/model/load` (wait: true), `/v1/model/activate` and
+  /// `/v1/model/unload` use.
+  func enqueueModelOperation(_ op: ModelOperation) async throws -> ModelOperationResult {
+    try await coordinator.enqueueModelOperation(op)
+  }
+
+  /// The seam `/v1/model/load` (wait: false) uses — returns the queue job id.
+  func enqueueModelOperationDetached(_ op: ModelOperation) async throws -> String {
+    try await coordinator.enqueueModelOperationDetached(op)
+  }
+
+  /// The kinds of the jobs still waiting, read through the same
+  /// lock-based snapshot `/health` and `/v1/queue` publish.
+  func pendingJobKinds() -> [String] {
+    liveHealthSnapshot.pending.map { $0.kind }
+  }
+
+  /// The pause sentinel the coordinator would read, exposed so a test can
+  /// assert it is redirected away from the LIVE `~/.comfybox/queue-paused`
+  /// before any coordinator is constructed.
+  static var pauseSentinelPath: String { WarmServerCoordinator.pauseSentinelPath }
+
+  /// Pause / resume the queue, exactly as `/v1/queue/pause` does.
+  func setPaused(_ paused: Bool) async {
+    await coordinator.setPaused(paused)
+  }
+
+  /// The summary of the job the loop is running, or nil when idle.
+  var activeJobSummary: String? { liveHealthSnapshot.activeSummary }
+
+  /// Nothing running and nothing waiting.
+  ///
+  /// The drain guard reads this: a test must not tear down its isolated state
+  /// directory while the coordinator still has work, because the loop's
+  /// per-job `persistQueueState()` would then resolve — and `removeItem` —
+  /// the LIVE snapshot path (K-FIX-1 round 2, New-2).
+  var isDrained: Bool {
+    let snapshot = liveHealthSnapshot
+    return snapshot.activeJobId == nil && snapshot.pending.isEmpty
+  }
+
+  var pendingCount: Int { liveHealthSnapshot.pending.count }
+
+  var isPaused: Bool { liveHealthSnapshot.isPaused }
+}
+#endif

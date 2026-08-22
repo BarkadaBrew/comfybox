@@ -271,17 +271,22 @@ final class Krea2TruncatedLoRATests: XCTestCase {
     XCTAssertFalse(LoRAApplicator.hasDynamicLoRA(in: strictModel))
   }
 
-  // MARK: - Known gap (reported, NOT fixed here)
+  // MARK: - Orphan LoKr half (K-FIX-1 / I3 — the E7 tripwire, now flipped)
 
-  /// FINDING for the E7 report: a truncated **LyCORIS LoKr** file is the one
-  /// damage mode that is neither refused nor reported. `loadForKrea2` pairs
-  /// `lokr_w1`/`lokr_w2` with `guard let w2 = lokrW2[key] else { continue }`
-  /// — a `lokr_w1` whose `lokr_w2` was dropped is consumed (so it is not an
+  /// Was the E7 report's KNOWN GAP: a truncated **LyCORIS LoKr** file was the
+  /// one damage mode neither refused nor reported — `loadForKrea2` paired the
+  /// halves with `guard let w2 = lokrW2[key] else { continue }`, so a
+  /// `lokr_w1` whose `lokr_w2` was dropped was consumed (hence not an
   /// `unknownKeys` refusal) and then silently discarded, and LoKr modules are
-  /// outside `LoRAApplicationReport.offered` entirely, so strict apply cannot
-  /// see it either. Pinned as an intentional tripwire: when the gap is
-  /// closed, THIS test is the one that flips.
-  func testTruncatedLoKrHalfIsSilentlyDroppedKnownGap() throws {
+  /// outside `LoRAApplicationReport.offered` entirely, so strict apply could
+  /// not see it either.
+  ///
+  /// Codex engine review I3 / ledger AC-42: an orphan LoKr half is now
+  /// refused as `invalidFormat` naming the key — the same posture the plain
+  /// `lora_A`/`lora_B` pair has had all along (see
+  /// `testDroppedLoRABIsRefusedAsAnOrphanPairHalf`). A complete file still
+  /// loads both entries.
+  func testOrphanLoKrHalfIsRefusedAsInvalidFormat() throws {
     var arrays: [String: MLXArray] = [:]
     for proj in ["wq", "wk"] {
       arrays["diffusion_model.blocks.0.attn.\(proj).lokr_w1"] =
@@ -292,19 +297,46 @@ final class Krea2TruncatedLoRATests: XCTestCase {
     let complete = try write(arrays, as: "lokr-complete.safetensors")
     XCTAssertEqual(try LoRAWeightLoader.loadForKrea2(from: complete).lokrWeights.count, 2)
 
-    arrays.removeValue(forKey: "diffusion_model.blocks.0.attn.wk.lokr_w2")
-    let truncated = try write(arrays, as: "lokr-truncated.safetensors")
-    let weights = try LoRAWeightLoader.loadForKrea2(from: truncated)
-    XCTAssertEqual(
-      weights.lokrWeights.count, 1,
-      "KNOWN GAP: the orphaned lokr_w1 is dropped without an error and without a report entry")
+    // w2 dropped — the orphan is `lokr_w1`.
+    var missingW2 = arrays
+    missingW2.removeValue(forKey: "diffusion_model.blocks.0.attn.wk.lokr_w2")
+    let truncatedW2 = try write(missingW2, as: "lokr-truncated-w2.safetensors")
+    XCTAssertThrowsError(try LoRAWeightLoader.loadForKrea2(from: truncatedW2)) { error in
+      guard case LoRAError.invalidFormat(let message) = error else {
+        return XCTFail("expected invalidFormat, got \(error)")
+      }
+      XCTAssertTrue(message.contains("lokr_w2"), message)
+      XCTAssertTrue(message.contains("blocks.0.attn.wk"), message)
+    }
 
-    // …and strict apply is blind to it: nothing in the report names the key.
-    let model = ToyDiT(blocks: blockCount, dim: dim)
-    let report = try LoRAApplicator.applyDynamically(
-      to: model, loraWeights: weights, scale: 1.0, strict: true, name: "lokr-truncated")
-    XCTAssertTrue(
-      report.unbound.isEmpty,
-      "KNOWN GAP: a truncated LoKr file passes strict apply clean — see the WP-E7 report")
+    // …and the mirror case: w1 dropped, the orphan is `lokr_w2`. Without this
+    // half of the guard a file that lost its w1 would still load a half-LoKr
+    // dictionary entry-free and report a clean apply.
+    var missingW1 = arrays
+    missingW1.removeValue(forKey: "diffusion_model.blocks.0.attn.wk.lokr_w1")
+    let truncatedW1 = try write(missingW1, as: "lokr-truncated-w1.safetensors")
+    XCTAssertThrowsError(try LoRAWeightLoader.loadForKrea2(from: truncatedW1)) { error in
+      guard case LoRAError.invalidFormat(let message) = error else {
+        return XCTFail("expected invalidFormat, got \(error)")
+      }
+      XCTAssertTrue(message.contains("lokr_w1"), message)
+      XCTAssertTrue(message.contains("blocks.0.attn.wk"), message)
+    }
+  }
+
+  /// An `.alpha` beside a LoKr pair is metadata, not a half: a module that
+  /// carries alpha but no w1/w2 at all must NOT be reported as an orphan
+  /// (that would refuse files the loader has always accepted).
+  func testAlphaWithoutLoKrHalvesIsNotAnOrphan() throws {
+    var arrays: [String: MLXArray] = [:]
+    arrays["diffusion_model.blocks.0.attn.wq.lokr_w1"] =
+      (MLXArray.ones([dim, rank]) * Float(0.1)).asType(.float32)
+    arrays["diffusion_model.blocks.0.attn.wq.lokr_w2"] =
+      (MLXArray.ones([rank, dim]) * Float(0.1)).asType(.float32)
+    arrays["diffusion_model.blocks.0.attn.wq.alpha"] = MLXArray(Float(4.0))
+    let url = try write(arrays, as: "lokr-with-alpha.safetensors")
+    let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+    XCTAssertEqual(weights.lokrWeights.count, 1)
+    XCTAssertEqual(weights.lokrWeights.values.first?.alpha, 4.0)
   }
 }

@@ -19,6 +19,9 @@ enum RenderRecipeFixture {
     sampler: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .krea2,
     sigmaScheduleRequested: String? = nil,
+    /// The negative the REQUEST carried; the fixture resolves what a pipeline
+    /// would have encoded from it exactly as the pipelines do (I4).
+    negativePrompt: String? = nil,
     eta: Float = 0,
     bongmath: Bool = false,
     mu: Float = 0.9062,
@@ -46,14 +49,15 @@ enum RenderRecipeFixture {
       bongmath: bongmath,
       seed: seed,
       width: 1024,
-      height: 1024)
+      height: 1024,
+      negativePromptApplied: Krea2RunTrace.negativePromptApplied(
+        cfgActive: guidance > 1.0, requested: negativePrompt))
   }
 
   /// The pipeline-side read-backs around a trace: what loaded, not what was
   /// asked for.
   static func inputs(
     trace: Krea2RunTrace,
-    negativePrompt: String? = nil,
     quantizationBits: Int? = 8,
     loras: [RenderRecipe.LoRAReadBack] = [],
     control: RenderRecipe.ControlReadBack? = nil,
@@ -71,8 +75,7 @@ enum RenderRecipeFixture {
       textEncoderFile: URL(fileURLWithPath: "/Users/me/LocalModels/krea2-raw/text_encoder/model.safetensors"),
       loras: loras,
       control: control,
-      trace: trace,
-      negativePrompt: negativePrompt)
+      trace: trace)
   }
 
   static func recipe(
@@ -83,9 +86,9 @@ enum RenderRecipeFixture {
   ) -> RenderRecipe {
     RenderRecipe.krea2(inputs(
       trace: trace(steps: steps, guidance: guidance, startIndex: startIndex,
-                   sigmaScheduleRequested: sigmaScheduleRequested),
-      negativePrompt: negativePrompt, quantizationBits: quantizationBits,
-      loras: loras, control: control))
+                   sigmaScheduleRequested: sigmaScheduleRequested,
+                   negativePrompt: negativePrompt),
+      quantizationBits: quantizationBits, loras: loras, control: control))
   }
 
   static func report(offered: Int, bound: Int, deltasApplied: Int = 0, shapeRejected: Int = 0)

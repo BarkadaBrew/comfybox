@@ -71,6 +71,20 @@ public struct Krea2RunTrace: Sendable, Equatable {
   // — request echo the record needs —
 
   public let guidance: Float
+  /// K-FIX-1 / Codex I4 — the negative prompt the pipeline ACTUALLY encoded,
+  /// resolved at the CFG branch itself:
+  ///
+  ///   * `nil`  — guidance ≤ 1, the CFG branch never ran, nothing applied.
+  ///   * `""`   — CFG ran and the caller sent no negative, so the pipeline
+  ///              encoded the empty string and paid a second model pass for
+  ///              it (`request.negativePrompt ?? ""`).
+  ///   * text   — CFG ran against that text.
+  ///
+  /// Every provenance sink (`applied`, PNG metadata, `/health.last_recipe`,
+  /// async status) reads this instead of the request payload, so an omitted
+  /// negative under CFG can no longer be recorded as "no negative prompt".
+  /// Invariant, pinned by test: non-nil exactly when ``cfgActive``.
+  public let negativePromptApplied: String?
   /// RES4LYF SDE eta (T2). 0 until WP-E15.
   public let eta: Float
   /// RES4LYF bongmath (T3). `false` until WP-E16.
@@ -101,7 +115,8 @@ public struct Krea2RunTrace: Sendable, Equatable {
     bongmath: Bool,
     seed: UInt64,
     width: Int,
-    height: Int
+    height: Int,
+    negativePromptApplied: String? = nil
   ) {
     self.sampler = sampler
     self.sigmaSchedule = sigmaSchedule
@@ -118,6 +133,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.startIndex = startIndex
     self.denoise = denoise
     self.guidance = guidance
+    self.negativePromptApplied = negativePromptApplied
     self.eta = eta
     self.bongmath = bongmath
     self.seed = seed
@@ -141,7 +157,8 @@ extension Krea2RunTrace {
     startIndex: Int,
     denoise: Float,
     width: Int,
-    height: Int
+    height: Int,
+    negativePromptApplied: String?
   ) {
     self.init(
       sampler: request.sampler,
@@ -151,7 +168,8 @@ extension Krea2RunTrace {
       shift: shift, scheduler: scheduler, stats: stats,
       stepsRequested: request.steps, startIndex: startIndex, denoise: denoise,
       guidance: request.guidance, eta: request.eta, bongmath: request.bongmath,
-      seed: request.seed, width: width, height: height)
+      seed: request.seed, width: width, height: height,
+      negativePromptApplied: negativePromptApplied)
   }
 
   /// The img2img trace.
@@ -163,7 +181,8 @@ extension Krea2RunTrace {
     startIndex: Int,
     denoise: Float,
     width: Int,
-    height: Int
+    height: Int,
+    negativePromptApplied: String?
   ) {
     self.init(
       sampler: request.sampler,
@@ -173,7 +192,8 @@ extension Krea2RunTrace {
       shift: shift, scheduler: scheduler, stats: stats,
       stepsRequested: request.steps, startIndex: startIndex, denoise: denoise,
       guidance: request.guidance, eta: request.eta, bongmath: request.bongmath,
-      seed: request.seed, width: width, height: height)
+      seed: request.seed, width: width, height: height,
+      negativePromptApplied: negativePromptApplied)
   }
 
   /// The shared body: everything the loop and the scheduler are the witnesses to.
@@ -192,7 +212,8 @@ extension Krea2RunTrace {
     bongmath: Bool,
     seed: UInt64,
     width: Int,
-    height: Int
+    height: Int,
+    negativePromptApplied: String?
   ) {
     self.init(
       sampler: sampler,
@@ -214,7 +235,8 @@ extension Krea2RunTrace {
       bongmath: bongmath,
       seed: seed,
       width: width,
-      height: height)
+      height: height,
+      negativePromptApplied: negativePromptApplied)
   }
 
   /// The grid as walked: the scheduler's own sigmas, plus the `0.0` a
@@ -243,7 +265,17 @@ extension Krea2RunTrace {
   /// CFG ran: two model evaluations per step, and the negative prompt was
   /// actually conditioned on. `false` at guidance ≤ 1, where the record must
   /// omit `negative_prompt` because it did not apply (AC-61).
+  ///
+  /// This is the SAME predicate the pipelines branch on (`useCFG`), which is
+  /// why ``negativePromptApplied`` is non-nil exactly when this is true.
   public var cfgActive: Bool { guidance > 1.0 }
+
+  /// What a pipeline encodes for the CFG pass, given the branch it took and
+  /// the request it was handed. One spelling of the I4 rule, so the two
+  /// pipelines and the fixtures cannot drift from each other.
+  public static func negativePromptApplied(cfgActive: Bool, requested: String?) -> String? {
+    cfgActive ? (requested ?? "") : nil
+  }
 
   /// First three sigmas of the grid the loop walked (`RenderRecipe.Stage.sigmaHead`).
   public var sigmaHead: [Float] { Array(sigmas.prefix(3)) }

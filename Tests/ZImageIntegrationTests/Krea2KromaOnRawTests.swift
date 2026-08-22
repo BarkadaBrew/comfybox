@@ -233,22 +233,25 @@ final class Krea2KromaOnRawTests: XCTestCase {
 
     // The E10 read-back pairs config with report without desyncing.
     let readBacks = try XCTUnwrap(
-      RenderRecipe.loRAReadBacks(configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports),
+      RenderRecipe.loRAReadBacks(
+        configs: k2.loadedLoRAConfigs, reports: k2.loadedLoRAReports,
+        relativities: k2.loadedLoRARelativities),
       "\(name): config/report desync")
     XCTAssertEqual(readBacks.count, 1)
     XCTAssertEqual(readBacks[0].report.bound, report.bound)
     XCTAssertEqual(readBacks[0].configuration.role, "kroma")
     XCTAssertEqual(readBacks[0].configuration.scale, 0.6)
-    // KNOWN GAP (WP-E7 report concern 2; E6/E10 own the fix):
-    // `RenderRecipe.Applied.relativeTo` is built from
-    // `configuration.requiresBase` alone, and the seed table resolves
-    // relativity INSIDE `loadLoRAs` without writing it back — so the preset
-    // path exercised above records `relative_to: null` even though the guard
-    // did use `.raw`. Pinned as a tripwire, NOT as intended behaviour: when
-    // the resolved relativity is carried into the record, this flips.
+    // K-FIX-1 / Codex I6 — the E7 KNOWN GAP, now closed. This request
+    // declares no `requiresBase`; the SEED table supplies `.raw` and the
+    // guard enforces it, and the record now names that enforced value
+    // instead of the request's silence.
     XCTAssertNil(readBacks[0].configuration.requiresBase,
-                 "KNOWN GAP: this request declared nothing and the SEED supplied the relativity, "
-                   + "so provenance will record relative_to: null — see the WP-E7 report")
+                 "\(name): the REQUEST still declares nothing — that is the case under test")
+    XCTAssertEqual(readBacks[0].resolvedRelativeTo, .raw,
+                   "\(name): the pipeline kept the relativity it enforced")
+    XCTAssertEqual(
+      readBacks[0].relativeTo, .raw,
+      "\(name): provenance records relative_to: raw, not null")
 
     try applyStack(k2, [])
     XCTAssertTrue(k2.loadedLoRAConfigs.isEmpty)

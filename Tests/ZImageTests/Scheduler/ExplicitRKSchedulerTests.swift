@@ -347,17 +347,21 @@ final class ExplicitRKSchedulerTests: XCTestCase {
     XCTAssertEqual(claimed, [.ralston2s, .ralston3s, .ralston4s, .res3s])
   }
 
-  /// The server's family gate (`validateTableauSampler`): a tableau sampler is
-  /// a 400 on every family but `krea2`, and every other sampler passes
-  /// everywhere. Accepted-and-advertised is unchanged (E4); what is
+  /// The server's family gate: a tableau sampler is a 400 on every family but
+  /// `krea2`. Accepted-and-advertised as a NAME is unchanged (E4); what is
   /// family-scoped is whether the loop can honour it.
+  ///
+  /// K-FIX-1 / I5: the gate is now the family capability matrix, of which this
+  /// is one row — so a NON-tableau sampler is no longer universally accepted
+  /// either; it passes exactly on the families that drive it.
   func testTableauSamplersAreRefusedOffKrea2() throws {
     for kind in SchedulerKind.allCases {
       for family in WarmModelFamily.allCases {
         let names = ResolvedRecipeNames(
           scheduler: kind, schedulerRequested: kind.rawValue,
           sigmaSchedule: nil, sigmaScheduleRequested: nil)
-        let error = GeneratePayload.validateTableauSampler(names, family: family)
+        let error = GeneratePayload.validateFamilyRecipe(names, family: family)
+        let familyRunsIt = FamilyRecipeMatrix.capability(for: family).samplers.contains(kind)
         if kind.isNRowTableau && family != .krea2 {
           let rejection = try XCTUnwrap(
             error, "\(kind.rawValue) on \(family.rawValue) must be refused")
@@ -366,14 +370,15 @@ final class ExplicitRKSchedulerTests: XCTestCase {
           XCTAssertTrue(message.contains(family.rawValue), message)
           XCTAssertTrue(message.contains("Krea 2"), message)
         } else {
-          XCTAssertNil(
-            error, "\(kind.rawValue) on \(family.rawValue) must pass: \(String(describing: error))")
+          XCTAssertEqual(
+            error == nil, familyRunsIt,
+            "\(kind.rawValue) on \(family.rawValue): \(String(describing: error))")
         }
       }
     }
     // A request with no sampler at all is never gated.
     XCTAssertNil(
-      GeneratePayload.validateTableauSampler(
+      GeneratePayload.validateFamilyRecipe(
         ResolvedRecipeNames(
           scheduler: nil, schedulerRequested: nil, sigmaSchedule: nil, sigmaScheduleRequested: nil),
         family: .flux1))
@@ -385,7 +390,7 @@ final class ExplicitRKSchedulerTests: XCTestCase {
     let names = ResolvedRecipeNames(
       scheduler: .ralston4s, schedulerRequested: "linear/ralston_4s",
       sigmaSchedule: nil, sigmaScheduleRequested: nil)
-    let error = try XCTUnwrap(GeneratePayload.validateTableauSampler(names, family: .flux1))
+    let error = try XCTUnwrap(GeneratePayload.validateFamilyRecipe(names, family: .flux1))
     let message = try XCTUnwrap(error.errorDescription)
     // The raw string the caller sent is echoed, prefix and all.
     XCTAssertTrue(message.contains("linear/ralston_4s"), message)
