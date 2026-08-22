@@ -38,15 +38,20 @@ smoke() {
   say "smoke d) unknown sampler must 400"
   local code; code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "http://127.0.0.1:$PORT/v1/generate" -H 'content-type: application/json' -d '{"prompt":"x","scheduler":"uni_pc","steps":1,"width":64,"height":64}')
   [[ "$code" == "400" ]] || fail "POST /v1/generate scheduler=uni_pc returned $code, expected 400 (WP-E4 not live?)"
-  say "smoke e) build_sha matches deployed sha"
-  print -- "$h" | python3 -c "import sys,json; d=json.load(sys.stdin); s=d.get('build_sha') or ''; sys.exit(0 if s.startswith('$sha') else 1)" || fail "/health build_sha != $sha (clobbered binary?)"
+  say "smoke e) build_sha matches deployed sha (field lands with WP-E10; absent = warn)"
+  local bs; bs=$(print -- "$h" | python3 -c "import sys,json; print(json.load(sys.stdin).get('build_sha') or '')")
+  if [[ -z "$bs" ]]; then print -P "  %F{yellow}warn: /health has no build_sha yet (pre-E10) — binary identity unverified from outside%f"
+  elif [[ "$bs" != "$sha"* ]]; then fail "/health build_sha=$bs != $sha (clobbered binary?)"; fi
   say "smoke b/f) seed-44821 turbo SHA-256 fixture and a Krita default-style render are manual until WP-E3/E19 land — see FDD §7.3"
 }
 
 if (( SMOKE_ONLY )); then smoke; exit 0; fi
 
 say "1) Todd was told before this ran (pause is visible; codesign can prompt)."
-if (( PAUSE )); then say "2) pausing queue"; queue_pause || fail "could not pause queue"; fi
+PAUSED=0
+resume_on_exit() { if (( PAUSED )); then say "exit: resuming queue (pause persists across restarts — never leave it paused)"; queue_resume && PAUSED=0 || print -P "%F{red}RESUME FAILED — run: curl -X POST http://127.0.0.1:$PORT/v1/queue/resume%f" >&2; fi }
+trap resume_on_exit EXIT
+if (( PAUSE )); then say "2) pausing queue"; queue_pause || fail "could not pause queue"; PAUSED=1; fi
 
 say "3) building release in $ROOT (never rm -rf .build)"
 ( cd "$ROOT" && swift build -c release --product ComfyBox 2>&1 | tail -3 )
@@ -68,8 +73,7 @@ say "   current -> ComfyBox-$sha (previous: $prev)"
 
 if ! grep -q "$BIN_DIR/current" "$PLIST"; then
   say "PLIST NOT REPOINTED (Q9). Binary installed; to activate, set ProgramArguments[0] in $PLIST to $BIN_DIR/current, then: launchctl bootout gui/$UID/$LABEL; launchctl bootstrap gui/$UID $PLIST"
-  (( PAUSE )) && { say "resuming queue (nothing restarted)"; queue_resume || true; }
-  exit 2
+  exit 2  # trap resumes the queue
 fi
 
 say "6) restarting $LABEL"
@@ -79,6 +83,6 @@ for i in {1..60}; do health >/dev/null 2>&1 && break; sleep 2; done
 health >/dev/null || fail "engine did not come back within 120s — rollback: ln -sfn $prev $BIN_DIR/current && launchctl kickstart -k gui/$UID/$LABEL"
 
 say "7) smoke"; smoke
-if (( PAUSE )); then say "8) resuming queue"; queue_resume || fail "RESUME FAILED — resume manually, pause persists across restarts"; fi
+if (( PAUSED )); then say "8) resuming queue"; queue_resume && PAUSED=0 || fail "RESUME FAILED — resume manually, pause persists across restarts"; fi
 health | python3 -c 'import sys,json; d=json.load(sys.stdin); print("  is_paused", d.get("is_paused"), "status", d.get("status"))'
 say "done"
