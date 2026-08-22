@@ -40,6 +40,12 @@ private final class Gate: @unchecked Sendable {
   func waitUntilOpen() { semaphore.wait() }
 }
 
+/// Holds the shutdown call's result across the polling loop.
+private actor ShutdownOutcome {
+  private(set) var value: Bool?
+  func record(_ response: Bool?) { value = response }
+}
+
 final class ModelOperationQueueTests: XCTestCase {
 
   override func setUpWithError() throws {
@@ -368,6 +374,302 @@ final class ModelOperationQueueTests: XCTestCase {
     await first.value
     await second.value
     XCTAssertEqual(order.all, ["A", "B"], "FIFO order across the pause")
+    try await drain(probe)
+  }
+
+  // MARK: - Pause exemption for shutdown + the capacity gate (WP-E8 hygiene)
+
+  /// `/v1/shutdown` on a PAUSED engine bricked it.
+  ///
+  /// `enqueueShutdown` sets `shuttingDown = true` BEFORE appending the job,
+  /// and `.shutdown` was not pause-exempt — so the job parked behind the
+  /// pause gate, the caller's continuation never resumed, and every later
+  /// enqueue threw `.shuttingDown`. The engine could then only be recovered
+  /// with SIGKILL. The handler is a bare continuation resume with no GPU
+  /// work, so "pause means no RENDERS" covers it exactly as it covers a
+  /// model operation.
+  func testShutdownCompletesWhileTheQueueIsPaused() async throws {
+    let probe = makeQueueProbe()
+    await probe.setPaused(true)
+
+    let outcome = ShutdownOutcome()
+    let posted = Task { await outcome.record(try? await probe.enqueueShutdown()) }
+
+    // Bounded: a parked continuation never resumes, so poll rather than await.
+    let deadline = Date().addingTimeInterval(3)
+    while await outcome.value == nil, Date() < deadline {
+      try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    // Deliberately NOT `await posted.value`: with the bug present that task
+    // is parked on a continuation that never resumes, and awaiting it would
+    // hang the whole suite instead of failing this test.
+    let recorded = await outcome.value
+    if recorded != nil { _ = await posted.result }
+    let success = try XCTUnwrap(
+      recorded,
+      "/v1/shutdown parked under the pause gate — the caller hangs forever and "
+        + "every later enqueue throws .shuttingDown (only SIGKILL recovers)")
+    XCTAssertTrue(success)
+
+    // Pausing is unchanged by it, and the queue is empty.
+    XCTAssertTrue(probe.isPaused)
+    XCTAssertTrue(probe.isDrained)
+    await probe.setPaused(false)
+  }
+
+  /// A shutdown posted while paused does not resurrect the parked renders:
+  /// they stay queued (the process is going away, not draining).
+  func testShutdownWhilePausedDoesNotRunParkedRenders() async throws {
+    let probe = makeQueueProbe()
+    let order = Recorder()
+    await probe.setPaused(true)
+
+    let render = Task { _ = try? await probe.enqueueFakeRender { order.record("render"); return true } }
+    try await Task.sleep(nanoseconds: 100_000_000)
+    XCTAssertEqual(probe.pendingJobKinds(), ["model_switch"])
+
+    _ = try? await probe.enqueueShutdown()
+    XCTAssertEqual(order.all, [], "a render must not run because a shutdown passed it")
+    XCTAssertEqual(probe.pendingJobKinds(), ["model_switch"], "still parked, not dropped")
+
+    // Clean up: resume so the parked render finishes before teardown.
+    await probe.setPaused(false)
+    await render.value
+    XCTAssertEqual(order.all, ["render"])
+  }
+
+  /// A paused queue holding `maxPendingRequests` parked renders answered
+  /// `/v1/model/unload` with `queueFull` — the same "cannot free the GPU
+  /// while paused" wedge as the parked continuation, one layer up. Model
+  /// operations are operator actions, bounded in number; they bypass the
+  /// capacity gate.
+  func testModelOperationsBypassTheCapacityGate() async throws {
+    let probe = makeQueueProbe(maxPendingRequests: 10)
+    let order = Recorder()
+    await probe.setPaused(true)
+
+    var renders: [Task<Void, Never>] = []
+    for index in 0..<10 {
+      renders.append(Task {
+        _ = try? await probe.enqueueFakeRender { order.record("r\(index)"); return true }
+      })
+    }
+    let deadline = Date().addingTimeInterval(5)
+    while probe.pendingCount < 10, Date() < deadline {
+      try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertEqual(probe.pendingCount, 10, "the queue must be at capacity for this test to mean anything")
+
+    // Synchronous seam (/v1/model/unload, /v1/model/activate, wait:true load).
+    var caught: Error?
+    do {
+      _ = try await probe.enqueueModelOperation(.unload(modelId: "no-such-model"))
+    } catch {
+      caught = error
+    }
+    let error = try XCTUnwrap(caught)
+    if WarmServerQueueProbe.isQueueFull(error) {
+      XCTFail("a model operation was refused with queueFull on a full, paused queue — "
+        + "the operator cannot free the GPU")
+    }
+    expectNotInPool(error, "the operation must RUN, not be refused")
+
+    // Detached seam (/v1/model/load, wait:false).
+    let jobId = try await probe.enqueueModelOperationDetached(.unload(modelId: "no-such-model-2"))
+    XCTAssertFalse(jobId.isEmpty)
+
+    XCTAssertEqual(order.all, [], "no parked render ran")
+
+    await probe.setPaused(false)
+    for render in renders { await render.value }
+    try await drain(probe)
+    XCTAssertEqual(order.all.count, 10, "every parked render still ran on resume")
+  }
+
+  /// Review finding 1: the render gate is not the only bound. Model
+  /// operations get their OWN cap (`maxPendingModelOps`, default 8) — the
+  /// routes are unauthenticated, so "operator actions, bounded in number"
+  /// had to become something the server enforces rather than something it
+  /// assumes about the caller.
+  func testTheNinthPendingModelOperationIsRefusedByItsOwnCap() async throws {
+    let probe = makeQueueProbe()
+    let releaseRender = Gate()
+    let renderStarted = Gate()
+
+    // One ACTIVE job, so nothing behind it runs and the ops accumulate.
+    async let renderDone: Bool = probe.enqueueFakeRender {
+      renderStarted.open()
+      await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().async { releaseRender.waitUntilOpen(); c.resume() }
+      }
+      return true
+    }
+    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global().async { renderStarted.waitUntilOpen(); c.resume() }
+    }
+
+    for index in 0..<8 {
+      _ = try await probe.enqueueModelOperationDetached(.unload(modelId: "op-\(index)"))
+    }
+    XCTAssertEqual(probe.pendingCount, 8, "all eight were accepted")
+
+    var caught: Error?
+    do {
+      _ = try await probe.enqueueModelOperationDetached(.unload(modelId: "op-9"))
+    } catch {
+      caught = error
+    }
+    let error = try XCTUnwrap(caught, "the ninth pending model operation must be refused")
+    XCTAssertTrue(
+      WarmServerQueueProbe.isModelOperationQueueFull(error),
+      "refused, but not by the model-op cap: \(error)")
+    XCTAssertFalse(
+      WarmServerQueueProbe.isQueueFull(error),
+      "the render gate must not be what refused it — the message would name the wrong limit")
+    let response = WarmServer.errorResponse(for: error)
+    XCTAssertEqual(response.status, 429)
+    let body = String(decoding: response.body, as: UTF8.self)
+    XCTAssertTrue(body.contains("Model operation"), body)
+    XCTAssertTrue(body.contains("8"), body)
+    XCTAssertEqual(probe.pendingCount, 8, "the refusal enqueued nothing")
+
+    // The synchronous seam is capped identically.
+    var caughtSync: Error?
+    do {
+      _ = try await probe.enqueueModelOperation(.unload(modelId: "op-9-sync"))
+    } catch {
+      caughtSync = error
+    }
+    XCTAssertTrue(
+      WarmServerQueueProbe.isModelOperationQueueFull(try XCTUnwrap(caughtSync)),
+      "both seams share the cap")
+
+    releaseRender.open()
+    _ = try await renderDone
+    try await drain(probe)
+  }
+
+  /// Parked renders do not consume the model-op budget — the whole point of
+  /// counting `.modelOperation` jobs rather than `pending.count`.
+  func testParkedRendersDoNotCountTowardTheModelOpCap() async throws {
+    let probe = makeQueueProbe()
+    let releaseRender = Gate()
+    let renderStarted = Gate()
+
+    async let renderDone: Bool = probe.enqueueFakeRender {
+      renderStarted.open()
+      await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().async { releaseRender.waitUntilOpen(); c.resume() }
+      }
+      return true
+    }
+    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global().async { renderStarted.waitUntilOpen(); c.resume() }
+    }
+
+    // Six renders queued behind the active one.
+    var renders: [Task<Void, Never>] = []
+    for _ in 0..<6 {
+      renders.append(Task { _ = try? await probe.enqueueFakeRender { true } })
+    }
+    let deadline = Date().addingTimeInterval(5)
+    while probe.pendingCount < 6, Date() < deadline {
+      try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertEqual(probe.pendingCount, 6)
+
+    // The full model-op budget is still available.
+    for index in 0..<8 {
+      _ = try await probe.enqueueModelOperationDetached(.unload(modelId: "op-\(index)"))
+    }
+    XCTAssertEqual(probe.pendingCount, 14, "6 renders + 8 model ops, each on its own budget")
+
+    releaseRender.open()
+    _ = try await renderDone
+    for render in renders { await render.value }
+    try await drain(probe)
+  }
+
+  /// The two caps are independent in BOTH directions: a render past
+  /// `maxPendingRequests` is refused while model ops keep flowing, and a
+  /// model op past `maxPendingModelOps` is refused while the render queue
+  /// still has room.
+  func testTheTwoCapsAreIndependent() async throws {
+    let probe = makeQueueProbe(maxPendingRequests: 2, maxPendingModelOps: 3)
+    let releaseRender = Gate()
+    let renderStarted = Gate()
+
+    async let renderDone: Bool = probe.enqueueFakeRender {
+      renderStarted.open()
+      await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+        DispatchQueue.global().async { releaseRender.waitUntilOpen(); c.resume() }
+      }
+      return true
+    }
+    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global().async { renderStarted.waitUntilOpen(); c.resume() }
+    }
+
+    var renders: [Task<Void, Never>] = []
+    for _ in 0..<2 {
+      renders.append(Task { _ = try? await probe.enqueueFakeRender { true } })
+    }
+    let deadline = Date().addingTimeInterval(5)
+    while probe.pendingCount < 2, Date() < deadline {
+      try await Task.sleep(nanoseconds: 20_000_000)
+    }
+
+    // Render queue is FULL…
+    var renderRefusal: Error?
+    do { _ = try await probe.enqueueFakeRender { true } } catch { renderRefusal = error }
+    XCTAssertTrue(WarmServerQueueProbe.isQueueFull(try XCTUnwrap(renderRefusal)))
+
+    // …and the model-op budget is untouched by that.
+    for index in 0..<3 {
+      _ = try await probe.enqueueModelOperationDetached(.unload(modelId: "op-\(index)"))
+    }
+    XCTAssertEqual(probe.pendingCount, 5,
+                   "pending exceeds maxPendingRequests — the model ops are on their own cap")
+
+    var opRefusal: Error?
+    do { _ = try await probe.enqueueModelOperationDetached(.unload(modelId: "op-4")) }
+    catch { opRefusal = error }
+    XCTAssertTrue(WarmServerQueueProbe.isModelOperationQueueFull(try XCTUnwrap(opRefusal)))
+
+    releaseRender.open()
+    _ = try await renderDone
+    for render in renders { await render.value }
+    try await drain(probe)
+  }
+
+  /// The gate stays on for RENDERS — bypassing it for model ops must not
+  /// turn the queue into an unbounded buffer for generate traffic.
+  func testTheCapacityGateStillRefusesRendersWhenFull() async throws {
+    let probe = makeQueueProbe(maxPendingRequests: 2)
+    await probe.setPaused(true)
+
+    var renders: [Task<Void, Never>] = []
+    for _ in 0..<2 {
+      renders.append(Task { _ = try? await probe.enqueueFakeRender { true } })
+    }
+    let deadline = Date().addingTimeInterval(5)
+    while probe.pendingCount < 2, Date() < deadline {
+      try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    XCTAssertEqual(probe.pendingCount, 2)
+
+    var caught: Error?
+    do {
+      _ = try await probe.enqueueFakeRender { true }
+    } catch {
+      caught = error
+    }
+    XCTAssertTrue(
+      WarmServerQueueProbe.isQueueFull(try XCTUnwrap(caught)),
+      "a render past capacity must still be refused with queueFull, got \(caught as Any)")
+
+    await probe.setPaused(false)
+    for render in renders { await render.value }
     try await drain(probe)
   }
 

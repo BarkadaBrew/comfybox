@@ -47,6 +47,21 @@ public struct ServerPresetKroma: Codable, Sendable, Equatable {
     }
 }
 
+/// Bypass policy (engine `BypassPolicy`, WP-E8 / D10): the censorship-bypass
+/// `.diff` dial, first-class like kroma. Passthrough — absence here would be
+/// indistinguishable from `{strength: 0}` on the next save, and the engine's
+/// derived default (kroma on ⇒ bypass off) would silently replace whatever
+/// the preset declared.
+public struct ServerPresetBypass: Codable, Sendable, Equatable {
+    public var strength: Double
+    public var file: String?
+
+    public init(strength: Double, file: String? = nil) {
+        self.strength = strength
+        self.file = file
+    }
+}
+
 /// Second-stage recipe (engine `PresetStage`, WP-E20 / D4). Passthrough.
 public struct ServerPresetStage: Codable, Sendable, Equatable {
     public var sampler: String?
@@ -97,6 +112,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var vae: String?
     public var checkpointFamily: String?
     public var kroma: ServerPresetKroma?
+    public var bypass: ServerPresetBypass?
     public var sampler: String?
     public var sigmaSchedule: String?
     public var shift: Double?
@@ -136,6 +152,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         vae: String? = nil,
         checkpointFamily: String? = nil,
         kroma: ServerPresetKroma? = nil,
+        bypass: ServerPresetBypass? = nil,
         sampler: String? = nil,
         sigmaSchedule: String? = nil,
         shift: Double? = nil,
@@ -169,6 +186,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         self.vae = vae
         self.checkpointFamily = checkpointFamily
         self.kroma = kroma
+        self.bypass = bypass
         self.sampler = sampler
         self.sigmaSchedule = sigmaSchedule
         self.shift = shift
@@ -185,6 +203,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case steps, guidance, seed, width, height
         case loras, scheduler, upscale
         case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
+        case bypass
         case invalid, invalidReason
     }
 
@@ -216,6 +235,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(vae, forKey: .vae)
         try c.encodeIfPresent(checkpointFamily, forKey: .checkpointFamily)
         try c.encodeIfPresent(kroma, forKey: .kroma)
+        try c.encodeIfPresent(bypass, forKey: .bypass)
         try c.encodeIfPresent(sampler, forKey: .sampler)
         try c.encodeIfPresent(sigmaSchedule, forKey: .sigmaSchedule)
         try c.encodeIfPresent(shift, forKey: .shift)
@@ -253,6 +273,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         vae = try c.decodeIfPresent(String.self, forKey: .vae)
         checkpointFamily = try c.decodeIfPresent(String.self, forKey: .checkpointFamily)
         kroma = try c.decodeIfPresent(ServerPresetKroma.self, forKey: .kroma)
+        bypass = try c.decodeIfPresent(ServerPresetBypass.self, forKey: .bypass)
         sampler = try c.decodeIfPresent(String.self, forKey: .sampler)
         sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
         shift = try c.decodeIfPresent(Double.self, forKey: .shift)

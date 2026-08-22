@@ -85,9 +85,11 @@ extension XCTestCase {
   /// That is precisely the hazard the isolation commit exists to close, so
   /// leaving work in flight is a test FAILURE, not a race to tolerate.
   func makeQueueProbe(
-    maxPendingRequests: Int = 10, file: StaticString = #filePath, line: UInt = #line
+    maxPendingRequests: Int = 10, maxPendingModelOps: Int = 8,
+    file: StaticString = #filePath, line: UInt = #line
   ) -> WarmServerQueueProbe {
-    let probe = WarmServerQueueProbe(maxPendingRequests: maxPendingRequests)
+    let probe = WarmServerQueueProbe(
+      maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps)
     addTeardownBlock {
       // Bounded wait: a job that is legitimately finishing gets a moment; a
       // test that forgot to await its own work fails loudly rather than

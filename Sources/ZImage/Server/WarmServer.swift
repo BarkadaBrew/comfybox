@@ -35,6 +35,17 @@ public struct WarmServerConfiguration: Sendable {
   public var forceTransformerOverrideOnly: Bool
   public var maxSequenceLength: Int
   public var maxPendingRequests: Int
+  /// Separate cap for MUTATING pool operations waiting in the FIFO
+  /// (`/v1/model/load|activate|unload`), counted independently of
+  /// `maxPendingRequests` (WP-E8 review, finding 1).
+  ///
+  /// Model ops deliberately do not sit under the render capacity gate — a
+  /// paused engine full of parked renders must still accept the operator
+  /// action that frees the GPU. "Bounded in number" was an assumption about
+  /// the caller, though, and these routes are unauthenticated: repeated
+  /// `wait: false` loads could grow the queue without limit. This is the
+  /// bound that makes the sentence true.
+  public var maxPendingModelOps: Int
   public var allowedOutputDirectory: String
   /// Path to SeedVR2 upscale model weights directory.
   /// When set, enables upscale via the ComfyUI bridge. The pipeline is lazy-loaded
@@ -60,6 +71,7 @@ public struct WarmServerConfiguration: Sendable {
     forceTransformerOverrideOnly: Bool = false,
     maxSequenceLength: Int = 512,
     maxPendingRequests: Int = 10,
+    maxPendingModelOps: Int = 8,
     allowedOutputDirectory: String = FileManager.default.currentDirectoryPath,
     seedvr2WeightsPath: String? = nil,
     ltx2WeightsPath: String? = nil,
@@ -73,6 +85,7 @@ public struct WarmServerConfiguration: Sendable {
     self.forceTransformerOverrideOnly = forceTransformerOverrideOnly
     self.maxSequenceLength = maxSequenceLength
     self.maxPendingRequests = max(1, maxPendingRequests)
+    self.maxPendingModelOps = max(1, maxPendingModelOps)
     self.allowedOutputDirectory = allowedOutputDirectory
     self.seedvr2WeightsPath = seedvr2WeightsPath
     self.ltx2WeightsPath = ltx2WeightsPath
@@ -4324,6 +4337,10 @@ public final class WarmServer {
       switch error {
       case .queueFull(let maxPending):
         return .error(status: 429, message: "Queue full (\(maxPending) pending max)")
+      case .modelOperationQueueFull(let maxPending):
+        return .error(
+          status: 429,
+          message: "Model operation queue full (\(maxPending) pending model operations max)")
       case .shuttingDown:
         return .error(status: 503, message: "Server is shutting down")
       case .cancelled:
@@ -5271,6 +5288,10 @@ final class VideoJobTracker: @unchecked Sendable {
 private actor WarmServerCoordinator {
   enum ServerError: Error {
     case queueFull(maxPending: Int)
+    /// The model-operation cap (`maxPendingModelOps`), which is counted and
+    /// reported separately from the render queue so the message names the
+    /// limit the caller actually hit (WP-E8 review, finding 1).
+    case modelOperationQueueFull(maxPending: Int)
     case shuttingDown
     /// The pending request was removed by a queue clear (not a server shutdown).
     case cancelled
@@ -6432,6 +6453,23 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// How many MUTATING pool operations are waiting. Counts only
+  /// `.modelOperation` jobs, so parked renders never consume the model-op
+  /// budget and vice versa.
+  private var pendingModelOperationCount: Int {
+    pending.reduce(into: 0) { count, job in
+      if case .modelOperation = job.operation { count += 1 }
+    }
+  }
+
+  /// The model-operation bound (review finding 1). Independent of
+  /// `maxPendingRequests` in both directions.
+  private func checkModelOperationCapacity() throws {
+    if pendingModelOperationCount >= configuration.maxPendingModelOps {
+      throw ServerError.modelOperationQueueFull(maxPending: configuration.maxPendingModelOps)
+    }
+  }
+
   /// Enqueue a mutating pool operation and wait for it (K-FIX-1 / C2).
   ///
   /// MUST NOT be called from inside the process loop — see `runModelOperation`.
@@ -6439,9 +6477,14 @@ private actor WarmServerCoordinator {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
-    if pending.count >= configuration.maxPendingRequests {
-      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
-    }
+    // Not the RENDER capacity gate (WP-E8 hygiene): that gate exists to bound
+    // render backlog, and applied here it reproduced the pause wedge one
+    // layer up — a paused queue holding `maxPendingRequests` parked renders
+    // answered `/v1/model/unload` with `queueFull`, so the operator could not
+    // free the GPU precisely when they needed to. Model operations get their
+    // OWN cap instead (review finding 1): parked renders never crowd them
+    // out, and an unauthenticated client cannot grow the FIFO without limit.
+    try checkModelOperationCapacity()
 
     return try await withCheckedThrowingContinuation { continuation in
       pending.append(PendingJob(operation: .modelOperation(op, ContinuationBox(continuation))))
@@ -6462,9 +6505,9 @@ private actor WarmServerCoordinator {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
-    if pending.count >= configuration.maxPendingRequests {
-      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
-    }
+    // Same reasoning as `enqueueModelOperation` — the model-op cap, not the
+    // render capacity gate.
+    try checkModelOperationCapacity()
     let job = PendingJob(operation: .modelOperation(op, nil))
     pending.append(job)
     startProcessingIfNeeded()
@@ -6771,11 +6814,20 @@ private actor WarmServerCoordinator {
   /// does — the loop runs one job at a time either way.
   ///
   /// Exhaustive on purpose (no `default`): a new queue kind must decide.
+  ///
+  /// `.shutdown` joins them (WP-E8 hygiene). `enqueueShutdown` sets
+  /// `shuttingDown = true` BEFORE appending, so a shutdown parked behind the
+  /// pause gate wedged the engine permanently: the caller's continuation
+  /// never resumed and every later enqueue threw `.shuttingDown`, leaving
+  /// SIGKILL as the only recovery — on exactly the paused engine an operator
+  /// is trying to shut down. Its handler is a bare continuation resume with
+  /// no GPU work, so nothing about "pause means no RENDERS" argues for
+  /// parking it.
   private static func runsWhilePaused(_ operation: QueuedOperation) -> Bool {
     switch operation {
-    case .modelOperation:
+    case .modelOperation, .shutdown:
       return true
-    case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo, .shutdown:
+    case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo:
       return false
     }
   }
@@ -9090,9 +9142,10 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   private let liveHealth = LiveHealthState()
   private var liveHealthSnapshot: HealthSnapshot { liveHealth.read().0 }
 
-  init(maxPendingRequests: Int = 10) {
+  init(maxPendingRequests: Int = 10, maxPendingModelOps: Int = 8) {
     self.coordinator = WarmServerCoordinator(
-      configuration: WarmServerConfiguration(maxPendingRequests: maxPendingRequests),
+      configuration: WarmServerConfiguration(
+        maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps),
       logger: Logger(label: "z-image.queue-probe"),
       videoHolder: VideoGeneratorHolder(),
       liveHealth: liveHealth,
@@ -9123,6 +9176,28 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// The seam `/v1/model/load` (wait: false) uses — returns the queue job id.
   func enqueueModelOperationDetached(_ op: ModelOperation) async throws -> String {
     try await coordinator.enqueueModelOperationDetached(op)
+  }
+
+  /// `ServerError` is nested in the file-private coordinator, so a test
+  /// cannot pattern-match it. This is the one predicate the WP-E8 hygiene
+  /// tests need: was this refusal the capacity gate?
+  static func isQueueFull(_ error: Error) -> Bool {
+    if case WarmServerCoordinator.ServerError.queueFull = error { return true }
+    return false
+  }
+
+  /// The model-operation cap, distinct from the render queue's.
+  static func isModelOperationQueueFull(_ error: Error) -> Bool {
+    if case WarmServerCoordinator.ServerError.modelOperationQueueFull = error { return true }
+    return false
+  }
+
+  /// The seam `/v1/shutdown` uses. Returns the response's `success` flag —
+  /// the response type is file-private, and the only thing a test needs to
+  /// know is that the call RETURNED rather than parking forever under a
+  /// pause (WP-E8 hygiene).
+  func enqueueShutdown() async throws -> Bool {
+    try await coordinator.enqueueShutdown().success
   }
 
   /// The kinds of the jobs still waiting, read through the same
