@@ -77,7 +77,8 @@ final class Krea2RunTraceTests: XCTestCase {
     let trace = Krea2RunTrace(
       request: request, shift: shift, scheduler: scheduler,
       stats: Self.stats(stepsRun: 6, rowsAtStart: 2, modelEvals: 12),
-      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+      negativePromptApplied: nil)
 
     XCTAssertEqual(trace.eta, 0.5)
     let sde = try XCTUnwrap(trace.sde)

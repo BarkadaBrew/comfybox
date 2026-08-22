@@ -555,7 +555,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
         let names = ResolvedRecipeNames(
           scheduler: kind, schedulerRequested: kind.rawValue,
           sigmaSchedule: nil, sigmaScheduleRequested: nil)
-        let error = GeneratePayload.validateTableauSampler(names, family: family)
+        let error = GeneratePayload.validateFamilyRecipe(names, family: family)
         if family == .krea2 {
           XCTAssertNil(error, "\(kind.rawValue) must run on krea2")
         } else {
@@ -577,7 +577,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     let scheduler = try SchedulerFactory.create(kind: .deis, numInferenceSteps: 9, config: config)
     XCTAssertTrue(scheduler is DEISScheduler)
     XCTAssertNil(
-      GeneratePayload.validateTableauSampler(
+      GeneratePayload.validateFamilyRecipe(
         ResolvedRecipeNames(
           scheduler: .deis, schedulerRequested: "deis", sigmaSchedule: nil,
           sigmaScheduleRequested: nil),
