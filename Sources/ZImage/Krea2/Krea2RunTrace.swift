@@ -92,8 +92,17 @@ public struct Krea2RunTrace: Sendable, Equatable {
   // — request echo the record needs —
 
   public let guidance: Float
-  /// RES4LYF SDE eta (T2). 0 until WP-E15.
+  /// RES4LYF SDE eta (T2).
   public let eta: Float
+
+  /// What the T2 SDE actually ran with, or `nil` when this render had none
+  /// (`eta == 0`) — WP-E15, §3.13.
+  ///
+  /// Additive and optional on purpose: it is the record of a thing that mostly
+  /// does not happen, and `eta: 0` renders must not grow a block of zeros in
+  /// their provenance. ``eta`` stays a plain field because `RenderRecipe.Stage`
+  /// already reads it.
+  public let sde: SDEParameters?
   /// RES4LYF bongmath (T3). `false` until WP-E16.
   public let bongmath: Bool
   public let seed: UInt64
@@ -101,6 +110,54 @@ public struct Krea2RunTrace: Sendable, Equatable {
   /// was asked for.
   public let width: Int
   public let height: Int
+
+  /// The RES4LYF SDE settings one stage ran under.
+  ///
+  /// Everything here is either a knob the request set or a value derived from
+  /// it by a rule that lives in one place — so a render that looks wrong can
+  /// be re-derived from the record instead of from the source. The seeds are
+  /// included because they are the only part of the SDE that is NOT visible in
+  /// the request: they are derived from the stage's seed by upstream's own
+  /// offsets (`seed + 1`, `+ MAX_STEPS`), and without them "same payload, same
+  /// output" (AC-27) is a claim rather than a check.
+  public struct SDEParameters: Sendable, Equatable {
+    /// `eta` — the step-level SDE strength.
+    public let eta: Float
+    /// `eta_substep`. `ClownsharKSampler_Beta` sets it equal to `eta`.
+    public let etaSubstep: Float
+    /// `noise_mode_sde`. `"hard"` is the only mode this port implements, and
+    /// it is the one the workflow uses.
+    public let noiseMode: String
+    /// `s_noise` — the multiplier on the injected noise.
+    public let sNoise: Float
+    /// The step noise stream's seed: the stage's seed + 1.
+    public let stepNoiseSeed: UInt64
+    /// The substep noise stream's seed: the step seed + `MAX_STEPS`.
+    public let substepNoiseSeed: UInt64
+
+    public init(
+      eta: Float, etaSubstep: Float, noiseMode: String, sNoise: Float,
+      stepNoiseSeed: UInt64, substepNoiseSeed: UInt64
+    ) {
+      self.eta = eta
+      self.etaSubstep = etaSubstep
+      self.noiseMode = noiseMode
+      self.sNoise = sNoise
+      self.stepNoiseSeed = stepNoiseSeed
+      self.substepNoiseSeed = substepNoiseSeed
+    }
+
+    /// What ``Krea2Pipeline`` builds its injector with, for a stage that has
+    /// one. `nil` at `eta == 0`, so the two agree by construction rather than
+    /// by a comment.
+    public static func forRun(eta: Float, stageSeed: UInt64) -> SDEParameters? {
+      guard eta != 0 else { return nil }
+      return SDEParameters(
+        eta: eta, etaSubstep: eta, noiseMode: "hard", sNoise: 1.0,
+        stepNoiseSeed: RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed: stageSeed),
+        substepNoiseSeed: RES4LYFSDENoiseInjector.substepNoiseSeed(stageSeed: stageSeed))
+    }
+  }
 
   public init(
     sampler: SchedulerKind,
@@ -144,6 +201,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.denoise = denoise
     self.guidance = guidance
     self.eta = eta
+    self.sde = SDEParameters.forRun(eta: eta, stageSeed: seed)
     self.bongmath = bongmath
     self.seed = seed
     self.width = width

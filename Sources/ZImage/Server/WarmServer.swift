@@ -8322,20 +8322,36 @@ extension GeneratePayload: Decodable {
   /// Z-Image path is a different, shipped parameter (DDIM η / DPM++ 2S-A η)
   /// and keeps working (AC-28).
   ///
-  /// - `eta != 0`: RES4LYF SDE eta is tier T2 (WP-E15) — refused until it lands.
+  /// The sampler and the sigma-schedule arms went with WP-E3: the Krea 2 loop
+  /// dispatches on both, so every name `RecipeNameResolver` accepts is honoured
+  /// rather than refused. **The `eta` arm went with WP-E15**: tier T2 has
+  /// landed, so a non-zero `eta` is now either applied (the RES4LYF samplers)
+  /// or refused BY SAMPLER at `Krea2Pipeline.makeSDEInjector` — it is never
+  /// ignored, and the refusal names the sampler rather than the tier.
   ///
-  /// The sampler and the sigma-schedule arms are GONE as of WP-E3: the Krea 2
-  /// loop now dispatches on both, so every name `RecipeNameResolver` accepts
-  /// is honoured rather than refused. `names` is still taken — the unknown-name
-  /// failure happens in `validateRecipeNames()`, which the caller runs to
-  /// produce it, and the parameter keeps that ordering explicit at every call
-  /// site. `bongmath` has no wire key and is refused at the pipeline
-  /// (`Krea2Pipeline.validateTiers`).
+  /// `names` is still taken — the unknown-name failure happens in
+  /// `validateRecipeNames()`, which the caller runs to produce it, and the
+  /// parameter keeps that ordering explicit at every call site. `bongmath` has
+  /// no wire key and is refused at the pipeline (`Krea2Pipeline.validateTiers`).
+  ///
+  /// What remains is the SAMPLER boundary the SDE has: RES4LYF's `eta` splits
+  /// a step against RES4LYF's own prepared grid and re-noises the non-final
+  /// rows of its tableau, so it is defined for the RES4LYF ports and for
+  /// nothing else. Asked for with `euler` — the Krea 2 default — or with
+  /// `ddim` / `dpmpp-2s-a`, where the same wire key already means a different
+  /// stochasticity parameter on the Z-Image path, it is a 400 naming the
+  /// sampler, never a silent drop. Mirrors
+  /// `Krea2Pipeline.makeSDEInjector(eta:sampler:stageSeed:layout:)`, which
+  /// refuses the same request for a non-server caller.
   func validateKrea2TierGates(_ names: ResolvedRecipeNames) throws {
-    if let eta, eta != 0 {
+    guard let eta, eta != 0 else { return }
+    let sampler = names.scheduler ?? .euler
+    guard sampler.isRES4LYFFamily else {
       throw WarmServerError.unsupportedRecipeField(
         field: "eta", value: "\(eta)", family: "krea2",
-        reason: "RES4LYF SDE eta (parity tier T2, WP-E15) is not implemented yet; send eta 0 or omit it")
+        reason: "eta is RES4LYF's SDE (parity tier T2) and applies to the RES4LYF samplers only; "
+          + "'\(sampler.rawValue)' is not one of them. Send eta 0, or a sampler from "
+          + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m")
     }
   }
 

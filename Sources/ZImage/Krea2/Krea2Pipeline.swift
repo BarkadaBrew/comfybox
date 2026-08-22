@@ -303,6 +303,19 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
   /// never silently substitute".
   case tierNotImplemented(field: String, value: String, tier: String)
 
+  /// `eta != 0` was asked for with a sampler RES4LYF's SDE is not defined
+  /// against (WP-E15, D18).
+  ///
+  /// The SDE is a property of RES4LYF's own solver: it splits `σ → σ'` into
+  /// `σ → σ_down` plus a re-noise, re-noises the non-final ROWS of the
+  /// tableau, and lands on the prepared grid's `sigma_min`. The samplers here
+  /// that are NOT RES4LYF ports (`euler`, `heun`, `dpmpp-2m`, `dpmpp-2s-a`,
+  /// `deis`, `ddim`) walk an unprepared grid with their own semantics — on
+  /// `ddim` and `dpmpp-2s-a`, `eta` already means something else entirely.
+  /// Applying the split there would be an invention, so it is refused by name
+  /// rather than silently ignored.
+  case etaUnsupportedSampler(sampler: String, value: String)
+
   public var description: String {
     switch self {
     case .invalidShift(let value):
@@ -310,6 +323,10 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
     case .tierNotImplemented(let field, let value, let tier):
       return "\(field)=\(value) is parity tier \(tier) (\(Self.workPackage(forTier: tier))) and is not "
         + "implemented yet; omit it or send its default"
+    case .etaUnsupportedSampler(let sampler, let value):
+      return "eta=\(value) is RES4LYF's SDE and applies to the RES4LYF samplers only; "
+        + "'\(sampler)' is not one of them. Send eta 0, or a sampler from "
+        + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m"
     }
   }
 
@@ -682,14 +699,54 @@ public final class Krea2Pipeline {
   /// Refuse the request fields whose behaviour is not implemented yet, before
   /// any model work (D18). A silent downgrade to the default is the one
   /// outcome this programme forbids.
+  ///
+  /// `eta`'s arm is GONE as of WP-E15: tier T2 has landed, so a non-zero `eta`
+  /// is either honoured (``makeSDEInjector(eta:sampler:stageSeed:layout:)``)
+  /// or refused there by sampler — never here, and never ignored. `bongmath`
+  /// is still T3.
   static func validateTiers(eta: Float, bongmath: Bool) throws {
-    guard eta == 0 else {
-      throw Krea2ScheduleError.tierNotImplemented(field: "eta", value: "\(eta)", tier: "T2")
-    }
     guard !bongmath else {
       throw Krea2ScheduleError.tierNotImplemented(field: "bongmath", value: "true", tier: "T3")
     }
   }
+
+  /// WP-E15 (§3.13, D18): the RES4LYF SDE injector a request asks for, or
+  /// `nil` when it asks for none.
+  ///
+  /// Pure — no weights, no GPU — so the honour/refuse boundary is asserted
+  /// without a model. Three outcomes and no fourth:
+  ///   * `eta == 0` → `nil`; the loop runs exactly as it did before T2, and
+  ///     ``Krea2DenoiseLoop`` is handed no hook at all.
+  ///   * `eta != 0` on a RES4LYF sampler → an injector seeded from THIS
+  ///     stage's seed.
+  ///   * `eta != 0` on anything else → ``Krea2ScheduleError/etaUnsupportedSampler(sampler:value:)``.
+  ///
+  /// - Parameters:
+  ///   - stageSeed: the seed of the stage being rendered — the injector's two
+  ///     noise streams are derived from it, so two stages of one render have
+  ///     two streams and changing only `stage2.seed` changes only stage 2
+  ///     (AC-27).
+  ///   - layout: where the working latent keeps its channels, for the
+  ///     per-channel z-score upstream applies to every draw. Krea 2's loop runs
+  ///     on the PATCHIFIED latent, so this is not `(B, C, H, W)`.
+  static func makeSDEInjector(
+    eta: Float,
+    sampler: SchedulerKind,
+    stageSeed: UInt64,
+    layout: RES4LYFNoiseLayout
+  ) throws -> RES4LYFSDENoiseInjector? {
+    guard eta != 0 else { return nil }
+    guard sampler.isRES4LYFFamily else {
+      throw Krea2ScheduleError.etaUnsupportedSampler(sampler: sampler.rawValue, value: "\(eta)")
+    }
+    return RES4LYFSDENoiseInjector(eta: Double(eta), stageSeed: stageSeed, layout: layout)
+  }
+
+  /// The layout ``Krea2DenoiseLoop`` sees: `(1, tokens, C·p·p)`, where the
+  /// patch size only sets the group WIDTH — the channel count is what
+  /// identifies the groups, and it is the VAE's.
+  static let sdeNoiseLayout: RES4LYFNoiseLayout =
+    .patchifiedTrailing(channels: Krea2VAE.latentChannels)
 
   /// Generate one image. Returns RGB float array (H, W, 3) in [0,1].
   ///
@@ -727,9 +784,15 @@ public final class Krea2Pipeline {
     // D3/A.1: nil → resolution-dependent mu (unchanged); explicit → mu = shift. Fails before any model work.
     let scheduleShift = try Krea2Sampling.resolveShift(
       explicit: request.shift, seqLen: hTok * wTok, align: align)
-    // D18: eta / bongmath belong to tiers that are not implemented — refuse
-    // them here, before any model work, rather than rendering the default.
+    // D18: bongmath belongs to a tier that is not implemented — refuse it
+    // here, before any model work, rather than rendering the default.
     try Krea2Pipeline.validateTiers(eta: request.eta, bongmath: request.bongmath)
+    // WP-E15: the T2 SDE. `nil` at eta 0, and a refusal (never a silent drop)
+    // when eta is asked for with a sampler it is not defined against. Built
+    // before any model work for the same reason the tier gates are.
+    let sdeNoise = try Krea2Pipeline.makeSDEInjector(
+      eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
+      layout: Krea2Pipeline.sdeNoiseLayout)
 
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
@@ -793,6 +856,7 @@ public final class Krea2Pipeline {
                                   mask: negFullMask, control: controlTokens, ropeScales: ropeScales)
         return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       },
+      noise: sdeNoise,
       progress: progress)
 
     let latentNCHW = Krea2Sampling.unpatchify(
