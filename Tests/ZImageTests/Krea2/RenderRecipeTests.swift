@@ -81,13 +81,61 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(s.guidance, 1.0)
     XCTAssertEqual(s.eta, 0)
     XCTAssertFalse(s.bongmath)
+    // WP-E14: forwarded from the trace, not hard-coded. `euler` does not ramp,
+    // so the trace it produced carries none and the record says none — which is
+    // a DIFFERENT statement from "the record always says none", and
+    // `testWarmUpProvenanceIsForwardedFromTheTrace` is the other half of it.
     XCTAssertNil(s.warmupSampler)
     XCTAssertEqual(s.warmupSteps, 0)
+    XCTAssertEqual(s.warmupSampler, trace().warmupSampler)
+    XCTAssertEqual(s.warmupSteps, trace().warmupSteps)
     XCTAssertEqual(s.sigmaHead.count, 3)
     XCTAssertEqual(s.sigmaHead.first, 1.0)
     XCTAssertEqual(s.sigmaTail.last, 0.0)
     XCTAssertEqual(s.seed, 44821)
     XCTAssertEqual(r.modelEvalsTotal, 30)
+  }
+
+  /// WP-E14 / AC-24: the DEIS order ramp reaches the RECORD, not just the
+  /// trace. At the published stage-2 settings `deis_3m` runs `ralston_3s` on
+  /// every one of its steps — the DEIS coefficients never engage and the stage
+  /// costs 6 model evaluations — and the record has to say so, or the fact has
+  /// to be rediscovered from the upstream source every time.
+  ///
+  /// Shaped exactly as `Krea2DenoiseLoop` + `DEISMultistepScheduler` report it
+  /// (pinned end to end in `DEISMultistepSchedulerTests`); this file's job is
+  /// the FORWARDING, so the builder cannot quietly go back to hard-coding.
+  func testWarmUpProvenanceIsForwardedFromTheTrace() throws {
+    let t = RenderRecipeFixture.trace(
+      steps: 2, sampler: .deis3m, sigmaSchedule: .bongTangent,
+      warmupSampler: "ralston_3s", warmupSteps: 2)
+    let r = RenderRecipe.krea2(RenderRecipeFixture.inputs(trace: t))
+    let s = try XCTUnwrap(r.stages.first)
+    XCTAssertEqual(s.sampler, "deis_3m")
+    XCTAssertEqual(s.warmupSampler, "ralston_3s")
+    XCTAssertEqual(s.warmupSteps, 2)
+
+    // …and out through the wire encoder every sink uses, where the client
+    // reads it: `warmup_sampler` is PRESENT here, which is the other half of
+    // `testWireKeysAreSnakeCase`'s "nil → absent".
+    let snake = JSONEncoder(); snake.keyEncodingStrategy = .convertToSnakeCase
+    let obj = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: snake.encode(r)) as? [String: Any])
+    let stage = try XCTUnwrap((obj["stages"] as? [[String: Any]])?.first)
+    XCTAssertEqual(stage["warmup_sampler"] as? String, "ralston_3s")
+    XCTAssertEqual(stage["warmup_steps"] as? Int, 2)
+  }
+
+  /// An 8-step `deis_3m` warms up for FOUR steps (RES4LYF's
+  /// `multistep_extra_initial_steps` defaults to 1), and the record carries the
+  /// count the run actually had rather than a per-sampler constant.
+  func testWarmUpStepCountIsTheRunsOwn() throws {
+    let t = RenderRecipeFixture.trace(
+      steps: 8, sampler: .deis3m, sigmaSchedule: .bongTangent,
+      warmupSampler: "ralston_3s", warmupSteps: 4)
+    let r = RenderRecipe.krea2(RenderRecipeFixture.inputs(trace: t))
+    XCTAssertEqual(r.stages[0].warmupSteps, 4)
+    XCTAssertEqual(r.stages[0].warmupSampler, "ralston_3s")
   }
 
   /// D22: an aliased / different schedule name the caller sent is recorded

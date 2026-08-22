@@ -38,12 +38,29 @@
 //        εⱼ = (x₀ⁱ − D^{i−j}) / σᵢ        x' = x₀ + h · Σⱼ (coeffⱼ/h) · εⱼ
 //
 //    NOT the derivative at that node's own sample and sigma, which is what a
-//    textbook Adams–Bashforth would use. The difference costs `deis_Nm` its
-//    nominal order — every variant measures as **order 2** — for the same
-//    reason the linear-frame ralstons lose theirs (`RES4LYFTableau.swift`).
-//    That is upstream's behaviour and therefore the recipe's; it is asserted
-//    two-sided in `DEISMultistepSchedulerTests` so the loss can never be
-//    mistaken for a transcription bug, and never "fixed".
+//    textbook Adams–Bashforth would use.
+//
+// AND THEREFORE ORDER 2 — but the CAUSE is the frame, not the recycling.
+// Every `deis_Nm` measures as **order 2**, and so does every `ralston_Ns`,
+// which has no history at all. The common cause is the one
+// `RES4LYFTableau.swift` already names for the ralstons: the anchored linear
+// frame FREEZES the `1/σ` kernel at the step's own sigma. Whatever the rows or
+// the interpolation produce, the step collapses to
+//
+//     x' = x₀ + (h/σ)·(x₀ − D_eff)
+//
+// for some effective data prediction `D_eff`. That form integrates a CONSTANT
+// `D` exactly — it is the closed-form `x(σ) = D + (σ/σ₀)(x₀ − D)` — but the
+// exact solution weights `D(s)` by `σ'/s²` across the step while the scheme
+// weights it by `1/σ`; the difference integrates to `−D′h³/(6σ²)`. That is a
+// local `O(h³)` error and therefore global order 2, and it is independent of
+// the interpolation degree and of whether any history was recycled at all.
+// Which is exactly why `ralston_3s`/`ralston_4s` cap at 2 with no history, and
+// why `deis_2m` — whose nominal order is 2 — loses nothing.
+//
+// That is upstream's behaviour and therefore the recipe's; it is asserted
+// two-sided in `DEISMultistepSchedulerTests` so the cap can never be mistaken
+// for a transcription bug, and never "fixed".
 //
 // THE HISTORY, EXACTLY. Upstream keeps `data_prev_` (4 slots) and rolls it at
 // the end of EVERY step — warm-up steps included:

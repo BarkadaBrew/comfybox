@@ -259,11 +259,12 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       negativePrompt: t.cfgActive ? i.negativePrompt : nil,
       eta: t.eta,
       bongmath: t.bongmath,
-      // T2/T3 warm-up (`deis_3m` below order → `ralston_3s`) lands with
-      // WP-E15/E16; until then the loop reports none and the record says so
-      // rather than inventing one.
-      warmupSampler: nil,
-      warmupSteps: 0,
+      // WP-E14: the DEIS order ramp. The loop's trace is the only witness to
+      // it (`Krea2RunTrace.warmUpSampler(of:)` reads the conformer after the
+      // run), so the record FORWARDS what ran and never re-derives it — a
+      // sampler that does not ramp forwards nil/0 of its own accord.
+      warmupSampler: t.warmupSampler,
+      warmupSteps: t.warmupSteps,
       sigmaHead: t.sigmaHead,
       sigmaTail: t.sigmaTail,
       seed: t.seed)

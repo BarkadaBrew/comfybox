@@ -22,7 +22,9 @@ import XCTest
 ///     one model call per step (`rows − multistep_stages − row_offset + 1`),
 ///     and the previous steps' DATA predictions re-anchored at the CURRENT
 ///     step's `x₀` and `σ` (`:925`, `get_epsilon_anchored`). The history is
-///     `data_prev_`, rolled at `:2126-2128`.
+///     `data_prev_`, rolled at `:2126-2128`. That anchoring is the linear
+///     frame's, and the frame — not the recycling — is what caps this whole
+///     family at order 2; see `testMeasuredOrderIsTwoForEveryVariant`.
 ///
 /// The AC-26 T1 gate is the published stage-2 recipe, and it is — by AC-24's
 /// own arithmetic — entirely warm-up: `deis_3m` at 2 steps never reaches the
@@ -389,23 +391,104 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     }
   }
 
+  // MARK: - AC-13: run state does not leak between runs
+
+  /// `deis_Nm` is the FIRST conformer whose run state is not idempotent: a step
+  /// counter that drives the order ramp, an origin index that pins the run's
+  /// contiguity, and a latent history that the multistep half integrates
+  /// through. Every one of them has to be cleared, or a second render on the
+  /// same instance would start already-ramped — skipping its warm-up and
+  /// interpolating through the PREVIOUS image's data predictions.
+  ///
+  /// Asserted as bit-identity between two runs of one instance, which is the
+  /// only formulation that catches all three at once (a stale counter changes
+  /// the evaluation count; a stale history changes the pixels; a stale origin
+  /// index trips the contiguity precondition).
+  func testResetBetweenRunsOnOneInstance() throws {
+    let config = Krea2Sampling.schedulerConfig()
+    for kind in [SchedulerKind.deis2m, .deis3m, .deis4m] {
+      var scheduler = try SchedulerFactory.create(
+        kind: kind, sigmaSchedule: .bongTangent, numInferenceSteps: 10, config: config,
+        mu: Self.tracedMu, res4lyfSigmaPreparation: true)
+      let initial = MLXArray((0..<64).map { Float($0 % 7) * 0.11 - 0.3 }, [1, 1, 8, 8])
+
+      let (first, firstStats) = Krea2DenoiseLoop.run(
+        scheduler: &scheduler, initialSample: initial
+      ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
+
+      // Dirty it deliberately between runs, the way a partial/abandoned render
+      // would: a second run must not care what the first one left behind.
+      let mid = try XCTUnwrap(scheduler as? DEISMultistepScheduler)
+      XCTAssertGreaterThan(mid.multistepSteps, 0, "\(kind.rawValue): the ramp must have fired")
+
+      let (second, secondStats) = Krea2DenoiseLoop.run(
+        scheduler: &scheduler, initialSample: initial
+      ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
+
+      XCTAssertEqual(
+        first.asArray(Float.self), second.asArray(Float.self),
+        "\(kind.rawValue): the second run saw state from the first")
+      XCTAssertEqual(firstStats.evaluateCalls, secondStats.evaluateCalls, kind.rawValue)
+      XCTAssertEqual(firstStats.modelEvals, secondStats.modelEvals, kind.rawValue)
+      XCTAssertEqual(firstStats.rowsAtStart, secondStats.rowsAtStart, kind.rawValue)
+
+      let after = try XCTUnwrap(scheduler as? DEISMultistepScheduler)
+      XCTAssertEqual(after.warmUpSteps, mid.warmUpSteps, "\(kind.rawValue): warm-up count reran")
+      XCTAssertEqual(after.multistepSteps, mid.multistepSteps, kind.rawValue)
+    }
+  }
+
+  /// A run that starts partway down the grid resets to ITS own origin, so a
+  /// stage-2 render after a full one still warms up (the origin index is run
+  /// state too, not a constant).
+  func testResetRestoresTheRunOriginForAPartialSecondRun() throws {
+    let (base, startIndex, _, _) = try Self.stage2Scheduler(order: .three)
+    var scheduler = base
+    let initial = MLXArray([Float(0.4)], [1])
+    let (fresh, freshStats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler, initialSample: initial, startIndex: startIndex
+    ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
+
+    let (again, againStats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler, initialSample: initial, startIndex: startIndex
+    ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
+
+    XCTAssertEqual(fresh.asArray(Float.self), again.asArray(Float.self))
+    XCTAssertEqual(freshStats.evaluateCalls, 6)
+    XCTAssertEqual(againStats.evaluateCalls, 6, "the second run warmed up from its own step 0")
+  }
+
   // MARK: - AC-25: the order of accuracy, measured
 
   /// AC-25 for `deis_Nm`, **measured and pinned two-sided** — the controller's
   /// ruling, and the same discipline `ExplicitRKSchedulerTests` applies to the
   /// ralston family.
   ///
-  /// RES4LYF anchors every epsilon at the STEP's `x₀` and `σ`
-  /// (`get_epsilon_anchored`, `noise_anchor = 1.0`), including the recycled
-  /// data predictions from earlier steps: it uses `(x₀ⁱ − D^{i−k})/σᵢ`, not the
-  /// derivative at that node's own sample and sigma. That perturbation is
-  /// `O(h)` in the history terms, so the multistep interpolation cannot deliver
-  /// its nominal order and every `deis_Nm` lands at **2** — measured 1.97 /
-  /// 2.05 / 2.01 for 2m / 3m / 4m at the finest pair, in double precision.
+  /// Every variant lands at **2** — measured 1.97 / 2.05 / 2.01 for 2m / 3m /
+  /// 4m at the finest pair.
+  ///
+  /// The cause is the FRAME, not the history. RES4LYF's anchored linear frame
+  /// freezes the `1/σ` kernel at the step's own sigma, so whatever the
+  /// interpolation produces the step collapses to `x' = x₀ + (h/σ)(x₀ − D_eff)`.
+  /// That integrates a constant `D` exactly, but the exact solution weights
+  /// `D(s)` by `σ'/s²` across the step where the scheme weights it by `1/σ`;
+  /// the difference integrates to `−D′h³/(6σ²)`, a local `O(h³)` and therefore
+  /// global order 2 — independent of the interpolation degree and of whether
+  /// any history was recycled. That is why `ralston_3s`/`ralston_4s` cap at 2
+  /// with no history at all (`ExplicitRKSchedulerTests`,
+  /// `RES4LYFTableau.swift`), and why `deis_2m`, whose nominal order IS 2,
+  /// loses nothing here.
   ///
   /// The lower bound proves the solver is consistent and correctly wired; the
-  /// upper bound proves nobody "fixed" the anchoring into a textbook
+  /// upper bound proves nobody "fixed" the frame into a textbook
   /// Adams–Bashforth and diverged from the oracle.
+  ///
+  /// Precision: the coefficients and the scripted field are `Double`; the state
+  /// the driver carries is float32 MLX, as in production. At these step counts
+  /// the truncation error (≥ 2e-5) is orders of magnitude above float32
+  /// round-off, so the measured slopes are the scheme's, not the arithmetic's —
+  /// which the monotonicity assertion below would catch if it stopped being
+  /// true.
   func testMeasuredOrderIsTwoForEveryVariant() {
     let reference = ExplicitRKSchedulerTests.referenceSolution()
     for order in DEISMultistepScheduler.Order.allCases {
@@ -423,8 +506,9 @@ final class DEISMultistepSchedulerTests: XCTestCase {
         XCTAssertGreaterThan(p, floorAt, "pair \(i): \(context)")
         XCTAssertLessThan(
           p, 2.6,
-          "pair \(i) reached order \(p): the RES4LYF x₀ anchoring of the recycled data "
-            + "predictions is gone — a divergence from the oracle, not an improvement. \(context)")
+          "pair \(i) reached order \(p): RES4LYF's anchored linear frame — the frozen `1/σ` "
+            + "kernel that caps this whole family at 2 — is gone. That is a divergence from "
+            + "the oracle, not an improvement. \(context)")
       }
       XCTAssertTrue(
         zip(errors, errors.dropFirst()).allSatisfy { $0 > $1 },
