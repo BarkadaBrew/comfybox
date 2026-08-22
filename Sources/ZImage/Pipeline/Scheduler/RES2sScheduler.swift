@@ -8,9 +8,20 @@ import MLX
 /// then a substep at `c2 * h` is used for the second evaluation before the
 /// exponential-integrator final update.
 ///
+/// **Takes the data prediction, not the velocity.** The update
+/// `x' = e^{-h}·x + h·Σ bᵢ·φ(−h)·kᵢ` with `h = −log(σ'/σ)` is the
+/// exponential-integrator form in x₀: for rectified flow
+/// `x_σ = σ·ε + (1−σ)·x₀` it gives `x' = (σ'/σ)·x + (1 − σ'/σ)·x₀`, which is
+/// exactly the trajectory point at σ'. Fed a velocity it is dimensionally
+/// wrong (FDD-krea2-raw-recipe D2). Callers convert through
+/// ``ZImageScheduler/modelInput(velocity:sample:sigma:)``.
+///
 /// Reference: "Improved Order Analysis and Design of Exponential Integrator
 /// for Diffusion Models Sampling" (arXiv:2308.02157).
 public struct RES2sScheduler: ZImageScheduler {
+  /// Exponential frame: every `modelOutput` here is `x₀ = x − σ·v`.
+  public let modelOutputConvention: ModelOutputConvention = .dataPrediction
+
   public let sigmas: MLXArray
   public let timesteps: MLXArray
   public let numInferenceSteps: Int

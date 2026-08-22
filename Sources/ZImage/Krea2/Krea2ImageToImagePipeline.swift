@@ -38,12 +38,14 @@ extension Krea2Pipeline {
     public var strength: Float
     /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
     public var dyPE: DyPEConfig = .disabled
+    /// Explicit schedule shift (FDD-krea2-raw-recipe D3); see `Krea2Pipeline.Request.shift`.
+    public var shift: Float? = nil
 
     public init(
       prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
       sourceImage: MLXArray, width: Int = 1024, height: Int = 1024,
       steps: Int = 9, seed: UInt64 = 0, strength: Float = 0.3,
-      dyPE: DyPEConfig = .disabled
+      dyPE: DyPEConfig = .disabled, shift: Float? = nil
     ) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
@@ -55,15 +57,19 @@ extension Krea2Pipeline {
       self.seed = seed
       self.strength = strength
       self.dyPE = dyPE
+      self.shift = shift
     }
   }
 
   /// Generate one image conditioned on a source image. Returns RGB float
   /// array (H, W, 3) in [0,1] — same output shape as `generate(_:progress:)`.
+  ///
+  /// - Throws: ``Krea2ScheduleError`` when the request's `shift` is invalid
+  ///   (checked before any model work).
   public func generateImg2Img(
     _ request: Img2ImgRequest,
     progress: ((Int, Int) -> Void)? = nil
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     let dtype = DType.bfloat16
     let patch = config.patch
     let comp = Krea2VAE.spatialScale
@@ -73,6 +79,9 @@ extension Krea2Pipeline {
 
     let latH = height / comp, latW = width / comp
     let hTok = latH / patch, wTok = latW / patch
+    // D3: nil → resolution-dependent mu (unchanged); explicit → log(shift). Fails before any model work.
+    let scheduleShift = try Krea2Sampling.resolveShift(
+      explicit: request.shift, seqLen: hTok * wTok, align: align)
 
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
@@ -106,7 +115,8 @@ extension Krea2Pipeline {
     let x1 = Float((256 / align) * (256 / align))
     let x2 = Float((1280 / align) * (1280 / align))
     let seqLen = hTok * wTok
-    let ts = Krea2Sampling.timesteps(seqLen: seqLen, steps: request.steps, x1: x1, x2: x2)
+    let ts = Krea2Sampling.timesteps(
+      seqLen: seqLen, steps: request.steps, x1: x1, x2: x2, mu: scheduleShift.mu)
     let total = ts.count - 1
 
     // strength -> denoise -> startIndex, matching Z-Image's img2img convention

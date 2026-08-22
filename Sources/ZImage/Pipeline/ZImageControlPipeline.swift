@@ -1020,7 +1020,7 @@ public class ZImageControlPipeline {
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
-    var scheduler = SchedulerFactory.create(
+    var scheduler = try SchedulerFactory.create(
       kind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,
@@ -1030,6 +1030,12 @@ public class ZImageControlPipeline {
       eta: request.eta
     )
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
+    let sigmasArray = scheduler.sigmas.asArray(Float.self)
+    // Produced count is authoritative (de-duplicating `beta`/`beta57`; WP-E12, AC-22).
+    let stepsEffective = scheduler.numInferenceSteps
+    if stepsEffective != request.steps {
+      logger.warning("Schedule '\(request.sigmaSchedule.rawValue)' produced \(stepsEffective) steps (\(request.steps) requested) — running \(stepsEffective) (steps_effective)")
+    }
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
     if self.transformer == nil {
       logger.info("Reloading transformer after prompt encoding...")
@@ -1062,18 +1068,18 @@ public class ZImageControlPipeline {
       }
       try await applyLoRAIfNeeded(request.loras)
     }
-    logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
+    logger.info("Running \(stepsEffective) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
     do {
       guard let transformer = self.transformer else {
         throw PipelineError.transformerNotLoaded
       }
-      for stepIndex in 0..<request.steps {
+      for stepIndex in 0..<stepsEffective {
         try Task.checkCancellation()
         request.progressCallback?(ControlProgress(
           stage: "Denoising",
           stepIndex: stepIndex,
-          totalSteps: request.steps,
-          fractionCompleted: Double(stepIndex) / Double(request.steps)
+          totalSteps: stepsEffective,
+          fractionCompleted: Double(stepIndex) / Double(stepsEffective)
         ))
         let timestep = timestepsArray[stepIndex]
         let normalizedTimestep = (1000.0 - timestep) / 1000.0
@@ -1102,10 +1108,19 @@ public class ZImageControlPipeline {
         } else {
           guidedNoise = noisePred
         }
-        // Multi-evaluation schedulers (e.g. Heun) need a second model forward pass
+        // The transformer emits x₀ − ε; the flow velocity dx/dσ = ε − x₀ is its
+        // negation. Convert once per evaluation, after CFG, into the quantity the
+        // scheduler integrates: the velocity itself (identity, byte-identical
+        // default path) or x₀ = x − σ·v for the exponential-frame res_2s
+        // (FDD-krea2-raw-recipe D2 / §3.2).
+        let velocity = -guidedNoise
+        let modelOutput = scheduler.modelInput(
+          velocity: velocity, sample: latents, sigma: sigmasArray[stepIndex]
+        )
+        // Multi-evaluation schedulers (e.g. Heun, RES 2s) need a second model forward pass
         if scheduler.requiresIntermediateEvaluation,
            let intermediateSample = scheduler.intermediateStep(
-             modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
+             modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents
            ) {
           let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
             ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
@@ -1136,14 +1151,17 @@ public class ZImageControlPipeline {
           } else {
             intermediateGuidedNoise = intermediateNoisePred
           }
+          let intermediateOutput = scheduler.modelInput(
+            velocity: -intermediateGuidedNoise, sample: intermediateSample, sigma: intermediateSigma
+          )
           latents = scheduler.finalizeStep(
-            originalOutput: -guidedNoise,
-            intermediateOutput: -intermediateGuidedNoise,
+            originalOutput: modelOutput,
+            intermediateOutput: intermediateOutput,
             timestepIndex: stepIndex,
             sample: latents
           )
         } else {
-          latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+          latents = scheduler.step(modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents)
         }
         MLX.eval(latents)
       }
@@ -1333,7 +1351,7 @@ public class ZImageControlPipeline {
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
-    var scheduler = SchedulerFactory.create(
+    var scheduler = try SchedulerFactory.create(
       kind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,
@@ -1343,6 +1361,12 @@ public class ZImageControlPipeline {
       eta: request.eta
     )
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
+    let sigmasArray = scheduler.sigmas.asArray(Float.self)
+    // Produced count is authoritative (de-duplicating `beta`/`beta57`; WP-E12, AC-22).
+    let stepsEffective = scheduler.numInferenceSteps
+    if stepsEffective != request.steps {
+      logger.warning("Schedule '\(request.sigmaSchedule.rawValue)' produced \(stepsEffective) steps (\(request.steps) requested) — running \(stepsEffective) (steps_effective)")
+    }
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
     if self.transformer == nil {
       logger.info("Reloading transformer after prompt encoding...")
@@ -1375,18 +1399,18 @@ public class ZImageControlPipeline {
       }
       try await applyLoRAIfNeeded(request.loras)
     }
-    logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
+    logger.info("Running \(stepsEffective) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
     do {
       guard let transformer = self.transformer else {
         throw PipelineError.transformerNotLoaded
       }
-      for stepIndex in 0..<request.steps {
+      for stepIndex in 0..<stepsEffective {
         try Task.checkCancellation()
         request.progressCallback?(ControlProgress(
           stage: "Denoising",
           stepIndex: stepIndex,
-          totalSteps: request.steps,
-          fractionCompleted: Double(stepIndex) / Double(request.steps)
+          totalSteps: stepsEffective,
+          fractionCompleted: Double(stepIndex) / Double(stepsEffective)
         ))
         let timestep = timestepsArray[stepIndex]
         let normalizedTimestep = (1000.0 - timestep) / 1000.0
@@ -1415,10 +1439,19 @@ public class ZImageControlPipeline {
         } else {
           guidedNoise = noisePred
         }
-        // Multi-evaluation schedulers (e.g. Heun) need a second model forward pass
+        // The transformer emits x₀ − ε; the flow velocity dx/dσ = ε − x₀ is its
+        // negation. Convert once per evaluation, after CFG, into the quantity the
+        // scheduler integrates: the velocity itself (identity, byte-identical
+        // default path) or x₀ = x − σ·v for the exponential-frame res_2s
+        // (FDD-krea2-raw-recipe D2 / §3.2).
+        let velocity = -guidedNoise
+        let modelOutput = scheduler.modelInput(
+          velocity: velocity, sample: latents, sigma: sigmasArray[stepIndex]
+        )
+        // Multi-evaluation schedulers (e.g. Heun, RES 2s) need a second model forward pass
         if scheduler.requiresIntermediateEvaluation,
            let intermediateSample = scheduler.intermediateStep(
-             modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents
+             modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents
            ) {
           let intermediateSigma = scheduler.intermediateSigma(timestepIndex: stepIndex)
             ?? scheduler.sigmas[stepIndex + 1].item(Float.self)
@@ -1449,14 +1482,17 @@ public class ZImageControlPipeline {
           } else {
             intermediateGuidedNoise = intermediateNoisePred
           }
+          let intermediateOutput = scheduler.modelInput(
+            velocity: -intermediateGuidedNoise, sample: intermediateSample, sigma: intermediateSigma
+          )
           latents = scheduler.finalizeStep(
-            originalOutput: -guidedNoise,
-            intermediateOutput: -intermediateGuidedNoise,
+            originalOutput: modelOutput,
+            intermediateOutput: intermediateOutput,
             timestepIndex: stepIndex,
             sample: latents
           )
         } else {
-          latents = scheduler.step(modelOutput: -guidedNoise, timestepIndex: stepIndex, sample: latents)
+          latents = scheduler.step(modelOutput: modelOutput, timestepIndex: stepIndex, sample: latents)
         }
         MLX.eval(latents)
       }
