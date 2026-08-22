@@ -4307,6 +4307,14 @@ public final class WarmServer {
     case let error as LoRAError:
       return .error(status: 400, message: error.localizedDescription)
 
+    // WP-E9 (AC-56): a VAE the caller named that is not on disk, or a file in
+    // a key layout the engine cannot name, is the caller's error — named in
+    // full, never substituted.
+    case let error as Krea2VAESelectionError:
+      return .error(status: 400, message: error.localizedDescription)
+    case let error as Krea2VAEKeyMapError:
+      return .error(status: 400, message: error.localizedDescription)
+
     case let error as WarmServerError:
       switch error {
       case .loraSwapNotSupported, .controlNetNotSupported:
@@ -6883,6 +6891,14 @@ private actor WarmServerCoordinator {
       }
       // WP-E4 (D18): krea2-only tier gates — a 400, never a silent downgrade.
       try payload.validateKrea2TierGates(try payload.validateRecipeNames())
+      // WP-E9 (§3.9, D16, D17): VAE selection — payload.vae → model dir. A
+      // named file that is not on disk fails the render here (AC-56); a
+      // different file than the resident one reloads the decoder IN PLACE on
+      // the one Krea2VAE (never a pool eviction), and the selection is
+      // recorded on the pipeline for the response record (WP-E10).
+      let vaeChoice = try Krea2VAESelector.resolve(requested: payload.vae, paths: k2.paths)
+      try k2.ensureVAE(path: vaeChoice.file, source: vaeChoice.source)
+      logger.info("Krea2: VAE \(k2.currentVAE.layout.rawValue) \(k2.currentVAE.file.path) (source=\(k2.currentVAE.source.rawValue), reloads=\(k2.vaeReloadCount))")
       let outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
         defaultFilename: ComfyBoxOutputNaming.defaultFilename(
@@ -7686,6 +7702,13 @@ struct GeneratePayload: Sendable {
   /// default absent/false — omitting it is byte-identical to today.
   let preempt: Bool?
 
+  /// WP-E9 (FDD §3.9, D16): path of the VAE file to decode (and encode)
+  /// through — e.g. `Wan2_1_VAE_fp32.safetensors`. Tilde allowed. Absent →
+  /// the model directory's VAE. A path that is not on disk FAILS the render
+  /// (AC-56); the layout is sniffed from the file's keys, never its name.
+  /// Krea 2 only today (the other families ignore it).
+  let vae: String?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -7702,9 +7725,10 @@ struct GeneratePayload: Sendable {
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil,
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
-    preempt: Bool? = nil
+    preempt: Bool? = nil, vae: String? = nil
   ) {
     self.preempt = preempt
+    self.vae = vae
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -7762,6 +7786,7 @@ extension GeneratePayload: Decodable {
     case controlImage
     case model, loras
     case preempt
+    case vae
   }
 
   init(from decoder: Decoder) throws {
@@ -7815,6 +7840,7 @@ extension GeneratePayload: Decodable {
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
     preempt = try c.decodeIfPresent(Bool.self, forKey: .preempt)
+    vae = try c.decodeIfPresent(String.self, forKey: .vae)
   }
 
   /// The DyPE configuration this payload implies at the given resolution.

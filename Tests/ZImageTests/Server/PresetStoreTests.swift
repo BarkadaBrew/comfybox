@@ -297,3 +297,36 @@ final class PresetStoreTests: XCTestCase {
   }
 
 }
+
+// MARK: - WP-E9 (FDD §3.9, AC-58 slice): `vae` on ImagePreset at every site
+
+extension PresetStoreTests {
+
+  /// The `videoTuning` regression class: a field must survive the custom
+  /// decoder, the synthesized encoder, the memberwise init, the store and
+  /// `ResolvedPreset`. WP-E20 widens this to the nine new fields.
+  func testVAEFieldRoundTrip() throws {
+    let wan = "/Users/toddwalderman/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"
+    // Memberwise init.
+    let preset = ImagePreset(id: "ref", name: "Reference", vae: wan)
+    XCTAssertEqual(preset.vae, wan)
+    // JSON round trip (decoder + encoder).
+    let data = try JSONEncoder().encode(preset)
+    XCTAssertTrue(String(data: data, encoding: .utf8)!.contains("\"vae\""), "encoder dropped vae")
+    let decoded = try JSONDecoder().decode(ImagePreset.self, from: data)
+    XCTAssertEqual(decoded.vae, wan)
+    XCTAssertEqual(decoded, preset)
+    // Wire decode from a hand-written document.
+    let fromJSON = try JSONDecoder().decode(
+      ImagePreset.self, from: Data(#"{"id":"r","name":"R","vae":"\#(wan)"}"#.utf8))
+    XCTAssertEqual(fromJSON.vae, wan)
+    // Absent stays nil — Wan is never ambient (D16).
+    XCTAssertNil(try JSONDecoder().decode(ImagePreset.self, from: Data(#"{"id":"r","name":"R"}"#.utf8)).vae)
+    // Store + resolve.
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    try store.upsert(preset)
+    let resolved = try store.resolve("ref")
+    XCTAssertEqual(resolved.vae, wan)
+    XCTAssertNil(ResolvedPreset(preset: ImagePreset(id: "p", name: "P")).vae)
+  }
+}

@@ -22,8 +22,16 @@ public struct Krea2ModelPaths {
   /// filename (FDD §3.5), and provenance records exactly what loaded.
   public let transformerFile: URL
   public var textEncoderFile: URL { root.appending(path: "text_encoder/model.safetensors") }
-  public var vaeFile: URL { root.appending(path: "vae/diffusion_pytorch_model.safetensors") }
+  /// The model directory's VAE — the bottom of the selection precedence
+  /// (WP-E9, §3.9): `model_index.json` `"vae_file"` when declared, else
+  /// `vae/diffusion_pytorch_model.safetensors`. Stored, not derived, for the
+  /// same reason as `transformerFile`.
+  public let vaeFile: URL
   public var tokenizerDirectory: URL { root.appending(path: "tokenizer") }
+
+  public static func defaultVAEFile(root: URL) -> URL {
+    root.appending(path: "vae/diffusion_pytorch_model.safetensors")
+  }
 
   /// A root whose transformer is `variant.transformerFilename`. Use
   /// `Krea2ModelDetection.detect(at:)` to read the variant off disk.
@@ -31,10 +39,11 @@ public struct Krea2ModelPaths {
     self.init(root: root, variant: variant, transformerFile: root.appending(path: variant.transformerFilename))
   }
 
-  public init(root: URL, variant: Krea2Variant, transformerFile: URL) {
+  public init(root: URL, variant: Krea2Variant, transformerFile: URL, vaeFile: URL? = nil) {
     self.root = root
     self.variant = variant
     self.transformerFile = transformerFile
+    self.vaeFile = vaeFile ?? Self.defaultVAEFile(root: root)
   }
 
   /// An explicit dir is detected fail-closed (variant read from disk, throws
@@ -158,7 +167,16 @@ public final class Krea2Pipeline {
   public let transformer: Krea2SingleStreamDiT
   public let textEncoder: Qwen3TextEncoder
   public let conditioner: Krea2TextConditioner
-  public let vae: Krea2VAE
+  /// The ONE `Krea2VAE` instance — serves both `decode` and `encode`, so
+  /// encoder-side selection follows decoder-side automatically (AC-57). Owned
+  /// by `vaeSlot`, which reloads its weights in place (WP-E9, D17).
+  public var vae: Krea2VAE { vaeSlot.vae }
+  public let vaeSlot: Krea2VAESlot
+  /// What decoded the last/next render and how it was selected (WP-E9; feeds
+  /// `RenderRecipe.vae`, WP-E10).
+  public var currentVAE: Krea2VAESelection { vaeSlot.current }
+  /// In-place decoder reloads since load (AC-59).
+  public var vaeReloadCount: Int { vaeSlot.reloadCount }
 
   private let logger = Logger(label: "z-image.krea2-pipeline")
 
@@ -236,11 +254,35 @@ public final class Krea2Pipeline {
     let tokenizer = try QwenTokenizer.load(from: paths.root)
     self.conditioner = Krea2TextConditioner(encoder: encoder, tokenizer: tokenizer)
 
-    let vae = Krea2VAE()
-    try Krea2WeightLoader.loadVAE(vae, from: paths.vaeFile)
-    self.vae = vae
+    // The model directory's VAE is the resident default (D16); the layout is
+    // sniffed from the keys, so a Wan file declared via model_index.json
+    // `vae_file` loads correctly too.
+    let slot = try Krea2VAESlot(loading: paths.vaeFile, source: .modelDir)
+    self.vaeSlot = slot
+    logger.info("Krea2: VAE \(slot.current.layout.rawValue) from \(paths.vaeFile.path)")
 
-    MLX.eval(transformer.parameters(), encoder.parameters(), vae.parameters())
+    MLX.eval(transformer.parameters(), encoder.parameters(), slot.vae.parameters())
+  }
+
+  // MARK: - VAE selection (WP-E9)
+
+  /// Make `path` the resident decoder, reloading IN PLACE on the one
+  /// `Krea2VAE` instance — never a pool eviction (D17). Returns `true` when
+  /// weights were reloaded, `false` when `path` was already resident.
+  /// Fail-closed: a file that is not on disk, or a layout `detectLayout`
+  /// cannot name, throws and leaves the resident decoder untouched.
+  @discardableResult
+  public func ensureVAE(
+    path: URL, layout: VAELayout? = nil, source: Krea2VAESelection.Source = .payload
+  ) throws -> Bool {
+    let previous = vaeSlot.current
+    let reloaded = try vaeSlot.ensure(file: path, layout: layout, source: source)
+    if reloaded {
+      let line = "Krea2: VAE reloaded in place \(previous.layout.rawValue) \(previous.file.lastPathComponent) → "
+        + "\(vaeSlot.current.layout.rawValue) \(path.path) (source=\(source.rawValue), reloads=\(vaeSlot.reloadCount))"
+      logger.info("\(line)")
+    }
+    return reloaded
   }
 
   // MARK: - LoRA Support

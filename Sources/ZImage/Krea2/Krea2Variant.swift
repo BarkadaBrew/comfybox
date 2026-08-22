@@ -109,7 +109,7 @@ public enum Krea2ModelPathsError: Error, Equatable, CustomStringConvertible {
       case .notADirectory: why = "not an existing directory"
       case .noTransformer: why = "no raw.safetensors / turbo.safetensors and no model_index.json naming one"
       case .missingTextEncoder: why = "missing text_encoder/model.safetensors"
-      case .missingVAE: why = "missing vae/diffusion_pytorch_model.safetensors"
+      case .missingVAE: why = "missing the model dir's VAE (vae/diffusion_pytorch_model.safetensors, or model_index.json \"vae_file\")"
       case .invalidModelIndex(let detail): why = "model_index.json is not usable: \(detail)"
       case .unmappedSpec:
         why = "not an existing path, not a declared alias (config.json krea2Models), and not one of the "

@@ -93,6 +93,10 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   public var loras: [LoraReference]
   public var scheduler: String?
   public var upscale: PresetUpscale?
+  /// WP-E9 (FDD §3.9, D16): path of the VAE file this preset decodes through.
+  /// nil = the model directory's VAE (the no-regression default). Wan is
+  /// never ambient — it is a named field that appears in every record.
+  public var vae: String?
 
   public init(
     id: String,
@@ -117,7 +121,8 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     height: Int? = nil,
     loras: [LoraReference] = [],
     scheduler: String? = nil,
-    upscale: PresetUpscale? = nil
+    upscale: PresetUpscale? = nil,
+    vae: String? = nil
   ) {
     self.id = id
     self.name = name
@@ -142,6 +147,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.loras = loras
     self.scheduler = scheduler
     self.upscale = upscale
+    self.vae = vae
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -155,6 +161,9 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     // tuning write since task #9 Phase 2 silently vanished on the JSON/API
     // path. The desktop tuning UI was writing values nothing ever read.
     case videoTuning
+    // WP-E9: same regression class — a field must be listed here AND in the
+    // custom decoder, or both directions silently drop it.
+    case vae
   }
 
   public init(from decoder: Decoder) throws {
@@ -184,6 +193,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
     upscale = try c.decodeIfPresent(PresetUpscale.self, forKey: .upscale)
     videoTuning = try c.decodeIfPresent(LTX2VideoTuning.self, forKey: .videoTuning)
+    vae = try c.decodeIfPresent(String.self, forKey: .vae)
   }
 }
 
@@ -254,6 +264,8 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
   public var loras: [LoraReference]
   public var scheduler: String?
   public var upscale: PresetUpscale?
+  /// WP-E9: nil = the model directory's VAE.
+  public var vae: String?
 
   public init(preset: ImagePreset, defaults: PresetDefaults = .standard) {
     id = preset.id
@@ -279,6 +291,7 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
     loras = preset.loras
     scheduler = preset.scheduler
     upscale = preset.upscale
+    vae = preset.vae
   }
 }
 

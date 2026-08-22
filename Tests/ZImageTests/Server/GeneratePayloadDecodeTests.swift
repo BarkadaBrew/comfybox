@@ -84,3 +84,24 @@ extension GeneratePayloadDecodeTests {
     XCTAssertEqual(legacy.scheduler, "heun")
   }
 }
+
+// MARK: - WP-E9 (FDD §3.9, AC-56/59): the `vae` request field
+
+extension GeneratePayloadDecodeTests {
+
+  private func decodeE9(_ json: String) throws -> GeneratePayload {
+    let d = JSONDecoder()
+    d.keyDecodingStrategy = .convertFromSnakeCase
+    return try d.decode(GeneratePayload.self, from: Data(json.utf8))
+  }
+
+  /// `vae` is a path (tilde allowed) naming the decoder file; absent means
+  /// the model directory's VAE. It is never interpreted by filename.
+  func testVaeKeyDecodes() throws {
+    let p = try decodeE9(#"{"prompt":"x","vae":"~/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"}"#)
+    XCTAssertEqual(p.vae, "~/LocalModels/vae/Wan2_1_VAE_fp32.safetensors")
+    XCTAssertNil(try decodeE9(#"{"prompt":"x"}"#).vae)
+    XCTAssertNil(GeneratePayload(prompt: "x").vae, "memberwise default is no selection")
+    XCTAssertEqual(GeneratePayload(prompt: "x", vae: "/v.safetensors").vae, "/v.safetensors")
+  }
+}

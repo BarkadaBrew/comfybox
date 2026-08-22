@@ -113,7 +113,11 @@ public enum Krea2ModelDetection {
       (variant, transformerFile) = try readModelIndex(indexURL, root: url)
     }
 
-    let paths = Krea2ModelPaths(root: url, variant: variant, transformerFile: transformerFile)
+    // WP-E9: `model_index.json` may name the model dir's VAE (`"vae_file"`);
+    // absent → `vae/diffusion_pytorch_model.safetensors`. A declared file
+    // that is not there is an invalid index, never a fallback.
+    let vaeFile = try readModelIndexVAEFile(url.appending(path: "model_index.json"), root: url)
+    let paths = Krea2ModelPaths(root: url, variant: variant, transformerFile: transformerFile, vaeFile: vaeFile)
     guard fm.fileExists(atPath: paths.textEncoderFile.path) else {
       throw Krea2ModelPathsError.notAKrea2ModelDirectory(url.path, reason: .missingTextEncoder)
     }
@@ -121,6 +125,26 @@ public enum Krea2ModelDetection {
       throw Krea2ModelPathsError.notAKrea2ModelDirectory(url.path, reason: .missingVAE)
     }
     return paths
+  }
+
+  /// Optional `"vae_file"` in `model_index.json` (relative to `root`). nil
+  /// when there is no index or it does not declare one.
+  private static func readModelIndexVAEFile(_ indexURL: URL, root: URL) throws -> URL? {
+    guard FileManager.default.fileExists(atPath: indexURL.path),
+          let data = try? Data(contentsOf: indexURL),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let file = json["vae_file"] as? String
+    else { return nil }
+    guard !file.isEmpty else {
+      throw Krea2ModelPathsError.notAKrea2ModelDirectory(
+        root.path, reason: .invalidModelIndex("\"vae_file\" is empty"))
+    }
+    let url = root.appending(path: file)
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw Krea2ModelPathsError.notAKrea2ModelDirectory(
+        root.path, reason: .invalidModelIndex("vae_file \"\(file)\" does not exist in \(root.path)"))
+    }
+    return url
   }
 
   private static func readModelIndex(_ indexURL: URL, root: URL) throws -> (Krea2Variant, URL) {
