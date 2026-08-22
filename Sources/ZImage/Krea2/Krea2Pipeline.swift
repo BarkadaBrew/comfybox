@@ -541,6 +541,13 @@ public final class Krea2Pipeline {
           required: Krea2LoRARelativity.required(for: config, resolvedURL: url),
           loaded: variant)
         let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+        // K-FIX-1 / Codex C1 — the second half of the transactional contract,
+        // and like the relativity guard it fires BEFORE any weight mutation:
+        // LoKr rewrites base parameters and `clearDynamicLoRA` (this block's
+        // rollback) cannot restore them, so the stack would accumulate across
+        // renders while `appliedLoRAs` reported none. Refuse instead.
+        try Krea2AdapterSupport.checkTransactional(
+          lokrLayerCount: weights.lokrLayerCount, lora: name)
         logger.info("Applying Krea-2 LoRA: \(name) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale), base=\(variant.rawValue))")
         let report = try LoRAApplicator.applyDynamically(
           to: transformer, loraWeights: weights, scale: config.scale,
@@ -588,6 +595,12 @@ public final class Krea2Pipeline {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
         let weights = try LoRAWeightLoader.loadForKrea2(from: src)
+        // Belt and braces: nothing carrying LoKr can be in `appliedLoRAs`
+        // (loadLoRAs refuses it), but this loop re-reads the files from disk,
+        // so a file swapped underneath us is refused here too rather than
+        // mutating the base on a control toggle (C1's compounding path).
+        try Krea2AdapterSupport.checkTransactional(
+          lokrLayerCount: weights.lokrLayerCount, lora: cfg.source.displayName)
         try LoRAApplicator.applyDynamically(
           to: transformer, loraWeights: weights, scale: cfg.scale,
           strict: true, name: cfg.source.displayName, logger: logger)
