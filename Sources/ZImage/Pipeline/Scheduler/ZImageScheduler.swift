@@ -54,6 +54,18 @@ public protocol ZImageScheduler {
   /// Number of inference steps configured for this scheduler.
   var numInferenceSteps: Int { get }
 
+  /// RES4LYF's model-free final conversion sigma, or `nil` when this grid ends
+  /// without one — which is every scheduler outside the RES4LYF family and
+  /// every RES4LYF scheduler built from an unprepared grid.
+  ///
+  /// Non-nil means ``sigmas`` ends on the model's `sigma_min` rather than on
+  /// the usual `0.0` sentinel, and the run finishes with RES4LYF's
+  /// `sigma_min → 0` conversion `x − σ_min·eps`
+  /// (`rk_sampler_beta.py:2202`) — **not** a model evaluation, and not a
+  /// solver step. `Krea2DenoiseLoop` is the party that applies it; see
+  /// ``RES4LYFSigmaPreparation``.
+  var finalConversionSigma: Float? { get }
+
   /// Whether this scheduler requires two model evaluations per step.
   var requiresIntermediateEvaluation: Bool { get }
 
@@ -118,6 +130,11 @@ public protocol ZImageScheduler {
 public extension ZImageScheduler {
   /// The default; the RES family and the WP-E13 tableau conformers override.
   var modelOutputConvention: ModelOutputConvention { .velocity }
+
+  /// The default: no model-free tail. Only the RES4LYF conformers built from a
+  /// ``RES4LYFSigmaPreparation``-prepared grid carry one, so the euler + krea2
+  /// default path is untouched by this machinery (AC-1/AC-2).
+  var finalConversionSigma: Float? { nil }
 
   /// Convert the transformer's flow velocity into what this scheduler expects
   /// in `modelOutput`. Call once per model evaluation, **after** CFG

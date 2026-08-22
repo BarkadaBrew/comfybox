@@ -35,8 +35,20 @@ public struct Krea2RunTrace: Sendable, Equatable {
   public let shift: Float
   /// `"dynamic"` (resolution-derived) or `"explicit"` (request-stated).
   public let shiftSource: String
-  /// The full grid the loop walked, `stepsEffective + 1` values, trailing 0.
+  /// The full grid the loop walked, trailing 0.
+  ///
+  /// `stepsEffective + 1` values on the ordinary path. On a RES4LYF-prepared
+  /// grid it is `stepsEffective + 2`: the solver sigmas end on the model's
+  /// `sigma_min` and the trailing 0 is where the model-free conversion landed,
+  /// so the record shows the grid as actually walked rather than the published
+  /// one (``finalConversionSigma``).
   public let sigmas: [Float]
+
+  /// The sigma RES4LYF's model-free `σ_min → 0` conversion ran from, or `nil`
+  /// when the run had none. When set, the last entry of ``sigmas`` was reached
+  /// WITHOUT a model evaluation — it is not one of ``stepsRun``'s steps and it
+  /// contributes nothing to ``modelEvals``.
+  public let finalConversionSigma: Float?
 
   // — what actually ran —
 
@@ -77,6 +89,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     shift: Float,
     shiftSource: String,
     sigmas: [Float],
+    finalConversionSigma: Float? = nil,
     stepsRequested: Int,
     stepsEffective: Int,
     stepsRun: Int,
@@ -97,6 +110,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.shift = shift
     self.shiftSource = shiftSource
     self.sigmas = sigmas
+    self.finalConversionSigma = finalConversionSigma
     self.stepsRequested = stepsRequested
     self.stepsEffective = stepsEffective
     self.stepsRun = stepsRun
@@ -187,7 +201,8 @@ extension Krea2RunTrace {
       mu: shift.mu,
       shift: shift.shift,
       shiftSource: shift.source.rawValue,
-      sigmas: scheduler.sigmas.asArray(Float.self),
+      sigmas: Self.walkedGrid(scheduler: scheduler),
+      finalConversionSigma: stats.finalConversionSigma,
       stepsRequested: stepsRequested,
       stepsEffective: scheduler.numInferenceSteps,
       stepsRun: stats.stepsRun,
@@ -200,6 +215,17 @@ extension Krea2RunTrace {
       seed: seed,
       width: width,
       height: height)
+  }
+
+  /// The grid as walked: the scheduler's own sigmas, plus the `0.0` a
+  /// RES4LYF-prepared run's model-free conversion lands on. A prepared
+  /// scheduler's `sigmas` stop at the model's `sigma_min` (the zero is a
+  /// sentinel, never a solver target), so without this the record would omit
+  /// where the render actually finished.
+  private static func walkedGrid(scheduler: any ZImageScheduler) -> [Float] {
+    let solver = scheduler.sigmas.asArray(Float.self)
+    guard scheduler.finalConversionSigma != nil else { return solver }
+    return solver + [0.0]
   }
 
   /// D22: the requested name is recorded only when it is not simply the

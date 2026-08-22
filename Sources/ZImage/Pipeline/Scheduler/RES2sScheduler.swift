@@ -28,6 +28,11 @@ public struct RES2sScheduler: ZImageScheduler {
   public let requiresIntermediateEvaluation: Bool = true
   public let c2: Float
 
+  /// RES4LYF's model-free `σ_min → 0` conversion sigma when this scheduler was
+  /// built from a ``RES4LYFSigmaPreparation``-prepared grid; `nil` otherwise
+  /// (the Z-Image pipelines, and any direct construction).
+  public let finalConversionSigma: Float?
+
   private var firstModelOutput: (timestepIndex: Int, output: MLXArray)?
 
   /// Create a RES 2s scheduler with pre-computed sigma values.
@@ -42,7 +47,8 @@ public struct RES2sScheduler: ZImageScheduler {
     numInferenceSteps: Int,
     sigmaValues: [Float],
     numTrainTimesteps: Int = 1000,
-    c2: Float = 0.5
+    c2: Float = 0.5,
+    finalConversionSigma: Float? = nil
   ) {
     precondition(numInferenceSteps > 0, "numInferenceSteps must be positive")
     precondition(
@@ -58,6 +64,7 @@ public struct RES2sScheduler: ZImageScheduler {
     self.timesteps = MLXArray(timestepValues, [timestepValues.count])
     self.numInferenceSteps = numInferenceSteps
     self.c2 = c2
+    self.finalConversionSigma = finalConversionSigma
   }
 
   /// Single-step fallback: first-order exponential Euler update.

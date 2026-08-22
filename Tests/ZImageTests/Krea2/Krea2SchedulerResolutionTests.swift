@@ -54,14 +54,49 @@ final class Krea2SchedulerResolutionTests: XCTestCase {
 
   // MARK: - Every sampler resolves on every schedule the factory offers for the family
 
+  /// Every sampler × schedule resolves, and each ends where its family ends.
+  ///
+  /// The RES4LYF ports (`res_2s`, `res_3s`, `ralston_*`) come back on a
+  /// `prepare_sigmas`-prepared grid (S-FIX-1): the trailing `0.0` is a sentinel
+  /// they never step onto, so their last SOLVER sigma is the active
+  /// `ModelSamplingFlux` table's σ_min and the zero is reached by
+  /// `Krea2DenoiseLoop`'s model-free conversion instead. Everything else still
+  /// carries the schedule's own trailing zero.
   func testEverySamplerAndScheduleResolves() throws {
     let shift = try Krea2Sampling.resolveShift(explicit: nil, seqLen: 4096, align: Self.align)
+    let sigmaMin = SigmaSchedule.fluxSigmaTable(
+      shift: shift.mu, tableSize: Krea2Sampling.fluxTableSize)[0]
+
     for sampler in SchedulerKind.allCases {
       for schedule in SigmaScheduleKind.allCases {
+        let what = "\(sampler.rawValue)/\(schedule.rawValue)"
         let scheduler = try Krea2Pipeline.makeScheduler(
           sampler: sampler, sigmaSchedule: schedule, steps: 9, shift: shift, seed: 7, c2: 0.5)
-        XCTAssertEqual(scheduler.sigmas.asArray(Float.self).first, 1.0, "\(sampler.rawValue)/\(schedule.rawValue)")
-        XCTAssertEqual(scheduler.sigmas.asArray(Float.self).last, 0.0, "\(sampler.rawValue)/\(schedule.rawValue)")
+        let sigmas = scheduler.sigmas.asArray(Float.self)
+        XCTAssertEqual(sigmas.first, 1.0, what)
+
+        if sampler.isRES4LYFFamily {
+          XCTAssertNotEqual(sigmas.last, 0.0, "\(what): RES4LYF never solves onto the 0 sentinel")
+          XCTAssertEqual(
+            Double(try XCTUnwrap(sigmas.last)), Double(sigmaMin),
+            accuracy: Double(RES4LYFSigmaPreparation.sigmaMinMatchTolerance),
+            "\(what): the last solver sigma is the model's σ_min")
+          // Upstream guards the model-free tail on `sigmas[-2] == NS.sigma_min`
+          // EXACTLY. `karras` ramps down to σ_min itself and hits it; the
+          // `exponential` log/exp round trip misses by an ulp and therefore
+          // finishes at that sigma with no conversion, exactly as upstream does.
+          XCTAssertEqual(
+            scheduler.finalConversionSigma, sigmas.last == sigmaMin ? sigmaMin : nil, what)
+          // …and only an INSERT keeps the requested step count. `karras` and
+          // `exponential` already sit inside the 1e-4 window, so nothing is
+          // inserted and the count is upstream's `len(sigmas) − 2`.
+          let inserts = ![SigmaScheduleKind.karras, .exponential].contains(schedule)
+          XCTAssertEqual(scheduler.numInferenceSteps, inserts ? 9 : 8, "\(what): step count")
+        } else {
+          XCTAssertEqual(sigmas.last, 0.0, what)
+          XCTAssertNil(scheduler.finalConversionSigma, what)
+          XCTAssertEqual(scheduler.numInferenceSteps, 9, "\(what): step count is unmoved")
+        }
       }
     }
   }

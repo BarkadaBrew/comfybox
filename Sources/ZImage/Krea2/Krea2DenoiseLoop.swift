@@ -75,6 +75,32 @@ public enum Krea2DenoiseLoop {
     /// requires be reported rather than discovered, and it is a count, not a
     /// product of labels.
     public let modelEvals: Int
+
+    /// The sigma RES4LYF's model-free `σ_min → 0` conversion ran from, or `nil`
+    /// when the run finished without one.
+    ///
+    /// Non-nil means the last solver step landed on the model's `sigma_min`
+    /// and the loop then converted to zero with `x − σ_min·eps`, reusing the
+    /// last step's own epsilon (`rk_sampler_beta.py:1997,2202`). It costs **no**
+    /// model evaluation, so it is deliberately absent from ``modelEvals`` and
+    /// ``evaluateCalls``; it is not a solver step either, so ``stepsRun``
+    /// excludes it too. ``Krea2RunTrace`` reports the grid including the zero
+    /// it landed on.
+    public let finalConversionSigma: Float?
+
+    public init(
+      stepsRun: Int,
+      rowsAtStart: Int,
+      evaluateCalls: Int,
+      modelEvals: Int,
+      finalConversionSigma: Float? = nil
+    ) {
+      self.stepsRun = stepsRun
+      self.rowsAtStart = rowsAtStart
+      self.evaluateCalls = evaluateCalls
+      self.modelEvals = modelEvals
+      self.finalConversionSigma = finalConversionSigma
+    }
   }
 
   /// Drive `scheduler` from `startIndex` to the end of its grid.
@@ -130,8 +156,20 @@ public enum Krea2DenoiseLoop {
     var x = initialSample
     var evaluateCalls = 0
 
+    // RES4LYF's model-free tail (`rk_sampler_beta.py:1997,2202`) needs the LAST
+    // step's own epsilon, `(x₀ − x_next)/(σ − σ_next)`, taken BEFORE that step's
+    // T2 re-noise — exactly as upstream computes it. Recorded per step so the
+    // conversion after the loop reads no scheduler state and makes no model call.
+    //
+    // Read once: the conversion sigma is a property of the grid, and a run that
+    // has none (every non-RES4LYF sampler, the default euler path included)
+    // must not pay to retain a step's latents for it.
+    let tailSigma = scheduler.finalConversionSigma
+    var lastStep: (index: Int, x0: MLXArray, xNext: MLXArray, sigma: Float, sigmaNext: Float)?
+
     for i in startIndex..<total {
       let sigma = sigmas[i]
+      let stepStart = tailSigma != nil ? x : nil
 
       if var tableau = scheduler as? TableauScheduler {
         // 3. N-row: rows evaluations at rowSigma / rowSample, then commit.
@@ -175,6 +213,8 @@ public enum Krea2DenoiseLoop {
         }
       }
 
+      if let stepStart { lastStep = (i, stepStart, x, sigma, sigmas[i + 1]) }
+
       // 6. T2 / T3 hooks — nil today.
       noise?.inject(sample: &x, timestepIndex: i, scheduler: scheduler)
       if let bongmath {
@@ -187,11 +227,33 @@ public enum Krea2DenoiseLoop {
       progress?(i + 1, total)
     }
 
+    // 8. RES4LYF's model-free final conversion, σ_min → 0.
+    //
+    // The prepared grid (`RES4LYFSigmaPreparation`) stops the solver ON the
+    // model's `sigma_min`; upstream then converts to zero with the flow model's
+    // `calculate_denoised(σ_min, eps, x) = x − σ_min·eps`, reusing the epsilon
+    // the last step already implies. No model evaluation, no scheduler step —
+    // so `modelEvals` and `stepsRun` are untouched by it. Upstream guards the
+    // tail on having reached the end of the grid (`step == len(sigmas) − 2`);
+    // a run that took no step at all reached nothing and gets no conversion.
+    var conversionSigma: Float? = nil
+    if let tailSigma, let last = lastStep, last.index == total - 1 {
+      let denominator = last.sigma - last.sigmaNext
+      precondition(
+        denominator != 0,
+        "final conversion needs a non-degenerate last step (σ \(last.sigma) == σ' \(last.sigmaNext))")
+      let eps = (last.x0 - last.xNext) / MLXArray(denominator).asType(last.x0.dtype)
+      x = x - MLXArray(tailSigma).asType(x.dtype) * eps
+      MLX.eval(x)
+      conversionSigma = tailSigma
+    }
+
     let stats = Stats(
       stepsRun: total - startIndex,
       rowsAtStart: rowsAtStart,
       evaluateCalls: evaluateCalls,
-      modelEvals: evaluateCalls * modelEvalsPerEvaluate)
+      modelEvals: evaluateCalls * modelEvalsPerEvaluate,
+      finalConversionSigma: conversionSigma)
     return (x, stats)
   }
 }

@@ -45,6 +45,10 @@ public struct RalstonScheduler: TableauScheduler {
   public let numInferenceSteps: Int
   public let stages: Stages
 
+  /// RES4LYF's model-free `σ_min → 0` conversion sigma when this scheduler was
+  /// built from a ``RES4LYFSigmaPreparation``-prepared grid; `nil` otherwise.
+  public let finalConversionSigma: Float?
+
   public var rows: Int { stages.rawValue }
   public var frame: TableauFrame { .linear }
 
@@ -66,7 +70,8 @@ public struct RalstonScheduler: TableauScheduler {
     stages: Stages,
     numInferenceSteps: Int,
     sigmaValues: [Float],
-    numTrainTimesteps: Int = 1000
+    numTrainTimesteps: Int = 1000,
+    finalConversionSigma: Float? = nil
   ) {
     precondition(numInferenceSteps > 0, "numInferenceSteps must be positive")
     precondition(
@@ -80,6 +85,7 @@ public struct RalstonScheduler: TableauScheduler {
     self.cNodes = table.c
     self.sigmaValues = sigmaValues
     self.numInferenceSteps = numInferenceSteps
+    self.finalConversionSigma = finalConversionSigma
     self.sigmas = MLXArray(sigmaValues, [sigmaValues.count])
     let numTrainF = Float(numTrainTimesteps)
     let timestepValues = sigmaValues.dropLast().map { $0 * numTrainF }

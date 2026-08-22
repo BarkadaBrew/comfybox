@@ -671,7 +671,12 @@ public final class Krea2Pipeline {
       config: shift.config,
       mu: shift.mu,
       seed: seed,
-      c2: c2)
+      c2: c2,
+      // S-FIX-1: on the Krea 2 family a RES4LYF sampler runs RES4LYF's
+      // `prepare_sigmas` — solve to the model's σ_min, then convert to 0
+      // model-free. A no-op for `.euler` and every other non-RES4LYF kind, so
+      // the default path's grid is unmoved (AC-1/AC-2).
+      res4lyfSigmaPreparation: true)
   }
 
   /// Refuse the request fields whose behaviour is not implemented yet, before

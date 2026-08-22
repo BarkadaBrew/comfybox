@@ -40,6 +40,10 @@ public struct RES3sScheduler: TableauScheduler {
   /// exactly on `σ_next`. Not exposed on the wire (D23).
   public let c3: Float
 
+  /// RES4LYF's model-free `σ_min → 0` conversion sigma when this scheduler was
+  /// built from a ``RES4LYFSigmaPreparation``-prepared grid; `nil` otherwise.
+  public let finalConversionSigma: Float?
+
   public let rows = 3
   public var frame: TableauFrame { .exponential }
 
@@ -57,7 +61,8 @@ public struct RES3sScheduler: TableauScheduler {
     sigmaValues: [Float],
     numTrainTimesteps: Int = 1000,
     c2: Float = 0.5,
-    c3: Float = 1.0
+    c3: Float = 1.0,
+    finalConversionSigma: Float? = nil
   ) {
     precondition(numInferenceSteps > 0, "numInferenceSteps must be positive")
     precondition(
@@ -75,6 +80,7 @@ public struct RES3sScheduler: TableauScheduler {
     self.c3 = c3
     self.sigmaValues = sigmaValues
     self.numInferenceSteps = numInferenceSteps
+    self.finalConversionSigma = finalConversionSigma
     self.sigmas = MLXArray(sigmaValues, [sigmaValues.count])
     let numTrainF = Float(numTrainTimesteps)
     let timestepValues = sigmaValues.dropLast().map { $0 * numTrainF }
