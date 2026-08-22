@@ -122,7 +122,8 @@ public struct RalstonScheduler: TableauScheduler {
   ///
   /// That is precisely the silent substitution this FDD exists to kill, so it
   /// is a hard failure here and the reachable paths refuse the name earlier:
-  /// `GeneratePayload.validateTableauSampler(_:family:)` returns 400 on any
+  /// `GeneratePayload.validateFamilyRecipe(_:family:)` (the family capability
+  /// matrix, `FamilyRecipeMatrix`) returns 400 on any
   /// non-Krea 2 family, and the CLI's `--scheduler` refuses before weights
   /// load. `RES2sScheduler` keeping a fallback is not a precedent — it is a
   /// 2-row scheduler and the Z-Image pipelines dispatch 2-row.

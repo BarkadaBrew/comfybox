@@ -13,13 +13,17 @@ final class HealthSinkTests: XCTestCase {
   }
 
   private func sample(lastRecipe: RenderRecipe?, alias: String?) -> HealthResponse {
+    sample(slot: lastRecipe.map(AppliedRecordSlot.init(record:)), alias: alias)
+  }
+
+  private func sample(slot: AppliedRecordSlot?, alias: String?) -> HealthResponse {
     HealthResponse(
       status: "ok", model: "/Users/me/LocalModels/krea2-raw", modelFamily: "krea2", modelVariant: "raw",
       modelAlias: alias, buildSha: BuildInfo.gitSHA,
       textEncoderPath: nil, loaded: true, loras: [], uptimeSeconds: 1, renderCount: 1, failedRenderCount: 0,
       pendingCount: 0, maxPending: 8, isRendering: false, isPaused: false, activeRequestAgeMs: nil,
       currentJobId: nil, progressPercent: nil, memoryUsageBytes: 0, memoryUsageMB: 0,
-      lastRenderDurationMs: 1234, lastError: nil, lastRecipe: lastRecipe)
+      lastRenderDurationMs: 1234, lastError: nil, lastRecipe: slot)
   }
 
   /// The same builder every other sink test uses (AC-62: the four sinks

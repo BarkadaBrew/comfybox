@@ -408,13 +408,13 @@ final class RenderRecipeTests: XCTestCase {
     let r = RenderRecipe.krea2(inputs())
     let status = ImageJobStatus(
       jobId: "j2", status: .succeeded, source: "api", outputPath: "/y.png", durationMs: 5, error: nil,
-      elapsedMs: 6, preemptRefused: nil, etaSec: nil, applied: r)
+      elapsedMs: 6, preemptRefused: nil, etaSec: nil, applied: AppliedRecordSlot(record: r))
     let e = JSONEncoder(); e.keyEncodingStrategy = .convertToSnakeCase
     let json = try XCTUnwrap(JSONSerialization.jsonObject(with: e.encode(status)) as? [String: Any])
     let applied = try XCTUnwrap(json["applied"] as? [String: Any])
     XCTAssertEqual(applied["base_variant"] as? String, "raw")
     let back = try d.decode(ImageJobStatus.self, from: e.encode(status))
-    XCTAssertEqual(back.applied, r)
+    XCTAssertEqual(back.appliedRecord, r)
   }
 
   /// Sink 2: the PNG's EXIF `UserComment` JSON carries the same record under

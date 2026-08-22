@@ -26,7 +26,7 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   /// drive `step` directly, which for these samplers is a hard failure rather
   /// than a quiet first-order Euler (WP-E13 review finding 1). Callers on a
   /// non-Krea 2 path must refuse the name up front — see
-  /// `GeneratePayload.validateTableauSampler(_:family:)` and the CLI's
+  /// `GeneratePayload.validateFamilyRecipe(_:family:)` and the CLI's
   /// `--scheduler` parsing.
   ///
   /// Exhaustive on purpose (no `default`): a new kind must declare itself.

@@ -4572,7 +4572,7 @@ private struct HealthSnapshot: Sendable {
   /// the resolved directory path once `parseModelSpec` has expanded it.
   var modelAlias: String? = nil
   /// WP-E10 sink 3: the record of the last successful Krea 2 render.
-  var lastRecipe: RenderRecipe? = nil
+  var lastRecipe: AppliedRecordSlot? = nil
   var loaded: Bool
   var loras: [LoRAState]
   var renderCount: Int
@@ -4808,11 +4808,15 @@ public struct ImageJobStatus: Codable, Sendable {
   /// job — the same `applied` the sync response carries. Optional so
   /// persisted pre-upgrade JSON still decodes (AC-64); null for other
   /// families (D12) and until the job succeeds.
-  public let applied: RenderRecipe?
+  public let applied: AppliedRecordSlot?
+
+  /// The record itself; see ``AppliedRecordSlot`` for absent-vs-null.
+  public var appliedRecord: RenderRecipe? { applied?.record }
 
   public init(
     jobId: String, status: ImageJobState, source: String, outputPath: String?, durationMs: Int?,
-    error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?, applied: RenderRecipe? = nil
+    error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?,
+    applied: AppliedRecordSlot? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -4841,8 +4845,8 @@ private final class ImageJob: @unchecked Sendable {
   /// refused it.
   var preemptRefused: Bool?
   var etaSec: Double?
-  /// WP-E10: set with the result on success.
-  var applied: RenderRecipe?
+  /// WP-E10: set with the result on success (tri-state, see AppliedRecordSlot).
+  var applied: AppliedRecordSlot?
 
   init(id: String, source: String) {
     self.id = id
@@ -5353,7 +5357,7 @@ private actor WarmServerCoordinator {
   /// WP-E10 sink 3: the record of the last successful Krea 2 render,
   /// published into /health as `last_recipe`. Set only from a completed
   /// render (a failed one writes no record), never from a request.
-  private var lastRecipe: RenderRecipe?
+  private var lastRecipe: AppliedRecordSlot?
 
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
@@ -5367,11 +5371,22 @@ private actor WarmServerCoordinator {
   /// EVERY writer of `krea2Pipeline` calls this immediately after: pool
   /// activation, `prepare()`, and `releaseImageModelsForVideo()`. Adding a
   /// fourth writer without this call is the bug this comment exists to catch.
+  /// A record that no longer describes what is resident is dropped ENTIRELY
+  /// (the key goes absent), not turned into a `null` — `null` means "a Krea 2
+  /// render just refused its record", which is a different statement.
   private func revalidateLastRecipe() {
+    guard let slot = lastRecipe else { return }
+    guard let record = slot.record else {
+      // A refused record describes a render, not a checkpoint; once the
+      // resident model may have changed there is nothing left to say.
+      lastRecipe = currentModelFamily == .krea2 ? slot : nil
+      return
+    }
     lastRecipe = RenderRecipe.retained(
-      lastRecipe,
+      record,
       family: currentModelFamily,
-      krea2TransformerFile: krea2Pipeline?.paths.transformerFile.path)
+      krea2TransformerFile: krea2Pipeline?.paths.transformerFile.path
+    ).map(AppliedRecordSlot.init(record:))
   }
   private var activeRenderStartedAt: Date?
   /// Synthetic id for the currently-rendering job — surfaced as `current_job_id`.
@@ -6743,19 +6758,50 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// Whether a queued operation may run while the queue is PAUSED
+  /// (K-FIX-1 round 2, New-1).
+  ///
+  /// "Pause" means *no renders* — it is what Todd uses to free the GPU for a
+  /// deploy, and it persists across restarts via the sentinel. Mutating model
+  /// operations are exactly what an operator needs during that window
+  /// (swap the resident checkpoint, unload to free memory), and they were
+  /// available before this wave because the routes called the pool directly.
+  /// Routing them through the FIFO (C2) must not take that away: the FIFO's
+  /// job is to serialise them against an in-flight render, which it still
+  /// does — the loop runs one job at a time either way.
+  ///
+  /// Exhaustive on purpose (no `default`): a new queue kind must decide.
+  private static func runsWhilePaused(_ operation: QueuedOperation) -> Bool {
+    switch operation {
+    case .modelOperation:
+      return true
+    case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo, .shutdown:
+      return false
+    }
+  }
+
   private func processLoop() async {
     while true {
-      // Paused: stop pulling new jobs until resumed (setPaused restarts the loop).
+      // Paused: renders stay parked, but a model operation still runs (New-1).
+      // Picking it out of the middle does not reorder anything that runs: the
+      // jobs it passes are parked until resume, and they keep their relative
+      // order for when it comes.
+      let index: Int
       if isPaused {
-        isProcessing = false
-        return
-      }
-      guard !pending.isEmpty else {
-        isProcessing = false
-        return
+        guard let next = pending.firstIndex(where: { Self.runsWhilePaused($0.operation) }) else {
+          isProcessing = false
+          return
+        }
+        index = next
+      } else {
+        guard !pending.isEmpty else {
+          isProcessing = false
+          return
+        }
+        index = 0
       }
 
-      let job = pending.removeFirst()
+      let job = pending.remove(at: index)
       activeJobSummary = Self.describe(job.operation)
       activeJobSource = job.source
       // Keep the same id the job had while pending, so clients can correlate.
@@ -7352,7 +7398,7 @@ private actor WarmServerCoordinator {
       // `base_model` is the declared alias when the active spec is one (or
       // resolves to one's directory — AC-34b), else the spec as loaded.
       let activeSpec = activePoolModelSpec ?? configuration.modelSpec ?? "krea2"
-      let applied: RenderRecipe? = loraReadBacks.map { readBacks in
+      let record: RenderRecipe? = loraReadBacks.map { readBacks in
         RenderRecipe.krea2(.init(
           baseModel: Krea2ModelDetection.alias(forSpec: activeSpec) ?? activeSpec,
           variant: k2.variant,
@@ -7380,7 +7426,9 @@ private actor WarmServerCoordinator {
         generatedBy: payload.source,
         contentMode: payload.contentMode,
         loras: k2.loadedLoRAConfigs,
-        applied: applied
+        // The SLOT, so a refused record writes `"applied": null` in the file
+        // rather than looking like a family that has no record (round 2, C4).
+        appliedSlot: AppliedRecordSlot(record: record)
       )
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
@@ -7388,6 +7436,10 @@ private actor WarmServerCoordinator {
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
       lastError = nil
+      // Round 2 (C4): THIS render is Krea 2, so the slot is always present —
+      // it carries the record, or a literal `null` when `loraReadBacks` refused
+      // it above. An absent key must never be able to mean "engine-incomplete".
+      let applied = AppliedRecordSlot(record: record)
       lastRecipe = applied  // sink 3 — /health.last_recipe
       activeRenderStartedAt = nil
       resumed = true
@@ -7597,12 +7649,13 @@ private actor WarmServerCoordinator {
 
     // Save image (with embedded, Finder-readable generation metadata)
     try QwenImageIO.saveImage(array: imageArray, to: outputURL,
-      // Non-Krea 2 families still hand `ImageMetadata` a raw payload value,
-      // where `""` means "not given" — normalised here so the I4 change to
-      // `ImageMetadata.generation` (an explicit `""` is written) cannot add a
-      // `negative_prompt: ""` key to any other family's PNG.
+      // Non-Krea 2 families hand `ImageMetadata` a RAW payload value, where
+      // `""` means "not given" — normalised through the one shared helper so
+      // the I4 change to `ImageMetadata.generation` (an explicit `""` is
+      // written) cannot add a `negative_prompt: ""` key to any other family's
+      // PNG. Krea 2's APPLIED value deliberately does not go through it.
       metadata: .generation(prompt: payload.prompt,
-        negativePrompt: (payload.negativePrompt?.isEmpty ?? true) ? nil : payload.negativePrompt,
+        negativePrompt: QwenImageIO.ImageMetadata.requestNegative(payload.negativePrompt),
         seed: seed, steps: steps, guidance: guidance, width: width, height: height,
         generatedBy: payload.source, contentMode: payload.contentMode, loras: loras))
   }
@@ -8580,14 +8633,21 @@ struct GenerateResponse: Encodable, Sendable {
   let preemptRefused: Bool
   let etaSec: Double?
   /// WP-E10 sink 1 (FDD §3.10, D8): the provenance record — what APPLIED,
-  /// read back from the pipeline. Krea 2 only (D12); other families emit
-  /// null. Defaulted in this explicit init for the same reason as
-  /// `preemptRefused`: a property-level default would drop it from the
-  /// synthesized memberwise init.
-  let applied: RenderRecipe?
+  /// read back from the pipeline. Krea 2 only (D12).
+  ///
+  /// Tri-state via ``AppliedRecordSlot`` (round 2, C4): key ABSENT for another
+  /// family, literal `null` for a Krea 2 render whose record was refused
+  /// (engine-incomplete), the object otherwise. Defaulted in this explicit init
+  /// for the same reason as `preemptRefused`: a property-level default would
+  /// drop it from the synthesized memberwise init.
+  let applied: AppliedRecordSlot?
+
+  /// The record itself, for Swift readers that do not care about the
+  /// absent-vs-null distinction.
+  var appliedRecord: RenderRecipe? { applied?.record }
 
   init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
-       applied: RenderRecipe? = nil) {
+       applied: AppliedRecordSlot? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
@@ -8822,9 +8882,11 @@ struct HealthResponse: Encodable, Sendable {
   let lastRenderDurationMs: Int?
   let lastError: String?
   /// WP-E10 sink 3: `last_recipe` — the record of the last successful Krea 2
-  /// render, identical to that render's `applied` (AC-62). Null until one
-  /// has run, and for other families (D12).
-  let lastRecipe: RenderRecipe?
+  /// render, identical to that render's `applied` (AC-62). Tri-state via
+  /// ``AppliedRecordSlot`` (round 2, C4): ABSENT until a Krea 2 render has run
+  /// (and for other families, D12), literal `null` when the last Krea 2
+  /// render's record was refused, the object otherwise.
+  let lastRecipe: AppliedRecordSlot?
 }
 
 struct LoRAState: Encodable, Sendable {
@@ -9055,5 +9117,28 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// assert it is redirected away from the LIVE `~/.comfybox/queue-paused`
   /// before any coordinator is constructed.
   static var pauseSentinelPath: String { WarmServerCoordinator.pauseSentinelPath }
+
+  /// Pause / resume the queue, exactly as `/v1/queue/pause` does.
+  func setPaused(_ paused: Bool) async {
+    await coordinator.setPaused(paused)
+  }
+
+  /// The summary of the job the loop is running, or nil when idle.
+  var activeJobSummary: String? { liveHealthSnapshot.activeSummary }
+
+  /// Nothing running and nothing waiting.
+  ///
+  /// The drain guard reads this: a test must not tear down its isolated state
+  /// directory while the coordinator still has work, because the loop's
+  /// per-job `persistQueueState()` would then resolve — and `removeItem` —
+  /// the LIVE snapshot path (K-FIX-1 round 2, New-2).
+  var isDrained: Bool {
+    let snapshot = liveHealthSnapshot
+    return snapshot.activeJobId == nil && snapshot.pending.isEmpty
+  }
+
+  var pendingCount: Int { liveHealthSnapshot.pending.count }
+
+  var isPaused: Bool { liveHealthSnapshot.isPaused }
 }
 #endif

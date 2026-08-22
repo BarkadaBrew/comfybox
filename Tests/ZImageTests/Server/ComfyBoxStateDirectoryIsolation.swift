@@ -68,6 +68,44 @@ extension XCTestCase {
       "a test resolved the live ~/.comfybox state path", file: file, line: line)
     return directory
   }
+
+  /// Build a queue probe whose DRAIN is a precondition of tearing the isolated
+  /// state directory down (K-FIX-1 round 2, New-2).
+  ///
+  /// This is the factory tests must use. `addTeardownBlock` runs LIFO, so a
+  /// probe created after `isolateComfyBoxStateDirectory()` has its drain guard
+  /// registered later and therefore runs EARLIER — the queue is proven empty
+  /// before `COMFYBOX_STATE_DIR` is unset.
+  ///
+  /// Why it matters: the process loop calls `persistQueueState()` around every
+  /// job, and `QueueStateStore.save` of an empty queue does `removeItem`. A
+  /// test that returned while a detached model operation was still executing
+  /// would unset the override mid-flight and the next `persistQueueState()`
+  /// would resolve — and delete — the LIVE `~/.comfybox/queue-state.json`.
+  /// That is precisely the hazard the isolation commit exists to close, so
+  /// leaving work in flight is a test FAILURE, not a race to tolerate.
+  func makeQueueProbe(
+    maxPendingRequests: Int = 10, file: StaticString = #filePath, line: UInt = #line
+  ) -> WarmServerQueueProbe {
+    let probe = WarmServerQueueProbe(maxPendingRequests: maxPendingRequests)
+    addTeardownBlock {
+      // Bounded wait: a job that is legitimately finishing gets a moment; a
+      // test that forgot to await its own work fails loudly rather than
+      // silently reaching through to the live path.
+      let deadline = Date().addingTimeInterval(20)
+      while !probe.isDrained && Date() < deadline {
+        try? await Task.sleep(nanoseconds: 10_000_000)
+      }
+      XCTAssertTrue(
+        probe.isDrained,
+        "the queue still has work at teardown (pending: \(probe.pendingCount), active: "
+          + "\(probe.activeJobSummary ?? "none")) — unsetting COMFYBOX_STATE_DIR now would let "
+          + "the loop's persistQueueState() delete the LIVE ~/.comfybox/queue-state.json. "
+          + "Await every operation the test enqueues.",
+        file: file, line: line)
+    }
+    return probe
+  }
 }
 
 /// The helper's own contract, including the half that matters most: with the

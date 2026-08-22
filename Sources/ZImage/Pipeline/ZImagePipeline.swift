@@ -38,7 +38,9 @@ public struct ZImageGenerationRequest: Sendable {
   /// Generation params embedded into the saved PNG (Finder/Spotlight-readable),
   /// so every render carries its own sidecar — the mflux-style default.
   public func embeddedMetadata(loras: [LoRAConfiguration] = []) -> QwenImageIO.ImageMetadata {
-    .generation(prompt: prompt, negativePrompt: negativePrompt, seed: seed,
+    .generation(prompt: prompt,
+                negativePrompt: QwenImageIO.ImageMetadata.requestNegative(negativePrompt),
+                seed: seed,
                 steps: steps, guidance: guidanceScale, width: width, height: height,
                 model: model, generatedBy: source, contentMode: contentMode, loras: loras)
   }
