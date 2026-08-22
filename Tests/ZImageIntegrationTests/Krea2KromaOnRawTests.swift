@@ -57,24 +57,54 @@ final class Krea2KromaOnRawTests: XCTestCase {
   // MARK: - The Raw pipeline (built once)
 
   private static var sharedRaw: Krea2Pipeline?
-  private static var rawLoadFailure: Error?
+  /// The model directory is genuinely absent → every test in the class skips.
+  private static var rawSkip: XCTSkip?
+  /// The directory is THERE and `Krea2Pipeline` init threw anyway → every
+  /// test in the class FAILS. A quantization fault, a shape mismatch or an
+  /// OOM is a regression this batch exists to catch; it must never read as
+  /// "the model is not installed".
+  private static var rawInitFailure: Error?
 
   private func rawPipeline() throws -> Krea2Pipeline {
     if ProcessInfo.processInfo.environment["CI"] != nil { throw XCTSkip("GPU test skipped in CI") }
     if let existing = Self.sharedRaw { return existing }
-    if let failure = Self.rawLoadFailure { throw failure }
+    if let skip = Self.rawSkip { throw skip }
+    if let failure = Self.rawInitFailure {
+      XCTFail("Krea2Pipeline init already failed once on an INSTALLED krea2-raw — real regression: \(failure)")
+      throw failure
+    }
+
+    // 1. Resolution only. A `Krea2ModelPathsError` means the directory is
+    //    absent / unusable, which is the ONLY skippable condition here.
+    let paths: Krea2ModelPaths
     do {
-      let paths = try Krea2ModelDetection.resolve(spec: "krea2-raw")
-      XCTAssertEqual(paths.variant, .raw)
-      XCTAssertEqual(paths.transformerFile.lastPathComponent, "raw.safetensors")
+      paths = try Krea2ModelDetection.resolve(spec: "krea2-raw")
+    } catch let error as Krea2ModelPathsError {
+      let skip = XCTSkip("krea2-raw not installed (\(error)) — WP-E7 Raw batch not runnable here")
+      Self.rawSkip = skip
+      throw skip
+    }
+    guard FileManager.default.fileExists(atPath: paths.transformerFile.path) else {
+      let skip = XCTSkip("\(paths.transformerFile.path) absent — WP-E7 Raw batch not runnable here")
+      Self.rawSkip = skip
+      throw skip
+    }
+    XCTAssertEqual(paths.variant, .raw)
+    XCTAssertEqual(paths.transformerFile.lastPathComponent, "raw.safetensors")
+
+    // 2. Construction. The weights ARE on disk, so anything thrown here is a
+    //    real fault in the pipeline — fail, never skip.
+    do {
       // Production quantisation (ModelPool / prepare both pass 8).
       let pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: 8)
       Self.sharedRaw = pipeline
       return pipeline
     } catch {
-      let skip = XCTSkip("krea2-raw not loadable (\(error)) — WP-E7 Raw batch not runnable here")
-      Self.rawLoadFailure = skip
-      throw skip
+      Self.rawInitFailure = error
+      XCTFail("Krea2Pipeline(paths:quantizeTransformer: 8) failed with krea2-raw INSTALLED at "
+        + "\(paths.transformerFile.path) — this is a regression (quantization, shape or memory), "
+        + "not a missing model: \(error)")
+      throw error
     }
   }
 
@@ -209,11 +239,16 @@ final class Krea2KromaOnRawTests: XCTestCase {
     XCTAssertEqual(readBacks[0].report.bound, report.bound)
     XCTAssertEqual(readBacks[0].configuration.role, "kroma")
     XCTAssertEqual(readBacks[0].configuration.scale, 0.6)
-    // FINDING (WP-E7 report, E6/E10 to decide): `Applied.relativeTo` is built
-    // from `configuration.requiresBase` alone, so a seed-resolved relativity
-    // — the preset path exercised above — records `relative_to: null`.
+    // KNOWN GAP (WP-E7 report concern 2; E6/E10 own the fix):
+    // `RenderRecipe.Applied.relativeTo` is built from
+    // `configuration.requiresBase` alone, and the seed table resolves
+    // relativity INSIDE `loadLoRAs` without writing it back — so the preset
+    // path exercised above records `relative_to: null` even though the guard
+    // did use `.raw`. Pinned as a tripwire, NOT as intended behaviour: when
+    // the resolved relativity is carried into the record, this flips.
     XCTAssertNil(readBacks[0].configuration.requiresBase,
-                 "this request declared nothing; the SEED supplied the relativity")
+                 "KNOWN GAP: this request declared nothing and the SEED supplied the relativity, "
+                   + "so provenance will record relative_to: null — see the WP-E7 report")
 
     try applyStack(k2, [])
     XCTAssertTrue(k2.loadedLoRAConfigs.isEmpty)

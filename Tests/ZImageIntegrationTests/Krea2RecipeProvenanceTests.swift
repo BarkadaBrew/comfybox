@@ -27,16 +27,29 @@ final class Krea2RecipeProvenanceTests: XCTestCase {
 
   private func loadRaw() throws -> Krea2Pipeline {
     if ProcessInfo.processInfo.environment["CI"] != nil { throw XCTSkip("GPU test skipped in CI") }
+    // Only an absent / unusable model DIRECTORY is skippable. An untyped
+    // `catch` here would turn any fault into "not installed" (WP-E7 review).
     let paths: Krea2ModelPaths
     do {
       paths = try Krea2ModelDetection.resolve(spec: "krea2-raw")
-    } catch {
+    } catch let error as Krea2ModelPathsError {
       throw XCTSkip("krea2-raw not installed (\(error)) — Raw provenance batch not runnable here")
     }
+    try XCTSkipUnless(
+      FileManager.default.fileExists(atPath: paths.transformerFile.path),
+      "\(paths.transformerFile.path) absent — Raw provenance batch not runnable here")
     XCTAssertEqual(paths.variant, .raw)
     XCTAssertEqual(paths.transformerFile.lastPathComponent, "raw.safetensors")
-    // Production quantisation (ModelPool / prepare both pass 8).
-    return try Krea2Pipeline(paths: paths, quantizeTransformer: 8)
+    // Production quantisation (ModelPool / prepare both pass 8). The weights
+    // ARE on disk by here, so anything init throws is a real regression
+    // (quantization, shape, memory) and must FAIL rather than skip.
+    do {
+      return try Krea2Pipeline(paths: paths, quantizeTransformer: 8)
+    } catch {
+      XCTFail("Krea2Pipeline(paths:quantizeTransformer: 8) failed with krea2-raw INSTALLED at "
+        + "\(paths.transformerFile.path) — regression, not a missing model: \(error)")
+      throw error
+    }
   }
 
   private func readUserComment(_ url: URL) throws -> [String: Any] {
