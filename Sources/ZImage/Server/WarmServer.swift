@@ -6182,6 +6182,9 @@ private actor WarmServerCoordinator {
       // The pipeline is the physical fact; the pool entry carries the same
       // value back from loadPipeline (WP-E5).
       krea2Variant = krea2Pipeline?.variant ?? (entry.detectedInfo as? Krea2Variant)
+      // WP-E10 sink 3: a record whose base is no longer resident is not
+      // provenance. Kept only when THIS transformer file produced it.
+      lastRecipe = RenderRecipe.retained(lastRecipe, activeTransformerFile: krea2Pipeline?.paths.transformerFile.path)
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -6205,6 +6208,11 @@ private actor WarmServerCoordinator {
         }
       }
       zimageVariant = (entry.detectedInfo as? ZImageVariant) ?? .turbo
+    }
+    if entry.family != .krea2 {
+      // Same rule from the other side: no krea2 base is resident, so there is
+      // no record for /health to publish (D12).
+      lastRecipe = nil
     }
     pipelinePrepared = true
     // Model/family/variant just changed — refresh the health snapshot (#217).
@@ -7096,6 +7104,18 @@ private actor WarmServerCoordinator {
       }
       let guardedPrompt = LoRATriggerGuard.ensure(prompt: payload.prompt, triggers: loraTriggers)
 
+      // WP-E10: publish per-step progress the way the Z-Image path does.
+      // `/health.progress_percent` used to stay 0 for the whole of a Krea 2
+      // render because this arm's callback only logged.
+      let tracker = progressTracker
+      let health = liveHealth
+      let publishProgress: @Sendable (Int, Int) -> Void = { [logger] step, total in
+        let pct = RenderProgressPercent.of(step: step, total: total)
+        tracker.set(pct)
+        health.setProgress(pct)
+        logger.info("Krea2: step \(step)/\(total)")
+      }
+
       let image: MLXArray
       let trace: Krea2RunTrace
       if let initPath = payload.imagePath {
@@ -7122,10 +7142,8 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta)
-        ) { [logger] step, total in
-          logger.info("Krea2 img2img: step \(step)/\(total)")
-        }
+                eta: recipe.eta),
+          progress: publishProgress)
       } else {
         (image, trace) = try k2.generateWithRecipe(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
@@ -7135,10 +7153,8 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta)
-        ) { [logger] step, total in
-          logger.info("Krea2: step \(step)/\(total)")
-        }
+                eta: recipe.eta),
+          progress: publishProgress)
       }
       // WP-E10 (FDD §3.10, AC-60): the provenance record is READ BACK from
       // the pipeline — the variant and transformer file it loaded, the

@@ -32,7 +32,11 @@ final class AsyncJobIdTests: XCTestCase {
       captured.record(jobId)
       return GenerateResponse(success: true, outputPath: "/tmp/x.png", durationMs: 1)
     }
-    XCTAssertEqual(status.status, .queued)
+    // Not `.queued`: the detached worker may already have flipped it to
+    // `.processing` by the time submit returns. The claim under test is the
+    // id, and that it is pollable from the moment the caller has it.
+    XCTAssertFalse(status.jobId.isEmpty)
+    XCTAssertNotNil(tracker.status(jobId: status.jobId))
     let done = try XCTUnwrap(waitUntilDone(tracker, status.jobId))
     XCTAssertEqual(done.status, .succeeded)
     XCTAssertEqual(captured.all, [status.jobId], "the queue saw exactly the client-visible id")

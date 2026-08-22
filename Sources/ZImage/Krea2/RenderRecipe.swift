@@ -121,6 +121,22 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
 
   }
 
+  // MARK: - Retention across a base handoff
+
+  /// The record `/health.last_recipe` may still publish once `activeTransformerFile`
+  /// is what is resident — `nil` when the base changed under it.
+  ///
+  /// `/health` reports `model`, `model_variant` and `last_recipe` side by
+  /// side; a record that outlived its base would describe a checkpoint that
+  /// is no longer loaded, which reads as provenance and is not. Pass `nil`
+  /// for `activeTransformerFile` when the active family is not Krea 2.
+  public static func retained(_ record: RenderRecipe?, activeTransformerFile: String?) -> RenderRecipe? {
+    guard let record, let activeTransformerFile,
+          record.baseModelFile == activeTransformerFile
+    else { return nil }
+    return record
+  }
+
   // MARK: - Builder: Krea 2 read-backs → record
 
   /// One loaded adapter: the configuration the pipeline holds in

@@ -229,7 +229,13 @@ public enum QwenImageIO {
         p.isEmpty ? nil : ((p as NSString).lastPathComponent as NSString).deletingPathExtension
       }
       if let modelName { params["model"] = modelName }
-      let json = (try? JSONSerialization.data(withJSONObject: params))
+      // `.sortedKeys` is load-bearing, not cosmetic: `JSONSerialization` walks
+      // a Swift `Dictionary` in hash order and Swift seeds its hasher PER
+      // PROCESS, so without it the same render wrote different EXIF
+      // `UserComment` bytes after every server restart and the whole-file SHA
+      // of a PNG could never be compared across runs (WP-E10; AC-5's
+      // byte-identity oracle depends on it). Sorting recurses into `applied`.
+      let json = (try? JSONSerialization.data(withJSONObject: params, options: [.sortedKeys]))
         .flatMap { String(data: $0, encoding: .utf8) }
       return ImageMetadata(description: prompt,
                            keywords: [modelName].compactMap { $0 },

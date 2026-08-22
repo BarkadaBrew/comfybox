@@ -72,3 +72,33 @@ final class HealthSinkTests: XCTestCase {
     XCTAssertEqual(BuildInfo.isKnown, sha != BuildInfo.placeholder)
   }
 }
+
+/// `/health.last_recipe` must never describe a model that is no longer
+/// resident. A base handoff (a different Raw/Turbo file, or a switch out of
+/// the family entirely) invalidates the record: keeping it would put a
+/// `krea2-raw` provenance block beside a `model: z-image-turbo` line, which
+/// is exactly the silent mismatch this document exists to prevent.
+final class LastRecipeRetentionTests: XCTestCase {
+
+  private var recipe: RenderRecipe { RenderRecipeFixture.recipe() }
+
+  func testTheRecordSurvivesAReactivationOfTheSameBase() {
+    XCTAssertEqual(
+      RenderRecipe.retained(recipe, activeTransformerFile: recipe.baseModelFile),
+      recipe)
+  }
+
+  func testADifferentTransformerFileDropsTheRecord() {
+    XCTAssertNil(RenderRecipe.retained(recipe, activeTransformerFile: "/Users/me/LocalModels/kroma-v0.2/turbo.safetensors"))
+  }
+
+  /// Another family has no krea2 transformer to compare against — the record
+  /// goes, rather than being reported next to a foreign model.
+  func testAnotherFamilyDropsTheRecord() {
+    XCTAssertNil(RenderRecipe.retained(recipe, activeTransformerFile: nil))
+  }
+
+  func testNoRecordStaysNoRecord() {
+    XCTAssertNil(RenderRecipe.retained(nil, activeTransformerFile: "/x/raw.safetensors"))
+  }
+}

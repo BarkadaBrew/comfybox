@@ -6,7 +6,60 @@ decided them.
 
 ## Unreleased
 
+### Added
+
+- **Every Krea 2 render now carries a provenance record, `applied`, on four
+  sinks.** The `/v1/generate` response, the async job status
+  (`GET /v1/generate/async/{id}`), `/health.last_recipe`, and the PNG's EXIF
+  `UserComment` JSON all carry the same block: what LOADED (`base_model`,
+  `base_variant`, `base_model_file`, `quantization`, `vae`, `vae_layout`,
+  `vae_source`, `text_encoder`, `loras[]` with `pairs_bound` /
+  `shape_rejected` / `deltas_applied` / `role`, `control_lora`) and what RAN
+  (`stages[]` with the resolved `sampler` / `sigma_schedule`, the shift, the
+  sigma head and tail, `steps_requested` / `steps_effective` / `steps_run` /
+  `model_evals`, and `negative_prompt` **only when guidance > 1**, because
+  below that it did not apply). Every value is read back from the pipeline and
+  the loop — none is echoed from the request. Krea 2 only for now; other
+  families emit no `applied` block rather than a half-filled one.
+  FDD-krea2-raw-recipe WP-E10 §3.10, D8/D12/D15/D22, AC-60..64.
+- **`/health` gains `build_sha`, `model_alias`, `model_variant` for Krea 2,
+  and `last_recipe`.** `build_sha` is the git short sha stamped into the binary
+  by `scripts/gen-build-info.sh` (`"unknown"` for an unstamped build), so a
+  clobbered or wrong-branch binary is detectable from outside. `model_alias`
+  restores the declared alias (`krea2-raw`) beside the resolved directory that
+  `model` carries. `last_recipe` is dropped the moment a different base is
+  activated — a record whose checkpoint is no longer resident is not
+  provenance. WP-E10, AC-34b.
+- **PNG generation metadata is byte-stable.** `parametersJSON` is now written
+  with sorted keys; it previously followed Swift's per-process dictionary hash
+  order, so the same render produced different EXIF bytes after every restart
+  and the whole-file SHA of a PNG could not be compared across runs.
+- **`/health.progress_percent` advances during a Krea 2 render.** The Krea 2
+  arm's per-step callback only wrote a log line, so the field sat at 0 for the
+  whole render; both families now publish through one mapping.
+- **`loras[].role`** on `/v1/generate` and `/v1/lora/swap` — `kroma` | `accel`
+  | `bypass` | `control`. The sender declares which configuration slot an
+  adapter fills; the engine stores it on the applied configuration and reads
+  it back into `applied.loras[].role`, so a client reports `kroma_strength`
+  as applied instead of matching filenames. An unknown label is a 400.
+
 ### Changed
+
+- **`vae` on a non-Krea-2 family is now a 400, not silently ignored.** A
+  caller that named a decoder for flux1/flux2/fibo/chroma previously got the
+  family's default with no error and no log. WP-E10 ("E9b"), D18.
+- **A Krea 2 VAE file carrying only a SUBSET of the decoder's parameters is
+  refused (`vaeIncomplete`) instead of loading a mixed decoder.** The subset
+  used to overwrite its targets and leave every other parameter at whatever
+  was resident — half one VAE, half another, named as the new file. Nothing is
+  written when the check fails. WP-E10 ("E9b").
+- **The `krea2 handoff:` log line fires only on an actual base swap.** A no-op
+  re-activation of the resident base, and a cold start with nothing to hand
+  off from, emit nothing. D17, AC-59a.
+- **An async job's id is the id the queue persists and replays under.** A job
+  that failed replay after a restart was recorded under the coordinator's own
+  private id — a second UUID the `/v1/generate/async` caller never saw — so it
+  could not be polled. AC-18.
 
 - **Krea 2 `shift` is mu, and Krea 2's `beta`/`beta57`/`karras`/`exponential`
   are built on ComfyUI's `ModelSamplingFlux` table (deliberate behaviour
