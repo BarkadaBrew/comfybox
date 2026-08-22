@@ -236,62 +236,192 @@ public enum SigmaSchedule {
     return sigmas
   }
 
-  // MARK: - Beta
+  // MARK: - Beta (ComfyUI-exact)
 
-  /// Beta-distribution-inspired sigma schedule.
+  /// ComfyUI's `beta_scheduler` (`comfy/samplers.py:696-708`, pinned copy under
+  /// `scripts/oracles/upstream/comfyui/`; FDD-krea2-raw-recipe D5, §3.11,
+  /// AC-21/AC-22), ported literally:
   ///
-  /// Warps uniform timesteps through the beta CDF to redistribute step
-  /// density. With alpha=beta=0.6 (U-shaped PDF), the CDF rises steeply
-  /// at both edges and slowly through the middle. When used as the
-  /// interpolation factor, this concentrates more sigma steps in the
-  /// mid-noise range where denoising quality matters most, while
-  /// spending fewer steps at extreme noise levels.
+  /// ```python
+  /// total_timesteps = len(model_sampling.sigmas) - 1
+  /// ts = 1 - numpy.linspace(0, 1, steps, endpoint=False)
+  /// ts = numpy.rint(scipy.stats.beta.ppf(ts, alpha, beta) * total_timesteps)
+  /// sigs = [sigmas[int(t)] for consecutive-distinct t] + [0.0]
+  /// ```
   ///
-  /// The CDF is computed via numerical integration of the beta PDF at
-  /// high resolution — no scipy dependency required.
+  /// The beta **PPF** (inverse CDF) is evaluated at `1 − i/steps`, scaled to
+  /// the table's top index, rounded half-to-even (`numpy.rint`), and used as an
+  /// index into the model's discrete sigma table. Consecutive repeats are
+  /// dropped, so the result can have **fewer** than `numSteps + 1` entries;
+  /// `SchedulerFactory` constructs with the produced count and the scheduler's
+  /// `numInferenceSteps` reports it — never hidden (AC-22).
+  ///
+  /// This replaced, in place and under the same name, a CDF-integrator that
+  /// interpolated in log-sigma space: at 6 steps / shift 1.15 its σ₁ was 0.1596
+  /// where ComfyUI's is 0.9199 (D5; `BetaScheduleComfyParityTests.testBeforeAfterFixture`
+  /// pins both). `CHANGELOG.md` announces the change.
+  ///
+  /// - Parameters:
+  ///   - numSteps: Requested step count. `0` → `[0.0]`, as upstream.
+  ///   - sigmaTable: The model's discrete sigma table, **ascending** (index 0 is
+  ///     `σ_min`, the last entry `σ_max`), e.g. ``discreteFlowSigmaTable(shift:numTrainTimesteps:)``
+  ///     or ``fluxSigmaTable(shift:tableSize:)``.
+  ///   - alpha, betaParam: Beta-distribution shape. `beta` = (0.6, 0.6); `beta57` = (0.5, 0.7).
   public static func beta(
     numSteps: Int,
-    sigmaMin: Float = 0.02,
-    sigmaMax: Float = 100.0,
+    sigmaTable: [Float],
     alpha: Float = 0.6,
     betaParam: Float = 0.6
   ) -> [Float] {
+    precondition(!sigmaTable.isEmpty, "beta schedule needs a non-empty sigma table")
     guard numSteps > 0 else { return [0.0] }
 
-    // Build CDF via midpoint-rule integration of beta PDF.
-    // PDF(x; a, b) ∝ x^(a-1) * (1-x)^(b-1)
-    // Midpoint rule avoids the singularities at x=0 and x=1 when alpha,beta < 1.
-    let resolution = 10000
-    var cdf = [Float](repeating: 0.0, count: resolution + 1)
-    cdf[0] = 0.0  // CDF(0) = 0 by definition
-    for i in 1...resolution {
-      let xMid = (Float(i) - 0.5) / Float(resolution)  // midpoint of bin
-      let pdfVal = powf(xMid, alpha - 1) * powf(1.0 - xMid, betaParam - 1)
-      cdf[i] = cdf[i - 1] + pdfVal
-    }
-    // Normalize so CDF(1) = 1.
-    let total = cdf[resolution]
-    guard total > 0 else {
-      return exponential(numSteps: numSteps, sigmaMin: sigmaMin, sigmaMax: sigmaMax)
-    }
-    for i in 1...resolution {
-      cdf[i] /= total
-    }
+    let totalTimesteps = Double(sigmaTable.count - 1)
+    let a = Double(alpha), b = Double(betaParam)
+    // numpy.linspace(0, 1, steps, endpoint=False) is `i * (1/steps)`; then `1 - …`.
+    let step = 1.0 / Double(numSteps)
 
-    // Evaluate CDF at uniform timesteps and use as interpolation factor.
-    // CDF(t) warps the uniform spacing: steep CDF regions = big sigma
-    // jumps (fewer effective steps), flat CDF regions = small sigma
-    // changes (more effective steps concentrated there).
-    let logMin = logf(sigmaMin)
-    let logMax = logf(sigmaMax)
-    var sigmas: [Float] = (0..<numSteps).map { i in
-      let t = Float(i) / Float(max(1, numSteps - 1))
-      let idx = min(Int(t * Float(resolution)), resolution)
-      let warped = cdf[idx]
-      return expf(logMax + (logMin - logMax) * warped)
+    var sigmas: [Float] = []
+    sigmas.reserveCapacity(numSteps + 1)
+    var lastIndex = -1.0
+    for i in 0..<numSteps {
+      let p = 1.0 - Double(i) * step
+      let index = (betaPPF(p, alpha: a, beta: b) * totalTimesteps).rounded(.toNearestOrEven)
+      if index != lastIndex {
+        sigmas.append(sigmaTable[Int(index)])
+      }
+      lastIndex = index
     }
     sigmas.append(0.0)
     return sigmas
+  }
+
+  /// ``beta(numSteps:sigmaTable:alpha:betaParam:)`` over the discrete-flow table
+  /// `σ[i] = shift·t / (1 + (shift − 1)·t)`, `t = (i+1)/T` — the signature
+  /// FDD-krea2-raw-recipe §3.11 names. `SchedulerFactory` reads `shift` and `T`
+  /// from the model's scheduler config (`Krea2Sampling.schedulerConfig(shift:)`
+  /// for Krea 2, D3).
+  public static func beta(
+    numSteps: Int,
+    shift: Float,
+    numTrainTimesteps: Int,
+    alpha: Float = 0.6,
+    betaParam: Float = 0.6
+  ) -> [Float] {
+    beta(
+      numSteps: numSteps,
+      sigmaTable: discreteFlowSigmaTable(shift: shift, numTrainTimesteps: numTrainTimesteps),
+      alpha: alpha, betaParam: betaParam)
+  }
+
+  // MARK: Discrete sigma tables
+
+  /// ComfyUI `ModelSamplingDiscreteFlow.set_parameters` (`model_sampling.py:298-302`):
+  /// `σ[i] = time_snr_shift(shift, (i+1)/T) = shift·t / (1 + (shift − 1)·t)`,
+  /// ascending, `σ[T−1] = 1.0` exactly. `shift == 1` is the identity (`σ = t`),
+  /// as upstream special-cases it. Float32 arithmetic mirrors the torch tensor.
+  public static func discreteFlowSigmaTable(shift: Float, numTrainTimesteps: Int) -> [Float] {
+    precondition(numTrainTimesteps > 0, "numTrainTimesteps must be positive")
+    let count = Float(numTrainTimesteps)
+    return (0..<numTrainTimesteps).map { i in
+      let t = Float(i + 1) / count
+      if shift == 1.0 { return t }
+      return shift * t / (1 + (shift - 1) * t)
+    }
+  }
+
+  /// ComfyUI `ModelSamplingFlux.set_parameters` (`model_sampling.py:416-419`):
+  /// `σ[i] = flux_time_shift(shift, 1.0, (i+1)/N) = e^shift / (e^shift + 1/t − 1)`,
+  /// a 10 000-entry table by default. This is the class ComfyUI actually
+  /// registers Krea 2 under (`supported_models.py`, E18's finding recorded in
+  /// `comfy_sigmas.json`), where `shift` is a **log**-shift — the same
+  /// parameterisation as `SigmaSchedule.krea2`'s `mu`.
+  public static func fluxSigmaTable(shift: Float, tableSize: Int = 10000) -> [Float] {
+    precondition(tableSize > 0, "tableSize must be positive")
+    let count = Float(tableSize)
+    let expShift = Float(Foundation.exp(Double(shift)))
+    return (0..<tableSize).map { i in
+      let t = Float(i + 1) / count
+      return expShift / (expShift + (1 / t - 1))
+    }
+  }
+
+  // MARK: Beta distribution
+
+  /// Inverse of the regularized incomplete beta function — `scipy.stats.beta.ppf`.
+  ///
+  /// Bisection in `Double` on ``regularizedIncompleteBeta(_:a:b:)`` to machine
+  /// precision (~1e-15 in `x`). The symmetric midpoint `p = 0.5, a == b` is
+  /// returned exactly (`I_0.5(a, a) = 0.5` by symmetry), so `rint(ppf·T)` lands
+  /// on the same half-to-even tie as upstream instead of an ulp either side.
+  ///
+  /// Accuracy matters here: the FDD's proposed bisection on the old midpoint-rule
+  /// CDF (10 000 bins) mis-rounds 2 of 6 indices at the AC-21 case and up to 17
+  /// indices on the 10 000-entry flux table — the `rint` quantisation does not
+  /// absorb a ~1e-3 CDF error (checked against scipy, 2026-08-22).
+  static func betaPPF(_ p: Double, alpha a: Double, beta b: Double) -> Double {
+    precondition(a > 0 && b > 0, "beta shape parameters must be positive")
+    if p <= 0 { return 0 }
+    if p >= 1 { return 1 }
+    if a == b && p == 0.5 { return 0.5 }
+    var lo = 0.0, hi = 1.0
+    for _ in 0..<200 {
+      let mid = 0.5 * (lo + hi)
+      if mid == lo || mid == hi { break }  // Double exhausted
+      if regularizedIncompleteBeta(mid, a: a, b: b) < p { lo = mid } else { hi = mid }
+    }
+    return 0.5 * (lo + hi)
+  }
+
+  /// Regularized incomplete beta function `I_x(a, b)` via Lentz's continued
+  /// fraction (Numerical Recipes `betai`/`betacf`), with the `x > (a+1)/(a+b+2)`
+  /// symmetry swap so the fraction always converges fast. Relative accuracy
+  /// ~1e-14 for the shape range used here (`a, b ∈ [0.5, 0.7]`).
+  static func regularizedIncompleteBeta(_ x: Double, a: Double, b: Double) -> Double {
+    if x <= 0 { return 0 }
+    if x >= 1 { return 1 }
+    // Prefactor x^a (1−x)^b / (a B(a,b)), in log space.
+    let lnBeta = lgamma(a) + lgamma(b) - lgamma(a + b)
+    let front = Foundation.exp(a * Foundation.log(x) + b * Foundation.log(1 - x) - lnBeta)
+    if x < (a + 1) / (a + b + 2) {
+      return front * betaContinuedFraction(x, a: a, b: b) / a
+    } else {
+      return 1 - front * betaContinuedFraction(1 - x, a: b, b: a) / b
+    }
+  }
+
+  /// `betacf` — modified Lentz evaluation of the continued fraction for `I_x(a, b)`.
+  private static func betaContinuedFraction(_ x: Double, a: Double, b: Double) -> Double {
+    let tiny = 1e-300
+    let eps = 1e-16
+    let qab = a + b, qap = a + 1, qam = a - 1
+    var c = 1.0
+    var d = 1 - qab * x / qap
+    if abs(d) < tiny { d = tiny }
+    d = 1 / d
+    var h = d
+    for m in 1...300 {
+      let mD = Double(m), m2 = 2 * mD
+      // Even step.
+      var aa = mD * (b - mD) * x / ((qam + m2) * (a + m2))
+      d = 1 + aa * d
+      if abs(d) < tiny { d = tiny }
+      c = 1 + aa / c
+      if abs(c) < tiny { c = tiny }
+      d = 1 / d
+      h *= d * c
+      // Odd step.
+      aa = -(a + mD) * (qab + mD) * x / ((a + m2) * (qap + m2))
+      d = 1 + aa * d
+      if abs(d) < tiny { d = tiny }
+      c = 1 + aa / c
+      if abs(c) < tiny { c = tiny }
+      d = 1 / d
+      let del = d * c
+      h *= del
+      if abs(del - 1) < eps { break }
+    }
+    return h
   }
 
   // MARK: - Helpers

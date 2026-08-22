@@ -1031,6 +1031,11 @@ public class ZImageControlPipeline {
     )
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
     let sigmasArray = scheduler.sigmas.asArray(Float.self)
+    // Produced count is authoritative (de-duplicating `beta`/`beta57`; WP-E12, AC-22).
+    let stepsEffective = scheduler.numInferenceSteps
+    if stepsEffective != request.steps {
+      logger.warning("Schedule '\(request.sigmaSchedule.rawValue)' produced \(stepsEffective) steps (\(request.steps) requested) — running \(stepsEffective) (steps_effective)")
+    }
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
     if self.transformer == nil {
       logger.info("Reloading transformer after prompt encoding...")
@@ -1063,18 +1068,18 @@ public class ZImageControlPipeline {
       }
       try await applyLoRAIfNeeded(request.loras)
     }
-    logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
+    logger.info("Running \(stepsEffective) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
     do {
       guard let transformer = self.transformer else {
         throw PipelineError.transformerNotLoaded
       }
-      for stepIndex in 0..<request.steps {
+      for stepIndex in 0..<stepsEffective {
         try Task.checkCancellation()
         request.progressCallback?(ControlProgress(
           stage: "Denoising",
           stepIndex: stepIndex,
-          totalSteps: request.steps,
-          fractionCompleted: Double(stepIndex) / Double(request.steps)
+          totalSteps: stepsEffective,
+          fractionCompleted: Double(stepIndex) / Double(stepsEffective)
         ))
         let timestep = timestepsArray[stepIndex]
         let normalizedTimestep = (1000.0 - timestep) / 1000.0
@@ -1357,6 +1362,11 @@ public class ZImageControlPipeline {
     )
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
     let sigmasArray = scheduler.sigmas.asArray(Float.self)
+    // Produced count is authoritative (de-duplicating `beta`/`beta57`; WP-E12, AC-22).
+    let stepsEffective = scheduler.numInferenceSteps
+    if stepsEffective != request.steps {
+      logger.warning("Schedule '\(request.sigmaSchedule.rawValue)' produced \(stepsEffective) steps (\(request.steps) requested) — running \(stepsEffective) (steps_effective)")
+    }
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
     if self.transformer == nil {
       logger.info("Reloading transformer after prompt encoding...")
@@ -1389,18 +1399,18 @@ public class ZImageControlPipeline {
       }
       try await applyLoRAIfNeeded(request.loras)
     }
-    logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
+    logger.info("Running \(stepsEffective) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue), control_context_scale=\(request.controlContextScale))...")
     do {
       guard let transformer = self.transformer else {
         throw PipelineError.transformerNotLoaded
       }
-      for stepIndex in 0..<request.steps {
+      for stepIndex in 0..<stepsEffective {
         try Task.checkCancellation()
         request.progressCallback?(ControlProgress(
           stage: "Denoising",
           stepIndex: stepIndex,
-          totalSteps: request.steps,
-          fractionCompleted: Double(stepIndex) / Double(request.steps)
+          totalSteps: stepsEffective,
+          fractionCompleted: Double(stepIndex) / Double(stepsEffective)
         ))
         let timestep = timestepsArray[stepIndex]
         let normalizedTimestep = (1000.0 - timestep) / 1000.0

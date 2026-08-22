@@ -70,26 +70,32 @@ public enum SchedulerFactory {
       config: config,
       mu: mu
     )
+    // The produced count is authoritative: ComfyUI-style de-duplication
+    // (`beta`/`beta57`) can return fewer than `numInferenceSteps + 1` sigmas,
+    // and every scheduler init preconditions `sigmaValues.count == steps + 1`.
+    // The scheduler's `numInferenceSteps` then reports the effective count
+    // (FDD-krea2-raw-recipe D5, AC-22) — callers loop over it, not the request.
+    let effectiveSteps = sigmaValues.count - 1
 
     switch kind {
     case .euler:
       if sigmaSchedule == .flow {
         // Use the native flow-match init for exact backward compatibility.
         return FlowMatchEulerScheduler(
-          numInferenceSteps: numInferenceSteps,
+          numInferenceSteps: effectiveSteps,
           config: config,
           mu: config.useDynamicShifting ? mu : nil
         )
       }
       return FlowMatchEulerScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps
       )
 
     case .dpmplusplus2m:
       return DPMPlusPlus2MScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps
       )
@@ -97,7 +103,7 @@ public enum SchedulerFactory {
     case .ddim:
       let randomKey = seed.map { MLXRandom.key($0) }
       return DDIMScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,
         eta: eta ?? 0.0,
@@ -106,7 +112,7 @@ public enum SchedulerFactory {
 
     case .deis:
       return DEISScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps
       )
@@ -114,7 +120,7 @@ public enum SchedulerFactory {
     case .dpmplusplus2sa:
       let randomKey = seed.map { MLXRandom.key($0) }
       return DPMPlusPlus2SAScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,
         eta: eta ?? 1.0,
@@ -123,14 +129,14 @@ public enum SchedulerFactory {
 
     case .heun:
       return HeunScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps
       )
 
     case .res2s:
       return RES2sScheduler(
-        numInferenceSteps: numInferenceSteps,
+        numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,
         c2: c2
@@ -171,17 +177,16 @@ public enum SchedulerFactory {
       let (lo, hi) = flowMatchingSigmaBounds(config: config)
       return SigmaSchedule.exponential(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
     case .beta:
-      let (lo, hi) = flowMatchingSigmaBounds(config: config)
-      return SigmaSchedule.beta(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
-    case .beta57:
-      let (lo, hi) = flowMatchingSigmaBounds(config: config)
+      // ComfyUI-exact (D5): beta PPF → rint → index into the model's discrete
+      // sigma table (shift / numTrainTimesteps from the config), de-duplicated.
+      // May return fewer than numSteps + 1 sigmas; `create` constructs with
+      // the produced count (AC-22).
       return SigmaSchedule.beta(
-        numSteps: numSteps,
-        sigmaMin: lo,
-        sigmaMax: hi,
-        alpha: 0.5,
-        betaParam: 0.7
-      )
+        numSteps: numSteps, shift: config.shift, numTrainTimesteps: config.numTrainTimesteps)
+    case .beta57:
+      return SigmaSchedule.beta(
+        numSteps: numSteps, shift: config.shift, numTrainTimesteps: config.numTrainTimesteps,
+        alpha: 0.5, betaParam: 0.7)
     }
   }
 
@@ -189,8 +194,10 @@ public enum SchedulerFactory {
   ///
   /// Z-Image Turbo uses velocity-prediction flow matching where sigmas
   /// represent noise fraction in [0, 1]. Alternative schedules (karras,
-  /// exponential, beta) redistribute points within this range instead of
-  /// using their DDPM defaults (0.02..100).
+  /// exponential) redistribute points within this range instead of using
+  /// their DDPM defaults (0.02..100). `beta`/`beta57` no longer take bounds:
+  /// they index the discrete table built from the same `shift` and
+  /// `numTrainTimesteps`, whose floor is this `shiftedSigmaMin`.
   private static func flowMatchingSigmaBounds(
     config: ZImageSchedulerConfig
   ) -> (sigmaMin: Float, sigmaMax: Float) {

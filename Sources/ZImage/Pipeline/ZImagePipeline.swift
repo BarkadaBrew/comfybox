@@ -1100,6 +1100,13 @@ public final class ZImagePipeline {
     let timestepsArray = scheduler.timesteps.asArray(Float.self)
     let sigmasArray = scheduler.sigmas.asArray(Float.self)
     let numTrainTimestepsF = Float(modelConfigs.scheduler.numTrainTimesteps)
+    // The scheduler's count is authoritative: a de-duplicating schedule
+    // (`beta`/`beta57`, ComfyUI-exact since WP-E12) can produce fewer steps
+    // than requested; the loop runs the produced grid and says so (AC-22).
+    let stepsEffective = scheduler.numInferenceSteps
+    if stepsEffective != request.steps {
+      logger.warning("Schedule '\(request.sigmaSchedule.rawValue)' produced \(stepsEffective) steps (\(request.steps) requested) — running \(stepsEffective) (steps_effective)")
+    }
 
     // --- Latent-space inpainting setup ---
     var originalLatents: MLXArray?
@@ -1140,17 +1147,17 @@ public final class ZImagePipeline {
 
       // Handle denoise < 1.0: start from partially noised original
       if request.denoise < 1.0 {
-        inpaintStartStep = max(0, request.steps - Int(ceil(Float(request.steps) * request.denoise)))
+        inpaintStartStep = max(0, stepsEffective - Int(ceil(Float(stepsEffective) * request.denoise)))
         let startSigma = scheduler.sigmas[inpaintStartStep].item(Float.self)
         latents = MLXArray(startSigma) * latents + MLXArray(1.0 - startSigma) * origLatents
         MLX.eval(latents)
-        logger.info("Inpaint: denoise=\(request.denoise), starting at step \(inpaintStartStep)/\(request.steps), sigma=\(startSigma)")
+        logger.info("Inpaint: denoise=\(request.denoise), starting at step \(inpaintStartStep)/\(stepsEffective), sigma=\(startSigma)")
       } else {
-        logger.info("Inpaint: full denoise (1.0), running all \(request.steps) steps")
+        logger.info("Inpaint: full denoise (1.0), running all \(stepsEffective) steps")
       }
     }
 
-    logger.info("Running \(request.steps) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue))...")
+    logger.info("Running \(stepsEffective) denoising steps (sampler: \(request.schedulerKind.rawValue), schedule: \(request.sigmaSchedule.rawValue))...")
     do {
       guard let transformer = transformer else {
         throw PipelineError.transformerNotLoaded
@@ -1161,9 +1168,9 @@ public final class ZImagePipeline {
       if request.dyPE.enabled {
         logger.info("DyPE enabled: \(request.dyPE.method.rawValue) (base \(request.dyPE.baseResolution)px → \(request.width)x\(request.height))")
       }
-      for stepIndex in inpaintStartStep..<request.steps {
+      for stepIndex in inpaintStartStep..<stepsEffective {
         try Task.checkCancellation()
-        progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepIndex, totalSteps: request.steps))
+        progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepIndex, totalSteps: stepsEffective))
         let timestep = timestepsArray[stepIndex]
         let normalizedTimestep = (1000.0 - timestep) / 1000.0
         let timestepArray = MLXArray([normalizedTimestep], [1])
@@ -1262,12 +1269,12 @@ public final class ZImagePipeline {
         // Live denoising preview — send current latent state to preview handler.
         // The handler decides whether to emit a preview frame (based on step interval).
         // Non-blocking: if encoding is slow, frames are simply skipped.
-        latentPreviewHandler?(latents, stepIndex + 1, request.steps, latentH, latentW)
+        latentPreviewHandler?(latents, stepIndex + 1, stepsEffective, latentH, latentW)
       }
       transformer.clearCache()
     }
 
-    progressHandler?(GenerationProgress(stage: .denoising, stepIndex: request.steps, totalSteps: request.steps))
+    progressHandler?(GenerationProgress(stage: .denoising, stepIndex: stepsEffective, totalSteps: stepsEffective))
     if retentionPolicy == .releaseAfterRender {
       unloadTransformer()
     } else {
@@ -1275,7 +1282,7 @@ public final class ZImagePipeline {
       GPU.clearCache()
     }
     logger.info("Denoising complete, decoding with VAE...")
-    progressHandler?(GenerationProgress(stage: .decoding, stepIndex: request.steps, totalSteps: request.steps))
+    progressHandler?(GenerationProgress(stage: .decoding, stepIndex: stepsEffective, totalSteps: stepsEffective))
 
     let decodeVAE: VAEImageDecoding
     if originalLatents == nil {

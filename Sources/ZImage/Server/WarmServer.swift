@@ -6583,6 +6583,13 @@ private actor WarmServerCoordinator {
       }
     }
 
+    // D3 `shift`: refuse before dispatch so no family can silently ignore it.
+    if let message = GeneratePayload.validateShift(payload.shift, family: currentModelFamily) {
+      lastError = message
+      continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
+      return
+    }
+
     switch currentModelFamily {
     case .chroma:
       await runChromaGenerate(payload, continuation: continuation)
@@ -6847,20 +6854,22 @@ private actor WarmServerCoordinator {
           strength = 0.3
         }
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
-        image = k2.generateImg2Img(
+        image = try k2.generateImg2Img(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
                 guidance: payload.guidance ?? 1.0,
                 sourceImage: sourceNHWC, width: width, height: height,
-                steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE)
+                steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE,
+                shift: payload.shift)
         ) { [logger] step, total in
           logger.info("Krea2 img2img: step \(step)/\(total)")
         }
       } else {
-        image = k2.generate(
+        image = try k2.generate(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
                 guidance: payload.guidance ?? 1.0,
                 width: width, height: height, steps: steps, seed: seed,
-                controlImagePixels: controlPixels, dyPE: krea2DyPE)
+                controlImagePixels: controlPixels, dyPE: krea2DyPE,
+                shift: payload.shift)
         ) { [logger] step, total in
           logger.info("Krea2: step \(step)/\(total)")
         }
@@ -7512,6 +7521,10 @@ struct GeneratePayload: Sendable {
   let scheduler: String?
   let sigmaSchedule: String?
   let eta: Float?
+  /// Explicit schedule shift (FDD-krea2-raw-recipe D3). Krea 2 only: nil =
+  /// the resolution-dependent default; a value overrides `mu` with
+  /// `log(shift)`. Validated by `validateShift(_:family:)` → 400, never clamped.
+  let shift: Float?
   let dype: String?
   // Phase 3: Inpainting data (set by bridge, not by HTTP API)
   let inpaintImageData: Data?
@@ -7584,6 +7597,7 @@ struct GeneratePayload: Sendable {
     guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
     levelsMin: Float? = nil, levelsMax: Float? = nil,
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
+    shift: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
     maskCropX: Int? = nil, maskCropY: Int? = nil,
@@ -7608,7 +7622,7 @@ struct GeneratePayload: Sendable {
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
     self.levelsMin = levelsMin; self.levelsMax = levelsMax
     self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
-    self.eta = eta; self.dype = dype
+    self.eta = eta; self.shift = shift; self.dype = dype
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
     self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
@@ -7623,7 +7637,7 @@ struct GeneratePayload: Sendable {
 extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
-    case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, dype
+    case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, shift, dype
     case preset
     case denoise, maskGrow, maskFeather
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
@@ -7664,6 +7678,7 @@ extension GeneratePayload: Decodable {
     scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
+    shift = try c.decodeIfPresent(Float.self, forKey: .shift)
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
     // Inpaint image + mask arrive as base64 strings from the HTTP API.
     inpaintImageData = (try c.decodeIfPresent(String.self, forKey: .inpaintImageData))
@@ -7694,6 +7709,23 @@ extension GeneratePayload: Decodable {
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
     preempt = try c.decodeIfPresent(Bool.self, forKey: .preempt)
+  }
+
+  /// Validate the D3 `shift` field for the family that will render it.
+  ///
+  /// Returns a 400 message, or nil when the request is acceptable. `shift` is
+  /// a Krea 2 schedule field: it must be a positive finite number, and it is
+  /// refused — not ignored — on any other family, whose schedules never read
+  /// it (FDD-krea2-raw-recipe D3; "fail loud, never silently substitute").
+  static func validateShift(_ shift: Float?, family: WarmModelFamily) -> String? {
+    guard let shift else { return nil }
+    guard shift.isFinite, shift > 0 else {
+      return "shift must be a positive number (got \(shift)); omit it for the resolution-dependent default"
+    }
+    guard family == .krea2 else {
+      return "shift is a Krea 2 request field and is not honoured by model family '\(family.rawValue)'; remove it"
+    }
+    return nil
   }
 
   /// The DyPE configuration this payload implies at the given resolution.

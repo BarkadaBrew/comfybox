@@ -4653,7 +4653,7 @@ struct ZImageCLI {
     logger.info("krea2: models loaded in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s")
 
     let genStart = Date()
-    let image = pipeline.generate(
+    let image = try pipeline.generate(
       .init(prompt: prompt, width: width, height: height, steps: steps, seed: seed)
     ) { step, total in
       logger.info("krea2: step \(step)/\(total)")

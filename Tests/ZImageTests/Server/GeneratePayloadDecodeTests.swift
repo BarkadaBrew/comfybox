@@ -46,4 +46,30 @@ final class GeneratePayloadDecodeTests: XCTestCase {
         XCTAssertNil(p.inpaintImageData)
         XCTAssertNil(p.maskData)
     }
+
+    // MARK: - WP-E12: `shift` (FDD-krea2-raw-recipe D3)
+
+    func testShiftDecodes() throws {
+        let p = try decode(#"{"prompt":"x","shift":1.15}"#)
+        XCTAssertEqual(p.shift, 1.15)
+        let absent = try decode(#"{"prompt":"x"}"#)
+        XCTAssertNil(absent.shift, "absent = dynamic mu; nothing is defaulted in")
+    }
+
+    /// A non-positive shift is a 400 naming the field, and so is `shift` on a
+    /// family whose schedule does not consult it — never silently ignored.
+    func testShiftValidation() {
+        XCTAssertNil(GeneratePayload.validateShift(nil, family: .flux1))
+        XCTAssertNil(GeneratePayload.validateShift(nil, family: .krea2))
+        XCTAssertNil(GeneratePayload.validateShift(1.15, family: .krea2))
+        for bad: Float in [0, -1] {
+            let msg = GeneratePayload.validateShift(bad, family: .krea2)
+            XCTAssertNotNil(msg)
+            XCTAssertTrue(msg?.contains("shift") == true, "names the field: \(msg ?? "nil")")
+        }
+        let wrongFamily = GeneratePayload.validateShift(1.15, family: .flux1)
+        XCTAssertNotNil(wrongFamily)
+        XCTAssertTrue(wrongFamily?.contains("shift") == true && wrongFamily?.contains("flux1") == true,
+                      "names the field and the family: \(wrongFamily ?? "nil")")
+    }
 }
