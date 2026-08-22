@@ -89,6 +89,16 @@ enum Krea2Sampling {
     ((value + multiple - 1) / multiple) * multiple
   }
 
+  /// img2img's first grid index for `strength` over `total` intervals —
+  /// Z-Image's convention exactly (`ImageToImagePipeline.swift`):
+  /// `denoise = 1 - clamp(strength, 0.01, 0.99)`,
+  /// `start = max(0, total - ceil(total · denoise))`. Pure, so the
+  /// `steps_run` accounting (AC-63) is testable without weights.
+  public static func img2imgStartIndex(total: Int, strength: Float) -> Int {
+    let denoise = 1.0 - max(0.01, min(0.99, strength))
+    return max(0, total - Int((Double(total) * Double(denoise)).rounded(.up)))
+  }
+
   /// (b, c, H, W) -> (b, (H/p)*(W/p), c*p*p) with [c, ph, pw] channel ordering.
   static func patchify(_ x: MLXArray, patch p: Int) -> MLXArray {
     let b = x.dim(0), c = x.dim(1), H = x.dim(2), W = x.dim(3)
@@ -278,6 +288,22 @@ public final class Krea2Pipeline {
   /// In-place decoder reloads since load (AC-59).
   public var vaeReloadCount: Int { vaeSlot.reloadCount }
 
+  /// How the resident transformer was loaded — `"q8"` / `"q4"` / `"bf16"`
+  /// (WP-E10 `RenderRecipe.quantization`). A physical fact of THIS instance,
+  /// set once in `init` from the bits actually applied.
+  public let quantization: String
+
+  /// What the last completed `generate` / `generateImg2Img` actually did —
+  /// the grid it walked, the steps and model evaluations it COUNTED, the
+  /// shift it resolved (WP-E10). nil until the first run completes; a run
+  /// that throws leaves the previous trace in place (a failed render writes
+  /// no record).
+  public internal(set) var lastRunTrace: Krea2RunTrace?
+
+  /// The depth Control-LoRA as applied by `setControlLoRA` (file, scale and
+  /// the strict bind report); nil when none is active (WP-E10 `control_lora`).
+  public private(set) var controlLoRAApplied: RenderRecipe.ControlReadBack?
+
   private let logger = Logger(label: "z-image.krea2-pipeline")
 
   /// Currently applied LoRA configurations (for hot-swap tracking).
@@ -354,6 +380,7 @@ public final class Krea2Pipeline {
       }
     }
     self.transformer = transformer
+    self.quantization = quantizeTransformer.map { "q\($0)" } ?? "bf16"
 
     let encoder = Krea2TextEncoderFactory.makeEncoder()
     try Krea2WeightLoader.loadTextEncoder(encoder, from: paths.textEncoderFile)
@@ -491,6 +518,7 @@ public final class Krea2Pipeline {
       transformer.controlFirstWeight = nil
       transformer.controlFirstBias = nil
       controlLoRAActive = false
+      controlLoRAApplied = nil
       throw error
     }
 
@@ -498,6 +526,7 @@ public final class Krea2Pipeline {
       transformer.controlFirstWeight = nil
       transformer.controlFirstBias = nil
       controlLoRAActive = false
+      controlLoRAApplied = nil
       return
     }
     let cl = try Krea2ControlLoRA.load(from: url, layers: config.layers)
@@ -508,17 +537,20 @@ public final class Krea2Pipeline {
     transformer.controlFirstWeight = cw
     transformer.controlFirstBias = cb
     // Strict: the 224 control adapters must ALL bind or none do (WP-E6).
+    let controlReport: LoRAApplicationReport
     do {
-      try LoRAApplicator.applyDynamically(
+      controlReport = try LoRAApplicator.applyDynamically(
         to: transformer, loraWeights: cl.loraWeights, scale: scale,
         strict: true, name: url.lastPathComponent, logger: logger)
     } catch {
       transformer.controlFirstWeight = nil
       transformer.controlFirstBias = nil
       controlLoRAActive = false
+      controlLoRAApplied = nil
       throw error
     }
     controlLoRAActive = true
+    controlLoRAApplied = RenderRecipe.ControlReadBack(file: url, scale: scale, report: controlReport)
     logger.info("Krea-2 depth Control-LoRA active (scale=\(scale))")
   }
 
@@ -589,21 +621,27 @@ public final class Krea2Pipeline {
       seqLen: img.dim(1), steps: request.steps, x1: x1, x2: x2, mu: scheduleShift.mu)
 
     let total = ts.count - 1
+    // WP-E10: the loop COUNTS its own steps and model evaluations; the
+    // record reads them back from `lastRunTrace`, never from the request.
+    let counter = Krea2RunCounter()
     for i in 0..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
       let vCond = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
                               control: controlTokens, ropeScales: ropeScales)
+      counter.eval()
       let v: MLXArray
       if useCFG, let negCtx, let negPos, let negFullMask {
         let vUncond = transformer(img: img, context: negCtx, t: t, pos: negPos, mask: negFullMask,
                                   control: controlTokens, ropeScales: ropeScales)
+        counter.eval()
         v = Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       } else {
         v = vCond
       }
       img = img + (tp - tc) * v
       MLX.eval(img)
+      counter.step()
       progress?(i + 1, total)
     }
 
@@ -612,6 +650,15 @@ public final class Krea2Pipeline {
     let latentNHWC = latentNCHW.transposed(0, 2, 3, 1).asType(.float32)
     let decoded = vae.decode(latentNHWC)  // (1, H, W, 3) in [0,1]
     MLX.eval(decoded)
+    // The loop is Euler over the native krea2 warp (WP-E3 replaces this arm
+    // with real sampler dispatch); the trace names exactly that.
+    lastRunTrace = Krea2RunTrace(
+      width: width, height: height, seed: request.seed,
+      mu: scheduleShift.mu, shift: scheduleShift.shift, shiftSource: scheduleShift.source.rawValue,
+      sigmas: ts, stepsRequested: request.steps, startIndex: 0,
+      guidance: request.guidance, denoise: 1.0,
+      sampler: SchedulerKind.euler.rawValue, sigmaSchedule: SigmaScheduleKind.krea2.rawValue,
+      counter: counter)
     return decoded[0]
   }
 }

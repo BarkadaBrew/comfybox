@@ -195,9 +195,21 @@ public enum QwenImageIO {
       prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil,
       steps: Int? = nil, guidance: Float? = nil, width: Int? = nil,
       height: Int? = nil, model: String? = nil, generatedBy: String? = nil,
-      contentMode: String? = nil, loras: [LoRAConfiguration] = []
+      contentMode: String? = nil, loras: [LoRAConfiguration] = [],
+      applied: RenderRecipe? = nil
     ) -> ImageMetadata {
       var params: [String: Any] = ["prompt": prompt]
+      // WP-E10 sink 2: the provenance record rides in the PNG under `applied`
+      // (snake_case, the same bytes the /v1/generate response carries).
+      // Krea 2 only today (D12) — other families pass nil and emit no key.
+      if let applied {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        if let data = try? encoder.encode(applied),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+          params["applied"] = object
+        }
+      }
       if let width { params["width"] = width }
       if let height { params["height"] = height }
       if let steps { params["steps"] = steps }

@@ -38,10 +38,12 @@ smoke() {
   say "smoke d) unknown sampler must 400"
   local code; code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X POST "http://127.0.0.1:$PORT/v1/generate" -H 'content-type: application/json' -d '{"prompt":"x","scheduler":"uni_pc","steps":1,"width":64,"height":64}')
   [[ "$code" == "400" ]] || fail "POST /v1/generate scheduler=uni_pc returned $code, expected 400 (WP-E4 not live?)"
-  say "smoke e) build_sha matches deployed sha (field lands with WP-E10; absent = warn)"
+  say "smoke e) build_sha matches deployed sha (WP-E10: stamped by scripts/gen-build-info.sh before the build)"
   local bs; bs=$(print -- "$h" | python3 -c "import sys,json; print(json.load(sys.stdin).get('build_sha') or '')")
-  if [[ -z "$bs" ]]; then print -P "  %F{yellow}warn: /health has no build_sha yet (pre-E10) — binary identity unverified from outside%f"
+  if [[ -z "$bs" || "$bs" == "unknown" ]]; then fail "/health build_sha is '${bs:-absent}' — the running binary was not stamped (pre-E10, or built without scripts/gen-build-info.sh); binary identity unverifiable"
   elif [[ "$bs" != "$sha"* ]]; then fail "/health build_sha=$bs != $sha (clobbered binary?)"; fi
+  say "smoke c2) /health carries last_recipe + model_alias keys (WP-E10 sinks; null until the first krea2 render)"
+  print -- "$h" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert "last_recipe" in d and "model_alias" in d, "last_recipe/model_alias missing from /health"; print("  model_alias", d.get("model_alias"), "last_recipe", "present" if d.get("last_recipe") else "null")' || fail "/health lacks the WP-E10 keys"
   say "smoke b/f) seed-44821 turbo SHA-256 fixture and a Krita default-style render are manual until WP-E3/E19 land — see FDD §7.3"
 }
 
@@ -49,11 +51,17 @@ if (( SMOKE_ONLY )); then smoke; exit 0; fi
 
 say "1) Todd was told before this ran (pause is visible; codesign can prompt)."
 PAUSED=0
-resume_on_exit() { if (( PAUSED )); then say "exit: resuming queue (pause persists across restarts — never leave it paused)"; queue_resume && PAUSED=0 || print -P "%F{red}RESUME FAILED — run: curl -X POST http://127.0.0.1:$PORT/v1/queue/resume%f" >&2; fi }
-trap resume_on_exit EXIT
+STAMPED=0
+on_exit() {
+  # WP-E10: never leave a real sha in the committed BuildInfo.swift.
+  if (( STAMPED )); then "$ROOT/scripts/gen-build-info.sh" --reset >/dev/null 2>&1 || print -P "%F{red}gen-build-info --reset FAILED — run it by hand before committing%f" >&2; fi
+  if (( PAUSED )); then say "exit: resuming queue (pause persists across restarts — never leave it paused)"; queue_resume && PAUSED=0 || print -P "%F{red}RESUME FAILED — run: curl -X POST http://127.0.0.1:$PORT/v1/queue/resume%f" >&2; fi
+}
+trap on_exit EXIT
 if (( PAUSE )); then say "2) pausing queue"; queue_pause || fail "could not pause queue"; PAUSED=1; fi
 
-say "3) building release in $ROOT (never rm -rf .build)"
+say "3) stamping build sha into Sources/ZImage/Support/BuildInfo.swift (reset on exit), then building release in $ROOT (never rm -rf .build)"
+"$ROOT/scripts/gen-build-info.sh" || fail "gen-build-info failed"; STAMPED=1
 ( cd "$ROOT" && swift build -c release --product ComfyBox 2>&1 | tail -3 )
 src="$ROOT/.build/release/ComfyBox"; [[ -x "$src" ]] || fail "no binary at $src"
 

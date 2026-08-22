@@ -123,7 +123,7 @@ extension Krea2Pipeline {
     // exactly (Img2ImgRequest.denoise in ImageToImagePipeline.swift):
     //   denoise = 1 - strength; startStep = max(0, steps - ceil(steps * denoise))
     let denoise = 1.0 - max(0.01, min(0.99, request.strength))
-    let startIndex = max(0, total - Int((Double(total) * Double(denoise)).rounded(.up)))
+    let startIndex = Krea2Sampling.img2imgStartIndex(total: total, strength: request.strength)
 
     // Mix noise and the source latent at ts[startIndex]. Krea2Sampling.timesteps
     // runs 1 (pure noise) -> 0 (clean data), so this is the standard
@@ -134,21 +134,26 @@ extension Krea2Pipeline {
     let mixedNCHW = (noise * tStart + sourceLatent * (1.0 - tStart)).asType(dtype)
     var img = Krea2Sampling.patchify(mixedNCHW, patch: patch)
 
+    // WP-E10: counted by the loop, read back by the record (AC-63).
+    let counter = Krea2RunCounter()
     for i in startIndex..<total {
       let tc = ts[i], tp = ts[i + 1]
       let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
       let vCond = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
                               ropeScales: ropeScales)
+      counter.eval()
       let v: MLXArray
       if useCFG, let negCtx, let negPos, let negFullMask {
         let vUncond = transformer(img: img, context: negCtx, t: t, pos: negPos, mask: negFullMask,
                                   ropeScales: ropeScales)
+        counter.eval()
         v = Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       } else {
         v = vCond
       }
       img = img + (tp - tc) * v
       MLX.eval(img)
+      counter.step()
       progress?(i + 1, total)
     }
 
@@ -157,6 +162,13 @@ extension Krea2Pipeline {
     let latentNHWC = latentNCHW.transposed(0, 2, 3, 1).asType(.float32)
     let decoded = vae.decode(latentNHWC)
     MLX.eval(decoded)
+    lastRunTrace = Krea2RunTrace(
+      width: width, height: height, seed: request.seed,
+      mu: scheduleShift.mu, shift: scheduleShift.shift, shiftSource: scheduleShift.source.rawValue,
+      sigmas: ts, stepsRequested: request.steps, startIndex: startIndex,
+      guidance: request.guidance, denoise: Float(denoise),
+      sampler: SchedulerKind.euler.rawValue, sigmaSchedule: SigmaScheduleKind.krea2.rawValue,
+      counter: counter)
     return decoded[0]
   }
 }

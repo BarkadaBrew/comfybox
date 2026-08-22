@@ -57,6 +57,33 @@ public enum Krea2ModelDetection {
     return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
   }
 
+  /// The declared alias a spec corresponds to, for `/health.model_alias`
+  /// (WP-E10 "E9b", AC-34b): `/health.model` carries the RESOLVED directory
+  /// once `parseModelSpec` has expanded `"krea2-raw"` to `~/LocalModels/krea2-raw`,
+  /// so the name the caller used is reverse-looked-up in THE table — never
+  /// guessed from a filename. Returns the canonical (table) spelling for a
+  /// declared alias or its directory, the lowercase name for one of the four
+  /// Turbo HF aliases, and nil for anything else.
+  public static func alias(forSpec spec: String, table: [String: String]? = nil) -> String? {
+    let t = table ?? specDirectories
+    let lower = spec.lowercased()
+    if let key = t.keys.first(where: { $0.lowercased() == lower }) { return key }
+    if turboAliases.contains(lower) { return lower }
+    let wanted = standardizedPath(spec)
+    guard !wanted.isEmpty else { return nil }
+    return t.first(where: { standardizedPath($0.value) == wanted })?.key
+  }
+
+  /// Tilde-expanded, `.`/`..`/double-slash-free, no trailing slash — so two
+  /// spellings of one directory compare equal without touching the disk.
+  private static func standardizedPath(_ path: String) -> String {
+    let expanded = (path as NSString).expandingTildeInPath
+    guard expanded.hasPrefix("/") else { return "" }
+    var out = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
+    while out.count > 1, out.hasSuffix("/") { out.removeLast() }
+    return out
+  }
+
   /// Family hint ONLY: routes a spec to `.krea2` in `ModelPool.detectFamily` /
   /// `WarmServer.prepare`. The directory comes from `resolve(spec:)`, which
   /// throws for an alias nobody has declared instead of loading Turbo.

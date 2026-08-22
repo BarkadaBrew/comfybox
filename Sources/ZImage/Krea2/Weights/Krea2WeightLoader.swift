@@ -110,6 +110,14 @@ public enum Krea2WeightLoader {
     // `update` applies progressively — a mid-walk throw would leave a
     // half-swapped decoder).
     let resident = Dictionary(uniqueKeysWithValues: vae.parameters().flattened())
+    // WP-E10 "E9b": key-set COMPLETENESS. A file carrying a subset of the
+    // module's parameters would overwrite its targets and leave the rest at
+    // whatever was resident — a mixed decoder named as the new file. Every
+    // module parameter must be present in the file, or nothing is written.
+    let missing = resident.keys.filter { weights[$0] == nil }.sorted()
+    guard missing.isEmpty else {
+      throw Krea2VAEKeyMapError.vaeIncomplete(file: file.path, missing: missing, expected: resident.count)
+    }
     for (path, tensor) in weights {
       guard let param = resident[path] else {
         throw Krea2VAEKeyMapError.unmappedKey(file: file.path, key: path)

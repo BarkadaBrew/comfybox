@@ -82,7 +82,7 @@ public struct WarmServerConfiguration: Sendable {
 }
 
 /// Model family used by the warm server to route generation to the correct pipeline.
-enum WarmModelFamily: String, Sendable {
+enum WarmModelFamily: String, Sendable, CaseIterable {
   case flux1
   case flux2
   case fibo
@@ -604,25 +604,10 @@ public final class WarmServer {
       // synchronous render, so awaiting it made /health hang (HTTP 000) for the
       // render's duration. The snapshot is published on every state transition.
       let health = liveHealthResponse(memoryBytes: memoryBytes)
-      // Encode base health, then inject video section
-      let encoder = JSONEncoder()
-      encoder.keyEncodingStrategy = .convertToSnakeCase
-      if var healthJSON = try? JSONSerialization.jsonObject(
-        with: encoder.encode(health)
-      ) as? [String: Any] {
-        // Telemetry contract: always emit these keys (JSON null when idle) so
-        // clients can decode current_job_id / progress_percent unconditionally.
-        healthJSON["current_job_id"] = (health.currentJobId as Any?) ?? NSNull()
-        healthJSON["progress_percent"] = (health.progressPercent as Any?) ?? NSNull()
-        let videoAvailable = replicateVideoProxy != nil
-        healthJSON["video"] = [
-          "available": videoAvailable,
-          "backend": videoAvailable ? "replicate" : "none",
-          "active_jobs": replicateVideoProxy?.activeJobCount ?? 0,
-        ] as [String: Any]
-        if let data = try? JSONSerialization.data(withJSONObject: healthJSON, options: [.sortedKeys]) {
-          return .json(.rawJSON(status: 200, data: data))
-        }
+      if let data = Self.healthJSON(
+        health, videoAvailable: replicateVideoProxy != nil,
+        activeVideoJobs: replicateVideoProxy?.activeJobCount ?? 0) {
+        return .json(.rawJSON(status: 200, data: data))
       }
       return .json(status: 200, payload: health)
 
@@ -644,7 +629,7 @@ public final class WarmServer {
           let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
           let stamped = GenerateResponse(
             success: result.success, outputPath: result.outputPath, durationMs: result.durationMs,
-            preemptRefused: true, etaSec: eta)
+            preemptRefused: true, etaSec: eta, applied: result.applied)
           return .json(status: 200, payload: stamped)
         }
       } catch {
@@ -666,8 +651,8 @@ public final class WarmServer {
         // before this feature.
         let status = imageJobTracker.submitPreempting(
           payload, source: source, coordinator: coordinator, rawBody: request.body,
-          preemptor: { [weak self] in
-            await self?.attemptPreemption(payload, source: source, rawBody: request.body) ?? .notApplicable
+          preemptor: { [weak self] jobId in
+            await self?.attemptPreemption(payload, source: source, rawBody: request.body, jobId: jobId) ?? .notApplicable
           })
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -2640,7 +2625,7 @@ public final class WarmServer {
   /// Result of an `attemptPreemption` call. `fileprivate` (not `private`)
   /// because `ImageJobTracker.submitPreempting`, a sibling top-level type in
   /// this same file, needs to name it in its own parameter type.
-  fileprivate enum PreemptionOutcome {
+  enum PreemptionOutcome {
     /// Nothing to do — caller enqueues normally, unmodified.
     case notApplicable
     /// The refusal guard declined (finishing beats preempting). `eta` is the
@@ -2663,7 +2648,7 @@ public final class WarmServer {
   }
 
   private func attemptPreemption(
-    _ payload: GeneratePayload, source: String, rawBody: Data?
+    _ payload: GeneratePayload, source: String, rawBody: Data?, jobId: String? = nil
   ) async -> PreemptionOutcome {
     guard payload.preempt == true, videoHolder.isRendering() else { return .notApplicable }
     guard preemptionInFlight.trySet() else {
@@ -2722,7 +2707,7 @@ public final class WarmServer {
         // continuation was still outstanding. `claim(matching:)` below only
         // succeeds against the entry this very call parked.
         let episodeToken = pendingPreemptorBox.set(
-          .init(payload: payload, source: source, rawBody: rawBody, continuation: ContinuationBox(cont)))
+          .init(payload: payload, source: source, rawBody: rawBody, jobId: jobId, continuation: ContinuationBox(cont)))
         ltx2PreemptionSignal.raise()
         Task { [weak self] in
           try? await Task.sleep(nanoseconds: UInt64(max(0, windowSec) * 1_000_000_000))
@@ -4280,7 +4265,9 @@ public final class WarmServer {
           switch job.kind {
           case "generate":
             let payload = try decodedGeneratePayload(from: job.rawBody)
-            _ = try await coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody)
+            // AC-18: replay under the job's OWN id (the client-visible one for
+            // an async job), so a second restart persists the same name.
+            _ = try await coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody, jobId: job.id)
             logger.info("Queue recovery: completed generate job \(job.id)")
           case "lora_swap":
             let payload = stageNearlineLoras(in: try decode(LoRASwapPayload.self, from: job.rawBody))
@@ -4425,6 +4412,30 @@ public final class WarmServer {
     return info.phys_footprint
   }
 
+  /// The /health body: the snake_case encoding of `health` plus the video
+  /// section, with the telemetry-contract keys ALWAYS present (JSON null when
+  /// idle) so clients decode them unconditionally — `current_job_id`,
+  /// `progress_percent`, and (WP-E10) `last_recipe`, `model_alias`,
+  /// `model_variant`. Static so the contract is unit-testable (`HealthSinkTests`).
+  static func healthJSON(_ health: HealthResponse, videoAvailable: Bool, activeVideoJobs: Int) -> Data? {
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    guard var healthJSON = try? JSONSerialization.jsonObject(with: encoder.encode(health)) as? [String: Any] else {
+      return nil
+    }
+    healthJSON["current_job_id"] = (health.currentJobId as Any?) ?? NSNull()
+    healthJSON["progress_percent"] = (health.progressPercent as Any?) ?? NSNull()
+    healthJSON["model_variant"] = (health.modelVariant as Any?) ?? NSNull()
+    healthJSON["model_alias"] = (health.modelAlias as Any?) ?? NSNull()
+    if healthJSON["last_recipe"] == nil { healthJSON["last_recipe"] = NSNull() }
+    healthJSON["video"] = [
+      "available": videoAvailable,
+      "backend": videoAvailable ? "replicate" : "none",
+      "active_jobs": activeVideoJobs,
+    ] as [String: Any]
+    return try? JSONSerialization.data(withJSONObject: healthJSON, options: [.sortedKeys])
+  }
+
   /// Max render age (ms) before /health flags the render as likely deadlocked.
   private static let healthRenderStaleThresholdMs = 300_000  // 5 minutes (#141)
 
@@ -4443,6 +4454,8 @@ public final class WarmServer {
       model: snap.model.isEmpty ? (configuration.modelSpec ?? ZImageRepository.id) : snap.model,
       modelFamily: snap.modelFamily,
       modelVariant: snap.modelVariant,
+      modelAlias: snap.modelAlias,
+      buildSha: BuildInfo.gitSHA,
       textEncoderPath: configuration.textEncoderPath,
       loaded: snap.loaded,
       loras: snap.loras,
@@ -4459,7 +4472,8 @@ public final class WarmServer {
       memoryUsageBytes: memoryBytes,
       memoryUsageMB: memoryBytes / (1024 * 1024),
       lastRenderDurationMs: snap.lastRenderDurationMs,
-      lastError: snap.lastError
+      lastError: snap.lastError,
+      lastRecipe: snap.lastRecipe
     )
   }
 
@@ -4533,6 +4547,12 @@ private struct HealthSnapshot: Sendable {
   var model: String
   var modelFamily: String
   var modelVariant: String?
+  /// WP-E10 "E9b" (AC-34b): the declared alias `model` resolved from
+  /// (`krea2-raw`), when the active krea2 spec is one — `model` itself carries
+  /// the resolved directory path once `parseModelSpec` has expanded it.
+  var modelAlias: String? = nil
+  /// WP-E10 sink 3: the record of the last successful Krea 2 render.
+  var lastRecipe: RenderRecipe? = nil
   var loaded: Bool
   var loras: [LoRAState]
   var renderCount: Int
@@ -4711,12 +4731,17 @@ struct PendingPreemptor {
   fileprivate let payload: GeneratePayload
   fileprivate let source: String
   fileprivate let rawBody: Data?
+  /// The client-visible async job id, when the preemptor came through
+  /// `/v1/generate/async` (AC-18) — the preempting render takes it as its
+  /// active-job identity so the persisted snapshot names the same job.
+  fileprivate let jobId: String?
   fileprivate let continuation: ContinuationBox<GenerateResponse>
 
-  fileprivate init(payload: GeneratePayload, source: String, rawBody: Data?, continuation: ContinuationBox<GenerateResponse>) {
+  fileprivate init(payload: GeneratePayload, source: String, rawBody: Data?, jobId: String?, continuation: ContinuationBox<GenerateResponse>) {
     self.payload = payload
     self.source = source
     self.rawBody = rawBody
+    self.jobId = jobId
     self.continuation = continuation
   }
 }
@@ -4759,6 +4784,27 @@ public struct ImageJobStatus: Codable, Sendable {
   /// predates this field.
   public let preemptRefused: Bool?
   public let etaSec: Double?
+  /// WP-E10 sink 4 (FDD §3.10): the provenance record of a succeeded Krea 2
+  /// job — the same `applied` the sync response carries. Optional so
+  /// persisted pre-upgrade JSON still decodes (AC-64); null for other
+  /// families (D12) and until the job succeeds.
+  public let applied: RenderRecipe?
+
+  public init(
+    jobId: String, status: ImageJobState, source: String, outputPath: String?, durationMs: Int?,
+    error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?, applied: RenderRecipe? = nil
+  ) {
+    self.jobId = jobId
+    self.status = status
+    self.source = source
+    self.outputPath = outputPath
+    self.durationMs = durationMs
+    self.error = error
+    self.elapsedMs = elapsedMs
+    self.preemptRefused = preemptRefused
+    self.etaSec = etaSec
+    self.applied = applied
+  }
 }
 
 /// Internal mutable state for a tracked async image generation job.
@@ -4775,6 +4821,8 @@ private final class ImageJob: @unchecked Sendable {
   /// refused it.
   var preemptRefused: Bool?
   var etaSec: Double?
+  /// WP-E10: set with the result on success.
+  var applied: RenderRecipe?
 
   init(id: String, source: String) {
     self.id = id
@@ -4790,7 +4838,7 @@ private final class ImageJob: @unchecked Sendable {
     ImageJobStatus(
       jobId: id, status: state, source: source, outputPath: outputPath,
       durationMs: durationMs, error: error, elapsedMs: elapsedMs,
-      preemptRefused: preemptRefused, etaSec: etaSec
+      preemptRefused: preemptRefused, etaSec: etaSec, applied: applied
     )
   }
 }
@@ -4814,6 +4862,19 @@ final class ImageJobTracker: @unchecked Sendable {
   /// itself runs in a detached Task against the existing FIFO render queue,
   /// so submitting async doesn't skip the line ahead of synchronous callers.
   fileprivate func submit(_ payload: GeneratePayload, source: String, coordinator: WarmServerCoordinator, rawBody: Data? = nil) -> ImageJobStatus {
+    submit(payload, source: source, rawBody: rawBody) { jobId in
+      try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody, jobId: jobId)
+    }
+  }
+
+  /// The enqueue seam (WP-E10 "E9b", AC-18): the tracker's OWN id — the one
+  /// the `/v1/generate/async` caller receives — is handed to the queue, so
+  /// the persisted job, a failed replay after a restart, and the status
+  /// route all name the same job. `enqueue` receives that id.
+  func submit(
+    _ payload: GeneratePayload, source: String, rawBody: Data?,
+    enqueue: @escaping @Sendable (String) async throws -> GenerateResponse
+  ) -> ImageJobStatus {
     let jobId = UUID().uuidString
     let job = ImageJob(id: jobId, source: source)
     lock.lock(); jobs[jobId] = job; lock.unlock()
@@ -4822,7 +4883,7 @@ final class ImageJobTracker: @unchecked Sendable {
       guard let self else { return }
       self.markProcessing(jobId)
       do {
-        let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
+        let result = try await enqueue(jobId)
         self.markSucceeded(jobId, result: result)
       } catch {
         self.markFailed(jobId, error: error)
@@ -4841,7 +4902,20 @@ final class ImageJobTracker: @unchecked Sendable {
   /// `submit` above does.
   fileprivate func submitPreempting(
     _ payload: GeneratePayload, source: String, coordinator: WarmServerCoordinator, rawBody: Data? = nil,
-    preemptor: @escaping @Sendable () async -> WarmServer.PreemptionOutcome
+    preemptor: @escaping @Sendable (String) async -> WarmServer.PreemptionOutcome
+  ) -> ImageJobStatus {
+    submitPreempting(payload, source: source, rawBody: rawBody, preemptor: preemptor) { jobId in
+      try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody, jobId: jobId)
+    }
+  }
+
+  /// Closure-seam twin of `submit(_:source:rawBody:enqueue:)` for the
+  /// preempting path; both the preemptor and the enqueue receive the
+  /// client-visible id (AC-18).
+  func submitPreempting(
+    _ payload: GeneratePayload, source: String, rawBody: Data?,
+    preemptor: @escaping @Sendable (String) async -> WarmServer.PreemptionOutcome,
+    enqueue: @escaping @Sendable (String) async throws -> GenerateResponse
   ) -> ImageJobStatus {
     let jobId = UUID().uuidString
     let job = ImageJob(id: jobId, source: source)
@@ -4849,7 +4923,7 @@ final class ImageJobTracker: @unchecked Sendable {
 
     Task { [weak self] in
       guard let self else { return }
-      switch await preemptor() {
+      switch await preemptor(jobId) {
       case .ran(let result):
         self.markSucceeded(jobId, result: result)
         return
@@ -4863,7 +4937,7 @@ final class ImageJobTracker: @unchecked Sendable {
       }
       self.markProcessing(jobId)
       do {
-        let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
+        let result = try await enqueue(jobId)
         self.markSucceeded(jobId, result: result)
       } catch {
         self.markFailed(jobId, error: error)
@@ -4908,6 +4982,7 @@ final class ImageJobTracker: @unchecked Sendable {
       job.state = .succeeded
       job.outputPath = result.outputPath
       job.durationMs = result.durationMs
+      job.applied = result.applied
       job.completedAt = Date()
     }
     lock.unlock()
@@ -5212,7 +5287,10 @@ private actor WarmServerCoordinator {
   /// A queued operation tagged with identity + arrival time so the queue can
   /// be listed and individual pending jobs cancelled.
   private struct PendingJob {
-    let id = UUID().uuidString
+    /// The job's id everywhere it is named: /v1/queue, the persisted
+    /// snapshot, a failed replay. Supplied by the caller when a client already
+    /// holds one (AC-18); defaults to a fresh UUID.
+    var id: String = UUID().uuidString
     let enqueuedAt = Date()
     /// Which client/app submitted this job (desktop, comfyui/krita, bree, api…).
     var source: String = "api"
@@ -5247,6 +5325,10 @@ private actor WarmServerCoordinator {
   private var failedRenderCount = 0
   private var lastRenderDurationMs: Int?
   private var lastError: String?
+  /// WP-E10 sink 3: the record of the last successful Krea 2 render,
+  /// published into /health as `last_recipe`. Set only from a completed
+  /// render (a failed one writes no record), never from a request.
+  private var lastRecipe: RenderRecipe?
   private var activeRenderStartedAt: Date?
   /// Synthetic id for the currently-rendering job — surfaced as `current_job_id`.
   private var activeJobId: String?
@@ -5682,7 +5764,7 @@ private actor WarmServerCoordinator {
       rawBody: activeJobRawBody, kind: activeJobKindForPersistence,
       startedAt: currentJobStartedAt, renderStartedAt: activeRenderStartedAt
     )
-    activeJobId = UUID().uuidString
+    activeJobId = claimed.jobId ?? UUID().uuidString  // AC-18: the async caller's id when it has one
     activeJobSummary = "Render (preempting): \(claimed.payload.prompt.prefix(100))"
     activeJobSource = claimed.source
     activeJobRawBody = claimed.rawBody
@@ -6036,11 +6118,14 @@ private actor WarmServerCoordinator {
     if videoHolder.release() {
       logger.info("Released resident LTX-2 video stack before image load (#218)")
     }
-    // D17: every base handoff that touches the krea2 family logs outgoing and
-    // incoming spec/variant, so a slow A/B is attributable, not mysterious.
-    let outgoing = "\(activePoolModelSpec ?? configuration.modelSpec ?? "none")/"
-      + (currentModelFamily == .krea2 ? (krea2Variant?.rawValue ?? "unknown") : currentModelFamily.rawValue)
-    let outgoingIsKrea2 = currentModelFamily == .krea2 && pipelinePrepared
+    // D17 (AC-59a): every ACTUAL base handoff that touches the krea2 family
+    // logs outgoing and incoming spec/variant, so a slow A/B is attributable,
+    // not mysterious. `Krea2Handoff.logLine` is nil for a no-op re-activation
+    // of the resident base and for a cold start with nothing resident.
+    let outgoing: Krea2Handoff.Side? = {
+      guard pipelinePrepared, let spec = activePoolModelSpec ?? configuration.modelSpec else { return nil }
+      return Krea2Handoff.Side(spec: spec, family: currentModelFamily, krea2Variant: currentKrea2Variant)
+    }()
     let start = Date()
     let entry = try await modelPool.load(
       modelSpec: modelSpec,
@@ -6055,10 +6140,9 @@ private actor WarmServerCoordinator {
 
     if activate {
       try await poolActivate(modelId: entry.id)
-      if entry.family == .krea2 || outgoingIsKrea2 {
-        let incoming = "\(entry.modelSpec)/"
-          + (entry.family == .krea2 ? (krea2Variant?.rawValue ?? "unknown") : entry.family.rawValue)
-        logger.info("krea2 handoff: \(outgoing) → \(incoming) (loadTimeMs=\(loadTimeMs))")
+      let incoming = Krea2Handoff.Side(spec: entry.modelSpec, family: entry.family, krea2Variant: currentKrea2Variant)
+      if let line = Krea2Handoff.logLine(outgoing: outgoing, incoming: incoming, loadTimeMs: loadTimeMs) {
+        logger.info("\(line)")
       }
     }
 
@@ -6171,7 +6255,8 @@ private actor WarmServerCoordinator {
     progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil,
     latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil,
     source: String = "api",
-    rawBody: Data? = nil
+    rawBody: Data? = nil,
+    jobId: String? = nil
   ) async throws -> GenerateResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
@@ -6181,7 +6266,15 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(source: source, operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler), rawBody: rawBody))
+      // AC-18 (WP-E10 "E9b"): `jobId` is the CLIENT-VISIBLE id when the caller
+      // has one (`/v1/generate/async`'s tracker id, or a persisted job's own
+      // id on replay), so the queue, its on-disk snapshot, a failed replay
+      // and the status route all name the same job. nil → a fresh id (the
+      // synchronous route, which never exposes one).
+      pending.append(PendingJob(
+        id: jobId ?? UUID().uuidString, source: source,
+        operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler),
+        rawBody: rawBody))
       startProcessingIfNeeded()
     }
   }
@@ -6292,6 +6385,11 @@ private actor WarmServerCoordinator {
         case .chroma: return nil
         }
       }(),
+      // WP-E10 "E9b": the declared alias beside the resolved path (AC-34b).
+      modelAlias: currentModelFamily == .krea2
+        ? (activePoolModelSpec ?? configuration.modelSpec).flatMap { Krea2ModelDetection.alias(forSpec: $0) }
+        : nil,
+      lastRecipe: lastRecipe,
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),
       renderCount: successfulRenderCount,
@@ -6720,6 +6818,12 @@ private actor WarmServerCoordinator {
       continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
       return
     }
+    // WP-E10 "E9b": `vae` on a non-krea2 family is refused, never ignored.
+    if let error = GeneratePayload.vaeGate(payload.vae, family: currentModelFamily) {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
+      return
+    }
 
     switch currentModelFamily {
     case .chroma:
@@ -7018,17 +7122,45 @@ private actor WarmServerCoordinator {
           logger.info("Krea2: step \(step)/\(total)")
         }
       }
+      // WP-E10 (FDD §3.10, AC-60): the provenance record is READ BACK from
+      // the pipeline — the variant and transformer file it loaded, the
+      // quantization it applied, the VAE resident in its slot, its loaded
+      // LoRA configs joined with their bind reports, and the run trace the
+      // loop just counted. `steps`/`guidance` above are NOT consulted here.
+      guard let trace = k2.lastRunTrace else {
+        throw WarmServerError.invalidRequest(message: "Krea2: the render completed without a run trace — refusing to write an unrecorded image")
+      }
+      let names = try payload.validateRecipeNames()
+      // `base_model` is the declared alias when the active spec is one (or
+      // resolves to one's directory — AC-34b), else the spec as loaded.
+      let activeSpec = activePoolModelSpec ?? configuration.modelSpec ?? "krea2"
+      let recipe = RenderRecipe.krea2(.init(
+        baseModel: Krea2ModelDetection.alias(forSpec: activeSpec) ?? activeSpec,
+        variant: k2.variant,
+        transformerFile: k2.paths.transformerFile,
+        quantization: k2.quantization,
+        vae: k2.currentVAE,
+        textEncoderFile: k2.paths.textEncoderFile,
+        loras: zip(k2.loadedLoRAConfigs, k2.loadedLoRAReports).map { .init(configuration: $0, report: $1) },
+        control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
+        trace: trace,
+        requestedSigmaSchedule: names.sigmaScheduleRequested,
+        negativePrompt: payload.negativePrompt))
+      // Sink 2 — the PNG. `negativePrompt` is passed only when the CFG branch
+      // ran (AC-61: at guidance ≤ 1 it did not apply and is absent).
       let metadata = QwenImageIO.ImageMetadata.generation(
         prompt: guardedPrompt,
-        seed: seed,
-        steps: steps,
-        guidance: guidance,
-        width: width,
-        height: height,
+        negativePrompt: trace.cfgActive ? payload.negativePrompt : nil,
+        seed: trace.seed,
+        steps: trace.stepsRequested,
+        guidance: trace.guidance,
+        width: trace.width,
+        height: trace.height,
         model: ComfyBoxOutputNaming.shortModelName(activePoolModelSpec ?? configuration.modelSpec),
         generatedBy: payload.source,
         contentMode: payload.contentMode,
-        loras: k2.loadedLoRAConfigs
+        loras: k2.loadedLoRAConfigs,
+        applied: recipe
       )
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
@@ -7036,9 +7168,12 @@ private actor WarmServerCoordinator {
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
       lastError = nil
+      lastRecipe = recipe  // sink 3 — /health.last_recipe
       activeRenderStartedAt = nil
       resumed = true
-      continuation.resume(returning: GenerateResponse(success: true, outputPath: outputURL.path, durationMs: durationMs))
+      // sink 1 — the response; sink 4 reads `applied` off this same value.
+      continuation.resume(returning: GenerateResponse(
+        success: true, outputPath: outputURL.path, durationMs: durationMs, applied: recipe))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -7905,6 +8040,18 @@ extension GeneratePayload: Decodable {
     return nil
   }
 
+  /// WP-E10 "E9b" (Addendum A.2, E9 review MAJOR): `vae` is a Krea 2 request
+  /// field. On any other family it used to be silently ignored — the caller
+  /// named a decoder and got the family's default with no error. Refused
+  /// with the D18 shape (`unsupportedRecipeField` → 400) naming the field and
+  /// the family. nil when the request carries no `vae` or the family honours it.
+  static func vaeGate(_ vae: String?, family: WarmModelFamily) -> WarmServerError? {
+    guard let vae, family != .krea2 else { return nil }
+    return .unsupportedRecipeField(
+      field: "vae", value: vae, family: family.rawValue,
+      reason: "VAE selection is a Krea 2 request field (WP-E9); this family decodes through its own VAE and does not honour it — remove it")
+  }
+
   /// The DyPE configuration this payload implies at the given resolution.
   ///
   /// An explicit `dype` always wins, including "none". Otherwise DyPE
@@ -8133,7 +8280,9 @@ extension GeneratePayload: Decodable {
   }
 }
 
-private struct GenerateResponse: Encodable, Sendable {
+/// Internal (not private) so the async-job seam is unit-testable
+/// (`AsyncJobIdTests`); still `Encodable` only — nothing decodes into it (AC-64).
+struct GenerateResponse: Encodable, Sendable {
   let success: Bool
   let outputPath: String
   let durationMs: Int
@@ -8146,13 +8295,21 @@ private struct GenerateResponse: Encodable, Sendable {
   /// pre-#1479 construction site is unaffected.
   let preemptRefused: Bool
   let etaSec: Double?
+  /// WP-E10 sink 1 (FDD §3.10, D8): the provenance record — what APPLIED,
+  /// read back from the pipeline. Krea 2 only (D12); other families emit
+  /// null. Defaulted in this explicit init for the same reason as
+  /// `preemptRefused`: a property-level default would drop it from the
+  /// synthesized memberwise init.
+  let applied: RenderRecipe?
 
-  init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil) {
+  init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
+       applied: RenderRecipe? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
     self.preemptRefused = preemptRefused
     self.etaSec = etaSec
+    self.applied = applied
   }
 }
 
@@ -8226,9 +8383,37 @@ private struct LoRASwapResponse: Encodable, Sendable {
 struct LoRAEntry: Codable, Sendable {
   let path: String
   let scale: Float?
+  /// WP-E10 (FDD §3.10 `Applied.role`): the configuration SLOT this adapter
+  /// fills — `kroma` | `accel` | `bypass` | `control`. Declared by the sender
+  /// that expanded the preset (the engine never expands image presets, so it
+  /// cannot infer the slot from a flat list); stored on the
+  /// `LoRAConfiguration` the pipeline applies and READ BACK from there into
+  /// `applied.loras[].role`. An unknown label is a 400, never stored.
+  let role: String?
+
+  /// The declared roles, in one place.
+  static let roles: [String] = ["kroma", "accel", "bypass", "control"]
+
+  init(path: String, scale: Float?, role: String? = nil) {
+    self.path = path
+    self.scale = scale
+    self.role = role
+  }
+
+  private enum CodingKeys: String, CodingKey { case path, scale, role }
 
   /// Allowed range for LoRA scales — finite values outside are clamped.
   private static let scaleRange: ClosedRange<Float> = -10.0...10.0
+
+  /// The declared role, validated. nil when absent.
+  private func resolvedRole() throws -> String? {
+    guard let role else { return nil }
+    guard Self.roles.contains(role) else {
+      throw WarmServerError.invalidRequest(
+        message: "Invalid LoRA role '\(role)' for '\(path)': expected one of \(Self.roles.joined(separator: ", "))")
+    }
+    return role
+  }
 
   /// Validate the requested scale: reject non-finite values, clamp finite
   /// values to `scaleRange`. Defaults to 1.0 when absent.
@@ -8264,6 +8449,12 @@ struct LoRAEntry: Codable, Sendable {
   }
 
   func makeConfiguration() throws -> LoRAConfiguration {
+    var configuration = try resolveSource()
+    configuration.role = try resolvedRole()
+    return configuration
+  }
+
+  private func resolveSource() throws -> LoRAConfiguration {
     let clampedScale = try resolvedScale()
     let expanded = (path as NSString).expandingTildeInPath
 
@@ -8312,11 +8503,18 @@ private struct ShutdownResponse: Encodable, Sendable {
   let message: String
 }
 
-private struct HealthResponse: Encodable, Sendable {
+/// Internal (not private) so the sink shape is unit-testable (`HealthSinkTests`).
+struct HealthResponse: Encodable, Sendable {
   let status: String
   let model: String
   let modelFamily: String
   let modelVariant: String?
+  /// WP-E10 "E9b" (AC-34b): `model_alias` — the declared alias beside the
+  /// resolved `model` path for the krea2 family; null otherwise.
+  let modelAlias: String?
+  /// WP-E10 (FDD §7.3 smoke e): git short sha stamped at build time, or
+  /// `"unknown"` for a build that did not run `scripts/gen-build-info.sh`.
+  let buildSha: String
   let textEncoderPath: String?
   let loaded: Bool
   let loras: [LoRAState]
@@ -8339,9 +8537,13 @@ private struct HealthResponse: Encodable, Sendable {
   let memoryUsageMB: UInt64
   let lastRenderDurationMs: Int?
   let lastError: String?
+  /// WP-E10 sink 3: `last_recipe` — the record of the last successful Krea 2
+  /// render, identical to that render's `applied` (AC-62). Null until one
+  /// has run, and for other families (D12).
+  let lastRecipe: RenderRecipe?
 }
 
-private struct LoRAState: Encodable, Sendable {
+struct LoRAState: Encodable, Sendable {
   let source: String
   let scale: Float
 

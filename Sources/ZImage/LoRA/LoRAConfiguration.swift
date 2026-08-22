@@ -29,11 +29,19 @@ public struct LoRAConfiguration: Sendable, Equatable {
     /// `krea2_relative`, else ``Krea2LoRARelativity/seeded(forFilename:)``.
     /// `nil` declares nothing. Ignored by every non-Krea-2 pipeline.
     public var requiresBase: Krea2Variant?
+    /// The configuration SLOT this adapter fills (WP-E10, FDD §3.10
+    /// `Applied.role`): `"kroma"` | `"accel"` | `"bypass"` | `"control"`, or
+    /// nil when undeclared. Labelled once, where the stack is built, and read
+    /// back into `RenderRecipe.loras[].role` so the client reports
+    /// `kroma_strength` AS APPLIED instead of matching filenames (AC-45).
+    /// Ignored by every non-Krea-2 pipeline.
+    public var role: String?
 
-    public init(source: LoRASource, scale: Float = 1.0, requiresBase: Krea2Variant? = nil) {
+    public init(source: LoRASource, scale: Float = 1.0, requiresBase: Krea2Variant? = nil, role: String? = nil) {
         self.source = source
         self.scale = scale
         self.requiresBase = requiresBase
+        self.role = role
     }
 
     public static func local(_ path: String, scale: Float = 1.0, requiresBase: Krea2Variant? = nil) -> LoRAConfiguration {

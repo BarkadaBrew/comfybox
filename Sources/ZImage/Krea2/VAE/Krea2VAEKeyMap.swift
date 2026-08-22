@@ -30,6 +30,11 @@ public enum Krea2VAEKeyMapError: Error, Equatable, LocalizedError {
   /// A key in the file has no Krea2VAE path (the map is total over the two
   /// real files; this fires for a file that only looks like one of them).
   case unmappedKey(file: String, key: String)
+  /// The file carries only a SUBSET of the decoder's parameters (WP-E10
+  /// "E9b"). Loading it would leave every missing parameter at whatever was
+  /// resident — a mixed decoder named as the new file. `missing` is sorted;
+  /// `expected` is the module's full parameter count.
+  case vaeIncomplete(file: String, missing: [String], expected: Int)
 
   public var errorDescription: String? {
     switch self {
@@ -39,6 +44,10 @@ public enum Krea2VAEKeyMapError: Error, Equatable, LocalizedError {
       return "Krea2 VAE: \(file) was requested as \(requested.rawValue) but its keys are \(detected.rawValue)"
     case .unmappedKey(let file, let key):
       return "Krea2 VAE: \(file) key '\(key)' has no Krea2VAE parameter path"
+    case .vaeIncomplete(let file, let missing, let expected):
+      let shown = missing.prefix(8).joined(separator: ", ") + (missing.count > 8 ? ", …" : "")
+      return "Krea2 VAE: \(file) is incomplete — \(missing.count) of \(expected) decoder/encoder parameters are absent "
+        + "(\(shown)); refusing to load a mixed decoder"
     }
   }
 }
