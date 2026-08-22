@@ -40,12 +40,27 @@ extension Krea2Pipeline {
     public var dyPE: DyPEConfig = .disabled
     /// Explicit schedule shift (FDD-krea2-raw-recipe D3); see `Krea2Pipeline.Request.shift`.
     public var shift: Float? = nil
+    /// The sampler the denoise loop runs; see `Krea2Pipeline.Request.sampler`.
+    public var sampler: SchedulerKind = .euler
+    /// The sigma grid the sampler walks; see `Krea2Pipeline.Request.sigmaSchedule`.
+    public var sigmaSchedule: SigmaScheduleKind = .krea2
+    /// The raw schedule name the caller sent (D22); see `Krea2Pipeline.Request.sigmaScheduleRequested`.
+    public var sigmaScheduleRequested: String? = nil
+    /// RES4LYF SDE eta (T2, WP-E15); see `Krea2Pipeline.Request.eta`.
+    public var eta: Float = 0.0
+    /// RES4LYF `bongmath` (T3, WP-E16); see `Krea2Pipeline.Request.bongmath`.
+    public var bongmath: Bool = false
+    /// `res_2s` / `res_3s` substep, not on the wire (D23).
+    public var c2: Float = 0.5
 
     public init(
       prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
       sourceImage: MLXArray, width: Int = 1024, height: Int = 1024,
       steps: Int = 9, seed: UInt64 = 0, strength: Float = 0.3,
-      dyPE: DyPEConfig = .disabled, shift: Float? = nil
+      dyPE: DyPEConfig = .disabled, shift: Float? = nil,
+      sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
+      sigmaScheduleRequested: String? = nil,
+      eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5
     ) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
@@ -58,18 +73,34 @@ extension Krea2Pipeline {
       self.strength = strength
       self.dyPE = dyPE
       self.shift = shift
+      self.sampler = sampler
+      self.sigmaSchedule = sigmaSchedule
+      self.sigmaScheduleRequested = sigmaScheduleRequested
+      self.eta = eta
+      self.bongmath = bongmath
+      self.c2 = c2
     }
   }
 
   /// Generate one image conditioned on a source image. Returns RGB float
   /// array (H, W, 3) in [0,1] — same output shape as `generate(_:progress:)`.
   ///
-  /// - Throws: ``Krea2ScheduleError`` when the request's `shift` is invalid
-  ///   (checked before any model work).
+  /// A one-line wrapper over ``generateImg2ImgWithRecipe(_:progress:)``.
+  ///
+  /// - Throws: ``Krea2ScheduleError`` when the request's `shift` is invalid or
+  ///   a field belongs to an unimplemented tier (checked before any model work).
   public func generateImg2Img(
     _ request: Img2ImgRequest,
     progress: ((Int, Int) -> Void)? = nil
   ) throws -> MLXArray {
+    try generateImg2ImgWithRecipe(request, progress: progress).image
+  }
+
+  /// Generate one img2img render and the record of how (WP-E3 + WP-E10).
+  public func generateImg2ImgWithRecipe(
+    _ request: Img2ImgRequest,
+    progress: ((Int, Int) -> Void)? = nil
+  ) throws -> (image: MLXArray, trace: Krea2RunTrace) {
     let dtype = DType.bfloat16
     let patch = config.patch
     let comp = Krea2VAE.spatialScale
@@ -79,9 +110,11 @@ extension Krea2Pipeline {
 
     let latH = height / comp, latW = width / comp
     let hTok = latH / patch, wTok = latW / patch
-    // D3: nil → resolution-dependent mu (unchanged); explicit → log(shift). Fails before any model work.
+    // D3/A.1: nil → resolution-dependent mu (unchanged); explicit → mu = shift. Fails before any model work.
     let scheduleShift = try Krea2Sampling.resolveShift(
       explicit: request.shift, seqLen: hTok * wTok, align: align)
+    // D18: unimplemented tiers are refused before any model work.
+    try Krea2Pipeline.validateTiers(eta: request.eta, bongmath: request.bongmath)
 
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
@@ -112,12 +145,10 @@ extension Krea2Pipeline {
       negFullMask = MLX.concatenated([nMask, MLX.ones([1, hTok * wTok])], axis: 1)
     }
 
-    let x1 = Float((256 / align) * (256 / align))
-    let x2 = Float((1280 / align) * (1280 / align))
-    let seqLen = hTok * wTok
-    let ts = Krea2Sampling.timesteps(
-      seqLen: seqLen, steps: request.steps, x1: x1, x2: x2, mu: scheduleShift.mu)
-    let total = ts.count - 1
+    var scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: request.sampler, sigmaSchedule: request.sigmaSchedule,
+      steps: request.steps, shift: scheduleShift, seed: request.seed, c2: request.c2)
+    let total = scheduler.numInferenceSteps
 
     // strength -> denoise -> startIndex, matching Z-Image's img2img convention
     // exactly (Img2ImgRequest.denoise in ImageToImagePipeline.swift):
@@ -125,38 +156,41 @@ extension Krea2Pipeline {
     let denoise = 1.0 - max(0.01, min(0.99, request.strength))
     let startIndex = max(0, total - Int((Double(total) * Double(denoise)).rounded(.up)))
 
-    // Mix noise and the source latent at ts[startIndex]. Krea2Sampling.timesteps
-    // runs 1 (pure noise) -> 0 (clean data), so this is the standard
-    // rectified-flow "noise a real sample to time t" interpolation — the
-    // same formula the pure-noise path implicitly uses at t=ts[0]≈1 (all
-    // noise, no data).
-    let tStart = MLXArray(ts[startIndex])
-    let mixedNCHW = (noise * tStart + sourceLatent * (1.0 - tStart)).asType(dtype)
-    var img = Krea2Sampling.patchify(mixedNCHW, patch: patch)
+    // Mix noise and the source latent at sigmas[startIndex]. The grid runs
+    // 1 (pure noise) -> 0 (clean data), so this is the standard rectified-flow
+    // "noise a real sample to time σ" interpolation — the same formula the
+    // pure-noise path implicitly uses at σ=1 (all noise, no data). The sigma
+    // stays a float32 MLXArray: see `Krea2Sampling.mixSourceLatent` for why
+    // `.item(Float.self)` would silently move every img2img render (§3.3).
+    let mixedNCHW = Krea2Sampling.mixSourceLatent(
+      noise: noise, source: sourceLatent, sigma: scheduler.sigmas[startIndex], dtype: dtype)
+    let img = Krea2Sampling.patchify(mixedNCHW, patch: patch)
 
-    for i in startIndex..<total {
-      let tc = ts[i], tp = ts[i + 1]
-      let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let vCond = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
-                              ropeScales: ropeScales)
-      let v: MLXArray
-      if useCFG, let negCtx, let negPos, let negFullMask {
-        let vUncond = transformer(img: img, context: negCtx, t: t, pos: negPos, mask: negFullMask,
-                                  ropeScales: ropeScales)
-        v = Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
-      } else {
-        v = vCond
-      }
-      img = img + (tp - tc) * v
-      MLX.eval(img)
-      progress?(i + 1, total)
-    }
+    let (denoised, stats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler,
+      initialSample: img,
+      startIndex: startIndex,
+      modelEvalsPerEvaluate: useCFG ? 2 : 1,
+      evaluate: { [transformer] latent, sigma in
+        let t = MLX.full([1], values: MLXArray(sigma)).asType(dtype)
+        let vCond = transformer(img: latent, context: ctx, t: t, pos: pos, mask: fullMask,
+                                ropeScales: ropeScales)
+        guard useCFG, let negCtx, let negPos, let negFullMask else { return vCond }
+        let vUncond = transformer(img: latent, context: negCtx, t: t, pos: negPos,
+                                  mask: negFullMask, ropeScales: ropeScales)
+        return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
+      },
+      progress: progress)
 
     let latentNCHW = Krea2Sampling.unpatchify(
-      img, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
+      denoised, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
     let latentNHWC = latentNCHW.transposed(0, 2, 3, 1).asType(.float32)
     let decoded = vae.decode(latentNHWC)
     MLX.eval(decoded)
-    return decoded[0]
+
+    let trace = Krea2RunTrace(
+      request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
+      startIndex: startIndex, denoise: denoise, width: width, height: height)
+    return (decoded[0], trace)
   }
 }

@@ -62,3 +62,55 @@ extension Krea2RequestTests {
         XCTAssertEqual(request.shift, 1.15)
     }
 }
+
+// MARK: - WP-E3: sampler / schedule / tier fields (FDD-krea2-raw-recipe §3.3, D1, D18, D23)
+
+extension Krea2RequestTests {
+
+  /// The defaults ARE today's behaviour: euler over the native krea2 warp at
+  /// the resolution-dependent mu, no SDE, no bongmath, res_2s substep 0.5.
+  func testRequestRecipeDefaultsPreserveToday() {
+    let request = Krea2Pipeline.Request(prompt: "x")
+    XCTAssertEqual(request.sampler, .euler)
+    XCTAssertEqual(request.sigmaSchedule, .krea2)
+    XCTAssertNil(request.shift)
+    XCTAssertEqual(request.eta, 0)
+    XCTAssertFalse(request.bongmath)
+    XCTAssertEqual(request.c2, 0.5)
+  }
+
+  func testRequestCarriesRecipeFields() {
+    let request = Krea2Pipeline.Request(
+      prompt: "x", shift: 1.15, sampler: .res2s, sigmaSchedule: .beta57, eta: 0.5, bongmath: true, c2: 0.3)
+    XCTAssertEqual(request.sampler, .res2s)
+    XCTAssertEqual(request.sigmaSchedule, .beta57)
+    XCTAssertEqual(request.shift, 1.15)
+    XCTAssertEqual(request.eta, 0.5)
+    XCTAssertTrue(request.bongmath)
+    XCTAssertEqual(request.c2, 0.3)
+  }
+
+  func testImg2ImgRequestRecipeDefaultsPreserveToday() {
+    let source = MLX.zeros([1, 64, 64, 3])
+    let request = Krea2Pipeline.Img2ImgRequest(prompt: "x", sourceImage: source)
+    XCTAssertEqual(request.sampler, .euler)
+    XCTAssertEqual(request.sigmaSchedule, .krea2)
+    XCTAssertNil(request.shift)
+    XCTAssertEqual(request.eta, 0)
+    XCTAssertFalse(request.bongmath)
+    XCTAssertEqual(request.c2, 0.5)
+  }
+
+  func testImg2ImgRequestCarriesRecipeFields() {
+    let source = MLX.zeros([1, 64, 64, 3])
+    let request = Krea2Pipeline.Img2ImgRequest(
+      prompt: "x", sourceImage: source, shift: 1.15,
+      sampler: .dpmplusplus2m, sigmaSchedule: .flow, eta: 0.25, bongmath: true, c2: 0.4)
+    XCTAssertEqual(request.sampler, .dpmplusplus2m)
+    XCTAssertEqual(request.sigmaSchedule, .flow)
+    XCTAssertEqual(request.shift, 1.15)
+    XCTAssertEqual(request.eta, 0.25)
+    XCTAssertTrue(request.bongmath)
+    XCTAssertEqual(request.c2, 0.4)
+  }
+}

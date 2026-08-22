@@ -89,7 +89,8 @@ public enum SigmaSchedule {
   /// - Parameters:
   ///   - numSteps: Number of denoising steps; the result has `numSteps + 1` entries.
   ///   - mu: Log-shift. Resolution-dependent by default (`Krea2Sampling.mu`),
-  ///     or `log(shift)` when a request states an explicit shift (D3).
+  ///     or the request's explicit `shift` itself — shift IS mu, ComfyUI's
+  ///     `ModelSamplingFlux` parameterisation (D3 as amended by Addendum A.1).
   ///   - sigmaExp: Exponent on `(1/t − 1)`; Krea's reference uses 1.0.
   public static func krea2(numSteps: Int, mu: Float, sigmaExp: Float = 1.0) -> [Float] {
     guard numSteps > 0 else { return [0.0] }
@@ -298,9 +299,10 @@ public enum SigmaSchedule {
 
   /// ``beta(numSteps:sigmaTable:alpha:betaParam:)`` over the discrete-flow table
   /// `σ[i] = shift·t / (1 + (shift − 1)·t)`, `t = (i+1)/T` — the signature
-  /// FDD-krea2-raw-recipe §3.11 names. `SchedulerFactory` reads `shift` and `T`
-  /// from the model's scheduler config (`Krea2Sampling.schedulerConfig(shift:)`
-  /// for Krea 2, D3).
+  /// FDD-krea2-raw-recipe §3.11 names for the `ModelSamplingDiscreteFlow`
+  /// families. `SchedulerFactory` reads `shift` and `T` from a decoded
+  /// scheduler config; Krea 2 is **not** on this table (its family is
+  /// `ModelSamplingFlux`, built from `mu` — Addendum A.1).
   public static func beta(
     numSteps: Int,
     shift: Float,
@@ -335,7 +337,9 @@ public enum SigmaSchedule {
   /// a 10 000-entry table by default. This is the class ComfyUI actually
   /// registers Krea 2 under (`supported_models.py`, E18's finding recorded in
   /// `comfy_sigmas.json`), where `shift` is a **log**-shift — the same
-  /// parameterisation as `SigmaSchedule.krea2`'s `mu`.
+  /// parameterisation as `SigmaSchedule.krea2`'s `mu`, which is why the wire's
+  /// `shift` for Krea 2 IS mu (FDD Addendum A.1). `SchedulerFactory` builds
+  /// this table for `.flux` configs from the render's `mu`.
   public static func fluxSigmaTable(shift: Float, tableSize: Int = 10000) -> [Float] {
     precondition(tableSize > 0, "tableSize must be positive")
     let count = Float(tableSize)

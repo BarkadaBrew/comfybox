@@ -81,16 +81,14 @@ final class BongTangentScheduleTests: XCTestCase {
   func testIgnoresModelSampling() throws {
     let reference = SigmaSchedule.bongTangent(numSteps: 9)
     let configs: [(String, ZImageSchedulerConfig)] = [
-      ("krea2 dynamic", Krea2Sampling.schedulerConfig()),
-      ("krea2 shift 1.15", Krea2Sampling.schedulerConfig(shift: 1.15)),
-      ("krea2 shift 2.475", Krea2Sampling.schedulerConfig(shift: 2.475)),
+      ("krea2 (ModelSamplingFlux)", Krea2Sampling.schedulerConfig()),
       ("static shift 1.0", ZImageSchedulerConfig(numTrainTimesteps: 1000, shift: 1.0, useDynamicShifting: false)),
       ("static shift 1.15", ZImageSchedulerConfig(numTrainTimesteps: 1000, shift: 1.15, useDynamicShifting: false)),
       ("static shift 2.475", ZImageSchedulerConfig(numTrainTimesteps: 1000, shift: 2.475, useDynamicShifting: false)),
       ("static shift 3.0 / T=10000", ZImageSchedulerConfig(numTrainTimesteps: 10000, shift: 3.0, useDynamicShifting: false)),
       ("zimage turbo", FlowMatchSchedulerTests.makeConfig()),
     ]
-    let mus: [Float?] = [nil, 0.0, 0.5, log(1.15), Krea2Sampling.mu(seqLen: 4096, align: 16)]
+    let mus: [Float?] = [nil, 0.0, 0.5, 1.15, 2.475, Krea2Sampling.mu(seqLen: 4096, align: 16)]
     for (label, config) in configs {
       for mu in mus {
         let sigmas = try SchedulerFactory.resolveSigmas(

@@ -133,6 +133,27 @@ enum Krea2Sampling {
     return [1, Float(hTok) / baseTokens, Float(wTok) / baseTokens]
   }
 
+  /// Mix pure noise with an encoded source latent at the schedule sigma a
+  /// partial denoise starts from — rectified flow's "noise a real sample to
+  /// time σ": `noise·σ + source·(1 − σ)`, rounded to `dtype` once, at the end.
+  ///
+  /// `sigma` MUST be the scheduler's float32 0-d `MLXArray`
+  /// (`scheduler.sigmas[startIndex]`), never `.item(Float.self)`. This is
+  /// FDD-krea2-raw-recipe §3.3's byte-identity trap: mlx-swift converts a
+  /// Swift `Float` operand to the ARRAY's dtype first
+  /// (`MLXArray+Ops.swift:253-255`), so a scalar would run the whole mix in
+  /// bf16 and move every img2img render (AC-2). A float32 0-d array promotes
+  /// the mix to float32 — exactly what the pre-WP-E3 `MLXArray(ts[startIndex])`
+  /// did. The precondition makes the trap a crash, not a drift.
+  static func mixSourceLatent(
+    noise: MLXArray, source: MLXArray, sigma: MLXArray, dtype: DType
+  ) -> MLXArray {
+    precondition(
+      sigma.dtype == .float32 && sigma.ndim == 0,
+      "the img2img mix needs the float32 0-d sigma array; a Float scalar runs the mix in bf16 (§3.3)")
+    return (noise * sigma + source * (1.0 - sigma)).asType(dtype)
+  }
+
   /// Resolution-shifted timestep schedule (exp/sigmoid warp), 1 → 0 inclusive.
   ///
   /// Signature unchanged; the warp itself now lives in
@@ -156,8 +177,9 @@ enum Krea2Sampling {
   /// Krea 2's constants: base 256 tokens / 0.5, max 6400 tokens / 1.15.
   ///
   /// Effective shift is `exp(mu)`: ~2.475 at 1024². ComfyUI registers Krea 2
-  /// with a *fixed* shift 1.15 instead; an explicit request `shift` overrides
-  /// this value with `log(shift)` (FDD D3).
+  /// as `ModelSamplingFlux(shift=1.15)` — a *fixed* mu of 1.15 (effective
+  /// `e^1.15` ≈ 3.158) — and an explicit request `shift` replaces this value
+  /// **as mu** (FDD D3 as amended by Addendum A.1).
   static func mu(seqLen: Int, align: Int) -> Float {
     let baseSeqLen = (256 / align) * (256 / align)      // 256 at align 16
     let maxSeqLen = (1280 / align) * (1280 / align)     // 6400 at align 16
@@ -170,48 +192,58 @@ enum Krea2Sampling {
     )
   }
 
+  /// ComfyUI's `ModelSamplingFlux` table size for Krea 2 (`timesteps=10000`).
+  static let fluxTableSize = 10000
+
   /// Synthetic scheduler config for Krea 2, which ships no `scheduler_config.json`.
   ///
   /// Carries the constants baked into `timesteps` so `SchedulerFactory` can
   /// build any `SigmaScheduleKind` for this family. Values are specified, not
-  /// implicit (FDD-krea2-raw-recipe §3.1; pinned by
+  /// implicit (FDD-krea2-raw-recipe §3.1, Addendum A.1; pinned by
   /// `Krea2SigmaScheduleTests.testSchedulerConfigPinnedValues`):
   ///
-  /// - `numTrainTimesteps: 1000` — sigma ↔ timestep scale, and the
-  ///   `flowMatchingSigmaBounds` floor for karras/exponential/beta.
-  /// - `shift: shift ?? 1.0` — D3: an explicit shift moves the karras/beta
-  ///   bounds with it; `nil` leaves the bounds at `(0.001, 1.0)`.
+  /// - `numTrainTimesteps: 1000` — sigma ↔ timestep scale.
+  /// - `shift: 1.0` — **not** where Krea 2's shift lives. The shift is `mu`,
+  ///   resolved per render by `resolveShift` and handed to the factory beside
+  ///   this config; `.flow`'s base grid reads this value and stays unshifted.
   /// - `useDynamicShifting: true` — so `.flow` and `.krea2` both take the `mu` warp.
   /// - `baseShift 0.5 / maxShift 1.15 / baseImageSeqLen 256 / maxImageSeqLen 6400`
   ///   — the `mu(seqLen:align:)` line.
-  static func schedulerConfig(shift: Float? = nil) -> ZImageSchedulerConfig {
+  /// - `modelSampling: .flux(tableSize: 10000)` — ComfyUI registers Krea 2 as
+  ///   `ModelSamplingFlux`, so `beta`/`beta57` index the 10 000-entry Flux
+  ///   table built from `mu`, and `karras`/`exponential` take its bounds —
+  ///   never the 1000-entry DiscreteFlow table (A.1).
+  static func schedulerConfig() -> ZImageSchedulerConfig {
     ZImageSchedulerConfig(
       numTrainTimesteps: 1000,
-      shift: shift ?? 1.0,
+      shift: 1.0,
       useDynamicShifting: true,
       baseShift: 0.5,
       maxShift: 1.15,
       baseImageSeqLen: 256,
-      maxImageSeqLen: 6400
+      maxImageSeqLen: 6400,
+      modelSampling: .flux(tableSize: fluxTableSize)
     )
   }
 
-  // MARK: Schedule shift (FDD-krea2-raw-recipe D3)
+  // MARK: Schedule shift (FDD-krea2-raw-recipe D3, as amended by Addendum A.1)
 
   /// Where the schedule's shift came from — recorded by provenance (WP-E10).
   enum ShiftSource: String, Sendable {
     /// The resolution-dependent `mu` from `mu(seqLen:align:)` (the default).
     case dynamic
-    /// A request-stated `shift`; `mu = log(shift)`.
+    /// A request-stated `shift`; `mu = shift` (shift IS mu, A.1).
     case explicit
   }
 
   /// Everything a schedule needs to know about the shift, resolved once per
-  /// render: the log-shift `mu` the warp-by-`mu` schedules (`.krea2`, `.flow`)
-  /// take, the effective linear `shift` (`e^mu`), its source, and the
-  /// `ZImageSchedulerConfig` the table-backed schedules (`beta`, `beta57`,
-  /// `karras`, `exponential`) read `shift`/`numTrainTimesteps` from. Hand
-  /// `config` and `mu` to `SchedulerFactory` together so they cannot disagree.
+  /// render: the log-shift `mu` — which the warp-by-`mu` schedules (`.krea2`,
+  /// `.flow`) take directly and the table-backed schedules (`beta`, `beta57`,
+  /// `karras`, `exponential`) build the `ModelSamplingFlux` table from — the
+  /// effective linear `shift` (`e^mu`, for the record), its source, and the
+  /// family's `ZImageSchedulerConfig`. Hand `config` and `mu` to
+  /// `SchedulerFactory` together; the factory refuses the table-backed
+  /// schedules without `mu`.
   struct ScheduleShift {
     let mu: Float
     let shift: Float
@@ -219,39 +251,65 @@ enum Krea2Sampling {
     let config: ZImageSchedulerConfig
   }
 
-  /// Resolve the schedule shift for a render (D3).
+  /// Resolve the schedule shift for a render (D3 as amended by A.1).
   ///
   /// - `explicit == nil` → today's resolution-dependent `mu` (every existing
-  ///   render is unmoved) and `schedulerConfig()` (non-flow bounds `(0.001, 1.0)`).
-  /// - `explicit == s` → `mu = log(s)` and `schedulerConfig(shift: s)`, so the
-  ///   warp and the table move together. At `s = 1.15` the `.krea2` grid is
-  ///   exactly ComfyUI's `ModelSamplingDiscreteFlow(shift=1.15)` warp on the
-  ///   native `linspace(1 → 0)` grid.
+  ///   render is unmoved).
+  /// - `explicit == s` → **`mu = s`**. ComfyUI registers Krea 2 as
+  ///   `ModelSamplingFlux(shift=1.15)`, whose `flux_time_shift(mu=shift, t) =
+  ///   e^mu / (e^mu + 1/t − 1)` is the same function as `SigmaSchedule.krea2`'s
+  ///   warp — so the wire's `shift` is mu directly and the effective linear
+  ///   shift is `e^s` (≈ 3.158 at 1.15). The earlier `mu = log(s)` mapping is
+  ///   withdrawn: it would have rendered the published `shift: 1.15` as a
+  ///   linear 1.15 (mu 0.14), nowhere near the workflow's grid.
+  ///
+  /// Either way the config is `schedulerConfig()` — the same Flux family
+  /// object; only `mu` moves.
   ///
   /// - Throws: ``Krea2ScheduleError/invalidShift(_:)`` for a shift that is not
   ///   a positive finite number. There is no clamp and no fallback.
   static func resolveShift(explicit: Float?, seqLen: Int, align: Int) throws -> ScheduleShift {
+    let config = schedulerConfig()
     guard let explicit else {
       let mu = mu(seqLen: seqLen, align: align)
-      return ScheduleShift(mu: mu, shift: Foundation.exp(mu), source: .dynamic, config: schedulerConfig())
+      return ScheduleShift(mu: mu, shift: Foundation.exp(mu), source: .dynamic, config: config)
     }
     guard explicit.isFinite, explicit > 0 else { throw Krea2ScheduleError.invalidShift(explicit) }
-    return ScheduleShift(
-      mu: Foundation.log(explicit), shift: explicit, source: .explicit,
-      config: schedulerConfig(shift: explicit))
+    return ScheduleShift(mu: explicit, shift: Foundation.exp(explicit), source: .explicit, config: config)
   }
 }
 
 /// Errors raised while resolving a Krea 2 schedule from a request.
 public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
-  /// The request's `shift` is not a positive finite number. The schedule warp
-  /// takes `log(shift)`; there is no value to substitute (FDD-krea2-raw-recipe D3).
+  /// The request's `shift` is not a positive finite number. `shift` is the
+  /// schedule's mu and there is no value to substitute (FDD-krea2-raw-recipe
+  /// D3, Addendum A.1).
   case invalidShift(Float)
+
+  /// A request field whose behaviour belongs to a parity tier the loop does
+  /// not implement yet (FDD-krea2-raw-recipe D18, §3.13): `eta` is T2
+  /// (WP-E15), `bongmath` is T3 (WP-E16). Refused at the pipeline so a
+  /// non-server caller cannot get a silent downgrade either — "fail loud,
+  /// never silently substitute".
+  case tierNotImplemented(field: String, value: String, tier: String)
 
   public var description: String {
     switch self {
     case .invalidShift(let value):
       return "shift must be a positive number (got \(value)); omit it for the resolution-dependent default"
+    case .tierNotImplemented(let field, let value, let tier):
+      return "\(field)=\(value) is parity tier \(tier) (\(Self.workPackage(forTier: tier))) and is not "
+        + "implemented yet; omit it or send its default"
+    }
+  }
+
+  /// The work package that lands a tier — named in the error so the caller is
+  /// told what is missing, not merely that something is.
+  private static func workPackage(forTier tier: String) -> String {
+    switch tier {
+    case "T2": return "WP-E15"
+    case "T3": return "WP-E16"
+    default: return "unassigned"
     }
   }
 }
@@ -264,6 +322,12 @@ public final class Krea2Pipeline {
   public let paths: Krea2ModelPaths
   /// The physical checkpoint variant this pipeline loaded (WP-E5, D7).
   public var variant: Krea2Variant { paths.variant }
+  /// Group-wise quantization bits applied to the transformer at load, or nil
+  /// when it stayed at full precision (WP-E3 §3.3; feeds
+  /// `RenderRecipe.quantization`, WP-E10). Stored once from what `init`
+  /// actually applied — never re-derived from the module tree, which cannot
+  /// tell "loaded bf16" from "loaded quantized then restored".
+  public let transformerQuantBits: Int?
   public let transformer: Krea2SingleStreamDiT
   public let textEncoder: Qwen3TextEncoder
   public let conditioner: Krea2TextConditioner
@@ -314,16 +378,44 @@ public final class Krea2Pipeline {
     public var controlImagePixels: MLXArray?
     /// High-resolution position handling. `.disabled` keeps vanilla RoPE.
     public var dyPE: DyPEConfig = .disabled
-    /// Explicit schedule shift (FDD-krea2-raw-recipe D3). `nil` (default) keeps
-    /// the resolution-dependent `mu` every existing render uses; a value
-    /// overrides `mu` with `log(shift)` for schedule construction — the
-    /// `krea2-reference` preset states `1.15`, ComfyUI's registered shift.
-    /// Must be > 0; `generate` throws ``Krea2ScheduleError/invalidShift(_:)``.
+    /// Explicit schedule shift (FDD-krea2-raw-recipe D3, Addendum A.1). `nil`
+    /// (default) keeps the resolution-dependent `mu` every existing render
+    /// uses; a value **is** `mu` for schedule construction (ComfyUI's
+    /// `ModelSamplingFlux(shift=…)` parameterisation; effective linear shift
+    /// `e^shift`) — the `krea2-reference` preset states `1.15`, ComfyUI's
+    /// registered shift. Must be > 0; `generate` throws
+    /// ``Krea2ScheduleError/invalidShift(_:)``.
     public var shift: Float? = nil
+    /// The sampler the denoise loop runs (WP-E3, §3.3). `.euler` is today's
+    /// behaviour. The WIRE key is `scheduler`, with `sampler` as a declared
+    /// alias (D25) — the naming asymmetry is deliberate and lives in
+    /// `RecipeNameResolver`, not here.
+    public var sampler: SchedulerKind = .euler
+    /// The sigma grid the sampler walks. `.krea2` is the family's native warp
+    /// and today's behaviour; `.flow` and the rest stay legal (D11).
+    public var sigmaSchedule: SigmaScheduleKind = .krea2
+    /// The raw schedule name the caller sent, when it differed from the
+    /// resolved kind (Krita's `normal` → `.flow`, D22). Record-only: it never
+    /// changes what runs, it makes the alias visible in the trace.
+    public var sigmaScheduleRequested: String? = nil
+    /// RES4LYF SDE eta (parity tier T2, WP-E15). NOTE: the SAME wire field
+    /// `eta` means DDIM η / DPM++ 2S-A ancestral η on the Z-Image path, where
+    /// it has shipped since April. Two meanings, one key — gated per family,
+    /// never at the decoder (D18). Non-zero throws
+    /// ``Krea2ScheduleError/tierNotImplemented(field:value:tier:)`` here.
+    public var eta: Float = 0.0
+    /// RES4LYF `bongmath` (parity tier T3, WP-E16). `true` throws until it lands.
+    public var bongmath: Bool = false
+    /// `res_2s` / `res_3s` substep location in log-sigma space. Not on the
+    /// wire (D23) — a pipeline-level knob the reference recipe pins at 0.5.
+    public var c2: Float = 0.5
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled,
-                shift: Float? = nil) {
+                shift: Float? = nil,
+                sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
+                sigmaScheduleRequested: String? = nil,
+                eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
       self.guidance = guidance
@@ -334,6 +426,12 @@ public final class Krea2Pipeline {
       self.controlImagePixels = controlImagePixels
       self.dyPE = dyPE
       self.shift = shift
+      self.sampler = sampler
+      self.sigmaSchedule = sigmaSchedule
+      self.sigmaScheduleRequested = sigmaScheduleRequested
+      self.eta = eta
+      self.bongmath = bongmath
+      self.c2 = c2
     }
   }
 
@@ -343,6 +441,7 @@ public final class Krea2Pipeline {
   public init(paths: Krea2ModelPaths, quantizeTransformer: Int? = nil) throws {
     self.config = Krea2Config()
     self.paths = paths
+    self.transformerQuantBits = quantizeTransformer
 
     let transformer = Krea2SingleStreamDiT(cfg: config)
     logger.info("Krea2: loading \(paths.variant.rawValue) transformer from \(paths.transformerFile.path)")
@@ -522,14 +621,76 @@ public final class Krea2Pipeline {
     logger.info("Krea-2 depth Control-LoRA active (scale=\(scale))")
   }
 
+  // MARK: - Request → scheduler (WP-E3, §3.3)
+
+  /// Build the scheduler a request asks for. Pure — no weights, no GPU — so
+  /// the resolution rules are asserted without a model
+  /// (`Krea2SchedulerResolutionTests`).
+  ///
+  /// The default `(.euler, .krea2)` is today's grid element-for-element:
+  /// `SigmaSchedule.krea2(numSteps:mu:)` is the body
+  /// `Krea2Sampling.timesteps` already delegates to (AC-3), and
+  /// `FlowMatchEulerScheduler.step`'s `(σ_{i+1} − σ_i).asType(sample.dtype)`
+  /// is the same rounding as the pre-change `(tp − tc) * v` (§4 criterion 1).
+  ///
+  /// `eta` is deliberately NOT forwarded to the factory: on the Krea 2 family
+  /// `eta` means the RES4LYF SDE eta (T2), not DDIM/ancestral η, and
+  /// ``validateTiers(eta:bongmath:)`` has already refused any non-zero value
+  /// (D18). The factory's own defaults therefore stand.
+  static func makeScheduler(
+    sampler: SchedulerKind,
+    sigmaSchedule: SigmaScheduleKind,
+    steps: Int,
+    shift: Krea2Sampling.ScheduleShift,
+    seed: UInt64,
+    c2: Float
+  ) throws -> any ZImageScheduler {
+    try SchedulerFactory.create(
+      kind: sampler,
+      sigmaSchedule: sigmaSchedule,
+      numInferenceSteps: steps,
+      config: shift.config,
+      mu: shift.mu,
+      seed: seed,
+      c2: c2)
+  }
+
+  /// Refuse the request fields whose behaviour is not implemented yet, before
+  /// any model work (D18). A silent downgrade to the default is the one
+  /// outcome this programme forbids.
+  static func validateTiers(eta: Float, bongmath: Bool) throws {
+    guard eta == 0 else {
+      throw Krea2ScheduleError.tierNotImplemented(field: "eta", value: "\(eta)", tier: "T2")
+    }
+    guard !bongmath else {
+      throw Krea2ScheduleError.tierNotImplemented(field: "bongmath", value: "true", tier: "T3")
+    }
+  }
+
   /// Generate one image. Returns RGB float array (H, W, 3) in [0,1].
   ///
-  /// - Throws: ``Krea2ScheduleError`` when the request's `shift` is invalid
-  ///   (checked before any model work).
+  /// A one-line wrapper over ``generateWithRecipe(_:progress:)``: the trace is
+  /// handed to the caller that asked for it and held nowhere else (§3.3 — no
+  /// shared "last recipe" state on the pipeline).
+  ///
+  /// - Throws: ``Krea2ScheduleError`` when the request's `shift` is invalid or
+  ///   a field belongs to an unimplemented tier (checked before any model work).
   public func generate(
     _ request: Request,
     progress: ((Int, Int) -> Void)? = nil
   ) throws -> MLXArray {
+    try generateWithRecipe(request, progress: progress).image
+  }
+
+  /// Generate one image and the record of how (WP-E3 + WP-E10).
+  ///
+  /// Returns the RGB array `generate` returns, plus the ``Krea2RunTrace`` the
+  /// caller maps into `RenderRecipe` — the loop's own numbers, read back
+  /// rather than predicted.
+  public func generateWithRecipe(
+    _ request: Request,
+    progress: ((Int, Int) -> Void)? = nil
+  ) throws -> (image: MLXArray, trace: Krea2RunTrace) {
     let dtype = DType.bfloat16
     let patch = config.patch
     let comp = Krea2VAE.spatialScale  // 8
@@ -539,9 +700,12 @@ public final class Krea2Pipeline {
 
     let latH = height / comp, latW = width / comp
     let hTok = latH / patch, wTok = latW / patch
-    // D3: nil → resolution-dependent mu (unchanged); explicit → log(shift). Fails before any model work.
+    // D3/A.1: nil → resolution-dependent mu (unchanged); explicit → mu = shift. Fails before any model work.
     let scheduleShift = try Krea2Sampling.resolveShift(
       explicit: request.shift, seqLen: hTok * wTok, align: align)
+    // D18: eta / bongmath belong to tiers that are not implemented — refuse
+    // them here, before any model work, rather than rendering the default.
+    try Krea2Pipeline.validateTiers(eta: request.eta, bongmath: request.bongmath)
 
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
@@ -552,7 +716,7 @@ public final class Krea2Pipeline {
     let ctx = ctxRaw.asType(dtype)
     let txtLen = ctx.dim(1)
 
-    var img = Krea2Sampling.patchify(noise, patch: patch)  // (1, hTok*wTok, 64)
+    let img = Krea2Sampling.patchify(noise, patch: patch)  // (1, hTok*wTok, 64)
     let pos = Krea2Sampling.buildPositions(txtLen: txtLen, h: hTok, w: wTok)
     let ropeScales = Krea2Sampling.ropeScales(
       hTok: hTok, wTok: wTok, patch: patch, dyPE: request.dyPE)
@@ -583,35 +747,39 @@ public final class Krea2Pipeline {
       MLX.eval(controlTokens!)
     }
 
-    let x1 = Float((256 / align) * (256 / align))
-    let x2 = Float((1280 / align) * (1280 / align))
-    let ts = Krea2Sampling.timesteps(
-      seqLen: img.dim(1), steps: request.steps, x1: x1, x2: x2, mu: scheduleShift.mu)
+    // WP-E3: the request's sampler over the request's grid. Built AFTER the
+    // noise so the global RNG stream the reference reproduces is untouched.
+    var scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: request.sampler, sigmaSchedule: request.sigmaSchedule,
+      steps: request.steps, shift: scheduleShift, seed: request.seed, c2: request.c2)
 
-    let total = ts.count - 1
-    for i in 0..<total {
-      let tc = ts[i], tp = ts[i + 1]
-      let t = MLX.full([1], values: MLXArray(tc)).asType(dtype)
-      let vCond = transformer(img: img, context: ctx, t: t, pos: pos, mask: fullMask,
-                              control: controlTokens, ropeScales: ropeScales)
-      let v: MLXArray
-      if useCFG, let negCtx, let negPos, let negFullMask {
-        let vUncond = transformer(img: img, context: negCtx, t: t, pos: negPos, mask: negFullMask,
-                                  control: controlTokens, ropeScales: ropeScales)
-        v = Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
-      } else {
-        v = vCond
-      }
-      img = img + (tp - tc) * v
-      MLX.eval(img)
-      progress?(i + 1, total)
-    }
+    let (denoised, stats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler,
+      initialSample: img,
+      startIndex: 0,
+      modelEvalsPerEvaluate: useCFG ? 2 : 1,
+      evaluate: { [transformer] latent, sigma in
+        // `sigma` IS Krea 2's `t`: it goes into the transformer with no
+        // (1000 − t)/1000 renormalisation, exactly as the inline loop did.
+        let t = MLX.full([1], values: MLXArray(sigma)).asType(dtype)
+        let vCond = transformer(img: latent, context: ctx, t: t, pos: pos, mask: fullMask,
+                                control: controlTokens, ropeScales: ropeScales)
+        guard useCFG, let negCtx, let negPos, let negFullMask else { return vCond }
+        let vUncond = transformer(img: latent, context: negCtx, t: t, pos: negPos,
+                                  mask: negFullMask, control: controlTokens, ropeScales: ropeScales)
+        return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
+      },
+      progress: progress)
 
     let latentNCHW = Krea2Sampling.unpatchify(
-      img, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
+      denoised, patch: patch, h: hTok, w: wTok, c: Krea2VAE.latentChannels)
     let latentNHWC = latentNCHW.transposed(0, 2, 3, 1).asType(.float32)
     let decoded = vae.decode(latentNHWC)  // (1, H, W, 3) in [0,1]
     MLX.eval(decoded)
-    return decoded[0]
+
+    let trace = Krea2RunTrace(
+      request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
+      startIndex: 0, denoise: 1.0, width: width, height: height)
+    return (decoded[0], trace)
   }
 }

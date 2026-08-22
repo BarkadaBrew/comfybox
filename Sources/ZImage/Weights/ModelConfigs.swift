@@ -139,6 +139,25 @@ public struct ZImageVAEConfig: Decodable {
 }
 
 public struct ZImageSchedulerConfig: Decodable {
+  /// Which discrete sigma table the model is sampled on — ComfyUI's
+  /// `ModelSampling*` class, which decides what the table-backed schedules
+  /// (`beta`, `beta57`) index and where `karras`/`exponential` take their bounds.
+  ///
+  /// - `.discreteFlow`: `ModelSamplingDiscreteFlow` — `numTrainTimesteps` entries
+  ///   of `σ = shift·t / (1 + (shift − 1)·t)`, built from this config's **linear**
+  ///   `shift`. Every family that decodes a `scheduler_config.json` (Z-Image)
+  ///   is this, and needs no `mu` for those schedules.
+  /// - `.flux(tableSize:)`: `ModelSamplingFlux` — `tableSize` entries of
+  ///   `σ = e^mu / (e^mu + 1/t − 1)`, built from the render's **`mu`** (a
+  ///   log-shift), which `SchedulerFactory` therefore requires. Krea 2 is this
+  ///   (FDD-krea2-raw-recipe Addendum A.1: ComfyUI registers it
+  ///   `ModelType.FLUX` → `ModelSamplingFlux(shift=1.15, timesteps=10000)`, and
+  ///   `shift` on the wire IS mu). `config.shift` is not consulted for the table.
+  public enum ModelSampling: Equatable, Sendable {
+    case discreteFlow
+    case flux(tableSize: Int)
+  }
+
   public let numTrainTimesteps: Int
   public let shift: Float
   public let useDynamicShifting: Bool
@@ -146,10 +165,13 @@ public struct ZImageSchedulerConfig: Decodable {
   public let maxShift: Float?
   public let baseImageSeqLen: Int?
   public let maxImageSeqLen: Int?
+  /// Not a `scheduler_config.json` key: decoded configs are always
+  /// `.discreteFlow`; only `Krea2Sampling.schedulerConfig()` sets `.flux`.
+  public let modelSampling: ModelSampling
 
   /// Memberwise init. Model families that ship a `scheduler_config.json`
   /// decode it; families without one (Krea 2) construct it directly —
-  /// see `Krea2Sampling.schedulerConfig(shift:)`.
+  /// see `Krea2Sampling.schedulerConfig()`.
   public init(
     numTrainTimesteps: Int,
     shift: Float,
@@ -157,7 +179,8 @@ public struct ZImageSchedulerConfig: Decodable {
     baseShift: Float? = nil,
     maxShift: Float? = nil,
     baseImageSeqLen: Int? = nil,
-    maxImageSeqLen: Int? = nil
+    maxImageSeqLen: Int? = nil,
+    modelSampling: ModelSampling = .discreteFlow
   ) {
     self.numTrainTimesteps = numTrainTimesteps
     self.shift = shift
@@ -166,6 +189,21 @@ public struct ZImageSchedulerConfig: Decodable {
     self.maxShift = maxShift
     self.baseImageSeqLen = baseImageSeqLen
     self.maxImageSeqLen = maxImageSeqLen
+    self.modelSampling = modelSampling
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      numTrainTimesteps: try c.decode(Int.self, forKey: .numTrainTimesteps),
+      shift: try c.decode(Float.self, forKey: .shift),
+      useDynamicShifting: try c.decode(Bool.self, forKey: .useDynamicShifting),
+      baseShift: try c.decodeIfPresent(Float.self, forKey: .baseShift),
+      maxShift: try c.decodeIfPresent(Float.self, forKey: .maxShift),
+      baseImageSeqLen: try c.decodeIfPresent(Int.self, forKey: .baseImageSeqLen),
+      maxImageSeqLen: try c.decodeIfPresent(Int.self, forKey: .maxImageSeqLen),
+      modelSampling: .discreteFlow
+    )
   }
 
   enum CodingKeys: String, CodingKey {

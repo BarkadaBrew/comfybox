@@ -146,24 +146,39 @@ final class Krea2SigmaScheduleTests: XCTestCase {
 
   // MARK: - §3.1 synthetic scheduler config (pinned values)
 
+  /// The eight values §3.1 (as amended by A.1) specifies. There is no
+  /// `shift:` parameter any more: Krea 2's shift is `mu`, carried beside the
+  /// config by `ScheduleShift`, and the table-backed schedules build the Flux
+  /// table from it — `config.shift` stays 1.0 and is not where the shift lives.
   func testSchedulerConfigPinnedValues() {
-    let dynamic = Krea2Sampling.schedulerConfig()
-    XCTAssertEqual(dynamic.numTrainTimesteps, 1000)
-    XCTAssertEqual(dynamic.shift, 1.0)
-    XCTAssertTrue(dynamic.useDynamicShifting)
-    XCTAssertEqual(dynamic.baseShift, 0.5)
-    XCTAssertEqual(dynamic.maxShift, 1.15)
-    XCTAssertEqual(dynamic.baseImageSeqLen, 256)
-    XCTAssertEqual(dynamic.maxImageSeqLen, 6400)
+    let config = Krea2Sampling.schedulerConfig()
+    XCTAssertEqual(config.numTrainTimesteps, 1000)
+    XCTAssertEqual(config.shift, 1.0)
+    XCTAssertTrue(config.useDynamicShifting)
+    XCTAssertEqual(config.baseShift, 0.5)
+    XCTAssertEqual(config.maxShift, 1.15)
+    XCTAssertEqual(config.baseImageSeqLen, 256)
+    XCTAssertEqual(config.maxImageSeqLen, 6400)
+    XCTAssertEqual(config.modelSampling, .flux(tableSize: 10000), "ComfyUI registers Krea 2 as ModelSamplingFlux (A.1)")
+    XCTAssertEqual(Krea2Sampling.fluxTableSize, 10000)
+  }
 
-    let explicit = Krea2Sampling.schedulerConfig(shift: 1.15)
-    XCTAssertEqual(explicit.numTrainTimesteps, 1000)
-    XCTAssertEqual(explicit.shift, 1.15)
-    XCTAssertTrue(explicit.useDynamicShifting)
-    XCTAssertEqual(explicit.baseShift, 0.5)
-    XCTAssertEqual(explicit.maxShift, 1.15)
-    XCTAssertEqual(explicit.baseImageSeqLen, 256)
-    XCTAssertEqual(explicit.maxImageSeqLen, 6400)
+  /// A config decoded from a `scheduler_config.json` (every non-Krea-2 family)
+  /// is `.discreteFlow` — the key is not on the wire and the default is the
+  /// table those families always used.
+  func testDecodedSchedulerConfigIsDiscreteFlow() throws {
+    let decoded = FlowMatchSchedulerTests.makeConfig(
+      numTrainTimesteps: 1000, shift: 3.0, useDynamicShifting: true,
+      baseShift: 0.5, maxShift: 1.15, baseImageSeqLen: 256, maxImageSeqLen: 4096)
+    XCTAssertEqual(decoded.modelSampling, .discreteFlow)
+    let minimal = try JSONDecoder().decode(
+      ZImageSchedulerConfig.self,
+      from: Data(#"{"num_train_timesteps": 1000, "shift": 3.0, "use_dynamic_shifting": false}"#.utf8))
+    XCTAssertEqual(minimal.modelSampling, .discreteFlow)
+    XCTAssertEqual(minimal.shift, 3.0)
+    XCTAssertNil(minimal.baseShift)
+    // The memberwise default is the same.
+    XCTAssertEqual(ZImageSchedulerConfig(numTrainTimesteps: 1000, shift: 1.0, useDynamicShifting: false).modelSampling, .discreteFlow)
   }
 
   /// `ZImageSchedulerConfig` now has a public memberwise init; it must agree
@@ -194,15 +209,17 @@ final class Krea2SigmaScheduleTests: XCTestCase {
 
   func testNoEDMLeakage() throws {
     let schedules: [SigmaScheduleKind] = [.karras, .exponential, .beta, .beta57]
-    let configs: [(String, ZImageSchedulerConfig)] = [
-      ("dynamic", Krea2Sampling.schedulerConfig()),
-      ("shift 1.15", Krea2Sampling.schedulerConfig(shift: 1.15)),
+    let config = Krea2Sampling.schedulerConfig()
+    // Dynamic mu at 1024² and the published shift 1.15 (A.1: shift IS mu).
+    let mus: [(String, Float)] = [
+      ("dynamic", Krea2Sampling.mu(seqLen: 4096, align: Self.align)),
+      ("shift 1.15", 1.15),
     ]
-    for (label, config) in configs {
+    for (label, mu) in mus {
       for schedule in schedules {
         for steps in Self.stepSet {
           let sigmas = try SchedulerFactory.resolveSigmas(
-            schedule: schedule, numSteps: steps, config: config, mu: nil)
+            schedule: schedule, numSteps: steps, config: config, mu: mu)
           XCTAssertEqual(sigmas.count, steps + 1,
                          "\(schedule.rawValue)/\(label)/\(steps): count")
           XCTAssertEqual(sigmas[0], 1.0,
@@ -218,19 +235,34 @@ final class Krea2SigmaScheduleTests: XCTestCase {
     }
   }
 
-  /// With `shift: nil` the bounds are `(0.001, 1.0)`; with `shift: 1.15`
-  /// they move with it (D3). Read through the lowest non-zero karras sigma,
-  /// which is the schedule's `sigmaMin` exactly (t = 1 at the last grid point).
+  /// The karras/exponential bounds under the Krea 2 family are the Flux
+  /// table's ends, `(e^mu / (e^mu + 9999), 1.0)` — ComfyUI's
+  /// `model_sampling.sigma_min/sigma_max` under `ModelSamplingFlux` — so they
+  /// move with `mu` exactly as `beta` does (D3 as amended). Read through the
+  /// lowest non-zero karras sigma, which is the schedule's `sigmaMin` exactly
+  /// (t = 1 at the last grid point). At shift 1.15 that is the fixture's
+  /// `model_samplings.flux.sigma_min`; at 1024² (mu 0.90625) it is 2.4747e-4.
   func testExplicitShiftMovesNonFlowBounds() throws {
     let steps = 9
+    let config = Krea2Sampling.schedulerConfig()
+    let dynamicMu = Krea2Sampling.mu(seqLen: 4096, align: Self.align)
     let dynamic = try SchedulerFactory.resolveSigmas(
-      schedule: .karras, numSteps: steps, config: Krea2Sampling.schedulerConfig(), mu: nil)
+      schedule: .karras, numSteps: steps, config: config, mu: dynamicMu)
     let explicit = try SchedulerFactory.resolveSigmas(
-      schedule: .karras, numSteps: steps, config: Krea2Sampling.schedulerConfig(shift: 1.15), mu: nil)
-    XCTAssertEqual(dynamic[steps - 1], 0.001, accuracy: 1e-7)
-    // 1.15 * 0.001 / (1 + 0.15 * 0.001)
-    XCTAssertEqual(explicit[steps - 1], 0.00114983, accuracy: 1e-7)
+      schedule: .karras, numSteps: steps, config: config, mu: 1.15)
+    let fixture = try SchedulerOracleFixtures.json("comfy_sigmas.json")
+    let fluxMin = try XCTUnwrap(
+      ((fixture["model_samplings"] as? [String: Any])?["flux"] as? [String: Any])?["sigma_min"] as? Double)
+    XCTAssertEqual(Double(explicit[steps - 1]), fluxMin, accuracy: 1e-9, "shift 1.15 → ModelSamplingFlux σ_min 3.1575e-4")
+    XCTAssertEqual(Double(dynamic[steps - 1]), exp(0.90625) / (exp(0.90625) + 9999.0), accuracy: 1e-9)
     XCTAssertNotEqual(dynamic[steps - 1], explicit[steps - 1])
+    // Neither is the DiscreteFlow bound E12 used (1.15e-3 / (1 + 0.15e-3) = 0.00114983) or the unshifted 0.001.
+    XCTAssertNotEqual(explicit[steps - 1], 0.00114983, accuracy: 1e-5)
+    XCTAssertNotEqual(dynamic[steps - 1], 0.001, accuracy: 1e-5)
+    // exponential shares the bounds.
+    let expo = try SchedulerFactory.resolveSigmas(
+      schedule: .exponential, numSteps: steps, config: config, mu: 1.15)
+    XCTAssertEqual(Double(expo[steps - 1]), fluxMin, accuracy: 1e-9)
   }
 
   // MARK: - Factory seam
