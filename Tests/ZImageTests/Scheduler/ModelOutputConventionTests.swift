@@ -36,6 +36,12 @@ final class ModelOutputConventionTests: XCTestCase {
       .ralston3s: .dataPrediction,
       .ralston4s: .dataPrediction,
       .res3s: .dataPrediction,
+      // WP-E14: the DEIS ramp is anchored in BOTH halves — the ralston warm-up
+      // and the multistep, whose recycled history is re-anchored at the
+      // current step's x₀ and σ.
+      .deis2m: .dataPrediction,
+      .deis3m: .dataPrediction,
+      .deis4m: .dataPrediction,
     ]
     // Every kind must be in the table — a new kind without a declared
     // convention is the silent-default hazard D2 exists to close.
@@ -56,7 +62,9 @@ final class ModelOutputConventionTests: XCTestCase {
         kind: kind, sigmaSchedule: .flow, numInferenceSteps: 9, config: config, seed: 1))?
         .modelOutputConvention == .dataPrediction
     }
-    XCTAssertEqual(dataPrediction, [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s])
+    XCTAssertEqual(
+      dataPrediction,
+      [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s, .deis2m, .deis3m, .deis4m])
   }
 
   /// The conversion helper the pipelines call: identity for velocity

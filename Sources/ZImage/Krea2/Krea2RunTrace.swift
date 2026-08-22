@@ -62,7 +62,28 @@ public struct Krea2RunTrace: Sendable, Equatable {
   public let stepsRun: Int
   /// Transformer forwards: `stepsRun × rows × (guidance > 1 ? 2 : 1)`.
   /// Counted by the loop, never predicted (§3.3).
+  ///
+  /// That product is a description, not a formula: `deis_Nm`'s row count FALLS
+  /// mid-run when its order ramp completes, and this field is the loop's count
+  /// either way (WP-E14, `Krea2DenoiseLoop.Stats.modelEvals`).
   public let modelEvals: Int
+
+  // — the order ramp, when there was one (WP-E14, §3.12 / AC-24) —
+
+  /// The sampler that actually ran during a DEIS warm-up (`"ralston_3s"`), or
+  /// `nil` when the run had no warm-up — which is every sampler but `deis_Nm`,
+  /// and `deis_Nm` itself on a run that took no step.
+  ///
+  /// It exists because the published stage-2 recipe (`deis_3m`, 2 steps) is
+  /// ENTIRELY warm-up: RES4LYF swaps `ralston_3s` in while
+  /// `step < order + multistep_extra_initial_steps` (the latter defaulting to
+  /// 1), so the DEIS coefficients never engage and the stage costs 6 model
+  /// evaluations. Without this field that fact has to be rediscovered from the
+  /// upstream source every time.
+  public let warmupSampler: String?
+
+  /// How many of ``stepsRun`` used ``warmupSampler``. 0 when there was none.
+  public let warmupSteps: Int
   /// First grid index stepped from. 0 for text-to-image.
   public let startIndex: Int
   /// The denoise fraction the start index came from. 1.0 for text-to-image.
@@ -90,6 +111,8 @@ public struct Krea2RunTrace: Sendable, Equatable {
     shiftSource: String,
     sigmas: [Float],
     finalConversionSigma: Float? = nil,
+    warmupSampler: String? = nil,
+    warmupSteps: Int = 0,
     stepsRequested: Int,
     stepsEffective: Int,
     stepsRun: Int,
@@ -111,6 +134,8 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.shiftSource = shiftSource
     self.sigmas = sigmas
     self.finalConversionSigma = finalConversionSigma
+    self.warmupSampler = warmupSampler
+    self.warmupSteps = warmupSteps
     self.stepsRequested = stepsRequested
     self.stepsEffective = stepsEffective
     self.stepsRun = stepsRun
@@ -203,6 +228,10 @@ extension Krea2RunTrace {
       shiftSource: shift.source.rawValue,
       sigmas: Self.walkedGrid(scheduler: scheduler),
       finalConversionSigma: stats.finalConversionSigma,
+      // The scheduler is the only witness to its own order ramp; a sampler
+      // that does not ramp reports none rather than an invented one (WP-E14).
+      warmupSampler: Self.warmUpSampler(of: scheduler),
+      warmupSteps: Self.warmUpSteps(of: scheduler),
       stepsRequested: stepsRequested,
       stepsEffective: scheduler.numInferenceSteps,
       stepsRun: stats.stepsRun,
@@ -226,6 +255,24 @@ extension Krea2RunTrace {
     let solver = scheduler.sigmas.asArray(Float.self)
     guard scheduler.finalConversionSigma != nil else { return solver }
     return solver + [0.0]
+  }
+
+  /// The warm-up sampler a ramping conformer actually ran, or `nil`.
+  ///
+  /// Read off the scheduler AFTER the run, through
+  /// ``WarmUpReportingScheduler``: only the conformer knows how many of its
+  /// steps were the ramp's, and only the run that just finished knows how many
+  /// steps it took at all (a 2-step `deis_3m` warms up twice; an 8-step one
+  /// warms up four times). `internal` so the tests can pin both halves without
+  /// building a whole `RenderRecipe`.
+  static func warmUpSampler(of scheduler: any ZImageScheduler) -> String? {
+    (scheduler as? WarmUpReportingScheduler)?.warmUpSampler
+  }
+
+  /// How many steps of the finished run used it; 0 for every non-ramping
+  /// sampler.
+  static func warmUpSteps(of scheduler: any ZImageScheduler) -> Int {
+    (scheduler as? WarmUpReportingScheduler)?.warmUpSteps ?? 0
   }
 
   /// D22: the requested name is recorded only when it is not simply the

@@ -192,21 +192,34 @@ final class Krea2DenoiseLoopTests: XCTestCase {
         calls += 1
         return field.velocity(x, sigma)
       }
-      // WP-E13 added N-row conformers; the row count is the tableau's when
-      // there is one, and otherwise the 2-row / 1-row protocol's.
-      let rows = (scheduler as? TableauScheduler)?.rows
-        ?? (scheduler.requiresIntermediateEvaluation ? 2 : 1)
-      XCTAssertEqual(stats.rowsAtStart, rows, kind.rawValue)
+      // WP-E13 added N-row conformers; WP-E14 added `deis_Nm`, whose row count
+      // FALLS to 1 the moment its order ramp completes. So the expected call
+      // count is derived from what the sampler IS, and `rowsAtStart` is
+      // checked as the label it is rather than used as a multiplier.
+      let expectedRowsAtStart: Int
+      let expectedCalls: Int
+      if let deis = scheduler as? DEISMultistepScheduler {
+        let warm = min(deis.order.warmUpStepCount, steps)
+        expectedRowsAtStart = deis.order.rawValue
+        expectedCalls = warm * deis.order.rawValue + (steps - warm)
+        XCTAssertEqual(deis.warmUpSteps, warm, kind.rawValue)
+      } else {
+        let rows = (scheduler as? TableauScheduler)?.rows
+          ?? (scheduler.requiresIntermediateEvaluation ? 2 : 1)
+        expectedRowsAtStart = rows
+        expectedCalls = steps * rows
+        // The product identity holds only BECAUSE these samplers have a
+        // CONSTANT row count. It is asserted here as a property of them, not
+        // as a law of the driver — `testRowsMayChangeMidRun` pins the general
+        // contract, and `deis_Nm` above is the shipping counter-example.
+        XCTAssertEqual(stats.modelEvals, stats.stepsRun * stats.rowsAtStart * 2, kind.rawValue)
+      }
+      XCTAssertEqual(stats.rowsAtStart, expectedRowsAtStart, kind.rawValue)
       XCTAssertEqual(stats.stepsRun, steps, kind.rawValue)
-      XCTAssertEqual(calls, steps * rows, kind.rawValue)
+      XCTAssertEqual(calls, expectedCalls, kind.rawValue)
       // The counted truth, which holds for every scheduler.
       XCTAssertEqual(stats.modelEvals, calls * 2, kind.rawValue)
       XCTAssertEqual(stats.evaluateCalls, calls, kind.rawValue)
-      // The product identity holds only BECAUSE every `SchedulerKind` shipping
-      // today has a constant row count. It is asserted here as a property of
-      // these samplers, not as a law of the driver — `testRowsMayChangeMidRun`
-      // pins the general contract.
-      XCTAssertEqual(stats.modelEvals, stats.stepsRun * stats.rowsAtStart * 2, kind.rawValue)
       XCTAssertFalse(MLX.any(MLX.isNaN(x)).item(Bool.self), kind.rawValue)
     }
   }

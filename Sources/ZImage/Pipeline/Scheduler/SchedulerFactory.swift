@@ -17,6 +17,15 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   case ralston3s = "ralston_3s"
   case ralston4s = "ralston_4s"
   case res3s = "res_3s"
+  // WP-E14 (§3.12, AC-23/24): RES4LYF's DEIS multistep samplers. Distinct
+  // names from the legacy `deis` above, which is the k-diffusion velocity port
+  // and stays exactly as it is — `deis_Nm` is a different algorithm (rhoab
+  // coefficients, a ralston warm-up, an anchored history) and repointing the
+  // old name at it would be the silent substitution this FDD exists to kill,
+  // and would make a name that works on every family Krea-2-only.
+  case deis2m = "deis_2m"
+  case deis3m = "deis_3m"
+  case deis4m = "deis_4m"
 
   /// Whether this kind builds a ``TableauScheduler`` — an N-row conformer that
   /// takes `rows` model evaluations per step and can ONLY be driven by a loop
@@ -30,9 +39,14 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   /// `--scheduler` parsing.
   ///
   /// Exhaustive on purpose (no `default`): a new kind must declare itself.
+  /// `deis_2m/3m/4m` are here too, and are the reason the doc above says
+  /// "`rows` model evaluations per step" rather than "a constant number": their
+  /// row count FALLS to 1 when the order ramp completes (WP-E14). The driver
+  /// re-reads `rows` every step, so this predicate is still exactly "must be
+  /// driven by the N-row loop".
   public var isNRowTableau: Bool {
     switch self {
-    case .ralston2s, .ralston3s, .ralston4s, .res3s:
+    case .ralston2s, .ralston3s, .ralston4s, .res3s, .deis2m, .deis3m, .deis4m:
       return true
     case .euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .deis, .ddim, .res2s:
       return false
@@ -45,14 +59,19 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   /// the last solver step lands on the model's `sigma_min`, and `σ_min → 0` is
   /// a model-free conversion.
   ///
-  /// `.deis` is deliberately **false** today: the shipped `DEISScheduler` is
-  /// the k-diffusion multistep port, not RES4LYF's `deis_*`. WP-E14 replaces
-  /// it with a RES4LYF conformer and flips this case with it.
+  /// WP-E14 flipped the DEIS ports in — as `.deis2m` / `.deis3m` / `.deis4m`,
+  /// the names RES4LYF actually has (`multistep/deis_Nm`), NOT as `.deis`.
+  /// `.deis` stays **false** because it stays what it has always been: the
+  /// k-diffusion velocity port, reachable on every family, with no `sigma_min`
+  /// preparation and no model-free tail. `DEISMultistepScheduler` is a
+  /// different algorithm under a different name; making the old name mean the
+  /// new sampler would both substitute silently and turn a working Z-Image
+  /// sampler into a Krea-2-only one (see `DEISMultistepSchedulerTests`).
   ///
   /// Exhaustive on purpose (no `default`): a new kind must declare itself.
   public var isRES4LYFFamily: Bool {
     switch self {
-    case .res2s, .res3s, .ralston2s, .ralston3s, .ralston4s:
+    case .res2s, .res3s, .ralston2s, .ralston3s, .ralston4s, .deis2m, .deis3m, .deis4m:
       return true
     case .euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .deis, .ddim:
       return false
@@ -245,6 +264,21 @@ public enum SchedulerFactory {
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,
         c2: c2,
+        finalConversionSigma: finalConversionSigma
+      )
+
+    // WP-E14: RES4LYF's DEIS multistep. The conformer owns its own order ramp
+    // — `ralston_{order}s` for the first `order + 1` steps of the RUN, then the
+    // `rhoab` coefficients at one evaluation per step — so there is nothing
+    // per-kind to decide here beyond which order was asked for.
+    case .deis2m, .deis3m, .deis4m:
+      let order: DEISMultistepScheduler.Order =
+        kind == .deis2m ? .two : (kind == .deis3m ? .three : .four)
+      return DEISMultistepScheduler(
+        order: order,
+        numInferenceSteps: effectiveSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps,
         finalConversionSigma: finalConversionSigma
       )
     }
