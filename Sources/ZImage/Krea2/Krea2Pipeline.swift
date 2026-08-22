@@ -429,11 +429,14 @@ public final class Krea2Pipeline {
     /// resolved kind (Krita's `normal` → `.flow`, D22). Record-only: it never
     /// changes what runs, it makes the alias visible in the trace.
     public var sigmaScheduleRequested: String? = nil
-    /// RES4LYF SDE eta (parity tier T2, WP-E15). NOTE: the SAME wire field
-    /// `eta` means DDIM η / DPM++ 2S-A ancestral η on the Z-Image path, where
-    /// it has shipped since April. Two meanings, one key — gated per family,
-    /// never at the decoder (D18). Non-zero throws
-    /// ``Krea2ScheduleError/tierNotImplemented(field:value:tier:)`` here.
+    /// RES4LYF SDE eta (parity tier T2, WP-E15 — landed). NOTE: the SAME
+    /// wire field `eta` means DDIM η / DPM++ 2S-A ancestral η on the Z-Image
+    /// path, where it has shipped since April. Two meanings, one key — gated
+    /// per family, never at the decoder (D18).
+    ///
+    /// Non-zero runs RES4LYF's SDE on a RES4LYF sampler and throws
+    /// ``Krea2ScheduleError/etaUnsupportedSampler(sampler:value:)`` on any
+    /// other — including ``sampler``'s own default, `euler`.
     public var eta: Float = 0.0
     /// RES4LYF `bongmath` (parity tier T3, WP-E16). `true` throws until it lands.
     public var bongmath: Bool = false
@@ -670,9 +673,11 @@ public final class Krea2Pipeline {
   /// is the same rounding as the pre-change `(tp − tc) * v` (§4 criterion 1).
   ///
   /// `eta` is deliberately NOT forwarded to the factory: on the Krea 2 family
-  /// `eta` means the RES4LYF SDE eta (T2), not DDIM/ancestral η, and
-  /// ``validateTiers(eta:bongmath:)`` has already refused any non-zero value
-  /// (D18). The factory's own defaults therefore stand.
+  /// `eta` means the RES4LYF SDE eta (T2), not the DDIM/ancestral η the factory
+  /// would apply. It reaches the run through
+  /// ``makeSDEInjector(eta:sampler:stageSeed:layout:)`` and the loop's T2 hook
+  /// instead, which is a property of the SOLVER and not of the grid — so the
+  /// factory's own defaults stand here and the schedule is unmoved by eta.
   static func makeScheduler(
     sampler: SchedulerKind,
     sigmaSchedule: SigmaScheduleKind,

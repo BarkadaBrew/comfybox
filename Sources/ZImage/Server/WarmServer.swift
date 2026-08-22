@@ -8381,7 +8381,9 @@ extension GeneratePayload: Decodable {
     let sigmaSchedule: SigmaScheduleKind
     /// `nil` = the resolution-dependent mu (D3/A.1); a value IS mu.
     let shift: Float?
-    /// RES4LYF SDE eta — gated to 0 before T2 by `validateKrea2TierGates`.
+    /// RES4LYF SDE eta (T2, WP-E15). Forwarded whatever the sampler;
+    /// `validateKrea2TierGates` is what decides whether the render may have
+    /// it, and it decides by SAMPLER.
     let eta: Float
     let samplerRequested: String?
     let sigmaScheduleRequested: String?
