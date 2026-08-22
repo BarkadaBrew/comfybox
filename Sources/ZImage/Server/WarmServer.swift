@@ -3327,6 +3327,13 @@ public final class WarmServer {
     // style whose sampler we do not implement is refused by name, never
     // rendered as euler. The krea2 tier gates run here too (D18).
     let recipeNames = try payload.validateRecipeNames()
+    // I5: the bridge builds its payload directly and forwards the request's
+    // sampler on every family arm, so it runs the same family capability gate
+    // the REST dispatch does — a Krita style naming a sampler this family
+    // cannot drive is refused, never rendered as euler under that name.
+    if let error = GeneratePayload.validateFamilyRecipe(recipeNames, family: family) {
+      throw error
+    }
     if family == .krea2 {
       try payload.validateKrea2TierGates(recipeNames)
     }
@@ -6851,11 +6858,11 @@ private actor WarmServerCoordinator {
       return
     }
 
-    // WP-E13: an N-row tableau sampler only runs under the Krea 2 loop. The
-    // name resolved at decode (unknown names are already 400 by then); this is
-    // the family gate, so it lives here rather than at the decoder (D18).
+    // I5: the family capability gate. The name resolved at decode (unknown
+    // names are already 400 by then); whether THIS family's loop can honour
+    // it is decided here, from the one matrix (D18: family gates at dispatch).
     if let names = try? payload.validateRecipeNames(),
-       let error = GeneratePayload.validateTableauSampler(names, family: currentModelFamily) {
+       let error = GeneratePayload.validateFamilyRecipe(names, family: currentModelFamily) {
       lastError = error.localizedDescription ?? "unsupported sampler"
       continuation.resume(throwing: error)
       return
@@ -7418,6 +7425,15 @@ private actor WarmServerCoordinator {
     let cfgScale = payload.cfg ?? 4.0
     let cfgWarmup = payload.firstNStepsWithoutCFG ?? 0
 
+    // K-FIX-1 / Codex I5: Chroma HAS native heun and beta and this call used
+    // to pass neither, so `scheduler: "heun"` rendered Euler pixels under the
+    // name "heun". The pair is mapped through the one family matrix — which
+    // has already refused (400) any pair it cannot map, so the fallback here
+    // is the unreachable default, not a silent substitution.
+    let names = try payload.validateRecipeNames()
+    let chromaScheduler = FamilyRecipeMatrix.chromaSchedulerType(
+      sampler: names.scheduler, schedule: names.sigmaSchedule) ?? .euler
+
     // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
     let result = pipeline.generate(
       tokenIds: tokenIds,
@@ -7428,6 +7444,7 @@ private actor WarmServerCoordinator {
       guidance: guidance,
       cfg: cfgScale,
       firstNStepsWithoutCFG: cfgWarmup,
+      schedulerType: chromaScheduler,
       seed: seed,
       progressCallback: { step, total in
         // Progress logging
@@ -8130,32 +8147,26 @@ extension GeneratePayload: Decodable {
       reason: "VAE selection is a Krea 2 request field (WP-E9); this family decodes through its own VAE and does not honour it — remove it")
   }
 
-  /// WP-E13: refuse an N-row tableau sampler on a family that cannot drive one.
+  /// K-FIX-1 / Codex I5: refuse a sampler / sigma schedule the ACTIVE FAMILY
+  /// cannot honour, from the one family capability matrix
+  /// (``FamilyRecipeMatrix``).
   ///
-  /// `ralston_2s/3s/4s` and `res_3s` take `rows` model evaluations per step
-  /// through `TableauScheduler`. Only `Krea2DenoiseLoop` dispatches that
-  /// protocol; every other family's loop calls `ZImageScheduler.step`, which
-  /// for these conformers is a `preconditionFailure` — and before WP-E13's
-  /// review was a first-order Euler render carrying the tableau's name. The
-  /// names stay accepted and advertised (E4: advertised == accepted); what is
-  /// family-scoped is whether the render can honour them.
+  /// Supersedes WP-E13's `validateTableauSampler`, which is now one row of
+  /// that table: N-row tableaus (`ralston_2s/3s/4s`, `res_3s`) are dispatched
+  /// only by `Krea2DenoiseLoop`. The table also closes the silences E13's
+  /// single row left open — Chroma ignoring its own native `heun`/`beta`, and
+  /// Flux 2 / FIBO accepting any name into a fixed Euler loop.
   ///
+  /// Names stay accepted and advertised globally (E4: advertised == accepted
+  /// as a NAME); what is family-scoped is whether the render can honour them.
   /// Returns the 400 to throw, or nil. Runs at the one dispatch point in
-  /// `generate`, beside `validateShift(_:family:)` (D18: family gates live at
-  /// dispatch, not at the decoder).
-  static func validateTableauSampler(
+  /// `generate` and in the bridge's family arm, beside
+  /// `validateShift(_:family:)` (D18: family gates live at dispatch, not at
+  /// the decoder).
+  static func validateFamilyRecipe(
     _ names: ResolvedRecipeNames, family: WarmModelFamily
   ) -> WarmServerError? {
-    guard let sampler = names.scheduler, sampler.isNRowTableau else { return nil }
-    guard family != .krea2 else { return nil }
-    return .unsupportedSampler(
-      name: names.schedulerRequested ?? sampler.rawValue,
-      family: family.rawValue,
-      reason: "it is an N-row tableau sampler (\(sampler.rawValue)) dispatched only by the "
-        + "Krea 2 denoise loop; this family takes one model evaluation per step and would "
-        + "render first-order Euler under that name. Load a krea2 model, or use one of: "
-        + SchedulerKind.allCases.filter { !$0.isNRowTableau }.map(\.rawValue)
-          .joined(separator: ", "))
+    FamilyRecipeMatrix.validate(names, family: family)
   }
 
   /// The DyPE configuration this payload implies at the given resolution.

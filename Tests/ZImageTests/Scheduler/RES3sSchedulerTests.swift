@@ -288,7 +288,7 @@ final class RES3sSchedulerTests: XCTestCase {
     let scheduler = try SchedulerFactory.create(kind: .res3s, numInferenceSteps: 9, config: config)
     XCTAssertNotNil(scheduler as? TableauScheduler)
     XCTAssertNotNil(
-      GeneratePayload.validateTableauSampler(
+      GeneratePayload.validateFamilyRecipe(
         ResolvedRecipeNames(
           scheduler: .res3s, schedulerRequested: "res_3s",
           sigmaSchedule: nil, sigmaScheduleRequested: nil),

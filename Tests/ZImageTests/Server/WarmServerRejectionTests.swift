@@ -91,12 +91,12 @@ final class WarmServerRejectionTests: XCTestCase {
 
       // Krea 2 dispatches the N-row protocol, so it is honoured there.
       XCTAssertNil(
-        GeneratePayload.validateTableauSampler(names, family: .krea2),
+        GeneratePayload.validateFamilyRecipe(names, family: .krea2),
         "\(name) must render on krea2")
 
       for family in WarmModelFamily.allCases where family != .krea2 {
         let error = try XCTUnwrap(
-          GeneratePayload.validateTableauSampler(names, family: family),
+          GeneratePayload.validateFamilyRecipe(names, family: family),
           "\(name) on \(family.rawValue) must be refused")
         guard case WarmServerError.unsupportedSampler(let got, let gotFamily, _) = error else {
           return XCTFail("\(error) is not .unsupportedSampler")
@@ -115,14 +115,18 @@ final class WarmServerRejectionTests: XCTestCase {
       }
     }
 
-    // Every non-tableau sampler is untouched on every family — including the
-    // 2-row `res_2s`, which the Z-Image loop does dispatch.
+    // Every non-tableau sampler is untouched on the families that DRIVE it —
+    // including the 2-row `res_2s`, which the Z-Image loop does dispatch.
+    // K-FIX-1 / I5: "every family" was the silence; the gate is now the family
+    // capability matrix, so a family that cannot run a sampler refuses it
+    // instead of rendering euler under its name.
     for kind in SchedulerKind.allCases where !kind.isNRowTableau {
       let payload = try decode(#"{"prompt":"x","scheduler":"\#(kind.rawValue)"}"#)
       let names = try payload.validateRecipeNames()
       for family in WarmModelFamily.allCases {
-        XCTAssertNil(
-          GeneratePayload.validateTableauSampler(names, family: family),
+        let runs = FamilyRecipeMatrix.capability(for: family).samplers.contains(kind)
+        XCTAssertEqual(
+          GeneratePayload.validateFamilyRecipe(names, family: family) == nil, runs,
           "\(kind.rawValue) on \(family.rawValue)")
       }
     }
