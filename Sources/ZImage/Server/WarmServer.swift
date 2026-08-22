@@ -2940,29 +2940,50 @@ public final class WarmServer {
   // Presets ------------------------------------------------------------------
 
   private func presetsListResponse() -> RoutedResponse {
-    .json(status: 200, payload: presetStore.list())
+    Self.presetsList(store: presetStore)
+  }
+
+  /// `GET /v1/presets` (WP-E20, AC-44c): every preset, flat, with
+  /// `invalid` / `invalid_reason` so a flagged preset is visible and
+  /// un-selectable by the desktop app, the bridge and MCP alike.
+  static func presetsList(store: PresetStore) -> RoutedResponse {
+    .json(status: 200, payload: store.listing())
   }
 
   private func getPresetResponse(rawId: String) -> RoutedResponse {
     guard let id = Self.pathIdComponent(rawId) else {
       return .error(.error(status: 400, message: "Invalid preset id"))
     }
-    guard let preset = presetStore.get(id) else {
+    // WP-E20: the single-preset read carries the same validity flag as the list.
+    guard let entry = presetStore.listing().first(where: { $0.preset.id == id }) else {
       return .error(.error(status: 404, message: "Preset not found: \(id)"))
     }
-    return .json(status: 200, payload: preset)
+    return .json(status: 200, payload: entry)
   }
 
   private func upsertPresetResponse(body: Data) -> RoutedResponse {
-    do {
-      let preset = try decode(ImagePreset.self, from: body)
-      let saved = try presetStore.upsert(preset)
+    let (response, saved) = Self.upsertPreset(store: presetStore, body: body)
+    if let saved {
       auditLog.append(kind: "preset.upsert", message: "Upserted preset \(saved.id)", metadata: ["id": saved.id])
-      return .json(status: 200, payload: saved)
+    }
+    return response
+  }
+
+  /// `POST`/`PUT /v1/presets` (WP-E20, AC-44b): decode, validate through
+  /// `PresetStore.upsert` (O4a kroma rule, recipe-name resolution, ranges)
+  /// and persist. A refused preset is a 400 naming the preset and the field;
+  /// nothing is stored. Returns the saved preset for the audit log.
+  static func upsertPreset(store: PresetStore, body: Data) -> (RoutedResponse, saved: ImagePreset?) {
+    do {
+      let decoder = JSONDecoder()
+      decoder.keyDecodingStrategy = .convertFromSnakeCase
+      let preset = try decoder.decode(ImagePreset.self, from: body)
+      let saved = try store.upsert(preset)
+      return (.json(status: 200, payload: saved), saved)
     } catch let error as PresetStoreError {
-      return presetErrorResponse(error)
+      return (presetErrorResponse(error), nil)
     } catch {
-      return .error(.error(status: 400, message: "Invalid preset payload: \(error.localizedDescription)"))
+      return (.error(.error(status: 400, message: "Invalid preset payload: \(error.localizedDescription)")), nil)
     }
   }
 
@@ -2982,10 +3003,18 @@ public final class WarmServer {
   }
 
   private func resolvePresetResponse(body: Data) -> RoutedResponse {
+    Self.resolvePreset(store: presetStore, body: body)
+  }
+
+  /// `POST /v1/presets/resolve`. A preset flagged invalid at load (WP-E20,
+  /// AC-44c) is a 400 naming it and the reason — it can never be selected.
+  static func resolvePreset(store: PresetStore, body: Data) -> RoutedResponse {
     struct ResolveRequest: Decodable { let id: String }
     do {
-      let request = try decode(ResolveRequest.self, from: body)
-      let resolved = try presetStore.resolve(request.id)
+      let decoder = JSONDecoder()
+      decoder.keyDecodingStrategy = .convertFromSnakeCase
+      let request = try decoder.decode(ResolveRequest.self, from: body)
+      let resolved = try store.resolve(request.id)
       return .json(status: 200, payload: resolved)
     } catch let error as PresetStoreError {
       return presetErrorResponse(error)
@@ -2994,11 +3023,14 @@ public final class WarmServer {
     }
   }
 
-  /// Map a ``PresetStoreError`` to the right HTTP status: validation -> 400, notFound -> 404.
-  private func presetErrorResponse(_ error: PresetStoreError) -> RoutedResponse {
+  /// Map a ``PresetStoreError`` to the right HTTP status: validation -> 400,
+  /// invalid (flagged on disk) -> 400, notFound -> 404.
+  private static func presetErrorResponse(_ error: PresetStoreError) -> RoutedResponse {
     switch error {
     case .validation(let message):
       return .error(.error(status: 400, message: message))
+    case .invalid:
+      return .error(.error(status: 400, message: error.description))
     case .notFound(let id):
       return .error(.error(status: 404, message: "Preset not found: \(id)"))
     }
