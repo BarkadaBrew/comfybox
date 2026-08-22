@@ -154,6 +154,7 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(SigmaScheduleKind(rawValue: "beta"), .beta)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "beta57"), .beta57)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "krea2"), .krea2)
+    XCTAssertEqual(SigmaScheduleKind(rawValue: "bong_tangent"), .bongTangent)
   }
 
   // MARK: - All Kinds

@@ -10,6 +10,11 @@ public enum SigmaScheduleKind: String, CaseIterable, Sendable {
   /// Krea 2's native resolution-shifted warp over `linspace(1 → 0)` inclusive
   /// (see ``SigmaSchedule/krea2(numSteps:mu:sigmaExp:)``). Requires `mu`.
   case krea2 = "krea2"
+  /// RES4LYF's `bong_tangent` — two arctan arcs joined at exactly 0.5, pure
+  /// index arithmetic, **never consults the model** (no shift, no `mu`; FDD
+  /// D6). Wire name is the upstream snake_case so a workflow value pastes
+  /// verbatim. See ``SigmaSchedule/bongTangent(numSteps:)``.
+  case bongTangent = "bong_tangent"
 }
 
 /// Pure-function sigma schedule generators.
@@ -101,6 +106,88 @@ public enum SigmaSchedule {
       }
     }
     return out
+  }
+
+  // MARK: - bong_tangent (RES4LYF)
+
+  /// RES4LYF's `bong_tangent_scheduler`, ported literally from the pinned
+  /// upstream source (`scripts/oracles/upstream/res4lyf/sigmas.py:4065-4098`,
+  /// commit `26036f6`; FDD-krea2-raw-recipe §3.11, D6, AC-19/AC-20).
+  ///
+  /// Two arctan arcs — `start 1.0 → middle 0.5` and `middle 0.5 → end 0.0` —
+  /// joined at **exactly** 0.5, emitting `numSteps + 1` values that end at an
+  /// exact `0.0`. The upstream defaults are baked in (`pivot_1 = pivot_2 = 0.6`,
+  /// `slope_1 = slope_2 = 0.2`, `pad = false`); no caller has asked for the
+  /// knobs, and the published recipe uses the defaults.
+  ///
+  /// **Port literally, do not clean up.** The arc lengths come from
+  /// `int((steps+2) · 0.6)` — integer truncation — so the schedule is
+  /// deliberately non-smooth in `numSteps`; smoothing it would move every
+  /// sigma off the oracle. Arithmetic is in `Double` (Python `float`) and cast
+  /// to `Float` once at the end (upstream's `torch.tensor(list)` → float32), so
+  /// the grid matches the fixture `comfy_sigmas.json` to the last bit rather
+  /// than to a tolerance.
+  ///
+  /// **Model-free** (D6): upstream accepts `model_sampling` and never reads it
+  /// in the body. `SchedulerFactory.resolveSigmas` therefore ignores `config`
+  /// and `mu` for this schedule — there is no shift to compose on top, and
+  /// `RenderRecipe` records `shift_applied: false` for it.
+  ///
+  /// - Precondition: `numSteps >= 2`. Upstream raises `ZeroDivisionError` for
+  ///   0 and 1 (a one-point arc has `smax == smin`). `SchedulerFactory` refuses
+  ///   those step counts by name (``SchedulerFactoryError/stepCountBelowMinimum(_:steps:minimum:)``)
+  ///   before reaching this function; the precondition is the last line of
+  ///   defence against a NaN grid, not the wire-level check.
+  public static let bongTangentMinimumSteps = 2
+
+  public static func bongTangent(numSteps: Int) -> [Float] {
+    precondition(
+      numSteps >= bongTangentMinimumSteps,
+      "bong_tangent needs at least \(bongTangentMinimumSteps) steps (upstream divides by zero below that); got \(numSteps)")
+
+    // bong_tangent_scheduler(model_sampling, steps, start=1.0, middle=0.5, end=0.0,
+    //                        pivot_1=0.6, pivot_2=0.6, slope_1=0.2, slope_2=0.2, pad=False)
+    let start = 1.0, middle = 0.5, end = 0.0
+    var pivot1 = 0.6, pivot2 = 0.6
+    var slope1 = 0.2, slope2 = 0.2
+
+    let steps = numSteps + 2                                                   // steps += 2
+    let midpoint = Int((Double(steps) * pivot1 + Double(steps) * pivot2) / 2)  // int((steps*p1 + steps*p2)/2)
+    pivot1 = Double(Int(Double(steps) * pivot1))                               // int(steps * pivot_1)
+    pivot2 = Double(Int(Double(steps) * pivot2))                               // int(steps * pivot_2)
+    slope1 = slope1 / (Double(steps) / 40)                                     // slope_1 / (steps/40)
+    slope2 = slope2 / (Double(steps) / 40)                                     // slope_2 / (steps/40)
+
+    let stage2Len = steps - midpoint
+    let stage1Len = steps - stage2Len
+
+    var tanSigmas1 = bongTangentArc(
+      steps: stage1Len, slope: slope1, pivot: pivot1, start: start, end: middle)
+    let tanSigmas2 = bongTangentArc(
+      steps: stage2Len, slope: slope2, pivot: pivot2 - Double(stage1Len), start: middle, end: end)
+
+    tanSigmas1.removeLast()  // tan_sigmas_1[:-1]
+    // pad=False: no trailing extra 0 (tan_sigmas_2 already ends at `end`).
+
+    return (tanSigmas1 + tanSigmas2).map { Float($0) }  // torch.tensor(list) → float32
+  }
+
+  /// `get_bong_tangent_sigmas(steps, slope, pivot, start, end)` — one arctan
+  /// arc over `range(steps)`, normalised so `x = 0 → start` and
+  /// `x = steps-1 → end`. Operation order is upstream's, in `Double`.
+  private static func bongTangentArc(
+    steps: Int, slope: Double, pivot: Double, start: Double, end: Double
+  ) -> [Double] {
+    let twoOverPi = 2.0 / Double.pi
+    let smax = (twoOverPi * atan(-slope * (0.0 - pivot)) + 1) / 2
+    let smin = (twoOverPi * atan(-slope * (Double(steps - 1) - pivot)) + 1) / 2
+
+    let srange = smax - smin
+    let sscale = start - end
+
+    return (0..<steps).map { x in
+      (((twoOverPi * atan(-slope * (Double(x) - pivot)) + 1) / 2) - smin) * (1 / srange) * sscale + end
+    }
   }
 
   // MARK: - Karras (Karras et al. 2022)

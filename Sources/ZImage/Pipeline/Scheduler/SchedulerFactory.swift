@@ -19,11 +19,17 @@ public enum SchedulerFactoryError: Error, Equatable, CustomStringConvertible {
   /// supplied. There is no default: `mu = 0` would be an unshifted linear grid
   /// presented as the model's own schedule (FDD-krea2-raw-recipe §3.1).
   case missingMu(SigmaScheduleKind)
+  /// The schedule is undefined below `minimum` steps and the request asked for
+  /// fewer. `bong_tangent` divides by zero upstream at 0 and 1 steps; refusing
+  /// by name is the only alternative to a NaN grid (FDD-krea2-raw-recipe §3.11).
+  case stepCountBelowMinimum(SigmaScheduleKind, steps: Int, minimum: Int)
 
   public var description: String {
     switch self {
     case .missingMu(let schedule):
       return "sigma schedule '\(schedule.rawValue)' requires mu (the model's resolution shift) and none was supplied"
+    case .stepCountBelowMinimum(let schedule, let steps, let minimum):
+      return "sigma schedule '\(schedule.rawValue)' needs at least \(minimum) steps; \(steps) requested"
     }
   }
 }
@@ -149,6 +155,15 @@ public enum SchedulerFactory {
       // mu is required: `mu ?? 0` would silently be an unshifted linear grid.
       guard let mu else { throw SchedulerFactoryError.missingMu(.krea2) }
       return SigmaSchedule.krea2(numSteps: numSteps, mu: mu)
+    case .bongTangent:
+      // Model-free by construction (D6): upstream takes `model_sampling` and
+      // never reads it, so `config` and `mu` are deliberately ignored here —
+      // Krea 2's resolution shift is NOT composed on top.
+      guard numSteps >= SigmaSchedule.bongTangentMinimumSteps else {
+        throw SchedulerFactoryError.stepCountBelowMinimum(
+          .bongTangent, steps: numSteps, minimum: SigmaSchedule.bongTangentMinimumSteps)
+      }
+      return SigmaSchedule.bongTangent(numSteps: numSteps)
     case .karras:
       let (lo, hi) = flowMatchingSigmaBounds(config: config)
       return SigmaSchedule.karras(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)
