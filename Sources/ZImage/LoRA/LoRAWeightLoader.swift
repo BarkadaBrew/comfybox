@@ -625,11 +625,25 @@ public final class LoRAWeightLoader {
     }
     guard unknown.isEmpty else { throw LoRAError.unknownKeys(unknown) }
 
+    // K-FIX-1 / Codex I3 (ledger AC-42): an orphan LoKr half is a REFUSAL,
+    // not a silent drop. Both halves are consumed above (so they never reach
+    // the `unknownKeys` guard) and LoKr modules are outside
+    // `LoRAApplicationReport.offered` entirely — so a `lokr_w1` whose
+    // `lokr_w2` was truncated away used to vanish with no error, no report
+    // entry, and a clean-looking strict apply. Same posture as the plain
+    // `lora_A`/`lora_B` orphan guard above.
     var lokrWeights: [String: LoKrWeights] = [:]
     lokrWeights.reserveCapacity(min(lokrW1.count, lokrW2.count))
     for (key, w1) in lokrW1 {
-      guard let w2 = lokrW2[key] else { continue }
+      guard let w2 = lokrW2[key] else {
+        throw LoRAError.invalidFormat(
+          "orphan LoKr half '\(key).lokr_w1' — counterpart '\(key).lokr_w2' missing")
+      }
       lokrWeights[key] = LoKrWeights(w1: w1, w2: w2, alpha: moduleAlphas[key])
+    }
+    for key in lokrW2.keys where lokrW1[key] == nil {
+      throw LoRAError.invalidFormat(
+        "orphan LoKr half '\(key).lokr_w2' — counterpart '\(key).lokr_w1' missing")
     }
 
     guard !loraPairs.isEmpty || !lokrWeights.isEmpty || !deltas.isEmpty else {
