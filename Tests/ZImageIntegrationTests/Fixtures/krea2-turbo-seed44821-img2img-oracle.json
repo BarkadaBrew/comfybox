@@ -1,5 +1,6 @@
 {
   "purpose": "AC-2 byte-identity oracle: default Krea 2 img2img at strength 0.3, captured 2026-08-22 from a release build of aa8e590 (the commit immediately before WP-E3) running as a second warm server on port 7898 against the same model directory. There was no pinned img2img oracle before this file.",
+  "provenance_caveat": "aa8e590 is the commit before WP-E3, NOT the pre-programme binary: it already carries WP-E12b (shift IS mu, beta/beta57 on the ModelSamplingFlux table). So this oracle pins \"unchanged by WP-E3\", not \"unchanged by the whole programme\". The controller accepted that gap for the default path because AC-3 pins SigmaSchedule.krea2(numSteps:mu:) element-for-element against the pre-change Krea2Sampling.timesteps, and the default recipe (euler over krea2 at the resolution-dependent mu) touches nothing else E12b changed.",
   "engine_model": "/Users/toddwalderman/LocalModels/kroma-v0.2",
   "model_family": "krea2",
   "loras_active_after": [],
@@ -11,9 +12,9 @@
     "width": 1024,
     "height": 1024,
     "strength": 0.3,
-    "source_image": "/Users/toddwalderman/Pictures/ComfyBox/comfybox-kroma-v0.2-manual-krea2raw-oracle-20260822-123609-aea0.png",
+    "source_image": "krea2-img2img-source-1024.png",
     "source_image_sha256": "6bb6eed75a39a0aed78fbcd64b52904f224298d3a85ecb26b43c8dd1dcfc9160",
-    "source_image_note": "the AC-1 oracle's own output, still at its recorded output_path — a fixed 1024x1024 PNG. The capture fed a byte-identical copy of it from the scratchpad; the pinned hash is what makes the two interchangeable.",
+    "source_image_note": "Resolved RELATIVE TO THIS FIXTURES DIRECTORY, and committed alongside this file (~1.4 MB). It is the AC-1 oracle's own output. It used to be referenced at its original path under ~/Pictures/ComfyBox, which is a temporary symlink to an external volume — a merge gate that turns into a skip when a volume is unmounted is exactly the silent downgrade byte-identity exists to prevent. The capture fed a byte-identical copy of this file; the pinned sha256, which the test asserts before use, is what makes the copies interchangeable.",
     "loras": [],
     "quantization": "q8 (server default)"
   },

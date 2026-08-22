@@ -19,8 +19,10 @@
 // raster geometry and the compressed pixels, and nothing else. That is the
 // byte-identity the criterion is about, and it IS reproducible.
 //
-// Skipped, with the reason named, when the model directory is not on this
-// machine.
+// The ONE thing these skip on is the model directory being absent from this
+// machine, and they name it when they do. Everything else they need — the
+// request, the pinned digests, the img2img source image — is committed, so a
+// gate that cannot run says so instead of quietly passing.
 
 import XCTest
 import MLX
@@ -46,7 +48,8 @@ final class Krea2SamplerParityTests: XCTestCase {
       let height: Int
       /// img2img only.
       let strength: Float?
-      /// img2img only: the fixed source PNG, pinned by path and by hash.
+      /// img2img only: the committed source PNG, named relative to the
+      /// Fixtures directory and pinned by hash.
       let sourceImage: String?
       let sourceImageSha256: String?
     }
@@ -173,10 +176,14 @@ final class Krea2SamplerParityTests: XCTestCase {
           let strength = oracle.request.strength else {
       return XCTFail("the img2img fixture must pin source_image and strength")
     }
-    let sourceURL = URL(fileURLWithPath: (sourcePath as NSString).expandingTildeInPath)
-    guard FileManager.default.fileExists(atPath: sourceURL.path) else {
-      throw XCTSkip("the pinned img2img source image is not on this machine: \(sourceURL.path)")
-    }
+    // Repo-relative, and committed beside the fixture. It is deliberately NOT
+    // a path on this machine: the only thing this gate may skip on is a
+    // missing model directory. A missing fixture is a broken checkout and
+    // fails.
+    let sourceURL = Self.fixturesDirectory.appendingPathComponent(sourcePath)
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: sourceURL.path),
+      "the committed img2img source fixture is missing: \(sourceURL.path)")
     XCTAssertEqual(
       try fileSHA256(sourceURL), oracle.request.sourceImageSha256,
       "the pinned source image changed — the oracle is meaningless against a different input")
