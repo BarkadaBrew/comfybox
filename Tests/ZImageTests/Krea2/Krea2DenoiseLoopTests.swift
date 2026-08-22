@@ -489,14 +489,29 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     }
   }
 
+  /// WP-E16 corrected this seam from a step hook to a ROW hook: upstream's
+  /// `bong_iter` runs inside the row loop and rewrites the step's ANCHOR, not
+  /// the sample. This stub records where it was called and moves nothing, so
+  /// the driver's plumbing can be asserted without the arithmetic.
   final class CountingBongMath: BongMath {
-    var steps: [Int] = []
+    /// `(step, upstream row)` — the row whose UPDATE built the sample.
+    var calls: [(Int, Int)] = []
+    /// How many extra evaluations to claim, so the accounting can be tested.
+    let claimedEvals: Int
+    /// The samples it was handed, to prove `buildRowSample` inverts.
+    var rebuilt: [MLXArray] = []
+
+    init(claimedEvals: Int = 0) { self.claimedEvals = claimedEvals }
+
     func iterate(
-      sample: inout MLXArray, timestepIndex: Int, scheduler: any ZImageScheduler,
+      x0: inout MLXArray, rowSample: MLXArray, timestepIndex: Int, row: Int,
+      scheduler: any ZImageScheduler,
+      buildRowSample: (MLXArray) -> MLXArray,
       evaluate: (MLXArray, Float) -> MLXArray
     ) -> Int {
-      steps.append(timestepIndex)
-      return 0
+      calls.append((timestepIndex, row))
+      rebuilt.append(buildRowSample(x0))
+      return claimedEvals
     }
   }
 
@@ -508,10 +523,69 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 19), startIndex: 3,
       evaluate: Self.syntheticTransformer, noise: injector, bongmath: bong)
     XCTAssertEqual(injector.steps, [3, 4, 5, 6, 7, 8])
-    XCTAssertEqual(bong.steps, [3, 4, 5, 6, 7, 8])
-    // The default euler path is 1-row: there is no non-final row to re-noise,
-    // so the substep hook never fires (WP-E15).
+    // The default euler path is 1-row: there is no non-final row to re-noise
+    // and none to re-anchor, so NEITHER row hook fires (WP-E15 / WP-E16).
+    // Upstream agrees: `bong_iter` returns immediately unless
+    // `row < rows − row_offset`, which no 1-row sampler ever satisfies.
     XCTAssertTrue(injector.substeps.isEmpty, "1-row schedulers have no substep")
+    XCTAssertTrue(bong.calls.isEmpty, "1-row schedulers have no row to re-anchor")
+  }
+
+  /// The T3 hook fires once per non-final row, on both branches that have
+  /// rows, at upstream's row index (`driver row − 1`) — and it fires AFTER the
+  /// T2 substep re-noise and BEFORE that row's evaluation, which is the only
+  /// position where the sample it is handed is the re-noised one.
+  func testBongMathFiresPerNonFinalRowAfterTheSubstepSwapAndBeforeTheEvaluation() throws {
+    let sigmas = try Self.defaultScheduler(steps: 3).sigmas.asArray(Float.self)
+
+    var twoRow: any ZImageScheduler = RES2sScheduler(numInferenceSteps: 3, sigmaValues: sigmas)
+    let twoRowInjector = CountingInjector()
+    let twoRowBong = CountingBongMath()
+    var evaluationsSeen: [Int] = []
+    _ = Krea2DenoiseLoop.run(
+      scheduler: &twoRow, initialSample: Self.bf16Noise(seed: 23),
+      evaluate: { latent, sigma in
+        evaluationsSeen.append(twoRowBong.calls.count)
+        return Self.syntheticTransformer(latent, sigma)
+      },
+      noise: twoRowInjector, bongmath: twoRowBong)
+    XCTAssertEqual(twoRowBong.calls.map { $0.0 }, [0, 1, 2], "one rebase per step")
+    XCTAssertEqual(twoRowBong.calls.map { $0.1 }, [0, 0, 0], "upstream's row 0, not the driver's 1")
+    // Rows alternate 0, 1: the rebase count seen at row 1's evaluation is
+    // always one more than at row 0's, i.e. the rebase preceded it.
+    XCTAssertEqual(evaluationsSeen, [0, 1, 1, 2, 2, 3])
+    // …and it ran after the substep swap, not before: both hooks fired the
+    // same number of times, and the injector's fired first each round.
+    XCTAssertEqual(twoRowInjector.substeps.count, twoRowBong.calls.count)
+
+    var threeRow: any ZImageScheduler = RalstonScheduler(
+      stages: .three, numInferenceSteps: 3, sigmaValues: sigmas)
+    let threeRowBong = CountingBongMath()
+    _ = Krea2DenoiseLoop.run(
+      scheduler: &threeRow, initialSample: Self.bf16Noise(seed: 23),
+      evaluate: Self.syntheticTransformer, noise: CountingInjector(), bongmath: threeRowBong)
+    XCTAssertEqual(
+      threeRowBong.calls.map { $0.0 }, [0, 0, 1, 1, 2, 2], "two rebases per 3-row step")
+    XCTAssertEqual(
+      threeRowBong.calls.map { $0.1 }, [0, 1, 0, 1, 0, 1],
+      "rows 0 and 1 — never the committing row")
+  }
+
+  /// Whatever a T3 conformer says it evaluated is ADDED to the count, so the
+  /// number reported stays the number that happened (§3.3).
+  func testBongMathExtraEvaluationsAreCountedNotAssumed() throws {
+    let sigmas = try Self.defaultScheduler(steps: 3).sigmas.asArray(Float.self)
+    var scheduler: any ZImageScheduler = RES2sScheduler(
+      numInferenceSteps: 3, sigmaValues: sigmas)
+    let bong = CountingBongMath(claimedEvals: 2)
+    let (_, stats) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 29),
+      modelEvalsPerEvaluate: 2,
+      evaluate: Self.syntheticTransformer, bongmath: bong)
+    XCTAssertEqual(bong.calls.count, 3)
+    XCTAssertEqual(stats.evaluateCalls, 3 * 2 + 3 * 2, "6 row calls + 6 the hook reported")
+    XCTAssertEqual(stats.modelEvals, stats.evaluateCalls * 2)
+    XCTAssertEqual(stats.stepsRun, 3, "a hook's evaluations are not steps")
   }
 
   /// The substep hook fires once per non-final row, in row order, before that

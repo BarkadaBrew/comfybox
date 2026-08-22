@@ -7271,7 +7271,7 @@ private actor WarmServerCoordinator {
       let recipeLine: String =
         "Krea2 recipe: sampler=\(recipe.sampler.rawValue) (requested \(samplerAsked)) "
         + "sigma_schedule=\(recipe.sigmaSchedule.rawValue) (requested \(scheduleAsked)) "
-        + "shift=\(shiftLabel) eta=\(recipe.eta)"
+        + "shift=\(shiftLabel) eta=\(recipe.eta) bongmath=\(recipe.bongmath)"
       logger.info("\(recipeLine)")
       // WP-E9 (§3.9, D16, D17): VAE selection — payload.vae → model dir. A
       // named file that is not on disk fails the render here (AC-56); a
@@ -7364,7 +7364,7 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta),
+                eta: recipe.eta, bongmath: recipe.bongmath),
           progress: publishProgress)
       } else {
         (image, trace) = try k2.generateWithRecipe(
@@ -7375,7 +7375,7 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta),
+                eta: recipe.eta, bongmath: recipe.bongmath),
           progress: publishProgress)
       }
       // WP-E10 (FDD §3.10, AC-60): the provenance record is READ BACK from
@@ -8099,6 +8099,11 @@ struct GeneratePayload: Sendable {
   let scheduler: String?
   let sigmaSchedule: String?
   let eta: Float?
+  /// RES4LYF `bongmath` (parity tier T3, WP-E16). Krea 2 + the RES4LYF
+  /// samplers only; asked for with any other sampler it is a 400 naming the
+  /// sampler (`validateKrea2TierGates`), never a silent drop. Absent/false is
+  /// byte-identical to today.
+  let bongmath: Bool?
   /// Explicit schedule shift (FDD-krea2-raw-recipe D3, Addendum A.1). Krea 2
   /// only: nil = the resolution-dependent default; a value IS `mu` (ComfyUI's
   /// `ModelSamplingFlux(shift=…)` parameterisation — `1.15` reproduces the
@@ -8183,6 +8188,7 @@ struct GeneratePayload: Sendable {
     guidance: Float? = nil, seed: UInt64? = nil, outputPath: String? = nil,
     levelsMin: Float? = nil, levelsMax: Float? = nil,
     scheduler: String? = nil, sigmaSchedule: String? = nil, eta: Float? = nil,
+    bongmath: Bool? = nil,
     shift: Float? = nil,
     dype: String? = nil, inpaintImageData: Data? = nil, maskData: Data? = nil,
     denoise: Float? = nil, maskGrow: Int? = nil, maskFeather: Int? = nil,
@@ -8209,7 +8215,7 @@ struct GeneratePayload: Sendable {
     self.guidance = guidance; self.seed = seed; self.outputPath = outputPath
     self.levelsMin = levelsMin; self.levelsMax = levelsMax
     self.scheduler = scheduler; self.sigmaSchedule = sigmaSchedule
-    self.eta = eta; self.shift = shift; self.dype = dype
+    self.eta = eta; self.bongmath = bongmath; self.shift = shift; self.dype = dype
     self.inpaintImageData = inpaintImageData; self.maskData = maskData
     self.denoise = denoise; self.maskGrow = maskGrow; self.maskFeather = maskFeather
     self.maskCropX = maskCropX; self.maskCropY = maskCropY
@@ -8224,7 +8230,7 @@ struct GeneratePayload: Sendable {
 extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
-    case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, shift, dype
+    case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, bongmath, shift, dype
     /// D25: `sampler` is an accepted ALIAS of the wire key `scheduler` (so a
     /// value pasted out of a ComfyUI/RES4LYF UI works). The request key stays
     /// `scheduler` — two live senders post that spelling — while the response
@@ -8278,6 +8284,7 @@ extension GeneratePayload: Decodable {
     scheduler = schedulerRaw ?? samplerRaw
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
+    bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
     shift = try c.decodeIfPresent(Float.self, forKey: .shift)
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
     // Inpaint image + mask arrive as base64 strings from the HTTP API.
@@ -8545,8 +8552,13 @@ extension GeneratePayload: Decodable {
   ///
   /// `names` is still taken — the unknown-name failure happens in
   /// `validateRecipeNames()`, which the caller runs to produce it, and the
-  /// parameter keeps that ordering explicit at every call site. `bongmath` has
-  /// no wire key and is refused at the pipeline (`Krea2Pipeline.validateTiers`).
+  /// parameter keeps that ordering explicit at every call site.
+  ///
+  /// **The `bongmath` arm arrived with WP-E16**, and it is the eta arm's twin:
+  /// tier T3 has landed, `bongmath` now has a wire key, and it is applied on
+  /// the RES4LYF samplers or refused BY SAMPLER — never ignored. Mirrors
+  /// `Krea2Pipeline.makeBongMath(bongmath:sampler:sigmaSchedule:shift:)`,
+  /// which refuses the same request for a non-server caller.
   ///
   /// What remains is the SAMPLER boundary the SDE has: RES4LYF's `eta` splits
   /// a step against RES4LYF's own prepared grid and re-noises the non-final
@@ -8558,14 +8570,22 @@ extension GeneratePayload: Decodable {
   /// `Krea2Pipeline.makeSDEInjector(eta:sampler:stageSeed:layout:)`, which
   /// refuses the same request for a non-server caller.
   func validateKrea2TierGates(_ names: ResolvedRecipeNames) throws {
-    guard let eta, eta != 0 else { return }
     let sampler = names.scheduler ?? .euler
-    guard sampler.isRES4LYFFamily else {
+    let res4lyfList =
+      "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m"
+    if let eta, eta != 0, !sampler.isRES4LYFFamily {
       throw WarmServerError.unsupportedRecipeField(
         field: "eta", value: "\(eta)", family: "krea2",
         reason: "eta is RES4LYF's SDE (parity tier T2) and applies to the RES4LYF samplers only; "
           + "'\(sampler.rawValue)' is not one of them. Send eta 0, or a sampler from "
-          + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m")
+          + res4lyfList)
+    }
+    if bongmath == true, !sampler.isRES4LYFFamily {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "bongmath", value: "true", family: "krea2",
+        reason: "bongmath is RES4LYF's fixed point (parity tier T3) over its own tableau rows "
+          + "and applies to the RES4LYF samplers only; '\(sampler.rawValue)' is not one of "
+          + "them. Send bongmath false, or a sampler from " + res4lyfList)
     }
   }
 
@@ -8583,6 +8603,7 @@ extension GeneratePayload: Decodable {
       sigmaSchedule: names.sigmaSchedule ?? .krea2,
       shift: shift,
       eta: eta ?? 0,
+      bongmath: bongmath ?? false,
       samplerRequested: names.schedulerRequested,
       sigmaScheduleRequested: names.sigmaScheduleRequested)
   }
@@ -8599,6 +8620,9 @@ extension GeneratePayload: Decodable {
     /// `validateKrea2TierGates` is what decides whether the render may have
     /// it, and it decides by SAMPLER.
     let eta: Float
+    /// RES4LYF bongmath (T3, WP-E16). Forwarded on the same terms as `eta`,
+    /// and gated the same way — by sampler, in `validateKrea2TierGates`.
+    let bongmath: Bool
     let samplerRequested: String?
     let sigmaScheduleRequested: String?
   }

@@ -109,7 +109,9 @@ public protocol WarmUpReportingScheduler {
 /// (see the file comment). Callers convert through
 /// ``ZImageScheduler/modelInput(velocity:sample:sigma:)``; `Krea2DenoiseLoop`
 /// does it per row.
-public struct DEISMultistepScheduler: TableauScheduler, WarmUpReportingScheduler {
+public struct DEISMultistepScheduler: TableauScheduler, WarmUpReportingScheduler,
+  RES4LYFFrameScheduler
+{
 
   /// `int(rk_type[-2])` upstream — the multistep order, which also selects the
   /// warm-up's ralston.
@@ -306,10 +308,10 @@ public struct DEISMultistepScheduler: TableauScheduler, WarmUpReportingScheduler
       // never sees) from `eta`.
       //
       // The Krea 2 path sets `overshoot = 0`, so `σ_down == σ_next` and the
-      // factor is exactly 1 at EVERY eta — including 0.5, where the T2 traces
-      // reproduce with it absent. A future implementer must therefore NOT
-      // substitute `sigma_down_eta` here; overshoot is what would make this
-      // term live, and it is unimplemented by choice
+      // factor is exactly 1 at EVERY eta — including 0.5, where the T3 traces
+      // still reproduce with it absent. A future implementer must therefore
+      // NOT substitute `sigma_down_eta` here; overshoot is what would make
+      // this term live, and it is unimplemented by choice
       // (`RES4LYFSDENoise.swift`, "What is NOT modelled").
       precondition(
         previousData.count >= order.historyDepth,
@@ -379,6 +381,12 @@ public struct DEISMultistepScheduler: TableauScheduler, WarmUpReportingScheduler
   }
 
   // MARK: - Helpers
+
+  /// ``RES4LYFFrameScheduler``: `NS.h` for this step. The multistep half
+  /// and the ralston warm-up share it — both are the linear frame.
+  public func frameStepSize(timestepIndex: Int) -> Float {
+    stepSize(timestepIndex: timestepIndex)
+  }
 
   private func stepSize(timestepIndex: Int) -> Float {
     let i = checked(timestepIndex)
