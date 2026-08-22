@@ -15,18 +15,50 @@ import Logging
 
 public struct Krea2ModelPaths {
   public let root: URL
-  public var transformerFile: URL { root.appending(path: "turbo.safetensors") }
+  /// The physical variant read from the checkpoint file present in `root`
+  /// (WP-E5, D7). Reported, never requested.
+  public let variant: Krea2Variant
+  /// Stored, not derived: a `model_index.json` escape hatch may name a third
+  /// filename (FDD §3.5), and provenance records exactly what loaded.
+  public let transformerFile: URL
   public var textEncoderFile: URL { root.appending(path: "text_encoder/model.safetensors") }
-  public var vaeFile: URL { root.appending(path: "vae/diffusion_pytorch_model.safetensors") }
+  /// The model directory's VAE — the bottom of the selection precedence
+  /// (WP-E9, §3.9): `model_index.json` `"vae_file"` when declared, else
+  /// `vae/diffusion_pytorch_model.safetensors`. Stored, not derived, for the
+  /// same reason as `transformerFile`.
+  public let vaeFile: URL
   public var tokenizerDirectory: URL { root.appending(path: "tokenizer") }
 
-  public init(root: URL) { self.root = root }
+  public static func defaultVAEFile(root: URL) -> URL {
+    root.appending(path: "vae/diffusion_pytorch_model.safetensors")
+  }
 
-  /// Locate the newest HF-cache snapshot of krea/Krea-2-Turbo, or use an explicit dir.
+  /// A root whose transformer is `variant.transformerFilename`. Use
+  /// `Krea2ModelDetection.detect(at:)` to read the variant off disk.
+  public init(root: URL, variant: Krea2Variant = .turbo) {
+    self.init(root: root, variant: variant, transformerFile: root.appending(path: variant.transformerFilename))
+  }
+
+  public init(root: URL, variant: Krea2Variant, transformerFile: URL, vaeFile: URL? = nil) {
+    self.root = root
+    self.variant = variant
+    self.transformerFile = transformerFile
+    self.vaeFile = vaeFile ?? Self.defaultVAEFile(root: root)
+  }
+
+  /// An explicit dir is detected fail-closed (variant read from disk, throws
+  /// on a non-Krea-2 dir); nil → the newest HF-cache snapshot of krea/Krea-2-Turbo.
   public static func resolve(modelDir: String? = nil) throws -> Krea2ModelPaths {
     if let modelDir {
-      return Krea2ModelPaths(root: URL(fileURLWithPath: (modelDir as NSString).expandingTildeInPath))
+      return try Krea2ModelDetection.detect(
+        at: URL(fileURLWithPath: (modelDir as NSString).expandingTildeInPath, isDirectory: true))
     }
+    return try turboSnapshot()
+  }
+
+  /// The newest HF-cache snapshot of krea/Krea-2-Turbo. Reached ONLY through
+  /// the four declared turbo aliases (`Krea2ModelDetection.turboAliases`).
+  public static func turboSnapshot() throws -> Krea2ModelPaths {
     let snapshots = ("~/.cache/huggingface/hub/models--krea--Krea-2-Turbo/snapshots" as NSString)
       .expandingTildeInPath
     let fm = FileManager.default
@@ -37,7 +69,7 @@ public struct Krea2ModelPaths {
     for entry in entries.sorted(by: >) {
       let candidate = URL(fileURLWithPath: snapshots).appending(path: entry)
       if fm.fileExists(atPath: candidate.appending(path: "turbo.safetensors").path) {
-        return Krea2ModelPaths(root: candidate)
+        return Krea2ModelPaths(root: candidate, variant: .turbo)
       }
     }
     throw Krea2WeightLoaderError.missingFile("\(snapshots)/*/turbo.safetensors")
@@ -228,10 +260,23 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
 
 public final class Krea2Pipeline {
   public let config: Krea2Config
+  /// Where the weights came from — root, physical variant, transformer file.
+  public let paths: Krea2ModelPaths
+  /// The physical checkpoint variant this pipeline loaded (WP-E5, D7).
+  public var variant: Krea2Variant { paths.variant }
   public let transformer: Krea2SingleStreamDiT
   public let textEncoder: Qwen3TextEncoder
   public let conditioner: Krea2TextConditioner
-  public let vae: Krea2VAE
+  /// The ONE `Krea2VAE` instance — serves both `decode` and `encode`, so
+  /// encoder-side selection follows decoder-side automatically (AC-57). Owned
+  /// by `vaeSlot`, which reloads its weights in place (WP-E9, D17).
+  public var vae: Krea2VAE { vaeSlot.vae }
+  public let vaeSlot: Krea2VAESlot
+  /// What decoded the last/next render and how it was selected (WP-E9; feeds
+  /// `RenderRecipe.vae`, WP-E10).
+  public var currentVAE: Krea2VAESelection { vaeSlot.current }
+  /// In-place decoder reloads since load (AC-59).
+  public var vaeReloadCount: Int { vaeSlot.reloadCount }
 
   private let logger = Logger(label: "z-image.krea2-pipeline")
 
@@ -245,6 +290,12 @@ public final class Krea2Pipeline {
 
   /// Public accessor for currently loaded LoRA configurations.
   public var loadedLoRAConfigs: [LoRAConfiguration] { appliedLoRAs }
+
+  /// One report per entry of `loadedLoRAConfigs`, same order (WP-E6). Every
+  /// report here is complete (`bound == offered`, `unbound.isEmpty`) because
+  /// Krea-2 applies strictly — a partial bind never survives `loadLoRAs`.
+  /// `deltasApplied` feeds `RenderRecipe.loras[].deltas_applied` (D15).
+  public private(set) var loadedLoRAReports: [LoRAApplicationReport] = []
 
   public struct Request {
     public var prompt: String
@@ -291,8 +342,10 @@ public final class Krea2Pipeline {
 
   public init(paths: Krea2ModelPaths, quantizeTransformer: Int? = nil) throws {
     self.config = Krea2Config()
+    self.paths = paths
 
     let transformer = Krea2SingleStreamDiT(cfg: config)
+    logger.info("Krea2: loading \(paths.variant.rawValue) transformer from \(paths.transformerFile.path)")
     try Krea2WeightLoader.loadTransformer(transformer, from: paths.transformerFile)
     if let bits = quantizeTransformer {
       quantize(model: transformer, groupSize: 64, bits: bits) { path, module in
@@ -309,11 +362,35 @@ public final class Krea2Pipeline {
     let tokenizer = try QwenTokenizer.load(from: paths.root)
     self.conditioner = Krea2TextConditioner(encoder: encoder, tokenizer: tokenizer)
 
-    let vae = Krea2VAE()
-    try Krea2WeightLoader.loadVAE(vae, from: paths.vaeFile)
-    self.vae = vae
+    // The model directory's VAE is the resident default (D16); the layout is
+    // sniffed from the keys, so a Wan file declared via model_index.json
+    // `vae_file` loads correctly too.
+    let slot = try Krea2VAESlot(loading: paths.vaeFile, source: .modelDir)
+    self.vaeSlot = slot
+    logger.info("Krea2: VAE \(slot.current.layout.rawValue) from \(paths.vaeFile.path)")
 
-    MLX.eval(transformer.parameters(), encoder.parameters(), vae.parameters())
+    MLX.eval(transformer.parameters(), encoder.parameters(), slot.vae.parameters())
+  }
+
+  // MARK: - VAE selection (WP-E9)
+
+  /// Make `path` the resident decoder, reloading IN PLACE on the one
+  /// `Krea2VAE` instance — never a pool eviction (D17). Returns `true` when
+  /// weights were reloaded, `false` when `path` was already resident.
+  /// Fail-closed: a file that is not on disk, or a layout `detectLayout`
+  /// cannot name, throws and leaves the resident decoder untouched.
+  @discardableResult
+  public func ensureVAE(
+    path: URL, layout: VAELayout? = nil, source: Krea2VAESelection.Source = .payload
+  ) throws -> Bool {
+    let previous = vaeSlot.current
+    let reloaded = try vaeSlot.ensure(file: path, layout: layout, source: source)
+    if reloaded {
+      let line = "Krea2: VAE reloaded in place \(previous.layout.rawValue) \(previous.file.lastPathComponent) → "
+        + "\(vaeSlot.current.layout.rawValue) \(path.path) (source=\(source.rawValue), reloads=\(vaeSlot.reloadCount))"
+      logger.info("\(line)")
+    }
+    return reloaded
   }
 
   // MARK: - LoRA Support
@@ -330,32 +407,46 @@ public final class Krea2Pipeline {
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
       patchSession.clear()
       appliedLoRAs = []
+      loadedLoRAReports = []
     }
 
     guard !configs.isEmpty else { return }
 
     // Load and preflight-able failures (missing file, bad format, unknown
-    // keys) all surface from loadForKrea2 BEFORE any weight mutation for
-    // that config. If a later config fails after earlier ones applied, roll
-    // the whole stack back so applied weights and `appliedLoRAs` can never
-    // disagree (delta-key spec rev 2, Codex finding 2).
+    // keys, wrong-base relativity, strict partial bind) all surface BEFORE
+    // any weight mutation for that config. If a later config fails after
+    // earlier ones applied, roll the whole stack back so applied weights and
+    // `appliedLoRAs` can never disagree (delta-key spec rev 2, Codex finding 2).
+    var reports: [LoRAApplicationReport] = []
     do {
       for config in configs {
         let url = try await LoRAWeightLoader.resolveSource(config.source)
+        let name = config.source.displayName
+        // WP-E6 / AC-41 relativity guard — before the file is even read.
+        try Krea2LoRARelativity.check(
+          lora: name,
+          required: Krea2LoRARelativity.required(for: config, resolvedURL: url),
+          loaded: variant)
         let weights = try LoRAWeightLoader.loadForKrea2(from: url)
-        logger.info("Applying Krea-2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale))")
-        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: config.scale, logger: logger)
-        try patchSession.apply(weights: weights, scale: config.scale)
+        logger.info("Applying Krea-2 LoRA: \(name) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale), base=\(variant.rawValue))")
+        let report = try LoRAApplicator.applyDynamically(
+          to: transformer, loraWeights: weights, scale: config.scale,
+          strict: true, name: name, logger: logger)
+        let deltas = try patchSession.apply(weights: weights, scale: config.scale)
+        reports.append(report.withDeltasApplied(deltas))
+        logger.info("Krea-2 LoRA \(name): bound \(report.bound)/\(report.offered) (\(report.quantizedBound) quantized), deltas=\(deltas)")
       }
     } catch {
       logger.error("Krea-2 LoRA stack failed mid-apply — rolling back to base: \(error)")
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
       patchSession.clear()
       appliedLoRAs = []
+      loadedLoRAReports = []
       throw error
     }
 
     appliedLoRAs = configs
+    loadedLoRAReports = reports
   }
 
   /// Load (or clear) the depth Control-LoRA. Sets the expanded input projection
@@ -384,7 +475,9 @@ public final class Krea2Pipeline {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
         let weights = try LoRAWeightLoader.loadForKrea2(from: src)
-        LoRAApplicator.applyDynamically(to: transformer, loraWeights: weights, scale: cfg.scale, logger: logger)
+        try LoRAApplicator.applyDynamically(
+          to: transformer, loraWeights: weights, scale: cfg.scale,
+          strict: true, name: cfg.source.displayName, logger: logger)
         try patchSession.apply(weights: weights, scale: cfg.scale)
       }
     } catch {
@@ -394,6 +487,7 @@ public final class Krea2Pipeline {
       LoRAApplicator.clearDynamicLoRA(from: transformer, logger: logger)
       patchSession.clear()
       appliedLoRAs = []
+      loadedLoRAReports = []
       transformer.controlFirstWeight = nil
       transformer.controlFirstBias = nil
       controlLoRAActive = false
@@ -413,7 +507,17 @@ public final class Krea2Pipeline {
     MLX.eval(cw, cb)
     transformer.controlFirstWeight = cw
     transformer.controlFirstBias = cb
-    LoRAApplicator.applyDynamically(to: transformer, loraWeights: cl.loraWeights, scale: scale, logger: logger)
+    // Strict: the 224 control adapters must ALL bind or none do (WP-E6).
+    do {
+      try LoRAApplicator.applyDynamically(
+        to: transformer, loraWeights: cl.loraWeights, scale: scale,
+        strict: true, name: url.lastPathComponent, logger: logger)
+    } catch {
+      transformer.controlFirstWeight = nil
+      transformer.controlFirstBias = nil
+      controlLoRAActive = false
+      throw error
+    }
     controlLoRAActive = true
     logger.info("Krea-2 depth Control-LoRA active (scale=\(scale))")
   }

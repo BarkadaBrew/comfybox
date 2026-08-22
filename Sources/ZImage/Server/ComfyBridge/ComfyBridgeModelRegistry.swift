@@ -428,6 +428,20 @@ public enum ComfyBoxModelRegistry {
       description: "lodestones' Kroma — a Krea-2 fine-tune with the Turbo delta baked in (rank-512). Distilled for 8-12 steps. MIT. Successor to the kroma-v0.1 LoRA-delta packaging."
     ),
 
+    ComfyBoxModel(
+      id: "krea2-raw",
+      family: .krea2, variant: .base, quantization: .q8,
+      huggingFaceId: "krea/Krea-2-Raw",
+      parametersBillions: 13.5, latentChannels: 16,
+      defaultSteps: Krea2Variant.raw.defaultSteps, defaultGuidance: Krea2Variant.raw.defaultGuidance,
+      supportsGuidance: true, supportsLoRA: true,
+      supportsControlNet: false, supportsImg2Img: false,
+      defaultWidth: 1024, defaultHeight: 1024,
+      estimatedVRAM_GB: 22.0,
+      displayName: "Krea-2-Raw",
+      description: "Krea's undistilled base (raw.safetensors). Honours CFG and negative prompts; step/guidance budgets are client policy (raw-accel / raw-stock). Resolved from the declared krea2Models table — never the Turbo snapshot (WP-E5)."
+    ),
+
     // ─── ESRGAN Family ───────────────────────────────────────────────
     // RRDBNet-based 4× upscalers. Various community weights.
 

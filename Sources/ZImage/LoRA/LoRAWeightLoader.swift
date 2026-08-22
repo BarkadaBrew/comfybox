@@ -106,6 +106,34 @@ public final class LoRAWeightLoader {
         )
     }
 
+    /// B4a (WP-E6, FDD §3.6 / D10 / AC-49): open a safetensors file, and when
+    /// the header fails to parse AND the body is JSON, throw
+    /// ``LoRAError/notASafetensorsFile(_:firstBytes:)`` quoting the payload —
+    /// the civitai early-access error page saved as `.safetensors` is the
+    /// motivating artifact. Deliberately NOT a size check: the real bypass
+    /// LoRA is 1,040 bytes and must load. Non-JSON failures rethrow the
+    /// reader's own error untouched.
+    static func openSafetensors(_ url: URL) throws -> SafeTensorsReader {
+        do {
+            return try SafeTensorsReader(fileURL: url)
+        } catch {
+            guard let head = try? FileHandle(forReadingFrom: url).read(upToCount: 256),
+                  let firstNonSpace = head.first(where: { !Self.asciiWhitespace.contains($0) }),
+                  firstNonSpace == UInt8(ascii: "{") || firstNonSpace == UInt8(ascii: "["),
+                  // A real safetensors prefix is a little-endian UInt64 header
+                  // length — bytes 1…7 are zero for any sane size. `{` is 0x7B,
+                  // so a corrupt binary whose length happens to be 123 must not
+                  // be re-labelled as JSON.
+                  !(head.count >= 8 && head[head.startIndex + 1 ..< head.startIndex + 8].allSatisfy { $0 == 0 })
+            else { throw error }
+            let text = String(decoding: head, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw LoRAError.notASafetensorsFile(url.path, firstBytes: text)
+        }
+    }
+
+    private static let asciiWhitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D, 0x0B, 0x0C]
+
     public static func resolveSource(_ source: LoRASource) async throws -> URL {
         switch source {
         case .local(let url):
@@ -125,7 +153,7 @@ public final class LoRAWeightLoader {
         }
 
         do {
-            let reader = try SafeTensorsReader(fileURL: url)
+            let reader = try openSafetensors(url)
             let keys = reader.tensorNames
 
             let hasDownWeights = keys.contains { key in loraPatterns.contains { key.contains($0.down) } }
@@ -299,7 +327,7 @@ public final class LoRAWeightLoader {
     private static let outOfScopePrefixes = ["lora_te_", "text_encoder.", "te_"]
 
     private static func loadSafetensorFile(_ url: URL) throws -> PartialLoRAWeights {
-        let reader = try SafeTensorsReader(fileURL: url)
+        let reader = try openSafetensors(url)
         let keys = reader.tensorNames
 
         var consumedKeys = Set<String>()
@@ -435,7 +463,7 @@ public final class LoRAWeightLoader {
             throw LoRAError.fileNotFound(url.path)
         }
 
-        let reader = try SafeTensorsReader(fileURL: url)
+        let reader = try openSafetensors(url)
         let keys = reader.tensorNames
 
         var processedKeys = Set<String>()
@@ -515,7 +543,7 @@ public final class LoRAWeightLoader {
       throw LoRAError.fileNotFound(url.path)
     }
 
-    let reader = try SafeTensorsReader(fileURL: url)
+    let reader = try openSafetensors(url)
     let keys = reader.tensorNames
 
     var consumedKeys = Set<String>()

@@ -321,6 +321,18 @@ public final class Krea2VAE: Module {
     3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916,
   ]
 
+  /// The latent-space normalisation constants are a property of the Krea-2
+  /// latent space (Qwen-Image `vae/config.json` `latents_mean`/`latents_std`),
+  /// NOT of the decoder file: the Wan 2.1 FP32 decoder (WP-E9, D16) shares
+  /// the same lineage and uses the same constants. AC-55 pins this; if a
+  /// layout ever needs its own constants, this is where it surfaces.
+  public static func latentNormalization(for layout: VAELayout) -> (mean: [Float], std: [Float]) {
+    switch layout {
+    case .qwenDiffusers, .wanNative:
+      return (latentsMean, latentsStd)
+    }
+  }
+
   @ModuleInfo(key: "post_quant_conv") var postQuantConv: Conv2d
   @ModuleInfo(key: "decoder") var decoder: Krea2VAEDecoder
   @ModuleInfo(key: "quant_conv") var quantConv: Conv2d

@@ -624,7 +624,7 @@ public class ZImageControlPipeline {
         logger.info("Loading LoRA \(index + 1)/\(requestedConfigs.count) from \(config.source.displayName)...")
         let loraWeights = try await LoRAWeightLoader.load(from: config)
         logger.info("Loaded LoRA: rank=\(loraWeights.rank), alpha=\(loraWeights.alpha), layers=\(loraWeights.layerCount)")
-        LoRAApplicator.applyDynamically(to: transformer, loraWeights: loraWeights, scale: config.scale, logger: logger)
+        try LoRAApplicator.applyDynamically(to: transformer, loraWeights: loraWeights, scale: config.scale, logger: logger)
         currentLoRAs.append(AppliedLoRA(weights: loraWeights, configuration: config))
         logger.info("LoRA applied successfully with scale=\(config.scale)")
       }

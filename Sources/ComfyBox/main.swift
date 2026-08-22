@@ -1636,6 +1636,8 @@ struct ZImageCLI {
     // Load ~/.comfybox/config.json, auto-migrating from ~/.coffeeshop on first launch.
     // Config supplies defaults; explicit CLI flags below override them.
     let config = ComfyBoxServerConfig.loadOrMigrate()
+    // Seed the ONE Krea-2 spec→directory table from config (WP-E5).
+    Krea2ModelDetection.configureSpecDirectories(config.krea2Models)
 
     var model: String? = config.modelSpec
     var textEncoderPath: String?
@@ -4646,7 +4648,7 @@ struct ZImageCLI {
     }
 
     let paths = try Krea2ModelPaths.resolve(modelDir: modelDir)
-    logger.info("krea2: model root \(paths.root.path)")
+    logger.info("krea2: model root \(paths.root.path) variant=\(paths.variant.rawValue) transformer=\(paths.transformerFile.lastPathComponent)")
 
     let loadStart = Date()
     let pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: quantBits)

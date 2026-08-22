@@ -10,7 +10,7 @@ import MLXNN
 ///
 /// - **Preflight before mutation** (finding 2): every delta key is resolved
 ///   against a flattened parameter-path index first; any miss throws
-///   ``LoRAError/partialApplication(missing:)`` with nothing changed.
+///   ``LoRAError/partialApplication(lora:unbound:)`` with nothing changed.
 /// - **Parameter index, not module traversal** (finding 7): Kroma's targets
 ///   include bare leaf parameters (`prenorm.scale`, modulation arrays) that
 ///   no Linear-module walk can reach.
@@ -50,7 +50,7 @@ public final class LoRAPatchSession {
 
     /// Dry-run: resolve every delta against the module's parameter index
     /// without mutating anything. Returns the number of resolved ops; throws
-    /// ``LoRAError/partialApplication(missing:)`` listing every miss.
+    /// ``LoRAError/partialApplication(lora:unbound:)`` listing every miss.
     /// Shape metadata only — safe on a lazily-initialized module.
     @discardableResult
     public func preflight(weights: LoRAWeights) throws -> Int {
@@ -67,15 +67,17 @@ public final class LoRAPatchSession {
             resolved += 1
         }
         guard missing.isEmpty else {
-            throw LoRAError.partialApplication(missing: missing)
+            throw LoRAError.partialApplication(lora: nil, unbound: missing.sorted())
         }
         return resolved
     }
 
     /// Preflights and applies all deltas in `weights`. Throws BEFORE any
-    /// mutation if a single target fails to resolve.
-    public func apply(weights: LoRAWeights, scale: Float) throws {
-        guard !weights.deltas.isEmpty else { return }
+    /// mutation if a single target fails to resolve. Returns the number of
+    /// deltas applied (``LoRAApplicationReport/deltasApplied`` — WP-E6).
+    @discardableResult
+    public func apply(weights: LoRAWeights, scale: Float) throws -> Int {
+        guard !weights.deltas.isEmpty else { return 0 }
 
         let paramIndex = flattenedParameters()
         let moduleIndex = flattenedModules()
@@ -101,7 +103,7 @@ public final class LoRAPatchSession {
                 quantized: path.hasSuffix(".weight") ? quantized : nil))
         }
         guard missing.isEmpty else {
-            throw LoRAError.partialApplication(missing: missing)
+            throw LoRAError.partialApplication(lora: nil, unbound: missing.sorted())
         }
 
         // Validate shapes up front too — still pre-mutation.
@@ -140,6 +142,7 @@ public final class LoRAPatchSession {
 
         module.update(parameters: ModuleParameters.unflattened(updates))
         eval(module.parameters())
+        return ops.count
     }
 
     private func commitQuantized(

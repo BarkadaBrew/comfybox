@@ -280,7 +280,7 @@ public final class Flux2Pipeline {
 
       logger.info("Applying Flux 2 LoRA: \(config.source.displayName) (rank=\(weights.rank), layers=\(weights.layerCount), scale=\(config.scale))")
 
-      LoRAApplicator.applyDynamically(
+      try LoRAApplicator.applyDynamically(
         to: components.transformer,
         loraWeights: weights,
         scale: config.scale,

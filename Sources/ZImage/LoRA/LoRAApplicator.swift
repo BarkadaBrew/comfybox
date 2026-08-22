@@ -3,6 +3,46 @@ import MLX
 import MLXNN
 import Logging
 
+/// What one `applyDynamically` call actually bound (WP-E6, FDD §3.6 / D9).
+/// `bound < offered` is the strict *test*; `unbound` is the strict *evidence*.
+public struct LoRAApplicationReport: Sendable, Equatable {
+    /// `loraWeights.weights.count` — low-rank pairs the file offered.
+    public let offered: Int
+    /// Modules that received an adapter (`appliedCount`).
+    public let bound: Int
+    /// Of `bound`, how many landed on quantized Linears.
+    public let quantizedBound: Int
+    /// Bare-parameter deltas applied through ``LoRAPatchSession`` (the
+    /// applicator itself never applies deltas; the pipeline fills this in
+    /// via ``withDeltasApplied(_:)``). Required on every Krea-2 render's
+    /// provenance so a Raw+kroma render shows `deltas_applied: 0` (D15).
+    public let deltasApplied: Int
+    /// Pairs that matched a module but failed `normalizeLoRAPair` — a real,
+    /// different fault from `unbound`; counted, and in neither list.
+    public let shapeRejected: Int
+    /// OFFERED KEYS THAT BOUND NOTHING. Sorted. Logged capped at 32.
+    public let unbound: [String]
+
+    public init(offered: Int, bound: Int, quantizedBound: Int, deltasApplied: Int,
+                shapeRejected: Int, unbound: [String]) {
+        self.offered = offered
+        self.bound = bound
+        self.quantizedBound = quantizedBound
+        self.deltasApplied = deltasApplied
+        self.shapeRejected = shapeRejected
+        self.unbound = unbound
+    }
+
+    /// Every offered pair bound and nothing was shape-rejected.
+    public var isComplete: Bool { unbound.isEmpty && shapeRejected == 0 }
+
+    public func withDeltasApplied(_ count: Int) -> LoRAApplicationReport {
+        LoRAApplicationReport(offered: offered, bound: bound, quantizedBound: quantizedBound,
+                              deltasApplied: count, shapeRejected: shapeRejected, unbound: unbound)
+    }
+}
+
+
 public struct LoRAApplicator {
 
     private static func linearDims(for module: Module) -> (out: Int, in: Int)? {
@@ -430,24 +470,62 @@ public struct LoRAApplicator {
         }
     }
 
+    /// Apply the low-rank pairs in `loraWeights` as dynamic adapters and
+    /// report exactly what bound (WP-E6, FDD §3.6 / D9).
+    ///
+    /// - `strict: false` (default — Z-Image, Flux2, Chroma): behaviour is
+    ///   byte-identical to the pre-E6 applicator; the report is informational.
+    /// - `strict: true` (Krea-2 only): an offered key that matched no module,
+    ///   or a pair that matched but failed shape normalisation, throws BEFORE
+    ///   any module is touched — the bind list is built first and committed
+    ///   only once it is complete. `partialApplication` names the unbound
+    ///   keys; a shape rejection throws `incompatibleWeights` naming the key.
+    ///
+    /// `unbound` is **offered keys minus consumed keys** — never the modules
+    /// that had no adapter (thousands for any sparse LoRA) and never blind to
+    /// an offered key no module visits (the one failure that matters).
+    /// One resolved (module, normalized pair) awaiting commit — built in full
+    /// before anything is mutated so a strict refusal touches nothing.
+    private struct PendingBind {
+        let key: String
+        let module: Module
+        let down: MLXArray
+        let up: MLXArray
+        let scale: Float
+    }
+
+    @discardableResult
     public static func applyDynamically<T: Module>(
         to transformer: T,
         loraWeights: LoRAWeights,
         scale: Float,
+        strict: Bool = false,
+        name: String? = nil,
         logger: Logger? = nil
-    ) {
-        logger?.info("Applying dynamic LoRA with scale=\(scale)")
+    ) throws -> LoRAApplicationReport {
+        logger?.info("Applying dynamic LoRA with scale=\(scale)\(strict ? " (strict)" : "")")
 
-        var moduleUpdates: [(String, Module)] = []
-        var appliedCount = 0
-        var quantizedCount = 0
+        var pending: [PendingBind] = []
+        var consumedKeys = Set<String>()
+        var shapeRejectedKeys: [String] = []
 
         for (key, module) in transformer.namedModules() {
             guard let dims = linearDims(for: module) else { continue }
 
             let loraKey = key.hasSuffix(".weight") ? key : key + ".weight"
-            var pair: (down: MLXArray, up: MLXArray)? = loraWeights.weights[loraKey] ?? loraWeights.weights[key]
+            var pair: (down: MLXArray, up: MLXArray)?
             var scaleKey = loraKey
+            // The dictionary key that actually matched — what `consumedKeys`
+            // records (the offered spelling, with or without ".weight").
+            var matchedKey: String?
+
+            if let direct = loraWeights.weights[loraKey] {
+                pair = direct
+                matchedKey = loraKey
+            } else if let bare = loraWeights.weights[key] {
+                pair = bare
+                matchedKey = key
+            }
 
             if pair == nil {
                 // Fallback: some LoRA packs store combined qkv deltas under attention.qkv.*
@@ -469,22 +547,28 @@ public struct LoRAApplicator {
                         projectionIndex = 0
                     }
 
-                    if let qkvKey,
-                       let qkvPair = loraWeights.weights[qkvKey + ".weight"] ?? loraWeights.weights[qkvKey],
-                       let normalized = normalizeQKVLoRAPair(
-                        down: qkvPair.down,
-                        up: qkvPair.up,
-                        inFeatures: dims.in,
-                        outFeatures: dims.out,
-                        projectionIndex: projectionIndex
-                       ) {
-                        pair = normalized
-                        scaleKey = qkvKey + ".weight"
+                    if let qkvKey {
+                        let qkvMatched: String? = loraWeights.weights[qkvKey + ".weight"] != nil
+                            ? qkvKey + ".weight"
+                            : (loraWeights.weights[qkvKey] != nil ? qkvKey : nil)
+                        if let qkvMatched,
+                           let qkvPair = loraWeights.weights[qkvMatched],
+                           let normalized = normalizeQKVLoRAPair(
+                            down: qkvPair.down,
+                            up: qkvPair.up,
+                            inFeatures: dims.in,
+                            outFeatures: dims.out,
+                            projectionIndex: projectionIndex
+                           ) {
+                            pair = normalized
+                            scaleKey = qkvKey + ".weight"
+                            matchedKey = qkvMatched
+                        }
                     }
                 }
             }
 
-            guard let pair else { continue }
+            guard let pair, let matchedKey else { continue }
 
             let effectiveScale = scale * loraWeights.effectiveScale(forLayer: scaleKey)
 
@@ -495,35 +579,65 @@ public struct LoRAApplicator {
                 outFeatures: dims.out
             ) else {
                 logger?.debug("Skipping LoRA for \(key): down=\(pair.down.shape) up=\(pair.up.shape) vs weight (\(dims.out)x\(dims.in))")
+                shapeRejectedKeys.append(matchedKey)
                 continue
             }
 
-            let down = normalized.down
-            let up = normalized.up
+            pending.append(PendingBind(
+                key: key, module: module,
+                down: normalized.down, up: normalized.up, scale: effectiveScale))
+            consumedKeys.insert(matchedKey)
+        }
 
-            if let loraLinear = module as? LoRALinear {
-                loraLinear.addLoRA(down: down, up: up, scale: effectiveScale)
+        let offered = loraWeights.weights.count
+        let shapeRejectedSet = Set(shapeRejectedKeys)
+        let unbound = Set(loraWeights.weights.keys)
+            .subtracting(consumedKeys)
+            .subtracting(shapeRejectedSet)
+            .sorted()
+
+        if strict {
+            if !unbound.isEmpty {
+                logger?.error("LoRA \(name ?? "<unnamed>") bound \(pending.count)/\(offered): \(unbound.count) offered key(s) matched no module — refusing (strict): \(unbound.prefix(32).joined(separator: ", "))")
+                throw LoRAError.partialApplication(lora: name, unbound: unbound)
+            }
+            if !shapeRejectedSet.isEmpty {
+                let listed = shapeRejectedSet.sorted().prefix(32).joined(separator: ", ")
+                logger?.error("LoRA \(name ?? "<unnamed>"): \(shapeRejectedSet.count) pair(s) matched a module but not its shape — refusing (strict): \(listed)")
+                throw LoRAError.incompatibleWeights(
+                    "LoRA '\(name ?? "<unnamed>")' has \(shapeRejectedSet.count) pair(s) whose shape does not fit the target module: \(listed)")
+            }
+        }
+
+        // ---- Commit: nothing above mutated the module tree ----
+        var moduleUpdates: [(String, Module)] = []
+        var appliedCount = 0
+        var quantizedCount = 0
+
+        for p in pending {
+            if let loraLinear = p.module as? LoRALinear {
+                loraLinear.addLoRA(down: p.down, up: p.up, scale: p.scale)
                 appliedCount += 1
                 continue
             }
-            if let loraQuantized = module as? LoRAQuantizedLinear {
-                loraQuantized.addLoRA(down: down, up: up, scale: effectiveScale)
+            if let loraQuantized = p.module as? LoRAQuantizedLinear {
+                loraQuantized.addLoRA(down: p.down, up: p.up, scale: p.scale)
                 appliedCount += 1
                 quantizedCount += 1
                 continue
             }
-            if let quantizedLinear = module as? QuantizedLinear {
+            if let quantizedLinear = p.module as? QuantizedLinear {
                 let loraQuantized = LoRAQuantizedLinear(from: quantizedLinear)
-                loraQuantized.addLoRA(down: down, up: up, scale: effectiveScale)
-                moduleUpdates.append((key, loraQuantized))
+                loraQuantized.addLoRA(down: p.down, up: p.up, scale: p.scale)
+                moduleUpdates.append((p.key, loraQuantized))
                 appliedCount += 1
                 quantizedCount += 1
                 continue
             }
-            if let linear = module as? Linear {
+            if let linear = p.module as? Linear {
                 let loraLinear = LoRALinear(from: linear)
-                loraLinear.addLoRA(down: down, up: up, scale: effectiveScale)
-                moduleUpdates.append((key, loraLinear))
+                loraLinear.addLoRA(down: p.down, up: p.up, scale: p.scale)
+                moduleUpdates.append((p.key, loraLinear))
                 appliedCount += 1
                 continue
             }
@@ -548,6 +662,17 @@ public struct LoRAApplicator {
         if appliedCount == 0 && !loraWeights.hasLoKr {
             logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
         }
+        if !unbound.isEmpty {
+            logger?.warning("LoRA \(name ?? "<unnamed>") bound \(appliedCount)/\(offered): \(unbound.count) offered key(s) matched no module: \(unbound.prefix(32).joined(separator: ", "))\(unbound.count > 32 ? " …" : "")")
+        }
+
+        return LoRAApplicationReport(
+            offered: offered,
+            bound: appliedCount,
+            quantizedBound: quantizedCount,
+            deltasApplied: 0,
+            shapeRejected: shapeRejectedSet.count,
+            unbound: unbound)
     }
 
     public static func clearDynamicLoRA<T: Module>(

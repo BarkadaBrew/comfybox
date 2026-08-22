@@ -271,6 +271,10 @@ enum ComfyBridgeObjectInfo {
     )
 
     // --- Sampling helper nodes ---
+    // WP-E4 (AC-17): sampler_name / scheduler option lists are GENERATED from
+    // the engine's enums + declared aliases (RecipeNameResolver), so every
+    // advertised name resolves and nothing phantom (uni_pc, dpmpp_2m_sde) can
+    // reappear. Krita reads these lists at connect time.
     info["BasicGuider"] = nodeDefinition(
       required: [
         "model": modelInput(),
@@ -290,7 +294,7 @@ enum ComfyBridgeObjectInfo {
     info["BasicScheduler"] = nodeDefinition(
       required: [
         "model": modelInput(),
-        "scheduler": optionInput(["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"]),
+        "scheduler": optionInput(RecipeNameResolver.advertisedSigmaScheduleNames),
         "steps": intInput(default: 9),
         "denoise": floatInput(default: 1.0),
       ],
@@ -299,7 +303,7 @@ enum ComfyBridgeObjectInfo {
     )
     info["KSamplerSelect"] = nodeDefinition(
       required: [
-        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
+        "sampler_name": optionInput(RecipeNameResolver.advertisedSamplerNames),
       ],
       outputs: ["SAMPLER"]
     )
@@ -330,8 +334,8 @@ enum ComfyBridgeObjectInfo {
         "seed": intInput(default: 0),
         "steps": intInput(default: 9),
         "cfg": floatInput(default: 0.0),
-        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
-        "scheduler": optionInput(["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"]),
+        "sampler_name": optionInput(RecipeNameResolver.advertisedSamplerNames),
+        "scheduler": optionInput(RecipeNameResolver.advertisedSigmaScheduleNames),
         "positive": conditioningInput(),
         "negative": conditioningInput(),
         "latent_image": latentInput(),
@@ -350,8 +354,8 @@ enum ComfyBridgeObjectInfo {
         "noise_seed": intInput(default: 0),
         "steps": intInput(default: 20),
         "cfg": floatInput(default: 8.0),
-        "sampler_name": optionInput(["euler", "heun", "dpmpp_2m", "dpmpp_2s_ancestral", "deis", "ddim", "uni_pc", "res_2s"]),
-        "scheduler": optionInput(["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"]),
+        "sampler_name": optionInput(RecipeNameResolver.advertisedSamplerNames),
+        "scheduler": optionInput(RecipeNameResolver.advertisedSigmaScheduleNames),
         "positive": conditioningInput(),
         "negative": conditioningInput(),
         "latent_image": latentInput(),

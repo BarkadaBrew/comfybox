@@ -1114,6 +1114,17 @@ public final class WarmServer {
       guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
         return .error(.error(status: 400, message: "Invalid request body"))
       }
+      // WP-E6: `krea2_relative` is declared by the user — an unknown value
+      // is a 400, never silently dropped.
+      var krea2Relative: Krea2Variant?
+      if let raw = json["krea2_relative"] {
+        guard let str = raw as? String, let parsed = Krea2Variant(rawValue: str) else {
+          return .error(.error(
+            status: 400,
+            message: "Invalid krea2_relative '\(raw)': expected one of \(Krea2Variant.allCases.map(\.rawValue))"))
+        }
+        krea2Relative = parsed
+      }
       let patch = LoRAEntryPatch(
         triggerwords: json["triggerwords"] as? [String],
         recommendedScale: (json["recommended_scale"] as? NSNumber)?.floatValue,
@@ -1121,7 +1132,8 @@ public final class WarmServer {
         tags: json["tags"] as? [String],
         notes: json["notes"] as? String,
         sourceURL: json["source_url"] as? String,
-        civitaiModelId: json["civitai_model_id"] as? Int
+        civitaiModelId: json["civitai_model_id"] as? Int,
+        krea2Relative: krea2Relative
       )
       do {
         try library.update(id, patch: patch)
@@ -2928,29 +2940,50 @@ public final class WarmServer {
   // Presets ------------------------------------------------------------------
 
   private func presetsListResponse() -> RoutedResponse {
-    .json(status: 200, payload: presetStore.list())
+    Self.presetsList(store: presetStore)
+  }
+
+  /// `GET /v1/presets` (WP-E20, AC-44c): every preset, flat, with
+  /// `invalid` / `invalid_reason` so a flagged preset is visible and
+  /// un-selectable by the desktop app, the bridge and MCP alike.
+  static func presetsList(store: PresetStore) -> RoutedResponse {
+    .json(status: 200, payload: store.listing())
   }
 
   private func getPresetResponse(rawId: String) -> RoutedResponse {
     guard let id = Self.pathIdComponent(rawId) else {
       return .error(.error(status: 400, message: "Invalid preset id"))
     }
-    guard let preset = presetStore.get(id) else {
+    // WP-E20: the single-preset read carries the same validity flag as the list.
+    guard let entry = presetStore.listing().first(where: { $0.preset.id == id }) else {
       return .error(.error(status: 404, message: "Preset not found: \(id)"))
     }
-    return .json(status: 200, payload: preset)
+    return .json(status: 200, payload: entry)
   }
 
   private func upsertPresetResponse(body: Data) -> RoutedResponse {
-    do {
-      let preset = try decode(ImagePreset.self, from: body)
-      let saved = try presetStore.upsert(preset)
+    let (response, saved) = Self.upsertPreset(store: presetStore, body: body)
+    if let saved {
       auditLog.append(kind: "preset.upsert", message: "Upserted preset \(saved.id)", metadata: ["id": saved.id])
-      return .json(status: 200, payload: saved)
+    }
+    return response
+  }
+
+  /// `POST`/`PUT /v1/presets` (WP-E20, AC-44b): decode, validate through
+  /// `PresetStore.upsert` (O4a kroma rule, recipe-name resolution, ranges)
+  /// and persist. A refused preset is a 400 naming the preset and the field;
+  /// nothing is stored. Returns the saved preset for the audit log.
+  static func upsertPreset(store: PresetStore, body: Data) -> (RoutedResponse, saved: ImagePreset?) {
+    do {
+      let decoder = JSONDecoder()
+      decoder.keyDecodingStrategy = .convertFromSnakeCase
+      let preset = try decoder.decode(ImagePreset.self, from: body)
+      let saved = try store.upsert(preset)
+      return (.json(status: 200, payload: saved), saved)
     } catch let error as PresetStoreError {
-      return presetErrorResponse(error)
+      return (presetErrorResponse(error), nil)
     } catch {
-      return .error(.error(status: 400, message: "Invalid preset payload: \(error.localizedDescription)"))
+      return (.error(.error(status: 400, message: "Invalid preset payload: \(error.localizedDescription)")), nil)
     }
   }
 
@@ -2970,10 +3003,18 @@ public final class WarmServer {
   }
 
   private func resolvePresetResponse(body: Data) -> RoutedResponse {
+    Self.resolvePreset(store: presetStore, body: body)
+  }
+
+  /// `POST /v1/presets/resolve`. A preset flagged invalid at load (WP-E20,
+  /// AC-44c) is a 400 naming it and the reason — it can never be selected.
+  static func resolvePreset(store: PresetStore, body: Data) -> RoutedResponse {
     struct ResolveRequest: Decodable { let id: String }
     do {
-      let request = try decode(ResolveRequest.self, from: body)
-      let resolved = try presetStore.resolve(request.id)
+      let decoder = JSONDecoder()
+      decoder.keyDecodingStrategy = .convertFromSnakeCase
+      let request = try decoder.decode(ResolveRequest.self, from: body)
+      let resolved = try store.resolve(request.id)
       return .json(status: 200, payload: resolved)
     } catch let error as PresetStoreError {
       return presetErrorResponse(error)
@@ -2982,11 +3023,14 @@ public final class WarmServer {
     }
   }
 
-  /// Map a ``PresetStoreError`` to the right HTTP status: validation -> 400, notFound -> 404.
-  private func presetErrorResponse(_ error: PresetStoreError) -> RoutedResponse {
+  /// Map a ``PresetStoreError`` to the right HTTP status: validation -> 400,
+  /// invalid (flagged on disk) -> 400, notFound -> 404.
+  private static func presetErrorResponse(_ error: PresetStoreError) -> RoutedResponse {
     switch error {
     case .validation(let message):
       return .error(.error(status: 400, message: message))
+    case .invalid:
+      return .error(.error(status: 400, message: error.description))
     case .notFound(let id):
       return .error(.error(status: 404, message: "Preset not found: \(id)"))
     }
@@ -3221,11 +3265,24 @@ public final class WarmServer {
 
     switch family {
     case .krea2:
-      // Krea-2-Turbo: 8-step distilled, no CFG. Clamp runaway KSampler defaults.
-      resolvedSteps = request.steps > 0 ? min(request.steps, 12) : 9
-      resolvedGuidance = 0.0
-      resolvedNegativePrompt = nil
-      resolvedSampler = request.sampler
+      // WP-E19 (FDD §3.5, D13, AC-5a): split by the PHYSICAL variant the
+      // engine loaded. .turbo is byte-identical to today (clamp 12, guidance
+      // 0, negative dropped); .raw takes what Krita sent — no clamp, CFG and
+      // the negative prompt live, variant defaults only when absent. A krea2
+      // family with no known variant is a fault, never "turbo".
+      let resolution = try BridgeKrea2Arm.resolve(request, variant: await coordinator.currentKrea2Variant)
+      resolvedSteps = resolution.steps
+      resolvedGuidance = resolution.guidance
+      resolvedNegativePrompt = resolution.negativePrompt
+      resolvedSampler = resolution.sampler
+      let clampNote: String = resolution.stepsClamped ? " (clamped from \(request.steps))" : ""
+      let negativeNote: String = resolution.negativePrompt.map { "\($0.count) chars" } ?? "none"
+      let samplerNote: String = resolution.sampler ?? "nil"
+      let scheduleNote: String = request.sigmaSchedule ?? "nil"
+      let armLine = "WarmServer: bridge krea2 arm (\(resolution.variant.rawValue)): steps=\(resolution.steps)\(clampNote) "
+        + "guidance=\(resolution.guidance) (requested \(request.guidance)) negative=\(negativeNote) "
+        + "sampler=\(samplerNote) sigma_schedule=\(scheduleNote)"
+      logger.info("\(armLine)")
     case .fibo:
       // FIBO: use model defaults, no step clamping
       resolvedSteps = request.steps
@@ -3274,27 +3331,20 @@ public final class WarmServer {
       resolvedSampler = request.sampler
     }
 
-    let payload = GeneratePayload(
-      prompt: request.prompt,
-      negativePrompt: resolvedNegativePrompt,
-      width: genWidth,
-      height: genHeight,
-      steps: resolvedSteps,
-      guidance: resolvedGuidance,
-      seed: request.seed,
-      outputPath: nil,
-      levelsMin: request.levelsMin,
-      levelsMax: request.levelsMax,
-      scheduler: resolvedSampler,
-      sigmaSchedule: request.sigmaSchedule,
-      inpaintImageData: request.inpaintImageData,
-      maskData: request.maskImageData,
-      denoise: request.denoise,
-      maskGrow: request.maskGrow,
-      maskFeather: request.maskFeather,
-      maskCropX: request.maskCropX,
-      maskCropY: request.maskCropY
-    )
+    // One constructor for every family arm (BridgeKrea2Arm.swift) so the
+    // field set is asserted once, field-for-field (AC-5a).
+    let payload = request.makeGeneratePayload(
+      width: genWidth, height: genHeight,
+      steps: resolvedSteps, guidance: resolvedGuidance,
+      negativePrompt: resolvedNegativePrompt, sampler: resolvedSampler)
+    // WP-E4 (§3.4): the bridge builds its payload directly, so it runs the
+    // same fail-loud name resolution the /v1/generate decoder does — a Krita
+    // style whose sampler we do not implement is refused by name, never
+    // rendered as euler. The krea2 tier gates run here too (D18).
+    let recipeNames = try payload.validateRecipeNames()
+    if family == .krea2 {
+      try payload.validateKrea2TierGates(recipeNames)
+    }
 
     // Convert bridge progress callback to pipeline progress handler.
     let pipelineProgress: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = progressCallback.map { callback in
@@ -4200,6 +4250,13 @@ public final class WarmServer {
       payload.imagePath = tempPath
     }
     try payload.validateOutputPath(configuration: configuration)
+    // WP-E4 (D22): name resolution + structural checks happen ONCE, here, for
+    // /v1/generate, /v1/generate/async and persisted-queue replay alike. An
+    // unknown sampler/schedule name is a 400 before anything is enqueued —
+    // never euler/flow by coercion. Family-specific tier gates (eta on krea2,
+    // …) live in runKrea2Generate, NOT here: the family is unknown at this
+    // point and Z-Image `eta` is a shipped parameter (D18, AC-28).
+    _ = try payload.validateRecipeNames()
     return payload
   }
 
@@ -4233,13 +4290,29 @@ public final class WarmServer {
             logger.warning("Queue recovery: unknown job kind '\(job.kind)' for \(job.id), skipping")
           }
         } catch {
+          // WP-E4 (D22, AC-18): a persisted job that fails replay is marked
+          // FAILED with the reason on its own id (GET /v1/generate/status/{id})
+          // and in the audit log — never rendered, never silently dropped.
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
+          if job.kind == "generate" {
+            imageJobTracker.recordFailedReplay(jobId: job.id, source: job.source, error: error)
+          }
+          auditLog.append(
+            kind: "queue.recovery_failed",
+            message: "job \(job.id) (\(job.kind)) failed replay: \(error.localizedDescription)",
+            metadata: ["job_id": job.id, "kind": job.kind, "source": job.source])
         }
       }
     }
   }
 
   private func response(for error: Error) -> HTTPResponse {
+    Self.errorResponse(for: error)
+  }
+
+  /// Error → HTTP mapping, static so the 400/500 split is unit-testable
+  /// without a listening server (WP-E4 `WarmServerRejectionTests`).
+  static func errorResponse(for error: Error) -> HTTPResponse {
     switch error {
     case let error as WarmServerCoordinator.ServerError:
       switch error {
@@ -4264,14 +4337,26 @@ public final class WarmServer {
     case let error as LoRAError:
       return .error(status: 400, message: error.localizedDescription)
 
+    // WP-E9 (AC-56): a VAE the caller named that is not on disk, or a file in
+    // a key layout the engine cannot name, is the caller's error — named in
+    // full, never substituted.
+    case let error as Krea2VAESelectionError:
+      return .error(status: 400, message: error.localizedDescription)
+    case let error as Krea2VAEKeyMapError:
+      return .error(status: 400, message: error.localizedDescription)
+
     case let error as WarmServerError:
       switch error {
       case .loraSwapNotSupported, .controlNetNotSupported:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
+      // caller's error, named in full (AC-15, AC-28).
+      case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
-           .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded:
+           .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
@@ -4313,7 +4398,7 @@ public final class WarmServer {
     }
   }
 
-  private func describe(decodingError: DecodingError) -> String {
+  private static func describe(decodingError: DecodingError) -> String {
     switch decodingError {
     case .dataCorrupted(let context):
       return context.debugDescription
@@ -4411,21 +4496,22 @@ public final class WarmServer {
       "moody-wild-v4-fp8": "~/Models-working/moody-wild-mix/moody-wild-v4-fp8.safetensors",
       "moody-real-v6": "~/Models-working/moody-real-v6/moody-real-v6.safetensors",
       "cyberrealistic-v5": "~/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors",
-      // Kroma v0.2 (lodestones) — a Krea-2 fine-tune shipped as a full turbo
-      // checkpoint. The dir holds the Kroma transformer as turbo.safetensors
-      // with text_encoder/vae/tokenizer symlinked from the Krea-2 snapshot
-      // (Kroma reuses them unchanged). Krea2ModelDetection treats an explicit
-      // dir as a model root, so this resolves like any Krea-2 install.
-      "kroma-v0.2-turbo": "~/LocalModels/kroma-v0.2",
     ]
     if let path = civitaiPaths[modelId] {
       return NSString(string: path).expandingTildeInPath
+    }
+    // Krea-2 family installs (kroma-v0.2-turbo, krea2-raw, …) live in ONE
+    // declared spec→directory table (WP-E5) — seeded from config.json
+    // `krea2Models` over the built-in defaults — so this function never grows
+    // a second one. The directory is then detected fail-closed.
+    if let dir = Krea2ModelDetection.specDirectory(modelId) {
+      return dir.path
     }
 
     let suffixes = ["-q4", "-q8", "-bf16"]
     for suffix in suffixes {
       if modelId.lowercased().hasSuffix(suffix) {
-        return String(modelId.dropLast(suffix.count))
+        return parseModelSpec(from: String(modelId.dropLast(suffix.count)))
       }
     }
     return modelId
@@ -4791,6 +4877,18 @@ final class ImageJobTracker: @unchecked Sendable {
     return jobs[jobId]?.toStatus()
   }
 
+  /// WP-E4 (D22, AC-18): register a persisted-queue job that failed replay
+  /// validation as FAILED under its original id, with the reason, so a client
+  /// polling `GET /v1/generate/status/{id}` across a restart sees why it never
+  /// rendered instead of a 404.
+  func recordFailedReplay(jobId: String, source: String, error: Error) {
+    let job = ImageJob(id: jobId, source: source)
+    job.state = .failed
+    job.error = error.localizedDescription
+    job.completedAt = Date()
+    lock.lock(); jobs[jobId] = job; lock.unlock()
+  }
+
   private func markProcessing(_ jobId: String) {
     lock.lock(); jobs[jobId]?.state = .processing; lock.unlock()
   }
@@ -5089,8 +5187,11 @@ private actor WarmServerCoordinator {
   /// Chroma pipeline — created when the model is detected as Chroma.
   private var chromaPipeline: ChromaPipeline?
 
-  /// Krea-2-Turbo pipeline (native port), loaded when the model spec is Krea-2.
+  /// Krea-2 pipeline (native port), loaded when the model spec is Krea-2.
   private var krea2Pipeline: Krea2Pipeline?
+  /// The physical Krea-2 variant the resident pipeline loaded (WP-E5, D7) —
+  /// beside `zimageVariant`. nil when no Krea-2 model is resident.
+  private var krea2Variant: Krea2Variant?
   /// Trigger lookups for the rewriter-proof guard (set by WarmServer.run()).
   var loraLibrary: LoRALibrary?
   func setLoraLibrary(_ library: LoRALibrary) { loraLibrary = library }
@@ -5689,7 +5790,7 @@ private actor WarmServerCoordinator {
 
         // If not already detected by name, check the snapshot directory
         if !isFibo && !isFlux2 && !isChroma {
-          if Krea2ModelDetection.detect(at: resolved) != nil {
+          if Krea2ModelDetection.isKrea2ModelDirectory(resolved) {
             isKrea2 = true
           } else if ChromaModelDetection.detect(at: resolved) != nil {
             isChroma = true
@@ -5703,13 +5804,15 @@ private actor WarmServerCoordinator {
     }
 
     if isKrea2, let spec = modelSpec {
-      // --- Krea-2-Turbo path (native port) ---
+      // --- Krea-2 path (native port) — variant read off disk, fail-closed (WP-E5) ---
       currentModelFamily = .krea2
       let paths = try Krea2ModelDetection.resolve(spec: spec)
-      logger.info("Detected Krea-2-Turbo — 8-bit transformer, estimated GPU memory: ~22GB")
+      logger.info(
+        "Detected Krea-2 \(paths.variant.rawValue) (\(paths.transformerFile.path)) — 8-bit transformer, estimated GPU memory: ~22GB")
       krea2Pipeline = try Krea2Pipeline(paths: paths, quantizeTransformer: 8)
+      krea2Variant = paths.variant
       pipelinePrepared = true
-      logger.info("Warm server pipeline ready (Krea-2-Turbo)")
+      logger.info("Warm server pipeline ready (Krea-2 \(paths.variant.rawValue))")
     } else if isChroma, let snapshot = snapshotURL {
       // --- Chroma path ---
       currentModelFamily = .chroma
@@ -5866,7 +5969,7 @@ private actor WarmServerCoordinator {
         vramMB = 12288
       case .krea2:
         box = PipelineBox(pipeline: krea2Pipeline! as AnyObject)
-        detectedInfo = nil
+        detectedInfo = krea2Pipeline!.variant
         vramMB = 22528
       }
       let poolKey = ModelPool.poolKey(for: spec)
@@ -5915,6 +6018,13 @@ private actor WarmServerCoordinator {
     zimageVariant
   }
 
+  /// The physical Krea-2 variant of the resident pipeline (WP-E5). nil when
+  /// the active family is not krea2 — callers on the krea2 arm must treat nil
+  /// as a fault, never as "turbo".
+  var currentKrea2Variant: Krea2Variant? {
+    currentModelFamily == .krea2 ? krea2Variant : nil
+  }
+
   // MARK: - Model Pool Operations
 
   /// Load a model into the pool, optionally activating it.
@@ -5926,6 +6036,11 @@ private actor WarmServerCoordinator {
     if videoHolder.release() {
       logger.info("Released resident LTX-2 video stack before image load (#218)")
     }
+    // D17: every base handoff that touches the krea2 family logs outgoing and
+    // incoming spec/variant, so a slow A/B is attributable, not mysterious.
+    let outgoing = "\(activePoolModelSpec ?? configuration.modelSpec ?? "none")/"
+      + (currentModelFamily == .krea2 ? (krea2Variant?.rawValue ?? "unknown") : currentModelFamily.rawValue)
+    let outgoingIsKrea2 = currentModelFamily == .krea2 && pipelinePrepared
     let start = Date()
     let entry = try await modelPool.load(
       modelSpec: modelSpec,
@@ -5940,6 +6055,11 @@ private actor WarmServerCoordinator {
 
     if activate {
       try await poolActivate(modelId: entry.id)
+      if entry.family == .krea2 || outgoingIsKrea2 {
+        let incoming = "\(entry.modelSpec)/"
+          + (entry.family == .krea2 ? (krea2Variant?.rawValue ?? "unknown") : entry.family.rawValue)
+        logger.info("krea2 handoff: \(outgoing) → \(incoming) (loadTimeMs=\(loadTimeMs))")
+      }
     }
 
     return ModelLoadResponse(
@@ -5975,6 +6095,9 @@ private actor WarmServerCoordinator {
     switch entry.family {
     case .krea2:
       krea2Pipeline = entry.box.pipeline as? Krea2Pipeline
+      // The pipeline is the physical fact; the pool entry carries the same
+      // value back from loadPipeline (WP-E5).
+      krea2Variant = krea2Pipeline?.variant ?? (entry.detectedInfo as? Krea2Variant)
     case .chroma:
       chromaPipeline = entry.box.pipeline as? ChromaPipeline
       chromaTokenizer = entry.box.context["tokenizer"] as? ChromaTokenizer
@@ -6160,7 +6283,15 @@ private actor WarmServerCoordinator {
       shuttingDown: shuttingDown,
       model: activePoolModelSpec ?? configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
-      modelVariant: currentModelFamily == .fibo ? "fibo" : (currentModelFamily == .flux1 ? zimageVariant.rawValue : detectedFlux2Model?.variant),
+      modelVariant: {
+        switch currentModelFamily {
+        case .fibo: return "fibo"
+        case .flux1: return zimageVariant.rawValue
+        case .flux2: return detectedFlux2Model?.variant
+        case .krea2: return krea2Variant?.rawValue  // "turbo" | "raw" (WP-E5, AC-34b)
+        case .chroma: return nil
+        }
+      }(),
       loaded: pipelinePrepared,
       loras: activeLoRAs.map(LoRAState.init),
       renderCount: successfulRenderCount,
@@ -6795,6 +6926,16 @@ private actor WarmServerCoordinator {
       guard let k2 = krea2Pipeline else {
         throw WarmServerError.krea2NotLoaded
       }
+      // WP-E4 (D18): krea2-only tier gates — a 400, never a silent downgrade.
+      try payload.validateKrea2TierGates(try payload.validateRecipeNames())
+      // WP-E9 (§3.9, D16, D17): VAE selection — payload.vae → model dir. A
+      // named file that is not on disk fails the render here (AC-56); a
+      // different file than the resident one reloads the decoder IN PLACE on
+      // the one Krea2VAE (never a pool eviction), and the selection is
+      // recorded on the pipeline for the response record (WP-E10).
+      let vaeChoice = try Krea2VAESelector.resolve(requested: payload.vae, paths: k2.paths)
+      try k2.ensureVAE(path: vaeChoice.file, source: vaeChoice.source)
+      logger.info("Krea2: VAE \(k2.currentVAE.layout.rawValue) \(k2.currentVAE.file.path) (source=\(k2.currentVAE.source.rawValue), reloads=\(k2.vaeReloadCount))")
       let outputURL = try payload.resolvedOutputURL(
         configuration: configuration,
         defaultFilename: ComfyBoxOutputNaming.defaultFilename(
@@ -6803,7 +6944,10 @@ private actor WarmServerCoordinator {
       )
 
       let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
-      let steps = payload.steps ?? 9
+      // Variant defaults (WP-E5, AC-5b): turbo 9 / 1.0, raw 30 / 1.0 — never 3.5.
+      let variant = k2.variant
+      let steps = variant.resolvedSteps(payload.steps)
+      let guidance = variant.resolvedGuidance(payload.guidance)
       let width = payload.width ?? 1024
       let height = payload.height ?? 1024
       // Krea-2 builds its requests straight from the payload rather than going
@@ -6856,7 +7000,7 @@ private actor WarmServerCoordinator {
         logger.info("Krea2: img2img init=\(initPath) strength=\(strength)")
         image = try k2.generateImg2Img(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
-                guidance: payload.guidance ?? 1.0,
+                guidance: guidance,
                 sourceImage: sourceNHWC, width: width, height: height,
                 steps: steps, seed: seed, strength: strength, dyPE: krea2DyPE,
                 shift: payload.shift)
@@ -6866,7 +7010,7 @@ private actor WarmServerCoordinator {
       } else {
         image = try k2.generate(
           .init(prompt: guardedPrompt, negativePrompt: payload.negativePrompt,
-                guidance: payload.guidance ?? 1.0,
+                guidance: guidance,
                 width: width, height: height, steps: steps, seed: seed,
                 controlImagePixels: controlPixels, dyPE: krea2DyPE,
                 shift: payload.shift)
@@ -6878,7 +7022,7 @@ private actor WarmServerCoordinator {
         prompt: guardedPrompt,
         seed: seed,
         steps: steps,
-        guidance: payload.guidance ?? 1.0,
+        guidance: guidance,
         width: width,
         height: height,
         model: ComfyBoxOutputNaming.shortModelName(activePoolModelSpec ?? configuration.modelSpec),
@@ -7165,8 +7309,19 @@ private actor WarmServerCoordinator {
       activeLoRAs = newLoRAs
     } else if currentModelFamily == .krea2 {
       guard let k2 = krea2Pipeline else { throw WarmServerError.krea2NotLoaded }
-      try await k2.loadLoRAs(newLoRAs)
-      activeLoRAs = newLoRAs
+      // WP-E6: fold the library's declared relativity into any config that
+      // did not declare one itself (request > library > seed — never inferred).
+      let declared = newLoRAs.map { cfg -> LoRAConfiguration in
+        guard cfg.requiresBase == nil, case .local(let url) = cfg.source,
+              let entry = loraLibrary?.entry(for: url.lastPathComponent),
+              let relative = entry.krea2Relative
+        else { return cfg }
+        var out = cfg
+        out.requiresBase = relative
+        return out
+      }
+      try await k2.loadLoRAs(declared)
+      activeLoRAs = declared
     } else {
       try await pipeline.swapLoRAs(newLoRAs)
       activeLoRAs = newLoRAs
@@ -7590,6 +7745,13 @@ struct GeneratePayload: Sendable {
   /// default absent/false — omitting it is byte-identical to today.
   let preempt: Bool?
 
+  /// WP-E9 (FDD §3.9, D16): path of the VAE file to decode (and encode)
+  /// through — e.g. `Wan2_1_VAE_fp32.safetensors`. Tilde allowed. Absent →
+  /// the model directory's VAE. A path that is not on disk FAILS the render
+  /// (AC-56); the layout is sniffed from the file's keys, never its name.
+  /// Krea 2 only today (the other families ignore it).
+  let vae: String?
+
   /// Default memberwise init for bridge-created payloads.
   init(
     prompt: String, negativePrompt: String? = nil,
@@ -7607,9 +7769,10 @@ struct GeneratePayload: Sendable {
     source: String? = nil, contentMode: String? = nil, initImageData: Data? = nil,
     model: String? = nil, loras: [LoRAEntry]? = nil,
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
-    preempt: Bool? = nil
+    preempt: Bool? = nil, vae: String? = nil
   ) {
     self.preempt = preempt
+    self.vae = vae
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -7638,6 +7801,12 @@ extension GeneratePayload: Decodable {
   private enum CodingKeys: String, CodingKey {
     case prompt, negativePrompt, width, height, steps, guidance, seed
     case outputPath, levelsMin, levelsMax, scheduler, sigmaSchedule, eta, shift, dype
+    /// D25: `sampler` is an accepted ALIAS of the wire key `scheduler` (so a
+    /// value pasted out of a ComfyUI/RES4LYF UI works). The request key stays
+    /// `scheduler` — two live senders post that spelling — while the response
+    /// record reports `applied.stages[].sampler` (WP-E10); the asymmetry is
+    /// deliberate. Both present and different → `mutuallyExclusive` (400).
+    case sampler
     case preset
     case denoise, maskGrow, maskFeather
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
@@ -7661,6 +7830,7 @@ extension GeneratePayload: Decodable {
     case controlImage
     case model, loras
     case preempt
+    case vae
   }
 
   init(from decoder: Decoder) throws {
@@ -7675,7 +7845,13 @@ extension GeneratePayload: Decodable {
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
     levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
     levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
-    scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    let schedulerRaw = try c.decodeIfPresent(String.self, forKey: .scheduler)
+    let samplerRaw = try c.decodeIfPresent(String.self, forKey: .sampler)
+    if let schedulerRaw, let samplerRaw, schedulerRaw != samplerRaw {
+      throw WarmServerError.mutuallyExclusive(
+        "scheduler='\(schedulerRaw)' and sampler='\(samplerRaw)' disagree — 'sampler' is an alias of 'scheduler'; send one, or the same value in both")
+    }
+    scheduler = schedulerRaw ?? samplerRaw
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
     shift = try c.decodeIfPresent(Float.self, forKey: .shift)
@@ -7709,6 +7885,7 @@ extension GeneratePayload: Decodable {
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
     preempt = try c.decodeIfPresent(Bool.self, forKey: .preempt)
+    vae = try c.decodeIfPresent(String.self, forKey: .vae)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.
@@ -7759,8 +7936,9 @@ extension GeneratePayload: Decodable {
         contentMode: contentMode, source: source)
     )
 
-    let schedulerKind = Self.parseSchedulerKind(scheduler)
-    let sigmaScheduleKind = Self.parseSigmaScheduleKind(sigmaSchedule)
+    let names = try validateRecipeNames()
+    let schedulerKind = names.scheduler ?? .euler
+    let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
     // Build DyPE config — auto-enable for high-res requests
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
@@ -7829,8 +8007,9 @@ extension GeneratePayload: Decodable {
       specifiedAs = .strength
     }
 
-    let schedulerKind = Self.parseSchedulerKind(scheduler)
-    let sigmaScheduleKind = Self.parseSigmaScheduleKind(sigmaSchedule)
+    let names = try validateRecipeNames()
+    let schedulerKind = names.scheduler ?? .euler
+    let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
     let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
@@ -7885,30 +8064,40 @@ extension GeneratePayload: Decodable {
     }
   }
 
-  private static func parseSchedulerKind(_ rawValue: String?) -> SchedulerKind {
-    guard let rawValue else { return .euler }
-    switch rawValue {
-    case "res_2s":
-      return .res2s
-    case "dpmpp_2m":
-      return .dpmplusplus2m
-    case "dpmpp_2s_ancestral":
-      return .dpmplusplus2sa
-    default:
-      return SchedulerKind(rawValue: rawValue) ?? .euler
-    }
+  /// WP-E4 (FDD-krea2-raw-recipe §3.4, D22, D25): resolve the sampler and
+  /// sigma-schedule names fail-loud. Returns the resolved kinds AND the raw
+  /// strings so the record can carry `sigma_schedule_requested`. Absent names
+  /// come back nil — the request builders apply euler / flow as today.
+  /// Family-agnostic; safe before the family is known.
+  func validateRecipeNames() throws -> ResolvedRecipeNames {
+    try RecipeNameResolver.resolve(scheduler: scheduler, sigmaSchedule: sigmaSchedule)
   }
 
-  private static func parseSigmaScheduleKind(_ rawValue: String?) -> SigmaScheduleKind {
-    guard let rawValue else { return .flow }
-    switch rawValue {
-    case "beta57":
-      return .beta57
-    case "normal", "simple", "sgm_uniform", "ddim_uniform":
-      // ComfyUI schedule names that map to the model's native flow-matching schedule.
-      return .flow
-    default:
-      return SigmaScheduleKind(rawValue: rawValue) ?? .flow
+  /// WP-E4 (D18, §3.4): Krea 2 tier / capability gates. Runs inside the
+  /// Krea 2 generate path and the bridge's `.krea2` arm ONLY — `eta` on the
+  /// Z-Image path is a different, shipped parameter (DDIM η / DPM++ 2S-A η)
+  /// and keeps working (AC-28).
+  ///
+  /// - `eta != 0`: RES4LYF SDE eta is tier T2 (WP-E15) — refused until it lands.
+  /// - a sampler other than euler, or a schedule other than flow (incl. its
+  ///   ComfyUI aliases): the Krea 2 loop does not take a sampler yet (WP-E3).
+  ///   Before this gate such a request rendered euler / native warp silently;
+  ///   WP-E3 replaces this arm with real dispatch when it plumbs the fields.
+  func validateKrea2TierGates(_ names: ResolvedRecipeNames) throws {
+    if let eta, eta != 0 {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "eta", value: "\(eta)", family: "krea2",
+        reason: "RES4LYF SDE eta (parity tier T2, WP-E15) is not implemented yet; send eta 0 or omit it")
+    }
+    if let kind = names.scheduler, kind != .euler {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "scheduler", value: names.schedulerRequested ?? kind.rawValue, family: "krea2",
+        reason: "the Krea 2 denoise loop does not take a sampler yet (WP-E3); only euler is honoured")
+    }
+    if let kind = names.sigmaSchedule, kind != .flow {
+      throw WarmServerError.unsupportedRecipeField(
+        field: "sigma_schedule", value: names.sigmaScheduleRequested ?? kind.rawValue, family: "krea2",
+        reason: "the Krea 2 denoise loop runs its native warp only (WP-E1/E3); only flow and its aliases are accepted")
     }
   }
 
@@ -8245,8 +8434,24 @@ public enum WarmServerError: Error, LocalizedError {
   case chromaDetectionFailed(String)
   case chromaNotLoaded
   case krea2NotLoaded
+  /// WP-E19: the krea2 family is resident but the coordinator holds no
+  /// `Krea2Variant` for it. The bridge arm refuses rather than assuming turbo.
+  case krea2VariantUnknown
   case loraSwapNotSupported
   case controlNetNotSupported
+  // WP-E4 (FDD-krea2-raw-recipe §3.4, D22, D25, D18): fail-loud recipe names.
+  /// A sampler name that is neither a `SchedulerKind` raw value nor a declared
+  /// alias. `valid` is the full accepted set, listed in the message.
+  case unknownSampler(name: String, valid: [String])
+  /// A sigma-schedule name that is neither a `SigmaScheduleKind` raw value nor
+  /// a declared alias (`normal`/`simple`/`sgm_uniform`/`ddim_uniform`/`beta57`).
+  case unknownSigmaSchedule(name: String, valid: [String])
+  /// Two request keys that name the same thing carry different values
+  /// (`scheduler` vs its `sampler` alias, D25).
+  case mutuallyExclusive(String)
+  /// A recipe field the named family cannot honour yet — an unimplemented
+  /// tier is a 400, never a downgrade (D18).
+  case unsupportedRecipeField(field: String, value: String, family: String, reason: String)
 
   public var errorDescription: String? {
     switch self {
@@ -8270,10 +8475,20 @@ public enum WarmServerError: Error, LocalizedError {
       return "Chroma pipeline is not loaded"
     case .krea2NotLoaded:
       return "Krea-2 pipeline is not loaded"
+    case .krea2VariantUnknown:
+      return "Krea-2 pipeline is resident but its variant (turbo|raw) is unknown — refusing to assume turbo"
     case .loraSwapNotSupported:
       return "LoRA swap is not supported for this model family"
     case .controlNetNotSupported:
       return "ControlNet is not supported for this model family"
+    case .unknownSampler(let name, let valid):
+      return "Unknown sampler '\(name)'. Valid samplers: \(valid.joined(separator: ", "))"
+    case .unknownSigmaSchedule(let name, let valid):
+      return "Unknown sigma schedule '\(name)'. Valid schedules: \(valid.joined(separator: ", "))"
+    case .mutuallyExclusive(let message):
+      return message
+    case .unsupportedRecipeField(let field, let value, let family, let reason):
+      return "'\(field)' = '\(value)' is not supported on the \(family) family: \(reason)"
     }
   }
 }

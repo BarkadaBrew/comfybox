@@ -119,13 +119,18 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "Output file path. Must be within the server's allowed output directory. Omit to write to a temp file.",
         ] as [String: Any],
+        // WP-E4 (AC-17): enums generated from the engine's own kinds so the
+        // schema cannot drift again (it used to advertise `linear`, which
+        // does not exist). The wire key stays `scheduler` (D25).
         "scheduler": [
           "type": "string",
-          "description": "Sampler/scheduler algorithm. Options: euler (default), heun, res_2s, ddim, dpmpp_2m.",
+          "enum": SchedulerKind.allCases.map(\.rawValue),
+          "description": "Sampler algorithm (wire key `scheduler`). Default: euler. ComfyUI spellings res_2s / dpmpp_2m / dpmpp_2s_ancestral are accepted aliases; an unknown name is a 400.",
         ] as [String: Any],
         "sigma_schedule": [
           "type": "string",
-          "description": "Sigma noise schedule. Options: flow (default), beta, beta57, linear.",
+          "enum": SigmaScheduleKind.allCases.map(\.rawValue),
+          "description": "Sigma noise schedule. Default: flow. ComfyUI names normal / simple / sgm_uniform / ddim_uniform alias to flow; an unknown name is a 400.",
         ] as [String: Any],
         "image_path": [
           "type": "string",
