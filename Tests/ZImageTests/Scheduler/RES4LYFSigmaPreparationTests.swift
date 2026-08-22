@@ -289,7 +289,8 @@ final class RES4LYFSigmaPreparationTests: XCTestCase {
       prompt: "x", steps: 6, seed: 7, sampler: .res2s, sigmaSchedule: .beta)
     let trace = Krea2RunTrace(
       request: request, shift: shift, scheduler: scheduler, stats: stats,
-      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024,
+      negativePromptApplied: nil)  // guidance 1.0 → no CFG → nothing applied (K-FIX-1 I4)
 
     XCTAssertEqual(trace.finalConversionSigma, Self.fluxSigmaMin)
     XCTAssertEqual(trace.stepsRun, 6)
