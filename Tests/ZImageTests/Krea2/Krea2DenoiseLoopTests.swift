@@ -473,8 +473,19 @@ final class Krea2DenoiseLoopTests: XCTestCase {
 
   final class CountingInjector: SDENoiseInjector {
     var steps: [Int] = []
-    func inject(sample: inout MLXArray, timestepIndex: Int, scheduler: any ZImageScheduler) {
+    /// `(step, row)` — WP-E15 added the substep hook, which fires once per
+    /// non-final ROW before that row's evaluation.
+    var substeps: [(Int, Int)] = []
+    func inject(
+      sample: inout MLXArray, x0: MLXArray, timestepIndex: Int, scheduler: any ZImageScheduler
+    ) {
       steps.append(timestepIndex)
+    }
+    func injectSubstep(
+      sample: inout MLXArray, x0: MLXArray, timestepIndex: Int, row: Int,
+      scheduler: any ZImageScheduler
+    ) {
+      substeps.append((timestepIndex, row))
     }
   }
 
@@ -498,5 +509,44 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       evaluate: Self.syntheticTransformer, noise: injector, bongmath: bong)
     XCTAssertEqual(injector.steps, [3, 4, 5, 6, 7, 8])
     XCTAssertEqual(bong.steps, [3, 4, 5, 6, 7, 8])
+    // The default euler path is 1-row: there is no non-final row to re-noise,
+    // so the substep hook never fires (WP-E15).
+    XCTAssertTrue(injector.substeps.isEmpty, "1-row schedulers have no substep")
+  }
+
+  /// The substep hook fires once per non-final row, in row order, before that
+  /// row's model evaluation — the position RES4LYF re-noises at
+  /// (`rk_sampler_beta.py:1874`). Asserted on both driver branches that have
+  /// rows: the 2-row `res_2s` and a 3-row tableau.
+  func testSubstepHookFiresOncePerNonFinalRowBeforeItsEvaluation() throws {
+    let sigmas = try Self.defaultScheduler(steps: 4).sigmas.asArray(Float.self)
+
+    var twoRow: any ZImageScheduler = RES2sScheduler(numInferenceSteps: 4, sigmaValues: sigmas)
+    let twoRowInjector = CountingInjector()
+    var seenAtEvaluate: [Int] = []
+    _ = Krea2DenoiseLoop.run(
+      scheduler: &twoRow, initialSample: Self.bf16Noise(seed: 21),
+      evaluate: { latent, sigma in
+        seenAtEvaluate.append(twoRowInjector.substeps.count)
+        return Self.syntheticTransformer(latent, sigma)
+      },
+      noise: twoRowInjector)
+    XCTAssertEqual(
+      twoRowInjector.substeps.map { $0.0 }, [0, 1, 2, 3], "one substep re-noise per step")
+    XCTAssertEqual(twoRowInjector.substeps.map { $0.1 }, [1, 1, 1, 1], "the non-final row is row 1")
+    // Rows alternate 0, 1: the substep count seen at row 1's evaluation is
+    // always one more than at row 0's, i.e. the injection preceded it.
+    XCTAssertEqual(seenAtEvaluate, [0, 1, 1, 2, 2, 3, 3, 4])
+
+    var threeRow: any ZImageScheduler = RalstonScheduler(
+      stages: .three, numInferenceSteps: 4, sigmaValues: sigmas)
+    let threeRowInjector = CountingInjector()
+    _ = Krea2DenoiseLoop.run(
+      scheduler: &threeRow, initialSample: Self.bf16Noise(seed: 22),
+      evaluate: Self.syntheticTransformer, noise: threeRowInjector)
+    XCTAssertEqual(
+      threeRowInjector.substeps.map { "\($0.0):\($0.1)" },
+      ["0:1", "0:2", "1:1", "1:2", "2:1", "2:2", "3:1", "3:2"],
+      "rows 1 and 2 of 3, in order, on every step — never the committing row")
   }
 }

@@ -19,13 +19,46 @@
 import Foundation
 import MLX
 
-/// Parity tier T2 seam (WP-E15): RES4LYF SDE `eta`. Called once per step,
-/// after the step's commit, with the scheduler the step was taken on. The
-/// conformer owns its RNG and its `sigma_down` / `sigma_up` split; E3
-/// guarantees only that `nil` is today's path. Reference-typed so a
-/// stateful injector persists across steps.
+/// Parity tier T2 seam (WP-E15): RES4LYF SDE `eta`. The conformer owns its
+/// RNG and its `sigma_down` / `sigma_up` split. Reference-typed so a stateful
+/// injector persists across steps and across rows.
+///
+/// TWO hooks, because RES4LYF re-noises twice per step and the second one is
+/// not optional decoration:
+///
+///   * ``injectSubstep(sample:x0:timestepIndex:row:scheduler:)`` runs after a
+///     non-final row's sample has been built and BEFORE the model is evaluated
+///     on it (`rk_sampler_beta.py:1874`) — so the row's evaluation sees the
+///     re-noised sample. `res_2s` reproduces its T2 trace only with this.
+///   * ``inject(sample:x0:timestepIndex:scheduler:)`` runs once per step,
+///     after the step's commit and before the T3 hook
+///     (`rk_sampler_beta.py:2027`).
+///
+/// Both are handed the step's own `x0` — the sample the step started from —
+/// because upstream's swap is written in `eps' = (x₀ − x)/(σ − σ_target)` and
+/// anchored at the STEP's sigma, in the substep case too. The driver is the
+/// only party that still has `x0` when the hooks fire.
+///
+/// Ordering with S-FIX-1's model-free tail is fixed and load-bearing: the tail
+/// epsilon is computed from the PRE-swap `(x₀, x_next)` and the tail is applied
+/// to the POST-swap sample (`rk_sampler_beta.py:1997, 2017-2022, 2202`).
 public protocol SDENoiseInjector: AnyObject {
-  func inject(sample: inout MLXArray, timestepIndex: Int, scheduler: any ZImageScheduler)
+  func inject(
+    sample: inout MLXArray, x0: MLXArray, timestepIndex: Int, scheduler: any ZImageScheduler)
+
+  /// Re-noise the sample row `row` (≥ 1, never the committing row) will be
+  /// evaluated on. Defaulted to a no-op so an injector that models only the
+  /// step-level swap stays valid.
+  func injectSubstep(
+    sample: inout MLXArray, x0: MLXArray, timestepIndex: Int, row: Int,
+    scheduler: any ZImageScheduler)
+}
+
+extension SDENoiseInjector {
+  public func injectSubstep(
+    sample: inout MLXArray, x0: MLXArray, timestepIndex: Int, row: Int,
+    scheduler: any ZImageScheduler
+  ) {}
 }
 
 /// Parity tier T3 seam (WP-E16): `bongmath`. Called once per step after the
@@ -169,15 +202,25 @@ public enum Krea2DenoiseLoop {
 
     for i in startIndex..<total {
       let sigma = sigmas[i]
-      let stepStart = tailSigma != nil ? x : nil
+      // The step's own `x₀`. Retained only when someone downstream needs it —
+      // the model-free tail, or a T2 injector whose swap is written in it — so
+      // the default euler path still keeps no second latent alive per step.
+      let stepStart = (tailSigma != nil || noise != nil) ? x : nil
 
       if var tableau = scheduler as? TableauScheduler {
         // 3. N-row: rows evaluations at rowSigma / rowSample, then commit.
         var k: [MLXArray] = []
         k.reserveCapacity(tableau.rows)
         for r in 0..<tableau.rows {
-          let xr = r == 0 ? x : tableau.rowSample(timestepIndex: i, row: r, x0: x, k: k)
+          var xr = r == 0 ? x : tableau.rowSample(timestepIndex: i, row: r, x0: x, k: k)
           let sr = r == 0 ? sigma : tableau.rowSigma(timestepIndex: i, row: r)
+          // T2 substep re-noise: rows 1 ..< rows are upstream's non-final rows
+          // (`row + row_offset` for `row < rows − row_offset`), and row 0 is
+          // the step's start sample, which is never re-noised.
+          if r > 0, let noise, let stepStart {
+            noise.injectSubstep(
+              sample: &xr, x0: stepStart, timestepIndex: i, row: r, scheduler: tableau)
+          }
           let v = evaluate(xr, sr)
           evaluateCalls += 1
           k.append(tableau.modelInput(velocity: v, sample: xr, sigma: sr))
@@ -191,7 +234,7 @@ public enum Krea2DenoiseLoop {
         let out = scheduler.modelInput(velocity: v, sample: x, sigma: sigma)
 
         if scheduler.requiresIntermediateEvaluation,
-           let mid = scheduler.intermediateStep(modelOutput: out, timestepIndex: i, sample: x) {
+           var mid = scheduler.intermediateStep(modelOutput: out, timestepIndex: i, sample: x) {
           // 4. 2-row: the second evaluation at the scheduler's own substep
           //    (res_2s: σ·e^{−c₂h}, a genuine substep — not σ_{i+1}).
           // Fail loud: σ_{i+1} is the WRONG substep (§3.3), so there is no
@@ -201,6 +244,13 @@ public enum Krea2DenoiseLoop {
             preconditionFailure(
               "scheduler requires an intermediate evaluation at step \(i) but returned no "
                 + "intermediateSigma; σ_{i+1} is not a valid substitute (§3.3)")
+          }
+          // T2 substep re-noise: the 2-row branch's one non-final row. For
+          // `res_2s` this is the difference between reproducing the T2 trace
+          // and not — the second evaluation happens on the re-noised sample.
+          if let noise, let stepStart {
+            noise.injectSubstep(
+              sample: &mid, x0: stepStart, timestepIndex: i, row: 1, scheduler: scheduler)
           }
           let vMid = evaluate(mid, midSigma)
           evaluateCalls += 1
@@ -215,8 +265,13 @@ public enum Krea2DenoiseLoop {
 
       if let stepStart { lastStep = (i, stepStart, x, sigma, sigmas[i + 1]) }
 
-      // 6. T2 / T3 hooks — nil today.
-      noise?.inject(sample: &x, timestepIndex: i, scheduler: scheduler)
+      // 6. T2 / T3 hooks. The T2 step swap runs AFTER the commit and after
+      //    `lastStep` has recorded the pre-swap `(x₀, x_next)` the model-free
+      //    tail needs — upstream computes that epsilon before the swap and
+      //    applies the tail to the post-swap sample.
+      if let noise, let stepStart {
+        noise.inject(sample: &x, x0: stepStart, timestepIndex: i, scheduler: scheduler)
+      }
       if let bongmath {
         evaluateCalls += bongmath.iterate(
           sample: &x, timestepIndex: i, scheduler: scheduler, evaluate: evaluate)
