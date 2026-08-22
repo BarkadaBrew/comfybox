@@ -9,59 +9,40 @@ import XCTest
 final class RenderRecipeTests: XCTestCase {
 
   // MARK: - Fixtures
+  //
+  // Everything comes from `RenderRecipeFixture` so this file and the /health
+  // sink test assert against the same record (AC-62).
 
-  private func counter(steps: Int, cfg: Bool) -> Krea2RunCounter {
-    let c = Krea2RunCounter()
-    for _ in 0..<steps { c.eval(); if cfg { c.eval() }; c.step() }
-    return c
-  }
-
-  private func trace(steps: Int = 30, guidance: Float = 1.0, startIndex: Int = 0) -> Krea2RunTrace {
-    let sigmas = SigmaSchedule.krea2(numSteps: steps, mu: 0.9062)
-    return Krea2RunTrace(
-      width: 1024, height: 1024, seed: 44821,
-      mu: 0.9062, shift: 2.475, shiftSource: "dynamic",
-      sigmas: sigmas, stepsRequested: steps, startIndex: startIndex,
-      guidance: guidance, denoise: 1.0,
-      sampler: "euler", sigmaSchedule: "krea2",
-      counter: counter(steps: steps - startIndex, cfg: guidance > 1))
+  private func trace(steps: Int = 30, guidance: Float = 1.0, startIndex: Int = 0,
+                     sigmaScheduleRequested: String? = nil) -> Krea2RunTrace {
+    RenderRecipeFixture.trace(steps: steps, guidance: guidance, startIndex: startIndex,
+                              sigmaScheduleRequested: sigmaScheduleRequested)
   }
 
   private func inputs(
     guidance: Float = 1.0, negativePrompt: String? = nil, requestedSigmaSchedule: String? = nil,
     loras: [RenderRecipe.LoRAReadBack] = [], control: RenderRecipe.ControlReadBack? = nil
   ) -> RenderRecipe.Krea2Inputs {
-    RenderRecipe.Krea2Inputs(
-      baseModel: "krea2-raw",
-      variant: .raw,
-      transformerFile: URL(fileURLWithPath: "/Users/me/LocalModels/krea2-raw/raw.safetensors"),
-      quantization: "q8",
-      vae: Krea2VAESelection(
-        file: URL(fileURLWithPath: "/Users/me/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"),
-        layout: .wanNative, source: .payload),
-      textEncoderFile: URL(fileURLWithPath: "/Users/me/LocalModels/krea2-raw/text_encoder/model.safetensors"),
-      loras: loras,
-      control: control,
-      trace: trace(guidance: guidance),
-      requestedSigmaSchedule: requestedSigmaSchedule,
-      negativePrompt: negativePrompt)
+    RenderRecipeFixture.inputs(
+      trace: trace(guidance: guidance, sigmaScheduleRequested: requestedSigmaSchedule),
+      negativePrompt: negativePrompt, loras: loras, control: control)
   }
 
   private func kromaReadBack(scale: Float = 0.3) -> RenderRecipe.LoRAReadBack {
     var cfg = LoRAConfiguration.local("/vault/kroma-v0.2-base-lora-rank-384-fro-0985.safetensors", scale: scale, requiresBase: .raw)
     cfg.role = "kroma"
-    return .init(configuration: cfg, report: .init(offered: 256, bound: 256, quantizedBound: 200, deltasApplied: 0, shapeRejected: 0, unbound: []))
+    return .init(configuration: cfg, report: RenderRecipeFixture.report(offered: 256, bound: 256))
   }
 
   private func accelReadBack() -> RenderRecipe.LoRAReadBack {
     var cfg = LoRAConfiguration.local("/vault/krea2_turbo_lora_rank_64_bf16.safetensors", scale: 0.6, requiresBase: .raw)
     cfg.role = "accel"
-    return .init(configuration: cfg, report: .init(offered: 264, bound: 264, quantizedBound: 264, deltasApplied: 7, shapeRejected: 0, unbound: []))
+    return .init(configuration: cfg, report: RenderRecipeFixture.report(offered: 264, bound: 264, deltasApplied: 7))
   }
 
   // MARK: - Physics is read back
 
-  func testPhysicsFieldsComeFromThePipelineNotTheRequest() {
+  func testPhysicsFieldsComeFromThePipelineNotTheRequest() throws {
     let r = RenderRecipe.krea2(inputs())
     XCTAssertEqual(r.baseModel, "krea2-raw")
     XCTAssertEqual(r.baseVariant, "raw")
@@ -76,7 +57,7 @@ final class RenderRecipeTests: XCTestCase {
     XCTAssertEqual(r.height, 1024)
     XCTAssertEqual(r.seed, 44821)
     XCTAssertEqual(r.mu, 0.9062)
-    XCTAssertEqual(r.shift, 2.475)
+    XCTAssertEqual(try XCTUnwrap(r.shift), exp(Float(0.9062)), accuracy: 1e-5)
     XCTAssertEqual(r.shiftSource, "dynamic")
     XCTAssertNil(r.controlLora)
   }
@@ -110,13 +91,64 @@ final class RenderRecipeTests: XCTestCase {
   }
 
   /// D22: an aliased / different schedule name the caller sent is recorded
-  /// beside what ran — never silently folded.
-  func testRequestedScheduleNameIsRecordedWhenItDiffers() {
+  /// beside what ran — never silently folded. The "only when it differs" rule
+  /// itself lives on the trace (`Krea2RunTrace.requestedName`, asserted in
+  /// `Krea2RunTraceTests`); the record must FORWARD what the loop decided and
+  /// never re-derive it, or the two would drift.
+  func testRequestedScheduleNameIsForwardedFromTheTrace() {
     let r = RenderRecipe.krea2(inputs(requestedSigmaSchedule: "normal"))
     XCTAssertEqual(r.stages[0].sigmaSchedule, "krea2")
     XCTAssertEqual(r.stages[0].sigmaScheduleRequested, "normal")
-    let same = RenderRecipe.krea2(inputs(requestedSigmaSchedule: "krea2"))
-    XCTAssertNil(same.stages[0].sigmaScheduleRequested)
+    XCTAssertNil(RenderRecipe.krea2(inputs()).stages[0].sigmaScheduleRequested)
+  }
+
+  /// D6: `bong_tangent` builds its own grid and the shift does not warp it —
+  /// the stage says so instead of implying a shift that never applied.
+  func testShiftAppliedIsFalseForBongTangent() {
+    let bong = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(sigmaSchedule: .bongTangent)))
+    XCTAssertFalse(bong.stages[0].shiftApplied)
+    XCTAssertEqual(bong.stages[0].sigmaSchedule, "bong_tangent")
+    XCTAssertTrue(RenderRecipe.krea2(inputs()).stages[0].shiftApplied)
+  }
+
+  /// The sampler and schedule are the RESOLVED enums the loop ran, spelled by
+  /// their wire names — not the request's strings.
+  func testSamplerAndScheduleAreTheResolvedKindsWireNames() {
+    let r = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(sampler: .res2s, sigmaSchedule: .beta57)))
+    XCTAssertEqual(r.stages[0].sampler, SchedulerKind.res2s.rawValue)
+    XCTAssertEqual(r.stages[0].sigmaSchedule, SigmaScheduleKind.beta57.rawValue)
+  }
+
+  /// `eta` and `bongmath` come off the trace, not a constant: when the loop
+  /// starts reporting them (T2/T3) the record moves with it.
+  func testEtaAndBongmathAreReadOffTheTrace() {
+    let r = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(eta: 0.35, bongmath: true)))
+    XCTAssertEqual(r.stages[0].eta, 0.35)
+    XCTAssertTrue(r.stages[0].bongmath)
+  }
+
+  /// AC-63: img2img starts mid-grid — `steps_requested` is what was asked
+  /// for, `steps_run` and `model_evals` are what happened.
+  func testImg2ImgStepAccountingIsHonest() {
+    let r = RenderRecipe.krea2(RenderRecipeFixture.inputs(
+      trace: RenderRecipeFixture.trace(steps: 20, startIndex: 6)))
+    XCTAssertEqual(r.stages[0].stepsRequested, 20)
+    XCTAssertEqual(r.stages[0].stepsEffective, 20)
+    XCTAssertEqual(r.stages[0].stepsRun, 14)
+    XCTAssertEqual(r.stages[0].modelEvals, 14)
+    XCTAssertEqual(r.modelEvalsTotal, 14)
+  }
+
+  /// `quantization` is the label for the bits the transformer was LOADED
+  /// with — one spelling, derived, never a request field.
+  func testQuantizationLabelComesFromTheLoadedBits() {
+    XCTAssertEqual(RenderRecipe.quantizationLabel(bits: 8), "q8")
+    XCTAssertEqual(RenderRecipe.quantizationLabel(bits: 4), "q4")
+    XCTAssertEqual(RenderRecipe.quantizationLabel(bits: nil), "bf16")
+    XCTAssertEqual(RenderRecipeFixture.recipe(quantizationBits: nil).quantization, "bf16")
   }
 
   /// AC-61: `negative_prompt` is present only when guidance > 1 — at
@@ -158,7 +190,7 @@ final class RenderRecipeTests: XCTestCase {
 
   func testUndeclaredRoleAndRelativityAreNull() {
     let cfg = LoRAConfiguration.local("/vault/some-style.safetensors", scale: 0.8)
-    let r = RenderRecipe.krea2(inputs(loras: [.init(configuration: cfg, report: .init(offered: 10, bound: 10, quantizedBound: 0, deltasApplied: 0, shapeRejected: 0, unbound: []))]))
+    let r = RenderRecipe.krea2(inputs(loras: [.init(configuration: cfg, report: RenderRecipeFixture.report(offered: 10, bound: 10))]))
     XCTAssertNil(r.loras[0].role)
     XCTAssertNil(r.loras[0].relativeTo)
   }
@@ -167,7 +199,7 @@ final class RenderRecipeTests: XCTestCase {
     let control = RenderRecipe.ControlReadBack(
       file: URL(fileURLWithPath: "/Volumes/Bolt/Models/krea2-controlnet/depth-control-lora.safetensors"),
       scale: 0.9,
-      report: .init(offered: 224, bound: 224, quantizedBound: 224, deltasApplied: 0, shapeRejected: 0, unbound: []))
+      report: RenderRecipeFixture.report(offered: 224, bound: 224))
     let r = RenderRecipe.krea2(inputs(control: control))
     let c = try XCTUnwrap(r.controlLora)
     XCTAssertEqual(c.role, "control")
@@ -218,7 +250,7 @@ final class RenderRecipeTests: XCTestCase {
     let r = RenderRecipe.krea2(inputs(guidance: 2.0, negativePrompt: "n", requestedSigmaSchedule: "normal",
                                       loras: [accelReadBack(), kromaReadBack()],
                                       control: .init(file: URL(fileURLWithPath: "/c.safetensors"), scale: 1,
-                                                     report: .init(offered: 224, bound: 224, quantizedBound: 0, deltasApplied: 0, shapeRejected: 0, unbound: []))))
+                                                     report: RenderRecipeFixture.report(offered: 224, bound: 224))))
     let back = try fromSnake.decode(RenderRecipe.self, from: snake.encode(r))
     XCTAssertEqual(back, r)
   }

@@ -76,10 +76,10 @@ final class WarmServerRejectionTests: XCTestCase {
     XCTAssertTrue(body.contains("krea2"), body)
   }
 
-  /// Krea 2 tier gates (D18, §3.4): `eta != 0` is refused before T2; a sampler
-  /// or schedule the Krea 2 loop does not yet honour is refused rather than
-  /// silently rendered as euler / native warp (removed by WP-E3 when the loop
-  /// takes the sampler). `eta: 0`, euler and the flow aliases pass.
+  /// Krea 2 tier gates (D18, §3.4): `eta != 0` is refused before T2. Since
+  /// WP-E3 the loop takes the sampler and the schedule, so every name the
+  /// resolver accepts passes the gate — `res_2s`, `karras`, Krita's
+  /// `euler`/`normal`, and a bare request alike.
   func testKrea2TierGates() throws {
     let eta = try decode(#"{"prompt":"x","eta":0.5}"#)
     XCTAssertThrowsError(try eta.validateKrea2TierGates(try eta.validateRecipeNames())) { error in
@@ -91,19 +91,18 @@ final class WarmServerRejectionTests: XCTestCase {
     let etaZero = try decode(#"{"prompt":"x","eta":0}"#)
     XCTAssertNoThrow(try etaZero.validateKrea2TierGates(try etaZero.validateRecipeNames()))
 
+    // WP-E3: the sampler and the schedule are honoured, not gated.
     let sampler = try decode(#"{"prompt":"x","scheduler":"res_2s"}"#)
-    XCTAssertThrowsError(try sampler.validateKrea2TierGates(try sampler.validateRecipeNames())) { error in
-      guard case WarmServerError.unsupportedRecipeField(let field, let value, _, _) = error else {
-        return XCTFail("\(error)")
-      }
-      XCTAssertEqual(field, "scheduler"); XCTAssertEqual(value, "res_2s")
-    }
+    XCTAssertNoThrow(try sampler.validateKrea2TierGates(try sampler.validateRecipeNames()))
     let schedule = try decode(#"{"prompt":"x","sigma_schedule":"karras"}"#)
-    XCTAssertThrowsError(try schedule.validateKrea2TierGates(try schedule.validateRecipeNames())) { error in
-      guard case WarmServerError.unsupportedRecipeField(let field, let value, _, _) = error else {
-        return XCTFail("\(error)")
-      }
-      XCTAssertEqual(field, "sigma_schedule"); XCTAssertEqual(value, "karras")
+    XCTAssertNoThrow(try schedule.validateKrea2TierGates(try schedule.validateRecipeNames()))
+    for name in RecipeNameResolver.validSamplerNames {
+      let p = try decode(#"{"prompt":"x","scheduler":"\#(name)"}"#)
+      XCTAssertNoThrow(try p.validateKrea2TierGates(try p.validateRecipeNames()), name)
+    }
+    for name in RecipeNameResolver.validSigmaScheduleNames {
+      let p = try decode(#"{"prompt":"x","sigma_schedule":"\#(name)"}"#)
+      XCTAssertNoThrow(try p.validateKrea2TierGates(try p.validateRecipeNames()), name)
     }
     // Krita's default style on the bridge: euler / normal → passes.
     let kritaDefault = try decode(#"{"prompt":"x","scheduler":"euler","sigma_schedule":"normal"}"#)

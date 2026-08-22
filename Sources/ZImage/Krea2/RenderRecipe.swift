@@ -158,43 +158,51 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
     public var baseModel: String
     public var variant: Krea2Variant
     public var transformerFile: URL
-    public var quantization: String
+    /// The bits the transformer was quantized to at load
+    /// (`Krea2Pipeline.transformerQuantBits`), nil for bf16. The label is
+    /// derived here, so there is one spelling of `"q8"` in the codebase.
+    public var quantizationBits: Int?
     public var vae: Krea2VAESelection
     public var textEncoderFile: URL
     public var loras: [LoRAReadBack]
     public var control: ControlReadBack?
     public var trace: Krea2RunTrace
-    public var requestedSigmaSchedule: String?
     public var negativePrompt: String?
 
     public init(
-      baseModel: String, variant: Krea2Variant, transformerFile: URL, quantization: String,
+      baseModel: String, variant: Krea2Variant, transformerFile: URL, quantizationBits: Int?,
       vae: Krea2VAESelection, textEncoderFile: URL,
       loras: [LoRAReadBack], control: ControlReadBack?,
-      trace: Krea2RunTrace, requestedSigmaSchedule: String?, negativePrompt: String?
+      trace: Krea2RunTrace, negativePrompt: String?
     ) {
       self.baseModel = baseModel
       self.variant = variant
       self.transformerFile = transformerFile
-      self.quantization = quantization
+      self.quantizationBits = quantizationBits
       self.vae = vae
       self.textEncoderFile = textEncoderFile
       self.loras = loras
       self.control = control
       self.trace = trace
-      self.requestedSigmaSchedule = requestedSigmaSchedule
       self.negativePrompt = negativePrompt
     }
+  }
+
+  /// `"q8"` / `"q4"` / `"bf16"` from the bits actually applied at load.
+  public static func quantizationLabel(bits: Int?) -> String {
+    bits.map { "q\($0)" } ?? "bf16"
   }
 
   public static func krea2(_ i: Krea2Inputs) -> RenderRecipe {
     let t = i.trace
     let stage = Stage(
       index: 0,
-      sampler: t.sampler,
-      sigmaSchedule: t.sigmaSchedule,
-      sigmaScheduleRequested: i.requestedSigmaSchedule.flatMap { $0 == t.sigmaSchedule ? nil : $0 },
-      shiftApplied: t.sigmaSchedule != SigmaScheduleKind.bongTangent.rawValue,
+      sampler: t.sampler.rawValue,
+      sigmaSchedule: t.sigmaSchedule.rawValue,
+      // D22: the loop already decided whether the caller's raw name is worth
+      // contrasting with what ran; the record does not second-guess it.
+      sigmaScheduleRequested: t.sigmaScheduleRequested,
+      shiftApplied: t.sigmaSchedule != .bongTangent,
       stepsRequested: t.stepsRequested,
       stepsEffective: t.stepsEffective,
       stepsRun: t.stepsRun,
@@ -202,8 +210,11 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       denoise: t.denoise,
       guidance: t.guidance,
       negativePrompt: t.cfgActive ? i.negativePrompt : nil,
-      eta: 0,
-      bongmath: false,
+      eta: t.eta,
+      bongmath: t.bongmath,
+      // T2/T3 warm-up (`deis_3m` below order → `ralston_3s`) lands with
+      // WP-E15/E16; until then the loop reports none and the record says so
+      // rather than inventing one.
       warmupSampler: nil,
       warmupSteps: 0,
       sigmaHead: t.sigmaHead,
@@ -231,7 +242,7 @@ public struct RenderRecipe: Codable, Sendable, Equatable {
       baseModel: i.baseModel,
       baseVariant: i.variant.rawValue,
       baseModelFile: i.transformerFile.path,
-      quantization: i.quantization,
+      quantization: quantizationLabel(bits: i.quantizationBits),
       vae: i.vae.file.path,
       vaeLayout: i.vae.layout.rawValue,
       vaeSource: i.vae.source.rawValue,

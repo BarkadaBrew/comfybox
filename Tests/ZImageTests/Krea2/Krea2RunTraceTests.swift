@@ -1,82 +1,195 @@
 import XCTest
+import MLX
 @testable import ZImage
 
-/// WP-E10 — the pipeline's run trace (FDD §3.10): every provenance number
-/// that describes the loop is COUNTED by the loop (`Krea2RunCounter`), never
-/// recomputed from the request. The trace is a plain value so its accounting
-/// is asserted here with no weights (AC-63 for the img2img start index; the
-/// sigma head/tail and `steps_effective` for the record).
+/// WP-E3 — `Krea2RunTrace` (FDD-krea2-raw-recipe §3.3, §3.10).
+///
+/// The trace is what `generateWithRecipe` / `generateImg2ImgWithRecipe` HAND
+/// the caller; WP-E10 maps it into `RenderRecipe.Stage`. Weight-free: every
+/// input (request, resolved shift, scheduler, loop stats) is constructible
+/// without a model, which is the point of keeping the trace a plain value.
 final class Krea2RunTraceTests: XCTestCase {
 
-  private func trace(sigmas: [Float], stepsRequested: Int, startIndex: Int, cfg: Bool) -> Krea2RunTrace {
-    let counter = Krea2RunCounter()
-    // Walk the grid exactly as the loop does: one step per interval from
-    // startIndex, one eval per transformer call (two under CFG).
-    for _ in startIndex..<(sigmas.count - 1) {
-      counter.eval()
-      if cfg { counter.eval() }
-      counter.step()
+  static let align = 16
+  static let seqLen1024 = (1024 / 16) * (1024 / 16)
+
+  static func shift(explicit: Float? = nil, seqLen: Int = seqLen1024) throws
+    -> Krea2Sampling.ScheduleShift
+  {
+    try Krea2Sampling.resolveShift(explicit: explicit, seqLen: seqLen, align: align)
+  }
+
+  static func stats(stepsRun: Int, rowsAtStart: Int = 1, modelEvals: Int)
+    -> Krea2DenoiseLoop.Stats
+  {
+    Krea2DenoiseLoop.Stats(
+      stepsRun: stepsRun, rowsAtStart: rowsAtStart,
+      evaluateCalls: stepsRun * rowsAtStart, modelEvals: modelEvals)
+  }
+
+  // MARK: - Text-to-image
+
+  func testT2ITraceReportsTheGridTheLoopWalked() throws {
+    let shift = try Self.shift()
+    let scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: .euler, sigmaSchedule: .krea2, steps: 9, shift: shift, seed: 44821, c2: 0.5)
+    let request = Krea2Pipeline.Request(prompt: "x", steps: 9, seed: 44821)
+    let trace = Krea2RunTrace(
+      request: request, shift: shift, scheduler: scheduler,
+      stats: Self.stats(stepsRun: 9, modelEvals: 9),
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+
+    XCTAssertEqual(trace.sampler, .euler)
+    XCTAssertEqual(trace.sigmaSchedule, .krea2)
+    XCTAssertNil(trace.sigmaScheduleRequested)
+    XCTAssertEqual(trace.sigmas, scheduler.sigmas.asArray(Float.self))
+    XCTAssertEqual(trace.sigmas.count, 10)
+    XCTAssertEqual(trace.sigmas.last, 0.0)
+    XCTAssertEqual(trace.stepsRequested, 9)
+    XCTAssertEqual(trace.stepsEffective, 9)
+    XCTAssertEqual(trace.stepsRun, 9)
+    XCTAssertEqual(trace.modelEvals, 9)
+    XCTAssertEqual(trace.startIndex, 0)
+    XCTAssertEqual(trace.denoise, 1.0)
+    XCTAssertEqual(trace.guidance, 1.0)
+    XCTAssertEqual(trace.eta, 0)
+    XCTAssertFalse(trace.bongmath)
+    XCTAssertEqual(trace.seed, 44821)
+    XCTAssertEqual(trace.width, 1024)
+    XCTAssertEqual(trace.height, 1024)
+  }
+
+  /// D3 as amended by A.1: `mu` is the shift, the recorded `shift` is `e^mu`,
+  /// and the source says which of the two ways it was arrived at.
+  func testShiftSourceAndEffectiveShift() throws {
+    let dynamic = try Self.shift()
+    let explicit = try Self.shift(explicit: 1.15)
+    for (shift, expectedSource) in [(dynamic, "dynamic"), (explicit, "explicit")] {
+      let scheduler = try Krea2Pipeline.makeScheduler(
+        sampler: .euler, sigmaSchedule: .krea2, steps: 9, shift: shift, seed: 1, c2: 0.5)
+      let trace = Krea2RunTrace(
+        request: Krea2Pipeline.Request(prompt: "x", steps: 9, shift: shift.source == .explicit ? 1.15 : nil),
+        shift: shift, scheduler: scheduler, stats: Self.stats(stepsRun: 9, modelEvals: 9),
+        startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+      XCTAssertEqual(trace.shiftSource, expectedSource)
+      XCTAssertEqual(trace.mu, shift.mu)
+      XCTAssertEqual(trace.shift, Foundation.exp(shift.mu), accuracy: 1e-6)
     }
-    return Krea2RunTrace(
-      width: 1024, height: 1024, seed: 44821,
-      mu: 0.9062, shift: 2.475, shiftSource: "dynamic",
-      sigmas: sigmas, stepsRequested: stepsRequested, startIndex: startIndex,
-      guidance: cfg ? 2.0 : 1.0, denoise: startIndex == 0 ? 1.0 : 0.7,
-      sampler: "euler", sigmaSchedule: "krea2", counter: counter)
+    XCTAssertEqual(explicit.mu, 1.15, "A.1: shift IS mu, not log(shift)")
   }
 
-  func testTextToImageAccounting() {
-    let sigmas = SigmaSchedule.krea2(numSteps: 9, mu: 0.9062)
-    let t = trace(sigmas: sigmas, stepsRequested: 9, startIndex: 0, cfg: false)
-    XCTAssertEqual(t.stepsRequested, 9)
-    XCTAssertEqual(t.stepsEffective, 9)
-    XCTAssertEqual(t.stepsRun, 9)
-    XCTAssertEqual(t.modelEvals, 9)
-    XCTAssertEqual(t.sigmaHead, Array(sigmas.prefix(3)))
-    XCTAssertEqual(t.sigmaTail, Array(sigmas.suffix(3)))
-    XCTAssertEqual(t.sigmaHead.first, 1.0)
-    XCTAssertEqual(t.sigmaTail.last, 0.0)
+  /// The width/height on the trace are the POST-round-up numbers the render
+  /// actually used, not the request's (`Krea2Pipeline.generate` rounds to the
+  /// VAE scale × patch = 16 before anything else).
+  func testTraceCarriesRoundedGeometry() throws {
+    let shift = try Self.shift(seqLen: (1040 / 16) * (1024 / 16))
+    let scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: .euler, sigmaSchedule: .krea2, steps: 9, shift: shift, seed: 1, c2: 0.5)
+    let request = Krea2Pipeline.Request(prompt: "x", width: 1030, height: 1024, steps: 9)
+    let rounded = Krea2Sampling.roundUp(request.width, multiple: 16)
+    XCTAssertEqual(rounded, 1040)
+    let trace = Krea2RunTrace(
+      request: request, shift: shift, scheduler: scheduler,
+      stats: Self.stats(stepsRun: 9, modelEvals: 9),
+      startIndex: 0, denoise: 1.0, width: rounded, height: 1024)
+    XCTAssertEqual(trace.width, 1040)
   }
 
-  /// AC-12's cost line: CFG doubles the evals, never the steps.
-  func testCFGDoublesModelEvals() {
-    let sigmas = SigmaSchedule.krea2(numSteps: 6, mu: 0.9062)
-    let t = trace(sigmas: sigmas, stepsRequested: 6, startIndex: 0, cfg: true)
-    XCTAssertEqual(t.stepsRun, 6)
-    XCTAssertEqual(t.modelEvals, 12)
-    XCTAssertEqual(t.guidance, 2.0)
+  // MARK: - The alias is visible, never silent (D22)
+
+  func testRequestedScheduleNameIsRecordedOnlyWhenItIsAnAlias() throws {
+    let shift = try Self.shift()
+    let scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: .euler, sigmaSchedule: .flow, steps: 9, shift: shift, seed: 1, c2: 0.5)
+    func trace(requested: String?) -> Krea2RunTrace {
+      Krea2RunTrace(
+        request: Krea2Pipeline.Request(
+          prompt: "x", steps: 9, sigmaSchedule: .flow, sigmaScheduleRequested: requested),
+        shift: shift, scheduler: scheduler, stats: Self.stats(stepsRun: 9, modelEvals: 9),
+        startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+    }
+    // Krita's default style sends "normal", which resolves to flow.
+    XCTAssertEqual(trace(requested: "normal").sigmaScheduleRequested, "normal")
+    // The resolved kind's own spelling is not worth recording twice.
+    XCTAssertNil(trace(requested: "flow").sigmaScheduleRequested)
+    XCTAssertNil(trace(requested: nil).sigmaScheduleRequested)
   }
 
-  /// AC-63: `strength 0.3` / 20 steps → `steps_requested 20`, `steps_run 14`,
-  /// `model_evals 14` at guidance 1 — the start index is the loop's own
-  /// convention (`denoise = 1 - strength`, `start = total - ceil(total·denoise)`).
-  func testImg2ImgStepAccounting() {
-    XCTAssertEqual(Krea2Sampling.img2imgStartIndex(total: 20, strength: 0.3), 6)
-    XCTAssertEqual(Krea2Sampling.img2imgStartIndex(total: 9, strength: 0.3), 2)   // 9 - ceil(6.3) = 2
-    XCTAssertEqual(Krea2Sampling.img2imgStartIndex(total: 9, strength: 0.99), 8)  // denoise 0.01 → ceil(0.09)=1 → 8
-    XCTAssertEqual(Krea2Sampling.img2imgStartIndex(total: 9, strength: 0.01), 0)  // denoise 0.99 → ceil(8.91)=9 → 0
-    let sigmas = SigmaSchedule.krea2(numSteps: 20, mu: 0.9062)
-    let start = Krea2Sampling.img2imgStartIndex(total: 20, strength: 0.3)
-    let t = trace(sigmas: sigmas, stepsRequested: 20, startIndex: start, cfg: false)
-    XCTAssertEqual(t.stepsRequested, 20)
-    XCTAssertEqual(t.stepsEffective, 20)
-    XCTAssertEqual(t.stepsRun, 14)
-    XCTAssertEqual(t.modelEvals, 14)
-    XCTAssertEqual(t.startIndex, 6)
+  // MARK: - Steps: requested vs the grid's own count (D5, AC-22)
+
+  /// `beta`/`beta57` de-duplicate colliding table indices, so the grid can be
+  /// shorter than the request. The trace reports BOTH — the request's number
+  /// and the count the loop actually walked — rather than conflating them.
+  ///
+  /// Pinned with the 1000-entry DiscreteFlow table, where the first collision
+  /// is at `beta57(97) → 96` (`BetaScheduleComfyParityTests`). On Krea 2's own
+  /// 10 000-entry Flux table the two agree at every production budget, so a
+  /// krea2-config case could not tell a conflation from a correct mapping.
+  func testStepsEffectiveIsTheGridsCountNotTheRequests() throws {
+    let config = ZImageSchedulerConfig(numTrainTimesteps: 1000, shift: 1.0, useDynamicShifting: false)
+    let scheduler = try SchedulerFactory.create(
+      kind: .euler, sigmaSchedule: .beta57, numInferenceSteps: 97, config: config)
+    XCTAssertEqual(scheduler.numInferenceSteps, 96, "precondition: this grid de-dups")
+
+    let trace = Krea2RunTrace(
+      request: Krea2Pipeline.Request(prompt: "x", steps: 97, sigmaSchedule: .beta57),
+      shift: try Self.shift(), scheduler: scheduler,
+      stats: Self.stats(stepsRun: 96, modelEvals: 96),
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+    XCTAssertEqual(trace.stepsRequested, 97)
+    XCTAssertEqual(trace.stepsEffective, 96)
+    XCTAssertEqual(trace.stepsRun, 96)
+    XCTAssertEqual(trace.sigmas.count, 97)
   }
 
-  func testCounterStartsAtZeroAndIsIndependentPerRun() {
-    let a = Krea2RunCounter(), b = Krea2RunCounter()
-    a.eval(); a.eval(); a.step()
-    XCTAssertEqual(a.steps, 1); XCTAssertEqual(a.evals, 2)
-    XCTAssertEqual(b.steps, 0); XCTAssertEqual(b.evals, 0)
+  // MARK: - img2img
+
+  /// The img2img trace records where the partial denoise started and how much
+  /// of the schedule it therefore ran.
+  func testImg2ImgTraceRecordsStartIndexAndDenoise() throws {
+    let shift = try Self.shift()
+    let scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: .euler, sigmaSchedule: .krea2, steps: 9, shift: shift, seed: 7, c2: 0.5)
+    // The pipeline's own arithmetic at strength 0.3.
+    let denoise = 1.0 - Float(0.3)
+    let startIndex = max(0, 9 - Int((Double(9) * Double(denoise)).rounded(.up)))
+    XCTAssertEqual(startIndex, 2)
+
+    let request = Krea2Pipeline.Img2ImgRequest(
+      prompt: "x", sourceImage: MLX.zeros([1, 64, 64, 3]), steps: 9, seed: 7, strength: 0.3)
+    let trace = Krea2RunTrace(
+      request: request, shift: shift, scheduler: scheduler,
+      stats: Self.stats(stepsRun: 9 - startIndex, modelEvals: 9 - startIndex),
+      startIndex: startIndex, denoise: denoise, width: 1024, height: 1024)
+
+    XCTAssertEqual(trace.startIndex, 2)
+    XCTAssertEqual(trace.denoise, denoise)
+    XCTAssertEqual(trace.stepsRequested, 9)
+    XCTAssertEqual(trace.stepsEffective, 9)
+    XCTAssertEqual(trace.stepsRun, 7)
+    XCTAssertEqual(trace.modelEvals, 7)
+    XCTAssertEqual(trace.seed, 7)
   }
 
-  func testShortGridHeadAndTailDoNotOverlapBeyondTheGrid() {
-    let sigmas: [Float] = [1.0, 0.5, 0.0]
-    let t = trace(sigmas: sigmas, stepsRequested: 2, startIndex: 0, cfg: false)
-    XCTAssertEqual(t.sigmaHead, [1.0, 0.5, 0.0])
-    XCTAssertEqual(t.sigmaTail, [1.0, 0.5, 0.0])
-    XCTAssertEqual(t.stepsEffective, 2)
+  /// §3.3's cost line: a `res_2s` + CFG render is 4x a plain euler one, and
+  /// the trace carries that number so it is reported rather than discovered.
+  ///
+  /// The number itself comes from `Stats.modelEvals`, which the loop COUNTS.
+  /// `stepsRun × rowsAtStart × cfg` happens to equal it here only because
+  /// `res_2s` takes 2 rows on every step; `Krea2DenoiseLoopTests`'
+  /// `testRowsMayChangeMidRunAndModelEvalsCountsTheActualCalls` pins the case
+  /// where it does not.
+  func testTraceCarriesTheMultiplicativeEvalCost() throws {
+    let shift = try Self.shift()
+    let scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: .res2s, sigmaSchedule: .krea2, steps: 6, shift: shift, seed: 1, c2: 0.5)
+    let trace = Krea2RunTrace(
+      request: Krea2Pipeline.Request(prompt: "x", guidance: 2.0, steps: 6, sampler: .res2s),
+      shift: shift, scheduler: scheduler,
+      stats: Self.stats(stepsRun: 6, rowsAtStart: 2, modelEvals: 6 * 2 * 2),
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+    XCTAssertEqual(trace.modelEvals, 24)
+    XCTAssertEqual(trace.guidance, 2.0)
+    XCTAssertEqual(trace.sampler, .res2s)
   }
 }

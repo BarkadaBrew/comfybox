@@ -51,10 +51,9 @@ final class Krea2RecipeProvenanceTests: XCTestCase {
   func testRawRenderIsReadBackIntoTheRecordAndThePNG() throws {
     let k2 = try loadRaw()
     XCTAssertEqual(k2.variant, .raw)
-    XCTAssertEqual(k2.quantization, "q8")
+    XCTAssertEqual(k2.transformerQuantBits, 8)
     XCTAssertEqual(k2.currentVAE.source, .modelDir)
     XCTAssertEqual(k2.currentVAE.layout, .qwenDiffusers)
-    XCTAssertNil(k2.lastRunTrace, "no record before a run")
 
     // Two LoRAs when the vault has them (AC-60's "preset with two LoRAs");
     // each declared with its slot so the record labels it.
@@ -79,11 +78,11 @@ final class Krea2RecipeProvenanceTests: XCTestCase {
     let request = Krea2Pipeline.Request(
       prompt: "a wooden table by a window, soft morning light, a glass of water",
       negativePrompt: "blurry", guidance: 1.0, width: 1024, height: 1024, steps: steps, seed: 44821)
-    let image = try k2.generate(request)
+    // §3.3: the trace is HANDED back by the call, never read off the pipeline.
+    let (image, trace) = try k2.generateWithRecipe(request)
     MLX.eval(image)
 
     // The loop's own accounting.
-    let trace = try XCTUnwrap(k2.lastRunTrace)
     XCTAssertEqual(trace.width, 1024)
     XCTAssertEqual(trace.height, 1024)
     XCTAssertEqual(trace.seed, 44821)
@@ -95,16 +94,16 @@ final class Krea2RecipeProvenanceTests: XCTestCase {
     XCTAssertEqual(trace.sigmas.first, 1.0)
     XCTAssertEqual(trace.sigmas.last, 0.0)
     XCTAssertEqual(trace.shiftSource, "dynamic")
-    XCTAssertEqual(trace.sampler, "euler")
-    XCTAssertEqual(trace.sigmaSchedule, "krea2")
+    XCTAssertEqual(trace.sampler, .euler)
+    XCTAssertEqual(trace.sigmaSchedule, .krea2)
 
     // The record, built exactly as runKrea2Generate builds it.
     let recipe = RenderRecipe.krea2(.init(
       baseModel: "krea2-raw", variant: k2.variant, transformerFile: k2.paths.transformerFile,
-      quantization: k2.quantization, vae: k2.currentVAE, textEncoderFile: k2.paths.textEncoderFile,
+      quantizationBits: k2.transformerQuantBits, vae: k2.currentVAE, textEncoderFile: k2.paths.textEncoderFile,
       loras: zip(k2.loadedLoRAConfigs, k2.loadedLoRAReports).map { .init(configuration: $0, report: $1) },
       control: k2.controlLoRAActive ? k2.controlLoRAApplied : nil,
-      trace: trace, requestedSigmaSchedule: nil, negativePrompt: request.negativePrompt))
+      trace: trace, negativePrompt: request.negativePrompt))
     XCTAssertEqual(recipe.baseVariant, "raw")
     XCTAssertTrue(recipe.baseModelFile.hasSuffix("/raw.safetensors"), recipe.baseModelFile)
     XCTAssertEqual(recipe.quantization, "q8")

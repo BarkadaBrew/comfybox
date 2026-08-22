@@ -37,9 +37,11 @@ final class OracleFixtureTests: XCTestCase {
 
   // MARK: - AC-21 pins: ComfyUI `beta`
 
-  /// The FDD's AC-21 values (`beta(6, shift: 1.15)`) were derived under
-  /// `ModelSamplingDiscreteFlow(shift=1.15)`. The dump under that class must
-  /// reproduce them to 1e-5 — that is the "FDD is stale" alarm.
+  /// The FDD's *original* AC-21 values (`beta(6, shift: 1.15)`) were derived
+  /// under `ModelSamplingDiscreteFlow(shift=1.15)`; Addendum A.1 re-pinned AC-21
+  /// to the Flux table and keeps this grid only as the D5 before/after record.
+  /// The dump under that class must still reproduce it to 1e-5 — that is the
+  /// "port source moved" alarm for the DiscreteFlow families.
   func testBetaDiscreteFlowMatchesFDDPins() throws {
     let fixture = try SchedulerOracleFixtures.json("comfy_sigmas.json")
     let beta = try XCTUnwrap(fixture["beta"] as? [String: Any])
@@ -79,7 +81,8 @@ final class OracleFixtureTests: XCTestCase {
   /// `ModelSamplingFlux(shift=1.15)` — a 10 000-entry table whose `shift` is a
   /// log-shift (`exp(1.15)`), not `ModelSamplingDiscreteFlow`'s linear 1.15.
   /// The fixture records both and names the class, so no consumer can read the
-  /// DiscreteFlow numbers as the grid the published workflow ran on.
+  /// DiscreteFlow numbers as the grid the published workflow ran on. A.1's
+  /// re-pinned AC-21 values are the `flux` grid, pinned here against the dump.
   func testBetaUnderComfyKrea2RegistrationIsFluxAndDiffers() throws {
     let fixture = try SchedulerOracleFixtures.json("comfy_sigmas.json")
     XCTAssertEqual(
@@ -108,7 +111,16 @@ final class OracleFixtureTests: XCTestCase {
     XCTAssertEqual(fluxSix.first, 1.0)
     XCTAssertEqual(fluxSix.last, 0.0)
     XCTAssertGreaterThan(abs(fluxSix[1] - dfSix[1]), 1e-2,
-      "the two classes produce materially different grids; the FDD's D3/D5/AC-21 assume DiscreteFlow")
+      "the two classes produce materially different grids; A.1 re-pinned AC-21 to the flux grid")
+    // Addendum A.1's quoted AC-21 grids, verified against the dump.
+    let a1Beta: [Double] = [1.0, 0.969095, 0.892582, 0.759584, 0.545649, 0.241540, 0.0]
+    let a1Beta57: [Double] = [1.0, 0.941558, 0.823777, 0.640931, 0.390072, 0.125063, 0.0]
+    let flux57Six = try SchedulerOracleFixtures.doubles(
+      ((fixture["beta57"] as? [String: Any])?["flux"] as? [String: Any])?["6"], "beta57.flux.6")
+    for i in 0..<7 {
+      XCTAssertEqual(fluxSix[i], a1Beta[i], accuracy: 1e-5, "A.1 beta(6) i=\(i)")
+      XCTAssertEqual(flux57Six[i], a1Beta57[i], accuracy: 1e-5, "A.1 beta57(6) i=\(i)")
+    }
   }
 
   // MARK: - AC-19 pins: RES4LYF `bong_tangent`

@@ -22,18 +22,10 @@ final class HealthSinkTests: XCTestCase {
       lastRenderDurationMs: 1234, lastError: nil, lastRecipe: lastRecipe)
   }
 
+  /// The same builder every other sink test uses (AC-62: the four sinks
+  /// carry one record, not four look-alikes).
   private func recipe() -> RenderRecipe {
-    let c = Krea2RunCounter(); for _ in 0..<9 { c.eval(); c.step() }
-    let trace = Krea2RunTrace(
-      width: 1024, height: 1024, seed: 1, mu: 0.9, shift: 2.46, shiftSource: "dynamic",
-      sigmas: SigmaSchedule.krea2(numSteps: 9, mu: 0.9), stepsRequested: 9, startIndex: 0,
-      guidance: 1.0, denoise: 1.0, sampler: "euler", sigmaSchedule: "krea2", counter: c)
-    return RenderRecipe.krea2(.init(
-      baseModel: "krea2-raw", variant: .raw,
-      transformerFile: URL(fileURLWithPath: "/m/raw.safetensors"), quantization: "q8",
-      vae: .init(file: URL(fileURLWithPath: "/m/vae.safetensors"), layout: .qwenDiffusers, source: .modelDir),
-      textEncoderFile: URL(fileURLWithPath: "/m/text_encoder/model.safetensors"),
-      loras: [], control: nil, trace: trace, requestedSigmaSchedule: nil, negativePrompt: nil))
+    RenderRecipeFixture.recipe(steps: 9)
   }
 
   func testHealthCarriesLastRecipeAliasAndBuildSha() throws {
@@ -45,6 +37,7 @@ final class HealthSinkTests: XCTestCase {
     let last = try XCTUnwrap(json["last_recipe"] as? [String: Any])
     XCTAssertEqual(last["base_variant"] as? String, "raw")
     XCTAssertEqual((last["stages"] as? [[String: Any]])?.first?["steps_run"] as? Int, 9)
+    XCTAssertEqual(last["quantization"] as? String, "q8")
   }
 
   /// Before any krea2 render, and on other families, the /health body still
