@@ -12,8 +12,10 @@ import MLXRandom
 ///   * AC-10 `res_2s` fed the data prediction x₀ = x − σ·v reconstructs x₀ to
 ///           ≤1e-5 relative over the krea2 schedule; fed velocity (the
 ///           pre-change behaviour) it misses by >1.0 relative.
-///   * AC-11 every `SchedulerKind` reports a convention; only `res_2s`
-///           (and later `res_3s`) is `.dataPrediction`.
+///   * AC-11 every `SchedulerKind` reports a convention; `res_2s`, `res_3s`
+///           and the WP-E13 tableau conformers (`ralston_2s/3s/4s` — RES4LYF
+///           anchors their rows at the step's x₀ too) are `.dataPrediction`,
+///           everything else is `.velocity`.
 final class ModelOutputConventionTests: XCTestCase {
 
   // MARK: - AC-11
