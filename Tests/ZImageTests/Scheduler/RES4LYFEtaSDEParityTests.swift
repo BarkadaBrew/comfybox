@@ -50,7 +50,9 @@ final class RES4LYFEtaSDEParityTests: XCTestCase {
       let t = tensors[drawn]
       drawn += 1
       XCTAssertEqual(t.shape, sample.shape, "\(name): draw \(drawn) shape")
-      return t.asType(sample.dtype)
+      // float32, not `sample.dtype`: the stream's contract is that `swap` owns
+      // the single cast, and the recorded tensors are upstream's work_dtype.
+      return t.asType(.float32)
     }
 
     var exhausted: Bool { drawn == tensors.count }
@@ -61,7 +63,7 @@ final class RES4LYFEtaSDEParityTests: XCTestCase {
     private(set) var drawn = 0
     func next(like sample: MLXArray) -> MLXArray {
       drawn += 1
-      return MLXArray.zeros(like: sample)
+      return MLXArray.zeros(sample.shape, dtype: .float32)
     }
   }
 
