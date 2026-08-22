@@ -3233,11 +3233,24 @@ public final class WarmServer {
 
     switch family {
     case .krea2:
-      // Krea-2-Turbo: 8-step distilled, no CFG. Clamp runaway KSampler defaults.
-      resolvedSteps = request.steps > 0 ? min(request.steps, 12) : 9
-      resolvedGuidance = 0.0
-      resolvedNegativePrompt = nil
-      resolvedSampler = request.sampler
+      // WP-E19 (FDD §3.5, D13, AC-5a): split by the PHYSICAL variant the
+      // engine loaded. .turbo is byte-identical to today (clamp 12, guidance
+      // 0, negative dropped); .raw takes what Krita sent — no clamp, CFG and
+      // the negative prompt live, variant defaults only when absent. A krea2
+      // family with no known variant is a fault, never "turbo".
+      let resolution = try BridgeKrea2Arm.resolve(request, variant: await coordinator.currentKrea2Variant)
+      resolvedSteps = resolution.steps
+      resolvedGuidance = resolution.guidance
+      resolvedNegativePrompt = resolution.negativePrompt
+      resolvedSampler = resolution.sampler
+      let clampNote: String = resolution.stepsClamped ? " (clamped from \(request.steps))" : ""
+      let negativeNote: String = resolution.negativePrompt.map { "\($0.count) chars" } ?? "none"
+      let samplerNote: String = resolution.sampler ?? "nil"
+      let scheduleNote: String = request.sigmaSchedule ?? "nil"
+      let armLine = "WarmServer: bridge krea2 arm (\(resolution.variant.rawValue)): steps=\(resolution.steps)\(clampNote) "
+        + "guidance=\(resolution.guidance) (requested \(request.guidance)) negative=\(negativeNote) "
+        + "sampler=\(samplerNote) sigma_schedule=\(scheduleNote)"
+      logger.info("\(armLine)")
     case .fibo:
       // FIBO: use model defaults, no step clamping
       resolvedSteps = request.steps
@@ -3286,27 +3299,12 @@ public final class WarmServer {
       resolvedSampler = request.sampler
     }
 
-    let payload = GeneratePayload(
-      prompt: request.prompt,
-      negativePrompt: resolvedNegativePrompt,
-      width: genWidth,
-      height: genHeight,
-      steps: resolvedSteps,
-      guidance: resolvedGuidance,
-      seed: request.seed,
-      outputPath: nil,
-      levelsMin: request.levelsMin,
-      levelsMax: request.levelsMax,
-      scheduler: resolvedSampler,
-      sigmaSchedule: request.sigmaSchedule,
-      inpaintImageData: request.inpaintImageData,
-      maskData: request.maskImageData,
-      denoise: request.denoise,
-      maskGrow: request.maskGrow,
-      maskFeather: request.maskFeather,
-      maskCropX: request.maskCropX,
-      maskCropY: request.maskCropY
-    )
+    // One constructor for every family arm (BridgeKrea2Arm.swift) so the
+    // field set is asserted once, field-for-field (AC-5a).
+    let payload = request.makeGeneratePayload(
+      width: genWidth, height: genHeight,
+      steps: resolvedSteps, guidance: resolvedGuidance,
+      negativePrompt: resolvedNegativePrompt, sampler: resolvedSampler)
     // WP-E4 (§3.4): the bridge builds its payload directly, so it runs the
     // same fail-loud name resolution the /v1/generate decoder does — a Krita
     // style whose sampler we do not implement is refused by name, never
@@ -4326,7 +4324,7 @@ public final class WarmServer {
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
-           .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded:
+           .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
@@ -8372,6 +8370,9 @@ public enum WarmServerError: Error, LocalizedError {
   case chromaDetectionFailed(String)
   case chromaNotLoaded
   case krea2NotLoaded
+  /// WP-E19: the krea2 family is resident but the coordinator holds no
+  /// `Krea2Variant` for it. The bridge arm refuses rather than assuming turbo.
+  case krea2VariantUnknown
   case loraSwapNotSupported
   case controlNetNotSupported
   // WP-E4 (FDD-krea2-raw-recipe §3.4, D22, D25, D18): fail-loud recipe names.
@@ -8410,6 +8411,8 @@ public enum WarmServerError: Error, LocalizedError {
       return "Chroma pipeline is not loaded"
     case .krea2NotLoaded:
       return "Krea-2 pipeline is not loaded"
+    case .krea2VariantUnknown:
+      return "Krea-2 pipeline is resident but its variant (turbo|raw) is unknown — refusing to assume turbo"
     case .loraSwapNotSupported:
       return "LoRA swap is not supported for this model family"
     case .controlNetNotSupported:
