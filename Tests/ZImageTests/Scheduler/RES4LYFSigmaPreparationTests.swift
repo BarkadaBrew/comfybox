@@ -174,7 +174,14 @@ final class RES4LYFSigmaPreparationTests: XCTestCase {
     XCTAssertTrue(SchedulerKind.ralston2s.isRES4LYFFamily)
     XCTAssertTrue(SchedulerKind.ralston3s.isRES4LYFFamily)
     XCTAssertTrue(SchedulerKind.ralston4s.isRES4LYFFamily)
-    // `.deis` is the k-diffusion multistep port today; WP-E14 replaces it.
+    // WP-E14: RES4LYF's DEIS multistep ports, under the names RES4LYF has.
+    XCTAssertTrue(SchedulerKind.deis2m.isRES4LYFFamily)
+    XCTAssertTrue(SchedulerKind.deis3m.isRES4LYFFamily)
+    XCTAssertTrue(SchedulerKind.deis4m.isRES4LYFFamily)
+    // The bare `deis` is NOT one of them and stays out: it is the k-diffusion
+    // velocity port, it runs on every family, and it has no `sigma_min`
+    // preparation and no model-free tail. WP-E14 added `deis_Nm` beside it
+    // rather than repointing this name at a different algorithm.
     XCTAssertFalse(SchedulerKind.deis.isRES4LYFFamily)
     for kind in [SchedulerKind.euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .ddim] {
       XCTAssertFalse(kind.isRES4LYFFamily, "\(kind.rawValue)")

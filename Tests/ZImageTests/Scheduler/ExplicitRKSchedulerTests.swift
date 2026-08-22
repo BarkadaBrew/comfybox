@@ -344,7 +344,8 @@ final class ExplicitRKSchedulerTests: XCTestCase {
         claimed.insert(kind)
       }
     }
-    XCTAssertEqual(claimed, [.ralston2s, .ralston3s, .ralston4s, .res3s])
+    XCTAssertEqual(
+      claimed, [.ralston2s, .ralston3s, .ralston4s, .res3s, .deis2m, .deis3m, .deis4m])
   }
 
   /// The server's family gate: a tableau sampler is a 400 on every family but

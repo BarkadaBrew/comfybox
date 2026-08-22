@@ -25,7 +25,11 @@ enum RenderRecipeFixture {
     eta: Float = 0,
     bongmath: Bool = false,
     mu: Float = 0.9062,
-    seed: UInt64 = 44821
+    seed: UInt64 = 44821,
+    // WP-E14: the DEIS order ramp, as the loop reported it. Defaults are the
+    // non-ramping case, which is every sampler but `deis_Nm`.
+    warmupSampler: String? = nil,
+    warmupSteps: Int = 0
   ) -> Krea2RunTrace {
     let sigmas = SigmaSchedule.krea2(numSteps: steps, mu: mu)
     let effective = sigmas.count - 1
@@ -38,6 +42,8 @@ enum RenderRecipeFixture {
       shift: exp(mu),
       shiftSource: "dynamic",
       sigmas: sigmas,
+      warmupSampler: warmupSampler,
+      warmupSteps: warmupSteps,
       stepsRequested: steps,
       stepsEffective: effective,
       stepsRun: run,

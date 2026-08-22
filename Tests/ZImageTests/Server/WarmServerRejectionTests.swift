@@ -132,20 +132,40 @@ final class WarmServerRejectionTests: XCTestCase {
     }
   }
 
-  /// Krea 2 tier gates (D18, §3.4): `eta != 0` is refused before T2. Since
-  /// WP-E3 the loop takes the sampler and the schedule, so every name the
-  /// resolver accepts passes the gate — `res_2s`, `karras`, Krita's
-  /// `euler`/`normal`, and a bare request alike.
+  /// Krea 2 tier gates (D18, §3.4). Since WP-E3 the loop takes the sampler and
+  /// the schedule, so every name the resolver accepts passes the gate —
+  /// `res_2s`, `karras`, Krita's `euler`/`normal`, and a bare request alike.
+  ///
+  /// WP-E15 changed what `eta` means here, not whether it is checked. T2 has
+  /// landed, so `eta != 0` is APPLIED on a RES4LYF sampler and refused — 400,
+  /// naming the sampler — on anything else. A bare `{"eta":0.5}` still 400s,
+  /// because the Krea 2 default sampler is `euler` and RES4LYF's SDE is not
+  /// defined against it.
   func testKrea2TierGates() throws {
     let eta = try decode(#"{"prompt":"x","eta":0.5}"#)
     XCTAssertThrowsError(try eta.validateKrea2TierGates(try eta.validateRecipeNames())) { error in
-      guard case WarmServerError.unsupportedRecipeField(let field, let value, let family, _) = error else {
+      guard case WarmServerError.unsupportedRecipeField(let field, let value, let family, let reason) = error else {
         return XCTFail("\(error)")
       }
       XCTAssertEqual(field, "eta"); XCTAssertEqual(value, "0.5"); XCTAssertEqual(family, "krea2")
+      XCTAssertTrue(reason.contains("euler"), "the refusal names the sampler: \(reason)")
+      XCTAssertTrue(reason.contains("res_2s"), "…and what to send instead: \(reason)")
     }
     let etaZero = try decode(#"{"prompt":"x","eta":0}"#)
     XCTAssertNoThrow(try etaZero.validateKrea2TierGates(try etaZero.validateRecipeNames()))
+
+    // WP-E15: on a RES4LYF sampler the same eta is honoured, not refused.
+    for sampler in ["res_2s", "res_3s", "ralston_3s", "deis_3m"] {
+      let ok = try decode(#"{"prompt":"x","scheduler":"\#(sampler)","eta":0.5}"#)
+      XCTAssertNoThrow(
+        try ok.validateKrea2TierGates(try ok.validateRecipeNames()), "eta 0.5 on \(sampler)")
+    }
+    // …and on the samplers where `eta` already means something else, refused.
+    for sampler in ["ddim", "dpmpp-2s-a", "heun"] {
+      let bad = try decode(#"{"prompt":"x","scheduler":"\#(sampler)","eta":0.5}"#)
+      XCTAssertThrowsError(
+        try bad.validateKrea2TierGates(try bad.validateRecipeNames()), "eta 0.5 on \(sampler)")
+    }
 
     // WP-E3: the sampler and the schedule are honoured, not gated.
     let sampler = try decode(#"{"prompt":"x","scheduler":"res_2s"}"#)

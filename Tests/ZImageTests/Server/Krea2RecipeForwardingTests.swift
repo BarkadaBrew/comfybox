@@ -55,12 +55,20 @@ final class Krea2RecipeForwardingTests: XCTestCase {
     XCTAssertEqual(fields.sigmaScheduleRequested, "normal")
   }
 
-  /// `eta` is forwarded as the RES4LYF SDE eta and is still gated at the
-  /// server before T2 (D18) — the gate refuses, the forwarding does not hide it.
-  func testEtaForwardsAndIsGated() throws {
-    let p = try decode(#"{"prompt":"x","eta":0.5}"#)
-    XCTAssertEqual(try p.krea2RecipeFields().eta, 0.5)
-    XCTAssertThrowsError(try p.validateKrea2TierGates(try p.validateRecipeNames()))
+  /// `eta` is forwarded as the RES4LYF SDE eta whatever the sampler, and the
+  /// gate — not the forwarding — decides whether the render may have it
+  /// (D18). Since WP-E15 that decision is by SAMPLER: honoured on a RES4LYF
+  /// port, 400 on the default `euler`.
+  func testEtaForwardsAndIsGatedBySampler() throws {
+    let bare = try decode(#"{"prompt":"x","eta":0.5}"#)
+    XCTAssertEqual(try bare.krea2RecipeFields().eta, 0.5)
+    XCTAssertEqual(try bare.krea2RecipeFields().sampler, .euler)
+    XCTAssertThrowsError(try bare.validateKrea2TierGates(try bare.validateRecipeNames()))
+
+    let res2s = try decode(#"{"prompt":"x","scheduler":"res_2s","eta":0.5}"#)
+    XCTAssertEqual(try res2s.krea2RecipeFields().eta, 0.5)
+    XCTAssertEqual(try res2s.krea2RecipeFields().sampler, .res2s)
+    XCTAssertNoThrow(try res2s.validateKrea2TierGates(try res2s.validateRecipeNames()))
   }
 
   func testUnknownNamesStillThrow() throws {

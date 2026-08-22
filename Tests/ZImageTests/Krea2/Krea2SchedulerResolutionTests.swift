@@ -110,14 +110,24 @@ final class Krea2SchedulerResolutionTests: XCTestCase {
 
   // MARK: - D18: unimplemented tiers fail loud at the pipeline, never downgrade
 
-  func testEtaIsRefusedBeforeT2() {
-    XCTAssertThrowsError(try Krea2Pipeline.validateTiers(eta: 0.5, bongmath: false)) { error in
-      guard case Krea2ScheduleError.tierNotImplemented(let field, let value, let tier) = error else {
+  /// WP-E15 landed T2, so `eta` is no longer a TIER refusal — but it is still
+  /// never ignored: a non-zero `eta` is honoured on a RES4LYF sampler and
+  /// refused by name on any other (`etaUnsupportedSampler`). The two arms
+  /// together are the D18 property; the tier gate is now bongmath's alone.
+  func testEtaIsNoLongerATierRefusalButIsStillRefusedBySampler() {
+    XCTAssertNoThrow(try Krea2Pipeline.validateTiers(eta: 0.5, bongmath: false))
+    XCTAssertThrowsError(
+      try Krea2Pipeline.makeSDEInjector(
+        eta: 0.5, sampler: .euler, stageSeed: 0, layout: .channelsAtAxis1)
+    ) { error in
+      guard case Krea2ScheduleError.etaUnsupportedSampler(let sampler, let value) = error else {
         return XCTFail("\(error)")
       }
-      XCTAssertEqual(field, "eta"); XCTAssertEqual(value, "0.5"); XCTAssertEqual(tier, "T2")
-      XCTAssertTrue("\(error)".contains("WP-E15"), "\(error)")
+      XCTAssertEqual(sampler, "euler"); XCTAssertEqual(value, "0.5")
     }
+    XCTAssertNotNil(
+      try Krea2Pipeline.makeSDEInjector(
+        eta: 0.5, sampler: .res2s, stageSeed: 0, layout: .channelsAtAxis1))
   }
 
   func testBongmathIsRefusedBeforeT3() {

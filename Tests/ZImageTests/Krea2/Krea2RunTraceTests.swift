@@ -55,10 +55,41 @@ final class Krea2RunTraceTests: XCTestCase {
     XCTAssertEqual(trace.denoise, 1.0)
     XCTAssertEqual(trace.guidance, 1.0)
     XCTAssertEqual(trace.eta, 0)
+    XCTAssertNil(trace.sde, "eta 0 renders carry no SDE block (WP-E15)")
     XCTAssertFalse(trace.bongmath)
     XCTAssertEqual(trace.seed, 44821)
     XCTAssertEqual(trace.width, 1024)
     XCTAssertEqual(trace.height, 1024)
+  }
+
+  /// WP-E15 (§3.13, scope 4): a render that ran the T2 SDE records what it ran
+  /// with — including the two stream seeds, which are the only part of the SDE
+  /// the request does not state and which are what makes AC-27's "same
+  /// payload, same output" checkable from the record.
+  func testT2ITraceRecordsTheSDEWhenEtaRan() throws {
+    let shift = try Self.shift()
+    let scheduler = try Krea2Pipeline.makeScheduler(
+      sampler: .res2s, sigmaSchedule: .beta, steps: 6, shift: shift, seed: 4242, c2: 0.5)
+    var request = Krea2Pipeline.Request(prompt: "x", steps: 6, seed: 4242)
+    request.sampler = .res2s
+    request.sigmaSchedule = .beta
+    request.eta = 0.5
+    let trace = Krea2RunTrace(
+      request: request, shift: shift, scheduler: scheduler,
+      stats: Self.stats(stepsRun: 6, rowsAtStart: 2, modelEvals: 12),
+      startIndex: 0, denoise: 1.0, width: 1024, height: 1024)
+
+    XCTAssertEqual(trace.eta, 0.5)
+    let sde = try XCTUnwrap(trace.sde)
+    XCTAssertEqual(sde.eta, 0.5)
+    XCTAssertEqual(sde.etaSubstep, 0.5, "ClownsharKSampler sets eta_substep = eta")
+    XCTAssertEqual(sde.noiseMode, "hard")
+    XCTAssertEqual(sde.sNoise, 1.0)
+    XCTAssertEqual(sde.stepNoiseSeed, 4243, "seed + 1, as SharkSampler derives it")
+    XCTAssertEqual(sde.substepNoiseSeed, 4243 + 10_000, "+ MAX_STEPS")
+    // The record and the injector agree by construction, not by comment.
+    XCTAssertEqual(
+      sde.stepNoiseSeed, RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed: request.seed))
   }
 
   /// D3 as amended by A.1: `mu` is the shift, the recorded `shift` is `e^mu`,

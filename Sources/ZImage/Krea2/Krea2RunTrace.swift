@@ -62,7 +62,28 @@ public struct Krea2RunTrace: Sendable, Equatable {
   public let stepsRun: Int
   /// Transformer forwards: `stepsRun × rows × (guidance > 1 ? 2 : 1)`.
   /// Counted by the loop, never predicted (§3.3).
+  ///
+  /// That product is a description, not a formula: `deis_Nm`'s row count FALLS
+  /// mid-run when its order ramp completes, and this field is the loop's count
+  /// either way (WP-E14, `Krea2DenoiseLoop.Stats.modelEvals`).
   public let modelEvals: Int
+
+  // — the order ramp, when there was one (WP-E14, §3.12 / AC-24) —
+
+  /// The sampler that actually ran during a DEIS warm-up (`"ralston_3s"`), or
+  /// `nil` when the run had no warm-up — which is every sampler but `deis_Nm`,
+  /// and `deis_Nm` itself on a run that took no step.
+  ///
+  /// It exists because the published stage-2 recipe (`deis_3m`, 2 steps) is
+  /// ENTIRELY warm-up: RES4LYF swaps `ralston_3s` in while
+  /// `step < order + multistep_extra_initial_steps` (the latter defaulting to
+  /// 1), so the DEIS coefficients never engage and the stage costs 6 model
+  /// evaluations. Without this field that fact has to be rediscovered from the
+  /// upstream source every time.
+  public let warmupSampler: String?
+
+  /// How many of ``stepsRun`` used ``warmupSampler``. 0 when there was none.
+  public let warmupSteps: Int
   /// First grid index stepped from. 0 for text-to-image.
   public let startIndex: Int
   /// The denoise fraction the start index came from. 1.0 for text-to-image.
@@ -85,8 +106,17 @@ public struct Krea2RunTrace: Sendable, Equatable {
   /// negative under CFG can no longer be recorded as "no negative prompt".
   /// Invariant, pinned by test: non-nil exactly when ``cfgActive``.
   public let negativePromptApplied: String?
-  /// RES4LYF SDE eta (T2). 0 until WP-E15.
+  /// RES4LYF SDE eta (T2).
   public let eta: Float
+
+  /// What the T2 SDE actually ran with, or `nil` when this render had none
+  /// (`eta == 0`) — WP-E15, §3.13.
+  ///
+  /// Additive and optional on purpose: it is the record of a thing that mostly
+  /// does not happen, and `eta: 0` renders must not grow a block of zeros in
+  /// their provenance. ``eta`` stays a plain field because `RenderRecipe.Stage`
+  /// already reads it.
+  public let sde: SDEParameters?
   /// RES4LYF bongmath (T3). `false` until WP-E16.
   public let bongmath: Bool
   public let seed: UInt64
@@ -94,6 +124,54 @@ public struct Krea2RunTrace: Sendable, Equatable {
   /// was asked for.
   public let width: Int
   public let height: Int
+
+  /// The RES4LYF SDE settings one stage ran under.
+  ///
+  /// Everything here is either a knob the request set or a value derived from
+  /// it by a rule that lives in one place — so a render that looks wrong can
+  /// be re-derived from the record instead of from the source. The seeds are
+  /// included because they are the only part of the SDE that is NOT visible in
+  /// the request: they are derived from the stage's seed by upstream's own
+  /// offsets (`seed + 1`, `+ MAX_STEPS`), and without them "same payload, same
+  /// output" (AC-27) is a claim rather than a check.
+  public struct SDEParameters: Sendable, Equatable {
+    /// `eta` — the step-level SDE strength.
+    public let eta: Float
+    /// `eta_substep`. `ClownsharKSampler_Beta` sets it equal to `eta`.
+    public let etaSubstep: Float
+    /// `noise_mode_sde`. `"hard"` is the only mode this port implements, and
+    /// it is the one the workflow uses.
+    public let noiseMode: String
+    /// `s_noise` — the multiplier on the injected noise.
+    public let sNoise: Float
+    /// The step noise stream's seed: the stage's seed + 1.
+    public let stepNoiseSeed: UInt64
+    /// The substep noise stream's seed: the step seed + `MAX_STEPS`.
+    public let substepNoiseSeed: UInt64
+
+    public init(
+      eta: Float, etaSubstep: Float, noiseMode: String, sNoise: Float,
+      stepNoiseSeed: UInt64, substepNoiseSeed: UInt64
+    ) {
+      self.eta = eta
+      self.etaSubstep = etaSubstep
+      self.noiseMode = noiseMode
+      self.sNoise = sNoise
+      self.stepNoiseSeed = stepNoiseSeed
+      self.substepNoiseSeed = substepNoiseSeed
+    }
+
+    /// What ``Krea2Pipeline`` builds its injector with, for a stage that has
+    /// one. `nil` at `eta == 0`, so the two agree by construction rather than
+    /// by a comment.
+    public static func forRun(eta: Float, stageSeed: UInt64) -> SDEParameters? {
+      guard eta != 0 else { return nil }
+      return SDEParameters(
+        eta: eta, etaSubstep: eta, noiseMode: "hard", sNoise: 1.0,
+        stepNoiseSeed: RES4LYFSDENoiseInjector.stepNoiseSeed(stageSeed: stageSeed),
+        substepNoiseSeed: RES4LYFSDENoiseInjector.substepNoiseSeed(stageSeed: stageSeed))
+    }
+  }
 
   public init(
     sampler: SchedulerKind,
@@ -104,6 +182,8 @@ public struct Krea2RunTrace: Sendable, Equatable {
     shiftSource: String,
     sigmas: [Float],
     finalConversionSigma: Float? = nil,
+    warmupSampler: String? = nil,
+    warmupSteps: Int = 0,
     stepsRequested: Int,
     stepsEffective: Int,
     stepsRun: Int,
@@ -126,6 +206,8 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.shiftSource = shiftSource
     self.sigmas = sigmas
     self.finalConversionSigma = finalConversionSigma
+    self.warmupSampler = warmupSampler
+    self.warmupSteps = warmupSteps
     self.stepsRequested = stepsRequested
     self.stepsEffective = stepsEffective
     self.stepsRun = stepsRun
@@ -135,6 +217,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.guidance = guidance
     self.negativePromptApplied = negativePromptApplied
     self.eta = eta
+    self.sde = SDEParameters.forRun(eta: eta, stageSeed: seed)
     self.bongmath = bongmath
     self.seed = seed
     self.width = width
@@ -224,6 +307,10 @@ extension Krea2RunTrace {
       shiftSource: shift.source.rawValue,
       sigmas: Self.walkedGrid(scheduler: scheduler),
       finalConversionSigma: stats.finalConversionSigma,
+      // The scheduler is the only witness to its own order ramp; a sampler
+      // that does not ramp reports none rather than an invented one (WP-E14).
+      warmupSampler: Self.warmUpSampler(of: scheduler),
+      warmupSteps: Self.warmUpSteps(of: scheduler),
       stepsRequested: stepsRequested,
       stepsEffective: scheduler.numInferenceSteps,
       stepsRun: stats.stepsRun,
@@ -248,6 +335,24 @@ extension Krea2RunTrace {
     let solver = scheduler.sigmas.asArray(Float.self)
     guard scheduler.finalConversionSigma != nil else { return solver }
     return solver + [0.0]
+  }
+
+  /// The warm-up sampler a ramping conformer actually ran, or `nil`.
+  ///
+  /// Read off the scheduler AFTER the run, through
+  /// ``WarmUpReportingScheduler``: only the conformer knows how many of its
+  /// steps were the ramp's, and only the run that just finished knows how many
+  /// steps it took at all (a 2-step `deis_3m` warms up twice; an 8-step one
+  /// warms up four times). `internal` so the tests can pin both halves without
+  /// building a whole `RenderRecipe`.
+  static func warmUpSampler(of scheduler: any ZImageScheduler) -> String? {
+    (scheduler as? WarmUpReportingScheduler)?.warmUpSampler
+  }
+
+  /// How many steps of the finished run used it; 0 for every non-ramping
+  /// sampler.
+  static func warmUpSteps(of scheduler: any ZImageScheduler) -> Int {
+    (scheduler as? WarmUpReportingScheduler)?.warmUpSteps ?? 0
   }
 
   /// D22: the requested name is recorded only when it is not simply the

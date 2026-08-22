@@ -115,6 +115,11 @@ extension Krea2Pipeline {
       explicit: request.shift, seqLen: hTok * wTok, align: align)
     // D18: unimplemented tiers are refused before any model work.
     try Krea2Pipeline.validateTiers(eta: request.eta, bongmath: request.bongmath)
+    // WP-E15: the T2 SDE, on the same terms as the t2i path — `nil` at eta 0,
+    // a refusal (never a silent drop) on a sampler it is not defined against.
+    let sdeNoise = try Krea2Pipeline.makeSDEInjector(
+      eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
+      layout: Krea2Pipeline.sdeNoiseLayout)
 
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
@@ -187,6 +192,7 @@ extension Krea2Pipeline {
                                   mask: negFullMask, ropeScales: ropeScales)
         return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       },
+      noise: sdeNoise,
       progress: progress)
 
     let latentNCHW = Krea2Sampling.unpatchify(
