@@ -1316,29 +1316,41 @@ public final class LTX2VideoGenerator {
                 if audioVAE == nil {
                     logger.info("LTX-2 audio: binding audio VAE + vocoder from monolith…")
                     audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
+                    // OFFICIAL vocoder override (Todd 2026-08-17 metallic fix):
+                    // the JoyAI BigVGAN is a foreign vocoder for our audio_vae →
+                    // metallic. When LTX2_VOCODER_PATH points at the official
+                    // LTX-2.3 HiFi-GAN weights, route audio decode through it.
+                    if let vp = ProcessInfo.processInfo.environment["LTX2_VOCODER_PATH"],
+                       !vp.isEmpty, let av = audioVAE {
+                        av.officialVocoder = try LTX2HiFiGANVocoder.load(path: vp, logger: logger)
+                        logger.info("LTX-2 audio: OFFICIAL HiFi-GAN vocoder bound from \(vp) (24 kHz).")
+                    }
                 }
                 if let av = audioVAE {
                     telemetry?.begin(.vocoder)
                     defer { telemetry?.end(.vocoder) }
-                    let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N) @48k
+                    // Official HiFi-GAN outputs 24 kHz; the BigVGAN+BWE path 48 kHz.
+                    let audioSR = av.officialVocoder != nil ? 24000 : 48000
+                    let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N)
                     var clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
                     // Trim to the actual video duration (ceil(s*25) latent
                     // quantization overshoots; Codex #8). Shorter audio is
                     // left as-is — AAC tolerates a short tail.
-                    let videoSamples = Int((Double(allFrames.count) / Double(request.fps) * 48000).rounded(.up))
+                    let videoSamples = Int((Double(allFrames.count) / Double(request.fps) * Double(audioSR)).rounded(.up))
                     if clamped.dim(1) > videoSamples {
                         clamped = clamped[0..., 0..<videoSamples]
                     }
                     // In-engine mastering (task #26): rumble cut, BWE de-harsh,
-                    // loudness raise with soft ceiling. LTX2_AUDIO_ENHANCE=0
-                    // keeps the raw track (A/B + training-data use).
-                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" {
-                        clamped = LTX2AudioEnhance.process(clamped, sampleRate: 48000)
+                    // loudness raise with soft ceiling. The de-harsh dip targeted
+                    // the BigVGAN metallic — skip enhance for the clean official
+                    // vocoder. LTX2_AUDIO_ENHANCE=0 also disables it entirely.
+                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" && av.officialVocoder == nil {
+                        clamped = LTX2AudioEnhance.process(clamped, sampleRate: audioSR)
                         logger.info("LTX-2 audio: enhancement chain applied (hp50 + dip7.5k + loudnorm).")
                     }
                     eval(clamped)
-                    audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: 48000)
-                    logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / 48000.0))s stereo).")
+                    audioTrack = LTX2PostProcess.AudioTrack(samples: clamped, sampleRate: audioSR)
+                    logger.info("LTX-2 audio: decoded \(clamped.dim(1)) samples (\(String(format: "%.2f", Double(clamped.dim(1)) / Double(audioSR)))s stereo @\(audioSR)Hz).")
                 }
             } catch {
                 logger.error("LTX-2 audio: decode failed (\(error)) — writing video-only output.")
