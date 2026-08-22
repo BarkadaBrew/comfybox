@@ -7161,6 +7161,16 @@ private actor WarmServerCoordinator {
       // quantization it applied, the VAE resident in its slot, its loaded
       // LoRA configs joined with their bind reports, and the run trace the
       // loop just counted. `steps`/`guidance` above are NOT consulted here.
+      // `loadedLoRAConfigs` and `loadedLoRAReports` are written in one
+      // statement pair on every path through `loadLoRAs`, so the zip below
+      // is total. If that invariant ever breaks the zip would silently SHORTEN
+      // the record, which is the one failure mode this whole work package
+      // exists to prevent — say so loudly rather than under-report.
+      if k2.loadedLoRAConfigs.count != k2.loadedLoRAReports.count {
+        let mismatch = "Krea2 provenance: \(k2.loadedLoRAConfigs.count) loaded LoRA configs but "
+          + "\(k2.loadedLoRAReports.count) bind reports — applied.loras is UNDER-REPORTING this render"
+        logger.error("\(mismatch)")
+      }
       // `base_model` is the declared alias when the active spec is one (or
       // resolves to one's directory — AC-34b), else the spec as loaded.
       let activeSpec = activePoolModelSpec ?? configuration.modelSpec ?? "krea2"
