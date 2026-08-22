@@ -1087,7 +1087,7 @@ public final class ZImagePipeline {
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
 
-    var scheduler = SchedulerFactory.create(
+    var scheduler = try SchedulerFactory.create(
       kind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,

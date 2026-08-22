@@ -102,25 +102,66 @@ enum Krea2Sampling {
   }
 
   /// Resolution-shifted timestep schedule (exp/sigmoid warp), 1 → 0 inclusive.
+  ///
+  /// Signature unchanged; the warp itself now lives in
+  /// ``SigmaSchedule/krea2(numSteps:mu:sigmaExp:)`` and this delegates to it,
+  /// so the pipelines' grid and `SchedulerFactory`'s `.krea2` grid are one body
+  /// (FDD-krea2-raw-recipe §3.1, AC-3). The `mu` derivation is the original
+  /// inline slope form — `mu(seqLen:align:)` is pinned equal to it.
   static func timesteps(
     seqLen: Int, steps: Int, x1: Float, x2: Float,
     y1: Float = 0.5, y2: Float = 1.15, sigma: Float = 1.0, mu muOverride: Float? = nil
   ) -> [Float] {
     let slope = (y2 - y1) / (x2 - x1)
     let mu = muOverride ?? (slope * Float(seqLen) + (y1 - slope * x1))
-    let expMu = Foundation.exp(mu)
-    var out: [Float] = []
-    out.reserveCapacity(steps + 1)
-    for i in 0...steps {
-      let t = 1.0 - Float(i) / Float(steps)  // linspace 1 -> 0
-      if t <= 0 {
-        out.append(0)
-      } else {
-        let warped = expMu / (expMu + Foundation.pow(1.0 / t - 1.0, sigma))
-        out.append(warped)
-      }
-    }
-    return out
+    return SigmaSchedule.krea2(numSteps: steps, mu: mu, sigmaExp: sigma)
+  }
+
+  /// The schedule's resolution-dependent log-shift `mu`: linear in the image
+  /// token count from 0.5 at a 256² render to 1.15 at 1280², with the token
+  /// grid aligned to `align` (VAE spatial scale × patch = 16). Delegates to
+  /// `PipelineUtilities.calculateShift` — the same function Z-Image uses — with
+  /// Krea 2's constants: base 256 tokens / 0.5, max 6400 tokens / 1.15.
+  ///
+  /// Effective shift is `exp(mu)`: ~2.475 at 1024². ComfyUI registers Krea 2
+  /// with a *fixed* shift 1.15 instead; an explicit request `shift` overrides
+  /// this value with `log(shift)` (FDD D3).
+  static func mu(seqLen: Int, align: Int) -> Float {
+    let baseSeqLen = (256 / align) * (256 / align)      // 256 at align 16
+    let maxSeqLen = (1280 / align) * (1280 / align)     // 6400 at align 16
+    return PipelineUtilities.calculateShift(
+      imageSeqLen: seqLen,
+      baseSeqLen: baseSeqLen,
+      maxSeqLen: maxSeqLen,
+      baseShift: 0.5,
+      maxShift: 1.15
+    )
+  }
+
+  /// Synthetic scheduler config for Krea 2, which ships no `scheduler_config.json`.
+  ///
+  /// Carries the constants baked into `timesteps` so `SchedulerFactory` can
+  /// build any `SigmaScheduleKind` for this family. Values are specified, not
+  /// implicit (FDD-krea2-raw-recipe §3.1; pinned by
+  /// `Krea2SigmaScheduleTests.testSchedulerConfigPinnedValues`):
+  ///
+  /// - `numTrainTimesteps: 1000` — sigma ↔ timestep scale, and the
+  ///   `flowMatchingSigmaBounds` floor for karras/exponential/beta.
+  /// - `shift: shift ?? 1.0` — D3: an explicit shift moves the karras/beta
+  ///   bounds with it; `nil` leaves the bounds at `(0.001, 1.0)`.
+  /// - `useDynamicShifting: true` — so `.flow` and `.krea2` both take the `mu` warp.
+  /// - `baseShift 0.5 / maxShift 1.15 / baseImageSeqLen 256 / maxImageSeqLen 6400`
+  ///   — the `mu(seqLen:align:)` line.
+  static func schedulerConfig(shift: Float? = nil) -> ZImageSchedulerConfig {
+    ZImageSchedulerConfig(
+      numTrainTimesteps: 1000,
+      shift: shift ?? 1.0,
+      useDynamicShifting: true,
+      baseShift: 0.5,
+      maxShift: 1.15,
+      baseImageSeqLen: 256,
+      maxImageSeqLen: 6400
+    )
   }
 }
 

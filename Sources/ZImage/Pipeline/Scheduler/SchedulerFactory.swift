@@ -13,6 +13,21 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   case res2s = "res_2s"
 }
 
+/// Errors raised while resolving a sigma schedule.
+public enum SchedulerFactoryError: Error, Equatable, CustomStringConvertible {
+  /// The schedule is defined by the model's resolution shift and no `mu` was
+  /// supplied. There is no default: `mu = 0` would be an unshifted linear grid
+  /// presented as the model's own schedule (FDD-krea2-raw-recipe §3.1).
+  case missingMu(SigmaScheduleKind)
+
+  public var description: String {
+    switch self {
+    case .missingMu(let schedule):
+      return "sigma schedule '\(schedule.rawValue)' requires mu (the model's resolution shift) and none was supplied"
+    }
+  }
+}
+
 /// Creates scheduler instances by kind.
 public enum SchedulerFactory {
 
@@ -26,10 +41,13 @@ public enum SchedulerFactory {
   ///   - numInferenceSteps: Number of denoising steps.
   ///   - config: The model's scheduler configuration.
   ///   - mu: Dynamic shifting parameter (pass non-nil when `config.useDynamicShifting`).
+  ///     **Required** for `.krea2`, which is defined by it; the factory throws
+  ///     ``SchedulerFactoryError/missingMu(_:)`` rather than defaulting it.
   ///   - seed: Random seed for stochastic samplers (DPM++ 2S-A, DDIM with eta > 0).
   ///   - eta: DDIM stochasticity parameter (0 = deterministic, 1 = full DDPM).
   ///   - c2: RES 2s second-stage substep location in log-sigma space.
   /// - Returns: A type-erased ``ZImageScheduler``.
+  /// - Throws: ``SchedulerFactoryError`` when the schedule cannot be resolved.
   public static func create(
     kind: SchedulerKind,
     sigmaSchedule: SigmaScheduleKind = .flow,
@@ -39,8 +57,8 @@ public enum SchedulerFactory {
     seed: UInt64? = nil,
     eta: Float? = nil,
     c2: Float = 0.5
-  ) -> any ZImageScheduler {
-    let sigmaValues = resolveSigmas(
+  ) throws -> any ZImageScheduler {
+    let sigmaValues = try resolveSigmas(
       schedule: sigmaSchedule,
       numSteps: numInferenceSteps,
       config: config,
@@ -116,15 +134,21 @@ public enum SchedulerFactory {
 
   // MARK: - Sigma Resolution
 
-  private static func resolveSigmas(
+  /// Resolve the float32 sigma grid for a schedule. Pure; internal so the
+  /// schedule tests can pin grids without constructing a scheduler.
+  static func resolveSigmas(
     schedule: SigmaScheduleKind,
     numSteps: Int,
     config: ZImageSchedulerConfig,
     mu: Float?
-  ) -> [Float] {
+  ) throws -> [Float] {
     switch schedule {
     case .flow:
       return SigmaSchedule.flow(numSteps: numSteps, config: config, mu: mu)
+    case .krea2:
+      // mu is required: `mu ?? 0` would silently be an unshifted linear grid.
+      guard let mu else { throw SchedulerFactoryError.missingMu(.krea2) }
+      return SigmaSchedule.krea2(numSteps: numSteps, mu: mu)
     case .karras:
       let (lo, hi) = flowMatchingSigmaBounds(config: config)
       return SigmaSchedule.karras(numSteps: numSteps, sigmaMin: lo, sigmaMax: hi)

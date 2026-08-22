@@ -147,6 +147,27 @@ public struct ZImageSchedulerConfig: Decodable {
   public let baseImageSeqLen: Int?
   public let maxImageSeqLen: Int?
 
+  /// Memberwise init. Model families that ship a `scheduler_config.json`
+  /// decode it; families without one (Krea 2) construct it directly —
+  /// see `Krea2Sampling.schedulerConfig(shift:)`.
+  public init(
+    numTrainTimesteps: Int,
+    shift: Float,
+    useDynamicShifting: Bool,
+    baseShift: Float? = nil,
+    maxShift: Float? = nil,
+    baseImageSeqLen: Int? = nil,
+    maxImageSeqLen: Int? = nil
+  ) {
+    self.numTrainTimesteps = numTrainTimesteps
+    self.shift = shift
+    self.useDynamicShifting = useDynamicShifting
+    self.baseShift = baseShift
+    self.maxShift = maxShift
+    self.baseImageSeqLen = baseImageSeqLen
+    self.maxImageSeqLen = maxImageSeqLen
+  }
+
   enum CodingKeys: String, CodingKey {
     case numTrainTimesteps = "num_train_timesteps"
     case shift

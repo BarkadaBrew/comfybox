@@ -6,14 +6,14 @@ final class SchedulerFactoryTests: XCTestCase {
 
   // MARK: - Factory Creation
 
-  func testEulerFlowIdenticalToLegacy() {
+  func testEulerFlowIdenticalToLegacy() throws {
     // Factory-created Euler + flow must produce identical sigmas/timesteps
     // to direct FlowMatchEulerScheduler construction.
     let config = FlowMatchSchedulerTests.makeConfig()
     let steps = 9
 
     let direct = FlowMatchEulerScheduler(numInferenceSteps: steps, config: config)
-    let factory = SchedulerFactory.create(
+    let factory = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .flow,
       numInferenceSteps: steps,
@@ -37,7 +37,7 @@ final class SchedulerFactoryTests: XCTestCase {
     }
   }
 
-  func testEulerFlowWithDynamicShiftingIdenticalToLegacy() {
+  func testEulerFlowWithDynamicShiftingIdenticalToLegacy() throws {
     let config = FlowMatchSchedulerTests.makeConfig(
       useDynamicShifting: true,
       baseShift: 0.5,
@@ -49,7 +49,7 @@ final class SchedulerFactoryTests: XCTestCase {
     let steps = 9
 
     let direct = FlowMatchEulerScheduler(numInferenceSteps: steps, config: config, mu: mu)
-    let factory = SchedulerFactory.create(
+    let factory = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .flow,
       numInferenceSteps: steps,
@@ -65,11 +65,11 @@ final class SchedulerFactoryTests: XCTestCase {
     }
   }
 
-  func testEulerWithKarrasSchedule() {
+  func testEulerWithKarrasSchedule() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
     let steps = 9
 
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .karras,
       numInferenceSteps: steps,
@@ -87,11 +87,11 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)
   }
 
-  func testEulerWithExponentialSchedule() {
+  func testEulerWithExponentialSchedule() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
     let steps = 9
 
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .exponential,
       numInferenceSteps: steps,
@@ -105,11 +105,11 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)
   }
 
-  func testEulerWithBetaSchedule() {
+  func testEulerWithBetaSchedule() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
     let steps = 9
 
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .beta,
       numInferenceSteps: steps,
@@ -126,13 +126,13 @@ final class SchedulerFactoryTests: XCTestCase {
 
   // MARK: - Enum Parsing
 
-  func testUnknownSchedulerKindFromString() {
+  func testUnknownSchedulerKindFromString() throws {
     XCTAssertNil(SchedulerKind(rawValue: "bogus"))
     XCTAssertNil(SchedulerKind(rawValue: ""))
     XCTAssertNil(SchedulerKind(rawValue: "Euler"))  // case-sensitive
   }
 
-  func testValidSchedulerKindFromString() {
+  func testValidSchedulerKindFromString() throws {
     XCTAssertEqual(SchedulerKind(rawValue: "euler"), .euler)
     XCTAssertEqual(SchedulerKind(rawValue: "heun"), .heun)
     XCTAssertEqual(SchedulerKind(rawValue: "dpmpp-2m"), .dpmplusplus2m)
@@ -142,25 +142,26 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(SchedulerKind(rawValue: "res_2s"), .res2s)
   }
 
-  func testUnknownSigmaScheduleKindFromString() {
+  func testUnknownSigmaScheduleKindFromString() throws {
     XCTAssertNil(SigmaScheduleKind(rawValue: "bogus"))
     XCTAssertNil(SigmaScheduleKind(rawValue: ""))
   }
 
-  func testValidSigmaScheduleKindFromString() {
+  func testValidSigmaScheduleKindFromString() throws {
     XCTAssertEqual(SigmaScheduleKind(rawValue: "flow"), .flow)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "karras"), .karras)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "exponential"), .exponential)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "beta"), .beta)
     XCTAssertEqual(SigmaScheduleKind(rawValue: "beta57"), .beta57)
+    XCTAssertEqual(SigmaScheduleKind(rawValue: "krea2"), .krea2)
   }
 
   // MARK: - All Kinds
 
-  func testAllSchedulerKindsCreateSuccessfully() {
+  func testAllSchedulerKindsCreateSuccessfully() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
     for kind in SchedulerKind.allCases {
-      let scheduler = SchedulerFactory.create(
+      let scheduler = try SchedulerFactory.create(
         kind: kind,
         numInferenceSteps: 9,
         config: config
@@ -172,14 +173,17 @@ final class SchedulerFactoryTests: XCTestCase {
     }
   }
 
-  func testAllSigmaScheduleKindsCreateSuccessfully() {
+  func testAllSigmaScheduleKindsCreateSuccessfully() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
     for scheduleKind in SigmaScheduleKind.allCases {
-      let scheduler = SchedulerFactory.create(
+      // `.krea2` is defined by mu and throws without it (WP-E1); the other
+      // schedules ignore mu under this non-dynamic-shifting config.
+      let scheduler = try SchedulerFactory.create(
         kind: .euler,
         sigmaSchedule: scheduleKind,
         numInferenceSteps: 9,
-        config: config
+        config: config,
+        mu: 0.9
       )
       XCTAssertEqual(scheduler.numInferenceSteps, 9,
                      "Sigma schedule \(scheduleKind.rawValue) should produce 9 steps")
@@ -188,9 +192,9 @@ final class SchedulerFactoryTests: XCTestCase {
 
   // MARK: - Phase 2 Sampler Creation
 
-  func testDPMPlusPlus2MCreation() {
+  func testDPMPlusPlus2MCreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .dpmplusplus2m,
       numInferenceSteps: 9,
       config: config
@@ -201,9 +205,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testDDIMCreation() {
+  func testDDIMCreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .ddim,
       numInferenceSteps: 9,
       config: config,
@@ -215,9 +219,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testDDIMWithSeed() {
+  func testDDIMWithSeed() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .ddim,
       numInferenceSteps: 9,
       config: config,
@@ -228,9 +232,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertEqual(scheduler.numInferenceSteps, 9)
   }
 
-  func testDEISCreation() {
+  func testDEISCreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .deis,
       numInferenceSteps: 9,
       config: config
@@ -241,9 +245,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testDPMPlusPlus2SACreation() {
+  func testDPMPlusPlus2SACreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .dpmplusplus2sa,
       numInferenceSteps: 9,
       config: config,
@@ -255,9 +259,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testHeunCreation() {
+  func testHeunCreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .heun,
       numInferenceSteps: 9,
       config: config
@@ -268,9 +272,9 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertTrue(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testRES2sCreation() {
+  func testRES2sCreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .res2s,
       numInferenceSteps: 9,
       config: config
@@ -281,15 +285,15 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertTrue(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testBeta57ScheduleCreation() {
+  func testBeta57ScheduleCreation() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .beta57,
       numInferenceSteps: 9,
       config: config
     )
-    let defaultBeta = SchedulerFactory.create(
+    let defaultBeta = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .beta,
       numInferenceSteps: 9,
@@ -311,14 +315,14 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertTrue(differs, "Factory beta57 should differ from default beta")
   }
 
-  func testPhase2SamplersWithKarrasSchedule() {
+  func testPhase2SamplersWithKarrasSchedule() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
     let phase2Kinds: [SchedulerKind] = [
       .dpmplusplus2m, .ddim, .deis, .dpmplusplus2sa, .heun, .res2s
     ]
 
     for kind in phase2Kinds {
-      let scheduler = SchedulerFactory.create(
+      let scheduler = try SchedulerFactory.create(
         kind: kind,
         sigmaSchedule: .karras,
         numInferenceSteps: 9,
@@ -337,9 +341,9 @@ final class SchedulerFactoryTests: XCTestCase {
 
   // MARK: - Protocol Conformance
 
-  func testFactoryReturnsZImageScheduler() {
+  func testFactoryReturnsZImageScheduler() throws {
     let config = FlowMatchSchedulerTests.makeConfig()
-    let scheduler = SchedulerFactory.create(
+    let scheduler = try SchedulerFactory.create(
       kind: .euler,
       numInferenceSteps: 9,
       config: config
@@ -349,17 +353,17 @@ final class SchedulerFactoryTests: XCTestCase {
     XCTAssertFalse(scheduler.requiresIntermediateEvaluation)
   }
 
-  func testFactoryDefaultSigmaScheduleIsFlow() {
+  func testFactoryDefaultSigmaScheduleIsFlow() throws {
     // When sigmaSchedule is not specified, it should default to .flow
     let config = FlowMatchSchedulerTests.makeConfig()
     let steps = 9
 
-    let withDefault = SchedulerFactory.create(
+    let withDefault = try SchedulerFactory.create(
       kind: .euler,
       numInferenceSteps: steps,
       config: config
     )
-    let withExplicitFlow = SchedulerFactory.create(
+    let withExplicitFlow = try SchedulerFactory.create(
       kind: .euler,
       sigmaSchedule: .flow,
       numInferenceSteps: steps,

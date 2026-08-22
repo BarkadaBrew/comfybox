@@ -7,6 +7,9 @@ public enum SigmaScheduleKind: String, CaseIterable, Sendable {
   case exponential = "exponential"
   case beta = "beta"
   case beta57 = "beta57"
+  /// Krea 2's native resolution-shifted warp over `linspace(1 → 0)` inclusive
+  /// (see ``SigmaSchedule/krea2(numSteps:mu:sigmaExp:)``). Requires `mu`.
+  case krea2 = "krea2"
 }
 
 /// Pure-function sigma schedule generators.
@@ -58,6 +61,46 @@ public enum SigmaSchedule {
 
     sigmas.append(0.0)
     return sigmas
+  }
+
+  // MARK: - Krea 2 (native resolution-shifted warp)
+
+  /// Krea 2's native timestep schedule, as Krea's reference `sampling.py` runs it.
+  ///
+  /// Emits `numSteps + 1` points over `linspace(1 → 0)` **inclusive of an exact
+  /// 0**, each warped by `exp(mu) / (exp(mu) + (1/t − 1)^sigmaExp)`. The final
+  /// point is the exact `0.0` sentinel every other schedule here appends.
+  ///
+  /// This is **not** ``flow(numSteps:config:mu:)``: `.flow` applies the same
+  /// warp to `linspace(1 → shiftedSigmaMin)` and then appends 0, so the two
+  /// grids share only their endpoints (the penultimate sigma differs). Krea 2
+  /// must default to this schedule, never to `.flow` (FDD-krea2-raw-recipe §3.1).
+  ///
+  /// `Krea2Sampling.timesteps` delegates here, so the pipelines' schedule and
+  /// the factory's `.krea2` grid are one body and cannot drift. The loop is the
+  /// pre-change `timesteps` body verbatim — its float operation order is
+  /// pinned by `Krea2SigmaScheduleTests.testMatchesPreChangeOracle`.
+  ///
+  /// - Parameters:
+  ///   - numSteps: Number of denoising steps; the result has `numSteps + 1` entries.
+  ///   - mu: Log-shift. Resolution-dependent by default (`Krea2Sampling.mu`),
+  ///     or `log(shift)` when a request states an explicit shift (D3).
+  ///   - sigmaExp: Exponent on `(1/t − 1)`; Krea's reference uses 1.0.
+  public static func krea2(numSteps: Int, mu: Float, sigmaExp: Float = 1.0) -> [Float] {
+    guard numSteps > 0 else { return [0.0] }
+    let expMu = Foundation.exp(mu)
+    var out: [Float] = []
+    out.reserveCapacity(numSteps + 1)
+    for i in 0...numSteps {
+      let t = 1.0 - Float(i) / Float(numSteps)  // linspace 1 -> 0
+      if t <= 0 {
+        out.append(0)
+      } else {
+        let warped = expMu / (expMu + Foundation.pow(1.0 / t - 1.0, sigmaExp))
+        out.append(warped)
+      }
+    }
+    return out
   }
 
   // MARK: - Karras (Karras et al. 2022)
