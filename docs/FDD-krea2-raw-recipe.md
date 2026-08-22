@@ -1523,3 +1523,70 @@ Only decisions an architect cannot make. Everything else is settled in §2.
 - **An MCP `compare_recipes` tool** — CLI first (§3.18); the MCP wrapper that enqueues and returns a report path is a follow-up.
 - **Same-seed bit-comparison against ComfyUI end to end** (§5.2) — assessed, not feasible, deferred with a stated fallback.
 - ~~**Todd's Buzz/CivitAI acquisition of the workflow's exact bypass filename.** F1 makes it unnecessary~~ — **struck in v2.** It is not unnecessary: the file is the censorship axis of the reference stack, it is not on disk (`fetch.log:3`), and the artifact v1 substituted for it is a different file at a conflicting strength. Acquiring it is **step 0 of WP-E8**, in scope, and it gates `krea2-reference` the same way T3 does (D10, D19, §7.1).
+
+
+---
+
+## Addendum A — Phase A integration record and decisions (2026-08-22, Fable)
+
+Phase A (WP-E1 E2 E18 E11 E12 · E5 E4 E6 E9 E19 E20 · C1 C2) landed on
+`claude/krea2-raw-recipe` (engine `147dcd5`, client `6c074ba8`). Every WP was
+adversarially reviewed and APPROVEd (E20 reviewed by Fable directly: 60 tests
+green, six-file scope). Full engine unit target green after integration;
+client `tsc --noEmit` clean and `src/providers/comfybox` 17/17.
+
+### A.1 Decision D3 is amended — `shift` IS mu (ComfyUI `ModelSamplingFlux`)
+
+E18/E12 established, at pinned ComfyUI `783545f`, that Krea 2 is registered
+`ModelType.FLUX` → `ModelSamplingFlux(shift=1.15, timesteps=10000)`, whose
+`flux_time_shift(mu=shift, t) = e^mu / (e^mu + 1/t − 1)`. That is the **same
+function** as `Krea2Sampling.timesteps` (`expMu / (expMu + (1/t − 1)^sigma)`),
+where mu is Krea's resolution-derived value (0.5…1.15). So:
+
+- **`shift` on the wire means mu directly.** `mu = shift`, effective linear
+  shift `e^shift`. D3's `mu = log(shift)` is withdrawn. `Krea2Sampling.resolveShift`
+  must return `mu = explicit` (not `log(explicit)`), and `shift_source`
+  semantics are unchanged (`request` / `preset` / `resolution`).
+- **`beta` / `beta57` under the Krea 2 family index the Flux table**
+  (`SigmaSchedule.fluxSigmaTable(shift:tableSize: 10000)`, already exposed by
+  E12), never the 1000-entry DiscreteFlow table. The DiscreteFlow grid stays in
+  the fixture only as the D5 before/after record.
+- **AC-21 is re-pinned** to the Flux grid: `beta(6)` at shift 1.15 =
+  `[1.0, 0.969095, 0.892582, 0.759584, 0.545649, 0.241540, 0.0]`; `beta57(6)`
+  = `[1.0, 0.941558, 0.823777, 0.640931, 0.390072, 0.125063, 0.0]` (both from
+  `Tests/ZImageTests/Fixtures/Scheduler/comfy_sigmas.json` `model_samplings.flux`).
+- **AC-24 is corrected**: `deis_3m` warms up for **4** steps (RES4LYF
+  `multistep_extra_initial_steps = 1`, `rk_coefficients_beta.py:1343,1376`),
+  i.e. `ralston_3s` on steps 0…3, not 0…2.
+- The six AC-26 step traces were generated under `ModelSamplingFlux`
+  (sigma_min 3.1575e-4). Swift samplers must land on those sigmas when driven
+  from the Flux table; the trace's own grid is not to be fed back in as a
+  shortcut once E13 exists.
+
+Owner: **WP-E12b** (sched lane, first in Phase B) — code + re-pin + the
+`krea2-reference` preset's `shift: 1.15` therefore reproduces the published
+grid (closes R11 properly).
+
+### A.2 Review MAJORs carried forward (approved-with-notes; each has an owner)
+
+| From | Finding (short) | Owner |
+|---|---|---|
+| E5 | D17 handoff log fires on no-op re-activation and is untested; SHA-256 pin of `raw.safetensors` (§7.1 row 27) not recorded; `/health.model` carries the resolved path, not the `krea2-raw` alias (AC-34b half) | **E10** (log test + `/health.model_alias`; pin the SHA in `Tests/ZImageTests/Fixtures/krea2-raw.sha256` and assert it in the integration batch) |
+| E4 | AC-18: `recordFailedReplay` keys on the coordinator's `PendingJob.id`, not the id the `/v1/generate/async` caller received | **E10** (record under the client-visible id; status route reports it) |
+| E6 | AC-42 "truncated LoRA → partialApplication" was satisfied by a superset file, not a truncation | **E7** (add a real truncated-file case: drop one `lora_up` of a bound pair → `partialApplication`) |
+| E9 | A VAE file with a SUBSET of expected keys loads a mixed decoder silently; `payload.vae` silently ignored on non-krea2 families | **E10** (first item, "E9b"): key-set completeness check → `vaeIncomplete` error; `vae` on a non-krea2 family → 400 `unsupportedField`) |
+| E18 | AC-24 warm-up count (see A.1) | **E12b / E14** |
+| C1 | §3.16 ladder puts `preset` above `family default for lane intent`, so an explicit `quality`/`sketch` lane is inert on every preset that declares `steps` — contradicts PRD O2's first acceptance | **C3**: an *explicitly requested* lane intent outranks the preset's `steps`/`guidance` (ladder: request > explicit lane intent > preset > mode > family default); the default `render` intent keeps the preset. Test both orders. |
+| C1 | Bree's premium/quality lane silently changes on deploy day (two-step pipeline on `polishCheckpoint` → single recipe) and neither the diff table nor the startup warning says so | **C6**: `preflightRecipePolicy` resolution-diff table gains a `pipeline` column (two-step → single) and logs it at warn; the deploy note names it |
+| C2 | `detail_denoise` without `detail_pass` (or on a family/preset with no stage 2) is silently dropped, NaN included | **C3**: refuse with `orphanField` |
+
+### A.3 Integration notes
+
+- `WarmServer.swift` `GeneratePayload.CodingKeys` conflict (E12 `shift` vs E4
+  `sampler` alias) resolved as the union.
+- Lane worktrees remain: `~/Projects/zimage-lane-sched`, `~/Projects/zimage-lane-core`,
+  `coffeeshop-server/.worktrees/lane-client`; each is merged up to the
+  integration branch before Phase B starts.
+- Phase B lanes: **sched** E12b → E3 → E13 → E14; **core** E10 (incl. E9b) →
+  E7 → E8; **client** C3 → C6. Phase C (after E3 + E10 merge): E15 E16 ·
+  E17 E21 · C4 C5.
