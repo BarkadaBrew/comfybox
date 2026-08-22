@@ -17,8 +17,8 @@
 // until that job exits.
 //
 // The probe (`WarmServerQueueProbe`) drives the real coordinator, so it
-// persists a queue snapshot and reads a pause sentinel — `COMFYBOX_STATE_DIR`
-// points both at a temp directory so the live engine's are untouched.
+// persists a queue snapshot and reads a pause sentinel — `isolateComfyBoxStateDirectory()`
+// points both at a per-test temp directory so the live engine's are untouched.
 
 import Foundation
 import XCTest
@@ -42,21 +42,13 @@ private final class Gate: @unchecked Sendable {
 
 final class ModelOperationQueueTests: XCTestCase {
 
-  private var stateDir: URL!
-
   override func setUpWithError() throws {
-    stateDir = URL(fileURLWithPath: NSTemporaryDirectory())
-      .appendingPathComponent("comfybox-queue-probe-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
-    setenv("COMFYBOX_STATE_DIR", stateDir.path, 1)
-    // Precondition for the whole file: the probe must not be reading (or
-    // clearing) the live engine's state.
-    XCTAssertEqual(QueueStateStore.stateDirectory.path, stateDir.path)
-  }
-
-  override func tearDownWithError() throws {
-    unsetenv("COMFYBOX_STATE_DIR")
-    try? FileManager.default.removeItem(at: stateDir)
+    try super.setUpWithError()
+    // Precondition for the whole file: the probe drives a REAL coordinator,
+    // which persists a queue snapshot and reads a pause sentinel — neither of
+    // which is the test's to touch. The shared helper redirects both and
+    // asserts the redirection took effect.
+    try isolateComfyBoxStateDirectory()
   }
 
   /// An operation on an empty pool fails fast with `modelNotInPool` — the

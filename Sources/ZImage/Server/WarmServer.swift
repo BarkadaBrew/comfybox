@@ -9050,5 +9050,10 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   func pendingJobKinds() -> [String] {
     liveHealthSnapshot.pending.map { $0.kind }
   }
+
+  /// The pause sentinel the coordinator would read, exposed so a test can
+  /// assert it is redirected away from the LIVE `~/.comfybox/queue-paused`
+  /// before any coordinator is constructed.
+  static var pauseSentinelPath: String { WarmServerCoordinator.pauseSentinelPath }
 }
 #endif
