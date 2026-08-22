@@ -65,12 +65,11 @@ public struct RES3sScheduler: TableauScheduler {
       "sigmaValues must have numInferenceSteps + 1 elements")
     precondition(c2 > 0.0 && c2 <= 1.0, "c2 must be in (0, 1]")
     precondition(c3 > 0.0 && c3 <= 1.0, "c3 must be in (0, 1]")
-    // γ = (3c₃³ − 2c₃)/(c₂(2 − 3c₂)) is singular at c₂ = 2/3. Upstream does not
-    // guard it and produces an inf tableau; refusing by name is the only
-    // alternative to a NaN latent.
+    // Both of upstream's denominators, checked together. Neither is guarded in
+    // RES4LYF; either one produces an inf tableau and a NaN latent.
     precondition(
-      abs(Double(c2) - 2.0 / 3.0) > 1e-6,
-      "c2 = 2/3 is the singularity of res_3s's γ; pick another substep")
+      Self.unsupportedSubstepReason(c2: Double(c2), c3: Double(c3)) == nil,
+      Self.unsupportedSubstepReason(c2: Double(c2), c3: Double(c3)) ?? "")
 
     self.c2 = c2
     self.c3 = c3
@@ -114,19 +113,21 @@ public struct RES3sScheduler: TableauScheduler {
       frame: frame, x0: x0, dataPredictions: k, weights: table.b, h: h, sigma: sigmaValues[i])
   }
 
-  // MARK: - 1-row fallback
+  // MARK: - There is no 1-row fallback
 
-  /// First-order exponential Euler, byte-for-byte `RES2sScheduler.step`'s
-  /// update: the single-evaluation path non-tableau callers (the Z-Image
-  /// pipelines) take. A loss of order, never of frame.
+  /// A `res_3s` step is three model evaluations. Reaching `step` means an
+  /// N-row conformer was dispatched by a 1-row loop, which would render
+  /// first-order exponential Euler under the name `res_3s` — a silent
+  /// downgrade, so it fails hard. The reachable paths refuse the name first
+  /// (`GeneratePayload.validateTableauSampler(_:family:)`, the CLI's
+  /// `--scheduler`). See ``RalstonScheduler/step(modelOutput:timestepIndex:sample:)``.
   public mutating func step(
     modelOutput: MLXArray, timestepIndex: Int, sample: MLXArray
   ) -> MLXArray {
-    let i = checked(timestepIndex)
-    let h = stepSize(timestepIndex: i)
-    return RES4LYFTableau.advance(
-      frame: frame, x0: sample, dataPredictions: [modelOutput],
-      weights: [RES4LYFTableau.phi(1, Double(-h))], h: h, sigma: sigmaValues[i])
+    preconditionFailure(
+      "res_3s is an N-row conformer driven by a 1-row loop: `step` would silently render "
+        + "first-order exponential Euler under the name res_3s. Drive it through "
+        + "Krea2DenoiseLoop (rowSigma / rowSample / commit), or refuse the sampler on this path.")
   }
 
   // MARK: - Coefficients
@@ -136,6 +137,32 @@ public struct RES3sScheduler: TableauScheduler {
   /// `calculate_gamma` (`phi_functions.py:16`).
   static func gamma(c2: Double, c3: Double) -> Double {
     (3 * (c3 * c3 * c3) - 2 * c3) / (c2 * (2 - 3 * c2))
+  }
+
+  /// The two poles `res_3s`'s closed forms have in `(c₂, c₃)`, as a message —
+  /// one source shared by the initializer's precondition and its tests.
+  ///
+  ///   * `γ = (3c₃³ − 2c₃)/(c₂(2 − 3c₂))` blows up as `c₂ → 0` or `c₂ → 2/3`;
+  ///   * `b₃ = φ₂(−h)/(γc₂ + c₃)` blows up wherever `γc₂ + c₃ → 0`, which the
+  ///     defaults reach at `c₂ = c₃ = 1` (γ = −1) — a value the old `c₂ ∈ (0,1]`
+  ///     range admitted and the `c₂ = 2/3` check did not catch (WP-E13 review
+  ///     finding 2).
+  ///
+  /// Both are `h`-independent, so one check at init covers every step.
+  static func unsupportedSubstepReason(c2: Double, c3: Double) -> String? {
+    let epsilon = 1e-6
+    let gammaDenominator = c2 * (2 - 3 * c2)
+    if abs(gammaDenominator) < epsilon {
+      return "res_3s substep c2 = \(c2) is a pole of γ = (3c₃³ − 2c₃)/(c₂(2 − 3c₂)) "
+        + "(c₂(2 − 3c₂) = \(gammaDenominator)); pick a c2 away from 0 and 2/3"
+    }
+    let g = (3 * (c3 * c3 * c3) - 2 * c3) / gammaDenominator
+    let b3Denominator = g * c2 + c3
+    if abs(b3Denominator) < epsilon {
+      return "res_3s substeps c2 = \(c2), c3 = \(c3) are a pole of b₃ = φ₂(−h)/(γc₂ + c₃) "
+        + "(γ = \(g), γc₂ + c₃ = \(b3Denominator)); pick another c2"
+    }
+    return nil
   }
 
   /// `case "res_3s"` (`rk_coefficients_beta.py:1825`) followed by

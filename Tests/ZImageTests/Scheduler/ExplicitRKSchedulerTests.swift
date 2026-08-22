@@ -198,10 +198,19 @@ final class ExplicitRKSchedulerTests: XCTestCase {
         }
         errors.append(abs(x - reference))
       }
+      // Minor 6: the WHOLE Richardson sweep, not just the finest pair —
+      // a single good ratio can hide a non-monotone error curve. The band
+      // widens at the coarse end because the asymptotic regime is not reached
+      // there; the finest pair must be within 0.15 of the nominal order.
       let orders = Self.observedOrders(errors)
-      XCTAssertGreaterThan(
-        orders.last!, expected - 0.15,
-        "ralston_\(stages.rawValue)s classical order \(orders) from errors \(errors)")
+      let context = "ralston_\(stages.rawValue)s classical orders \(orders) from errors \(errors)"
+      for (i, order) in orders.enumerated() {
+        let floorAt = i == orders.count - 1 ? expected - 0.15 : expected - 0.75
+        XCTAssertGreaterThan(order, floorAt, "pair \(i): \(context)")
+      }
+      XCTAssertTrue(
+        zip(errors, errors.dropFirst()).allSatisfy { $0 > $1 },
+        "error must fall monotonically as steps double: \(context)")
     }
   }
 
@@ -222,14 +231,20 @@ final class ExplicitRKSchedulerTests: XCTestCase {
           stages: stages, numInferenceSteps: n, sigmaValues: Self.linearGrid(steps: n))
         errors.append(abs(Self.runThroughDriver(scheduler) - reference))
       }
+      // Minor 6: every pair in the sweep, not only the finest.
       let orders = Self.observedOrders(errors)
-      let last = orders.last!
-      XCTAssertGreaterThan(
-        last, 1.85, "ralston_\(stages.rawValue)s order \(orders) from errors \(errors)")
-      XCTAssertLessThan(
-        last, 2.6,
-        "ralston_\(stages.rawValue)s reached order \(last): the RES4LYF x₀ anchoring is gone "
-          + "— that is a divergence from the oracle, not an improvement")
+      let context = "ralston_\(stages.rawValue)s orders \(orders) from errors \(errors)"
+      for (i, order) in orders.enumerated() {
+        let floorAt = i == orders.count - 1 ? 1.85 : 1.5
+        XCTAssertGreaterThan(order, floorAt, "pair \(i): \(context)")
+        XCTAssertLessThan(
+          order, 2.6,
+          "pair \(i) reached order \(order): the RES4LYF x₀ anchoring is gone — that is a "
+            + "divergence from the oracle, not an improvement. \(context)")
+      }
+      XCTAssertTrue(
+        zip(errors, errors.dropFirst()).allSatisfy { $0 > $1 },
+        "error must fall monotonically as steps double: \(context)")
     }
   }
 
@@ -303,28 +318,79 @@ final class ExplicitRKSchedulerTests: XCTestCase {
     }
   }
 
-  /// The 1-row fallback (`step`) that non-tableau callers — the Z-Image
-  /// pipelines — take is exact Euler in the data-prediction frame, not a
-  /// mangled tableau: identical to `FlowMatchEulerScheduler` on the same grid.
-  func testSingleRowFallbackIsExactEuler() {
-    let grid: [Float] = [1.0, 0.6, 0.25, 0.05]
-    var ralston: any ZImageScheduler = RalstonScheduler(
-      stages: .four, numInferenceSteps: 3, sigmaValues: grid)
-    var euler: any ZImageScheduler = FlowMatchEulerScheduler(
-      numInferenceSteps: 3, sigmaValues: grid, numTrainTimesteps: 1000)
-    var a = MLXArray([Float(0.7)], [1])
-    var b = a
-    for i in 0..<3 {
-      let sigma = grid[i]
-      let v = (a - Float(-0.35)) / sigma
-      a = ralston.step(
-        modelOutput: ralston.modelInput(velocity: v, sample: a, sigma: sigma),
-        timestepIndex: i, sample: a)
-      let vb = (b - Float(-0.35)) / sigma
-      b = euler.step(
-        modelOutput: euler.modelInput(velocity: vb, sample: b, sigma: sigma),
-        timestepIndex: i, sample: b)
+  // MARK: - No 1-row fallback: the review's finding 1
+
+  /// `SchedulerKind.isNRowTableau` is the one predicate the CLI and the server
+  /// family gate branch on, so it must agree with what the factory actually
+  /// builds. Checked in both directions: every kind that claims to be a
+  /// tableau builds a `TableauScheduler` with `rows ≥ 2`, and no kind that
+  /// denies it builds one.
+  ///
+  /// `step` on those conformers is a `preconditionFailure` (it would render
+  /// first-order Euler under the tableau's name), so this predicate is the
+  /// only thing standing between a wire name and a crash — it cannot drift.
+  func testIsNRowTableauMatchesWhatTheFactoryBuilds() throws {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    var claimed: Set<SchedulerKind> = []
+    for kind in SchedulerKind.allCases {
+      let scheduler = try SchedulerFactory.create(
+        kind: kind, numInferenceSteps: 9, config: config, seed: 1)
+      let tableau = scheduler as? TableauScheduler
+      XCTAssertEqual(
+        kind.isNRowTableau, tableau != nil,
+        "\(kind.rawValue): isNRowTableau = \(kind.isNRowTableau) but conformance says otherwise")
+      if let tableau {
+        XCTAssertGreaterThanOrEqual(tableau.rows, 2, kind.rawValue)
+        claimed.insert(kind)
+      }
     }
-    XCTAssertEqual(a.item(Float.self), b.item(Float.self), accuracy: 1e-6)
+    XCTAssertEqual(claimed, [.ralston2s, .ralston3s, .ralston4s, .res3s])
+  }
+
+  /// The server's family gate (`validateTableauSampler`): a tableau sampler is
+  /// a 400 on every family but `krea2`, and every other sampler passes
+  /// everywhere. Accepted-and-advertised is unchanged (E4); what is
+  /// family-scoped is whether the loop can honour it.
+  func testTableauSamplersAreRefusedOffKrea2() throws {
+    for kind in SchedulerKind.allCases {
+      for family in WarmModelFamily.allCases {
+        let names = ResolvedRecipeNames(
+          scheduler: kind, schedulerRequested: kind.rawValue,
+          sigmaSchedule: nil, sigmaScheduleRequested: nil)
+        let error = GeneratePayload.validateTableauSampler(names, family: family)
+        if kind.isNRowTableau && family != .krea2 {
+          let rejection = try XCTUnwrap(
+            error, "\(kind.rawValue) on \(family.rawValue) must be refused")
+          let message = try XCTUnwrap(rejection.errorDescription)
+          XCTAssertTrue(message.contains(kind.rawValue), message)
+          XCTAssertTrue(message.contains(family.rawValue), message)
+          XCTAssertTrue(message.contains("Krea 2"), message)
+        } else {
+          XCTAssertNil(
+            error, "\(kind.rawValue) on \(family.rawValue) must pass: \(String(describing: error))")
+        }
+      }
+    }
+    // A request with no sampler at all is never gated.
+    XCTAssertNil(
+      GeneratePayload.validateTableauSampler(
+        ResolvedRecipeNames(
+          scheduler: nil, schedulerRequested: nil, sigmaSchedule: nil, sigmaScheduleRequested: nil),
+        family: .flux1))
+  }
+
+  /// The refusal names what the caller can use instead, and never offers a
+  /// tableau sampler as the alternative.
+  func testRefusalListsUsableSamplers() throws {
+    let names = ResolvedRecipeNames(
+      scheduler: .ralston4s, schedulerRequested: "linear/ralston_4s",
+      sigmaSchedule: nil, sigmaScheduleRequested: nil)
+    let error = try XCTUnwrap(GeneratePayload.validateTableauSampler(names, family: .flux1))
+    let message = try XCTUnwrap(error.errorDescription)
+    // The raw string the caller sent is echoed, prefix and all.
+    XCTAssertTrue(message.contains("linear/ralston_4s"), message)
+    for kind in SchedulerKind.allCases where !kind.isNRowTableau {
+      XCTAssertTrue(message.contains(kind.rawValue), "must offer \(kind.rawValue): \(message)")
+    }
   }
 }

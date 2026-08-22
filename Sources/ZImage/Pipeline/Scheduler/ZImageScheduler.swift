@@ -8,11 +8,21 @@ import MLX
 /// through ``ZImageScheduler/modelInput(velocity:sample:sigma:)``. A solver
 /// that integrates in the wrong quantity is dimensionally wrong, not merely
 /// inaccurate — the `res_2s` correction in FDD-krea2-raw-recipe D2/§3.2.
+///
+/// The frame does NOT decide the convention. The exponential solvers take the
+/// data prediction because their update is written in it; the RES4LYF tableau
+/// conformers take it because RES4LYF anchors every row's derivative at the
+/// STEP's `x₀` and the STEP's `σ` (`noise_anchor = 1.0`) — which is a function
+/// of `denoised`, `x₀` and `σ`, and cannot be recovered from a row-local
+/// velocity alone. So the linear-frame `ralston_2s/3s/4s` are
+/// ``dataPrediction`` too (WP-E13, §3.12).
 public enum ModelOutputConvention: Sendable, Equatable {
-  /// Linear-frame solvers integrate `dx/dσ = v` and take the velocity as-is.
+  /// The solver integrates `dx/dσ = v` on a row-local derivative and takes the
+  /// velocity as-is: `euler`, `heun`, `dpmpp_2m`, `dpmpp_2s_ancestral`,
+  /// `deis`, `ddim`.
   case velocity
-  /// Exponential-frame solvers (`res_*`) integrate in `h = −log(σ'/σ)` and
-  /// take the data prediction `x₀ = x − σ·v`.
+  /// The solver takes the data prediction `x₀ = x − σ·v`: the exponential-frame
+  /// `res_2s` / `res_3s`, and the x₀-anchored linear-frame `ralston_2s/3s/4s`.
   case dataPrediction
 }
 
@@ -25,13 +35,14 @@ public enum ModelOutputConvention: Sendable, Equatable {
 /// that requires a second model forward pass.
 ///
 /// Every `modelOutput` argument below carries the quantity named by
-/// ``modelOutputConvention`` — a velocity for every scheduler except the
-/// exponential-frame RES family, which takes the data prediction.
+/// ``modelOutputConvention`` — a velocity by default, the data prediction for
+/// the RES family and the RES4LYF tableau conformers (WP-E13).
 public protocol ZImageScheduler {
-  /// What quantity `step` / `intermediateStep` / `finalizeStep` expect in
-  /// `modelOutput`. Linear-frame solvers integrate `dx/dσ = v` and take a
-  /// velocity. Exponential-frame solvers (`res_2s`, later `res_3s`) integrate
-  /// in `h = −log(σ'/σ)` and take the data prediction `x₀ = x − σ·v`.
+  /// What quantity `step` / `intermediateStep` / `finalizeStep` / the N-row
+  /// `rowSample` / `commit` expect in `modelOutput`. Row-local linear solvers
+  /// take a velocity; the exponential-frame `res_2s` / `res_3s` and the
+  /// x₀-anchored `ralston_2s/3s/4s` take the data prediction `x₀ = x − σ·v`.
+  /// See ``ModelOutputConvention``.
   var modelOutputConvention: ModelOutputConvention { get }
 
   /// Sigma values for each step plus a trailing zero: shape `[numInferenceSteps + 1]`.
@@ -105,7 +116,7 @@ public protocol ZImageScheduler {
 // MARK: - Default implementations for single-evaluation schedulers
 
 public extension ZImageScheduler {
-  /// Every existing scheduler takes a velocity; only the RES family overrides.
+  /// The default; the RES family and the WP-E13 tableau conformers override.
   var modelOutputConvention: ModelOutputConvention { .velocity }
 
   /// Convert the transformer's flow velocity into what this scheduler expects

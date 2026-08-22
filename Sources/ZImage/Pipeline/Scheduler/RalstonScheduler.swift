@@ -113,21 +113,26 @@ public struct RalstonScheduler: TableauScheduler {
       h: stepSize(timestepIndex: timestepIndex), sigma: sigmaValues[checked(timestepIndex)])
   }
 
-  // MARK: - 1-row fallback
+  // MARK: - There is no 1-row fallback
 
-  /// The single-evaluation path taken by callers that do not dispatch the
-  /// N-row protocol — today the Z-Image pipelines, which drive `step` directly.
-  /// It is exact Euler in the data-prediction frame (`x + h·(x − x₀)/σ`),
-  /// identical to `FlowMatchEulerScheduler` on the same grid: a loss of ORDER
-  /// relative to the tableau, never a dimensionally wrong update. Krea 2 goes
-  /// through `Krea2DenoiseLoop`, which never calls this.
+  /// A `ralston_Ns` step is `rows` model evaluations. There is no meaningful
+  /// one-evaluation version of it, so a caller that reaches `step` has
+  /// dispatched an N-row conformer through a 1-row loop and is about to get a
+  /// first-order Euler render under a third-order sampler's name.
+  ///
+  /// That is precisely the silent substitution this FDD exists to kill, so it
+  /// is a hard failure here and the reachable paths refuse the name earlier:
+  /// `GeneratePayload.validateTableauSampler(_:family:)` returns 400 on any
+  /// non-Krea 2 family, and the CLI's `--scheduler` refuses before weights
+  /// load. `RES2sScheduler` keeping a fallback is not a precedent — it is a
+  /// 2-row scheduler and the Z-Image pipelines dispatch 2-row.
   public mutating func step(
     modelOutput: MLXArray, timestepIndex: Int, sample: MLXArray
   ) -> MLXArray {
-    let sigma = sigmaValues[checked(timestepIndex)]
-    return RES4LYFTableau.advance(
-      frame: frame, x0: sample, dataPredictions: [modelOutput], weights: [1.0],
-      h: stepSize(timestepIndex: timestepIndex), sigma: sigma)
+    preconditionFailure(
+      "\(stages.name) is an N-row conformer driven by a 1-row loop: `step` would silently "
+        + "render first-order Euler under the name \(stages.name). Drive it through "
+        + "Krea2DenoiseLoop (rowSigma / rowSample / commit), or refuse the sampler on this path.")
   }
 
   // MARK: - Coefficients

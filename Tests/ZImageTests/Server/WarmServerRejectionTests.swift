@@ -76,6 +76,58 @@ final class WarmServerRejectionTests: XCTestCase {
     XCTAssertTrue(body.contains("krea2"), body)
   }
 
+  /// WP-E13 (review finding 1): an N-row tableau sampler is a 400 on any
+  /// family whose denoise loop takes one model evaluation per step. It stays
+  /// accepted and advertised (E4) — the gate is family-scoped and lives at
+  /// dispatch, beside `validateShift`, not at the decoder (D18).
+  ///
+  /// Before this gate, `{"scheduler":"ralston_4s"}` on a Z-Image model decoded
+  /// fine and rendered first-order Euler under the name `ralston_4s`: no 400,
+  /// no warning, no telemetry. That is the substitution §3.4 exists to kill.
+  func testTableauSamplerOffKrea2Is400() throws {
+    for name in ["ralston_2s", "ralston_3s", "ralston_4s", "res_3s"] {
+      let payload = try decode(#"{"prompt":"x","scheduler":"\#(name)"}"#)
+      let names = try payload.validateRecipeNames()
+
+      // Krea 2 dispatches the N-row protocol, so it is honoured there.
+      XCTAssertNil(
+        GeneratePayload.validateTableauSampler(names, family: .krea2),
+        "\(name) must render on krea2")
+
+      for family in WarmModelFamily.allCases where family != .krea2 {
+        let error = try XCTUnwrap(
+          GeneratePayload.validateTableauSampler(names, family: family),
+          "\(name) on \(family.rawValue) must be refused")
+        guard case WarmServerError.unsupportedSampler(let got, let gotFamily, _) = error else {
+          return XCTFail("\(error) is not .unsupportedSampler")
+        }
+        XCTAssertEqual(got, name)
+        XCTAssertEqual(gotFamily, family.rawValue)
+
+        let response = WarmServer.errorResponse(for: error)
+        XCTAssertEqual(response.status, 400, "\(name) on \(family.rawValue)")
+        let body = bodyString(response)
+        XCTAssertTrue(body.contains(name), body)
+        XCTAssertTrue(body.contains(family.rawValue), body)
+        // …and it says where the sampler DOES work, plus what to use instead.
+        XCTAssertTrue(body.contains("Krea 2"), body)
+        XCTAssertTrue(body.contains("euler"), body)
+      }
+    }
+
+    // Every non-tableau sampler is untouched on every family — including the
+    // 2-row `res_2s`, which the Z-Image loop does dispatch.
+    for kind in SchedulerKind.allCases where !kind.isNRowTableau {
+      let payload = try decode(#"{"prompt":"x","scheduler":"\#(kind.rawValue)"}"#)
+      let names = try payload.validateRecipeNames()
+      for family in WarmModelFamily.allCases {
+        XCTAssertNil(
+          GeneratePayload.validateTableauSampler(names, family: family),
+          "\(kind.rawValue) on \(family.rawValue)")
+      }
+    }
+  }
+
   /// Krea 2 tier gates (D18, §3.4): `eta != 0` is refused before T2. Since
   /// WP-E3 the loop takes the sampler and the schedule, so every name the
   /// resolver accepts passes the gate — `res_2s`, `karras`, Krita's

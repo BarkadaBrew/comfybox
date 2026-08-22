@@ -17,6 +17,27 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   case ralston3s = "ralston_3s"
   case ralston4s = "ralston_4s"
   case res3s = "res_3s"
+
+  /// Whether this kind builds a ``TableauScheduler`` — an N-row conformer that
+  /// takes `rows` model evaluations per step and can ONLY be driven by a loop
+  /// that dispatches `rowSigma` / `rowSample` / `commit`.
+  ///
+  /// Today that is `Krea2DenoiseLoop` and nothing else: the Z-Image pipelines
+  /// drive `step` directly, which for these samplers is a hard failure rather
+  /// than a quiet first-order Euler (WP-E13 review finding 1). Callers on a
+  /// non-Krea 2 path must refuse the name up front — see
+  /// `GeneratePayload.validateTableauSampler(_:family:)` and the CLI's
+  /// `--scheduler` parsing.
+  ///
+  /// Exhaustive on purpose (no `default`): a new kind must declare itself.
+  public var isNRowTableau: Bool {
+    switch self {
+    case .ralston2s, .ralston3s, .ralston4s, .res3s:
+      return true
+    case .euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .deis, .ddim, .res2s:
+      return false
+    }
+  }
 }
 
 /// Errors raised while resolving a sigma schedule.

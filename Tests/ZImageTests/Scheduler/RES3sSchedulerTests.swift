@@ -162,8 +162,15 @@ final class RES3sSchedulerTests: XCTestCase {
       let scheduler = RES3sScheduler(numInferenceSteps: n, sigmaValues: Self.grid(steps: n), c2: 0.5)
       errors.append(abs(ExplicitRKSchedulerTests.runThroughDriver(scheduler) - reference))
     }
+    // Minor 6: the whole Richardson sweep, not only the finest pair.
     let orders = ExplicitRKSchedulerTests.observedOrders(errors)
-    XCTAssertGreaterThan(orders.last!, 2.85, "res_3s order \(orders) from errors \(errors)")
+    let context = "res_3s orders \(orders) from errors \(errors)"
+    for (i, order) in orders.enumerated() {
+      XCTAssertGreaterThan(order, i == orders.count - 1 ? 2.85 : 2.5, "pair \(i): \(context)")
+    }
+    XCTAssertTrue(
+      zip(errors, errors.dropFirst()).allSatisfy { $0 > $1 },
+      "error must fall monotonically as steps double: \(context)")
   }
 
   // MARK: - D23: c2 is honoured
@@ -216,23 +223,76 @@ final class RES3sSchedulerTests: XCTestCase {
     XCTAssertTrue(RecipeNameResolver.validSamplerNames.contains("res_3s"))
   }
 
-  /// The 1-row fallback non-tableau callers take is `res_2s`'s first-order
-  /// exponential Euler, to the digit — same frame, same φ₁.
-  func testSingleRowFallbackMatchesRES2s() {
-    let grid = Self.grid(steps: 3)
-    var res3s: any ZImageScheduler = RES3sScheduler(numInferenceSteps: 3, sigmaValues: grid)
-    var res2s: any ZImageScheduler = RES2sScheduler(numInferenceSteps: 3, sigmaValues: grid)
-    var a = MLXArray([Float(0.7)], [1])
-    var b = a
-    for i in 0..<3 {
-      let sigma = grid[i]
-      a = res3s.step(
-        modelOutput: res3s.modelInput(velocity: (a + 0.35) / sigma, sample: a, sigma: sigma),
-        timestepIndex: i, sample: a)
-      b = res2s.step(
-        modelOutput: res2s.modelInput(velocity: (b + 0.35) / sigma, sample: b, sigma: sigma),
-        timestepIndex: i, sample: b)
+  // MARK: - The two poles in (c₂, c₃) — the review's finding 2
+
+  /// `res_3s` has two `h`-independent poles, and neither is guarded upstream:
+  /// `γ`'s denominator `c₂(2 − 3c₂)` (at c₂ → 0 and c₂ = 2/3) and `b₃`'s
+  /// `γc₂ + c₃`, which the DEFAULT `c₃ = 1` reaches at `c₂ = 1` (γ = −1) — a
+  /// value the `c₂ ∈ (0,1]` range admitted and the old `c₂ = 2/3` check missed.
+  ///
+  /// The pole is demonstrated, not assumed: the raw tableau at those substeps
+  /// is non-finite, which is the NaN latent the guard exists to prevent.
+  func testRejectsBothPoles() {
+    for (c2, c3, label) in [(2.0 / 3.0, 1.0, "γ"), (1.0, 1.0, "b₃")] {
+      XCTAssertNotNil(
+        RES3sScheduler.unsupportedSubstepReason(c2: c2, c3: c3),
+        "c2=\(c2) c3=\(c3) is the \(label) pole and must be refused")
+      let broken = RES3sScheduler.tableau(h: 0.5, c2: c2, c3: c3)
+      let entries = broken.a.flatMap { $0 } + broken.b
+      XCTAssertTrue(
+        entries.contains { !$0.isFinite },
+        "c2=\(c2) c3=\(c3) must actually produce a non-finite tableau, else the guard is "
+          + "decoration: a=\(broken.a) b=\(broken.b)")
     }
-    XCTAssertEqual(a.item(Float.self), b.item(Float.self), accuracy: 1e-6)
+    // The refusal names the offending value and which denominator vanished.
+    let reason = RES3sScheduler.unsupportedSubstepReason(c2: 1.0, c3: 1.0) ?? ""
+    XCTAssertTrue(reason.contains("1.0"), reason)
+    XCTAssertTrue(reason.contains("b₃"), reason)
+  }
+
+  /// A substep close to — but not at — the `b₃` pole is legal and finite. The
+  /// guard refuses a singularity, not a neighbourhood, and `res_3s` still
+  /// integrates the constant-x₀ closed form exactly there.
+  func testValidSubstepNearThePoleStillRuns() {
+    let c2: Float = 0.95  // γ = −1.2384, γc₂ + c₃ = −0.1765
+    XCTAssertNil(RES3sScheduler.unsupportedSubstepReason(c2: Double(c2), c3: 1.0))
+    let table = RES3sScheduler.tableau(h: 0.5, c2: Double(c2), c3: 1.0)
+    XCTAssertTrue((table.a.flatMap { $0 } + table.b).allSatisfy { $0.isFinite })
+
+    let dConst: Float = -0.35
+    let grid = Self.grid(steps: 4)
+    var scheduler: any ZImageScheduler = RES3sScheduler(
+      numInferenceSteps: 4, sigmaValues: grid, c2: c2)
+    let (out, _) = Krea2DenoiseLoop.run(
+      scheduler: &scheduler, initialSample: MLXArray([Float(0.7)], [1])
+    ) { latent, sigma in (latent - dConst) / sigma }
+    let want = dConst + (grid.last! / grid.first!) * (0.7 - dConst)
+    XCTAssertEqual(out.item(Float.self), want, accuracy: 3e-6)
+  }
+
+  /// The default substeps are nowhere near either pole.
+  func testDefaultSubstepsAreLegal() {
+    XCTAssertNil(RES3sScheduler.unsupportedSubstepReason(c2: 0.5, c3: 1.0))
+    for c2 in stride(from: 0.05, through: 0.6, by: 0.05) {
+      XCTAssertNil(RES3sScheduler.unsupportedSubstepReason(c2: c2, c3: 1.0), "c2=\(c2)")
+    }
+  }
+
+  /// `res_3s` is an N-row conformer: `step` is a hard failure, not a quiet
+  /// first-order render (review finding 1). Asserted via the predicate the
+  /// server gate and the CLI branch on, since a `preconditionFailure` cannot
+  /// be caught in-process.
+  func testIsAnNRowConformerWithNoOneRowFallback() throws {
+    XCTAssertTrue(SchedulerKind.res3s.isNRowTableau)
+    let config = FlowMatchSchedulerTests.makeConfig()
+    let scheduler = try SchedulerFactory.create(kind: .res3s, numInferenceSteps: 9, config: config)
+    XCTAssertNotNil(scheduler as? TableauScheduler)
+    XCTAssertNotNil(
+      GeneratePayload.validateTableauSampler(
+        ResolvedRecipeNames(
+          scheduler: .res3s, schedulerRequested: "res_3s",
+          sigmaSchedule: nil, sigmaScheduleRequested: nil),
+        family: .flux1),
+      "res_3s must be refused on a family whose loop cannot drive it")
   }
 }
