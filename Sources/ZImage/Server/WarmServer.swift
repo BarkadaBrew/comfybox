@@ -4420,6 +4420,26 @@ public final class WarmServer {
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       }
 
+    // WP-E4 / WP-E17: the pipeline's own fail-loud refusals are the CALLER's
+    // error, not the server's. Every one of these is pre-empted by a wire gate
+    // on the paths that have one; a non-server caller — and any path a gate
+    // does not cover — must still get a 400 naming the field rather than a 500
+    // naming nothing.
+    case let error as Krea2ScheduleError:
+      return .error(status: 400, message: error.description)
+    case let error as Krea2StageError:
+      return .error(status: 400, message: error.description)
+    case let error as SchedulerFactoryError:
+      switch error {
+      // "this schedule cannot be built at that step count" is the request's
+      // problem. `missingMu` is the engine failing to hand the factory a shift
+      // it owns, which is ours.
+      case .stepCountBelowMinimum:
+        return .error(status: 400, message: error.description)
+      case .missingMu:
+        return .error(status: 500, message: error.description)
+      }
+
     case let error as DecodingError:
       return .error(status: 400, message: "Invalid JSON body: \(describe(decodingError: error))")
 
@@ -8868,9 +8888,35 @@ extension GeneratePayload: Decodable {
     // NAMES already threw at `krea2Stage2Fields()`; this is whether the family
     // can honour a known one.
     guard let names = try? RecipeNameResolver.resolve(
-      scheduler: stage2.scheduler, sigmaSchedule: stage2.sigmaSchedule)
+      scheduler: stage2.scheduler, sigmaSchedule: stage2.sigmaSchedule),
+      let renderNames = try? RecipeNameResolver.resolve(
+        scheduler: payload.scheduler, sigmaSchedule: payload.sigmaSchedule)
     else { return nil }
-    return FamilyRecipeMatrix.validate(names, family: family)
+    if let error = FamilyRecipeMatrix.validate(names, family: family) { return error }
+
+    // The stage's TIER gates, evaluated on the values the stage will actually
+    // run with — an unstated field inherits the render's, so the pairing that
+    // matters is the resolved one (a stage that names `euler` inherits the
+    // render's `eta: 0.5` and would be an SDE on a sampler RES4LYF's SDE is not
+    // defined against). `Krea2StagedRender.preflight` refuses these too, before
+    // any model work; refusing them HERE is what makes them a 400 rather than
+    // the 500 an unmapped pipeline error would become.
+    if stage2.bongmath ?? false {
+      return .unsupportedRecipeField(
+        field: "stage2.bongmath", value: "true", family: family.rawValue,
+        reason: "bongmath is parity tier T3 (WP-E16) and is not implemented yet; omit it or send false")
+    }
+    let effectiveEta = stage2.eta ?? payload.eta ?? 0
+    let effectiveSampler = names.scheduler ?? renderNames.scheduler ?? .euler
+    if effectiveEta != 0, !effectiveSampler.isRES4LYFFamily {
+      return .unsupportedRecipeField(
+        field: "stage2.eta", value: "\(effectiveEta)", family: family.rawValue,
+        reason: "eta is RES4LYF's SDE (parity tier T2) and applies to the RES4LYF samplers only; "
+          + "stage 2 runs '\(effectiveSampler.rawValue)', which is not one of them. Send "
+          + "stage2.eta 0, or a stage2 sampler from res_2s / res_3s / ralston_2s / ralston_3s / "
+          + "ralston_4s / deis_2m / deis_3m / deis_4m")
+    }
+    return nil
   }
 
   /// What `krea2RecipeFields()` resolved: the kinds the pipeline runs, plus

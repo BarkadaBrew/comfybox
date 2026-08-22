@@ -150,6 +150,53 @@ final class StagedPayloadDecodeTests: XCTestCase {
     XCTAssertNil(GeneratePayload.stage2Gate(tableau, family: .krea2))
   }
 
+  /// The stage's tier gates are evaluated on what it will RUN with — an
+  /// unstated field inherits the render's — and they are 400s at dispatch, not
+  /// 500s from an unmapped pipeline throw halfway through the render.
+  func testStageTwoTierGates() throws {
+    // T3 is WP-E16's; `stage2.bongmath: true` is refused by name.
+    let bong = try decode(#"{"prompt":"x","stage2":{"steps":2,"denoise":0.2,"bongmath":true}}"#)
+    guard case .unsupportedRecipeField(let bongField, _, _, _)? =
+            GeneratePayload.stage2Gate(bong, family: .krea2)
+    else { return XCTFail("stage2.bongmath must be refused until T3 lands") }
+    XCTAssertEqual(bongField, "stage2.bongmath")
+
+    // An INHERITED eta on a stage that names a non-RES4LYF sampler: the render
+    // is legal (res_2s + eta), the stage is not, and the pairing that matters
+    // is the resolved one.
+    let inherited = try decode("""
+      {"prompt":"x","scheduler":"res_2s","eta":0.5,
+       "stage2":{"steps":2,"denoise":0.2,"scheduler":"euler"}}
+      """)
+    guard case .unsupportedRecipeField(let etaField, let etaValue, _, let reason)? =
+            GeneratePayload.stage2Gate(inherited, family: .krea2)
+    else { return XCTFail("an inherited eta on a euler stage 2 must be refused") }
+    XCTAssertEqual(etaField, "stage2.eta")
+    XCTAssertEqual(etaValue, "0.5")
+    XCTAssertTrue(reason.contains("euler"), "the refusal names the sampler: \(reason)")
+
+    // The stage INHERITING a RES4LYF sampler is fine.
+    XCTAssertNil(GeneratePayload.stage2Gate(
+      try decode("""
+        {"prompt":"x","scheduler":"res_2s","eta":0.5,"stage2":{"steps":2,"denoise":0.2}}
+        """),
+      family: .krea2))
+  }
+
+  /// The pipeline's own refusals are the CALLER's error even when no wire gate
+  /// pre-empted them — a non-server caller and any uncovered path still get a
+  /// 400 naming the field rather than a 500 naming nothing.
+  func testPipelineRefusalsMapTo400() {
+    for error: Error in [
+      Krea2StageError.invalidDenoise(0),
+      Krea2StageError.degenerateStageGrid(schedule: "beta", steps: 4, denoise: 0.9, produced: 1),
+      Krea2ScheduleError.tierNotImplemented(field: "bongmath", value: "true", tier: "T3"),
+      SchedulerFactoryError.stepCountBelowMinimum(.bongTangent, steps: 1, minimum: 2),
+    ] {
+      XCTAssertEqual(WarmServer.errorResponse(for: error).status, 400, "\(error)")
+    }
+  }
+
   /// `detail_denoise` / `detail_pass` are the MCP TOOL-SCHEMA spelling (§3.17,
   /// AC-68a): the client expands `detail_pass` into `stage2` from its family
   /// policy table. The engine has no such table, so it refuses both rather
