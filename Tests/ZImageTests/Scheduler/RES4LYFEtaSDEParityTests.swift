@@ -475,6 +475,39 @@ final class RES4LYFEtaSDEParityTests: XCTestCase {
     check(patched, groups: (0..<16).map { patched[0..., 0..., ($0 * 4)..<(($0 + 1) * 4)] }, "patchified")
   }
 
+  /// …and the patchified grouping IS the latent's channel grouping, checked
+  /// where it matters rather than where it is convenient: un-patchify the
+  /// noise the production layout produced and the result is z-scored per
+  /// LATENT channel, which is the statement upstream's
+  /// `normalize_zscore(channelwise: True)` makes about `(1, C, H, W)`.
+  ///
+  /// Without this the patchified case would only be self-consistent — it would
+  /// pass just as happily if `Krea2Sampling.patchify` interleaved channels
+  /// instead of grouping them.
+  func testPatchifiedZScoreIsPerLatentChannelAfterUnpatchify() {
+    let channels = Krea2VAE.latentChannels  // 16
+    let patch = 2
+    let hTok = 6, wTok = 5
+    let noise = RES4LYFGaussianNoiseStream(
+      seed: 31, layout: .patchifiedTrailing(channels: channels)
+    ).next(like: MLXArray.zeros([1, hTok * wTok, channels * patch * patch], dtype: .float32))
+
+    let nchw = Krea2Sampling.unpatchify(noise, patch: patch, h: hTok, w: wTok, c: channels)
+    XCTAssertEqual(nchw.shape, [1, channels, hTok * patch, wTok * patch])
+    for c in 0..<channels {
+      let plane = nchw[0, c]
+      XCTAssertEqual(plane.mean().item(Float.self), 0, accuracy: 2e-5, "channel \(c) mean")
+      XCTAssertEqual(
+        MLX.std(plane, axes: [0, 1], ddof: 1).item(Float.self), 1, accuracy: 2e-5,
+        "channel \(c) std")
+    }
+    // And it is genuinely per channel, not a whole-tensor normalisation that
+    // happens to look per-channel: the GLOBAL unbiased std of a per-channel
+    // z-score is not 1 (the fixtures' recorded noise reads 0.9926 the same way).
+    XCTAssertNotEqual(
+      MLX.std(nchw, axes: Array(0..<nchw.ndim), ddof: 1).item(Float.self), 1, accuracy: 1e-6)
+  }
+
   /// The production stream seeds mirror upstream's: `SharkSampler` hands
   /// `sample_rk_beta` `noise_seed = seed + 1` (the fixtures record exactly
   /// that — `seed 4242`, `noise_seed_sde 4243`), and `rk_sampler_beta.py:364`
