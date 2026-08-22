@@ -158,3 +158,35 @@ public extension ZImageScheduler {
 
   mutating func reset() {}
 }
+
+// MARK: - N-row protocol (WP-E3, FDD-krea2-raw-recipe D1 / §3.3)
+
+/// A scheduler that takes `rows` model evaluations per step in explicit
+/// Runge–Kutta form — `ralston_2s/3s/4s`, `res_3s`, the DEIS warm-up
+/// (WP-E13/E14). Declared with the driver (D1) so the byte-identity gate is
+/// run once: `Krea2DenoiseLoop` dispatches a `TableauScheduler` through
+/// `rowSigma` / `rowSample` / `commit` and never through `step`.
+///
+/// Row 0 is always evaluated at the grid sigma on the step's start sample;
+/// the driver does not call `rowSample` for it. Every `k[r]` handed back is
+/// the model output **after** conversion through
+/// ``ZImageScheduler/modelInput(velocity:sample:sigma:)`` at that row's
+/// sigma, so a `.dataPrediction` tableau receives x₀ rows and a `.velocity`
+/// tableau receives velocity rows — the same discipline as the 1- and 2-row
+/// branches.
+public protocol TableauScheduler: ZImageScheduler {
+  /// Model evaluations per step. `modelEvals = stepsRun × rows × (CFG ? 2 : 1)`
+  /// is reported, never discovered (§3.3).
+  var rows: Int { get }
+
+  /// The sigma row `row` of step `timestepIndex` is evaluated at. Row 0 is
+  /// `sigmas[timestepIndex]`.
+  func rowSigma(timestepIndex: Int, row: Int) -> Float
+
+  /// The sample row `row` (≥ 1) is evaluated on, from the step's start
+  /// sample `x0` and the converted outputs of rows `0 ..< row`.
+  mutating func rowSample(timestepIndex: Int, row: Int, x0: MLXArray, k: [MLXArray]) -> MLXArray
+
+  /// Commit the step from the start sample and all `rows` converted outputs.
+  mutating func commit(timestepIndex: Int, x0: MLXArray, k: [MLXArray]) -> MLXArray
+}
