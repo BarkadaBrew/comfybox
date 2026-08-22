@@ -291,6 +291,15 @@ public struct DEISMultistepScheduler: TableauScheduler, WarmUpReportingScheduler
         coefficients.count == order.rawValue,
         "\(order.name): the ramp yielded \(coefficients.count) coefficients at step \(i)")
       let hDouble = sigmaValuesDouble[i + 1] - sigmaValuesDouble[i]
+      // `b = coeff/h` has no meaning at h = 0, and `inf` weights would produce
+      // a NaN latent several steps later rather than here. RES4LYF's own
+      // `prepare_sigmas` de-duplicates for exactly this reason
+      // (``RES4LYFSigmaPreparation/dedupeConsecutive(_:)``); a caller that
+      // bypassed it and handed us a repeated sigma finds out now.
+      precondition(
+        hDouble != 0,
+        "\(order.name): a repeated sigma at step \(i) (σ = σ' = \(sigmaValues[i])) gives the "
+          + "multistep no step to integrate over")
       let weights = coefficients.map { $0 / hDouble }
       // `[current] + data_prev_[1 ..< order]`, which is `Dᵢ₋₁, Dᵢ₋₂, …`.
       let nodes = [k[0]] + previousData.prefix(order.historyDepth)
