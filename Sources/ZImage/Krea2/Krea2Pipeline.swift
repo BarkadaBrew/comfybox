@@ -297,10 +297,16 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
   case invalidShift(Float)
 
   /// A request field whose behaviour belongs to a parity tier the loop does
-  /// not implement yet (FDD-krea2-raw-recipe D18, §3.13): `eta` is T2
-  /// (WP-E15), `bongmath` is T3 (WP-E16). Refused at the pipeline so a
-  /// non-server caller cannot get a silent downgrade either — "fail loud,
-  /// never silently substitute".
+  /// not implement yet (FDD-krea2-raw-recipe D18, §3.13). Refused at the
+  /// pipeline so a non-server caller cannot get a silent downgrade either —
+  /// "fail loud, never silently substitute".
+  ///
+  /// **It currently has no throw site, by intent.** `eta` was T2 and
+  /// `bongmath` was T3; both landed (WP-E15, WP-E16) and each is now honoured
+  /// or refused BY SAMPLER at its own factory. The case and
+  /// ``Krea2Pipeline/validateTiers(eta:bongmath:)`` are kept as the matched
+  /// pair the NEXT such field uses, so a tier gate is never invented under
+  /// time pressure at a fresh call site. Delete both together or neither.
   case tierNotImplemented(field: String, value: String, tier: String)
 
   /// `eta != 0` was asked for with a sampler RES4LYF's SDE is not defined
@@ -316,6 +322,16 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
   /// rather than silently ignored.
   case etaUnsupportedSampler(sampler: String, value: String)
 
+  /// `bongmath: true` was asked for with a sampler RES4LYF's fixed point is
+  /// not defined against (WP-E16, D18).
+  ///
+  /// The same boundary `eta` has, for the same reason: `bong_iter` re-derives
+  /// the step anchor by INVERTING a RES4LYF tableau row, so it exists only for
+  /// samplers that have one. `euler` — the Krea 2 default — `heun`, `dpmpp-2m`,
+  /// `dpmpp-2s-a`, `deis` and `ddim` have no such row, and there is nothing to
+  /// substitute. Refused by name rather than silently dropped.
+  case bongmathUnsupportedSampler(sampler: String)
+
   public var description: String {
     switch self {
     case .invalidShift(let value):
@@ -327,6 +343,11 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
       return "eta=\(value) is RES4LYF's SDE and applies to the RES4LYF samplers only; "
         + "'\(sampler)' is not one of them. Send eta 0, or a sampler from "
         + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m"
+    case .bongmathUnsupportedSampler(let sampler):
+      return "bongmath is RES4LYF's fixed point over its own tableau rows and applies to the "
+        + "RES4LYF samplers only; '\(sampler)' is not one of them. Send bongmath false, or a "
+        + "sampler from res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / "
+        + "deis_3m / deis_4m"
     }
   }
 
@@ -733,14 +754,50 @@ public final class Krea2Pipeline {
   /// any model work (D18). A silent downgrade to the default is the one
   /// outcome this programme forbids.
   ///
-  /// `eta`'s arm is GONE as of WP-E15: tier T2 has landed, so a non-zero `eta`
-  /// is either honoured (``makeSDEInjector(eta:sampler:stageSeed:layout:)``)
-  /// or refused there by sampler — never here, and never ignored. `bongmath`
-  /// is still T3.
-  static func validateTiers(eta: Float, bongmath: Bool) throws {
-    guard !bongmath else {
-      throw Krea2ScheduleError.tierNotImplemented(field: "bongmath", value: "true", tier: "T3")
+  /// `eta`'s arm went with WP-E15 and **`bongmath`'s went with WP-E16**: both
+  /// tiers have landed, so each is now either honoured or refused BY SAMPLER
+  /// at its own factory (``makeSDEInjector(eta:sampler:stageSeed:layout:)``,
+  /// ``makeBongMath(bongmath:sampler:)``) — never here, and never ignored.
+  ///
+  /// The function stays, empty, because it is the SEAM: it is called before
+  /// any model work on both generate paths, and the next field whose behaviour
+  /// arrives ahead of its implementation belongs here rather than in a new
+  /// call site invented under time pressure.
+  static func validateTiers(eta: Float, bongmath: Bool) throws {}
+
+  /// WP-E16 (§3.13, §4 AC-26, D18): the RES4LYF `bongmath` hook a request asks
+  /// for, or `nil` when it asks for none.
+  ///
+  /// Pure — no weights, no GPU — so the honour/refuse boundary is asserted
+  /// without a model, exactly as ``makeSDEInjector(eta:sampler:stageSeed:layout:)``
+  /// is. Three outcomes and no fourth:
+  ///   * `bongmath == false` → `nil`; the loop is handed no hook at all and is
+  ///     bit-identical to the run without one.
+  ///   * `true` on a RES4LYF sampler → the fixed point, bounded by the ACTIVE
+  ///     model sampling's `σ_min` / `σ_max` (upstream's own guards are written
+  ///     in them, not in constants).
+  ///   * `true` on anything else → ``Krea2ScheduleError/bongmathUnsupportedSampler(sampler:)``.
+  ///
+  /// The bounds are DERIVED, not defaulted: upstream's guards are written in
+  /// `RK.sigma_min` / `RK.sigma_max`, which are the ACTIVE model sampling's —
+  /// `ModelSamplingFlux(mu)`'s table moves with `mu` (Addendum A.1), so a
+  /// hard-coded `3.1575e-4` would be right only at `shift: 1.15`. Both come
+  /// from the same table `SchedulerFactory` builds the grid from, and both are
+  /// known before any model work, which is what lets the refusal stay early.
+  static func makeBongMath(
+    bongmath: Bool,
+    sampler: SchedulerKind,
+    sigmaSchedule: SigmaScheduleKind,
+    shift: Krea2Sampling.ScheduleShift
+  ) throws -> RES4LYFBongMath? {
+    guard bongmath else { return nil }
+    guard sampler.isRES4LYFFamily else {
+      throw Krea2ScheduleError.bongmathUnsupportedSampler(sampler: sampler.rawValue)
     }
+    let table = try SchedulerFactory.sigmaTable(
+      schedule: sigmaSchedule, config: shift.config, mu: shift.mu)
+    return RES4LYFBongMath(
+      sigmaMin: Double(table[0]), sigmaMax: Double(table[table.count - 1]))
   }
 
   /// WP-E15 (§3.13, D18): the RES4LYF SDE injector a request asks for, or
@@ -826,6 +883,14 @@ public final class Krea2Pipeline {
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
       layout: Krea2Pipeline.sdeNoiseLayout)
+    // WP-E16: the T3 fixed point. `nil` at bongmath false — the loop is then
+    // handed no hook and is bit-identical to the run without one — and a
+    // refusal naming the sampler when it is asked for with one RES4LYF's
+    // tableau inversion is not defined against. Before any model work, for the
+    // same reason the SDE injector is.
+    let bongMath = try Krea2Pipeline.makeBongMath(
+      bongmath: request.bongmath, sampler: request.sampler,
+      sigmaSchedule: request.sigmaSchedule, shift: scheduleShift)
 
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
@@ -897,6 +962,7 @@ public final class Krea2Pipeline {
         return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       },
       noise: sdeNoise,
+      bongmath: bongMath,
       progress: progress)
 
     let latentNCHW = Krea2Sampling.unpatchify(
@@ -908,7 +974,10 @@ public final class Krea2Pipeline {
     let trace = Krea2RunTrace(
       request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
       startIndex: 0, denoise: 1.0, width: width, height: height,
-      negativePromptApplied: negativePromptApplied)
+      negativePromptApplied: negativePromptApplied,
+      // WP-E16: what the fixed point DID, counted by the hook while it ran —
+      // `nil` when the render had none.
+      bong: Krea2RunTrace.BongMathParameters.forRun(bongMath))
     return (decoded[0], trace)
   }
 }

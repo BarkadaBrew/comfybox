@@ -120,6 +120,14 @@ extension Krea2Pipeline {
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
       layout: Krea2Pipeline.sdeNoiseLayout)
+    // WP-E16: the T3 fixed point. `nil` at bongmath false — the loop is then
+    // handed no hook and is bit-identical to the run without one — and a
+    // refusal naming the sampler when it is asked for with one RES4LYF's
+    // tableau inversion is not defined against. Before any model work, for the
+    // same reason the SDE injector is.
+    let bongMath = try Krea2Pipeline.makeBongMath(
+      bongmath: request.bongmath, sampler: request.sampler,
+      sigmaSchedule: request.sigmaSchedule, shift: scheduleShift)
 
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
@@ -193,6 +201,7 @@ extension Krea2Pipeline {
         return Krea2Sampling.applyCFG(cond: vCond, uncond: vUncond, scale: request.guidance)
       },
       noise: sdeNoise,
+      bongmath: bongMath,
       progress: progress)
 
     let latentNCHW = Krea2Sampling.unpatchify(
@@ -204,7 +213,10 @@ extension Krea2Pipeline {
     let trace = Krea2RunTrace(
       request: request, shift: scheduleShift, scheduler: scheduler, stats: stats,
       startIndex: startIndex, denoise: denoise, width: width, height: height,
-      negativePromptApplied: negativePromptApplied)
+      negativePromptApplied: negativePromptApplied,
+      // WP-E16: what the fixed point DID, counted by the hook while it ran —
+      // `nil` when the render had none.
+      bong: Krea2RunTrace.BongMathParameters.forRun(bongMath))
     return (decoded[0], trace)
   }
 }

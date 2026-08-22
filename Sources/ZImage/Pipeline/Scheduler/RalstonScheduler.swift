@@ -24,7 +24,7 @@ import MLX
 /// ``ZImageScheduler/modelInput(velocity:sample:sigma:)``; the E3 driver does
 /// it per row. See `RES4LYFTableau.swift` for why the anchoring costs this
 /// family its classical order and why we keep it anyway.
-public struct RalstonScheduler: TableauScheduler {
+public struct RalstonScheduler: TableauScheduler, RES4LYFFrameScheduler {
 
   /// How many rows — and therefore which tableau. Fixed for the life of the
   /// scheduler: the variable-row case is `deis_*` (WP-E14), not this one.
@@ -187,6 +187,11 @@ public struct RalstonScheduler: TableauScheduler {
   }
 
   // MARK: - Helpers
+
+  /// ``RES4LYFFrameScheduler``: `NS.h` for this step.
+  public func frameStepSize(timestepIndex: Int) -> Float {
+    stepSize(timestepIndex: timestepIndex)
+  }
 
   private func stepSize(timestepIndex: Int) -> Float {
     let i = checked(timestepIndex)

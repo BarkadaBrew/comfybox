@@ -137,13 +137,21 @@ public enum RES4LYFNoiseLayout: Equatable, Sendable {
 /// `normalize_zscore(channelwise = True)` — the injector multiplies by `σ_up`
 /// and does not normalise again.
 ///
+/// **Draws are `float32`, whatever the sample's dtype.** Upstream keeps noise
+/// in `work_dtype` (float32) right through the `σ_up · noise` multiply and
+/// rounds once, at the end of the swap; a stream that pre-rounded to the
+/// production bfloat16 latent would throw away 16 mantissa bits before the
+/// multiply and hand ``RES4LYFSDENoiseInjector/swap(_:x0:sigma:target:split:noise:sNoise:)``
+/// a value it cannot recover. `swap` owns the single final cast.
+///
 /// A seam, not an abstraction for its own sake: MLX's PRNG is not torch's, so
 /// the T2 trace gates cannot re-derive the oracle's realisation and instead
 /// feed the fixture's RECORDED noise tensors through this protocol. Everything
 /// else in the SDE — the split, the epsilon, the substep the swap happens at,
 /// and the ORDER of the draws — is then still under test.
 public protocol RES4LYFNoiseStream: AnyObject {
-  /// The next draw, shaped and typed like `sample`.
+  /// The next draw, shaped like `sample` and typed `float32` — see the note
+  /// on this protocol about who owns the cast.
   func next(like sample: MLXArray) -> MLXArray
 }
 
@@ -169,7 +177,8 @@ public final class RES4LYFGaussianNoiseStream: RES4LYFNoiseStream {
     let keys = MLXRandom.split(key: key, into: 2)
     key = keys[0]
     let raw = MLXRandom.normal(sample.shape, dtype: .float32, key: keys[1])
-    return RES4LYFNoiseNormalization.zscore(raw, layout: layout).asType(sample.dtype)
+    // float32 out, deliberately: `swap` does the one cast. See the protocol.
+    return RES4LYFNoiseNormalization.zscore(raw, layout: layout)
   }
 }
 
@@ -393,7 +402,19 @@ public final class RES4LYFSDENoiseInjector: SDENoiseInjector {
   }
 
   private func gridValues(_ scheduler: any ZImageScheduler) -> [Float] {
-    if let grid { return grid }
+    // Shape only — `dim(0)` is host-side metadata, so the check costs no sync.
+    let count = scheduler.sigmas.dim(0)
+    if let grid {
+      // The cache is sound only while this injector is driven on ONE run of
+      // ONE scheduler ("one instance per run", above). Re-used across a
+      // different grid it would split every step against the wrong sigmas and
+      // still produce a plausible latent — so it fails here instead.
+      precondition(
+        grid.count == count,
+        "the SDE injector cached a \(grid.count)-sigma grid and is now driven on a "
+          + "\(count)-sigma one; build one RES4LYFSDENoiseInjector per run")
+      return grid
+    }
     let values = scheduler.sigmas.asArray(Float.self)
     grid = values
     return values

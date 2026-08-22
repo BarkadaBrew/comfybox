@@ -53,6 +53,26 @@ public enum TableauFrame: Sendable, Equatable {
   case exponential
 }
 
+/// A scheduler that integrates in one of RES4LYF's two frames and can say what
+/// step size it is using — upstream's `NS.h`.
+///
+/// WP-E16. It exists because `bongmath`'s guards are written in `h`
+/// (`rk_sampler_beta.py:1967`: `NS.h < RK.sigma_max/2`), and `h` is a property
+/// of the SOLVER's frame, not of the grid: `σ' − σ` in the linear frame and
+/// `−log(σ'/σ)` in the exponential one, which differ by a factor of 20 at the
+/// schedule tail. A T3 hook that guessed one would refuse the wrong steps.
+///
+/// Deliberately NOT folded into ``TableauScheduler``: `res_2s` runs on the
+/// driver's 2-row branch and is not a `TableauScheduler` at all, yet it has a
+/// frame and a step size like every other RES4LYF port.
+public protocol RES4LYFFrameScheduler: ZImageScheduler {
+  /// Which frame this conformer integrates in.
+  var frame: TableauFrame { get }
+  /// `NS.h` for `timestepIndex` — the frame's own step size, with the same
+  /// `sigmaFloor` clamping the conformer's row arithmetic uses.
+  func frameStepSize(timestepIndex: Int) -> Float
+}
+
 /// Frame arithmetic and the φ functions, shared by every tableau conformer.
 /// `internal` on purpose: the conformers are the public surface.
 enum RES4LYFTableau {

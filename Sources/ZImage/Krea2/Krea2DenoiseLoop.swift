@@ -31,8 +31,9 @@ import MLX
 ///     on it (`rk_sampler_beta.py:1874`) — so the row's evaluation sees the
 ///     re-noised sample. `res_2s` reproduces its T2 trace only with this.
 ///   * ``inject(sample:x0:timestepIndex:scheduler:)`` runs once per step,
-///     after the step's commit and before the T3 hook
-///     (`rk_sampler_beta.py:2027`).
+///     after the step's commit (`rk_sampler_beta.py:2029`). The `x0` it is
+///     handed is the one T3 may have re-derived during the row loop, because
+///     that is the `x_0` upstream's `swap_noise_step` reads.
 ///
 /// Both are handed the step's own `x0` — the sample the step started from —
 /// because upstream's swap is written in `eps' = (x₀ − x)/(σ − σ_target)` and
@@ -61,12 +62,36 @@ extension SDENoiseInjector {
   ) {}
 }
 
-/// Parity tier T3 seam (WP-E16): `bongmath`. Called once per step after the
-/// T2 hook; may evaluate the model and returns how many times it did, so the
-/// model-eval count stays reported rather than discovered.
+/// Parity tier T3 seam (WP-E16): `bongmath`.
+///
+/// **It is a ROW hook, not a step hook** — the one correction E16 made to E3's
+/// declared seam, and the reason is upstream's, not stylistic. `bong_iter`
+/// runs inside RES4LYF's row loop (`rk_sampler_beta.py:1967-1974`), after a
+/// non-final row's sample has been built AND re-noised by the T2 substep swap,
+/// and what it rewrites is the STEP's `x₀` — not the sample. Everything after
+/// it in the step then reads the re-derived anchor: the remaining rows, the
+/// commit, the T2 step-level swap, and the epsilon the model-free tail is
+/// written in. A hook that ran once after the commit could not reach any of
+/// them, and E18's traces measure the difference (`step/x_0` is 1.89 away from
+/// the sample the step started on, at step 0 of `res2s_beta6_T3`).
+///
+/// `buildRowSample` is supplied by the driver because only the driver knows
+/// which branch built this row — the N-row `TableauScheduler.rowSample` or the
+/// 2-row `intermediateStep`. The conformer inverts it and never has to carry a
+/// copy of anyone's Butcher tableau.
+///
+/// A conformer MAY evaluate the model — hence `evaluate`, and hence the return
+/// value, which is added to `Stats.evaluateCalls`, so the eval count stays
+/// reported rather than discovered (§3.3). ``RES4LYFBongMath`` returns 0:
+/// upstream's fixed point is algebraic.
 public protocol BongMath: AnyObject {
   func iterate(
-    sample: inout MLXArray, timestepIndex: Int, scheduler: any ZImageScheduler,
+    x0: inout MLXArray,
+    rowSample: MLXArray,
+    timestepIndex: Int,
+    row: Int,
+    scheduler: any ZImageScheduler,
+    buildRowSample: (_ x0: MLXArray) -> MLXArray,
     evaluate: (_ latent: MLXArray, _ sigma: Float) -> MLXArray
   ) -> Int
 }
@@ -203,16 +228,23 @@ public enum Krea2DenoiseLoop {
     for i in startIndex..<total {
       let sigma = sigmas[i]
       // The step's own `x₀`. Retained only when someone downstream needs it —
-      // the model-free tail, or a T2 injector whose swap is written in it — so
-      // the default euler path still keeps no second latent alive per step.
-      let stepStart = (tailSigma != nil || noise != nil) ? x : nil
+      // the model-free tail, a T2 injector whose swap is written in it, or the
+      // T3 fixed point, which REWRITES it — so the default euler path still
+      // keeps no second latent alive per step.
+      //
+      // `var`, because bongmath moves the anchor mid-step and every consumer
+      // below (the later rows, the commit, the T2 step swap, `lastStep`) must
+      // see the moved one. With no T3 hook it is assigned once and never
+      // reassigned, so the pre-E16 arithmetic is untouched op for op.
+      var stepStart = (tailSigma != nil || noise != nil || bongmath != nil) ? x : nil
 
       if var tableau = scheduler as? TableauScheduler {
         // 3. N-row: rows evaluations at rowSigma / rowSample, then commit.
         var k: [MLXArray] = []
         k.reserveCapacity(tableau.rows)
         for r in 0..<tableau.rows {
-          var xr = r == 0 ? x : tableau.rowSample(timestepIndex: i, row: r, x0: x, k: k)
+          let anchor = stepStart ?? x
+          var xr = r == 0 ? x : tableau.rowSample(timestepIndex: i, row: r, x0: anchor, k: k)
           let sr = r == 0 ? sigma : tableau.rowSigma(timestepIndex: i, row: r)
           // T2 substep re-noise: rows 1 ..< rows are upstream's non-final rows
           // (`row + row_offset` for `row < rows − row_offset`), and row 0 is
@@ -221,11 +253,27 @@ public enum Krea2DenoiseLoop {
             noise.injectSubstep(
               sample: &xr, x0: stepStart, timestepIndex: i, row: r, scheduler: tableau)
           }
+          // T3: re-anchor on the row the T2 swap just moved. Upstream's `row`
+          // is the row whose UPDATE built this sample, i.e. `r − 1`; it never
+          // runs for the committing row, which is why the driver's `r` stops
+          // at `rows − 1` and this call is inside the loop rather than after
+          // it (`rk_method_beta.py:713` — `row < rows − row_offset`).
+          if r > 0, let bongmath, var anchor = stepStart {
+            let history = k
+            evaluateCalls += bongmath.iterate(
+              x0: &anchor, rowSample: xr, timestepIndex: i, row: r - 1, scheduler: tableau,
+              buildRowSample: { [tableau] x0 in
+                var t = tableau
+                return t.rowSample(timestepIndex: i, row: r, x0: x0, k: history)
+              },
+              evaluate: evaluate)
+            stepStart = anchor
+          }
           let v = evaluate(xr, sr)
           evaluateCalls += 1
           k.append(tableau.modelInput(velocity: v, sample: xr, sigma: sr))
         }
-        x = tableau.commit(timestepIndex: i, x0: x, k: k)
+        x = tableau.commit(timestepIndex: i, x0: stepStart ?? x, k: k)
         scheduler = tableau
       } else {
         // 2. First evaluation at the grid sigma; convert per WP-E2.
@@ -252,11 +300,32 @@ public enum Krea2DenoiseLoop {
             noise.injectSubstep(
               sample: &mid, x0: stepStart, timestepIndex: i, row: 1, scheduler: scheduler)
           }
+          // T3, at the same position as in the N-row branch: after the one
+          // non-final row has been built and re-noised, before it is evaluated.
+          if let bongmath, var anchor = stepStart {
+            let snapshot = scheduler
+            evaluateCalls += bongmath.iterate(
+              x0: &anchor, rowSample: mid, timestepIndex: i, row: 0, scheduler: scheduler,
+              buildRowSample: { x0 in
+                var s = snapshot
+                guard let row = s.intermediateStep(
+                  modelOutput: out, timestepIndex: i, sample: x0)
+                else {
+                  preconditionFailure(
+                    "scheduler built an intermediate sample at step \(i) and then refused to "
+                      + "rebuild it; the T3 fixed point has nothing to invert")
+                }
+                return row
+              },
+              evaluate: evaluate)
+            stepStart = anchor
+          }
           let vMid = evaluate(mid, midSigma)
           evaluateCalls += 1
           let outMid = scheduler.modelInput(velocity: vMid, sample: mid, sigma: midSigma)
           x = scheduler.finalizeStep(
-            originalOutput: out, intermediateOutput: outMid, timestepIndex: i, sample: x)
+            originalOutput: out, intermediateOutput: outMid, timestepIndex: i,
+            sample: stepStart ?? x)
         } else {
           // 5. 1-row.
           x = scheduler.step(modelOutput: out, timestepIndex: i, sample: x)
@@ -265,16 +334,19 @@ public enum Krea2DenoiseLoop {
 
       if let stepStart { lastStep = (i, stepStart, x, sigma, sigmas[i + 1]) }
 
-      // 6. T2 / T3 hooks. The T2 step swap runs AFTER the commit and after
-      //    `lastStep` has recorded the pre-swap `(x₀, x_next)` the model-free
-      //    tail needs — upstream computes that epsilon before the swap and
-      //    applies the tail to the post-swap sample.
+      // 6. The T2 step swap runs AFTER the commit and after `lastStep` has
+      //    recorded the pre-swap `(x₀, x_next)` the model-free tail needs —
+      //    upstream computes that epsilon before the swap and applies the tail
+      //    to the post-swap sample. Both read the anchor T3 may have moved:
+      //    `swap_noise_step(x_0, x_next)` and `eps = (x_0 − x_next)/(σ − σ')`
+      //    are written in the POST-bongmath `x_0` (`rk_sampler_beta.py:1997`,
+      //    `:2029`), and E18 exports `step/x_0` from exactly there.
+      //
+      //    There is no T3 hook here: upstream's `bong_iter` refuses the
+      //    committing row (`row < rows − row_offset`), so every call it makes
+      //    has already happened inside the row loop above.
       if let noise, let stepStart {
         noise.inject(sample: &x, x0: stepStart, timestepIndex: i, scheduler: scheduler)
-      }
-      if let bongmath {
-        evaluateCalls += bongmath.iterate(
-          sample: &x, timestepIndex: i, scheduler: scheduler, evaluate: evaluate)
       }
 
       // 7. Materialise, report.

@@ -117,8 +117,17 @@ public struct Krea2RunTrace: Sendable, Equatable {
   /// their provenance. ``eta`` stays a plain field because `RenderRecipe.Stage`
   /// already reads it.
   public let sde: SDEParameters?
-  /// RES4LYF bongmath (T3). `false` until WP-E16.
+  /// RES4LYF bongmath (T3) — what the request asked for.
   public let bongmath: Bool
+
+  /// What the T3 fixed point actually DID, or `nil` when this render had none
+  /// (`bongmath == false`, or a sampler it is not defined against) — WP-E16.
+  ///
+  /// Additive and optional for the same reason ``sde`` is: it is the record of
+  /// a thing that mostly does not happen, and a `bongmath: false` render must
+  /// not grow a block of zeros in its provenance. ``bongmath`` stays a plain
+  /// field because `RenderRecipe.Stage` already reads it.
+  public let bong: BongMathParameters?
   public let seed: UInt64
   /// Width/height AFTER the alignment round-up — what was rendered, not what
   /// was asked for.
@@ -173,6 +182,47 @@ public struct Krea2RunTrace: Sendable, Equatable {
     }
   }
 
+  /// What the T3 `bongmath` fixed point did in one stage (WP-E16).
+  ///
+  /// Everything here is COUNTED by the hook while it ran, not derived from the
+  /// request afterwards — which is the point. `bongmath: true` in the request
+  /// does not mean the fixed point ran: upstream's own guards refuse it below
+  /// `σ = 0.03` and above `h = σ_max/2`, and on a 6-step `res_2s` grid that is
+  /// two of the six steps. A record that said "bongmath: true" and nothing
+  /// else would hide that.
+  public struct BongMathParameters: Sendable, Equatable {
+    /// Fixed-point rounds per rebase — upstream's fixed `range(100)`.
+    public let iterations: Int
+    /// Rebases performed: one per non-final tableau row whose guards passed.
+    public let rebases: Int
+    /// The grid indices the fixed point ran on, in order.
+    public let steps: [Int]
+    /// Rows upstream's guards refused, counted rather than dropped silently.
+    public let refusals: Int
+    /// Extra model evaluations the fixed point made. **0** — `bong_iter` is
+    /// algebraic. Reported rather than asserted: it is the number the hook
+    /// returned to the loop and that `modelEvals` already includes.
+    public let extraModelEvals: Int
+
+    public init(
+      iterations: Int, rebases: Int, steps: [Int], refusals: Int, extraModelEvals: Int
+    ) {
+      self.iterations = iterations
+      self.rebases = rebases
+      self.steps = steps
+      self.refusals = refusals
+      self.extraModelEvals = extraModelEvals
+    }
+
+    /// The record of a hook that ran, or `nil` for a stage that had none.
+    public static func forRun(_ hook: RES4LYFBongMath?) -> BongMathParameters? {
+      guard let hook else { return nil }
+      return BongMathParameters(
+        iterations: hook.iterations, rebases: hook.rebases, steps: hook.rebasedSteps,
+        refusals: hook.refusals, extraModelEvals: hook.extraModelEvals)
+    }
+  }
+
   public init(
     sampler: SchedulerKind,
     sigmaSchedule: SigmaScheduleKind,
@@ -193,6 +243,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     guidance: Float,
     eta: Float,
     bongmath: Bool,
+    bong: BongMathParameters? = nil,
     seed: UInt64,
     width: Int,
     height: Int,
@@ -219,6 +270,7 @@ public struct Krea2RunTrace: Sendable, Equatable {
     self.eta = eta
     self.sde = SDEParameters.forRun(eta: eta, stageSeed: seed)
     self.bongmath = bongmath
+    self.bong = bong
     self.seed = seed
     self.width = width
     self.height = height
@@ -241,7 +293,8 @@ extension Krea2RunTrace {
     denoise: Float,
     width: Int,
     height: Int,
-    negativePromptApplied: String?
+    negativePromptApplied: String?,
+    bong: BongMathParameters? = nil
   ) {
     self.init(
       sampler: request.sampler,
@@ -250,7 +303,7 @@ extension Krea2RunTrace {
         request.sigmaScheduleRequested, resolved: request.sigmaSchedule),
       shift: shift, scheduler: scheduler, stats: stats,
       stepsRequested: request.steps, startIndex: startIndex, denoise: denoise,
-      guidance: request.guidance, eta: request.eta, bongmath: request.bongmath,
+      guidance: request.guidance, eta: request.eta, bongmath: request.bongmath, bong: bong,
       seed: request.seed, width: width, height: height,
       negativePromptApplied: negativePromptApplied)
   }
@@ -265,7 +318,8 @@ extension Krea2RunTrace {
     denoise: Float,
     width: Int,
     height: Int,
-    negativePromptApplied: String?
+    negativePromptApplied: String?,
+    bong: BongMathParameters? = nil
   ) {
     self.init(
       sampler: request.sampler,
@@ -274,7 +328,7 @@ extension Krea2RunTrace {
         request.sigmaScheduleRequested, resolved: request.sigmaSchedule),
       shift: shift, scheduler: scheduler, stats: stats,
       stepsRequested: request.steps, startIndex: startIndex, denoise: denoise,
-      guidance: request.guidance, eta: request.eta, bongmath: request.bongmath,
+      guidance: request.guidance, eta: request.eta, bongmath: request.bongmath, bong: bong,
       seed: request.seed, width: width, height: height,
       negativePromptApplied: negativePromptApplied)
   }
@@ -293,6 +347,7 @@ extension Krea2RunTrace {
     guidance: Float,
     eta: Float,
     bongmath: Bool,
+    bong: BongMathParameters? = nil,
     seed: UInt64,
     width: Int,
     height: Int,
@@ -320,6 +375,7 @@ extension Krea2RunTrace {
       guidance: guidance,
       eta: eta,
       bongmath: bongmath,
+      bong: bong,
       seed: seed,
       width: width,
       height: height,
