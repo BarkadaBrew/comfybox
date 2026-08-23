@@ -29,6 +29,7 @@ struct LoRAPicker: View {
     @State private var compatibleOnly: Bool = true
     @State private var editingLoraID: String?
     @State private var editingKeywordsText: String = ""
+    @State private var isRefreshingCatalog = false
 
     /// The active model's identifier for compatibility checks (family or name).
     private var activeModel: String? {
@@ -62,7 +63,7 @@ struct LoRAPicker: View {
         // architecturally useless there, not just "unverified."
         if compatibleOnly {
             base = base.filter { lora in
-                passesCompatibilityFilter(lora) || selectedLoras.contains { $0.id == lora.id }
+                passesCompatibilityFilter(lora) || selectionIndex(for: lora) != nil
             }
         }
 
@@ -88,8 +89,8 @@ struct LoRAPicker: View {
     /// the previous stable-position behavior (coffeeshop-server#1180).
     private func sortedLoras(_ loras: [LoRAInfo]) -> [LoRAInfo] {
         loras.sorted { a, b in
-            let aSelected = selectedLoras.contains { $0.id == a.id }
-            let bSelected = selectedLoras.contains { $0.id == b.id }
+            let aSelected = selectionIndex(for: a) != nil
+            let bSelected = selectionIndex(for: b) != nil
             if aSelected != bSelected { return aSelected }
             if a.isActive != b.isActive { return a.isActive }
             return a.id < b.id
@@ -112,11 +113,17 @@ struct LoRAPicker: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Button(action: { Task { await engine.refreshLoras() } }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption)
+                Button(action: { Task { await refreshCatalog() } }) {
+                    if isRefreshingCatalog {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption)
+                    }
                 }
                 .buttonStyle(.plain)
+                .disabled(isRefreshingCatalog)
                 .help("Refresh LoRA library")
             }
 
@@ -155,10 +162,28 @@ struct LoRAPicker: View {
 
             // LoRA list
             if engine.availableLoras.isEmpty {
+                if !selectedLoras.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Selected adapters")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        ForEach(Array(selectedLoras.indices), id: \.self) { index in
+                            if let selection = selectedLoras[safe: index] {
+                                selectedFallbackRow(selection, index: index)
+                            }
+                        }
+                    }
+                }
+
                 if engine.connectionState.isConnected {
-                    Text("No LoRAs available")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(engine.loraLoadError ?? "LoRA catalog has not loaded yet.")
+                            .font(.caption)
+                            .foregroundStyle(engine.loraLoadError == nil ? Color.secondary : Color.red)
+                        Button("Retry") { Task { await refreshCatalog() } }
+                            .controlSize(.small)
+                            .disabled(isRefreshingCatalog)
+                    }
                 } else {
                     Text("Connect to server to load LoRAs")
                         .font(.caption)
@@ -194,13 +219,22 @@ struct LoRAPicker: View {
                     .foregroundStyle(.red)
             }
         }
+        // The app can connect before the warm server has finished reopening.
+        // Refresh immediately when this picker appears or connectivity returns;
+        // otherwise the global 30-second recovery poll leaves a misleading
+        // empty catalog next to a non-empty persisted selection count.
+        .task(id: engine.connectionState.isConnected) {
+            if engine.connectionState.isConnected, engine.availableLoras.isEmpty {
+                await refreshCatalog()
+            }
+        }
     }
 
     // MARK: - LoRA Row
 
     private func loraRow(_ lora: LoRAInfo) -> some View {
-        let isSelected = selectedLoras.contains { $0.id == lora.id }
-        let selectionIndex = selectedLoras.firstIndex { $0.id == lora.id }
+        let selectionIndex = selectionIndex(for: lora)
+        let isSelected = selectionIndex != nil
 
         return VStack(spacing: 4) {
             HStack(spacing: 6) {
@@ -272,48 +306,103 @@ struct LoRAPicker: View {
 
             // Scale slider when selected
             if isSelected, let index = selectionIndex {
-                HStack(spacing: 6) {
-                    Text("Scale")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 32, alignment: .leading)
-
-                    Slider(
-                        value: Binding(
-                            get: { selectedLoras[index].scale },
-                            set: { newValue in
-                                // Magnetic detent at 0 so it's easy to neutralize/disable a
-                                // LoRA; otherwise round to 0.01 for fine-grained control across
-                                // the wider -5...5 range (sliders often need negatives/overdrive).
-                                selectedLoras[index].scale = abs(newValue) < 0.08
-                                    ? 0.0
-                                    : (newValue * 100).rounded() / 100
-                            }
-                        ),
-                        in: -5.0...5.0
-                    )
-                    .controlSize(.mini)
-
-                    TextField(
-                        "",
-                        value: Binding(
-                            get: { selectedLoras[safe: index]?.scale ?? 1.0 },
-                            set: { selectedLoras[index].scale = min(max($0, -5.0), 5.0) }
-                        ),
-                        format: .number.precision(.fractionLength(0...2))
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption2.monospacedDigit())
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 44)
-                }
-                .padding(.leading, 22)
+                selectionScaleEditor(index: index)
             }
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
         .background(isSelected ? Color.accentColor.opacity(0.06) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+
+    /// Keeps preset/restored selections usable while the catalog endpoint is
+    /// temporarily unavailable. These rows intentionally use the selection's
+    /// filename directly because there is no LoRAInfo to resolve against yet.
+    private func selectedFallbackRow(_ selection: LoRASelection, index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Button {
+                    selectedLoras.removeAll { $0.id == selection.id }
+                } label: {
+                    Image(systemName: "checkmark.square.fill")
+                        .foregroundStyle(Color.accentColor)
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .help("Remove this LoRA")
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(selection.id)
+                        .font(.caption)
+                        .lineLimit(1)
+                    Text(selection.filename)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                if let role = selection.role, !role.isEmpty {
+                    Text(role)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(.quaternary.opacity(0.5), in: Capsule())
+                }
+            }
+
+            selectionScaleEditor(index: index)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(Color.accentColor.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+
+    private func selectionScaleEditor(index: Int) -> some View {
+        HStack(spacing: 6) {
+            Text("Scale")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 32, alignment: .leading)
+
+            Slider(
+                value: Binding(
+                    get: { selectedLoras[safe: index]?.scale ?? 1.0 },
+                    set: { newValue in
+                        guard selectedLoras.indices.contains(index) else { return }
+                        // Magnetic detent at 0 so it's easy to neutralize/disable a
+                        // LoRA; otherwise round to 0.01 for fine-grained control across
+                        // the wider -5...5 range (sliders often need negatives/overdrive).
+                        selectedLoras[index].scale = abs(newValue) < 0.08
+                            ? 0.0
+                            : (newValue * 100).rounded() / 100
+                    }
+                ),
+                in: -5.0...5.0
+            )
+            .controlSize(.mini)
+
+            TextField(
+                "",
+                value: Binding(
+                    get: { selectedLoras[safe: index]?.scale ?? 1.0 },
+                    set: { newValue in
+                        guard selectedLoras.indices.contains(index) else { return }
+                        selectedLoras[index].scale = min(max(newValue, -5.0), 5.0)
+                    }
+                ),
+                format: .number.precision(.fractionLength(0...2))
+            )
+            .textFieldStyle(.roundedBorder)
+            .font(.caption2.monospacedDigit())
+            .multilineTextAlignment(.trailing)
+            .frame(width: 44)
+        }
+        .padding(.leading, 22)
     }
 
     private func keywordEditorPopover(_ lora: LoRAInfo) -> some View {
@@ -374,8 +463,15 @@ struct LoRAPicker: View {
 
     // MARK: - Actions
 
+    private func refreshCatalog() async {
+        guard !isRefreshingCatalog else { return }
+        isRefreshingCatalog = true
+        defer { isRefreshingCatalog = false }
+        await engine.refreshLoras()
+    }
+
     private func toggleLora(_ lora: LoRAInfo) {
-        if let index = selectedLoras.firstIndex(where: { $0.id == lora.id }) {
+        if let index = selectionIndex(for: lora) {
             selectedLoras.remove(at: index)
             errorMessage = nil
         } else {
@@ -388,6 +484,16 @@ struct LoRAPicker: View {
                 filename: lora.filename,
                 scale: lora.recommendedScale
             ))
+        }
+    }
+
+    /// A preset applied before the catalog arrives only knows its persisted
+    /// id, which may not be the catalog's normalized slug. Filename is the
+    /// server's actual swap identity, so use it as the stable reconciliation
+    /// key once catalog entries become available.
+    private func selectionIndex(for lora: LoRAInfo) -> Int? {
+        selectedLoras.firstIndex {
+            $0.id == lora.id || $0.filename.caseInsensitiveCompare(lora.filename) == .orderedSame
         }
     }
 
