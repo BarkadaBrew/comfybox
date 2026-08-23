@@ -57,6 +57,27 @@ contained to the server's allowed output directory.
 | POST/DELETE | `/v1/loras/{id}/quarantine` | Quarantine / unquarantine a LoRA | `lora_quarantine` |
 | POST | `/v1/lora/swap` | Swap active LoRAs (auto-stages nearline items) | `swap_loras` |
 
+`POST /v1/lora/swap` accepts an optional semantic role on every entry:
+
+```json
+{
+  "loras": [
+    {
+      "path": "krea2_turbo_distill_r256.safetensors",
+      "scale": 0.6,
+      "role": "accel"
+    }
+  ]
+}
+```
+
+Valid roles are `kroma`, `accel`, `bypass`, and `control`; omit `role` for an
+ordinary style/character LoRA. Roles are declarations, not filename guesses.
+In particular, Krea-2 distillation files such as
+`krea2_turbo_distill_r256.safetensors` must declare `"role":"accel"` when
+they fill the accelerator slot. Auto-staging may change `path`, but preserves
+`role`.
+
 ## Nearline storage (attached disk, staged on demand)
 
 | Method | Path | Purpose | MCP tool |
@@ -79,6 +100,25 @@ contained to the server's allowed output directory.
 | GET | `/v1/content-modes` | Content-mode definitions | `list_styles` (styles) |
 | GET | `/v1/styles` | Style presets | `list_styles` |
 | GET | `/v1/audit-log?limit=N` | Recent audit events | |
+
+Preset LoRA references use `filename` rather than `path` and preserve the
+same optional `role`:
+
+```json
+{
+  "loras": [
+    {
+      "filename": "krea2_turbo_distill_r256.safetensors",
+      "scale": 0.6,
+      "role": "accel"
+    }
+  ]
+}
+```
+
+For Krea-2 presets, Kroma belongs in the structured `kroma` object and must
+not be duplicated in `loras[]`. See
+[Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md).
 
 ## Lifecycle
 

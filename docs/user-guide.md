@@ -161,6 +161,30 @@ LoRA sources:
 - **Absolute path:** `/Users/me/loras/style.safetensors`
 - **Relative path:** `./loras/style.safetensors`
 
+### Krea-2 Raw accelerator presets
+
+Krea-2 Raw can use a distillation LoRA as an accelerator. In the CoffeeShop
+Desktop Preset editor, keep the adapter visible in the ordinary LoRA list so
+its scale remains adjustable, then set its role menu to **Accelerator**.
+
+For the tested r256 stack:
+
+- File: `krea2_turbo_distill_r256.safetensors`
+- Role: **Accelerator** (`accel` on the wire)
+- Current Krea-Kira scale: `0.6`
+- Normal guidance: `1`
+
+Kroma is separate: adjust it through the structured Kroma row, not by adding
+the Kroma file a second time to the ordinary LoRA list. A duplicate Kroma
+entry makes the preset contradictory and is rejected.
+
+Guidance around `2` enables the positive/negative CFG pair and makes negative
+prompts active, at roughly twice the model evaluations. It is optional and
+is not required by the r256 accelerator.
+
+See [Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md) for
+the exact preset JSON and non-rendering verification commands.
+
 ### LoRA Library Management
 
 ```bash
