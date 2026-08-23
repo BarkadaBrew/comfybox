@@ -26,6 +26,17 @@ final class LoRAEntryRoleTests: XCTestCase {
     XCTAssertNil(try entries[1].makeConfiguration().role)
   }
 
+  func testR256DistillKeepsExplicitAcceleratorRole() throws {
+    let p = try decode(
+      #"{"prompt":"x","loras":[{"path":"/tmp/krea2_turbo_distill_r256.safetensors","scale":0.6,"role":"accel"}]}"#)
+    let entry = try XCTUnwrap(p.loras?.first)
+    let configuration = try entry.makeConfiguration()
+
+    XCTAssertEqual(entry.role, "accel")
+    XCTAssertEqual(configuration.role, "accel")
+    XCTAssertEqual(configuration.scale, 0.6)
+  }
+
   func testEveryDeclaredRoleIsAccepted() throws {
     for role in LoRAEntry.roles {
       let entry = try decode(#"{"prompt":"x","loras":[{"path":"/tmp/a.safetensors","role":"\#(role)"}]}"#).loras![0]

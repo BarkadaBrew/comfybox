@@ -253,7 +253,11 @@ struct GenerationView: View {
                         width: effectiveWidth,
                         height: effectiveHeight,
                         loras: selectedLoras.map {
-                            ServerPresetLora(filename: $0.filename, scale: Double($0.scale))
+                            ServerPresetLora(
+                                filename: $0.filename,
+                                scale: Double($0.scale),
+                                role: $0.role
+                            )
                         }
                     )
                     var withModel = preset
@@ -1661,9 +1665,19 @@ struct GenerationView: View {
         // even though generation itself would still use the right file.
         selectedLoras = preset.loras.map { presetLora in
             if let match = engine.availableLoras.first(where: { $0.filename == presetLora.filename }) {
-                return LoRASelection(id: match.id, filename: match.filename, scale: presetLora.scale)
+                return LoRASelection(
+                    id: match.id,
+                    filename: match.filename,
+                    scale: presetLora.scale,
+                    role: presetLora.role
+                )
             }
-            return LoRASelection(id: presetLora.id, filename: presetLora.filename, scale: presetLora.scale)
+            return LoRASelection(
+                id: presetLora.id,
+                filename: presetLora.filename,
+                scale: presetLora.scale,
+                role: presetLora.role
+            )
         }
 
         // Activate the preset's model via the model-pool API if it differs

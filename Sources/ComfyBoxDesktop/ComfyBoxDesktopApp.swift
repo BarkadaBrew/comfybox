@@ -873,8 +873,12 @@ struct ComfyBoxDesktopApp: App {
         }
         if !request.loras.isEmpty {
             metadata["loras"] = request.loras.map { lora in
-                ["name": lora.filename.replacingOccurrences(of: ".safetensors", with: ""),
-                 "scale": Double(lora.scale)]
+                var entry: [String: Any] = [
+                    "name": lora.filename.replacingOccurrences(of: ".safetensors", with: ""),
+                    "scale": Double(lora.scale),
+                ]
+                if let role = lora.role { entry["role"] = role }
+                return entry
             }
         }
 

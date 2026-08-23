@@ -324,6 +324,7 @@ private struct ServerPresetEditor: View {
         let id = UUID()
         var filename: String
         var scale: Double
+        var role: String?
     }
 
     @State private var name: String
@@ -366,7 +367,7 @@ private struct ServerPresetEditor: View {
                 guard let kromaFile = original.kroma?.file else { return true }
                 return lora.filename != kromaFile
             }
-            .map { EditableLora(filename: $0.filename, scale: $0.scale) })
+            .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _scheduler = State(initialValue: original.scheduler ?? "")
     }
 
@@ -489,6 +490,21 @@ private struct ServerPresetEditor: View {
                     .truncationMode(.middle)
                     .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
                     .help(lora.filename)
+                Menu {
+                    Button("Style / unassigned") { lora.role = nil }
+                    Divider()
+                    Button("Accelerator") { lora.role = "accel" }
+                    Button("Bypass") { lora.role = "bypass" }
+                    Button("Control") { lora.role = "control" }
+                } label: {
+                    Text(roleLabel(for: lora.role))
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .frame(width: 72, alignment: .leading)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Declare what this LoRA does. Krea-2 distill files must be Accelerator; the role is not inferred from the filename.")
                 // Slider range matches the field's clamp (-3...3) so a typed
                 // value is not silently snapped back on the next slider nudge.
                 // NEGATIVE weights are meaningful — bidirectional LoRAs (e.g.
@@ -537,7 +553,8 @@ private struct ServerPresetEditor: View {
                 Button {
                     editableLoras.append(EditableLora(
                         filename: info.filename,
-                        scale: Double(info.recommendedScale)
+                        scale: Double(info.recommendedScale),
+                        role: nil
                     ))
                 } label: {
                     if info.category.isEmpty {
@@ -558,6 +575,16 @@ private struct ServerPresetEditor: View {
         filename
             .replacingOccurrences(of: ".safetensors", with: "")
             .replacingOccurrences(of: "_", with: " ")
+    }
+
+    private func roleLabel(for role: String?) -> String {
+        switch role {
+        case "accel": return "Accelerator"
+        case "bypass": return "Bypass"
+        case "control": return "Control"
+        case .some(let role): return role.capitalized
+        case nil: return "Style"
+        }
     }
 
     /// Trigger words for the currently selected LoRAs — tap to insert into
@@ -618,7 +645,9 @@ private struct ServerPresetEditor: View {
         let structuredKromaFile = p.kroma?.file
         p.loras = editableLoras
             .filter { !$0.filename.isEmpty && $0.filename != structuredKromaFile }
-            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale) }
+            .map {
+                ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role)
+            }
         return p
     }
 }

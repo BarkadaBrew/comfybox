@@ -62,11 +62,13 @@ public struct PresetLoRA: Codable, Sendable, Identifiable {
     public var id: String
     public var filename: String
     public var scale: Float
+    public var role: String?
 
-    public init(id: String, filename: String, scale: Float = 1.0) {
+    public init(id: String, filename: String, scale: Float = 1.0, role: String? = nil) {
         self.id = id
         self.filename = filename
         self.scale = scale
+        self.role = role
     }
 }
 
@@ -101,7 +103,9 @@ public final class PresetManager {
             name: name,
             promptTemplate: promptTemplate,
             modelId: modelId,
-            loras: loras.map { PresetLoRA(id: $0.id, filename: $0.filename, scale: $0.scale) },
+            loras: loras.map {
+                PresetLoRA(id: $0.id, filename: $0.filename, scale: $0.scale, role: $0.role)
+            },
             steps: steps,
             guidance: guidance,
             width: width,

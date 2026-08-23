@@ -16,8 +16,9 @@ public struct ImageRecipe {
         let loras: [PresetLoRA] = (params["loras"] as? [[String: Any]] ?? []).compactMap { l in
             guard let name = l["name"] as? String, !name.isEmpty else { return nil }
             let scale = ((l["scale"] as? NSNumber)?.floatValue) ?? 1.0
+            let role = l["role"] as? String
             let filename = name.hasSuffix(".safetensors") ? name : name + ".safetensors"
-            return PresetLoRA(id: name, filename: filename, scale: scale)
+            return PresetLoRA(id: name, filename: filename, scale: scale, role: role)
         }
 
         let preset = GenerationPreset(
