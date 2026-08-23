@@ -8,6 +8,31 @@ decided them.
 
 ### Added
 
+- **A LoRA pair whose target is a bare parameter now binds, as a delta.**
+  `LoRAApplicator.applyDynamically` binds by walking `namedModules()` and
+  wrapping Linears, so it can only reach a target that IS a `Linear` or
+  `QuantizedLinear`. The Krea 2 turbo distills
+  (`krea2_turbo_distill_r256`, `…_r128`) offer
+  `diffusion_model.last.modulation.lin.lora_A/lora_B` — a rank-2 SVD of the
+  (2, 6144) modulation delta — and `Krea2SimpleModulation.lin` is a bare
+  `MLXArray` added to the timestep vector, not a Linear. The strict Krea 2
+  apply therefore refused all 531 keys over the one it could not reach
+  ("did not bind completely — 1 key(s) matched nothing:
+  `last.modulation.lin.weight`"), and no r256/r128 render was possible.
+  `LoRABareParameterPairs.split` now rewrites such a pair into a `.diff` on
+  the real parameter path — the same route Kroma's
+  `last.modulation.lin.diff` [2, 6144] has always taken — so it applies
+  through `LoRAPatchSession` with an exact first-write-wins snapshot and is
+  restored on rollback. It shows up in provenance as
+  `loras[].deltas_applied`, never as a silently dropped layer.
+  **Fail-closed is unchanged:** a pair diverts only when no bindable Linear
+  answers to its key AND a real parameter path does AND `up @ down` fits that
+  shape exactly, so a key naming something the architecture does not have
+  still throws `partialApplication`, and one naming a parameter it cannot fit
+  throws `incompatibleWeights`. The module walk wins unconditionally, so
+  every adapter that bound before binds identically
+  (`krea2_turbo_lora_rank_64_bf16`: 264/264 pairs, 7 deltas, before and
+  after).
 - **Every Krea 2 render now carries a provenance record, `applied`, on four
   sinks.** The `/v1/generate` response, the async job status
   (`GET /v1/generate/async/{id}`), `/health.last_recipe`, and the PNG's EXIF

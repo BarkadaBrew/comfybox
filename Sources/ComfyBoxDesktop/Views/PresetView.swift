@@ -38,14 +38,21 @@ struct PresetView: View {
         }
         .navigationTitle("Presets")
         .task {
+            // Refresh the picker inventory before the preset list. The editor
+            // receives a value snapshot of `availableLoras`; opening it while
+            // this fetch is still pending would freeze the old catalog into
+            // that sheet until the user closed and reopened it.
+            await engine.refreshLoras()
             await reload()
             warmModelSpec = (try? await engine.fetchServerConfig())?.modelSpec
-            // The editor's Add-LoRA picker needs the server's library list;
-            // Generate populates it lazily, so make sure it's fresh here too.
-            await engine.refreshLoras()
         }
         .onChange(of: engine.connectionState.isConnected) { _, connected in
-            if connected { Task { await reload() } }
+            if connected {
+                Task {
+                    await engine.refreshLoras()
+                    await reload()
+                }
+            }
         }
         .sheet(item: $editing) { preset in
             ServerPresetEditor(
@@ -67,7 +74,12 @@ struct PresetView: View {
                 .foregroundStyle(.secondary)
             Spacer()
             if isLoading { ProgressView().controlSize(.small) }
-            Button { Task { await reload() } } label: { Image(systemName: "arrow.clockwise") }
+            Button {
+                Task {
+                    await engine.refreshLoras()
+                    await reload()
+                }
+            } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
             Menu {
                 Button("Import from Image Service") { Task { await importLegacy() } }
@@ -79,8 +91,7 @@ struct PresetView: View {
             .disabled(!engine.connectionState.isConnected)
             .help("Import presets from the old image-service")
             Button {
-                isNew = true
-                editing = ServerPreset(name: "")
+                Task { await beginEditing(ServerPreset(name: ""), asNew: true) }
             } label: { Label("New Preset", systemImage: "plus") }
                 .buttonStyle(.borderedProminent)
                 .disabled(!engine.connectionState.isConnected)
@@ -97,7 +108,7 @@ struct PresetView: View {
                         preset: preset,
                         isWarm: presetModelSpec(preset) != nil && presetModelSpec(preset) == warmModelSpec,
                         onApply: { onApply?(preset.toGenerationPreset()) },
-                        onEdit: { isNew = false; editing = preset },
+                        onEdit: { Task { await beginEditing(preset, asNew: false) } },
                         onDuplicate: { Task { await duplicate(preset) } },
                         onDelete: { Task { await delete(preset) } },
                         onSetWarm: presetModelSpec(preset) != nil ? { Task { await setAsWarm(preset) } } : nil
@@ -123,6 +134,15 @@ struct PresetView: View {
     }
 
     // MARK: - Actions
+
+    /// A sheet captures `availableLoras` by value, so make the inventory
+    /// current before constructing it. This is also what makes LoRAs imported
+    /// while the app is running immediately visible in Presets.
+    private func beginEditing(_ preset: ServerPreset, asNew: Bool) async {
+        await engine.refreshLoras()
+        isNew = asNew
+        editing = preset
+    }
 
     private func reload() async {
         guard engine.connectionState.isConnected else { return }
@@ -304,6 +324,7 @@ private struct ServerPresetEditor: View {
         let id = UUID()
         var filename: String
         var scale: Double
+        var role: String?
     }
 
     @State private var name: String
@@ -315,6 +336,10 @@ private struct ServerPresetEditor: View {
     @State private var heightText: String
     @State private var stepsText: String
     @State private var guidanceText: String
+    /// Kroma is a first-class recipe field, never a generic `loras[]` row.
+    /// Keep it visible beside the additional LoRAs while saving edits back to
+    /// `kroma.strength`, which is the engine's single source of truth.
+    @State private var kromaStrength: Double
     @State private var editableLoras: [EditableLora]
     @State private var scheduler: String
     @State private var saveAsName: String = ""
@@ -336,8 +361,13 @@ private struct ServerPresetEditor: View {
         _heightText = State(initialValue: original.height.map(String.init) ?? "")
         _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
         _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
+        _kromaStrength = State(initialValue: original.kroma?.strength ?? 0)
         _editableLoras = State(initialValue: original.loras
-            .map { EditableLora(filename: $0.filename, scale: $0.scale) })
+            .filter { lora in
+                guard let kromaFile = original.kroma?.file else { return true }
+                return lora.filename != kromaFile
+            }
+            .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _scheduler = State(initialValue: original.scheduler ?? "")
     }
 
@@ -367,6 +397,9 @@ private struct ServerPresetEditor: View {
                     }
                 }
                 Section("LoRAs") {
+                    if original.kroma != nil {
+                        structuredKromaRow
+                    }
                     loraRows
                     addLoraMenu
                     presetLoraKeywordsRow
@@ -408,11 +441,46 @@ private struct ServerPresetEditor: View {
 
     // MARK: - LoRA editing
 
+    /// Kroma looks and behaves like an adjustable LoRA in the editor, but it
+    /// writes the structured recipe field. Showing it here avoids the tempting
+    /// (and invalid) workaround of also adding its file to `loras[]`.
+    @ViewBuilder
+    private var structuredKromaRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                HStack(spacing: 5) {
+                    Text("Kroma")
+                    Text("Recipe")
+                        .font(.caption2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                }
+                .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
+                Slider(value: $kromaStrength, in: 0...1.5, step: 0.05)
+                TextField("", value: Binding(
+                    get: { kromaStrength },
+                    set: { kromaStrength = min(max($0, 0), 1.5) }
+                ), format: .number.precision(.fractionLength(0...2)))
+                    .font(.system(.caption, design: .monospaced))
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 52)
+            }
+            Text(original.kroma?.file ?? "Engine-default Kroma file")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help("Saved as kroma.strength; this file is excluded from the generic LoRA stack.")
+        }
+    }
+
     /// One row per selected LoRA: name, scale slider, numeric value, remove.
     @ViewBuilder
     private var loraRows: some View {
         if editableLoras.isEmpty {
-            Text("No LoRAs — add one below.")
+            Text(original.kroma == nil ? "No LoRAs — add one below." : "No additional LoRAs — add one below.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         ForEach($editableLoras) { $lora in
@@ -422,6 +490,21 @@ private struct ServerPresetEditor: View {
                     .truncationMode(.middle)
                     .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
                     .help(lora.filename)
+                Menu {
+                    Button("Style / unassigned") { lora.role = nil }
+                    Divider()
+                    Button("Accelerator") { lora.role = "accel" }
+                    Button("Bypass") { lora.role = "bypass" }
+                    Button("Control") { lora.role = "control" }
+                } label: {
+                    Text(roleLabel(for: lora.role))
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .frame(width: 72, alignment: .leading)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Declare what this LoRA does. Krea-2 distill files must be Accelerator; the role is not inferred from the filename.")
                 // Slider range matches the field's clamp (-3...3) so a typed
                 // value is not silently snapped back on the next slider nudge.
                 // NEGATIVE weights are meaningful — bidirectional LoRAs (e.g.
@@ -454,8 +537,13 @@ private struct ServerPresetEditor: View {
     @ViewBuilder
     private var addLoraMenu: some View {
         let added = Set(editableLoras.map(\.filename))
+        let structuredKromaFile = original.kroma?.file
         let candidates = availableLoras
-            .filter { !$0.quarantined && !added.contains($0.filename) }
+            .filter {
+                !$0.quarantined
+                    && !added.contains($0.filename)
+                    && $0.filename != structuredKromaFile
+            }
             .sorted { $0.filename.localizedCaseInsensitiveCompare($1.filename) == .orderedAscending }
         Menu {
             if candidates.isEmpty {
@@ -465,7 +553,8 @@ private struct ServerPresetEditor: View {
                 Button {
                     editableLoras.append(EditableLora(
                         filename: info.filename,
-                        scale: Double(info.recommendedScale)
+                        scale: Double(info.recommendedScale),
+                        role: nil
                     ))
                 } label: {
                     if info.category.isEmpty {
@@ -486,6 +575,16 @@ private struct ServerPresetEditor: View {
         filename
             .replacingOccurrences(of: ".safetensors", with: "")
             .replacingOccurrences(of: "_", with: " ")
+    }
+
+    private func roleLabel(for role: String?) -> String {
+        switch role {
+        case "accel": return "Accelerator"
+        case "bypass": return "Bypass"
+        case "control": return "Control"
+        case .some(let role): return role.capitalized
+        case nil: return "Style"
+        }
     }
 
     /// Trigger words for the currently selected LoRAs — tap to insert into
@@ -539,9 +638,16 @@ private struct ServerPresetEditor: View {
         p.steps = Int(stepsText)
         p.guidance = Double(guidanceText.replacingOccurrences(of: ",", with: "."))
         p.scheduler = scheduler.isEmpty ? nil : scheduler
+        if var kroma = p.kroma {
+            kroma.strength = min(max(kromaStrength, 0), 1.5)
+            p.kroma = kroma
+        }
+        let structuredKromaFile = p.kroma?.file
         p.loras = editableLoras
-            .filter { !$0.filename.isEmpty }
-            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale) }
+            .filter { !$0.filename.isEmpty && $0.filename != structuredKromaFile }
+            .map {
+                ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role)
+            }
         return p
     }
 }

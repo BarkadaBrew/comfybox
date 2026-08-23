@@ -62,11 +62,13 @@ public struct LoRASelection: Sendable, Identifiable, Equatable, Codable {
     public var id: String
     public var filename: String
     public var scale: Float
+    public var role: String?
 
-    public init(id: String, filename: String, scale: Float = 1.0) {
+    public init(id: String, filename: String, scale: Float = 1.0, role: String? = nil) {
         self.id = id
         self.filename = filename
         self.scale = scale
+        self.role = role
     }
 }
 
@@ -727,7 +729,9 @@ public final class EngineService {
             // Server resolves LoRAs by filename (e.g. "Anneliese_Zbase3.safetensors"),
             // NOT by the slugified library id ("anneliese-zbase3") — sending the id
             // silently fails to resolve and renders with no LoRAs.
-            ["path": lora.filename, "scale": lora.scale]
+            var entry: [String: Any] = ["path": lora.filename, "scale": lora.scale]
+            if let role = lora.role { entry["role"] = role }
+            return entry
         }
         let payloadDict: [String: Any] = ["loras": loraEntries]
         let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
@@ -1236,7 +1240,11 @@ public final class EngineService {
         if !request.loras.isEmpty {
             // Same convention as image LoRA swap: the server resolves by
             // filename, not the slugified library id.
-            body["loras"] = request.loras.map { ["path": $0.filename, "scale": $0.scale] }
+            body["loras"] = request.loras.map {
+                var entry: [String: Any] = ["path": $0.filename, "scale": $0.scale]
+                if let role = $0.role { entry["role"] = role }
+                return entry
+            }
         }
         if let tuning = request.tuning, !tuning.isEmpty {
             body["tuning"] = tuning

@@ -11,18 +11,23 @@ import Foundation
 public struct ServerPresetLora: Codable, Sendable, Equatable, Identifiable {
     public var filename: String
     public var scale: Double
+    /// Semantic configuration slot declared by the preset. Kept as a string
+    /// for forward-compatible wire passthrough; the server validates it.
+    public var role: String?
 
     public var id: String { filename }
 
-    public init(filename: String, scale: Double = 1.0) {
+    public init(filename: String, scale: Double = 1.0, role: String? = nil) {
         self.filename = filename
         self.scale = scale
+        self.role = role
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         filename = try c.decodeIfPresent(String.self, forKey: .filename) ?? ""
         scale = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1.0
+        role = try c.decodeIfPresent(String.self, forKey: .role)
     }
 }
 
@@ -292,7 +297,15 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             promptTemplate: prompt ?? "",
             negativePrompt: negativePrompt,
             modelId: customModelPath ?? model,
-            loras: loras.map { PresetLoRA(id: $0.filename, filename: $0.filename, scale: Float($0.scale)) },
+            loras: loras.map {
+                PresetLoRA(
+                    id: $0.filename,
+                    filename: $0.filename,
+                    scale: Float($0.scale),
+                    role: $0.role
+                )
+            },
+            kroma: kroma.map { PresetKroma(strength: $0.strength, file: $0.file) },
             steps: steps ?? 9,
             guidance: Float(guidance ?? 3.5),
             width: width ?? 1024,

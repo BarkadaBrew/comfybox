@@ -17,14 +17,19 @@ import Logging
 
 // MARK: - LoRA reference
 
-/// One LoRA a preset applies, by filename + scale. Port of `LoraReference` (types.ts).
+/// One LoRA a preset applies, by filename + scale and an optional semantic
+/// slot. `role` is declared metadata — never inferred from a filename. It is
+/// what lets clients distinguish a Krea-2 accelerator such as
+/// `krea2_turbo_distill_r256.safetensors` from an ordinary style LoRA.
 public struct LoraReference: Codable, Equatable, Sendable {
   public var filename: String
   public var scale: Double
+  public var role: String?
 
-  public init(filename: String, scale: Double) {
+  public init(filename: String, scale: Double, role: String? = nil) {
     self.filename = filename
     self.scale = scale
+    self.role = role
   }
 }
 
@@ -862,6 +867,11 @@ public final class PresetStore: @unchecked Sendable {
       }
       if !lora.scale.isFinite {
         throw PresetStoreError.validation("loras[\(i)].scale must be a finite number")
+      }
+      if let role = lora.role, !LoRAEntry.roles.contains(role) {
+        throw PresetStoreError.validation(
+          "loras[\(i)].role \"\(role)\" is invalid — expected one of "
+            + LoRAEntry.roles.joined(separator: ", "))
       }
     }
     try validateRecipeFields(preset)

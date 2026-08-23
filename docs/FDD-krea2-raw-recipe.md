@@ -892,6 +892,16 @@ Request shape (D4), additive — a payload without `stage2` is byte-identical to
 
 **WP-E19:** the bridge Raw branch (D13), §3.5.
 
+> **Implementation addendum — 2026-08-23.** `LoraReference` also carries an
+> optional semantic `role`. This is required for Raw accelerators whose
+> filenames do not match the historical `krea2[-]turbo[-]lora` spelling. The
+> tested Krea-Kira stack uses
+> `krea2_turbo_distill_r256.safetensors @ 0.6` with `role: "accel"`, beside
+> structured Kroma at `0.6`. The role survives preset persistence, desktop
+> editing/application, request wiring, metadata, and nearline staging. It is
+> declared, never inferred. See
+> `docs/methods/krea2-r256-preset-stack.md` for the canonical deployed shape.
+
 **WP-E20:** `ImagePreset` (`PresetStore.swift:61-190`) gains — at **all five** sites (stored property, `CodingKeys`, custom `init(from:)`, memberwise `init`, `ResolvedPreset`), per the `videoTuning` lesson; v1 said "four" and listed five:
 ```swift
 public var checkpointFamily: String?            // "turbo" | "raw-accel" | "raw-stock" | "zimage-turbo" | "zimage-base"

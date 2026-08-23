@@ -65,7 +65,8 @@ struct ServerPresetTests {
             prompt: "a test", steps: 12, guidance: 4.0,
             width: 1280, height: 1280,
             loras: [ServerPresetLora(filename: "a.safetensors", scale: 0.6)],
-            scheduler: "euler"
+            scheduler: "euler",
+            kroma: ServerPresetKroma(strength: 0.45, file: "kroma.safetensors")
         )
         let g = p.toGenerationPreset()
         #expect(g.promptTemplate == "a test")
@@ -73,6 +74,7 @@ struct ServerPresetTests {
         #expect(g.steps == 12)
         #expect(g.width == 1280)
         #expect(g.loras.first?.scale == 0.6)
+        #expect(g.kroma == PresetKroma(strength: 0.45, file: "kroma.safetensors"))
         #expect(g.sampler == "euler")
     }
 

@@ -22,7 +22,8 @@ struct GenerationPresetTests {
 
     @Test("codable round-trip")
     func codable() throws {
-        let preset = TestData.makePreset(name: "My Preset", promptTemplate: "a test prompt", steps: 20, guidance: 7.5)
+        var preset = TestData.makePreset(name: "My Preset", promptTemplate: "a test prompt", steps: 20, guidance: 7.5)
+        preset.kroma = PresetKroma(strength: 0.6, file: "kroma.safetensors")
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(preset)
@@ -34,6 +35,7 @@ struct GenerationPresetTests {
         #expect(decoded.steps == 20)
         #expect(decoded.guidance == 7.5)
         #expect(decoded.id == preset.id)
+        #expect(decoded.kroma == preset.kroma)
     }
 
     @Test("identifiable via id")

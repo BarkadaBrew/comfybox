@@ -293,8 +293,22 @@ struct KiraView: View {
                         set: { on in Task { await client.setSchedulerPaused(!on) } }))
                         .toggleStyle(.switch)
                         .disabled(client.actionInFlight)
+                    Button {
+                        Task { await client.runSchedulerNow() }
+                    } label: {
+                        Label("Run now", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(client.actionInFlight || scheduler.paused || !scheduler.enabled)
+                    .help("Start one content-scheduler tick immediately using the current tier, pacing, and safety gates.")
                     Text(cadenceLine(scheduler))
                         .font(.caption).foregroundStyle(.secondary)
+                }
+                if let requestedAt = client.lastSchedulerRunNowAt {
+                    Text("Tick requested at \(requestedAt.formatted(date: .omitted, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
                 // Stream steering (tiered scheduler v2, Todd 2026-07-27):
                 // precedence = your override > Kira's choice > schedule.

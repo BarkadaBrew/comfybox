@@ -98,9 +98,15 @@ final class Krea2BypassLoRATests: XCTestCase {
 
   /// AC-49's other half: the real 1,040-byte file must load — no size floor.
   func testTheSmallFilesAreNotRejectedForBeingSmall() throws {
-    XCTAssertEqual(try Data(contentsOf: try fedorFile()).count, 1040)
-    _ = try onlyDelta(of: try fedorFile())
-    _ = try onlyDelta(of: try workflowFile())
+    // Resolve fixtures before entering an XCTest assertion autoclosure. A
+    // missing optional artifact throws XCTSkip; inside XCTAssertEqual that
+    // skip is converted into a failure instead of skipping the test on CI.
+    let fedor = try fedorFile()
+    let workflow = try workflowFile()
+    let fedorSize = try Data(contentsOf: fedor).count
+    XCTAssertEqual(fedorSize, 1040)
+    _ = try onlyDelta(of: fedor)
+    _ = try onlyDelta(of: workflow)
   }
 
   // MARK: - AC-47a — the substitution is MEASURED, not assumed

@@ -176,6 +176,59 @@ final class PresetStoreTests: XCTestCase {
     XCTAssertEqual(original, decoded)
   }
 
+  /// The Krea-2 r256 distill is an accelerator by declaration, not by its
+  /// spelling. The canonical preset store must retain that declaration across
+  /// both persistence and resolve; otherwise the daemon sees an ordinary
+  /// style LoRA and refuses the raw-turbo recipe before ComfyBox is called.
+  func testKrea2R256AcceleratorRoleSurvivesStoreAndResolve() throws {
+    let path = try makeTempPath()
+    let store = PresetStore(path: path, seedDefaults: false)
+    let r256 = LoraReference(
+      filename: "krea2_turbo_distill_r256.safetensors",
+      scale: 0.6,
+      role: "accel")
+    let preset = ImagePreset(
+      id: "krea-kira",
+      name: "Krea Kira",
+      mediaKind: "image",
+      engine: "zimage",
+      model: "krea2-raw",
+      steps: 12,
+      guidance: 1,
+      width: 1024,
+      height: 1024,
+      loras: [r256],
+      kroma: KromaPolicy(
+        strength: 0.6,
+        file: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"))
+
+    try store.upsert(preset)
+
+    let reopened = PresetStore(path: path, seedDefaults: false)
+    XCTAssertEqual(reopened.get("krea-kira")?.loras, [r256])
+    XCTAssertEqual(try reopened.resolve("krea-kira").loras, [r256])
+
+    let root = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
+    let presets = try XCTUnwrap(root["presets"] as? [[String: Any]])
+    let loras = try XCTUnwrap(presets.first?["loras"] as? [[String: Any]])
+    XCTAssertEqual(loras.first?["role"] as? String, "accel")
+  }
+
+  func testPresetRejectsUnknownLoraRole() throws {
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    var bad = sample()
+    bad.loras = [LoraReference(filename: "r256.safetensors", scale: 0.6, role: "turboish")]
+
+    XCTAssertThrowsError(try store.upsert(bad)) { error in
+      guard case PresetStoreError.validation(let message) = error else {
+        return XCTFail("unexpected error: \(error)")
+      }
+      XCTAssertTrue(message.contains("loras[0].role"), message)
+      XCTAssertTrue(message.contains("accel"), message)
+    }
+  }
+
   func testStoreRoundTripThroughDisk() throws {
     let path = try makeTempPath()
     let store = PresetStore(path: path, seedDefaults: false)

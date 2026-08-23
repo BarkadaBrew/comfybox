@@ -494,6 +494,9 @@ public final class KiraClient {
     /// In-flight control action (pause/resume/mode) — disables the controls.
     public private(set) var actionInFlight = false
     public private(set) var actionError: String?
+    /// Local acknowledgement for the operator-triggered scheduler tick. The
+    /// daemon remains authoritative for actual render progress and output.
+    public private(set) var lastSchedulerRunNowAt: Date?
 
     // Editor read models (Todd 2026-07-27): character description, Her Now
     // raw numbers, lorebook. Refreshed with the dashboard poll and after writes.
@@ -784,29 +787,44 @@ public final class KiraClient {
 
     // MARK: - Controls (writes)
 
-    private func perform(_ path: String, method: String, body: [String: Any]? = nil) async {
+    @discardableResult
+    private func perform(_ path: String, method: String, body: [String: Any]? = nil) async -> Bool {
         actionInFlight = true
         actionError = nil
         defer { actionInFlight = false }
-        guard let request = request(path, method: method, body: body, timeout: 10) else { return }
+        guard let request = request(path, method: method, body: body, timeout: 10) else {
+            actionError = "Invalid host binding"
+            return false
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(status) else {
                 let detail = String(data: data.prefix(200), encoding: .utf8) ?? ""
                 actionError = "\(method) \(path): HTTP \(status) \(detail)"
-                return
+                return false
             }
         } catch {
             actionError = error.localizedDescription
+            return false
         }
         await refreshDashboard()
+        return true
     }
 
     /// B1: toggles the Kira CONTENT scheduler sentinel — deliberately not the
     /// generic /v1/scheduler (the FDD §3.2 conflation trap).
     public func setSchedulerPaused(_ paused: Bool) async {
         await perform("v1/kira/content-scheduler/\(paused ? "pause" : "resume")", method: "POST")
+    }
+
+    /// Ask the live daemon to execute one content-scheduler tick immediately.
+    /// This uses the scheduler's normal policy path; it does not submit a
+    /// render directly or bypass pause/tier gates.
+    public func runSchedulerNow() async {
+        if await perform("v1/kira/content-scheduler/run-now", method: "POST") {
+            lastSchedulerRunNowAt = Date()
+        }
     }
 
     /// B5: set the default content mode (allowlisted server-side).

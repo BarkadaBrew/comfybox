@@ -1774,7 +1774,10 @@ public final class WarmServer {
       else { return entry }
       guard let staged = try? nearlineLibrary.stage(name: entry.path) else { return entry }
       logger.info("Nearline: auto-staged \(entry.path) for LoRA swap")
-      return LoRAEntry(path: staged, scale: entry.scale)
+      // Staging changes only the storage path. The semantic slot is part of
+      // the requested stack and must survive (notably `role: "accel"` for
+      // Krea-2 distill adapters whose names do not contain `turbo_lora`).
+      return LoRAEntry(path: staged, scale: entry.scale, role: entry.role)
     }
     return LoRASwapPayload(loras: entries)
   }
@@ -2171,7 +2174,9 @@ public final class WarmServer {
 
     var loraEntries: [LoRAEntry] = req.loras ?? []
     if loraEntries.isEmpty, req.loraPath == nil, let preset = videoPreset, !preset.loras.isEmpty {
-      loraEntries = preset.loras.map { LoRAEntry(path: $0.filename, scale: Float($0.scale)) }
+      loraEntries = preset.loras.map {
+        LoRAEntry(path: $0.filename, scale: Float($0.scale), role: $0.role)
+      }
     }
     if loraEntries.isEmpty, req.loraPath == nil,
        let defaultLoRA = configuration.ltx2DefaultLoRA, !defaultLoRA.isEmpty {
