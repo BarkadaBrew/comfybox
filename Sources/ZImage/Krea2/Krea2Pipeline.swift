@@ -600,7 +600,14 @@ public final class Krea2Pipeline {
         // is what provenance records as `relative_to`.
         let required = Krea2LoRARelativity.required(for: config, resolvedURL: url)
         try Krea2LoRARelativity.check(lora: name, required: required, loaded: variant)
-        let weights = try LoRAWeightLoader.loadForKrea2(from: url)
+        // A pair whose target is a BARE PARAMETER (the distills'
+        // `last.modulation.lin` — a (2, features) array, not a Linear) becomes
+        // a `.diff` on that parameter, so it applies through `patchSession`
+        // with an exact restore instead of being reported as unbound and
+        // taking the whole stack down with it. Inert for every adapter whose
+        // keys all name Linears. See ``LoRABareParameterPairs``.
+        let weights = try LoRABareParameterPairs.split(
+          LoRAWeightLoader.loadForKrea2(from: url), for: transformer, name: name)
         // K-FIX-1 / Codex C1 — the second half of the transactional contract,
         // and like the relativity guard it fires BEFORE any weight mutation:
         // LoKr rewrites base parameters and `clearDynamicLoRA` (this block's
@@ -657,7 +664,9 @@ public final class Krea2Pipeline {
     do {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
-        let weights = try LoRAWeightLoader.loadForKrea2(from: src)
+        let weights = try LoRABareParameterPairs.split(
+          LoRAWeightLoader.loadForKrea2(from: src), for: transformer,
+          name: cfg.source.displayName)
         // Belt and braces: nothing carrying LoKr can be in `appliedLoRAs`
         // (loadLoRAs refuses it), but this loop re-reads the files from disk,
         // so a file swapped underneath us is refused here too rather than
