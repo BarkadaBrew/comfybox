@@ -46,4 +46,88 @@ final class GeneratePayloadDecodeTests: XCTestCase {
         XCTAssertNil(p.inpaintImageData)
         XCTAssertNil(p.maskData)
     }
+
+    // MARK: - WP-E12: `shift` (FDD-krea2-raw-recipe D3)
+
+    func testShiftDecodes() throws {
+        let p = try decode(#"{"prompt":"x","shift":1.15}"#)
+        XCTAssertEqual(p.shift, 1.15)
+        let absent = try decode(#"{"prompt":"x"}"#)
+        XCTAssertNil(absent.shift, "absent = dynamic mu; nothing is defaulted in")
+    }
+
+    /// A non-positive shift is a 400 naming the field, and so is `shift` on a
+    /// family whose schedule does not consult it — never silently ignored.
+    func testShiftValidation() {
+        XCTAssertNil(GeneratePayload.validateShift(nil, family: .flux1))
+        XCTAssertNil(GeneratePayload.validateShift(nil, family: .krea2))
+        XCTAssertNil(GeneratePayload.validateShift(1.15, family: .krea2))
+        for bad: Float in [0, -1] {
+            let msg = GeneratePayload.validateShift(bad, family: .krea2)
+            XCTAssertNotNil(msg)
+            XCTAssertTrue(msg?.contains("shift") == true, "names the field: \(msg ?? "nil")")
+        }
+        let wrongFamily = GeneratePayload.validateShift(1.15, family: .flux1)
+        XCTAssertNotNil(wrongFamily)
+        XCTAssertTrue(wrongFamily?.contains("shift") == true && wrongFamily?.contains("flux1") == true,
+                      "names the field and the family: \(wrongFamily ?? "nil")")
+    }
+}
+
+// MARK: - WP-E4 (FDD-krea2-raw-recipe D25, AC-15a): the `sampler` key alias
+
+extension GeneratePayloadDecodeTests {
+
+  private func decodeE4(_ json: String) throws -> GeneratePayload {
+    let d = JSONDecoder()
+    d.keyDecodingStrategy = .convertFromSnakeCase
+    return try d.decode(GeneratePayload.self, from: Data(json.utf8))
+  }
+
+  /// `sampler` is a decoded alias of the wire key `scheduler`. It can never be
+  /// silently ignored: `{"sampler":"res_2s"}` resolves to `.res2s`, both keys
+  /// with different values is a 400 (`mutuallyExclusive`), both equal succeeds.
+  func testSamplerKeyAlias() throws {
+    let aliased = try decodeE4(#"{"prompt":"x","sampler":"res_2s"}"#)
+    XCTAssertEqual(aliased.scheduler, "res_2s", "sampler must land on the scheduler field, not be dropped")
+    XCTAssertEqual(try aliased.validateRecipeNames().scheduler, .res2s)
+
+    XCTAssertThrowsError(try decodeE4(#"{"prompt":"x","scheduler":"res_2s","sampler":"euler"}"#)) { error in
+      guard case WarmServerError.mutuallyExclusive(let message) = error else {
+        return XCTFail("expected WarmServerError.mutuallyExclusive, got \(error)")
+      }
+      XCTAssertTrue(message.contains("scheduler"), message)
+      XCTAssertTrue(message.contains("sampler"), message)
+      XCTAssertTrue(message.contains("res_2s") && message.contains("euler"), "message names both values: \(message)")
+    }
+
+    let agreeing = try decodeE4(#"{"prompt":"x","scheduler":"res_2s","sampler":"res_2s"}"#)
+    XCTAssertEqual(agreeing.scheduler, "res_2s")
+    XCTAssertEqual(try agreeing.validateRecipeNames().scheduler, .res2s)
+
+    // The legacy key alone is byte-identical to today.
+    let legacy = try decodeE4(#"{"prompt":"x","scheduler":"heun"}"#)
+    XCTAssertEqual(legacy.scheduler, "heun")
+  }
+}
+
+// MARK: - WP-E9 (FDD §3.9, AC-56/59): the `vae` request field
+
+extension GeneratePayloadDecodeTests {
+
+  private func decodeE9(_ json: String) throws -> GeneratePayload {
+    let d = JSONDecoder()
+    d.keyDecodingStrategy = .convertFromSnakeCase
+    return try d.decode(GeneratePayload.self, from: Data(json.utf8))
+  }
+
+  /// `vae` is a path (tilde allowed) naming the decoder file; absent means
+  /// the model directory's VAE. It is never interpreted by filename.
+  func testVaeKeyDecodes() throws {
+    let p = try decodeE9(#"{"prompt":"x","vae":"~/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"}"#)
+    XCTAssertEqual(p.vae, "~/LocalModels/vae/Wan2_1_VAE_fp32.safetensors")
+    XCTAssertNil(try decodeE9(#"{"prompt":"x"}"#).vae)
+    XCTAssertNil(GeneratePayload(prompt: "x").vae, "memberwise default is no selection")
+    XCTAssertEqual(GeneratePayload(prompt: "x", vae: "/v.safetensors").vae, "/v.safetensors")
+  }
 }

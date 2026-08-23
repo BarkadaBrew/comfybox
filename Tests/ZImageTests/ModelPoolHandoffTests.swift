@@ -70,3 +70,36 @@ final class ModelPoolHandoffTests: XCTestCase {
     XCTAssertEqual(count, 0, "both evicted — 22.5 + anything exceeds 40GB with 22.5 incoming")
   }
 }
+
+// MARK: - WP-E9 (FDD D17, AC-59): the VAE is reloaded in place, never pool-keyed
+
+extension ModelPoolHandoffTests {
+
+  /// A VAE change must never evict or re-key the resident pipeline: the pool
+  /// key has no VAE term, and a failed (missing-file) swap on the resident
+  /// slot leaves the pool entry, its instance and its count untouched.
+  func testVAESwapDoesNotEvictOrRekey() async throws {
+    XCTAssertEqual(ModelPool.poolKey(for: "krea2-raw"), "krea2-raw")
+    XCTAssertEqual(ModelPool.poolKey(for: "krea2-raw", quantization: "q8"), "krea2-raw-q8")
+
+    let pool = ModelPool(
+      budgetMB: 40960, textEncoderPath: nil, maxSequenceLength: 512,
+      forceTransformerOverrideOnly: false, logger: Logger(label: "test"))
+    let resident = FileManager.default.temporaryDirectory.appending(path: "resident-\(UUID()).safetensors")
+    let slot = Krea2VAESlot(unloaded: Krea2VAE(), file: resident, layout: .qwenDiffusers, source: .modelDir)
+    let box = PipelineBox(pipeline: slot)
+    await pool.registerExisting(
+      poolKey: "krea2-raw", modelSpec: "krea2-raw", family: .krea2,
+      box: box, vramEstimateMB: 22528, detectedInfo: Krea2Variant.raw)
+    _ = try await pool.activate(modelId: "krea2-raw")
+
+    let missing = FileManager.default.temporaryDirectory.appending(path: "missing-\(UUID()).safetensors")
+    XCTAssertThrowsError(try slot.ensure(file: missing, source: .payload))
+
+    let count = await pool.count()
+    XCTAssertEqual(count, 1, "a VAE request never evicts")
+    let entry = try await pool.activate(modelId: "krea2-raw")
+    XCTAssertTrue((entry.box.pipeline as AnyObject) === slot, "same resident instance")
+    XCTAssertEqual(slot.reloadCount, 0)
+  }
+}

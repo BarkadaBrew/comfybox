@@ -50,7 +50,7 @@ final class Krea2Img2ImgSpike: XCTestCase {
       steps: 9, seed: 7, strength: 0.5
     )
 
-    let decoded = pipeline.generateImg2Img(request) { step, total in
+    let decoded = try pipeline.generateImg2Img(request) { step, total in
       print("  img2img step \(step)/\(total)")
     }
 

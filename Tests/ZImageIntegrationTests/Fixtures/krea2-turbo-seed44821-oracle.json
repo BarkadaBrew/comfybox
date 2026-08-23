@@ -1,0 +1,27 @@
+{
+  "purpose": "AC-1 byte-identity oracle: pre-E3 Krea 2 turbo render on the LIVE engine (binary built 2026-08-18 from fix/face-anchor-icref-broadcast; Krea2 sources identical to origin/main at that date)",
+  "engine_model": "/Users/toddwalderman/LocalModels/kroma-v0.2",
+  "model_family": "krea2",
+  "loras_active_after": [],
+  "request": {
+    "prompt": "a woman sitting on the edge of a bed in a bedroom, warm lamplight",
+    "seed": 44821,
+    "steps": 9,
+    "guidance": 1.0,
+    "width": 1024,
+    "height": 1024,
+    "loras": [],
+    "quantization": "q8 (server default — WarmServer loads Krea 2 with quantizeTransformer: 8)"
+  },
+  "output_path": "/Users/toddwalderman/Pictures/ComfyBox/comfybox-kroma-v0.2-manual-krea2raw-oracle-20260822-123609-aea0.png",
+  "sha256": "6bb6eed75a39a0aed78fbcd64b52904f224298d3a85ecb26b43c8dd1dcfc9160",
+  "image_sha256": "a49a7f6f330305cea4b3aa5c866af50cdc68bab535978fe46b1d779a2b8e29e0",
+  "image_sha256_note": "SHA-256 of the PNG's IHDR chunk data followed by every IDAT chunk's data: the raster geometry and the pixels, and nothing else. This — not the whole-file `sha256` above — is what AC-1 compares, because the whole-file hash is NOT reproducible across processes: QwenImageIO.ImageMetadata.generation serialises an unordered Swift Dictionary, so the eXIf/iTXt chunks come out with a different key order in every process. Verified 2026-08-22 on this exact request: the pre-refactor render and the post-refactor render differ in 344 bytes, ALL of them inside file offsets 233..1474 (the eXIf and iTXt chunks), and are byte-identical from the first IDAT chunk to EOF. Both digests above were read off the same pre-refactor file.",
+  "duration_s": 120,
+  "response": {
+    "preempt_refused": false,
+    "success": true,
+    "output_path": "/Users/toddwalderman/Pictures/ComfyBox/comfybox-kroma-v0.2-manual-krea2raw-oracle-20260822-123609-aea0.png",
+    "duration_ms": 120462
+  }
+}

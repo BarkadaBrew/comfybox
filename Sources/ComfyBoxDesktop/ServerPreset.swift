@@ -33,6 +33,45 @@ public struct ServerPresetUpscale: Codable, Sendable, Equatable {
     public var scale: Double?
 }
 
+/// Kroma policy (engine `KromaPolicy`, WP-E20 / D14): a first-class field,
+/// never a `loras[]` entry. Passthrough — the engine refuses a krea2 image
+/// preset that lacks it, so dropping it here would turn every desktop edit
+/// of such a preset into a 400.
+public struct ServerPresetKroma: Codable, Sendable, Equatable {
+    public var strength: Double
+    public var file: String?
+
+    public init(strength: Double, file: String? = nil) {
+        self.strength = strength
+        self.file = file
+    }
+}
+
+/// Bypass policy (engine `BypassPolicy`, WP-E8 / D10): the censorship-bypass
+/// `.diff` dial, first-class like kroma. Passthrough — absence here would be
+/// indistinguishable from `{strength: 0}` on the next save, and the engine's
+/// derived default (kroma on ⇒ bypass off) would silently replace whatever
+/// the preset declared.
+public struct ServerPresetBypass: Codable, Sendable, Equatable {
+    public var strength: Double
+    public var file: String?
+
+    public init(strength: Double, file: String? = nil) {
+        self.strength = strength
+        self.file = file
+    }
+}
+
+/// Second-stage recipe (engine `PresetStage`, WP-E20 / D4). Passthrough.
+public struct ServerPresetStage: Codable, Sendable, Equatable {
+    public var sampler: String?
+    public var sigmaSchedule: String?
+    public var steps: Int?
+    public var denoise: Double?
+    public var eta: Double?
+    public var bongmath: Bool?
+}
+
 public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var name: String
@@ -67,6 +106,25 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var scheduler: String?
     public var upscale: ServerPresetUpscale?
 
+    // WP-E9/WP-E20 recipe + policy fields (passthrough, not edited in the UI
+    // yet). Upsert REPLACES the stored document, so every engine field must
+    // round-trip here or a desktop save silently erases it (FDD §7.3).
+    public var vae: String?
+    public var checkpointFamily: String?
+    public var kroma: ServerPresetKroma?
+    public var bypass: ServerPresetBypass?
+    public var sampler: String?
+    public var sigmaSchedule: String?
+    public var shift: Double?
+    public var eta: Double?
+    public var bongmath: Bool?
+    public var stage2: ServerPresetStage?
+
+    // Read-only validity flag the engine attaches on GET (WP-E20, AC-44c).
+    // Never sent back: the engine recomputes it on every save.
+    public var invalid: Bool?
+    public var invalidReason: String?
+
     public init(
         id: String = UUID().uuidString,
         name: String,
@@ -90,7 +148,17 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         height: Int? = nil,
         loras: [ServerPresetLora] = [],
         scheduler: String? = nil,
-        upscale: ServerPresetUpscale? = nil
+        upscale: ServerPresetUpscale? = nil,
+        vae: String? = nil,
+        checkpointFamily: String? = nil,
+        kroma: ServerPresetKroma? = nil,
+        bypass: ServerPresetBypass? = nil,
+        sampler: String? = nil,
+        sigmaSchedule: String? = nil,
+        shift: Double? = nil,
+        eta: Double? = nil,
+        bongmath: Bool? = nil,
+        stage2: ServerPresetStage? = nil
     ) {
         self.id = id
         self.name = name
@@ -115,6 +183,66 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         self.loras = loras
         self.scheduler = scheduler
         self.upscale = upscale
+        self.vae = vae
+        self.checkpointFamily = checkpointFamily
+        self.kroma = kroma
+        self.bypass = bypass
+        self.sampler = sampler
+        self.sigmaSchedule = sigmaSchedule
+        self.shift = shift
+        self.eta = eta
+        self.bongmath = bongmath
+        self.stage2 = stage2
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, description
+        case mediaKind, provider, engine, mode
+        case model, customModelPath, baseModel
+        case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
+        case steps, guidance, seed, width, height
+        case loras, scheduler, upscale
+        case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
+        case bypass
+        case invalid, invalidReason
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(description, forKey: .description)
+        try c.encodeIfPresent(mediaKind, forKey: .mediaKind)
+        try c.encodeIfPresent(provider, forKey: .provider)
+        try c.encodeIfPresent(engine, forKey: .engine)
+        try c.encodeIfPresent(mode, forKey: .mode)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(customModelPath, forKey: .customModelPath)
+        try c.encodeIfPresent(baseModel, forKey: .baseModel)
+        try c.encodeIfPresent(prompt, forKey: .prompt)
+        try c.encodeIfPresent(negativePrompt, forKey: .negativePrompt)
+        try c.encodeIfPresent(promptPrefix, forKey: .promptPrefix)
+        try c.encodeIfPresent(promptSuffix, forKey: .promptSuffix)
+        try c.encodeIfPresent(injectedKeywords, forKey: .injectedKeywords)
+        try c.encodeIfPresent(steps, forKey: .steps)
+        try c.encodeIfPresent(guidance, forKey: .guidance)
+        try c.encodeIfPresent(seed, forKey: .seed)
+        try c.encodeIfPresent(width, forKey: .width)
+        try c.encodeIfPresent(height, forKey: .height)
+        try c.encode(loras, forKey: .loras)
+        try c.encodeIfPresent(scheduler, forKey: .scheduler)
+        try c.encodeIfPresent(upscale, forKey: .upscale)
+        try c.encodeIfPresent(vae, forKey: .vae)
+        try c.encodeIfPresent(checkpointFamily, forKey: .checkpointFamily)
+        try c.encodeIfPresent(kroma, forKey: .kroma)
+        try c.encodeIfPresent(bypass, forKey: .bypass)
+        try c.encodeIfPresent(sampler, forKey: .sampler)
+        try c.encodeIfPresent(sigmaSchedule, forKey: .sigmaSchedule)
+        try c.encodeIfPresent(shift, forKey: .shift)
+        try c.encodeIfPresent(eta, forKey: .eta)
+        try c.encodeIfPresent(bongmath, forKey: .bongmath)
+        try c.encodeIfPresent(stage2, forKey: .stage2)
+        // `invalid` / `invalidReason` are deliberately NOT encoded.
     }
 
     public init(from decoder: Decoder) throws {
@@ -142,6 +270,18 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         loras = try c.decodeIfPresent([ServerPresetLora].self, forKey: .loras) ?? []
         scheduler = try c.decodeIfPresent(String.self, forKey: .scheduler)
         upscale = try c.decodeIfPresent(ServerPresetUpscale.self, forKey: .upscale)
+        vae = try c.decodeIfPresent(String.self, forKey: .vae)
+        checkpointFamily = try c.decodeIfPresent(String.self, forKey: .checkpointFamily)
+        kroma = try c.decodeIfPresent(ServerPresetKroma.self, forKey: .kroma)
+        bypass = try c.decodeIfPresent(ServerPresetBypass.self, forKey: .bypass)
+        sampler = try c.decodeIfPresent(String.self, forKey: .sampler)
+        sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
+        shift = try c.decodeIfPresent(Double.self, forKey: .shift)
+        eta = try c.decodeIfPresent(Double.self, forKey: .eta)
+        bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
+        stage2 = try c.decodeIfPresent(ServerPresetStage.self, forKey: .stage2)
+        invalid = try c.decodeIfPresent(Bool.self, forKey: .invalid)
+        invalidReason = try c.decodeIfPresent(String.self, forKey: .invalidReason)
     }
 
     /// Map to the local apply-to-Generate shape.

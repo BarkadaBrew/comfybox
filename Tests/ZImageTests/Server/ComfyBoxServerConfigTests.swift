@@ -136,4 +136,22 @@ final class ComfyBoxServerConfigTests: XCTestCase {
     XCTAssertEqual(config.port, 7870)
     XCTAssertEqual(config.providers.promptOptimization, AIProviderRegistry.lmStudioPromptDefault)
   }
+
+  // MARK: - Krea 2 model directories (WP-E5)
+
+  func testKrea2ModelsDecodesEncodesAndDefaultsEmpty() throws {
+    // Absent key → empty table (the built-in defaults apply at runtime).
+    let bare = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: Data(#"{ "host": "h" }"#.utf8))
+    XCTAssertEqual(bare.krea2Models, [:])
+    XCTAssertFalse(String(data: try JSONEncoder().encode(bare), encoding: .utf8)!.contains("krea2Models"),
+                   "an empty table is not written")
+
+    // Declared spec → directory round-trips.
+    var config = ComfyBoxServerConfig()
+    config.krea2Models = ["krea2-raw": "/Volumes/Bolt/Models/krea2-raw"]
+    let data = try JSONEncoder().encode(config)
+    let decoded = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: data)
+    XCTAssertEqual(decoded, config)
+    XCTAssertEqual(decoded.krea2Models["krea2-raw"], "/Volumes/Bolt/Models/krea2-raw")
+  }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import MLX
 
 #if canImport(CoreGraphics)
@@ -11,7 +12,16 @@ public enum QwenImageIOError: Error {
   case invalidArrayShape
   case resizeFailed
   case writeFailed
+  /// The WP-E10 `applied` record could not be turned into JSON for the PNG's
+  /// EXIF `UserComment`. The image is still written; the record is not. Never
+  /// thrown out of `saveImage` — it exists so the omission has a reason to log.
+  case appliedRecordNotEncodable(reason: String)
 }
+
+/// The image writer has no injected logger and is called from every family's
+/// render path; one file-scoped logger keeps a dropped provenance record from
+/// being silent (WP-E10).
+private let metadataLogger = Logger(label: "z-image.image-metadata")
 
 public enum QwenImageIO {
   static func resizedCGImage(
@@ -189,20 +199,82 @@ public enum QwenImageIO {
       self.parametersJSON = parametersJSON; self.software = software
     }
 
+    /// Normalise a RAW REQUEST negative prompt for `generation(negativePrompt:)`
+    /// (K-FIX-1 round 2, Minor 3).
+    ///
+    /// `generation` writes any non-nil value verbatim, `""` included, because
+    /// Krea 2 hands it `trace.negativePromptApplied` where `""` is a FACT: CFG
+    /// ran against an empty negative and paid a second model pass for it.
+    /// Every other family hands it a raw payload field, where `""` means "the
+    /// caller typed nothing" and must stay absent from the metadata — those
+    /// families have no CFG-applied reading to distinguish it from.
+    ///
+    /// Call this at any site that forwards a request/payload value. Krea 2's
+    /// applied value must NOT go through it.
+    public static func requestNegative(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
+    }
+
     /// Build from common generation params — shared by every image pipeline so
     /// all model families embed the same Finder-readable sidecar.
     public static func generation(
       prompt: String, negativePrompt: String? = nil, seed: UInt64? = nil,
       steps: Int? = nil, guidance: Float? = nil, width: Int? = nil,
       height: Int? = nil, model: String? = nil, generatedBy: String? = nil,
-      contentMode: String? = nil, loras: [LoRAConfiguration] = []
+      contentMode: String? = nil, loras: [LoRAConfiguration] = [],
+      applied: RenderRecipe? = nil,
+      /// Tri-state provenance (round 2, C4). Pass this — not `applied` — from
+      /// a Krea 2 render, so a REFUSED record writes `"applied": null` rather
+      /// than vanishing into the same absent key a non-krea2 render produces.
+      /// Takes precedence over `applied` when both are given.
+      appliedSlot: AppliedRecordSlot? = nil
     ) -> ImageMetadata {
       var params: [String: Any] = ["prompt": prompt]
+      // WP-E10 sink 2: the provenance record rides in the PNG under `applied`
+      // (snake_case, the same bytes the /v1/generate response carries).
+      // Krea 2 only today (D12) — other families pass nil and emit no key.
+      //
+      // The omission is kept (a PNG without its record is still the image the
+      // caller asked for) but it is never SILENT: `JSONEncoder` throws on a
+      // non-conforming float, so a NaN sigma would otherwise drop the whole
+      // block with nothing to explain the gap between the response and the file.
+      // Round 2 (C4): the slot is the tri-state — a PRESENT slot holding no
+      // record writes a literal `null` ("this was a Krea 2 render and the
+      // engine refused its record"), which is a different fact from the key
+      // being absent ("no Krea 2 provenance applies").
+      let appliedRecordSlot = appliedSlot ?? applied.map(AppliedRecordSlot.init(record:))
+      if let appliedRecordSlot {
+        if let record = appliedRecordSlot.record {
+          do {
+            let encoder = JSONEncoder()
+            encoder.keyEncodingStrategy = .convertToSnakeCase
+            let data = try encoder.encode(record)
+            guard let object = try? JSONSerialization.jsonObject(with: data) else {
+              throw QwenImageIOError.appliedRecordNotEncodable(
+                reason: "the encoded record is not a JSON object")
+            }
+            params["applied"] = object
+          } catch {
+            metadataLogger.error(
+              "PNG metadata: the `applied` provenance record could not be encoded — writing the image WITHOUT it (\(error))")
+          }
+        } else {
+          params["applied"] = NSNull()
+        }
+      }
       if let width { params["width"] = width }
       if let height { params["height"] = height }
       if let steps { params["steps"] = steps }
       if let guidance { params["guidance"] = Self.cleanNumber(guidance) }
-      if let negativePrompt, !negativePrompt.isEmpty { params["negative_prompt"] = negativePrompt }
+      // K-FIX-1 / Codex I4: `nil` means the field does not apply; a non-nil
+      // value — INCLUDING `""` — is a fact the caller resolved and is written
+      // verbatim. Krea 2 passes `trace.negativePromptApplied`, where `""`
+      // means CFG ran against an empty negative and a second model pass was
+      // paid for it; dropping it wrote a file that read as if CFG never ran.
+      // Callers that hold a raw payload normalise an empty string to nil
+      // themselves, so no other family's metadata changes.
+      if let negativePrompt { params["negative_prompt"] = negativePrompt }
       if let seed { params["seed"] = seed }
       // Which app/persona generated it — placed persona renders in the gallery.
       if let generatedBy, !generatedBy.isEmpty { params["source"] = generatedBy }
@@ -217,7 +289,13 @@ public enum QwenImageIO {
         p.isEmpty ? nil : ((p as NSString).lastPathComponent as NSString).deletingPathExtension
       }
       if let modelName { params["model"] = modelName }
-      let json = (try? JSONSerialization.data(withJSONObject: params))
+      // `.sortedKeys` is load-bearing, not cosmetic: `JSONSerialization` walks
+      // a Swift `Dictionary` in hash order and Swift seeds its hasher PER
+      // PROCESS, so without it the same render wrote different EXIF
+      // `UserComment` bytes after every server restart and the whole-file SHA
+      // of a PNG could never be compared across runs (WP-E10; AC-5's
+      // byte-identity oracle depends on it). Sorting recurses into `applied`.
+      let json = (try? JSONSerialization.data(withJSONObject: params, options: [.sortedKeys]))
         .flatMap { String(data: $0, encoding: .utf8) }
       return ImageMetadata(description: prompt,
                            keywords: [modelName].compactMap { $0 },

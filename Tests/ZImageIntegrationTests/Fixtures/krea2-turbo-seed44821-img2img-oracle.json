@@ -1,0 +1,34 @@
+{
+  "purpose": "AC-2 byte-identity oracle: default Krea 2 img2img at strength 0.3, captured 2026-08-22 from a release build of aa8e590 (the commit immediately before WP-E3) running as a second warm server on port 7898 against the same model directory. There was no pinned img2img oracle before this file.",
+  "provenance_caveat": "aa8e590 is the commit before WP-E3, NOT the pre-programme binary: it already carries WP-E12b (shift IS mu, beta/beta57 on the ModelSamplingFlux table). So this oracle pins \"unchanged by WP-E3\", not \"unchanged by the whole programme\". The controller accepted that gap for the default path because AC-3 pins SigmaSchedule.krea2(numSteps:mu:) element-for-element against the pre-change Krea2Sampling.timesteps, and the default recipe (euler over krea2 at the resolution-dependent mu) touches nothing else E12b changed.",
+  "engine_model": "/Users/toddwalderman/LocalModels/kroma-v0.2",
+  "model_family": "krea2",
+  "loras_active_after": [],
+  "request": {
+    "prompt": "a woman sitting on the edge of a bed in a bedroom, warm lamplight",
+    "seed": 44821,
+    "steps": 9,
+    "guidance": 1.0,
+    "width": 1024,
+    "height": 1024,
+    "strength": 0.3,
+    "source_image": "krea2-img2img-source-1024.png",
+    "source_image_sha256": "6bb6eed75a39a0aed78fbcd64b52904f224298d3a85ecb26b43c8dd1dcfc9160",
+    "source_image_note": "Resolved RELATIVE TO THIS FIXTURES DIRECTORY, and committed alongside this file (~1.4 MB). It is the AC-1 oracle's own output. It used to be referenced at its original path under ~/Pictures/ComfyBox, which is a temporary symlink to an external volume — a merge gate that turns into a skip when a volume is unmounted is exactly the silent downgrade byte-identity exists to prevent. The capture fed a byte-identical copy of this file; the pinned sha256, which the test asserts before use, is what makes the copies interchangeable.",
+    "loras": [],
+    "quantization": "q8 (server default)"
+  },
+  "image_sha256": "3a490c2f47dfb6993d8d7bc0633787015b2af3ded4831b995b1748917742a2e0",
+  "image_sha256_note": "SHA-256 of the PNG's IHDR chunk data followed by every IDAT chunk's data. See krea2-turbo-seed44821-oracle.json for why the whole-file hash is not the comparison: the embedded EXIF/XMP JSON key order is process-dependent. Verified 2026-08-22: the aa8e590 render and the post-WP-E3 render of this request differ in 346 bytes, ALL inside file offsets 233..1474 (eXIf + iTXt), and are byte-identical from the first IDAT chunk to EOF.",
+  "pre_refactor": {
+    "binary": "release build of aa8e590 in a temporary git worktree",
+    "whole_file_sha256": "d9a28bf37de12ca50382da07c077ed7cbf8251d136d93de7936b713eb33349bd",
+    "duration_ms": 101492
+  },
+  "post_refactor": {
+    "binary": "release build of the WP-E3 branch",
+    "whole_file_sha256": "e793646a12da1d586e49dbd2155ba87122e6abd11c468a115e51007f54fc6781",
+    "duration_ms": 109736
+  },
+  "steps_run": "7 of 9 — strength 0.3 gives denoise 0.7 and startIndex 2"
+}

@@ -212,8 +212,16 @@ public enum LoRAScanner {
     var hasImgAttn = false
     var hasTxtAttn = false
     var hasLTX2AudioVideoBranch = false
+    var hasKrea2Signature = false
 
     for key in baseKeys {
+      // Krea-2 SingleStreamDiT (WP-E6, FDD §3.6): `blocks.N.attn.w{q,k,v,o}`
+      // is the DiT's own attention naming (no other family uses `attn.w*`),
+      // and `txtfusion.` is its text-fusion stack — the bypass LoRA carries
+      // ONLY `txtfusion.projector.diff`, so either signature alone suffices.
+      if key.contains("txtfusion.") || isKrea2AttentionKey(key) {
+        hasKrea2Signature = true
+      }
       // LTX-2's transformer is the only architecture with audio/video
       // cross-attention branches — a reliable, distinctive signal since its
       // 48 numbered `layers.N.` otherwise look like Z-Image's.
@@ -251,6 +259,10 @@ public enum LoRAScanner {
       return ["ltx"]
     }
 
+    if hasKrea2Signature {
+      return ["krea2"]
+    }
+
     // Z-Image: layers + context_refiner + noise_refiner
     if hasLayers && (hasContextRefiner || hasNoiseRefiner) {
       return ["z-image"]
@@ -278,6 +290,20 @@ public enum LoRAScanner {
     }
 
     return ["unknown"]
+  }
+
+  /// `…blocks.<n>.attn.w{q,k,v,o}…` — Krea-2's attention projections.
+  private static func isKrea2AttentionKey(_ key: String) -> Bool {
+    guard let range = key.range(of: "blocks.") else { return false }
+    var rest = key[range.upperBound...]
+    let digits = rest.prefix { $0.isNumber }
+    guard !digits.isEmpty else { return false }
+    rest = rest.dropFirst(digits.count)
+    guard rest.hasPrefix(".attn.w") else { return false }
+    let proj = rest.dropFirst(".attn.w".count)
+    guard let first = proj.first, "qkvo".contains(first) else { return false }
+    let after = proj.dropFirst()
+    return after.isEmpty || after.hasPrefix(".")
   }
 
   /// Check for Chroma-specific key patterns (approximator, specific block structure).

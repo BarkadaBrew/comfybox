@@ -158,57 +158,61 @@ final class SigmaScheduleTests: XCTestCase {
     XCTAssertEqual(sigmas, [0.0])
   }
 
-  // MARK: - Beta Schedule
+  // MARK: - Beta Schedule (ComfyUI-exact since WP-E12; parity pins live in
+  // BetaScheduleComfyParityTests — these are the shape/edge contracts)
 
   func testBetaBounds() {
-    let sigmas = SigmaSchedule.beta(numSteps: 20, sigmaMin: 0.02, sigmaMax: 100.0)
-    // Beta schedule values should all be positive (except trailing 0)
+    let sigmas = SigmaSchedule.beta(numSteps: 20, shift: 1.0, numTrainTimesteps: 1000)
+    // Beta schedule values are table sigmas in (0, 1] (except trailing 0)
     for i in 0..<(sigmas.count - 1) {
       XCTAssertGreaterThan(sigmas[i], 0.0, "Beta sigma at index \(i) should be positive")
+      XCTAssertLessThanOrEqual(sigmas[i], 1.0)
     }
     XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)
   }
 
   func testBetaCount() {
+    // No de-duplication on a 1000-entry table at these budgets: steps + 1.
     for steps in [1, 4, 9, 20, 50] {
-      let sigmas = SigmaSchedule.beta(numSteps: steps)
+      let sigmas = SigmaSchedule.beta(numSteps: steps, shift: 1.0, numTrainTimesteps: 1000)
       XCTAssertEqual(sigmas.count, steps + 1)
     }
   }
 
   func testBetaSingleStep() {
-    let sigmas = SigmaSchedule.beta(numSteps: 1)
+    let sigmas = SigmaSchedule.beta(numSteps: 1, shift: 1.0, numTrainTimesteps: 1000)
     XCTAssertEqual(sigmas.count, 2)
-    XCTAssertGreaterThan(sigmas[0], 0.0)
+    XCTAssertEqual(sigmas[0], 1.0, "ppf(1) = 1 → the table top, σ = 1.0 exactly")
     XCTAssertEqual(sigmas[1], 0.0, accuracy: 1e-10)
   }
 
   func testBetaZeroSteps() {
-    let sigmas = SigmaSchedule.beta(numSteps: 0)
+    let sigmas = SigmaSchedule.beta(numSteps: 0, shift: 1.0, numTrainTimesteps: 1000)
     XCTAssertEqual(sigmas, [0.0])
   }
 
   func testBetaMonotonicallyDecreasing() {
-    let sigmas = SigmaSchedule.beta(numSteps: 20, sigmaMin: 0.02, sigmaMax: 100.0)
-    for i in 1..<(sigmas.count - 1) {
-      XCTAssertLessThanOrEqual(
+    let sigmas = SigmaSchedule.beta(numSteps: 20, shift: 1.0, numTrainTimesteps: 1000)
+    for i in 1..<sigmas.count {
+      XCTAssertLessThan(
         sigmas[i], sigmas[i - 1],
-        "Beta sigmas should decrease monotonically (index \(i): \(sigmas[i]) > \(sigmas[i-1]))"
+        "Beta sigmas decrease strictly after de-dup (index \(i): \(sigmas[i]) >= \(sigmas[i-1]))"
       )
     }
   }
 
   func testBetaFirstAndLastValues() {
-    let sigmas = SigmaSchedule.beta(numSteps: 9, sigmaMin: 0.001, sigmaMax: 1.0)
-    // First sigma should be close to sigmaMax, last (before sentinel) close to sigmaMin.
-    XCTAssertEqual(sigmas[0], 1.0, accuracy: 1e-4, "First sigma should be ~sigmaMax")
-    XCTAssertEqual(sigmas[8], 0.001, accuracy: 1e-4, "Last sigma should be ~sigmaMin")
+    let sigmas = SigmaSchedule.beta(numSteps: 9, shift: 1.0, numTrainTimesteps: 1000)
+    // First sigma is the table top exactly; the last non-zero one is a low table entry.
+    XCTAssertEqual(sigmas[0], 1.0, "First sigma is σ(1) = 1.0")
+    XCTAssertLessThan(sigmas[8], 0.1, "Last sigma before the sentinel is near the table floor")
+    XCTAssertGreaterThanOrEqual(sigmas[8], 0.001, "…but never below σ(1/T)")
     XCTAssertEqual(sigmas[9], 0.0, accuracy: 1e-10, "Trailing sentinel should be 0")
   }
 
   func testBetaFlowMatchingBounds() {
-    // With flow-matching bounds (0.001 to 1.0), all sigmas should be in [0, 1].
-    let sigmas = SigmaSchedule.beta(numSteps: 9, sigmaMin: 0.001, sigmaMax: 1.0)
+    // Table sigmas live in [σ(1/T), 1]; the schedule can never leave the flow domain.
+    let sigmas = SigmaSchedule.beta(numSteps: 9, shift: 1.15, numTrainTimesteps: 1000)
     for i in 0..<(sigmas.count - 1) {
       XCTAssertGreaterThanOrEqual(sigmas[i], 0.001 - 1e-6)
       XCTAssertLessThanOrEqual(sigmas[i], 1.0 + 1e-6)
@@ -217,18 +221,9 @@ final class SigmaScheduleTests: XCTestCase {
 
   func testBeta57DiffersFromDefaultBeta() {
     let steps = 9
-    let beta = SigmaSchedule.beta(
-      numSteps: steps,
-      sigmaMin: 0.001,
-      sigmaMax: 1.0
-    )
+    let beta = SigmaSchedule.beta(numSteps: steps, shift: 1.0, numTrainTimesteps: 1000)
     let beta57 = SigmaSchedule.beta(
-      numSteps: steps,
-      sigmaMin: 0.001,
-      sigmaMax: 1.0,
-      alpha: 0.5,
-      betaParam: 0.7
-    )
+      numSteps: steps, shift: 1.0, numTrainTimesteps: 1000, alpha: 0.5, betaParam: 0.7)
 
     XCTAssertEqual(beta57.count, steps + 1)
     XCTAssertEqual(beta57.last!, 0.0, accuracy: 1e-10)
@@ -245,19 +240,14 @@ final class SigmaScheduleTests: XCTestCase {
 
   func testBeta57MonotonicallyDecreasing() {
     let sigmas = SigmaSchedule.beta(
-      numSteps: 20,
-      sigmaMin: 0.001,
-      sigmaMax: 1.0,
-      alpha: 0.5,
-      betaParam: 0.7
-    )
+      numSteps: 20, shift: 1.0, numTrainTimesteps: 1000, alpha: 0.5, betaParam: 0.7)
 
     XCTAssertEqual(sigmas.count, 21)
     for i in 1..<sigmas.count {
-      XCTAssertLessThanOrEqual(
+      XCTAssertLessThan(
         sigmas[i],
         sigmas[i - 1],
-        "beta57 sigmas should decrease monotonically at index \(i)"
+        "beta57 sigmas should decrease strictly at index \(i)"
       )
     }
     XCTAssertEqual(sigmas.last!, 0.0, accuracy: 1e-10)

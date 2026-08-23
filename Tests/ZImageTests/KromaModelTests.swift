@@ -28,7 +28,9 @@ final class KromaModelTests: XCTestCase {
     guard FileManager.default.fileExists(atPath: root.appending(path: "turbo.safetensors").path) else {
       throw XCTSkip("kroma-v0.2 checkpoint not downloaded on this machine")
     }
-    XCTAssertNotNil(Krea2ModelDetection.detect(at: root), "assembled root must detect as Krea-2")
+    let paths = try Krea2ModelDetection.detect(at: root)
+    XCTAssertEqual(paths.variant, .turbo, "Kroma ships as a full turbo checkpoint")
+    XCTAssertEqual(paths.transformerFile.lastPathComponent, "turbo.safetensors")
   }
 }
 

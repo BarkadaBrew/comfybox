@@ -6,11 +6,14 @@
 //  - Text encoder (`text_encoder/model.safetensors`): strip the `language_model.`
 //    prefix (keys then match Qwen3TextEncoder: embed_tokens/layers/norm) and skip
 //    the unused `visual.*` vision tower.
-//  - VAE (`vae/diffusion_pytorch_model.safetensors`): encoder + decoder. 3D causal
-//    conv kernels [O,I,kT,kH,kW] reduce to their LAST temporal slice for images (see
-//    Krea2VAE.swift) then transpose NCHW→NHWC ([O,kH,kW,I]); norm `gamma` tensors
-//    flatten to [C]; `time_conv` weights are skipped (dead code in the reference
-//    forward pass — see Krea2VAEDownsampler's doc comment).
+//  - VAE (the model dir's `vae/diffusion_pytorch_model.safetensors`, or any
+//    file `payload.vae` names — WP-E9): encoder + decoder. The key layout is
+//    sniffed (Qwen-diffusers or Wan-native, Krea2VAEKeyMap) and canonicalised
+//    first; then 3D causal conv kernels [O,I,kT,kH,kW] reduce to their LAST
+//    temporal slice for images (see Krea2VAE.swift) and transpose NCHW→NHWC
+//    ([O,kH,kW,I]); norm `gamma` tensors flatten to [C]; `time_conv` weights
+//    are skipped (dead code in the reference forward pass — see
+//    Krea2VAEDownsampler's doc comment).
 
 import Foundation
 import MLX
@@ -84,22 +87,73 @@ public enum Krea2WeightLoader {
 
   // MARK: - VAE
 
-  /// Load `vae/diffusion_pytorch_model.safetensors` (encoder + decoder).
+  /// Load a Krea-2 VAE file (encoder + decoder) into `vae`, in place.
+  ///
+  /// WP-E9: the file may be the Qwen-Image diffusers VAE (the model dir's
+  /// `vae/diffusion_pytorch_model.safetensors`) or the Wan 2.1 FP32 file; the
+  /// layout is sniffed from the keys (never the filename) and every Wan key is
+  /// canonicalised onto its Krea2VAE path BEFORE the existing 5-D slice /
+  /// NHWC transpose / gamma flatten. `layout:` is an optional declaration — a
+  /// declared layout that contradicts the keys is `layoutMismatch`.
+  ///
+  /// Fail-closed and atomic: every key is mapped, transformed and checked
+  /// against the module's own parameter set (presence AND shape) before the
+  /// first weight is written, so a failure leaves `vae` exactly as it was.
+  /// Returns the layout that loaded.
+  @discardableResult
   public static func loadVAE(
-    _ vae: Krea2VAE, from file: URL, dtype: DType = .float32
-  ) throws {
+    _ vae: Krea2VAE, from file: URL, layout: VAELayout? = nil, dtype: DType = .float32
+  ) throws -> VAELayout {
+    let (weights, used) = try prepareVAEWeights(from: file, layout: layout, dtype: dtype)
+    // Preflight against the resident parameter set: an unknown path or a
+    // shape mismatch throws here, before `update` mutates anything (MLX's
+    // `update` applies progressively — a mid-walk throw would leave a
+    // half-swapped decoder).
+    let resident = Dictionary(uniqueKeysWithValues: vae.parameters().flattened())
+    // WP-E10 "E9b": key-set COMPLETENESS. A file carrying a subset of the
+    // module's parameters would overwrite its targets and leave the rest at
+    // whatever was resident — a mixed decoder named as the new file. Every
+    // module parameter must be present in the file, or nothing is written.
+    let missing = resident.keys.filter { weights[$0] == nil }.sorted()
+    guard missing.isEmpty else {
+      throw Krea2VAEKeyMapError.vaeIncomplete(file: file.path, missing: missing, expected: resident.count)
+    }
+    for (path, tensor) in weights {
+      guard let param = resident[path] else {
+        throw Krea2VAEKeyMapError.unmappedKey(file: file.path, key: path)
+      }
+      guard param.shape == tensor.shape else {
+        throw Krea2WeightLoaderError.unexpectedShape(key: path, shape: tensor.shape)
+      }
+    }
+    try vae.update(parameters: ModuleParameters.unflattened(weights), verify: [.shapeMismatch])
+    return used
+  }
+
+  /// Read, canonicalise and transform every tensor of a VAE file into the
+  /// Krea2VAE module-path → array dictionary `update` takes. Pure with
+  /// respect to any module: nothing is mutated.
+  static func prepareVAEWeights(
+    from file: URL, layout: VAELayout?, dtype: DType
+  ) throws -> (weights: [String: MLXArray], layout: VAELayout) {
     guard FileManager.default.fileExists(atPath: file.path) else {
       throw Krea2WeightLoaderError.missingFile(file.path)
     }
     let reader = try SafeTensorsReader(fileURL: file)
+    let detected = try Krea2VAEKeyMap.detectLayout(keys: reader.tensorNames, file: file)
+    if let layout, layout != detected {
+      throw Krea2VAEKeyMapError.layoutMismatch(file: file.path, requested: layout, detected: detected)
+    }
     var weights: [String: MLXArray] = [:]
     for meta in reader.allMetadata() {
-      let key = meta.name
+      guard let key = Krea2VAEKeyMap.canonicalize(meta.name) else {
+        throw Krea2VAEKeyMapError.unmappedKey(file: file.path, key: meta.name)
+      }
       // Unused temporal convs (see Krea2VAEDownsampler's doc comment).
       if key.contains(".time_conv.") {
         continue
       }
-      var tensor = try reader.tensor(named: key).asType(dtype)
+      var tensor = try reader.tensor(named: meta.name).asType(dtype)
 
       if key.hasSuffix(".gamma") {
         // [C,1,1] / [C,1,1,1] -> [C]
@@ -114,8 +168,15 @@ public enum Krea2WeightLoader {
       } else if key.hasSuffix(".weight") && tensor.ndim > 2 {
         throw Krea2WeightLoaderError.unexpectedShape(key: key, shape: tensor.shape)
       }
-      weights[key.replacingOccurrences(of: ".resample.1.", with: ".resample.conv.")] = tensor
+      weights[vaeModulePath(forCanonicalKey: key)] = tensor
     }
-    try vae.update(parameters: ModuleParameters.unflattened(weights), verify: [.shapeMismatch])
+    return (weights, detected)
+  }
+
+  /// Canonical (Qwen-diffusers) key → Krea2VAE module path. The checkpoint
+  /// stores the resample conv at a numeric Sequential index, which MLX-Swift
+  /// would unflatten as an array index; the module names it `resample.conv`.
+  static func vaeModulePath(forCanonicalKey key: String) -> String {
+    key.replacingOccurrences(of: ".resample.1.", with: ".resample.conv.")
   }
 }

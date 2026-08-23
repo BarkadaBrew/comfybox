@@ -8,14 +8,33 @@ import MLX
 /// then a substep at `c2 * h` is used for the second evaluation before the
 /// exponential-integrator final update.
 ///
+/// **Takes the data prediction, not the velocity.** The update
+/// `x' = e^{-h}·x + h·Σ bᵢ·φ(−h)·kᵢ` with `h = −log(σ'/σ)` is the
+/// exponential-integrator form in x₀: for rectified flow
+/// `x_σ = σ·ε + (1−σ)·x₀` it gives `x' = (σ'/σ)·x + (1 − σ'/σ)·x₀`, which is
+/// exactly the trajectory point at σ'. Fed a velocity it is dimensionally
+/// wrong (FDD-krea2-raw-recipe D2). Callers convert through
+/// ``ZImageScheduler/modelInput(velocity:sample:sigma:)``.
+///
 /// Reference: "Improved Order Analysis and Design of Exponential Integrator
 /// for Diffusion Models Sampling" (arXiv:2308.02157).
-public struct RES2sScheduler: ZImageScheduler {
+public struct RES2sScheduler: ZImageScheduler, RES4LYFFrameScheduler {
+  /// Exponential frame: every `modelOutput` here is `x₀ = x − σ·v`.
+  public let modelOutputConvention: ModelOutputConvention = .dataPrediction
+
+  /// `h = −log(σ'/σ)`, `ε = denoised − x₀` (WP-E16's T3 guards read this).
+  public var frame: TableauFrame { .exponential }
+
   public let sigmas: MLXArray
   public let timesteps: MLXArray
   public let numInferenceSteps: Int
   public let requiresIntermediateEvaluation: Bool = true
   public let c2: Float
+
+  /// RES4LYF's model-free `σ_min → 0` conversion sigma when this scheduler was
+  /// built from a ``RES4LYFSigmaPreparation``-prepared grid; `nil` otherwise
+  /// (the Z-Image pipelines, and any direct construction).
+  public let finalConversionSigma: Float?
 
   private var firstModelOutput: (timestepIndex: Int, output: MLXArray)?
 
@@ -31,7 +50,8 @@ public struct RES2sScheduler: ZImageScheduler {
     numInferenceSteps: Int,
     sigmaValues: [Float],
     numTrainTimesteps: Int = 1000,
-    c2: Float = 0.5
+    c2: Float = 0.5,
+    finalConversionSigma: Float? = nil
   ) {
     precondition(numInferenceSteps > 0, "numInferenceSteps must be positive")
     precondition(
@@ -47,6 +67,7 @@ public struct RES2sScheduler: ZImageScheduler {
     self.timesteps = MLXArray(timestepValues, [timestepValues.count])
     self.numInferenceSteps = numInferenceSteps
     self.c2 = c2
+    self.finalConversionSigma = finalConversionSigma
   }
 
   /// Single-step fallback: first-order exponential Euler update.
@@ -161,6 +182,11 @@ public struct RES2sScheduler: ZImageScheduler {
   }
 
   // MARK: - Helpers
+
+  /// ``RES4LYFFrameScheduler``: `NS.h`, the exponential frame's step size.
+  public func frameStepSize(timestepIndex: Int) -> Float {
+    stepSize(timestepIndex: timestepIndex)
+  }
 
   private func stepSize(timestepIndex: Int) -> Float {
     let sigma = max(sigmas[timestepIndex].item(Float.self), 1e-8)

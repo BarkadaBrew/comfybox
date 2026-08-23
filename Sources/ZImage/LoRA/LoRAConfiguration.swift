@@ -23,18 +23,33 @@ public enum LoRASource: Sendable, Equatable {
 public struct LoRAConfiguration: Sendable, Equatable {
     public let source: LoRASource
     public let scale: Float
+    /// Krea-2 relativity (WP-E6, FDD §3.6 / AC-41): the physical base this
+    /// adapter was extracted against. DECLARED, never inferred from the
+    /// file — set by the caller, else filled from the library entry's
+    /// `krea2_relative`, else ``Krea2LoRARelativity/seeded(forFilename:)``.
+    /// `nil` declares nothing. Ignored by every non-Krea-2 pipeline.
+    public var requiresBase: Krea2Variant?
+    /// The configuration SLOT this adapter fills (WP-E10, FDD §3.10
+    /// `Applied.role`): `"kroma"` | `"accel"` | `"bypass"` | `"control"`, or
+    /// nil when undeclared. Labelled once, where the stack is built, and read
+    /// back into `RenderRecipe.loras[].role` so the client reports
+    /// `kroma_strength` AS APPLIED instead of matching filenames (AC-45).
+    /// Ignored by every non-Krea-2 pipeline.
+    public var role: String?
 
-    public init(source: LoRASource, scale: Float = 1.0) {
+    public init(source: LoRASource, scale: Float = 1.0, requiresBase: Krea2Variant? = nil, role: String? = nil) {
         self.source = source
         self.scale = scale
+        self.requiresBase = requiresBase
+        self.role = role
     }
 
-    public static func local(_ path: String, scale: Float = 1.0) -> LoRAConfiguration {
-        LoRAConfiguration(source: .local(URL(fileURLWithPath: path)), scale: scale)
+    public static func local(_ path: String, scale: Float = 1.0, requiresBase: Krea2Variant? = nil) -> LoRAConfiguration {
+        LoRAConfiguration(source: .local(URL(fileURLWithPath: path)), scale: scale, requiresBase: requiresBase)
     }
 
-    public static func local(_ url: URL, scale: Float = 1.0) -> LoRAConfiguration {
-        LoRAConfiguration(source: .local(url), scale: scale)
+    public static func local(_ url: URL, scale: Float = 1.0, requiresBase: Krea2Variant? = nil) -> LoRAConfiguration {
+        LoRAConfiguration(source: .local(url), scale: scale, requiresBase: requiresBase)
     }
 
     public static func huggingFace(_ modelId: String, filename: String? = nil, scale: Float = 1.0) -> LoRAConfiguration {
@@ -156,9 +171,26 @@ public enum LoRAError: Error, LocalizedError {
     /// Tensor keys matching no known suffix. Listed so an update to the
     /// loader can be scoped precisely instead of guessed at.
     case unknownKeys([String])
-    /// Some bindable keys resolved to no target parameter. Thrown by
-    /// preflight BEFORE any mutation.
-    case partialApplication(missing: [String])
+    /// Some offered keys bound nothing. Thrown BEFORE any mutation — by
+    /// ``LoRAPatchSession`` preflight (delta keys with no target parameter;
+    /// `lora` is nil there) and by ``LoRAApplicator/applyDynamically`` under
+    /// `strict: true` (offered pair keys that matched no module — WP-E6,
+    /// FDD D9 / AC-42a). `unbound` is the sorted list of offending keys.
+    case partialApplication(lora: String?, unbound: [String])
+    /// WP-E6 / AC-41: the adapter declares (or is seeded as) relative to one
+    /// Krea-2 base and a different one is loaded. Thrown before any weight
+    /// is touched.
+    case incompatibleBase(lora: String, requires: Krea2Variant, loaded: Krea2Variant)
+    /// K-FIX-1 / Codex C1: the adapter's FORMAT is one this path refuses —
+    /// not a parse failure and not a feature gap, but a format whose
+    /// application cannot be rolled back here (LoKr rewrites base weights;
+    /// see ``Krea2AdapterSupport``). Thrown before any weight is touched.
+    case unsupportedAdapter(lora: String, format: String, reason: String)
+    /// WP-E6 B4a / AC-49: the file is JSON (an HTTP error page saved under a
+    /// `.safetensors` name — the 99-byte civitai early-access body in
+    /// `fetch.log`) AND the safetensors header failed to parse. Never a size
+    /// floor alone — the real 1,040-byte bypass LoRA must load.
+    case notASafetensorsFile(String, firstBytes: String)
 
     public var errorDescription: String? {
         switch self {
@@ -176,8 +208,18 @@ public enum LoRAError: Error, LocalizedError {
             return "LoRA uses an unsupported adapter feature: \(feature)"
         case .unknownKeys(let keys):
             return "LoRA contains unrecognised tensor keys: \(keys.sorted().joined(separator: ", "))"
-        case .partialApplication(let missing):
-            return "LoRA patch preflight failed — no target parameter for: \(missing.sorted().joined(separator: ", "))"
+        case .partialApplication(let lora, let unbound):
+            let who = lora.map { "LoRA '\($0)'" } ?? "LoRA patch"
+            let shown = unbound.sorted()
+            let listed = shown.prefix(32).joined(separator: ", ")
+            let more = shown.count > 32 ? " … (+\(shown.count - 32) more)" : ""
+            return "\(who) did not bind completely — \(shown.count) key(s) matched nothing: \(listed)\(more)"
+        case .incompatibleBase(let lora, let requires, let loaded):
+            return "LoRA '\(lora)' is extracted against Krea-2 \(requires.rawValue) but the loaded base is \(loaded.rawValue) — refusing to apply a \(requires.rawValue)-relative adapter on \(loaded.rawValue)"
+        case .unsupportedAdapter(let lora, let format, let reason):
+            return "LoRA '\(lora)' is a \(format) adapter, which this model path refuses: \(reason)"
+        case .notASafetensorsFile(let path, let firstBytes):
+            return "'\(path)' is not a safetensors file — it is JSON (an HTTP error page saved under the wrong name?): \(firstBytes)"
         }
     }
 }

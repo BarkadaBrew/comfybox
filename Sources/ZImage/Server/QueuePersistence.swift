@@ -38,12 +38,27 @@ struct PersistedQueueState: Codable, Sendable {
 /// actor-isolated itself — the only writer is the WarmServerCoordinator
 /// actor, which already serializes access to the queue it mirrors here.
 enum QueueStateStore {
-  static let path: URL = {
+  /// The engine's state directory — `~/.comfybox`, or `COMFYBOX_STATE_DIR`
+  /// when set.
+  ///
+  /// COMPUTED, not a cached `static let`: the override has to be readable
+  /// after process start, because a test that drives a real coordinator would
+  /// otherwise DELETE the live engine's queue snapshot (`save` of an empty
+  /// state removes the file) and read its pause sentinel. Both are cheap and
+  /// called only at queue transitions.
+  static var stateDirectory: URL {
+    if let override = ProcessInfo.processInfo.environment["COMFYBOX_STATE_DIR"], !override.isEmpty {
+      let dir = URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      return dir
+    }
     let dir = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent(".comfybox", isDirectory: true)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.appendingPathComponent("queue-state.json")
-  }()
+    return dir
+  }
+
+  static var path: URL { stateDirectory.appendingPathComponent("queue-state.json") }
 
   static func save(_ state: PersistedQueueState) {
     guard state.active != nil || !state.pending.isEmpty else {
