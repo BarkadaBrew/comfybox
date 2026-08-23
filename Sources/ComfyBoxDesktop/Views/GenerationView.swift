@@ -114,8 +114,48 @@ struct GenerationView: View {
 
     // LoRA selections
     @State private var selectedLoras: [LoRASelection] = []
+    /// Kroma remains a first-class preset field, but Generate composes it into
+    /// the live swap payload with role `kroma` so this dial controls the next
+    /// render without creating an invalid duplicate `loras[]` preset row.
+    @State private var kromaPolicy: PresetKroma?
     /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
     @SceneStorage("gen.lorasJSON") private var lorasJSON: String = ""
+
+    private var currentModelIsKrea2: Bool {
+        [engine.currentModelFamily, engine.currentModel]
+            .compactMap { $0?.lowercased() }
+            .contains { $0.contains("krea2") || $0.contains("krea-2") }
+    }
+
+    /// Runtime stack for the next render. The persisted preset keeps Kroma in
+    /// `kroma`; the swap wire represents that same slot as a role-tagged entry.
+    /// Filtering first protects older scene state from reintroducing a second,
+    /// untagged copy of the same file.
+    private var generationLoras: [LoRASelection] {
+        var stack = selectedLoras.filter {
+            $0.role?.lowercased() != "kroma" && $0.filename != kromaPolicy?.file
+        }
+        guard let policy = kromaPolicy,
+              let file = policy.file?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !file.isEmpty else { return stack }
+        let catalogID = engine.availableLoras.first(where: { $0.filename == file })?.id
+        stack.append(LoRASelection(
+            id: catalogID ?? "structured-kroma:\(file)",
+            filename: file,
+            scale: Float(min(max(policy.strength, 0), 1.5)),
+            role: "kroma"
+        ))
+        return stack
+    }
+
+    private var kromaRenderValidationError: String? {
+        guard let policy = kromaPolicy, policy.strength > 0 else { return nil }
+        guard let file = policy.file?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !file.isEmpty else {
+            return "This preset uses an engine-default Kroma file. Choose an explicit Kroma file in Presets before adjusting it from Generate."
+        }
+        return nil
+    }
 
     // Sidebar sections
     @State private var showModelSelector: Bool = true
@@ -244,6 +284,9 @@ struct GenerationView: View {
                 onSave: { name, editedNegative in
                     // Save to the canonical server preset store (shared with
                     // Bree/Telegram), not the old device-local list.
+                    let savedKroma = kromaPolicy.map {
+                        ServerPresetKroma(strength: min(max($0.strength, 0), 1.5), file: $0.file)
+                    } ?? (currentModelIsKrea2 ? ServerPresetKroma(strength: 0) : nil)
                     let preset = ServerPreset(
                         name: name,
                         prompt: prompt.isEmpty ? nil : prompt,
@@ -252,13 +295,16 @@ struct GenerationView: View {
                         guidance: guidance,
                         width: effectiveWidth,
                         height: effectiveHeight,
-                        loras: selectedLoras.map {
+                        loras: selectedLoras.filter {
+                            $0.role?.lowercased() != "kroma" && $0.filename != kromaPolicy?.file
+                        }.map {
                             ServerPresetLora(
                                 filename: $0.filename,
                                 scale: Double($0.scale),
                                 role: $0.role
                             )
-                        }
+                        },
+                        kroma: savedKroma
                     )
                     var withModel = preset
                     if let model = engine.currentModel {
@@ -779,6 +825,39 @@ struct GenerationView: View {
             // Guidance
             NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
 
+            // Kroma is structured recipe state, not an ordinary LoRA row.
+            if kromaPolicy != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        NumericSliderField(
+                            label: "Kroma",
+                            value: Binding(
+                                get: { kromaPolicy?.strength ?? 0 },
+                                set: { value in
+                                    guard var policy = kromaPolicy else { return }
+                                    policy.strength = min(max(value, 0), 1.5)
+                                    kromaPolicy = policy
+                                }
+                            ),
+                            range: 0...1.5,
+                            step: 0.05,
+                            fractionDigits: 2
+                        )
+                        Text("Recipe")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.15), in: Capsule())
+                    }
+                    Text(kromaPolicy?.file ?? "Engine-default Kroma file")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .help("Adjusts the structured Kroma adapter for the next render; it is not saved as a duplicate generic LoRA.")
+            }
+
             // Seed field
             VStack(alignment: .leading, spacing: 4) {
                 Text("Seed (empty = random)")
@@ -1067,6 +1146,10 @@ struct GenerationView: View {
     // MARK: - Actions
 
     private func submitGeneration() {
+        if let error = kromaRenderValidationError {
+            engine.lastError = error
+            return
+        }
         let seed: UInt64
         if let parsed = UInt64(seedText), parsed > 0 {
             seed = parsed
@@ -1083,7 +1166,7 @@ struct GenerationView: View {
             guidance: Float(guidance),
             seed: seed,
             modelId: engine.currentModel,
-            loras: selectedLoras,
+            loras: generationLoras,
             initImagePath: referenceImagePath,
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
             dype: dype == "none" ? nil : dype
@@ -1107,6 +1190,10 @@ struct GenerationView: View {
     /// through the same server queue as Generate; still results land in the
     /// Gallery/Compare tab via onGenerated/onBatchComplete.
     private func queueVariant() {
+        if let error = kromaRenderValidationError {
+            engine.lastError = error
+            return
+        }
         let seed: UInt64
         if let parsed = UInt64(seedText), parsed > 0 {
             seed = parsed
@@ -1123,7 +1210,7 @@ struct GenerationView: View {
             guidance: Float(guidance),
             seed: seed,
             modelId: engine.currentModel,
-            loras: selectedLoras,
+            loras: generationLoras,
             initImagePath: referenceImagePath,
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
             dype: dype == "none" ? nil : dype
@@ -1149,7 +1236,7 @@ struct GenerationView: View {
         // swap — only what's actually compatible with the active model
         // goes to the server.
         let activeModel = engine.currentModelFamily ?? engine.currentModel
-        let (compatibleLoras, skippedLoras) = selectedLoras.reduce(into: ([LoRASelection](), [LoRASelection]())) { acc, sel in
+        let (compatibleLoras, skippedLoras) = request.loras.reduce(into: ([LoRASelection](), [LoRASelection]())) { acc, sel in
             let lora = engine.availableLoras.first { $0.id == sel.id }
             let compat = lora?.modelCompatibility ?? ""
             if case .incompatible = LoRACompatibility.status(loraCompatibility: compat, modelIdentifier: activeModel) {
@@ -1644,6 +1731,7 @@ struct GenerationView: View {
         negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
+        kromaPolicy = preset.kroma
 
         // Find a matching resolution preset, else carry the preset's exact
         // dimensions through the custom fields.
@@ -1663,7 +1751,10 @@ struct GenerationView: View {
         // actual library id by filename; the picker's "selected" check keys
         // on id, and a mismatched id silently fails to show the checkmark
         // even though generation itself would still use the right file.
-        selectedLoras = preset.loras.map { presetLora in
+        selectedLoras = preset.loras.filter { presetLora in
+            presetLora.role?.lowercased() != "kroma"
+                && presetLora.filename != preset.kroma?.file
+        }.map { presetLora in
             if let match = engine.availableLoras.first(where: { $0.filename == presetLora.filename }) {
                 return LoRASelection(
                     id: match.id,

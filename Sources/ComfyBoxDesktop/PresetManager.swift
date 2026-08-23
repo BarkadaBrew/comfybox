@@ -6,6 +6,19 @@
 
 import Foundation
 
+/// Structured Kroma recipe value carried into the Generate tab. Kroma is not
+/// a generic `loras[]` row in persisted presets, but a render still needs its
+/// file + adjustable strength when the preset is applied interactively.
+public struct PresetKroma: Codable, Sendable, Equatable {
+    public var strength: Double
+    public var file: String?
+
+    public init(strength: Double, file: String? = nil) {
+        self.strength = strength
+        self.file = file
+    }
+}
+
 /// A saved generation preset.
 public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var id: String
@@ -14,6 +27,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var negativePrompt: String?
     public var modelId: String?
     public var loras: [PresetLoRA]
+    public var kroma: PresetKroma?
     public var steps: Int
     public var guidance: Float
     public var width: Int
@@ -31,6 +45,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         negativePrompt: String? = nil,
         modelId: String? = nil,
         loras: [PresetLoRA] = [],
+        kroma: PresetKroma? = nil,
         steps: Int = 9,
         guidance: Float = 3.5,
         width: Int = 1024,
@@ -47,6 +62,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.negativePrompt = negativePrompt
         self.modelId = modelId
         self.loras = loras
+        self.kroma = kroma
         self.steps = steps
         self.guidance = guidance
         self.width = width

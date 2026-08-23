@@ -305,6 +305,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
                     role: $0.role
                 )
             },
+            kroma: kroma.map { PresetKroma(strength: $0.strength, file: $0.file) },
             steps: steps ?? 9,
             guidance: Float(guidance ?? 3.5),
             width: width ?? 1024,

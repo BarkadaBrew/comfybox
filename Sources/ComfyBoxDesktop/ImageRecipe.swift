@@ -13,10 +13,20 @@ public struct ImageRecipe {
         let prompt = params["prompt"] as? String ?? ""
         guard !prompt.isEmpty || params["seed"] != nil || params["model"] != nil else { return nil }
 
-        let loras: [PresetLoRA] = (params["loras"] as? [[String: Any]] ?? []).compactMap { l in
+        let wireLoras = params["loras"] as? [[String: Any]] ?? []
+        let kroma: PresetKroma? = wireLoras.first(where: {
+            ($0["role"] as? String)?.lowercased() == "kroma"
+        }).flatMap { l in
+            guard let name = l["name"] as? String, !name.isEmpty else { return nil }
+            let scale = ((l["scale"] as? NSNumber)?.doubleValue) ?? 1.0
+            let filename = name.hasSuffix(".safetensors") ? name : name + ".safetensors"
+            return PresetKroma(strength: scale, file: filename)
+        }
+        let loras: [PresetLoRA] = wireLoras.compactMap { l in
             guard let name = l["name"] as? String, !name.isEmpty else { return nil }
             let scale = ((l["scale"] as? NSNumber)?.floatValue) ?? 1.0
             let role = l["role"] as? String
+            guard role?.lowercased() != "kroma" else { return nil }
             let filename = name.hasSuffix(".safetensors") ? name : name + ".safetensors"
             return PresetLoRA(id: name, filename: filename, scale: scale, role: role)
         }
@@ -28,6 +38,7 @@ public struct ImageRecipe {
             negativePrompt: params["negative_prompt"] as? String,
             modelId: params["model"] as? String,
             loras: loras,
+            kroma: kroma,
             steps: (params["steps"] as? NSNumber)?.intValue ?? 9,
             guidance: (params["guidance"] as? NSNumber)?.floatValue ?? 3.5,
             width: (params["width"] as? NSNumber)?.intValue ?? 1024,

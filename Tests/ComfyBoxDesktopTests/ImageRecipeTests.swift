@@ -10,6 +10,7 @@ final class ImageRecipeTests: XCTestCase {
             "model": "cyberrealisticZImage_v50", "content_mode": "banana",
             "loras": [
                 ["name": "Anneliese_Zbase3", "scale": 0.8],
+                ["name": "kroma-v0.3", "scale": 0.55, "role": "kroma"],
                 ["name": "Z-Breast-Slider", "scale": -3],
             ],
         ]
@@ -26,6 +27,7 @@ final class ImageRecipeTests: XCTestCase {
         XCTAssertEqual(r.preset.loras.map(\.filename),
                        ["Anneliese_Zbase3.safetensors", "Z-Breast-Slider.safetensors"])
         XCTAssertEqual(r.preset.loras.map(\.scale), [0.8, -3])
+        XCTAssertEqual(r.preset.kroma, PresetKroma(strength: 0.55, file: "kroma-v0.3.safetensors"))
     }
 
     func testFromParamsEmptyReturnsNil() {
