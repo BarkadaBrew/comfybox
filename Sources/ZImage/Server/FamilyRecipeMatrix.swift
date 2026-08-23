@@ -240,3 +240,103 @@ enum FamilyRecipeMatrix {
     }
   }
 }
+
+// MARK: - Public sampling-option surface
+
+/// Public, UI-safe access to the same sampler/sigma-schedule capability table
+/// the warm server validates at render time.
+///
+/// Keeping this facade beside ``FamilyRecipeMatrix`` prevents desktop clients
+/// from maintaining a second option list that can advertise a recipe the
+/// active model family will later reject. Strings are used at the boundary so
+/// callers do not need access to the server's internal ``WarmModelFamily``.
+public enum SamplingRecipeCatalog {
+  /// Canonical warm-server family name inferred from either `/health`'s
+  /// `model_family` value or a model id/path shown in the desktop UI.
+  public static func canonicalFamily(_ raw: String?) -> String? {
+    guard let raw else { return nil }
+    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !value.isEmpty else { return nil }
+
+    if value == "krea2" || value.contains("krea-2") || value.contains("krea2") {
+      return WarmModelFamily.krea2.rawValue
+    }
+    if value == "flux2" || value.contains("flux-2") || value.contains("flux.2") {
+      return WarmModelFamily.flux2.rawValue
+    }
+    if value == "fibo" || value.contains("fibo") {
+      return WarmModelFamily.fibo.rawValue
+    }
+    if value == "chroma" || value.contains("chroma") {
+      return WarmModelFamily.chroma.rawValue
+    }
+    if value == "flux1" || value.contains("z-image") || value.contains("zimage")
+      || value.contains("flux")
+    {
+      return WarmModelFamily.flux1.rawValue
+    }
+    return nil
+  }
+
+  /// Supported sampler wire names, in the engine enum's stable display order.
+  /// Unknown/absent family returns the union so a disconnected preset remains
+  /// editable; the server still performs authoritative validation on save.
+  public static func samplerNames(forModelFamily raw: String?) -> [String] {
+    guard let family = family(raw) else { return SchedulerKind.allCases.map(\.rawValue) }
+    return FamilyRecipeMatrix.supportedSamplerNames(for: family)
+  }
+
+  /// Supported sigma-schedule wire names. When a sampler is supplied, pair
+  /// constraints are applied too (notably Chroma's heun+beta requirement).
+  public static func sigmaScheduleNames(
+    forModelFamily raw: String?, sampler: String? = nil
+  ) -> [String] {
+    guard let family = family(raw) else { return SigmaScheduleKind.allCases.map(\.rawValue) }
+    let capability = FamilyRecipeMatrix.capability(for: family)
+    let samplerName = normalized(sampler)
+    let samplerKind = samplerName.flatMap { try? RecipeNameResolver.resolveSchedulerKind($0) }
+      ?? (samplerName == nil ? SchedulerKind.euler : nil)
+    return SigmaScheduleKind.allCases.filter { schedule in
+      guard capability.sigmaSchedules.contains(schedule) else { return false }
+      guard let samplerKind else { return true }
+      return capability.isPairSupported(sampler: samplerKind, schedule: schedule)
+    }.map(\.rawValue)
+  }
+
+  /// Whether the named values are known and runnable together on the family.
+  /// Empty/nil values mean "model default" and are intentionally accepted.
+  public static func supports(
+    sampler: String?, sigmaSchedule: String?, forModelFamily raw: String?
+  ) -> Bool {
+    let sampler = normalized(sampler)
+    let schedule = normalized(sigmaSchedule)
+    let resolvedSampler = sampler.flatMap { try? RecipeNameResolver.resolveSchedulerKind($0) }
+    let resolvedSchedule = schedule.flatMap { try? RecipeNameResolver.resolveSigmaScheduleKind($0) }
+    if sampler != nil, resolvedSampler == nil { return false }
+    if schedule != nil, resolvedSchedule == nil { return false }
+
+    guard let family = family(raw) else { return true }
+    let names = ResolvedRecipeNames(
+      scheduler: resolvedSampler, schedulerRequested: sampler,
+      sigmaSchedule: resolvedSchedule, sigmaScheduleRequested: schedule)
+    return FamilyRecipeMatrix.validate(names, family: family) == nil
+  }
+
+  public static func defaultSamplerName(forModelFamily _: String?) -> String {
+    SchedulerKind.euler.rawValue
+  }
+
+  public static func defaultSigmaScheduleName(forModelFamily raw: String?) -> String {
+    family(raw) == .krea2 ? SigmaScheduleKind.krea2.rawValue : SigmaScheduleKind.flow.rawValue
+  }
+
+  private static func normalized(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  private static func family(_ raw: String?) -> WarmModelFamily? {
+    canonicalFamily(raw).flatMap(WarmModelFamily.init(rawValue:))
+  }
+}

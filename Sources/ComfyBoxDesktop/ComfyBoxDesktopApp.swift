@@ -868,6 +868,12 @@ struct ComfyBoxDesktopApp: App {
         if request.seed > 0 {
             metadata["seed"] = request.seed
         }
+        if let sampler = request.sampler, !sampler.isEmpty {
+            metadata["sampler"] = sampler
+        }
+        if let schedule = request.sigmaSchedule, !schedule.isEmpty {
+            metadata["sigma_schedule"] = schedule
+        }
         if let model = request.modelId ?? engine.currentModel {
             metadata["model"] = model
         }

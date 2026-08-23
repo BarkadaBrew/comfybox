@@ -43,6 +43,8 @@ public struct ImageRecipe {
             guidance: (params["guidance"] as? NSNumber)?.floatValue ?? 3.5,
             width: (params["width"] as? NSNumber)?.intValue ?? 1024,
             height: (params["height"] as? NSNumber)?.intValue ?? 1024,
+            sampler: params["sampler"] as? String ?? params["scheduler"] as? String,
+            sigmaSchedule: params["sigma_schedule"] as? String ?? params["sigmaSchedule"] as? String,
             seed: (params["seed"] as? NSNumber)?.uint64Value
         )
         let mode = (params["content_mode"] as? String).flatMap(ContentMode.init(rawValue:))

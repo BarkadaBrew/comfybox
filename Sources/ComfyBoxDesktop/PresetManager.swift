@@ -33,6 +33,9 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var width: Int
     public var height: Int
     public var sampler: String?
+    /// Sigma/noise schedule paired with ``sampler`` (for example `krea2`,
+    /// `beta`, or `bong_tangent`). Nil leaves the choice to the model.
+    public var sigmaSchedule: String?
     /// Fixed seed to reproduce the preset (nil/0 = random).
     public var seed: UInt64?
     public var createdAt: Date
@@ -51,6 +54,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         width: Int = 1024,
         height: Int = 1024,
         sampler: String? = nil,
+        sigmaSchedule: String? = nil,
         seed: UInt64? = nil,
         createdAt: Date = Date(),
         modifiedAt: Date = Date()
@@ -68,6 +72,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.width = width
         self.height = height
         self.sampler = sampler
+        self.sigmaSchedule = sigmaSchedule
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
     }
@@ -113,7 +118,8 @@ public final class PresetManager {
         guidance: Float,
         width: Int,
         height: Int,
-        sampler: String? = nil
+        sampler: String? = nil,
+        sigmaSchedule: String? = nil
     ) -> GenerationPreset {
         let preset = GenerationPreset(
             name: name,
@@ -126,7 +132,8 @@ public final class PresetManager {
             guidance: guidance,
             width: width,
             height: height,
-            sampler: sampler
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule
         )
         presets.append(preset)
         save()
