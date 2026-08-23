@@ -81,6 +81,9 @@ struct GenerationView: View {
     @SceneStorage("gen.customHeight") private var customHeight: Int = 1024
     @SceneStorage("gen.steps") private var steps: Double = 9
     @SceneStorage("gen.guidance") private var guidance: Double = 3.5
+    /// Empty = let the active model choose its native recipe.
+    @SceneStorage("gen.sampler") private var sampler: String = ""
+    @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
     @SceneStorage("gen.seedText") private var seedText: String = ""
     @State private var displayedImage: NSImage?
 
@@ -125,6 +128,21 @@ struct GenerationView: View {
         [engine.currentModelFamily, engine.currentModel]
             .compactMap { $0?.lowercased() }
             .contains { $0.contains("krea2") || $0.contains("krea-2") }
+    }
+
+    private var samplingModelFamily: String? {
+        engine.currentModelFamily ?? engine.currentModel
+    }
+
+    private var samplingValidationError: String? {
+        guard !sampler.isEmpty || !sigmaSchedule.isEmpty else { return nil }
+        guard !SamplingRecipeCatalog.supports(
+            sampler: sampler.isEmpty ? nil : sampler,
+            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            forModelFamily: samplingModelFamily
+        ) else { return nil }
+        let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "the active model"
+        return "Sampler '\(sampler.isEmpty ? "Model Default" : sampler)' and scheduler '\(sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)' are not supported together by \(family)."
     }
 
     /// Runtime stack for the next render. The persisted preset keeps Kroma in
@@ -281,6 +299,8 @@ struct GenerationView: View {
                 guidance: Float(guidance),
                 width: effectiveWidth,
                 height: effectiveHeight,
+                sampler: sampler,
+                sigmaSchedule: sigmaSchedule,
                 onSave: { name, editedNegative in
                     // Save to the canonical server preset store (shared with
                     // Bree/Telegram), not the old device-local list.
@@ -304,7 +324,13 @@ struct GenerationView: View {
                                 role: $0.role
                             )
                         },
-                        kroma: savedKroma
+                        // Mirror the sampler into the legacy field for older
+                        // preset consumers while the structured fields remain
+                        // the authoritative Krea 2 recipe.
+                        scheduler: sampler.isEmpty ? nil : sampler,
+                        kroma: savedKroma,
+                        sampler: sampler.isEmpty ? nil : sampler,
+                        sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule
                     )
                     var withModel = preset
                     if let model = engine.currentModel {
@@ -825,6 +851,15 @@ struct GenerationView: View {
             // Guidance
             NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
 
+            // Sampler = solver; Scheduler = sigma/noise schedule. Options are
+            // sourced from the engine's family capability matrix.
+            SamplingRecipePicker(
+                sampler: $sampler,
+                sigmaSchedule: $sigmaSchedule,
+                modelFamily: samplingModelFamily
+            )
+            .disabled(backend != .local)
+
             // Kroma is structured recipe state, not an ordinary LoRA row.
             if kromaPolicy != nil {
                 VStack(alignment: .leading, spacing: 4) {
@@ -936,7 +971,10 @@ struct GenerationView: View {
                 : selectedLoras.map {
                     "\($0.filename.replacingOccurrences(of: ".safetensors", with: "")) @\(String(format: "%g", $0.scale))"
                   }.joined(separator: ", "))
-            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
+            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · sampler \(sampler.isEmpty ? "default" : sampler) · scheduler \(sigmaSchedule.isEmpty ? "default" : sigmaSchedule) · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
+            if let warning = samplingValidationError, backend == .local {
+                Text(warning).foregroundStyle(.orange)
+            }
             if let warn = loraSwapWarning {
                 Text(warn).foregroundStyle(.orange)
             }
@@ -1030,7 +1068,8 @@ struct GenerationView: View {
     private var canGenerate: Bool {
         let hasPrompt = !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if backend == .local {
-            return engine.connectionState.isConnected && !engine.isGenerating && !isApplyingPreset && hasPrompt
+            return engine.connectionState.isConnected && !engine.isGenerating && !isApplyingPreset
+                && samplingValidationError == nil && hasPrompt
         }
         // Cloud backends don't need the local server, just a key.
         return !isCloudGenerating && hasPrompt && !cloudBackendKey.isEmpty
@@ -1040,6 +1079,7 @@ struct GenerationView: View {
     /// whole point of Add to Queue is stacking variants while one runs.
     private var canQueue: Bool {
         backend == .local && engine.connectionState.isConnected && !isApplyingPreset
+            && samplingValidationError == nil
             && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -1150,6 +1190,10 @@ struct GenerationView: View {
             engine.lastError = error
             return
         }
+        if let error = samplingValidationError {
+            engine.lastError = error
+            return
+        }
         let seed: UInt64
         if let parsed = UInt64(seedText), parsed > 0 {
             seed = parsed
@@ -1164,6 +1208,8 @@ struct GenerationView: View {
             height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
+            sampler: sampler.isEmpty ? nil : sampler,
+            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
             modelId: engine.currentModel,
             loras: generationLoras,
@@ -1194,6 +1240,10 @@ struct GenerationView: View {
             engine.lastError = error
             return
         }
+        if let error = samplingValidationError {
+            engine.lastError = error
+            return
+        }
         let seed: UInt64
         if let parsed = UInt64(seedText), parsed > 0 {
             seed = parsed
@@ -1208,6 +1258,8 @@ struct GenerationView: View {
             height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
+            sampler: sampler.isEmpty ? nil : sampler,
+            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
             modelId: engine.currentModel,
             loras: generationLoras,
@@ -1731,6 +1783,8 @@ struct GenerationView: View {
         negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
+        sampler = preset.sampler ?? ""
+        sigmaSchedule = preset.sigmaSchedule ?? ""
         kromaPolicy = preset.kroma
 
         // Find a matching resolution preset, else carry the preset's exact

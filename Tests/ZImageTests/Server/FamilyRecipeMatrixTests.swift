@@ -194,4 +194,57 @@ final class FamilyRecipeMatrixTests: XCTestCase {
       }
     }
   }
+
+  // MARK: - Public desktop option facade
+
+  /// The desktop selectors consume the public facade, not a copied list. Pin
+  /// that each family sees exactly the matrix capability and that model paths
+  /// are classified the same way as `/health` family names.
+  func testPublicSamplingCatalogUsesTheFamilyMatrix() {
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("krea2"), "krea2")
+    XCTAssertEqual(
+      SamplingRecipeCatalog.canonicalFamily("/models/krea2_raw_bf16.safetensors"),
+      "krea2")
+    XCTAssertEqual(SamplingRecipeCatalog.canonicalFamily("Tongyi-MAI/Z-Image-Turbo"), "flux1")
+
+    for family in WarmModelFamily.allCases {
+      let capability = FamilyRecipeMatrix.capability(for: family)
+      XCTAssertEqual(
+        SamplingRecipeCatalog.samplerNames(forModelFamily: family.rawValue),
+        FamilyRecipeMatrix.supportedSamplerNames(for: family),
+        family.rawValue)
+      XCTAssertEqual(
+        Set(SamplingRecipeCatalog.sigmaScheduleNames(forModelFamily: family.rawValue)),
+        Set(SigmaScheduleKind.allCases.filter {
+          capability.sigmaSchedules.contains($0)
+            && capability.isPairSupported(sampler: .euler, schedule: $0)
+        }.map(\.rawValue)),
+        family.rawValue)
+    }
+
+    XCTAssertEqual(
+      SamplingRecipeCatalog.defaultSigmaScheduleName(forModelFamily: "krea2"), "krea2")
+    XCTAssertEqual(
+      SamplingRecipeCatalog.defaultSigmaScheduleName(forModelFamily: "flux1"), "flow")
+  }
+
+  /// Chroma is the one family with a pair constraint: beta is available only
+  /// after choosing Heun. The UI list and its validation must agree with the
+  /// render gate so an advertised selection never becomes a later 400.
+  func testPublicSamplingCatalogFiltersUnsupportedPairs() {
+    XCTAssertFalse(
+      SamplingRecipeCatalog.sigmaScheduleNames(forModelFamily: "chroma").contains("beta"))
+    XCTAssertTrue(
+      SamplingRecipeCatalog.sigmaScheduleNames(
+        forModelFamily: "chroma", sampler: "heun").contains("beta"))
+    XCTAssertFalse(
+      SamplingRecipeCatalog.supports(
+        sampler: "euler", sigmaSchedule: "beta", forModelFamily: "chroma"))
+    XCTAssertTrue(
+      SamplingRecipeCatalog.supports(
+        sampler: "heun", sigmaSchedule: "beta", forModelFamily: "chroma"))
+    XCTAssertFalse(
+      SamplingRecipeCatalog.supports(
+        sampler: "uni_pc", sigmaSchedule: nil, forModelFamily: "krea2"))
+  }
 }

@@ -6,6 +6,7 @@
 // (engine/provider/mode) are shown as chips and preserved verbatim on save.
 
 import SwiftUI
+import ZImage
 
 struct PresetView: View {
     @Bindable var engine: EngineService
@@ -296,7 +297,12 @@ private struct ServerPresetRow: View {
         if let steps = preset.steps { parts.append("\(steps) steps") }
         if let guidance = preset.guidance { parts.append(String(format: "g %.1f", guidance)) }
         if !preset.loras.isEmpty { parts.append("\(preset.loras.count) LoRA\(preset.loras.count == 1 ? "" : "s")") }
-        if let scheduler = preset.scheduler { parts.append(scheduler) }
+        if let sampler = preset.sampler ?? preset.scheduler {
+            let schedule = preset.sigmaSchedule.map { " / \($0)" } ?? ""
+            parts.append("\(sampler)\(schedule)")
+        } else if let schedule = preset.sigmaSchedule {
+            parts.append("default / \(schedule)")
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -341,7 +347,8 @@ private struct ServerPresetEditor: View {
     /// `kroma.strength`, which is the engine's single source of truth.
     @State private var kromaStrength: Double
     @State private var editableLoras: [EditableLora]
-    @State private var scheduler: String
+    @State private var sampler: String
+    @State private var sigmaSchedule: String
     @State private var saveAsName: String = ""
     @State private var showingSaveAs = false
 
@@ -368,7 +375,25 @@ private struct ServerPresetEditor: View {
                 return lora.filename != kromaFile
             }
             .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
-        _scheduler = State(initialValue: original.scheduler ?? "")
+        _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
+        _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
+    }
+
+    private var samplingModelFamily: String? {
+        let edited = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !edited.isEmpty { return edited }
+        return original.customModelPath ?? original.model
+    }
+
+    private var samplingValidationError: String? {
+        guard !sampler.isEmpty || !sigmaSchedule.isEmpty else { return nil }
+        guard !SamplingRecipeCatalog.supports(
+            sampler: sampler.isEmpty ? nil : sampler,
+            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            forModelFamily: samplingModelFamily
+        ) else { return nil }
+        let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "this model"
+        return "The selected sampler/scheduler pair is not supported by \(family)."
     }
 
     var body: some View {
@@ -393,8 +418,14 @@ private struct ServerPresetEditor: View {
                     HStack {
                         TextField("Steps", text: $stepsText).frame(width: 90)
                         TextField("Guidance", text: $guidanceText).frame(width: 90)
-                        TextField("Scheduler", text: $scheduler)
+                        Spacer()
                     }
+                    SamplingRecipePicker(
+                        sampler: $sampler,
+                        sigmaSchedule: $sigmaSchedule,
+                        modelFamily: samplingModelFamily,
+                        showsExplanation: true
+                    )
                 }
                 Section("LoRAs") {
                     if original.kroma != nil {
@@ -419,11 +450,11 @@ private struct ServerPresetEditor: View {
                 }
                 Button("Save") { onSave(buildPreset()) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || samplingValidationError != nil)
             }
             .padding()
         }
-        .frame(minWidth: 540, idealWidth: 600, minHeight: 540, idealHeight: 620)
+        .frame(minWidth: 560, idealWidth: 620, minHeight: 590, idealHeight: 680)
         .alert("Save as New Preset", isPresented: $showingSaveAs) {
             TextField("New preset name", text: $saveAsName)
             Button("Cancel", role: .cancel) { }
@@ -433,7 +464,7 @@ private struct ServerPresetEditor: View {
                 copy.name = saveAsName.trimmingCharacters(in: .whitespaces)
                 onSave(copy)
             }
-            .disabled(saveAsName.trimmingCharacters(in: .whitespaces).isEmpty)
+            .disabled(saveAsName.trimmingCharacters(in: .whitespaces).isEmpty || samplingValidationError != nil)
         } message: {
             Text("Creates a separate preset with these settings; “\(original.name)” is left unchanged.")
         }
@@ -637,7 +668,11 @@ private struct ServerPresetEditor: View {
         p.height = Int(heightText)
         p.steps = Int(stepsText)
         p.guidance = Double(guidanceText.replacingOccurrences(of: ",", with: "."))
-        p.scheduler = scheduler.isEmpty ? nil : scheduler
+        p.sampler = sampler.isEmpty ? nil : sampler
+        p.sigmaSchedule = sigmaSchedule.isEmpty ? nil : sigmaSchedule
+        // Keep the legacy sampler spelling synchronized for older preset
+        // consumers; modern engine validation and Generate use `sampler`.
+        p.scheduler = p.sampler
         if var kroma = p.kroma {
             kroma.strength = min(max(kromaStrength, 0), 1.5)
             p.kroma = kroma
@@ -663,6 +698,8 @@ struct SavePresetSheet: View {
     var guidance: Float
     var width: Int
     var height: Int
+    var sampler: String = ""
+    var sigmaSchedule: String = ""
     /// (name, negativePrompt) — the sheet lets the user edit the negative
     /// prompt before saving, so the callback returns the edited value.
     var onSave: (String, String) -> Void
@@ -692,6 +729,8 @@ struct SavePresetSheet: View {
                     LabeledContent("Steps", value: "\(steps)")
                     LabeledContent("Guidance", value: String(format: "%.1f", guidance))
                     LabeledContent("Resolution", value: "\(width) x \(height)")
+                    LabeledContent("Sampler", value: sampler.isEmpty ? "Model Default" : sampler)
+                    LabeledContent("Scheduler", value: sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)
                     if let model = modelId {
                         LabeledContent("Model", value: model)
                     }
@@ -727,7 +766,7 @@ struct SavePresetSheet: View {
             }
             .padding()
         }
-        .frame(width: 400, height: 400)
+        .frame(width: 420, height: 440)
         .onAppear {
             if !didSeedNegative {
                 editedNegative = negativePrompt

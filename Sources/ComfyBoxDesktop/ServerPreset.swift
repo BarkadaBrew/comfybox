@@ -310,7 +310,10 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             guidance: Float(guidance ?? 3.5),
             width: width ?? 1024,
             height: height ?? 1024,
-            sampler: scheduler,
+            // `scheduler` is the legacy preset spelling for the sampler.
+            // Prefer the structured recipe field, but keep old presets usable.
+            sampler: sampler ?? scheduler,
+            sigmaSchedule: sigmaSchedule,
             seed: seed.map { UInt64(truncatingIfNeeded: $0) }
         )
     }

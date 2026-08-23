@@ -18,6 +18,11 @@ public struct GenerationRequest: Sendable {
     public var height: Int
     public var steps: Int
     public var guidance: Float
+    /// Solver name (`res_2s`, `deis_3m`, `euler`, …). Nil = model default.
+    public var sampler: String?
+    /// Sigma/noise schedule (`krea2`, `beta`, `bong_tangent`, …).
+    /// Nil = model default.
+    public var sigmaSchedule: String?
     public var seed: UInt64  // 0 = random
     public var modelId: String?
     public var loras: [LoRASelection]
@@ -35,6 +40,8 @@ public struct GenerationRequest: Sendable {
         height: Int = 1024,
         steps: Int = 9,
         guidance: Float = 3.5,
+        sampler: String? = nil,
+        sigmaSchedule: String? = nil,
         seed: UInt64 = 0,
         modelId: String? = nil,
         loras: [LoRASelection] = [],
@@ -48,6 +55,8 @@ public struct GenerationRequest: Sendable {
         self.height = height
         self.steps = steps
         self.guidance = guidance
+        self.sampler = sampler
+        self.sigmaSchedule = sigmaSchedule
         self.seed = seed
         self.dype = dype
         self.modelId = modelId
@@ -398,6 +407,17 @@ public final class EngineService {
 
         if request.seed > 0 {
             payloadDict["seed"] = request.seed
+        }
+
+        if let sampler = request.sampler?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !sampler.isEmpty {
+            // `sampler` is the user-facing alias accepted by GeneratePayload;
+            // it maps to the engine's historical `scheduler` field.
+            payloadDict["sampler"] = sampler
+        }
+        if let schedule = request.sigmaSchedule?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !schedule.isEmpty {
+            payloadDict["sigma_schedule"] = schedule
         }
 
         if !request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
