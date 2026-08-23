@@ -38,14 +38,21 @@ struct PresetView: View {
         }
         .navigationTitle("Presets")
         .task {
+            // Refresh the picker inventory before the preset list. The editor
+            // receives a value snapshot of `availableLoras`; opening it while
+            // this fetch is still pending would freeze the old catalog into
+            // that sheet until the user closed and reopened it.
+            await engine.refreshLoras()
             await reload()
             warmModelSpec = (try? await engine.fetchServerConfig())?.modelSpec
-            // The editor's Add-LoRA picker needs the server's library list;
-            // Generate populates it lazily, so make sure it's fresh here too.
-            await engine.refreshLoras()
         }
         .onChange(of: engine.connectionState.isConnected) { _, connected in
-            if connected { Task { await reload() } }
+            if connected {
+                Task {
+                    await engine.refreshLoras()
+                    await reload()
+                }
+            }
         }
         .sheet(item: $editing) { preset in
             ServerPresetEditor(
@@ -67,7 +74,12 @@ struct PresetView: View {
                 .foregroundStyle(.secondary)
             Spacer()
             if isLoading { ProgressView().controlSize(.small) }
-            Button { Task { await reload() } } label: { Image(systemName: "arrow.clockwise") }
+            Button {
+                Task {
+                    await engine.refreshLoras()
+                    await reload()
+                }
+            } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
             Menu {
                 Button("Import from Image Service") { Task { await importLegacy() } }
@@ -79,8 +91,7 @@ struct PresetView: View {
             .disabled(!engine.connectionState.isConnected)
             .help("Import presets from the old image-service")
             Button {
-                isNew = true
-                editing = ServerPreset(name: "")
+                Task { await beginEditing(ServerPreset(name: ""), asNew: true) }
             } label: { Label("New Preset", systemImage: "plus") }
                 .buttonStyle(.borderedProminent)
                 .disabled(!engine.connectionState.isConnected)
@@ -97,7 +108,7 @@ struct PresetView: View {
                         preset: preset,
                         isWarm: presetModelSpec(preset) != nil && presetModelSpec(preset) == warmModelSpec,
                         onApply: { onApply?(preset.toGenerationPreset()) },
-                        onEdit: { isNew = false; editing = preset },
+                        onEdit: { Task { await beginEditing(preset, asNew: false) } },
                         onDuplicate: { Task { await duplicate(preset) } },
                         onDelete: { Task { await delete(preset) } },
                         onSetWarm: presetModelSpec(preset) != nil ? { Task { await setAsWarm(preset) } } : nil
@@ -123,6 +134,15 @@ struct PresetView: View {
     }
 
     // MARK: - Actions
+
+    /// A sheet captures `availableLoras` by value, so make the inventory
+    /// current before constructing it. This is also what makes LoRAs imported
+    /// while the app is running immediately visible in Presets.
+    private func beginEditing(_ preset: ServerPreset, asNew: Bool) async {
+        await engine.refreshLoras()
+        isNew = asNew
+        editing = preset
+    }
 
     private func reload() async {
         guard engine.connectionState.isConnected else { return }
