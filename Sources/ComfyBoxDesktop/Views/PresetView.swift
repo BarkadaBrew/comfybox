@@ -315,6 +315,10 @@ private struct ServerPresetEditor: View {
     @State private var heightText: String
     @State private var stepsText: String
     @State private var guidanceText: String
+    /// Kroma is a first-class recipe field, never a generic `loras[]` row.
+    /// Keep it visible beside the additional LoRAs while saving edits back to
+    /// `kroma.strength`, which is the engine's single source of truth.
+    @State private var kromaStrength: Double
     @State private var editableLoras: [EditableLora]
     @State private var scheduler: String
     @State private var saveAsName: String = ""
@@ -336,7 +340,12 @@ private struct ServerPresetEditor: View {
         _heightText = State(initialValue: original.height.map(String.init) ?? "")
         _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
         _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
+        _kromaStrength = State(initialValue: original.kroma?.strength ?? 0)
         _editableLoras = State(initialValue: original.loras
+            .filter { lora in
+                guard let kromaFile = original.kroma?.file else { return true }
+                return lora.filename != kromaFile
+            }
             .map { EditableLora(filename: $0.filename, scale: $0.scale) })
         _scheduler = State(initialValue: original.scheduler ?? "")
     }
@@ -367,6 +376,9 @@ private struct ServerPresetEditor: View {
                     }
                 }
                 Section("LoRAs") {
+                    if original.kroma != nil {
+                        structuredKromaRow
+                    }
                     loraRows
                     addLoraMenu
                     presetLoraKeywordsRow
@@ -408,11 +420,46 @@ private struct ServerPresetEditor: View {
 
     // MARK: - LoRA editing
 
+    /// Kroma looks and behaves like an adjustable LoRA in the editor, but it
+    /// writes the structured recipe field. Showing it here avoids the tempting
+    /// (and invalid) workaround of also adding its file to `loras[]`.
+    @ViewBuilder
+    private var structuredKromaRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                HStack(spacing: 5) {
+                    Text("Kroma")
+                    Text("Recipe")
+                        .font(.caption2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                }
+                .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
+                Slider(value: $kromaStrength, in: 0...1.5, step: 0.05)
+                TextField("", value: Binding(
+                    get: { kromaStrength },
+                    set: { kromaStrength = min(max($0, 0), 1.5) }
+                ), format: .number.precision(.fractionLength(0...2)))
+                    .font(.system(.caption, design: .monospaced))
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 52)
+            }
+            Text(original.kroma?.file ?? "Engine-default Kroma file")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help("Saved as kroma.strength; this file is excluded from the generic LoRA stack.")
+        }
+    }
+
     /// One row per selected LoRA: name, scale slider, numeric value, remove.
     @ViewBuilder
     private var loraRows: some View {
         if editableLoras.isEmpty {
-            Text("No LoRAs — add one below.")
+            Text(original.kroma == nil ? "No LoRAs — add one below." : "No additional LoRAs — add one below.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         ForEach($editableLoras) { $lora in
@@ -454,8 +501,13 @@ private struct ServerPresetEditor: View {
     @ViewBuilder
     private var addLoraMenu: some View {
         let added = Set(editableLoras.map(\.filename))
+        let structuredKromaFile = original.kroma?.file
         let candidates = availableLoras
-            .filter { !$0.quarantined && !added.contains($0.filename) }
+            .filter {
+                !$0.quarantined
+                    && !added.contains($0.filename)
+                    && $0.filename != structuredKromaFile
+            }
             .sorted { $0.filename.localizedCaseInsensitiveCompare($1.filename) == .orderedAscending }
         Menu {
             if candidates.isEmpty {
@@ -539,8 +591,13 @@ private struct ServerPresetEditor: View {
         p.steps = Int(stepsText)
         p.guidance = Double(guidanceText.replacingOccurrences(of: ",", with: "."))
         p.scheduler = scheduler.isEmpty ? nil : scheduler
+        if var kroma = p.kroma {
+            kroma.strength = min(max(kromaStrength, 0), 1.5)
+            p.kroma = kroma
+        }
+        let structuredKromaFile = p.kroma?.file
         p.loras = editableLoras
-            .filter { !$0.filename.isEmpty }
+            .filter { !$0.filename.isEmpty && $0.filename != structuredKromaFile }
             .map { ServerPresetLora(filename: $0.filename, scale: $0.scale) }
         return p
     }
