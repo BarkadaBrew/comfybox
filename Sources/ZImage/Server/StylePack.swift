@@ -20,6 +20,10 @@ import Foundation
 public enum StylePack: String, CaseIterable, Sendable {
   case phone = "phone"
   case trixBW = "trix-bw"
+  /// Soft classic-gradation B&W (Todd 2026-08-24: the prompt-only probe
+  /// "looks like HP4" — this makes that gentler emulsion repeatable):
+  /// same guaranteed mono, gentle contrast, no push, soft blacks.
+  case hp5Soft = "hp5-soft"
 
   /// Registry lookup. nil for unknown names — the caller decides whether
   /// that is a 400 (the generate decode) or a skip.
@@ -77,7 +81,12 @@ public enum StylePack: String, CaseIterable, Sendable {
     case .phone:
       PhoneLook.apply(pixels: &pixels, width: width, height: height)
     case .trixBW:
-      Self.applyTrixBW(pixels: &pixels, width: width, height: height)
+      Self.applyBW(pixels: &pixels, width: width, height: height,
+                   contrast: Self.pushContrast, shoulderStart: Self.shoulderStart,
+                   shoulderStrength: Self.shoulderStrength)
+    case .hp5Soft:
+      Self.applyBW(pixels: &pixels, width: width, height: height,
+                   contrast: 1.08, shoulderStart: 0.75, shoulderStrength: 0.7)
     }
   }
 
@@ -93,7 +102,10 @@ public enum StylePack: String, CaseIterable, Sendable {
   static let shoulderStrength: Float = 0.55
   static let minLevelsWindow: Float = 0.05
 
-  static func applyTrixBW(pixels: inout [Float], width: Int, height: Int) {
+  static func applyBW(
+    pixels: inout [Float], width: Int, height: Int,
+    contrast: Float, shoulderStart: Float, shoulderStrength: Float
+  ) {
     let n = width * height
     guard n > 0, pixels.count == n * 3 else { return }
 
@@ -114,8 +126,8 @@ public enum StylePack: String, CaseIterable, Sendable {
     for i in 0..<n {
       var v = mono[i]
       if stretch { v = (v - lo) * inv }
-      // pushed contrast around mid
-      v = 0.5 + (v - 0.5) * pushContrast
+      // contrast around mid (pushed for trix, gentle for hp5)
+      v = 0.5 + (v - 0.5) * contrast
       // soft shoulder: compress above shoulderStart instead of clipping
       if v > shoulderStart {
         v = shoulderStart + (v - shoulderStart) * shoulderStrength

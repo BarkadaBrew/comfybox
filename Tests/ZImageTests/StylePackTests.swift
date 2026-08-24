@@ -80,3 +80,29 @@ final class StylePackTests: XCTestCase {
     }
   }
 }
+
+extension StylePackTests {
+  func testHP5SoftIsMonochromeAndGentlerThanTrix() {
+    let w = 64, h = 64
+    func gray(_ px: [Float]) -> [Float] { (0..<(w * h)).map { lum(px, $0) } }
+    func std(_ v: [Float]) -> Float {
+      let m = v.reduce(0, +) / Float(v.count)
+      return (v.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Float(v.count)).squareRoot()
+    }
+    var hp5 = scene(w: w, h: h)
+    var trix = scene(w: w, h: h)
+    StylePack.named("hp5-soft")!.apply(pixels: &hp5, width: w, height: h)
+    StylePack.named("trix-bw")!.apply(pixels: &trix, width: w, height: h)
+    // truly mono
+    for i in 0..<(w * h) {
+      XCTAssertEqual(hp5[i * 3], hp5[i * 3 + 1], accuracy: 1e-5)
+      XCTAssertEqual(hp5[i * 3 + 1], hp5[i * 3 + 2], accuracy: 1e-5)
+    }
+    // soft classic gradation: lower global contrast than the pushed Tri-X
+    XCTAssertLessThan(std(gray(hp5)), std(gray(trix)), "HP5 is the gentler curve")
+    // blacks sit soft, not crushed; range still healthy
+    let g = gray(hp5)
+    XCTAssertGreaterThan(g.max()!, 0.85)
+    for v in hp5 { XCTAssertFalse(v.isNaN); XCTAssertGreaterThanOrEqual(v, 0); XCTAssertLessThanOrEqual(v, 1) }
+  }
+}
