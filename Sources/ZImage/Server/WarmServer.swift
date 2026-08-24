@@ -7901,6 +7901,32 @@ private actor WarmServerCoordinator {
     }
 
     do {
+      // A swap-first client (kira-daemon: swap → generate) must not fail
+      // because the image pipeline is not resident — video eviction (#218)
+      // or a fresh boot leaves it nil, and the only restore path lived in
+      // runGenerate, so a failed swap meant generate was never called and
+      // image creation deadlocked until an out-of-band generate landed.
+      let familyPipelineMissing =
+        (currentModelFamily == .krea2 && krea2Pipeline == nil)
+        || (currentModelFamily == .flux2 && flux2Pipeline == nil)
+      let restoreSpec = activePoolModelSpec ?? lastActiveImageSpec ?? configuration.modelSpec
+      switch SwapResidencyRestore.decide(
+        imageModelsEvicted: imageModelsEvicted,
+        familyPipelineMissing: familyPipelineMissing,
+        restoreSpec: restoreSpec
+      ) {
+      case .none:
+        break
+      case .reloadEvicted:
+        try await reloadImageModelIfEvicted(requestedModel: nil)
+      case .load(let modelSpec):
+        logger.info("Swap arrived with no resident image pipeline — loading '\(modelSpec)' before applying LoRAs")
+        _ = try await poolLoad(
+          modelSpec: WarmServer.parseModelSpec(from: modelSpec),
+          quantization: WarmServer.parseQuantization(from: modelSpec),
+          activate: true)
+      }
+
       let newLoRAs = try payload.makeConfigurations()
       try await applyActiveLoRAs(newLoRAs)
 
