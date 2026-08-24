@@ -5496,6 +5496,17 @@ public final class WarmServer {
     // warm pipeline happened to hold, on whatever base was active.
     var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // Todd 2026-08-24: a preset may DECLARE the phone-look post-process.
+    // Resolved here rather than at the route so `/v1/generate`,
+    // `/v1/generate/async` and persisted-queue replay all agree about it —
+    // and the request always wins, exactly as it does for steps/guidance/vae.
+    // Read from the DECLARED preset (`store.lookup`), never from
+    // `ResolvedPreset`: `PresetDefaults` must never manufacture a look.
+    if expanded.phoneLook == nil,
+       let pid = payload.preset?.trimmingCharacters(in: .whitespacesAndNewlines), !pid.isEmpty,
+       store.lookup(pid).0?.phoneLook == true {
+      expanded.phoneLook = true
+    }
     // #22 (PR #363 review, C2): resolution/memory preflight — refuses an
     // oversized request BEFORE it is enqueued (let alone before any model
     // load), with the estimate/available/cap named in the refusal. Runs
@@ -11030,7 +11041,7 @@ private actor WarmServerCoordinator {
         }
       }
 
-      let image: MLXArray
+      var image: MLXArray
       // WP-E17: one trace per stage that ran, in order. `traces[0]` is the
       // render's own — the geometry, seed and schedule shift every sink reads.
       let traces: [Krea2RunTrace]
@@ -11158,6 +11169,14 @@ private actor WarmServerCoordinator {
         // rather than looking like a family that has no record (round 2, C4).
         appliedSlot: AppliedRecordSlot(record: record)
       )
+      if payload.phoneLook == true {
+        // Accel-distill color correction (Todd 2026-08-24): pure CPU pass,
+        // preset-gated — see PhoneLook.swift for the recipe and its numbers.
+        let hDim = image.dim(0), wDim = image.dim(1)
+        var px: [Float] = image.asArray(Float.self)
+        PhoneLook.apply(pixels: &px, width: wDim, height: hDim)
+        image = MLXArray(px, [hDim, wDim, 3])
+      }
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
 
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
@@ -12303,6 +12322,8 @@ struct GeneratePayload: Sendable {
 
   // Phase 4: Img2img (set via HTTP API)
   var imagePath: String?   // var: may be filled in from initImageData (bytes upload)
+  /// Phone-look post-process; nil = resolve from the named preset at the route.
+  var phoneLook: Bool?
   /// Img2img init image sent as base64 (init_image_base64) — for remote clients
   /// that can't put a file on the server's filesystem. Decoded to a temp file.
   let initImageData: Data?
@@ -12569,6 +12590,7 @@ extension GeneratePayload: Decodable {
     case sampler
     case preset
     case denoise, maskGrow, maskFeather
+    case phoneLook
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
     // incoming keys to camelCase BEFORE matching CodingKey stringValues. So the
     // wire keys inpaint_image_base64 / mask_base64 arrive as these camelCase

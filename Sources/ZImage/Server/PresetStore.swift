@@ -276,6 +276,14 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   /// "zimage-turbo" | "zimage-base". Never a physical fact — that is
   /// `Krea2Variant`, which is reported, not requested.
   public var checkpointFamily: String?
+  /// Phone-look post-process (levels+contrast+saturation+unsharp) applied
+  /// engine-side after decode — the accel-distill color correction
+  /// (Todd 2026-08-24). nil/absent = off.
+  ///
+  /// #399 (merge onto main): this is DECLARED-only, like `steps`/`guidance`/
+  /// `vae`/`shift` — it is read off `ImagePreset`, never off `ResolvedPreset`,
+  /// so `PresetDefaults` can never manufacture a look nobody asked for.
+  public var phoneLook: Bool?
   /// DEPRECATED (Todd 2026-09-04 — kroma has no special engine semantics;
   /// it is a regular LoRA, applied via `loras[]` like any other). Kept for
   /// one release as a compatibility shim: no longer an independent
@@ -343,6 +351,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     upscale: PresetUpscale? = nil,
     vae: String? = nil,
     checkpointFamily: String? = nil,
+    phoneLook: Bool? = nil,
     kroma: KromaPolicy? = nil,
     kromaDeprecated: Bool? = nil,
     migrationNotes: [String]? = nil,
@@ -384,6 +393,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.upscale = upscale
     self.vae = vae
     self.checkpointFamily = checkpointFamily
+    self.phoneLook = phoneLook
     self.kroma = kroma
     self.kromaDeprecated = kromaDeprecated
     self.migrationNotes = migrationNotes
@@ -416,6 +426,11 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     case kromaDeprecated, migrationNotes
     // WP-E8: the tenth. Same regression class — listed here AND decoded below.
     case bypass
+    // #399: the StylePack post-process dial. SAME regression class as
+    // `videoTuning` and `vae` above — the lane this came from added the
+    // stored property WITHOUT this case, so a preset-declared phone look
+    // never decoded from presets.json and never encoded back out.
+    case phoneLook
   }
 
   public init(from decoder: Decoder) throws {
@@ -464,6 +479,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     eta = try c.decodeIfPresent(Double.self, forKey: .eta)
     bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
     stage2 = try c.decodeIfPresent(PresetStage.self, forKey: .stage2)
+    phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
   }
 }
 
