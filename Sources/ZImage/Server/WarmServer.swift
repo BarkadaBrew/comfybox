@@ -5496,17 +5496,32 @@ public final class WarmServer {
     // warm pipeline happened to hold, on whatever base was active.
     var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
-    // Todd 2026-08-24: a preset may DECLARE the phone-look post-process.
+    // Todd 2026-08-24 ("I prefer style pack"): collapse the request's and the
+    // preset's look declarations onto ONE resolved `style` name.
+    //
     // Resolved here rather than at the route so `/v1/generate`,
-    // `/v1/generate/async` and persisted-queue replay all agree about it —
-    // and the request always wins, exactly as it does for steps/guidance/vae.
-    // Read from the DECLARED preset (`store.lookup`), never from
-    // `ResolvedPreset`: `PresetDefaults` must never manufacture a look.
-    if expanded.phoneLook == nil,
-       let pid = payload.preset?.trimmingCharacters(in: .whitespacesAndNewlines), !pid.isEmpty,
-       store.lookup(pid).0?.phoneLook == true {
-      expanded.phoneLook = true
-    }
+    // `/v1/generate/async` and persisted-queue replay all agree about it, and
+    // precedence is main's rule for every other preset-contributed field
+    // (#286/#285/#154): explicit request > preset > nothing. Read from the
+    // DECLARED preset (`store.lookup`), never from `ResolvedPreset`, so
+    // `PresetDefaults` can never manufacture a look nobody asked for.
+    //
+    // #399: unlike `loras`/`model`/`steps`/`shift`, a style is NOT part of the
+    // recipe — it is a pure CPU pass over the decoded RGB buffer, family- and
+    // stack-independent. So it is taken from the declared preset even when the
+    // preset itself could not be expanded (`preset_unresolved`): "expand the
+    // recipe as a whole or not at all" exists to stop adapters landing on the
+    // wrong base, and there is no such hazard here. That also preserves the
+    // lane's shipped behaviour, where the look was read straight off the
+    // preset with no expansion involved.
+    let declaredPreset: ImagePreset? = payload.preset
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .flatMap { $0.isEmpty ? nil : store.lookup($0).0 }
+    expanded.style = StylePack.resolveName(
+      requestStyle: payload.style, requestPhoneLook: payload.phoneLook,
+      presetStyle: declaredPreset?.style, presetPhoneLook: declaredPreset?.phoneLook)
+    // An unknown name is a 400 HERE — never a silent no-op at save time.
+    try StylePack.validate(expanded.style)
     // #22 (PR #363 review, C2): resolution/memory preflight — refuses an
     // oversized request BEFORE it is enqueued (let alone before any model
     // load), with the estimate/available/cap named in the refusal. Runs
@@ -5635,6 +5650,10 @@ public final class WarmServer {
       // replayed body that dropped it would silently render on the model's
       // own schedule instead.
       ("shift", payload.shift as Any?),
+      // #399: same reason for a preset-owned StylePack name — a replayed body
+      // that dropped it would render the job WITHOUT the look it was accepted
+      // with. (`style` needs no snake_case rewrite; it is one word.)
+      ("style", payload.style as Any?),
     ] where object[key] == nil {
       if let value {
         object[key] = value
@@ -6004,7 +6023,7 @@ public final class WarmServer {
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
            .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType,
-           .implicitStepsOutOfRange, .c2OutOfRange:
+           .unknownStyle, .implicitStepsOutOfRange, .c2OutOfRange:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -11169,12 +11188,15 @@ private actor WarmServerCoordinator {
         // rather than looking like a family that has no record (round 2, C4).
         appliedSlot: AppliedRecordSlot(record: record)
       )
-      if payload.phoneLook == true {
-        // Accel-distill color correction (Todd 2026-08-24): pure CPU pass,
-        // preset-gated — see PhoneLook.swift for the recipe and its numbers.
+      if let styleName = payload.style, let style = StylePack.named(styleName) {
+        // Engine-applied style pack (Todd 2026-08-24): pure CPU pass — see
+        // StylePack.swift for the recipes and their numbers. The decode
+        // validated the name; phoneLook:true arrives here as style "phone".
+        // An ABSENT style leaves `image` untouched, so a render that asked
+        // for no look is byte-identical to the pre-#399 engine.
         let hDim = image.dim(0), wDim = image.dim(1)
         var px: [Float] = image.asArray(Float.self)
-        PhoneLook.apply(pixels: &px, width: wDim, height: hDim)
+        style.apply(pixels: &px, width: wDim, height: hDim)
         image = MLXArray(px, [hDim, wDim, 3])
       }
       try QwenImageIO.saveImage(array: image.transposed(2, 0, 1), to: outputURL, metadata: metadata)
@@ -12322,8 +12344,13 @@ struct GeneratePayload: Sendable {
 
   // Phase 4: Img2img (set via HTTP API)
   var imagePath: String?   // var: may be filled in from initImageData (bytes upload)
-  /// Phone-look post-process; nil = resolve from the named preset at the route.
+  /// Phone-look post-process; an alias for ``style`` == "phone". Kept as its
+  /// own wire field because the daemon already sends it (intent.md: version
+  /// or shim, never silently change).
   var phoneLook: Bool?
+  /// The RESOLVED StylePack name (request > preset), filled in by
+  /// `WarmServer.decodedGeneratePayload`. nil = no post-process at all.
+  var style: String?
   /// Img2img init image sent as base64 (init_image_base64) — for remote clients
   /// that can't put a file on the server's filesystem. Decoded to a temp file.
   let initImageData: Data?
@@ -12591,6 +12618,7 @@ extension GeneratePayload: Decodable {
     case preset
     case denoise, maskGrow, maskFeather
     case phoneLook
+    case style
     // NOTE: the /v1/generate decoder uses .convertFromSnakeCase, which rewrites
     // incoming keys to camelCase BEFORE matching CodingKey stringValues. So the
     // wire keys inpaint_image_base64 / mask_base64 arrive as these camelCase
@@ -12639,6 +12667,7 @@ extension GeneratePayload: Decodable {
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
     phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
+    style = try c.decodeIfPresent(String.self, forKey: .style)
     levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
     levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
     let schedulerRaw = try c.decodeIfPresent(String.self, forKey: .scheduler)
@@ -14072,6 +14101,10 @@ public enum WarmServerError: Error, LocalizedError {
   /// name is a 400 naming the valid set — it must never silently degrade to
   /// gaussian (absent stays gaussian; that is the default, not a coercion).
   case unknownNoiseType(name: String, valid: [String])
+  /// #399: a `style` (or preset-declared style) that is not in the
+  /// ``StylePack`` registry. A 400 naming the known set at the generate
+  /// decode — a look the caller asked for must never be silently skipped.
+  case unknownStyle(name: String, valid: [String])
   /// #286: the request named a `preset` AND an explicit `model` that resolve
   /// to different bases. Applying the preset's adapters to the requested base,
   /// or the requested base under the preset's name, are both wrong — so it is
@@ -14154,6 +14187,9 @@ public enum WarmServerError: Error, LocalizedError {
     case .unknownNoiseType(let name, let valid):
       return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
         + "omit it for gaussian"
+    case .unknownStyle(let name, let valid):
+      return "Unknown style '\(name)'. Known styles: \(valid.joined(separator: ", ")); "
+        + "omit `style` for no post-process"
     case .renderInterrupted:
       return "Render interrupted by /v1/queue/interrupt"
     case .queueRecoveryInProgress:

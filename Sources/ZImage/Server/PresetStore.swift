@@ -284,6 +284,10 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   /// `vae`/`shift` — it is read off `ImagePreset`, never off `ResolvedPreset`,
   /// so `PresetDefaults` can never manufacture a look nobody asked for.
   public var phoneLook: Bool?
+  /// Named StylePack post-process (e.g. "phone", "trix-bw", "hp5-soft").
+  /// Wins over ``phoneLook`` when both are set; `phoneLook: true` is an
+  /// alias for "phone". DECLARED-only, same rule as ``phoneLook``.
+  public var style: String?
   /// DEPRECATED (Todd 2026-09-04 — kroma has no special engine semantics;
   /// it is a regular LoRA, applied via `loras[]` like any other). Kept for
   /// one release as a compatibility shim: no longer an independent
@@ -352,6 +356,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     vae: String? = nil,
     checkpointFamily: String? = nil,
     phoneLook: Bool? = nil,
+    style: String? = nil,
     kroma: KromaPolicy? = nil,
     kromaDeprecated: Bool? = nil,
     migrationNotes: [String]? = nil,
@@ -394,6 +399,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.vae = vae
     self.checkpointFamily = checkpointFamily
     self.phoneLook = phoneLook
+    self.style = style
     self.kroma = kroma
     self.kromaDeprecated = kromaDeprecated
     self.migrationNotes = migrationNotes
@@ -430,7 +436,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     // `videoTuning` and `vae` above — the lane this came from added the
     // stored property WITHOUT this case, so a preset-declared phone look
     // never decoded from presets.json and never encoded back out.
-    case phoneLook
+    case phoneLook, style
   }
 
   public init(from decoder: Decoder) throws {
@@ -480,6 +486,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
     stage2 = try c.decodeIfPresent(PresetStage.self, forKey: .stage2)
     phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
+    style = try c.decodeIfPresent(String.self, forKey: .style)
   }
 }
 
