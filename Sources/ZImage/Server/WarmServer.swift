@@ -12638,6 +12638,7 @@ extension GeneratePayload: Decodable {
     guidance = try c.decodeIfPresent(Float.self, forKey: .guidance)
     seed = try c.decodeIfPresent(UInt64.self, forKey: .seed)
     outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
     levelsMin = try c.decodeIfPresent(Float.self, forKey: .levelsMin)
     levelsMax = try c.decodeIfPresent(Float.self, forKey: .levelsMax)
     let schedulerRaw = try c.decodeIfPresent(String.self, forKey: .scheduler)
