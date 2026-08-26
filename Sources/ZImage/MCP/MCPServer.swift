@@ -242,18 +242,25 @@ public final class MCPServer {
   private func startParentDeathWatchdog() {
     let parentPid = getppid()
     guard parentPid > 1 else {
-      // Already orphaned (parent is launchd) — nothing to watch.
-      return
+      // Already orphaned (parent is launchd) — no client to serve. Exit
+      // immediately rather than blocking on stdin with no one reading.
+      log("Parent is launchd (pid 1) at startup — no parent, exiting")
+      _exit(0)
     }
 
     DispatchQueue.global(qos: .utility).async {
       while true {
         sleep(5)
         if getppid() != parentPid {
-          FileHandle.standardError.write(Data(
-            "[mcp-server:comfybox] Parent process exited — shutting down\n".utf8
-          ))
-          exit(0)
+          // Use _exit (not exit) to avoid atexit/stdio flush racing with
+          // the main thread's readLine(). Use raw write(2) for the same
+          // reason — FileHandle.standardError is not thread-safe with the
+          // main thread's log() calls.
+          let msg = "[mcp-server:comfybox] Parent process exited — shutting down\n"
+          msg.withCString { ptr in
+            _ = write(STDERR_FILENO, ptr, msg.utf8.count)
+          }
+          _exit(0)
         }
       }
     }
