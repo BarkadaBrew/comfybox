@@ -27,6 +27,7 @@ public final class MCPServer {
 
   /// Run the MCP server — blocks on stdin until it closes.
   public func run() {
+    startParentDeathWatchdog()
     log("Starting — bridging to WarmServer at \(client.host):\(client.port)")
 
     let decoder = JSONDecoder()
@@ -227,4 +228,35 @@ public final class MCPServer {
     let logLine = "[mcp-server:comfybox] \(message)\n"
     FileHandle.standardError.write(Data(logLine.utf8))
   }
+  // MARK: - Parent Death Watchdog
+
+  /// Start a background watchdog that exits the process when the parent dies.
+  ///
+  /// When the parent process (SSH session, Claude.app, etc.) exits, macOS
+  /// reparents this process to launchd (pid 1). Without this watchdog, the
+  /// MCP server keeps running indefinitely as an orphan — blocked on stdin
+  /// with no client to serve — leaking memory and file descriptors.
+  ///
+  /// Polls `getppid()` every 5 seconds. When the parent PID changes (parent
+  /// died → reparented to pid 1), the process exits cleanly.
+  private func startParentDeathWatchdog() {
+    let parentPid = getppid()
+    guard parentPid > 1 else {
+      // Already orphaned (parent is launchd) — nothing to watch.
+      return
+    }
+
+    DispatchQueue.global(qos: .utility).async {
+      while true {
+        sleep(5)
+        if getppid() != parentPid {
+          FileHandle.standardError.write(Data(
+            "[mcp-server:comfybox] Parent process exited — shutting down\n".utf8
+          ))
+          exit(0)
+        }
+      }
+    }
+  }
+
 }
