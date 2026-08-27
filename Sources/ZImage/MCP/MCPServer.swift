@@ -124,17 +124,9 @@ public final class MCPServer {
   // MARK: - Tools List
 
   private func handleToolsList(id: MCPRequestId) -> MCPResponse {
-    // Build tools list using JSONSerialization to ensure clean JSON output.
-    // MCPToolDefinition stores inputSchema as [String: Any] which serializes
-    // cleanly via JSONSerialization without AnyCodable debug descriptions.
-    var toolDicts: [[String: Any]] = []
-    for tool in MCPToolRegistry.tools {
-      toolDicts.append([
-        "name": tool.name,
-        "description": tool.description,
-        "inputSchema": tool.inputSchema,
-      ] as [String: Any])
-    }
+    // MCPToolDefinition owns its complete wire representation, including the
+    // safety hints clients use to distinguish read-only and destructive tools.
+    let toolDicts = MCPToolRegistry.tools.map { $0.responseJSON() }
     let result: [String: Any] = ["tools": toolDicts]
     return MCPResponse(id: id, result: AnyCodable(result))
   }
