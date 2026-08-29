@@ -21,6 +21,17 @@ struct MotionView: View {
     @State private var isReferenceDropTargeted: Bool = false
     @State private var resolution: VideoResolution = .landscape
     @State private var frames: Int = 97
+    /// Clip length in SECONDS — the unit you actually think in. LTX renders
+    /// 1+8k frames on a 24fps playback basis, so `frames` (still the value the
+    /// request carries) is DERIVED from this and snapped to the nearest legal
+    /// count. Previously the only control was a fixed frame-count Picker that
+    /// merely *displayed* seconds — you could not ask for "6 seconds".
+    @State private var seconds: Double = 4.0
+    /// Temporal conditioning rate (`tuning.cond_fps`) — the real motion dial:
+    /// the same action spread over a LOWER cond_fps reads as MORE movement.
+    /// Independent of the 24fps playback basis. 0 = auto (engine picks, which
+    /// is the previous behaviour). The engine floors a set value at 6.
+    @State private var condFps: Double = 0
     @State private var steps: Double = 8
     @State private var didApplyDefaults = false
     @State private var seedText: String = ""
@@ -61,6 +72,21 @@ struct MotionView: View {
     /// renders SINGLE-PASS — the old 97f ceiling was never real (2026-08-02:
     /// one 193f pass beat 97+97 chaining, 2x faster, no seam).
     private static let frameOptions = [25, 49, 97, 121, 145, 193, 241, 289]
+
+    /// Playback basis LTX renders against. Clip length = frames / 24. This is
+    /// NOT the motion dial — that is `cond_fps` (see `condFps`).
+    private static let playbackFps: Double = 24
+
+    /// Legal frame counts are 1+8k, from 25f (~1s) to the 289f (~12s)
+    /// single-pass cap. Snap a seconds request to the nearest one.
+    private static func framesForSeconds(_ s: Double) -> Int {
+        let k = ((s * playbackFps) - 1) / 8
+        return min(36, max(3, Int(k.rounded()))) * 8 + 1
+    }
+
+    private static func secondsForFrames(_ f: Int) -> Double {
+        (Double(f) / playbackFps * 10).rounded() / 10
+    }
 
     var body: some View {
         HSplitView {
@@ -105,15 +131,24 @@ struct MotionView: View {
                     }.labelsHidden()
                 }
 
-                HStack(spacing: 12) {
-                    labeled("Frames") {
-                        Picker("", selection: $frames) {
-                            ForEach(Self.frameOptions, id: \.self) { f in
-                                Text("\(f)  (\(String(format: "%.1fs", Double(f) / 24.0)))").tag(f)
-                            }
-                        }.labelsHidden()
+                // Duration is the primary length control; frames are derived
+                // and snapped to LTX's legal 1+8k counts. The read-out below
+                // shows exactly what will be rendered so the snap is visible.
+                NumericSliderField(label: "Duration (s)", value: $seconds, range: 1...12, step: 0.5, fractionDigits: 1)
+                    .help("Clip length. Snapped to the nearest legal LTX frame count (1+8k, 25–289f). 289f (~12s) is the single-pass cap.")
+                    .onChange(of: seconds) { _, s in
+                        frames = Self.framesForSeconds(s)
                     }
-                }
+
+                Text("→ \(frames) frames · \(String(format: "%.1fs", Self.secondsForFrames(frames))) at \(Int(Self.playbackFps))fps"
+                     + (frames >= 289 ? "  (single-pass cap)" : ""))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // The ACTUAL motion dial. Distinct from playback fps: spreading
+                // the same action over a lower cond_fps yields more movement.
+                NumericSliderField(label: "Motion FPS (0 = auto)", value: $condFps, range: 0...30, step: 1)
+                    .help("Temporal conditioning rate (cond_fps). Lower = more motion for the same action; higher = stiller. 0 leaves it to the engine (previous behaviour). Values below 6 are floored by the engine.")
 
                 NumericSliderField(label: "Steps", value: $steps, range: 1...30, step: 1)
                 if referencePath != nil {
@@ -268,6 +303,9 @@ struct MotionView: View {
         didApplyDefaults = true
         let s = DesktopSettings.load()
         if let f = s.videoFrames, Self.frameOptions.contains(f) { frames = f }
+        // Keep the seconds control showing the same clip the saved frame count
+        // represents, so the derived read-out is never out of step on launch.
+        seconds = Self.secondsForFrames(frames)
         if let st = s.videoSteps { steps = Double(st) }
         if let w = s.videoWidth, let h = s.videoHeight,
            let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
@@ -294,6 +332,12 @@ struct MotionView: View {
         resultURL = nil
         statusMessage = "Loading LTX-2 and generating \(frames) frames…"
 
+        // Merge the UI's motion dial into any tuning already staged (e.g. from
+        // a preset). An explicit control wins; 0 means "auto" so the key is
+        // omitted entirely and the engine keeps choosing, exactly as before.
+        var tuning = tuningOverrides
+        if condFps > 0 { tuning["cond_fps"] = condFps }
+
         let request = EngineService.VideoRequest(
             prompt: prompt,
             initImagePath: referencePath,
@@ -302,7 +346,7 @@ struct MotionView: View {
             extendToSeconds: Float(extendSeconds),
             loras: selectedLoras,
             outputPath: outputPath,
-            tuning: tuningOverrides.isEmpty ? nil : tuningOverrides,
+            tuning: tuning.isEmpty ? nil : tuning,
             optimizationAttemptId: optimizationAttemptId
         )
 
