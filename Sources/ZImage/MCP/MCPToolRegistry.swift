@@ -54,6 +54,8 @@ public enum MCPToolRegistry {
     nearlineScan,
     nearlineStage,
     nearlineEvict,
+    civitaiSearch,
+    civitaiPrompts,
   ]
 
   // MARK: - Tool Definitions
@@ -827,6 +829,93 @@ public enum MCPToolRegistry {
       "properties": ["name": ["type": "string", "description": "The item filename to evict."] as [String: Any]] as [String: Any],
       "required": ["name"],
     ] as [String: Any]
+  )
+
+  // MARK: - CivitAI conduit + prompt repository (#234)
+
+  static let civitaiSearch = MCPToolDefinition(
+    name: "civitai_search",
+    description: "Search CivitAI (or civitai.red) for models/LoRAs — name/tag search, filterable by type and base model, sorted by rating/downloads/likes/newest. Requires a CivitAI API key to be resolved server-side (--civitai-key, CIVITAI_API_KEY, or the Desktop app's saved key); returns an error if none resolves.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "query": [
+          "type": "string",
+          "description": "Text search query (model/LoRA name or keyword). Empty lists by sort order instead of searching.",
+        ] as [String: Any],
+        "types": [
+          "type": "array",
+          "items": ["type": "string"] as [String: Any],
+          "description": "Filter by CivitAI model types, e.g. [\"LORA\", \"Checkpoint\"].",
+        ] as [String: Any],
+        "base_model": [
+          "type": "string",
+          "description": "Filter by base model family, e.g. \"Z-Image\", \"SDXL 1.0\". Only applied when query is empty (CivitAI's API quirk: query + baseModels together returns zero results).",
+        ] as [String: Any],
+        "sort": [
+          "type": "string",
+          "description": "Sort order: 'Highest Rated' | 'Most Downloaded' | 'Most Liked' | 'Newest' (case/spacing-insensitive, e.g. 'most_liked' also works). Default 'Most Downloaded'.",
+        ] as [String: Any],
+        "period": [
+          "type": "string",
+          "description": "Time window for the sort: 'AllTime' | 'Year' | 'Month' | 'Week' | 'Day'. Default 'AllTime'.",
+        ] as [String: Any],
+        "nsfw": [
+          "type": "boolean",
+          "description": "Include NSFW results. Default false.",
+        ] as [String: Any],
+        "limit": [
+          "type": "integer",
+          "description": "Max results to return (default 24).",
+        ] as [String: Any],
+        "site": [
+          "type": "string",
+          "description": "CivitAI host to query: \"civitai.com\" (default) or \"civitai.red\" (same API, NSFW-default mirror).",
+        ] as [String: Any],
+      ] as [String: Any],
+    ]
+  )
+
+  static let civitaiPrompts = MCPToolDefinition(
+    name: "civitai_prompts",
+    description: "Query the local prompt repository (trained words, description excerpts, and inferred act-taxonomy category harvested from CivitAI model versions — see PromptRepositoryStore). Set harvest=true to run a fresh CivitAI harvest with the given search params FIRST, upserting results, then query. Without harvest=true this only reads what's already been harvested; it never calls CivitAI.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "harvest": [
+          "type": "boolean",
+          "description": "If true, run a harvest against CivitAI (using query/types/base_model/sort/period/nsfw/limit/site below) before querying. Requires a resolved CivitAI API key; returns an error if none resolves. Default false.",
+        ] as [String: Any],
+        "query": ["type": "string", "description": "Harvest-only: text search query, same as civitai_search."] as [String: Any],
+        "types": [
+          "type": "array",
+          "items": ["type": "string"] as [String: Any],
+          "description": "Harvest-only: filter by CivitAI model types.",
+        ] as [String: Any],
+        "base_model": ["type": "string", "description": "Harvest-only: filter by base model family."] as [String: Any],
+        "sort": ["type": "string", "description": "Harvest-only: sort order, same values as civitai_search."] as [String: Any],
+        "period": ["type": "string", "description": "Harvest-only: time window, same values as civitai_search."] as [String: Any],
+        "nsfw": ["type": "boolean", "description": "Harvest-only: include NSFW results."] as [String: Any],
+        "limit": ["type": "integer", "description": "Harvest-only: total models to scan across pages (default 24)."] as [String: Any],
+        "site": ["type": "string", "description": "Harvest-only: \"civitai.com\" (default) or \"civitai.red\"."] as [String: Any],
+        "filter_base_model": [
+          "type": "string",
+          "description": "Query filter: only entries harvested from this base model.",
+        ] as [String: Any],
+        "filter_act": [
+          "type": "string",
+          "description": "Query filter: only entries with this inferred act-taxonomy category (pose/action/clothing/body/character/style/concept).",
+        ] as [String: Any],
+        "filter_tag": [
+          "type": "string",
+          "description": "Query filter: only entries whose source model carries this tag.",
+        ] as [String: Any],
+        "keyword": [
+          "type": "string",
+          "description": "Query filter: keyword match across model name, trained words, description excerpt and tags.",
+        ] as [String: Any],
+      ] as [String: Any],
+    ]
   )
 
   // MARK: - Lookup

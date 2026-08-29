@@ -75,9 +75,14 @@ public struct CivitAIModelVersion: Decodable, Sendable, Identifiable {
     public var trainedWords: [String] = []
     public var files: [CivitAIFile] = []
     public var images: [CivitAIImage] = []
+    /// Free-text version description (CivitAI serves this as HTML). Used by
+    /// the prompt-repository harvester (issue #234) as a fallback prompt
+    /// source alongside `trainedWords`, since `meta.prompt` on images is
+    /// gated even with a valid API key.
+    public var description: String?
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, baseModel, trainedWords, files, images
+        case id, name, baseModel, trainedWords, files, images, description
     }
 
     public init(from decoder: Decoder) throws {
@@ -88,6 +93,7 @@ public struct CivitAIModelVersion: Decodable, Sendable, Identifiable {
         trainedWords = (try? c.decodeIfPresent([String].self, forKey: .trainedWords)) ?? []
         files = (try? c.decodeIfPresent([CivitAIFile].self, forKey: .files)) ?? []
         images = (try? c.decodeIfPresent([CivitAIImage].self, forKey: .images)) ?? []
+        description = try? c.decodeIfPresent(String.self, forKey: .description)
     }
 
     /// The file to download: the primary model file, else the first.
