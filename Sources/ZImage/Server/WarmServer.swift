@@ -62,6 +62,11 @@ public struct WarmServerConfiguration: Sendable {
   /// render when the request carries none — lets preset-only callers (daemon
   /// MCP) get e.g. a distill LoRA required by a non-distilled checkpoint.
   public var ltx2DefaultLoRA: String?
+  /// Explicit CivitAI API key — the top tier of `CivitAISecrets.resolve`'s
+  /// resolution order (--civitai-key flag > CIVITAI_API_KEY env > Keychain).
+  /// nil here just means "no explicit override"; the /v1/civitai/* routes
+  /// still fall through to env/Keychain before giving up (#234).
+  public var civitaiApiKey: String?
 
   public init(
     port: UInt16 = ComfyBoxServerConfig.canonicalPort,
@@ -76,7 +81,8 @@ public struct WarmServerConfiguration: Sendable {
     seedvr2WeightsPath: String? = nil,
     ltx2WeightsPath: String? = nil,
     ltx2GemmaPath: String? = nil,
-    ltx2DefaultLoRA: String? = nil
+    ltx2DefaultLoRA: String? = nil,
+    civitaiApiKey: String? = nil
   ) {
     self.port = port
     self.modelSpec = modelSpec
@@ -91,6 +97,7 @@ public struct WarmServerConfiguration: Sendable {
     self.ltx2WeightsPath = ltx2WeightsPath
     self.ltx2GemmaPath = ltx2GemmaPath
     self.ltx2DefaultLoRA = ltx2DefaultLoRA
+    self.civitaiApiKey = civitaiApiKey
   }
 }
 
@@ -1692,6 +1699,17 @@ public final class WarmServer {
 
     case ("GET", "/v1/audit-log"):
       return auditLogResponse(query: request.queryParameters)
+
+    // MARK: - CivitAI conduit + prompt repository (#234)
+
+    case ("GET", "/v1/civitai/search"):
+      return await civitaiSearchRoute(request: request)
+
+    case ("POST", "/v1/civitai/harvest"):
+      return await civitaiHarvestRoute(request: request)
+
+    case ("GET", "/v1/civitai/repo"):
+      return civitaiRepoRoute(request: request)
 
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
@@ -4338,6 +4356,86 @@ public final class WarmServer {
 
   private func response(for error: Error) -> HTTPResponse {
     Self.errorResponse(for: error)
+  }
+
+  // MARK: - CivitAI conduit (#234)
+
+  /// Message returned on every /v1/civitai/* route when no API key resolves
+  /// via CivitAISecrets — never crash/trap on a missing key.
+  private static let civitaiKeyMissingMessage =
+    "CivitAI API key not configured. Set --civitai-key on `serve`, export CIVITAI_API_KEY, " +
+    "or save a key in the Desktop app's CivitAI settings (shared Keychain entry, " +
+    "service com.barkadabrew.comfybox.desktop / account civitai)."
+
+  private func civitaiSearchRoute(request: HTTPRequest) async -> RoutedResponse {
+    guard let apiKey = CivitAISecrets.resolve(explicit: configuration.civitaiApiKey) else {
+      return .error(.error(status: 503, message: Self.civitaiKeyMissingMessage))
+    }
+    let q = CivitAISearchQuery(queryParameters: request.queryParameters)
+    // P1-1: the site allowlist (CivitAIHostAllowlist, shared with the
+    // harvest route) must pass BEFORE a client carrying the Bearer key is
+    // ever constructed — an unlisted host would receive the CivitAI key.
+    guard let baseURL = q.validatedBaseURL else {
+      return .error(.error(status: 400, message: CivitAIHostAllowlist.rejectionMessage(forSite: q.site)))
+    }
+    let client = CivitAIClient(baseURL: baseURL, apiKey: apiKey)
+    do {
+      let page = try await client.searchModels(
+        query: q.query, types: q.types, baseModel: q.baseModel,
+        sort: q.sort, period: q.period, nsfw: q.nsfw, cursor: q.cursor, limit: q.limit)
+      let payload = CivitAISearchResponse(
+        models: page.items.map(CivitAISearchResultModel.init),
+        count: page.items.count,
+        nextCursor: page.nextCursor)
+      return .json(status: 200, payload: payload)
+    } catch {
+      return .error(.error(status: 502, message: "CivitAI search failed: \(error.localizedDescription)"))
+    }
+  }
+
+  private func civitaiHarvestRoute(request: HTTPRequest) async -> RoutedResponse {
+    guard let apiKey = CivitAISecrets.resolve(explicit: configuration.civitaiApiKey) else {
+      return .error(.error(status: 503, message: Self.civitaiKeyMissingMessage))
+    }
+    let body: CivitAIHarvestRequestBody
+    do {
+      body = try request.body.isEmpty
+        ? CivitAIHarvestRequestBody()
+        : decode(CivitAIHarvestRequestBody.self, from: request.body)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid harvest request: \(error.localizedDescription)"))
+    }
+    // P1-1: same shared allowlist as the search route, same reason.
+    guard let baseURL = body.validatedBaseURL else {
+      return .error(.error(status: 400, message: CivitAIHostAllowlist.rejectionMessage(forSite: body.site)))
+    }
+    let client = CivitAIClient(baseURL: baseURL, apiKey: apiKey)
+    do {
+      // Behavior notes (P1-2): the runner clamps body.limit to
+      // CivitAIHarvestRunner.maxModelsPerHarvest (200) models per call,
+      // upserts page-by-page, and stops after ~60s with truncated: true in
+      // the summary — partial results are already persisted.
+      let summary = try await CivitAIHarvestRunner.run(client: client, request: body)
+      return .json(status: 200, payload: summary)
+    } catch {
+      return .error(.error(status: 502, message: "CivitAI harvest failed: \(error.localizedDescription)"))
+    }
+  }
+
+  private func civitaiRepoRoute(request: HTTPRequest) -> RoutedResponse {
+    let q = CivitAIRepoQuery(queryParameters: request.queryParameters)
+    // Result cap (P2): default 100 entries, raisable via ?limit= up to 500 —
+    // never the whole store per request.
+    let entries = PromptRepositoryStore.query(
+      baseModel: q.baseModel, act: q.act, tag: q.tag, keyword: q.keyword, limit: q.limit)
+    let payload = CivitAIRepoResponse(entries: entries, count: entries.count)
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    encoder.dateEncodingStrategy = .iso8601
+    guard let data = try? encoder.encode(payload) else {
+      return .error(.error(status: 500, message: "Failed to serialize prompt repository"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
   }
 
   /// Error → HTTP mapping, static so the 400/500 split is unit-testable
@@ -8219,6 +8317,7 @@ struct HTTPResponse {
     case 413: return "Payload Too Large"
     case 429: return "Too Many Requests"
     case 500: return "Internal Server Error"
+    case 502: return "Bad Gateway"
     case 503: return "Service Unavailable"
     default: return "OK"
     }

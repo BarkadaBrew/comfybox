@@ -107,6 +107,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeNearlineAction("/v1/nearline/stage", arguments)
       case "nearline_evict":
         return try await executeNearlineAction("/v1/nearline/evict", arguments)
+      case "civitai_search":
+        return try await executeCivitAISearch(arguments)
+      case "civitai_prompts":
+        return try await executeCivitAIPrompts(arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -805,6 +809,81 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let jsonData = try JSONSerialization.data(withJSONObject: ["name": name])
     let (status, data) = try await client.post(path, body: jsonData)
     return mapHTTPResponse(status: status, data: data)
+  }
+
+  // MARK: - CivitAI conduit (#234)
+
+  /// civitai_search -> GET /v1/civitai/search. Free-text params are
+  /// percent-encoded — WarmServer's query-string split happens before any
+  /// decoding, and a raw space can't survive an HTTP request line anyway.
+  private func executeCivitAISearch(_ params: MCPParams?) async throws -> MCPToolResult {
+    let path = "/v1/civitai/search" + Self.civitaiSearchQueryString(params)
+    let (status, data) = try await client.get(path)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  /// civitai_prompts -> optional POST /v1/civitai/harvest, then always
+  /// GET /v1/civitai/repo with the filter_* params.
+  private func executeCivitAIPrompts(_ params: MCPParams?) async throws -> MCPToolResult {
+    if params?.bool("harvest") == true {
+      var body: [String: Any] = [:]
+      if let q = params?.string("query") { body["query"] = q }
+      if let types = params?.array("types") {
+        body["types"] = types.compactMap(\.stringValue)
+      }
+      if let baseModel = params?.string("base_model") { body["base_model"] = baseModel }
+      if let sort = params?.string("sort") { body["sort"] = sort }
+      if let period = params?.string("period") { body["period"] = period }
+      if let nsfw = params?.bool("nsfw") { body["nsfw"] = nsfw }
+      if let limit = params?.integer("limit") { body["limit"] = limit }
+      if let site = params?.string("site") { body["site"] = site }
+      let jsonData = try JSONSerialization.data(withJSONObject: body)
+      let (harvestStatus, harvestData) = try await client.post("/v1/civitai/harvest", body: jsonData)
+      guard harvestStatus == 200 else {
+        return mapHTTPResponse(status: harvestStatus, data: harvestData)
+      }
+    }
+
+    var queryItems: [String] = []
+    if let v = params?.string("filter_base_model") {
+      queryItems.append("base_model=\(Self.percentEncode(v))")
+    }
+    if let v = params?.string("filter_act") {
+      queryItems.append("act=\(Self.percentEncode(v))")
+    }
+    if let v = params?.string("filter_tag") {
+      queryItems.append("tag=\(Self.percentEncode(v))")
+    }
+    if let v = params?.string("keyword") {
+      queryItems.append("keyword=\(Self.percentEncode(v))")
+    }
+    if let v = params?.integer("max_entries") {
+      // Route-side this is `limit`: default 100, clamped to max 500.
+      queryItems.append("limit=\(v)")
+    }
+    let path = "/v1/civitai/repo" + (queryItems.isEmpty ? "" : "?" + queryItems.joined(separator: "&"))
+    let (status, data) = try await client.get(path)
+    return mapHTTPResponse(status: status, data: data)
+  }
+
+  private static func civitaiSearchQueryString(_ params: MCPParams?) -> String {
+    var items: [String] = []
+    if let q = params?.string("query") { items.append("query=\(percentEncode(q))") }
+    if let types = params?.array("types") {
+      let joined = types.compactMap(\.stringValue).joined(separator: ",")
+      if !joined.isEmpty { items.append("types=\(percentEncode(joined))") }
+    }
+    if let baseModel = params?.string("base_model") { items.append("base_model=\(percentEncode(baseModel))") }
+    if let sort = params?.string("sort") { items.append("sort=\(percentEncode(sort))") }
+    if let period = params?.string("period") { items.append("period=\(percentEncode(period))") }
+    if let nsfw = params?.bool("nsfw") { items.append("nsfw=\(nsfw)") }
+    if let limit = params?.integer("limit") { items.append("limit=\(limit)") }
+    if let site = params?.string("site") { items.append("site=\(percentEncode(site))") }
+    return items.isEmpty ? "" : "?" + items.joined(separator: "&")
+  }
+
+  private static func percentEncode(_ s: String) -> String {
+    s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
   }
 
   /// Map WarmServer HTTP response to MCP tool result.

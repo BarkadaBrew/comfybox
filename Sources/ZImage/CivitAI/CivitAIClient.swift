@@ -2,8 +2,13 @@
 //
 // Search + browse models and LoRAs, scrape prompts from posted images, and
 // download model files into the local LoRA library. Works keyless for
-// public content; an API key (Settings) unlocks auth-gated listings and
-// downloads. The base URL is configurable so civitai.red (same API) works.
+// public content; an API key unlocks auth-gated listings and downloads.
+// The base URL is configurable so civitai.red (same API) works.
+//
+// Lives in the ZImage library target (moved from ComfyBoxDesktop in #234) so
+// the headless warm server / MCP layer can act as a CivitAI conduit, not just
+// the desktop app. Desktop keeps sourcing the key from its Keychain-backed
+// `AppSecrets.civitai`; the server resolves it via `CivitAISecrets`.
 
 import Foundation
 

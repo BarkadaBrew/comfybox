@@ -1667,6 +1667,7 @@ struct ZImageCLI {
     var ltx2Weights: String? = nil
     var ltx2Gemma: String? = nil
     var ltx2DefaultLoRA: String? = nil
+    var civitaiKey: String? = nil
 
     var iterator = args.makeIterator()
     while let arg = iterator.next() {
@@ -1708,6 +1709,8 @@ struct ZImageCLI {
         ltx2Gemma = nextValue(for: arg, iterator: &iterator)
       case "--ltx2-lora":
         ltx2DefaultLoRA = nextValue(for: arg, iterator: &iterator)
+      case "--civitai-key":
+        civitaiKey = nextValue(for: arg, iterator: &iterator)
       case "--help", "-h":
         printServeUsage()
         return
@@ -1742,7 +1745,8 @@ struct ZImageCLI {
       seedvr2WeightsPath: seedvr2Weights,
       ltx2WeightsPath: ltx2Weights,
       ltx2GemmaPath: ltx2Gemma,
-      ltx2DefaultLoRA: ltx2DefaultLoRA
+      ltx2DefaultLoRA: ltx2DefaultLoRA,
+      civitaiApiKey: civitaiKey
     )
 
     let server = WarmServer(configuration: configuration, host: host, logger: logger)
@@ -1766,6 +1770,7 @@ struct ZImageCLI {
       --ltx2-weights               LTX-2 weights dir OR "org/repo[:rev]" HF spec (enables LOCAL video on /v1/video/generate; lazy-loaded + auto-downloaded on first request, ~38GB)
       --ltx2-gemma                 Gemma-3 tokenizer/text-encoder snapshot dir OR HF spec for LTX-2 (required alongside --ltx2-weights; ~24GB, downloaded on first request, not swappable for a different encoder)
       --ltx2-lora                  Default LoRA for LOCAL video renders when the request carries none, as "path" or "path@scale" (e.g. a distill LoRA for a non-distilled checkpoint). Request LoRAs override it.
+      --civitai-key                 CivitAI API key for the /v1/civitai/* conduit routes + MCP civitai_search/civitai_prompts tools. Explicit flag wins over CIVITAI_API_KEY and the Desktop app's Keychain entry (see CivitAISecrets). Optional — those routes 503 with a clear message if no key resolves any of the three ways.
       --lora, -l                Initial LoRA path or HuggingFace ID (repeatable, prefer path=scale; path:scale is legacy)
       --lora-scale              LoRA scale factor override for the next unmatched --lora (repeatable)
       --lora-paths              Comma-separated LoRA paths or HuggingFace IDs
@@ -1777,6 +1782,9 @@ struct ZImageCLI {
       POST /v1/lora/swap        Hot-swap active LoRAs
       GET  /health              Report model/server status
       POST /v1/shutdown         Gracefully stop the server
+      GET  /v1/civitai/search   Search CivitAI models/LoRAs (needs a resolved API key)
+      POST /v1/civitai/harvest  Harvest trained words + descriptions into the local prompt repository
+      GET  /v1/civitai/repo     Query the local prompt repository (baseModel/act/tag/keyword filters)
 
     Example:
       ComfyBox serve -m /path/to/model --text-encoder-path /path/to/encoder --port 7870 \\

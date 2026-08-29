@@ -31,7 +31,7 @@ queue_resume() { curl -sf -X POST --max-time 10 "http://127.0.0.1:$PORT/v1/queue
 
 smoke() {
   say "smoke a) LTX2 face-anchor fix present in build: git log"
-  git -C "$ROOT" log --oneline -50 | grep -q c39136a || fail "c39136a (face-anchor mask pad) missing from this build's history"
+  git -C "$ROOT" merge-base --is-ancestor c39136a HEAD || fail "c39136a (face-anchor mask pad) missing from this build's history"
   say "smoke c) /health reachable"
   local h; h=$(health) || fail "/health not reachable"
   print -- "$h" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("  model_family", d.get("model_family"), "variant", d.get("model_variant"), "build_sha", d.get("build_sha"))'
@@ -65,7 +65,7 @@ say "3) stamping build sha into Sources/ZImage/Support/BuildInfo.swift (reset on
 ( cd "$ROOT" && swift build -c release --product ComfyBox 2>&1 | tail -3 )
 src="$ROOT/.build/release/ComfyBox"; [[ -x "$src" ]] || fail "no binary at $src"
 
-say "4) face-anchor fix check"; git -C "$ROOT" log --oneline -50 | grep -q c39136a || fail "c39136a missing"
+say "4) face-anchor fix check"; git -C "$ROOT" merge-base --is-ancestor c39136a HEAD || fail "c39136a missing"
 
 say "5) installing $BIN_DIR/ComfyBox-$sha"
 mkdir -p "$BIN_DIR"
@@ -86,6 +86,12 @@ fi
 
 say "6) restarting $LABEL"
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+# Confirm the label is fully unregistered before bootstrap — otherwise
+# bootstrap races a half-registered label and fails "5: Input/output error",
+# leaving the engine DOWN (observed 2026-08-29). See reference: bootout first,
+# confirm gone, then bootstrap.
+for i in {1..15}; do launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 || break; sleep 1; done
+launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 && fail "label still registered after bootout — engine left stopped; run: launchctl bootout gui/$UID/$LABEL; launchctl bootstrap gui/$UID $PLIST"
 launchctl bootstrap "gui/$UID" "$PLIST"
 for i in {1..60}; do health >/dev/null 2>&1 && break; sleep 2; done
 health >/dev/null || fail "engine did not come back within 120s — rollback: ln -sfn $prev $BIN_DIR/current && launchctl kickstart -k gui/$UID/$LABEL"
