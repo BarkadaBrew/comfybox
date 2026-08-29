@@ -44,6 +44,53 @@ struct MotionView: View {
     @State private var tuningOverrides: [String: Any] = [:]
     @State private var optimizationAttemptId: String?
 
+    // ── Advanced per-render tuning overrides ────────────────────────────────
+    // These knobs are otherwise only settable as LTX2_* environment variables
+    // in the launchd plist, which needs an edit + engine restart and applies
+    // GLOBALLY. Surfacing them here makes them per-render, which is what
+    // experimenting actually requires.
+    //
+    // Sentinel: -1 (or "" for strings) means INHERIT — the key is omitted from
+    // the request entirely, so the engine's env/plist default applies exactly
+    // as it does today. 0 is a meaningful value for several of these
+    // (guidance_rescale, color_anchor, nag_scale all default to 0), which is
+    // why the sentinel is -1 and not 0. Ranges mirror the engine's own
+    // registry in LTX2ConfigResolver.swift.
+    @State private var showAdvanced = false
+    @State private var advSampler: String = ""            // "" = inherit
+    @State private var advGuidanceRescale: Double = -1    // engine: 0...1
+    @State private var advImgCompression: Double = -1     // engine: 0...100 (i2v)
+    @State private var advColorAnchor: Double = -1        // engine: 0...1
+    @State private var advNagScale: Double = -1           // engine: 0...50
+    @State private var advNagAlpha: Double = -1           // engine: 0...1
+    @State private var advNagTau: Double = -1             // engine: 1...10
+    @State private var advTwoStage: Int = -1              // -1 inherit, 0 off, 1 on
+
+    /// Samplers the LTX-2 pipeline accepts. Empty tag = inherit.
+    private static let samplerOptions = ["", "euler", "euler_cfg_pp", "euler_ancestral_cfg_pp", "res_2s"]
+
+    /// Advanced overrides that are actually set (i.e. not inherit), as
+    /// snake_case wire keys matching the engine's LTX2VideoTuning. Single
+    /// source of truth for BOTH the request body and the on-screen summary, so
+    /// the badge can never claim something the render does not send.
+    private var advancedOverrides: [String: Any] {
+        var t: [String: Any] = [:]
+        if !advSampler.isEmpty { t["sampler"] = advSampler }
+        if advGuidanceRescale >= 0 { t["guidance_rescale"] = advGuidanceRescale }
+        if advImgCompression >= 0 { t["img_compression"] = Int(advImgCompression) }
+        if advColorAnchor >= 0 { t["color_anchor"] = advColorAnchor }
+        if advNagScale >= 0 { t["nag_scale"] = advNagScale }
+        if advNagAlpha >= 0 { t["nag_alpha"] = advNagAlpha }
+        if advNagTau >= 1 { t["nag_tau"] = advNagTau }   // engine range starts at 1
+        if advTwoStage >= 0 { t["two_stage"] = advTwoStage == 1 }
+        return t
+    }
+
+    /// Comma-joined key list for the "Overriding: …" badge.
+    private var activeOverrideSummary: String {
+        advancedOverrides.keys.sorted().joined(separator: ", ")
+    }
+
     @State private var isGenerating = false
     @State private var statusMessage: String?
     @State private var errorMessage: String?
@@ -159,6 +206,47 @@ struct MotionView: View {
 
                 labeled("Seed (empty = random)") {
                     TextField("Random", text: $seedText).textFieldStyle(.roundedBorder)
+                }
+
+                // Per-render overrides for knobs that otherwise live only in
+                // the launchd plist as LTX2_* env vars (global + restart).
+                // Everything here defaults to inherit, so leaving the group
+                // untouched sends exactly what it sends today.
+                DisclosureGroup("Advanced — per-render overrides", isExpanded: $showAdvanced) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        labeled("Sampler (blank = inherit)") {
+                            Picker("", selection: $advSampler) {
+                                ForEach(Self.samplerOptions, id: \.self) { s in
+                                    Text(s.isEmpty ? "inherit" : s).tag(s)
+                                }
+                            }.labelsHidden()
+                        }
+                        .help("LTX-2 sampler. Your engine default is LTX2_SAMPLER=euler_ancestral_cfg_pp (the PinkCherry-validated pairing).")
+
+                        NumericSliderField(label: "Guidance rescale (-1 = inherit)", value: $advGuidanceRescale, range: -1...1, step: 0.05, fractionDigits: 2)
+                        NumericSliderField(label: "Img compression, i2v (-1 = inherit)", value: $advImgCompression, range: -1...100, step: 1)
+                            .help("LTX2_I2V_COMPRESSION. Lower preserves more of the seed frame's detail.")
+                        NumericSliderField(label: "Color anchor (-1 = inherit)", value: $advColorAnchor, range: -1...1, step: 0.05, fractionDigits: 2)
+                        NumericSliderField(label: "NAG scale (-1 = inherit)", value: $advNagScale, range: -1...50, step: 0.5, fractionDigits: 1)
+                            .help("Normalized Attention Guidance — how PinkCherry gets prompt adherence at CFG 1.0.")
+                        NumericSliderField(label: "NAG alpha (-1 = inherit)", value: $advNagAlpha, range: -1...1, step: 0.05, fractionDigits: 2)
+                        NumericSliderField(label: "NAG tau (-1 = inherit)", value: $advNagTau, range: -1...10, step: 0.1, fractionDigits: 1)
+
+                        labeled("Two-stage refine") {
+                            Picker("", selection: $advTwoStage) {
+                                Text("inherit").tag(-1)
+                                Text("off").tag(0)
+                                Text("on").tag(1)
+                            }.pickerStyle(.segmented)
+                        }
+                        .help("Your engine default is LTX2_TWO_STAGE=0 (off) — refine renders SOFTER on this recipe.")
+
+                        if !activeOverrideSummary.isEmpty {
+                            Text("Overriding: \(activeOverrideSummary)")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(.top, 6)
                 }
 
                 labeled("LoRAs") {
@@ -337,6 +425,9 @@ struct MotionView: View {
         // omitted entirely and the engine keeps choosing, exactly as before.
         var tuning = tuningOverrides
         if condFps > 0 { tuning["cond_fps"] = condFps }
+        // Advanced group wins over staged tuning — it is the most explicit
+        // expression of intent for THIS render.
+        for (k, v) in advancedOverrides { tuning[k] = v }
 
         let request = EngineService.VideoRequest(
             prompt: prompt,
