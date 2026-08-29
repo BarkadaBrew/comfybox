@@ -43,6 +43,37 @@ enum CivitAISortPeriodParsing {
   }
 }
 
+// MARK: - Site allowlist (adversarial review P1-1)
+
+/// The ONE shared place the `site` parameter is turned into a base URL, for
+/// BOTH the search and harvest routes (and anything added later).
+///
+/// Why strict: `CivitAIClient` attaches the resolved Bearer API key to every
+/// request it makes. The previous code interpolated caller input straight
+/// into `URL(string: "https://\(site)")`, so `site=attacker.com` (or
+/// `site=evil.example/%2e%2e`) would ship the CivitAI key to an arbitrary
+/// host — SSRF plus credential exfiltration. Only the two known CivitAI
+/// hosts are ever allowed; anything else maps to `nil`, which WarmServer's
+/// route handlers turn into HTTP 400 before a client is even constructed.
+enum CivitAIHostAllowlist {
+  /// Exactly the two hosts the conduit may talk to. civitai.red is the same
+  /// API, NSFW-default mirror (see CivitAIBrowserView.CivitAISource).
+  static let allowedSites: [String] = ["civitai.com", "civitai.red"]
+
+  /// `nil` unless `site` (case-insensitively, whitespace-trimmed) is exactly
+  /// one of `allowedSites`.
+  static func baseURL(forSite site: String) -> URL? {
+    let normalized = site.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard allowedSites.contains(normalized) else { return nil }
+    return URL(string: "https://\(normalized)")
+  }
+
+  /// The HTTP 400 body both routes return for a disallowed site.
+  static func rejectionMessage(forSite site: String) -> String {
+    "Invalid site \"\(site)\": allowed values are \(allowedSites.joined(separator: ", "))"
+  }
+}
+
 // MARK: - GET /v1/civitai/search
 
 /// Parsed query parameters for `GET /v1/civitai/search`.
@@ -72,7 +103,10 @@ struct CivitAISearchQuery: Equatable {
     site = Self.nonEmpty(CivitAIQueryDecoding.decode(params["site"])) ?? "civitai.com"
   }
 
-  var baseURL: URL { URL(string: "https://\(site)") ?? URL(string: "https://civitai.com")! }
+  /// `nil` for any site outside `CivitAIHostAllowlist` — the route returns
+  /// HTTP 400 rather than falling back, so a typo'd/hostile site is never
+  /// silently redirected (P1-1).
+  var validatedBaseURL: URL? { CivitAIHostAllowlist.baseURL(forSite: site) }
 
   private static func nonEmpty(_ s: String?) -> String? {
     guard let s, !s.isEmpty else { return nil }
@@ -110,6 +144,9 @@ struct CivitAIHarvestRequestBody: Decodable, Equatable {
   var period: String?
   var nsfw: Bool = false
   /// Total number of MODELS to scan across pages (not a per-page size).
+  /// Server-side, `CivitAIHarvestRunner` clamps this to
+  /// `CivitAIHarvestRunner.maxModelsPerHarvest` (200) per harvest call —
+  /// asking for more silently harvests 200 (P1-2a).
   var limit: Int = 24
   var site: String = "civitai.com"
 
@@ -129,23 +166,35 @@ struct CivitAIHarvestRequestBody: Decodable, Equatable {
     site = (try? c.decodeIfPresent(String.self, forKey: .site)) ?? "civitai.com"
   }
 
-  var resolvedBaseURL: URL { URL(string: "https://\(site)") ?? URL(string: "https://civitai.com")! }
+  /// Same allowlist enforcement as `CivitAISearchQuery.validatedBaseURL` —
+  /// both routes go through `CivitAIHostAllowlist`, the single shared
+  /// enforcement point (P1-1).
+  var validatedBaseURL: URL? { CivitAIHostAllowlist.baseURL(forSite: site) }
 }
 
 // MARK: - GET /v1/civitai/repo
 
 /// Parsed query parameters for `GET /v1/civitai/repo`.
 struct CivitAIRepoQuery: Equatable {
+  /// Result cap when the caller doesn't pass `limit` (P2: the route used to
+  /// return the whole store per request).
+  static let defaultLimit = 100
+  /// Hard ceiling — `limit` above this clamps down to it.
+  static let maxLimit = 500
+
   var baseModel: String?
   var act: String?
   var tag: String?
   var keyword: String?
+  /// Max entries to return: default 100, clamped to 1...500.
+  var limit: Int
 
   init(queryParameters params: [String: String]) {
     baseModel = Self.nonEmpty(CivitAIQueryDecoding.decode(params["base_model"]))
     act = Self.nonEmpty(CivitAIQueryDecoding.decode(params["act"]))
     tag = Self.nonEmpty(CivitAIQueryDecoding.decode(params["tag"]))
     keyword = Self.nonEmpty(CivitAIQueryDecoding.decode(params["keyword"]))
+    limit = min(max(params["limit"].flatMap(Int.init) ?? Self.defaultLimit, 1), Self.maxLimit)
   }
 
   private static func nonEmpty(_ s: String?) -> String? {
@@ -209,7 +258,9 @@ enum CivitAIHarvestExtractor {
   }
 }
 
-// MARK: - Harvest runner (network — NOT unit tested; see CivitAIHarvestExtractionTests)
+// MARK: - Harvest runner (paging loop is unit-tested via the fetchPage/upsert
+// seams — CivitAIHarvestRunnerTests; only the thin `run(client:request:)`
+// overload touches the network)
 
 enum CivitAIHarvestRunner {
   struct Summary: Encodable {
@@ -217,6 +268,12 @@ enum CivitAIHarvestRunner {
     let versionsHarvested: Int
     let created: Int
     let updated: Int
+    /// True when the harvest stopped early — time budget exhausted or the
+    /// surrounding task was cancelled. The counts above reflect only what
+    /// was actually fetched AND persisted (upserts happen per page), so a
+    /// truncated summary is still accurate, just smaller than asked for
+    /// (P1-2c).
+    let truncated: Bool
   }
 
   /// Politeness delay between paged upstream requests during a harvest — the
@@ -225,52 +282,97 @@ enum CivitAIHarvestRunner {
   /// the issue).
   static let interPageDelayNanoseconds: UInt64 = 500_000_000
 
-  /// Search + paginate up to `request.limit` MODELS, extract prompt-repo
-  /// entries from every version of every model scanned, and upsert them all
-  /// into `PromptRepositoryStore`.
+  /// Server-side cap on MODELS scanned per harvest call (P1-2a). Documented
+  /// in the `civitai_prompts` MCP tool description and the harvest body's
+  /// `limit` field; requests above it are clamped, not rejected.
+  static let maxModelsPerHarvest = 200
+
+  /// Soft wall-clock budget per harvest call (P1-2c). Checked between pages;
+  /// on expiry the harvest returns what it has (already persisted) with
+  /// `truncated: true` instead of paging on forever.
+  static let timeBudgetSeconds: TimeInterval = 60
+
+  /// `request.limit` → the number of models this run will actually scan.
+  static func clampedLimit(_ requested: Int) -> Int {
+    min(max(requested, 1), maxModelsPerHarvest)
+  }
+
+  /// Production entry point: search + paginate up to
+  /// `clampedLimit(request.limit)` models via a real `CivitAIClient`,
+  /// upserting into `PromptRepositoryStore` one page at a time.
   static func run(client: CivitAIClient, request: CivitAIHarvestRequestBody) async throws -> Summary {
+    try await run(
+      request: request,
+      fetchPage: { cursor, pageLimit in
+        try await client.searchModels(
+          query: request.query,
+          types: request.types,
+          baseModel: request.baseModel,
+          sort: CivitAISortPeriodParsing.parseSort(request.sort),
+          period: CivitAISortPeriodParsing.parsePeriod(request.period),
+          nsfw: request.nsfw,
+          cursor: cursor,
+          limit: pageLimit)
+      })
+  }
+
+  /// The paging loop, with the network (`fetchPage`) and persistence
+  /// (`upsert`) injected so it is unit-testable without either. Entries are
+  /// upserted PER PAGE (P1-2b) — peak memory is one page's worth of entries,
+  /// never the whole multi-page harvest, and a failure/timeout partway
+  /// through keeps every page already persisted.
+  static func run(
+    request: CivitAIHarvestRequestBody,
+    timeBudget: TimeInterval = timeBudgetSeconds,
+    interPageDelay: UInt64 = interPageDelayNanoseconds,
+    fetchPage: (_ cursor: String?, _ pageLimit: Int) async throws -> CivitAIModelsPage,
+    upsert: ([PromptRepositoryEntry]) -> PromptRepositoryStore.UpsertResult = { PromptRepositoryStore.upsert($0) }
+  ) async throws -> Summary {
+    let start = Date()
     var modelsScanned = 0
-    var allEntries: [PromptRepositoryEntry] = []
+    var versionsHarvested = 0
+    var created = 0
+    var updated = 0
+    var truncated = false
     var cursor: String?
-    var remaining = max(request.limit, 1)
+    var remaining = clampedLimit(request.limit)
     var firstPage = true
 
     while remaining > 0 {
+      // Budget/cancellation check INSIDE the loop, before each page (P1-2c):
+      // whatever pages already ran are persisted, so stopping here loses
+      // nothing — the summary just reports truncated: true.
+      if Task.isCancelled || Date().timeIntervalSince(start) >= timeBudget {
+        truncated = true
+        break
+      }
       if !firstPage {
-        try? await Task.sleep(nanoseconds: interPageDelayNanoseconds)
+        try? await Task.sleep(nanoseconds: interPageDelay)
       }
       firstPage = false
 
       let pageLimit = min(remaining, 100)
-      let page = try await client.searchModels(
-        query: request.query,
-        types: request.types,
-        baseModel: request.baseModel,
-        sort: CivitAISortPeriodParsing.parseSort(request.sort),
-        period: CivitAISortPeriodParsing.parsePeriod(request.period),
-        nsfw: request.nsfw,
-        cursor: cursor,
-        limit: pageLimit)
+      let page = try await fetchPage(cursor, pageLimit)
 
       guard !page.items.isEmpty else { break }
+      var pageEntries: [PromptRepositoryEntry] = []
       for model in page.items {
         modelsScanned += 1
-        allEntries.append(contentsOf: entries(from: model))
+        pageEntries.append(contentsOf: CivitAIHarvestExtractor.entries(from: model))
       }
+      let result = upsert(pageEntries)
+      versionsHarvested += pageEntries.count
+      created += result.created
+      updated += result.updated
       remaining -= page.items.count
 
       guard let next = page.nextCursor, !next.isEmpty else { break }
       cursor = next
     }
 
-    let result = PromptRepositoryStore.upsert(allEntries)
     return Summary(
-      modelsScanned: modelsScanned, versionsHarvested: allEntries.count,
-      created: result.created, updated: result.updated)
-  }
-
-  private static func entries(from model: CivitAIModel) -> [PromptRepositoryEntry] {
-    CivitAIHarvestExtractor.entries(from: model)
+      modelsScanned: modelsScanned, versionsHarvested: versionsHarvested,
+      created: created, updated: updated, truncated: truncated)
   }
 }
 

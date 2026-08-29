@@ -4372,7 +4372,13 @@ public final class WarmServer {
       return .error(.error(status: 503, message: Self.civitaiKeyMissingMessage))
     }
     let q = CivitAISearchQuery(queryParameters: request.queryParameters)
-    let client = CivitAIClient(baseURL: q.baseURL, apiKey: apiKey)
+    // P1-1: the site allowlist (CivitAIHostAllowlist, shared with the
+    // harvest route) must pass BEFORE a client carrying the Bearer key is
+    // ever constructed — an unlisted host would receive the CivitAI key.
+    guard let baseURL = q.validatedBaseURL else {
+      return .error(.error(status: 400, message: CivitAIHostAllowlist.rejectionMessage(forSite: q.site)))
+    }
+    let client = CivitAIClient(baseURL: baseURL, apiKey: apiKey)
     do {
       let page = try await client.searchModels(
         query: q.query, types: q.types, baseModel: q.baseModel,
@@ -4399,8 +4405,16 @@ public final class WarmServer {
     } catch {
       return .error(.error(status: 400, message: "Invalid harvest request: \(error.localizedDescription)"))
     }
-    let client = CivitAIClient(baseURL: body.resolvedBaseURL, apiKey: apiKey)
+    // P1-1: same shared allowlist as the search route, same reason.
+    guard let baseURL = body.validatedBaseURL else {
+      return .error(.error(status: 400, message: CivitAIHostAllowlist.rejectionMessage(forSite: body.site)))
+    }
+    let client = CivitAIClient(baseURL: baseURL, apiKey: apiKey)
     do {
+      // Behavior notes (P1-2): the runner clamps body.limit to
+      // CivitAIHarvestRunner.maxModelsPerHarvest (200) models per call,
+      // upserts page-by-page, and stops after ~60s with truncated: true in
+      // the summary — partial results are already persisted.
       let summary = try await CivitAIHarvestRunner.run(client: client, request: body)
       return .json(status: 200, payload: summary)
     } catch {
@@ -4410,7 +4424,10 @@ public final class WarmServer {
 
   private func civitaiRepoRoute(request: HTTPRequest) -> RoutedResponse {
     let q = CivitAIRepoQuery(queryParameters: request.queryParameters)
-    let entries = PromptRepositoryStore.query(baseModel: q.baseModel, act: q.act, tag: q.tag, keyword: q.keyword)
+    // Result cap (P2): default 100 entries, raisable via ?limit= up to 500 —
+    // never the whole store per request.
+    let entries = PromptRepositoryStore.query(
+      baseModel: q.baseModel, act: q.act, tag: q.tag, keyword: q.keyword, limit: q.limit)
     let payload = CivitAIRepoResponse(entries: entries, count: entries.count)
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase

@@ -870,7 +870,7 @@ public enum MCPToolRegistry {
         ] as [String: Any],
         "site": [
           "type": "string",
-          "description": "CivitAI host to query: \"civitai.com\" (default) or \"civitai.red\" (same API, NSFW-default mirror).",
+          "description": "CivitAI host to query: \"civitai.com\" (default) or \"civitai.red\" (same API, NSFW-default mirror). Any other value is rejected with HTTP 400 — the server only ever sends its API key to these two hosts.",
         ] as [String: Any],
       ] as [String: Any],
     ]
@@ -878,7 +878,7 @@ public enum MCPToolRegistry {
 
   static let civitaiPrompts = MCPToolDefinition(
     name: "civitai_prompts",
-    description: "Query the local prompt repository (trained words, description excerpts, and inferred act-taxonomy category harvested from CivitAI model versions — see PromptRepositoryStore). Set harvest=true to run a fresh CivitAI harvest with the given search params FIRST, upserting results, then query. Without harvest=true this only reads what's already been harvested; it never calls CivitAI.",
+    description: "Query the local prompt repository (trained words, description excerpts, and inferred act-taxonomy category harvested from CivitAI model versions — see PromptRepositoryStore). Set harvest=true to run a fresh CivitAI harvest with the given search params FIRST, upserting results, then query. Without harvest=true this only reads what's already been harvested; it never calls CivitAI. Harvests are capped server-side at 200 models per call and a ~60s time budget (results are upserted page-by-page, so a truncated harvest keeps everything fetched so far; the summary reports truncated=true); the query step returns at most max_entries results (default 100, max 500).",
     inputSchema: [
       "type": "object",
       "properties": [
@@ -896,8 +896,8 @@ public enum MCPToolRegistry {
         "sort": ["type": "string", "description": "Harvest-only: sort order, same values as civitai_search."] as [String: Any],
         "period": ["type": "string", "description": "Harvest-only: time window, same values as civitai_search."] as [String: Any],
         "nsfw": ["type": "boolean", "description": "Harvest-only: include NSFW results."] as [String: Any],
-        "limit": ["type": "integer", "description": "Harvest-only: total models to scan across pages (default 24)."] as [String: Any],
-        "site": ["type": "string", "description": "Harvest-only: \"civitai.com\" (default) or \"civitai.red\"."] as [String: Any],
+        "limit": ["type": "integer", "description": "Harvest-only: total models to scan across pages (default 24; the server clamps this to 200 per harvest call)."] as [String: Any],
+        "site": ["type": "string", "description": "Harvest-only: \"civitai.com\" (default) or \"civitai.red\". Any other value is rejected with HTTP 400."] as [String: Any],
         "filter_base_model": [
           "type": "string",
           "description": "Query filter: only entries harvested from this base model.",
@@ -913,6 +913,10 @@ public enum MCPToolRegistry {
         "keyword": [
           "type": "string",
           "description": "Query filter: keyword match across model name, trained words, description excerpt and tags.",
+        ] as [String: Any],
+        "max_entries": [
+          "type": "integer",
+          "description": "Query step: max repository entries to return (default 100, max 500).",
         ] as [String: Any],
       ] as [String: Any],
     ]

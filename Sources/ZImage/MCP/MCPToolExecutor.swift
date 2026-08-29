@@ -857,6 +857,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let v = params?.string("keyword") {
       queryItems.append("keyword=\(Self.percentEncode(v))")
     }
+    if let v = params?.integer("max_entries") {
+      // Route-side this is `limit`: default 100, clamped to max 500.
+      queryItems.append("limit=\(v)")
+    }
     let path = "/v1/civitai/repo" + (queryItems.isEmpty ? "" : "?" + queryItems.joined(separator: "&"))
     let (status, data) = try await client.get(path)
     return mapHTTPResponse(status: status, data: data)

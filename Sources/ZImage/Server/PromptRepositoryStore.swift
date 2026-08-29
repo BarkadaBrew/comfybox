@@ -16,6 +16,7 @@
 // truncated/corrupt file).
 
 import Foundation
+import Logging
 
 /// One harvested prompt-repository entry, keyed by the CivitAI
 /// (modelId, versionId) pair it was harvested from.
@@ -79,17 +80,32 @@ struct PromptRepositoryState: Codable, Sendable {
   var entries: [PromptRepositoryEntry] = []
 }
 
-/// Reads/writes `~/.comfybox/prompt-repository.json`. Not actor-isolated:
-/// callers are WarmServer route handlers, which run one request at a time
-/// per connection; two harvests racing the same file is a known, accepted
-/// narrow window (last-write-wins on save) — identical to QueueStateStore's
-/// contract.
+/// Reads/writes `~/.comfybox/prompt-repository.json`.
+///
+/// Concurrency (adversarial review P2): every load→merge→save is serialized
+/// under one `NSLock` — the same idiom PresetStore / NearlineLibrary /
+/// VideoGeneratorHolder use for their shared mutable state. Two concurrent
+/// harvests used to be able to interleave load→merge→save and silently drop
+/// each other's whole batch; with the lock (and per-page upserts in
+/// CivitAIHarvestRunner) every batch lands. All critical sections are
+/// synchronous — no awaits are ever held across the lock.
 public enum PromptRepositoryStore {
   /// Result of an upsert batch.
   public struct UpsertResult: Sendable, Equatable {
     public var created: Int
     public var updated: Int
   }
+
+  /// Cap on stored entries (adversarial review P2: the file used to grow
+  /// forever). When an upsert would overflow, the oldest-`harvestedAt`
+  /// entries are evicted down to the cap — mirroring the job-pruner
+  /// convention in WarmServer (`pruneCompleted`) of bounding every
+  /// long-running server's stores. Tests inject a smaller cap via
+  /// `upsert(_:cap:)`.
+  public static let defaultMaxEntries = 5000
+
+  private static let lock = NSLock()
+  private static let logger = Logger(label: "comfybox.prompt-repository")
 
   /// `~/.comfybox`, or `COMFYBOX_STATE_DIR` when set — same resolution as
   /// `QueueStateStore.stateDirectory`. Kept as its own computed property
@@ -110,21 +126,41 @@ public enum PromptRepositoryStore {
   public static var path: URL { stateDirectory.appendingPathComponent("prompt-repository.json") }
 
   public static func loadAll() -> [PromptRepositoryEntry] {
-    load().entries
+    lock.lock()
+    defer { lock.unlock() }
+    return load().entries
   }
 
   /// Upsert a batch of freshly-harvested entries into the store, keyed by
   /// `id` (== the (sourceModelId, sourceVersionId) composite). Re-harvesting
   /// the same model version REPLACES its stored entry (fresher
   /// trainedWords/description/tags win) rather than duplicating it.
+  ///
+  /// The whole load→merge→save runs under `lock`, so concurrent upserts
+  /// (e.g. two harvests' per-page batches) serialize instead of clobbering
+  /// each other. If the merged store exceeds `cap` (default
+  /// `defaultMaxEntries`), the oldest-`harvestedAt` entries are evicted down
+  /// to the cap, with one log line per evicting upsert.
   @discardableResult
-  public static func upsert(_ incoming: [PromptRepositoryEntry]) -> UpsertResult {
+  public static func upsert(
+    _ incoming: [PromptRepositoryEntry], cap: Int = defaultMaxEntries
+  ) -> UpsertResult {
     guard !incoming.isEmpty else { return UpsertResult(created: 0, updated: 0) }
+    lock.lock()
+    defer { lock.unlock() }
+
     var state = load()
-    var byId = Dictionary(uniqueKeysWithValues: state.entries.map { ($0.id, $0) })
+    // Last-writer-wins on BOTH sides (adversarial review P2):
+    // `Dictionary(uniqueKeysWithValues:)` TRAPS on a duplicate key, so a
+    // persisted file that ever picked up two entries with the same id would
+    // crash the server on its next harvest. `load()` already self-heals the
+    // file's contents; dedupe the incoming batch the same way so a page that
+    // carries the same model version twice can't trap either.
+    var byId = Dictionary(state.entries.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+    let incomingDeduped = dedupedLastWins(incoming)
     var created = 0
     var updated = 0
-    for entry in incoming {
+    for entry in incomingDeduped {
       if byId.updateValue(entry, forKey: entry.id) != nil {
         updated += 1
       } else {
@@ -137,11 +173,20 @@ public enum PromptRepositoryStore {
     var seen = Set<String>()
     var merged: [PromptRepositoryEntry] = []
     for id in existingIds {
-      if let e = byId[id] { merged.append(e); seen.insert(id) }
+      if let e = byId[id], seen.insert(id).inserted { merged.append(e) }
     }
-    for entry in incoming where !seen.contains(entry.id) {
+    for entry in incomingDeduped where !seen.contains(entry.id) {
       merged.append(entry)
       seen.insert(entry.id)
+    }
+    // Cap the store: evict oldest-harvestedAt first down to `cap` (P2).
+    if merged.count > cap {
+      let evictCount = merged.count - cap
+      let evictIds = Set(
+        merged.sorted { $0.harvestedAt < $1.harvestedAt }.prefix(evictCount).map(\.id))
+      merged.removeAll { evictIds.contains($0.id) }
+      logger.info(
+        "Prompt repository over cap — evicted \(evictCount) oldest entries (cap \(cap))")
     }
     state.entries = merged
     save(state)
@@ -150,9 +195,12 @@ public enum PromptRepositoryStore {
 
   /// Filter the stored repository. Every filter is optional and
   /// case-insensitive; `keyword` matches against modelName, trainedWords,
-  /// descriptionExcerpt and tags.
+  /// descriptionExcerpt and tags. `limit`, when set, caps the number of
+  /// results returned (the /v1/civitai/repo route passes
+  /// `CivitAIRepoQuery.limit`: default 100, max 500 — P2).
   public static func query(
-    baseModel: String? = nil, act: String? = nil, tag: String? = nil, keyword: String? = nil
+    baseModel: String? = nil, act: String? = nil, tag: String? = nil, keyword: String? = nil,
+    limit: Int? = nil
   ) -> [PromptRepositoryEntry] {
     var results = loadAll()
     if let baseModel, !baseModel.isEmpty {
@@ -173,16 +221,44 @@ public enum PromptRepositoryStore {
           || entry.tags.contains { $0.lowercased().contains(needle) }
       }
     }
+    if let limit, limit >= 0, results.count > limit {
+      results = Array(results.prefix(limit))
+    }
     return results
+  }
+
+  // MARK: - Deduplication (adversarial review P2)
+
+  /// Order-preserving, last-writer-wins dedupe: each id keeps its FIRST
+  /// position but its LAST value. Built on
+  /// `Dictionary(_:uniquingKeysWith:)` — never the trapping
+  /// `Dictionary(uniqueKeysWithValues:)` — so duplicate ids (a hand-edited
+  /// or corrupt persisted file, or a page that repeats a model version)
+  /// self-heal instead of crashing the server.
+  static func dedupedLastWins(_ entries: [PromptRepositoryEntry]) -> [PromptRepositoryEntry] {
+    let byId = Dictionary(entries.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+    guard byId.count < entries.count else { return entries }
+    var seen = Set<String>()
+    var result: [PromptRepositoryEntry] = []
+    result.reserveCapacity(byId.count)
+    for entry in entries where seen.insert(entry.id).inserted {
+      result.append(byId[entry.id]!)
+    }
+    return result
   }
 
   // MARK: - Private
 
+  /// Callers must hold `lock` (or be inside a caller that does).
   private static func load() -> PromptRepositoryState {
     guard let data = try? Data(contentsOf: path) else { return PromptRepositoryState() }
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .iso8601
-    return (try? decoder.decode(PromptRepositoryState.self, from: data)) ?? PromptRepositoryState()
+    var state = (try? decoder.decode(PromptRepositoryState.self, from: data)) ?? PromptRepositoryState()
+    // Self-heal a file with duplicate ids on the way in (last entry wins) —
+    // the next save persists the deduped form.
+    state.entries = dedupedLastWins(state.entries)
+    return state
   }
 
   private static func save(_ state: PromptRepositoryState) {
