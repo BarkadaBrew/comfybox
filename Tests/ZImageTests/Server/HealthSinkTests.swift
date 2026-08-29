@@ -64,6 +64,56 @@ final class HealthSinkTests: XCTestCase {
     XCTAssertEqual(with["model_alias"] as? String, "krea2-raw")
   }
 
+  func testHealthAdvertisesReadyLocalLTX2WithRequiredAndOptionalAssets() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("comfybox-video-health-\(UUID().uuidString)", isDirectory: true)
+    let weights = root.appendingPathComponent("weights", isDirectory: true)
+    let gemma = root.appendingPathComponent("gemma", isDirectory: true)
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: gemma, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data().write(to: weights.appendingPathComponent("local-monolith.safetensors"))
+    try Data().write(to: gemma.appendingPathComponent("model.safetensors"))
+    try Data("{}".utf8).write(to: gemma.appendingPathComponent("config.json"))
+    try Data("{}".utf8).write(to: gemma.appendingPathComponent("tokenizer.json"))
+
+    let data = try XCTUnwrap(WarmServer.healthJSON(
+      sample(lastRecipe: nil, alias: nil), videoAvailable: false, activeVideoJobs: 0,
+      localVideoWeightsPath: weights.path, localVideoGemmaPath: gemma.path,
+      localVideoUpsamplerPath: nil))
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let video = try XCTUnwrap(json["video"] as? [String: Any])
+    XCTAssertEqual(video["available"] as? Bool, true)
+    XCTAssertEqual(video["backend"] as? String, "local_ltx2")
+    let readiness = try XCTUnwrap(video["readiness"] as? [String: Any])
+    XCTAssertEqual(readiness["ready"] as? Bool, true)
+    XCTAssertEqual((readiness["required_assets"] as? [[String: Any]])?.count, 2)
+    let optional = try XCTUnwrap((readiness["optional_assets"] as? [[String: Any]])?.first)
+    XCTAssertEqual(optional["name"] as? String, "ltx2_upsampler")
+    XCTAssertEqual(optional["required"] as? Bool, false)
+    XCTAssertEqual(optional["valid"] as? Bool, true, "an absent optional upsampler must not disable core video")
+  }
+
+  func testHealthRejectsIncompleteLocalLTX2Assets() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("comfybox-video-health-missing-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let data = try XCTUnwrap(WarmServer.healthJSON(
+      sample(lastRecipe: nil, alias: nil), videoAvailable: false, activeVideoJobs: 0,
+      localVideoWeightsPath: root.appendingPathComponent("missing-weights").path,
+      localVideoGemmaPath: root.appendingPathComponent("missing-gemma").path))
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let video = try XCTUnwrap(json["video"] as? [String: Any])
+    XCTAssertEqual(video["available"] as? Bool, false)
+    XCTAssertEqual(video["backend"] as? String, "none")
+    let readiness = try XCTUnwrap(video["readiness"] as? [String: Any])
+    XCTAssertEqual(readiness["ready"] as? Bool, false)
+    let required = try XCTUnwrap(readiness["required_assets"] as? [[String: Any]])
+    XCTAssertTrue(required.allSatisfy { ($0["valid"] as? Bool) == false })
+  }
+
   /// `build_sha` is a git short sha (7–40 hex, optional `-dirty`) or the
   /// committed placeholder — never empty, never a version string.
   func testBuildShaFormat() {

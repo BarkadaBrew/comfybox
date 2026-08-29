@@ -619,7 +619,10 @@ public final class WarmServer {
       let health = liveHealthResponse(memoryBytes: memoryBytes)
       if let data = Self.healthJSON(
         health, videoAvailable: replicateVideoProxy != nil,
-        activeVideoJobs: replicateVideoProxy?.activeJobCount ?? 0) {
+        activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
+        localVideoWeightsPath: configuration.ltx2WeightsPath,
+        localVideoGemmaPath: configuration.ltx2GemmaPath,
+        localVideoUpsamplerPath: ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"]) {
         return .json(.rawJSON(status: 200, data: data))
       }
       return .json(status: 200, payload: health)
@@ -4485,7 +4488,14 @@ public final class WarmServer {
   /// idle) so clients decode them unconditionally — `current_job_id`,
   /// `progress_percent`, and (WP-E10) `last_recipe`, `model_alias`,
   /// `model_variant`. Static so the contract is unit-testable (`HealthSinkTests`).
-  static func healthJSON(_ health: HealthResponse, videoAvailable: Bool, activeVideoJobs: Int) -> Data? {
+  static func healthJSON(
+    _ health: HealthResponse,
+    videoAvailable: Bool,
+    activeVideoJobs: Int,
+    localVideoWeightsPath: String? = nil,
+    localVideoGemmaPath: String? = nil,
+    localVideoUpsamplerPath: String? = nil
+  ) -> Data? {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
     guard var healthJSON = try? JSONSerialization.jsonObject(with: encoder.encode(health)) as? [String: Any] else {
@@ -4496,12 +4506,106 @@ public final class WarmServer {
     healthJSON["model_variant"] = (health.modelVariant as Any?) ?? NSNull()
     healthJSON["model_alias"] = (health.modelAlias as Any?) ?? NSNull()
     if healthJSON["last_recipe"] == nil { healthJSON["last_recipe"] = NSNull() }
+    let readiness = localVideoReadiness(
+      weightsPath: localVideoWeightsPath,
+      gemmaPath: localVideoGemmaPath,
+      upsamplerPath: localVideoUpsamplerPath)
+    let localVideoAvailable = readiness["ready"] as? Bool == true
     healthJSON["video"] = [
-      "available": videoAvailable,
-      "backend": videoAvailable ? "replicate" : "none",
+      "available": localVideoAvailable || videoAvailable,
+      "backend": localVideoAvailable ? "local_ltx2" : (videoAvailable ? "replicate" : "none"),
       "active_jobs": activeVideoJobs,
+      "readiness": readiness,
     ] as [String: Any]
     return try? JSONSerialization.data(withJSONObject: healthJSON, options: [.sortedKeys])
+  }
+
+  /// Disk-only LTX-2 preflight for `/health`. This deliberately performs no
+  /// model load and no network resolution: health must stay cheap and must be
+  /// truthful when the machine is offline. The learned upsampler is optional
+  /// because the built-in default is a single-stage core render.
+  private static func localVideoReadiness(
+    weightsPath: String?, gemmaPath: String?, upsamplerPath: String?
+  ) -> [String: Any] {
+    let weights = localVideoDirectoryAsset(
+      name: "ltx2_weights", path: weightsPath,
+      requiredFiles: ["safetensors"])
+    let gemma = localVideoDirectoryAsset(
+      name: "gemma_text_encoder", path: gemmaPath,
+      requiredFiles: ["config.json", "tokenizer.json", "safetensors"])
+    let upsampler = localVideoOptionalFileAsset(name: "ltx2_upsampler", path: upsamplerPath)
+    return [
+      "ready": weights.valid && gemma.valid,
+      "required_assets": [weights.json, gemma.json],
+      "optional_assets": [upsampler],
+    ]
+  }
+
+  private static func expandedLocalVideoPath(_ path: String?) -> String? {
+    guard let path, !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    return URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+  }
+
+  /// `requiredFiles` accepts literal filenames plus the sentinel
+  /// "safetensors", which means at least one top-level checkpoint shard or
+  /// monolith. That matches the loader's split and JoyAI-Echo fallback forms.
+  private static func localVideoDirectoryAsset(
+    name: String, path: String?, requiredFiles: [String]
+  ) -> (json: [String: Any], valid: Bool) {
+    guard let resolved = expandedLocalVideoPath(path) else {
+      return ([
+        "name": name, "required": true, "configured": false,
+        "path": NSNull(), "exists": false, "readable": false,
+        "valid": false, "error": "not_configured",
+      ], false)
+    }
+    var isDirectory: ObjCBool = false
+    let exists = FileManager.default.fileExists(atPath: resolved, isDirectory: &isDirectory)
+    let readable = exists && FileManager.default.isReadableFile(atPath: resolved)
+    var error: String? = nil
+    if !exists { error = "path_not_found" }
+    else if !isDirectory.boolValue { error = "not_a_directory" }
+    else if !readable { error = "path_not_readable" }
+    else {
+      let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
+      for requirement in requiredFiles {
+        let present = requirement == "safetensors"
+          ? entries.contains(where: { $0.hasSuffix(".safetensors") })
+          : entries.contains(requirement)
+        if !present {
+          error = requirement == "safetensors" ? "missing_safetensors" : "missing_\(requirement)"
+          break
+        }
+      }
+    }
+    let valid = error == nil
+    return ([
+      "name": name, "required": true, "configured": true,
+      "path": resolved, "exists": exists, "readable": readable,
+      "valid": valid, "error": error ?? NSNull(),
+    ], valid)
+  }
+
+  private static func localVideoOptionalFileAsset(name: String, path: String?) -> [String: Any] {
+    guard let resolved = expandedLocalVideoPath(path) else {
+      return [
+        "name": name, "required": false, "configured": false,
+        "path": NSNull(), "exists": false, "readable": false,
+        "valid": true, "error": NSNull(),
+      ]
+    }
+    let exists = FileManager.default.fileExists(atPath: resolved)
+    let readable = exists && FileManager.default.isReadableFile(atPath: resolved)
+    let error: Any
+    if !exists { error = "path_not_found" }
+    else if !readable { error = "path_not_readable" }
+    else { error = NSNull() }
+    return [
+      "name": name, "required": false, "configured": true,
+      "path": resolved, "exists": exists, "readable": readable,
+      "valid": exists && readable,
+      "error": error,
+    ]
   }
 
   /// Max render age (ms) before /health flags the render as likely deadlocked.
@@ -5151,6 +5255,14 @@ final class VideoJobTracker: @unchecked Sendable {
   var traceStore: RenderTraceStore?
   private let lock = NSLock()
   private var jobs: [String: LocalVideoJob] = [:]
+
+  /// Queued/processing/paused jobs currently owned by this local tracker.
+  /// Terminal jobs carry `completedAt` and remain queryable for the TTL, but
+  /// must not inflate `/health.video.active_jobs` during that hour.
+  var activeJobCount: Int {
+    lock.lock(); defer { lock.unlock() }
+    return jobs.values.filter { $0.completedAt == nil }.count
+  }
 
   /// Create a tracked job in `.queued` and return (jobId, its status). Testable
   /// without a coordinator.
