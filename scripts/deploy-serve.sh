@@ -86,6 +86,12 @@ fi
 
 say "6) restarting $LABEL"
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+# Confirm the label is fully unregistered before bootstrap — otherwise
+# bootstrap races a half-registered label and fails "5: Input/output error",
+# leaving the engine DOWN (observed 2026-08-29). See reference: bootout first,
+# confirm gone, then bootstrap.
+for i in {1..15}; do launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 || break; sleep 1; done
+launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 && fail "label still registered after bootout — engine left stopped; run: launchctl bootout gui/$UID/$LABEL; launchctl bootstrap gui/$UID $PLIST"
 launchctl bootstrap "gui/$UID" "$PLIST"
 for i in {1..60}; do health >/dev/null 2>&1 && break; sleep 2; done
 health >/dev/null || fail "engine did not come back within 120s — rollback: ln -sfn $prev $BIN_DIR/current && launchctl kickstart -k gui/$UID/$LABEL"
