@@ -31,7 +31,7 @@ queue_resume() { curl -sf -X POST --max-time 10 "http://127.0.0.1:$PORT/v1/queue
 
 smoke() {
   say "smoke a) LTX2 face-anchor fix present in build: git log"
-  git -C "$ROOT" log --oneline -50 | grep -q c39136a || fail "c39136a (face-anchor mask pad) missing from this build's history"
+  git -C "$ROOT" merge-base --is-ancestor c39136a HEAD || fail "c39136a (face-anchor mask pad) missing from this build's history"
   say "smoke c) /health reachable"
   local h; h=$(health) || fail "/health not reachable"
   print -- "$h" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("  model_family", d.get("model_family"), "variant", d.get("model_variant"), "build_sha", d.get("build_sha"))'
@@ -65,7 +65,7 @@ say "3) stamping build sha into Sources/ZImage/Support/BuildInfo.swift (reset on
 ( cd "$ROOT" && swift build -c release --product ComfyBox 2>&1 | tail -3 )
 src="$ROOT/.build/release/ComfyBox"; [[ -x "$src" ]] || fail "no binary at $src"
 
-say "4) face-anchor fix check"; git -C "$ROOT" log --oneline -50 | grep -q c39136a || fail "c39136a missing"
+say "4) face-anchor fix check"; git -C "$ROOT" merge-base --is-ancestor c39136a HEAD || fail "c39136a missing"
 
 say "5) installing $BIN_DIR/ComfyBox-$sha"
 mkdir -p "$BIN_DIR"
