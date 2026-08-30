@@ -5445,6 +5445,32 @@ private actor WarmServerCoordinator {
     executorQueue.asUnownedSerialExecutor()
   }
 
+  /// 0.B-1 (FDD-ui-api-parity.md §3.1.3, comfybox#300): 0.A above pins the
+  /// actor's OWN isolated code off the cooperative pool, but the render call
+  /// chain (`pipeline.generateFromRequest` and friends) is nonisolated async
+  /// — per SE-0338 it hops back onto the cooperative pool at every `await`
+  /// and blocks there on MLX's mutex for the whole render. This shared,
+  /// width-2 executor (see RenderTaskExecutor.swift) is what the three render
+  /// spawn sites (`startProcessingIfNeeded`, and the two `renderTask = Task {`
+  /// sites in `processLoop`) attach via `Task(executorPreference:)`, keeping
+  /// that nonisolated code off the pool too. One shared instance (not one per
+  /// spawn site) so the width-2 cap is enforced across all of them together.
+  /// `nil` on macOS <15 or with `COMFYBOX_RENDER_TASK_EXECUTOR=0` — every call
+  /// site falls back to a plain `Task {}` in that case, exactly today's
+  /// pre-0.B-1 behavior.
+  ///
+  /// Typed `Any?` rather than `RenderTaskExecutor?`: `RenderTaskExecutor`
+  /// conforms to `TaskExecutor`, which is `@available(macOS 15.0, *)`, so a
+  /// STORED property of that type would force the whole actor declaration to
+  /// carry the same availability — which would drop the package below its
+  /// macOS 14 floor (`Package.swift:6`). Type-erasing to `Any?` here keeps
+  /// the actor universally available; `spawnRenderTask` downcasts under its
+  /// own `#available` guard.
+  private let renderTaskExecutor: Any? = {
+    guard #available(macOS 15.0, *), RenderTaskExecutorFlag.isEnabled else { return nil }
+    return RenderTaskExecutor()
+  }()
+
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private var pipeline: ZImagePipeline
@@ -6937,6 +6963,22 @@ private actor WarmServerCoordinator {
     return true
   }
 
+  /// 0.B-1: spawns an unstructured task on `renderTaskExecutor` when it's
+  /// available and enabled, otherwise a plain `Task {}` — exactly today's
+  /// (pre-0.B-1) behavior. All three render spawn sites go through this one
+  /// helper so the fallback path can't drift between them.
+  ///
+  /// The 0.B-0 spike (ExecutorPreferenceSpikeTests.swift) confirmed executor
+  /// preference does NOT survive an inner unstructured `Task {}` boundary —
+  /// so this is called at each of the three sites individually; none of them
+  /// may rely on inheriting the preference from a caller.
+  private func spawnRenderTask(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+    if #available(macOS 15.0, *), let executor = renderTaskExecutor as? RenderTaskExecutor {
+      return Task(executorPreference: executor, operation: operation)
+    }
+    return Task(operation: operation)
+  }
+
   private func startProcessingIfNeeded() {
     // Every enqueue routes through here, so this is the one spot that reflects a
     // just-changed pending count into the lock-based health snapshot (#217).
@@ -6944,7 +6986,10 @@ private actor WarmServerCoordinator {
     persistQueueState()
     guard !isProcessing else { return }
     isProcessing = true
-    Task {
+    // 0.B-1 spawn site 1/3 — the outer processLoop task. `.localVideo` runs
+    // inline inside processLoop (confirmed in the 0.B-0 spike; it does not
+    // spawn its own child Task), so this one attachment also covers it.
+    _ = spawnRenderTask { [self] in
       await processLoop()
     }
   }
@@ -7027,14 +7072,18 @@ private actor WarmServerCoordinator {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
         // without cancelling the queue's processing loop.
-        let renderTask = Task {
+        // 0.B-1 spawn site 2/3 — re-attached explicitly (the 0.B-0 spike
+        // confirmed preference does not survive this inner Task{} boundary
+        // by inheritance alone).
+        let renderTask = spawnRenderTask {
           await self.runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
         }
         activeRenderTask = renderTask
         await renderTask.value
         activeRenderTask = nil
       case .controlGenerate(let request, let continuation):
-        let renderTask = Task {
+        // 0.B-1 spawn site 3/3 — same re-attachment as .generate above.
+        let renderTask = spawnRenderTask {
           await self.runControlGenerate(request, continuation: continuation)
         }
         activeRenderTask = renderTask
