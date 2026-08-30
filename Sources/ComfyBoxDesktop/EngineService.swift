@@ -657,7 +657,10 @@ public final class EngineService {
             throw EngineServiceError.notConnected
         }
         let (status, responseData) = try await client.post(paused ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
-        guard status == 200 else {
+        // F-1 (adversarial review): accept the whole success range — a 2xx here
+        // means the engine applied the gate; guarding ==200 turned a successful
+        // resume into a thrown error.
+        guard (200...299).contains(status) else {
             let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
             throw EngineServiceError.serverError(status, errorMessage)
         }
@@ -1526,7 +1529,9 @@ public final class EngineService {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
         let enc = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         let (status, data) = try await client.delete("/v1/queue/\(enc)")
-        guard status == 200 else {
+        // F-3 companion: the sync engine path ACKs a recorded cancel with 202
+        // (it cannot guarantee deletion); any 2xx is success.
+        guard (200...299).contains(status) else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Cancel failed")
         }
     }
@@ -1545,7 +1550,7 @@ public final class EngineService {
     public func setQueuePaused(_ paused: Bool) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
         let (status, data) = try await client.post("/v1/queue/\(paused ? "pause" : "resume")", body: Data("{}".utf8))
-        guard status == 200 else {
+        guard (200...299).contains(status) else {  // F-1: 2xx is success
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Pause failed")
         }
     }

@@ -762,29 +762,8 @@ public final class WarmServer {
       }
 
     case ("GET", "/v1/models"):
-      let models = ComfyBoxModelRegistry.allModels.map { model -> [String: Any] in
-        [
-          "id": model.id,
-          "family": model.family.rawValue,
-          "variant": model.variant.rawValue,
-          "quantization": model.quantization.rawValue,
-          "display_name": model.displayName,
-          "description": model.description,
-          "parameters_b": model.parametersBillions,
-          "default_steps": model.defaultSteps,
-          "default_guidance": model.defaultGuidance,
-          "supports_guidance": model.supportsGuidance,
-          "supports_lora": model.supportsLoRA,
-          "supports_controlnet": model.supportsControlNet,
-          "supports_img2img": model.supportsImg2Img,
-          "default_resolution": "\(model.defaultWidth)x\(model.defaultHeight)",
-          "estimated_vram_gb": model.estimatedVRAM_GB,
-          "huggingface_id": model.huggingFaceId,
-        ] as [String: Any]
-      }
-      if let data = try? JSONSerialization.data(
-        withJSONObject: ["models": models, "count": models.count]
-      ) {
+      // 0.B-2: shared with the sync control-plane path so both emit identical bytes.
+      if let data = Self.modelsPayloadData() {
         return .json(.rawJSON(status: 200, data: data))
       }
       return .error(.error(status: 500, message: "Failed to serialize models"))
@@ -804,10 +783,8 @@ public final class WarmServer {
     // convention used by the render/status routes.
 
     case ("GET", "/v1/config"):
-      let config = ComfyBoxServerConfig.loadOrMigrate()
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-      if let data = try? encoder.encode(config) {
+      // 0.B-2: shared with the sync control-plane path so both emit identical bytes.
+      if let data = Self.configPayloadData() {
         return .json(.rawJSON(status: 200, data: data))
       }
       return .error(.error(status: 500, message: "Failed to serialize config"))
@@ -2807,7 +2784,19 @@ public final class WarmServer {
   /// also read `isRendering` off a stale field, so the tab showed an empty,
   /// not-rendering queue while a job was actually active.
   private func queueListResponse() async -> RoutedResponse {
+    guard let data = buildQueuePayloadData() else {
+      return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
+  }
+
+  /// GET /v1/queue payload, shared by the async arm and the sync control plane.
+  /// Composes the actor-authored snapshot with the lock store's UNDRAINED deltas
+  /// (§3.1.4a point 5), so a just-issued cancel/move is reflected IMMEDIATELY —
+  /// before the actor next drains — rather than after the in-flight render.
+  private func buildQueuePayloadData() -> Data? {
     let (snap, progress) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
     let iso = ISO8601DateFormatter()
     var payload: [String: Any] = [
       "is_rendering": snap.isRendering,
@@ -2815,7 +2804,7 @@ public final class WarmServer {
       "max_pending": snap.maxPending,
       "render_count": snap.renderCount,
       "failed_count": snap.failedRenderCount,
-      "pending": snap.pending.map { job in
+      "pending": pending.map { job in
         [
           "id": job.id,
           "kind": job.kind,
@@ -2830,16 +2819,188 @@ public final class WarmServer {
     if let source = snap.activeSource { payload["active_source"] = source }
     if let started = snap.activeRenderStartedAt { payload["active_started_at"] = iso.string(from: started) }
     if let pct = progress { payload["progress_percent"] = pct }
-    // #1479: LTX-2 phase telemetry — additive, lock-based (no actor hop), so
-    // this stays as responsive during a render as the rest of this route.
+    // #1479: LTX-2 phase telemetry — additive, lock-based (no actor hop).
     let tv = ltx2Telemetry.view()
     if let phase = tv.currentPhase { payload["phase"] = phase }
     if let m = tv.maxUninterruptibleSec { payload["max_uninterruptible_sec"] = m }
     payload["phase_timings"] = tv.phases.mapValues { ["mean_sec": $0.meanSec, "samples": $0.samples] }
-    guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-      return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
+    return try? JSONSerialization.data(withJSONObject: payload)
+  }
+
+  // MARK: - 0.B-2 sync control plane (FDD §3.1.4)
+
+  /// Serve the SYNC-SERVABLE control set on the caller's OWN connection queue,
+  /// synchronously — zero cooperative threads, no actor hop — so these routes
+  /// answer even when the pool is exhausted by a blocking render. Returns nil for
+  /// anything not classified (→ the async `respond` path). Consulted only when
+  /// `ControlPlaneSyncFlag.isEnabled`; with the flag off this is never called and
+  /// every route falls through to today's async dispatch byte-for-byte.
+  fileprivate func serveControlPlaneSync(_ request: HTTPRequest) -> HTTPResponse? {
+    guard ControlPlaneClassifier.isSyncServable(method: request.method, path: request.path) else {
+      return nil
     }
-    return .json(.rawJSON(status: 200, data: data))
+    switch (request.method, request.path) {
+    case ("GET", "/v1/queue"):     return syncQueueResponse()
+    case ("GET", "/v1/models"):    return syncModelsResponse()
+    case ("GET", "/v1/stats"):     return syncStatsResponse()
+    case ("GET", "/v1/config"):    return syncConfigResponse()
+    case ("POST", "/v1/queue/pause"):     return syncPauseResponse(paused: true)
+    case ("POST", "/v1/queue/resume"):    return syncPauseResponse(paused: false)
+    case ("POST", "/v1/queue/clear"):     return syncClearResponse()
+    case ("POST", "/v1/queue/interrupt"): return syncInterruptResponse()
+    case ("POST", _) where request.path.hasPrefix("/v1/queue/") && request.path.hasSuffix("/move"):
+      return syncMoveResponse(request: request)
+    case ("DELETE", _) where request.path.hasPrefix("/v1/queue/"):
+      return syncCancelResponse(request: request)
+    default:
+      return nil
+    }
+  }
+
+  static func modelsPayloadData() -> Data? {
+    let models = ComfyBoxModelRegistry.allModels.map { model -> [String: Any] in
+      [
+        "id": model.id,
+        "family": model.family.rawValue,
+        "variant": model.variant.rawValue,
+        "quantization": model.quantization.rawValue,
+        "display_name": model.displayName,
+        "description": model.description,
+        "parameters_b": model.parametersBillions,
+        "default_steps": model.defaultSteps,
+        "default_guidance": model.defaultGuidance,
+        "supports_guidance": model.supportsGuidance,
+        "supports_lora": model.supportsLoRA,
+        "supports_controlnet": model.supportsControlNet,
+        "supports_img2img": model.supportsImg2Img,
+        "default_resolution": "\(model.defaultWidth)x\(model.defaultHeight)",
+        "estimated_vram_gb": model.estimatedVRAM_GB,
+        "huggingface_id": model.huggingFaceId,
+      ] as [String: Any]
+    }
+    return try? JSONSerialization.data(withJSONObject: ["models": models, "count": models.count])
+  }
+
+  static func configPayloadData() -> Data? {
+    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    return try? encoder.encode(config)
+  }
+
+  private func syncQueueResponse() -> HTTPResponse {
+    guard let data = buildQueuePayloadData() else {
+      return .error(status: 500, message: "Failed to serialize queue snapshot")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  private func syncModelsResponse() -> HTTPResponse {
+    guard let data = Self.modelsPayloadData() else {
+      return .error(status: 500, message: "Failed to serialize models")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  private func syncConfigResponse() -> HTTPResponse {
+    guard let data = Self.configPayloadData() else {
+      return .error(status: 500, message: "Failed to serialize config")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  /// Stats without an actor hop: the render counters come from the lock snapshot
+  /// (the same numbers `coordinator.queueStatus()` returns, published on every
+  /// transition), so this answers during a render.
+  private func syncStatsResponse() -> HTTPResponse {
+    let (snap, _) = liveHealth.read()
+    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let snapshot = statsProvider.snapshot(
+      memory: statsProvider.sampleMemoryStatus(),
+      uptimeSeconds: StatsProvider.uptimeSeconds(startTime: serverStartTime),
+      renderCount: snap.renderCount,
+      failedRenderCount: snap.failedRenderCount,
+      pendingCount: snap.pending.count,
+      config: config)
+    return .json(status: 200, payload: snapshot)
+  }
+
+  private func syncPauseResponse(paused: Bool) -> HTTPResponse {
+    struct PauseResult: Encodable { let success: Bool; let paused: Bool }
+    // Authoritative + persisted, immediately visible via LiveHealthState.read().
+    liveHealth.setPaused(paused)
+    if !paused {
+      // The wake (§3.1.4a point 1) — fire-and-forget, NEVER a mailbox command.
+      // resume's only job through the actor is to (re)start the parked loop;
+      // decoupling the ACK from that effect is what avoids the v1 wedge.
+      Task { await coordinator.setPaused(false) }
+    }
+    auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
+    // F-1 (adversarial review): BOTH arms return 200. The authoritative
+    // lock-store write completes before this response is built (resume’s wake
+    // is fire-and-forget, but `isPaused` itself is already false), and clients
+    // guard pause/resume on 200 — a 202 here made every UI resume throw while
+    // the engine actually resumed.
+    return .json(status: 200, payload: PauseResult(success: true, paused: paused))
+  }
+
+  private func syncClearResponse() -> HTTPResponse {
+    struct ClearResult: Encodable { let success: Bool; let cleared: Int }
+    // Record a cancel delta for each currently-pending job (composed view), applied
+    // at the next drain; the jobs disappear from the composed GET /v1/queue at once.
+    let (snap, _) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
+    for job in pending { liveHealth.recordDelta(.cancel(job.id)) }
+    if !pending.isEmpty { Task { await coordinator.drainControlDeltas() } }
+    auditLog.append(kind: "queue.clear", message: "Cleared \(pending.count) pending job(s)")
+    return .json(status: 200, payload: ClearResult(success: true, cleared: pending.count))
+  }
+
+  private func syncInterruptResponse() -> HTTPResponse {
+    struct InterruptResult: Encodable { let success: Bool; let interrupted: Bool }
+    let cancelled = liveHealth.cancelActiveRender()
+    auditLog.append(kind: "queue.interrupt", message: cancelled ? "Interrupted active render" : "No active render")
+    return .json(status: 200, payload: InterruptResult(success: true, interrupted: cancelled))
+  }
+
+  private func syncMoveResponse(request: HTTPRequest) -> HTTPResponse {
+    struct MoveResult: Encodable { let success: Bool; let moved: Bool }
+    let mid = request.path.dropFirst("/v1/queue/".count).dropLast("/move".count)
+    guard let id = Self.pathIdComponent(String(mid)) else {
+      return .error(status: 400, message: "Invalid job id")
+    }
+    struct MoveBody: Decodable { let direction: String }
+    let direction = (try? JSONDecoder().decode(MoveBody.self, from: request.body))?.direction ?? "up"
+    let (snap, _) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
+    let present = pending.contains { $0.id == id }
+    if present {
+      liveHealth.recordDelta(.move(id, direction: direction))
+      Task { await coordinator.drainControlDeltas() }
+      auditLog.append(kind: "queue.move", message: "Moved job \(id) \(direction)", metadata: ["id": id, "direction": direction])
+    }
+    return .json(status: 200, payload: MoveResult(success: true, moved: present))
+  }
+
+  private func syncCancelResponse(request: HTTPRequest) -> HTTPResponse {
+    guard let id = Self.pathIdComponent(String(request.path.dropFirst("/v1/queue/".count))) else {
+      return .error(status: 400, message: "Invalid job id")
+    }
+    let (snap, _) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
+    guard pending.contains(where: { $0.id == id }) else {
+      return .error(status: 404, message: "Job not pending: \(id)")
+    }
+    liveHealth.recordDelta(.cancel(id))
+    Task { await coordinator.drainControlDeltas() }
+    auditLog.append(kind: "queue.cancel", message: "Recorded cancel for pending job \(id)", metadata: ["id": id])
+    // F-3 (adversarial review): between the presence read above and the drain,
+    // the loop may dequeue-and-start this job — so the sync path must never
+    // claim `deleted: true`. Record the delta, ACK the recording, and let the
+    // composed GET /v1/queue (where the job is already absent) and job status
+    // tell the truth. The flag-off async arm still reports deleted:true
+    // because it actually removes the job before responding.
+    return .json(status: 202, payload: SyncCancelAccepted.ack(id: id))
   }
 
   // Prompt enhancement --------------------------------------------------------
@@ -4335,8 +4496,22 @@ public final class WarmServer {
   /// restarts). Runs as a detached background task so a large recovered
   /// queue never delays the listener from coming up.
   private func recoverPersistedQueue() {
-    guard let state = QueueStateStore.load() else { return }
-    let jobs = (state.active.map { [$0] } ?? []) + state.pending
+    // 0.B-2 (FDD §3.1.4a point 4): fold any undrained deltas from the sidecar
+    // into the recovered set BEFORE re-enqueue, resolving them against the
+    // persisted snapshot (not the live actor `pending` mid-replay). This is what
+    // makes "cancel → bounce → stays cancelled" deterministic: a persisted cancel
+    // keeps its job from resurrecting, a persisted move survives the bounce, and
+    // the sidecar is cleared exactly once.
+    let deltas = QueueDeltaStore.load()
+    let state = QueueStateStore.load()
+    var jobs = (state?.active.map { [$0] } ?? []) + (state?.pending ?? [])
+    if !deltas.isEmpty {
+      let before = jobs.count
+      jobs = QueueDeltaApplier.apply(deltas, to: jobs, id: { $0.id })
+      logger.info("Queue recovery: folded \(deltas.count) undrained delta(s), \(before) -> \(jobs.count) job(s)")
+      QueueDeltaStore.clear()
+      liveHealth.clearDeltas()
+    }
     guard !jobs.isEmpty else { return }
     logger.info("Queue recovery: replaying \(jobs.count) job(s) left over from before a restart")
 
@@ -4775,11 +4950,116 @@ private final class LiveHealthState: @unchecked Sendable {
   private var snapshot = HealthSnapshot.initial
   private var progressPercent: Int?
 
+  // 0.B-2 (FDD §3.1.5): `isPaused` and the undrained-delta list are
+  // AUTHORITATIVE here, not on the actor. Off-actor/sync control writes land
+  // here and are visible to the read path IMMEDIATELY (not after the actor
+  // catches up at the end of a render). The actor is a READER of `paused` (its
+  // between-items gate) and DRAINS `deltas` at its scheduling points.
+  private var paused: Bool
+  private var deltas: [QueueControlCommand] = []
+  /// The in-flight render's task, published here (Task is Sendable) so the SYNC
+  /// `/v1/queue/interrupt` can cancel it with no actor hop. Set/cleared by the
+  /// process loop around each render.
+  private var activeRenderTask: Task<Void, Never>?
+
+  /// Cap on undrained deltas. Deltas drain promptly (every processLoop
+  /// iteration + every startProcessingIfNeeded), so this is only reached under a
+  /// pathological flood while the loop is wedged; oldest is evicted so a flood
+  /// cannot grow memory unbounded. Set generously: a dropped cancel would
+  /// resurrect a job, so eviction must stay a pathological-only event.
+  static let maxDeltas = 512
+
+  init() {
+    // Seed the authoritative pause flag from the same sentinel the actor used to
+    // read directly, so a paused queue survives a restart exactly as before.
+    // Undrained deltas are NOT preloaded here: `recoverPersistedQueue` is the
+    // single startup consumer of the sidecar (§3.1.4a point 4); preloading would
+    // double-count.
+    self.paused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
+  }
+
   func publish(_ s: HealthSnapshot) { lock.lock(); snapshot = s; lock.unlock() }
   func setProgress(_ p: Int?) { lock.lock(); progressPercent = p; lock.unlock() }
+
+  /// Read the published snapshot with the AUTHORITATIVE pause overlaid (§3.1.5:
+  /// "the read path composes lockStore.isPaused with the actor-authored
+  /// remainder"). `publishHealth()` no longer writes `isPaused`, so this overlay
+  /// is the sole source of `is_paused` for /health and /v1/queue.
   func read() -> (HealthSnapshot, Int?) {
     lock.lock(); defer { lock.unlock() }
-    return (snapshot, progressPercent)
+    var s = snapshot
+    s.isPaused = paused
+    return (s, progressPercent)
+  }
+
+  // MARK: pause authority
+
+  func isPausedAuthoritative() -> Bool { lock.lock(); defer { lock.unlock() }; return paused }
+
+  /// Authoritative pause write + its persistence (the sentinel IS the on-disk
+  /// form of this flag). Idempotent, so the sync route and the actor's
+  /// `setPaused` can both call it without racing to an inconsistent sentinel.
+  func setPaused(_ value: Bool) {
+    lock.lock(); paused = value; lock.unlock()
+    if value {
+      FileManager.default.createFile(
+        atPath: WarmServerCoordinator.pauseSentinelPath,
+        contents: Data("paused \(Date())\n".utf8))
+    } else {
+      try? FileManager.default.removeItem(atPath: WarmServerCoordinator.pauseSentinelPath)
+    }
+  }
+
+  // MARK: delta mailbox
+
+  func recordDelta(_ delta: QueueControlCommand) {
+    lock.lock(); defer { lock.unlock() }
+    deltas.append(delta)
+    if deltas.count > Self.maxDeltas { deltas.removeFirst(deltas.count - Self.maxDeltas) }
+    QueueDeltaStore.save(deltas)  // under the lock: serialized, ordered
+  }
+
+  func undrainedDeltas() -> [QueueControlCommand] {
+    lock.lock(); defer { lock.unlock() }
+    return deltas
+  }
+
+  /// Snapshot the undrained deltas for the actor to apply — WITHOUT clearing
+  /// (F-2, WAL ordering): the sidecar must outlive the canonical
+  /// `persistQueueState()` write, so a kill mid-drain replays the deltas on the
+  /// next boot instead of resurrecting a cancelled job. The actor calls
+  /// `commitDrainedDeltas` only AFTER canonical state is on disk.
+  func peekDeltas() -> [QueueControlCommand] {
+    lock.lock(); defer { lock.unlock() }
+    return deltas
+  }
+
+  /// WAL commit point (F-2): canonical queue state is persisted; drop the first
+  /// `count` deltas — the ones the drain applied — and rewrite the sidecar to
+  /// the remainder, so deltas recorded DURING the drain survive to the next one.
+  func commitDrainedDeltas(_ count: Int) {
+    lock.lock(); defer { lock.unlock() }
+    deltas.removeFirst(min(count, deltas.count))
+    QueueDeltaStore.save(deltas)
+  }
+
+  /// Clear the in-memory deltas without a take (recovery already folded them into
+  /// the queue and cleared the sidecar).
+  func clearDeltas() { lock.lock(); deltas.removeAll(); lock.unlock() }
+
+  // MARK: active-render interrupt (sync /v1/queue/interrupt)
+
+  func setActiveRenderTask(_ task: Task<Void, Never>?) {
+    lock.lock(); activeRenderTask = task; lock.unlock()
+  }
+
+  /// Cancel the in-flight render if one is published. `Task.cancel` is Sendable,
+  /// so the sync interrupt route calls this with no actor hop.
+  func cancelActiveRender() -> Bool {
+    lock.lock(); let task = activeRenderTask; lock.unlock()
+    guard let task else { return false }
+    task.cancel()
+    return true
   }
 }
 
@@ -5544,14 +5824,12 @@ private actor WarmServerCoordinator {
   /// Source/app of the currently-running job.
   private var activeJobSource: String?
   private var isProcessing = false
-  /// When paused, the process loop finishes the current job (if any) but does
-  /// not start pending ones until resumed.
-  ///
-  /// PERSISTED across restarts via a sentinel file (2026-08-10): the flag was
-  /// in-memory only, so any engine restart — watchdog kickstart, crash,
-  /// deploy — silently resumed creation. "Paused" that un-pauses itself is
-  /// how the July mystery-GPU-usage class of incident happens.
-  private var isPaused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
+  // 0.B-2 (FDD §3.1.5): `isPaused` is no longer owned here. It is AUTHORITATIVE
+  // in the lock store (`LiveHealthState`), persisted by the same sentinel file
+  // (2026-08-10 rationale unchanged: a "paused" that un-pauses itself across a
+  // watchdog kickstart / crash / deploy is how the mystery-GPU-usage incidents
+  // happen). This actor is a READER of it — see the `processLoop` gate and
+  // `setPaused` below.
 
   /// Sentinel marking the queue paused; survives engine restarts. Computed
   /// from `QueueStateStore.stateDirectory` so it follows `COMFYBOX_STATE_DIR`
@@ -6759,6 +7037,21 @@ private actor WarmServerCoordinator {
     }
   }
 
+  #if DEBUG
+  /// 0.B-2 test seam: enqueue a synthetic loop-occupying operation. Mirrors
+  /// `enqueueModelSwitch`'s FIFO handling exactly.
+  func enqueueSynthetic(durationMs: Int, id: String = UUID().uuidString) async throws -> Bool {
+    if shuttingDown { throw ServerError.shuttingDown }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(PendingJob(id: id, operation: .synthetic(durationMs: durationMs, ContinuationBox(continuation))))
+      startProcessingIfNeeded()
+    }
+  }
+  #endif
+
   /// Publish the current health-relevant state into the lock-based
   /// ``LiveHealthState`` so GET /health reads it without hopping onto this
   /// actor (which blocks for a whole render). Call at every state transition:
@@ -6797,7 +7090,8 @@ private actor WarmServerCoordinator {
       activeJobId: activeJobId,
       lastRenderDurationMs: lastRenderDurationMs,
       lastError: lastError,
-      isPaused: isPaused,
+      // isPaused intentionally omitted (§3.1.5): LiveHealthState.read() overlays
+      // the AUTHORITATIVE value, so publishHealth no longer writes it.
       activeSummary: activeJobSummary,
       activeSource: activeJobSource,
       pending: pending.map { job in
@@ -6901,6 +7195,10 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
       cont.resume(throwing: ServerError.cancelled)
+    #if DEBUG
+    case .synthetic(_, let cont):
+      cont.resume(throwing: ServerError.cancelled)
+    #endif
     }
   }
 
@@ -6921,6 +7219,10 @@ private actor WarmServerCoordinator {
       return "LTX-2 video"
     case .shutdown:
       return "Shutdown"
+    #if DEBUG
+    case .synthetic(let durationMs, _):
+      return "Synthetic op (\(durationMs)ms)"
+    #endif
     }
   }
 
@@ -6933,6 +7235,9 @@ private actor WarmServerCoordinator {
     case .modelOperation(let op, _): return op.kind
     case .localVideo: return "video"
     case .shutdown: return "shutdown"
+    #if DEBUG
+    case .synthetic: return "synthetic"
+    #endif
     }
   }
 
@@ -6948,14 +7253,13 @@ private actor WarmServerCoordinator {
   // MARK: - Queue controls (pause / resume / reorder)
 
   func setPaused(_ paused: Bool) {
-    isPaused = paused
-    // Persist so a watchdog kickstart / crash / deploy cannot silently
-    // resume creation the user paused (see isPaused declaration).
-    if paused {
-      FileManager.default.createFile(atPath: Self.pauseSentinelPath, contents: Data("paused \(Date())\n".utf8))
-    } else {
-      try? FileManager.default.removeItem(atPath: Self.pauseSentinelPath)
-    }
+    // Authority + persistence (the sentinel is the on-disk form of the flag)
+    // live in the lock store now (§3.1.5). Idempotent, so this is safe whether or
+    // not the sync `/v1/queue/pause` route already wrote it.
+    liveHealth.setPaused(paused)
+    // The wake (§3.1.4a point 1): resume must still cause a PARKED loop to pick
+    // work up — the exact path v1's mailbox `resume` wedged. `resume` reaches
+    // here fire-and-forget; only the caller's ACK is decoupled, not this effect.
     if !paused { startProcessingIfNeeded() }
     publishHealth()
   }
@@ -6963,6 +7267,16 @@ private actor WarmServerCoordinator {
   /// Move a pending job within the queue. direction: up | down | top | bottom.
   /// Returns true if the job was found and moved.
   func movePending(id: String, direction: String) -> Bool {
+    let moved = reorderPending(id: id, direction: direction)
+    if moved { publishHealth(); persistQueueState() }
+    return moved
+  }
+
+  /// Reorder `pending` in place. Shared by `movePending` (the flag-off async arm)
+  /// and `drainQueueDeltas` (a `.move` delta from the sync path) so both use
+  /// identical top/bottom/up/down semantics.
+  @discardableResult
+  private func reorderPending(id: String, direction: String) -> Bool {
     guard let idx = pending.firstIndex(where: { $0.id == id }) else { return false }
     let job = pending.remove(at: idx)
     let target: Int
@@ -6974,10 +7288,54 @@ private actor WarmServerCoordinator {
     default: pending.insert(job, at: idx); return false
     }
     pending.insert(job, at: target)
-    publishHealth()
-    persistQueueState()
     return true
   }
+
+  /// 0.B-2: apply the lock store's undrained deltas against the live `pending`
+  /// array at a scheduling point. Called at the top of every `processLoop`
+  /// iteration AND from `startProcessingIfNeeded()`, so a delta lands whether the
+  /// loop is running or parked (FDD §3.1.4a point 3). A `.cancel` here resumes the
+  /// waiting continuation with `.cancelled`, exactly like `cancelPending`; a
+  /// `.move` reorders. WAL ordering (F-2, adversarial review): PEEK the deltas,
+  /// apply them, persist the canonical queue state, and only THEN commit (drop
+  /// the applied deltas and shrink the sidecar). A kill anywhere in that window
+  /// leaves the sidecar on disk, and replaying an already-applied cancel over
+  /// the persisted state is a no-op — the old take-and-clear-first order let a
+  /// kill between the clear and `persistQueueState()` resurrect a cancelled job.
+  private func drainQueueDeltas() {
+    let commands = liveHealth.peekDeltas()
+    guard !commands.isEmpty else { return }
+    for command in commands {
+      // Structural guard against the F1 wedge (§3.1.4a): a mailbox delta must
+      // never require a wake. `resume` is fire-and-forget, not a delta. (The type
+      // makes `requiresWake: true` unconstructable; this asserts it at the drain
+      // too, so a future factory that sets it fails here in test.)
+      assert(!command.requiresWake,
+             "queue delta must not require a wake — resume is fire-and-forget (FDD §3.1.4a)")
+      switch command.kind {
+      case .cancel(let id):
+        if let index = pending.firstIndex(where: { $0.id == id }) {
+          Self.cancel(pending[index].operation)
+          pending.remove(at: index)
+        }
+      case .move(let id, let direction):
+        _ = reorderPending(id: id, direction: direction)
+      }
+    }
+    publishHealth()
+    persistQueueState()
+    #if DEBUG
+    QueueDeltaStore.drainCrashWindowHook?()
+    #endif
+    liveHealth.commitDrainedDeltas(commands.count)
+  }
+
+  /// Best-effort prompt drain nudged by the sync cancel/move/clear routes so a
+  /// delta applies quickly when the pool is healthy (the actor is free during a
+  /// render — the render runs in a child task). If the nudge cannot run (pool
+  /// exhausted), the delta still applies at the next real scheduling point; the
+  /// composed `GET /v1/queue` reflects it immediately regardless.
+  func drainControlDeltas() { drainQueueDeltas() }
 
   /// 0.B-1: spawns an unstructured task on `renderTaskExecutor` when it's
   /// available and enabled, otherwise a plain `Task {}` — exactly today's
@@ -6996,6 +7354,11 @@ private actor WarmServerCoordinator {
   }
 
   private func startProcessingIfNeeded() {
+    // 0.B-2 drain point 2/2 (FDD §3.1.4a point 3): apply undrained deltas here
+    // too, so a delta lands even when the loop is PARKED (this is the only path
+    // that restarts a parked loop). Runs before publishHealth so the published
+    // pending count reflects the applied deltas.
+    drainQueueDeltas()
     // Every enqueue routes through here, so this is the one spot that reflects a
     // just-changed pending count into the lock-based health snapshot (#217).
     publishHealth()
@@ -7038,17 +7401,25 @@ private actor WarmServerCoordinator {
       return true
     case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo:
       return false
+    #if DEBUG
+    case .synthetic:
+      return false
+    #endif
     }
   }
 
   private func processLoop() async {
     while true {
+      // 0.B-2 drain point 1/2 (FDD §3.1.4a point 3): apply undrained deltas at
+      // the top of every iteration — whether this iteration runs a job or parks,
+      // and crucially BEFORE dequeuing, so a cancelled job never runs.
+      drainQueueDeltas()
       // Paused: renders stay parked, but a model operation still runs (New-1).
       // Picking it out of the middle does not reorder anything that runs: the
       // jobs it passes are parked until resume, and they keep their relative
       // order for when it comes.
       let index: Int
-      if isPaused {
+      if liveHealth.isPausedAuthoritative() {
         guard let next = pending.firstIndex(where: { Self.runsWhilePaused($0.operation) }) else {
           isProcessing = false
           return
@@ -7095,16 +7466,39 @@ private actor WarmServerCoordinator {
           await self.runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
         }
         activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)  // 0.B-2: sync /interrupt handle
         await renderTask.value
         activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
       case .controlGenerate(let request, let continuation):
         // 0.B-1 spawn site 3/3 — same re-attachment as .generate above.
         let renderTask = spawnRenderTask {
           await self.runControlGenerate(request, continuation: continuation)
         }
         activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)  // 0.B-2: sync /interrupt handle
         await renderTask.value
         activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
+      #if DEBUG
+      case .synthetic(let durationMs, let continuation):
+        // 0.B-2 test seam (FDD §4.1). Runs through the retained-task path (so
+        // /interrupt can cancel it) and BLOCKS its thread for the duration —
+        // occupying a worker exactly like a real synchronous render, which is
+        // what makes the "sync control plane answers with zero cooperative
+        // threads" test meaningful.
+        let renderTask = spawnRenderTask {
+          if !Task.isCancelled {
+            Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
+          }
+          continuation.resume(returning: !Task.isCancelled)
+        }
+        activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)
+        await renderTask.value
+        activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
+      #endif
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
       case .modelSwitch(let body, let continuation):
@@ -8278,6 +8672,17 @@ private final class ConnectionHandler {
         // Invalid WebSocket upgrade request — send 400 and close.
         finish(with: .error(status: 400, message: "Invalid WebSocket upgrade request"))
       }
+      return
+    }
+
+    // 0.B-2 (FDD §3.1.4): serve the sync-servable control set synchronously on
+    // THIS connection's queue, before any Task — zero cooperative threads, no
+    // actor hop, so these routes answer even if the pool is exhausted by a
+    // render. Flag off (`COMFYBOX_CONTROL_PLANE_SYNC=0`) skips this entirely and
+    // every route falls through to the async path below, byte-for-byte as before.
+    if ControlPlaneSyncFlag.isEnabled,
+       let response = server.serveControlPlaneSync(request) {
+      finish(with: response)
       return
     }
 
@@ -9522,6 +9927,14 @@ private enum QueuedOperation: Sendable {
   /// job paused-for-preemption / resumed in `VideoJobTracker`.
   case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome, ContinuationBox<LTX2VideoResult>, wantsAudio: Bool, videoJobId: String?)
   case shutdown(ContinuationBox<ShutdownResponse>)
+  #if DEBUG
+  /// 0.B-2 test seam (FDD §4.1): occupies the processing loop for a controlled
+  /// duration with no GPU. Its body BLOCKS its thread (Thread.sleep, not
+  /// Task.sleep), so it exercises the exact pool-exhaustion mechanism 0.B-1 fixes
+  /// — a render that holds a worker without suspending. DEBUG-only; the release
+  /// deploy never compiles it.
+  case synthetic(durationMs: Int, ContinuationBox<Bool>)
+  #endif
 }
 
 private final class ContinuationBox<Value>: @unchecked Sendable {
@@ -9760,5 +10173,62 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   var pendingCount: Int { liveHealthSnapshot.pending.count }
 
   var isPaused: Bool { liveHealthSnapshot.isPaused }
+
+  // MARK: - 0.B-2 control-plane probe surface
+
+  /// Occupy the loop with a synthetic op that BLOCKS its thread for `durationMs`.
+  func enqueueSynthetic(durationMs: Int, id: String = UUID().uuidString) async throws -> Bool {
+    try await coordinator.enqueueSynthetic(durationMs: durationMs, id: id)
+  }
+
+  /// The sync `/v1/queue/pause` path: authoritative lock-store write.
+  func controlPause() { liveHealth.setPaused(true) }
+
+  /// The sync `/v1/queue/resume` path: authoritative write + fire-and-forget wake
+  /// (never a mailbox command — the F1 wedge guard).
+  func controlResume() {
+    liveHealth.setPaused(false)
+    Task { await coordinator.setPaused(false) }
+  }
+
+  /// Whether the AUTHORITATIVE (lock-store) pause flag is set — the value the
+  /// between-items gate and the read path both see.
+  var lockStorePaused: Bool { liveHealth.isPausedAuthoritative() }
+
+  /// The sync `DELETE /v1/queue/{id}` path: record a cancel delta + drain nudge.
+  func controlCancel(id: String) {
+    liveHealth.recordDelta(.cancel(id))
+    Task { await coordinator.drainControlDeltas() }
+  }
+
+  /// The sync `POST /v1/queue/{id}/move` path.
+  func controlMove(id: String, direction: String) {
+    liveHealth.recordDelta(.move(id, direction: direction))
+    Task { await coordinator.drainControlDeltas() }
+  }
+
+  /// The sync `/v1/queue/interrupt` path.
+  @discardableResult
+  func controlInterrupt() -> Bool { liveHealth.cancelActiveRender() }
+
+  /// Record a cancel delta WITHOUT the drain nudge — lets tests hold a delta
+  /// in the undrained window deterministically (F-2 crash-window test).
+  func recordCancelDeltaOnly(id: String) { liveHealth.recordDelta(.cancel(id)) }
+
+  /// Deterministically run one drain on the actor (the same
+  /// `drainControlDeltas` the sync routes nudge fire-and-forget).
+  func drainNow() async { await coordinator.drainControlDeltas() }
+
+  var undrainedDeltaCount: Int { liveHealth.undrainedDeltas().count }
+
+  /// Pending ids as `GET /v1/queue` composes them (snapshot + undrained deltas) —
+  /// a just-cancelled job is already absent here.
+  var composedPendingIds: [String] {
+    let (snap, _) = liveHealth.read()
+    return QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id }).map { $0.id }
+  }
+
+  /// Pending ids in the raw actor-published snapshot (no delta compose).
+  var snapshotPendingIds: [String] { liveHealth.read().0.pending.map { $0.id } }
 }
 #endif
