@@ -367,6 +367,27 @@ struct KiraView: View {
                             .frame(width: 120, alignment: .leading)
                     }
                 }
+                // Cycle interval (Todd 2026-08-29): how often the 24/7
+                // scheduler starts a new tick. The daemon policy endpoint
+                // already accepted intervalMinutes — this was the missing
+                // UI. Segmented, same idiom as the videoMode picker above;
+                // shorter intervals suit i2v-only stretches, longer ones
+                // give mixed/t2v cycles room to actually finish.
+                HStack(spacing: 10) {
+                    Text("Interval:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.intervalMinutes ?? 30 },
+                        set: { v in Task { await client.updateSchedulerPolicy(["intervalMinutes": v]) } })) {
+                        ForEach([15, 20, 30, 45, 60], id: \.self) { minutes in
+                            Text("\(minutes)m").tag(minutes)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 260)
+                    .disabled(client.actionInFlight)
+                    .help("How often the 24/7 scheduler starts a new cycle.")
+                }
                 // Per-tier schedule + pacing. Editing writes the FULL tiers
                 // map (server replaces; an unchecked tier is scheduled off).
                 ForEach(Self.tierOrder, id: \.self) { mode in
