@@ -483,7 +483,7 @@ struct ComfyBoxDesktopApp: App {
             ApplicationsView(engine: engine)
 
         case .queue:
-            QueueView(engine: engine)
+            QueueView(engine: engine, kira: kiraClient)
 
         case .remoteGallery:
             // One gallery (2026-07-31). This tab used to open RemoteGalleryView,
