@@ -128,6 +128,10 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     /// i2v share of a `videoMode == "mixed"` cycle, 0-1 (server default 0.5).
     /// nil when the config never set one — mixed then runs the 50/50 default.
     public var videoI2vRatio: Double?
+    /// Two-pass render tier for cycle videos (Todd 2026-08-30): "hq" = base →
+    /// latent upscale → refine, audio refined on pass 2. nil/"standard" =
+    /// single-pass.
+    public var videoQuality: String?
     /// Unlimited-within-cycle images: renders chain until the cycle window
     /// closes; imageCount is ignored while true.
     public var unlimitedImages: Bool
@@ -160,6 +164,7 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             videoCount: (config?["videoCount"] as? NSNumber)?.intValue,
             videoMode: config?["videoMode"] as? String,
             videoI2vRatio: (config?["videoI2vRatio"] as? NSNumber)?.doubleValue,
+            videoQuality: config?["videoQuality"] as? String,
             unlimitedImages: config?["unlimitedImages"] as? Bool ?? false,
             activeHoursStart: hours?["start"] as? String,
             activeHoursEnd: hours?["end"] as? String,
