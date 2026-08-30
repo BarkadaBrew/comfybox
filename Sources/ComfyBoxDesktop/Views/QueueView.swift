@@ -9,6 +9,9 @@ import SwiftUI
 
 struct QueueView: View {
     @Bindable var engine: EngineService
+    /// Daemon-side queue (Kira cycles) — the engine list below only ever
+    /// shows the ONE dispatched job; the rest wait in the daemon.
+    @Bindable var kira: KiraClient
 
     @State private var queue: EngineService.QueueJobList?
     @State private var refreshTick = 0
@@ -22,6 +25,10 @@ struct QueueView: View {
                 if let error { Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
                 activeSection
                 pendingSection
+                // Daemon-side queue: everything the scheduler has booked that
+                // has NOT yet been dispatched to the engine (Todd 2026-08-30
+                // "the queue doesnt show all queued or pending jobs").
+                DaemonRenderQueuePanel(client: kira)
                 countsFooter
             }
             .padding(20)
