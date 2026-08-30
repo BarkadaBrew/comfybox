@@ -77,7 +77,7 @@ A `GET /v1/controls` (name TBD in FDD) enumerating controllable settings: id, cu
 
 ## 7. Risks & open questions
 
-- **Unauthenticated surface grows.** More mutating routes on an unauthenticated (loopback-bound) server widens the blast radius of any local process or prompt-injected agent. Recommend the FDD state the exposure explicitly; a token gate may become necessary before any non-loopback binding.
+- **Security/authn is explicitly OUT OF SCOPE** (Todd, 2026-08-29): this stack is never publicly accessible, so no token gate, permission model, or auth middleware is to be designed, and "unauthenticated routes" is not a risk to raise. Input validation still applies as a correctness concern (malformed params → clean 400, not a trap), as do resource bounds that protect the render engine and anything that would send credentials outbound.
 - **Kira isolation.** Phase 2 must not pull companion logic into warm-server core (established regime; boundary ratchet test exists on the coffeeshop-server side).
 - **Config migration** (Phase 3) can silently change render behavior if server defaults differ from a user's local values — migration must be value-preserving and logged.
 - **Whole-document `PUT /v1/config`** is the current settings idiom; concurrent writers can clobber. FDD should decide patch-vs-replace.
