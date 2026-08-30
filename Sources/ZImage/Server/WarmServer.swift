@@ -604,7 +604,11 @@ public final class WarmServer {
   private func accept(connection: NWConnection) {
     let handler = ConnectionHandler(
       connection: connection,
-      queue: DispatchQueue(label: "z-image.warm-server.connection.\(UUID().uuidString)"),
+      // #300: pin QoS explicitly. Without it the queue runs at whatever QoS
+      // is donated by whoever schedules onto it, which during a render is
+      // the coordinator's `.utility` render work — demoting control/HTTP
+      // responses on this connection right when they need to stay responsive.
+      queue: DispatchQueue(label: "z-image.warm-server.connection.\(UUID().uuidString)", qos: .userInitiated),
       server: self
     )
     handler.start()
@@ -5424,6 +5428,21 @@ private actor WarmServerCoordinator {
     case shuttingDown
     /// The pending request was removed by a queue clear (not a server shutdown).
     case cancelled
+  }
+
+  /// #300: this actor's isolated work (including the synchronous render call)
+  /// otherwise runs on the Swift cooperative thread pool
+  /// (`com.apple.root.utility-qos.cooperative`), which is width-capped at
+  /// ~core count and does NOT grow when a worker blocks. A `sample` of the
+  /// live process during a render showed 2964/2972 samples parked in
+  /// `__psynch_cvwait` on that pool — starving every other actor hop,
+  /// including `Task { await respond(...) }` for async HTTP routes (HTTP 000
+  /// at 120s while sync routes stayed fine). Giving the coordinator its own
+  /// serial executor (SE-0392) moves its work off the shared cooperative pool
+  /// entirely; actor serialization semantics are unchanged.
+  private let executorQueue = DispatchSerialQueue(label: "z-image.warm-server.coordinator", qos: .userInitiated)
+  nonisolated var unownedExecutor: UnownedSerialExecutor {
+    executorQueue.asUnownedSerialExecutor()
   }
 
   private let configuration: WarmServerConfiguration
