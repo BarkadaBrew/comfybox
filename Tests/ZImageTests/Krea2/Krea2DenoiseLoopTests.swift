@@ -87,7 +87,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
         var scheduler = try Self.defaultScheduler(steps: steps)
         // The grid the driver walks IS the pre-change grid, element for element.
         XCTAssertEqual(scheduler.sigmas.asArray(Float.self), ts, "steps \(steps)")
-        let (new, stats) = Krea2DenoiseLoop.run(
+        let (new, stats) = try Krea2DenoiseLoop.run(
           scheduler: &scheduler, initialSample: initial, startIndex: 0, evaluate: Self.syntheticTransformer)
 
         XCTAssertEqual(new.dtype, .bfloat16)
@@ -108,7 +108,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     let ts = Self.preChangeTimesteps(seqLen: Self.seqLen1024, steps: steps)
     var seen: [Float] = []
     var scheduler = try Self.defaultScheduler(steps: steps)
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 3), startIndex: 0
     ) { x, sigma in
       seen.append(sigma)
@@ -131,7 +131,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       let old = Self.inlineEulerLoop(ts: ts, initial: initial, startIndex: startIndex, evaluate: Self.syntheticTransformer)
       var scheduler = try Self.defaultScheduler(steps: steps)
       var progressSeen: [(Int, Int)] = []
-      let (new, stats) = Krea2DenoiseLoop.run(
+      let (new, stats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: initial, startIndex: startIndex,
         evaluate: Self.syntheticTransformer, progress: { progressSeen.append(($0, $1)) })
 
@@ -185,7 +185,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       var scheduler = try Krea2Pipeline.makeScheduler(
         sampler: kind, sigmaSchedule: .krea2, steps: steps, shift: shift, seed: 42, c2: 0.5)
       var calls = 0
-      let (x, stats) = Krea2DenoiseLoop.run(
+      let (x, stats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: field.sample(at: 1.0), startIndex: 0,
         modelEvalsPerEvaluate: 2
       ) { x, sigma in
@@ -232,11 +232,11 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       sampler: .dpmplusplus2m, sigmaSchedule: .krea2, steps: 9, shift: shift, seed: 0, c2: 0.5)
     let initial = Self.bf16Noise(seed: 13)
 
-    let (first, _) = Krea2DenoiseLoop.run(
+    let (first, _) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: initial, startIndex: 0, evaluate: Self.syntheticTransformer)
     // Dirty the multistep cache deliberately: a stray step leaves previousOutput set.
     _ = scheduler.step(modelOutput: initial * 3.0, timestepIndex: 4, sample: initial)
-    let (second, _) = Krea2DenoiseLoop.run(
+    let (second, _) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: initial, startIndex: 0, evaluate: Self.syntheticTransformer)
     XCTAssertEqual(Self.bits(first), Self.bits(second), "dpmpp_2m leaked state across runs")
   }
@@ -250,7 +250,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     let field = ModelOutputConventionTests.makeField(seed: 10)
     var midSigmas: [Float] = []
     let grid = scheduler.sigmas.asArray(Float.self)
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: field.sample(at: grid[0]), startIndex: 0
     ) { x, sigma in
       if !grid.contains(sigma) { midSigmas.append(sigma) }
@@ -338,7 +338,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
       c: [0, 0.5, 0.75])
     var scheduler: any ZImageScheduler = ralston3
     var seen: [Float] = []
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: field.sample(at: grid[0]), startIndex: 0
     ) { x, sigma in
       seen.append(sigma)
@@ -371,11 +371,11 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var euler = try Self.defaultScheduler(steps: steps)
     let grid = euler.sigmas.asArray(Float.self)
     let initial = Self.bf16Noise(seed: 17)
-    let (viaEuler, _) = Krea2DenoiseLoop.run(
+    let (viaEuler, _) = try Krea2DenoiseLoop.run(
       scheduler: &euler, initialSample: initial, startIndex: 0, evaluate: Self.syntheticTransformer)
 
     var tableau: any ZImageScheduler = TestTableau(sigmaValues: grid, a: [[0]], b: [1], c: [0])
-    let (viaTableau, stats) = Krea2DenoiseLoop.run(
+    let (viaTableau, stats) = try Krea2DenoiseLoop.run(
       scheduler: &tableau, initialSample: initial, startIndex: 0, evaluate: Self.syntheticTransformer)
     XCTAssertEqual(stats.rowsAtStart, 1)
     XCTAssertEqual(Self.bits(viaTableau), Self.bits(viaEuler))
@@ -443,7 +443,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     let grid = try Self.defaultScheduler(steps: steps).sigmas.asArray(Float.self)
     var scheduler: any ZImageScheduler = WarmUpTableau(sigmaValues: grid, warmUpSteps: warmUp)
     var calls = 0
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 41), startIndex: 0,
       modelEvalsPerEvaluate: 2
     ) { x, sigma in
@@ -519,7 +519,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var scheduler = try Self.defaultScheduler(steps: 9)
     let injector = CountingInjector()
     let bong = CountingBongMath()
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 19), startIndex: 3,
       evaluate: Self.syntheticTransformer, noise: injector, bongmath: bong)
     XCTAssertEqual(injector.steps, [3, 4, 5, 6, 7, 8])
@@ -542,7 +542,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     let twoRowInjector = CountingInjector()
     let twoRowBong = CountingBongMath()
     var evaluationsSeen: [Int] = []
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &twoRow, initialSample: Self.bf16Noise(seed: 23),
       evaluate: { latent, sigma in
         evaluationsSeen.append(twoRowBong.calls.count)
@@ -561,7 +561,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var threeRow: any ZImageScheduler = RalstonScheduler(
       stages: .three, numInferenceSteps: 3, sigmaValues: sigmas)
     let threeRowBong = CountingBongMath()
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &threeRow, initialSample: Self.bf16Noise(seed: 23),
       evaluate: Self.syntheticTransformer, noise: CountingInjector(), bongmath: threeRowBong)
     XCTAssertEqual(
@@ -578,7 +578,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var scheduler: any ZImageScheduler = RES2sScheduler(
       numInferenceSteps: 3, sigmaValues: sigmas)
     let bong = CountingBongMath(claimedEvals: 2)
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 29),
       modelEvalsPerEvaluate: 2,
       evaluate: Self.syntheticTransformer, bongmath: bong)
@@ -598,7 +598,7 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var twoRow: any ZImageScheduler = RES2sScheduler(numInferenceSteps: 4, sigmaValues: sigmas)
     let twoRowInjector = CountingInjector()
     var seenAtEvaluate: [Int] = []
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &twoRow, initialSample: Self.bf16Noise(seed: 21),
       evaluate: { latent, sigma in
         seenAtEvaluate.append(twoRowInjector.substeps.count)
@@ -615,12 +615,72 @@ final class Krea2DenoiseLoopTests: XCTestCase {
     var threeRow: any ZImageScheduler = RalstonScheduler(
       stages: .three, numInferenceSteps: 4, sigmaValues: sigmas)
     let threeRowInjector = CountingInjector()
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &threeRow, initialSample: Self.bf16Noise(seed: 22),
       evaluate: Self.syntheticTransformer, noise: threeRowInjector)
     XCTAssertEqual(
       threeRowInjector.substeps.map { "\($0.0):\($0.1)" },
       ["0:1", "0:2", "1:1", "1:2", "2:1", "2:2", "3:1", "3:2"],
       "rows 1 and 2 of 3, in order, on every step — never the committing row")
+  }
+
+  // MARK: - comfybox#304: step-boundary cancellation
+
+  /// `Task.checkCancellation()` runs first in the loop body (matching the
+  /// Flux2/Fibo idiom — see Flux2Pipeline.swift, FiboPipeline.swift), so a
+  /// task already cancelled before the run starts throws immediately and
+  /// never calls `evaluate` at all.
+  func testCancelledTaskThrowsBeforeAnyEvaluation() async throws {
+    let steps = 6
+    var scheduler = try Self.defaultScheduler(steps: steps)
+    var evalCount = 0
+
+    let task = Task<(sample: MLXArray, stats: Krea2DenoiseLoop.Stats), Error> {
+      try Krea2DenoiseLoop.run(
+        scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 7), startIndex: 0
+      ) { x, sigma in
+        evalCount += 1
+        return Self.syntheticTransformer(x, sigma)
+      }
+    }
+    task.cancel()
+
+    do {
+      _ = try await task.value
+      XCTFail("expected CancellationError")
+    } catch is CancellationError {
+      XCTAssertEqual(evalCount, 0, "cancelled-before-start must not evaluate any step")
+    }
+  }
+
+  /// Cancelling mid-run stops the loop at the NEXT step boundary — the driver
+  /// does not run all `steps` to completion, and `CancellationError`
+  /// propagates unmodified (no wrapping, no new error type), exactly as
+  /// Flux2Pipeline / FiboPipeline let it propagate from their denoising loops.
+  func testCancellationMidRunStopsAtNextStepBoundary() async throws {
+    let steps = 6
+    var scheduler = try Self.defaultScheduler(steps: steps)
+    var evalCount = 0
+    var capturedTask: Task<(sample: MLXArray, stats: Krea2DenoiseLoop.Stats), Error>?
+
+    let task = Task<(sample: MLXArray, stats: Krea2DenoiseLoop.Stats), Error> {
+      try Krea2DenoiseLoop.run(
+        scheduler: &scheduler, initialSample: Self.bf16Noise(seed: 7), startIndex: 0
+      ) { x, sigma in
+        evalCount += 1
+        if evalCount == 2 {
+          capturedTask?.cancel()
+        }
+        return Self.syntheticTransformer(x, sigma)
+      }
+    }
+    capturedTask = task
+
+    do {
+      _ = try await task.value
+      XCTFail("expected CancellationError after step 2 of \(steps)")
+    } catch is CancellationError {
+      XCTAssertEqual(evalCount, 2, "loop must stop at the step boundary right after cancellation, not run to completion")
+    }
   }
 }

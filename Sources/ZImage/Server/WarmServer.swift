@@ -7875,7 +7875,7 @@ private actor WarmServerCoordinator {
       sampler: names.scheduler, schedule: names.sigmaSchedule) ?? .euler
 
     // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
-    let result = pipeline.generate(
+    let result = try pipeline.generate(
       tokenIds: tokenIds,
       negativeTokenIds: negTokenIds,
       width: width,

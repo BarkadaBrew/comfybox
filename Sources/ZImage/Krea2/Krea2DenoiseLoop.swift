@@ -188,7 +188,7 @@ public enum Krea2DenoiseLoop {
     noise: SDENoiseInjector? = nil,
     bongmath: BongMath? = nil,
     progress: ((Int, Int) -> Void)? = nil
-  ) -> (sample: MLXArray, stats: Stats) {
+  ) throws -> (sample: MLXArray, stats: Stats) {
     let total = scheduler.numInferenceSteps
     precondition(startIndex >= 0 && startIndex <= total, "startIndex \(startIndex) outside 0...\(total)")
     precondition(modelEvalsPerEvaluate >= 1, "modelEvalsPerEvaluate must be ≥ 1")
@@ -226,6 +226,10 @@ public enum Krea2DenoiseLoop {
     var lastStep: (index: Int, x0: MLXArray, xNext: MLXArray, sigma: Float, sigmaNext: Float)?
 
     for i in startIndex..<total {
+      // comfybox#304: step-boundary cancellation check, matching the
+      // Flux2/Fibo idiom (Flux2Pipeline.swift, FiboPipeline.swift) — one
+      // check per sampler step, CancellationError propagates unmodified.
+      try Task.checkCancellation()
       let sigma = sigmas[i]
       // The step's own `x₀`. Retained only when someone downstream needs it —
       // the model-free tail, a T2 injector whose swap is written in it, or the

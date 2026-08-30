@@ -71,9 +71,9 @@ final class ExplicitRKSchedulerTests: XCTestCase {
   }
 
   /// Run a conformer through the production driver with the scripted field.
-  static func runThroughDriver(_ scheduler: any ZImageScheduler) -> Double {
+  static func runThroughDriver(_ scheduler: any ZImageScheduler) throws -> Double {
     var s = scheduler
-    let (out, _) = Krea2DenoiseLoop.run(
+    let (out, _) = try Krea2DenoiseLoop.run(
       scheduler: &s,
       initialSample: MLXArray([Float(x0)], [1])
     ) { latent, sigma in
@@ -222,14 +222,14 @@ final class ExplicitRKSchedulerTests: XCTestCase {
   /// assertion is two-sided on purpose: ≥2 proves the solver is consistent and
   /// correctly wired, <2.6 proves we did NOT quietly "fix" the anchoring into
   /// a classical RK and diverge from the oracle.
-  func testAnchoredLinearFrameIsSecondOrderForEveryRalston() {
+  func testAnchoredLinearFrameIsSecondOrderForEveryRalston() throws {
     let reference = Self.referenceSolution()
     for stages in [RalstonScheduler.Stages.two, .three, .four] {
       var errors: [Double] = []
       for n in [8, 16, 32, 64] {
         let scheduler = RalstonScheduler(
           stages: stages, numInferenceSteps: n, sigmaValues: Self.linearGrid(steps: n))
-        errors.append(abs(Self.runThroughDriver(scheduler) - reference))
+        errors.append(abs(try Self.runThroughDriver(scheduler) - reference))
       }
       // Minor 6: every pair in the sweep, not only the finest.
       let orders = Self.observedOrders(errors)
@@ -252,12 +252,12 @@ final class ExplicitRKSchedulerTests: XCTestCase {
   /// `x(σ) = D + (σ/σ₀)(x₀ − D)` is reproduced to float32 precision in a
   /// single step by every ralston, which is why the anchoring is harmless on
   /// a well-behaved rectified-flow trajectory.
-  func testExactOnAConstantDataPrediction() {
+  func testExactOnAConstantDataPrediction() throws {
     let dConst: Float = -0.35
     for stages in [RalstonScheduler.Stages.two, .three, .four] {
       var scheduler: any ZImageScheduler = RalstonScheduler(
         stages: stages, numInferenceSteps: 3, sigmaValues: [1.0, 0.6, 0.25, 0.05])
-      let (out, stats) = Krea2DenoiseLoop.run(
+      let (out, stats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: MLXArray([Float(0.7)], [1])
       ) { latent, sigma in (latent - dConst) / sigma }
       let want = dConst + Float(0.05 / 1.0) * (0.7 - dConst)

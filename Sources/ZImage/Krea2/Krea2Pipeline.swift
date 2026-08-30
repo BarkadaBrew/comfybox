@@ -1015,7 +1015,7 @@ public final class Krea2Pipeline {
         }
       } ?? progress
 
-    let (denoised, stats) = Krea2DenoiseLoop.run(
+    let (denoised, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: img,
       startIndex: 0,

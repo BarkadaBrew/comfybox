@@ -537,7 +537,7 @@ public enum Krea2StagedRender {
       latentHeight: latentHeight, latentWidth: latentWidth, dtype: dtype)
 
     let useCFG = stage.guidance > 1.0
-    let (denoised, stats) = Krea2DenoiseLoop.run(
+    let (denoised, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: start,
       // The stage walks its OWN grid from the top: the stretch already put the
