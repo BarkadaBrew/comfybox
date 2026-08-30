@@ -193,6 +193,32 @@ public final class WarmServer {
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
   private let renderTraceStore = RenderTraceStore()
+
+  /// 0.B-1 (v2.3 rework, FDD-ui-api-parity.md §3.1.3, comfybox#300): lifts the
+  /// async-internals route handlers (`/v1/enhance`, `/v1/civitai/search`,
+  /// `/v1/civitai/harvest`) off the Swift cooperative pool, so they keep
+  /// answering while a render saturates it (measured: 2964/2972 samples in
+  /// `__psynch_cvwait` on the pool during a render). v2.2 tried this on the
+  /// RENDER side instead and crashed LTX (native MLX mutex EINVAL from
+  /// cross-thread eval migration) — deleted. These route handlers only ever
+  /// `await` on network/disk/actor I/O (`PromptOptimizer.optimize`,
+  /// `CivitAIClient.searchModels`, `CivitAIHarvestRunner.run`); they are
+  /// verified MLX-free (§3.1.3), so thread migration is harmless and a plain
+  /// concurrent `RouteTaskExecutor` is correct and safe. `nil` on macOS <15
+  /// or with `COMFYBOX_RENDER_TASK_EXECUTOR=0`; `respondOnRouteExecutor`
+  /// falls back to running the handler inline (today's pre-0.B-1 behavior,
+  /// on whatever executor `respond(to:)` itself is running on) in that case.
+  ///
+  /// Typed `Any?` for the same reason the deleted `RenderTaskExecutor`
+  /// property was: `RouteTaskExecutor` conforms to `TaskExecutor`, which is
+  /// `@available(macOS 15.0, *)`, so a STORED property of that type would
+  /// force this class's availability down with it, below the package's
+  /// macOS 14 floor (`Package.swift:6`).
+  private let routeTaskExecutor: Any? = {
+    guard #available(macOS 15.0, *), RouteTaskExecutorFlag.isEnabled else { return nil }
+    return RouteTaskExecutor()
+  }()
+
   let comfyBridge: ComfyBridge
 
   /// Imported ComfyUI workflows (#238), file-backed at ~/.comfybox/workflows/.
@@ -612,6 +638,23 @@ public final class WarmServer {
       server: self
     )
     handler.start()
+  }
+
+  /// 0.B-1 (v2.3 rework): runs `operation` under `routeTaskExecutor`'s
+  /// preference when available and enabled, otherwise runs it inline exactly
+  /// as before this change (pre-0.B-1 behavior — no executor involved at
+  /// all). Structured, not a new unstructured `Task {}`: `respond(to:)` is
+  /// already running inside the connection's own task, so this only needs to
+  /// redirect where ITS continuations resume, via `withTaskExecutorPreference`
+  /// (SE-0417) — no child task, no `.value` await, no change to cancellation
+  /// or the caller's control flow.
+  private func respondOnRouteExecutor(
+    _ operation: () async -> RoutedResponse
+  ) async -> RoutedResponse {
+    if #available(macOS 15.0, *), let executor = routeTaskExecutor as? RouteTaskExecutor {
+      return await withTaskExecutorPreference(executor, operation: operation)
+    }
+    return await operation()
   }
 
   fileprivate func respond(to request: HTTPRequest) async -> RoutedResponse {
@@ -1575,7 +1618,8 @@ public final class WarmServer {
     // /v1/loras/ hasPrefix pattern.
 
     case ("POST", "/v1/enhance"):
-      return await enhancePromptResponse(body: request.body)
+      // 0.B-1 (v2.3): async-internals route, lifted off the cooperative pool.
+      return await respondOnRouteExecutor { await self.enhancePromptResponse(body: request.body) }
 
     // MARK: - Queue management
 
@@ -1684,10 +1728,12 @@ public final class WarmServer {
     // MARK: - CivitAI conduit + prompt repository (#234)
 
     case ("GET", "/v1/civitai/search"):
-      return await civitaiSearchRoute(request: request)
+      // 0.B-1 (v2.3): async-internals route, lifted off the cooperative pool.
+      return await respondOnRouteExecutor { await self.civitaiSearchRoute(request: request) }
 
     case ("POST", "/v1/civitai/harvest"):
-      return await civitaiHarvestRoute(request: request)
+      // 0.B-1 (v2.3): async-internals route, lifted off the cooperative pool.
+      return await respondOnRouteExecutor { await self.civitaiHarvestRoute(request: request) }
 
     case ("GET", "/v1/civitai/repo"):
       return civitaiRepoRoute(request: request)
@@ -5741,32 +5787,6 @@ private actor WarmServerCoordinator {
     executorQueue.asUnownedSerialExecutor()
   }
 
-  /// 0.B-1 (FDD-ui-api-parity.md §3.1.3, comfybox#300): 0.A above pins the
-  /// actor's OWN isolated code off the cooperative pool, but the render call
-  /// chain (`pipeline.generateFromRequest` and friends) is nonisolated async
-  /// — per SE-0338 it hops back onto the cooperative pool at every `await`
-  /// and blocks there on MLX's mutex for the whole render. This shared,
-  /// width-2 executor (see RenderTaskExecutor.swift) is what the three render
-  /// spawn sites (`startProcessingIfNeeded`, and the two `renderTask = Task {`
-  /// sites in `processLoop`) attach via `Task(executorPreference:)`, keeping
-  /// that nonisolated code off the pool too. One shared instance (not one per
-  /// spawn site) so the width-2 cap is enforced across all of them together.
-  /// `nil` on macOS <15 or with `COMFYBOX_RENDER_TASK_EXECUTOR=0` — every call
-  /// site falls back to a plain `Task {}` in that case, exactly today's
-  /// pre-0.B-1 behavior.
-  ///
-  /// Typed `Any?` rather than `RenderTaskExecutor?`: `RenderTaskExecutor`
-  /// conforms to `TaskExecutor`, which is `@available(macOS 15.0, *)`, so a
-  /// STORED property of that type would force the whole actor declaration to
-  /// carry the same availability — which would drop the package below its
-  /// macOS 14 floor (`Package.swift:6`). Type-erasing to `Any?` here keeps
-  /// the actor universally available; `spawnRenderTask` downcasts under its
-  /// own `#available` guard.
-  private let renderTaskExecutor: Any? = {
-    guard #available(macOS 15.0, *), RenderTaskExecutorFlag.isEnabled else { return nil }
-    return RenderTaskExecutor()
-  }()
-
   private let configuration: WarmServerConfiguration
   private let logger: Logger
   private var pipeline: ZImagePipeline
@@ -7337,22 +7357,6 @@ private actor WarmServerCoordinator {
   /// composed `GET /v1/queue` reflects it immediately regardless.
   func drainControlDeltas() { drainQueueDeltas() }
 
-  /// 0.B-1: spawns an unstructured task on `renderTaskExecutor` when it's
-  /// available and enabled, otherwise a plain `Task {}` — exactly today's
-  /// (pre-0.B-1) behavior. All three render spawn sites go through this one
-  /// helper so the fallback path can't drift between them.
-  ///
-  /// The 0.B-0 spike (ExecutorPreferenceSpikeTests.swift) confirmed executor
-  /// preference does NOT survive an inner unstructured `Task {}` boundary —
-  /// so this is called at each of the three sites individually; none of them
-  /// may rely on inheriting the preference from a caller.
-  private func spawnRenderTask(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
-    if #available(macOS 15.0, *), let executor = renderTaskExecutor as? RenderTaskExecutor {
-      return Task(executorPreference: executor, operation: operation)
-    }
-    return Task(operation: operation)
-  }
-
   private func startProcessingIfNeeded() {
     // 0.B-2 drain point 2/2 (FDD §3.1.4a point 3): apply undrained deltas here
     // too, so a delta lands even when the loop is PARKED (this is the only path
@@ -7365,10 +7369,7 @@ private actor WarmServerCoordinator {
     persistQueueState()
     guard !isProcessing else { return }
     isProcessing = true
-    // 0.B-1 spawn site 1/3 — the outer processLoop task. `.localVideo` runs
-    // inline inside processLoop (confirmed in the 0.B-0 spike; it does not
-    // spawn its own child Task), so this one attachment also covers it.
-    _ = spawnRenderTask { [self] in
+    Task {
       await processLoop()
     }
   }
@@ -7459,10 +7460,7 @@ private actor WarmServerCoordinator {
       case .generate(let payload, let continuation, let progressHandler, let latentPreviewHandler):
         // Run the render in a retained child task so /interrupt can cancel it
         // without cancelling the queue's processing loop.
-        // 0.B-1 spawn site 2/3 — re-attached explicitly (the 0.B-0 spike
-        // confirmed preference does not survive this inner Task{} boundary
-        // by inheritance alone).
-        let renderTask = spawnRenderTask {
+        let renderTask = Task {
           await self.runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
         }
         activeRenderTask = renderTask
@@ -7471,8 +7469,7 @@ private actor WarmServerCoordinator {
         activeRenderTask = nil
         liveHealth.setActiveRenderTask(nil)
       case .controlGenerate(let request, let continuation):
-        // 0.B-1 spawn site 3/3 — same re-attachment as .generate above.
-        let renderTask = spawnRenderTask {
+        let renderTask = Task {
           await self.runControlGenerate(request, continuation: continuation)
         }
         activeRenderTask = renderTask
@@ -7487,7 +7484,7 @@ private actor WarmServerCoordinator {
         // occupying a worker exactly like a real synchronous render, which is
         // what makes the "sync control plane answers with zero cooperative
         // threads" test meaningful.
-        let renderTask = spawnRenderTask {
+        let renderTask = Task {
           if !Task.isCancelled {
             Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
           }
