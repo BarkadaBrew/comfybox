@@ -69,6 +69,37 @@ public final class WarmServerClient: @unchecked Sendable {
     return (response.statusCode, data)
   }
 
+  /// Perform an arbitrary-method request with caller-supplied request headers,
+  /// returning the response headers too (keys lowercased). Added for
+  /// `set_warm_preset`'s conditional PUT (If-Match from the GET's ETag —
+  /// adversarial review F2, 2026-08-30): the fixed-shape helpers above can
+  /// neither send extra request headers nor surface response headers.
+  public func send(
+    method: String, path: String, body: Data, headers: [String: String] = [:]
+  ) async throws -> (Int, Data, [String: String]) {
+    guard let url = URL(string: baseURL + path) else {
+      throw WarmServerClientError.invalidURL(path)
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    if method != "GET", method != "DELETE" {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = body
+    }
+    for (name, value) in headers {
+      request.setValue(value, forHTTPHeaderField: name)
+    }
+    let (data, response) = try await perform(request)
+    var responseHeaders: [String: String] = [:]
+    for (name, value) in response.allHeaderFields {
+      if let name = name as? String, let value = value as? String {
+        responseHeaders[name.lowercased()] = value
+      }
+    }
+    return (response.statusCode, data, responseHeaders)
+  }
+
   /// Perform a PATCH request (RFC 7386 JSON Merge Patch body). Returns
   /// (HTTP status code, response body).
   public func patch(_ path: String, body: Data) async throws -> (Int, Data) {

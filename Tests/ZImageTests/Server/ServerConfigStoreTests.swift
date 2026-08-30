@@ -17,15 +17,14 @@ final class ServerConfigStoreTests: XCTestCase {
     return dir
   }
 
-  /// A store over an empty temp directory, with an absent desktop-config and
-  /// no coffee-shop sources — the "brand new install" shape. `auditLog: nil`
-  /// so tests don't leave a stray file behind.
+  /// A store over an empty temp directory with no coffee-shop sources — the
+  /// "brand new install" shape. `auditLog: nil` so tests don't leave a stray
+  /// file behind.
   private func makeStore(in dir: URL) -> ServerConfigStore {
     ServerConfigStore(
       path: dir.appendingPathComponent("config.json"),
       coffeeShopProviders: dir.appendingPathComponent("absent-providers.json"),
       coffeeShopConfig: dir.appendingPathComponent("absent-config.json"),
-      desktopConfigPath: dir.appendingPathComponent("absent-desktop-config.json"),
       auditLog: nil
     )
   }
@@ -142,6 +141,13 @@ final class ServerConfigStoreTests: XCTestCase {
     XCTAssertEqual(krea2.height, 1024)
     XCTAssertNil(krea2.steps, "krea2 steps are variant-dependent — not seeded")
     XCTAssertNil(krea2.guidance, "krea2 guidance is variant-dependent — not seeded")
+
+    // Video: ltx2 seeds from the ENGINE constants (704x448, 97f), never from
+    // desktop values (adversarial review F1 — see the neutrality guard test).
+    let ltx2 = store.videoDefaults()
+    XCTAssertEqual(ltx2.width, 704)
+    XCTAssertEqual(ltx2.height, 448)
+    XCTAssertEqual(ltx2.frames, 97)
   }
 
   /// Migration is idempotent: a second call, or a fresh store re-loading the
@@ -159,12 +165,21 @@ final class ServerConfigStoreTests: XCTestCase {
     XCTAssertEqual(reloaded.renderDefaults(family: "fibo").steps, 30)
   }
 
-  /// `desktop-config.json`'s `videoWidth/Height/Frames` import into
-  /// `videoDefaults.default` — and ONLY those three fields (never
-  /// `videoSteps`, which no client ever read — FDD §3.3).
-  func testMigrationImportsVideoTrioFromDesktopConfigOnly() throws {
+  /// The engine-neutrality guard (adversarial review F1, 2026-08-30):
+  /// migration must NOT import desktop video values. Even with a
+  /// `desktop-config.json` carrying Motion-tab dims (the moment Desktop
+  /// Motion settings are saved, it does — `SettingsView.swift:80-82`),
+  /// a post-migration LTX request that omits dims must still resolve to
+  /// the engine's own 704x448x97 — one operator's UI numbers must never
+  /// silently shift every headless caller of THE production video family.
+  /// Desktop values stay Desktop-local; server-side `videoDefaults` starts
+  /// at the engine constants and changes only via explicit `PUT`/`PATCH`.
+  func testMigrationIsVideoEngineNeutralDespiteDesktopValues() throws {
     let dir = try makeTempDir()
     defer { try? FileManager.default.removeItem(at: dir) }
+    // A desktop-config.json with video dims, in the same directory the
+    // server config lives in — exactly where the (rejected) import would
+    // have found it.
     let desktopConfigPath = dir.appendingPathComponent("desktop-config.json")
     let desktopJSON: [String: Any] = [
       "serverHost": "127.0.0.1", "serverPort": 7870, "autoConnect": true,
@@ -175,36 +190,28 @@ final class ServerConfigStoreTests: XCTestCase {
     ]
     try JSONSerialization.data(withJSONObject: desktopJSON).write(to: desktopConfigPath)
 
-    let store = ServerConfigStore(
-      path: dir.appendingPathComponent("config.json"),
-      coffeeShopProviders: dir.appendingPathComponent("absent-providers.json"),
-      coffeeShopConfig: dir.appendingPathComponent("absent-config.json"),
-      desktopConfigPath: desktopConfigPath,
-      auditLog: nil
-    )
+    let store = makeStore(in: dir)
     XCTAssertTrue(store.runFirstRunDefaultsMigrationIfNeeded())
-    let video = store.videoDefaults()
-    XCTAssertEqual(video.width, 960)
-    XCTAssertEqual(video.height, 544)
-    XCTAssertEqual(video.frames, 121)
 
-    // desktop-config.json itself is untouched (read-only source, rollback artifact).
+    // The migrated document carries the ENGINE constants, not 960x544x121.
+    let video = store.videoDefaults()
+    XCTAssertEqual(video.width, 704, "desktop videoWidth must NOT be imported")
+    XCTAssertEqual(video.height, 448, "desktop videoHeight must NOT be imported")
+    XCTAssertEqual(video.frames, 97, "desktop videoFrames must NOT be imported")
+
+    // And the LTX prep path's exact resolution chain — request/named/preset
+    // all absent — lands on 704x448x97, bit-identical to pre-migration.
+    let reqWidth: Int? = nil, namedWidth: Int? = nil, presetWidth: Int? = nil
+    XCTAssertEqual(reqWidth ?? namedWidth ?? presetWidth ?? video.width ?? 704, 704)
+    let reqHeight: Int? = nil, namedHeight: Int? = nil, presetHeight: Int? = nil
+    XCTAssertEqual(reqHeight ?? namedHeight ?? presetHeight ?? video.height ?? 448, 448)
+    let reqFrames: Int? = nil
+    XCTAssertEqual(reqFrames ?? video.frames ?? 97, 97)
+
+    // desktop-config.json itself is untouched (never read, never written).
     let stillThere = try Data(contentsOf: desktopConfigPath)
     let decoded = try JSONSerialization.jsonObject(with: stillThere) as? [String: Any]
-    XCTAssertEqual(decoded?["videoSteps"] as? Int, 12, "desktop-config.json must never be modified")
-  }
-
-  /// No desktop-config.json present (or no video keys in it) → videoDefaults
-  /// stays empty; resolution keeps falling through to the engine's 704x448/97f.
-  func testMigrationLeavesVideoDefaultsEmptyWithNoDesktopConfig() throws {
-    let dir = try makeTempDir()
-    defer { try? FileManager.default.removeItem(at: dir) }
-    let store = makeStore(in: dir)
-    _ = store.runFirstRunDefaultsMigrationIfNeeded()
-    let video = store.videoDefaults()
-    XCTAssertNil(video.width)
-    XCTAssertNil(video.height)
-    XCTAssertNil(video.frames)
+    XCTAssertEqual(decoded?["videoWidth"] as? Int, 960, "desktop-config.json must never be modified")
   }
 
   // MARK: - byFamily resolution order

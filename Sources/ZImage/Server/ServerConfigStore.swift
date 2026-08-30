@@ -58,19 +58,10 @@ public final class ServerConfigStore: @unchecked Sendable {
   private var document: ComfyBoxServerConfig
   private var etag: String
 
-  /// The desktop-config path this instance uses for a later
-  /// ``runFirstRunDefaultsMigrationIfNeeded()`` call. Stored (not just taken
-  /// as a migration-call parameter) so `.shared`'s migration can be triggered
-  /// with zero call-site plumbing from `comfybox serve`.
-  private let desktopConfigPath: URL
-
   /// - Parameters:
   ///   - path: where the document lives (defaults to `~/.comfybox/config.json`).
   ///   - coffeeShopProviders/coffeeShopConfig: the pre-existing coffee-shop migration
   ///     sources, forwarded to `ComfyBoxServerConfig.loadOrMigrate` unchanged.
-  ///   - desktopConfigPath: the desktop's local settings file, read ONLY by
-  ///     ``runFirstRunDefaultsMigrationIfNeeded()`` for the one-time
-  ///     videoDefaults import (FDD §3.3) — never written, never deleted.
   ///   - auditLog: where migrated values are logged (`config.migrate.*`). `nil`
   ///     silences logging (handy for tests that don't want a stray file).
   ///
@@ -86,14 +77,12 @@ public final class ServerConfigStore: @unchecked Sendable {
     path: URL = ComfyBoxServerConfig.defaultPath(),
     coffeeShopProviders: URL = ComfyBoxServerConfig.coffeeShopProvidersPath(),
     coffeeShopConfig: URL = ComfyBoxServerConfig.coffeeShopConfigPath(),
-    desktopConfigPath: URL = ServerConfigStore.defaultDesktopConfigPath(),
     fileManager: FileManager = .default,
     auditLog: AuditLog? = AuditLog()
   ) {
     self.path = path
     self.fileManager = fileManager
     self.auditLog = auditLog
-    self.desktopConfigPath = desktopConfigPath
 
     let loaded = ComfyBoxServerConfig.loadOrMigrate(
       at: path, coffeeShopProviders: coffeeShopProviders, coffeeShopConfig: coffeeShopConfig,
@@ -117,22 +106,12 @@ public final class ServerConfigStore: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     var mutable = document
-    let migrated = Self.migrateRenderAndVideoDefaults(
-      into: &mutable, desktopConfigPath: desktopConfigPath, fileManager: fileManager, auditLog: auditLog)
+    let migrated = Self.migrateRenderAndVideoDefaults(into: &mutable, auditLog: auditLog)
     guard migrated else { return false }
     try? mutable.save(to: path, fileManager: fileManager)
     document = mutable
     etag = Self.computeETag(mutable)
     return true
-  }
-
-  /// `~/.comfybox/desktop-config.json` — the desktop's local settings file
-  /// (`ComfyBoxDesktop/Views/SettingsView.swift:configPath`). Read-only, never
-  /// written here. Follows `COMFYBOX_STATE_DIR` like every other `.comfybox`
-  /// path (K-FIX-1) so `ServerConfigStore.shared`'s one-time migration read
-  /// can't pick up a real machine's desktop settings during a test run.
-  public static func defaultDesktopConfigPath() -> URL {
-    ComfyBoxServerConfig.stateDirectory().appendingPathComponent("desktop-config.json")
   }
 
   // MARK: - Read
@@ -294,20 +273,42 @@ public final class ServerConfigStore: @unchecked Sendable {
     }
   }
 
-  /// First-run migration (FDD §3.3): if `renderDefaults` is empty, seed it from the
-  /// engine's own current fallbacks (freezing TODAY's numbers into an editable
-  /// document — resolution is unaffected, since the seed equals what the engine
-  /// already does). If `videoDefaults` is empty and the desktop's local
-  /// `desktop-config.json` has video values, import `videoWidth/Height/Frames`
-  /// ONLY (never `videoSteps` — no client ever read it, §3.3). `desktop-config.json`
-  /// is only ever read here, never deleted or modified. Each imported/seeded value
-  /// is logged individually to the audit log (`config.migrate.*`). Returns whether
-  /// anything changed, so the caller knows whether to persist.
+  /// The one video engine family today. `byFamily` keying matches
+  /// `renderDefaults`' shape so discovery (Phase 4) treats both uniformly.
+  static let videoEngineFamilies = ["ltx2"]
+
+  /// Video engine-constant seed, ported 1:1 from the LTX-2 prep path's
+  /// hardcoded fallbacks (`WarmServer.swift` `prepareLocalVideo`:
+  /// `?? 704`/`?? 448` dims, `?? 97` frames — same constants echoed by
+  /// `POST /v1/video/config/effective`).
+  static func videoEngineSeed(family: String) -> VideoDefaultValues {
+    switch family {
+    case "ltx2": return VideoDefaultValues(width: 704, height: 448, frames: 97)
+    default: return VideoDefaultValues()
+    }
+  }
+
+  /// First-run migration (FDD §3.3, engine-neutrality corrected per the
+  /// 2026-08-30 adversarial review F1): if `renderDefaults`/`videoDefaults`
+  /// is empty, seed it from the ENGINE's own current fallbacks — freezing
+  /// TODAY's numbers into an editable document; resolution is unaffected,
+  /// since every seed equals what the engine already does.
+  ///
+  /// Desktop values are deliberately NOT imported — for video either. The
+  /// v2 FDD text carved out `videoWidth/Height/Frames` as "genuinely read"
+  /// (by `MotionView.applyDefaults`), but importing them here would push one
+  /// operator's Motion-tab UI numbers onto EVERY headless LTX caller that
+  /// omits dims — the exact anti-pattern §3.3's inverted-migration rule
+  /// exists to prevent, on THE production video family. Desktop values stay
+  /// Desktop-local (MotionView keeps reading them for its own prefill);
+  /// server-side `videoDefaults` starts at the engine constants and changes
+  /// only via an explicit `PUT`/`PATCH /v1/config`.
+  ///
+  /// Each seeded value is logged to the audit log (`config.migrate.*`).
+  /// Returns whether anything changed, so the caller knows whether to persist.
   @discardableResult
   static func migrateRenderAndVideoDefaults(
     into config: inout ComfyBoxServerConfig,
-    desktopConfigPath: URL,
-    fileManager: FileManager,
     auditLog: AuditLog?
   ) -> Bool {
     var changed = false
@@ -334,36 +335,25 @@ public final class ServerConfigStore: @unchecked Sendable {
       changed = true
     }
 
-    if config.videoDefaults.isEmpty,
-       fileManager.fileExists(atPath: desktopConfigPath.path),
-       let data = try? Data(contentsOf: desktopConfigPath),
-       let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-      let width = root["videoWidth"] as? Int
-      let height = root["videoHeight"] as? Int
-      let frames = root["videoFrames"] as? Int
-      if width != nil || height != nil || frames != nil {
-        config.videoDefaults = VideoDefaultsConfig(
-          default: VideoDefaultValues(width: width, height: height, frames: frames))
-        changed = true
-        if let width {
-          auditLog?.append(
-            kind: "config.migrate.videoDefaults",
-            message: "Imported videoDefaults.default.width from desktop-config.json",
-            metadata: ["value": String(width)])
-        }
-        if let height {
-          auditLog?.append(
-            kind: "config.migrate.videoDefaults",
-            message: "Imported videoDefaults.default.height from desktop-config.json",
-            metadata: ["value": String(height)])
-        }
-        if let frames {
-          auditLog?.append(
-            kind: "config.migrate.videoDefaults",
-            message: "Imported videoDefaults.default.frames from desktop-config.json",
-            metadata: ["value": String(frames)])
-        }
+    if config.videoDefaults.isEmpty {
+      var byFamily: [String: VideoDefaultValues] = [:]
+      for family in videoEngineFamilies {
+        let seed = videoEngineSeed(family: family)
+        guard !seed.isEmpty else { continue }
+        byFamily[family] = seed
+        auditLog?.append(
+          kind: "config.migrate.videoDefaults",
+          message: "Seeded videoDefaults.byFamily.\(family) from the engine's current fallback",
+          metadata: [
+            "family": family,
+            "width": seed.width.map(String.init) ?? "",
+            "height": seed.height.map(String.init) ?? "",
+            "frames": seed.frames.map(String.init) ?? "",
+          ]
+        )
       }
+      config.videoDefaults = VideoDefaultsConfig(byFamily: byFamily)
+      changed = true
     }
 
     return changed

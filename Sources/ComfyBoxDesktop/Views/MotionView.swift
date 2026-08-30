@@ -387,10 +387,11 @@ struct MotionView: View {
     /// Prefill from Settings → Motion (once), matching a stored resolution to a
     /// preset when possible. Local `desktop-config.json` values apply
     /// immediately (instant, works offline); the server's `videoDefaults` —
-    /// migrated from these same local values on first run, but the
-    /// authoritative, agent-editable copy from then on (FDD-ui-api-parity
-    /// §3.3) — overlay a moment later if reachable. An unreachable server
-    /// simply leaves the local (last-known/cached) values in place.
+    /// seeded from the ENGINE constants on first run, never from these local
+    /// values (engine-neutrality: FDD-ui-api-parity §3.3, review F1
+    /// 2026-08-30), and agent-editable via PATCH /v1/config from then on —
+    /// overlay a moment later if reachable. An unreachable server simply
+    /// leaves the local (last-known/cached) values in place.
     private func applyDefaults() {
         guard !didApplyDefaults else { return }
         didApplyDefaults = true

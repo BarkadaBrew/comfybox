@@ -239,15 +239,15 @@ final class MCPParityPhase1ToolTests: XCTestCase {
     let configDoc: [String: Any] = ["modelSpec": "old-model", "otherField": "keep-me"]
     let configData = try JSONSerialization.data(withJSONObject: configDoc)
 
-    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _ in
+    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _, _ in
       await log.record(method, path)
       switch (method, path) {
-      case ("POST", "/v1/model/activate"): return (200, Data("{}".utf8))
-      case ("GET", "/v1/config"): return (200, configData)
-      case ("PUT", "/v1/config"): return (200, Data("{}".utf8))
+      case ("POST", "/v1/model/activate"): return (200, Data("{}".utf8), [:])
+      case ("GET", "/v1/config"): return (200, configData, [:])
+      case ("PUT", "/v1/config"): return (200, Data("{}".utf8), [:])
       default:
         XCTFail("unexpected call \(method) \(path)")
-        return (500, Data())
+        return (500, Data(), [:])
       }
     }
 
@@ -266,16 +266,16 @@ final class MCPParityPhase1ToolTests: XCTestCase {
     let configData = try JSONSerialization.data(withJSONObject: configDoc)
     var putBody: Data?
 
-    _ = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, body in
+    _ = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, body, _ in
       switch (method, path) {
-      case ("POST", "/v1/model/activate"): return (200, Data("{}".utf8))
-      case ("GET", "/v1/config"): return (200, configData)
+      case ("POST", "/v1/model/activate"): return (200, Data("{}".utf8), [:])
+      case ("GET", "/v1/config"): return (200, configData, [:])
       case ("PUT", "/v1/config"):
         putBody = body
-        return (200, Data("{}".utf8))
+        return (200, Data("{}".utf8), [:])
       default:
         XCTFail("unexpected call \(method) \(path)")
-        return (500, Data())
+        return (500, Data(), [:])
       }
     }
 
@@ -290,16 +290,16 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   func testSetWarmPresetActivateFails_loadFallbackSucceeds_thenConfigWritten() async throws {
     let log = CallLog()
 
-    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _ in
+    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _, _ in
       await log.record(method, path)
       switch (method, path) {
-      case ("POST", "/v1/model/activate"): return (500, Data("{\"error\":\"not in pool\"}".utf8))
-      case ("POST", "/v1/model/load"): return (202, Data("{}".utf8))
-      case ("GET", "/v1/config"): return (200, Data("{}".utf8))
-      case ("PUT", "/v1/config"): return (200, Data("{}".utf8))
+      case ("POST", "/v1/model/activate"): return (500, Data("{\"error\":\"not in pool\"}".utf8), [:])
+      case ("POST", "/v1/model/load"): return (202, Data("{}".utf8), [:])
+      case ("GET", "/v1/config"): return (200, Data("{}".utf8), [:])
+      case ("PUT", "/v1/config"): return (200, Data("{}".utf8), [:])
       default:
         XCTFail("unexpected call \(method) \(path)")
-        return (500, Data())
+        return (500, Data(), [:])
       }
     }
 
@@ -316,14 +316,14 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   func testSetWarmPresetActivateAndLoadBothFail_configNeverTouched() async throws {
     let log = CallLog()
 
-    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _ in
+    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _, _ in
       await log.record(method, path)
       switch (method, path) {
-      case ("POST", "/v1/model/activate"): return (500, Data("{\"error\":\"nope\"}".utf8))
-      case ("POST", "/v1/model/load"): return (500, Data("{\"error\":\"still nope\"}".utf8))
+      case ("POST", "/v1/model/activate"): return (500, Data("{\"error\":\"nope\"}".utf8), [:])
+      case ("POST", "/v1/model/load"): return (500, Data("{\"error\":\"still nope\"}".utf8), [:])
       default:
         XCTFail("config must never be touched when activation fails entirely: \(method) \(path)")
-        return (500, Data())
+        return (500, Data(), [:])
       }
     }
 
@@ -337,19 +337,129 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   func testSetWarmPresetGetConfigFails_putNeverAttempted() async throws {
     let log = CallLog()
 
-    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _ in
+    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _, _ in
       await log.record(method, path)
       switch (method, path) {
-      case ("POST", "/v1/model/activate"): return (200, Data("{}".utf8))
-      case ("GET", "/v1/config"): return (500, Data("{\"error\":\"disk error\"}".utf8))
+      case ("POST", "/v1/model/activate"): return (200, Data("{}".utf8), [:])
+      case ("GET", "/v1/config"): return (500, Data("{\"error\":\"disk error\"}".utf8), [:])
       default:
         XCTFail("PUT must never be attempted when GET /v1/config fails: \(method) \(path)")
-        return (500, Data())
+        return (500, Data(), [:])
       }
     }
 
     XCTAssertTrue(result.isError)
     let calls = await log.methodsAndPaths().map { "\($0.0) \($0.1)" }
     XCTAssertEqual(calls, ["POST /v1/model/activate", "GET /v1/config"])
+  }
+
+  /// The lost-update fix (adversarial review F2, 2026-08-30): a concurrent
+  /// `PATCH /v1/config` landing between set_warm_preset's GET and PUT must
+  /// not be clobbered. The composite sends the GET's ETag as If-Match, so
+  /// the stale PUT is rejected with 409; the ONE bounded retry re-fetches
+  /// the patched document and re-applies only the modelSpec mutation — the
+  /// final PUT body carries BOTH the concurrent patch's field AND the new
+  /// modelSpec.
+  func testSetWarmPresetRetriesOn409PreservingConcurrentPatch() async throws {
+    /// A tiny fake config server whose document is PATCHed by "someone else"
+    /// immediately after the first GET is served — the exact interleaving
+    /// that used to lose the patch.
+    actor FakeConfigServer {
+      var doc: [String: Any] = ["modelSpec": "old-model", "otherField": "keep-me"]
+      var etag = "\"v1\""
+      private(set) var getCount = 0
+      private(set) var putAttempts: [(ifMatch: String?, body: Data)] = []
+
+      func get() throws -> (Data, String) {
+        getCount += 1
+        let data = try JSONSerialization.data(withJSONObject: doc)
+        let servedETag = etag
+        if getCount == 1 {
+          // The concurrent PATCH: lands right after our GET response is on
+          // the wire, before our PUT arrives.
+          doc["patchedField"] = "concurrent"
+          etag = "\"v2\""
+        }
+        return (data, servedETag)
+      }
+
+      func put(ifMatch: String?, body: Data) throws -> Int {
+        putAttempts.append((ifMatch, body))
+        if let ifMatch, ifMatch != etag { return 409 }
+        doc = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        etag = "\"v3\""
+        return 200
+      }
+    }
+
+    let server = FakeConfigServer()
+    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, body, headers in
+      switch (method, path) {
+      case ("POST", "/v1/model/activate"):
+        return (200, Data("{}".utf8), [:])
+      case ("GET", "/v1/config"):
+        let (data, etag) = try await server.get()
+        return (200, data, ["ETag": etag])
+      case ("PUT", "/v1/config"):
+        let status = try await server.put(ifMatch: headers["If-Match"], body: body)
+        return (status, Data("{}".utf8), [:])
+      default:
+        XCTFail("unexpected call \(method) \(path)")
+        return (500, Data(), [:])
+      }
+    }
+
+    XCTAssertFalse(result.isError, "the bounded retry should succeed")
+
+    let attempts = await server.putAttempts
+    XCTAssertEqual(attempts.count, 2, "exactly one retry after the 409")
+    XCTAssertEqual(attempts[0].ifMatch, "\"v1\"", "first PUT must send the first GET's ETag as If-Match")
+    XCTAssertEqual(attempts[1].ifMatch, "\"v2\"", "the retry must send the RE-FETCHED document's ETag")
+
+    // The winning PUT body carries BOTH writes: the concurrent patch's field
+    // and our modelSpec mutation (plus the untouched pre-existing field).
+    let finalBody = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: attempts[1].body) as? [String: Any])
+    XCTAssertEqual(finalBody["modelSpec"] as? String, "new-model")
+    XCTAssertEqual(finalBody["patchedField"] as? String, "concurrent",
+                    "the concurrent PATCH must survive the retry")
+    XCTAssertEqual(finalBody["otherField"] as? String, "keep-me")
+
+    // And the server's final document agrees.
+    let finalDoc = await server.doc
+    XCTAssertEqual(finalDoc["modelSpec"] as? String, "new-model")
+    XCTAssertEqual(finalDoc["patchedField"] as? String, "concurrent")
+  }
+
+  /// The bounded half of the F2 fix: if a SECOND 409 follows the retry (a
+  /// pathological write storm), the composite returns the 409 as a clean
+  /// error instead of looping.
+  func testSetWarmPresetSecondConflictReturns409() async throws {
+    actor Counter {
+      private(set) var puts = 0
+      func bump() -> Int { puts += 1; return puts }
+    }
+    let counter = Counter()
+    let configData = try JSONSerialization.data(withJSONObject: ["modelSpec": "old"])
+
+    let result = try await MCPToolExecutor.runSetWarmPreset(model: "new-model") { method, path, _, headers in
+      switch (method, path) {
+      case ("POST", "/v1/model/activate"):
+        return (200, Data("{}".utf8), [:])
+      case ("GET", "/v1/config"):
+        return (200, configData, ["ETag": "\"stale\""])
+      case ("PUT", "/v1/config"):
+        _ = await counter.bump()
+        XCTAssertEqual(headers["If-Match"], "\"stale\"")
+        return (409, Data("{\"error\":\"conflict\"}".utf8), [:])
+      default:
+        XCTFail("unexpected call \(method) \(path)")
+        return (500, Data(), [:])
+      }
+    }
+
+    XCTAssertTrue(result.isError, "a second conflict must surface as an error")
+    let puts = await counter.puts
+    XCTAssertEqual(puts, 2, "exactly two PUT attempts — never an unbounded loop")
   }
 }
