@@ -1,5 +1,7 @@
 # FDD: Headless parity — every UI control reachable by API
 
+> **v2.1 (2026-08-29, late):** interrupt sections updated after confirming the LIVE model family is krea2 — the family-qualification excludes the entire production path (comfybox#304 filed). §7 line refs pinned @ c9dd27d; refresh after Phase 0.A merges.
+
 **Repo:** `BarkadaBrew/comfybox` (`zimage.swift`, Swift/MLX)
 **Worktree/branch:** `~/Projects/zimage-apiparity` @ `feat/ui-api-parity` (base `origin/main` c9dd27d)
 **Components:** `Sources/ZImage/Server/WarmServer.swift`, `Sources/ZImage/Server/ComfyBridge/ComfyBridge.swift`, `Sources/ZImage/MCP/*`, `Sources/ZImage/Server/ComfyBoxServerConfig.swift`, `Sources/ComfyBoxDesktop/Views/SettingsView.swift`; cross-repo: `coffeeshop-server/src/tools/`
@@ -132,7 +134,7 @@ This is the minimum inversion that makes the AC honest. Without it, Phase 0's "r
 - #1479 is a **handoff-and-resume** — yield, run the preemptor, resume — not an indefinite park. Parking a render would pin materialized latents in unified memory precisely against #218's eviction logic.
 - `isPaused` is a **between-items gate** on a live endpoint. Redefining it as "stops the current render" is a breaking semantic change for every existing caller.
 
-**Mid-render abort is scoped to `interrupt`, and family-qualified.** `interrupt` already works mid-render for ZImage, ZImageControl, Flux2 and Fibo; **Krea2 and Chroma have zero `checkCancellation` sites** and will not abort until their sampling loops gain them. The AC says exactly that, rather than implying uniform behavior.
+**Mid-render abort is scoped to `interrupt`, and family-qualified — and the qualification bites in production.** `interrupt` already works mid-render for ZImage, ZImageControl, Flux2 and Fibo; **Krea2 and Chroma have zero `checkCancellation` sites** — and krea2 is the family the 24/7 engine actually runs (`/health`: family=krea2, alias=krea2-raw). So until comfybox#304 lands (step-boundary `checkCancellation` in the Krea2/Chroma samplers, ~<1min abort latency at 12 steps), **no mid-render abort exists on the production path at all** — interrupt only prevents the next queue item. This is also why deploys must be timed to job rotation. Phase 0 makes the route *reachable* during a render; #304 makes it *effective*.
 
 #### 3.1.7 Alternatives rejected
 
@@ -259,7 +261,7 @@ Anti-drift by construction: the registry is load-bearing in three consumers — 
 
 **Tests.** Delta mailbox: ordering, cap, eviction, and — critically — a **`resume`-while-parked** test asserting the loop restarts (the v1 blocker, pinned). Enqueue-during-render + concurrent cancel: neither job is lost. Cancel → bounce → job stays cancelled (sidecar replay). Integration: with a synthetic 60s operation active, every residual control route returns `< 2s`, and `GET /v1/queue` reports `is_paused: true` **during** the operation, not after.
 
-**ACs.** (1) With a render in flight, every control route returns within 2s. (2) `GET /v1/queue` reflects a pause/cancel issued during that render, in that render. (3) `interrupt` aborts mid-render **for ZImage, ZImageControl, Flux2 and Fibo**; Krea2 and Chroma abort at the next item boundary until `checkCancellation` sites are added (tracked separately). (4) **No** mid-render pause AC (§3.1.6).
+**ACs.** (1) With a render in flight, every control route returns within 2s. (2) `GET /v1/queue` reflects a pause/cancel issued during that render, in that render. (3) `interrupt` aborts mid-render **for ZImage, ZImageControl, Flux2 and Fibo**; Krea2 and Chroma — including the production krea2-raw path — abort at the next item boundary until comfybox#304 lands. Do not read this AC as "interrupt works in production"; today it does not, mid-render. (4) **No** mid-render pause AC (§3.1.6).
 
 **Rollback.** 0.A reverts as one commit (removing an executor restores the default one; no data). 0.B reverts behind `COMFYBOX_CONTROL_PLANE_SYNC=0`, with the delta sidecar drained on next boot regardless of the flag so no cancel is lost across the toggle.
 
