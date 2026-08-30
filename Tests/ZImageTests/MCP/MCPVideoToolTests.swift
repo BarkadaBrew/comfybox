@@ -72,6 +72,20 @@ final class MCPVideoToolTests: XCTestCase {
     XCTAssertEqual(skip?["type"] as? String, "boolean")
   }
 
+  /// Run overrides (coffeeshop-server#1751): the executor body is an explicit
+  /// whitelist, so an undeclared/unforwarded key vanishes silently — exactly
+  /// how skip_character_injection was dropped once. Pin both keys.
+  func testGenerateVideoSchemaExposesRunOverrides() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    let loras = properties?["loras"] as? [String: Any]
+    XCTAssertNotNil(loras, "generate_video must expose loras (per-render stack override)")
+    XCTAssertEqual(loras?["type"] as? String, "array")
+    let fps = properties?["fps"] as? [String: Any]
+    XCTAssertNotNil(fps, "generate_video must expose fps")
+    XCTAssertEqual(fps?["type"] as? String, "integer")
+  }
+
   func testGenerateVideoSchemaOnlyPromptRequired() {
     let tool = MCPToolRegistry.tool(named: "generate_video")!
     let required = tool.inputSchema["required"] as? [String]
