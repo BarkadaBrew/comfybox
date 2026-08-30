@@ -2488,6 +2488,12 @@ public final class WarmServer {
     let renderId: String?
     let path: String?
     let resolution: String?
+    /// Tier-A overrides applied ON TOP of the replayed request — the point is
+    /// "same seed, same prompt, but rendered differently". The daemon's hq
+    /// quality tier sends { two_stage, audio_refine } here so a cheap 480p
+    /// single-pass explore can be promoted to a two-pass keeper without
+    /// re-rolling the seed.
+    let tuning: LTX2VideoTuning?
   }
 
   private struct VideoExtendBody: Decodable {
@@ -2567,7 +2573,8 @@ public final class WarmServer {
         resolvedSeed: trace.submitted["seed"],
         effectivePrompt: trace.submitted["prompt"],
         resolution: resolution,
-        initImagePath: trace.submitted["image_path"])
+        initImagePath: trace.submitted["image_path"],
+        tuningOverride: req.tuning)
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
         logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
         return routed
