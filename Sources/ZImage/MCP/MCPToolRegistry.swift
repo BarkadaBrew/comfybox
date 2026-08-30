@@ -56,6 +56,13 @@ public enum MCPToolRegistry {
     nearlineEvict,
     civitaiSearch,
     civitaiPrompts,
+    moveQueueJob,
+    updateLoraTriggerwords,
+    createPreset,
+    deletePreset,
+    setWarmPreset,
+    createCharacter,
+    deleteCharacter,
   ]
 
   // MARK: - Tool Definitions
@@ -929,6 +936,163 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
     ]
+  )
+
+  // MARK: - Headless parity Phase 1 (comfybox#300, FDD §4.2) — gap-set tools
+  // for mutating routes that had no MCP tool as of c9dd27d's route inventory
+  // (§2.6). Scope is intentionally the 6-item gap set only — update_config
+  // and the rest of §4.2's "New tools" list are other phases'/worktrees'
+  // territory (see FDD §0 row 10, §4 preamble).
+
+  static let moveQueueJob = MCPToolDefinition(
+    name: "move_queue_job",
+    description: "Reorder one pending job in the render queue: move it to the top, or one slot up/down from its current position.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "The pending job id (from queue_list)."] as [String: Any],
+        "direction": [
+          "type": "string",
+          "enum": ["top", "up", "down"],
+          "description": "Where to move the job: 'top' (front of queue), 'up' (one slot earlier), 'down' (one slot later). Any other value is rejected with a clean error.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "direction"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/{id}/move")]
+  )
+
+  static let updateLoraTriggerwords = MCPToolDefinition(
+    name: "update_lora_triggerwords",
+    description: "Edit a LoRA's trigger-word list in the library index (does not modify the .safetensors file itself). Replaces the full list — pass every trigger word you want kept.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "LoRA identifier from the library (see lora_library)."] as [String: Any],
+        "triggerwords": [
+          "type": "array",
+          "items": ["type": "string"] as [String: Any],
+          "description": "Replacement trigger-word list. Pass an empty array to clear all trigger words.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "triggerwords"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/loras/{id}/update")]
+  )
+
+  static let createPreset = MCPToolDefinition(
+    name: "create_preset",
+    description: "Create or fully replace a saved generation preset (the canonical /v1/presets store). This is a full-document write, not a patch — fields you omit are absent from the saved preset, not preserved from any existing preset with the same id. Use list_presets first to see the current shape when updating an existing preset.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Stable preset id."] as [String: Any],
+        "name": ["type": "string", "description": "Display name."] as [String: Any],
+        "description": ["type": "string", "description": "Preset description."] as [String: Any],
+        "media_kind": [
+          "type": "string",
+          "enum": ["image", "video"],
+          "description": "Routes the preset to the image or video pipeline.",
+        ] as [String: Any],
+        "provider": ["type": "string", "description": "\"local\" | \"replicate\" | \"auto\"."] as [String: Any],
+        "engine": ["type": "string", "description": "\"mflux\" | \"zimage\"."] as [String: Any],
+        "model": ["type": "string", "description": "Model spec (e.g. \"z-image-turbo-bf16\")."] as [String: Any],
+        "prompt": ["type": "string"] as [String: Any],
+        "negative_prompt": ["type": "string"] as [String: Any],
+        "prompt_prefix": ["type": "string"] as [String: Any],
+        "prompt_suffix": ["type": "string"] as [String: Any],
+        "steps": ["type": "integer"] as [String: Any],
+        "guidance": ["type": "number"] as [String: Any],
+        "seed": ["type": "integer"] as [String: Any],
+        "width": ["type": "integer"] as [String: Any],
+        "height": ["type": "integer"] as [String: Any],
+        "scheduler": ["type": "string"] as [String: Any],
+        "loras": [
+          "type": "array",
+          "description": "LoRA stack for this preset: [{filename, scale}].",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "name"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/presets")]
+  )
+
+  static let deletePreset = MCPToolDefinition(
+    name: "delete_preset",
+    description: "Delete a saved generation preset by id.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Preset id to delete (from list_presets)."] as [String: Any],
+      ] as [String: Any],
+      "required": ["id"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/presets/{id}")]
+  )
+
+  static let setWarmPreset = MCPToolDefinition(
+    name: "set_warm_preset",
+    description: "Make a model the server's warm-start default: activate it now (loading it into the pool first if it isn't already loaded there), then persist it as the server config's modelSpec so it survives the next restart. Mirrors the Desktop app's Preset 'Set as Warm' action exactly. If activation cannot succeed (even after a load attempt), the config is left untouched — this never partially applies.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "model": [
+          "type": "string",
+          "description": "Model spec to make the warm-start default — a preset's model or customModelPath (see list_presets).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["model"] as [String],
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/model/activate"),
+      RouteRef(method: "POST", path: "/v1/model/load"),
+      RouteRef(method: "GET", path: "/v1/config"),
+      RouteRef(method: "PUT", path: "/v1/config"),
+    ]
+  )
+
+  static let createCharacter = MCPToolDefinition(
+    name: "create_character",
+    description: "Create or update a creative character/scene (the canonical /v1/characters store). Full-document upsert: fields you omit are absent from the saved entry, not preserved from any existing entry with the same id. Use list_characters first to see the current shape when updating. 'id' defaults to a slug of 'name' when omitted.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Stable id. Defaults to a slug of 'name' when omitted."] as [String: Any],
+        "name": ["type": "string", "description": "Display name."] as [String: Any],
+        "kind": [
+          "type": "string",
+          "enum": ["character", "scene"],
+          "description": "\"character\" (a subject) or \"scene\" (an environment/location). Default: character.",
+        ] as [String: Any],
+        "description": ["type": "string", "description": "Flat description (legacy/fallback; also used when no tiered 'base' is present)."] as [String: Any],
+        "base": ["type": "string", "description": "SFW physical appearance — always included when assembling a description."] as [String: Any],
+        "banana": ["type": "string", "description": "Suggestive additions — appended in banana + avocado content modes."] as [String: Any],
+        "avocado": ["type": "string", "description": "Explicit additions — appended in avocado content mode only."] as [String: Any],
+        "default_loras": [
+          "type": "array",
+          "description": "LoRAs applied by default when rendering this character: [{filename, scale}].",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "prompt_snippet": ["type": "string", "description": "A reusable prompt fragment injected when this character is selected."] as [String: Any],
+        "negative_prompt": ["type": "string", "description": "Negative-prompt additions specific to this character."] as [String: Any],
+      ] as [String: Any],
+      "required": ["name"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/characters"), RouteRef(method: "PUT", path: "/v1/characters")]
+  )
+
+  static let deleteCharacter = MCPToolDefinition(
+    name: "delete_character",
+    description: "Delete a creative character/scene by id.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Character id to delete (from list_characters)."] as [String: Any],
+      ] as [String: Any],
+      "required": ["id"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/characters/{id}")]
   )
 
   // MARK: - Lookup

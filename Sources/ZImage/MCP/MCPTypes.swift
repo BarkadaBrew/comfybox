@@ -153,6 +153,37 @@ public struct MCPError: Codable, Sendable {
   }
 }
 
+// MARK: - Route parity (FDD headless-parity §3.5/§4.2)
+
+/// Which dispatch surface a route lives on. `.v1` routes are WarmServer's
+/// primary API and are held to MCP parity (D5 anti-drift test — every
+/// mutating `.v1` route must be claimed by a tool or listed as an
+/// exemption). `.comfyUICompat` routes are `ComfyBridge`'s second dispatch
+/// switch — they exist for ComfyUI/Krita clients with their own protocol
+/// and never require an MCP tool, but must still be enumerated.
+public enum RouteSurface: String, Codable, Sendable {
+  case v1
+  case comfyUICompat
+}
+
+/// A single HTTP route claimed by an MCP tool. `path` uses `{name}` for
+/// path parameters (e.g. `/v1/queue/{id}/move`). Populated on every tool
+/// added starting Phase 1 so the anti-drift parity test (FDD §3.5) can
+/// cross-check the compile-time tool catalog against routes parsed from
+/// the dispatch switches at `WarmServer.swift:respond(to:)` and
+/// `ComfyBridge.swift:route()`.
+public struct RouteRef: Codable, Sendable, Hashable {
+  public let method: String
+  public let path: String
+  public let surface: RouteSurface
+
+  public init(method: String, path: String, surface: RouteSurface = .v1) {
+    self.method = method
+    self.path = path
+    self.surface = surface
+  }
+}
+
 // MARK: - MCP Tool Definition
 
 /// Tool definition for the MCP tools/list response.
@@ -160,11 +191,16 @@ public struct MCPToolDefinition: Sendable {
   public let name: String
   public let description: String
   public let inputSchema: [String: Any]
+  /// HTTP routes this tool proxies to (see ``RouteRef``). Defaults to empty
+  /// so existing call sites are unaffected; populated for tools added
+  /// starting Phase 1 of the headless-parity FDD (comfybox#300, §4.2).
+  public let routes: [RouteRef]
 
-  public init(name: String, description: String, inputSchema: [String: Any]) {
+  public init(name: String, description: String, inputSchema: [String: Any], routes: [RouteRef] = []) {
     self.name = name
     self.description = description
     self.inputSchema = inputSchema
+    self.routes = routes
   }
 
   /// Serialize inputSchema to JSON-compatible dictionary (for tools/list response).

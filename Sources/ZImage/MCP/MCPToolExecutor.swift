@@ -111,6 +111,20 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeCivitAISearch(arguments)
       case "civitai_prompts":
         return try await executeCivitAIPrompts(arguments)
+      case "move_queue_job":
+        return try await executeMoveQueueJob(arguments)
+      case "update_lora_triggerwords":
+        return try await executeUpdateLoraTriggerwords(arguments)
+      case "create_preset":
+        return try await executeCreatePreset(arguments)
+      case "delete_preset":
+        return try await executeDeletePreset(arguments)
+      case "set_warm_preset":
+        return try await executeSetWarmPreset(arguments)
+      case "create_character":
+        return try await executeCreateCharacter(arguments)
+      case "delete_character":
+        return try await executeDeleteCharacter(arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -210,7 +224,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/generate", body: jsonData)
     guard status == 200, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      return mapHTTPResponse(status: status, data: data)
+      return Self.mapHTTPResponse(status: status, data: data)
     }
     // Mark the rerender (Todd) + base64-encode so the caller delivers WITHOUT
     // server file access — fully on-device product.
@@ -290,7 +304,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/generate", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// swap_loras -> POST /v1/lora/swap
@@ -313,7 +327,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["loras": loraEntries]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/lora/swap", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// clear_queue -> POST /queue with {"clear": true}
@@ -321,14 +335,14 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["clear": true]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/queue", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// pause_queue / resume_queue -> POST /v1/queue/pause | /v1/queue/resume
   /// (the same persistent gate the desktop toolbar and HTTP API use).
   private func executeQueuePause(_ pause: Bool) async throws -> MCPToolResult {
     let (status, data) = try await client.post(pause ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// list_loras -> GET /object_info, extract LoraLoader lora_name options
@@ -336,7 +350,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let (status, data) = try await client.get("/object_info")
 
     guard status == 200 else {
-      return mapHTTPResponse(status: status, data: data)
+      return Self.mapHTTPResponse(status: status, data: data)
     }
 
     // Parse /object_info JSON and extract LoraLoader.input.required.lora_name options
@@ -365,7 +379,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
 
     let (status, data) = try await client.post("/v1/shutdown", body: Data("{}".utf8))
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// apply_style — local-only, no HTTP call.
@@ -433,7 +447,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
 
     let (status, data) = try await client.get(path)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// lora_scan -> POST /v1/loras/scan
@@ -444,7 +458,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/loras/scan", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// lora_quarantine -> POST /v1/loras/{id}/quarantine or DELETE /v1/loras/{id}/quarantine
@@ -465,10 +479,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
       }
       let jsonData = try JSONSerialization.data(withJSONObject: body)
       let (status, data) = try await client.post(path, body: jsonData)
-      return mapHTTPResponse(status: status, data: data)
+      return Self.mapHTTPResponse(status: status, data: data)
     } else {
       let (status, data) = try await client.delete(path)
-      return mapHTTPResponse(status: status, data: data)
+      return Self.mapHTTPResponse(status: status, data: data)
     }
   }
 
@@ -495,7 +509,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
       let text = String(data: data, encoding: .utf8) ?? "{}"
       return MCPToolResult(text: text)
     }
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// switch_model -> POST /v1/model/activate
@@ -506,7 +520,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["model": model]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/model/activate", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
 
@@ -518,7 +532,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let body: [String: Any] = ["model": model]
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/model/unload", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
 
@@ -630,7 +644,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
       let text = String(data: data, encoding: .utf8) ?? "{}"
       return MCPToolResult(text: text)
     }
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// rerender_video / extend_video -> POST /v1/video/{rerender,extend}
@@ -645,7 +659,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if status == 200 || status == 202 {
       return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// compose_montage -> POST /v1/montage/compose (sync — compositing is cheap).
@@ -660,7 +674,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if status == 200 {
       return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// render_storyboard -> POST /v1/storyboard/render (202 + job id; poll
@@ -674,7 +688,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if status == 200 || status == 202 {
       return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// import_workflow -> POST /v1/workflows/import
@@ -689,7 +703,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if status == 200 {
       return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
     }
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// run_workflow -> POST /v1/workflows/{id}/run (202 + run_id), then poll the
@@ -707,7 +721,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/workflows/\(workflowId)/run", body: jsonData)
     guard status == 200 || status == 202 else {
-      return mapHTTPResponse(status: status, data: data)
+      return Self.mapHTTPResponse(status: status, data: data)
     }
     guard let submitted = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let runId = submitted["run_id"] as? String else {
@@ -741,7 +755,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
 
     let (status, data) = try await client.get("/v1/video/status/\(jobId)")
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// upscale -> POST /v1/upscale
@@ -770,7 +784,162 @@ public final class MCPToolExecutor: @unchecked Sendable {
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/upscale", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  // MARK: - Headless parity Phase 1 (comfybox#300, FDD §4.2) — gap-set tools
+
+  /// move_queue_job -> POST /v1/queue/{id}/move { direction }. `direction`
+  /// is validated client-side against the declared enum: WarmServer's
+  /// `movePending` (WarmServer.swift:6965) silently no-ops (200, moved:false)
+  /// on an unrecognized direction rather than 400ing, so an unknown value
+  /// has to be caught here to honor "unknown enum members produce a clean
+  /// 400, not a trap" (FDD scope note).
+  private func executeMoveQueueJob(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard let direction = params?.string("direction"), !direction.isEmpty else {
+      return MCPToolResult(error: "Error: 'direction' is required")
+    }
+    let allowedDirections: Set<String> = ["top", "up", "down"]
+    guard allowedDirections.contains(direction) else {
+      return MCPToolResult(error: "Error: 'direction' must be one of top, up, down (got '\(direction)')")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let body: [String: Any] = ["direction": direction]
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/queue/\(encoded)/move", body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// update_lora_triggerwords -> POST /v1/loras/{id}/update { triggerwords }
+  private func executeUpdateLoraTriggerwords(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard let triggerwordsArray = params?.array("triggerwords") else {
+      return MCPToolResult(error: "Error: 'triggerwords' (array of strings) is required")
+    }
+    let triggerwords = triggerwordsArray.compactMap(\.stringValue)
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let body: [String: Any] = ["triggerwords": triggerwords]
+    let jsonData = try JSONSerialization.data(withJSONObject: body)
+    let (status, data) = try await client.post("/v1/loras/\(encoded)/update", body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// create_preset -> POST /v1/presets. Params ARE the wire payload (decoded
+  /// server-side with convertFromSnakeCase), forwarded verbatim — same
+  /// pattern as compose_montage/render_storyboard — because ImagePreset has
+  /// ~30 optional fields and a hand-maintained whitelist here would silently
+  /// drop new ones (exactly the `skip_character_injection` failure mode
+  /// noted on generate_video). Server requires non-empty id + name
+  /// (PresetStore.swift:854-857); validated client-side too for a fast,
+  /// clean error before the round trip.
+  private func executeCreatePreset(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, let id = params.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard let name = params.string("name"), !name.isEmpty else {
+      return MCPToolResult(error: "Error: 'name' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/presets", body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// delete_preset -> DELETE /v1/presets/{id}
+  private func executeDeletePreset(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let (status, data) = try await client.delete("/v1/presets/\(encoded)")
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// set_warm_preset -> composite action mirroring the Desktop app's
+  /// PresetView.setAsWarm (ComfyBoxDesktop/Views/PresetView.swift:207-219)
+  /// exactly: activate the model (falling back to a load if it isn't in the
+  /// pool yet — PresetView's do/catch), THEN fetch the server config,
+  /// patch modelSpec, and save it back. The composite body lives in
+  /// `runSetWarmPreset` below, parameterized over an injectable HTTP call so
+  /// the order and abort-on-activation-failure contract are unit-testable
+  /// without a real server.
+  private func executeSetWarmPreset(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let model = params?.string("model"), !model.isEmpty else {
+      return MCPToolResult(error: "Error: 'model' is required")
+    }
+    let client = self.client
+    return try await Self.runSetWarmPreset(model: model) { method, path, body in
+      switch method {
+      case "GET": return try await client.get(path)
+      case "PUT": return try await client.put(path, body: body)
+      default: return try await client.post(path, body: body)
+      }
+    }
+  }
+
+  /// The set_warm_preset composite, isolated from `WarmServerClient` behind
+  /// an injectable `call` closure. `internal` (not `private`) so tests can
+  /// invoke it directly with a fake `call` and assert exact order without
+  /// networking. Mirrors PresetView.setAsWarm:
+  ///   1. POST /v1/model/activate { model }
+  ///   2. IF (1) fails: POST /v1/model/load { model, activate: true, wait: true }
+  ///      (PresetView's catch-and-load fallback). If this also fails, abort —
+  ///      the config is never read or written.
+  ///   3. GET /v1/config
+  ///   4. PUT /v1/config with modelSpec set to `model` (fetch-then-mutate-
+  ///      then-save, because PUT is a whole-document replace — WarmServer's
+  ///      `encode(to:)` only writes enumerated keys, so saving a document
+  ///      that wasn't first fetched would drop unrelated config fields).
+  static func runSetWarmPreset(
+    model: String,
+    call: (_ method: String, _ path: String, _ body: Data) async throws -> (Int, Data)
+  ) async throws -> MCPToolResult {
+    let activateBody = try JSONSerialization.data(withJSONObject: ["model": model])
+    let (activateStatus, activateData) = try await call("POST", "/v1/model/activate", activateBody)
+    if activateStatus != 200 {
+      let loadBody = try JSONSerialization.data(withJSONObject: ["model": model, "activate": true, "wait": true])
+      let (loadStatus, loadData) = try await call("POST", "/v1/model/load", loadBody)
+      guard loadStatus == 200 || loadStatus == 202 else {
+        return Self.mapHTTPResponse(status: loadStatus, data: loadData)
+      }
+    }
+    let (getStatus, getData) = try await call("GET", "/v1/config", Data())
+    guard getStatus == 200,
+          var configObj = try? JSONSerialization.jsonObject(with: getData) as? [String: Any] else {
+      return Self.mapHTTPResponse(status: getStatus, data: getData)
+    }
+    configObj["modelSpec"] = model
+    let putBody = try JSONSerialization.data(withJSONObject: configObj)
+    let (putStatus, putData) = try await call("PUT", "/v1/config", putBody)
+    return Self.mapHTTPResponse(status: putStatus, data: putData)
+  }
+
+  /// create_character -> POST /v1/characters. Params ARE the wire payload
+  /// (CharacterEntry decodes convertFromSnakeCase server-side), forwarded
+  /// verbatim like create_preset. 'name' is the only field the server
+  /// actually requires — 'id' defaults to a slug of 'name'
+  /// (CharacterStore.swift:60-62, WarmServer.swift:2967-2968).
+  private func executeCreateCharacter(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let params, let name = params.string("name"), !name.isEmpty else {
+      return MCPToolResult(error: "Error: 'name' is required")
+    }
+    let jsonData = try JSONEncoder().encode(params.raw)
+    let (status, data) = try await client.post("/v1/characters", body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// delete_character -> DELETE /v1/characters/{id}
+  private func executeDeleteCharacter(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+    let (status, data) = try await client.delete("/v1/characters/\(encoded)")
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   // MARK: - Helpers
@@ -778,13 +947,13 @@ public final class MCPToolExecutor: @unchecked Sendable {
   /// Generic GET endpoint handler.
   private func executeGet(_ path: String) async throws -> MCPToolResult {
     let (status, data) = try await client.get(path)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// POST an empty JSON body (for trigger-style endpoints).
   private func executePostEmpty(_ path: String) async throws -> MCPToolResult {
     let (status, data) = try await client.post(path, body: Data("{}".utf8))
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// enhance_prompt -> POST /v1/enhance
@@ -797,7 +966,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let mode = params?.string("content_mode") { body["content_mode"] = mode }
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     let (status, data) = try await client.post("/v1/enhance", body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// cancel_job -> DELETE /v1/queue/{id}
@@ -807,7 +976,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
     let (status, data) = try await client.delete("/v1/queue/\(encoded)")
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// nearline_stage / nearline_evict -> POST /v1/nearline/{action} { name }
@@ -817,7 +986,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let jsonData = try JSONSerialization.data(withJSONObject: ["name": name])
     let (status, data) = try await client.post(path, body: jsonData)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   // MARK: - CivitAI conduit (#234)
@@ -828,7 +997,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
   private func executeCivitAISearch(_ params: MCPParams?) async throws -> MCPToolResult {
     let path = "/v1/civitai/search" + Self.civitaiSearchQueryString(params)
     let (status, data) = try await client.get(path)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   /// civitai_prompts -> optional POST /v1/civitai/harvest, then always
@@ -849,7 +1018,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
       let jsonData = try JSONSerialization.data(withJSONObject: body)
       let (harvestStatus, harvestData) = try await client.post("/v1/civitai/harvest", body: jsonData)
       guard harvestStatus == 200 else {
-        return mapHTTPResponse(status: harvestStatus, data: harvestData)
+        return Self.mapHTTPResponse(status: harvestStatus, data: harvestData)
       }
     }
 
@@ -872,7 +1041,7 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let path = "/v1/civitai/repo" + (queryItems.isEmpty ? "" : "?" + queryItems.joined(separator: "&"))
     let (status, data) = try await client.get(path)
-    return mapHTTPResponse(status: status, data: data)
+    return Self.mapHTTPResponse(status: status, data: data)
   }
 
   private static func civitaiSearchQueryString(_ params: MCPParams?) -> String {
@@ -897,7 +1066,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
 
   /// Map WarmServer HTTP response to MCP tool result.
   /// 200 -> success (text + structured fields), any other -> error text.
-  private func mapHTTPResponse(status: Int, data: Data) -> MCPToolResult {
+  /// `static` (no `self` use) so `runSetWarmPreset`'s injectable-call
+  /// composite can share it without needing an executor instance.
+  private static func mapHTTPResponse(status: Int, data: Data) -> MCPToolResult {
     let text = String(data: data, encoding: .utf8) ?? "{}"
     if status == 200 {
       // Surface parsed fields as structuredContent (not a JSON string), and pin
