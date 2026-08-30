@@ -2,324 +2,360 @@
 
 **Repo:** `BarkadaBrew/comfybox` (`zimage.swift`, Swift/MLX)
 **Worktree/branch:** `~/Projects/zimage-apiparity` @ `feat/ui-api-parity` (base `origin/main` c9dd27d)
-**Components:** `Sources/ZImage/Server/WarmServer.swift`, `Sources/ZImage/MCP/*`, `Sources/ZImage/Server/ComfyBoxServerConfig.swift`, `Sources/ComfyBoxDesktop/Views/SettingsView.swift`; cross-repo: `coffeeshop-server/src/tools/`
+**Components:** `Sources/ZImage/Server/WarmServer.swift`, `Sources/ZImage/Server/ComfyBridge/ComfyBridge.swift`, `Sources/ZImage/MCP/*`, `Sources/ZImage/Server/ComfyBoxServerConfig.swift`, `Sources/ComfyBoxDesktop/Views/SettingsView.swift`; cross-repo: `coffeeshop-server/src/tools/`
 **PRD:** `docs/PRD-ui-api-parity.md`
-**Related:** comfybox#300 (async route starvation), comfybox#217 (the same class of bug, already fixed for `/health`), comfybox#1479 (preemption — the lock-based write path this design reuses), coffeeshop-server#1293
+**Related:** comfybox#300 (async route starvation), comfybox#217 (actor head-of-line, fixed for `/health` + `GET /v1/queue`), comfybox#218 (unified-memory eviction), comfybox#1479 (LTX-2 preemption), coffeeshop-server#1293
 **Author:** Fable (Opus), architect pass — 2026-08-29
-**Status:** v1 design. Not implemented. Phase 0 carries an unresolved diagnostic (§3.1.2) that must be closed by measurement before its second half is built.
+**Status:** **v2 — revised after adversarial review (2026-08-29).** v1 shipped 5 blockers, three of them in sections v1 had marked "unverified" and guessed wrong on. Every §-heading changed in v2 is marked **[REVISED v2]**. Phase 0's mechanism question is now **closed by measurement**, not open.
 
 **Scope note (Todd, 2026-08-29):** authentication/authorization is explicitly **out of scope and not a risk on this project** — this stack is never publicly reachable and all callers are trusted local operators or agents. The PRD's §7 "unauthenticated surface grows" risk is **withdrawn**. No token gate, no per-route permission model, no rate limiting. Input *validation* stays (malformed params, out-of-range values, unknown enum members must produce a clean `400`, not a trap) — that is correctness, not security.
 
 ---
 
-## 1. Summary
+## 0. v2 changelog [NEW]
 
-The Desktop app is already an API client for most engine behavior. The defect is not "UI-only controls" — it is that the control surface is **fragmented across two hosts, split between HTTP and MCP unevenly, and self-describes nowhere.** An agent cannot answer "what can I change, and how?" without reading 9,680 lines of Swift.
+What the review overturned, and where it landed:
 
-This FDD delivers five phases, each independently shippable:
-
-| Phase | Delivers | Primary risk |
-|---|---|---|
-| **0** | Control-plane routes answer during a render (#300) | Touches concurrency near the render path |
-| **1** | MCP tool for every mutating warm-server route | Low — additive |
-| **2** | Kira scheduler controls reachable by agents | Cross-host coupling; Kira isolation |
-| **3** | Engine-affecting defaults move server-side, content modes become writable | Migration silently changing render output |
-| **4** | `GET /v1/controls` + generated `docs/api-reference.md` + anti-drift test | Registry becomes hand-maintained and rots |
-
-The through-line is a single new construct — the **ControlRegistry** (§3.4) — a compile-time table of control descriptors that the discovery route, the MCP tool definitions, the generated docs, and the parity test all read. Phases 1–3 are written so their outputs *land in that registry*, which is why Phase 4 is last rather than first: the registry is populated by the work, not ahead of it.
+| # | v1 claim | Reality | Now in |
+|---|---|---|---|
+| 1 | "Mechanism B is unverified; diagnose first" | **B1 confirmed by live `sample`:** 2964/2972 samples in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative` — MLX render work blocks *on the cooperative pool*. | §3.1, §4.1 — the executor fix is now **primary and first** |
+| 2 | Command mailbox drained "at existing scheduling points" | **No such points exist.** `processLoop` (`:6965–6980`) *exits* (`isProcessing = false; return`) when paused with no `runsWhilePaused` job. A mailbox `resume` would 202 and wedge the queue forever. | §3.1.4 — deltas + explicit wake, `resume` never goes through the mailbox |
+| 3 | Serve control reads from `LiveHealthState` | The snapshot is **written only on the actor** (`publishHealth()` `:6729`, all ~15 call sites actor-isolated). Mailbox writes would be invisible for the whole render — AC green, answers wrong. | §3.1.5 — `isPaused` + pending deltas become **authoritative in the lock store** |
+| 4 | "Pause takes effect mid-render" | **Undeliverable.** #1479 preemption is LTX-2-only (`LTX2VideoGenerator.swift:288`); it's handoff-and-resume, not an indefinite park (parking pins latents against #218). And `isPaused` is a between-items gate — redefining it breaks a live endpoint. | §3.1.6 — AC dropped; mid-render abort scoped to `interrupt`, family-qualified |
+| 5 | Migrate Desktop defaults to preserve client-side behavior | **`DesktopSettings.default{Steps,Guidance,Width,Height}` are write-only UI state** — nothing reads them to build a request. Migrating them would move Bree/MCP/Kira *off* engine defaults. | §3.3 — inverted: seed from the **engine's** fallbacks |
+| 6 | Mirror adoption for queue mutations | `pending` has other writers (enqueue `:6929`, `recoverPersistedQueue` `:4310+`); wholesale adoption **drops jobs**. | §3.1.4 — deltas only |
+| 7 | D5 pins parser by counting `case (` lines | 73 lines but **76 tuples** — 3 arms carry two (`:1620` pause+resume, `:1654`, `:1680`). A control route would be silently missed. Plus 2 false hits in comments. | §3.5 |
+| 8 | Exempt ComfyBridge routes from parity | Can't — they're in a **second switch** (`ComfyBridge.swift:106`) the parser never sees, and include real mutating routes (`POST /queue` `:135`). | §3.5 |
+| 9 | `If-Match` mandatory on `PUT /v1/config` | Breaks every current caller; none send it. Also `encode(to:)` `:154–171` writes only enumerated keys, so the rollback story was half-true. | §3.3 |
+| 10 | Phases independently shippable | Phase 1's `update_config` would proxy the clobbering `PUT` that Phase 3 then replaces; Phase 4 depends on Phase 3's store. | §4 preamble |
 
 ---
 
-## 2. Findings that change the PRD's picture
+## 1. Summary
 
-The PRD's audit table stands. Four things the code review adds or corrects:
+The Desktop app is already an API client for most engine behavior. The defect is not "UI-only controls" — it is that the control surface is **fragmented across two hosts, split unevenly between HTTP and MCP, and self-describes nowhere.** An agent cannot answer "what can I change, and how?" without reading 9,680 lines of Swift.
 
-**2.1 — #300 is #217 recurring, but only partly.** `/v1/queue/pause` hangs for a provable, already-diagnosed reason: it calls `await coordinator.setPaused(paused)` (`WarmServer.swift:1619`), and `WarmServerCoordinator` (`:5417`) is a `private actor` whose executor is occupied for the **entire synchronous GPU render**. This is documented verbatim in-repo at `:4700–4710`:
+| Phase | Delivers | Primary risk |
+|---|---|---|
+| **0** | Control routes answer during a render (#300) — via a coordinator executor change, then a narrow control-plane carve-out | Concurrency near the render path (now much smaller than v1 assumed) |
+| **1** | MCP tool for every mutating warm-server route (minus `update_config`, held to Phase 3) | Low — additive |
+| **2** | Kira scheduler controls reachable by agents | Cross-host coupling; a dated topology precondition |
+| **3** | Engine defaults become server-side and writable; content modes writable; `ServerConfigStore` + `PATCH` | Changing engine behavior for *non-Desktop* callers |
+| **4** | `GET /v1/controls` + generated `docs/api-reference.md` + anti-drift test | Registry rot; parser brittleness |
 
-> *"The actor is blocked for the full duration of a synchronous GPU render (seconds to minutes). Routing /health through `await coordinator.health()` made the endpoint queue behind the render and return nothing (HTTP 000) for the render's whole duration…"*
+The through-line is the **ControlRegistry** (§3.4) — a compile-time table that the discovery route, the MCP tool schemas, the generated docs, and the parity test all read. Phases 1–3 populate it; Phase 4 exposes it.
 
-Every failing route in the #300 report that touches the coordinator is explained by this. **`/v1/civitai/search` is not** (§3.1.2) — it never touches the coordinator, which means #300 is at least two bugs wearing one issue number.
+---
 
-**2.2 — the repo already contains both halves of the fix pattern.** `LiveHealthState` (`:4750+`) is a lock-based snapshot the coordinator publishes to, read by `/health` with no actor hop. `PreemptionSignal`, `LTX2StepPosition`, `LTX2PhaseTelemetry`, `PendingPreemptorBox` (`:253–278`) are lock-based channels that an *off-actor route handler writes* and the *in-flight render loop reads* — explicitly "read inside the render loop with no actor hop." Phase 0 does not need a novel concurrency mechanism; it needs these two patterns generalized and applied to the remaining control routes.
+## 2. Findings
 
-**2.3 — `PUT /v1/config` is worse than "can clobber."** It is a whole-document decode-and-`save()` (`:811–822`) with no read-back, no version, and no in-memory store — and the *running* server reads most of its own settings from a separate `WarmServerConfiguration` captured at boot. So today a `PUT` both (a) silently discards any key a client didn't round-trip and (b) mostly doesn't affect the running engine. Phase 3 cannot be built on it as-is.
+**2.1 — #300 is two bugs, and the bigger one is now measured. [REVISED v2]** `/v1/queue/pause` hangs because it calls `await coordinator.setPaused()` (`:1619`) and `WarmServerCoordinator` (`:5417`) is an actor occupied for the whole synchronous render (`pipeline.generateFromRequest` is awaited *on* the actor, `:7313`). This is #217, documented in-repo at `:4700–4710`. **Separately**, `/v1/civitai/search` (`:4370`) hangs while its synchronous sibling `/v1/civitai/repo` (`:4425`) is healthy, despite never touching the coordinator. A live `sample` under render settles it: **2964 of 2972 samples sit in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative`** — the render blocks *on the cooperative pool*, so continuations for every unrelated `await` starve. Call these **Mechanism A** (actor head-of-line) and **Mechanism B1** (pool exhaustion). B1 is the larger and cheaper of the two to fix.
 
-**2.4 — Kira is genuinely cross-host, over an SSH tunnel.** `KiraClient` (`Sources/ComfyBoxDesktop/Kira/KiraClient.swift:21–24`) defaults to `127.0.0.1:3787` with the comment *"127.0.0.1-only on the server (reach it via `ssh -N -L 3787:127.0.0.1:3787`)"*. Verified live: `kira-daemon.service` is running on the Linux box and `GET /v1/kira/content-scheduler/status` returns the tier/video-mix document the PRD wants controllable. The warm server is on the Mac. Any warm-server proxy would be a Mac→Linux hop over a hand-managed tunnel. This is the single fact that decides Phase 2.
+**2.2 — the repo already contains the read-side pattern, but it is actor-authored.** `LiveHealthState` (`:4750+`) is an `NSLock`-guarded snapshot read by `/health` and `GET /v1/queue` (`:2789`) with no actor hop — genuinely torn-read-free (single-lock swap, `:4756–4764`). **But `publishHealth()` (`:6729`) is actor-isolated and called from ~15 actor-isolated sites**; only `setProgress()` is written off-actor. So the snapshot is a *projection of actor state*, not a place off-actor code can record a fact. v1 missed this. Any control write that must be *observable during a render* has to be authoritative in the lock store, with the actor as a reader.
 
-### 2.5 Route/tool inventory (as of c9dd27d)
+**2.3 — `PUT /v1/config` is worse than "can clobber."** Whole-document decode-and-`save()` (`:811–822`), no version, no in-memory store, and the running server reads most settings from a boot-captured `WarmServerConfiguration`. Two specifics v1 got half-right: `init(from:)` (`:133–151`) **is** tolerant of unknown keys, but `encode(to:)` (`:154–171`) writes **only enumerated keys** — so an older build performing a `GET`→`PUT` round-trip *deletes* any config block added by a newer build. Tolerant decode does not buy forward-compatible round-tripping.
 
-- 55 literal `case ("METHOD", "/path")` arms in `respond(to:)` plus ~20 prefix/suffix-matched arms (`:685`, `:978`, `:1081`, `:1106`, `:1123`, `:1215`, `:1222`, `:1372`, `:1398`, `:1623`, `:1635`, `:1653`, `:1656`, `:1679`, `:1682`).
-- 31 literal mutating (`POST`/`PUT`/`DELETE`) routes + 8 prefix-matched mutating routes.
+**2.4 — Kira is genuinely cross-host, and the topology has a shelf life. [REVISED v2]** `KiraClient.swift:21–24` targets `127.0.0.1:3787` "reach it via `ssh -N -L`". Verified live on the Linux box: `kira-daemon.service` active; `GET /v1/kira/content-scheduler/status` returns the tier/video-mix document; the write endpoints exist and were confirmed in `kira-api.ts` (`:649, :658, :670, :681, :699, :704, :980, :985`). **This is a dated precondition** — a Kira→Mac migration is in progress, and if the daemon lands on the Mac, D2's co-location argument inverts and Phase 2's host should be revisited (§3.2).
+
+**2.5 — engine defaults are family-dependent. [NEW v2]** `payload.width ?? 1024` / `?? 1024` / `steps ?? defaultSteps` / `guidance ?? defaultGuidance` at `:7413–7416`, but a *different* family path hardcodes `steps ?? 30` at `:7739`, and video is `width ?? preset ?? 704`, `height ?? preset ?? 448` (`:2229–2230`), `steps ?? preset ?? 8` (`:2380`). A single flat `renderDefaults` block would flatten family-aware behavior. This constrains D3's shape.
+
+### 2.6 Route/tool inventory (@ c9dd27d)
+
+- `respond(to:)`: 73 `case (` **lines** but **76 tuples** — `:1620`, `:1654`, `:1680` each carry two — plus ~20 prefix/suffix-matched arms. Two further `case (` occurrences are inside comments (`:271`, `:4891`).
+- A **second dispatch switch** in `ComfyBridge.route()` (`ComfyBridge.swift:106`), reached *before* the main one (`WarmServer.swift:615`), containing mutating routes including `POST /queue` (`:135`).
 - 44 MCP tools in `MCPToolRegistry.tools`.
 
-**Mutating routes with no MCP tool (Phase 1 worklist):**
+**Mutating warm-server routes with no MCP tool (Phase 1 worklist):** `POST /v1/characters` + `PUT /v1/characters` + `DELETE /v1/characters/{id}`; `POST|PUT /v1/presets`, `DELETE /v1/presets/{id}`; `PUT /v1/config` *(held to Phase 3)*; `POST /v1/queue/{id}/move`, `DELETE /v1/queue/{id}`; `POST /v1/loras/import`, `POST /v1/loras/{id}/update`; `POST /v1/civitai/harvest`; `POST /v1/video/traces/{id}/{promote,rating}`; `DELETE /v1/workflows/{id}`; `POST /v1/generate/async`, `POST /v1/video/generate/async`.
 
-| Route | Control it gates |
-|---|---|
-| `POST /v1/characters`, `DELETE /v1/characters/{id}` | character registry write |
-| `POST /v1/presets`, `DELETE /v1/presets/{id}` | preset create/delete |
-| `PUT /v1/config` | providers, content-mode default map, krea2 model map, model spec ("Set as Warm") |
-| `POST /v1/queue/{id}/move`, `DELETE /v1/queue/{id}` | queue reorder / per-job cancel |
-| `POST /v1/loras/import`, `POST /v1/loras/{id}/update` | LoRA import; trigger-word edit |
-| `POST /v1/civitai/harvest` | prompt-repo harvest |
-| `POST /v1/video/traces/{id}/promote`, `/rating` | trace curation |
-| `DELETE /v1/workflows/{id}` | workflow delete |
-| `POST /v1/generate/async`, `POST /v1/video/generate/async` | submit-and-poll (tools are sync-only today) |
-| `POST /v1/nearline/*` | *(has tools — listed for completeness)* |
-
-**Read-only with no writer (Phase 3 worklist):** `GET /v1/content-modes` (`:1687`) — `ContentModeStore` is a `Codable` value type with a working `save()` (`ContentModeStore.swift:389`) and no route that calls it.
+**Read-only with no writer (Phase 3):** `GET /v1/content-modes` (`:1687`) — `ContentModeStore` has a working, uncalled `save()` (`ContentModeStore.swift:389`).
 
 ---
 
 ## 3. Design decisions
 
-### 3.1 — D1: Phase 0 mechanism for #300
+### 3.1 — D1: Phase 0 mechanism for #300 **[REVISED v2 — restructured]**
 
-#### 3.1.1 Mechanism A (verified): coordinator-actor head-of-line blocking
+#### 3.1.1 The measurement
 
-The request path is: `NWListener` (serial `listenerQueue`) → `accept()` makes a **fresh serial `DispatchQueue` per connection** (`:605–612`) → `ConnectionHandler.handle()` → `Task { await server.respond(to: request) }` (`:8200`) on the **global cooperative pool**. So connection I/O is genuinely parallel; the bottleneck is entirely downstream.
+Confirmed by live `sample` of `comfybox serve` under a continuous render: **2964/2972 samples in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative`.** The MLX render, awaited on the coordinator actor, executes on a cooperative-pool worker and blocks it. The pool does not grow past its width, so unrelated continuations — URLSession completions for `/v1/civitai/search`, every other in-flight request task — have nowhere to run. v1 listed this as hypothesis "B1" and gated work on diagnosing it; it is now **fact**, and it reorders the phase.
 
-`respond(to:)` then dispatches a `switch`. Any arm that says `await coordinator.…` enqueues a message on an actor whose executor thread is inside a synchronous MLX render (`pipeline.generateFromRequest` is awaited *on the actor*, `:7313`, not detached). Actor messages are FIFO-ish and the render never suspends, so the message is not delivered until the render returns. `/v1/queue/pause`, `/v1/queue/clear`, `/v1/queue/interrupt`, `/v1/queue/{id}/move`, `DELETE /v1/queue/{id}`, `/v1/models`, `/v1/stats` are all in this class. **`/health` and `GET /v1/queue` already escaped it** via `LiveHealthState`.
+#### 3.1.2 The decision: fix the executor first, then carve out only what's left
 
-This half is proven by the code and by #217's precedent. No further diagnosis needed.
+**0.C from v1 is promoted to task 0.A and ships first.** Give `WarmServerCoordinator` a dedicated serial-queue-backed executor:
 
-#### 3.1.2 Mechanism B (NOT verified): coordinator-free async routes also hang
-
-`/v1/civitai/search` (`:4370`) reaches the coordinator **nowhere**. It resolves a key, validates a host against the allowlist, and `await`s `CivitAIClient.searchModels` over URLSession. Its sibling `/v1/civitai/repo` (`:4425`) is a **synchronous** function and, per the audit, responds fine under load. The one structural difference between them is *the presence of an await*. That points at the Swift cooperative thread pool, not at the actor.
-
-Two candidate causes, both plausible, neither confirmed:
-
-- **B1 — cooperative pool exhaustion.** The render occupies a cooperative worker for minutes. If concurrent in-flight request `Task`s (Desktop polling, ComfyBridge clients, Bree/MCP) each park a worker in blocking work, the pool — which will not grow past its width — has nothing left to resume a URLSession continuation on.
-- **B2 — CPU starvation.** MLX saturates every core during eval. Cooperative workers are not priority-elevated, so a continuation can sit runnable-but-unscheduled. This would produce *severe latency* rather than a hard 120s zero, so B2 alone is a weaker fit and probably a contributor rather than the cause.
-
-**Phase 0 therefore opens with a measurement, not a patch** (§4.1, task 0.A). The discipline is the one that worked in `FDD-ltx2-temporal-motion.md`: rule out hypotheses by measurement before touching the render path.
-
-#### 3.1.3 The decision
-
-**Take the control plane off the cooperative pool entirely, and off the coordinator actor entirely — reusing the two patterns already in the file. Do not insert yield points into the render loop, and do not add a second listener.**
-
-Concretely, three changes:
-
-1. **A control-plane classifier in `ConnectionHandler.handle()`.** Before `Task { await respond(…) }`, test the request against `ControlPlaneRoutes.matches(method:path:)`. On a hit, call a new **synchronous** `WarmServer.respondControlPlane(to:) -> RoutedResponse` directly on the connection's own serial `DispatchQueue` and `finish()` from there. Control-plane handlers are lock-bounded and microseconds long, so this is safe on a network queue. Crucially it makes the control plane **structurally independent of the cooperative pool**, which means it is correct whether Mechanism B turns out to be B1, B2, or something we haven't named. That robustness-under-uncertainty is the main reason to prefer it.
-
-2. **Reads served from lock-based snapshots** — generalize `LiveHealthState` into `LiveControlState` (same `NSLock` + value-snapshot shape, same `publish()`-at-every-transition contract). Queue listing, pause state, active job, model state, stats already have snapshot fields; extend the struct rather than adding parallel classes.
-
-3. **Writes delivered through a lock-based command mailbox**, not an actor call. New `ControlCommandMailbox` (`NSLock`-guarded, bounded, oldest-evicting — modelled directly on `PromptRepositoryStore`'s serialization + cap + eviction, and on `PendingPreemptorBox`). The route handler appends a command and returns `202 Accepted` with the recorded intent plus the *observed* state from `LiveControlState`; the coordinator drains the mailbox at every scheduling point it already has (between queue items, and — for `pause` specifically — the render loop reads the paused flag directly with no actor hop, exactly as it reads `ltx2PreemptionSignal` today). `pause` and `interrupt` thus take effect *mid-render* rather than after it, which is the behavior the operator always assumed they had.
-
-   For commands whose result the caller genuinely needs (`move`, per-job `DELETE`), the mailbox operation mutates a **lock-guarded pending-queue mirror** owned outside the actor, and the coordinator adopts the mirror when it next picks work. `202` + mirror state is honest; a synchronous `200` would be a lie under a render.
-
-**Alternatives rejected:**
-
-- *Yield points in the render loop.* Highest blast radius in the codebase — MLX eval ordering and the LTX-2 preemption checkpointing are both sensitive, and per `FDD-ltx2-temporal-motion.md` this pipeline has already produced one silent quality regression from an innocuous-looking numeric change. It also doesn't help: actor reentrancy at a yield point would let control messages interleave with half-mutated render state, trading a hang for a correctness hazard.
-- *A dedicated custom executor for `WarmServerCoordinator`* (`nonisolated var unownedExecutor` backed by a private serial queue). Attractive and small — it moves the render's blocking off the cooperative pool, which would fix B1 directly. But it does **not** fix Mechanism A (the actor is still serialized behind the render, so `pause` still queues). Keep it as **task 0.C, conditional**: adopt only if 0.A confirms B1, as a cheap defence-in-depth for every *non*-control async route (`/v1/civitai/*`, `/v1/enhance`, workflow runs) that the classifier deliberately leaves on the normal path.
-- *A second `NWListener` on another port for control routes.* Fixes nothing — the starvation is at the executor layer, not the accept layer (each connection already has its own queue) — and it splits the client contract across two ports for no benefit.
-- *Making the coordinator's render `Task.detached`.* Changes model-residency and preemption invariants that `#218`/`#1479` depend on. Out of proportion to the problem.
-
-**Route classification (the control plane):** `/health`, `GET /v1/queue`, `POST /v1/queue/{pause,resume,clear,interrupt}`, `POST /v1/queue/{id}/move`, `DELETE /v1/queue/{id}`, `GET /v1/models`, `GET /v1/stats`, `GET /v1/memory`, `GET|PUT|PATCH /v1/config`, `GET|PUT /v1/content-modes`, `GET /v1/presets*`, `GET /v1/characters*`, `GET /v1/audit-log`, `GET /v1/controls`. Everything that *does work* (render, upscale, video, workflow run, CivitAI network calls) stays exactly where it is. **The render path is not modified in Phase 0** except for the paused/interrupt flag read, which reuses an existing mechanism.
-
-### 3.2 — D2: Phase 2 cross-daemon strategy
-
-**Decision: option (c) — formally document the Kira daemon API as a first-class agent surface, and register its control tools in the coffeeshop-server agent-tool layer, co-located on the Linux box. The ComfyBox warm server gains no Kira routes and no Kira knowledge beyond a federated *descriptor* entry in `/v1/controls` (§3.4).**
-
-Justification, in the order the constraints bind:
-
-- **Topology decides it.** The Kira daemon is loopback-bound on the Linux box; the warm server is on the Mac and reaches it only through a manually-established `ssh -N -L` tunnel (`KiraClient.swift:21`). Option (a) — proxy routes on the warm server — would make ComfyBox's control plane depend on a hand-managed cross-host tunnel, and would fail in a way that looks like "ComfyBox is broken" when the tunnel drops. Option (b) — a second MCP server pointed at the Kira daemon — is topologically fine but *from the Mac* inherits the same tunnel; from the Linux box it is redundant with infrastructure that already exists.
-- **The infrastructure already exists and is co-located.** Verified on the Linux box: `kira-daemon.service` is active and answering on `127.0.0.1:3787`, and coffeeshop-server has an established built-in agent-tool pattern (`src/tools/*-tools.ts`, ~60 modules, with direct precedent in `comfybox-http-video-executor.ts` and `content-mode-tools.ts`). Phase 2 is therefore one new file, `src/tools/kira-control-tools.ts`, doing loopback HTTP — no tunnel, no new process, no new transport.
-- **Failure isolation is strictly better.** Warm server down → Kira controls still work. Kira daemon down → ComfyBox unaffected, and the tool returns a clean error instead of a proxy timeout. Under (a), a warm-server render stall (the very bug Phase 0 fixes) would also block Kira control.
-- **Kira isolation survives.** The regime forbids companion logic entering shared cores and forbids companion-role agents acquiring general surfaces. Nothing about Kira's *behavior* moves anywhere: the daemon keeps owning it. To keep the boundary ratchet meaningful, the tool set is **control-plane only and namespaced** — `kira_scheduler_status`, `kira_scheduler_pause`, `kira_scheduler_resume`, `kira_scheduler_run_now`, `kira_scheduler_policy` (tiers: `activeHours`, `imageCount`, `videoCount`, `tierRotation`, `intervalMinutes`, `videoMode`, `videoI2vRatio`, `clipSeconds`), `kira_stream_mode`. **Explicitly excluded:** anything touching conversation, memory, persona, Telegram, or media generation. Registration is gated the same way every other Kira-adjacent surface is (`role !== 'companion'`), and the existing boundary-ratchet test gets one added assertion: the `kira_control` namespace exposes no tool outside that allowlist.
-- **Trust ownership is unambiguous.** Both processes are on the same host, on loopback, under the same operator. There is no cross-trust question to answer (and per the scope note, no authn to design).
-
-**Cost, stated plainly:** the parity guarantee becomes federated rather than unified. An agent still makes one call to enumerate controls (`GET /v1/controls`), but Kira's entries carry `host: "kira-daemon"` and are *advertised, not proxied* — the agent must be able to reach the Linux box. For Bree that is trivially true (she runs there). For an agent running only on the Mac it is not, and that is an accepted, documented limitation rather than a tunnel we pretend is reliable.
-
-**Deliverables split:** comfybox repo → `docs/kira-control-api.md` (the daemon's control surface, documented as a supported contract) + federated descriptors in the ControlRegistry. coffeeshop-server repo → `src/tools/kira-control-tools.ts` + tests + one boundary-ratchet assertion.
-
-### 3.3 — D3: Phase 3 settings model
-
-**Decision: keep one config document; add `PATCH /v1/config` with RFC 7386 JSON Merge Patch semantics as the primary write path; keep `PUT /v1/config` as explicit full replace. Both go through a new lock-serialized `ServerConfigStore`. Concurrency safety by document version (`If-Match`), advisory on `PUT`, enforced on nothing else. No per-key routes.**
-
-- **Why merge-patch over per-key routes.** Per-key routes are the drift engine Phase 4 exists to kill: every new setting would need a route, a tool, a doc line, and a test, hand-maintained. Merge-patch gives "change one knob" semantics with **one** route and **one** MCP tool (`update_config`), and the *knobs* are described by the ControlRegistry rather than by URL space. It also composes with §3.4: a control descriptor's write action is `{method: "PATCH", path: "/v1/config", pointer: "/renderDefaults/steps"}`, which is machine-executable without inventing a route per control.
-- **Why not keep whole-doc PUT as primary.** Today's `PUT` is a read-modify-write from the client's perspective, and clients do not round-trip keys they don't know about — a Desktop build one version behind will silently delete a config block added by the server. Merge-patch makes omission mean "unchanged," which is the semantics every caller already assumes.
-- **Concurrency.** `ServerConfigStore` is a `final class: @unchecked Sendable` with an `NSLock` (the `PromptRepositoryStore` idiom, chosen over an actor precisely because §3.1 forbids actor hops on the control plane). It loads once at boot, holds the decoded document in memory, and every write is `lock → apply patch to in-memory doc → validate → atomic write (temp + `rename`) → publish → unlock`. Because the merge happens *inside* the lock against the current document, two agents patching different keys cannot clobber each other at all — no retry loop needed. `GET /v1/config` returns an `ETag` (SHA-256 of the canonical encoding); `PUT` **requires** `If-Match` and returns `409` on mismatch (full replace is the only genuinely destructive operation); `PATCH` accepts `If-Match` optionally and only fails when the *same pointers* changed underneath it.
-- **Hot-apply.** The live server currently reads from a boot-captured `WarmServerConfiguration`, so a config write mostly doesn't reach the engine (§2.3). Fix the specific keys this FDD needs: render/video defaults are read from `ServerConfigStore` **at request-decode time** in `decodedGeneratePayload` (`:4289`) and the video prep path — a lock read, off-actor, ~nanoseconds, Phase-0-compatible. Keys that genuinely cannot hot-apply (`port`, `host`) are marked `requiresRestart: true` in their descriptor and the response says so.
-
-**Migration (`desktop-config.json` → server config).**
-
-*Moves* (engine-affecting), into two new blocks:
-
+```swift
+private let coordinatorQueue = DispatchQueue(
+  label: "z-image.warm-server.coordinator", qos: .userInitiated)
+nonisolated var unownedExecutor: UnownedSerialExecutor { coordinatorQueue.asUnownedSerialExecutor() }
 ```
-renderDefaults: { steps, guidance, width, height }        ← defaultSteps, defaultGuidance, defaultWidth, defaultHeight
-videoDefaults:  { width, height, frames, steps, backend } ← videoWidth, videoHeight, videoFrames, videoSteps, (backend: see §6)
-```
-plus de-duplication of `civitaiApiKey` / `replicateApiKey` / `falApiKey`, which exist in **both** documents today — server wins after migration, Desktop stops persisting them.
 
-*Stays local* (presentation / Class D, per PRD non-goals): `serverHost`, `serverPort`, `autoConnect`, `serverHealthEndpoint`, `thumbnailSize`, `gallerySortDefault`, `uiScale`, `archiveRoots`, `watchedServices`. `outputDirectory` stays local as the Desktop's *save* location; the server keeps `allowedOutputDirectory` as its containment boundary — they are different concepts and merging them would weaken path containment.
+~20 lines. **Blast radius on the render path is zero**: it changes *which thread* serializes the actor, not *that* it serializes. Mutual exclusion, message ordering, and every invariant #218 (single heavy-model residency) and #1479 (preemption handoff) depend on are properties of actor serialization, which is preserved exactly. It fixes **all** async routes — including ones no classifier would ever have covered — rather than only a hand-listed set. Nothing about it touches MLX, the pipeline, or the queue loop.
 
-*First-run mechanics.* On boot, if `config.json` lacks `renderDefaults` **and** `~/.comfybox/desktop-config.json` exists → copy the local values verbatim into the new blocks, write once, append `config.migrate.desktopDefaults` to the audit log with the imported key/value pairs, and **leave `desktop-config.json` untouched** (it is the rollback artifact). If the local file is absent, seed from the constants the render path uses today (`448×768`, and the existing `defaultSteps`/`defaultGuidance` defaults) — *not* from new opinions.
+Alongside it, one line the review caught: **the per-connection `DispatchQueue` (`:606`) is created with no QoS**, so it defaults low and its work is descheduled behind the render's `.userInitiated` compute. Pin it `.userInitiated`.
 
-*Value-preservation invariant.* Server-side defaults are applied **only where the incoming request omits the field**, which is precisely what the Desktop did client-side before. A request carrying explicit `steps` is bit-identical pre- and post-migration. This is the property that makes "migration can silently change render behavior" (PRD §7) testable rather than hoped-for, and §4.4 pins it with a test.
+**Then re-measure.** After 0.A + the QoS pin, re-run the #300 repro. Everything that stalls afterwards stalls for **Mechanism A only** — a genuine actor hop behind the render. That residue, not v1's speculative list, defines 0.B's scope.
 
-*After migration the Desktop* reads defaults from `GET /v1/config` and writes them with `PATCH /v1/config`; the Generation and Motion tabs of `SettingsView` bind to the server document. If the server is unreachable it shows the last-known cached server values **read-only** with a "server unreachable" note, rather than silently falling back to stale local values — divergence is the disease, not the symptom.
+#### 3.1.3 0.B — the residual control-plane carve-out
 
-**Content modes (Class E)** get `PUT /v1/content-modes/{mode}` writing `guidanceBoost`, `promptHint`, `negativePromptAdditions`, `styleVariant` through `ContentModeStore.save()`, with range validation (`guidanceBoost` clamped to a documented band, unknown `styleVariant` → `400`). Built-ins remain in code as the reset source; `DELETE /v1/content-modes/{mode}` reverts a mode to its built-in definition rather than deleting it.
+Expected residue (routes that hop the actor and must answer during a render): `POST /v1/queue/{pause,resume,clear,interrupt}`, `POST /v1/queue/{id}/move`, `DELETE /v1/queue/{id}`, `GET /v1/models`, `GET /v1/stats`. Already actor-free and needing nothing: `/health`, `GET /v1/queue` (`:2789`), `GET /v1/config`, `GET /v1/content-modes`, `GET /v1/audit-log`, `GET /v1/presets*`, `/v1/civitai/repo`.
+
+**Removed from v1's list: `GET /v1/characters*`.** `CharacterStore` is an `actor` (`CharacterStore.swift:201`) and cannot be read synchronously. Converting it to the lock idiom is a separate, unbudgeted change; it is **out of Phase 0** and stays on the normal async path, where 0.A already makes it responsive.
+
+For the residue, classify in `ConnectionHandler.handle()` (`:8200`) before `Task { await respond(...) }` and serve synchronously on the connection's own (now `.userInitiated`) queue. This is belt-and-braces on top of 0.A: it removes the *dependency* on the pool rather than merely relieving pressure on it.
+
+#### 3.1.4 The write path: deltas, not a mirror; and `resume` is special **[REVISED v2 — v1 was broken]**
+
+v1 proposed a mailbox drained "at existing scheduling points" and a pending-queue *mirror* adopted wholesale. Both are wrong:
+
+- **There are no drain points.** `processLoop` (`:6965–6980`) exits outright — `isProcessing = false; return` — when `isPaused` and no `runsWhilePaused` job is pending. Today the *only* thing that restarts it is `setPaused(false)` calling `startProcessingIfNeeded()` (`:6921–6927`). A mailboxed `resume` would return `202` and the loop would never run again: an indefinite creation outage that reports success. This is the worst failure this FDD could have shipped.
+- **Wholesale mirror adoption drops jobs.** `pending` has other writers — `enqueue` (`:6929`) and `recoverPersistedQueue` (`:4310+`). Jobs enqueued as actor messages *during* a render, then overwritten by an adopted mirror, vanish while their HTTP callers hang.
+
+Revised design:
+
+1. **`resume` never goes through the mailbox.** It is a plain `Task { await coordinator.setPaused(false) }` fire-and-forget, and the route returns `202` immediately with the *intent*. Correctness is preserved because `setPaused(false)` → `startProcessingIfNeeded()` is exactly the wake the loop needs; only the caller's *acknowledgement* is decoupled, not the effect. Latency until the loop actually restarts is bounded by the in-flight render — which is fine, because when a render is in flight the loop isn't parked anyway.
+2. **`pause` writes the authoritative flag in the lock store (§3.1.5), then messages the actor.** The between-items gate reads the lock flag.
+3. **Queue mutations are deltas, never snapshots.** `ControlCommandMailbox` holds `.cancel(id)` / `.move(id, direction)` — operations applied against whatever `pending` actually is at drain time, so concurrent enqueues and recovery are unaffected. Drain happens at the top of each `processLoop` iteration **and** in `startProcessingIfNeeded()`, so a delta lands whether the loop is running or parked.
+4. **Persistence.** `persistQueueState()` is actor-only, so an off-actor cancel that isn't persisted **resurrects the job on the next bounce**. Undrained deltas are therefore written to a small sidecar (`~/.comfybox/queue-deltas.json`, atomic, same idiom as `QueuePersistence`) and replayed by `recoverPersistedQueue` before it publishes. This is the piece v1 omitted entirely.
+5. **`GET /v1/queue` composes** the actor-authored snapshot **plus undrained deltas**, so a cancelled job disappears from the listing immediately rather than after the render.
+
+#### 3.1.5 Snapshot authority **[NEW v2]**
+
+`LiveHealthState` is a projection of actor state (§2.2), so off-actor control writes are invisible to it. For the two facts a control caller must see immediately, **invert the ownership**: `isPaused` and the undrained-delta list become **authoritative in the lock store**, and the actor becomes a *reader* of `isPaused` (its between-items gate) rather than its owner. `publishHealth()` stops writing `isPaused` into the snapshot; the read path composes `lockStore.isPaused` with the actor-authored remainder. Everything else in `HealthSnapshot` keeps its current, correct actor-authored semantics.
+
+This is the minimum inversion that makes the AC honest. Without it, Phase 0's "returns within 2s" passes while `/v1/queue` reports `is_paused: false` for the entire render.
+
+#### 3.1.6 What Phase 0 does *not* deliver **[NEW v2 — v1 promised this and was wrong]**
+
+**"Pause takes effect mid-render" is withdrawn.** Three independent reasons:
+
+- The #1479 precedent is **LTX-2 only** (`LTX2VideoGenerator.swift:288`). Image families have no preemption plumbing at all, so there is nothing to reuse.
+- #1479 is a **handoff-and-resume** — yield, run the preemptor, resume — not an indefinite park. Parking a render would pin materialized latents in unified memory precisely against #218's eviction logic.
+- `isPaused` is a **between-items gate** on a live endpoint. Redefining it as "stops the current render" is a breaking semantic change for every existing caller.
+
+**Mid-render abort is scoped to `interrupt`, and family-qualified.** `interrupt` already works mid-render for ZImage, ZImageControl, Flux2 and Fibo; **Krea2 and Chroma have zero `checkCancellation` sites** and will not abort until their sampling loops gain them. The AC says exactly that, rather than implying uniform behavior.
+
+#### 3.1.7 Alternatives rejected
+
+- *Yield points in the render loop* — highest blast radius in the codebase, and 0.A makes it unnecessary.
+- *A second `NWListener`* — the stall is at the executor layer; each connection already has its own queue.
+- *`Task.detached` for the render* — changes the residency/preemption invariants #218 and #1479 depend on. 0.A achieves the thread-move without touching them.
+- *v1's plan (classifier-first, executor-second)* — inverted: it would have hand-fixed a listed subset while leaving every unlisted async route broken, at higher risk, for more work.
+
+### 3.2 — D2: Phase 2 cross-daemon strategy **[REVISED v2 — precondition + AC]**
+
+**Decision unchanged: option (c) — document the Kira daemon as a first-class agent surface and register control-plane tools in coffeeshop-server's built-in tool layer, on the Linux box.** No warm-server proxy routes.
+
+Justification: the daemon is loopback-only on the Linux box and reachable from the Mac only through a hand-managed `ssh -N -L` tunnel (`KiraClient.swift:21`). A warm-server proxy (option a) would make ComfyBox's control plane depend on that tunnel and fail looking like "ComfyBox is broken"; worse, a warm-server stall — the bug Phase 0 fixes — would also block Kira control. A second MCP server (option b) inherits the same tunnel from the Mac and is redundant from the Linux box, where coffeeshop-server already has ~60 `src/tools/*-tools.ts` modules with direct precedent (`comfybox-http-video-executor.ts`, `content-mode-tools.ts`). Option (c) is one new file over loopback: better failure isolation in both directions, and no Kira *behavior* moves anywhere.
+
+**Dated precondition [NEW v2].** This decision rests on *today's* topology: Kira daemon on Linux, warm server on Mac. A Kira→Mac migration is in progress. **If the daemon moves to the Mac, re-open D2** — co-location would then favour hosting the tools next to the warm server, and the tunnel argument disappears. Record the assumption in `docs/kira-control-api.md` with its date so the next reader doesn't inherit it as timeless.
+
+**Isolation.** Tools are namespaced and allowlisted to control-plane only — `kira_scheduler_status`, `kira_scheduler_pause`, `kira_scheduler_resume`, `kira_scheduler_run_now`, `kira_scheduler_policy`, `kira_stream_mode`. Nothing touching conversation, memory, persona, Telegram, or media generation. Gated on `role !== 'companion'`, with one added boundary-ratchet assertion that the namespace exposes nothing outside the list.
+
+**Federation cost.** Kira controls appear in `/v1/controls` with `host: "kira-daemon"` — **advertised, not proxied**. An agent on the Mac cannot reach them. Documented and machine-readable rather than papered over.
+
+**Strengthened AC [REVISED v2].** `PUT /v1/kira/content-scheduler/policy` (`kira-api.ts:704`) persists and *best-effort* live-applies without failing the response — so "returns 200" is not proof. The AC asserts **live application**: change a tier's `imageCount`, then observe the change reflected in `GET .../status` **and** in the next scheduler tick's behavior, with no daemon restart.
+
+### 3.3 — D3: Phase 3 settings model **[REVISED v2 — premise inverted]**
+
+**Write path: `PATCH /v1/config` (RFC 7386 JSON Merge Patch) as primary; `PUT` retained as full replace; both through a new lock-serialized `ServerConfigStore`. No per-key routes.**
+
+Per-key routes are the drift engine Phase 4 exists to kill. Merge-patch gives "change one knob" with one route and one tool, and composes with discovery: a descriptor's write action is `{PATCH, /v1/config, pointer: /renderDefaults/steps}` — machine-executable without a URL per control. Today's `PUT` makes omission mean *deletion* from the client's perspective (§2.3); merge-patch makes it mean "unchanged," which is what every caller already assumes.
+
+**Concurrency.** `ServerConfigStore` is a `final class: @unchecked Sendable` with an `NSLock` (the `PromptRepositoryStore` idiom — chosen over an actor precisely because §3.1 makes actor hops the enemy). Every write is `lock → apply patch to the in-memory document → validate → atomic write (temp + rename) → publish → unlock`. Because the merge happens *inside* the lock against the current document, two agents patching different pointers cannot conflict at all — no retry loop.
+
+**`If-Match` is advisory, not mandatory [REVISED v2].** v1 made it required on `PUT`. No current caller sends it; requiring it breaks the Desktop and every script on day one. Instead: `GET` returns an `ETag`; `PUT`/`PATCH` **honour** `If-Match` when present (`409` on mismatch) and proceed without it otherwise; a `Warning` header marks unconditional `PUT` as deprecated. Revisit making it mandatory once callers have migrated.
+
+**Rollback, stated correctly [REVISED v2].** `init(from:)` (`:133–151`) tolerates unknown keys, so an older build can *read* a newer config. But `encode(to:)` (`:154–171`) writes only enumerated keys, so an older build doing `GET`→`PUT` **silently deletes** the new blocks. The rollback story is therefore: reverting the server is safe for reading; the hazard is an old *client* round-tripping the document. Mitigation: after Phase 3, clients use `PATCH` (which never round-trips unknown keys), and the deprecation `Warning` on `PUT` exists for exactly this.
+
+#### The migration, inverted **[REVISED v2 — v1's premise was false]**
+
+v1 asserted that `DesktopSettings.default{Steps,Guidance,Width,Height}` were applied client-side and had to be preserved. **They are write-only UI state** — the only readers are the `SettingsView` declaration, its defaults (`:108–111`) and its own `TextField` bindings (`:357–389`). Nothing builds a generate request from them. (`EngineService.swift:171,503` has same-named fields, but those come from the *server's* model descriptor dict, unrelated.) So:
+
+- **There is no client-side default application to preserve.** The value-preservation test v1 specified would have tested a behavior that does not exist.
+- **Migrating those values would be a regression**, not a preservation: it would take one user's stale UI-form numbers and impose them on **every non-Desktop caller** — Bree, MCP, the Kira scheduler — which today get the engine's own defaults.
+
+**Revised rule: seed `renderDefaults` from the engine's existing fallbacks, not from `desktop-config.json`.** Those fallbacks are `payload.width ?? 1024`, `height ?? 1024`, `steps ?? defaultSteps`, `guidance ?? defaultGuidance` (`:7413–7416`), with a family-specific `steps ?? 30` elsewhere (`:7739`); video is `?? 704 × 448` (`:2229–2230`) and `steps ?? 8` (`:2380`) — *after* preset resolution.
+
+**Family-awareness [NEW v2].** Because the current defaults are family-dependent (§2.5), a flat `renderDefaults` would flatten real behavior. Shape it as `renderDefaults: { default: {...}, byFamily: { "krea2": {...}, ... } }`, resolution order **`request → preset → config.byFamily[family] → config.default → engine constant`**. The config layer slots *above* the hardcoded constant and *below* everything that exists today, so with an empty config the resolution is bit-identical to current behavior.
+
+**Rewritten value-preservation test:** with `config.json` freshly migrated and no user edits, assert that for a matrix of (family × request-with-fields-omitted) the resolved render parameters equal the **pre-migration engine** values. The baseline is the engine, not the Desktop.
+
+**What actually migrates from `desktop-config.json`:** only `videoWidth/Height/Frames` — and only because `MotionView.swift:393–398` genuinely reads them to seed its initial control state, so a user has meaningful values there. They land in `videoDefaults` and the Motion tab reads them from the server afterwards. **`videoDefaults.backend` is dropped — no such field exists in `DesktopSettings`** (v1 carried it over from the PRD without checking). The API keys (`civitaiApiKey`, `replicateApiKey`, `falApiKey`) still de-duplicate, server-wins.
+
+**Stays local** (presentation / Class D): `serverHost`, `serverPort`, `autoConnect`, `serverHealthEndpoint`, `thumbnailSize`, `gallerySortDefault`, `uiScale`, `archiveRoots`, `watchedServices`, and `default{Steps,Guidance,Width,Height}` — which, being pure UI form state, have no business on the server at all. `outputDirectory` stays local as the Desktop's save location; the server's `allowedOutputDirectory` is a containment boundary and merging the two would weaken it.
+
+**First run:** if `config.json` lacks `renderDefaults`, write the engine-derived seed; if it lacks `videoDefaults` and `desktop-config.json` has video values, import those. Log each imported value to the audit log (`config.migrate.*`). `desktop-config.json` is never deleted.
+
+**Hot-apply:** defaults are read from `ServerConfigStore` at request-decode time (`decodedGeneratePayload`, `:4289`) and in the video prep path — a lock read, off-actor, Phase-0-compatible. `port`/`host` are marked `requiresRestart: true`.
+
+**Content modes (Class E):** `PUT /v1/content-modes/{mode}` writing `guidanceBoost`, `promptHint`, `negativePromptAdditions`, `styleVariant` via `ContentModeStore.save()`, with range validation and `400` on unknown `styleVariant`. `DELETE` reverts a mode to its built-in definition rather than removing it.
 
 ### 3.4 — D4: Phase 4 discovery surface
 
-**Decision: `GET /v1/controls`, generated from a compile-time `ControlRegistry` that is the *same* source the MCP tool definitions and the generated `docs/api-reference.md` read. Name kept as the PRD's `/v1/controls` — it is the noun the operator uses.**
+**`GET /v1/controls`, generated from a compile-time `ControlRegistry`.**
 
 ```swift
 public struct ControlDescriptor: Codable, Sendable {
-  public let id: String            // "render.defaults.steps" — stable, dotted, the agent's handle
+  public let id: String            // "render.defaults.steps" — stable dotted handle
   public let title: String
   public let summary: String
   public let scope: ControlScope   // .engine .queue .creative .provider .model .kira
   public let type: ControlType     // .int .double .bool .string .enum .object .action
   public let range: ClosedRange<Double>?
-  public let allowed: [String]?    // enum members
+  public let allowed: [String]?
   public let unit: String?
   public let defaultValue: JSONValue?
   public let read: ActionRef?      // { host, method, path, pointer }
-  public let write: ActionRef?     // { host, method, path, pointer }
+  public let write: ActionRef?
   public let mcpTool: String?
-  public let host: ControlHost     // .comfybox | .kiraDaemon   (federated, §3.2)
+  public let host: ControlHost     // .comfybox | .kiraDaemon  (federated, §3.2)
   public let mutatesEngine: Bool
   public let requiresRestart: Bool
   public let since: String
 }
 ```
 
-The route returns `{controls: [...], generatedAt, serverVersion}`; `?scope=`/`?host=`/`?mutatesEngine=` filter. **Current values are resolved at request time** by dereferencing each descriptor's `read.pointer` against the live documents (`ServerConfigStore`, `ContentModeStore`, `LiveControlState`) — the registry declares *where* the value lives, it never caches a copy. That single rule is what keeps `/v1/controls` from becoming a third truth.
+The one rule that stops it becoming a third truth: **the registry declares where a value lives and never caches a copy.** Values are resolved per-request by dereferencing `read.pointer` against `ServerConfigStore` / `ContentModeStore` / the live control state.
 
-**Anti-drift by construction, not by discipline.** The registry is consumed in three places, and two of them are *load-bearing*:
+Anti-drift by construction: the registry is load-bearing in three consumers — (1) the route has no list of its own; (2) config-shaped MCP tools derive JSON Schema `properties` from descriptor `type`/`range`/`allowed`, so adding a control widens the tool automatically; (3) a new `comfybox docs generate` subcommand emits `docs/api-reference.md` from the registry plus the parsed route table, with CI asserting the checked-in file byte-matches a fresh generation.
 
-1. `GET /v1/controls` — the route has no control list of its own.
-2. `MCPToolRegistry` — config-shaped tools (`update_config`, `set_content_mode`, `set_render_default`) derive their JSON Schema `properties` **from the descriptors' `type`/`range`/`allowed`**, so a control with a bad range cannot produce a valid tool schema, and adding a control automatically widens the tool.
-3. `comfybox docs generate` (new subcommand under `Sources/ComfyBox/`) writes `docs/api-reference.md` from the registry + parsed route table. CI asserts the checked-in file byte-matches a fresh generation. Docs cannot rot without failing the build.
+### 3.5 — D5: the anti-drift test **[REVISED v2 — parser corrected]**
 
-Hand-maintenance is not eliminated — someone still writes the descriptor. What is eliminated is *silent* hand-maintenance: §3.5 makes the omission fail CI.
+**Parse the dispatch switches from source as ground truth for routes; compare against the compile-time registries.** Swift has no runtime reflection over a `switch`, and refactoring `respond(to:)`'s arms into a data table would be a large risky edit to a file Phases 0 and 3 are already rewriting. Parsing is honest; the design's job is making its failures loud. Test: `Tests/ZImageTests/ControlSurfaceParityTests.swift`.
 
-### 3.5 — D5: the anti-drift test
+**Both switches, not one [REVISED v2].** `ComfyBridge.route()` (`ComfyBridge.swift:106`) is a *second* dispatch switch reached **before** the main one (`WarmServer.swift:615`), and it contains real mutating routes (`POST /queue`, `:135`). v1 proposed exempting bridge routes — impossible, since the parser never sees them, so an exemption list would silently accept anything. **Decision: parse both files.** Bridge routes are tagged `surface: .comfyUICompat` and held to a *declared* policy — they need no MCP tool (they exist for ComfyUI/Krita clients, which have their own protocol) but they must be **enumerated**, so adding one is visible in review rather than invisible.
 
-**Decision: a hybrid — parse the dispatch switch from source as ground truth for routes, compare against the compile-time registries, and pin the parser's own yield so a parse miss also fails.** Test target `Tests/ZImageTests/ControlSurfaceParityTests.swift`.
+**Parser rules, corrected:**
 
-Swift offers no runtime reflection over a `switch`, and refactoring `respond(to:)`'s ~75 arms into a data-driven table would be a large, risky edit to a 9,680-line file that is simultaneously being changed by Phases 0–3. Parsing is the honest option; the design's job is to make the parser's failure modes loud.
+1. **Strip comments first.** Two `case (` occurrences live in comments (`:271`, `:4891`) and would otherwise inflate the count.
+2. **Count tuples, not lines.** 73 `case (` lines yield **76 tuples**: `:1620` (`pause`, `resume`), `:1654` (`POST`, `PUT /v1/characters`), `:1680` (`POST`, `PUT /v1/presets`). v1's line-count pin would have let a **control route be silently missed** — `/v1/queue/resume`, of all things.
+3. **Accept both orderings** of `hasPrefix`/`hasSuffix` in `where` clauses, and the `case _ where request.method == …` form the bridge uses (`ComfyBridge.swift:126`).
 
-The test does five things:
+**Five assertions:**
 
-1. **Extract the route table.** Read `WarmServer.swift` (path resolved from `#filePath`, so it works from any checkout) and scan for both dispatch forms: `case ("METHOD", "/literal")` and `case ("METHOD", _) where request.path.hasPrefix("…")` (with optional `hasSuffix`). Produce `Set<RouteRef>` of `(method, pattern)`.
-2. **Pin the parser.** Assert `parsed.count == expectedRouteCount` (a checked-in constant) **and** that every `case (` occurrence in the switch body was consumed by one of the two recognizers. A route written in a shape the parser doesn't know therefore fails CI as "unparsed dispatch arm at line N" instead of being silently skipped. This is the assertion that makes the whole approach trustworthy.
-3. **Route → tool.** `MCPToolDefinition` gains a `routes: [RouteRef]` field (populated during Phase 1 — it is the only new metadata the phase needs). Assert every **mutating** parsed route is claimed by at least one tool, or appears in `ParityExemptions.swift` with a non-empty `reason` string. Exemptions are expected for the ComfyUI-bridge compatibility routes and `/v1/shutdown`-adjacent lifecycle paths; each is one line with a written justification, reviewed like code.
-4. **Descriptor → route/tool.** Assert every `ControlDescriptor.write?.route` with `host == .comfybox` resolves to a parsed route, and every `mcpTool` resolves to a registered tool. Kira-hosted descriptors are skipped here and covered by a contract test in coffeeshop-server instead.
-5. **Config key → descriptor.** Encode a default `ComfyBoxServerConfig` to JSON, walk it into a set of key pointers, and assert every pointer either has a descriptor or is in a `nonControlKeys` allowlist. This is the direction that catches "someone added a config field and no descriptor" — the most likely future drift.
-
-Failure messages name the offender and the fix ("`POST /v1/loras/{id}/update` has no MCP tool; add one to `MCPToolRegistry.tools` with `routes: [...]`, or exempt it in `ParityExemptions.swift` with a reason").
+1. Extract `Set<RouteRef>` from both files.
+2. **Pin the parser:** parsed tuple count equals a checked-in constant **per file**, and every non-comment `case (` occurrence was consumed by a recognizer — an unrecognized arm fails as "unparsed dispatch arm at `<file>:<line>`" rather than being skipped. This is the assertion that makes the approach trustworthy.
+3. Every mutating `surface: .v1` route is claimed by ≥1 MCP tool via a new `routes: [RouteRef]` field on `MCPToolDefinition` (populated in Phase 1), or is listed in `ParityExemptions.swift` with a non-empty reason.
+4. Every `.comfybox`-hosted descriptor's `write.route` and `mcpTool` resolve to real entries. Kira-hosted descriptors are covered by a coffeeshop-server contract test instead.
+5. Encode a default `ComfyBoxServerConfig` to JSON, walk it to key pointers, assert each has a descriptor or is in `nonControlKeys`. This catches "someone added a config field and no descriptor" — the most likely future drift.
 
 ---
 
 ## 4. Phases
 
-### 4.1 Phase 0 — control routes answer during a render (#300)
+**Shippability, corrected [REVISED v2].** v1 claimed all five phases were independently shippable. Two dependencies are real: **`update_config` must not ship in Phase 1** (it would proxy the clobbering whole-doc `PUT` that Phase 3 replaces, breaking its callers) — it moves to Phase 3 alongside `PATCH`. And **Phase 4 depends on Phase 3's `ServerConfigStore`** for value resolution. Order: 0 → 1 → 3 → 4, with 2 parallel to any of them (different repo).
 
-**Tasks.**
-- **0.A — diagnose Mechanism B (blocking, do first).** Under a continuous render, capture `sample`/`spindump` of the `comfybox serve` process while curling `/v1/civitai/search`, and log cooperative-pool width and in-flight request-task count. Record which of B1/B2 (§3.1.2) holds, or a third cause. Deliverable: a findings note appended to this FDD's §3.1.2. **0.C is gated on this.**
-- **0.B — the control plane.** New `ControlPlaneRoutes` (classifier), `LiveControlState` (generalized from `LiveHealthState`), `ControlCommandMailbox` (`NSLock`, bounded, oldest-evicting). Synchronous `respondControlPlane(to:)`. Rewire the queue-mutation arms (`:1610–1646`) off `await coordinator.…`. Coordinator drains the mailbox at existing scheduling points; render loop reads the paused/interrupt flags with no actor hop.
-- **0.C — conditional.** If 0.A confirms B1, give `WarmServerCoordinator` a dedicated serial-queue-backed `unownedExecutor` so the render never consumes a cooperative worker, protecting the *non*-control async routes.
+### 4.1 Phase 0 — control routes answer during a render (#300) **[REVISED v2]**
 
-**Files.** `Sources/ZImage/Server/WarmServer.swift` (classifier + `ConnectionHandler.handle`; `respond`/`respondControlPlane` split; queue arms; coordinator drain points), new `Sources/ZImage/Server/ControlPlane.swift` (classifier + mailbox + `LiveControlState`).
+**0.A (first, primary).** `unownedExecutor` on `WarmServerCoordinator` backed by a dedicated `.userInitiated` serial queue; QoS pin on the per-connection queue (`:606`). ~20 lines, no render-path edits.
 
-**Tests.** Unit: mailbox ordering/cap/eviction; classifier coverage (every route in §3.1.3's list classifies as control-plane, and no render route does). Integration (`ZImageIntegrationTests`): with a long synthetic render occupying the coordinator, assert every control route returns `< 2s`; assert `pause` takes effect **mid-render**, not after.
+**0.A′ — re-measure.** Re-run the #300 repro plus a fresh `sample`. Record which routes still stall; those are Mechanism A and define 0.B.
 
-**AC.** PRD Phase 0 AC — with a render in flight, every control route returns within 2s. Plus: `POST /v1/queue/pause` during a 5-minute render pauses before the render completes.
+**0.B — residual carve-out.** Classifier in `ConnectionHandler.handle()`; `isPaused` + queue deltas authoritative in a lock store (§3.1.5); `ControlCommandMailbox` of **deltas** with drain at the top of `processLoop` **and** in `startProcessingIfNeeded()`; `resume` bypasses the mailbox entirely (§3.1.4); delta sidecar persisted and replayed by `recoverPersistedQueue`; `GET /v1/queue` composes snapshot + undrained deltas. **`GET /v1/characters*` excluded** (actor-backed store, §3.1.3).
 
-**Rollback.** `COMFYBOX_CONTROL_PLANE_SYNC=0` env restores the old `Task { await respond(…) }` path for every route (the classifier returns empty). Single-flag, no data migration. 0.C reverts independently.
+**Files.** `WarmServer.swift` (executor + QoS + classifier + queue arms `:1610–1646` + `processLoop` `:6965` + `startProcessingIfNeeded` `:6921` + `recoverPersistedQueue` `:4310`), new `Sources/ZImage/Server/ControlPlane.swift`.
 
-### 4.2 Phase 1 — MCP parity for existing routes
+**Test seam [NEW v2].** The integration AC needs a long-running operation that occupies the coordinator without a GPU. `QueuedOperation` has no injectable synthetic case today. **Budget it explicitly:** add a `#if DEBUG` `.synthetic(durationMs:)` case plus the `runsWhilePaused` arm and `processLoop` handling. Without this seam the AC is untestable in CI and would degrade into a manual check.
 
-**Scope.** One MCP tool per unmapped mutating route (§2.5 table). Add `routes: [RouteRef]` to `MCPToolDefinition` and populate it for **all** tools, existing ones included — this is the metadata D5 depends on.
+**Tests.** Delta mailbox: ordering, cap, eviction, and — critically — a **`resume`-while-parked** test asserting the loop restarts (the v1 blocker, pinned). Enqueue-during-render + concurrent cancel: neither job is lost. Cancel → bounce → job stays cancelled (sidecar replay). Integration: with a synthetic 60s operation active, every residual control route returns `< 2s`, and `GET /v1/queue` reports `is_paused: true` **during** the operation, not after.
 
-**New tools.** `upsert_character`, `delete_character`, `create_preset`, `delete_preset`, `update_config`, `move_queue_job`, `cancel_queue_job`, `import_loras`, `update_lora_triggers`, `civitai_harvest`, `promote_video_trace`, `rate_video_trace`, `delete_workflow`, `generate_image_async`, `generate_video_async`.
+**ACs.** (1) With a render in flight, every control route returns within 2s. (2) `GET /v1/queue` reflects a pause/cancel issued during that render, in that render. (3) `interrupt` aborts mid-render **for ZImage, ZImageControl, Flux2 and Fibo**; Krea2 and Chroma abort at the next item boundary until `checkCancellation` sites are added (tracked separately). (4) **No** mid-render pause AC (§3.1.6).
 
-**Files.** `Sources/ZImage/MCP/MCPToolRegistry.swift` (defs + `routes:`), `MCPToolExecutor.swift` (`switch name` arms — all proxy through `WarmServerClient`, no new transport), `MCPTypes.swift` (`RouteRef`), new `Sources/ZImage/MCP/ParityExemptions.swift`.
+**Rollback.** 0.A reverts as one commit (removing an executor restores the default one; no data). 0.B reverts behind `COMFYBOX_CONTROL_PLANE_SYNC=0`, with the delta sidecar drained on next boot regardless of the flag so no cancel is lost across the toggle.
 
-**Tests.** `ControlSurfaceParityTests` steps 1–3 (§3.5) land here — the parity assertion ships *with* the phase that satisfies it. Per-tool executor tests against a stub `WarmServerClient` asserting method + path + body shape, and that bad params yield a clean tool error rather than a trap.
+### 4.2 Phase 1 — MCP parity for existing routes **[REVISED v2]**
 
-**AC.** PRD Phase 1 AC — the diff-test asserts every mutating `/v1/*` route has a tool; a new route without one fails CI.
+**Scope.** One tool per unmapped mutating route (§2.6), **excluding `update_config`** (→ Phase 3). Add `routes: [RouteRef]` + `surface` to `MCPToolDefinition`, populated for all 44 existing tools — the metadata D5 needs.
 
-**Rollback.** Additive; revert the commit. No behavior change to existing tools.
+**New tools.** `upsert_character`, `delete_character`, `create_preset`, `delete_preset`, `move_queue_job`, `cancel_queue_job`, `import_loras`, `update_lora_triggers`, `civitai_harvest`, `promote_video_trace`, `rate_video_trace`, `delete_workflow`, `generate_image_async`, `generate_video_async`.
 
-### 4.3 Phase 2 — Kira controls as an agent surface
+**Files.** `MCPToolRegistry.swift`, `MCPToolExecutor.swift` (all proxy via `WarmServerClient` — no new transport), `MCPTypes.swift` (`RouteRef`, `RouteSurface`), new `ParityExemptions.swift`.
 
-**Scope.** Per §3.2. comfybox: `docs/kira-control-api.md` + federated `ControlDescriptor`s (`host: .kiraDaemon`) staged for Phase 4. coffeeshop-server: `src/tools/kira-control-tools.ts` — the seven namespaced tools, loopback HTTP to `127.0.0.1:3787`, tolerant parsing (the daemon's payloads are JSON dictionaries, and `KiraClient` already models them defensively), clean error text when the daemon is down.
+**Tests.** `ControlSurfaceParityTests` steps 1–3 land here, including the two-file parse and the tuple-count pin. Per-tool executor tests against a stub client asserting method/path/body and clean errors on bad params.
 
-**Tests.** coffeeshop-server: tool-level tests against a stubbed daemon; one added boundary-ratchet assertion that `kira_control` exposes nothing outside the allowlist and is unavailable to `role === 'companion'`. comfybox: a doc-contract test asserting each federated descriptor's `read.path` appears in `docs/kira-control-api.md` (weak, but it catches doc/registry divergence).
+**AC.** Every mutating `.v1` route has a tool or a reasoned exemption; a new route without one fails CI; a new *bridge* route is enumerated and visible in review.
 
-**AC.** PRD Phase 2 AC — an agent reads and sets 24/7 on/off, tier config, stream override, and video mix with no file edits and no service restart. Verify live against the running daemon: `run-now` produces a render; `policy` change is visible in `content-scheduler/status`.
+**Rollback.** Additive; revert the commit.
 
-**Rollback.** Remove the tool module from the coffeeshop-server registration list. Nothing in comfybox executes against Kira, so there is nothing to unwind on the Mac.
+### 4.3 Phase 2 — Kira controls as an agent surface **[REVISED v2]**
 
-### 4.4 Phase 3 — server-side settings
+**Scope.** comfybox: `docs/kira-control-api.md` (including the **dated topology precondition**, §3.2) + federated descriptors staged for Phase 4. coffeeshop-server: `src/tools/kira-control-tools.ts` — six namespaced tools over loopback to `127.0.0.1:3787`, tolerant parsing, clean errors when the daemon is down.
 
-**Scope.** `ServerConfigStore`; `PATCH /v1/config`; `If-Match`/`ETag` on `GET`/`PUT`; `renderDefaults` + `videoDefaults` blocks; the `desktop-config.json` migration; hot-apply of defaults at request-decode time; `PUT|DELETE /v1/content-modes/{mode}`; `SettingsView` Generation + Motion tabs rebound to the server document.
+**Tests.** coffeeshop-server: tool tests against a stubbed daemon; boundary-ratchet assertion that the namespace exposes nothing outside the allowlist and is unavailable to `role === 'companion'`. comfybox: doc-contract test that each federated descriptor's path appears in `docs/kira-control-api.md`.
 
-**Files.** New `Sources/ZImage/Server/ServerConfigStore.swift`; `ComfyBoxServerConfig.swift` (+2 blocks, +migration); `WarmServer.swift` (`:802–822` config arms, content-mode write arms, `decodedGeneratePayload` default resolution); `ContentModeStore.swift` (validation helpers); `Sources/ComfyBoxDesktop/Views/SettingsView.swift` (`DesktopSettings` shrinks; tabs rebind).
+**AC [strengthened].** An agent reads and sets 24/7 on/off, tier config, stream override and video mix with no file edits and no restart — **and the change is verified live**: a tier `imageCount` change is reflected in `GET .../status` *and* in the next scheduler tick's behavior (because `PUT .../policy`, `kira-api.ts:704`, live-applies best-effort and a 200 alone proves nothing).
+
+**Rollback.** Remove the module from the coffeeshop-server registration list. Nothing in comfybox executes against Kira.
+
+### 4.4 Phase 3 — server-side settings **[REVISED v2]**
+
+**Scope.** `ServerConfigStore`; `PATCH /v1/config`; advisory `ETag`/`If-Match` + `PUT` deprecation warning; **family-aware** `renderDefaults` seeded from **engine** fallbacks; `videoDefaults` (no `backend`) importing the three Motion values; hot-apply at request-decode time; `PUT|DELETE /v1/content-modes/{mode}`; the `update_config` MCP tool (moved from Phase 1); `SettingsView` Motion tab rebound to the server, Generation tab's four fields left local (they're UI state).
+
+**Files.** New `ServerConfigStore.swift`; `ComfyBoxServerConfig.swift` (+2 blocks, +`encode(to:)` extended, +migration); `WarmServer.swift` (`:802–822`, content-mode arms, `:4289` and the video prep default resolution); `ContentModeStore.swift`; `SettingsView.swift`; `MotionView.swift` (`:393–398` reads server values).
 
 **Tests.**
-- **The value-preservation test (the important one):** given a synthetic `desktop-config.json` with non-default values, run migration and assert the resulting effective render parameters for (i) a request omitting every field and (ii) a request specifying every field are **identical** to the pre-migration effective parameters. This is the direct guard against "migration silently changes render behavior."
-- Merge-patch semantics: omitted key unchanged, explicit `null` deletes, nested object merges not replaces.
-- Concurrency: N threads patching N distinct pointers → all N present, document valid, one file, no torn write.
-- `If-Match` mismatch on `PUT` → `409`.
-- Validation: out-of-range `guidanceBoost`, unknown `styleVariant`, negative `steps` → `400` with a message naming the field.
-- Desktop: `DesktopSettingsTests` updated — migrated keys no longer persisted locally; unreachable-server path shows cached values read-only.
+- **Engine-baseline value-preservation:** for a matrix of (family × request-with-omitted-fields), resolved parameters after a fresh migration equal the **pre-migration engine** values. Explicitly covers the family split (`:7415` vs `:7739`) and the video path.
+- Resolution order: `request → preset → byFamily → default → engine constant`, each layer verified to override only the one below.
+- Merge-patch semantics: omitted unchanged, explicit `null` deletes, nested merge not replace.
+- Concurrency: N threads patching N distinct pointers → all N present, one valid file, no torn write.
+- `If-Match` present-and-stale → `409`; absent → proceeds with a deprecation `Warning`.
+- Validation: out-of-range `guidanceBoost`, unknown `styleVariant`, negative `steps` → `400` naming the field.
+- Desktop: migrated video keys no longer persisted locally; unreachable-server shows cached values read-only.
 
-**AC.** PRD Phase 3 AC — changing a default via API changes what the engine produces; Desktop reflects it after refresh; migration preserves existing local values on first run (asserted, plus an audit-log line naming each imported value).
+**AC.** Changing a default via API changes what the engine produces for **all** callers; Desktop reflects it after refresh; migration is engine-behavior-neutral (asserted) and every imported value is in the audit log.
 
-**Rollback.** `desktop-config.json` is never deleted. Revert restores the Desktop's local reads; the added server config blocks are ignored by older builds (decoding is already tolerant of unknown keys — **verify** before shipping, §6).
+**Rollback.** Revert restores boot-captured config reads. `desktop-config.json` is never deleted. Hazard is an old client round-tripping `PUT` and dropping the new blocks (§3.3) — mitigated by `PATCH` and the deprecation warning.
 
-### 4.5 Phase 4 — discovery
+### 4.5 Phase 4 — discovery **[REVISED v2 — dependency stated]**
 
-**Scope.** `ControlRegistry` + `ControlDescriptor` + `GET /v1/controls` (control-plane classified, so it answers during renders); `comfybox docs generate`; `docs/api-reference.md` regenerated; `ControlSurfaceParityTests` steps 4–5.
+**Depends on Phase 3** (`ServerConfigStore` is the value-resolution backend). Not shippable before it.
 
-**Files.** New `Sources/ZImage/Server/ControlRegistry.swift`, `Sources/ZImage/Server/ControlDescriptor.swift`; `WarmServer.swift` (one route arm); new `Sources/ComfyBox/DocsGenerateCommand.swift`; `docs/api-reference.md` (now generated).
+**Scope.** `ControlRegistry` + `ControlDescriptor`; `GET /v1/controls` (control-plane classified); `comfybox docs generate`; regenerated `docs/api-reference.md`; parity steps 4–5.
 
-**Tests.** Every descriptor's `read.pointer` dereferences successfully against a live default state (no dangling pointers). `docs generate` is idempotent and byte-matches the checked-in file. Parity steps 4–5.
+**Files.** New `Sources/ZImage/Server/ControlRegistry.swift`, `Sources/ZImage/Server/ControlDescriptor.swift`; `WarmServer.swift` (one arm); new `Sources/ComfyBox/DocsGenerateCommand.swift`; `docs/api-reference.md` (generated).
 
-**AC.** PRD Phase 4 AC — one call answers "what can I change and how"; `docs/api-reference.md` regenerates from the same source and CI fails if the checked-in copy is stale.
+**Tests.** No dangling `read.pointer`; `docs generate` idempotent and byte-matching; parity steps 4–5.
 
-**Rollback.** Additive; revert. `api-reference.md` reverts to hand-maintained.
+**AC.** One call answers "what can I change and how"; `docs/api-reference.md` regenerates from the same source and CI fails on a stale checked-in copy.
 
----
-
-## 5. Risks
-
-**R1 — render-path regression from Phase 0 (highest).** The paused/interrupt flags become readable mid-render. If a flag is read at a point where the pipeline holds partially-updated state, an interrupt could leave a model or the LTX-2 preemption checkpoint inconsistent. *Mitigation:* read the flags **only at the existing `#1479` checkpoint sites**, which are already proven safe for exactly this kind of mid-render observation — do not introduce new observation points. Ship 0.B behind `COMFYBOX_CONTROL_PLANE_SYNC` and soak it for a full 24/7 cycle before removing the flag.
-
-**R2 — Mechanism B is neither B1 nor B2.** Then 0.C is wasted and some async routes still stall. *Mitigation:* 0.A is blocking and 0.C is explicitly conditional on it; 0.B's value does not depend on the answer, because taking the control plane off the pool entirely is correct under any cause.
-
-**R3 — migration changes render behavior (Phase 3).** Covered by the value-preservation test (§4.4) and by the omit-only application rule (§3.3). Residual risk: a code path that reads a Desktop default *indirectly* (e.g. the Motion tab computing an LTX-2 parameter before submitting) and is missed in the sweep. *Mitigation:* grep every `DesktopSettings` field read in `Sources/ComfyBoxDesktop/` before the cut, and enumerate them in the PR description.
-
-**R4 — cross-host coupling (Phase 2).** Accepted, not eliminated: an agent on the Mac cannot reach Kira controls. Documented in `docs/kira-control-api.md` and encoded in the descriptor's `host` field so the limitation is machine-readable rather than folklore.
-
-**R5 — Kira isolation erosion.** A future contributor adds a "convenient" Kira tool outside the control-plane allowlist. *Mitigation:* the boundary-ratchet assertion in §4.3 fails on any tool in the namespace that isn't on the list.
-
-**R6 — the registry rots anyway.** D5 catches *missing* descriptors and *missing* tools. It cannot catch a descriptor whose `range` or `summary` is wrong. Accepted; the pointer-dereference test at least catches a descriptor pointing at a key that no longer exists.
-
-**R7 — parser brittleness (D5).** Mitigated by the count/consumption pin (§3.5 step 2), which converts a silent parse miss into a named CI failure.
-
-**R8 — Phase 0 and Phase 3 both edit `WarmServer.swift` heavily.** Sequence them; do not run parallel builders against this file (established practice). Phase 1 and Phase 2 can run concurrently with either, since they touch `MCP/` and another repo.
+**Rollback.** Additive; `api-reference.md` reverts to hand-maintained.
 
 ---
 
-## 6. What I could not verify
+## 5. Risks **[REVISED v2]**
 
-Stated plainly, so nothing here is taken as established:
+**R1 — queue wedge from the Phase 0 write path (was: render regression).** The v1 design would have wedged the queue on `resume`. The revised design avoids it structurally (`resume` bypasses the mailbox) and pins it with a named test. Residual risk: a *future* mailbox command type added without a corresponding wake path. *Mitigation:* `ControlCommand` carries a `requiresWake: Bool` and the drain asserts it — a command that parks the loop without waking it fails in test.
 
-- **Why `/v1/civitai/search` starves.** I confirmed it never touches the coordinator and that its synchronous sibling `/v1/civitai/repo` is reported healthy — so the actor explanation cannot cover it. B1/B2 (§3.1.2) are hypotheses derived from the dispatch structure, **not measurements**. I did not run the repro. Task 0.A exists for exactly this and gates 0.C.
-- **The #300 symptom report itself** (HTTP 000 at 120s, which routes pass/fail) is taken from the task brief and the PRD. I did not reproduce it.
-- **The LTX-2 `backend` default.** The PRD names a "backend" key among the LTX-2 Desktop defaults. In `DesktopSettings` (`SettingsView.swift:60–90`) I found `videoWidth`, `videoHeight`, `videoFrames`, `videoSteps` and **no** backend field. It may live in the Motion tab's local state, in `AppConfig`, or be a naming difference. Confirm before writing the `videoDefaults` block.
-- **`ComfyBoxServerConfig` decoding tolerance of unknown keys.** It has a custom `init(from:)`/`encode(to:)` (`:134`, `:154`), which usually implies tolerance, but I did not read the bodies. Phase 3's rollback story depends on it — verify.
-- **Whether the coordinator has clean drain points** for the command mailbox between queue items. I read the actor's declaration and the render call sites, not its full queue loop. If no natural point exists, 0.B's write path needs one added, which raises R1's blast radius slightly.
-- **`GET /v1/queue`'s exact current implementation.** The comment at `:4735` says it was moved onto the health snapshot; I did not read the route arm to confirm it no longer hops.
-- **The Kira daemon's write endpoints.** I verified `GET /v1/kira/content-scheduler/status` live and read the shape it returns. The `PUT .../policy`, `POST .../{pause,resume,run-now}` and `PUT /v1/kira/stream-mode` contracts come from `KiraClient.swift`'s client-side expectations and the task brief, **not** from the daemon's source. Confirm against the daemon before writing `docs/kira-control-api.md`.
-- **coffeeshop-server tool registration mechanics.** I confirmed `src/tools/*-tools.ts` is the established pattern (~60 modules) and that `src/mcp/` exists, but did not read the registration entry point, so "one new file" is an estimate.
+**R1′ — render-path regression from 0.A.** Now small: the executor change preserves actor serialization exactly, so #218/#1479 invariants are structurally untouched. *Mitigation:* soak one full 24/7 cycle; watch for jetsam events and preemption-episode timings in `ltx2EvictMean`/`ltx2ReloadMean`.
+
+**R2 — lost queue mutations.** Off-actor cancels that aren't persisted resurrect on bounce; wholesale mirror adoption drops concurrent enqueues. Both were live defects in v1. *Mitigation:* deltas + sidecar + replay (§3.1.4), with tests for enqueue-during-render and cancel-then-bounce.
+
+**R3 — Phase 3 changes engine behavior for non-Desktop callers.** The real risk, and the inverse of what v1 named. Seeding from engine fallbacks and layering config *below* request/preset keeps an empty config bit-identical to today; the engine-baseline test pins it. Residual: a family path missed in the sweep. *Mitigation:* enumerate every `?? <constant>` default site in the generate/video paths in the PR description.
+
+**R4 — Kira topology moves.** D2 rests on a dated precondition (§3.2). *Mitigation:* the date and the trigger condition are written into `docs/kira-control-api.md`.
+
+**R5 — Kira isolation erosion.** Boundary-ratchet assertion on the namespace allowlist.
+
+**R6 — registry rot.** D5 catches missing descriptors and missing tools, not a descriptor whose `range` or `summary` is wrong. Accepted.
+
+**R7 — parser brittleness.** Mitigated by per-file tuple-count pins, comment stripping, and consumption assertions (§3.5). The v1 line-count version would have silently dropped `/v1/queue/resume`.
+
+**R8 — bridge surface invisible to parity.** Now parsed rather than exempted; bridge routes are enumerated under a declared no-MCP policy.
+
+**R9 — `WarmServer.swift` contention.** Phases 0 and 3 both edit it heavily. Sequence them; no parallel builders on this file.
+
+---
+
+## 6. What I could not verify **[REVISED v2]**
+
+v1's list is superseded — most of it was resolved during review, three items **against** what v1 assumed. Remaining:
+
+- **The post-0.A residue.** Which routes still stall after the executor fix is a prediction (§3.1.3), not a measurement. Task 0.A′ exists to replace it; 0.B's scope should be rewritten from that data, not from this list.
+- **`ControlCommandMailbox` drain placement.** `processLoop`'s top and `startProcessingIfNeeded()` are the right hooks based on reading `:6921–6980`, but I have not traced every path that mutates `pending` (`recoverPersistedQueue` `:4310+` in particular is read only at its call site). Confirm before implementing the sidecar replay ordering.
+- **Krea2/Chroma cancellation.** "Zero `checkCancellation` hits" comes from the review's grep, which I did not re-run. The AC is written conservatively either way.
+- **coffeeshop-server tool registration mechanics.** Confirmed `src/tools/*-tools.ts` is the pattern (~60 modules); did not read the registration entry point, so Phase 2's "one new file" remains an estimate.
+- **Kira daemon behavior under `PUT .../policy`.** Endpoint existence and persistence confirmed (`kira-api.ts:704`); "best-effort live-apply" is from the review's reading of that handler, not mine. The strengthened AC tests the behavior directly rather than trusting the reading.
+- **Whether `#if DEBUG` synthetic operations are acceptable** in `QueuedOperation` given the deploy procedure builds release. If not, the Phase 0 integration AC needs a different seam (e.g. an env-gated sleep in a real op) — budgeted either way, but the shape is unconfirmed.
 
 ---
 
@@ -327,30 +363,38 @@ Stated plainly, so nothing here is taken as established:
 
 | Location | What |
 |---|---|
-| `WarmServer.swift:200` | `listenerQueue` — single serial queue for listener + timers + pressure source |
-| `WarmServer.swift:253–278` | `ltx2PreemptionSignal` / `LTX2StepPosition` / `PendingPreemptorBox` — lock-based, "read inside the render loop with no actor hop" (the Phase 0 write-path precedent) |
-| `WarmServer.swift:284` | `liveHealth` — "served without hopping onto the actor… stays responsive during a render (#217)" (the read-path precedent) |
-| `WarmServer.swift:468` / `:605–612` | `NWListener` on `listenerQueue`; per-connection serial `DispatchQueue` |
-| `WarmServer.swift:606` | `respond(to:)` — the dispatch switch |
-| `WarmServer.swift:615` | `await comfyBridge.route(request)` — first hop for every request; `ComfyBridge` is a `final class`, not an actor |
-| `WarmServer.swift:620–632` | `/health` served from the lock snapshot, with the #217 explanation |
-| `WarmServer.swift:802–822` | `GET`/`PUT /v1/config` — load-from-disk / decode-and-`save()`, no version, no in-memory store |
-| `WarmServer.swift:1610–1646` | queue mutation arms — all `await coordinator.…` (the Phase 0 rewire target) |
-| `WarmServer.swift:1687` | `GET /v1/content-modes` — read-only, no writer |
-| `WarmServer.swift:4370` / `:4425` | `civitaiSearchRoute` (async, no coordinator) vs `civitaiRepoRoute` (synchronous) — the Mechanism B pair |
-| `WarmServer.swift:4273` | `Task.detached(priority:)` for montage — existing precedent for moving CPU-bound work off the request executor |
-| `WarmServer.swift:5417` | `private actor WarmServerCoordinator` |
-| `WarmServer.swift:7313` | `await pipeline.generateFromRequest(...)` — awaited **on the actor**; the blocking render |
-| `WarmServer.swift:4700–4710` | `HealthSnapshot` doc comment — the authoritative #217 root-cause statement |
-| `WarmServer.swift:4750+` | `LiveHealthState` — `NSLock` publisher (generalize to `LiveControlState`) |
-| `WarmServer.swift:8049` / `:8200` | `ConnectionHandler`; `Task { await server.respond(to: request) }` — the cooperative-pool entry point and Phase 0's classifier insertion site |
-| `ComfyBoxServerConfig.swift:80–96` | config document fields; `:134`/`:154` custom coding; `:197` `loadOrMigrate`; `:218` `save` |
-| `ContentModeStore.swift:65–79` | `ContentModeDefinition` (`guidanceBoost`, `styleVariant`, `promptHint`, `negativePromptAdditions`); `:389` unused `save()` |
-| `PromptRepositoryStore.swift` | `NSLock` + cap + oldest-eviction — the pattern for `ControlCommandMailbox` and `ServerConfigStore` |
-| `MCP/MCPToolRegistry.swift:13–52` | `tools: [MCPToolDefinition]` — 44 static defs |
-| `MCP/MCPToolExecutor.swift:22+` | `switch name` → `WarmServerClient` proxy |
+| `WarmServer.swift:200` | `listenerQueue` — serial queue for listener + timers + pressure source |
+| `WarmServer.swift:606` | per-connection `DispatchQueue` — **no QoS** (Phase 0 pins `.userInitiated`) |
+| `WarmServer.swift:615` | `await comfyBridge.route(request)` — first hop; `ComfyBridge` is a `final class` |
+| `WarmServer.swift:620–632` | `/health` from the lock snapshot + the #217 explanation |
+| `WarmServer.swift:802–822` | `GET`/`PUT /v1/config` — load-from-disk / decode-and-save |
+| `WarmServer.swift:1610–1646` | queue mutation arms — all `await coordinator.…` |
+| `WarmServer.swift:1620, 1654, 1680` | **multi-tuple `case` arms** — why D5 counts tuples, not lines |
+| `WarmServer.swift:271, 4891` | `case (` inside comments — why D5 strips comments |
+| `WarmServer.swift:2229–2230, 2380` | video engine fallbacks `704×448`, `steps ?? 8` |
+| `WarmServer.swift:2789` | `GET /v1/queue` — already actor-free, lock snapshot |
+| `WarmServer.swift:4289` | `decodedGeneratePayload` — Phase 3's default-resolution site |
+| `WarmServer.swift:4310+` | `recoverPersistedQueue` — another `pending` writer (R2) |
+| `WarmServer.swift:4700–4710` | `HealthSnapshot` doc comment — authoritative #217 statement |
+| `WarmServer.swift:4756–4764` | `LiveHealthState` single-lock swap — no torn reads |
+| `WarmServer.swift:5417` | `private actor WarmServerCoordinator` — 0.A's target |
+| `WarmServer.swift:6729` | `publishHealth()` — **actor-isolated**, ~15 actor-only call sites (§2.2) |
+| `WarmServer.swift:6889, 6921–6927` | `setPaused` → `startProcessingIfNeeded` — the only wake for a parked loop |
+| `WarmServer.swift:6955–6980` | `runsWhilePaused` + `processLoop` — **exits when paused** (the v1 blocker) |
+| `WarmServer.swift:6929` | `enqueue` — another `pending` writer |
+| `WarmServer.swift:7313` | `await pipeline.generateFromRequest(...)` on the actor — the blocking render |
+| `WarmServer.swift:7413–7416, 7739` | image engine fallbacks — **family-dependent** (§2.5) |
+| `WarmServer.swift:8049, 8200` | `ConnectionHandler`; `Task { await server.respond(...) }` — classifier site |
+| `ComfyBridge.swift:106, 126, 135` | **second dispatch switch**; `case _ where` form; `POST /queue` (mutating) |
+| `LTX2VideoGenerator.swift:288` | #1479 preemption — **LTX-2 only** (§3.1.6) |
+| `ComfyBoxServerConfig.swift:133–151 / 154–171` | tolerant `init(from:)` / **enumerated-keys-only `encode(to:)`** (§2.3) |
+| `ContentModeStore.swift:65–79, 389` | `ContentModeDefinition`; unused `save()` |
+| `PromptRepositoryStore.swift` | `NSLock` + cap + eviction — pattern for the mailbox and config store |
+| `CharacterStore.swift:201` | `public actor CharacterStore` — why `/v1/characters` left the control plane |
+| `MCP/MCPToolRegistry.swift:13–52` | 44 static tool defs |
 | `MCP/WarmServerClient.swift:30–73` | `get`/`post`/`put`/`delete` — all Phase 1 needs |
-| `ComfyBoxDesktop/Views/SettingsView.swift:60–90` | `DesktopSettings` fields; `:146` `configPath`; `:351` Generation tab; `:514` Motion tab |
-| `ComfyBoxDesktop/Kira/KiraClient.swift:21–29` | `127.0.0.1:3787`, "reach it via `ssh -N -L`" — the cross-host fact behind D2 |
-| Linux box, live | `kira-daemon.service` active; `GET /v1/kira/content-scheduler/status` returns `{enabled, intervalMinutes, videoMode, videoI2vRatio, clipSeconds, tiers{…}, tierRotation, activeHours}` |
-| `coffeeshop-server/src/tools/` | ~60 `*-tools.ts` modules incl. `comfybox-http-video-executor.ts`, `content-mode-tools.ts` — the Phase 2 host |
+| `ComfyBoxDesktop/Views/SettingsView.swift:60–90, 108–111, 357–389` | `DesktopSettings`; **`default*` are write-only UI state** (§3.3) |
+| `ComfyBoxDesktop/Views/MotionView.swift:393–398` | the only genuine reader of `videoWidth/Height/Frames` |
+| `ComfyBoxDesktop/Kira/KiraClient.swift:21–29` | `127.0.0.1:3787` + `ssh -N -L` — the cross-host fact behind D2 |
+| `coffeeshop-server` `kira-api.ts:649,658,670,681,699,704,980,985` | Kira write endpoints (verified live) |
+| Live `sample` (2026-08-29) | 2964/2972 in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative` — **B1 confirmed** |
