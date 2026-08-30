@@ -1,14 +1,12 @@
 # FDD: Headless parity — every UI control reachable by API
 
-> **v2.1 (2026-08-29, late):** interrupt sections updated after confirming the LIVE model family is krea2 — the family-qualification excludes the entire production path (comfybox#304 filed). §7 line refs pinned @ c9dd27d; refresh after Phase 0.A merges.
-
 **Repo:** `BarkadaBrew/comfybox` (`zimage.swift`, Swift/MLX)
 **Worktree/branch:** `~/Projects/zimage-apiparity` @ `feat/ui-api-parity` (base `origin/main` c9dd27d)
 **Components:** `Sources/ZImage/Server/WarmServer.swift`, `Sources/ZImage/Server/ComfyBridge/ComfyBridge.swift`, `Sources/ZImage/MCP/*`, `Sources/ZImage/Server/ComfyBoxServerConfig.swift`, `Sources/ComfyBoxDesktop/Views/SettingsView.swift`; cross-repo: `coffeeshop-server/src/tools/`
 **PRD:** `docs/PRD-ui-api-parity.md`
 **Related:** comfybox#300 (async route starvation), comfybox#217 (actor head-of-line, fixed for `/health` + `GET /v1/queue`), comfybox#218 (unified-memory eviction), comfybox#1479 (LTX-2 preemption), coffeeshop-server#1293
 **Author:** Fable (Opus), architect pass — 2026-08-29
-**Status:** **v2 — revised after adversarial review (2026-08-29).** v1 shipped 5 blockers, three of them in sections v1 had marked "unverified" and guessed wrong on. Every §-heading changed in v2 is marked **[REVISED v2]**. Phase 0's mechanism question is now **closed by measurement**, not open.
+**Status:** **v2.2 — §3.1/§4.1 finalized against the 0.A′ re-measure (2026-08-29, late).** v1 shipped 5 blockers, corrected in v2 after adversarial review; those corrections are marked **[REVISED v2]**. v2.2 folds in the post-deploy measurement: 0.A shipped (`fd08ba9`, live as build `ba7d525`), behaved exactly as designed — **and was insufficient**. The mechanism is now fully understood (§3.1.2) and 0.B is finalized around it. v2.2 changes are marked **[REVISED v2.2]**.
 
 **Scope note (Todd, 2026-08-29):** authentication/authorization is explicitly **out of scope and not a risk on this project** — this stack is never publicly reachable and all callers are trusted local operators or agents. The PRD's §7 "unauthenticated surface grows" risk is **withdrawn**. No token gate, no per-route permission model, no rate limiting. Input *validation* stays (malformed params, out-of-range values, unknown enum members must produce a clean `400`, not a trap) — that is correctness, not security.
 
@@ -21,15 +19,23 @@ What the review overturned, and where it landed:
 | # | v1 claim | Reality | Now in |
 |---|---|---|---|
 | 1 | "Mechanism B is unverified; diagnose first" | **B1 confirmed by live `sample`:** 2964/2972 samples in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative` — MLX render work blocks *on the cooperative pool*. | §3.1, §4.1 — the executor fix is now **primary and first** |
-| 2 | Command mailbox drained "at existing scheduling points" | **No such points exist.** `processLoop` (`:6965–6980`) *exits* (`isProcessing = false; return`) when paused with no `runsWhilePaused` job. A mailbox `resume` would 202 and wedge the queue forever. | §3.1.4 — deltas + explicit wake, `resume` never goes through the mailbox |
+| 2 | Command mailbox drained "at existing scheduling points" | **No such points exist.** `processLoop` (`:6965–6980`) *exits* (`isProcessing = false; return`) when paused with no `runsWhilePaused` job. A mailbox `resume` would 202 and wedge the queue forever. | §3.1.4a — deltas + explicit wake, `resume` never goes through the mailbox |
 | 3 | Serve control reads from `LiveHealthState` | The snapshot is **written only on the actor** (`publishHealth()` `:6729`, all ~15 call sites actor-isolated). Mailbox writes would be invisible for the whole render — AC green, answers wrong. | §3.1.5 — `isPaused` + pending deltas become **authoritative in the lock store** |
 | 4 | "Pause takes effect mid-render" | **Undeliverable.** #1479 preemption is LTX-2-only (`LTX2VideoGenerator.swift:288`); it's handoff-and-resume, not an indefinite park (parking pins latents against #218). And `isPaused` is a between-items gate — redefining it breaks a live endpoint. | §3.1.6 — AC dropped; mid-render abort scoped to `interrupt`, family-qualified |
 | 5 | Migrate Desktop defaults to preserve client-side behavior | **`DesktopSettings.default{Steps,Guidance,Width,Height}` are write-only UI state** — nothing reads them to build a request. Migrating them would move Bree/MCP/Kira *off* engine defaults. | §3.3 — inverted: seed from the **engine's** fallbacks |
-| 6 | Mirror adoption for queue mutations | `pending` has other writers (enqueue `:6929`, `recoverPersistedQueue` `:4310+`); wholesale adoption **drops jobs**. | §3.1.4 — deltas only |
+| 6 | Mirror adoption for queue mutations | `pending` has other writers (enqueue `:6929`, `recoverPersistedQueue` `:4310+`); wholesale adoption **drops jobs**. | §3.1.4a — deltas only |
 | 7 | D5 pins parser by counting `case (` lines | 73 lines but **76 tuples** — 3 arms carry two (`:1620` pause+resume, `:1654`, `:1680`). A control route would be silently missed. Plus 2 false hits in comments. | §3.5 |
 | 8 | Exempt ComfyBridge routes from parity | Can't — they're in a **second switch** (`ComfyBridge.swift:106`) the parser never sees, and include real mutating routes (`POST /queue` `:135`). | §3.5 |
 | 9 | `If-Match` mandatory on `PUT /v1/config` | Breaks every current caller; none send it. Also `encode(to:)` `:154–171` writes only enumerated keys, so the rollback story was half-true. | §3.3 |
 | 10 | Phases independently shippable | Phase 1's `update_config` would proxy the clobbering `PUT` that Phase 3 then replaces; Phase 4 depends on Phase 3's store. | §4 preamble |
+
+### 0.1 v2.2 changelog — the 0.A′ re-measure [NEW v2.2]
+
+| # | v2 claim | Reality (measured post-0.A) | Now in |
+|---|---|---|---|
+| 11 | 0.A (actor executor) fixes all async routes; residue is Mechanism A only | 0.A deployed and verified (coordinator on `DispatchQueue_78: z-image.warm-server.coordinator`) — **and all async routes still HTTP 000.** New sample: multiple threads on `com.apple.root.user-initiated-qos.cooperative` blocked in `@isolated(any)` async thunks, one in `__psynch_mutexwait` (MLX mutex). **Actor executor ≠ task executor** (SE-0338): nonisolated async pipeline code hops off the actor's queue at every await and blocks on the global pool. The QoS pin merely moved the exhausted tier from utility to user-initiated. | §3.1.2 |
+| 12 | "Mechanism A" (actor head-of-line) is a distinct residue | Largely dissolved: with the pool exhausted, `Task { await respond(…) }` (`:8219` in the 0.A tree) cannot even *start*, so every async route fails identically whether or not it touches the actor. What remains is one mechanism — cooperative-pool exhaustion by blocking nonisolated async render code — plus the structural argument for a pool-independent control plane. | §3.1.2, §3.1.4 |
+| 13 | (coordinator's working assumption) SE-0417 task executors "likely NOT available" on this toolchain | **Wrong — verified available.** Host is macOS **27.0**, toolchain Swift **6.4** (`swift-driver 1.168.5`). SE-0417 APIs are gated `@available(macOS 15+)`; the package floor is macOS 14, so usage needs an `#available` guard, but the production Mac clears it by 12 major versions. | §3.1.3 |
 
 ---
 
@@ -39,7 +45,7 @@ The Desktop app is already an API client for most engine behavior. The defect is
 
 | Phase | Delivers | Primary risk |
 |---|---|---|
-| **0** | Control routes answer during a render (#300) — via a coordinator executor change, then a narrow control-plane carve-out | Concurrency near the render path (now much smaller than v1 assumed) |
+| **0** | All routes answer during a render (#300) — actor executor (0.A, shipped) + render task-executor preference (0.B-1) + a pool-independent control plane (0.B-2) | Render thread-affinity change (0.B-1); soak-gated |
 | **1** | MCP tool for every mutating warm-server route (minus `update_config`, held to Phase 3) | Low — additive |
 | **2** | Kira scheduler controls reachable by agents | Cross-host coupling; a dated topology precondition |
 | **3** | Engine defaults become server-side and writable; content modes writable; `ServerConfigStore` + `PATCH` | Changing engine behavior for *non-Desktop* callers |
@@ -75,37 +81,52 @@ The through-line is the **ControlRegistry** (§3.4) — a compile-time table tha
 
 ## 3. Design decisions
 
-### 3.1 — D1: Phase 0 mechanism for #300 **[REVISED v2 — restructured]**
+### 3.1 — D1: Phase 0 mechanism for #300 **[REVISED v2.2 — finalized against the 0.A′ re-measure]**
 
-#### 3.1.1 The measurement
+#### 3.1.1 The measurements **[REVISED v2.2]**
 
-Confirmed by live `sample` of `comfybox serve` under a continuous render: **2964/2972 samples in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative`.** The MLX render, awaited on the coordinator actor, executes on a cooperative-pool worker and blocks it. The pool does not grow past its width, so unrelated continuations — URLSession completions for `/v1/civitai/search`, every other in-flight request task — have nowhere to run. v1 listed this as hypothesis "B1" and gated work on diagnosing it; it is now **fact**, and it reorders the phase.
+**Sample 1 (pre-0.A):** 2964/2972 samples in `__psynch_cvwait` on `com.apple.root.utility-qos.cooperative` — MLX render work blocks a cooperative-pool worker; the pool does not grow; every unrelated continuation starves.
 
-#### 3.1.2 The decision: fix the executor first, then carve out only what's left
+**0.A deployed** (`fd08ba9`, live as build `ba7d525`): `WarmServerCoordinator` on a dedicated serial-queue executor + per-connection queues pinned `.userInitiated`. **Verified working as designed** — the post-deploy sample shows `DispatchQueue_78: z-image.warm-server.coordinator (serial)` active during a render, and the utility cooperative pool no longer appears.
 
-**0.C from v1 is promoted to task 0.A and ships first.** Give `WarmServerCoordinator` a dedicated serial-queue-backed executor:
+**Sample 2 (post-0.A, during render + in-flight `/v1/civitai/search` probe):** all async routes **still** HTTP 000 (SSRF-guard 400 path, real search, queue pause/resume — 15–30s timeouts). Multiple threads on `com.apple.root.user-initiated-qos.cooperative` blocked in compiler-generated async thunks (`specialized thunk for @escaping @isolated(any) … @async`), at least one in `__psynch_mutexwait` — MLX's internal mutex.
 
-```swift
-private let coordinatorQueue = DispatchQueue(
-  label: "z-image.warm-server.coordinator", qos: .userInitiated)
-nonisolated var unownedExecutor: UnownedSerialExecutor { coordinatorQueue.asUnownedSerialExecutor() }
-```
+#### 3.1.2 The mechanism, fully understood **[REVISED v2.2]**
 
-~20 lines. **Blast radius on the render path is zero**: it changes *which thread* serializes the actor, not *that* it serializes. Mutual exclusion, message ordering, and every invariant #218 (single heavy-model residency) and #1479 (preemption handoff) depend on are properties of actor serialization, which is preserved exactly. It fixes **all** async routes — including ones no classifier would ever have covered — rather than only a hand-listed set. Nothing about it touches MLX, the pipeline, or the queue loop.
+**Actor executor ≠ task executor.** 0.A pins *actor-isolated* code to the coordinator's queue. But per SE-0338, **nonisolated async functions run on the global concurrent executor, not the caller's** — so the moment the coordinator awaits into the pipeline (`await pipeline.generateFromRequest`, a nonisolated async call), execution hops *off* the coordinator's queue and back onto the cooperative pool, where the pipeline's async code blocks on MLX's mutex while holding a cooperative worker. The QoS pin didn't change the mechanism; it moved the exhausted tier from utility to user-initiated.
 
-Alongside it, one line the review caught: **the per-connection `DispatchQueue` (`:606`) is created with no QoS**, so it defaults low and its work is descheduled behind the render's `.userInitiated` compute. Pin it `.userInitiated`.
+This also dissolves v2's "Mechanism A residue" as a separate category: with the pool exhausted, `Task { await server.respond(...) }` (`:8219`, 0.A tree) **cannot even start** — there is no free worker to run the first instruction of any async route, actor-touching or not. That is why the SSRF-guard *400 path* (pure validation, no I/O, no actor) also times out: one mechanism, uniform failure.
 
-**Then re-measure.** After 0.A + the QoS pin, re-run the #300 repro. Everything that stalls afterwards stalls for **Mechanism A only** — a genuine actor hop behind the render. That residue, not v1's speculative list, defines 0.B's scope.
+Corollary worth recording: v1/v2's reading of #217 ("the actor is blocked for the render") was mechanically imprecise. The actor's *task* blocks inside nonisolated async code that never suspends; pre-0.A the effect was indistinguishable from a blocked actor. 0.A was still correct and necessary — it removes the actor's serialization from the contended pool and is the substrate 0.B-2 needs — but it could never have been sufficient, and the FDD said otherwise. §0.1 row 11 owns that.
 
-#### 3.1.3 0.B — the residual control-plane carve-out
+#### 3.1.3 0.B-1 — the root-cause fix: task executor preference on the render task tree **[NEW v2.2]**
 
-Expected residue (routes that hop the actor and must answer during a render): `POST /v1/queue/{pause,resume,clear,interrupt}`, `POST /v1/queue/{id}/move`, `DELETE /v1/queue/{id}`, `GET /v1/models`, `GET /v1/stats`. Already actor-free and needing nothing: `/health`, `GET /v1/queue` (`:2789`), `GET /v1/config`, `GET /v1/content-modes`, `GET /v1/audit-log`, `GET /v1/presets*`, `/v1/civitai/repo`.
+**Decision: adopt SE-0417 task executor preference for the render tasks — the coordinator's (3) evaluated option, "move the blocking MLX work off the cooperative pool," in its language-sanctioned form.**
 
-**Removed from v1's list: `GET /v1/characters*`.** `CharacterStore` is an `actor` (`CharacterStore.swift:201`) and cannot be read synchronously. Converting it to the lock idiom is a separate, unbudgeted change; it is **out of Phase 0** and stays on the normal async path, where 0.A already makes it responsive.
+**Availability, verified tonight (this was the gating question):** host is **macOS 27.0**, toolchain **Swift 6.4** (`swift-driver 1.168.5`, target `arm64-apple-macosx27.0`). SE-0417 (`TaskExecutor`, `Task(executorPreference:)`, `withTaskExecutorPreference`) shipped in Swift 6.0 with runtime APIs gated `@available(macOS 15+)`. The package floor is macOS 14 (`Package.swift:6`), so call sites need `if #available(macOS 15.0, *)` — trivially true on the production Mac. The coordinator's "likely NOT available" was based on tools-version 5.9, but tools-version is a manifest minimum, not the compiler: the installed compiler and SDK are years past the requirement. On a hypothetical macOS 14 host the guard falls back to today's behavior — acceptable, documented.
 
-For the residue, classify in `ConnectionHandler.handle()` (`:8200`) before `Task { await respond(...) }` and serve synchronously on the connection's own (now `.userInitiated`) queue. This is belt-and-braces on top of 0.A: it removes the *dependency* on the pool rather than merely relieving pressure on it.
+**Mechanics.** One `RenderTaskExecutor` — a `TaskExecutor` backed by a dedicated dispatch queue (width 2: an image render and a parked/handing-off video render can coexist under #1479 preemption). The render is spawned as **unstructured `Task {}` at exactly three sites** in the 0.A tree: `startProcessingIfNeeded` (`:6947`, the `processLoop` spawn) and the two retained `renderTask = Task {` sites in `processLoop` (`:7030` `.generate`, `:7037` `.controlGenerate`), which exist so `/interrupt` can cancel the render without killing the loop. **Attach the preference explicitly at all three** (`Task(executorPreference: renderExecutor)`), plus the `.localVideo` path if it proves to run inline on the loop task. Do **not** rely on preference inheritance across unstructured-task boundaries — SE-0417's inheritance rules for structured vs unstructured tasks are exactly the kind of semantic v1 guessed wrong on, so a one-hour spike pins them first (§4.1, 0.B-0). With the preference attached, every nonisolated async function in the render's task tree — the thunks in sample 2 — runs on the render executor's threads, and the cooperative pool is freed for what it was built for: brief, suspending request tasks.
 
-#### 3.1.4 The write path: deltas, not a mirror; and `resume` is special **[REVISED v2 — v1 was broken]**
+**Why this beats the alternatives the coordinator priced:**
+
+- *(a) Callback-style rewrite of the civitai handlers (URLSession completion handlers + connection-queue hops).* Treats two symptoms and leaves the disease: **every other async route** (`/v1/enhance`, workflow runs, `/v1/generate` validation errors, future routes) stays starvable, and each new async route re-imports the bug. Rejected as primary; **retained verbatim as the named fallback** for the civitai pair if the 0.B-0 spike falsifies SE-0417's fit.
+- *(b) SE-0417* — this is the decision; the "verify toolchain" objection is resolved in its favor.
+- *(c) Dedicated thread bridged with `withCheckedThrowingContinuation` from a synchronous entry.* Structurally impossible as stated for the render: `generateFromRequest` is `async`, and an async function cannot be "run on a thread" by continuation-bridging — it needs an *executor*, which is precisely what SE-0417 provides declaratively. The manual version of option 3 converges on hand-rolling SE-0417 without language support. Rejected.
+
+**Blast radius, honestly.** This is a render-path-adjacent change — the render's code is untouched, but its *thread affinity* changes (cooperative pool → dedicated queue). Same class of change as 0.A, one ring further in. MLX's global state (default stream, buffer cache) has tolerated thread migration so far (0.A moved actor-isolated segments already, and `Task.detached` montage work has always run elsewhere), but "tolerated so far" is not proof: the overnight ba7d525 soak covers 0.A only, and **0.B-1 extends the soak gate** — same metrics (jetsam events, `ltx2EvictMean`/`ltx2ReloadMean` preemption timings), fresh cycle, before the flag flips to default-on. Ship behind `COMFYBOX_RENDER_TASK_EXECUTOR=0|1`.
+
+#### 3.1.4 0.B-2 — the control-plane carve-out, now the guarantee layer **[REVISED v2.2 — scope, not design]**
+
+The v2 design (this section and §3.1.5–3.1.6 below) **stands unchanged** — classifier in `ConnectionHandler.handle()` before the `Task`, synchronous service on the connection's own queue, lock-store authority for `isPaused` + deltas, fire-and-forget `resume`, delta sidecar. What changes is its *justification and scope*:
+
+- **It is no longer a residue-fix; it is the guarantee.** The pool has now been exhausted twice, on two QoS tiers, by two builds. 0.B-1 should empty it — but the PRD's Phase 0 AC is a *promise* ("control routes answer during a render"), and the only way to make that promise structural rather than statistical is a control plane that **requires zero free cooperative threads**. If any future dependency blocks the pool again, `/v1/queue/pause` still answers. That property is worth the ~200 lines regardless of 0.B-1's success.
+- **Scope: the sync-servable set only** — `POST /v1/queue/{pause,resume,clear,interrupt}`, `POST /v1/queue/{id}/move`, `DELETE /v1/queue/{id}`, `GET /v1/models` (from the snapshot), `GET /v1/stats`, `GET /v1/config`. Genuinely-async routes (civitai search/harvest, enhance, workflow runs) are **explicitly not classified** — they are 0.B-1's job; a synchronous classifier cannot serve network I/O and should not try. `GET /v1/characters*` stays excluded (actor-backed store, §3.1.4-v2 note below).
+
+The write-path design retained from v2 (deltas not mirrors, `resume` bypassing the mailbox, sidecar persistence) follows in the next section unchanged.
+
+(`GET /v1/characters*` exclusion, restated from v2: `CharacterStore` is an `actor`, `CharacterStore.swift:201`, and cannot be read synchronously; converting it to the lock idiom is separate, unbudgeted work. It stays on the normal async path, which 0.B-1 makes responsive.)
+
+#### 3.1.4a The write path: deltas, not a mirror; and `resume` is special **[REVISED v2 — v1 was broken; unchanged in v2.2]**
 
 v1 proposed a mailbox drained "at existing scheduling points" and a pending-queue *mirror* adopted wholesale. Both are wrong:
 
@@ -134,14 +155,16 @@ This is the minimum inversion that makes the AC honest. Without it, Phase 0's "r
 - #1479 is a **handoff-and-resume** — yield, run the preemptor, resume — not an indefinite park. Parking a render would pin materialized latents in unified memory precisely against #218's eviction logic.
 - `isPaused` is a **between-items gate** on a live endpoint. Redefining it as "stops the current render" is a breaking semantic change for every existing caller.
 
-**Mid-render abort is scoped to `interrupt`, and family-qualified — and the qualification bites in production.** `interrupt` already works mid-render for ZImage, ZImageControl, Flux2 and Fibo; **Krea2 and Chroma have zero `checkCancellation` sites** — and krea2 is the family the 24/7 engine actually runs (`/health`: family=krea2, alias=krea2-raw). So until comfybox#304 lands (step-boundary `checkCancellation` in the Krea2/Chroma samplers, ~<1min abort latency at 12 steps), **no mid-render abort exists on the production path at all** — interrupt only prevents the next queue item. This is also why deploys must be timed to job rotation. Phase 0 makes the route *reachable* during a render; #304 makes it *effective*.
+**Mid-render abort is scoped to `interrupt`, and family-qualified.** `interrupt` already works mid-render for ZImage, ZImageControl, Flux2 and Fibo; **Krea2 and Chroma have zero `checkCancellation` sites** and will not abort until their sampling loops gain them. The AC says exactly that, rather than implying uniform behavior.
 
-#### 3.1.7 Alternatives rejected
+#### 3.1.7 Alternatives rejected **[REVISED v2.2]**
 
-- *Yield points in the render loop* — highest blast radius in the codebase, and 0.A makes it unnecessary.
+- *Yield points in the render loop* — highest blast radius in the codebase; 0.B-1 achieves the same liberation of the pool without touching render code.
 - *A second `NWListener`* — the stall is at the executor layer; each connection already has its own queue.
-- *`Task.detached` for the render* — changes the residency/preemption invariants #218 and #1479 depend on. 0.A achieves the thread-move without touching them.
-- *v1's plan (classifier-first, executor-second)* — inverted: it would have hand-fixed a listed subset while leaving every unlisted async route broken, at higher risk, for more work.
+- *`Task.detached` for the render* — loses the retained-task structure `/interrupt` cancellation depends on (`:7030/:7037`) and still lands on the global pool it's trying to escape. `Task(executorPreference:)` at the same three sites keeps the structure and moves the threads.
+- *Callback-style rewrite of async handlers* — fixes only the routes you rewrite; every other and every future async route stays starvable. Retained solely as the civitai-pair fallback if the 0.B-0 spike fails (§3.1.3).
+- *Manual thread + continuation bridge for the render entry* — `generateFromRequest` is async; an async function needs an executor, not a thread. This is hand-rolled SE-0417 without language support.
+- *v1's plan (classifier-first, executor-second)* and *v2's plan (actor executor as sufficient)* — both inverted/insufficient; superseded by 0.B-1 + 0.B-2 with the classifier as guarantee, not residue-fix.
 
 ### 3.2 — D2: Phase 2 cross-daemon strategy **[REVISED v2 — precondition + AC]**
 
@@ -247,23 +270,29 @@ Anti-drift by construction: the registry is load-bearing in three consumers — 
 
 **Shippability, corrected [REVISED v2].** v1 claimed all five phases were independently shippable. Two dependencies are real: **`update_config` must not ship in Phase 1** (it would proxy the clobbering whole-doc `PUT` that Phase 3 replaces, breaking its callers) — it moves to Phase 3 alongside `PATCH`. And **Phase 4 depends on Phase 3's `ServerConfigStore`** for value resolution. Order: 0 → 1 → 3 → 4, with 2 parallel to any of them (different repo).
 
-### 4.1 Phase 0 — control routes answer during a render (#300) **[REVISED v2]**
+### 4.1 Phase 0 — control routes answer during a render (#300) **[REVISED v2.2]**
 
-**0.A (first, primary).** `unownedExecutor` on `WarmServerCoordinator` backed by a dedicated `.userInitiated` serial queue; QoS pin on the per-connection queue (`:606`). ~20 lines, no render-path edits.
+**0.A — DONE.** `unownedExecutor` on `WarmServerCoordinator` + per-connection QoS pin. Shipped `fd08ba9`, live as build `ba7d525`. Verified behaving as designed (coordinator on its own queue; utility pool clear). **Necessary, not sufficient** (§3.1.2). Overnight soak on `ba7d525` in progress (jetsam + preemption timings, per R1′).
 
-**0.A′ — re-measure.** Re-run the #300 repro plus a fresh `sample`. Record which routes still stall; those are Mechanism A and define 0.B.
+**0.A′ — DONE.** Re-measure complete; data in §3.1.1 sample 2. Residue: **all async routes**, one mechanism (nonisolated async render code blocking the user-initiated cooperative pool). Defines 0.B as follows.
 
-**0.B — residual carve-out.** Classifier in `ConnectionHandler.handle()`; `isPaused` + queue deltas authoritative in a lock store (§3.1.5); `ControlCommandMailbox` of **deltas** with drain at the top of `processLoop` **and** in `startProcessingIfNeeded()`; `resume` bypasses the mailbox entirely (§3.1.4); delta sidecar persisted and replayed by `recoverPersistedQueue`; `GET /v1/queue` composes snapshot + undrained deltas. **`GET /v1/characters*` excluded** (actor-backed store, §3.1.3).
+**0.B-0 — spike (hours, first).** Pin SE-0417 semantics before building on them: (i) `#available(macOS 15, *)` compiles clean under swift-tools 5.9 with the 6.4 toolchain; (ii) `Task(executorPreference:)` at a spawn site actually carries nonisolated async callees onto the preferred executor (assert via `Thread.current` logging in a toy blocking async function); (iii) whether preference crosses the *inner* unstructured `renderTask = Task {}` boundary or must be re-attached (design assumes re-attach; confirm); (iv) what backs `RenderTaskExecutor` — `DispatchQueue`'s `TaskExecutor` conformance if the SDK provides it, else a ~15-line custom conformance. Falsification of (ii) ⇒ fall back to the callback rewrite for the civitai pair and re-plan.
 
-**Files.** `WarmServer.swift` (executor + QoS + classifier + queue arms `:1610–1646` + `processLoop` `:6965` + `startProcessingIfNeeded` `:6921` + `recoverPersistedQueue` `:4310`), new `Sources/ZImage/Server/ControlPlane.swift`.
+**0.B-1 — render off the pool (primary).** `RenderTaskExecutor` (width 2, #1479 coexistence); `Task(executorPreference:)` at the three spawn sites (`:6947`, `:7030`, `:7037`, 0.A tree) + the `.localVideo` path if inline; behind `COMFYBOX_RENDER_TASK_EXECUTOR`. **Re-measure after** (0.B-1′): the #300 repro must go green for *all* async routes, and a fresh sample must show the cooperative pool clear during a render.
 
-**Test seam [NEW v2].** The integration AC needs a long-running operation that occupies the coordinator without a GPU. `QueuedOperation` has no injectable synthetic case today. **Budget it explicitly:** add a `#if DEBUG` `.synthetic(durationMs:)` case plus the `runsWhilePaused` arm and `processLoop` handling. Without this seam the AC is untestable in CI and would degrade into a manual check.
+**0.B-2 — control-plane guarantee.** Classifier in `ConnectionHandler.handle()` for the sync-servable set (§3.1.4); `isPaused` + queue deltas authoritative in a lock store (§3.1.5); `ControlCommandMailbox` of **deltas** with drain at the top of `processLoop` **and** in `startProcessingIfNeeded()`; `resume` bypasses the mailbox entirely (§3.1.4a); delta sidecar persisted and replayed by `recoverPersistedQueue`; `GET /v1/queue` composes snapshot + undrained deltas. `GET /v1/characters*` excluded (actor-backed store).
 
-**Tests.** Delta mailbox: ordering, cap, eviction, and — critically — a **`resume`-while-parked** test asserting the loop restarts (the v1 blocker, pinned). Enqueue-during-render + concurrent cancel: neither job is lost. Cancel → bounce → job stays cancelled (sidecar replay). Integration: with a synthetic 60s operation active, every residual control route returns `< 2s`, and `GET /v1/queue` reports `is_paused: true` **during** the operation, not after.
+**Files.** `WarmServer.swift` (spawn sites `:6947/:7030/:7037` + classifier + queue arms + `startProcessingIfNeeded` + `recoverPersistedQueue`), new `Sources/ZImage/Server/RenderTaskExecutor.swift`, new `Sources/ZImage/Server/ControlPlane.swift`.
 
-**ACs.** (1) With a render in flight, every control route returns within 2s. (2) `GET /v1/queue` reflects a pause/cancel issued during that render, in that render. (3) `interrupt` aborts mid-render **for ZImage, ZImageControl, Flux2 and Fibo**; Krea2 and Chroma — including the production krea2-raw path — abort at the next item boundary until comfybox#304 lands. Do not read this AC as "interrupt works in production"; today it does not, mid-render. (4) **No** mid-render pause AC (§3.1.6).
+**Test seam [NEW v2].** The integration AC needs a long-running operation that occupies the render path without a GPU. `QueuedOperation` has no injectable synthetic case today. **Budget it explicitly:** a `#if DEBUG` `.synthetic(durationMs:)` case (plus `runsWhilePaused` arm and `processLoop` handling) whose body *blocks* its thread — so it exercises exactly the pool-exhaustion mechanism 0.B-1 fixes. Without this seam the AC is untestable in CI.
 
-**Rollback.** 0.A reverts as one commit (removing an executor restores the default one; no data). 0.B reverts behind `COMFYBOX_CONTROL_PLANE_SYNC=0`, with the delta sidecar drained on next boot regardless of the flag so no cancel is lost across the toggle.
+**Tests.** 0.B-0 spike assertions promoted into unit tests where feasible (executor-affinity assertion on the toy function). Delta mailbox: ordering, cap, eviction, and the **`resume`-while-parked** test asserting the loop restarts (the v1 blocker, pinned). Enqueue-during-render + concurrent cancel: neither lost. Cancel → bounce → stays cancelled (sidecar replay). Integration: with a synthetic blocking 60s operation active, (a) every classified control route returns `< 2s` **with `COMFYBOX_RENDER_TASK_EXECUTOR=0`** (proving 0.B-2's independence), (b) every async route returns `< 2s` **with it `=1`** (proving 0.B-1), and (c) `GET /v1/queue` reports `is_paused: true` **during** the operation.
+
+**ACs.** (1) With a render in flight, every `/v1` route — control *and* async — returns within 2s (0.B-1 + 0.B-2 jointly). (2) The classified control set meets (1) even with the render executor flag off. (3) `GET /v1/queue` reflects a pause/cancel issued during that render, in that render. (4) `interrupt` aborts mid-render **for ZImage, ZImageControl, Flux2 and Fibo**; Krea2 and Chroma abort at the next item boundary until `checkCancellation` sites are added (tracked separately). (5) **No** mid-render pause AC (§3.1.6).
+
+**Rollback.** 0.A: revert commit (already soaking; no data). 0.B-1: `COMFYBOX_RENDER_TASK_EXECUTOR=0` restores today's spawn behavior at runtime. 0.B-2: `COMFYBOX_CONTROL_PLANE_SYNC=0`, with the delta sidecar drained on next boot regardless of the flag so no cancel is lost across the toggle. Flags are independent.
+
+**Sequencing note (per coordinator, 2026-08-29 late):** design-only tonight; 0.B builds tomorrow against clean overnight soak data from `ba7d525`. The 0.B-1 soak is a *separate, subsequent* cycle — do not conflate the two in the ledger.
 
 ### 4.2 Phase 1 — MCP parity for existing routes **[REVISED v2]**
 
@@ -328,9 +357,9 @@ Anti-drift by construction: the registry is load-bearing in three consumers — 
 
 **R1 — queue wedge from the Phase 0 write path (was: render regression).** The v1 design would have wedged the queue on `resume`. The revised design avoids it structurally (`resume` bypasses the mailbox) and pins it with a named test. Residual risk: a *future* mailbox command type added without a corresponding wake path. *Mitigation:* `ControlCommand` carries a `requiresWake: Bool` and the drain asserts it — a command that parks the loop without waking it fails in test.
 
-**R1′ — render-path regression from 0.A.** Now small: the executor change preserves actor serialization exactly, so #218/#1479 invariants are structurally untouched. *Mitigation:* soak one full 24/7 cycle; watch for jetsam events and preemption-episode timings in `ltx2EvictMean`/`ltx2ReloadMean`.
+**R1′ — render-path regression from 0.A / 0.B-1 [REVISED v2.2].** 0.A preserved actor serialization exactly and is soaking (`ba7d525`, overnight). **0.B-1 is the larger affinity change**: the render's nonisolated async code moves from cooperative-pool threads to the dedicated `RenderTaskExecutor`. Render *code* is untouched, but MLX's process-global state (default stream, buffer cache) will be driven from new threads. No evidence of thread-affinity sensitivity so far (0.A already moved the actor-isolated segments; detached montage work has always run elsewhere) — but that is absence of evidence. *Mitigation:* `COMFYBOX_RENDER_TASK_EXECUTOR` flag; the 0.B-0 spike's affinity assertions; and a **second, separate soak cycle** for 0.B-1 with the same metrics (jetsam events, `ltx2EvictMean`/`ltx2ReloadMean`) before default-on. The 0.A soak does not cover 0.B-1.
 
-**R2 — lost queue mutations.** Off-actor cancels that aren't persisted resurrect on bounce; wholesale mirror adoption drops concurrent enqueues. Both were live defects in v1. *Mitigation:* deltas + sidecar + replay (§3.1.4), with tests for enqueue-during-render and cancel-then-bounce.
+**R2 — lost queue mutations.** Off-actor cancels that aren't persisted resurrect on bounce; wholesale mirror adoption drops concurrent enqueues. Both were live defects in v1. *Mitigation:* deltas + sidecar + replay (§3.1.4a), with tests for enqueue-during-render and cancel-then-bounce.
 
 **R3 — Phase 3 changes engine behavior for non-Desktop callers.** The real risk, and the inverse of what v1 named. Seeding from engine fallbacks and layering config *below* request/preset keeps an empty config bit-identical to today; the engine-baseline test pins it. Residual: a family path missed in the sweep. *Mitigation:* enumerate every `?? <constant>` default site in the generate/video paths in the PR description.
 
@@ -348,12 +377,14 @@ Anti-drift by construction: the registry is load-bearing in three consumers — 
 
 ---
 
-## 6. What I could not verify **[REVISED v2]**
+## 6. What I could not verify **[REVISED v2.2]**
 
-v1's list is superseded — most of it was resolved during review, three items **against** what v1 assumed. Remaining:
+v1's list is superseded; v2's "post-0.A residue" item is now **measured and closed** (§3.1.1 sample 2 — the answer was "everything," against v2's prediction). Remaining:
 
-- **The post-0.A residue.** Which routes still stall after the executor fix is a prediction (§3.1.3), not a measurement. Task 0.A′ exists to replace it; 0.B's scope should be rewritten from that data, not from this list.
-- **`ControlCommandMailbox` drain placement.** `processLoop`'s top and `startProcessingIfNeeded()` are the right hooks based on reading `:6921–6980`, but I have not traced every path that mutates `pending` (`recoverPersistedQueue` `:4310+` in particular is read only at its call site). Confirm before implementing the sidecar replay ordering.
+- **SE-0417 semantics under this exact toolchain (the 0.B-0 spike, §4.1).** Verified tonight: macOS 27.0 host, Swift 6.4 toolchain, so the APIs *exist*. Not verified: that `#available`-guarded usage compiles under swift-tools 5.9 language mode; that preference demonstrably carries nonisolated async callees in *this* codebase; whether preference crosses the inner unstructured `renderTask = Task {}` boundary (design assumes it does not and re-attaches at all three sites); whether the SDK's `DispatchQueue` conforms to `TaskExecutor` or a custom conformance is needed. All four are the spike's exit criteria — 0.B-1 does not build until they pass.
+- **Whether the pipeline spawns further unstructured `Task {}`s internally.** Preference does not survive into tasks the design doesn't know about; a `grep` of the pipeline sources for `Task {`/`Task.detached` is part of 0.B-0. Any hit either gets its own preference or is shown to be non-blocking.
+- **The `.localVideo` execution shape.** Assumed to run inline on the `processLoop` task (thus covered by the `:6947` preference); not traced. Confirm during 0.B-1.
+- **`ControlCommandMailbox` drain placement.** `processLoop`'s top and `startProcessingIfNeeded()` are the right hooks based on reading `:6921–6980` (@ c9dd27d), but I have not traced every path that mutates `pending` (`recoverPersistedQueue` `:4310+` in particular is read only at its call site). Confirm before implementing the sidecar replay ordering.
 - **Krea2/Chroma cancellation.** "Zero `checkCancellation` hits" comes from the review's grep, which I did not re-run. The AC is written conservatively either way.
 - **coffeeshop-server tool registration mechanics.** Confirmed `src/tools/*-tools.ts` is the pattern (~60 modules); did not read the registration entry point, so Phase 2's "one new file" remains an estimate.
 - **Kira daemon behavior under `PUT .../policy`.** Endpoint existence and persistence confirmed (`kira-api.ts:704`); "best-effort live-apply" is from the review's reading of that handler, not mine. The strengthened AC tests the behavior directly rather than trusting the reading.
@@ -379,7 +410,12 @@ v1's list is superseded — most of it was resolved during review, three items *
 | `WarmServer.swift:4310+` | `recoverPersistedQueue` — another `pending` writer (R2) |
 | `WarmServer.swift:4700–4710` | `HealthSnapshot` doc comment — authoritative #217 statement |
 | `WarmServer.swift:4756–4764` | `LiveHealthState` single-lock swap — no torn reads |
-| `WarmServer.swift:5417` | `private actor WarmServerCoordinator` — 0.A's target |
+| `WarmServer.swift:5417` | `private actor WarmServerCoordinator` — 0.A's target (0.A now shipped, `fd08ba9`) |
+| `WarmServer.swift:6947, 7030, 7037` (0.A tree) | the three unstructured render `Task {}` spawn sites — 0.B-1's `Task(executorPreference:)` attachment points; `:7030/:7037` are the retained tasks `/interrupt` cancels |
+| `WarmServer.swift:8219` (0.A tree) | `Task { await server.respond(...) }` — cannot start when the pool is exhausted (§3.1.2) |
+| `Package.swift:1, 6` | swift-tools 5.9; platform floor macOS 14 — why 0.B-1 needs `#available(macOS 15, *)` |
+| Mac host (verified 2026-08-29) | macOS **27.0**, Swift **6.4** (`swift-driver 1.168.5`) — SE-0417 available |
+| Live `sample` #2 (post-0.A, 2026-08-29) | threads on `com.apple.root.user-initiated-qos.cooperative` in `@isolated(any)` async thunks, one in `__psynch_mutexwait` (MLX mutex); coordinator visible on `DispatchQueue_78` — 0.A working, insufficient |
 | `WarmServer.swift:6729` | `publishHealth()` — **actor-isolated**, ~15 actor-only call sites (§2.2) |
 | `WarmServer.swift:6889, 6921–6927` | `setPaused` → `startProcessingIfNeeded` — the only wake for a parked loop |
 | `WarmServer.swift:6955–6980` | `runsWhilePaused` + `processLoop` — **exits when paused** (the v1 blocker) |
