@@ -388,6 +388,25 @@ struct KiraView: View {
                     .disabled(client.actionInFlight)
                     .help("How often the 24/7 scheduler starts a new cycle.")
                 }
+                // Render quality (Todd 2026-08-30 "I expect perfection"):
+                // "hq" IS two-pass — base render → latent upscale → refine,
+                // audio refined on pass 2 (the PinkCherry pass-2 recipe the
+                // engine encodes). Roughly doubles render time; the daemon
+                // budgets its render watchdog accordingly (#1749).
+                HStack(spacing: 10) {
+                    Text("Quality:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.videoQuality ?? "standard" },
+                        set: { v in Task { await client.updateSchedulerPolicy(["videoQuality": v]) } })) {
+                        Text("Standard").tag("standard")
+                        Text("HQ 2-pass").tag("hq")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 210)
+                    .disabled(client.actionInFlight)
+                    .help("HQ renders cycle videos two-pass: latent upscale + short refine (refine scale auto-fits the engine gate), audio refined on pass 2. Roughly doubles render time.")
+                }
                 // Per-tier schedule + pacing. Editing writes the FULL tiers
                 // map (server replaces; an unchecked tier is scheduled off).
                 ForEach(Self.tierOrder, id: \.self) { mode in
