@@ -313,6 +313,12 @@ public final class LTX2Pipeline {
     telemetry: LTX2PhaseTelemetry? = nil,
     resume: LTX2ResumeState? = nil,
     chunkIndex: Int = 0,
+    // Temporal beat scheduling (comfybox#310): resolved (token-range located
+    // against THIS render's composed prompt, fail-open per beat) by the
+    // caller before encoding — see LTX2VideoGenerator. Empty (the default)
+    // is byte-identical to before this feature existed; v1 wires only the
+    // plain T2V path (Phase 2 restricts server emission to t2v as well).
+    beatSchedule: [LTX2ResolvedBeat] = [],
     progressCallback: ((Int, Int) -> Void)? = nil
   ) throws -> LTX2PipelineOutcome {
     let startTime = CFAbsoluteTimeGetCurrent()
@@ -484,6 +490,7 @@ public final class LTX2Pipeline {
         preemption: preemption,
         telemetry: telemetry,
         chunkIndex: chunkIndex,
+        beatSchedule: beatSchedule,
         progressCallback: progressCallback
       ) {
       case .completed(let l): latents = l
@@ -635,6 +642,11 @@ public final class LTX2Pipeline {
         telemetry: telemetry,
         loopPhase: .refineDenoise,
         chunkIndex: chunkIndex,
+        // Refine reruns through the SAME denoisingLoop at a different latent
+        // resolution — it rebuilds its own bias from ITS OWN `refineInit`
+        // frame geometry (never the base pass's matrix); passing the same
+        // resolved beats here is exactly what makes that rebuild happen.
+        beatSchedule: beatSchedule,
         progressCallback: progressCallback) {
       case .completed(let l):
         latents = l
@@ -1590,6 +1602,14 @@ public final class LTX2Pipeline {
     telemetry: LTX2PhaseTelemetry? = nil,
     loopPhase: LTX2Phase = .baseDenoise,
     chunkIndex: Int = 0,
+    // Temporal beat scheduling (comfybox#310). Resolved (token-range located,
+    // fail-open per beat) upstream from the request's `beat_schedule` field —
+    // this loop only needs frame/second geometry, which it derives fresh
+    // from `latents`/`avState` below so refine (a different latent
+    // resolution) rebuilds its own bias rather than reusing the base pass's.
+    // Empty (the default) builds nil bias both places — byte-identical to
+    // before this feature existed.
+    beatSchedule: [LTX2ResolvedBeat] = [],
     progressCallback: ((Int, Int) -> Void)?
   ) -> LTX2DenoiseResult {
     // #1479 phase timing. `defer` so a yield closes the phase too: a preempted
@@ -1653,6 +1673,32 @@ public final class LTX2Pipeline {
       frames: latents.dim(2),
       steps: numSteps,
       cfg: cfgScale)
+
+    // Temporal beat scheduling (comfybox#310): build the additive bias ONCE
+    // for THIS call's frame geometry — `latents` already reflects this
+    // stage's own resolution (base vs. refine), so a fresh call per stage
+    // naturally rebuilds rather than reusing a stale matrix. Kill switch:
+    // LTX2_BEAT_SCHEDULE=0 zeroes `beatSchedule` upstream, so both stay nil.
+    let videoBeatBias: MLXArray? = LTX2BeatScheduleBuilder.buildVideoBias(
+      resolved: beatSchedule,
+      frames: latents.dim(2),
+      tokensPerFrame: latents.dim(3) * latents.dim(4),
+      textLen: textEmbeddings.dim(1))
+    let audioBeatBias: MLXArray? = {
+      guard !beatSchedule.isEmpty, let av = avState else { return nil }
+      let audioFrames = av.audioLatents.dim(2)
+      guard audioFrames > 0 else { return nil }
+      let starts = LTX2AudioPatchifier.latentTimesSeconds(from: 0, to: audioFrames)
+      let ends = LTX2AudioPatchifier.latentTimesSeconds(from: 1, to: audioFrames + 1)
+      let midSeconds = zip(starts, ends).map { ($0 + $1) / 2 }
+      let fps = resolvedConfig.condFps ?? Float(config.fps)
+      return LTX2BeatScheduleBuilder.buildAudioBias(
+        resolved: beatSchedule,
+        totalFrames: latents.dim(2),
+        fps: fps,
+        audioTokenMidSeconds: midSeconds,
+        textLen: av.audioContext.dim(1))
+    }()
 
     for i in startStep..<numSteps {
       // #1479: yield at the step boundary. Checked first so a raised signal
@@ -1753,7 +1799,11 @@ public final class LTX2Pipeline {
           context: textEmbeddings.asType(dtype),
           audioContext: av.audioContext.asType(dtype),
           sigma: sigmaArray,
-          pe: av.pe)
+          pe: av.pe,
+          // Beat schedule rides ONLY the positive pass (cond-only threading,
+          // comfybox#310) — uncond/STG below never see it.
+          beatBias: videoBeatBias,
+          audioBeatBias: audioBeatBias)
         velocityPos = vv
         avVelocityPos = va
       } else {
@@ -1765,7 +1815,9 @@ public final class LTX2Pipeline {
           sigma: sigmaArray,
           precomputedPE: precomputedPE,
           nagContext: nagEmbeddings?.asType(dtype),
-          nag: nag
+          nag: nag,
+          // Beat schedule rides ONLY the positive pass — uncond/STG unbiased.
+          beatBias: videoBeatBias
         )
       }
 
