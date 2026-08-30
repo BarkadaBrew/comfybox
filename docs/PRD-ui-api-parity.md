@@ -41,7 +41,7 @@ Corrections this audit forced: the "creation task checkbox" referenced in prior 
 
 ## 4. Non-goals
 
-- Authentication/authorization. The warm server is unauthenticated on loopback today; adding authn is a separate decision (noted as a risk in §7, not solved here).
+- Authentication/authorization. Explicitly out of scope — this stack is never publicly accessible (Todd, 2026-08-29). Do not design auth for it.
 - Migrating **Class D** local concerns (DAM/gallery/canvas/archives, launchd service control). They don't change engine behavior; parity there is not worth the coupling.
 - Rewriting the Desktop UI's look or navigation. Rewiring is limited to where state moves server-side.
 - Merging the Kira daemon into the warm server. They stay separate services.
