@@ -568,7 +568,11 @@ public final class LTX2Pipeline {
       // pairs audio-ab-t2v-* / audio-ab-speech-*). Audio keeps its fully
       // denoised stage-1 track; video still refines. LTX2_AUDIO_REFINE=1
       // re-enables the joint refine for A/B.
-      let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
+      // Now resolved config (env -> preset -> request), not ProcessInfo:
+      // the two-pass quality tier needs to request audio refine PER RENDER,
+      // and an env read here could not see a per-request value.
+      // LTX2_AUDIO_REFINE still works as the global default.
+      let refineAudio = resolvedConfig.audioRefine
       // #1479: the refine loop owns its own validation basis — its fingerprint
       // and sigmas are the REFINE pass's, not the base pass's.
       let refineFingerprint = denoiseConfigFingerprint(
@@ -2284,7 +2288,8 @@ public final class LTX2Pipeline {
     let sigma0 = refineSigmas[0]
     // Audio bypasses pass 2 by default — see the t2v refine block comment
     // (final listen verdict 2026-08-05). LTX2_AUDIO_REFINE=1 re-enables.
-    let refineAudio = ProcessInfo.processInfo.environment["LTX2_AUDIO_REFINE"] == "1"
+    // Resolved config, not ProcessInfo — see the t2v refine block.
+    let refineAudio = resolvedConfig.audioRefine
     // #1479: the re-noise and the audio re-noise already happened before the
     // checkpoint — running them again would restart the pass.
     var mixed = upLatent
