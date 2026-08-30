@@ -184,6 +184,11 @@ final class RouteTaskExecutorTests: XCTestCase {
       "Sources/ZImage/CivitAI/CivitAIClient.swift",
       "Sources/ZImage/Server/CivitAIConduitRoutes.swift",
       "Sources/ZImage/Server/PromptRepositoryStore.swift",
+        "Sources/ZImage/Server/CharacterStore.swift",
+        "Sources/ZImage/Server/RenderTraceStore.swift",
+        "Sources/ZImage/Server/ContentModeStore.swift",
+        "Sources/ZImage/CivitAI/CivitAISecrets.swift",
+        "Sources/ZImage/Server/ComfyBoxServerConfig.swift",
     ]
 
     for relativePath in calleeGraphFiles {
