@@ -93,8 +93,8 @@ launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 for i in {1..15}; do launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 || break; sleep 1; done
 launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1 && fail "label still registered after bootout — engine left stopped; run: launchctl bootout gui/$UID/$LABEL; launchctl bootstrap gui/$UID $PLIST"
 launchctl bootstrap "gui/$UID" "$PLIST"
-for i in {1..60}; do health >/dev/null 2>&1 && break; sleep 2; done
-health >/dev/null || fail "engine did not come back within 120s — rollback: ln -sfn $prev $BIN_DIR/current && launchctl kickstart -k gui/$UID/$LABEL"
+for i in {1..180}; do health >/dev/null 2>&1 && break; sleep 2; done
+health >/dev/null || fail "engine did not come back within 360s (cold krea2 load takes ~4min) — rollback: ln -sfn $prev $BIN_DIR/current && launchctl kickstart -k gui/$UID/$LABEL"
 
 say "7) smoke"; smoke
 if (( PAUSED )); then say "8) resuming queue"; queue_resume && PAUSED=0 || fail "RESUME FAILED — resume manually, pause persists across restarts"; fi
