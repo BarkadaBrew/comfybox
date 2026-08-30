@@ -951,16 +951,22 @@ struct KiraView: View {
     @ViewBuilder private func tierRow(_ mode: String, scheduler: KiraSchedulerStatus) -> some View {
         HStack(spacing: 10) {
             Toggle(isOn: Binding(
-                get: { scheduler.tiers[mode] != nil },
+                get: { scheduler.tiers[mode]?.enabled ?? false },
                 set: { on in
                     putTiers { tiers in
-                        if on {
+                        if var existing = tiers[mode] {
+                            // Flip the switch, KEEP the config (Todd
+                            // 2026-08-30: "switching off motion clears
+                            // settings" — the old removeValue here deleted
+                            // counts/window server-side).
+                            existing.enabled = on
+                            tiers[mode] = existing
+                        } else if on {
+                            // Never-configured tier: create with defaults.
                             tiers[mode] = KiraTierConfig(
                                 activeHoursStart: nil, activeHoursEnd: nil,
                                 imageCount: 2, unlimitedImages: false,
                                 videoCount: mode == "neutral" ? 0 : 1)
-                        } else {
-                            tiers.removeValue(forKey: mode)
                         }
                     }
                 })) {

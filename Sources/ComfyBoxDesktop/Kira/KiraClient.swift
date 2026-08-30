@@ -234,6 +234,9 @@ public struct KiraTierConfig: Equatable, Sendable {
     public var imageCount: Int
     public var unlimitedImages: Bool
     public var videoCount: Int
+    /// false = scheduled off, config retained (Todd 2026-08-30: toggling a
+    /// tier must not destroy its counts/window). true/absent = on.
+    public var enabled: Bool = true
 
     public static func parse(_ dict: [String: Any]) -> KiraTierConfig {
         let hours = dict["activeHours"] as? [String: Any]
@@ -242,7 +245,8 @@ public struct KiraTierConfig: Equatable, Sendable {
             activeHoursEnd: hours?["end"] as? String,
             imageCount: (dict["imageCount"] as? NSNumber)?.intValue ?? 2,
             unlimitedImages: dict["unlimitedImages"] as? Bool ?? false,
-            videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1)
+            videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1,
+            enabled: (dict["enabled"] as? Bool) ?? true)
     }
 
     /// PUT payload fragment. The tiers PUT is a FULL REPLACEMENT server-side,
@@ -257,6 +261,7 @@ public struct KiraTierConfig: Equatable, Sendable {
         out["imageCount"] = imageCount
         out["unlimitedImages"] = unlimitedImages
         if !isNeutral { out["videoCount"] = videoCount }
+        if !enabled { out["enabled"] = false }   // absent = on (server contract)
         return out
     }
 }
