@@ -39,8 +39,10 @@ final class MCPVideoToolTests: XCTestCase {
     // + civitai_search/civitai_prompts (CivitAI conduit + prompt repository, #234) = 45;
     // + move_queue_job/update_lora_triggerwords/create_preset/delete_preset/
     //   set_warm_preset/create_character/delete_character (headless-parity
-    //   Phase 1 gap set, comfybox#300, FDD §4.2, 2026-08-30) = 52.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 52, "Expected 52 registered MCP tools")
+    //   Phase 1 gap set, comfybox#300, FDD §4.2, 2026-08-30) = 52;
+    // + get_config/patch_config/update_config (headless-parity Phase 3,
+    //   comfybox#300, FDD §3.3/§4.4, 2026-08-30) = 55.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 55, "Expected 55 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)

@@ -125,6 +125,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executeCreateCharacter(arguments)
       case "delete_character":
         return try await executeDeleteCharacter(arguments)
+      case "get_config":
+        return try await executeGet("/v1/config")
+      case "patch_config":
+        return try await executePatchConfig(arguments)
+      case "update_config":
+        return try await executeUpdateConfig(arguments)
       default:
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
@@ -872,12 +878,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
       return MCPToolResult(error: "Error: 'model' is required")
     }
     let client = self.client
-    return try await Self.runSetWarmPreset(model: model) { method, path, body in
-      switch method {
-      case "GET": return try await client.get(path)
-      case "PUT": return try await client.put(path, body: body)
-      default: return try await client.post(path, body: body)
-      }
+    return try await Self.runSetWarmPreset(model: model) { method, path, body, headers in
+      try await client.send(method: method, path: path, body: body, headers: headers)
     }
   }
 
@@ -889,33 +891,60 @@ public final class MCPToolExecutor: @unchecked Sendable {
   ///   2. IF (1) fails: POST /v1/model/load { model, activate: true, wait: true }
   ///      (PresetView's catch-and-load fallback). If this also fails, abort —
   ///      the config is never read or written.
-  ///   3. GET /v1/config
+  ///   3. GET /v1/config — capturing the response `ETag`
   ///   4. PUT /v1/config with modelSpec set to `model` (fetch-then-mutate-
   ///      then-save, because PUT is a whole-document replace — WarmServer's
   ///      `encode(to:)` only writes enumerated keys, so saving a document
-  ///      that wasn't first fetched would drop unrelated config fields).
+  ///      that wasn't first fetched would drop unrelated config fields),
+  ///      sending the captured ETag as `If-Match` (adversarial review F2,
+  ///      2026-08-30): an unconditional PUT here silently CLOBBERS any
+  ///      concurrent `PATCH /v1/config` that lands between the GET and the
+  ///      PUT — the exact lost-update the store's advisory ETag exists to
+  ///      catch. On `409`, re-GET (picking up the concurrent write), re-apply
+  ///      only our modelSpec mutation on the fresh document, and retry ONCE —
+  ///      bounded, so a pathological write storm degrades to a clean 409
+  ///      error rather than an unbounded loop. Absent ETag (older server) →
+  ///      unconditional PUT, exactly today's behavior.
   static func runSetWarmPreset(
     model: String,
-    call: (_ method: String, _ path: String, _ body: Data) async throws -> (Int, Data)
+    call: (_ method: String, _ path: String, _ body: Data, _ headers: [String: String]) async throws -> (Int, Data, [String: String])
   ) async throws -> MCPToolResult {
     let activateBody = try JSONSerialization.data(withJSONObject: ["model": model])
-    let (activateStatus, activateData) = try await call("POST", "/v1/model/activate", activateBody)
+    let (activateStatus, activateData, _) = try await call("POST", "/v1/model/activate", activateBody, [:])
     if activateStatus != 200 {
       let loadBody = try JSONSerialization.data(withJSONObject: ["model": model, "activate": true, "wait": true])
-      let (loadStatus, loadData) = try await call("POST", "/v1/model/load", loadBody)
+      let (loadStatus, loadData, _) = try await call("POST", "/v1/model/load", loadBody, [:])
       guard loadStatus == 200 || loadStatus == 202 else {
         return Self.mapHTTPResponse(status: loadStatus, data: loadData)
       }
     }
-    let (getStatus, getData) = try await call("GET", "/v1/config", Data())
-    guard getStatus == 200,
-          var configObj = try? JSONSerialization.jsonObject(with: getData) as? [String: Any] else {
-      return Self.mapHTTPResponse(status: getStatus, data: getData)
+    // GET → mutate → conditional PUT, with ONE bounded retry on 409.
+    var lastStatus = 0
+    var lastData = Data()
+    for attempt in 0..<2 {
+      let (getStatus, getData, getHeaders) = try await call("GET", "/v1/config", Data(), [:])
+      guard getStatus == 200,
+            var configObj = try? JSONSerialization.jsonObject(with: getData) as? [String: Any] else {
+        return Self.mapHTTPResponse(status: getStatus, data: getData)
+      }
+      configObj["modelSpec"] = model
+      let putBody = try JSONSerialization.data(withJSONObject: configObj)
+      // Header names are case-insensitive per RFC 9110; fake closures in
+      // tests and the real client may differ in casing.
+      let etag = getHeaders.first { $0.key.caseInsensitiveCompare("ETag") == .orderedSame }?.value
+      let putHeaders: [String: String] = etag.map { ["If-Match": $0] } ?? [:]
+      let (putStatus, putData, _) = try await call("PUT", "/v1/config", putBody, putHeaders)
+      if putStatus == 409, attempt == 0 {
+        // A concurrent write landed between our GET and PUT. Loop: re-fetch
+        // the (now newer) document — PRESERVING that write — and re-apply
+        // only our own modelSpec mutation on top of it.
+        lastStatus = putStatus
+        lastData = putData
+        continue
+      }
+      return Self.mapHTTPResponse(status: putStatus, data: putData)
     }
-    configObj["modelSpec"] = model
-    let putBody = try JSONSerialization.data(withJSONObject: configObj)
-    let (putStatus, putData) = try await call("PUT", "/v1/config", putBody)
-    return Self.mapHTTPResponse(status: putStatus, data: putData)
+    return Self.mapHTTPResponse(status: lastStatus, data: lastData)
   }
 
   /// create_character -> POST /v1/characters. Params ARE the wire payload
@@ -939,6 +968,34 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
     let (status, data) = try await client.delete("/v1/characters/\(encoded)")
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  // MARK: - Headless parity Phase 3 (comfybox#300, FDD §3.3/§4.4) — config
+
+  /// patch_config -> PATCH /v1/config { ...merge-patch document... }. `patch`
+  /// IS the wire body verbatim (RFC 7386 JSON Merge Patch) — forwarded, not
+  /// interpreted here, so nested-null deletes and nested-object merges survive
+  /// exactly as the caller wrote them.
+  private func executePatchConfig(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let patch = params?.dict("patch") else {
+      return MCPToolResult(error: "Error: 'patch' (a JSON merge-patch object) is required")
+    }
+    let jsonData = try JSONEncoder().encode(patch)
+    let (status, data) = try await client.patch("/v1/config", body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// update_config -> PUT /v1/config { ...full document... }. `config` IS the
+  /// wire payload verbatim — a full-document replace, same "forward the whole
+  /// object" convention as create_preset/create_character. Prefer
+  /// patch_config for changing one or a few fields.
+  private func executeUpdateConfig(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let config = params?.dict("config") else {
+      return MCPToolResult(error: "Error: 'config' (the full config document) is required")
+    }
+    let jsonData = try JSONEncoder().encode(config)
+    let (status, data) = try await client.put("/v1/config", body: jsonData)
     return Self.mapHTTPResponse(status: status, data: data)
   }
 
