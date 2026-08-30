@@ -549,7 +549,7 @@ struct ComfyBoxDesktopApp: App {
             BreeView(bree: breeService)
 
         case .kira:
-            KiraView(client: kiraClient)
+            KiraView(client: kiraClient, engine: engine)
 
         case .canvas:
             CanvasView(

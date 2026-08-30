@@ -117,6 +117,16 @@ public struct KiraStateSnapshot: Equatable, Sendable {
     }
 }
 
+/// One per-run LTX LoRA override entry (run overrides, Todd 2026-08-30).
+public struct KiraVideoLoRA: Equatable, Sendable {
+    public var name: String
+    public var scale: Double
+    public init(name: String, scale: Double = 1.0) {
+        self.name = name
+        self.scale = scale
+    }
+}
+
 /// `GET /v1/kira/content-scheduler/status` (A2).
 public struct KiraSchedulerStatus: Equatable, Sendable {
     public var paused: Bool
@@ -132,6 +142,14 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     /// latent upscale → refine, audio refined on pass 2. nil/"standard" =
     /// single-pass.
     public var videoQuality: String?
+    /// Run overrides (Todd 2026-08-30) — live policy knobs; nil/empty =
+    /// engine/mode defaults. videoLoras REPLACE the engine's preset/default
+    /// LTX stack per render; imagePreset fills only the explicit tiers' slot.
+    public var videoLoras: [KiraVideoLoRA] = []
+    public var videoFps: Int?
+    public var imagePreset: String?
+    public var imageKroma: Double?
+    public var imageAccelScale: Double?
     /// Unlimited-within-cycle images: renders chain until the cycle window
     /// closes; imageCount is ignored while true.
     public var unlimitedImages: Bool
@@ -165,6 +183,14 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             videoMode: config?["videoMode"] as? String,
             videoI2vRatio: (config?["videoI2vRatio"] as? NSNumber)?.doubleValue,
             videoQuality: config?["videoQuality"] as? String,
+            videoLoras: ((config?["videoLoras"] as? [[String: Any]]) ?? []).compactMap { entry in
+                guard let name = entry["name"] as? String, !name.isEmpty else { return nil }
+                return KiraVideoLoRA(name: name, scale: (entry["scale"] as? NSNumber)?.doubleValue ?? 1.0)
+            },
+            videoFps: (config?["videoFps"] as? NSNumber)?.intValue,
+            imagePreset: config?["imagePreset"] as? String,
+            imageKroma: (config?["imageKroma"] as? NSNumber)?.doubleValue,
+            imageAccelScale: (config?["imageAccelScale"] as? NSNumber)?.doubleValue,
             unlimitedImages: config?["unlimitedImages"] as? Bool ?? false,
             activeHoursStart: hours?["start"] as? String,
             activeHoursEnd: hours?["end"] as? String,

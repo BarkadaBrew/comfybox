@@ -513,6 +513,15 @@ public enum MCPToolRegistry {
           "type": "boolean",
           "description": "Skip the server-side character description prepend. Send TRUE when the caller has already woven the description into the prompt. Note `enhance:false` is NOT sufficient — it only stops the optimizer's injection, and on t2v the server still defaults the character to \u{22}kira\u{22} and prepends ~110 tokens, which overruns the 128-token cap and truncates the scene and camera direction off the end.",
         ] as [String: Any],
+        "loras": [
+          "type": "array",
+          "description": "Per-render LoRA stack override: [{path|name, scale}]. Request LoRAs REPLACE the preset/default stack for this render (precedence: request > preset > --ltx2-lora). Bare filenames resolve against the LoRA library.",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "fps": [
+          "type": "integer",
+          "description": "Generation frame-rate basis (default 24). Lower = slower on-screen motion per generated frame; duration maps onto the frame grid at this rate.",
+        ] as [String: Any],
         "enhance": [
           "type": "boolean",
           "description": "Whether the server should optimize the prompt (default true). Send FALSE when the caller has ALREADY run its own prompt optimizer — a second rewrite drifts the prompt away from concrete staging (limb placement, figure count) and double-injects the character description.",

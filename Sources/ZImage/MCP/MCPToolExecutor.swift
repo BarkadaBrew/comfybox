@@ -595,6 +595,15 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let tuning = params?.dict("tuning") {
       body["tuning"] = tuning.mapValues { $0.value }
     }
+    // Run overrides (coffeeshop-server#1751): request LoRAs replace the
+    // preset/default stack; fps shifts the generation frame-rate basis. The
+    // body is an explicit whitelist, so these must be forwarded by name.
+    if let loras = params?.array("loras") {
+      body["loras"] = loras.map { $0.value }
+    }
+    if let fps = params?.integer("fps") {
+      body["fps"] = fps
+    }
     if let attemptId = params?.string("optimization_attempt_id") {
       body["optimization_attempt_id"] = attemptId
     }
