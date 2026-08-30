@@ -31,6 +31,7 @@ struct KiraView: View {
     @State private var pendingKroma: Double?
     @State private var pendingAccel: Double?
     @State private var imagePresetChoices: [String] = []
+    @State private var videoPresets: [ServerPreset] = []
     /// Which cards are expanded. Empty by default → every card starts collapsed
     /// on launch (Todd 2026-07-17). Expansion is per-session, not persisted.
     @State private var expandedCards: Set<String> = []
@@ -701,10 +702,16 @@ struct KiraView: View {
         if imagePresetChoices.isEmpty {
             Task {
                 let presets = await engine.fetchPresets()
+                // mediaKind is unset on every existing preset, so the id is
+                // the working signal: "video" ids are the LTX presets
+                // (kira-video-*), everything else is an image preset.
                 imagePresetChoices = presets
-                    .filter { ($0.mediaKind ?? "image") == "image" }
+                    .filter { !$0.id.contains("video") && ($0.mediaKind ?? "image") == "image" }
                     .map(\.id)
                     .sorted()
+                videoPresets = presets
+                    .filter { $0.id.contains("video") || $0.mediaKind == "video" }
+                    .sorted { $0.id < $1.id }
             }
         }
     }
@@ -712,6 +719,13 @@ struct KiraView: View {
     private func applyVideoLoras() {
         let entries = overrideLoras.map { ["name": $0.filename, "scale": Double($0.scale)] as [String: Any] }
         Task {
+            // Selection IS the import trigger (Todd 2026-08-30): a picked LoRA
+            // that only exists on attached storage is staged to the internal
+            // cache now; already-local names no-op (nearlineAction errors are
+            // best-effort — the daemon render will surface a real miss).
+            for lora in overrideLoras {
+                _ = try? await engine.nearlineAction("stage", name: lora.filename)
+            }
             await client.updateSchedulerPolicy(["videoLoras": entries.isEmpty ? NSNull() : entries])
         }
     }
@@ -767,6 +781,21 @@ struct KiraView: View {
                             .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
+                    if !videoPresets.isEmpty {
+                        Menu("Load preset") {
+                            ForEach(videoPresets, id: \.id) { preset in
+                                Button("\(preset.id) (\(preset.loras.count) LoRA\(preset.loras.count == 1 ? "" : "s"))") {
+                                    overrideLoras = preset.loras.map {
+                                        LoRASelection(id: $0.filename, filename: $0.filename, scale: Float($0.scale), role: $0.role)
+                                    }
+                                }
+                            }
+                        }
+                        .font(.caption)
+                        .frame(maxWidth: 140)
+                        .disabled(client.actionInFlight)
+                        .help("Stage a prebuilt LTX preset's LoRA stack here, tweak it, then Apply — the preset itself is never modified.")
+                    }
                     Button("Apply LoRAs") { applyVideoLoras() }
                         .font(.caption)
                         .disabled(client.actionInFlight)
