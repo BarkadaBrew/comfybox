@@ -186,7 +186,7 @@ extension Krea2Pipeline {
       noise: noise, source: sourceLatent, sigma: scheduler.sigmas[startIndex], dtype: dtype)
     let img = Krea2Sampling.patchify(mixedNCHW, patch: patch)
 
-    let (denoised, stats) = Krea2DenoiseLoop.run(
+    let (denoised, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: img,
       startIndex: startIndex,

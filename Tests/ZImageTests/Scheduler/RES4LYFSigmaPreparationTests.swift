@@ -260,7 +260,7 @@ final class RES4LYFSigmaPreparationTests: XCTestCase {
 
     var sigmasSeen: [Float] = []
     let x0 = MLXArray.ones([1, 4, 4]).asType(.float32) * 0.3
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: x0, modelEvalsPerEvaluate: 2
     ) { latent, sigma in
       sigmasSeen.append(sigma)
@@ -288,7 +288,7 @@ final class RES4LYFSigmaPreparationTests: XCTestCase {
       sampler: .res2s, sigmaSchedule: .beta, steps: 6, shift: shift, seed: 7, c2: 0.5)
 
     let x0 = MLXArray.ones([1, 4, 4]).asType(.float32) * 0.3
-    let (_, stats) = Krea2DenoiseLoop.run(scheduler: &scheduler, initialSample: x0) {
+    let (_, stats) = try Krea2DenoiseLoop.run(scheduler: &scheduler, initialSample: x0) {
       latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma)
     }
 

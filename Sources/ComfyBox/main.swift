@@ -806,7 +806,7 @@ struct ZImageCLI {
           logger.info("Chroma: \(chromaSteps) steps, scheduler=\(chromaScheduler.rawValue), guidance=\(chromaGuidance), cfg=\(chromaCFG)")
 
           // Generate image
-          let pixels = pipeline.generate(
+          let pixels = try pipeline.generate(
             tokenIds: tokenIds,
             negativeTokenIds: negTokenIds,
             width: width,
