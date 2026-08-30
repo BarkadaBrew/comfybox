@@ -1906,6 +1906,21 @@ public final class WarmServer {
     /// condition on "prefix, prefix, …"). The preset's LoRAs, negatives, dims
     /// and steps still apply; only the prompt wrap is skipped.
     let skipPresetPrompt: Bool?
+    /// Temporal beat scheduling (comfybox#310): structured multi-beat
+    /// content (snake_case `start_frac`/`end_frac` via the decoder
+    /// strategy). Each beat's `text` must be a verbatim substring of
+    /// `prompt` — the engine locates it there and drops (fail-open) any
+    /// beat it can't find. nil/empty is byte-identical to today's flat
+    /// (joined) behavior; unknown-field-ignored convention means older
+    /// engines simply drop this key.
+    ///
+    /// Decode strictness is INTENTIONALLY not fail-open (adversarial review
+    /// F11): a structurally malformed `beat_schedule` (wrong types, missing
+    /// keys) fails the whole request decode → clean 4xx, like every other
+    /// field. Per-beat fail-open applies only to WELL-FORMED beats the
+    /// engine can't act on (unlocatable text, degenerate fracs) — a caller
+    /// bug should be loud, a tokenizer merge should not.
+    let beatSchedule: [BeatSegment]?
   }
 
   /// Map a named resolution + aspect to a width x height budget. Dims are
@@ -2412,7 +2427,8 @@ public final class WarmServer {
 ,
       tuning: req.tuning,
       presetTuning: videoPreset?.videoTuning,
-      audio: req.audio ?? false
+      audio: req.audio ?? false,
+      beatSchedule: req.beatSchedule
     )
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)

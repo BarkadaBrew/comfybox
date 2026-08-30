@@ -10,6 +10,10 @@ import SwiftUI
 
 struct KiraView: View {
     @Bindable var client: KiraClient
+    /// Local engine service — backs the run-override LoRA picker (LoRA
+    /// library + compatibility tags) and the image-preset list. The overrides
+    /// themselves live in DAEMON policy; the engine is read-only here.
+    @Bindable var engine: EngineService
     @State private var tokenDraft: String = ""
     @State private var hostDraft: String = ""
     @State private var portDraft: String = ""
@@ -19,6 +23,15 @@ struct KiraView: View {
     /// Local slider value while dragging the i2v share — the PUT fires on
     /// release, not per drag tick. nil = mirror the server value.
     @State private var pendingI2vRatio: Double?
+    // Run overrides (Todd 2026-08-30): LoRA edits stage locally and push on
+    // Apply (a per-slider-tick PUT would spam the policy endpoint); sliders
+    // use the same pending-then-push pattern as the i2v ratio above.
+    @State private var overrideLoras: [LoRASelection] = []
+    @State private var overrideLorasSeeded = false
+    @State private var pendingKroma: Double?
+    @State private var pendingAccel: Double?
+    @State private var imagePresetChoices: [String] = []
+    @State private var videoPresets: [ServerPreset] = []
     /// Which cards are expanded. Empty by default → every card starts collapsed
     /// on launch (Todd 2026-07-17). Expansion is per-session, not persisted.
     @State private var expandedCards: Set<String> = []
@@ -367,6 +380,51 @@ struct KiraView: View {
                             .frame(width: 120, alignment: .leading)
                     }
                 }
+                // Cycle interval (Todd 2026-08-29): how often the 24/7
+                // scheduler starts a new tick. The daemon policy endpoint
+                // already accepted intervalMinutes — this was the missing
+                // UI. Segmented, same idiom as the videoMode picker above;
+                // shorter intervals suit i2v-only stretches, longer ones
+                // give mixed/t2v cycles room to actually finish.
+                HStack(spacing: 10) {
+                    Text("Interval:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.intervalMinutes ?? 30 },
+                        set: { v in Task { await client.updateSchedulerPolicy(["intervalMinutes": v]) } })) {
+                        ForEach([15, 20, 30, 45, 60], id: \.self) { minutes in
+                            Text("\(minutes)m").tag(minutes)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 260)
+                    .disabled(client.actionInFlight)
+                    .help("How often the 24/7 scheduler starts a new cycle.")
+                }
+                // Render quality (Todd 2026-08-30 "I expect perfection"):
+                // "hq" IS two-pass — base render → latent upscale → refine,
+                // audio refined on pass 2 (the PinkCherry pass-2 recipe the
+                // engine encodes). Roughly doubles render time; the daemon
+                // budgets its render watchdog accordingly (#1749).
+                HStack(spacing: 10) {
+                    Text("Quality:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.videoQuality ?? "standard" },
+                        set: { v in Task { await client.updateSchedulerPolicy(["videoQuality": v]) } })) {
+                        Text("Standard").tag("standard")
+                        Text("HQ 2-pass").tag("hq")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 210)
+                    .disabled(client.actionInFlight)
+                    .help("HQ renders cycle videos two-pass: latent upscale + short refine (refine scale auto-fits the engine gate), audio refined on pass 2. Roughly doubles render time.")
+                }
+                // Run overrides (Todd 2026-08-30 "modify the presets for that
+                // run"): per-run LTX LoRA stack + fps and Krea2 preset/kroma/
+                // accel. Writes live policy (validated daemon-side, applies
+                // next tick); the engine's preset store is never touched.
+                runOverridesSection(scheduler)
                 // Per-tier schedule + pacing. Editing writes the FULL tiers
                 // map (server replaces; an unchecked tier is scheduled off).
                 ForEach(Self.tierOrder, id: \.self) { mode in
@@ -623,6 +681,194 @@ struct KiraView: View {
         guard var tiers = client.scheduler?.tiers else { return }
         mutate(&tiers)
         Task { await client.updateSchedulerTiers(tiers) }
+    }
+
+    // ── Run overrides (Todd 2026-08-30) ──────────────────────────────────
+
+    private func overridesActive(_ scheduler: KiraSchedulerStatus) -> Bool {
+        !scheduler.videoLoras.isEmpty || scheduler.videoFps != nil
+            || scheduler.imagePreset != nil || scheduler.imageKroma != nil
+            || scheduler.imageAccelScale != nil
+    }
+
+    private func seedOverrideState(_ scheduler: KiraSchedulerStatus) {
+        // One-shot seed from the daemon's stored overrides so reopening the
+        // tab shows what is actually live; local edits stay local until Apply.
+        guard !overrideLorasSeeded else { return }
+        overrideLorasSeeded = true
+        overrideLoras = scheduler.videoLoras.map {
+            LoRASelection(id: $0.name, filename: $0.name, scale: Float($0.scale))
+        }
+        if imagePresetChoices.isEmpty {
+            Task {
+                let presets = await engine.fetchPresets()
+                // mediaKind is unset on every existing preset, so the id is
+                // the working signal: "video" ids are the LTX presets
+                // (kira-video-*), everything else is an image preset.
+                imagePresetChoices = presets
+                    .filter { !$0.id.contains("video") && ($0.mediaKind ?? "image") == "image" }
+                    .map(\.id)
+                    .sorted()
+                videoPresets = presets
+                    .filter { $0.id.contains("video") || $0.mediaKind == "video" }
+                    .sorted { $0.id < $1.id }
+            }
+        }
+    }
+
+    private func applyVideoLoras() {
+        let entries = overrideLoras.map { ["name": $0.filename, "scale": Double($0.scale)] as [String: Any] }
+        Task {
+            // Selection IS the import trigger (Todd 2026-08-30): a picked LoRA
+            // that only exists on attached storage is staged to the internal
+            // cache now; already-local names no-op (nearlineAction errors are
+            // best-effort — the daemon render will surface a real miss).
+            for lora in overrideLoras {
+                _ = try? await engine.nearlineAction("stage", name: lora.filename)
+            }
+            await client.updateSchedulerPolicy(["videoLoras": entries.isEmpty ? NSNull() : entries])
+        }
+    }
+
+    @ViewBuilder
+    private func overrideSlider(
+        _ label: String, live: Double?, pending: Binding<Double?>,
+        range: ClosedRange<Double>, key: String, help: String,
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text("\(label):").font(.caption).foregroundStyle(.secondary)
+            let current = pending.wrappedValue ?? live ?? range.upperBound
+            Slider(value: Binding(
+                get: { current },
+                set: { pending.wrappedValue = $0 }
+            ), in: range, step: 0.05) { editing in
+                if !editing, let v = pending.wrappedValue {
+                    Task {
+                        await client.updateSchedulerPolicy([key: (v * 100).rounded() / 100])
+                        pending.wrappedValue = nil
+                    }
+                }
+            }
+            .frame(maxWidth: 180)
+            .disabled(client.actionInFlight)
+            Text(live != nil || pending.wrappedValue != nil ? String(format: "%.2f", current) : "preset")
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                .frame(width: 48, alignment: .leading)
+            if live != nil {
+                Button("\u{00D7}") {
+                    pending.wrappedValue = nil
+                    Task { await client.updateSchedulerPolicy([key: NSNull()]) }
+                }
+                .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                .help("Clear — back to the preset value")
+            }
+        }
+        .help(help)
+    }
+
+    @ViewBuilder
+    private func runOverridesSection(_ scheduler: KiraSchedulerStatus) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
+                // LTX: per-run LoRA stack. Request LoRAs REPLACE the engine's
+                // preset/default stack for every cycle render while set.
+                HStack(spacing: 10) {
+                    Text("LTX LoRAs:").font(.caption).foregroundStyle(.secondary)
+                    if scheduler.videoLoras.isEmpty {
+                        Text("engine default stack").font(.caption2).foregroundStyle(.tertiary)
+                    } else {
+                        Text(scheduler.videoLoras.map { "\($0.name) @\(String(format: "%.2f", $0.scale))" }.joined(separator: ", "))
+                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                    if !videoPresets.isEmpty {
+                        Menu("Load preset") {
+                            ForEach(videoPresets, id: \.id) { preset in
+                                Button("\(preset.id) (\(preset.loras.count) LoRA\(preset.loras.count == 1 ? "" : "s"))") {
+                                    overrideLoras = preset.loras.map {
+                                        LoRASelection(id: $0.filename, filename: $0.filename, scale: Float($0.scale), role: $0.role)
+                                    }
+                                }
+                            }
+                        }
+                        .font(.caption)
+                        .frame(maxWidth: 140)
+                        .disabled(client.actionInFlight)
+                        .help("Stage a prebuilt LTX preset's LoRA stack here, tweak it, then Apply — the preset itself is never modified.")
+                    }
+                    Button("Apply LoRAs") { applyVideoLoras() }
+                        .font(.caption)
+                        .disabled(client.actionInFlight)
+                        .help("Push the staged stack below as the per-run override (empty stack clears it)")
+                }
+                // strictFamilyFilter OFF: the scanner tags several real LTX
+                // LoRAs "unknown" (tensor-key detector misses comfy-export and
+                // control layouts, and rescans clobber manual tags) — hiding
+                // them made the library look incomplete (Todd 2026-08-30
+                // "not all the ltx loras are exposed").
+                LoRAPicker(engine: engine, selectedLoras: $overrideLoras, familyOverride: "ltx", strictFamilyFilter: false)
+                    .frame(maxHeight: 200)
+                HStack(spacing: 10) {
+                    Text("FPS:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.videoFps ?? 0 },
+                        set: { v in Task { await client.updateSchedulerPolicy(["videoFps": v == 0 ? NSNull() : v]) } })) {
+                        Text("Engine (24)").tag(0)
+                        ForEach([12, 16, 20, 24, 30], id: \.self) { Text("\($0)").tag($0) }
+                    }
+                    .pickerStyle(.segmented).labelsHidden().frame(maxWidth: 320)
+                    .disabled(client.actionInFlight)
+                    .help("Generation frame-rate basis for cycle videos. Lower = slower, dreamier on-screen motion per generated frame.")
+                }
+                Divider()
+                HStack(spacing: 10) {
+                    Text("Krea2 preset:").font(.caption).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { scheduler.imagePreset ?? "" },
+                        set: { v in Task { await client.updateSchedulerPolicy(["imagePreset": v.isEmpty ? NSNull() : v]) } })) {
+                        Text("Implicit render set").tag("")
+                        ForEach(imagePresetChoices, id: \.self) { Text($0).tag($0) }
+                    }
+                    .labelsHidden().frame(maxWidth: 240)
+                    .disabled(client.actionInFlight)
+                    .help("Preset override for the EXPLICIT tiers only — neutral/apple keep their pinned SFW presets.")
+                }
+                overrideSlider("kroma", live: scheduler.imageKroma, pending: $pendingKroma,
+                               range: 0...1.5, key: "imageKroma",
+                               help: "Per-render kroma LoRA strength (0 renders without kroma; the engine refuses it on kroma-baked checkpoints).")
+                overrideSlider("accel", live: scheduler.imageAccelScale, pending: $pendingAccel,
+                               range: 0.05...1.5, key: "imageAccelScale",
+                               help: "Acceleration-LoRA scale on raw-turbo/raw-4step presets (the engine refuses 0 — the tier IS the accelerator).")
+                HStack {
+                    Spacer()
+                    Button("Reset overrides") {
+                        overrideLoras = []
+                        pendingKroma = nil
+                        pendingAccel = nil
+                        Task {
+                            await client.updateSchedulerPolicy([
+                                "videoLoras": NSNull(), "videoFps": NSNull(), "imagePreset": NSNull(),
+                                "imageKroma": NSNull(), "imageAccelScale": NSNull(),
+                            ])
+                        }
+                    }
+                    .font(.caption)
+                    .disabled(client.actionInFlight)
+                    .help("Clear every run override — cycles go back to the engine/mode defaults.")
+                }
+            }
+            .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Text("Run overrides (LoRAs / FPS / preset)").font(.caption)
+                if overridesActive(scheduler) {
+                    Text("active").font(.caption2)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(.orange.opacity(0.25), in: Capsule())
+                }
+            }
+        }
+        .onAppear { seedOverrideState(scheduler) }
     }
 
     @ViewBuilder private func tierRow(_ mode: String, scheduler: KiraSchedulerStatus) -> some View {

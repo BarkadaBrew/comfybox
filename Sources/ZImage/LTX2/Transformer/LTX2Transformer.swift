@@ -243,7 +243,12 @@ public final class LTX2Transformer: Module {
     precomputedPE: (cos: MLXArray, sin: MLXArray)? = nil,
     stgBlocks: Set<Int>? = nil,
     nagContext: MLXArray? = nil,
-    nag: LTX2NAGConfig = .disabled
+    nag: LTX2NAGConfig = .disabled,
+    // Temporal beat scheduling (comfybox#310): additive cross-attention
+    // bias `(B, 1, numTokens, textLen)`, forwarded unchanged to every block.
+    // Callers pass this ONLY on the positive/conditional forward pass — nil
+    // (the default) is byte-identical to before this feature existed.
+    beatBias: MLXArray? = nil
   ) -> MLXArray {
     let batchSize = latent.dim(0)
 
@@ -322,7 +327,8 @@ public final class LTX2Transformer: Module {
         skipSelfAttn: stgSet.contains(idx),
         promptTimestep: promptTS,
         negativeContext: nagCtx,
-        nag: nag
+        nag: nag,
+        beatBias: beatBias
       )
     }
 

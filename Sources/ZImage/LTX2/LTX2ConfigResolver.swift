@@ -83,6 +83,13 @@ public enum LTX2ConfigResolver {
     Entry(name: "nag_tau", envKey: "LTX2_NAG_TAU", tier: "A", kind: .float(1...10), builtin: "2.5"),
     Entry(name: "reanchor_interval", envKey: "LTX2_REANCHOR_INTERVAL", tier: "A", kind: .int(0...10_000), builtin: "0"),
     Entry(name: "reanchor_strength", envKey: "LTX2_REANCHOR_STRENGTH", tier: "A", kind: .float(0...1), builtin: "0"),
+    // Temporal beat scheduling kill switch (comfybox#310): default ON —
+    // disabled only when the RAW env value is exactly "0", mirroring the
+    // renderer (LTX2Pipeline reads this via LTX2ResolvedVideoConfig, never
+    // ProcessInfo directly). A request with no `beat_schedule` field costs
+    // nothing regardless of this switch; it exists to kill the feature
+    // globally without a request-shape change if it misbehaves live.
+    Entry(name: "beat_schedule_enabled", envKey: "LTX2_BEAT_SCHEDULE", tier: "A", kind: .boolNotZero, builtin: "true"),
     // Tier B — machine-shaped
     Entry(name: "plain_decode_max_vol", envKey: "LTX2_PLAIN_DECODE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "4500"),
     Entry(name: "refine_max_vol", envKey: "LTX2_REFINE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "12000"),
@@ -279,6 +286,10 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let nagTau: Float
   public let reanchorInterval: Int
   public let reanchorStrength: Float
+  /// Temporal beat scheduling (comfybox#310) global kill switch. No
+  /// request/preset override — `beat_schedule` presence/absence on the
+  /// request is the per-render knob; this is only the emergency-off env.
+  public let beatScheduleEnabled: Bool
   // Tier B
   public let plainDecodeMaxVol: Int
   public let refineMaxVol: Int
@@ -335,6 +346,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "nag_tau": return fmt(nagTau)
     case "reanchor_interval": return String(reanchorInterval)
     case "reanchor_strength": return fmt(reanchorStrength)
+    case "beat_schedule_enabled": return beatScheduleEnabled ? "true" : "false"
     default: return nil
     }
   }
@@ -400,6 +412,7 @@ extension LTX2ConfigResolver {
       nagTau: pick("nag_tau", f("nag_tau"), preset?.nagTau, request?.nagTau),
       reanchorInterval: pick("reanchor_interval", i("reanchor_interval"), preset?.reanchorInterval, request?.reanchorInterval),
       reanchorStrength: pick("reanchor_strength", f("reanchor_strength"), preset?.reanchorStrength, request?.reanchorStrength),
+      beatScheduleEnabled: b("beat_schedule_enabled"),
       plainDecodeMaxVol: i("plain_decode_max_vol"),
       refineMaxVol: i("refine_max_vol"),
       decodeMode: str("decode_mode"),
