@@ -117,6 +117,35 @@ public struct KiraStateSnapshot: Equatable, Sendable {
     }
 }
 
+/// One daemon render-queue row (GET /v1/kira/render-queue). The ENGINE's own
+/// queue only ever holds the single dispatched job — this is where everything
+/// else actually waits (Todd 2026-08-30).
+public struct KiraQueueRow: Equatable, Sendable, Identifiable {
+    public var id: Int
+    public var kind: String
+    public var label: String
+    public var detail: String?
+    public var state: String      // "running" | "pending"
+    public var pos: Int
+    public var owner: String
+    public var enqueuedAtMs: Double
+    public var watchdogMs: Double?
+
+    static func parse(_ dict: [String: Any]) -> KiraQueueRow? {
+        guard let id = (dict["id"] as? NSNumber)?.intValue else { return nil }
+        return KiraQueueRow(
+            id: id,
+            kind: dict["kind"] as? String ?? "?",
+            label: dict["label"] as? String ?? "",
+            detail: dict["detail"] as? String,
+            state: dict["state"] as? String ?? "pending",
+            pos: (dict["pos"] as? NSNumber)?.intValue ?? 0,
+            owner: dict["owner"] as? String ?? "",
+            enqueuedAtMs: (dict["enqueuedAtMs"] as? NSNumber)?.doubleValue ?? 0,
+            watchdogMs: (dict["watchdogMs"] as? NSNumber)?.doubleValue)
+    }
+}
+
 /// One per-run LTX LoRA override entry (run overrides, Todd 2026-08-30).
 public struct KiraVideoLoRA: Equatable, Sendable {
     public var name: String
@@ -817,6 +846,36 @@ public final class KiraClient {
     }
 
     // MARK: - Controls (writes)
+
+    // ── Daemon render queue (Todd 2026-08-30: full visibility + control) ──
+
+    public var queueRows: [KiraQueueRow] = []
+
+    public func refreshRenderQueue() async {
+        guard let data = await fetch("v1/kira/render-queue") else { return }
+        guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rows = dict["rows"] as? [[String: Any]] else { return }
+        queueRows = rows.compactMap { KiraQueueRow.parse($0) }
+    }
+
+    /// delta < 0 moves the job up within its lane; > 0 down.
+    public func moveQueueJob(_ id: Int, delta: Int) async {
+        if await perform("v1/kira/render-queue/move", method: "POST", body: ["id": id, "delta": delta]) {
+            await refreshRenderQueue()
+        }
+    }
+
+    public func bumpQueueJob(_ id: Int) async {
+        if await perform("v1/kira/render-queue/move", method: "POST", body: ["id": id, "to": "top"]) {
+            await refreshRenderQueue()
+        }
+    }
+
+    public func removeQueueJob(_ id: Int) async {
+        if await perform("v1/kira/render-queue/remove", method: "POST", body: ["id": id]) {
+            await refreshRenderQueue()
+        }
+    }
 
     @discardableResult
     private func perform(_ path: String, method: String, body: [String: Any]? = nil) async -> Bool {
