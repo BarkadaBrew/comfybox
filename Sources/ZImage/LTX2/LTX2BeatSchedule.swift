@@ -102,6 +102,21 @@ public enum LTX2BeatScheduleLocator {
     var resolved: [LTX2ResolvedBeat] = []
 
     for beat in beats {
+      // Frac hygiene (adversarial review F10): the server-side sanitizer
+      // isn't merged yet and the flag defaults on, so the engine enforces
+      // its own invariants — clamp fracs into [0, 1] and drop degenerate
+      // (endFrac <= startFrac after clamping, or non-finite) spans. Same
+      // fail-open contract as an unlocatable beat: drop + log, never fail.
+      guard beat.startFrac.isFinite, beat.endFrac.isFinite else {
+        onDrop?(beat, "non-finite startFrac/endFrac")
+        continue
+      }
+      let startFrac = min(max(beat.startFrac, 0), 1)
+      let endFrac = min(max(beat.endFrac, 0), 1)
+      guard endFrac > startFrac else {
+        onDrop?(beat, "degenerate span after clamping fracs to [0,1] (endFrac <= startFrac)")
+        continue
+      }
       let beatIds = tokenize(beat.text)
       guard !beatIds.isEmpty else {
         onDrop?(beat, "standalone tokenization produced no tokens")
@@ -121,8 +136,8 @@ public enum LTX2BeatScheduleLocator {
       resolved.append(LTX2ResolvedBeat(
         tokenStart: padOffset + localStart,
         tokenEnd: padOffset + clampedEnd,
-        startFrac: beat.startFrac,
-        endFrac: beat.endFrac,
+        startFrac: startFrac,
+        endFrac: endFrac,
         strength: beat.strength ?? 1.0))
     }
     return resolved

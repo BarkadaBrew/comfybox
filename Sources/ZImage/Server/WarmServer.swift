@@ -1909,6 +1909,13 @@ public final class WarmServer {
     /// beat it can't find. nil/empty is byte-identical to today's flat
     /// (joined) behavior; unknown-field-ignored convention means older
     /// engines simply drop this key.
+    ///
+    /// Decode strictness is INTENTIONALLY not fail-open (adversarial review
+    /// F11): a structurally malformed `beat_schedule` (wrong types, missing
+    /// keys) fails the whole request decode → clean 4xx, like every other
+    /// field. Per-beat fail-open applies only to WELL-FORMED beats the
+    /// engine can't act on (unlocatable text, degenerate fracs) — a caller
+    /// bug should be loud, a tokenizer merge should not.
     let beatSchedule: [BeatSegment]?
   }
 

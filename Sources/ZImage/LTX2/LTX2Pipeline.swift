@@ -1679,11 +1679,16 @@ public final class LTX2Pipeline {
     // stage's own resolution (base vs. refine), so a fresh call per stage
     // naturally rebuilds rather than reusing a stale matrix. Kill switch:
     // LTX2_BEAT_SCHEDULE=0 zeroes `beatSchedule` upstream, so both stay nil.
+    // Converted to the MODEL dtype (bf16) here — the builder emits fp32 and
+    // SDPA runs bf16; the reference (prompt_relay.py) does the same
+    // `.to(dtype)` on its cached matrix. Adversarial review F1: without the
+    // conversion the fp32 bias rode into the bf16 attention (and doubled
+    // the tensor's allocation).
     let videoBeatBias: MLXArray? = LTX2BeatScheduleBuilder.buildVideoBias(
       resolved: beatSchedule,
       frames: latents.dim(2),
       tokensPerFrame: latents.dim(3) * latents.dim(4),
-      textLen: textEmbeddings.dim(1))
+      textLen: textEmbeddings.dim(1))?.asType(dtype)
     let audioBeatBias: MLXArray? = {
       guard !beatSchedule.isEmpty, let av = avState else { return nil }
       let audioFrames = av.audioLatents.dim(2)
@@ -1697,7 +1702,7 @@ public final class LTX2Pipeline {
         totalFrames: latents.dim(2),
         fps: fps,
         audioTokenMidSeconds: midSeconds,
-        textLen: av.audioContext.dim(1))
+        textLen: av.audioContext.dim(1))?.asType(dtype)
     }()
 
     for i in startStep..<numSteps {

@@ -4,6 +4,7 @@
 
 import XCTest
 import MLX
+import MLXNN
 import MLXRandom
 @testable import ZImage
 
@@ -102,5 +103,72 @@ final class LTX2BeatScheduleBlockTests: XCTestCase {
 
     XCTAssertLessThan(MLX.abs(withNil - withZero).max().item(Float.self), 1e-6,
                       "an explicit zero-bias tensor must be a true no-op, identical to nil")
+  }
+
+  /// Adversarial review F12(a): the PRODUCTION dtype path. The pipeline runs
+  /// the model at bf16 and (post-F1) converts the bias to bf16 before it
+  /// reaches SDPA — this drives WEIGHTS, inputs AND bias through the block
+  /// at .bfloat16 end to end (the fixture's randomized weights are cast to
+  /// bf16 so nothing silently promotes back to fp32), asserting the pass
+  /// completes (no SDPA dtype abort), stays bf16, and the differentiated
+  /// bias still changes the output, mirroring
+  /// testBeatBiasChangesOutputOnlyForDifferentiatedColumns at fp32.
+  func testBF16InputsAndBF16BiasChangeOutputOnBiasedColumns() throws {
+    let block = makeBlock(dim: 64, contextDim: 32, heads: 4)
+    // Cast every parameter to bf16 — production weights load as bf16, and
+    // fp32 fixture weights would promote the whole forward back to fp32.
+    let bf16Params = ModuleParameters.unflattened(
+      block.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) })
+    try block.update(parameters: bf16Params, verify: [.shapeMismatch])
+    MLX.eval(block.parameters())
+
+    MLXRandom.seed(43)
+    let x = MLXRandom.normal([1, 8, 64]).asType(.bfloat16)
+    let ctx = MLXRandom.normal([1, 5, 32]).asType(.bfloat16)
+    let ts = MLXRandom.normal([1, 1, 6 * 64]).asType(.bfloat16)
+
+    let baseline = block(x, context: ctx, timestep: ts)
+    XCTAssertEqual(baseline.dtype, .bfloat16, "bf16 weights + inputs must keep the block on the bf16 path")
+
+    var differentiated = [Float](repeating: 0, count: 8 * 5)
+    for q in 0..<8 { differentiated[q * 5 + 0] = -50; differentiated[q * 5 + 1] = -50 }
+    let bias = MLXArray(differentiated, [1, 1, 8, 5]).asType(.bfloat16)
+
+    let biased = block(x, context: ctx, timestep: ts, beatBias: bias)
+    MLX.eval(baseline, biased)
+    XCTAssertEqual(biased.dtype, .bfloat16, "the bf16 bias must not promote the output")
+
+    XCTAssertGreaterThan(
+      MLX.abs(baseline.asType(.float32) - biased.asType(.float32)).max().item(Float.self), 1e-4,
+      "a differentiating bf16 bias through a bf16 block must change the output")
+  }
+
+  /// Adversarial review F12(c): the AV branch composes an existing
+  /// contextMask WITH the beat bias — combine must sum both when non-nil,
+  /// broadcasting the (B,1,1,S) key-axis mask over the (B,1,Q,S) bias rows.
+  func testCombineSumsContextMaskAndBeatBiasWithBroadcast() {
+    // Key-axis mask like the transformer's float contextMask: (1, 1, 1, 5),
+    // last key column masked out at -1e9.
+    var maskVals = [Float](repeating: 0, count: 5)
+    maskVals[4] = -1e9
+    let contextMask = MLXArray(maskVals, [1, 1, 1, 5])
+
+    // Beat bias differentiated per query row: (1, 1, 8, 5).
+    var biasVals = [Float](repeating: 0, count: 8 * 5)
+    for q in 0..<8 { biasVals[q * 5 + 0] = Float(-(q + 1)) }
+    let beatBias = MLXArray(biasVals, [1, 1, 8, 5])
+
+    guard let combined = LTX2BeatScheduleBuilder.combine(contextMask, beatBias) else {
+      XCTFail("combine of two non-nil masks must be non-nil")
+      return
+    }
+    XCTAssertEqual(combined.shape, [1, 1, 8, 5], "mask must broadcast over the bias's query rows")
+
+    let vals = combined.reshaped([8 * 5]).asArray(Float.self)
+    for q in 0..<8 {
+      XCTAssertEqual(vals[q * 5 + 0], Float(-(q + 1)), accuracy: 1e-3, "bias-only column")
+      XCTAssertEqual(vals[q * 5 + 4], -1e9, accuracy: 1e3, "masked key column survives the sum in every row")
+      XCTAssertEqual(vals[q * 5 + 2], 0, accuracy: 1e-6, "untouched column stays zero")
+    }
   }
 }
