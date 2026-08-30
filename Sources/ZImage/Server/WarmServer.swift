@@ -2936,9 +2936,12 @@ public final class WarmServer {
       Task { await coordinator.setPaused(false) }
     }
     auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
-    // Pause takes effect synchronously (authoritative write) -> 200; resume is
-    // accepted and applied fire-and-forget -> 202 with the intent.
-    return .json(status: paused ? 200 : 202, payload: PauseResult(success: true, paused: paused))
+    // F-1 (adversarial review): BOTH arms return 200. The authoritative
+    // lock-store write completes before this response is built (resume’s wake
+    // is fire-and-forget, but `isPaused` itself is already false), and clients
+    // guard pause/resume on 200 — a 202 here made every UI resume throw while
+    // the engine actually resumed.
+    return .json(status: 200, payload: PauseResult(success: true, paused: paused))
   }
 
   private func syncClearResponse() -> HTTPResponse {
@@ -2990,8 +2993,14 @@ public final class WarmServer {
     }
     liveHealth.recordDelta(.cancel(id))
     Task { await coordinator.drainControlDeltas() }
-    auditLog.append(kind: "queue.cancel", message: "Cancelled pending job \(id)", metadata: ["id": id])
-    return .json(status: 200, payload: DeleteResult(success: true, id: id, deleted: true))
+    auditLog.append(kind: "queue.cancel", message: "Recorded cancel for pending job \(id)", metadata: ["id": id])
+    // F-3 (adversarial review): between the presence read above and the drain,
+    // the loop may dequeue-and-start this job — so the sync path must never
+    // claim `deleted: true`. Record the delta, ACK the recording, and let the
+    // composed GET /v1/queue (where the job is already absent) and job status
+    // tell the truth. The flag-off async arm still reports deleted:true
+    // because it actually removes the job before responding.
+    return .json(status: 202, payload: SyncCancelAccepted.ack(id: id))
   }
 
   // Prompt enhancement --------------------------------------------------------
@@ -5015,15 +5024,23 @@ private final class LiveHealthState: @unchecked Sendable {
     return deltas
   }
 
-  /// Atomically take-and-clear the undrained deltas for the actor to apply, and
-  /// clear the sidecar — once the actor holds them they are about to be applied
-  /// to `pending` and recorded canonically by `persistQueueState()`.
-  func drainDeltas() -> [QueueControlCommand] {
+  /// Snapshot the undrained deltas for the actor to apply — WITHOUT clearing
+  /// (F-2, WAL ordering): the sidecar must outlive the canonical
+  /// `persistQueueState()` write, so a kill mid-drain replays the deltas on the
+  /// next boot instead of resurrecting a cancelled job. The actor calls
+  /// `commitDrainedDeltas` only AFTER canonical state is on disk.
+  func peekDeltas() -> [QueueControlCommand] {
     lock.lock(); defer { lock.unlock() }
-    let taken = deltas
-    deltas.removeAll()
-    if !taken.isEmpty { QueueDeltaStore.clear() }
-    return taken
+    return deltas
+  }
+
+  /// WAL commit point (F-2): canonical queue state is persisted; drop the first
+  /// `count` deltas — the ones the drain applied — and rewrite the sidecar to
+  /// the remainder, so deltas recorded DURING the drain survive to the next one.
+  func commitDrainedDeltas(_ count: Int) {
+    lock.lock(); defer { lock.unlock() }
+    deltas.removeFirst(min(count, deltas.count))
+    QueueDeltaStore.save(deltas)
   }
 
   /// Clear the in-memory deltas without a take (recovery already folded them into
@@ -7279,11 +7296,14 @@ private actor WarmServerCoordinator {
   /// iteration AND from `startProcessingIfNeeded()`, so a delta lands whether the
   /// loop is running or parked (FDD §3.1.4a point 3). A `.cancel` here resumes the
   /// waiting continuation with `.cancelled`, exactly like `cancelPending`; a
-  /// `.move` reorders. Draining is take-and-clear (the lock store clears the
-  /// sidecar); `persistQueueState()` then records the result canonically, so the
-  /// two stores never double-count.
+  /// `.move` reorders. WAL ordering (F-2, adversarial review): PEEK the deltas,
+  /// apply them, persist the canonical queue state, and only THEN commit (drop
+  /// the applied deltas and shrink the sidecar). A kill anywhere in that window
+  /// leaves the sidecar on disk, and replaying an already-applied cancel over
+  /// the persisted state is a no-op — the old take-and-clear-first order let a
+  /// kill between the clear and `persistQueueState()` resurrect a cancelled job.
   private func drainQueueDeltas() {
-    let commands = liveHealth.drainDeltas()
+    let commands = liveHealth.peekDeltas()
     guard !commands.isEmpty else { return }
     for command in commands {
       // Structural guard against the F1 wedge (§3.1.4a): a mailbox delta must
@@ -7304,6 +7324,10 @@ private actor WarmServerCoordinator {
     }
     publishHealth()
     persistQueueState()
+    #if DEBUG
+    QueueDeltaStore.drainCrashWindowHook?()
+    #endif
+    liveHealth.commitDrainedDeltas(commands.count)
   }
 
   /// Best-effort prompt drain nudged by the sync cancel/move/clear routes so a
@@ -10186,6 +10210,14 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// The sync `/v1/queue/interrupt` path.
   @discardableResult
   func controlInterrupt() -> Bool { liveHealth.cancelActiveRender() }
+
+  /// Record a cancel delta WITHOUT the drain nudge — lets tests hold a delta
+  /// in the undrained window deterministically (F-2 crash-window test).
+  func recordCancelDeltaOnly(id: String) { liveHealth.recordDelta(.cancel(id)) }
+
+  /// Deterministically run one drain on the actor (the same
+  /// `drainControlDeltas` the sync routes nudge fire-and-forget).
+  func drainNow() async { await coordinator.drainControlDeltas() }
 
   var undrainedDeltaCount: Int { liveHealth.undrainedDeltas().count }
 

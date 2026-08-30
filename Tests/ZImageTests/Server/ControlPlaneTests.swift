@@ -281,4 +281,77 @@ final class ControlPlaneTests: XCTestCase {
     let loaded = QueueDeltaStore.load()
     XCTAssertEqual(loaded, deltas)
   }
+
+  // MARK: - Adversarial review regressions (F-2, F-3)
+
+  /// F-2: WAL ordering. The queue-deltas.json sidecar must survive until AFTER
+  /// `persistQueueState()` writes canonical state — a kill in the window leaves
+  /// the sidecar intact for replay (and replaying an applied cancel over the
+  /// persisted state is a no-op), so a cancelled job can never resurrect. The
+  /// crash-window hook fires between the canonical persist and the sidecar
+  /// commit; the sidecar must still exist there.
+  func testSidecarSurvivesUntilCanonicalStatePersists() async throws {
+    let probe = makeQueueProbe()
+    defer { QueueDeltaStore.drainCrashWindowHook = nil }
+
+    probe.controlPause()  // between-items gate: enqueued jobs stay pending
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "wal-a") }
+    let jobB = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "wal-b") }
+    try await waitUntil("both jobs parked pending") {
+      probe.snapshotPendingIds.contains("wal-a") && probe.snapshotPendingIds.contains("wal-b")
+    }
+
+    // Record WITHOUT the drain nudge so the delta deterministically sits
+    // undrained — exactly the state a crash-before-drain leaves behind.
+    probe.recordCancelDeltaOnly(id: "wal-a")
+    XCTAssertTrue(FileManager.default.fileExists(atPath: QueueDeltaStore.path.path),
+                  "recording a delta writes the sidecar")
+
+    let sidecarAliveInWindow = LockedFlag()
+    QueueDeltaStore.drainCrashWindowHook = {
+      if FileManager.default.fileExists(atPath: QueueDeltaStore.path.path) {
+        sidecarAliveInWindow.trySet()
+      }
+    }
+    await probe.drainNow()
+
+    XCTAssertTrue(sidecarAliveInWindow.get(),
+      "sidecar intact AFTER persistQueueState, BEFORE the commit — a kill there replays instead of resurrecting")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: QueueDeltaStore.path.path),
+                   "clean commit clears the sidecar")
+    XCTAssertEqual(probe.undrainedDeltaCount, 0, "drained deltas dropped exactly once")
+    XCTAssertFalse(probe.composedPendingIds.contains("wal-a"), "cancelled job stays cancelled")
+
+    // The cancelled job resolves as a cancellation; the survivor completes.
+    do { _ = try await jobA.value; XCTFail("wal-a should be cancelled") } catch {}
+    probe.controlResume()
+    let bFinished = try await jobB.value
+    XCTAssertTrue(bFinished, "wal-b unaffected by the drained cancel")
+  }
+
+  /// F-3: the sync DELETE ACK is record-then-accept — 202, and it NEVER claims
+  /// `deleted: true` (the loop may dequeue the job between the presence read
+  /// and the drain). A cancel delta recorded for an already-STARTED job is a
+  /// no-op: the render finishes and nothing pretended it was deleted.
+  func testSyncCancelNeverClaimsDeletionAndSparesAStartedJob() async throws {
+    // Response contract: accepted, honest note, no deletion claim.
+    let ack = SyncCancelAccepted.ack(id: "j1")
+    XCTAssertTrue(ack.accepted)
+    XCTAssertEqual(ack.id, "j1")
+    let json = String(decoding: try JSONEncoder().encode(ack), as: UTF8.self)
+    XCTAssertFalse(json.contains("deleted"), "sync path must never claim deleted")
+    XCTAssertTrue(json.contains("may start"), "ACK says the cancel may have raced a dequeue")
+
+    // TOCTOU half: job starts before the delta drains -> it must run to completion.
+    let probe = makeQueueProbe()
+    let started = Task { try await probe.enqueueSynthetic(durationMs: 250, id: "raced") }
+    try await waitUntil("synthetic op started") { probe.activeJobSummary != nil }
+
+    probe.controlCancel(id: "raced")   // records the delta + fire-and-forget nudge
+    await probe.drainNow()             // delta applies against pending — job is ACTIVE, not pending
+
+    let finished = try await started.value
+    XCTAssertTrue(finished, "started job completed — a cancel delta for an active id no-ops")
+    try await waitUntil("delta consumed") { probe.undrainedDeltaCount == 0 }
+  }
 }

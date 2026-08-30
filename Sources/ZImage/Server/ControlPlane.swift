@@ -124,6 +124,13 @@ extension QueueControlCommand {
 /// into the recovered queue on the next boot, which is what makes
 /// "cancel → bounce → stays cancelled" hold.
 enum QueueDeltaStore {
+  #if DEBUG
+  /// F-2 test seam: the drain fires this between the canonical
+  /// `persistQueueState()` write and the sidecar commit — the crash window the
+  /// WAL ordering protects. Tests assert queue-deltas.json still exists here.
+  nonisolated(unsafe) static var drainCrashWindowHook: (@Sendable () -> Void)?
+  #endif
+
   static var path: URL {
     QueueStateStore.stateDirectory.appendingPathComponent("queue-deltas.json")
   }
@@ -222,5 +229,24 @@ enum QueueDeltaApplier {
       }
     }
     return list
+  }
+}
+
+// MARK: - F-3: sync-cancel ACK (adversarial review)
+
+/// The sync `DELETE /v1/queue/{id}` ACK — 202, record-then-accept. It never
+/// carries `deleted: true`: the sync path records a delta and cannot know
+/// whether the loop dequeued the job in the race window, so it must not claim
+/// a deletion it cannot guarantee. (The flag-off async arm still returns
+/// `deleted: true` — it removes the job on the actor before responding.)
+struct SyncCancelAccepted: Codable, Sendable {
+  let accepted: Bool
+  let id: String
+  let note: String
+
+  static func ack(id: String) -> SyncCancelAccepted {
+    SyncCancelAccepted(
+      accepted: true, id: id,
+      note: "cancel recorded; job may start if dequeue raced — poll status")
   }
 }
