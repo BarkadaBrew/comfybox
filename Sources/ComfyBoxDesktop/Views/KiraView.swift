@@ -772,7 +772,12 @@ struct KiraView: View {
                         .disabled(client.actionInFlight)
                         .help("Push the staged stack below as the per-run override (empty stack clears it)")
                 }
-                LoRAPicker(engine: engine, selectedLoras: $overrideLoras, familyOverride: "ltx")
+                // strictFamilyFilter OFF: the scanner tags several real LTX
+                // LoRAs "unknown" (tensor-key detector misses comfy-export and
+                // control layouts, and rescans clobber manual tags) — hiding
+                // them made the library look incomplete (Todd 2026-08-30
+                // "not all the ltx loras are exposed").
+                LoRAPicker(engine: engine, selectedLoras: $overrideLoras, familyOverride: "ltx", strictFamilyFilter: false)
                     .frame(maxHeight: 200)
                 HStack(spacing: 10) {
                     Text("FPS:").font(.caption).foregroundStyle(.secondary)
