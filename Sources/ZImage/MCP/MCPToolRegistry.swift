@@ -63,6 +63,9 @@ public enum MCPToolRegistry {
     setWarmPreset,
     createCharacter,
     deleteCharacter,
+    getConfig,
+    patchConfig,
+    updateConfig,
   ]
 
   // MARK: - Tool Definitions
@@ -1093,6 +1096,52 @@ public enum MCPToolRegistry {
       "required": ["id"] as [String],
     ] as [String: Any],
     routes: [RouteRef(method: "DELETE", path: "/v1/characters/{id}")]
+  )
+
+  // MARK: - Headless parity Phase 3 (comfybox#300, FDD §3.3/§4.4) — server-side
+  // settings. `patch_config` is the primary write path going forward (RFC 7386
+  // JSON Merge Patch, merged server-side against the current document);
+  // `update_config` is the full-replace tool held back from Phase 1 (FDD §0 row
+  // 10 — it would have proxied the clobbering whole-document PUT that this
+  // phase replaces) and now lands alongside PATCH.
+
+  static let getConfig = MCPToolDefinition(
+    name: "get_config",
+    description: "Read the full server configuration document (~/.comfybox/config.json): providers, replicate, krea2Models, renderDefaults (engine width/height/steps/guidance overrides, family-aware), videoDefaults (Motion tab width/height/frames), and content-mode preset mappings. Use this before update_config (a full replace) to see the current shape; patch_config does not need it.",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/config")]
+  )
+
+  static let patchConfig = MCPToolDefinition(
+    name: "patch_config",
+    description: "Apply an RFC 7386 JSON Merge Patch to the server configuration — the primary way to change one or a few settings (e.g. {\"renderDefaults\": {\"byFamily\": {\"fibo\": {\"steps\": 40}}}}). Fields you omit are left unchanged (unlike update_config); an explicit `null` on a field deletes it, reverting to the built-in default. Two agents patching different fields cannot conflict with each other.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "patch": [
+          "type": "object",
+          "description": "RFC 7386 JSON Merge Patch document — a partial config shape. Nested objects merge; a null value deletes that key.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["patch"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "PATCH", path: "/v1/config")]
+  )
+
+  static let updateConfig = MCPToolDefinition(
+    name: "update_config",
+    description: "Replace the ENTIRE server configuration document. This is a full-document write, not a patch — fields you omit are ABSENT from the saved document, not preserved from the current one. Call get_config first, edit the returned object, and pass it back whole. Prefer patch_config for changing one or a few fields.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "config": [
+          "type": "object",
+          "description": "The full config document, as returned by get_config (with your edits applied).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["config"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "PUT", path: "/v1/config")]
   )
 
   // MARK: - Lookup

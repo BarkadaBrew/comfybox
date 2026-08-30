@@ -784,23 +784,21 @@ public final class WarmServer {
 
     case ("GET", "/v1/config"):
       // 0.B-2: shared with the sync control-plane path so both emit identical bytes.
-      if let data = Self.configPayloadData() {
-        return .json(.rawJSON(status: 200, data: data))
-      }
-      return .error(.error(status: 500, message: "Failed to serialize config"))
+      return Self.configGetResponse()
 
     case ("PUT", "/v1/config"):
-      do {
-        let updated = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: request.body)
-        try updated.save()
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(updated)
-        // Port/host changes take effect on next server start; the running listener is unchanged.
-        return .json(.rawJSON(status: 200, data: data))
-      } catch {
-        return .error(.error(status: 400, message: "Invalid config: \(error.localizedDescription)"))
-      }
+      // Full-document replace, routed through ServerConfigStore (FDD §3.3, D3).
+      // Port/host changes take effect on next server start; the running listener
+      // is unchanged. `If-Match` is advisory: honoured when present-and-stale
+      // (409), otherwise proceeds with a deprecation `Warning` — no current
+      // caller sends it, so requiring it would break every one of them on day one.
+      return Self.configPutResponse(request: request)
+
+    case ("PATCH", "/v1/config"):
+      // RFC 7386 JSON Merge Patch — the primary write path going forward
+      // (FDD §3.3). Merged INSIDE ServerConfigStore's lock against the CURRENT
+      // document, so two agents patching different pointers cannot conflict.
+      return Self.configPatchResponse(request: request)
 
     case ("GET", "/v1/providers/status"):
       let config = ComfyBoxServerConfig.loadOrMigrate()
@@ -1271,10 +1269,12 @@ public final class WarmServer {
         let resolvedTyped = LTX2ConfigResolver.resolveTyped(
           request: q.tuning, preset: videoPreset?.videoTuning)
 
-        // Derived plan, mirroring prepareLocalVideo's math step by step.
+        // Derived plan, mirroring prepareLocalVideo's math step by step —
+        // including the config.videoDefaults layer (FDD §3.3, D3).
+        let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
         var plan: [[String: String]] = []
-        var w = q.width ?? videoPreset?.width ?? 704
-        var h = q.height ?? videoPreset?.height ?? 448
+        var w = q.width ?? videoPreset?.width ?? videoConfigDefaults.width ?? 704
+        var h = q.height ?? videoPreset?.height ?? videoConfigDefaults.height ?? 448
         let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
         if snappedW != w || snappedH != h {
           plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
@@ -1291,7 +1291,7 @@ public final class WarmServer {
           }
         }
         let fps = q.fps ?? 24
-        var framesPerChunk = q.frames ?? 97
+        var framesPerChunk = q.frames ?? videoConfigDefaults.frames ?? 97
         var extendSeconds = Self.extendSecondsFromDuration(q.duration, framesPerChunk: framesPerChunk, fps: fps)
         if extendSeconds > 0 {
           let targetFrames = Int((extendSeconds * Float(fps)).rounded())
@@ -1668,6 +1668,19 @@ public final class WarmServer {
     case ("GET", "/v1/content-modes"):
       return contentModesResponse()
 
+    // FDD §3.3, D3 (Class E): writable content modes. PUT sets any of
+    // guidanceBoost/promptHint/negativePromptAdditions/styleVariant (fields
+    // omitted from the body keep their current value); DELETE reverts a mode
+    // to its built-in definition rather than removing it (there is always
+    // exactly one definition per ``ContentMode`` case).
+    case ("PUT", _) where request.path.hasPrefix("/v1/content-modes/"):
+      return putContentModeResponse(
+        rawMode: String(request.path.dropFirst("/v1/content-modes/".count)), body: request.body)
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/content-modes/"):
+      return deleteContentModeResponse(
+        rawMode: String(request.path.dropFirst("/v1/content-modes/".count)))
+
     // MARK: - Creative Layer: Stats / memory
 
     case ("GET", "/v1/stats"):
@@ -1697,11 +1710,12 @@ public final class WarmServer {
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
           "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/video/generate/async", "/v1/upscale",
           "/v1/characters", "/v1/presets", "/v1/presets/resolve",
-          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log"
+          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log", "/v1/config"
       ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
          || request.path.hasPrefix("/v1/video/status/")
          || request.path.hasPrefix("/v1/characters/")
-         || request.path.hasPrefix("/v1/presets/") {
+         || request.path.hasPrefix("/v1/presets/")
+         || request.path.hasPrefix("/v1/content-modes/") {
         return .error(.error(status: 405, message: "Method not allowed"))
       }
       return .error(.error(status: 404, message: "Not found"))
@@ -2216,10 +2230,13 @@ public final class WarmServer {
     // conditioning frame and the render drifts off the image. The requested
     // width x height is kept only as a pixel-area budget for I2V.
     // Priority: explicit width/height > named resolution ("720p" etc., FIXED:
-    // previously silently dropped) > preset dims > 704x448 default.
+    // previously silently dropped) > preset dims > config.videoDefaults >
+    // 704x448 engine default (FDD §3.3, D3 — only width/height/frames migrate
+    // from the desktop's local settings; steps stays untouched below).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
-    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? 704
-    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? 448
+    let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
+    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? videoConfigDefaults.width ?? 704
+    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? videoConfigDefaults.height ?? 448
     if req.width == nil, let nd = namedDims {
       logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
     }
@@ -2347,7 +2364,9 @@ public final class WarmServer {
     // moment two-stage went live: chunk 1 clean, chunk 2 psychedelic). The
     // daemon's rule only covers i2v, so fold ANY duration that fits the
     // trained window (289f = 12s) into ONE chunk here, t2v included.
-    var foldedFramesPerChunk = req.frames ?? 97
+    // FDD §3.3, D3: `videoDefaults.frames` (migrated from the desktop's
+    // `videoFrames`) slots between the request and the 97f engine default.
+    var foldedFramesPerChunk = req.frames ?? videoConfigDefaults.frames ?? 97
     var foldedExtendSeconds = req.extendToSeconds
       ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
     if foldedExtendSeconds > 0 {
@@ -2881,11 +2900,80 @@ public final class WarmServer {
     return try? JSONSerialization.data(withJSONObject: ["models": models, "count": models.count])
   }
 
-  static func configPayloadData() -> Data? {
-    let config = ComfyBoxServerConfig.loadOrMigrate()
+  /// GET /v1/config payload, shared by the async arm and the sync control plane
+  /// so both emit identical bytes. FDD §3.3, D3: reads the lock-serialized
+  /// ``ServerConfigStore`` (an in-memory snapshot) rather than the disk —
+  /// Phase-0-compatible (no I/O, no actor hop on the request path).
+  static func configPayloadData() -> (data: Data, etag: String)? {
+    let snapshot = ServerConfigStore.shared.current()
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    return try? encoder.encode(config)
+    guard let data = try? encoder.encode(snapshot.config) else { return nil }
+    return (data, snapshot.etag)
+  }
+
+  /// GET /v1/config route handler (async path).
+  static func configGetResponse() -> RoutedResponse {
+    guard let (data, etag) = Self.configPayloadData() else {
+      return .error(.error(status: 500, message: "Failed to serialize config"))
+    }
+    var response = HTTPResponse.rawJSON(status: 200, data: data)
+    response.extraHeaders["ETag"] = etag
+    return .json(response)
+  }
+
+  /// PUT /v1/config route handler (async path): full-document replace through
+  /// ``ServerConfigStore``. `If-Match` is advisory — present-and-stale is `409`;
+  /// absent proceeds with a deprecation `Warning` (FDD §3.3).
+  static func configPutResponse(request: HTTPRequest) -> RoutedResponse {
+    do {
+      let updated = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: request.body)
+      let ifMatch = request.headers["if-match"]
+      let snapshot = try ServerConfigStore.shared.replace(with: updated, ifMatch: ifMatch)
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try encoder.encode(snapshot.config)
+      var response = HTTPResponse.rawJSON(status: 200, data: data)
+      response.extraHeaders["ETag"] = snapshot.etag
+      if ifMatch == nil {
+        response.extraHeaders["Warning"] =
+          "299 - \"PUT /v1/config without If-Match is deprecated; migrate to PATCH /v1/config\""
+      }
+      return .json(response)
+    } catch let error as ServerConfigStoreError {
+      if case .etagMismatch = error {
+        return .error(.error(status: 409, message: error.description))
+      }
+      return .error(.error(status: 400, message: error.description))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid config: \(error.localizedDescription)"))
+    }
+  }
+
+  /// PATCH /v1/config route handler (async path): RFC 7386 JSON Merge Patch,
+  /// merged inside ``ServerConfigStore``'s lock against the current document —
+  /// the primary write path going forward (FDD §3.3).
+  static func configPatchResponse(request: HTTPRequest) -> RoutedResponse {
+    do {
+      guard let patchObject = try JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
+        return .error(.error(status: 400, message: "Invalid merge-patch body: expected a JSON object"))
+      }
+      let ifMatch = request.headers["if-match"]
+      let snapshot = try ServerConfigStore.shared.applyMergePatch(patchObject, ifMatch: ifMatch)
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try encoder.encode(snapshot.config)
+      var response = HTTPResponse.rawJSON(status: 200, data: data)
+      response.extraHeaders["ETag"] = snapshot.etag
+      return .json(response)
+    } catch let error as ServerConfigStoreError {
+      if case .etagMismatch = error {
+        return .error(.error(status: 409, message: error.description))
+      }
+      return .error(.error(status: 400, message: error.description))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid merge-patch: \(error.localizedDescription)"))
+    }
   }
 
   private func syncQueueResponse() -> HTTPResponse {
@@ -2903,10 +2991,12 @@ public final class WarmServer {
   }
 
   private func syncConfigResponse() -> HTTPResponse {
-    guard let data = Self.configPayloadData() else {
+    guard let (data, etag) = Self.configPayloadData() else {
       return .error(status: 500, message: "Failed to serialize config")
     }
-    return .rawJSON(status: 200, data: data)
+    var response = HTTPResponse.rawJSON(status: 200, data: data)
+    response.extraHeaders["ETag"] = etag
+    return response
   }
 
   /// Stats without an actor hop: the render counters come from the lock snapshot
@@ -3253,7 +3343,71 @@ public final class WarmServer {
   // Content modes ------------------------------------------------------------
 
   private func contentModesResponse() -> RoutedResponse {
-    .json(status: 200, payload: contentModeStore.listModes())
+    // Re-read fresh rather than the `let contentModeStore` snapshot captured at
+    // server start: PUT/DELETE below mutate the on-disk store directly (FDD
+    // §3.3), so a stale in-memory copy here would hide a write made moments
+    // earlier in the same process. `ContentModeStore.loadOrCreate` is cheap
+    // (small JSON, same cost the config route already pays per request).
+    .json(status: 200, payload: ContentModeStore.loadOrCreate().listModes())
+  }
+
+  /// PUT /v1/content-modes/{mode} — FDD §3.3, D3 (Class E). Sets any of
+  /// guidanceBoost/promptHint/negativePromptAdditions/styleVariant; fields the
+  /// body omits keep their current value (tolerant partial update, matching
+  /// `ContentModeDefinition`'s own tolerant decode). `400` on an unknown mode,
+  /// unknown `styleVariant`, or an out-of-range `guidanceBoost`.
+  private func putContentModeResponse(rawMode: String, body: Data) -> RoutedResponse {
+    guard let mode = ContentMode(rawValue: rawMode) else {
+      return .error(.error(status: 404, message: "Unknown content mode '\(rawMode)' (expected one of: neutral, banana, avocado)"))
+    }
+    struct ContentModePatchBody: Decodable {
+      let guidanceBoost: Double?
+      let promptHint: String?
+      let negativePromptAdditions: [String]?
+      let styleVariant: String?
+    }
+    let patch: ContentModePatchBody
+    do {
+      patch = try JSONDecoder().decode(ContentModePatchBody.self, from: body)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid content-mode body: \(error.localizedDescription)"))
+    }
+    var styleVariant: ContentStyleVariant?
+    if let rawVariant = patch.styleVariant {
+      guard let parsed = ContentStyleVariant(rawValue: rawVariant) else {
+        return .error(.error(status: 400, message: "Unknown styleVariant '\(rawVariant)' (expected one of: neutral, sensual, nsfw)"))
+      }
+      styleVariant = parsed
+    }
+    if let boost = patch.guidanceBoost, !ContentModeStore.guidanceBoostRange.contains(boost) {
+      return .error(.error(
+        status: 400,
+        message: "guidanceBoost must be between \(ContentModeStore.guidanceBoostRange.lowerBound) and \(ContentModeStore.guidanceBoostRange.upperBound) (got \(boost))"))
+    }
+    do {
+      let updated = try ContentModeStore.update(
+        mode: mode,
+        guidanceBoost: patch.guidanceBoost,
+        promptHint: patch.promptHint,
+        negativePromptAdditions: patch.negativePromptAdditions,
+        styleVariant: styleVariant)
+      auditLog.append(kind: "content_mode.change", message: "Updated content mode '\(mode.rawValue)'")
+      return .json(status: 200, payload: updated)
+    } catch {
+      return .error(.error(status: 400, message: "Failed to save content mode: \(error.localizedDescription)"))
+    }
+  }
+
+  /// DELETE /v1/content-modes/{mode} — reverts a mode to its built-in
+  /// definition rather than removing it (there is always exactly one
+  /// definition per ``ContentMode`` case).
+  private func deleteContentModeResponse(rawMode: String) -> RoutedResponse {
+    guard let mode = ContentMode(rawValue: rawMode) else {
+      return .error(.error(status: 404, message: "Unknown content mode '\(rawMode)' (expected one of: neutral, banana, avocado)"))
+    }
+    let reverted = ContentModeStore.reset(mode: mode)
+    auditLog.append(kind: "content_mode.change", message: "Reverted content mode '\(mode.rawValue)' to its built-in definition")
+    return .json(status: 200, payload: reverted)
   }
 
   // Stats / memory -----------------------------------------------------------
@@ -7866,13 +8020,19 @@ private actor WarmServerCoordinator {
         resolvedDenoise = 1.0
       }
 
+      // FDD §3.3, D3: config-layer render defaults for flux2. Only width/height
+      // are seeded on first-run migration — `defaultSteps`/`defaultGuidance`
+      // above are already checkpoint-dependent (base vs. distilled), so an
+      // explicit config override is honoured when present but nothing is
+      // frozen into config.json for them (see ServerConfigStore.engineSeed).
+      let flux2ConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "flux2")
       let flux2Request = Flux2GenerationRequest(
         prompt: payload.prompt,
         negativePrompt: payload.negativePrompt,
-        width: payload.width ?? 1024,
-        height: payload.height ?? 1024,
-        steps: payload.steps ?? defaultSteps,
-        guidanceScale: payload.guidance ?? defaultGuidance,
+        width: payload.width ?? flux2ConfigDefaults.width ?? 1024,
+        height: payload.height ?? flux2ConfigDefaults.height ?? 1024,
+        steps: payload.steps ?? flux2ConfigDefaults.steps ?? defaultSteps,
+        guidanceScale: payload.guidance ?? flux2ConfigDefaults.guidance.map(Float.init) ?? defaultGuidance,
         seed: payload.seed,
         outputPath: outputURL,
         levelsMin: payload.levelsMin ?? 0.0,
@@ -7969,11 +8129,19 @@ private actor WarmServerCoordinator {
 
       let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
       // Variant defaults (WP-E5, AC-5b): turbo 9 / 1.0, raw 30 / 1.0 — never 3.5.
+      // FDD §3.3, D3: the config layer slots BETWEEN the request and the
+      // variant's own default — `resolvedSteps`/`resolvedGuidance` already do
+      // `requested ?? variant.defaultX`, so passing a config default in place
+      // of `nil` preserves that exact fallback chain one layer further out.
+      // Only width/height are seeded on first-run migration (steps/guidance
+      // are physical-variant-dependent, not a fixed engine constant — see
+      // ServerConfigStore.engineSeed); an explicit override still applies.
+      let krea2ConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "krea2")
       let variant = k2.variant
-      let steps = variant.resolvedSteps(payload.steps)
-      let guidance = variant.resolvedGuidance(payload.guidance)
-      let width = payload.width ?? 1024
-      let height = payload.height ?? 1024
+      let steps = variant.resolvedSteps(payload.steps ?? krea2ConfigDefaults.steps)
+      let guidance = variant.resolvedGuidance(payload.guidance ?? krea2ConfigDefaults.guidance.map(Float.init))
+      let width = payload.width ?? krea2ConfigDefaults.width ?? 1024
+      let height = payload.height ?? krea2ConfigDefaults.height ?? 1024
       // Krea-2 builds its requests straight from the payload rather than going
       // through makePipelineRequest, so resolve DyPE explicitly here.
       let krea2DyPE = payload.resolvedDyPEConfig(width: width, height: height)
@@ -8190,13 +8358,16 @@ private actor WarmServerCoordinator {
           contentMode: payload.contentMode, source: payload.source)
       )
 
+      // FDD §3.3, D3: config-layer render defaults for fibo (the "steps ?? 30"
+      // family-specific fallback the FDD's §2.5 finding cites).
+      let fiboConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "fibo")
       let fiboRequest = FiboGenerationRequest(
         prompt: payload.prompt,
         negativePrompt: payload.negativePrompt,
-        width: payload.width ?? 1024,
-        height: payload.height ?? 1024,
-        steps: payload.steps ?? 30,
-        guidanceScale: payload.guidance ?? 4.0,
+        width: payload.width ?? fiboConfigDefaults.width ?? 1024,
+        height: payload.height ?? fiboConfigDefaults.height ?? 1024,
+        steps: payload.steps ?? fiboConfigDefaults.steps ?? 30,
+        guidanceScale: payload.guidance ?? fiboConfigDefaults.guidance.map(Float.init) ?? 4.0,
         seed: payload.seed,
         outputPath: outputURL,
         levelsMin: payload.levelsMin ?? 0.0,
@@ -8308,10 +8479,12 @@ private actor WarmServerCoordinator {
     outputURL: URL,
     loras: [LoRAConfiguration]
   ) async throws {
-    let width = payload.width ?? 1024
-    let height = payload.height ?? 1024
-    let steps = payload.steps ?? 28
-    let guidance = payload.guidance ?? 0.0
+    // FDD §3.3, D3: config-layer render defaults for chroma.
+    let chromaConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "chroma")
+    let width = payload.width ?? chromaConfigDefaults.width ?? 1024
+    let height = payload.height ?? chromaConfigDefaults.height ?? 1024
+    let steps = payload.steps ?? chromaConfigDefaults.steps ?? 28
+    let guidance = payload.guidance ?? chromaConfigDefaults.guidance.map(Float.init) ?? 0.0
     let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
 
     // Tokenize prompt (unpadded — matches Python behavior)
@@ -8751,6 +8924,11 @@ struct HTTPResponse {
   let reasonPhrase: String
   let contentType: String
   let body: Data
+  /// Additional response headers (e.g. `ETag`, `Warning`) beyond the fixed
+  /// Content-Type/Content-Length/Connection trio `serialize()` always writes.
+  /// Empty for every pre-existing call site — additive, no behavior change
+  /// (FDD §3.3: advisory `ETag`/`If-Match` on `/v1/config`).
+  var extraHeaders: [String: String] = [:]
 
   static func json<T: Encodable>(status: Int, payload: T) -> HTTPResponse {
     let encoder = JSONEncoder()
@@ -8782,15 +8960,20 @@ struct HTTPResponse {
     // No CORS headers: all known clients (desktop app, Krita plugin, Telegram
     // bot, MCP) are native, so browser cross-origin access is intentionally
     // not enabled.
-    let header = [
+    var lines = [
       "HTTP/1.1 \(status) \(reasonPhrase)",
       "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
       "Connection: close",
-      "",
-      ""
-    ].joined(separator: "\r\n")
-    data.append(Data(header.utf8))
+    ]
+    // Deterministic order (sorted) so header emission is stable across runs —
+    // matters for tests asserting on exact serialized bytes.
+    for (name, value) in extraHeaders.sorted(by: { $0.key < $1.key }) {
+      lines.append("\(name): \(value)")
+    }
+    lines.append("")
+    lines.append("")
+    data.append(Data(lines.joined(separator: "\r\n").utf8))
     data.append(body)
     return data
   }
@@ -9247,9 +9430,16 @@ extension GeneratePayload: Decodable {
     let schedulerKind = names.scheduler ?? .euler
     let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
+    // FDD §3.3, D3: config-layer render defaults for the base Z-Image family
+    // ("flux1" internally — WarmModelFamily's default case), resolved fresh
+    // (lock, no disk I/O) and slotted BELOW request/preset, ABOVE the engine's
+    // own hardcoded fallback. An unmigrated/empty config resolves every field
+    // to nil, so `?? ZImageModelMetadata.recommendedX` below is unchanged.
+    let configDefaults = ServerConfigStore.shared.renderDefaults(family: "flux1")
+
     // Build DyPE config — auto-enable for high-res requests
-    let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
-    let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
+    let resolvedWidth = width ?? configDefaults.width ?? ZImageModelMetadata.recommendedWidth
+    let resolvedHeight = height ?? configDefaults.height ?? ZImageModelMetadata.recommendedHeight
     let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     return ZImageGenerationRequest(
@@ -9257,8 +9447,8 @@ extension GeneratePayload: Decodable {
       negativePrompt: negativePrompt,
       width: resolvedWidth,
       height: resolvedHeight,
-      steps: steps ?? ZImageModelMetadata.recommendedInferenceSteps,
-      guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
+      steps: steps ?? configDefaults.steps ?? ZImageModelMetadata.recommendedInferenceSteps,
+      guidanceScale: guidance ?? configDefaults.guidance.map(Float.init) ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
       levelsMin: levelsMin ?? 0.0,
@@ -9318,8 +9508,16 @@ extension GeneratePayload: Decodable {
     let schedulerKind = names.scheduler ?? .euler
     let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
-    let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
-    let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
+    // FDD §3.3, D3: same config-layer defaults as makePipelineRequest. Note
+    // width/height are passed through UNRESOLVED below (`width`/`height`, not
+    // `resolvedWidth`/`resolvedHeight`) — img2img's pipeline derives the actual
+    // output size from the source image when the request omits them, so
+    // injecting a config default there would silently override that behavior.
+    // Only the DyPE heuristic (which only ever affects an internal auto-enable
+    // decision, never the output size) and steps/guidance are config-aware here.
+    let configDefaults = ServerConfigStore.shared.renderDefaults(family: "flux1")
+    let resolvedWidth = width ?? configDefaults.width ?? ZImageModelMetadata.recommendedWidth
+    let resolvedHeight = height ?? configDefaults.height ?? ZImageModelMetadata.recommendedHeight
     let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     let outputURL = try resolvedOutputURL(
@@ -9334,8 +9532,8 @@ extension GeneratePayload: Decodable {
       negativePrompt: negativePrompt,
       width: width,
       height: height,
-      steps: steps ?? ZImageModelMetadata.recommendedInferenceSteps,
-      guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
+      steps: steps ?? configDefaults.steps ?? ZImageModelMetadata.recommendedInferenceSteps,
+      guidanceScale: guidance ?? configDefaults.guidance.map(Float.init) ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
       levelsMin: levelsMin ?? 0.0,

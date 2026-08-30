@@ -1749,6 +1749,11 @@ struct ZImageCLI {
       civitaiApiKey: civitaiKey
     )
 
+    // FDD-ui-api-parity §3.3: the ONE place the renderDefaults/videoDefaults
+    // first-run migration is allowed to run — a real server boot, never a
+    // unit test (see ServerConfigStore.runFirstRunDefaultsMigrationIfNeeded).
+    ServerConfigStore.shared.runFirstRunDefaultsMigrationIfNeeded()
+
     let server = WarmServer(configuration: configuration, host: host, logger: logger)
     try server.run()
   }

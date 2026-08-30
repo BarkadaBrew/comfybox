@@ -385,7 +385,12 @@ struct MotionView: View {
     }
 
     /// Prefill from Settings → Motion (once), matching a stored resolution to a
-    /// preset when possible.
+    /// preset when possible. Local `desktop-config.json` values apply
+    /// immediately (instant, works offline); the server's `videoDefaults` —
+    /// migrated from these same local values on first run, but the
+    /// authoritative, agent-editable copy from then on (FDD-ui-api-parity
+    /// §3.3) — overlay a moment later if reachable. An unreachable server
+    /// simply leaves the local (last-known/cached) values in place.
     private func applyDefaults() {
         guard !didApplyDefaults else { return }
         didApplyDefaults = true
@@ -398,6 +403,27 @@ struct MotionView: View {
         if let w = s.videoWidth, let h = s.videoHeight,
            let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
             resolution = match
+        }
+        Task { await applyServerVideoDefaults() }
+    }
+
+    /// Best-effort overlay of the server's `videoDefaults` (FDD-ui-api-parity
+    /// §3.3) onto the Motion tab's initial state. Silently does nothing if the
+    /// server is unreachable or the block is unset (fresh/pre-migration
+    /// config) — the local values `applyDefaults()` already set stand as the
+    /// read-only cached fallback in that case.
+    private func applyServerVideoDefaults() async {
+        guard let config = try? await engine.fetchServerConfig() else { return }
+        let video = config.videoDefaults.resolved(family: "ltx2")
+        await MainActor.run {
+            if let f = video.frames, Self.frameOptions.contains(f) {
+                frames = f
+                seconds = Self.secondsForFrames(f)
+            }
+            if let w = video.width, let h = video.height,
+               let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
+                resolution = match
+            }
         }
     }
 

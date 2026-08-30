@@ -69,6 +69,22 @@ public final class WarmServerClient: @unchecked Sendable {
     return (response.statusCode, data)
   }
 
+  /// Perform a PATCH request (RFC 7386 JSON Merge Patch body). Returns
+  /// (HTTP status code, response body).
+  public func patch(_ path: String, body: Data) async throws -> (Int, Data) {
+    guard let url = URL(string: baseURL + path) else {
+      throw WarmServerClientError.invalidURL(path)
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "PATCH"
+    request.setValue("application/merge-patch+json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.httpBody = body
+
+    let (data, response) = try await perform(request)
+    return (response.statusCode, data)
+  }
+
   /// Perform a DELETE request. Returns (HTTP status code, response body).
   public func delete(_ path: String) async throws -> (Int, Data) {
     guard let url = URL(string: baseURL + path) else {

@@ -28,9 +28,11 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   }
 
   /// Pinned so a silent registry change is caught immediately (same
-  /// convention as MCPVideoToolTests.testTotalToolCount).
+  /// convention as MCPVideoToolTests.testTotalToolCount). Bumped 52 -> 55 by
+  /// Phase 3 (comfybox#300, FDD §3.3/§4.4, 2026-08-30): get_config,
+  /// patch_config, update_config.
   func testTotalToolCountIncludesGapSet() {
-    XCTAssertEqual(MCPToolRegistry.tools.count, 52, "Expected 52 registered MCP tools after the Phase 1 gap set")
+    XCTAssertEqual(MCPToolRegistry.tools.count, 55, "Expected 55 registered MCP tools after Phase 1 + Phase 3")
   }
 
   /// Every tool added in this session declares its route(s) (FDD §3.5 D5:
