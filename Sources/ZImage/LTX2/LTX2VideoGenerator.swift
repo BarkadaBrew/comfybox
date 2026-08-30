@@ -79,6 +79,15 @@ public struct LTX2VideoRequest: Sendable {
     /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
     /// loads the audio branch (+~11GiB) into the transformer on first use.
     public var audio: Bool
+    /// Temporal beat scheduling (comfybox#310): structured multi-beat
+    /// content, carried as its own top-level field rather than a `tuning`
+    /// key — tuning entries are scalar render knobs, this is structured
+    /// content the engine locates inside the composed prompt. Each beat's
+    /// `text` must be a verbatim substring of `prompt` (server-side
+    /// contract, Phase 2); beats that can't be located are dropped
+    /// fail-open at render time, never fail the render. nil/empty is
+    /// byte-identical to today's flat (joined) behavior.
+    public var beatSchedule: [BeatSegment]?
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -114,9 +123,11 @@ public struct LTX2VideoRequest: Sendable {
         outputPath: String,
         tuning: LTX2VideoTuning? = nil,
         presetTuning: LTX2VideoTuning? = nil,
-        audio: Bool = false
+        audio: Bool = false,
+        beatSchedule: [BeatSegment]? = nil
     ) {
         self.audio = audio
+        self.beatSchedule = beatSchedule
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.initImagePath = initImagePath
@@ -918,6 +929,30 @@ public final class LTX2VideoGenerator {
         let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: tokenizer.maxLength) }
         if let negBatch { MLX.eval(negBatch.inputIds, negBatch.attentionMask) }
 
+        // Temporal beat scheduling (comfybox#310): locate each beat's text as
+        // a token span in the SAME composed prompt just tokenized above, once
+        // per render. Fail-open per beat (never per render) — a beat whose
+        // span can't be located just contributes zero bias, logged once.
+        // Absent field or the LTX2_BEAT_SCHEDULE=0 kill switch both resolve
+        // to an empty list, which builds nil bias downstream (byte-identical
+        // to before this feature existed).
+        let resolvedBeats: [LTX2ResolvedBeat] = {
+            guard typedConfig.beatScheduleEnabled,
+                  let beats = request.beatSchedule, !beats.isEmpty else { return [] }
+            let fullIds = tokenizer.untruncatedTokenIds(prompt: guardedPrompt.effectivePrompt)
+            return LTX2BeatScheduleLocator.locate(
+                beats: beats,
+                fullPromptTokenIds: fullIds,
+                maxLength: tokenizer.maxLength,
+                onDrop: { beat, reason in
+                    self.logger.warning("[LTX2] beat_schedule: dropping beat '\(beat.text.prefix(40))…' — \(reason)")
+                },
+                tokenize: { tokenizer.untruncatedTokenIds(prompt: $0) })
+        }()
+        if !resolvedBeats.isEmpty {
+            logger.info("[LTX2] beat_schedule: \(resolvedBeats.count)/\(request.beatSchedule?.count ?? 0) beat(s) located.")
+        }
+
         segmentStart = CFAbsoluteTimeGetCurrent()
         // #1479: frames and audio banked by chunks that finished before an
         // earlier preemption. Empty on a fresh render.
@@ -1215,6 +1250,7 @@ public final class LTX2VideoGenerator {
                         ? Float(request.framesPerChunk) / Float(request.fps) : nil,
                     preemption: preemption, telemetry: telemetry,
                     resume: chunkResume, chunkIndex: chunk,
+                    beatSchedule: resolvedBeats,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 

@@ -215,7 +215,12 @@ public final class LTX2TransformerBlock: Module {
     crossGateTimestep: MLXArray? = nil,
     audioCrossGateTimestep: MLXArray? = nil,
     promptTimestep: MLXArray? = nil,
-    audioPromptTimestep: MLXArray? = nil
+    audioPromptTimestep: MLXArray? = nil,
+    // Temporal beat scheduling (comfybox#310): additive Gaussian-penalty
+    // bias on the TEXT cross-attentions only — a2v/v2a (cross-modal) are
+    // untouched. Nil (the default) leaves this byte-identical to before.
+    beatBias: MLXArray? = nil,
+    audioBeatBias: MLXArray? = nil
   ) -> (video: MLXArray, audio: MLXArray) {
     precondition(hasAudio, "callDualStream requires hasAudio")
     let b = video.dim(0)
@@ -233,7 +238,7 @@ public final class LTX2TransformerBlock: Module {
       vCtx = context * (1 + pp[1]) + pp[0]
     }
     v = v + attn2(weightFreeRMSNorm(v) * (1 + vCross[1]) + vCross[0],
-                  context: vCtx, mask: contextMask) * vCross[2]
+                  context: vCtx, mask: LTX2BeatScheduleBuilder.combine(contextMask, beatBias)) * vCross[2]
 
     // ---- Audio stream: self-attn, text cross-attn ----
     var a = audio
@@ -247,7 +252,7 @@ public final class LTX2TransformerBlock: Module {
       aCtx = audioContext * (1 + pp[1]) + pp[0]
     }
     a = a + audioAttn2!(audioRMSNorm(a) * (1 + aCross[1]) + aCross[0],
-                        context: aCtx, mask: audioContextMask) * aCross[2]
+                        context: aCtx, mask: LTX2BeatScheduleBuilder.combine(audioContextMask, audioBeatBias)) * aCross[2]
 
     // ---- Cross-modal: A2V (update video from audio) + V2A (update audio) ----
     // Norms taken once, BEFORE either update (reference vx_norm3/ax_norm3).
@@ -386,6 +391,12 @@ public final class LTX2TransformerBlock: Module {
   ///     CFG negative, which is inert in that recipe because CFG runs at 1.0.
   ///     Nil (or a disabled `nag`) leaves the block byte-identical to before.
   ///   - nag: Guidance strength/blend/clamp. `.disabled` is a true no-op.
+  /// - Parameters:
+  ///   - beatBias: Temporal beat scheduling (comfybox#310) additive bias,
+  ///     applied ONLY to the primary (positive) text cross-attention below —
+  ///     never to the NAG negative-context pass, which must stay a pure
+  ///     read of the unbiased negative concept. Nil (the default) is a true
+  ///     no-op, byte-identical to before this feature existed.
   public func callAsFunction(
     _ x: MLXArray,
     context: MLXArray,
@@ -395,7 +406,8 @@ public final class LTX2TransformerBlock: Module {
     skipSelfAttn: Bool = false,
     promptTimestep: MLXArray? = nil,
     negativeContext: MLXArray? = nil,
-    nag: LTX2NAGConfig = .disabled
+    nag: LTX2NAGConfig = .disabled,
+    beatBias: MLXArray? = nil
   ) -> MLXArray {
     // Cross-attention against the positive context, then — when NAG is on —
     // the same computation against the negative context, combined by
@@ -455,7 +467,8 @@ public final class LTX2TransformerBlock: Module {
         encoderStates = context * (1 + promptScale) + promptShift
       }
 
-      var crossOut = attn2(attnInput, context: encoderStates, mask: contextMask)
+      var crossOut = attn2(attnInput, context: encoderStates,
+                           mask: LTX2BeatScheduleBuilder.combine(contextMask, beatBias))
       if nagActive, let negCtx = negativeContext {
         var negStates = negCtx
         if let promptTS = promptTimestep, let promptTable = promptScaleShiftTable {
@@ -472,7 +485,8 @@ public final class LTX2TransformerBlock: Module {
     } else {
       // LTX-2: simple cross-attention with RMSNorm
       let normed = weightFreeRMSNorm(h)
-      var crossOut = attn2(normed, context: context, mask: contextMask)
+      var crossOut = attn2(normed, context: context,
+                           mask: LTX2BeatScheduleBuilder.combine(contextMask, beatBias))
       if nagActive, let negCtx = negativeContext {
         let negOut = attn2(normed, context: negCtx, mask: contextMask)
         crossOut = ltx2ApplyNAG(
