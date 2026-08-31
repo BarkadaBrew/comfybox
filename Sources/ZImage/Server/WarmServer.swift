@@ -7581,7 +7581,9 @@ private actor WarmServerCoordinator {
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
                 eta: recipe.eta, bongmath: recipe.bongmath,
-                projectorScale: payload.projectorScale ?? 1.0),
+                projectorScale: payload.projectorScale ?? 1.0,
+                noiseType: RES4LYFNoiseType(rawValue: payload.noiseType ?? "gaussian") ?? .gaussian,
+                noiseAlpha: payload.noiseAlpha ?? 0.0),
           progress: publishProgress)
         traces = [trace1]
       } else {
@@ -7598,7 +7600,9 @@ private actor WarmServerCoordinator {
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
                 eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2,
-                projectorScale: payload.projectorScale ?? 1.0),
+                projectorScale: payload.projectorScale ?? 1.0,
+                noiseType: RES4LYFNoiseType(rawValue: payload.noiseType ?? "gaussian") ?? .gaussian,
+                noiseAlpha: payload.noiseAlpha ?? 0.0),
           progress: publishProgress)
       }
       let trace = traces[0]
@@ -8528,6 +8532,12 @@ struct GeneratePayload: Sendable {
   /// Projector-scale text-conditioning gain (wire: `projector_scale`). Krea 2
   /// only; 1.0/absent = neutral. Forwarded verbatim to Krea2Pipeline.Request.
   let projectorScale: Float?
+  /// RES4LYF spatial noise generator (wire: `noise_type`: gaussian|fractal|
+  /// pyramid). Krea 2 only; absent/`gaussian` = byte-identical to today.
+  let noiseType: String?
+  /// Fractal `alpha` exponent (wire: `noise_alpha`); only read for
+  /// `noise_type: fractal`. Absent = 0.0 (fractal ≡ gaussian).
+  let noiseAlpha: Float?
   init(
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
@@ -8547,7 +8557,8 @@ struct GeneratePayload: Sendable {
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
     preempt: Bool? = nil, vae: String? = nil,
     stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil,
-    projectorScale: Float? = nil
+    projectorScale: Float? = nil,
+    noiseType: String? = nil, noiseAlpha: Float? = nil
   ) {
     self.preempt = preempt
     self.vae = vae
@@ -8555,6 +8566,8 @@ struct GeneratePayload: Sendable {
     self.detailPass = detailPass
     self.detailDenoise = detailDenoise
     self.projectorScale = projectorScale
+    self.noiseType = noiseType
+    self.noiseAlpha = noiseAlpha
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -8619,6 +8632,10 @@ extension GeneratePayload: Decodable {
     case detailPass
     case detailDenoise
     case projectorScale
+    // `noise_type` / `noise_alpha` arrive as these camelCase forms after
+    // `.convertFromSnakeCase`.
+    case noiseType
+    case noiseAlpha
   }
 
   init(from decoder: Decoder) throws {
@@ -8679,6 +8696,8 @@ extension GeneratePayload: Decodable {
     stage2 = try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
     detailPass = try c.decodeIfPresent(Bool.self, forKey: .detailPass)
     detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)
+    noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
+    noiseAlpha = try c.decodeIfPresent(Float.self, forKey: .noiseAlpha)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.

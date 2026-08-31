@@ -528,7 +528,8 @@ public enum Krea2StagedRender {
     try Krea2Pipeline.validateTiers(eta: stage.eta, bongmath: stage.bongmath)
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: stage.eta, sampler: stage.sampler, stageSeed: stage.seed,
-      layout: Krea2Pipeline.sdeNoiseLayout)
+      layout: Krea2Pipeline.sdeNoiseLayout,
+      noiseGrid: (hTok: hTok, wTok: wTok))
 
     var scheduler = try makeScheduler(
       sampler: stage.sampler, sigmaSchedule: stage.sigmaSchedule, steps: stage.steps,

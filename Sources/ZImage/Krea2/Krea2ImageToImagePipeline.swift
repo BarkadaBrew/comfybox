@@ -54,6 +54,10 @@ extension Krea2Pipeline {
     public var c2: Float = 0.5
     /// Text-conditioning gain on the fusion projector; see `Krea2Pipeline.Request.projectorScale`.
     public var projectorScale: Float = 1.0
+    /// RES4LYF spatial noise generator; see `Krea2Pipeline.Request.noiseType`.
+    public var noiseType: RES4LYFNoiseType = .gaussian
+    /// Fractal `alpha`; see `Krea2Pipeline.Request.noiseAlpha`.
+    public var noiseAlpha: Float = 0.0
 
     public init(
       prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
@@ -63,7 +67,8 @@ extension Krea2Pipeline {
       sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
       sigmaScheduleRequested: String? = nil,
       eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
-      projectorScale: Float = 1.0
+      projectorScale: Float = 1.0,
+      noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0
     ) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
@@ -83,6 +88,8 @@ extension Krea2Pipeline {
       self.bongmath = bongmath
       self.c2 = c2
       self.projectorScale = projectorScale
+      self.noiseType = noiseType
+      self.noiseAlpha = noiseAlpha
     }
   }
 
@@ -123,7 +130,9 @@ extension Krea2Pipeline {
     // a refusal (never a silent drop) on a sampler it is not defined against.
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
-      layout: Krea2Pipeline.sdeNoiseLayout)
+      layout: Krea2Pipeline.sdeNoiseLayout,
+      noiseType: request.noiseType, noiseGrid: (hTok: hTok, wTok: wTok),
+      noiseAlpha: Double(request.noiseAlpha))
     // WP-E16: the T3 fixed point. `nil` at bongmath false — the loop is then
     // handed no hook and is bit-identical to the run without one — and a
     // refusal naming the sampler when it is asked for with one RES4LYF's

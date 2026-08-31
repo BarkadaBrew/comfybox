@@ -483,6 +483,13 @@ public final class Krea2Pipeline {
     /// 1.0 = neutral; >1 strengthens prompt adherence with no CFG cost. Applied
     /// on the warm transformer for the whole render, stage 2 included.
     public var projectorScale: Float = 1.0
+    /// RES4LYF spatial noise generator for the SDE re-noise (opt-in). `.gaussian`
+    /// (default) is byte-identical to today; `.fractal` / `.pyramid` are the
+    /// RES4LYF alternatives, active only when `eta != 0` on a RES4LYF sampler.
+    public var noiseType: RES4LYFNoiseType = .gaussian
+    /// Fractal `alpha` exponent (RES4LYF `FractalNoiseGenerator`). 0 makes
+    /// fractal byte-identical to gaussian; only read when `noiseType == .fractal`.
+    public var noiseAlpha: Float = 0.0
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled,
@@ -490,7 +497,8 @@ public final class Krea2Pipeline {
                 sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
                 sigmaScheduleRequested: String? = nil,
                 eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
-                stage2: Stage2? = nil, projectorScale: Float = 1.0) {
+                stage2: Stage2? = nil, projectorScale: Float = 1.0,
+                noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
       self.guidance = guidance
@@ -509,6 +517,8 @@ public final class Krea2Pipeline {
       self.c2 = c2
       self.stage2 = stage2
       self.projectorScale = projectorScale
+      self.noiseType = noiseType
+      self.noiseAlpha = noiseAlpha
     }
   }
 
@@ -845,13 +855,20 @@ public final class Krea2Pipeline {
     eta: Float,
     sampler: SchedulerKind,
     stageSeed: UInt64,
-    layout: RES4LYFNoiseLayout
+    layout: RES4LYFNoiseLayout,
+    noiseType: RES4LYFNoiseType = .gaussian,
+    noiseGrid: (hTok: Int, wTok: Int)? = nil,
+    noiseAlpha: Double = 0.0
   ) throws -> RES4LYFSDENoiseInjector? {
     guard eta != 0 else { return nil }
     guard sampler.isRES4LYFFamily else {
       throw Krea2ScheduleError.etaUnsupportedSampler(sampler: sampler.rawValue, value: "\(eta)")
     }
-    return RES4LYFSDENoiseInjector(eta: Double(eta), stageSeed: stageSeed, layout: layout)
+    // `noiseType == .gaussian` with a nil `noiseGrid` reproduces the gaussian
+    // streams exactly — the default path is byte-identical to before.
+    return RES4LYFSDENoiseInjector(
+      eta: Double(eta), stageSeed: stageSeed, layout: layout,
+      noiseType: noiseType, grid: noiseGrid, noiseAlpha: noiseAlpha)
   }
 
   /// The layout ``Krea2DenoiseLoop`` sees: `(1, tokens, C·p·p)`, where the
@@ -928,7 +945,9 @@ public final class Krea2Pipeline {
     // before any model work for the same reason the tier gates are.
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
-      layout: Krea2Pipeline.sdeNoiseLayout)
+      layout: Krea2Pipeline.sdeNoiseLayout,
+      noiseType: request.noiseType, noiseGrid: (hTok: hTok, wTok: wTok),
+      noiseAlpha: Double(request.noiseAlpha))
     // WP-E17 (§3.14, D18): the SECOND stage's own gates, here — before the
     // noise draw and before the first transformer forward. A `stage2` field
     // that is going to be a 400 must not cost a stage-1 render first.
