@@ -32,6 +32,15 @@ public struct GenerationRequest: Sendable {
     public var imageStrength: Float?
     /// DyPE high-resolution scaling method: "ntk", "yarn", or nil/"none".
     public var dype: String?
+    /// Text-conditioning gain on the Krea2 fusion projector (projector-scale
+    /// trick). 1.0 = neutral; >1 strengthens prompt adherence with no CFG cost.
+    public var projectorScale: Float
+    /// RES4LYF SDE noise re-injection (eta). 0 = deterministic ODE (default);
+    /// >0 = SDE mode. Only bites with a RES4LYF sampler (res_*/ralston_*/deis_*).
+    public var eta: Float
+    /// RES4LYF bongmath: forward/backward substep alignment (free accuracy).
+    /// Only bites with a RES4LYF sampler.
+    public var bongmath: Bool
 
     public init(
         prompt: String = "",
@@ -40,6 +49,9 @@ public struct GenerationRequest: Sendable {
         height: Int = 1024,
         steps: Int = 9,
         guidance: Float = 3.5,
+        projectorScale: Float = 1.0,
+        eta: Float = 0.0,
+        bongmath: Bool = false,
         sampler: String? = nil,
         sigmaSchedule: String? = nil,
         seed: UInt64 = 0,
@@ -63,6 +75,9 @@ public struct GenerationRequest: Sendable {
         self.loras = loras
         self.initImagePath = initImagePath
         self.imageStrength = imageStrength
+        self.projectorScale = projectorScale
+        self.eta = eta
+        self.bongmath = bongmath
     }
 }
 
@@ -432,6 +447,19 @@ public final class EngineService {
         // DyPE high-resolution scaling (ntk / yarn).
         if let dype = request.dype, dype != "none", !dype.isEmpty {
             payloadDict["dype"] = dype
+        }
+        // Projector-scale trick: CFG-free prompt-adherence gain. 1.0 = omit
+        // (byte-identical); the engine also treats absent as neutral.
+        if request.projectorScale != 1.0 {
+            payloadDict["projector_scale"] = request.projectorScale
+        }
+        // RES4LYF SDE / bongmath (Clownshark recipe) — emitted only when active
+        // so an ODE render stays byte-identical.
+        if request.eta > 0 {
+            payloadDict["eta"] = request.eta
+        }
+        if request.bongmath {
+            payloadDict["bongmath"] = true
         }
 
         payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)
@@ -1474,6 +1502,8 @@ public final class EngineService {
         public var isPaused: Bool = false
         public var activeJobId: String?
         public var activeSummary: String?
+        /// LTX-2 render phase from /v1/queue (baseDenoise, refineDenoise, ...).
+        public var phase: String?
         public var activeSource: String?
         public var progressPercent: Int?
         public var pending: [QueueJob] = []
@@ -1495,6 +1525,7 @@ public final class EngineService {
             list.isPaused = (dict["is_paused"] as? Bool) ?? false
             list.activeJobId = dict["active_job_id"] as? String
             list.activeSummary = dict["active_summary"] as? String
+            list.phase = dict["phase"] as? String
             list.activeSource = dict["active_source"] as? String
             list.progressPercent = dict["progress_percent"] as? Int
             list.renderCount = (dict["render_count"] as? Int) ?? 0

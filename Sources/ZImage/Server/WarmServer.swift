@@ -4910,7 +4910,7 @@ public final class WarmServer {
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
-           .unsupportedSampler, .orphanField:
+           .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -8123,6 +8123,12 @@ private actor WarmServerCoordinator {
       // sampler/schedule name on the STAGE throws here, before any model work,
       // exactly as it does for the render's own recipe.
       let stage2 = try payload.krea2Stage2Fields()
+      // ClownsharK wire dials, validated where they are applied (same
+      // fail-loud stance as an unknown sampler name): a non-finite or
+      // out-of-range projector_scale and an unknown noise_type are 400s here,
+      // before any model work — never a clamp, never a silent gaussian.
+      let projectorScale = try payload.validatedProjectorScale()
+      let noiseType = try payload.validatedNoiseType()
       let samplerAsked: String = recipe.samplerRequested ?? "-"
       let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
       let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
@@ -8252,7 +8258,10 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta, bongmath: recipe.bongmath),
+                eta: recipe.eta, bongmath: recipe.bongmath,
+                projectorScale: projectorScale,
+                noiseType: noiseType,
+                noiseAlpha: payload.noiseAlpha ?? 0.0),
           progress: publishProgress)
         traces = [trace1]
       } else {
@@ -8268,7 +8277,10 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2),
+                eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2,
+                projectorScale: projectorScale,
+                noiseType: noiseType,
+                noiseAlpha: payload.noiseAlpha ?? 0.0),
           progress: publishProgress)
       }
       let trace = traces[0]
@@ -9221,6 +9233,20 @@ struct GeneratePayload: Sendable {
   let detailDenoise: Double?
 
   /// Default memberwise init for bridge-created payloads.
+  /// Projector-scale text-conditioning gain (wire: `projector_scale`). Krea 2
+  /// only; 1.0/absent = neutral. Forwarded verbatim to Krea2Pipeline.Request.
+  let projectorScale: Float?
+  /// RES4LYF spatial noise generator (wire: `noise_type`: gaussian|fractal|
+  /// pyramid). Krea 2 only; absent/`gaussian` = byte-identical to today.
+  let noiseType: String?
+  /// Fractal `alpha` exponent (wire: `noise_alpha`); only read for
+  /// `noise_type: fractal`. Absent = 0.0 (fractal ≡ gaussian).
+  let noiseAlpha: Float?
+  /// RES4LYF implicit-RK refinement (wire: `implicit_steps`). Krea 2 + the
+  /// RES4LYF explicit tableaus only; re-iterates the tableau this many extra
+  /// times as a fixed point. Absent/0 = byte-identical to today. Mirrors
+  /// `eta`/`bongmath`: decoded here, forwarded to Krea2Pipeline.Request.
+  let implicitSteps: Int?
   init(
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
@@ -9239,13 +9265,20 @@ struct GeneratePayload: Sendable {
     model: String? = nil, loras: [LoRAEntry]? = nil,
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
     preempt: Bool? = nil, vae: String? = nil,
-    stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil
+    stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil,
+    projectorScale: Float? = nil,
+    noiseType: String? = nil, noiseAlpha: Float? = nil,
+    implicitSteps: Int? = nil
   ) {
     self.preempt = preempt
     self.vae = vae
     self.stage2 = stage2
     self.detailPass = detailPass
     self.detailDenoise = detailDenoise
+    self.projectorScale = projectorScale
+    self.noiseType = noiseType
+    self.noiseAlpha = noiseAlpha
+    self.implicitSteps = implicitSteps
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -9309,6 +9342,13 @@ extension GeneratePayload: Decodable {
     case stage2
     case detailPass
     case detailDenoise
+    case projectorScale
+    // `noise_type` / `noise_alpha` arrive as these camelCase forms after
+    // `.convertFromSnakeCase`.
+    case noiseType
+    case noiseAlpha
+    // `implicit_steps` arrives as this camelCase form after .convertFromSnakeCase.
+    case implicitSteps
   }
 
   init(from decoder: Decoder) throws {
@@ -9333,6 +9373,7 @@ extension GeneratePayload: Decodable {
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
     bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
+    projectorScale = try c.decodeIfPresent(Float.self, forKey: .projectorScale)
     shift = try c.decodeIfPresent(Float.self, forKey: .shift)
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
     // Inpaint image + mask arrive as base64 strings from the HTTP API.
@@ -9368,6 +9409,9 @@ extension GeneratePayload: Decodable {
     stage2 = try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
     detailPass = try c.decodeIfPresent(Bool.self, forKey: .detailPass)
     detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)
+    noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
+    noiseAlpha = try c.decodeIfPresent(Float.self, forKey: .noiseAlpha)
+    implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.
@@ -9653,6 +9697,39 @@ extension GeneratePayload: Decodable {
           + "and applies to the RES4LYF samplers only; '\(sampler.rawValue)' is not one of "
           + "them. Send bongmath false, or a sampler from " + res4lyfList)
     }
+  }
+
+  /// The range the Desktop dial clamps to (`GenerationView`'s Projector Scale
+  /// slider, 0…3, 1.0 = neutral). The wire must not accept what the UI cannot
+  /// express: a NaN/inf or out-of-range scale multiplied into the projector's
+  /// text conditioning would render garbage (or something the caller did not
+  /// ask for) under a well-formed-looking record.
+  static let projectorScaleRange: ClosedRange<Float> = 0.0...3.0
+
+  /// `projector_scale`, validated at the point of application: absent → the
+  /// neutral 1.0; present → finite and inside ``projectorScaleRange``, else a
+  /// 400 naming the value (never clamped, same fail-loud stance as an unknown
+  /// sampler name).
+  func validatedProjectorScale() throws -> Float {
+    guard let projectorScale else { return 1.0 }
+    guard projectorScale.isFinite, Self.projectorScaleRange.contains(projectorScale) else {
+      throw WarmServerError.projectorScaleOutOfRange(value: "\(projectorScale)")
+    }
+    return projectorScale
+  }
+
+  /// `noise_type`, validated at the point of application: absent → gaussian
+  /// (the default, not a coercion); present → a `RES4LYFNoiseType` raw value,
+  /// else a 400 naming the value and the valid set. The old
+  /// `RES4LYFNoiseType(rawValue:) ?? .gaussian` silently rendered gaussian
+  /// under whatever name the caller sent.
+  func validatedNoiseType() throws -> RES4LYFNoiseType {
+    guard let noiseType else { return .gaussian }
+    guard let kind = RES4LYFNoiseType(rawValue: noiseType) else {
+      throw WarmServerError.unknownNoiseType(
+        name: noiseType, valid: RES4LYFNoiseType.allCases.map(\.rawValue))
+    }
+    return kind
   }
 
   /// WP-E3 (§3.3, D11, D22, D25): the recipe fields a Krea 2 request carries,
@@ -10243,6 +10320,15 @@ public enum WarmServerError: Error, LocalizedError {
   /// another field, sent without it. Silently dropping it made a request that
   /// asked for something render as if it had not.
   case orphanField(field: String, requires: String, reason: String)
+  /// A `projector_scale` the projector cannot honour: non-finite (NaN/inf) or
+  /// outside the Desktop dial's clamp range (`GenerationView`'s 0…3 slider).
+  /// Refused by value rather than clamped — a clamp would render something the
+  /// caller did not ask for under the number they sent.
+  case projectorScaleOutOfRange(value: String)
+  /// A `noise_type` that is not a `RES4LYFNoiseType` raw value. An unknown
+  /// name is a 400 naming the valid set — it must never silently degrade to
+  /// gaussian (absent stays gaussian; that is the default, not a coercion).
+  case unknownNoiseType(name: String, valid: [String])
 
   public var errorDescription: String? {
     switch self {
@@ -10284,6 +10370,12 @@ public enum WarmServerError: Error, LocalizedError {
       return "sampler '\(name)' is not supported on the \(family) family: \(reason)"
     case .orphanField(let field, let requires, let reason):
       return "'\(field)' has no meaning without '\(requires)': \(reason)"
+    case .projectorScaleOutOfRange(let value):
+      return "projector_scale must be a finite number in 0.0...3.0 (got \(value)); "
+        + "1.0 is neutral — omit it for the default"
+    case .unknownNoiseType(let name, let valid):
+      return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
+        + "omit it for gaussian"
     }
   }
 }
