@@ -193,13 +193,13 @@ final class WarmServerRejectionTests: XCTestCase {
   /// neutral 1.0; every in-range value (including the boundaries) passes
   /// through unchanged.
   func testProjectorScaleOutOfRangeIs400() throws {
-    // Out of range → refused by value. (1e39 overflows Float to +inf, so the
-    // non-finite arm is reachable from the wire even though JSON has no NaN.)
+    // Out of range → refused by value. Non-finite cannot arrive via JSON --
+    // Foundation refuses overflow literals at decode with its own 400; the
+    // non-finite validator arm is wire-unreachable defense-in-depth.
     for json in [
       #"{"prompt":"x","projector_scale":-0.01}"#,
       #"{"prompt":"x","projector_scale":3.01}"#,
       #"{"prompt":"x","projector_scale":-1}"#,
-      #"{"prompt":"x","projector_scale":1e39}"#,
     ] {
       let payload = try decode(json)
       XCTAssertThrowsError(try payload.validatedProjectorScale(), json) { error in

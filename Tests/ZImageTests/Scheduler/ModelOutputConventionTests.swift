@@ -67,7 +67,7 @@ final class ModelOutputConventionTests: XCTestCase {
     }
     XCTAssertEqual(
       dataPrediction,
-      [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s, .deis2m, .deis3m, .deis4m])
+      [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s, .heun2s, .heun3s, .deis2m, .deis3m, .deis4m])
   }
 
   /// The conversion helper the pipelines call: identity for velocity
