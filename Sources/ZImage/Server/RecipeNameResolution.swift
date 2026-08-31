@@ -40,7 +40,7 @@ enum RecipeNameResolver {
     "dpmpp_2s_ancestral": .dpmplusplus2sa,
   ]
 
-  /// ComfyUI schedule spellings → engine kinds. `normal` / `simple` /
+  /// ComfyUI schedule spellings → engine kinds. `normal` /
   /// `sgm_uniform` / `ddim_uniform` are KEPT as aliases of `.flow` (D22,
   /// reversed from FDD v1): Krita AI Diffusion's built-in styles send exactly
   /// these names by default, and our own `/object_info` advertises them.
@@ -49,7 +49,6 @@ enum RecipeNameResolver {
   static let sigmaScheduleAliases: [String: SigmaScheduleKind] = [
     "beta57": .beta57,
     "normal": .flow,
-    "simple": .flow,
     "sgm_uniform": .flow,
     "ddim_uniform": .flow,
   ]
