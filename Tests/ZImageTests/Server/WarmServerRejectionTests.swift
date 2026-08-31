@@ -187,6 +187,73 @@ final class WarmServerRejectionTests: XCTestCase {
     XCTAssertNoThrow(try bare.validateKrea2TierGates(try bare.validateRecipeNames()))
   }
 
+  /// M1 (ClownsharK adversarial review): `projector_scale` is validated where
+  /// the payload is applied — non-finite or outside the Desktop dial's 0…3
+  /// clamp range is a 400 naming the value, never a clamp. Absent → the
+  /// neutral 1.0; every in-range value (including the boundaries) passes
+  /// through unchanged.
+  func testProjectorScaleOutOfRangeIs400() throws {
+    // Out of range → refused by value. (1e39 overflows Float to +inf, so the
+    // non-finite arm is reachable from the wire even though JSON has no NaN.)
+    for json in [
+      #"{"prompt":"x","projector_scale":-0.01}"#,
+      #"{"prompt":"x","projector_scale":3.01}"#,
+      #"{"prompt":"x","projector_scale":-1}"#,
+      #"{"prompt":"x","projector_scale":1e39}"#,
+    ] {
+      let payload = try decode(json)
+      XCTAssertThrowsError(try payload.validatedProjectorScale(), json) { error in
+        guard case WarmServerError.projectorScaleOutOfRange(let value) = error else {
+          return XCTFail("expected projectorScaleOutOfRange, got \(error)")
+        }
+        let response = WarmServer.errorResponse(for: error)
+        XCTAssertEqual(response.status, 400)
+        let body = bodyString(response)
+        XCTAssertTrue(body.contains("projector_scale"), body)
+        XCTAssertTrue(body.contains(value), "message must name the value: \(body)")
+        XCTAssertTrue(body.contains("0.0...3.0"), "message must name the range: \(body)")
+      }
+    }
+
+    // In range (boundaries included) → applied as sent; absent → neutral 1.0.
+    for (json, expected) in [
+      (#"{"prompt":"x","projector_scale":0}"#, Float(0)),
+      (#"{"prompt":"x","projector_scale":3}"#, Float(3)),
+      (#"{"prompt":"x","projector_scale":1.35}"#, Float(1.35)),
+      (#"{"prompt":"x"}"#, Float(1.0)),
+    ] {
+      XCTAssertEqual(try decode(json).validatedProjectorScale(), expected, json)
+    }
+  }
+
+  /// M2 (ClownsharK adversarial review): an unknown `noise_type` is a 400
+  /// naming the value and the valid set — it must never silently degrade to
+  /// gaussian. Absent stays gaussian (the default, not a coercion).
+  func testUnknownNoiseTypeIs400() throws {
+    for name in ["gaussain", "perlin", "GAUSSIAN", "fractal "] {
+      let payload = try decode(#"{"prompt":"x","noise_type":"\#(name)"}"#)
+      XCTAssertThrowsError(try payload.validatedNoiseType(), name) { error in
+        guard case WarmServerError.unknownNoiseType(let got, let valid) = error else {
+          return XCTFail("expected unknownNoiseType for '\(name)', got \(error)")
+        }
+        XCTAssertEqual(got, name)
+        XCTAssertEqual(Set(valid), Set(RES4LYFNoiseType.allCases.map(\.rawValue)))
+        let response = WarmServer.errorResponse(for: error)
+        XCTAssertEqual(response.status, 400)
+        let body = bodyString(response)
+        XCTAssertTrue(body.contains(name), body)
+        for v in valid { XCTAssertTrue(body.contains(v), "400 body must list '\(v)': \(body)") }
+      }
+    }
+
+    // Every real noise type resolves; absent stays gaussian.
+    for kind in RES4LYFNoiseType.allCases {
+      let payload = try decode(#"{"prompt":"x","noise_type":"\#(kind.rawValue)"}"#)
+      XCTAssertEqual(try payload.validatedNoiseType(), kind, kind.rawValue)
+    }
+    XCTAssertEqual(try decode(#"{"prompt":"x"}"#).validatedNoiseType(), .gaussian)
+  }
+
   /// Decoding errors stay 400 and untouched by the new arms.
   func testDecodingErrorStill400() {
     let error: Error

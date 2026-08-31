@@ -4910,7 +4910,7 @@ public final class WarmServer {
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
-           .unsupportedSampler, .orphanField:
+           .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -8123,6 +8123,12 @@ private actor WarmServerCoordinator {
       // sampler/schedule name on the STAGE throws here, before any model work,
       // exactly as it does for the render's own recipe.
       let stage2 = try payload.krea2Stage2Fields()
+      // ClownsharK wire dials, validated where they are applied (same
+      // fail-loud stance as an unknown sampler name): a non-finite or
+      // out-of-range projector_scale and an unknown noise_type are 400s here,
+      // before any model work — never a clamp, never a silent gaussian.
+      let projectorScale = try payload.validatedProjectorScale()
+      let noiseType = try payload.validatedNoiseType()
       let samplerAsked: String = recipe.samplerRequested ?? "-"
       let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
       let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
@@ -8253,8 +8259,8 @@ private actor WarmServerCoordinator {
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
                 eta: recipe.eta, bongmath: recipe.bongmath,
-                projectorScale: payload.projectorScale ?? 1.0,
-                noiseType: RES4LYFNoiseType(rawValue: payload.noiseType ?? "gaussian") ?? .gaussian,
+                projectorScale: projectorScale,
+                noiseType: noiseType,
                 noiseAlpha: payload.noiseAlpha ?? 0.0),
           progress: publishProgress)
         traces = [trace1]
@@ -8272,8 +8278,8 @@ private actor WarmServerCoordinator {
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
                 eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2,
-                projectorScale: payload.projectorScale ?? 1.0,
-                noiseType: RES4LYFNoiseType(rawValue: payload.noiseType ?? "gaussian") ?? .gaussian,
+                projectorScale: projectorScale,
+                noiseType: noiseType,
                 noiseAlpha: payload.noiseAlpha ?? 0.0),
           progress: publishProgress)
       }
@@ -9683,6 +9689,39 @@ extension GeneratePayload: Decodable {
     }
   }
 
+  /// The range the Desktop dial clamps to (`GenerationView`'s Projector Scale
+  /// slider, 0…3, 1.0 = neutral). The wire must not accept what the UI cannot
+  /// express: a NaN/inf or out-of-range scale multiplied into the projector's
+  /// text conditioning would render garbage (or something the caller did not
+  /// ask for) under a well-formed-looking record.
+  static let projectorScaleRange: ClosedRange<Float> = 0.0...3.0
+
+  /// `projector_scale`, validated at the point of application: absent → the
+  /// neutral 1.0; present → finite and inside ``projectorScaleRange``, else a
+  /// 400 naming the value (never clamped, same fail-loud stance as an unknown
+  /// sampler name).
+  func validatedProjectorScale() throws -> Float {
+    guard let projectorScale else { return 1.0 }
+    guard projectorScale.isFinite, Self.projectorScaleRange.contains(projectorScale) else {
+      throw WarmServerError.projectorScaleOutOfRange(value: "\(projectorScale)")
+    }
+    return projectorScale
+  }
+
+  /// `noise_type`, validated at the point of application: absent → gaussian
+  /// (the default, not a coercion); present → a `RES4LYFNoiseType` raw value,
+  /// else a 400 naming the value and the valid set. The old
+  /// `RES4LYFNoiseType(rawValue:) ?? .gaussian` silently rendered gaussian
+  /// under whatever name the caller sent.
+  func validatedNoiseType() throws -> RES4LYFNoiseType {
+    guard let noiseType else { return .gaussian }
+    guard let kind = RES4LYFNoiseType(rawValue: noiseType) else {
+      throw WarmServerError.unknownNoiseType(
+        name: noiseType, valid: RES4LYFNoiseType.allCases.map(\.rawValue))
+    }
+    return kind
+  }
+
   /// WP-E3 (§3.3, D11, D22, D25): the recipe fields a Krea 2 request carries,
   /// resolved. A pure function of the payload, so the forwarding is asserted
   /// without a server or weights (`Krea2RecipeForwardingTests`).
@@ -10271,6 +10310,15 @@ public enum WarmServerError: Error, LocalizedError {
   /// another field, sent without it. Silently dropping it made a request that
   /// asked for something render as if it had not.
   case orphanField(field: String, requires: String, reason: String)
+  /// A `projector_scale` the projector cannot honour: non-finite (NaN/inf) or
+  /// outside the Desktop dial's clamp range (`GenerationView`'s 0…3 slider).
+  /// Refused by value rather than clamped — a clamp would render something the
+  /// caller did not ask for under the number they sent.
+  case projectorScaleOutOfRange(value: String)
+  /// A `noise_type` that is not a `RES4LYFNoiseType` raw value. An unknown
+  /// name is a 400 naming the valid set — it must never silently degrade to
+  /// gaussian (absent stays gaussian; that is the default, not a coercion).
+  case unknownNoiseType(name: String, valid: [String])
 
   public var errorDescription: String? {
     switch self {
@@ -10312,6 +10360,12 @@ public enum WarmServerError: Error, LocalizedError {
       return "sampler '\(name)' is not supported on the \(family) family: \(reason)"
     case .orphanField(let field, let requires, let reason):
       return "'\(field)' has no meaning without '\(requires)': \(reason)"
+    case .projectorScaleOutOfRange(let value):
+      return "projector_scale must be a finite number in 0.0...3.0 (got \(value)); "
+        + "1.0 is neutral — omit it for the default"
+    case .unknownNoiseType(let name, let valid):
+      return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
+        + "omit it for gaussian"
     }
   }
 }

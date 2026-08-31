@@ -130,9 +130,9 @@ public enum Krea2BypassPolicy {
   ///
   /// 1. a per-render override (`bypass_strength` on the request) wins;
   /// 2. an explicit preset `bypass` wins next;
-  /// 3. otherwise it is DERIVED from kroma — `kroma.strength > 0` ⇒ **0**
-  ///    (kroma already unlocks), `kroma.strength == 0` ⇒ the workflow's
-  ///    strength.
+  /// 3. otherwise the DERIVED default is **0** — always off (Todd 2026-08-31:
+  ///    projector_scale + adherence make the auto-loaded bypass unnecessary;
+  ///    this retires the 17:35 "kroma off ⇒ workflow strength" branch).
   ///
   /// The returned policy always names the effective `file`, so provenance can
   /// never be ambiguous about which of the two artifacts applied — even when
@@ -160,9 +160,11 @@ public enum Krea2BypassPolicy {
   }
 
   /// The preset-level entry point. Fail-closed for anything that is not a
-  /// krea2-family image preset: the derived default never turns a bypass on
-  /// for a `zimage-*` preset that has no kroma dial (the resolver's `nil`
-  /// kroma case would otherwise read as "no kroma ⇒ bypass on").
+  /// krea2-family image preset: only an explicit `bypass` or a per-render
+  /// override ever turns the adapter on (since 2026-08-31 the derived default
+  /// is 0 everywhere, so the historical "no kroma ⇒ bypass on" hazard for
+  /// `zimage-*` presets no longer exists — the guard stays as belt and
+  /// braces against any future derivation).
   public static func resolve(
     for preset: ImagePreset, requestStrength: Double? = nil
   ) -> BypassPolicy {

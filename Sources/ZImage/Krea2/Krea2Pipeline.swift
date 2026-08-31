@@ -342,12 +342,13 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
     case .etaUnsupportedSampler(let sampler, let value):
       return "eta=\(value) is RES4LYF's SDE and applies to the RES4LYF samplers only; "
         + "'\(sampler)' is not one of them. Send eta 0, or a sampler from "
-        + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m"
+        + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / heun_2s / heun_3s / "
+        + "deis_2m / deis_3m / deis_4m"
     case .bongmathUnsupportedSampler(let sampler):
       return "bongmath is RES4LYF's fixed point over its own tableau rows and applies to the "
         + "RES4LYF samplers only; '\(sampler)' is not one of them. Send bongmath false, or a "
-        + "sampler from res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / "
-        + "deis_3m / deis_4m"
+        + "sampler from res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / heun_2s / "
+        + "heun_3s / deis_2m / deis_3m / deis_4m"
     }
   }
 
