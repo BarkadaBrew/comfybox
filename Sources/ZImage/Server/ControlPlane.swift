@@ -176,6 +176,7 @@ enum ControlPlaneClassifier {
          ("GET", "/v1/models"),
          ("GET", "/v1/stats"),
          ("GET", "/v1/config"),
+         ("GET", "/v1/controls"),
          ("POST", "/v1/queue/pause"),
          ("POST", "/v1/queue/resume"),
          ("POST", "/v1/queue/clear"),

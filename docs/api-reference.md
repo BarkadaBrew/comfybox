@@ -1,136 +1,202 @@
 # ComfyBox Server — API Reference
 
-The warm server (`ComfyBox serve`, default port **7870**) exposes an HTTP/JSON
-API. New-route responses are **snake_case**. This reference is generated from
-the route switch in `Sources/ZImage/Server/WarmServer.swift`; keep it in sync
-when adding endpoints. Endpoints marked **(MCP)** have a matching tool in the
-ComfyBox MCP server (`Sources/ZImage/MCP/`).
+> **GENERATED FILE — do not edit by hand.** Regenerate with `comfybox docs generate`
+> (run from the repo root). CI byte-compares this file against a fresh generation
+> (`ControlSurfaceParityTests`), so a stale copy fails the build.
+>
+> Sources of truth (FDD-ui-api-parity §3.4): the dispatch switches in
+> `Sources/ZImage/Server/WarmServer.swift` and
+> `Sources/ZImage/Server/ComfyBridge/ComfyBridge.swift` (parsed), the compile-time
+> `ControlRegistry`, `MCPToolRegistry`, and `ParityExemptions`.
 
-## Health & status
+The warm server (`comfybox serve`, default port **7870**) exposes an HTTP/JSON API.
+`{id}` marks a path parameter. Mutating `v1` routes are each claimed by an MCP tool
+or carry a reasoned exemption (§3.5 assertion 3).
 
-| Method | Path | Purpose | MCP tool |
+## Warm-server routes (`surface: v1`)
+
+| Method | Path | MCP tools | Exemption |
 |---|---|---|---|
-| GET | `/health` | Liveness + model/queue summary | `server_health` |
-| GET | `/v1/stats` | Server + memory stats | `system_stats` |
-| GET | `/v1/memory` | Memory-pressure detail | |
-| GET | `/v1/config`, PUT `/v1/config` | Read / replace the server config document | |
-| GET | `/v1/providers/status` | Configured AI-provider status | |
+| GET | `/health` |  |  |
+| GET | `/v1/audit-log` |  |  |
+| GET | `/v1/characters` |  |  |
+| POST | `/v1/characters` | create_character |  |
+| PUT | `/v1/characters` | create_character |  |
+| DELETE | `/v1/characters/{id}` | delete_character |  |
+| GET | `/v1/characters/{id}` |  |  |
+| POST | `/v1/civitai/harvest` | civitai_prompts |  |
+| GET | `/v1/civitai/repo` |  |  |
+| GET | `/v1/civitai/search` |  |  |
+| GET | `/v1/config` | get_config, set_warm_preset |  |
+| PATCH | `/v1/config` | patch_config |  |
+| PUT | `/v1/config` | set_warm_preset, update_config |  |
+| GET | `/v1/content-modes` |  |  |
+| DELETE | `/v1/content-modes/{id}` |  | Reverts a mode to its built-in definition; same posture as the PUT — no agent caller yet, discoverable via GET /v1/controls. |
+| PUT | `/v1/content-modes/{id}` |  | Phase 3 creative-layer write (Class E); no agent caller edits content modes yet. Discoverable via GET /v1/controls (creative.contentMode.* descriptors). |
+| GET | `/v1/controls` |  |  |
+| POST | `/v1/enhance` | enhance_prompt |  |
+| GET | `/v1/gallery/file` |  |  |
+| GET | `/v1/gallery/list` |  |  |
+| POST | `/v1/generate` | generate_image, repair_image |  |
+| POST | `/v1/generate/async` |  | Async job variant of /v1/generate; MCP agents call generate_image (a synchronous MCP call wrapping the same render). A dedicated async tool was deferred from the Phase 1 worklist. |
+| GET | `/v1/generate/preview` |  |  |
+| GET | `/v1/generate/status/{id}` |  |  |
+| POST | `/v1/lora/swap` | swap_loras |  |
+| GET | `/v1/loras` |  |  |
+| POST | `/v1/loras/import` |  | Desktop drag-and-drop import (local file paths on the server host); agent flows discover LoRAs via lora_scan / nearline_stage instead. |
+| POST | `/v1/loras/scan` | lora_scan |  |
+| GET | `/v1/loras/{id}` |  |  |
+| DELETE | `/v1/loras/{id}/quarantine` | lora_quarantine |  |
+| POST | `/v1/loras/{id}/quarantine` | lora_quarantine |  |
+| POST | `/v1/loras/{id}/update` | update_lora_triggerwords |  |
+| GET | `/v1/memory` |  |  |
+| POST | `/v1/model/activate` | set_warm_preset, switch_model |  |
+| POST | `/v1/model/load` | load_model, set_warm_preset |  |
+| GET | `/v1/model/pool` |  |  |
+| POST | `/v1/model/unload` | unload_model |  |
+| GET | `/v1/models` |  |  |
+| POST | `/v1/montage/compose` | compose_montage |  |
+| GET | `/v1/nearline` |  |  |
+| POST | `/v1/nearline/evict` | nearline_evict |  |
+| POST | `/v1/nearline/scan` | nearline_scan |  |
+| POST | `/v1/nearline/stage` | nearline_stage |  |
+| GET | `/v1/presets` |  |  |
+| POST | `/v1/presets` | create_preset |  |
+| PUT | `/v1/presets` | create_preset |  |
+| POST | `/v1/presets/import-legacy` | import_legacy_presets |  |
+| POST | `/v1/presets/resolve` |  | POST-for-body READ: resolves a preset against the loaded model without changing state. Not a mutation; list_presets covers agent reads. |
+| DELETE | `/v1/presets/{id}` | delete_preset |  |
+| GET | `/v1/presets/{id}` |  |  |
+| GET | `/v1/providers/status` |  |  |
+| GET | `/v1/queue` |  |  |
+| POST | `/v1/queue/clear` | clear_queue |  |
+| POST | `/v1/queue/interrupt` | interrupt_render |  |
+| POST | `/v1/queue/pause` | pause_queue |  |
+| POST | `/v1/queue/resume` | resume_queue |  |
+| DELETE | `/v1/queue/{id}` | cancel_job |  |
+| POST | `/v1/queue/{id}/move` | move_queue_job |  |
+| POST | `/v1/shutdown` | shutdown_server |  |
+| GET | `/v1/stats` |  |  |
+| POST | `/v1/storyboard/render` | render_storyboard |  |
+| GET | `/v1/styles` |  |  |
+| POST | `/v1/upscale` | upscale |  |
+| GET | `/v1/video/config/effective` |  |  |
+| POST | `/v1/video/config/effective` |  | POST-for-body READ: echoes the effective video config for a hypothetical request without changing state (GET variant also exists). |
+| POST | `/v1/video/extend` | extend_video |  |
+| POST | `/v1/video/generate` |  | Synchronous variant; the generate_video tool proxies POST /v1/video/generate/async (job-based) so an agent is never blocked for a whole video render. |
+| POST | `/v1/video/generate/async` | generate_video |  |
+| GET | `/v1/video/output` |  |  |
+| POST | `/v1/video/rerender` | rerender_video |  |
+| GET | `/v1/video/status/{id}` |  |  |
+| GET | `/v1/video/traces` |  |  |
+| POST | `/v1/video/traces/{id}/promote` |  | Video-trace curation is Desktop/gallery-driven today; promote_video_trace tool deferred from the Phase 1 worklist. |
+| POST | `/v1/video/traces/{id}/rating` |  | Video-trace curation is Desktop/gallery-driven today; rate_video_trace tool deferred from the Phase 1 worklist. |
+| GET | `/v1/workflows` |  |  |
+| POST | `/v1/workflows/import` | import_workflow |  |
+| GET | `/v1/workflows/runs/{id}` |  |  |
+| DELETE | `/v1/workflows/{id}` |  | Desktop workflow management; delete_workflow tool deferred from the Phase 1 worklist (no agent caller deletes workflows today). |
+| GET | `/v1/workflows/{id}` |  |  |
+| POST | `/v1/workflows/{id}/run` | run_workflow |  |
 
-## Generation
+## ComfyUI compatibility bridge routes (`surface: comfyUICompat`)
 
-| Method | Path | Purpose | MCP tool |
-|---|---|---|---|
-| POST | `/v1/generate` | Text-to-image (also ControlNet / img2img via fields) | `generate_image` |
-| POST | `/v1/enhance` | Optimize a prompt via the configured provider (Dan's model); optional character injection | `enhance_prompt` |
-| POST | `/v1/upscale` | Creative upscale (SeedVR2 / ESRGAN) | `upscale` |
-| POST | `/v1/video/generate` | Video generation. **Local LTX-2** (T2V + I2V) when the server is started with `--ltx2-weights` + `--ltx2-gemma` (runs through the render queue, returns 200 with the MP4 path); otherwise the Replicate cloud proxy (202, job-based). | `generate_video` |
-| GET | `/v1/video/status/{id}` | Video job status (Replicate proxy) | `video_status` |
+Served by `ComfyBridge.route()` for ComfyUI/Krita clients, BEFORE the main switch.
+Declared policy (§3.5): these need no MCP tool, but every one must be enumerated here
+so adding one is visible in review.
 
-Local LTX-2 body (snake_case): `{prompt, negative_prompt?, image_path?, width?, height?, frames? (1+8k), steps?, seed?, strength?, extend_to_seconds?, fps?, output_path?}`
-→ `{success, output_path, frame_count, duration_seconds, elapsed_seconds, backend: "ltx2-local"}`.
-`image_path` present = image-to-video; absent = text-to-video. Output is
-contained to the server's allowed output directory.
+| Method | Path |
+|---|---|
+| GET | `/embeddings` |
+| GET | `/experiment/models` |
+| GET | `/extensions` |
+| GET | `/history` |
+| POST | `/interrupt` |
+| GET | `/object_info` |
+| GET | `/prompt` |
+| POST | `/prompt` |
+| GET | `/queue` |
+| POST | `/queue` |
+| GET | `/settings` |
+| GET | `/system_stats` |
+| POST | `/upload/image` |
+| GET | `/userdata*` |
+| GET | `/users` |
+| GET | `/view` |
+| GET | `/ws` |
 
-`POST /v1/enhance` body: `{prompt, character?, character_description?, content_mode?}`
-→ `{success, prompt, enhanced, note?}`.
+## Controls (`GET /v1/controls`)
 
-## Queue
+One call answers "what can I change and how" (§3.4). Each row is a
+`ControlDescriptor`; `GET /v1/controls` returns these plus per-request resolved
+`value`s. Writes with a pointer are JSON-pointer targets for the write route's
+document (config writes: RFC 7386 merge patch via `PATCH /v1/config`).
 
-| Method | Path | Purpose | MCP tool |
-|---|---|---|---|
-| GET | `/v1/queue` | Active job + pending jobs (each with an id) | `queue_list` |
-| POST | `/v1/queue/interrupt` | Cancel the in-flight render | `interrupt_render` |
-| POST | `/v1/queue/clear` | Cancel all pending jobs | `clear_queue` |
-| DELETE | `/v1/queue/{id}` | Cancel one pending job | `cancel_job` |
-
-## Models & LoRAs
-
-| Method | Path | Purpose | MCP tool |
-|---|---|---|---|
-| GET | `/v1/models` | Known model specs | `list_models` |
-| GET | `/v1/model/pool` | Loaded model pool | `model_pool` |
-| POST | `/v1/model/load` | Load a model into the pool | `load_model` |
-| POST | `/v1/model/activate` | Switch the active model | `switch_model` |
-| POST | `/v1/model/unload` | Unload a pooled model | `unload_model` |
-| GET | `/v1/loras` | LoRA library index | `lora_library` |
-| POST | `/v1/loras/scan` | Rescan the LoRA library | `lora_scan` |
-| POST/DELETE | `/v1/loras/{id}/quarantine` | Quarantine / unquarantine a LoRA | `lora_quarantine` |
-| POST | `/v1/lora/swap` | Swap active LoRAs (auto-stages nearline items) | `swap_loras` |
-
-`POST /v1/lora/swap` accepts an optional semantic role on every entry:
-
-```json
-{
-  "loras": [
-    {
-      "path": "krea2_turbo_distill_r256.safetensors",
-      "scale": 0.6,
-      "role": "accel"
-    }
-  ]
-}
-```
-
-Valid roles are `kroma`, `accel`, `bypass`, and `control`; omit `role` for an
-ordinary style/character LoRA. Roles are declarations, not filename guesses.
-In particular, Krea-2 distillation files such as
-`krea2_turbo_distill_r256.safetensors` must declare `"role":"accel"` when
-they fill the accelerator slot. Auto-staging may change `path`, but preserves
-`role`.
-
-## Nearline storage (attached disk, staged on demand)
-
-| Method | Path | Purpose | MCP tool |
-|---|---|---|---|
-| GET | `/v1/nearline` | Catalog + staging state + budget | `nearline_list` |
-| POST | `/v1/nearline/scan` | Rescan attached-storage roots | `nearline_scan` |
-| POST | `/v1/nearline/stage` | Stage an item locally (`{name}`; LRU eviction) | `nearline_stage` |
-| POST | `/v1/nearline/evict` | Remove a staged copy (`{name}`) | `nearline_evict` |
-
-## Creative layer
-
-| Method | Path | Purpose | MCP tool |
-|---|---|---|---|
-| GET | `/v1/characters` | Characters + scenes (bare array; `kind`, tiered descriptions, default LoRAs) | `list_characters` |
-| GET | `/v1/characters/{id}`, POST `/v1/characters`, DELETE `/v1/characters/{id}` | Character CRUD | |
-| GET | `/v1/presets` | Generation presets | `list_presets` |
-| GET `/v1/presets/{id}`, POST `/v1/presets`, DELETE `/v1/presets/{id}` | | Preset CRUD | |
-| POST | `/v1/presets/resolve` | Resolve a preset onto defaults | |
-| POST | `/v1/presets/import-legacy` | Import presets from the old image service (idempotent) | `import_legacy_presets` |
-| GET | `/v1/content-modes` | Content-mode definitions | `list_styles` (styles) |
-| GET | `/v1/styles` | Style presets | `list_styles` |
-| GET | `/v1/audit-log?limit=N` | Recent audit events | |
-
-Preset LoRA references use `filename` rather than `path` and preserve the
-same optional `role`:
-
-```json
-{
-  "loras": [
-    {
-      "filename": "krea2_turbo_distill_r256.safetensors",
-      "scale": 0.6,
-      "role": "accel"
-    }
-  ]
-}
-```
-
-For Krea-2 presets, Kroma belongs in the structured `kroma` object and must
-not be duplicated in `loras[]`. See
-[Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md).
-
-## Lifecycle
-
-| Method | Path | Purpose | MCP tool |
-|---|---|---|---|
-| POST | `/v1/shutdown` | Graceful shutdown | `shutdown_server` |
-
-## Notes
-
-- Character + preset legacy imports also run **once at server startup**
-  (idempotent), merging from `~/.coffeeshop/image-service/`.
-- The MCP server (`MCPToolRegistry` / `MCPToolExecutor`) currently exposes 32
-  tools; the `queue_status` / `clear_queue` tools target the ComfyUI-bridge
-  queue path, while `queue_list` / `interrupt_render` / `cancel_job` target the
-  native `/v1/queue`.
+| Id | Scope | Type | Range | Default | Write | MCP tool | Restart |
+|---|---|---|---|---|---|---|---|
+| `creative.contentMode.avocado.guidanceBoost` | creative | double | 0–10 | 2.5 | PUT `/v1/content-modes/avocado` @ `/guidanceBoost` |  |  |
+| `creative.contentMode.avocado.negativePromptAdditions` | creative | object |  | [] | PUT `/v1/content-modes/avocado` @ `/negativePromptAdditions` |  |  |
+| `creative.contentMode.avocado.promptHint` | creative | string |  | `explicit, uncensored, anatomically detailed` | PUT `/v1/content-modes/avocado` @ `/promptHint` |  |  |
+| `creative.contentMode.avocado.styleVariant` | creative | enum |  | `nsfw` | PUT `/v1/content-modes/avocado` @ `/styleVariant` |  |  |
+| `creative.contentMode.banana.guidanceBoost` | creative | double | 0–10 | 1.5 | PUT `/v1/content-modes/banana` @ `/guidanceBoost` |  |  |
+| `creative.contentMode.banana.negativePromptAdditions` | creative | object |  | [] | PUT `/v1/content-modes/banana` @ `/negativePromptAdditions` |  |  |
+| `creative.contentMode.banana.promptHint` | creative | string |  | `sensual, intimate, suggestive` | PUT `/v1/content-modes/banana` @ `/promptHint` |  |  |
+| `creative.contentMode.banana.styleVariant` | creative | enum |  | `sensual` | PUT `/v1/content-modes/banana` @ `/styleVariant` |  |  |
+| `creative.contentMode.neutral.guidanceBoost` | creative | double | 0–10 | 0 | PUT `/v1/content-modes/neutral` @ `/guidanceBoost` |  |  |
+| `creative.contentMode.neutral.negativePromptAdditions` | creative | object |  | [] | PUT `/v1/content-modes/neutral` @ `/negativePromptAdditions` |  |  |
+| `creative.contentMode.neutral.promptHint` | creative | string |  |  | PUT `/v1/content-modes/neutral` @ `/promptHint` |  |  |
+| `creative.contentMode.neutral.styleVariant` | creative | enum |  | `neutral` | PUT `/v1/content-modes/neutral` @ `/styleVariant` |  |  |
+| `creative.contentModeDefaultPresets` | creative | object |  |  | PATCH `/v1/config` @ `/contentModeDefaultPresets` | patch_config |  |
+| `engine.allowedOutputDirectory` | engine | string |  |  | PATCH `/v1/config` @ `/allowedOutputDirectory` | patch_config |  |
+| `engine.seedvr2WeightsPath` | engine | string |  |  | PATCH `/v1/config` @ `/seedvr2WeightsPath` | patch_config | yes |
+| `model.krea2Models` | model | object |  |  | PATCH `/v1/config` @ `/krea2Models` | patch_config | yes |
+| `model.spec` | model | string |  |  | PATCH `/v1/config` @ `/modelSpec` | patch_config | yes |
+| `provider.captioning.apiKey` | provider | string |  |  | PATCH `/v1/config` @ `/providers/captioning/apiKey` | patch_config |  |
+| `provider.captioning.baseUrl` | provider | string |  |  | PATCH `/v1/config` @ `/providers/captioning/baseUrl` | patch_config |  |
+| `provider.captioning.model` | provider | string |  |  | PATCH `/v1/config` @ `/providers/captioning/model` | patch_config |  |
+| `provider.promptOptimization.apiKey` | provider | string |  |  | PATCH `/v1/config` @ `/providers/promptOptimization/apiKey` | patch_config |  |
+| `provider.promptOptimization.baseUrl` | provider | string |  |  | PATCH `/v1/config` @ `/providers/promptOptimization/baseUrl` | patch_config |  |
+| `provider.promptOptimization.model` | provider | string |  |  | PATCH `/v1/config` @ `/providers/promptOptimization/model` | patch_config |  |
+| `provider.replicate.apiKey` | provider | string |  |  | PATCH `/v1/config` @ `/replicate/apiKey` | patch_config |  |
+| `provider.replicate.baseUrl` | provider | string |  |  | PATCH `/v1/config` @ `/replicate/baseUrl` | patch_config |  |
+| `provider.replicate.imageModel` | provider | string |  |  | PATCH `/v1/config` @ `/replicate/imageModel` | patch_config |  |
+| `provider.replicate.model` | provider | string |  |  | PATCH `/v1/config` @ `/replicate/model` | patch_config |  |
+| `provider.replicate.videoModel` | provider | string |  |  | PATCH `/v1/config` @ `/replicate/videoModel` | patch_config |  |
+| `provider.vision.apiKey` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/apiKey` | patch_config |  |
+| `provider.vision.baseUrl` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/baseUrl` | patch_config |  |
+| `provider.vision.model` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/model` | patch_config |  |
+| `queue.clear` | queue | action |  |  | POST `/v1/queue/clear` | clear_queue |  |
+| `queue.interrupt` | queue | action |  |  | POST `/v1/queue/interrupt` | interrupt_render |  |
+| `queue.pause` | queue | action |  |  | POST `/v1/queue/pause` | pause_queue |  |
+| `queue.resume` | queue | action |  |  | POST `/v1/queue/resume` | resume_queue |  |
+| `render.defaults.chroma.guidance` | engine | double |  | 0 | PATCH `/v1/config` @ `/renderDefaults/byFamily/chroma/guidance` | patch_config |  |
+| `render.defaults.chroma.height` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/chroma/height` | patch_config |  |
+| `render.defaults.chroma.steps` | engine | int |  | 28 | PATCH `/v1/config` @ `/renderDefaults/byFamily/chroma/steps` | patch_config |  |
+| `render.defaults.chroma.width` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/chroma/width` | patch_config |  |
+| `render.defaults.fibo.guidance` | engine | double |  | 4 | PATCH `/v1/config` @ `/renderDefaults/byFamily/fibo/guidance` | patch_config |  |
+| `render.defaults.fibo.height` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/fibo/height` | patch_config |  |
+| `render.defaults.fibo.steps` | engine | int |  | 30 | PATCH `/v1/config` @ `/renderDefaults/byFamily/fibo/steps` | patch_config |  |
+| `render.defaults.fibo.width` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/fibo/width` | patch_config |  |
+| `render.defaults.flux1.guidance` | engine | double |  | 0 | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux1/guidance` | patch_config |  |
+| `render.defaults.flux1.height` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux1/height` | patch_config |  |
+| `render.defaults.flux1.steps` | engine | int |  | 9 | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux1/steps` | patch_config |  |
+| `render.defaults.flux1.width` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux1/width` | patch_config |  |
+| `render.defaults.flux2.guidance` | engine | double |  |  | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux2/guidance` | patch_config |  |
+| `render.defaults.flux2.height` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux2/height` | patch_config |  |
+| `render.defaults.flux2.steps` | engine | int |  |  | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux2/steps` | patch_config |  |
+| `render.defaults.flux2.width` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/flux2/width` | patch_config |  |
+| `render.defaults.guidance` | engine | double |  |  | PATCH `/v1/config` @ `/renderDefaults/default/guidance` | patch_config |  |
+| `render.defaults.height` | engine | int |  |  | PATCH `/v1/config` @ `/renderDefaults/default/height` | patch_config |  |
+| `render.defaults.krea2.guidance` | engine | double |  |  | PATCH `/v1/config` @ `/renderDefaults/byFamily/krea2/guidance` | patch_config |  |
+| `render.defaults.krea2.height` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/krea2/height` | patch_config |  |
+| `render.defaults.krea2.steps` | engine | int |  |  | PATCH `/v1/config` @ `/renderDefaults/byFamily/krea2/steps` | patch_config |  |
+| `render.defaults.krea2.width` | engine | int |  | 1024 | PATCH `/v1/config` @ `/renderDefaults/byFamily/krea2/width` | patch_config |  |
+| `render.defaults.steps` | engine | int |  |  | PATCH `/v1/config` @ `/renderDefaults/default/steps` | patch_config |  |
+| `render.defaults.width` | engine | int |  |  | PATCH `/v1/config` @ `/renderDefaults/default/width` | patch_config |  |
+| `server.host` | engine | string |  | `127.0.0.1` | PATCH `/v1/config` @ `/host` | patch_config | yes |
+| `server.port` | engine | int | 1–65535 | 7870 | PATCH `/v1/config` @ `/port` | patch_config | yes |
+| `video.defaults.frames` | engine | int |  |  | PATCH `/v1/config` @ `/videoDefaults/default/frames` | patch_config |  |
+| `video.defaults.height` | engine | int |  |  | PATCH `/v1/config` @ `/videoDefaults/default/height` | patch_config |  |
+| `video.defaults.ltx2.frames` | engine | int |  | 97 | PATCH `/v1/config` @ `/videoDefaults/byFamily/ltx2/frames` | patch_config |  |
+| `video.defaults.ltx2.height` | engine | int |  | 448 | PATCH `/v1/config` @ `/videoDefaults/byFamily/ltx2/height` | patch_config |  |
+| `video.defaults.ltx2.width` | engine | int |  | 704 | PATCH `/v1/config` @ `/videoDefaults/byFamily/ltx2/width` | patch_config |  |
+| `video.defaults.width` | engine | int |  |  | PATCH `/v1/config` @ `/videoDefaults/default/width` | patch_config |  |

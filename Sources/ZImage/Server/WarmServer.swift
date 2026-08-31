@@ -843,6 +843,13 @@ public final class WarmServer {
       // document, so two agents patching different pointers cannot conflict.
       return Self.configPatchResponse(request: request)
 
+    case ("GET", "/v1/controls"):
+      // Phase 4 discovery (FDD §3.4, D4): every descriptor in the compile-time
+      // ControlRegistry plus its per-request resolved value — the registry
+      // never caches a copy. Shared with the sync control plane (0.B-2) so
+      // both paths emit identical bytes.
+      return .json(controlsResponse())
+
     case ("GET", "/v1/providers/status"):
       let config = ComfyBoxServerConfig.loadOrMigrate()
       func status(_ endpoint: AIProviderEndpoint?) -> [String: Any] {
@@ -1756,7 +1763,8 @@ public final class WarmServer {
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
           "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/video/generate/async", "/v1/upscale",
           "/v1/characters", "/v1/presets", "/v1/presets/resolve",
-          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log", "/v1/config"
+          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log", "/v1/config",
+          "/v1/controls"
       ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
          || request.path.hasPrefix("/v1/video/status/")
          || request.path.hasPrefix("/v1/characters/")
@@ -2909,6 +2917,7 @@ public final class WarmServer {
     case ("GET", "/v1/models"):    return syncModelsResponse()
     case ("GET", "/v1/stats"):     return syncStatsResponse()
     case ("GET", "/v1/config"):    return syncConfigResponse()
+    case ("GET", "/v1/controls"):  return controlsResponse()
     case ("POST", "/v1/queue/pause"):     return syncPauseResponse(paused: true)
     case ("POST", "/v1/queue/resume"):    return syncPauseResponse(paused: false)
     case ("POST", "/v1/queue/clear"):     return syncClearResponse()
@@ -3043,6 +3052,26 @@ public final class WarmServer {
     var response = HTTPResponse.rawJSON(status: 200, data: data)
     response.extraHeaders["ETag"] = etag
     return response
+  }
+
+  /// GET /v1/controls — Phase 4 discovery (FDD §3.4, D4), served identically by
+  /// the async arm and the sync control plane (0.B-2 classified: a lock read of
+  /// ServerConfigStore, a small-file ContentModeStore read — the same cost the
+  /// config/content-mode routes already pay — and the lock-based queue
+  /// snapshot; no actor hop, no cooperative threads). Values are resolved
+  /// per-request by dereferencing each descriptor's `read.pointer`; the
+  /// registry never caches a copy (§3.4's one rule).
+  private func controlsResponse() -> HTTPResponse {
+    let queueDocument = buildQueuePayloadData()
+      .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    guard let data = ControlRegistry.controlsPayload(
+      config: ServerConfigStore.shared.current().config,
+      contentModes: ContentModeStore.loadOrCreate(),
+      queueDocument: queueDocument)
+    else {
+      return .error(status: 500, message: "Failed to serialize controls")
+    }
+    return .rawJSON(status: 200, data: data)
   }
 
   /// Stats without an actor hop: the render counters come from the lock snapshot

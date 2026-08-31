@@ -58,7 +58,12 @@ final class MCPParityPhase1ToolTests: XCTestCase {
 
   func testCreatePresetRoute() {
     let tool = MCPToolRegistry.tool(named: "create_preset")!
-    XCTAssertEqual(tool.routes, [RouteRef(method: "POST", path: "/v1/presets")])
+    // Phase 4: the dispatch arm serves POST and PUT identically (upsert), so
+    // the tool claims both — same posture as create_character.
+    XCTAssertEqual(tool.routes, [
+      RouteRef(method: "POST", path: "/v1/presets"),
+      RouteRef(method: "PUT", path: "/v1/presets"),
+    ])
   }
 
   func testDeletePresetRoute() {
