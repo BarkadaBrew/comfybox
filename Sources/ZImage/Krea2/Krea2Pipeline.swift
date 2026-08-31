@@ -606,13 +606,25 @@ public final class Krea2Pipeline {
         // with an exact restore instead of being reported as unbound and
         // taking the whole stack down with it. Inert for every adapter whose
         // keys all name Linears. See ``LoRABareParameterPairs``.
-        let weights = try LoRABareParameterPairs.split(
-          LoRAWeightLoader.loadForKrea2(from: url), for: transformer, name: name)
+        // Full-matrix LoKr layers become dense `.diff` deltas on their target
+        // weights (comfybox#329): ΔW = kron(w1, w2) · alpha-scale, applied
+        // through `patchSession` whose first-write-wins snapshots (exact
+        // packed q8 weight/scales/biases tuple included) give LoKr the
+        // exact-restore transactionality the C1 guard below demands. A layer
+        // the densifier cannot prove out (no bindable target module) stays
+        // LoKr-shaped and the guard still refuses the file whole.
+        let weights = try LoKrDensifier.densify(
+          LoRABareParameterPairs.split(
+            LoRAWeightLoader.loadForKrea2(from: url), for: transformer, name: name),
+          for: transformer, name: name)
         // K-FIX-1 / Codex C1 — the second half of the transactional contract,
         // and like the relativity guard it fires BEFORE any weight mutation:
-        // LoKr rewrites base parameters and `clearDynamicLoRA` (this block's
-        // rollback) cannot restore them, so the stack would accumulate across
-        // renders while `appliedLoRAs` reported none. Refuse instead.
+        // in-place LoKr rewrites base parameters and `clearDynamicLoRA` (this
+        // block's rollback) cannot restore them, so the stack would accumulate
+        // across renders while `appliedLoRAs` reported none. The densifier
+        // above converts every provable full-matrix layer to a transactional
+        // delta (lokrLayerCount 0); this guard is the backstop for whatever
+        // it could not convert. Refuse instead.
         try Krea2AdapterSupport.checkTransactional(
           lokrLayerCount: weights.lokrLayerCount, lora: name)
         logger.info("Applying Krea-2 LoRA: \(name) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale), base=\(variant.rawValue))")
@@ -664,13 +676,16 @@ public final class Krea2Pipeline {
     do {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
-        let weights = try LoRABareParameterPairs.split(
-          LoRAWeightLoader.loadForKrea2(from: src), for: transformer,
-          name: cfg.source.displayName)
-        // Belt and braces: nothing carrying LoKr can be in `appliedLoRAs`
-        // (loadLoRAs refuses it), but this loop re-reads the files from disk,
-        // so a file swapped underneath us is refused here too rather than
-        // mutating the base on a control toggle (C1's compounding path).
+        let weights = try LoKrDensifier.densify(
+          LoRABareParameterPairs.split(
+            LoRAWeightLoader.loadForKrea2(from: src), for: transformer,
+            name: cfg.source.displayName),
+          for: transformer, name: cfg.source.displayName)
+        // Belt and braces: same densify → guard sequence as `loadLoRAs`, so a
+        // file that passed there passes identically here. This loop re-reads
+        // the files from disk, so a file swapped underneath us for one whose
+        // LoKr layers can NOT all be densified is refused here too rather
+        // than mutating the base on a control toggle (C1's compounding path).
         try Krea2AdapterSupport.checkTransactional(
           lokrLayerCount: weights.lokrLayerCount, lora: cfg.source.displayName)
         try LoRAApplicator.applyDynamically(
@@ -702,6 +717,15 @@ public final class Krea2Pipeline {
       return
     }
     let cl = try Krea2ControlLoRA.load(from: url, layers: config.layers)
+    // comfybox#329 M2: this is the ONE Krea-2 `applyDynamically` the C1 guard
+    // did not front. The densifier only runs on the identity stack, so a
+    // LoKr-bearing control file must be refused HERE — before controlFirst is
+    // swapped in or any adapter binds — or its LoKr half would reach the
+    // ungated in-place path and mutate the warm model non-transactionally.
+    // `Krea2ControlLoRA.load` surfaces LoKr tensors precisely so this count
+    // is truthful.
+    try Krea2AdapterSupport.checkTransactional(
+      lokrLayerCount: cl.loraWeights.lokrLayerCount, lora: url.lastPathComponent)
     // assertBaseHalfMatches skipped: transformer.first is q8-quantized (weight access unsafe on QuantizedLinear)
     let cw = cl.firstWeight
     let cb = cl.firstBias

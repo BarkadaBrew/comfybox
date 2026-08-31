@@ -69,8 +69,31 @@ public struct Krea2ControlLoRA {
         pairs["blocks.\(i).\(tg).weight"] = (down: a, up: b)
       }
     }
+    // comfybox#329 M2: SURFACE any LoKr tensors the checkpoint carries. This
+    // loader fetches only the fixed A/B key set, so without this scan a
+    // `.lokr_w1/.lokr_w2` half would silently vanish and the pipeline's
+    // transactional guard (`Krea2AdapterSupport.checkTransactional`, which
+    // reads `lokrLayerCount`) would have nothing to refuse on. The refusal
+    // POLICY stays in the pipeline, same as the identity-stack sites; this
+    // only makes the count truthful. Orphan halves are a loud invalidFormat,
+    // mirroring `loadForKrea2` (never a silent drop).
+    var lokrWeights: [String: LoKrWeights] = [:]
+    let lokrHalves = names.filter { $0.hasSuffix(".lokr_w1") || $0.hasSuffix(".lokr_w2") }
+    if !lokrHalves.isEmpty {
+      // ".lokr_w1" and ".lokr_w2" are the same length, so one dropLast fits both.
+      let modules = Set(lokrHalves.map { String($0.dropLast(".lokr_w1".count)) })
+      for module in modules.sorted() {
+        guard names.contains(module + ".lokr_w1"), names.contains(module + ".lokr_w2") else {
+          throw LoRAError.invalidFormat(
+            "orphan LoKr half at '\(module)' in control LoRA \(file.lastPathComponent)")
+        }
+        lokrWeights[module] = LoKrWeights(
+          w1: try reader.tensor(named: module + ".lokr_w1"),
+          w2: try reader.tensor(named: module + ".lokr_w2"))
+      }
+    }
     // alpha == nil -> alpha defaults to rank -> effectiveScale 1.0 (fixed-strength control LoRA).
-    let lw = LoRAWeights(weights: pairs, rank: rank, alpha: nil)
+    let lw = LoRAWeights(weights: pairs, lokrWeights: lokrWeights, rank: rank, alpha: nil)
     return Krea2ControlLoRA(firstWeight: fw, firstBias: fb, loraWeights: lw, baseInFeatures: baseIn)
   }
 
