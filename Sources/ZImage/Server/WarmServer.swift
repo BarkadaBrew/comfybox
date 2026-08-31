@@ -8538,6 +8538,11 @@ struct GeneratePayload: Sendable {
   /// Fractal `alpha` exponent (wire: `noise_alpha`); only read for
   /// `noise_type: fractal`. Absent = 0.0 (fractal ≡ gaussian).
   let noiseAlpha: Float?
+  /// RES4LYF implicit-RK refinement (wire: `implicit_steps`). Krea 2 + the
+  /// RES4LYF explicit tableaus only; re-iterates the tableau this many extra
+  /// times as a fixed point. Absent/0 = byte-identical to today. Mirrors
+  /// `eta`/`bongmath`: decoded here, forwarded to Krea2Pipeline.Request.
+  let implicitSteps: Int?
   init(
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
@@ -8558,7 +8563,8 @@ struct GeneratePayload: Sendable {
     preempt: Bool? = nil, vae: String? = nil,
     stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil,
     projectorScale: Float? = nil,
-    noiseType: String? = nil, noiseAlpha: Float? = nil
+    noiseType: String? = nil, noiseAlpha: Float? = nil,
+    implicitSteps: Int? = nil
   ) {
     self.preempt = preempt
     self.vae = vae
@@ -8568,6 +8574,7 @@ struct GeneratePayload: Sendable {
     self.projectorScale = projectorScale
     self.noiseType = noiseType
     self.noiseAlpha = noiseAlpha
+    self.implicitSteps = implicitSteps
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -8636,6 +8643,8 @@ extension GeneratePayload: Decodable {
     // `.convertFromSnakeCase`.
     case noiseType
     case noiseAlpha
+    // `implicit_steps` arrives as this camelCase form after .convertFromSnakeCase.
+    case implicitSteps
   }
 
   init(from decoder: Decoder) throws {
@@ -8698,6 +8707,7 @@ extension GeneratePayload: Decodable {
     detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)
     noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
     noiseAlpha = try c.decodeIfPresent(Float.self, forKey: .noiseAlpha)
+    implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.

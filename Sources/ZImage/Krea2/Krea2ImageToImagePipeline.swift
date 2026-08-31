@@ -58,6 +58,9 @@ extension Krea2Pipeline {
     public var noiseType: RES4LYFNoiseType = .gaussian
     /// Fractal `alpha`; see `Krea2Pipeline.Request.noiseAlpha`.
     public var noiseAlpha: Float = 0.0
+    /// RES4LYF implicit-RK refinement; see `Krea2Pipeline.Request.implicitStepsFull`.
+    /// 0 (default) is byte-identical to today.
+    public var implicitStepsFull: Int = 0
 
     public init(
       prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
@@ -68,7 +71,8 @@ extension Krea2Pipeline {
       sigmaScheduleRequested: String? = nil,
       eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
       projectorScale: Float = 1.0,
-      noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0
+      noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0,
+      implicitStepsFull: Int = 0
     ) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
@@ -90,6 +94,7 @@ extension Krea2Pipeline {
       self.projectorScale = projectorScale
       self.noiseType = noiseType
       self.noiseAlpha = noiseAlpha
+      self.implicitStepsFull = implicitStepsFull
     }
   }
 
@@ -207,6 +212,7 @@ extension Krea2Pipeline {
       initialSample: img,
       startIndex: startIndex,
       modelEvalsPerEvaluate: useCFG ? 2 : 1,
+      implicitStepsFull: request.implicitStepsFull,
       evaluate: { [transformer] latent, sigma in
         let t = MLX.full([1], values: MLXArray(sigma)).asType(dtype)
         let vCond = transformer(img: latent, context: ctx, t: t, pos: pos, mask: fullMask,

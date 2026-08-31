@@ -490,6 +490,12 @@ public final class Krea2Pipeline {
     /// Fractal `alpha` exponent (RES4LYF `FractalNoiseGenerator`). 0 makes
     /// fractal byte-identical to gaussian; only read when `noiseType == .fractal`.
     public var noiseAlpha: Float = 0.0
+    /// RES4LYF implicit-RK refinement: re-iterate the explicit tableau
+    /// `implicitStepsFull` extra times as a fixed point (upstream's `full_iter`
+    /// loop). 0 (default) is byte-identical to today's single explicit pass;
+    /// >0 re-anchors row 0 on the previous pass's x_next (see
+    /// ``Krea2DenoiseLoop``). Scoped to `heun_2s`, guides off, eta 0.
+    public var implicitStepsFull: Int = 0
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled,
@@ -498,7 +504,8 @@ public final class Krea2Pipeline {
                 sigmaScheduleRequested: String? = nil,
                 eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
                 stage2: Stage2? = nil, projectorScale: Float = 1.0,
-                noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0) {
+                noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0,
+                implicitStepsFull: Int = 0) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
       self.guidance = guidance
@@ -519,6 +526,7 @@ public final class Krea2Pipeline {
       self.projectorScale = projectorScale
       self.noiseType = noiseType
       self.noiseAlpha = noiseAlpha
+      self.implicitStepsFull = implicitStepsFull
     }
   }
 
@@ -1048,6 +1056,7 @@ public final class Krea2Pipeline {
       initialSample: img,
       startIndex: 0,
       modelEvalsPerEvaluate: useCFG ? 2 : 1,
+      implicitStepsFull: request.implicitStepsFull,
       evaluate: { [transformer] latent, sigma in
         // `sigma` IS Krea 2's `t`: it goes into the transformer with no
         // (1000 − t)/1000 renormalisation, exactly as the inline loop did.

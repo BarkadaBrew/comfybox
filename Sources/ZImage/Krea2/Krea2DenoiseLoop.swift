@@ -184,6 +184,7 @@ public enum Krea2DenoiseLoop {
     initialSample: MLXArray,
     startIndex: Int = 0,
     modelEvalsPerEvaluate: Int = 1,
+    implicitStepsFull: Int = 0,
     evaluate: (_ latent: MLXArray, _ sigma: Float) -> MLXArray,
     noise: SDENoiseInjector? = nil,
     bongmath: BongMath? = nil,
@@ -192,6 +193,7 @@ public enum Krea2DenoiseLoop {
     let total = scheduler.numInferenceSteps
     precondition(startIndex >= 0 && startIndex <= total, "startIndex \(startIndex) outside 0...\(total)")
     precondition(modelEvalsPerEvaluate >= 1, "modelEvalsPerEvaluate must be ≥ 1")
+    precondition(implicitStepsFull >= 0, "implicitStepsFull must be >= 0")
 
     // 1. Reset multistep state before the first step.
     scheduler.reset()
@@ -240,40 +242,68 @@ public enum Krea2DenoiseLoop {
 
       if var tableau = scheduler as? TableauScheduler {
         // 3. N-row: rows evaluations at rowSigma / rowSample, then commit.
-        var k: [MLXArray] = []
-        k.reserveCapacity(tableau.rows)
-        for r in 0..<tableau.rows {
-          let anchor = stepStart ?? x
-          var xr = r == 0 ? x : tableau.rowSample(timestepIndex: i, row: r, x0: anchor, k: k)
-          let sr = r == 0 ? sigma : tableau.rowSigma(timestepIndex: i, row: r)
-          // T2 substep re-noise: rows 1 ..< rows are upstream's non-final rows
-          // (`row + row_offset` for `row < rows − row_offset`), and row 0 is
-          // the step's start sample, which is never re-noised.
-          if r > 0, let noise, let stepStart {
-            noise.injectSubstep(
-              sample: &xr, x0: stepStart, timestepIndex: i, row: r, scheduler: tableau)
+        //
+        // RES4LYF's fully-implicit `full_iter` loop (`rk_sampler_beta.py:936`).
+        // Pass 0 is today's plain explicit step. Each further pass re-runs the
+        // whole tableau as a fixed point, re-anchoring row 0 on the PREVIOUS
+        // pass's committed x_next evaluated at σ_next — upstream's
+        // `full_iter > 0 && row_offset == 1 && row == 0` branch, which at eta 0
+        // / guides off / bongmath off falls to `x_tmp = x; s_tmp = σ_next`
+        // (`rk_sampler_beta.py:1033-1034`). The step's x₀ and σ stay the
+        // anchor for every row's epsilon; only WHERE the model is sampled moves.
+        // `heun_2s` has row_offset 1 (A[0] == 0). `implicitStepsFull == 0` ⇒
+        // one pass ⇒ byte-identical to the pre-change loop.
+        let fullPasses = implicitStepsFull + 1
+        let sigmaNext = sigmas[i + 1]
+        var committed = x
+        for pass in 0..<fullPasses {
+          var k: [MLXArray] = []
+          k.reserveCapacity(tableau.rows)
+          for r in 0..<tableau.rows {
+            let anchor = stepStart ?? x
+            let xrBase: MLXArray
+            let sr: Float
+            if r == 0 {
+              if pass == 0 {
+                xrBase = x
+                sr = sigma
+              } else {
+                // Fully-implicit re-anchor: model on the previous pass's x_next
+                // at σ_next; the row epsilon stays x₀/σ anchored downstream.
+                xrBase = committed
+                sr = sigmaNext
+              }
+            } else {
+              xrBase = tableau.rowSample(timestepIndex: i, row: r, x0: anchor, k: k)
+              sr = tableau.rowSigma(timestepIndex: i, row: r)
+            }
+            var xr = xrBase
+            // T2/T3 hooks fire on pass 0 only. Passes > 0 are the scoped T1
+            // regime (eta 0, bongmath off) where upstream's substep swap is the
+            // identity and `bong_iter` is disabled; gating on `pass == 0` keeps
+            // the default (implicitStepsFull == 0) path op-for-op untouched.
+            if pass == 0, r > 0, let noise, let stepStart {
+              noise.injectSubstep(
+                sample: &xr, x0: stepStart, timestepIndex: i, row: r, scheduler: tableau)
+            }
+            if pass == 0, r > 0, let bongmath, var banchor = stepStart {
+              let history = k
+              evaluateCalls += bongmath.iterate(
+                x0: &banchor, rowSample: xr, timestepIndex: i, row: r - 1, scheduler: tableau,
+                buildRowSample: { [tableau] x0 in
+                  var t = tableau
+                  return t.rowSample(timestepIndex: i, row: r, x0: x0, k: history)
+                },
+                evaluate: evaluate)
+              stepStart = banchor
+            }
+            let v = evaluate(xr, sr)
+            evaluateCalls += 1
+            k.append(tableau.modelInput(velocity: v, sample: xr, sigma: sr))
           }
-          // T3: re-anchor on the row the T2 swap just moved. Upstream's `row`
-          // is the row whose UPDATE built this sample, i.e. `r − 1`; it never
-          // runs for the committing row, which is why the driver's `r` stops
-          // at `rows − 1` and this call is inside the loop rather than after
-          // it (`rk_method_beta.py:713` — `row < rows − row_offset`).
-          if r > 0, let bongmath, var anchor = stepStart {
-            let history = k
-            evaluateCalls += bongmath.iterate(
-              x0: &anchor, rowSample: xr, timestepIndex: i, row: r - 1, scheduler: tableau,
-              buildRowSample: { [tableau] x0 in
-                var t = tableau
-                return t.rowSample(timestepIndex: i, row: r, x0: x0, k: history)
-              },
-              evaluate: evaluate)
-            stepStart = anchor
-          }
-          let v = evaluate(xr, sr)
-          evaluateCalls += 1
-          k.append(tableau.modelInput(velocity: v, sample: xr, sigma: sr))
+          committed = tableau.commit(timestepIndex: i, x0: stepStart ?? x, k: k)
         }
-        x = tableau.commit(timestepIndex: i, x0: stepStart ?? x, k: k)
+        x = committed
         scheduler = tableau
       } else {
         // 2. First evaluation at the grid sigma; convert per WP-E2.
