@@ -239,6 +239,8 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   /// resolved between request fields and config.json/env.
   public var videoTuning: LTX2VideoTuning?
   public var guidance: Double?
+  /// Krea2 projector-scale gain (CFG-free prompt adherence). nil = neutral (1.0).
+  public var projectorScale: Double?
   public var seed: Int?
   public var width: Int?
   public var height: Int?
@@ -296,6 +298,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     injectedKeywords: [String]? = nil,
     steps: Int? = nil,
     guidance: Double? = nil,
+    projectorScale: Double? = nil,
     seed: Int? = nil,
     width: Int? = nil,
     height: Int? = nil,
@@ -330,6 +333,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.injectedKeywords = injectedKeywords
     self.steps = steps
     self.guidance = guidance
+    self.projectorScale = projectorScale
     self.seed = seed
     self.width = width
     self.height = height
@@ -352,7 +356,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     case id, name, description
     case mediaKind, provider, engine, mode, model, customModelPath, baseModel
     case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
-    case steps, guidance, seed, width, height
+    case steps, guidance, projectorScale, seed, width, height
     case loras, scheduler, upscale
     // Missing until 2026-08-07: with it absent, BOTH the custom decoder and
     // the synthesized encoder dropped videoTuning — every preset-level Tier-A
@@ -387,6 +391,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     injectedKeywords = try c.decodeIfPresent([String].self, forKey: .injectedKeywords)
     steps = try c.decodeIfPresent(Int.self, forKey: .steps)
     guidance = try c.decodeIfPresent(Double.self, forKey: .guidance)
+    projectorScale = try c.decodeIfPresent(Double.self, forKey: .projectorScale)
     seed = try c.decodeIfPresent(Int.self, forKey: .seed)
     width = try c.decodeIfPresent(Int.self, forKey: .width)
     height = try c.decodeIfPresent(Int.self, forKey: .height)
@@ -422,6 +427,7 @@ public struct PresetDefaults: Equatable, Sendable {
   public var width: Int
   public var height: Int
   public var guidance: Double?
+  public var projectorScale: Double?
 
   public init(
     mediaKind: String = "image",
@@ -430,7 +436,8 @@ public struct PresetDefaults: Equatable, Sendable {
     steps: Int = 4,
     width: Int = 512,
     height: Int = 512,
-    guidance: Double? = nil
+    guidance: Double? = nil,
+    projectorScale: Double? = nil
   ) {
     self.mediaKind = mediaKind
     self.provider = provider
@@ -439,6 +446,7 @@ public struct PresetDefaults: Equatable, Sendable {
     self.width = width
     self.height = height
     self.guidance = guidance
+    self.projectorScale = projectorScale
   }
 
   public static let standard = PresetDefaults()
@@ -468,6 +476,8 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
 
   public var steps: Int
   public var guidance: Double?
+  /// Krea2 projector-scale gain (CFG-free prompt adherence). nil = neutral (1.0).
+  public var projectorScale: Double?
   public var seed: Int?
   public var width: Int
   public var height: Int
@@ -510,6 +520,7 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
     injectedKeywords = preset.injectedKeywords ?? []
     steps = preset.steps ?? defaults.steps
     guidance = preset.guidance ?? defaults.guidance
+    projectorScale = preset.projectorScale ?? defaults.projectorScale
     seed = preset.seed
     width = preset.width ?? defaults.width
     height = preset.height ?? defaults.height
