@@ -32,6 +32,13 @@
 //
 // No Krea 2 LoKr adapter exists in the vault today, so the refusal costs
 // nothing now and closes a compounding, falsely-reported weight-state bug.
+//
+// comfybox#329 is that "own ticket": ``LoKrDensifier`` now converts every
+// provable FULL-MATRIX LoKr layer into a dense `.diff` delta applied through
+// `LoRAPatchSession` (exact packed-tuple snapshot/restore), so such files
+// reach this guard with `lokrLayerCount == 0` and pass. The guard is
+// deliberately unchanged: it remains the fail-closed backstop for any layer
+// the densifier could not convert (no bindable target module).
 
 import Foundation
 
