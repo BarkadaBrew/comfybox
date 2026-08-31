@@ -30,6 +30,9 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     public var kroma: PresetKroma?
     public var steps: Int
     public var guidance: Float
+    /// Krea2 projector-scale gain; nil = neutral. Optional so presets saved
+    /// before this field still decode.
+    public var projectorScale: Float?
     public var width: Int
     public var height: Int
     public var sampler: String?
@@ -51,6 +54,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         kroma: PresetKroma? = nil,
         steps: Int = 9,
         guidance: Float = 3.5,
+        projectorScale: Float? = nil,
         width: Int = 1024,
         height: Int = 1024,
         sampler: String? = nil,
@@ -69,6 +73,7 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.kroma = kroma
         self.steps = steps
         self.guidance = guidance
+        self.projectorScale = projectorScale
         self.width = width
         self.height = height
         self.sampler = sampler

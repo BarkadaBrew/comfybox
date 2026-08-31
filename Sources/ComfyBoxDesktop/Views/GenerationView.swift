@@ -315,6 +315,7 @@ struct GenerationView: View {
                         negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
+                        projectorScale: projectorScale,
                         width: effectiveWidth,
                         height: effectiveHeight,
                         loras: selectedLoras.filter {
@@ -1790,6 +1791,7 @@ struct GenerationView: View {
         negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
+        projectorScale = Double(preset.projectorScale ?? 1.0)
         sampler = preset.sampler ?? ""
         sigmaSchedule = preset.sigmaSchedule ?? ""
         kromaPolicy = preset.kroma
