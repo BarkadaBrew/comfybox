@@ -57,6 +57,12 @@ public enum ParityExemptions {
       reason: "Reverts a mode to its built-in definition; same posture as the PUT — no agent"
         + " caller yet, discoverable via GET /v1/controls."),
     ParityExemption(
+      method: "POST", path: "/v1/queue/clear",
+      reason: "The clear_queue tool targets the ComfyUI-bridge queue path (POST /queue"
+        + " {\"clear\": true}, executeClearQueue) -- a pre-parity contract the old"
+        + " api-reference documented; the native /v1/queue/clear route currently has no"
+        + " agent caller. Declared reality (G1); re-point the tool in a behavior phase."),
+    ParityExemption(
       method: "POST", path: "/v1/presets/resolve",
       reason: "POST-for-body READ: resolves a preset against the loaded model without changing"
         + " state. Not a mutation; list_presets covers agent reads."),

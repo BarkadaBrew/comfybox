@@ -257,7 +257,11 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": [:] as [String: Any],
     ] as [String: Any],
-    routes: [RouteRef(method: "POST", path: "/v1/queue/clear")]
+    // DECLARED REALITY (parity G1): the executor posts the ComfyUI-bridge
+    // queue-clear (`POST /queue {"clear": true}`, executeClearQueue), NOT the
+    // native `POST /v1/queue/clear` -- which is exempted in ParityExemptions.
+    // The tool<->executor parity assertion pins this claim to the source.
+    routes: [RouteRef(method: "POST", path: "/queue", surface: .comfyUICompat)]
   )
 
   static let pauseQueue = MCPToolDefinition(

@@ -391,6 +391,187 @@ final class ControlSurfaceParityTests: XCTestCase {
     XCTAssertEqual(first, second)
   }
 
+  // MARK: - G2: tool route claims vs executor SOURCE (the hole G1 slipped through)
+
+  /// Evidence extracted from MCPToolExecutor.swift: a path the executor really
+  /// calls, with the HTTP method when the call form makes it derivable
+  /// (`client.post("…")`, `call("PUT", "…")`, `executeGet("…")`, …) and nil
+  /// when only the path literal is visible (variable/ternary paths).
+  private struct ExecutorEvidence: Hashable {
+    let method: String?
+    let path: String
+  }
+
+  /// Claims that are intentionally indirect and reviewer-cleared. Today: the
+  /// PUT-upsert aliases — the dispatch arms serve POST|PUT identically, the
+  /// executor POSTs, and the tool claims both so the parity claim-map covers
+  /// the PUT arm (same path, same surface).
+  private static let executorClaimExemptions: Set<String> = [
+    "create_preset PUT /v1/presets",
+    "create_character PUT /v1/characters",
+  ]
+
+  private static let executorSource: String = {
+    let url = repoRoot.appendingPathComponent("Sources/ZImage/MCP/MCPToolExecutor.swift")
+    return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+  }()
+
+  private static func evidence(inLines lines: ArraySlice<String>) -> Set<ExecutorEvidence> {
+    var result: Set<ExecutorEvidence> = []
+    func matches(_ pattern: String, in line: String) -> [[String]] {
+      guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+      let range = NSRange(line.startIndex..., in: line)
+      return regex.matches(in: line, range: range).map { match in
+        (1..<match.numberOfRanges).compactMap { index in
+          Range(match.range(at: index), in: line).map { String(line[$0]) }
+        }
+      }
+    }
+    func normalize(_ path: String) -> String {
+      // "\(expr)" interpolation segments are path parameters.
+      (try? NSRegularExpression(pattern: #"\\\([^)]*\)"#)).map { regex in
+        regex.stringByReplacingMatches(
+          in: path, range: NSRange(path.startIndex..., in: path), withTemplate: "{id}")
+      } ?? path
+    }
+    for line in lines {
+      for m in matches(#"client\.(get|post|put|patch|delete)\(\s*"(/[^"]*)""#, in: line) {
+        result.insert(ExecutorEvidence(method: m[0].uppercased(), path: normalize(m[1])))
+      }
+      for m in matches(#"call\(\s*"([A-Z]+)"\s*,\s*"(/[^"]*)""#, in: line) {
+        result.insert(ExecutorEvidence(method: m[0], path: normalize(m[1])))
+      }
+      for m in matches(#"executeGet\(\s*"(/[^"]*)""#, in: line) {
+        result.insert(ExecutorEvidence(method: "GET", path: normalize(m[0])))
+      }
+      for m in matches(#"executePostEmpty\(\s*"(/[^"]*)""#, in: line) {
+        result.insert(ExecutorEvidence(method: "POST", path: normalize(m[0])))
+      }
+      // Any other path-shaped literal (variable paths, ternaries, helper
+      // arguments like `route:` / executeNearlineAction) — method unknown.
+      for m in matches(#""(/[^" ]*)""#, in: line) {
+        result.insert(ExecutorEvidence(method: nil, path: normalize(m[0])))
+      }
+    }
+    return result
+  }
+
+  /// tool name → executor evidence, from the dispatch switch in
+  /// `MCPToolExecutor.execute(name:arguments:)`: each `case "tool":` body's
+  /// inline evidence plus the evidence of every `execute*` method the body
+  /// invokes (method bodies delimited by `func` starts).
+  private static let executorEvidenceByTool: [String: Set<ExecutorEvidence>] = {
+    let stripped = ControlSurfaceParser.stripComments(executorSource)
+    let lines = stripped.components(separatedBy: "\n")
+
+    // Method bodies: func name → line range.
+    var funcStarts: [(name: String, line: Int)] = []
+    for (index, line) in lines.enumerated() {
+      if let regex = try? NSRegularExpression(pattern: #"func\s+(\w+)\s*\("#),
+         let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+         let nameRange = Range(match.range(at: 1), in: line) {
+        funcStarts.append((String(line[nameRange]), index))
+      }
+    }
+    var evidenceByFunc: [String: Set<ExecutorEvidence>] = [:]
+    var calleesByFunc: [String: Set<String>] = [:]
+    func invokedHelpers(inLines body: ArraySlice<String>) -> Set<String> {
+      // Helpers worth following: execute*/run* (runSetWarmPreset is the
+      // composite behind set_warm_preset — one hop past executeSetWarmPreset).
+      guard let regex = try? NSRegularExpression(pattern: #"((?:execute|run)\w+)\("#) else { return [] }
+      var names: Set<String> = []
+      for line in body {
+        let range = NSRange(line.startIndex..., in: line)
+        for match in regex.matches(in: line, range: range) {
+          if let nameRange = Range(match.range(at: 1), in: line) {
+            names.insert(String(line[nameRange]))
+          }
+        }
+      }
+      return names
+    }
+    for (offset, start) in funcStarts.enumerated() {
+      let end = offset + 1 < funcStarts.count ? funcStarts[offset + 1].line : lines.count
+      let body = lines[start.line..<end]
+      evidenceByFunc[start.name] = evidence(inLines: body)
+      calleesByFunc[start.name] = invokedHelpers(inLines: body)
+    }
+    // Transitive closure over the helper call graph, so evidence flows back
+    // through composites (dispatch arm -> executeX -> runY -> call literals).
+    func reachableEvidence(from roots: Set<String>) -> Set<ExecutorEvidence> {
+      var visited: Set<String> = []
+      var queue = Array(roots)
+      var result: Set<ExecutorEvidence> = []
+      while let name = queue.popLast() {
+        guard !visited.contains(name) else { continue }
+        visited.insert(name)
+        if let found = evidenceByFunc[name] { result.formUnion(found) }
+        if let callees = calleesByFunc[name] { queue.append(contentsOf: callees) }
+      }
+      return result
+    }
+
+    // Dispatch arms: case "tool": … (until the next case/default).
+    var byTool: [String: Set<ExecutorEvidence>] = [:]
+    var caseStarts: [(tool: String, line: Int)] = []
+    for (index, line) in lines.enumerated() {
+      if let regex = try? NSRegularExpression(pattern: #"case\s+"([a-z0-9_]+)"\s*:"#),
+         let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+         let toolRange = Range(match.range(at: 1), in: line) {
+        caseStarts.append((String(line[toolRange]), index))
+      }
+      if line.trimmingCharacters(in: .whitespaces).hasPrefix("default:"),
+         let last = caseStarts.last, last.line < index {
+        caseStarts.append(("__default__", index))
+      }
+    }
+    for (offset, start) in caseStarts.enumerated() where start.tool != "__default__" {
+      let end = offset + 1 < caseStarts.count ? caseStarts[offset + 1].line : lines.count
+      let body = lines[start.line..<end]
+      var toolEvidence = evidence(inLines: body)
+      toolEvidence.formUnion(reachableEvidence(from: invokedHelpers(inLines: body)))
+      byTool[start.tool, default: []].formUnion(toolEvidence)
+    }
+    return byTool
+  }()
+
+  func testToolRouteClaimsMatchExecutorSource() {
+    XCTAssertFalse(Self.executorSource.isEmpty, "Could not read MCPToolExecutor.swift")
+    for tool in MCPToolRegistry.tools where !tool.routes.isEmpty {
+      guard let evidence = Self.executorEvidenceByTool[tool.name] else {
+        XCTFail("Tool \(tool.name) declares routes but has no dispatch arm in MCPToolExecutor.execute — claim cannot be grounded")
+        continue
+      }
+      for route in tool.routes {
+        let key = "\(tool.name) \(route.method) \(route.path)"
+        if Self.executorClaimExemptions.contains(key) { continue }
+        let satisfied = evidence.contains { item in
+          item.path == route.path && (item.method == nil || item.method == route.method)
+        }
+        XCTAssertTrue(
+          satisfied,
+          "Tool \(tool.name) claims \(route.method) \(route.path) (surface \(route.surface.rawValue)) but its executor never calls that path — executor evidence: \(evidence.map { "\($0.method ?? "?") \($0.path)" }.sorted()). Fix the routes: claim to declared reality or add a reasoned executorClaimExemptions entry")
+      }
+    }
+  }
+
+  /// The exemption table must stay grounded: every entry names a real tool and
+  /// a route that tool actually claims.
+  func testExecutorClaimExemptionsAreNotStale() {
+    for key in Self.executorClaimExemptions {
+      let parts = key.split(separator: " ").map(String.init)
+      XCTAssertEqual(parts.count, 3, "Malformed exemption key: \(key)")
+      guard parts.count == 3 else { continue }
+      guard let tool = MCPToolRegistry.tool(named: parts[0]) else {
+        XCTFail("Stale executor-claim exemption: no tool named \(parts[0])")
+        continue
+      }
+      XCTAssertTrue(
+        tool.routes.contains { $0.method == parts[1] && $0.path == parts[2] },
+        "Stale executor-claim exemption: \(parts[0]) no longer claims \(parts[1]) \(parts[2])")
+    }
+  }
+
   // MARK: - Parser unit coverage (the recognizers §3.5 rule 3 requires)
 
   func testParserStripsCommentsAndPreservesStrings() {

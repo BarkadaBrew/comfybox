@@ -203,10 +203,12 @@ public enum ControlRegistry {
         mcpTool: "resume_queue", since: "phase0"),
       ControlDescriptor(
         id: "queue.clear", title: "Clear queue",
-        summary: "Drop all pending render jobs; the in-flight render is untouched.",
+        summary: "Drop all pending render jobs; the in-flight render is untouched."
+          + " No MCP tool fronts this native route yet: the clear_queue tool posts the"
+          + " ComfyUI-bridge queue-clear instead (declared reality, see ParityExemptions).",
         scope: .queue, type: .action,
         write: ActionRef(method: "POST", path: "/v1/queue/clear"),
-        mcpTool: "clear_queue", since: "phase0"),
+        since: "phase0"),
       ControlDescriptor(
         id: "queue.interrupt", title: "Interrupt render",
         summary: "Abort the in-flight render at the next interruptible phase boundary.",
@@ -703,6 +705,11 @@ public enum APIReferenceDoc {
     `{id}` marks a path parameter. Mutating `v1` routes are each claimed by an MCP tool
     or carry a reasoned exemption (§3.5 assertion 3).
 
+    > **See also: [`api-notes.md`](api-notes.md)** — the HAND-MAINTAINED companion with
+    > body schemas and operational guidance (LTX-2 video bodies, `POST /v1/enhance`,
+    > LoRA `role` semantics, Krea-2 preset kroma rules, startup imports). This file is
+    > regenerated wholesale; durable prose belongs there, never here.
+
     ## Warm-server routes (`surface: v1`)
 
     | Method | Path | MCP tools | Exemption |
@@ -721,14 +728,16 @@ public enum APIReferenceDoc {
 
     Served by `ComfyBridge.route()` for ComfyUI/Krita clients, BEFORE the main switch.
     Declared policy (§3.5): these need no MCP tool, but every one must be enumerated here
-    so adding one is visible in review.
+    so adding one is visible in review. A tool listed here proxies the bridge path by
+    declared contract (e.g. `clear_queue`).
 
-    | Method | Path |
-    |---|---|
+    | Method | Path | MCP tools |
+    |---|---|---|
 
     """
     for route in sorted(bridgeRoutes) {
-      out += "| \(route.method) | `\(route.path)` |\n"
+      let tools = toolsByRoute[route]?.sorted().joined(separator: ", ") ?? ""
+      out += "| \(route.method) | `\(route.path)` | \(tools) |\n"
     }
 
     out += """

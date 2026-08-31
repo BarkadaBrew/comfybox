@@ -13,6 +13,11 @@ The warm server (`comfybox serve`, default port **7870**) exposes an HTTP/JSON A
 `{id}` marks a path parameter. Mutating `v1` routes are each claimed by an MCP tool
 or carry a reasoned exemption (§3.5 assertion 3).
 
+> **See also: [`api-notes.md`](api-notes.md)** — the HAND-MAINTAINED companion with
+> body schemas and operational guidance (LTX-2 video bodies, `POST /v1/enhance`,
+> LoRA `role` semantics, Krea-2 preset kroma rules, startup imports). This file is
+> regenerated wholesale; durable prose belongs there, never here.
+
 ## Warm-server routes (`surface: v1`)
 
 | Method | Path | MCP tools | Exemption |
@@ -69,7 +74,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | GET | `/v1/presets/{id}` |  |  |
 | GET | `/v1/providers/status` |  |  |
 | GET | `/v1/queue` |  |  |
-| POST | `/v1/queue/clear` | clear_queue |  |
+| POST | `/v1/queue/clear` |  | The clear_queue tool targets the ComfyUI-bridge queue path (POST /queue {"clear": true}, executeClearQueue) -- a pre-parity contract the old api-reference documented; the native /v1/queue/clear route currently has no agent caller. Declared reality (G1); re-point the tool in a behavior phase. |
 | POST | `/v1/queue/interrupt` | interrupt_render |  |
 | POST | `/v1/queue/pause` | pause_queue |  |
 | POST | `/v1/queue/resume` | resume_queue |  |
@@ -102,27 +107,28 @@ or carry a reasoned exemption (§3.5 assertion 3).
 
 Served by `ComfyBridge.route()` for ComfyUI/Krita clients, BEFORE the main switch.
 Declared policy (§3.5): these need no MCP tool, but every one must be enumerated here
-so adding one is visible in review.
+so adding one is visible in review. A tool listed here proxies the bridge path by
+declared contract (e.g. `clear_queue`).
 
-| Method | Path |
-|---|---|
-| GET | `/embeddings` |
-| GET | `/experiment/models` |
-| GET | `/extensions` |
-| GET | `/history` |
-| POST | `/interrupt` |
-| GET | `/object_info` |
-| GET | `/prompt` |
-| POST | `/prompt` |
-| GET | `/queue` |
-| POST | `/queue` |
-| GET | `/settings` |
-| GET | `/system_stats` |
-| POST | `/upload/image` |
-| GET | `/userdata*` |
-| GET | `/users` |
-| GET | `/view` |
-| GET | `/ws` |
+| Method | Path | MCP tools |
+|---|---|---|
+| GET | `/embeddings` |  |
+| GET | `/experiment/models` |  |
+| GET | `/extensions` |  |
+| GET | `/history` |  |
+| POST | `/interrupt` |  |
+| GET | `/object_info` |  |
+| GET | `/prompt` |  |
+| POST | `/prompt` |  |
+| GET | `/queue` |  |
+| POST | `/queue` | clear_queue |
+| GET | `/settings` |  |
+| GET | `/system_stats` |  |
+| POST | `/upload/image` |  |
+| GET | `/userdata*` |  |
+| GET | `/users` |  |
+| GET | `/view` |  |
+| GET | `/ws` |  |
 
 ## Controls (`GET /v1/controls`)
 
@@ -164,7 +170,7 @@ document (config writes: RFC 7386 merge patch via `PATCH /v1/config`).
 | `provider.vision.apiKey` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/apiKey` | patch_config |  |
 | `provider.vision.baseUrl` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/baseUrl` | patch_config |  |
 | `provider.vision.model` | provider | string |  |  | PATCH `/v1/config` @ `/providers/vision/model` | patch_config |  |
-| `queue.clear` | queue | action |  |  | POST `/v1/queue/clear` | clear_queue |  |
+| `queue.clear` | queue | action |  |  | POST `/v1/queue/clear` |  |  |
 | `queue.interrupt` | queue | action |  |  | POST `/v1/queue/interrupt` | interrupt_render |  |
 | `queue.pause` | queue | action |  |  | POST `/v1/queue/pause` | pause_queue |  |
 | `queue.resume` | queue | action |  |  | POST `/v1/queue/resume` | resume_queue |  |
