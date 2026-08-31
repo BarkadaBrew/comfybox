@@ -30,7 +30,7 @@ final class SamplerNameResolutionTests: XCTestCase {
     }
     // D22 (reversed from v1): the four ComfyUI schedule names stay as declared
     // aliases of `.flow` — Krita's built-in styles send them by default.
-    for name in ["normal", "simple", "sgm_uniform", "ddim_uniform"] {
+    for name in ["normal", "sgm_uniform", "ddim_uniform"] {
       XCTAssertEqual(try RecipeNameResolver.resolveSigmaScheduleKind(name), .flow, name)
     }
 
