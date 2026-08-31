@@ -364,6 +364,130 @@ final class Krea2LoKrDensifierTests: XCTestCase {
     }
   }
 
+  // MARK: - (M1) Asymmetric target vs an independent kron reference
+
+  /// Every other apply test here uses a SQUARE target, and the equivalence
+  /// test compares against in-place `applyLoKr` — which shares the same
+  /// `kron2D`. Here the target is 24x8 and the expected weights come from a
+  /// hand-rolled nested-loop Kronecker product computed inside the test, so
+  /// a kron orientation or transpose fault in the production path cannot
+  /// hide behind symmetry or a shared implementation.
+  func testAsymmetricTargetMatchesHandRolledKronReference() throws {
+    final class RectToy: Module {
+      @ModuleInfo(key: "lin") var lin: Linear
+      override init() {
+        self._lin.wrappedValue = Linear(8, 24, bias: false)  // weight [24, 8]
+        super.init()
+      }
+    }
+    let toy = RectToy()
+    let base = toy.lin.weight.asArray(Float.self)
+
+    let w1 = ramp(6, 2, step: 0.01)  // (i, j)
+    let w2 = ramp(4, 4, step: 0.02)  // (p, q); kron → (6·4, 2·4) = (24, 8)
+    let url = try write([
+      "diffusion_model.lin.lokr_w1": w1,
+      "diffusion_model.lin.lokr_w2": w2,
+      "diffusion_model.lin.alpha": MLXArray(Float(2.0)),  // dim 4 → alphaScale 0.5
+    ], as: "asymmetric.safetensors")
+    let weights = try LoKrDensifier.densify(
+      try LoRAWeightLoader.loadForKrea2(from: url), for: toy, name: nil)
+    XCTAssertEqual(weights.lokrLayerCount, 0)
+
+    let userScale: Float = 0.6
+    let session = LoRAPatchSession(module: toy)
+    try session.apply(weights: weights, scale: userScale)
+    let applied = toy.lin.weight.asArray(Float.self)
+
+    // Independent reference: kron[(i·4+p), (j·4+q)] = w1[i,j] · w2[p,q],
+    // never touching LoRAApplicator.kron2D.
+    let w1v = w1.asArray(Float.self)
+    let w2v = w2.asArray(Float.self)
+    let effective: Float = 0.5 * userScale
+    for i in 0..<6 {
+      for j in 0..<2 {
+        for p in 0..<4 {
+          for q in 0..<4 {
+            let row = i * 4 + p
+            let col = j * 4 + q
+            let flat = row * 8 + col
+            let expected = base[flat] + w1v[i * 2 + j] * w2v[p * 4 + q] * effective
+            XCTAssertEqual(applied[flat], expected, accuracy: 1e-4,
+              "hand-rolled kron mismatch at (\(row), \(col))")
+          }
+        }
+      }
+    }
+    session.clear()
+    XCTAssertEqual(toy.lin.weight.asArray(Float.self), base)
+  }
+
+  // MARK: - (M2) Control-LoRA path is gated too
+
+  /// A minimal layers-1 control checkpoint: `first.*` plus all 8 per-block
+  /// A/B targets, optionally smuggling a LoKr pair alongside.
+  private func controlFixture(withLoKr: Bool) -> [String: MLXArray] {
+    var arrays: [String: MLXArray] = [
+      "first.weight": MLXArray.ones([8, 4]),
+      "first.bias": MLXArray.ones([8]),
+    ]
+    for tg in ["attn.wq", "attn.wk", "attn.wv", "attn.wo", "attn.gate",
+               "mlp.gate", "mlp.up", "mlp.down"] {
+      arrays["blocks.0.\(tg).A"] = MLXArray.ones([2, 4])
+      arrays["blocks.0.\(tg).B"] = MLXArray.ones([4, 2])
+    }
+    if withLoKr {
+      arrays["blocks.0.attn.wq.lokr_w1"] = MLXArray.ones([2, 2])
+      arrays["blocks.0.attn.wq.lokr_w2"] = MLXArray.ones([2, 2])
+    }
+    return arrays
+  }
+
+  /// `setControlLoRA` is the one Krea-2 `applyDynamically` the C1 guard did
+  /// not front. `Krea2ControlLoRA.load` must SURFACE a smuggled LoKr pair
+  /// (its fixed-key fetch would otherwise silently drop it) and the guard —
+  /// now called in the pipeline before controlFirst is swapped in — must
+  /// refuse the file.
+  func testLoKrBearingControlFileIsSurfacedAndRefusedByTheGuard() throws {
+    let url = try write(controlFixture(withLoKr: true), as: "control-lokr.safetensors")
+    let cl = try Krea2ControlLoRA.load(from: url, layers: 1)
+    XCTAssertEqual(cl.loraWeights.lokrLayerCount, 1,
+      "load must surface the LoKr half, not drop it")
+    XCTAssertThrowsError(try Krea2AdapterSupport.checkTransactional(
+      lokrLayerCount: cl.loraWeights.lokrLayerCount, lora: url.lastPathComponent)) { error in
+      guard case LoRAError.unsupportedAdapter(let lora, let format, _) = error else {
+        return XCTFail("expected unsupportedAdapter, got \(error)")
+      }
+      XCTAssertEqual(lora, "control-lokr.safetensors")
+      XCTAssertEqual(format, "LoKr")
+    }
+  }
+
+  /// The real depth-control file (pure A/B) must keep loading and passing —
+  /// the new gate costs the existing control path nothing.
+  func testCleanControlFileStillPassesTheGuard() throws {
+    let url = try write(controlFixture(withLoKr: false), as: "control-clean.safetensors")
+    let cl = try Krea2ControlLoRA.load(from: url, layers: 1)
+    XCTAssertEqual(cl.loraWeights.lokrLayerCount, 0)
+    XCTAssertEqual(cl.loraWeights.weights.count, 8)
+    XCTAssertNoThrow(try Krea2AdapterSupport.checkTransactional(
+      lokrLayerCount: cl.loraWeights.lokrLayerCount, lora: url.lastPathComponent))
+  }
+
+  /// An orphan LoKr half in a control file is a loud refusal at load, same
+  /// posture as `loadForKrea2` — never a silent drop.
+  func testOrphanLoKrHalfInControlFileIsALoudRefusal() throws {
+    var arrays = controlFixture(withLoKr: false)
+    arrays["blocks.0.attn.wq.lokr_w1"] = MLXArray.ones([2, 2])
+    let url = try write(arrays, as: "control-orphan.safetensors")
+    XCTAssertThrowsError(try Krea2ControlLoRA.load(from: url, layers: 1)) { error in
+      guard case LoRAError.invalidFormat(let message) = error else {
+        return XCTFail("expected invalidFormat, got \(error)")
+      }
+      XCTAssertTrue(message.contains("orphan"), message)
+    }
+  }
+
   /// A file with no LoKr at all passes through untouched — the densifier is
   /// inert for every adapter loading today.
   func testNonLoKrWeightsPassThroughUnchanged() throws {

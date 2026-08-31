@@ -717,6 +717,15 @@ public final class Krea2Pipeline {
       return
     }
     let cl = try Krea2ControlLoRA.load(from: url, layers: config.layers)
+    // comfybox#329 M2: this is the ONE Krea-2 `applyDynamically` the C1 guard
+    // did not front. The densifier only runs on the identity stack, so a
+    // LoKr-bearing control file must be refused HERE — before controlFirst is
+    // swapped in or any adapter binds — or its LoKr half would reach the
+    // ungated in-place path and mutate the warm model non-transactionally.
+    // `Krea2ControlLoRA.load` surfaces LoKr tensors precisely so this count
+    // is truthful.
+    try Krea2AdapterSupport.checkTransactional(
+      lokrLayerCount: cl.loraWeights.lokrLayerCount, lora: url.lastPathComponent)
     // assertBaseHalfMatches skipped: transformer.first is q8-quantized (weight access unsafe on QuantizedLinear)
     let cw = cl.firstWeight
     let cb = cl.firstBias
