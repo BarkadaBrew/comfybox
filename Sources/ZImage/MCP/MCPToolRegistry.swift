@@ -90,7 +90,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["image_path"],
-    ]
+    ],
+    routes: [RouteRef(method: "POST", path: "/v1/generate")]
   )
 
   static let generateImage = MCPToolDefinition(
@@ -179,7 +180,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/generate")]
   )
 
   static let swapLoras = MCPToolDefinition(
@@ -208,7 +210,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["loras"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/lora/swap")]
   )
 
   static let listModels = MCPToolDefinition(
@@ -253,7 +256,12 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    // DECLARED REALITY (parity G1): the executor posts the ComfyUI-bridge
+    // queue-clear (`POST /queue {"clear": true}`, executeClearQueue), NOT the
+    // native `POST /v1/queue/clear` -- which is exempted in ParityExemptions.
+    // The tool<->executor parity assertion pins this claim to the source.
+    routes: [RouteRef(method: "POST", path: "/queue", surface: .comfyUICompat)]
   )
 
   static let pauseQueue = MCPToolDefinition(
@@ -262,7 +270,8 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/pause")]
   )
 
   static let resumeQueue = MCPToolDefinition(
@@ -271,7 +280,8 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/resume")]
   )
 
   static let listLoras = MCPToolDefinition(
@@ -295,7 +305,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["confirm"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/shutdown")]
   )
 
   static let systemStats = MCPToolDefinition(
@@ -360,7 +371,8 @@ public enum MCPToolRegistry {
           "description": "Force full rescan of all LoRA files. Default: false.",
         ] as [String: Any],
       ] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/loras/scan")]
   )
 
   static let loraQuarantine = MCPToolDefinition(
@@ -383,7 +395,11 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["id", "quarantine"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/loras/{id}/quarantine"),
+      RouteRef(method: "DELETE", path: "/v1/loras/{id}/quarantine"),
+    ]
   )
 
 
@@ -411,7 +427,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/model/load")]
   )
 
   static let switchModel = MCPToolDefinition(
@@ -426,7 +443,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/model/activate")]
   )
 
   static let modelPool = MCPToolDefinition(
@@ -450,7 +468,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/model/unload")]
   )
 
 
@@ -542,7 +561,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/generate/async")]
   )
 
   static let composeMontage = MCPToolDefinition(
@@ -571,7 +591,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["segments"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/montage/compose")]
   )
 
   static let rerenderVideo = MCPToolDefinition(
@@ -595,7 +616,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": [] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/rerender")]
   )
 
   static let extendVideo = MCPToolDefinition(
@@ -623,7 +645,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": [] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/extend")]
   )
 
   static let importWorkflow = MCPToolDefinition(
@@ -639,7 +662,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["workflow_json"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/workflows/import")]
   )
 
   static let listWorkflows = MCPToolDefinition(
@@ -676,7 +700,8 @@ public enum MCPToolRegistry {
         "output_path": ["type": "string", "description": "Output file path (within the allowed output directory). Omit to auto-generate."] as [String: Any],
       ] as [String: Any],
       "required": ["workflow_id"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/workflows/{id}/run")]
   )
 
   static let renderStoryboard = MCPToolDefinition(
@@ -706,7 +731,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["shots"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/storyboard/render")]
   )
 
   static let videoStatus = MCPToolDefinition(
@@ -759,7 +785,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["image_path"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/upscale")]
   )
 
   // MARK: - Creative layer & queue (added 2026-07)
@@ -775,7 +802,8 @@ public enum MCPToolRegistry {
         "content_mode": ["type": "string", "description": "neutral | banana | avocado (gates explicit tiers)."] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/enhance")]
   )
 
   static let listCharacters = MCPToolDefinition(
@@ -793,7 +821,8 @@ public enum MCPToolRegistry {
   static let importLegacyPresets = MCPToolDefinition(
     name: "import_legacy_presets",
     description: "Import presets from the old Coffee Shop image service (idempotent). Returns how many were newly imported.",
-    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/presets/import-legacy")]
   )
 
   static let queueList = MCPToolDefinition(
@@ -805,7 +834,8 @@ public enum MCPToolRegistry {
   static let interruptRender = MCPToolDefinition(
     name: "interrupt_render",
     description: "Cancel the in-flight render. Pending jobs continue.",
-    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/interrupt")]
   )
 
   static let cancelJob = MCPToolDefinition(
@@ -815,7 +845,8 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": ["id": ["type": "string", "description": "The pending job id."] as [String: Any]] as [String: Any],
       "required": ["id"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/queue/{id}")]
   )
 
   static let nearlineList = MCPToolDefinition(
@@ -827,7 +858,8 @@ public enum MCPToolRegistry {
   static let nearlineScan = MCPToolDefinition(
     name: "nearline_scan",
     description: "Rescan the configured attached-storage roots for models/LoRAs.",
-    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/scan")]
   )
 
   static let nearlineStage = MCPToolDefinition(
@@ -837,7 +869,8 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": ["name": ["type": "string", "description": "The item filename from nearline_list."] as [String: Any]] as [String: Any],
       "required": ["name"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/stage")]
   )
 
   static let nearlineEvict = MCPToolDefinition(
@@ -847,7 +880,8 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": ["name": ["type": "string", "description": "The item filename to evict."] as [String: Any]] as [String: Any],
       "required": ["name"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/evict")]
   )
 
   // MARK: - CivitAI conduit + prompt repository (#234)
@@ -938,7 +972,8 @@ public enum MCPToolRegistry {
           "description": "Query step: max repository entries to return (default 100, max 500).",
         ] as [String: Any],
       ] as [String: Any],
-    ]
+    ],
+    routes: [RouteRef(method: "POST", path: "/v1/civitai/harvest")]
   )
 
   // MARK: - Headless parity Phase 1 (comfybox#300, FDD §4.2) — gap-set tools
@@ -1018,7 +1053,7 @@ public enum MCPToolRegistry {
       ] as [String: Any],
       "required": ["id", "name"] as [String],
     ] as [String: Any],
-    routes: [RouteRef(method: "POST", path: "/v1/presets")]
+    routes: [RouteRef(method: "POST", path: "/v1/presets"), RouteRef(method: "PUT", path: "/v1/presets")]
   )
 
   static let deletePreset = MCPToolDefinition(

@@ -222,6 +222,9 @@ struct ZImageCLI {
       case "control":
         try runControl(args: Array(args.dropFirst()))
         return
+      case "docs":
+        try runDocs(args: Array(args.dropFirst()))
+        return
       case "serve":
         try runServe(args: Array(args.dropFirst()))
         return
