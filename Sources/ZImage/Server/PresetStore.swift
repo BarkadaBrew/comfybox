@@ -151,8 +151,12 @@ public enum Krea2BypassPolicy {
     // Derived. A krea2-family image preset must declare `kroma` (O4a), so
     // `nil` here is only reachable for a preset that has no kroma dial at
     // all — treated as "no kroma", the same as `strength: 0`.
-    let kromaStrength = kroma?.strength ?? 0
-    return BypassPolicy(strength: kromaStrength > 0 ? 0 : workflowStrength, file: file)
+    // Todd 2026-08-31: kroma=0 must NOT auto-load the bypass LoRA — projector_scale
+    // + adherence make it unnecessary. The DERIVED bypass is now always OFF; an
+    // explicit per-render bypass_strength or preset bypass (precedence 1 & 2 above)
+    // still turns it on when genuinely wanted. _ = kroma keeps the signature stable.
+    _ = kroma
+    return BypassPolicy(strength: 0, file: file)
   }
 
   /// The preset-level entry point. Fail-closed for anything that is not a

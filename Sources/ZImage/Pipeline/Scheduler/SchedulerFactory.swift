@@ -328,6 +328,9 @@ public enum SchedulerFactory {
       return SigmaSchedule.beta(
         numSteps: numSteps, sigmaTable: try sigmaTable(schedule: .beta57, config: config, mu: mu),
         alpha: 0.5, betaParam: 0.7)
+    case .simple:
+      return SigmaSchedule.simple(
+        numSteps: numSteps, sigmaTable: try sigmaTable(schedule: .simple, config: config, mu: mu))
     }
   }
 
