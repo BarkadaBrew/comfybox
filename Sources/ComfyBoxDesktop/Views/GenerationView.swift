@@ -83,6 +83,9 @@ struct GenerationView: View {
     @SceneStorage("gen.guidance") private var guidance: Double = 3.5
     /// Krea2 projector-scale gain (CFG-free prompt adherence). 1.0 = neutral.
     @SceneStorage("gen.projectorScale") private var projectorScale: Double = 1.0
+    /// RES4LYF SDE noise (eta) + bongmath — the Clownshark recipe knobs.
+    @SceneStorage("gen.eta") private var eta: Double = 0
+    @SceneStorage("gen.bongmath") private var bongmath: Bool = false
     /// Empty = let the active model choose its native recipe.
     @SceneStorage("gen.sampler") private var sampler: String = ""
     @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
@@ -866,6 +869,14 @@ struct GenerationView: View {
             )
             .disabled(backend != .local)
 
+            // RES4LYF SDE / bongmath (the Clownshark recipe): eta>0 turns on SDE
+            // noise re-injection, bongmath aligns substeps. Both need a RES4LYF
+            // sampler (res_*/ralston_*/deis_*) — harmless no-ops otherwise.
+            NumericSliderField(label: "Eta (SDE)", value: $eta, range: 0...1, step: 0.05, fractionDigits: 2)
+            Toggle("Bongmath", isOn: $bongmath)
+                .font(.caption)
+                .disabled(backend != .local)
+
             // Kroma is structured recipe state, not an ordinary LoRA row.
             if kromaPolicy != nil {
                 VStack(alignment: .leading, spacing: 4) {
@@ -1215,6 +1226,8 @@ struct GenerationView: View {
             steps: Int(steps),
             guidance: Float(guidance),
             projectorScale: Float(projectorScale),
+            eta: Float(eta),
+            bongmath: bongmath,
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1266,6 +1279,8 @@ struct GenerationView: View {
             steps: Int(steps),
             guidance: Float(guidance),
             projectorScale: Float(projectorScale),
+            eta: Float(eta),
+            bongmath: bongmath,
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,

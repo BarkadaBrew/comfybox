@@ -35,6 +35,12 @@ public struct GenerationRequest: Sendable {
     /// Text-conditioning gain on the Krea2 fusion projector (projector-scale
     /// trick). 1.0 = neutral; >1 strengthens prompt adherence with no CFG cost.
     public var projectorScale: Float
+    /// RES4LYF SDE noise re-injection (eta). 0 = deterministic ODE (default);
+    /// >0 = SDE mode. Only bites with a RES4LYF sampler (res_*/ralston_*/deis_*).
+    public var eta: Float
+    /// RES4LYF bongmath: forward/backward substep alignment (free accuracy).
+    /// Only bites with a RES4LYF sampler.
+    public var bongmath: Bool
 
     public init(
         prompt: String = "",
@@ -44,6 +50,8 @@ public struct GenerationRequest: Sendable {
         steps: Int = 9,
         guidance: Float = 3.5,
         projectorScale: Float = 1.0,
+        eta: Float = 0.0,
+        bongmath: Bool = false,
         sampler: String? = nil,
         sigmaSchedule: String? = nil,
         seed: UInt64 = 0,
@@ -68,6 +76,8 @@ public struct GenerationRequest: Sendable {
         self.initImagePath = initImagePath
         self.imageStrength = imageStrength
         self.projectorScale = projectorScale
+        self.eta = eta
+        self.bongmath = bongmath
     }
 }
 
@@ -442,6 +452,14 @@ public final class EngineService {
         // (byte-identical); the engine also treats absent as neutral.
         if request.projectorScale != 1.0 {
             payloadDict["projector_scale"] = request.projectorScale
+        }
+        // RES4LYF SDE / bongmath (Clownshark recipe) — emitted only when active
+        // so an ODE render stays byte-identical.
+        if request.eta > 0 {
+            payloadDict["eta"] = request.eta
+        }
+        if request.bongmath {
+            payloadDict["bongmath"] = true
         }
 
         payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)

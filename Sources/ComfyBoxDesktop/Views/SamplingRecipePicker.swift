@@ -128,6 +128,7 @@ struct SamplingRecipePicker: View {
         case "beta57": return "Beta 5.7"
         case "krea2": return "Krea 2 Native"
         case "bong_tangent": return "Bong Tangent"
+        case "simple": return "Simple"
         default: return raw.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
