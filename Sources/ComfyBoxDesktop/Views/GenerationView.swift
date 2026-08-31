@@ -81,6 +81,11 @@ struct GenerationView: View {
     @SceneStorage("gen.customHeight") private var customHeight: Int = 1024
     @SceneStorage("gen.steps") private var steps: Double = 9
     @SceneStorage("gen.guidance") private var guidance: Double = 3.5
+    /// Krea2 projector-scale gain (CFG-free prompt adherence). 1.0 = neutral.
+    @SceneStorage("gen.projectorScale") private var projectorScale: Double = 1.0
+    /// RES4LYF SDE noise (eta) + bongmath — the Clownshark recipe knobs.
+    @SceneStorage("gen.eta") private var eta: Double = 0
+    @SceneStorage("gen.bongmath") private var bongmath: Bool = false
     /// Empty = let the active model choose its native recipe.
     @SceneStorage("gen.sampler") private var sampler: String = ""
     @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
@@ -313,6 +318,7 @@ struct GenerationView: View {
                         negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
+                        projectorScale: projectorScale,
                         width: effectiveWidth,
                         height: effectiveHeight,
                         loras: selectedLoras.filter {
@@ -851,6 +857,9 @@ struct GenerationView: View {
             // Guidance
             NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
 
+            // Projector scale — CFG-free prompt-adherence gain (Krea2). 1.0 = off.
+            NumericSliderField(label: "Projector Scale", value: $projectorScale, range: 0...3, step: 0.05, fractionDigits: 2)
+
             // Sampler = solver; Scheduler = sigma/noise schedule. Options are
             // sourced from the engine's family capability matrix.
             SamplingRecipePicker(
@@ -859,6 +868,14 @@ struct GenerationView: View {
                 modelFamily: samplingModelFamily
             )
             .disabled(backend != .local)
+
+            // RES4LYF SDE / bongmath (the Clownshark recipe): eta>0 turns on SDE
+            // noise re-injection, bongmath aligns substeps. Both need a RES4LYF
+            // sampler (res_*/ralston_*/deis_*) — harmless no-ops otherwise.
+            NumericSliderField(label: "Eta (SDE)", value: $eta, range: 0...1, step: 0.05, fractionDigits: 2)
+            Toggle("Bongmath", isOn: $bongmath)
+                .font(.caption)
+                .disabled(backend != .local)
 
             // Kroma is structured recipe state, not an ordinary LoRA row.
             if kromaPolicy != nil {
@@ -1208,6 +1225,9 @@ struct GenerationView: View {
             height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
+            projectorScale: Float(projectorScale),
+            eta: Float(eta),
+            bongmath: bongmath,
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1258,6 +1278,9 @@ struct GenerationView: View {
             height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
+            projectorScale: Float(projectorScale),
+            eta: Float(eta),
+            bongmath: bongmath,
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1783,6 +1806,7 @@ struct GenerationView: View {
         negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
+        projectorScale = Double(preset.projectorScale ?? 1.0)
         sampler = preset.sampler ?? ""
         sigmaSchedule = preset.sigmaSchedule ?? ""
         kromaPolicy = preset.kroma
