@@ -352,6 +352,12 @@ public enum Krea2StagedRender {
         stages: stages, numInferenceSteps: effectiveSteps, sigmaValues: sigmaValues,
         numTrainTimesteps: trainSteps, finalConversionSigma: finalConversionSigma)
 
+    case .heun2s, .heun3s:
+      return RES4LYFHeunScheduler(
+        stages: sampler == .heun2s ? .two : .three, numInferenceSteps: effectiveSteps,
+        sigmaValues: sigmaValues, numTrainTimesteps: trainSteps,
+        finalConversionSigma: finalConversionSigma)
+
     case .res3s:
       return RES3sScheduler(
         numInferenceSteps: effectiveSteps, sigmaValues: sigmaValues,

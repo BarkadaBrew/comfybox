@@ -17,6 +17,10 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   case ralston3s = "ralston_3s"
   case ralston4s = "ralston_4s"
   case res3s = "res_3s"
+  // Classical Heun RK (heun_2s/3s), RES4LYF linear frame — same conformer as
+  // ralston_*, different tableau. See HeunScheduler.swift.
+  case heun2s = "heun_2s"
+  case heun3s = "heun_3s"
   // WP-E14 (§3.12, AC-23/24): RES4LYF's DEIS multistep samplers. Distinct
   // names from the legacy `deis` above, which is the k-diffusion velocity port
   // and stays exactly as it is — `deis_Nm` is a different algorithm (rhoab
@@ -46,7 +50,7 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   /// driven by the N-row loop".
   public var isNRowTableau: Bool {
     switch self {
-    case .ralston2s, .ralston3s, .ralston4s, .res3s, .deis2m, .deis3m, .deis4m:
+    case .ralston2s, .ralston3s, .ralston4s, .res3s, .heun2s, .heun3s, .deis2m, .deis3m, .deis4m:
       return true
     case .euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .deis, .ddim, .res2s:
       return false
@@ -71,7 +75,7 @@ public enum SchedulerKind: String, CaseIterable, Sendable {
   /// Exhaustive on purpose (no `default`): a new kind must declare itself.
   public var isRES4LYFFamily: Bool {
     switch self {
-    case .res2s, .res3s, .ralston2s, .ralston3s, .ralston4s, .deis2m, .deis3m, .deis4m:
+    case .res2s, .res3s, .ralston2s, .ralston3s, .ralston4s, .heun2s, .heun3s, .deis2m, .deis3m, .deis4m:
       return true
     case .euler, .heun, .dpmplusplus2m, .dpmplusplus2sa, .deis, .ddim:
       return false
@@ -252,6 +256,15 @@ public enum SchedulerFactory {
         kind == .ralston2s ? .two : (kind == .ralston3s ? .three : .four)
       return RalstonScheduler(
         stages: stages,
+        numInferenceSteps: effectiveSteps,
+        sigmaValues: sigmaValues,
+        numTrainTimesteps: config.numTrainTimesteps,
+        finalConversionSigma: finalConversionSigma
+      )
+
+    case .heun2s, .heun3s:
+      return RES4LYFHeunScheduler(
+        stages: kind == .heun2s ? .two : .three,
         numInferenceSteps: effectiveSteps,
         sigmaValues: sigmaValues,
         numTrainTimesteps: config.numTrainTimesteps,
