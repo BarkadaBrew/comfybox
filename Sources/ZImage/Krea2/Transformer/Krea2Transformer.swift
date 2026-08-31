@@ -289,6 +289,14 @@ public final class Krea2TextFusionTransformer: Module {
   @ModuleInfo(key: "projector") var projector: Linear
   @ModuleInfo(key: "refiner_blocks") var refinerBlocks: [Krea2TextFusionBlock]
 
+  /// Text-conditioning gain applied to the layer-fusion projector output
+  /// (Beinsezii Krea-2 "projector-scale" trick — kin to CFG, but with no
+  /// second forward pass). 1.0 = neutral / byte-identical. >1 strengthens
+  /// prompt adherence, <1 weakens it. Set per-render from `Request` on the
+  /// warm transformer; renders are serialized so a plain var is safe. A plain
+  /// `var` (not @ModuleInfo) so it stays out of quantize/parameter traversal.
+  public var projectorScale: Float = 1.0
+
   public init(numTxtLayers: Int, txtDim: Int, heads: Int, multiplier: Int, kvheads: Int) {
     self._layerwiseBlocks.wrappedValue = (0..<2).map { _ in
       Krea2TextFusionBlock(features: txtDim, heads: heads, multiplier: multiplier, kvheads: kvheads)
@@ -307,6 +315,7 @@ public final class Krea2TextFusionTransformer: Module {
     // (b*l, n, d) -> (b, l, d, n)
     h = h.reshaped(b, l, n, d).transposed(0, 1, 3, 2)
     h = projector(h)  // (b, l, d, 1)
+    if projectorScale != 1.0 { h = h * projectorScale }
     h = h[.ellipsis, 0]  // (b, l, d)
     for block in refinerBlocks { h = block(h, mask: mask) }
     return h

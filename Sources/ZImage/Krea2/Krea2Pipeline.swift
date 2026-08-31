@@ -479,6 +479,10 @@ public final class Krea2Pipeline {
     /// and seed. `nil` (the default) is today's single-stage render, statement
     /// for statement. See ``Krea2Pipeline/Stage2``.
     public var stage2: Stage2? = nil
+    /// Text-conditioning gain on the fusion projector (projector-scale trick).
+    /// 1.0 = neutral; >1 strengthens prompt adherence with no CFG cost. Applied
+    /// on the warm transformer for the whole render, stage 2 included.
+    public var projectorScale: Float = 1.0
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled,
@@ -486,7 +490,7 @@ public final class Krea2Pipeline {
                 sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
                 sigmaScheduleRequested: String? = nil,
                 eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
-                stage2: Stage2? = nil) {
+                stage2: Stage2? = nil, projectorScale: Float = 1.0) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
       self.guidance = guidance
@@ -504,6 +508,7 @@ public final class Krea2Pipeline {
       self.bongmath = bongmath
       self.c2 = c2
       self.stage2 = stage2
+      self.projectorScale = projectorScale
     }
   }
 
@@ -942,6 +947,10 @@ public final class Krea2Pipeline {
       bongmath: request.bongmath, sampler: request.sampler,
       sigmaSchedule: request.sigmaSchedule, shift: scheduleShift)
 
+    // Projector-scale trick: set the fusion gain on the warm transformer for
+    // this render — covers stage 1 and stage 2 (same transformer instance).
+    // Always assigned (default 1.0) so a prior render's value never leaks.
+    transformer.txtfusion.projectorScale = request.projectorScale
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)

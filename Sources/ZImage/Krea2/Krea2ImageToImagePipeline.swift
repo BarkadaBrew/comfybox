@@ -52,6 +52,8 @@ extension Krea2Pipeline {
     public var bongmath: Bool = false
     /// `res_2s` / `res_3s` substep, not on the wire (D23).
     public var c2: Float = 0.5
+    /// Text-conditioning gain on the fusion projector; see `Krea2Pipeline.Request.projectorScale`.
+    public var projectorScale: Float = 1.0
 
     public init(
       prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
@@ -60,7 +62,8 @@ extension Krea2Pipeline {
       dyPE: DyPEConfig = .disabled, shift: Float? = nil,
       sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
       sigmaScheduleRequested: String? = nil,
-      eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5
+      eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
+      projectorScale: Float = 1.0
     ) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
@@ -79,6 +82,7 @@ extension Krea2Pipeline {
       self.eta = eta
       self.bongmath = bongmath
       self.c2 = c2
+      self.projectorScale = projectorScale
     }
   }
 
@@ -129,6 +133,9 @@ extension Krea2Pipeline {
       bongmath: request.bongmath, sampler: request.sampler,
       sigmaSchedule: request.sigmaSchedule, shift: scheduleShift)
 
+    // Projector-scale trick: fusion gain on the warm transformer (always set,
+    // default 1.0, so no value leaks between renders).
+    transformer.txtfusion.projectorScale = request.projectorScale
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
 
