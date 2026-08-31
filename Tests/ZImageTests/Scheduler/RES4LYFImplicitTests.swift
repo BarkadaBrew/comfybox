@@ -113,7 +113,7 @@ final class RES4LYFImplicitTests: XCTestCase {
     XCTAssertEqual(m.recipe.implicitStepsDiag, 0)
 
     var scheduler: any ZImageScheduler = try makeScheduler(m)
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: try fx.tensor(m.xInit),
       startIndex: 0,
@@ -215,7 +215,7 @@ final class RES4LYFImplicitTests: XCTestCase {
     }
 
     var scheduler: any ZImageScheduler = try makeScheduler(m)
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: try fx.tensor(m.xInit),
       startIndex: 0,
