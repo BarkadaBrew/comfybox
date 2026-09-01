@@ -7583,7 +7583,8 @@ private actor WarmServerCoordinator {
                 eta: recipe.eta, bongmath: recipe.bongmath,
                 projectorScale: payload.projectorScale ?? 1.0,
                 noiseType: RES4LYFNoiseType(rawValue: payload.noiseType ?? "gaussian") ?? .gaussian,
-                noiseAlpha: payload.noiseAlpha ?? 0.0),
+                noiseAlpha: payload.noiseAlpha ?? 0.0,
+                implicitStepsFull: payload.implicitSteps ?? 0),
           progress: publishProgress)
         traces = [trace1]
       } else {
@@ -7602,7 +7603,8 @@ private actor WarmServerCoordinator {
                 eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2,
                 projectorScale: payload.projectorScale ?? 1.0,
                 noiseType: RES4LYFNoiseType(rawValue: payload.noiseType ?? "gaussian") ?? .gaussian,
-                noiseAlpha: payload.noiseAlpha ?? 0.0),
+                noiseAlpha: payload.noiseAlpha ?? 0.0,
+                implicitStepsFull: payload.implicitSteps ?? 0),
           progress: publishProgress)
       }
       let trace = traces[0]
