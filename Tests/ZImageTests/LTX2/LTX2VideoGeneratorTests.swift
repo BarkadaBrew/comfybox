@@ -196,3 +196,21 @@ final class LTX2VideoGeneratorTests: XCTestCase {
     XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "-128"), 1024)
     XCTAssertEqual(LTX2VideoGenerator.resolveGemmaMaxLength(env: "abc"), 1024)
   }
+
+final class LTX2VocoderSelectionTests: XCTestCase {
+  func testBundledVocoderRemainsDefaultWhenOnlyExternalPathIsSet() {
+    XCTAssertNil(LTX2VideoGenerator.externalVocoderOverridePath(environment: [
+      "LTX2_VOCODER_PATH": "/tmp/external-hifigan.safetensors",
+    ]))
+  }
+
+  func testExternalVocoderRequiresExplicitOptInAndPath() {
+    XCTAssertNil(LTX2VideoGenerator.externalVocoderOverridePath(environment: [
+      "LTX2_USE_EXTERNAL_VOCODER": "1",
+    ]))
+    XCTAssertEqual(LTX2VideoGenerator.externalVocoderOverridePath(environment: [
+      "LTX2_USE_EXTERNAL_VOCODER": "1",
+      "LTX2_VOCODER_PATH": " /tmp/external-hifigan.safetensors ",
+    ]), "/tmp/external-hifigan.safetensors")
+  }
+}

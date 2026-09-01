@@ -326,6 +326,19 @@ public final class LTX2VideoGenerator {
         return n
     }
 
+    /// Resolve the optional external 24 kHz HiFi-GAN override. A path alone is
+    /// deliberately insufficient: production historically carried a stale
+    /// `LTX2_VOCODER_PATH` that silently displaced the monolith's matched
+    /// BigVGAN+BWE. Both variables make the mismatch an explicit experiment.
+    public static func externalVocoderOverridePath(
+        environment: [String: String]
+    ) -> String? {
+        guard environment["LTX2_USE_EXTERNAL_VOCODER"] == "1" else { return nil }
+        guard let raw = environment["LTX2_VOCODER_PATH"] else { return nil }
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
+    }
+
     /// fps must be positive and sane (chunk planning divides by it; the RoPE
     /// temporal coords divide by it too).
     public static func isValidFPS(_ fps: Int) -> Bool {
@@ -1352,21 +1365,26 @@ public final class LTX2VideoGenerator {
                 if audioVAE == nil {
                     logger.info("LTX-2 audio: binding audio VAE + vocoder from monolith…")
                     audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
-                    // OFFICIAL vocoder override (Todd 2026-08-17 metallic fix):
-                    // the JoyAI BigVGAN is a foreign vocoder for our audio_vae →
-                    // metallic. When LTX2_VOCODER_PATH points at the official
-                    // LTX-2.3 HiFi-GAN weights, route audio decode through it.
-                    if let vp = ProcessInfo.processInfo.environment["LTX2_VOCODER_PATH"],
-                       !vp.isEmpty, let av = audioVAE {
-                        av.officialVocoder = try LTX2HiFiGANVocoder.load(path: vp, logger: logger)
-                        logger.info("LTX-2 audio: OFFICIAL HiFi-GAN vocoder bound from \(vp) (24 kHz).")
+                    // The monolith's `vocoder.*` BigVGAN+BWE is trained with its
+                    // `audio_vae.*` and is therefore the 48 kHz default. The
+                    // external Lightricks HiFi-GAN is a mismatched 24 kHz path;
+                    // keep it available for experiments, but require explicit
+                    // opt-in so a stale LTX2_VOCODER_PATH cannot replace the
+                    // checkpoint's matched vocoder.
+                    let env = ProcessInfo.processInfo.environment
+                    if let vp = Self.externalVocoderOverridePath(environment: env),
+                       let av = audioVAE {
+                        av.externalVocoder = try LTX2HiFiGANVocoder.load(path: vp, logger: logger)
+                        logger.warning("LTX-2 audio: external mismatched HiFi-GAN override bound from \(vp) (24 kHz, no BWE).")
+                    } else if let vp = env["LTX2_VOCODER_PATH"], !vp.isEmpty {
+                        logger.info("LTX-2 audio: ignoring LTX2_VOCODER_PATH=\(vp); bundled matched BigVGAN+BWE remains active. Set LTX2_USE_EXTERNAL_VOCODER=1 to opt in.")
                     }
                 }
                 if let av = audioVAE {
                     telemetry?.begin(.vocoder)
                     defer { telemetry?.end(.vocoder) }
-                    // Official HiFi-GAN outputs 24 kHz; the BigVGAN+BWE path 48 kHz.
-                    let audioSR = av.officialVocoder != nil ? 24000 : 48000
+                    // External HiFi-GAN outputs 24 kHz; bundled BigVGAN+BWE 48 kHz.
+                    let audioSR = av.externalVocoder != nil ? 24000 : 48000
                     let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N)
                     var clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
                     // Trim to the actual video duration (ceil(s*25) latent
@@ -1378,9 +1396,8 @@ public final class LTX2VideoGenerator {
                     }
                     // In-engine mastering (task #26): rumble cut, BWE de-harsh,
                     // loudness raise with soft ceiling. The de-harsh dip targeted
-                    // the BigVGAN metallic — skip enhance for the clean official
-                    // vocoder. LTX2_AUDIO_ENHANCE=0 also disables it entirely.
-                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" && av.officialVocoder == nil {
+                    // the BigVGAN path. LTX2_AUDIO_ENHANCE=0 disables it.
+                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" && av.externalVocoder == nil {
                         clamped = LTX2AudioEnhance.process(clamped, sampleRate: audioSR)
                         logger.info("LTX-2 audio: enhancement chain applied (hp50 + dip7.5k + loudnorm).")
                     }
