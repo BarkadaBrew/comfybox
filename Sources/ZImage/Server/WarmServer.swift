@@ -4910,7 +4910,8 @@ public final class WarmServer {
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
-           .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType:
+           .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType,
+           .implicitStepsOutOfRange:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
