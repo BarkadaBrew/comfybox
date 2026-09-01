@@ -88,6 +88,27 @@ public struct LTX2ResolvedBeat: Equatable {
 /// design per the FDD) is DROPPED, never fails the render: the caller logs
 /// once and the render proceeds with that beat contributing zero bias
 /// (identical to not having scheduled it at all).
+///
+/// comfybox#335: a beat's STANDALONE tokenization differs from its
+/// in-context run in two ways, either of which used to defeat the
+/// subsequence search (in production, both did — 100% of locates failed):
+///   1. BOS — `tokenize` is the production tokenizer's raw encode, which
+///      prepends special tokens to standalone text (Gemma: `<bos>` id 2).
+///      Those specials appear once at the START of the full prompt, never
+///      at a beat's mid-prompt position. `tokenize("")` yields exactly that
+///      standalone prefix (Gemma: `[2]`), so it is stripped from every
+///      candidate before searching.
+///   2. Leading space — SentencePiece-style pretokens keep their leading
+///      space, so mid-prompt "… counter. She walks…" contains `▁She`
+///      (2625) while standalone "She walks…" starts with bare `She`
+///      (5778). Each beat is therefore tokenized BOTH bare and with a
+///      leading space, and the earliest match of either form wins. The
+///      bare form still covers prompt-start and post-newline positions
+///      (after `\n` (107) the next word appears in its bare form).
+/// All tokens the search runs against come from the SAME
+/// `untruncatedTokenIds` view of the SAME post-reorder `effectivePrompt`
+/// the text encoder receives, so a string-level match is exactly a
+/// token-level match once these two standalone artifacts are removed.
 public enum LTX2BeatScheduleLocator {
   public static func locate(
     beats: [BeatSegment],
@@ -98,6 +119,9 @@ public enum LTX2BeatScheduleLocator {
   ) -> [LTX2ResolvedBeat] {
     let truncatedLen = min(fullPromptTokenIds.count, maxLength)
     let padOffset = max(0, maxLength - fullPromptTokenIds.count)
+    // Standalone-encode special-token prefix (Gemma: [2] — BOS). Computed
+    // once; empty for tokenizers that add nothing (e.g. the test fakes).
+    let standalonePrefix = tokenize("")
     var searchFrom = 0
     var resolved: [LTX2ResolvedBeat] = []
 
@@ -117,16 +141,30 @@ public enum LTX2BeatScheduleLocator {
         onDrop?(beat, "degenerate span after clamping fracs to [0,1] (endFrac <= startFrac)")
         continue
       }
-      let beatIds = tokenize(beat.text)
-      guard !beatIds.isEmpty else {
+      // comfybox#335: try the bare and leading-space tokenizations, both
+      // with the standalone special-token prefix stripped. Earliest match
+      // wins so the left-to-right monotonic contract is preserved.
+      var candidates: [[Int]] = []
+      for form in [beat.text, " " + beat.text] {
+        let ids = strippingStandalonePrefix(tokenize(form), prefix: standalonePrefix)
+        if !ids.isEmpty, !candidates.contains(ids) { candidates.append(ids) }
+      }
+      guard !candidates.isEmpty else {
         onDrop?(beat, "standalone tokenization produced no tokens")
         continue
       }
-      guard let localStart = findSubsequence(beatIds, in: fullPromptTokenIds, from: searchFrom) else {
+      var match: (start: Int, count: Int)?
+      for ids in candidates {
+        if let s = findSubsequence(ids, in: fullPromptTokenIds, from: searchFrom),
+           match == nil || s < match!.start {
+          match = (s, ids.count)
+        }
+      }
+      guard let (localStart, matchCount) = match else {
         onDrop?(beat, "could not locate beat text as a contiguous run in the composed prompt tokens")
         continue
       }
-      let localEnd = localStart + beatIds.count
+      let localEnd = localStart + matchCount
       searchFrom = localEnd
       guard localStart < truncatedLen else {
         onDrop?(beat, "beat fell entirely outside the tokenizer's \(maxLength)-token window")
@@ -141,6 +179,16 @@ public enum LTX2BeatScheduleLocator {
         strength: beat.strength ?? 1.0))
     }
     return resolved
+  }
+
+  /// Removes the tokenizer's standalone-encode special-token prefix
+  /// (Gemma: BOS `[2]`) from a candidate beat tokenization. A candidate
+  /// that is NOTHING BUT the prefix (an effectively empty beat text)
+  /// strips to `[]`, which the caller drops as token-less.
+  private static func strippingStandalonePrefix(_ ids: [Int], prefix: [Int]) -> [Int] {
+    guard !prefix.isEmpty, ids.count >= prefix.count,
+          Array(ids.prefix(prefix.count)) == prefix else { return ids }
+    return Array(ids.dropFirst(prefix.count))
   }
 
   private static func findSubsequence(_ needle: [Int], in haystack: [Int], from: Int) -> Int? {
