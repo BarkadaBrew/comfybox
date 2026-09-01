@@ -306,60 +306,95 @@ public enum Krea2DenoiseLoop {
         x = committed
         scheduler = tableau
       } else {
-        // 2. First evaluation at the grid sigma; convert per WP-E2.
-        let v = evaluate(x, sigma)
-        evaluateCalls += 1
-        let out = scheduler.modelInput(velocity: v, sample: x, sigma: sigma)
-
-        if scheduler.requiresIntermediateEvaluation,
-           var mid = scheduler.intermediateStep(modelOutput: out, timestepIndex: i, sample: x) {
-          // 4. 2-row: the second evaluation at the scheduler's own substep
-          //    (res_2s: σ·e^{−c₂h}, a genuine substep — not σ_{i+1}).
-          // Fail loud: σ_{i+1} is the WRONG substep (§3.3), so there is no
-          // fallback to substitute. A scheduler that says it needs a second
-          // evaluation and then will not say where owes the caller an answer.
-          guard let midSigma = scheduler.intermediateSigma(timestepIndex: i) else {
-            preconditionFailure(
-              "scheduler requires an intermediate evaluation at step \(i) but returned no "
-                + "intermediateSigma; σ_{i+1} is not a valid substitute (§3.3)")
-          }
-          // T2 substep re-noise: the 2-row branch's one non-final row. For
-          // `res_2s` this is the difference between reproducing the T2 trace
-          // and not — the second evaluation happens on the re-noised sample.
-          if let noise, let stepStart {
-            noise.injectSubstep(
-              sample: &mid, x0: stepStart, timestepIndex: i, row: 1, scheduler: scheduler)
-          }
-          // T3, at the same position as in the N-row branch: after the one
-          // non-final row has been built and re-noised, before it is evaluated.
-          if let bongmath, var anchor = stepStart {
-            let snapshot = scheduler
-            evaluateCalls += bongmath.iterate(
-              x0: &anchor, rowSample: mid, timestepIndex: i, row: 0, scheduler: scheduler,
-              buildRowSample: { x0 in
-                var s = snapshot
-                guard let row = s.intermediateStep(
-                  modelOutput: out, timestepIndex: i, sample: x0)
-                else {
-                  preconditionFailure(
-                    "scheduler built an intermediate sample at step \(i) and then refused to "
-                      + "rebuild it; the T3 fixed point has nothing to invert")
-                }
-                return row
-              },
-              evaluate: evaluate)
-            stepStart = anchor
-          }
-          let vMid = evaluate(mid, midSigma)
+        // 2/4/5. The 2-row and 1-row branches, optionally re-iterated as
+        // RES4LYF's fully-implicit `full_iter` fixed point
+        // (`rk_sampler_beta.py:936`). Pass 0 is today's plain step. For a 2-row
+        // sampler (`res_2s`, row_offset 1) each further pass re-anchors row 0 on
+        // the PREVIOUS pass's committed x_next evaluated at σ_next — the exact
+        // analogue of the N-row heun branch above, and upstream's
+        // `full_iter > 0 && row_offset == 1 && row == 0 ⇒ x_tmp = x; s_tmp = σ_next`
+        // (`rk_sampler_beta.py:1033-1034`).
+        //
+        // res_2s is EXPONENTIAL-frame, but this needs no special arithmetic
+        // here: with `noise_anchor == 1` the exponential `RK.__call__` returns
+        // `denoised' = x₀ − σ·(x₀ − denoised)/σ = denoised`, the raw model
+        // output (`rk_method_beta.py:954-957`), so the re-anchored row 0's data
+        // prediction is just `modelInput(evaluate(x_next, σ_next))` — exactly
+        // what the linear case does — while the substep and the commit stay
+        // anchored on the step's x₀/σ. A 1-row sampler (default euler) has no
+        // substep to re-iterate, so it runs exactly once and `break`s;
+        // `implicitStepsFull == 0` ⇒ one pass ⇒ byte-identical to before.
+        let fullPasses = implicitStepsFull + 1
+        let sigmaNext = sigmas[i + 1]
+        var committed = x
+        for pass in 0..<fullPasses {
+          // Row 0. Pass 0: the grid sigma. Pass > 0: re-anchor on the previous
+          // pass's committed x_next at σ_next. On pass 0, `stepStart ?? x == x`,
+          // so the model call is op-for-op the pre-change one.
+          let row0Sample = pass == 0 ? x : committed
+          let row0Sigma = pass == 0 ? sigma : sigmaNext
+          let v = evaluate(row0Sample, row0Sigma)
           evaluateCalls += 1
-          let outMid = scheduler.modelInput(velocity: vMid, sample: mid, sigma: midSigma)
-          x = scheduler.finalizeStep(
-            originalOutput: out, intermediateOutput: outMid, timestepIndex: i,
-            sample: stepStart ?? x)
-        } else {
-          // 5. 1-row.
-          x = scheduler.step(modelOutput: out, timestepIndex: i, sample: x)
+          let out = scheduler.modelInput(velocity: v, sample: row0Sample, sigma: row0Sigma)
+
+          if scheduler.requiresIntermediateEvaluation,
+             var mid = scheduler.intermediateStep(
+              modelOutput: out, timestepIndex: i, sample: stepStart ?? x) {
+            // 4. 2-row: the second evaluation at the scheduler's own substep
+            //    (res_2s: σ·e^{−c₂h}, a genuine substep — not σ_{i+1}).
+            // Fail loud: σ_{i+1} is the WRONG substep (§3.3), so there is no
+            // fallback to substitute. A scheduler that says it needs a second
+            // evaluation and then will not say where owes the caller an answer.
+            guard let midSigma = scheduler.intermediateSigma(timestepIndex: i) else {
+              preconditionFailure(
+                "scheduler requires an intermediate evaluation at step \(i) but returned no "
+                  + "intermediateSigma; σ_{i+1} is not a valid substitute (§3.3)")
+            }
+            // T2/T3 hooks fire on pass 0 only — the scoped T1 regime (eta 0,
+            // bongmath off) where upstream's substep swap is the identity and
+            // `bong_iter` is disabled. Gating on `pass == 0` keeps the default
+            // (implicitStepsFull == 0) path op-for-op untouched.
+            //
+            // T2 substep re-noise: the 2-row branch's one non-final row. For
+            // `res_2s` this is the difference between reproducing the T2 trace
+            // and not — the second evaluation happens on the re-noised sample.
+            if pass == 0, let noise, let stepStart {
+              noise.injectSubstep(
+                sample: &mid, x0: stepStart, timestepIndex: i, row: 1, scheduler: scheduler)
+            }
+            // T3, at the same position as in the N-row branch: after the one
+            // non-final row has been built and re-noised, before it is evaluated.
+            if pass == 0, let bongmath, var anchor = stepStart {
+              let snapshot = scheduler
+              evaluateCalls += bongmath.iterate(
+                x0: &anchor, rowSample: mid, timestepIndex: i, row: 0, scheduler: scheduler,
+                buildRowSample: { x0 in
+                  var s = snapshot
+                  guard let row = s.intermediateStep(
+                    modelOutput: out, timestepIndex: i, sample: x0)
+                  else {
+                    preconditionFailure(
+                      "scheduler built an intermediate sample at step \(i) and then refused to "
+                        + "rebuild it; the T3 fixed point has nothing to invert")
+                  }
+                  return row
+                },
+                evaluate: evaluate)
+              stepStart = anchor
+            }
+            let vMid = evaluate(mid, midSigma)
+            evaluateCalls += 1
+            let outMid = scheduler.modelInput(velocity: vMid, sample: mid, sigma: midSigma)
+            committed = scheduler.finalizeStep(
+              originalOutput: out, intermediateOutput: outMid, timestepIndex: i,
+              sample: stepStart ?? x)
+          } else {
+            // 5. 1-row: no substep, so no fixed point to re-iterate.
+            committed = scheduler.step(modelOutput: out, timestepIndex: i, sample: x)
+            break
+          }
         }
+        x = committed
       }
 
       if let stepStart { lastStep = (i, stepStart, x, sigma, sigmas[i + 1]) }
