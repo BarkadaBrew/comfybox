@@ -471,8 +471,8 @@ public final class Krea2Pipeline {
     public var eta: Float = 0.0
     /// RES4LYF `bongmath` (parity tier T3, WP-E16). `true` throws until it lands.
     public var bongmath: Bool = false
-    /// `res_2s` / `res_3s` substep location in log-sigma space. Not on the
-    /// wire (D23) — a pipeline-level knob the reference recipe pins at 0.5.
+    /// `res_2s` / `res_3s` substep location in log-sigma space. The optional
+    /// wire field defaults here to the reference recipe's midpoint, 0.5.
     public var c2: Float = 0.5
     /// WP-E17 (§3.14, D4): the optional second stage of ONE render — the
     /// detail pass, which re-noises the latent to the stretched tail's first

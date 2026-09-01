@@ -33,6 +33,11 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
     /// Krea2 projector-scale gain; nil = neutral. Optional so presets saved
     /// before this field still decode.
     public var projectorScale: Float?
+    /// Optional so presets written before the RES4LYF controls still decode.
+    public var noiseType: String?
+    public var noiseAlpha: Float?
+    public var implicitSteps: Int?
+    public var c2: Float?
     public var width: Int
     public var height: Int
     public var sampler: String?
@@ -55,6 +60,10 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         steps: Int = 9,
         guidance: Float = 3.5,
         projectorScale: Float? = nil,
+        noiseType: String? = nil,
+        noiseAlpha: Float? = nil,
+        implicitSteps: Int? = nil,
+        c2: Float? = nil,
         width: Int = 1024,
         height: Int = 1024,
         sampler: String? = nil,
@@ -74,6 +83,10 @@ public struct GenerationPreset: Identifiable, Codable, Sendable {
         self.steps = steps
         self.guidance = guidance
         self.projectorScale = projectorScale
+        self.noiseType = noiseType
+        self.noiseAlpha = noiseAlpha
+        self.implicitSteps = implicitSteps
+        self.c2 = c2
         self.width = width
         self.height = height
         self.sampler = sampler
@@ -121,6 +134,10 @@ public final class PresetManager {
         loras: [LoRASelection],
         steps: Int,
         guidance: Float,
+        noiseType: String? = nil,
+        noiseAlpha: Float? = nil,
+        implicitSteps: Int? = nil,
+        c2: Float? = nil,
         width: Int,
         height: Int,
         sampler: String? = nil,
@@ -135,6 +152,10 @@ public final class PresetManager {
             },
             steps: steps,
             guidance: guidance,
+            noiseType: noiseType,
+            noiseAlpha: noiseAlpha,
+            implicitSteps: implicitSteps,
+            c2: c2,
             width: width,
             height: height,
             sampler: sampler,

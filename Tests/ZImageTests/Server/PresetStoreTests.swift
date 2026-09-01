@@ -382,6 +382,38 @@ extension PresetStoreTests {
     XCTAssertEqual(resolved.vae, wan)
     XCTAssertNil(ResolvedPreset(preset: ImagePreset(id: "p", name: "P")).vae)
   }
+
+  func testRES4LYFKnobsRoundTripAndResolve() throws {
+    let preset = ImagePreset(
+      id: "res4lyf", name: "RES4LYF",
+      noiseType: "fractal", noiseAlpha: -0.7, implicitSteps: 4, c2: 0.4)
+
+    let data = try JSONEncoder().encode(preset)
+    let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+    for key in ["noiseType", "noiseAlpha", "implicitSteps", "c2"] {
+      XCTAssertTrue(text.contains("\"\(key)\""), "encoder dropped \(key): \(text)")
+    }
+
+    let decoded = try JSONDecoder().decode(ImagePreset.self, from: data)
+    XCTAssertEqual(decoded.noiseType, "fractal")
+    XCTAssertEqual(decoded.noiseAlpha, -0.7)
+    XCTAssertEqual(decoded.implicitSteps, 4)
+    XCTAssertEqual(decoded.c2, 0.4)
+
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    try store.upsert(decoded)
+    let resolved = try store.resolve("res4lyf")
+    XCTAssertEqual(resolved.noiseType, "fractal")
+    XCTAssertEqual(resolved.noiseAlpha, -0.7)
+    XCTAssertEqual(resolved.implicitSteps, 4)
+    XCTAssertEqual(resolved.c2, 0.4)
+
+    let bare = ResolvedPreset(preset: ImagePreset(id: "bare", name: "Bare"))
+    XCTAssertNil(bare.noiseType)
+    XCTAssertNil(bare.noiseAlpha)
+    XCTAssertNil(bare.implicitSteps)
+    XCTAssertNil(bare.c2)
+  }
 }
 
 // MARK: - WP-E20 (FDD §3.15, D14, AC-44b/44c, AC-58): the nine new ImagePreset fields + O4a on the engine
@@ -620,6 +652,13 @@ extension PresetStoreTests {
     expectRefusal({ $0.shift = 0 }, naming: "shift")
     expectRefusal({ $0.shift = .infinity }, naming: "shift")
     expectRefusal({ $0.eta = -0.5 }, naming: "eta")
+    expectRefusal({ $0.noiseType = "perlin" }, naming: "noise_type")
+    expectRefusal({ $0.noiseAlpha = .infinity }, naming: "noise_alpha")
+    expectRefusal({ $0.implicitSteps = -1 }, naming: "implicit_steps")
+    expectRefusal({ $0.implicitSteps = 9 }, naming: "implicit_steps")
+    expectRefusal({ $0.c2 = 0 }, naming: "c2")
+    expectRefusal({ $0.c2 = 1.01 }, naming: "c2")
+    expectRefusal({ $0.c2 = 2.0 / 3.0 }, naming: "2/3")
     expectRefusal({ $0.checkpointFamily = "raw" }, naming: "raw-accel")
     expectRefusal({ $0.vae = "" }, naming: "vae")
 

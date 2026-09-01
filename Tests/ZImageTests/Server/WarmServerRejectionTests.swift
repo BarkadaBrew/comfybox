@@ -216,6 +216,26 @@ final class WarmServerRejectionTests: XCTestCase {
     XCTAssertEqual(try decode(#"{"prompt":"x","implicit_steps":8}"#).validatedImplicitSteps(), 8)
   }
 
+  func testC2RejectsInvalidRangeAndRES3sPole() throws {
+    for json in [
+      #"{"prompt":"x","c2":0}"#,
+      #"{"prompt":"x","c2":-0.1}"#,
+      #"{"prompt":"x","c2":1.01}"#,
+      #"{"prompt":"x","c2":0.6666667}"#,
+    ] {
+      XCTAssertThrowsError(try decode(json).validatedC2(), json) { error in
+        guard case WarmServerError.c2OutOfRange = error else {
+          return XCTFail("expected c2OutOfRange, got \(error) for \(json)")
+        }
+        XCTAssertEqual(WarmServer.errorResponse(for: error).status, 400)
+      }
+    }
+
+    XCTAssertEqual(try decode(#"{"prompt":"x"}"#).validatedC2(), 0.5)
+    XCTAssertEqual(try decode(#"{"prompt":"x","c2":0.05}"#).validatedC2(), 0.05)
+    XCTAssertEqual(try decode(#"{"prompt":"x","c2":1}"#).validatedC2(), 1)
+  }
+
   func testProjectorScaleOutOfRangeIs400() throws {
     // Out of range → refused by value. Non-finite cannot arrive via JSON --
     // Foundation refuses overflow literals at decode with its own 400; the
