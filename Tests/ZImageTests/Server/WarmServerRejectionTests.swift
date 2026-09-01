@@ -192,6 +192,30 @@ final class WarmServerRejectionTests: XCTestCase {
   /// clamp range is a 400 naming the value, never a clamp. Absent → the
   /// neutral 1.0; every in-range value (including the boundaries) passes
   /// through unchanged.
+  // Implicit-RK batch-2 review F1: negative implicit_steps trapped the
+  // denoise-loop precondition (process abort); unbounded hung renders.
+  func testImplicitStepsOutOfRangeIsRejected() throws {
+    for json in [
+      #"{"prompt":"x","implicit_steps":-1}"#,
+      #"{"prompt":"x","implicit_steps":9}"#,
+      #"{"prompt":"x","implicit_steps":1000000}"#,
+    ] {
+      let payload = try decode(json)
+      XCTAssertThrowsError(try payload.validatedImplicitSteps(), json) { error in
+        guard case WarmServerError.implicitStepsOutOfRange = error else {
+          return XCTFail("expected implicitStepsOutOfRange, got \(error) for \(json)")
+        }
+      }
+    }
+  }
+
+  func testImplicitStepsAbsentAndValidPassThrough() throws {
+    XCTAssertEqual(try decode(#"{"prompt":"x"}"#).validatedImplicitSteps(), 0)
+    XCTAssertEqual(try decode(#"{"prompt":"x","implicit_steps":0}"#).validatedImplicitSteps(), 0)
+    XCTAssertEqual(try decode(#"{"prompt":"x","implicit_steps":4}"#).validatedImplicitSteps(), 4)
+    XCTAssertEqual(try decode(#"{"prompt":"x","implicit_steps":8}"#).validatedImplicitSteps(), 8)
+  }
+
   func testProjectorScaleOutOfRangeIs400() throws {
     // Out of range → refused by value. Non-finite cannot arrive via JSON --
     // Foundation refuses overflow literals at decode with its own 400; the

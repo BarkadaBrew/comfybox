@@ -4,14 +4,15 @@ gen_implicit_fixture.py — oracle fixture for the implicit-RK refinement port.
 
 VALIDATION TOOL ONLY (sibling of gen_scheduler_fixtures.py; same oracle
 discipline — ComfyUI/RES4LYF are oracles, never a ComfyBox backend). It emits a
-single trace fixture exercising RES4LYF's `full_iter` re-iteration loop:
+trace fixtures exercising RES4LYF's `full_iter` re-iteration loop:
 
-  res4lyf_trace_implicit_heun2s.json + .safetensors
+  res4lyf_trace_{explicit,implicit}_{heun2s,res2s}.json + .safetensors
 
-    RES4LYF `sample_rk_beta` with `rk_type="heun_2s"`, `implicit_steps_full=1`,
-    `implicit_steps_diag=0`, eta 0 (tier T1, no SDE noise), bongmath off, guides
-    off, on a `beta` grid of 4 steps against the scripted denoiser
-    `0.5*tanh(x) + 0.25*sigma - 0.1*x` on a 1x16x8x8 latent.
+    RES4LYF `sample_rk_beta` with `rk_type` in {heun_2s (linear frame), res_2s
+    (exponential frame)}, `implicit_steps_full` in {0, 1}, `implicit_steps_diag=0`,
+    eta 0 (tier T1, no SDE noise), bongmath off, guides off, on a `beta` grid of
+    4 steps against the scripted denoiser `0.5*tanh(x) + 0.25*sigma - 0.1*x` on a
+    1x16x8x8 latent.
 
     Captured PER STEP and PER full_iter pass: the model calls (x_in, the sigma
     the model was evaluated at, denoised, the x_0/sigma-anchored eps) and the
@@ -42,17 +43,29 @@ sys.modules["gen_scheduler_fixtures"] = H
 _spec.loader.exec_module(H)
 
 
-RECIPE = dict(sampler="heun_2s", scheduler="beta", steps=4, denoise=1.0)
+RECIPE = dict(scheduler="beta", steps=4, denoise=1.0)
 # T1: eta 0 (no SDE noise), bongmath off, guides off.
 TIER = dict(eta=0.0, bongmath=False)
 IMPLICIT_STEPS_DIAG = 0
 
-# Two fixtures: the plain explicit reference (full=0, one pass/step — the
-# byte-identical-when-off baseline) and the implicit refinement (full=1).
-VARIANTS = {
-    "explicit_heun2s": 0,
-    "implicit_heun2s": 1,
+# rk_type -> the RK_Method subclass whose `__call__` makes the model calls.
+# `heun_2s` is a LINEAR-frame tableau; `res_2s` is EXPONENTIAL-frame
+# (data-prediction, φ-functions) — the model calls go through a different
+# subclass, so the tracer must hook the matching one.
+SAMPLER_METHOD = {
+    "heun_2s": "RK_Method_Linear",
+    "res_2s": "RK_Method_Exponential",
 }
+
+# Fixtures: for each sampler, the plain explicit reference (full=0, one
+# pass/step — the byte-identical-when-off baseline) and the implicit refinement
+# (full=1). `(label, rk_type, implicit_steps_full)`.
+VARIANTS = [
+    ("explicit_heun2s", "heun_2s", 0),
+    ("implicit_heun2s", "heun_2s", 1),
+    ("explicit_res2s", "res_2s", 0),
+    ("implicit_res2s", "res_2s", 1),
+]
 
 
 class ImplicitTracer:
@@ -60,11 +73,16 @@ class ImplicitTracer:
 
     Records one record per solver step, and inside it one record per full_iter
     pass: the model calls made during that pass and the x_next it produced.
+
+    `method_cls_name` selects which `RK_Method` subclass makes the model calls
+    for this sampler (`RK_Method_Linear` for heun_2s, `RK_Method_Exponential`
+    for res_2s); both expose the same `(eps, denoised)` `__call__` contract.
     """
 
-    def __init__(self, rk_method_mod, noise_mod):
+    def __init__(self, rk_method_mod, noise_mod, method_cls_name):
         self.rkm = rk_method_mod
         self.nsm = noise_mod
+        self.method_cls_name = method_cls_name
         self.tensors: dict = {}
         self.steps: list = []
         self.cur: dict | None = None
@@ -106,9 +124,11 @@ class ImplicitTracer:
             tr.steps.append(tr.cur)
         nsm.RK_NoiseSampler.set_sde_step = set_sde_step
 
-        # Record every model call (RK_Method_Linear.__call__ for heun_2s).
-        cls = rkm.RK_Method_Linear
-        o["Linear.__call__"] = cls.__call__
+        # Record every model call (the sampler's RK_Method subclass __call__:
+        # RK_Method_Linear for heun_2s, RK_Method_Exponential for res_2s).
+        cls = getattr(rkm, self.method_cls_name)
+        o["method.__call__"] = cls.__call__
+        o["method_cls"] = cls
         def make_call(orig):
             def __call__(self_, x, sub_sigma, x_0=None, sigma=None, transformer_options=None):
                 eps, denoised = orig(self_, x, sub_sigma, x_0, sigma, transformer_options)
@@ -128,7 +148,7 @@ class ImplicitTracer:
                 ))
                 return eps, denoised
             return __call__
-        cls.__call__ = make_call(o["Linear.__call__"])
+        cls.__call__ = make_call(o["method.__call__"])
 
         # Close each full_iter pass and capture its x_next.
         o["rebound_overshoot_step"] = nsm.RK_NoiseSampler.rebound_overshoot_step
@@ -151,14 +171,14 @@ class ImplicitTracer:
         nsm, o = self.nsm, self._orig
         nsm.RK_NoiseSampler.prepare_sigmas = o["prepare_sigmas"]
         nsm.RK_NoiseSampler.set_sde_step = o["set_sde_step"]
-        self.rkm.RK_Method_Linear.__call__ = o["Linear.__call__"]
+        o["method_cls"].__call__ = o["method.__call__"]
         nsm.RK_NoiseSampler.rebound_overshoot_step = o["rebound_overshoot_step"]
         for s in self.steps:
             s.pop("_pass_calls", None)
         return False
 
 
-def run_implicit_trace(prov, r4, ms, implicit_steps_full):
+def run_implicit_trace(prov, r4, ms, sampler, method_cls_name, implicit_steps_full):
     import torch
 
     rks = r4.beta.rk_sampler_beta
@@ -178,13 +198,13 @@ def run_implicit_trace(prov, r4, ms, implicit_steps_full):
     assert x.dtype == torch.float32
 
     eta = TIER["eta"]
-    with ImplicitTracer(rkm, nsm) as tr:
+    with ImplicitTracer(rkm, nsm, method_cls_name) as tr:
         x_final = rks.sample_rk_beta(
             model, x.clone(), sigmas.clone(),
             extra_args={"model_options": {"transformer_options": {}}},
             callback=None, disable=True,
             sampler_mode="standard",
-            rk_type=RECIPE["sampler"], implicit_sampler_name="use_explicit",
+            rk_type=sampler, implicit_sampler_name="use_explicit",
             c1=0.0, c2=0.5, c3=1.0,
             noise_sampler_type="gaussian", noise_sampler_type_substep="gaussian",
             noise_mode_sde="hard", noise_mode_sde_substep="hard",
@@ -227,15 +247,18 @@ def run_implicit_trace(prov, r4, ms, implicit_steps_full):
     manifest = dict(
         provenance=prov,
         recipe=dict(
-            tier="T1", sampler=RECIPE["sampler"], scheduler=RECIPE["scheduler"],
+            tier="T1", sampler=sampler, scheduler=RECIPE["scheduler"],
             steps=RECIPE["steps"], denoise=RECIPE["denoise"],
             eta=eta, eta_substep=eta, bongmath=TIER["bongmath"],
             implicit_steps_full=implicit_steps_full, implicit_steps_diag=IMPLICIT_STEPS_DIAG,
             shift=H.KREA2_SHIFT, model_sampling="ModelSamplingFlux",
             seed=H.SEED, noise_seed_sde=H.SEED + 1,
-            note=("RES4LYF sample_rk_beta full_iter loop; explicit heun_2s re-iterated "
+            note=(f"RES4LYF sample_rk_beta full_iter loop; explicit {sampler} re-iterated "
                   "implicit_steps_full+1 times as a fixed point. row_offset=1, so pass>0 "
-                  "re-anchors row 0 on the previous pass's x_next at sigma_next."),
+                  "re-anchors row 0 on the previous pass's x_next at sigma_next. res_2s is "
+                  "exponential-frame (data-prediction); with noise_anchor=1 the __call__ "
+                  "returns the raw denoised, so the re-anchor is the exponential analogue "
+                  "of the linear heun case."),
         ),
         denoiser="0.5*tanh(x) + 0.25*sigma - 0.1*x",
         latent_shape=list(H.LATENT_SHAPE),
@@ -285,8 +308,9 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     from safetensors.torch import save_file
-    for label, full in VARIANTS.items():
-        manifest, tensors = run_implicit_trace(prov, r4, ms_flux, full)
+    for label, sampler, full in VARIANTS:
+        manifest, tensors = run_implicit_trace(
+            prov, r4, ms_flux, sampler, SAMPLER_METHOD[sampler], full)
         stem = f"res4lyf_trace_{label}"
         with open(out / f"{stem}.json", "w") as f:
             json.dump(manifest, f, indent=1)
