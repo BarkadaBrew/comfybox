@@ -8129,6 +8129,7 @@ private actor WarmServerCoordinator {
       // before any model work — never a clamp, never a silent gaussian.
       let projectorScale = try payload.validatedProjectorScale()
       let noiseType = try payload.validatedNoiseType()
+      let implicitSteps = try payload.validatedImplicitSteps()
       let samplerAsked: String = recipe.samplerRequested ?? "-"
       let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
       let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
@@ -8261,7 +8262,8 @@ private actor WarmServerCoordinator {
                 eta: recipe.eta, bongmath: recipe.bongmath,
                 projectorScale: projectorScale,
                 noiseType: noiseType,
-                noiseAlpha: payload.noiseAlpha ?? 0.0),
+                noiseAlpha: payload.noiseAlpha ?? 0.0,
+                implicitStepsFull: implicitSteps),
           progress: publishProgress)
         traces = [trace1]
       } else {
@@ -8280,7 +8282,8 @@ private actor WarmServerCoordinator {
                 eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2,
                 projectorScale: projectorScale,
                 noiseType: noiseType,
-                noiseAlpha: payload.noiseAlpha ?? 0.0),
+                noiseAlpha: payload.noiseAlpha ?? 0.0,
+                implicitStepsFull: implicitSteps),
           progress: publishProgress)
       }
       let trace = traces[0]
@@ -9705,6 +9708,7 @@ extension GeneratePayload: Decodable {
   /// text conditioning would render garbage (or something the caller did not
   /// ask for) under a well-formed-looking record.
   static let projectorScaleRange: ClosedRange<Float> = 0.0...3.0
+  static let implicitStepsRange: ClosedRange<Int> = 0...8
 
   /// `projector_scale`, validated at the point of application: absent → the
   /// neutral 1.0; present → finite and inside ``projectorScaleRange``, else a
@@ -9730,6 +9734,19 @@ extension GeneratePayload: Decodable {
         name: noiseType, valid: RES4LYFNoiseType.allCases.map(\.rawValue))
     }
     return kind
+  }
+
+  /// `implicit_steps`, validated at the point of application (implicit-RK
+  /// batch-2 review F1): absent -> 0 (today's explicit render, byte-identical).
+  /// Negative would trap the denoise loop's precondition and abort the warm
+  /// server; unbounded would hang a render (model evals scale with passes).
+  /// 0...8 covers every practical RES4LYF full_iter setting.
+  func validatedImplicitSteps() throws -> Int {
+    guard let implicitSteps else { return 0 }
+    guard Self.implicitStepsRange.contains(implicitSteps) else {
+      throw WarmServerError.implicitStepsOutOfRange(value: "\(implicitSteps)")
+    }
+    return implicitSteps
   }
 
   /// WP-E3 (§3.3, D11, D22, D25): the recipe fields a Krea 2 request carries,
@@ -10325,6 +10342,7 @@ public enum WarmServerError: Error, LocalizedError {
   /// Refused by value rather than clamped — a clamp would render something the
   /// caller did not ask for under the number they sent.
   case projectorScaleOutOfRange(value: String)
+  case implicitStepsOutOfRange(value: String)
   /// A `noise_type` that is not a `RES4LYFNoiseType` raw value. An unknown
   /// name is a 400 naming the valid set — it must never silently degrade to
   /// gaussian (absent stays gaussian; that is the default, not a coercion).
@@ -10373,6 +10391,9 @@ public enum WarmServerError: Error, LocalizedError {
     case .projectorScaleOutOfRange(let value):
       return "projector_scale must be a finite number in 0.0...3.0 (got \(value)); "
         + "1.0 is neutral — omit it for the default"
+    case .implicitStepsOutOfRange(let value):
+      return "implicit_steps must be an integer in 0...8 (got \(value)); "
+        + "0 is the explicit render — omit it for the default"
     case .unknownNoiseType(let name, let valid):
       return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
         + "omit it for gaussian"
