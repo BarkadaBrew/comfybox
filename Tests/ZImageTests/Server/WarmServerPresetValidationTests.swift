@@ -82,6 +82,26 @@ final class WarmServerPresetValidationTests: XCTestCase {
     XCTAssertNil(store.get("p"))
   }
 
+  func testResolveRouteCarriesRES4LYFKnobsInSnakeCase() throws {
+    let store = try makeStore()
+    let payload = Data(#"""
+    {"id":"res4lyf","name":"RES4LYF","noise_type":"pyramid","noise_alpha":-0.8,
+     "implicit_steps":3,"c2":0.4}
+    """#.utf8)
+    let saved = try http(WarmServer.upsertPreset(store: store, body: payload).0)
+    XCTAssertEqual(saved.status, 200, body(saved))
+
+    let response = try http(
+      WarmServer.resolvePreset(store: store, body: Data(#"{"id":"res4lyf"}"#.utf8)))
+    XCTAssertEqual(response.status, 200, body(response))
+    let json = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+    XCTAssertEqual(json["noise_type"] as? String, "pyramid")
+    XCTAssertEqual(json["noise_alpha"] as? Double, -0.8)
+    XCTAssertEqual(json["implicit_steps"] as? Int, 3)
+    XCTAssertEqual(json["c2"] as? Double, 0.4)
+  }
+
   /// AC-44c: an invalid preset already on disk is served by `GET /v1/presets`
   /// with `invalid: true` and the reason, beside valid entries carrying
   /// `invalid: false` — so a client can show it and refuse to select it.

@@ -4911,7 +4911,7 @@ public final class WarmServer {
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
            .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType,
-           .implicitStepsOutOfRange:
+           .implicitStepsOutOfRange, .c2OutOfRange:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
@@ -8131,6 +8131,7 @@ private actor WarmServerCoordinator {
       let projectorScale = try payload.validatedProjectorScale()
       let noiseType = try payload.validatedNoiseType()
       let implicitSteps = try payload.validatedImplicitSteps()
+      let c2 = try payload.validatedC2()
       let samplerAsked: String = recipe.samplerRequested ?? "-"
       let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
       let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
@@ -8261,6 +8262,7 @@ private actor WarmServerCoordinator {
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
                 eta: recipe.eta, bongmath: recipe.bongmath,
+                c2: c2,
                 projectorScale: projectorScale,
                 noiseType: noiseType,
                 noiseAlpha: payload.noiseAlpha ?? 0.0,
@@ -8280,7 +8282,7 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2,
+                eta: recipe.eta, bongmath: recipe.bongmath, c2: c2, stage2: stage2,
                 projectorScale: projectorScale,
                 noiseType: noiseType,
                 noiseAlpha: payload.noiseAlpha ?? 0.0,
@@ -9251,6 +9253,9 @@ struct GeneratePayload: Sendable {
   /// times as a fixed point. Absent/0 = byte-identical to today. Mirrors
   /// `eta`/`bongmath`: decoded here, forwarded to Krea2Pipeline.Request.
   let implicitSteps: Int?
+  /// RES4LYF `res_2s` / `res_3s` substep location (wire: `c2`). Krea 2
+  /// only; absent = 0.5, preserving the existing scheduler recipe.
+  let c2: Float?
   init(
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
@@ -9272,7 +9277,7 @@ struct GeneratePayload: Sendable {
     stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil,
     projectorScale: Float? = nil,
     noiseType: String? = nil, noiseAlpha: Float? = nil,
-    implicitSteps: Int? = nil
+    implicitSteps: Int? = nil, c2: Float? = nil
   ) {
     self.preempt = preempt
     self.vae = vae
@@ -9283,6 +9288,7 @@ struct GeneratePayload: Sendable {
     self.noiseType = noiseType
     self.noiseAlpha = noiseAlpha
     self.implicitSteps = implicitSteps
+    self.c2 = c2
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
@@ -9353,6 +9359,7 @@ extension GeneratePayload: Decodable {
     case noiseAlpha
     // `implicit_steps` arrives as this camelCase form after .convertFromSnakeCase.
     case implicitSteps
+    case c2
   }
 
   init(from decoder: Decoder) throws {
@@ -9416,6 +9423,7 @@ extension GeneratePayload: Decodable {
     noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
     noiseAlpha = try c.decodeIfPresent(Float.self, forKey: .noiseAlpha)
     implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
+    c2 = try c.decodeIfPresent(Float.self, forKey: .c2)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.
@@ -9710,6 +9718,7 @@ extension GeneratePayload: Decodable {
   /// ask for) under a well-formed-looking record.
   static let projectorScaleRange: ClosedRange<Float> = 0.0...3.0
   static let implicitStepsRange: ClosedRange<Int> = 0...8
+  static let c2Pole: Float = 2.0 / 3.0
 
   /// `projector_scale`, validated at the point of application: absent → the
   /// neutral 1.0; present → finite and inside ``projectorScaleRange``, else a
@@ -9748,6 +9757,17 @@ extension GeneratePayload: Decodable {
       throw WarmServerError.implicitStepsOutOfRange(value: "\(implicitSteps)")
     }
     return implicitSteps
+  }
+
+  /// `c2`, validated before constructing a scheduler whose RES3S tableau has
+  /// a pole at 2/3. Absent keeps the established midpoint substep (0.5).
+  func validatedC2() throws -> Float {
+    guard let c2 else { return 0.5 }
+    guard c2.isFinite, c2 > 0, c2 <= 1,
+          abs(c2 - Self.c2Pole) >= 1e-6 else {
+      throw WarmServerError.c2OutOfRange(value: "\(c2)")
+    }
+    return c2
   }
 
   /// WP-E3 (§3.3, D11, D22, D25): the recipe fields a Krea 2 request carries,
@@ -10344,6 +10364,7 @@ public enum WarmServerError: Error, LocalizedError {
   /// caller did not ask for under the number they sent.
   case projectorScaleOutOfRange(value: String)
   case implicitStepsOutOfRange(value: String)
+  case c2OutOfRange(value: String)
   /// A `noise_type` that is not a `RES4LYFNoiseType` raw value. An unknown
   /// name is a 400 naming the valid set — it must never silently degrade to
   /// gaussian (absent stays gaussian; that is the default, not a coercion).
@@ -10395,6 +10416,9 @@ public enum WarmServerError: Error, LocalizedError {
     case .implicitStepsOutOfRange(let value):
       return "implicit_steps must be an integer in 0...8 (got \(value)); "
         + "0 is the explicit render — omit it for the default"
+    case .c2OutOfRange(let value):
+      return "c2 must be a finite number in (0, 1] other than 2/3 (got \(value)); "
+        + "0.5 is the default"
     case .unknownNoiseType(let name, let valid):
       return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
         + "omit it for gaussian"

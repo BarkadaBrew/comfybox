@@ -41,6 +41,13 @@ public struct GenerationRequest: Sendable {
     /// RES4LYF bongmath: forward/backward substep alignment (free accuracy).
     /// Only bites with a RES4LYF sampler.
     public var bongmath: Bool
+    /// RES4LYF SDE noise generator and its fractal exponent.
+    public var noiseType: String
+    public var noiseAlpha: Float
+    /// Extra implicit fixed-point passes over the RES4LYF tableau.
+    public var implicitSteps: Int
+    /// RES4LYF `res_2s` / `res_3s` substep location.
+    public var c2: Float
 
     public init(
         prompt: String = "",
@@ -52,6 +59,10 @@ public struct GenerationRequest: Sendable {
         projectorScale: Float = 1.0,
         eta: Float = 0.0,
         bongmath: Bool = false,
+        noiseType: String = "gaussian",
+        noiseAlpha: Float = 0.0,
+        implicitSteps: Int = 0,
+        c2: Float = 0.5,
         sampler: String? = nil,
         sigmaSchedule: String? = nil,
         seed: UInt64 = 0,
@@ -78,6 +89,10 @@ public struct GenerationRequest: Sendable {
         self.projectorScale = projectorScale
         self.eta = eta
         self.bongmath = bongmath
+        self.noiseType = noiseType
+        self.noiseAlpha = noiseAlpha
+        self.implicitSteps = implicitSteps
+        self.c2 = c2
     }
 }
 
@@ -460,6 +475,18 @@ public final class EngineService {
         }
         if request.bongmath {
             payloadDict["bongmath"] = true
+        }
+        if request.noiseType != "gaussian" {
+            payloadDict["noise_type"] = request.noiseType
+        }
+        if request.noiseAlpha != 0 {
+            payloadDict["noise_alpha"] = request.noiseAlpha
+        }
+        if request.implicitSteps != 0 {
+            payloadDict["implicit_steps"] = request.implicitSteps
+        }
+        if request.c2 != 0.5 {
+            payloadDict["c2"] = request.c2
         }
 
         payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)

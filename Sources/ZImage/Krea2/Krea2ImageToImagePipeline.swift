@@ -50,7 +50,7 @@ extension Krea2Pipeline {
     public var eta: Float = 0.0
     /// RES4LYF `bongmath` (T3, WP-E16); see `Krea2Pipeline.Request.bongmath`.
     public var bongmath: Bool = false
-    /// `res_2s` / `res_3s` substep, not on the wire (D23).
+    /// `res_2s` / `res_3s` substep; absent on the wire defaults to 0.5.
     public var c2: Float = 0.5
     /// Text-conditioning gain on the fusion projector; see `Krea2Pipeline.Request.projectorScale`.
     public var projectorScale: Float = 1.0
