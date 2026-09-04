@@ -116,6 +116,11 @@ final class LTX2BeatScheduleLocatorRealTokenizerTests: XCTestCase {
   /// standalone special-token prefix (BOS, id 2). It neither spins nor blocks,
   /// so `tokenize("")` cannot be the source of a load-path wedge. (The locate
   /// tests above already run it, but only as a side effect — this pins it.)
+  ///
+  /// Scope, stated plainly (Codex r1): this is an EXONERATION PROBE, not a
+  /// regression guard. It passes on unmodified main — that is the whole point —
+  /// and it skips rather than fails without the local Gemma snapshot, like its
+  /// neighbours in this file.
   func testEmptyStringEncodeTerminatesAndYieldsOnlyBOS() throws {
     let tokenizer = try loadTokenizer()
 

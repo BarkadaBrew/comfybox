@@ -6,10 +6,12 @@
 // during encoder construction.
 //
 // It does not: `LTX2BeatScheduleLocator.locate` is called from exactly one
-// place, `LTX2VideoGenerator.generate` (LTX2VideoGenerator.swift:956), gated
-// on `beatScheduleEnabled && request.beatSchedule` being non-empty, and that
-// is reached long after `ensureLoaded` logs "LTX-2: models ready."
-// (LTX2VideoGenerator.swift:674). See the PR for the production-log evidence.
+// place — the `resolvedBeats` binding in `LTX2VideoGenerator.render`, gated on
+// `typedConfig.beatScheduleEnabled && request.beatSchedule` being non-empty —
+// and that is reached long after `LTX2VideoGenerator.load` logs
+// "LTX-2: models ready." (Deliberately named by symbol, not line: Codex r1
+// caught this comment's line numbers already stale one round in.) See the PR
+// for the production-log evidence.
 //
 // What these tests DO pin is the invariant the ticket asks for, at the one
 // layer that can be tested without weights: the locator performs NO tokenizer

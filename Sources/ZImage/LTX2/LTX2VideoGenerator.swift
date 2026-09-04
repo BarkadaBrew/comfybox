@@ -626,7 +626,7 @@ public final class LTX2VideoGenerator {
             slidingWindow: 1024, slidingWindowPattern: 6,
             quantization: nil
         )
-        let textEncoder = timedLoadStage("text encoder construct") {
+        let textEncoder = try timedLoadStage("text encoder construct") {
             LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
         }
         try timedLoadStage("text encoder bind weights (~14.5GB Gemma safetensors)") {
@@ -660,11 +660,18 @@ public final class LTX2VideoGenerator {
         // uniform grid/mesh artifact seen in every local I2V test tonight.
         // Two-stage refine (Phase 3): load the spatial latent upsampler if enabled.
         // ltx-2.3-spatial-upscaler-x2-1.1 keys map 1:1 to LTX2LatentUpsampler.
+        //
+        // Codex r1: `loadUpsampler` does its own `MLX.loadArrays` + `MLX.eval`
+        // (a second paged read), so a stall here produces the exact same
+        // "after the text encoder, before models ready" symptom. It gets its
+        // own named stage rather than hiding inside the gap.
         var upsampler: LTX2LatentUpsampler? = nil
         if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
            let upPath = ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"],
            FileManager.default.fileExists(atPath: upPath) {
-            upsampler = Self.loadUpsampler(path: upPath, logger: logger)
+            upsampler = try timedLoadStage("two-stage upsampler load (loadArrays + eval)") {
+                Self.loadUpsampler(path: upPath, logger: logger)
+            }
         }
         // Tiled/chunked VAE decode is OOM-safe on long/large clips but seams on
         // fast motion (spatial-tile mosaic + temporal-window jitter). Plain
@@ -676,35 +683,87 @@ public final class LTX2VideoGenerator {
         // The temporal-RoPE conditioning fps (the motion dial) is therefore
         // controlled per-render via LTX2_COND_FPS (read fresh in createPositionGrid).
         let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: tiled)
-        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
-        // 128 was a port artifact, NOT the trained recipe (discovered 2026-08-07):
-        // the official Lightricks pipeline tokenizes at max_length 1024, the
-        // ComfyUI Gemma loader defaults to 1024, and the reference PinkCherry
-        // workflow feeds 256-token enhancer output through this same encoder.
-        // The artifact silently truncated every long prompt for weeks — scene,
-        // camera and identity fell off the tail. Mirror upstream's env knob.
-        self.tokenizer = try timedLoadStage("tokenizer load (tokenizer.json parse)") {
-            try LTX2GemmaTokenizer.load(
-              from: URL(fileURLWithPath: config.gemmaPath),
-              maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
-        }
-        isLoaded = true
-        loadedLoraKey = wantKey
+        // Codex r1: the pipeline and the tokenizer are published as ONE step,
+        // after every throwing stage has succeeded. Assigning `self.pipeline`
+        // before the (throwing) tokenizer load used to leave a failed attempt
+        // retaining a complete ~54GB model stack that `isLoaded == false`
+        // claimed was not there, so the retry built a second one beside it.
+        try Self.atomicallyPublishLoad(
+            build: { () throws -> (LTX2Pipeline, LTX2GemmaTokenizer) in
+                let builtPipeline = try timedLoadStage("pipeline construct") {
+                    LTX2Pipeline(
+                        vae: vae, textEncoder: textEncoder, transformer: transformer,
+                        config: pipelineConfig, upsampler: upsampler)
+                }
+                // 128 was a port artifact, NOT the trained recipe (discovered 2026-08-07):
+                // the official Lightricks pipeline tokenizes at max_length 1024, the
+                // ComfyUI Gemma loader defaults to 1024, and the reference PinkCherry
+                // workflow feeds 256-token enhancer output through this same encoder.
+                // The artifact silently truncated every long prompt for weeks — scene,
+                // camera and identity fell off the tail. Mirror upstream's env knob.
+                let builtTokenizer = try timedLoadStage("tokenizer load (tokenizer.json parse)") {
+                    try LTX2GemmaTokenizer.load(
+                      from: URL(fileURLWithPath: config.gemmaPath),
+                      maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
+                }
+                return (builtPipeline, builtTokenizer)
+            },
+            publish: { stack in
+                self.pipeline = stack.0
+                self.tokenizer = stack.1
+                self.isLoaded = true
+                self.loadedLoraKey = wantKey
+            },
+            discard: { self.unload() })
         logger.info("LTX-2: models ready.")
     }
 
 
     // MARK: - Load-path stage timing (comfybox#340)
 
-    /// A load stage slower than this is reported as abnormally slow. The whole
-    /// warm load normally runs in single-digit seconds per stage (production
-    /// text-encoder loads: 3–17s end to end); 30s is well clear of a healthy
-    /// cold start and far below the 15-minute watchdog kill.
+    /// A load stage slower than this is reported as abnormally slow, and the
+    /// interval at which an in-flight stage repeats its heartbeat. A healthy
+    /// warm load runs single-digit seconds per stage (production text-encoder
+    /// loads: 3–17s end to end), so 30s is well clear of a cold start while
+    /// still firing ~30 times before the 15-minute watchdog kill.
     static let slowLoadStageWarnSeconds: Double = 30
 
-    /// One-line verdict for a completed load stage. Pure and unit-tested: the
-    /// wording is the thing a future wedge gets diagnosed from, and it must not
-    /// need a live 15-minute hang to be exercised.
+    /// The operational note shared by the heartbeat and the slow-completion
+    /// warning. `/health` is called out explicitly as NOT a signal here: it
+    /// reads a lock-backed snapshot precisely so it stays answerable while the
+    /// coordinator is blocked (WarmServer, #217), so a green health check
+    /// during this stall means nothing. Getting this wrong would send the next
+    /// person reading the log to the wrong place.
+    private static let stalledLoadNote =
+        "The render queue is stalled for the whole stage (/health is snapshot-backed and stays "
+        + "green, so it will NOT show this), and a watchdog restart here loses the in-flight "
+        + "render (comfybox#340, #339). Suspect cold page cache, memory pressure, or a near-full "
+        + "disk rather than a deadlock."
+
+    /// Logged BEFORE a stage runs. Codex r1: a report emitted after `body()`
+    /// returns is exactly the report a wedge never produces — the six
+    /// 2026-09-01 loads were SIGTERM'd mid-stage. This line is the one that
+    /// survives the kill and names the stage that was active.
+    static func loadStageEntryMessage(stage: String) -> String {
+        "LTX-2 load: \(stage) — started"
+    }
+
+    /// Repeated every `slowLoadStageWarnSeconds` while a stage is still
+    /// running, so a wedge is visible WHILE it happens rather than only in
+    /// hindsight (and at all, when the process is killed before completion).
+    static func loadStageStillRunningMessage(
+        stage: String,
+        seconds: Double,
+        warnAfter: Double = LTX2VideoGenerator.slowLoadStageWarnSeconds
+    ) -> String {
+        let secs = String(format: "%.0f", seconds)
+        return "LTX-2 load: \(stage) STILL RUNNING after \(secs)s "
+            + "(healthy is under \(Int(warnAfter))s). \(stalledLoadNote)"
+    }
+
+    /// One-line verdict for a COMPLETED load stage. Honest scope: this fires
+    /// only once the stage returns — the entry line and the heartbeat above are
+    /// what cover a stage that never returns.
     static func loadStageReport(
         stage: String,
         seconds: Double,
@@ -716,28 +775,93 @@ public final class LTX2VideoGenerator {
         }
         return (
             "LTX-2 load: \(stage) took \(secs)s — ABNORMALLY SLOW "
-                + "(healthy is under \(Int(warnAfter))s). The warm server is blocked for the whole "
-                + "stage, so /health and every queued job stall with it and a watchdog restart here "
-                + "loses the in-flight render (comfybox#340, #339). Suspect cold page cache, memory "
-                + "pressure, or a near-full disk rather than a deadlock.",
+                + "(healthy is under \(Int(warnAfter))s). \(stalledLoadNote)",
             true
         )
     }
 
-    /// Run one named load stage, timing it and logging the verdict. Splits what
-    /// used to be a single unnamed span between "loading text encoder" and
-    /// "models ready" into stages a log can point at.
-    @discardableResult
-    private func timedLoadStage<T>(_ stage: String, _ body: () throws -> T) rethrows -> T {
-        let started = CFAbsoluteTimeGetCurrent()
-        let result = try body()
-        let report = Self.loadStageReport(stage: stage, seconds: CFAbsoluteTimeGetCurrent() - started)
-        if report.isSlow {
-            logger.warning("\(report.message)")
-        } else {
-            logger.info("\(report.message)")
+    /// Logged when a stage throws. Names the stage, how long it burned before
+    /// failing, the cause, and that the partial load was dropped — so the next
+    /// line in the log (a retry) is understood to start from nothing.
+    static func loadStageFailureMessage(stage: String, seconds: Double, error: Error) -> String {
+        "LTX-2 load: \(stage) FAILED after \(String(format: "%.2f", seconds))s — \(error). "
+            + "Partial load discarded; nothing was published, so a retry starts clean."
+    }
+
+    /// Monotonic elapsed seconds. Wall-clock (`CFAbsoluteTimeGetCurrent`) can
+    /// step under NTP correction, which would make an incident's timings lie.
+    private static func elapsedSeconds(since start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000_000
+    }
+
+    /// Run one named load stage: entry line, in-flight heartbeat, then a
+    /// completion or failure line. Splits what used to be a single unnamed span
+    /// between "loading text encoder" and "models ready" into stages a log can
+    /// point at — including a stage that never finishes.
+    private func timedLoadStage<T>(_ stage: String, _ body: () throws -> T) throws -> T {
+        let started = DispatchTime.now()
+        logger.info("\(Self.loadStageEntryMessage(stage: stage))")
+
+        // Detached on purpose: `body()` blocks this thread for the whole stage
+        // (that IS the failure mode), so the heartbeat cannot live on it.
+        let interval = Self.slowLoadStageWarnSeconds
+        let heartbeat = Task.detached(priority: .utility) { [logger] in
+            var waited = 0.0
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                } catch {
+                    return  // cancelled while sleeping — the stage finished
+                }
+                waited += interval
+                logger.warning(
+                    "\(Self.loadStageStillRunningMessage(stage: stage, seconds: waited))")
+            }
         }
-        return result
+        defer { heartbeat.cancel() }
+
+        do {
+            let result = try body()
+            let report = Self.loadStageReport(
+                stage: stage, seconds: Self.elapsedSeconds(since: started))
+            if report.isSlow {
+                logger.warning("\(report.message)")
+            } else {
+                logger.info("\(report.message)")
+            }
+            return result
+        } catch {
+            let failure = Self.loadStageFailureMessage(
+                stage: stage, seconds: Self.elapsedSeconds(since: started), error: error)
+            logger.error("\(failure)")
+            throw error
+        }
+    }
+
+    /// Publish a freshly built model stack as ONE step.
+    ///
+    /// Codex review r1 (comfybox#340): `load()` used to assign `self.pipeline` —
+    /// the complete transformer + VAE + text encoder — and only THEN run the
+    /// throwing tokenizer stage. A tokenizer failure left `isLoaded == false`
+    /// while the generator still retained that whole stack, and since `load()`
+    /// unloads only when `isLoaded` is true, the retry built a SECOND stack
+    /// beside the first. At ~54GB a stack, that is an OOM, not a leak.
+    ///
+    /// `build` runs every throwing stage; `publish` runs only if all of them
+    /// succeed, and a throw runs `discard` instead.
+    static func atomicallyPublishLoad<Stack>(
+        build: () throws -> Stack,
+        publish: (Stack) -> Void,
+        discard: () -> Void
+    ) throws {
+        let stack: Stack
+        do {
+            stack = try build()
+        } catch {
+            discard()
+            throw error
+        }
+        publish(stack)
     }
 
     /// Load + validate the spatial latent upsampler. Shared by the load-time
