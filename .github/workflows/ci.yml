@@ -27,17 +27,31 @@ jobs:
       - name: Enable PrepareMetalShaders plugin
         run: defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
 
+      # Keyed on Package.resolved so a dependency bump invalidates the cache;
+      # restore-keys lets a partial hit still warm most of the build graph.
+      - name: Cache DerivedData
+        uses: actions/cache@v4
+        with:
+          path: .build/xcode
+          key: ${{ runner.os }}-derived-data-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-derived-data-
+
       - name: Type check
         run: |
-          xcodebuild build -scheme ComfyBox -configuration Debug -destination 'platform=macOS' -derivedDataPath ./dist -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1
+          xcodebuild build -scheme ComfyBox -configuration Debug -destination 'platform=macOS' -derivedDataPath .build/xcode -skipPackagePluginValidation ENABLE_PLUGIN_PREPAREMLSHADERS=YES CLANG_COVERAGE_MAPPING=NO 2>&1
 
+      # #332/#137: unit tier only (ZImageTests, ComfyBoxDesktopTests, ComfyBoxCatalogTests) runs
+      # on every push/PR. ZImageIntegrationTests and ZImageE2ETests need model weights and a GPU
+      # (intent.md: "Agents run unit tests only") and run nightly on a self-hosted runner instead —
+      # see nightly-integration.yml.
       - name: Run unit tests
-        run: xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ZImageTests
-
-      # ComfyBoxDesktopTests is not part of the comfybox-Package scheme's test action;
-      # it must run under the ComfyBoxDesktop scheme (scoped to skip the E2E suite).
-      - name: Run desktop tests
-        run: xcodebuild test -scheme ComfyBoxDesktop -destination 'platform=macOS' -enableCodeCoverage NO -only-testing:ComfyBoxDesktopTests
+        run: |
+          xcodebuild test -scheme comfybox-Package -destination 'platform=macOS' -enableCodeCoverage NO \
+            -only-testing:ZImageTests \
+            -only-testing:ComfyBoxDesktopTests \
+            -only-testing:ComfyBoxCatalogTests \
+            -derivedDataPath .build/xcode
 
   release-build:
     if: github.ref == 'refs/heads/main'
