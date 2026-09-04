@@ -154,4 +154,38 @@ final class ComfyBoxServerConfigTests: XCTestCase {
     XCTAssertEqual(decoded, config)
     XCTAssertEqual(decoded.krea2Models["krea2-raw"], "/Volumes/Bolt/Models/krea2-raw")
   }
+
+  // MARK: - Image memory caps (#22)
+
+  func testImageMemoryCapsAbsentKeyDefaultsAndDoesRoundTrip() throws {
+    let bare = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: Data(#"{ "host": "h" }"#.utf8))
+    XCTAssertEqual(bare.imageMemoryCaps, .default)
+    XCTAssertEqual(bare.imageMemoryCaps.maxLongEdge, 4096)
+    XCTAssertEqual(bare.imageMemoryCaps.maxPixels, 16_777_216)
+    XCTAssertEqual(bare.imageMemoryCaps.minAvailableHeadroomFraction, 0.10, accuracy: 1e-9)
+
+    var config = ComfyBoxServerConfig()
+    config.imageMemoryCaps = ImageMemoryCapsConfig(maxLongEdge: 3072, maxPixels: 3072 * 3072, minAvailableHeadroomFraction: 0.2)
+    let data = try JSONEncoder().encode(config)
+    let decoded = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: data)
+    XCTAssertEqual(decoded.imageMemoryCaps, config.imageMemoryCaps)
+  }
+
+  func testImageMemoryCapsValidationRejectsNonPositiveAndOutOfRangeHeadroom() {
+    var badLongEdge = ComfyBoxServerConfig()
+    badLongEdge.imageMemoryCaps.maxLongEdge = 0
+    XCTAssertThrowsError(try ServerConfigStore.validate(badLongEdge))
+
+    var badPixels = ComfyBoxServerConfig()
+    badPixels.imageMemoryCaps.maxPixels = -1
+    XCTAssertThrowsError(try ServerConfigStore.validate(badPixels))
+
+    var badHeadroom = ComfyBoxServerConfig()
+    badHeadroom.imageMemoryCaps.minAvailableHeadroomFraction = 1.0
+    XCTAssertThrowsError(try ServerConfigStore.validate(badHeadroom))
+
+    var okConfig = ComfyBoxServerConfig()
+    okConfig.imageMemoryCaps = ImageMemoryCapsConfig(maxLongEdge: 2048, maxPixels: 2048 * 2048, minAvailableHeadroomFraction: 0.0)
+    XCTAssertNoThrow(try ServerConfigStore.validate(okConfig))
+  }
 }

@@ -197,6 +197,14 @@ public final class ServerConfigStore: @unchecked Sendable {
     return document.videoDefaults.resolved(family: family)
   }
 
+  /// Resolution + memory caps for `ImageMemoryPreflight` (issue #22) — same
+  /// lock-read, no-disk-I/O posture as `renderDefaults(family:)`.
+  public func imageMemoryCaps() -> ImageMemoryCapsConfig {
+    lock.lock()
+    defer { lock.unlock() }
+    return document.imageMemoryCaps
+  }
+
   // MARK: - Validation
 
   /// Rejects a document with structurally-invalid render/video defaults — never
@@ -236,6 +244,22 @@ public final class ServerConfigStore: @unchecked Sendable {
     try checkVideo(config.videoDefaults.default, path: "videoDefaults.default")
     for (family, values) in config.videoDefaults.byFamily {
       try checkVideo(values, path: "videoDefaults.byFamily.\(family)")
+    }
+
+    // #22: image memory/resolution caps — never non-positive, headroom fraction
+    // must stay a finite value in [0, 1) (1.0 would demand ALL of `available`
+    // stay free, refusing every render outright).
+    let caps = config.imageMemoryCaps
+    if caps.maxLongEdge <= 0 {
+      throw ServerConfigStoreError.validation("imageMemoryCaps.maxLongEdge must be > 0 (got \(caps.maxLongEdge))")
+    }
+    if caps.maxPixels <= 0 {
+      throw ServerConfigStoreError.validation("imageMemoryCaps.maxPixels must be > 0 (got \(caps.maxPixels))")
+    }
+    if !caps.minAvailableHeadroomFraction.isFinite
+      || caps.minAvailableHeadroomFraction < 0 || caps.minAvailableHeadroomFraction >= 1 {
+      throw ServerConfigStoreError.validation(
+        "imageMemoryCaps.minAvailableHeadroomFraction must be in [0, 1) (got \(caps.minAvailableHeadroomFraction))")
     }
   }
 
