@@ -248,13 +248,28 @@ public final class ServerConfigStore: @unchecked Sendable {
 
     // #22: image memory/resolution caps — never non-positive, headroom fraction
     // must stay a finite value in [0, 1) (1.0 would demand ALL of `available`
-    // stay free, refusing every render outright).
+    // stay free, refusing every render outright). I6 (PR #363 review): both
+    // caps are also BOUNDED above — `ImageMemoryPreflight.estimateBytes` is
+    // overflow-safe regardless, but an absurd cap (e.g. maxPixels = Int.max)
+    // would make the resolution-cap gate itself meaningless, defeating its
+    // whole "no probing needed" purpose. `maxImageMemoryCapsLongEdge`/
+    // `maxImageMemoryCapsPixels` are themselves generous — well above any
+    // resolution DyPE is remotely usable at today — this only rejects
+    // configuration nonsense, not real requests.
     let caps = config.imageMemoryCaps
     if caps.maxLongEdge <= 0 {
       throw ServerConfigStoreError.validation("imageMemoryCaps.maxLongEdge must be > 0 (got \(caps.maxLongEdge))")
     }
+    if caps.maxLongEdge > Self.maxImageMemoryCapsLongEdge {
+      throw ServerConfigStoreError.validation(
+        "imageMemoryCaps.maxLongEdge must be <= \(Self.maxImageMemoryCapsLongEdge) (got \(caps.maxLongEdge))")
+    }
     if caps.maxPixels <= 0 {
       throw ServerConfigStoreError.validation("imageMemoryCaps.maxPixels must be > 0 (got \(caps.maxPixels))")
+    }
+    if caps.maxPixels > Self.maxImageMemoryCapsPixels {
+      throw ServerConfigStoreError.validation(
+        "imageMemoryCaps.maxPixels must be <= \(Self.maxImageMemoryCapsPixels) (got \(caps.maxPixels))")
     }
     if !caps.minAvailableHeadroomFraction.isFinite
       || caps.minAvailableHeadroomFraction < 0 || caps.minAvailableHeadroomFraction >= 1 {
@@ -262,6 +277,18 @@ public final class ServerConfigStore: @unchecked Sendable {
         "imageMemoryCaps.minAvailableHeadroomFraction must be in [0, 1) (got \(caps.minAvailableHeadroomFraction))")
     }
   }
+
+  /// I6 (PR #363 review): upper bound on `imageMemoryCaps.maxLongEdge` — well
+  /// above any resolution DyPE is usable at today (issue #22's own table
+  /// tops out at 2048px on a 128GB machine), but still small enough that
+  /// `width*height` in `ImageMemoryPreflight.decideResolution` (plain `Int`
+  /// arithmetic, checked before the overflow-safe `UInt64` estimate path)
+  /// cannot itself overflow: `16384 * 16384` is `2^28`, comfortably inside
+  /// `Int64`.
+  static let maxImageMemoryCapsLongEdge = 16_384
+  /// I6: upper bound on `imageMemoryCaps.maxPixels` — `2^28` (268,435,456),
+  /// i.e. exactly `maxImageMemoryCapsLongEdge²`.
+  static let maxImageMemoryCapsPixels = 1 << 28
 
   // MARK: - First-run migration (FDD §3.3 "The migration, inverted")
 

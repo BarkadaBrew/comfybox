@@ -188,4 +188,44 @@ final class ComfyBoxServerConfigTests: XCTestCase {
     okConfig.imageMemoryCaps = ImageMemoryCapsConfig(maxLongEdge: 2048, maxPixels: 2048 * 2048, minAvailableHeadroomFraction: 0.0)
     XCTAssertNoThrow(try ServerConfigStore.validate(okConfig))
   }
+
+  /// I6 (PR #363 review): both caps are also bounded ABOVE.
+  func testImageMemoryCapsValidationRejectsAbsurdlyLargeCaps() {
+    var hugeLongEdge = ComfyBoxServerConfig()
+    hugeLongEdge.imageMemoryCaps.maxLongEdge = ServerConfigStore.maxImageMemoryCapsLongEdge + 1
+    XCTAssertThrowsError(try ServerConfigStore.validate(hugeLongEdge))
+
+    var atLongEdgeBound = ComfyBoxServerConfig()
+    atLongEdgeBound.imageMemoryCaps.maxLongEdge = ServerConfigStore.maxImageMemoryCapsLongEdge
+    XCTAssertNoThrow(try ServerConfigStore.validate(atLongEdgeBound), "exactly at the bound must be accepted")
+
+    var hugePixels = ComfyBoxServerConfig()
+    hugePixels.imageMemoryCaps.maxPixels = ServerConfigStore.maxImageMemoryCapsPixels + 1
+    XCTAssertThrowsError(try ServerConfigStore.validate(hugePixels))
+
+    var atPixelsBound = ComfyBoxServerConfig()
+    atPixelsBound.imageMemoryCaps.maxPixels = ServerConfigStore.maxImageMemoryCapsPixels
+    XCTAssertNoThrow(try ServerConfigStore.validate(atPixelsBound))
+  }
+
+  /// C1b (PR #363 review): `enforceMemoryEstimate` defaults false and
+  /// round-trips, including over an old-shape persisted document that
+  /// predates this field.
+  func testEnforceMemoryEstimateDefaultsFalseAndRoundTrips() throws {
+    let bare = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: Data(#"{ "host": "h" }"#.utf8))
+    XCTAssertFalse(bare.imageMemoryCaps.enforceMemoryEstimate)
+
+    // Simulates a document saved by an EARLIER version of this struct (three
+    // fields only) — must still decode, defaulting the new field to false.
+    let oldShape = try JSONDecoder().decode(
+      ComfyBoxServerConfig.self,
+      from: Data(#"{ "host": "h", "imageMemoryCaps": { "maxLongEdge": 4096, "maxPixels": 16777216, "minAvailableHeadroomFraction": 0.1 } }"#.utf8))
+    XCTAssertFalse(oldShape.imageMemoryCaps.enforceMemoryEstimate)
+
+    var config = ComfyBoxServerConfig()
+    config.imageMemoryCaps.enforceMemoryEstimate = true
+    let data = try JSONEncoder().encode(config)
+    let decoded = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: data)
+    XCTAssertTrue(decoded.imageMemoryCaps.enforceMemoryEstimate)
+  }
 }

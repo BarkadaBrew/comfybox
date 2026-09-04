@@ -224,25 +224,56 @@ public struct ImageMemoryCapsConfig: Codable, Equatable, Sendable {
   public var maxPixels: Int
   /// Fraction of live free system memory (`MemoryProbe.systemAvailableMemoryBytes`)
   /// that must remain clear after the render's estimated activation
-  /// footprint. Default 0.10 — refuse once a render is projected to use more
-  /// than ~90% of what is free right now, mirroring issue #22's own proposed
-  /// formula ("refuse or warn if estimated usage exceeds ~90% of available
-  /// memory").
+  /// footprint. Default 0.10 — mirrors issue #22's own proposed formula
+  /// ("refuse or warn if estimated usage exceeds ~90% of available memory").
+  /// Whether crossing this actually REFUSES the request is governed by
+  /// `enforceMemoryEstimate` below.
   public var minAvailableHeadroomFraction: Double
+
+  /// PR #363 review, C1b: the byte-estimate formula in `ImageMemoryPreflight`
+  /// is UNCALIBRATED against any live memory trace. Default **false** — the
+  /// memory-budget check is ADVISORY: `ImageMemoryPreflight.validate` still
+  /// computes and returns it (and callers log a warning + stamp
+  /// `memory_estimate_bytes`/`memory_available_bytes` on the response) but
+  /// does not refuse the request. Set `true` only after calibrating the
+  /// estimate against real `/health` samples across a range of resolutions
+  /// (see `docs/user-guide.md`'s "DyPE / high-resolution pre-flight"
+  /// section) — at that point crossing the budget becomes a hard refusal,
+  /// same as it always has been for the resolution cap above.
+  public var enforceMemoryEstimate: Bool
 
   public init(
     maxLongEdge: Int = 4096,
     maxPixels: Int = 16_777_216,
-    minAvailableHeadroomFraction: Double = 0.10
+    minAvailableHeadroomFraction: Double = 0.10,
+    enforceMemoryEstimate: Bool = false
   ) {
     self.maxLongEdge = maxLongEdge
     self.maxPixels = maxPixels
     self.minAvailableHeadroomFraction = minAvailableHeadroomFraction
+    self.enforceMemoryEstimate = enforceMemoryEstimate
   }
 
   public static let `default` = ImageMemoryCapsConfig()
 
   public var isDefault: Bool { self == .default }
+
+  private enum CodingKeys: String, CodingKey {
+    case maxLongEdge, maxPixels, minAvailableHeadroomFraction, enforceMemoryEstimate
+  }
+
+  /// Tolerant decode: `enforceMemoryEstimate` is a field added after this
+  /// struct's first shape shipped — an old persisted document (or a
+  /// merge-patch fragment naming only the older three fields) must not fail
+  /// to decode over one missing key. Defaults false either way (never
+  /// silently starts enforcing).
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    maxLongEdge = try c.decodeIfPresent(Int.self, forKey: .maxLongEdge) ?? 4096
+    maxPixels = try c.decodeIfPresent(Int.self, forKey: .maxPixels) ?? 16_777_216
+    minAvailableHeadroomFraction = try c.decodeIfPresent(Double.self, forKey: .minAvailableHeadroomFraction) ?? 0.10
+    enforceMemoryEstimate = try c.decodeIfPresent(Bool.self, forKey: .enforceMemoryEstimate) ?? false
+  }
 }
 
 /// Persistent ComfyBox configuration, stored as a single `~/.comfybox/config.json`.

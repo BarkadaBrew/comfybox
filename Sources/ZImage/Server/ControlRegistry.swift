@@ -282,9 +282,15 @@ public enum ControlRegistry {
     controls.append(configControl(
       id: "engine.imageMemoryCaps.minAvailableHeadroomFraction", pointer: "/imageMemoryCaps/minAvailableHeadroomFraction",
       title: "Min memory headroom fraction",
-      summary: "Fraction of live free system memory a render's estimated peak activation footprint must leave clear (0.10 = refuse above ~90% projected usage).",
+      summary: "Fraction of live free system memory a render's estimated peak activation footprint must leave clear (0.10 = refuse above ~90% projected usage) — only enforced when enforceMemoryEstimate is true.",
       scope: .engine, type: .double, range: 0...1,
       defaultValue: .double(ImageMemoryCapsConfig.default.minAvailableHeadroomFraction), mutatesEngine: true))
+    controls.append(configControl(
+      id: "engine.imageMemoryCaps.enforceMemoryEstimate", pointer: "/imageMemoryCaps/enforceMemoryEstimate",
+      title: "Enforce memory estimate",
+      summary: "Whether the (uncalibrated) live-memory-budget estimate actually refuses a request. Default false — advisory only (logged + memory_estimate_bytes/memory_available_bytes on the response); the resolution cap above is always enforced regardless.",
+      scope: .engine, type: .bool,
+      defaultValue: .bool(ImageMemoryCapsConfig.default.enforceMemoryEstimate), mutatesEngine: true))
 
     // AI provider registry.
     controls += providerControls(capability: "promptOptimization", title: "Prompt optimization")

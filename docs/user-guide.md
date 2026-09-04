@@ -419,70 +419,75 @@ ComfyBox -p "a scene" --cache-limit 8192 -o scene.png
 ### DyPE / high-resolution pre-flight (#22)
 
 A high-resolution request (DyPE-territory, i.e. above 1024px on the longer
-edge) is checked BEFORE the server loads or runs anything — a request the
-server can't honour fails fast with a clear error instead of running out of
-memory partway through denoising.
-
-Two gates run, in order:
+edge) is checked BEFORE the server loads or runs anything. Two independent
+gates run, in order:
 
 1. **Resolution cap** — a hard ceiling on the request itself, checked with no
    memory probing at all: the longer edge must be at or under
    `imageMemoryCaps.maxLongEdge` (default **4096px**), and total pixels
    (`width * height`) must be at or under `imageMemoryCaps.maxPixels`
    (default **16,777,216**, i.e. 4096²). A non-square request can still be
-   refused here even under the long-edge cap (e.g. 4096×4097).
-2. **Live memory budget** — the render's estimated peak activation memory
-   (transformer joint-attention + VAE decode, scaling with resolution and
-   whether DyPE is active) is compared against how much system memory is
-   actually free right now. The request is refused if the estimate would
-   leave less than `imageMemoryCaps.minAvailableHeadroomFraction` (default
-   **10%**) of that free memory clear.
+   refused here even under the long-edge cap (e.g. 4096×4097). **Always
+   enforced** — refuses with HTTP 413 (REST) / 400 (the ComfyUI bridge's
+   `POST /prompt`) regardless of any other setting below.
+2. **Live memory budget** — the render's estimated peak activation memory is
+   compared against how much system memory is actually free right now.
 
-A refusal is HTTP **413** with an additive `error_code` field —
-`"resolution_cap"` for gate 1 (no estimate/available numbers — refused before
-any probing) or `"insufficient_memory"` for gate 2 (which also names
-`estimate_bytes`, `available_bytes` and `cap_bytes` in the response body).
-Existing error responses are unaffected — these fields are new and additive.
+**The memory-budget estimate is ADVISORY by default** —
+`imageMemoryCaps.enforceMemoryEstimate` is **false** out of the box. The
+estimate formula is not yet calibrated against any live memory trace (see
+"Calibrating the estimate" below), so an unenforced estimate that runs high
+does NOT refuse the request: the server logs a warning and the response
+carries two additive fields, `memory_estimate_bytes` and
+`memory_available_bytes`, so you can watch how the estimate tracks reality
+before deciding whether to trust it. Only the resolution cap is a hard limit
+until you turn enforcement on.
+
+```json
+{
+  "success": true,
+  "output_path": "/Users/todd/Pictures/ComfyBox/img-1234.png",
+  "duration_ms": 84213,
+  "memory_estimate_bytes": 3854761984,
+  "memory_available_bytes": 106300440576
+}
+```
+
+If a request is refused (resolution cap always; the memory budget only when
+`enforceMemoryEstimate` is true), the response is instead:
 
 ```json
 {
   "success": false,
-  "error": "[insufficient_memory] estimated 56464MB exceeds the 9216MB memory cap (10240MB available right now)",
+  "error": "[insufficient_memory] estimated 3676MB exceeds the 921MB memory cap (1024MB available right now)",
   "error_code": "insufficient_memory",
-  "estimate_bytes": 59194408960,
-  "available_bytes": 10737418240,
-  "cap_bytes": 9663676416
+  "estimate_bytes": 3854761984,
+  "available_bytes": 1073741824,
+  "cap_bytes": 966367641
 }
 ```
+
+`error_code` is `"resolution_cap"` (no `estimate_bytes`/`available_bytes` —
+refused before any probing) or `"insufficient_memory"` (only reachable when
+enforcement is on). Existing error responses are unaffected — every field
+above is new and additive (`Optional`, omitted rather than `null` when
+absent).
 
 **Config keys** (`~/.comfybox/config.json`, writable via `PATCH /v1/config`
 — see `engine.imageMemoryCaps.*` in [api-reference.md](api-reference.md)):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `imageMemoryCaps.maxLongEdge` | 4096 | Hard ceiling (px) on the longer of width/height. |
-| `imageMemoryCaps.maxPixels` | 16777216 | Hard ceiling on width×height. |
-| `imageMemoryCaps.minAvailableHeadroomFraction` | 0.10 | Fraction of live free memory a render's estimated footprint must leave clear. |
+| `imageMemoryCaps.maxLongEdge` | 4096 | Hard ceiling (px) on the longer of width/height. Always enforced. Bounded to ≤16384. |
+| `imageMemoryCaps.maxPixels` | 16777216 | Hard ceiling on width×height. Always enforced. Bounded to ≤2²⁸ (268,435,456). |
+| `imageMemoryCaps.minAvailableHeadroomFraction` | 0.10 | Fraction of live free memory a render's estimated footprint must leave clear. Only acted on when `enforceMemoryEstimate` is true. |
+| `imageMemoryCaps.enforceMemoryEstimate` | **false** | Whether the memory-budget estimate above actually refuses a request. See "Calibrating the estimate" below before flipping this on. |
 
-Neither cap is a hardcoded per-device table — the live memory-budget gate
-adapts to whatever headroom your particular Mac has free right now (shared
-with LM Studio, a resident video model, etc. — see `intent.md`, "Memory is a
-shared resource"), which is stricter than a static table on a loaded machine
-and more permissive on an idle one. As a **rough expectation** at the
-shared-Mac defaults above (krea2, a lightly-loaded machine — i.e. little else
-resident):
-
-| Device | Memory | Expect DyPE renders up to about |
-|---|---|---|
-| M3 Pro | 36 GB | 1280px |
-| M4 Pro | 64 GB | 1536px |
-| M3 Max / M4 Max | 128 GB | 2048px |
-
-Actual behavior always follows the live gate, not this table — a machine with
-a resident video model or another heavy process will bind lower, and a truly
-idle one may go a little higher. Shrink the request (or, only if you know
-what else is resident, raise `imageMemoryCaps.minAvailableHeadroomFraction`)
-rather than fight a refusal.
+Neither cap is a hardcoded per-device table — when enforcement IS on, the
+live memory-budget gate adapts to whatever headroom your particular Mac has
+free right now (shared with LM Studio, a resident video model, etc. — see
+`intent.md`, "Memory is a shared resource"), which is stricter than a static
+table on a loaded machine and more permissive on an idle one.
 
 `--cache-limit` (the MLX buffer-cache ceiling) is orthogonal to these caps: it
 bounds how much *idle* buffer cache MLX is allowed to retain between calls, not
@@ -490,9 +495,38 @@ what a single render is projected to need. Lowering it can reduce steady-state
 RSS between renders, but does not change what the pre-flight estimates for the
 render you are about to submit.
 
+#### Calibrating the estimate before enforcing it
+
+`imageMemoryCaps.enforceMemoryEstimate` should stay `false` until you have
+some evidence the estimate formula tracks real memory pressure on your
+machine. A simple recipe:
+
+1. Leave enforcement off. Submit renders across a spread of resolutions —
+   1024², 1536², 2048², with and without DyPE — under whatever else is
+   normally resident (LM Studio, an idle/warm video model, etc.).
+2. For each render, note `memory_estimate_bytes` from the response
+   alongside a `GET /health` sample taken just before and just after (its
+   `memory.system_free_mb`/`memory.process_rss_mb` fields — see
+   `StatsProvider.swift`). The estimate and the observed drop in free memory
+   should move together, even if the absolute numbers don't match exactly —
+   `ImageMemoryPreflight.swift`'s header lists which constants are cited
+   engine values and which are explicitly-flagged, uncalibrated assumptions
+   (a safety multiplier for concurrent-layer activations; the VAE decoder's
+   channel-width modeling).
+3. Once you trust the estimate's SHAPE (it refuses roughly where real
+   pressure shows up, not wildly early or wildly late), `PATCH /v1/config`
+   `imageMemoryCaps.enforceMemoryEstimate: true`. From then on, an
+   over-budget request gets the `insufficient_memory` refusal shown above
+   instead of just a logged warning.
+4. If it turns out to be miscalibrated once live, flip it back to `false`
+   and retune the constants in `ImageMemoryPreflight.swift` (each is
+   individually documented with what it approximates and why) rather than
+   just raising `minAvailableHeadroomFraction` to paper over it.
+
 Aggressive mid-render cache clearing and cross-step RoPE-frequency-table
 caching (the other two items from issue #22) are **not** part of this
-pre-flight — they remain open follow-up work.
+pre-flight — they remain open follow-up work. `POST /v1/upscale` is also not
+gated by this pre-flight yet — a separate follow-up.
 
 ## Edit tab
 
