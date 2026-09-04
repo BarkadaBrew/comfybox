@@ -45,3 +45,32 @@ public struct RenderHealthCounters: Equatable, Sendable {
     }
   }
 }
+
+// comfybox#308 (review r1, item 3b): the SELECTION logic — which of the
+// `.localVideo` case's three exit points maps to which `RenderCompletionEvent`
+// — pulled out of `WarmServerCoordinator` so it is pure and testable on its
+// own, not just `RenderHealthCounters.apply`. The actor calls
+// `recordRenderCompletion(.forLocalVideoCompletion(outcome))` at each of the
+// three sites (success / thrown error / memory-admission refusal); this type
+// is the one place that mapping is written down.
+public enum LocalVideoCompletionOutcome: Equatable, Sendable {
+  /// The render finished; `elapsedSeconds` is `LTX2VideoResult.elapsedSeconds`.
+  case succeeded(elapsedSeconds: Double)
+  /// `vacateImageModelsAndAdmitVideo` refused to admit the job (insufficient
+  /// memory after evicting image models) — a real completion (the job WAS
+  /// dequeued), not a queue-full rejection (which never dequeues).
+  case admissionRefused
+  /// `body(report)` (or a preemption episode resuming it) threw.
+  case threw
+}
+
+extension RenderCompletionEvent {
+  public static func forLocalVideoCompletion(_ outcome: LocalVideoCompletionOutcome) -> RenderCompletionEvent {
+    switch outcome {
+    case .succeeded(let elapsedSeconds):
+      return .succeeded(durationMs: Int(elapsedSeconds * 1000))
+    case .admissionRefused, .threw:
+      return .failed
+    }
+  }
+}

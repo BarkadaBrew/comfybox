@@ -1328,63 +1328,20 @@ public final class WarmServer {
       // requested_config + derived render_plan out. GET (below) stays as the
       // no-context readout.
       do {
-        struct EffectiveQuery: Decodable {
-          let width: Int?
-          let height: Int?
-          let frames: Int?
-          let duration: Float?
-          let fps: Int?
-          let tuning: LTX2VideoTuning?
-          let preset: String?
-        }
-        let q = (try? decode(EffectiveQuery.self, from: request.body)) ?? EffectiveQuery(
-          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil)
+        let q = (try? decode(EffectiveVideoConfigQuery.self, from: request.body)) ?? EffectiveVideoConfigQuery(
+          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil, twoPass: nil)
         let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
+        let effectiveTuning = Self.effectiveVideoTuning(for: q)
         let resolvedTyped = LTX2ConfigResolver.resolveTyped(
-          request: q.tuning, preset: videoPreset?.videoTuning)
+          request: effectiveTuning, preset: videoPreset?.videoTuning)
 
         // Derived plan, mirroring prepareLocalVideo's math step by step —
         // including the config.videoDefaults layer (FDD §3.3, D3).
-        let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
-        var plan: [[String: String]] = []
-        var w = q.width ?? videoPreset?.width ?? videoConfigDefaults.width ?? 704
-        var h = q.height ?? videoPreset?.height ?? videoConfigDefaults.height ?? 448
-        let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
-        if snappedW != w || snappedH != h {
-          plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
-          w = snappedW; h = snappedH
-        }
-        if resolvedTyped.twoStage {
-          let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
-          if s1.halved {
-            plan.append(["step": "two_stage_halving",
-                         "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
-          } else {
-            plan.append(["step": "stage1_floor",
-                         "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
-          }
-        }
-        let fps = q.fps ?? 24
-        var framesPerChunk = q.frames ?? videoConfigDefaults.frames ?? 97
-        var extendSeconds = Self.extendSecondsFromDuration(q.duration, framesPerChunk: framesPerChunk, fps: fps)
-        if extendSeconds > 0 {
-          let targetFrames = Int((extendSeconds * Float(fps)).rounded())
-          if targetFrames <= 289 {
-            let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
-            framesPerChunk = max(framesPerChunk, singleFrames)
-            extendSeconds = 0
-            plan.append(["step": "single_pass_fold",
-                         "note": "\(q.duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
-          } else {
-            plan.append(["step": "chunked_continuation",
-                         "note": "\(q.duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
-          }
-        }
-        plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(fps)"])
-        if q.width == nil && q.height == nil {
-          plan.append(["step": "caveat",
-                       "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
-        }
+        let plan = Self.effectiveVideoRenderPlan(
+          width: q.width, height: q.height, frames: q.frames, duration: q.duration, fps: q.fps,
+          presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
+          videoConfigDefaults: ServerConfigStore.shared.videoDefaults(),
+          resolvedTwoStage: resolvedTyped.twoStage)
 
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -1885,6 +1842,28 @@ public final class WarmServer {
     return (try? data.write(to: URL(fileURLWithPath: path))) != nil ? path : nil
   }
 
+  /// Body for `POST /v1/video/config/effective` — a HYPOTHETICAL resolution
+  /// (Finding #16): request-shaped context in, `requested_config` +
+  /// `render_plan` out. Promoted out of the route case (was a locally-scoped
+  /// struct, untestable — comfybox#307 review r1, item 2) so a test can
+  /// decode a real wire body against it, the same way `LocalVideoRequest`
+  /// already is.
+  struct EffectiveVideoConfigQuery: Decodable {
+    let width: Int?
+    let height: Int?
+    let frames: Int?
+    let duration: Float?
+    let fps: Int?
+    let tuning: LTX2VideoTuning?
+    let preset: String?
+    /// comfybox#307 (review r1): this preflight must mirror the real
+    /// generate routes — a caller checking "will two_pass do what I expect"
+    /// via `two_pass` alone (no `tuning` block) previously got back the
+    /// env/preset/builtin answer, silently ignoring the very field it was
+    /// probing.
+    let twoPass: Bool?
+  }
+
   struct LocalVideoRequest: Decodable {
     let prompt: String
     let negativePrompt: String?
@@ -2332,6 +2311,76 @@ public final class WarmServer {
       contentMode: contentMode, mediaKind: mediaKind)
   }
 
+  /// comfybox#307 (review r1, item 3a): the ACTUAL wiring `prepareLocalVideo`
+  /// runs to fold the top-level `two_pass` convenience into `tuning` — pulled
+  /// out to a static func (mirrors `localVideoProgressPercent` above) so a
+  /// test can decode a real wire-format `LocalVideoRequest` and assert on
+  /// this exact call, not a re-implementation of it.
+  static func effectiveVideoTuning(for req: LocalVideoRequest) -> LTX2VideoTuning? {
+    LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass)
+  }
+
+  /// Same merge, for the `/v1/video/config/effective` preflight's query
+  /// shape (comfybox#307 review r1, item 2) — one merge rule, two wire
+  /// shapes that both carry it.
+  static func effectiveVideoTuning(for query: EffectiveVideoConfigQuery) -> LTX2VideoTuning? {
+    LTX2VideoTuning.merging(query.tuning, twoPass: query.twoPass)
+  }
+
+  /// comfybox#307 (review r1, item 2): the derived render plan for
+  /// `POST /v1/video/config/effective` — pulled out of the route case,
+  /// mirroring `prepareLocalVideo`'s dims/frames math step by step, so
+  /// `resolvedTwoStage` (which the route now feeds from the `two_pass`-merged
+  /// tuning, not just `tuning.two_stage`) driving the `two_stage_halving`
+  /// step is directly testable without a decoder or a live server.
+  static func effectiveVideoRenderPlan(
+    width: Int?, height: Int?, frames: Int?, duration: Float?, fps: Int?,
+    presetWidth: Int?, presetHeight: Int?,
+    videoConfigDefaults: VideoDefaultValues,
+    resolvedTwoStage: Bool
+  ) -> [[String: String]] {
+    var plan: [[String: String]] = []
+    var w = width ?? presetWidth ?? videoConfigDefaults.width ?? 704
+    var h = height ?? presetHeight ?? videoConfigDefaults.height ?? 448
+    let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
+    if snappedW != w || snappedH != h {
+      plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
+      w = snappedW; h = snappedH
+    }
+    if resolvedTwoStage {
+      let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
+      if s1.halved {
+        plan.append(["step": "two_stage_halving",
+                     "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
+      } else {
+        plan.append(["step": "stage1_floor",
+                     "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
+      }
+    }
+    let effectiveFps = fps ?? 24
+    var framesPerChunk = frames ?? videoConfigDefaults.frames ?? 97
+    var extendSeconds = Self.extendSecondsFromDuration(duration, framesPerChunk: framesPerChunk, fps: effectiveFps)
+    if extendSeconds > 0 {
+      let targetFrames = Int((extendSeconds * Float(effectiveFps)).rounded())
+      if targetFrames <= 289 {
+        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
+        framesPerChunk = max(framesPerChunk, singleFrames)
+        extendSeconds = 0
+        plan.append(["step": "single_pass_fold",
+                     "note": "\(duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
+      } else {
+        plan.append(["step": "chunked_continuation",
+                     "note": "\(duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
+      }
+    }
+    plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(effectiveFps)"])
+    if width == nil && height == nil {
+      plan.append(["step": "caveat",
+                   "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
+    }
+    return plan
+  }
+
   /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
   /// local LTX-2 isn't configured (caller falls through to Replicate); throws for
   /// a malformed request or invalid output path.
@@ -2344,7 +2393,7 @@ public final class WarmServer {
     // before anything downstream reads it — every existing consumer
     // (dims math, `LTX2ConfigResolver.resolveTyped`, the trace snapshot) then
     // sees one authoritative tuning block, unchanged otherwise.
-    let effectiveTuning = LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass)
+    let effectiveTuning = Self.effectiveVideoTuning(for: req)
 
     // Video presets — same PresetStore as images (mediaKind "video"). A
     // preset is a named bundle: LoRAs (bare filenames resolve through the
@@ -8346,7 +8395,7 @@ private actor WarmServerCoordinator {
             // comfybox#308: this job DID reach the front of the queue and DID
             // fail to run — a real completion, not a queue-full rejection
             // (those throw before ever dequeuing, same as the image path).
-            self.recordRenderCompletion(.failed)
+            self.recordRenderCompletion(.forLocalVideoCompletion(.admissionRefused))
             self.lastError = message
             continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
             return
@@ -8385,7 +8434,7 @@ private actor WarmServerCoordinator {
               // methods did. Every video render (HQ two-pass included) was
               // invisible to `render_count`/`last_render_duration_ms` no
               // matter how many completed.
-              self.recordRenderCompletion(.succeeded(durationMs: Int(result.elapsedSeconds * 1000)))
+              self.recordRenderCompletion(.forLocalVideoCompletion(.succeeded(elapsedSeconds: result.elapsedSeconds)))
               self.lastError = nil
               continuation.resume(returning: result)
             }
@@ -8401,7 +8450,7 @@ private actor WarmServerCoordinator {
             self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
             continuation.resume(throwing: WarmServerError.renderInterrupted)
           } catch {
-            self.recordRenderCompletion(.failed)
+            self.recordRenderCompletion(.forLocalVideoCompletion(.threw))
             self.lastError = error.localizedDescription
             continuation.resume(throwing: error)
           }

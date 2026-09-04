@@ -592,7 +592,13 @@ public final class LTX2Pipeline {
       }
       let t2vRefineVolume = upLatent.dim(2) * sLatH * sLatW
       if resumeRefine == nil, t2vRefineVolume > t2vRefineMax {
-        logger.info("T2V two-stage refine: SKIPPED denoise (volume \(t2vRefineVolume) > \(t2vRefineMax)) — decoding upsampled latent directly (LTX2_REFINE_UPSCALE_ON_SKIP path).")
+        // comfybox#307 (review r1, minor 4): the LTX2_REFINE_UPSCALE_ON_SKIP=1
+        // debug bypass got PAST the main gate above, but still can't afford
+        // the denoise once the actual (post-upsample) volume is known — a
+        // real skip, own reason string (own `logger.warning`, not `.info`).
+        let reason = "volume_gate_post_upsample (post-upsample volume \(t2vRefineVolume) > refine_max_vol \(t2vRefineMax), LTX2_REFINE_UPSCALE_ON_SKIP=1) — decoding upsampled (soft) latent, denoise skipped"
+        logger.warning("T2V two-stage refine: SKIPPED — \(reason).")
+        lastRefineSkipReason = reason
         latents = upLatent
       } else {
       let rLatH = sLatH, rLatW = sLatW
@@ -2401,11 +2407,20 @@ public final class LTX2Pipeline {
     let refineVolume = upLatent.dim(2) * sLatH * sLatW
     let refineMaxVolume = resolvedConfig.refineMaxVol
     if resumeRefine == nil, ProcessInfo.processInfo.environment["LTX2_REFINE_DECODE_ONLY"] == "1" {
-      logger.info("Two-stage refine: DECODE_ONLY (skipped denoise) — decoding upsampled latent directly.")
+      // comfybox#307 (review r1, minor 4): explicit debug forcing — own
+      // reason string, own warning, same as every other skip.
+      let reason = "decode_only_debug (LTX2_REFINE_DECODE_ONLY=1) — decoding upsampled (soft) latent, denoise skipped unconditionally"
+      logger.warning("Two-stage refine: SKIPPED — \(reason).")
+      lastRefineSkipReason = reason
       return .completed(upLatent)
     }
     if resumeRefine == nil, refineVolume > refineMaxVolume {
-      logger.info("Two-stage refine: SKIPPED denoise (refine latent volume \(refineVolume) > \(refineMaxVolume)) — decoding upsampled latent directly (OOM guard).")
+      // comfybox#307 (review r1, minor 4): the post-upsample OOM guard — the
+      // pre-upsample estimate (the main gate above) let this proceed, but the
+      // ACTUAL upsampled volume still can't afford the denoise.
+      let reason = "volume_gate_post_upsample (post-upsample volume \(refineVolume) > refine_max_vol \(refineMaxVolume)) — decoding upsampled (soft) latent, denoise skipped (OOM guard)"
+      logger.warning("Two-stage refine: SKIPPED — \(reason).")
+      lastRefineSkipReason = reason
       return .completed(upLatent)
     }
     MLX.GPU.clearCache()

@@ -57,4 +57,43 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
     XCTAssertEqual(req.twoPass, true)
     XCTAssertEqual(req.tuning?.refineScale, 1.35)
   }
+
+  // MARK: - comfybox#307 (review r1, item 3a): the REAL request-preparation
+  // wiring — `WarmServer.effectiveVideoTuning(for:)` is the exact function
+  // `prepareLocalVideo` calls, not a re-implementation of the merge. These
+  // decode a real wire body and assert on ITS output, pinning the actual
+  // path a `two_pass` request travels before it ever reaches
+  // `LTX2ConfigResolver.resolveTyped`.
+
+  func testEffectiveTuningFollowsTopLevelTwoPassWithNoTuningBlock() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":true}"#)
+    XCTAssertEqual(WarmServer.effectiveVideoTuning(for: req)?.twoStage, true)
+  }
+
+  func testEffectiveTuningTwoPassFalseWithNoTuningBlock() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":false}"#)
+    XCTAssertEqual(WarmServer.effectiveVideoTuning(for: req)?.twoStage, false)
+  }
+
+  func testEffectiveTuningNilTwoPassLeavesTuningNil() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x"}"#)
+    XCTAssertNil(WarmServer.effectiveVideoTuning(for: req))
+  }
+
+  /// The nested field is the more specific one — it wins when the wire body
+  /// carries both, decoded exactly as a real caller would send it.
+  func testEffectiveTuningNestedTwoStageWinsOverConflictingTopLevelTwoPass() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":true,"tuning":{"two_stage":false}}"#)
+    XCTAssertEqual(WarmServer.effectiveVideoTuning(for: req)?.twoStage, false)
+  }
+
+  /// `two_pass` fills in `tuning.two_stage` when the tuning block is present
+  /// but doesn't itself set `two_stage` — other tuning fields on the request
+  /// survive the merge untouched.
+  func testEffectiveTuningTwoPassFillsInAlongsideOtherTuningFields() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":true,"tuning":{"refine_scale":1.35}}"#)
+    let merged = WarmServer.effectiveVideoTuning(for: req)
+    XCTAssertEqual(merged?.twoStage, true)
+    XCTAssertEqual(merged?.refineScale, 1.35)
+  }
 }

@@ -35,18 +35,6 @@ final class RenderHealthCountersTests: XCTestCase {
     XCTAssertEqual(counters.lastDurationMs, 5000)
   }
 
-  /// The exact soak scenario from the issue: renders complete but nothing
-  /// ever called an equivalent of `apply` — expressed here as "counters
-  /// start at zero and STAY zero unless something drives them", the inverse
-  /// pin of the bug (the real fix is wiring `.localVideo`'s completion into
-  /// this type — this test just documents what "never wired" looks like).
-  func testUnappliedCountersStayZero() {
-    let counters = RenderHealthCounters()
-    XCTAssertEqual(counters.successCount, 0)
-    XCTAssertEqual(counters.failedCount, 0)
-    XCTAssertNil(counters.lastDurationMs)
-  }
-
   func testMixedSequenceOfCompletions() {
     var counters = RenderHealthCounters()
     counters.apply(.succeeded(durationMs: 1000))
@@ -55,5 +43,52 @@ final class RenderHealthCountersTests: XCTestCase {
     XCTAssertEqual(counters.successCount, 2)
     XCTAssertEqual(counters.failedCount, 1)
     XCTAssertEqual(counters.lastDurationMs, 3000)
+  }
+
+  // MARK: - comfybox#308 (review r1, item 3b): the `.localVideo` WIRING —
+  // which of the three real completion outcomes maps to which event. Pins
+  // `RenderCompletionEvent.forLocalVideoCompletion`, the exact function
+  // `WarmServerCoordinator`'s `.localVideo` case calls at each of its three
+  // exit points (success / thrown error / memory-admission refusal), so this
+  // is the SELECTION logic under test, not only `RenderHealthCounters.apply`.
+
+  func testLocalVideoSuccessMapsToSucceededWithMillisecondDuration() {
+    var counters = RenderHealthCounters()
+    counters.apply(.forLocalVideoCompletion(.succeeded(elapsedSeconds: 12.5)))
+    XCTAssertEqual(counters.successCount, 1)
+    XCTAssertEqual(counters.failedCount, 0)
+    XCTAssertEqual(counters.lastDurationMs, 12_500, "elapsedSeconds must convert to whole milliseconds")
+  }
+
+  func testLocalVideoThrownErrorMapsToFailed() {
+    var counters = RenderHealthCounters()
+    counters.apply(.forLocalVideoCompletion(.threw))
+    XCTAssertEqual(counters.successCount, 0)
+    XCTAssertEqual(counters.failedCount, 1)
+    XCTAssertNil(counters.lastDurationMs)
+  }
+
+  /// The memory-admission refusal is a real completion (the job reached the
+  /// front of the queue and was refused) — NOT a queue-full rejection (which
+  /// never dequeues at all, and so never reaches this mapping).
+  func testLocalVideoAdmissionRefusalMapsToFailed() {
+    var counters = RenderHealthCounters()
+    counters.apply(.forLocalVideoCompletion(.admissionRefused))
+    XCTAssertEqual(counters.successCount, 0)
+    XCTAssertEqual(counters.failedCount, 1)
+    XCTAssertNil(counters.lastDurationMs)
+  }
+
+  /// One render of each of the three real outcomes, in the order production
+  /// code could plausibly hit them — the end-to-end soak scenario the issue
+  /// describes, expressed purely.
+  func testAllThreeLocalVideoOutcomesInSequence() {
+    var counters = RenderHealthCounters()
+    counters.apply(.forLocalVideoCompletion(.admissionRefused))
+    counters.apply(.forLocalVideoCompletion(.succeeded(elapsedSeconds: 30.0)))
+    counters.apply(.forLocalVideoCompletion(.threw))
+    XCTAssertEqual(counters.successCount, 1)
+    XCTAssertEqual(counters.failedCount, 2)
+    XCTAssertEqual(counters.lastDurationMs, 30_000)
   }
 }
