@@ -521,6 +521,140 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    // MARK: - Targeted id-based queries (#265)
+    //
+    // `assets(withIDs:)`, `assetIDs(withIDs:)` and `assetLocations(limit:offset:)`
+    // exist so a caller that already knows which handful of rows it needs
+    // (a restore's live-row lookup, a crash-recovery sweep, a folder's
+    // member set, a paged missing-file scan) never has to materialize the
+    // whole `assets` table to filter it in memory — see #265.
+
+    @Test("assets(withIDs:) returns exactly the requested rows, skipping ids that don't exist")
+    func assetsByIDs() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        for i in 0..<5 {
+            try await store.insertAsset(DAMAsset(id: "id-\(i)", filename: "f-\(i).png", absolutePath: "/tmp/f-\(i).png"))
+        }
+        let fetched = try await store.assets(withIDs: ["id-1", "id-3", "no-such-id"])
+        #expect(Set(fetched.map(\.id)) == ["id-1", "id-3"])
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assets(withIDs:) with an empty set returns no rows")
+    func assetsByIDsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        try await store.insertAsset(TestData.makeAsset(id: "solo"))
+        let fetched = try await store.assets(withIDs: [])
+        #expect(fetched.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assets(withIDs:) chunks an IN (...) list over 500 ids and returns every match")
+    func assetsByIDsChunking() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        var ids: Set<String> = []
+        for i in 0..<600 {
+            let id = "chunk-\(i)"
+            ids.insert(id)
+            try await store.insertAsset(DAMAsset(id: id, filename: "c-\(i).png", absolutePath: "/tmp/c-\(i).png"))
+        }
+        let fetched = try await store.assets(withIDs: ids)
+        #expect(fetched.count == 600)
+        #expect(Set(fetched.map(\.id)) == ids)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetIDs(withIDs:) returns only the ids that currently exist")
+    func assetIDsByIDs() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        for i in 0..<5 {
+            try await store.insertAsset(DAMAsset(id: "id-\(i)", filename: "f-\(i).png", absolutePath: "/tmp/f-\(i).png"))
+        }
+        let existing = try await store.assetIDs(withIDs: ["id-1", "id-3", "missing-id"])
+        #expect(existing == ["id-1", "id-3"])
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetIDs(withIDs:) with an empty set returns an empty set")
+    func assetIDsByIDsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        try await store.insertAsset(TestData.makeAsset(id: "solo"))
+        let existing = try await store.assetIDs(withIDs: [])
+        #expect(existing.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetIDs(withIDs:) chunks an IN (...) list over 500 ids and finds every existing one")
+    func assetIDsByIDsChunking() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        var ids: Set<String> = []
+        for i in 0..<600 {
+            let id = "chunk-\(i)"
+            ids.insert(id)
+            try await store.insertAsset(DAMAsset(id: id, filename: "c-\(i).png", absolutePath: "/tmp/c-\(i).png"))
+        }
+        let queried = ids.union(["definitely-not-there"])
+        let existing = try await store.assetIDs(withIDs: queried)
+        #expect(existing == ids)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetLocations pages through every row exactly once, in a stable order")
+    func assetLocationsPaging() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        var expected: [String: String] = [:]
+        for i in 0..<250 {
+            let id = "loc-\(String(format: "%03d", i))"
+            let path = "/tmp/loc-\(i).png"
+            expected[id] = path
+            try await store.insertAsset(DAMAsset(id: id, filename: "loc-\(i).png", absolutePath: path))
+        }
+
+        var seenIDs: [String] = []
+        var seenPaths: [String: String] = [:]
+        var offset = 0
+        let pageSize = 37 // not a divisor of 250 — exercises a partial last page
+        while true {
+            let page = try await store.assetLocations(limit: pageSize, offset: offset)
+            if page.isEmpty { break }
+            #expect(page.count <= pageSize)
+            for (id, path) in page { seenPaths[id] = path }
+            seenIDs.append(contentsOf: page.map(\.id))
+            offset += page.count
+            if page.count < pageSize { break }
+        }
+
+        #expect(seenIDs.count == 250, "every row visited")
+        #expect(Set(seenIDs).count == 250, "no row visited twice")
+        #expect(seenIDs == seenIDs.sorted(), "pages walk in a stable order")
+        #expect(seenPaths == expected)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetLocations on an empty store returns no rows on the first page")
+    func assetLocationsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let page = try await store.assetLocations(limit: 100, offset: 0)
+        #expect(page.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("preserves all asset fields through insert and fetch")
     func allFields() async throws {
         let tmpDir = NSTemporaryDirectory()

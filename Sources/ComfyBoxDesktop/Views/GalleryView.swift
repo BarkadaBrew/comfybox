@@ -1675,8 +1675,11 @@ struct GalleryView: View {
         await browser.apply(filter: catalogQuery())
         if let message = browser.error { errorMessage = message } else { errorMessage = nil }
 
+        // Targeted to exactly the ids the catalog is showing (#265) — not a
+        // fetch of the whole shared table to look up this page's rows.
         var damByID: [String: DAMAsset] = [:]
-        for row in try await store.fetchAssets(limit: 20_000) { damByID[row.id] = row }
+        let neededIDs = Set(browser.items.map { $0.id })
+        for row in try await store.assets(withIDs: neededIDs) { damByID[row.id] = row }
 
         var rows: [DAMAsset] = []
         var urls: [String: URL] = [:]
@@ -2160,23 +2163,27 @@ struct GalleryView: View {
 
     /// "Archive Folder…" must include every asset filed in the folder, not
     /// just whichever page happens to be sitting in the view's own `assets`
-    /// array (capped at `fetchAssets(limit: 500)`) — fetch the full asset
-    /// set from the store and filter by id instead, so folders larger than
-    /// the page size still archive completely.
+    /// array (capped at `fetchAssets(limit: 500)`) — fetch exactly the
+    /// folder's own member ids from the store (#265), rather than the whole
+    /// table filtered by id, so folders larger than the page size still
+    /// archive completely.
     private func requestArchiveFolder(ids: Set<String>, folder: DAMFolder) async {
         guard !ids.isEmpty else { return }
         do {
-            let total = try await store.assetCount()
-            let allAssets = try await store.fetchAssets(limit: total, offset: 0)
-            requestArchive(Self.folderMembers(ids: ids, from: allAssets), folder: folder)
+            let members = try await store.assets(withIDs: ids)
+            // Belt and braces, same discipline as the secured-id filter
+            // above: re-filter against `ids` even though the query already
+            // scoped to them, so a future change to `assets(withIDs:)`
+            // can't silently widen what gets archived here.
+            requestArchive(Self.folderMembers(ids: ids, from: members), folder: folder)
         } catch {
             errorMessage = "Failed to load folder assets: \(error.localizedDescription)"
         }
     }
 
-    /// Given a folder's asset id set (from `folderAssignments()`) and the
-    /// full, unpaged asset list, returns exactly the assets that belong to
-    /// the folder. A pure, directly unit-testable helper isolating the
+    /// Given a folder's asset id set (from `folderAssignments()`) and a
+    /// candidate asset list, returns exactly the assets that belong to the
+    /// folder. A pure, directly unit-testable helper isolating the
     /// membership filter from the store fetch above it.
     static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
         allAssets.filter { ids.contains($0.id) }
