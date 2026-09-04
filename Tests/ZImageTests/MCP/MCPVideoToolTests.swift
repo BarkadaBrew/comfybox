@@ -41,8 +41,9 @@ final class MCPVideoToolTests: XCTestCase {
     //   set_warm_preset/create_character/delete_character (headless-parity
     //   Phase 1 gap set, comfybox#300, FDD §4.2, 2026-08-30) = 52;
     // + get_config/patch_config/update_config (headless-parity Phase 3,
-    //   comfybox#300, FDD §3.3/§4.4, 2026-08-30) = 55.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 55, "Expected 55 registered MCP tools")
+    //   comfybox#300, FDD §3.3/§4.4, 2026-08-30) = 55;
+    // + get_job (one job model, comfybox#289, 2026-09-04) = 56.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 56, "Expected 56 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)

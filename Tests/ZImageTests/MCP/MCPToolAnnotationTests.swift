@@ -6,6 +6,7 @@ final class MCPToolAnnotationTests: XCTestCase {
     "apply_style",
     "civitai_search",
     "get_config",
+    "get_job",
     "list_characters",
     "list_loras",
     "list_models",
