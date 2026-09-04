@@ -163,6 +163,94 @@ final class VideoWinnerActionsTests: XCTestCase {
       requestJSON: "not json", resolvedSeed: nil, effectivePrompt: nil, resolution: "720p"))
   }
 
+  // MARK: - rerenderBody (tuningOverride — promote a winning seed to two-pass)
+
+  func testRerenderBodyTuningOverrideMergesOverStoredTuning() throws {
+    // The gallery's "make it a two-pass keeper" action names only what it
+    // wants to change; whatever the original render's own tuning block
+    // carried for every other key must ride through untouched.
+    var original = originalBody
+    original["tuning"] = ["two_stage": false, "sampler": "heun", "stg_scale": 1.5]
+    let json = String(
+      data: try JSONSerialization.data(withJSONObject: original), encoding: .utf8)!
+    var override = LTX2VideoTuning()
+    override.twoStage = true
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: json, resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p", tuningOverride: override))
+    let tuning = try XCTUnwrap(body["tuning"] as? [String: Any])
+    XCTAssertEqual(tuning["two_stage"] as? Bool, true)
+    XCTAssertEqual(tuning["sampler"] as? String, "heun")
+    XCTAssertEqual(tuning["stg_scale"] as? Double, 1.5)
+  }
+
+  func testRerenderBodyTuningOverrideNestedTwoStageLands() throws {
+    var override = LTX2VideoTuning()
+    override.twoStage = true
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: originalJSON(), resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p", tuningOverride: override))
+    let tuning = try XCTUnwrap(body["tuning"] as? [String: Any])
+    XCTAssertEqual(tuning["two_stage"] as? Bool, true)
+  }
+
+  func testRerenderBodyTuningOverrideTopLevelTwoPassAliasLands() throws {
+    // WarmServer folds the route's top-level `two_pass` convenience into
+    // `tuning.two_stage` (comfybox#307/#355) before it ever reaches
+    // rerenderBody — exercise that same merge here so the alias is proven
+    // to land in the replayed body, not just the nested shape.
+    let merged = try XCTUnwrap(LTX2VideoTuning.merging(nil, twoPass: true))
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: originalJSON(), resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p", tuningOverride: merged))
+    let tuning = try XCTUnwrap(body["tuning"] as? [String: Any])
+    XCTAssertEqual(tuning["two_stage"] as? Bool, true)
+  }
+
+  func testRerenderBodySecondRerenderCompoundsOverPreviousTuning() throws {
+    // A twice-promoted winner: rerender once with one override, then
+    // rerender the RESULT with a second override — the second call's stored
+    // tuning is the first call's merged output, so the two must compound
+    // rather than the second clobbering the first's untouched keys.
+    var first = LTX2VideoTuning()
+    first.twoStage = true
+    first.sampler = "heun"
+    let firstData = try VideoWinnerActions.rerenderBody(
+      requestJSON: originalJSON(), resolvedSeed: "1", effectivePrompt: "p",
+      resolution: "720p", tuningOverride: first)
+    let firstJSON = try XCTUnwrap(String(data: firstData, encoding: .utf8))
+
+    var second = LTX2VideoTuning()
+    second.audioRefine = true
+    let secondData = try VideoWinnerActions.rerenderBody(
+      requestJSON: firstJSON, resolvedSeed: "1", effectivePrompt: "p",
+      resolution: "720p", tuningOverride: second)
+    let body = try obj(secondData)
+    let tuning = try XCTUnwrap(body["tuning"] as? [String: Any])
+    XCTAssertEqual(tuning["two_stage"] as? Bool, true, "survives from the first rerender")
+    XCTAssertEqual(tuning["sampler"] as? String, "heun", "survives from the first rerender")
+    XCTAssertEqual(tuning["audio_refine"] as? Bool, true, "added by the second rerender")
+  }
+
+  func testRerenderBodyTuningOverrideLeavesBeatScheduleUntouched() throws {
+    var original = originalBody
+    original["beat_schedule"] = [["t": 0.0, "text": "she smiles"]]
+    let json = String(
+      data: try JSONSerialization.data(withJSONObject: original), encoding: .utf8)!
+    var override = LTX2VideoTuning()
+    override.twoStage = true
+    let body = try obj(
+      try VideoWinnerActions.rerenderBody(
+        requestJSON: json, resolvedSeed: "1", effectivePrompt: "p",
+        resolution: "720p", tuningOverride: override))
+    let beatSchedule = try XCTUnwrap(body["beat_schedule"] as? [[String: Any]])
+    XCTAssertEqual(beatSchedule.count, 1)
+    XCTAssertEqual(beatSchedule.first?["text"] as? String, "she smiles")
+  }
+
   // MARK: - extendBody (last-frame continuation)
 
   func testExtendBodyChainsFromExtractedFrameAtStandardLength() throws {

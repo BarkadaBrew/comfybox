@@ -619,6 +619,11 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "Named budget: '720p' (default) or '1080p'.",
         ] as [String: Any],
+        "tuning": [
+          "type": "object",
+          "description":
+            "Tier-A engine overrides applied ON TOP of the replayed request (snake_case, e.g. two_stage / audio_refine / sampler). Lets a cheap single-pass explore be promoted to a two-pass keeper on the SAME seed and prompt. Omit to replay the original settings unchanged.",
+        ] as [String: Any],
       ] as [String: Any],
       "required": [] as [String],
     ] as [String: Any],
