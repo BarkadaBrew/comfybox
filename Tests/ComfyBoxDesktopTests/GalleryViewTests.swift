@@ -81,6 +81,26 @@ struct GalleryViewIsMainSourceTests {
     }
 }
 
+// MARK: - X5 residual: "Edited from → Show" lands on the source's own persona section
+
+@Suite("GalleryView.personaFilterKey")
+struct GalleryViewPersonaFilterKeyTests {
+    @Test("a main source resolves to nil (the main gallery)")
+    func mainSourceResolvesToNil() {
+        #expect(GalleryView.personaFilterKey(for: nil) == nil)
+        #expect(GalleryView.personaFilterKey(for: "") == nil)
+        #expect(GalleryView.personaFilterKey(for: "desktop") == nil)
+        #expect(GalleryView.personaFilterKey(for: "desktop-edit") == nil)
+        #expect(GalleryView.personaFilterKey(for: "comfybox") == nil)
+    }
+
+    @Test("a persona source resolves to its own lowercased key, not nil")
+    func personaSourceResolvesToItsOwnKey() {
+        #expect(GalleryView.personaFilterKey(for: "kira") == "kira")
+        #expect(GalleryView.personaFilterKey(for: "Bree") == "bree")   // matches filteredAssets' own lowercasing
+    }
+}
+
 // MARK: - X5: "Edited from → Show" resolves against the full asset list
 
 @Suite("GalleryView.resolveSourceAsset")

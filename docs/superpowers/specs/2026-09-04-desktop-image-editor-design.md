@@ -135,9 +135,9 @@ operations, fixed and documented in code:
    whatever the crop/rotate/flip frame was AT PAINT TIME, not to the
    source image itself — painting a local mask and then changing the
    crop afterward rescales the mask onto the new frame, so the painted
-   region visibly moves relative to the picture. The Crop/Local mutual
-   exclusivity (see Views) prevents this within a single session step
-   but not across a later crop edit; paint the local mask after settling
+   region visibly moves relative to the picture. Crop/Local mutual
+   exclusivity (see Views) is a gesture-conflict fix, not a frame-order
+   one — it does not prevent this; paint the local mask after settling
    the crop.
 4. **Subject**: when `removeBackground` is set and `subjectMask` is
    present, multiply alpha by the (optionally inverted) mask via
@@ -263,11 +263,16 @@ back for reopen and for the detail view.
   Before, Save, Save and Open in Inpaint.
 
   **As shipped**, Crop and Local are mutually exclusive expanded groups:
-  opening one collapses the other. Local strokes are recorded against
-  the uncropped (post-geometry-so-far, pre-crop) frame, and the crop
-  overlay's drag gesture would otherwise steal the Local layer's paint
-  drags over the same canvas region — see `EditRenderer`'s local-layer
-  note above for the mask/crop-order caveat this implies.
+  opening one collapses the other. This is a gesture conflict, not a
+  frame one — the crop overlay's drag gesture would otherwise steal the
+  Local layer's paint drags over the same canvas region. The mask
+  itself is still normalized to the POST-geometry (cropped) frame, per
+  `EditRenderer`'s local-layer note above: the user paints on the
+  cropped preview, so painting a local mask and then changing the crop
+  afterward rescales the painted region onto the new frame rather than
+  keeping it fixed to the picture. Mutual exclusivity prevents editing
+  both in the same UI gesture; it does not prevent this sequential case
+  — paint the local mask after settling the crop.
 - **EditTab**: wraps EditView with an Open button (`NSOpenPanel`,
   PNG/JPEG/TIFF) and consumes a `@Binding pendingEditImage: String?`
   the same way Inpaint consumes `pendingInpaintImage`.

@@ -139,6 +139,15 @@ struct GalleryView: View {
     static func isMainSource(_ source: String?) -> Bool {
         mainSources.contains((source ?? "").lowercased())
     }
+    /// The `personaFilter` value that makes an asset with this `source` visible —
+    /// nil (main gallery) for a main source, else the lowercased persona key
+    /// `filteredAssets` and the sidebar's persona sections both key on. Used by
+    /// "Edited from → Show" (X5) to land on the RIGHT section, not just "main":
+    /// setting `personaFilter = nil` for every reveal would leave a persona-section
+    /// original (e.g. a Kira/Bree render) still filtered out after "Show".
+    static func personaFilterKey(for source: String?) -> String? {
+        isMainSource(source) ? nil : (source ?? "").lowercased()
+    }
     /// Distinct persona (non-main) sources present in the library, with counts.
     private var personaSources: [(name: String, count: Int)] {
         var counts: [String: Int] = [:]
@@ -1100,7 +1109,11 @@ struct GalleryView: View {
                                                    }) else { return }
         if !filteredAssets.contains(where: { $0.id == match.id }) {
             searchText = ""
-            personaFilter = nil
+            // Not just "clear to main" — a persona-section original (source is
+            // Kira/Bree/etc., not one of `mainSources`) needs `personaFilter` SET
+            // to its own section, or it stays hidden behind the main-gallery view
+            // `personaFilter = nil` switches to.
+            personaFilter = Self.personaFilterKey(for: match.source)
             folderFilter = .all
             filterFavorites = false
             filterContentMode = nil
