@@ -28,6 +28,17 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 /// `step` is a closure rather than a bound `OpaquePointer` so this can be
 /// unit-tested with a stub that fails after N rows, without standing up a
 /// real (and hard to fault-inject on purpose) SQLite connection.
+///
+/// Out of scope here, deliberately: this file's `defer { sqlite3_finalize(stmt) }`
+/// calls (including every one of this function's callers) never check
+/// `sqlite3_finalize`'s own return code. `sqlite3_finalize` can surface an
+/// error that occurred during the statement's *last* `sqlite3_step` call —
+/// which, for every loop this function now guards, is already caught by the
+/// `rc != SQLITE_DONE` check below before `finalize` ever runs; the residual
+/// gap is prepared-but-never-stepped and single-shot (INSERT/UPDATE/DELETE)
+/// statements elsewhere in this file, where a step failure is already
+/// checked separately and finalize is unlikely to add new information.
+/// Tracked, not fixed here — see #357.
 func drainSQLiteRows(step: () -> Int32, onRow: () -> Void) -> Int32 {
     var rc = step()
     while rc == SQLITE_ROW {
