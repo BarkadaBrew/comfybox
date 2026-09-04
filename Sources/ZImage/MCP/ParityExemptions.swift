@@ -25,10 +25,6 @@ public struct ParityExemption: Sendable {
 public enum ParityExemptions {
   public static let all: [ParityExemption] = [
     ParityExemption(
-      method: "POST", path: "/v1/generate/async",
-      reason: "Async job variant of /v1/generate; MCP agents call generate_image (a synchronous MCP call"
-        + " wrapping the same render). A dedicated async tool was deferred from the Phase 1 worklist."),
-    ParityExemption(
       method: "POST", path: "/v1/video/generate",
       reason: "Synchronous variant; the generate_video tool proxies POST /v1/video/generate/async"
         + " (job-based) so an agent is never blocked for a whole video render."),

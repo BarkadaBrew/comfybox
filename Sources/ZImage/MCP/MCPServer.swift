@@ -152,8 +152,16 @@ public final class MCPServer {
       arguments = nil
     }
 
-    log("Executing tool: \(toolName)")
-    let result = await executor.execute(name: toolName, arguments: arguments)
+    // comfybox#292: the client opts INTO progress by putting a progressToken
+    // in the request's `_meta` (MCP basic/utilities). No token -> no reporter
+    // -> the executor never polls the engine. The token can be a string or an
+    // integer and is echoed verbatim.
+    let reporter = (params?.dict("_meta")?["progressToken"]).map { token in
+      StdioProgressReporter(token: token) { [weak self] line in self?.writeLine(line) }
+    }
+
+    log("Executing tool: \(toolName)\(reporter == nil ? "" : " (with progress)")")
+    let result = await executor.execute(name: toolName, arguments: arguments, progress: reporter)
     log("Tool \(toolName) completed (isError=\(result.isError))")
 
     return MCPResponse(id: id, result: AnyCodable(result.toResponseDict()))
@@ -204,10 +212,23 @@ public final class MCPServer {
       log("Failed to encode response")
       return
     }
-    // Write to stdout with newline, then flush
+    writeLine(line)
+  }
+
+  /// Write one JSON-RPC line to stdout, under a lock.
+  ///
+  /// Responses come from the main readline loop; progress notifications
+  /// (comfybox#292) come from the poller's task. Two writers on one stream
+  /// interleave into unparseable garbage without this — the same reason the
+  /// parent-death watchdog below uses raw `write(2)` for stderr.
+  fileprivate func writeLine(_ line: String) {
+    MCPServer.stdoutLock.lock()
+    defer { MCPServer.stdoutLock.unlock() }
     print(line)
     fflush(stdout)
   }
+
+  private static let stdoutLock = NSLock()
 
   /// Send an error response.
   private func sendError(id: MCPRequestId?, error: MCPError) {
@@ -258,4 +279,30 @@ public final class MCPServer {
     }
   }
 
+}
+
+// MARK: - Progress reporting (comfybox#292)
+
+/// Writes MCP `notifications/progress` to stdout for one in-flight tool call.
+///
+/// Holds only the client's token and a write closure — no server state — so a
+/// notification cannot be emitted after the process is gone, and the reporter
+/// dies with the request that created it.
+final class StdioProgressReporter: MCPProgressReporter, @unchecked Sendable {
+  private let token: AnyCodable
+  private let write: @Sendable (String) -> Void
+
+  init(token: AnyCodable, write: @escaping @Sendable (String) -> Void) {
+    self.token = token
+    self.write = write
+  }
+
+  func report(progress: Double, total: Double?, message: String?) async {
+    let json = MCPProgressNotification.json(
+      token: token, progress: progress, total: total, message: message)
+    guard let data = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]),
+      let line = String(data: data, encoding: .utf8)
+    else { return }
+    write(line)
+  }
 }

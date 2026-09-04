@@ -130,8 +130,11 @@ final class MCPImageContentTests: XCTestCase {
     func imageBlocks(_ result: MCPToolResult) -> Int {
       result.content.filter { $0.type == "image" }.count
     }
-    XCTAssertEqual(imageBlocks(try await run(returnImage: false, state: "succeeded")), 0)
-    XCTAssertEqual(imageBlocks(try await run(returnImage: true, state: "succeeded")), 1)
-    XCTAssertEqual(imageBlocks(try await run(returnImage: true, state: "processing")), 0)
+    let offAndDone = imageBlocks(try await run(returnImage: false, state: "succeeded"))
+    let onAndDone = imageBlocks(try await run(returnImage: true, state: "succeeded"))
+    let onAndRunning = imageBlocks(try await run(returnImage: true, state: "processing"))
+    XCTAssertEqual(offAndDone, 0, "return_image defaults off — no image block")
+    XCTAssertEqual(onAndDone, 1)
+    XCTAssertEqual(onAndRunning, 0, "nothing to attach until the render completes")
   }
 }

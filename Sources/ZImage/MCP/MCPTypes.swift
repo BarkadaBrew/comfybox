@@ -278,14 +278,29 @@ public struct MCPToolDefinition: Sendable {
 
 // MARK: - MCP Content Block
 
-/// A content block in an MCP tool result.
+/// A content block in an MCP tool result — `text` or `image` (comfybox#294).
 public struct MCPContentBlock: Sendable {
   public let type: String
   public let text: String?
+  /// Base64 payload for an `image` block (nil for text).
+  public let data: String?
+  /// MIME type for an `image` block (nil for text).
+  public let mimeType: String?
 
   public init(text: String) {
     self.type = "text"
     self.text = text
+    self.data = nil
+    self.mimeType = nil
+  }
+
+  /// An MCP image content block. Built through `MCPImageAttachment`, which
+  /// owns the payload-size cap.
+  public init(imageBase64: String, mimeType: String) {
+    self.type = "image"
+    self.text = nil
+    self.data = imageBase64
+    self.mimeType = mimeType
   }
 }
 
@@ -312,6 +327,15 @@ public struct MCPToolResult: Sendable {
     self.structuredJSON = structuredJSON
   }
 
+  /// Success result with optional trailing `image` blocks (comfybox#294).
+  /// The text block stays FIRST and unchanged, so a client that only reads
+  /// `content[0]` sees exactly what it saw before `return_image` existed.
+  public init(text: String, structuredJSON: Data?, images: [MCPContentBlock]) {
+    self.content = [MCPContentBlock(text: text)] + images
+    self.isError = false
+    self.structuredJSON = structuredJSON
+  }
+
   public init(error: String) {
     self.content = [MCPContentBlock(text: error)]
     self.isError = true
@@ -324,6 +348,8 @@ public struct MCPToolResult: Sendable {
       "content": content.map { block -> [String: Any] in
         var dict: [String: Any] = ["type": block.type]
         if let text = block.text { dict["text"] = text }
+        if let data = block.data { dict["data"] = data }
+        if let mimeType = block.mimeType { dict["mimeType"] = mimeType }
         return dict
       }
     ]

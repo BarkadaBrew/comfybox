@@ -29,6 +29,25 @@ final class MCPJobModelTests: XCTestCase {
     XCTAssertEqual(MCPJobKind.storyboard.statusPath(jobId: "J-2"), "/v1/video/status/J-2")
   }
 
+  /// The executor spells the status paths out as literals so the §3.5
+  /// anti-drift parity extractor can see them. This drives `runGetJob` for
+  /// every kind and pins the path it ACTUALLY requests to the declared
+  /// template, so the duplication cannot drift.
+  func testExecutorRequestsTheDeclaredPathForEveryKind() async throws {
+    for kind in MCPJobKind.allCases {
+      let log = CallLog()
+      _ = try await MCPToolExecutor.runGetJob(jobId: "J-7", kind: kind) { method, path in
+        await log.record(method, path)
+        return (200, self.json(["job_id": "J-7", "status": "succeeded"]))
+      }
+      let calls = await log.all()
+      XCTAssertEqual(
+        calls,
+        ["GET " + kind.statusPathTemplate.replacingOccurrences(of: "{id}", with: "J-7")],
+        "\(kind.rawValue): executor path drifted from the declared template")
+    }
+  }
+
   func testProbeOrderIsImageThenVideo() {
     XCTAssertEqual(MCPJobModel.probeOrder, [.image, .video])
   }
@@ -203,9 +222,9 @@ final class MCPJobModelTests: XCTestCase {
 
   // MARK: - Submit envelope (#288)
 
-  func testSubmitEnvelopeFromAsyncAcceptBody() {
+  func testSubmitEnvelopeFromAsyncAcceptBody() throws {
     let accepted: [String: Any] = ["job_id": "J-9", "status": "queued", "source": "mcp", "elapsed_ms": 1]
-    let out = MCPJobModel.submitEnvelope(kind: .image, status: accepted)
+    let out = try XCTUnwrap(MCPJobModel.submitEnvelope(kind: .image, status: accepted))
     XCTAssertEqual(out["job_id"] as? String, "J-9")
     XCTAssertEqual(out["kind"] as? String, "image")
     XCTAssertEqual(out["state"] as? String, "queued")
@@ -310,7 +329,8 @@ final class MCPJobModelTests: XCTestCase {
       await log.record(method, path)
       return (200, self.json(["job_id": "J-1", "status": "succeeded", "output_path": "/tmp/a.png"]))
     }
-    XCTAssertEqual(await log.all(), ["GET /v1/generate/status/J-1"])
+    let calls = await log.all()
+    XCTAssertEqual(calls, ["GET /v1/generate/status/J-1"])
   }
 
   func testGetJobSurfacesQueueRecoveryRefusalAsQueuedWithRetryHint() async throws {
@@ -347,7 +367,8 @@ final class MCPJobModelTests: XCTestCase {
       return (202, self.json(["job_id": "J-42", "status": "queued", "source": "mcp", "elapsed_ms": 0]))
     }
     XCTAssertFalse(result.isError)
-    XCTAssertEqual(await log.all(), ["POST /v1/generate/async"])
+    let calls = await log.all()
+    XCTAssertEqual(calls, ["POST /v1/generate/async"])
     let obj = try XCTUnwrap(
       JSONSerialization.jsonObject(with: try XCTUnwrap(result.structuredJSON)) as? [String: Any])
     XCTAssertEqual(obj["job_id"] as? String, "J-42")
