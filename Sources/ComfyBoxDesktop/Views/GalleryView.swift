@@ -1623,15 +1623,20 @@ struct GalleryView: View {
         do {
             // Self-heal: drop rows whose file was deleted out from under the
             // DAM before presenting (only worth it on a full, unfiltered load).
-            // This is an unattended destructive sweep, so its refusal is SHOWN,
-            // not swallowed: a circuit breaker trip means a volume is probably
-            // unmounted, and silently skipping it would leave the gallery
-            // looking half-empty with no explanation.
+            // This is an unattended destructive sweep, so ANY failure to run
+            // it is SHOWN via `pruneWarning`, never swallowed: a circuit
+            // breaker trip means a volume is probably unmounted, and a read
+            // failure mid-sweep (DAMStoreError.stepFailed, #263) means the
+            // sweep didn't run at all — either way, silently proceeding as if
+            // it ran clean would leave the gallery looking half-empty (or
+            // stale) with no explanation. Browsing itself is never blocked:
+            // the failure is only ever logged and banner-surfaced here.
             if searchText.isEmpty {
                 do { _ = try await ingestor.pruneOrphans() }
-                catch let error as DAMStoreError {
-                    if case .pruneRefused = error { pruneWarning = error.localizedDescription }
-                } catch { /* a prune failure must never block browsing */ }
+                catch {
+                    print("[GalleryView] loadAssets: orphan self-heal sweep failed: \(error.localizedDescription)")
+                    pruneWarning = Self.pruneSweepWarning(for: error)
+                }
             }
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()
@@ -2175,6 +2180,24 @@ struct GalleryView: View {
     /// membership filter from the store fetch above it.
     static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
         allAssets.filter { ids.contains($0.id) }
+    }
+
+    /// Maps a `pruneOrphans()` failure to `pruneWarning` banner text.
+    /// `loadAssets`'s self-heal sweep must never look like it silently
+    /// succeeded when it didn't — this is a pure, directly unit-testable
+    /// decision isolated from the view's `catch` (PR #356 fix round 1:
+    /// `.stepFailed`, #263's new error, used to fall through that `catch`'s
+    /// unhandled-DAMStoreError-case and unmatched-non-DAMStoreError-case
+    /// paths with no banner and no log). `.pruneRefused` already explains
+    /// itself well (it names the candidate/total counts), so it passes
+    /// through verbatim; everything else — every other `DAMStoreError`
+    /// case and any non-DAMStoreError failure — is framed so the user knows
+    /// *what* didn't happen, not just the raw underlying message.
+    static func pruneSweepWarning(for error: Error) -> String {
+        if let damError = error as? DAMStoreError, case .pruneRefused = damError {
+            return damError.localizedDescription
+        }
+        return "Orphan cleanup skipped: \(error.localizedDescription)"
     }
 
     /// Resolves the "Edited from" source asset for an edit sidecar's `source_path`
