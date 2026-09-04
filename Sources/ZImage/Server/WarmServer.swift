@@ -1991,6 +1991,10 @@ public final class WarmServer {
     let durationSeconds: Float
     let elapsedSeconds: Double
     let backend: String
+    /// comfybox#328: non-nil (`"beat_schedule"`) when prompt enhancement
+    /// was skipped so the request's beats would locate. Absent field on
+    /// older engines/clients is the byte-identical no-op case.
+    let enhancementSkipped: String?
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2046,6 +2050,10 @@ public final class WarmServer {
     let source: String
     /// Lineage reference from /v1/enhance, if the caller optimized first.
     let optimizationAttemptId: String?
+    /// comfybox#328: non-nil when prompt enhancement was skipped so a
+    /// `beat_schedule` would survive verbatim in the composed prompt —
+    /// stamped onto the response/trace as `enhancement_skipped`.
+    let enhancementSkippedReason: String?
   }
 
   /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
@@ -2182,6 +2190,19 @@ public final class WarmServer {
     let done = max(0, chunk) * steps + max(0, step)
     let total = chunks * steps
     return min(100, max(0, Int((Double(done) / Double(total)) * 100.0)))
+  }
+
+  /// comfybox#328: pure decision of whether video-prompt enhancement should
+  /// be skipped for a request's `beat_schedule`. `beat_schedule` beats are
+  /// located as verbatim substrings of the composed prompt — enhancement
+  /// rewrites that prompt wholesale, so running both together silently
+  /// drops every beat. Beats are the more specific ask: a non-empty
+  /// `beat_schedule` always wins, independent of `enhance`. Returns the
+  /// skip reason (stamped onto the response/trace as `enhancement_skipped`)
+  /// or nil when enhancement should proceed as normal.
+  static func beatScheduleEnhancementSkip(beatSchedule: [BeatSegment]?) -> String? {
+    guard let beatSchedule, !beatSchedule.isEmpty else { return nil }
+    return "beat_schedule"
   }
 
   /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
@@ -2364,9 +2385,23 @@ public final class WarmServer {
     // description AND enriches the scene, so it replaces the manual character
     // prepend. Opt out per request with enhance:false; falls back to the manual
     // prepend when no provider is configured or enhancement fails.
+    //
+    // comfybox#328: `beat_schedule` beats are located as VERBATIM substrings
+    // of this same composed prompt (LTX2BeatScheduleLocator, matched against
+    // the exact text the tokenizer receives — see LTX2VideoGenerator). The
+    // dolphin enhancement rewrites the prompt wholesale, so none of the
+    // caller's beat phrasing survives and every beat silently fails to
+    // locate (fail-open, one warning each) whenever both features are
+    // requested together — which is the default, since enhancement defaults
+    // on. Beats are the more specific ask: a non-empty `beat_schedule` skips
+    // enhancement outright rather than let it neutralize the schedule.
     var enhancedApplied = false
+    let enhancementSkippedReason = Self.beatScheduleEnhancementSkip(beatSchedule: req.beatSchedule)
     let aiProviderConfig = ComfyBoxServerConfig.loadOrMigrate()
-    if req.enhance != false, let endpoint = aiProviderConfig.providers.promptOptimization {
+    if let reason = enhancementSkippedReason {
+      logger.warning(
+        "Video: skipping prompt enhancement — \(reason) present (\(req.beatSchedule?.count ?? 0) beat(s)); enhancement rewrites the prompt and would strand every beat (comfybox#328).")
+    } else if req.enhance != false, let endpoint = aiProviderConfig.providers.promptOptimization {
       var base = endpoint.baseUrl
       while base.hasSuffix("/") { base.removeLast() }
       if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
@@ -2488,7 +2523,8 @@ public final class WarmServer {
       request: videoRequest,
       mode: (effectiveInitImage?.isEmpty == false) ? .i2v : .t2v,
       source: req.source ?? "api",
-      optimizationAttemptId: req.optimizationAttemptId)
+      optimizationAttemptId: req.optimizationAttemptId,
+      enhancementSkippedReason: enhancementSkippedReason)
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -2508,6 +2544,12 @@ public final class WarmServer {
       }
       if let attemptId = prep.optimizationAttemptId {
         tracePayload["optimization_attempt_id"] = attemptId
+      }
+      // comfybox#328: visible on GET /v1/video/traces — confirms a
+      // beat_schedule request actually skipped enhancement instead of
+      // silently losing its beats to the rewrite.
+      if let reason = prep.enhancementSkippedReason {
+        tracePayload["enhancement_skipped"] = reason
       }
       // Winner actions (2026-08-10): store the sanitized request + the
       // resolved seed/dims so this render_id is replayable — /v1/video/rerender
@@ -2721,7 +2763,8 @@ public final class WarmServer {
         frameCount: result.frameCount,
         durationSeconds: result.durationSeconds,
         elapsedSeconds: result.elapsedSeconds,
-        backend: "ltx2-local"
+        backend: "ltx2-local",
+        enhancementSkipped: prep.enhancementSkippedReason
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
