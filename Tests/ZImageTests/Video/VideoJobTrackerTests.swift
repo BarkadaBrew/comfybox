@@ -9,11 +9,13 @@ final class VideoJobTrackerTests: XCTestCase {
 
   private func result(
     path: String = "/out/ltx2.mp4", frames: Int = 97,
-    duration: Float = 4.0, elapsed: Double = 12.5
+    duration: Float = 4.0, elapsed: Double = 12.5,
+    refineSkippedReason: String? = nil
   ) -> LTX2VideoResult {
     LTX2VideoResult(
       outputPath: path, frameCount: frames,
-      durationSeconds: duration, elapsedSeconds: elapsed)
+      durationSeconds: duration, elapsedSeconds: elapsed,
+      refineSkippedReason: refineSkippedReason)
   }
 
   // MARK: - Unknown id
@@ -100,6 +102,28 @@ final class VideoJobTrackerTests: XCTestCase {
     // Completion forces progress to 100 regardless of the last streamed value.
     XCTAssertEqual(s?.progressPercent, 100)
     XCTAssertNil(s?.error)
+  }
+
+  /// comfybox#307: `refine_skipped` must be nil on a normal (or non-two-stage)
+  /// success — additive, no change for every existing caller/test.
+  func testMarkSucceededWithNoRefineSkipLeavesFieldNil() {
+    let tracker = VideoJobTracker()
+    let (jobId, _) = tracker.register(source: "api", mode: .i2v)
+    tracker.markSucceeded(jobId, result: result())
+    XCTAssertNil(tracker.status(jobId: jobId)?.refineSkipped)
+  }
+
+  /// The phantom-refine case the issue describes: `two_stage` requested, the
+  /// volume gate skipped it, the render still "succeeds" — but the status
+  /// must say so.
+  func testMarkSucceededSurfacesRefineSkippedReason() {
+    let tracker = VideoJobTracker()
+    let (jobId, _) = tracker.register(source: "api", mode: .i2v)
+    tracker.markSucceeded(jobId, result: result(
+      refineSkippedReason: "volume_gate (pre-refine volume 30000 > refine_max_vol 26000)"))
+    XCTAssertEqual(
+      tracker.status(jobId: jobId)?.refineSkipped,
+      "volume_gate (pre-refine volume 30000 > refine_max_vol 26000)")
   }
 
   func testElapsedFreezesAfterCompletion() {

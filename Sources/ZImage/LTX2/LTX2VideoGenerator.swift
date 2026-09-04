@@ -157,6 +157,21 @@ public struct LTX2VideoResult: Sendable {
     public let frameCount: Int
     public let durationSeconds: Float
     public let elapsedSeconds: Double
+    /// comfybox#307: why the two-stage refine did not run, when `two_stage`
+    /// was requested for this render — nil when it ran, wasn't requested, or
+    /// (montage/storyboard assembly) doesn't apply. See `LTX2RefineGate`.
+    public let refineSkippedReason: String?
+
+    public init(
+        outputPath: String, frameCount: Int, durationSeconds: Float, elapsedSeconds: Double,
+        refineSkippedReason: String? = nil
+    ) {
+        self.outputPath = outputPath
+        self.frameCount = frameCount
+        self.durationSeconds = durationSeconds
+        self.elapsedSeconds = elapsedSeconds
+        self.refineSkippedReason = refineSkippedReason
+    }
 }
 
 /// #1479: what one generator-level render produced. The completed payload is
@@ -1116,6 +1131,12 @@ public final class LTX2VideoGenerator {
         // increment; until then this resolves configFile > env > builtin.
         let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
+        // comfybox#307: fresh top-level render — clear any skip reason left
+        // over from a PRIOR render on this same warm pipeline instance. Never
+        // clear on a checkpoint resume (`resume != nil`): the reason may have
+        // been recorded on an earlier chunk of THIS render, before the
+        // preemption that produced this resume.
+        if resume == nil { pipeline.lastRefineSkipReason = nil }
         let resolved = typedConfig.params
         // Finding #18: two_stage was load-time only — a request could not turn
         // it on without a server restart. Lazy-load the upsampler on the first
@@ -1674,7 +1695,8 @@ public final class LTX2VideoGenerator {
             durationSeconds: Float(allFrames.count) / Float(request.fps),
             // #1479: RENDER time, summed across segments — wall clock from a
             // single start would bill the preemptor's runtime to this render.
-            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart),
+            refineSkippedReason: pipeline.lastRefineSkipReason
         ))
         #else
         throw LTX2VideoError.unsupportedPlatform

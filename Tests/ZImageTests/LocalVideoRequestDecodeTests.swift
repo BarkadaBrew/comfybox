@@ -19,4 +19,42 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
     XCTAssertNotNil(req.tuning, "tuning must decode")
     XCTAssertEqual(req.tuning?.stage1Sigmas?.count, 10, "sigmas must survive")
   }
+
+  // MARK: - comfybox#307: top-level `two_pass` convenience field
+
+  private func decodeLocalVideoRequest(_ json: String) throws -> WarmServer.LocalVideoRequest {
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try decoder.decode(WarmServer.LocalVideoRequest.self, from: Data(json.utf8))
+  }
+
+  func testTwoPassTrueDecodes() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":true}"#)
+    XCTAssertEqual(req.twoPass, true)
+  }
+
+  func testTwoPassFalseDecodes() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":false}"#)
+    XCTAssertEqual(req.twoPass, false)
+  }
+
+  func testTwoPassExplicitNullDecodesAsNil() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x","two_pass":null}"#)
+    XCTAssertNil(req.twoPass)
+  }
+
+  func testTwoPassAbsentDecodesAsNil() throws {
+    let req = try decodeLocalVideoRequest(#"{"prompt":"x"}"#)
+    XCTAssertNil(req.twoPass, "no two_pass key, no tuning key — additive field must not be required")
+  }
+
+  /// `two_pass` is additive: it must not disturb the pre-existing
+  /// `tuning.two_stage` decode path exercised above.
+  func testTwoPassAlongsideExistingTuningBlockBothDecode() throws {
+    let req = try decodeLocalVideoRequest(#"""
+      {"prompt":"x","two_pass":true,"tuning":{"refine_scale":1.35}}
+      """#)
+    XCTAssertEqual(req.twoPass, true)
+    XCTAssertEqual(req.tuning?.refineScale, 1.35)
+  }
 }

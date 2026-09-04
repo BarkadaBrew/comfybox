@@ -256,6 +256,22 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var reanchorInterval: Int?
   public var reanchorStrength: Float?
   public init() {}
+
+  /// comfybox#307: merge the video routes' top-level `two_pass` convenience
+  /// field into a `tuning` block. Pure — no server/actor state — so the
+  /// precedence is unit-testable on its own.
+  ///
+  /// `twoPass` fills in `twoStage` only when the caller did NOT already set
+  /// `tuning.two_stage` — the nested field is the more specific one and wins
+  /// on conflict. `twoPass == nil` (absent or explicit JSON `null`) changes
+  /// nothing: `base` is returned untouched, deferring to whatever
+  /// `tuning.two_stage`/preset/configFile/env/builtin would already resolve.
+  public static func merging(_ base: LTX2VideoTuning?, twoPass: Bool?) -> LTX2VideoTuning? {
+    guard let twoPass, base?.twoStage == nil else { return base }
+    var merged = base ?? LTX2VideoTuning()
+    merged.twoStage = twoPass
+    return merged
+  }
 }
 
 /// The authoritative, TYPED configuration for one render. Codex finding #14:

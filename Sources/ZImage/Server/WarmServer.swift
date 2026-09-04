@@ -1925,6 +1925,15 @@ public final class WarmServer {
     let source: String?
     /// Tier A tuning overrides (snake_case JSON via decoder strategy).
     let tuning: LTX2VideoTuning?
+    /// comfybox#307: top-level convenience alias for `tuning.two_stage` — the
+    /// HQ two-pass quality tier, controllable per request/scheduler cycle
+    /// without a caller needing to know about the nested `tuning` object.
+    /// `true`/`false` sets the tier explicitly for this render; `null` (or
+    /// absent) defers to `tuning.two_stage`, then preset/configFile/env/
+    /// builtin — the existing resolution order (`LTX2ConfigResolver`) is
+    /// unchanged. When BOTH this and `tuning.two_stage` are set, the more
+    /// specific `tuning.two_stage` wins (see `LTX2VideoTuning.merging`).
+    let twoPass: Bool?
     /// Server-minted id from /v1/enhance binding this render to its
     /// optimization lineage (task #19, finding #6).
     let optimizationAttemptId: String?
@@ -2029,6 +2038,9 @@ public final class WarmServer {
     /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
     /// on this I2V request was dropped before reaching the generator.
     let beatScheduleIgnored: String?
+    /// comfybox#307: non-nil only when `two_stage` was requested and the
+    /// refine pass could not run — see `LTX2RefineGate`.
+    let refineSkipped: String?
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2328,6 +2340,11 @@ public final class WarmServer {
       return nil
     }
     let req = try decode(LocalVideoRequest.self, from: body)
+    // comfybox#307: fold the top-level `two_pass` convenience into `tuning`
+    // before anything downstream reads it — every existing consumer
+    // (dims math, `LTX2ConfigResolver.resolveTyped`, the trace snapshot) then
+    // sees one authoritative tuning block, unchanged otherwise.
+    let effectiveTuning = LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass)
 
     // Video presets — same PresetStore as images (mediaKind "video"). A
     // preset is a named bundle: LoRAs (bare filenames resolve through the
@@ -2459,7 +2476,7 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    if LTX2ConfigResolver.resolveTyped(request: req.tuning, preset: videoPreset?.videoTuning).twoStage {
+    if LTX2ConfigResolver.resolveTyped(request: effectiveTuning, preset: videoPreset?.videoTuning).twoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
       if s1.halved {
         logger.info(
@@ -2639,7 +2656,7 @@ public final class WarmServer {
       loras: resolvedLoRAs,
       outputPath: resolvedOutput
 ,
-      tuning: req.tuning,
+      tuning: effectiveTuning,
       presetTuning: videoPreset?.videoTuning,
       audio: req.audio ?? false,
       beatSchedule: effectiveBeatSchedule
@@ -2899,7 +2916,8 @@ public final class WarmServer {
         elapsedSeconds: result.elapsedSeconds,
         backend: "ltx2-local",
         enhancementSkipped: prep.enhancementSkippedReason,
-        beatScheduleIgnored: prep.beatScheduleIgnoredReason
+        beatScheduleIgnored: prep.beatScheduleIgnoredReason,
+        refineSkipped: result.refineSkippedReason
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
@@ -6157,6 +6175,9 @@ private final class LocalVideoJob: @unchecked Sendable {
   var interrupted = false
   /// Authoritative config snapshot, set at submit (finding #15).
   var resolvedConfig: [LTX2ResolvedParam]?
+  /// comfybox#307: set on success when `two_stage` was requested and the
+  /// refine could not run — see `LTX2RefineGate`.
+  var refineSkippedReason: String?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -6183,7 +6204,8 @@ private final class LocalVideoJob: @unchecked Sendable {
       progressPercent: progressPercent,
       resolvedConfig: resolvedConfig,
       frameCount: frameCount,
-      interrupted: interrupted ? true : nil
+      interrupted: interrupted ? true : nil,
+      refineSkipped: refineSkippedReason
     )
   }
 }
@@ -6336,16 +6358,22 @@ final class VideoJobTracker: @unchecked Sendable {
       job.durationMs = Int(result.elapsedSeconds * 1000)
       job.progressPercent = 100
       job.completedAt = Date()
+      job.refineSkippedReason = result.refineSkippedReason
     }
     lock.unlock()
+    var payload = [
+      "status": "succeeded",
+      "output_path": result.outputPath,
+      "frames": String(result.frameCount),
+      "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
+    ]
+    // comfybox#307: durable on the trace even after the job itself prunes —
+    // `RenderTraceStore` outlives `pruneCompleted`'s 1h job TTL.
+    if let reason = result.refineSkippedReason {
+      payload["refine_skipped"] = reason
+    }
     traceStore?.append(RenderTraceEvent(
-      renderId: jobId, event: .terminal, taskKind: .videoRender,
-      payload: [
-        "status": "succeeded",
-        "output_path": result.outputPath,
-        "frames": String(result.frameCount),
-        "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
-      ]))
+      renderId: jobId, event: .terminal, taskKind: .videoRender, payload: payload))
   }
 
   func markFailed(_ jobId: String, error: Error) {
@@ -6508,6 +6536,21 @@ private actor WarmServerCoordinator {
   /// published into /health as `last_recipe`. Set only from a completed
   /// render (a failed one writes no record), never from a request.
   private var lastRecipe: AppliedRecordSlot?
+
+  /// comfybox#308: apply one render's terminal outcome to the counters
+  /// `/health` and `/v1/queue` publish. The six image `run*Generate` methods
+  /// still hand-increment inline (unchanged, working, and out of scope here);
+  /// this is for paths — currently just `.localVideo` — that had no
+  /// equivalent at all.
+  private func recordRenderCompletion(_ event: RenderCompletionEvent) {
+    var counters = RenderHealthCounters(
+      successCount: successfulRenderCount, failedCount: failedRenderCount,
+      lastDurationMs: lastRenderDurationMs)
+    counters.apply(event)
+    successfulRenderCount = counters.successCount
+    failedRenderCount = counters.failedCount
+    lastRenderDurationMs = counters.lastDurationMs
+  }
 
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
@@ -8299,8 +8342,13 @@ private actor WarmServerCoordinator {
           // documented SIGKILL condition this gate exists to prevent.
           let admission = await self.admitVideoForRender(wantsAudio: wantsAudio)
           guard admission.admitted else {
-            continuation.resume(throwing: WarmServerError.invalidRequest(
-              message: "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"))
+            let message = "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"
+            // comfybox#308: this job DID reach the front of the queue and DID
+            // fail to run — a real completion, not a queue-full rejection
+            // (those throw before ever dequeuing, same as the image path).
+            self.recordRenderCompletion(.failed)
+            self.lastError = message
+            continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
             return
           }
           self.videoHolder.beginRender()
@@ -8332,6 +8380,13 @@ private actor WarmServerCoordinator {
               outcome = try await self.runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
             }
             if case .completed(let result) = outcome {
+              // comfybox#308: the `.localVideo` completion path never touched
+              // `/health`'s render counters — only the six image `run*Generate`
+              // methods did. Every video render (HQ two-pass included) was
+              // invisible to `render_count`/`last_render_duration_ms` no
+              // matter how many completed.
+              self.recordRenderCompletion(.succeeded(durationMs: Int(result.elapsedSeconds * 1000)))
+              self.lastError = nil
               continuation.resume(returning: result)
             }
           } catch is CancellationError {
@@ -8339,10 +8394,15 @@ private actor WarmServerCoordinator {
             // the client sees why the render stopped instead of the opaque
             // "CancellationError()" Todd reported on the 2026-08-30 incident.
             // `VideoJobTracker.markFailed` recognises this case and reports
-            // the job interrupted rather than failed.
+            // the job interrupted rather than failed. Deliberately NOT routed
+            // through `recordRenderCompletion`/`failedRenderCount` — an
+            // operator interrupt is not a render failure (comfybox#322's own
+            // framing); there is no separate "interrupted" health counter.
             self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
             continuation.resume(throwing: WarmServerError.renderInterrupted)
           } catch {
+            self.recordRenderCompletion(.failed)
+            self.lastError = error.localizedDescription
             continuation.resume(throwing: error)
           }
         }
