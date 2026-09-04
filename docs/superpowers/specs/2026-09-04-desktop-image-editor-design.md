@@ -96,6 +96,10 @@ mask tool the editor needs, so it moves to shared code:
   layer inside the fitted rect. `fitRect` moves alongside it as a static
   helper.
 
+  **As shipped**, `showOverlay` is `tint: Color` + `enabled: Bool` — the
+  editor and Inpaint want different overlay colors, not just an on/off
+  switch, so a single boolean couldn't carry both.
+
 `InpaintView` switches to these three with no behaviour change; its
 `maskPNG()` becomes `MaskRasterizer.render(...)` followed by PNG
 encoding. This is the one refactor of existing code in this design.
@@ -127,7 +131,14 @@ operations, fixed and documented in code:
    output with the local adjustments, feather the rasterized mask with
    `CIGaussianBlur`, then `CIBlendWithMask` (adjusted over unadjusted).
    The mask is rasterized at the *post-geometry* size because the user
-   paints on the cropped view.
+   paints on the cropped view. Consequence: the mask is normalized to
+   whatever the crop/rotate/flip frame was AT PAINT TIME, not to the
+   source image itself — painting a local mask and then changing the
+   crop afterward rescales the mask onto the new frame, so the painted
+   region visibly moves relative to the picture. The Crop/Local mutual
+   exclusivity (see Views) prevents this within a single session step
+   but not across a later crop edit; paint the local mask after settling
+   the crop.
 4. **Subject**: when `removeBackground` is set and `subjectMask` is
    present, multiply alpha by the (optionally inverted) mask via
    `CIBlendWithMask` against a transparent background. When set but no
@@ -170,6 +181,17 @@ can say "no subject found" versus "Vision failed".
   source, stores the mask, and re-renders.
 - `reset()` restores `EditRecipe()`.
 
+**As shipped**, two additions beyond the above:
+- `suppressCropForPreview: Bool` — when true, the preview renders with
+  `recipe.geometry.crop` cleared (every other stage still applied) so
+  the Crop group's overlay can draw its handles over the uncropped
+  frame; `EditView` sets it from whether the Crop group is expanded.
+  Export always honors the real crop regardless of this flag.
+- `export()` refuses (throws, doesn't write anything) when
+  `recipe.subject.removeBackground` is on and no subject mask has been
+  found yet — the export can't produce the requested transparent PNG,
+  so this fails loud at Save rather than silently ignoring the flag.
+
 ### EditExporter
 
 `enum EditExporter` with:
@@ -178,6 +200,14 @@ can say "no subject found" versus "Vision failed".
 static func export(session: EditSession, outputDirectory: String,
                    ingestor: AssetIngestor?) async throws -> String
 ```
+
+**As shipped**, `EditExporter.export` takes explicit parameters
+(`sourceImage`, `sourcePath`, `sourceAsset`, `recipe`, `subjectMask`,
+`outputDirectory`, `ingestor`, `resolveLineage`) rather than a whole
+`session:` — this makes it independently testable without constructing
+a `@MainActor` `EditSession`. `EditSession.export(outputDirectory:
+ingestor:)` wraps it, snapshotting the live recipe/mask and passing its
+own lineage state (see `resolveLineage` below).
 
 1. Render at full resolution with a fresh `CIContext` and write PNG to
    `<outputDirectory>/edit-<unixSeconds>.png` (with `-2`, `-3` suffix on
@@ -193,11 +223,24 @@ static func export(session: EditSession, outputDirectory: String,
      "recipe": <EditRecipe JSON>, "editor": "ComfyBoxDesktop", "created_at": ISO-8601 }`.
    - When the source itself is a derived edit, `source_path` and
      `source_asset_id` point at the **root original**, so re-edits stack
-     on original pixels.
-3. Ingest via `ingestor.ingestFile(at:)`. If step 1 fails nothing is
-   written; if step 2 fails the PNG is removed; if step 3 fails the
-   files remain and the error is surfaced (the poller will pick the
-   file up).
+     on original pixels — this chain walk is `resolveLineage: Bool = true`.
+     `EditSession` passes `false` when it already knows the chain can't be
+     trusted (a missing root, or a malformed/cyclic chain — both cases
+     where it fell back to editing flattened pixels rather than resolving
+     a root); with `resolveLineage: false`, `source_path`/`source_asset_id`
+     are `sourcePath`/`source.id` verbatim, with no chain walk, so the new
+     sidecar points at what was actually edited instead of re-discovering
+     the same broken chain.
+3. Ingest via `ingestor.ingestFile(at:)`. Writes are published atomically:
+   steps 1–2 happen under a non-image `<base>.png.part` temp name (reserved
+   up front, exclusive-create, so two concurrent exports can't collide) and
+   `<base>.json`; only once both are complete does `rename(2)` move `.part`
+   to its real `.png` name — the one moment the image becomes visible to
+   anything watching the output directory (the ingest poller included), by
+   which point its sidecar already exists too. Any failure before the
+   rename removes `.part` and any partial `.json`; a failed rename does the
+   same. If step 3 (ingest) fails, the published files remain and the
+   error is surfaced (the poller will pick the file up on its own).
 
 `EditSidecar.read(forImageAt:) -> EditSidecar?` parses the `edit` block
 back for reopen and for the detail view.
@@ -218,9 +261,23 @@ back for reopen and for the detail view.
   the restricted adjustment sliders, clear mask), Subject (Find
   subject, Remove background, Invert). Toolbar: Undo, Redo, Reset,
   Before, Save, Save and Open in Inpaint.
+
+  **As shipped**, Crop and Local are mutually exclusive expanded groups:
+  opening one collapses the other. Local strokes are recorded against
+  the uncropped (post-geometry-so-far, pre-crop) frame, and the crop
+  overlay's drag gesture would otherwise steal the Local layer's paint
+  drags over the same canvas region — see `EditRenderer`'s local-layer
+  note above for the mask/crop-order caveat this implies.
 - **EditTab**: wraps EditView with an Open button (`NSOpenPanel`,
   PNG/JPEG/TIFF) and consumes a `@Binding pendingEditImage: String?`
   the same way Inpaint consumes `pendingInpaintImage`.
+
+  **As shipped**, the binding is `@Binding pending: EditRequest?`, where
+  `EditRequest { let path: String; let asset: DAMAsset? }` — a path-only
+  request (e.g. from the Open… panel) carries `asset: nil`; a request
+  from the gallery/detail view carries the `DAMAsset` so the exported
+  sidecar can record `source_asset_id` and copy the generation fields
+  without a second lookup.
 - **Asset detail**: an Edit action beside Send to Generate; when the
   sidecar has an `edit` block, a line "Edited from <source filename>"
   with a button that selects the source asset. Gallery context menu gets
@@ -249,6 +306,7 @@ recipe is dropped, and a warning says so.
 | Preview render throws | Previous preview stays, `warning` set, next change retries. |
 | Export write failure | No partial files (see EditExporter); error shown in toolbar. |
 | Recipe version too new | Load pixels, drop recipe, warn. |
+| Remove Background on, no subject mask | `export()` throws before writing anything; error shown in toolbar. Run Find Subject, or turn Remove Background off. |
 
 ## Testing
 
