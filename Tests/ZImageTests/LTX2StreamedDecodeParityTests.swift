@@ -43,7 +43,7 @@ final class LTX2StreamedDecodeParityTests: XCTestCase {
 
     let plain = decoder(latent)
     MLX.eval(plain)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(streamed)
 
     XCTAssertEqual(plain.shape, streamed.shape,
@@ -62,7 +62,7 @@ final class LTX2StreamedDecodeParityTests: XCTestCase {
     let latent = MLXRandom.normal([1, 128, 4, 3, 3]).asType(.float32)
 
     let plain = decoder(latent)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(plain, streamed)
 
     XCTAssertEqual(plain.shape, streamed.shape)
@@ -80,8 +80,8 @@ final class LTX2StreamedDecodeParityTests: XCTestCase {
     // Two consecutive streamed decodes of the same input must agree — stale
     // stream state (conv caches, drop-first flags, skip queues) would skew
     // the second run.
-    let first = decoder.decodeStreamed(latent)
-    let second = decoder.decodeStreamed(latent)
+    let first = try decoder.decodeStreamed(latent)
+    let second = try decoder.decodeStreamed(latent)
     MLX.eval(first, second)
 
     let rel = MLX.abs(first - second).max().item(Float.self)

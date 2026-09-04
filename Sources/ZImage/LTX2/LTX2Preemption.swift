@@ -282,3 +282,48 @@ public struct LTX2ResumeState {
     self.context = context
   }
 }
+
+// MARK: - comfybox#322: step-boundary cancellation
+
+/// The ONE step-boundary gate every long LTX-2 loop calls.
+///
+/// comfybox#322: before this existed the LTX-2 render path had zero
+/// `Task.checkCancellation()` sites, so `/v1/queue/interrupt` could only stop
+/// the NEXT queue item — a bad 30-minute clip had to burn to completion. The
+/// image path got the same treatment in comfybox#304 (`Krea2DenoiseLoop.run`,
+/// `ChromaPipeline.denoise`), and this mirrors it exactly: one check per step,
+/// `CancellationError` propagating unmodified to the coordinator.
+///
+/// LTX-2 differs from the image path in one way that makes a shared function
+/// worth having: its loops ALSO carry the #1479 preemption signal, and the two
+/// mechanisms mean opposite things. A preemption yield parks a checkpoint so
+/// the render RESUMES later; a cancel must abandon the render. So the ordering
+/// is a correctness property, not a style choice — cancellation is evaluated
+/// FIRST, and a cancel arriving during a preemption handoff cancels cleanly
+/// instead of banking a checkpoint that would be resumed.
+public enum LTX2LoopBoundary {
+  /// What the loop should do once it is known not to be cancelled.
+  public enum Decision: Equatable {
+    /// Run the next step.
+    case proceed
+    /// Bank a #1479 checkpoint and hand it up (`.yielded`).
+    case yield
+  }
+
+  /// Pure form — the whole decision, with no ambient state. Kept separate from
+  /// the production entry so the ordering above is unit-testable without a
+  /// pipeline, weights, or a live task.
+  ///
+  /// - Throws: `CancellationError` when `cancelled` is true, regardless of
+  ///   `preemptionRaised`.
+  public static func decide(cancelled: Bool, preemptionRaised: Bool) throws -> Decision {
+    if cancelled { throw CancellationError() }
+    return preemptionRaised ? .yield : .proceed
+  }
+
+  /// Production entry: reads the ambient task's cancellation flag and the
+  /// render's preemption signal.
+  public static func decide(preemption: PreemptionSignal?) throws -> Decision {
+    try decide(cancelled: Task.isCancelled, preemptionRaised: preemption?.isRaised == true)
+  }
+}

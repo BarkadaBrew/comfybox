@@ -2904,6 +2904,13 @@ public final class WarmServer {
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
     } catch {
+      // comfybox#322: an operator interrupt is not a server failure. 499
+      // (client-closed / cancelled) rather than 500, with a sentence naming
+      // the cause instead of the bare "CancellationError()".
+      if isRenderInterruption(error) {
+        logger.info("LTX-2: synchronous video render interrupted by /v1/queue/interrupt.")
+        return .error(.error(status: 499, message: "LTX-2 video interrupted by /v1/queue/interrupt"))
+      }
       return .error(.error(status: 500, message: "LTX-2 video failed: \(error.localizedDescription)"))
     }
   }
@@ -5259,6 +5266,10 @@ public final class WarmServer {
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      // comfybox#322: an operator interrupt is not a server fault — 499
+      // (cancelled), the same code the synchronous video route reports.
+      case .renderInterrupted:
+        return .error(status: 499, message: error.localizedDescription ?? error.localizedDescription)
       }
 
     case let error as Flux2Pipeline.Flux2PipelineError:
@@ -6124,6 +6135,10 @@ private final class LocalVideoJob: @unchecked Sendable {
   var error: String?
   var progressPercent: Int?
   var completedAt: Date?
+  /// comfybox#322: this render was stopped by `/v1/queue/interrupt`, not by a
+  /// failure. Surfaced as the additive `interrupted` field on the status JSON
+  /// (see `VideoJobStatus.interrupted` for why `status` itself stays `failed`).
+  var interrupted = false
   /// Authoritative config snapshot, set at submit (finding #15).
   var resolvedConfig: [LTX2ResolvedParam]?
 
@@ -6151,7 +6166,8 @@ private final class LocalVideoJob: @unchecked Sendable {
       elapsedMs: elapsedMs,
       progressPercent: progressPercent,
       resolvedConfig: resolvedConfig,
-      frameCount: frameCount
+      frameCount: frameCount,
+      interrupted: interrupted ? true : nil
     )
   }
 }
@@ -6317,6 +6333,14 @@ final class VideoJobTracker: @unchecked Sendable {
   }
 
   func markFailed(_ jobId: String, error: Error) {
+    // comfybox#322: an operator interrupt is not a failure. Both spellings of
+    // it (a raw `CancellationError` out of a pipeline loop, and the named
+    // `WarmServerError.renderInterrupted` the video queue case substitutes)
+    // land here, because `submit`'s only terminal-error path is this method.
+    if isRenderInterruption(error) {
+      markInterrupted(jobId)
+      return
+    }
     lock.lock()
     if let job = jobs[jobId] {
       job.state = .failed
@@ -6327,6 +6351,27 @@ final class VideoJobTracker: @unchecked Sendable {
     traceStore?.append(RenderTraceEvent(
       renderId: jobId, event: .terminal, taskKind: .videoRender,
       payload: ["status": "failed", "error": error.localizedDescription]))
+  }
+
+  /// comfybox#322: terminal, but not a failure — `/v1/queue/interrupt` stopped
+  /// this render mid-flight.
+  ///
+  /// `state` stays `.failed` so every existing polling client still sees a
+  /// terminal status it knows (see `VideoJobStatus.interrupted`); the additive
+  /// `interrupted` flag and the trace's `status: interrupted` carry the real
+  /// outcome. The trace has no wire-compat constraint, so it says the truth.
+  func markInterrupted(_ jobId: String) {
+    lock.lock()
+    if let job = jobs[jobId] {
+      job.state = .failed
+      job.interrupted = true
+      job.error = "Render interrupted by /v1/queue/interrupt"
+      job.completedAt = Date()
+    }
+    lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .terminal, taskKind: .videoRender,
+      payload: ["status": "interrupted", "interrupted": "true"]))
   }
 
   /// Drop completed/failed jobs older than `ttl`. Mirrors `ImageJobTracker`.
@@ -8152,21 +8197,48 @@ private actor WarmServerCoordinator {
             // unconditionally; clearing an unraised signal is a no-op.
             ltx2PreemptionSignal.clear()
           }
-          do {
-            // #1479: body() may hand back a checkpoint instead of a finished
-            // clip (a `preempt: true` image job raised the signal). Loop
-            // rather than recurse: a resume can itself yield again (a second,
-            // later preemption), and each iteration is handled identically.
-            var outcome = try body(report)
-            while case .yielded(let state) = outcome {
-              outcome = try await runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
+          // comfybox#322: run the render in a RETAINED child task and publish
+          // it, exactly as `.generate` / `.controlGenerate` do above. Before
+          // this, `.localVideo` was the one render case that never published a
+          // handle, so `activeRenderTask` stayed nil for the whole 5-60 minute
+          // clip and `/v1/queue/interrupt` answered `interrupted: false` — the
+          // interrupt could only stop the NEXT queue item. The LTX-2 loops
+          // (`LTX2LoopBoundary` / `Task.checkCancellation`) observe the
+          // cancellation this handle delivers.
+          //
+          // The task inherits this actor's isolation, so the render is still
+          // serialized on the coordinator exactly as before; `await
+          // renderTask.value` keeps the queue loop parked until it finishes.
+          let renderTask = Task {
+            do {
+              // #1479: body() may hand back a checkpoint instead of a finished
+              // clip (a `preempt: true` image job raised the signal). Loop
+              // rather than recurse: a resume can itself yield again (a second,
+              // later preemption), and each iteration is handled identically.
+              var outcome = try body(report)
+              while case .yielded(let state) = outcome {
+                outcome = try await self.runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
+              }
+              if case .completed(let result) = outcome {
+                continuation.resume(returning: result)
+              }
+            } catch is CancellationError {
+              // comfybox#322: an operator interrupt, not a failure. Named so
+              // the client sees why the render stopped instead of the opaque
+              // "CancellationError()" Todd reported on the 2026-08-30 incident.
+              // `VideoJobTracker.markFailed` recognises this case and reports
+              // the job interrupted rather than failed.
+              self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
+              continuation.resume(throwing: WarmServerError.renderInterrupted)
+            } catch {
+              continuation.resume(throwing: error)
             }
-            if case .completed(let result) = outcome {
-              continuation.resume(returning: result)
-            }
-          } catch {
-            continuation.resume(throwing: error)
           }
+          activeRenderTask = renderTask
+          liveHealth.setActiveRenderTask(renderTask)
+          await renderTask.value
+          activeRenderTask = nil
+          liveHealth.setActiveRenderTask(nil)
         }
       case .shutdown(let continuation):
         continuation.resume(
@@ -10951,6 +11023,11 @@ public enum WarmServerError: Error, LocalizedError {
   /// or the requested base under the preset's name, are both wrong — so it is
   /// a 409 naming all three rather than a silent pick.
   case presetModelConflict(preset: String, presetModel: String, requestModel: String)
+  /// comfybox#322: the in-flight render was cancelled by
+  /// `/v1/queue/interrupt`. Distinct from every failure above — nothing went
+  /// wrong, an operator asked for the box back. `VideoJobTracker` and the
+  /// video routes recognise it and report the job interrupted, not failed.
+  case renderInterrupted
 
   public var errorDescription: String? {
     switch self {
@@ -11009,8 +11086,22 @@ public enum WarmServerError: Error, LocalizedError {
     case .unknownNoiseType(let name, let valid):
       return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
         + "omit it for gaussian"
+    case .renderInterrupted:
+      return "Render interrupted by /v1/queue/interrupt"
     }
   }
+}
+
+/// comfybox#322: is this error an operator interrupt rather than a failure?
+///
+/// Both spellings reach the trackers: `CancellationError` straight out of a
+/// pipeline loop (the image path's #304 contract — propagate unmodified), and
+/// `WarmServerError.renderInterrupted`, the named form the video queue case
+/// substitutes so the client sees a sentence instead of "CancellationError()".
+func isRenderInterruption(_ error: Error) -> Bool {
+  if error is CancellationError { return true }
+  if case WarmServerError.renderInterrupted = error { return true }
+  return false
 }
 
 #if DEBUG

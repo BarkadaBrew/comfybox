@@ -131,7 +131,7 @@ final class LTX2VAERowBandTests: XCTestCase {
     let latent = vae.encode(clip)
     MLX.eval(latent)
     XCTAssertEqual(latent.shape, [1, 128, 13, 16, 28], "unexpected latent shape")
-    let decoded = streamed ? vae.decodeStreamed(latent) : vae.decode(latent)
+    let decoded = streamed ? try vae.decodeStreamed(latent) : vae.decode(latent)
     MLX.eval(decoded)
     let pixF = decoded.dim(2)
     let s = (mid: frameStd(decoded, pixF / 2), first: frameStd(decoded, 0), last: frameStd(decoded, pixF - 1))
