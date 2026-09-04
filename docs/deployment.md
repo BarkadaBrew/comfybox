@@ -281,3 +281,66 @@ curl -s http://mac:7862/health | python3 -m json.tool
 | WarmServer crashes repeatedly | Circuit breaker trips | Check `screen -r warmserver` logs, fix root cause |
 | Port 7862 in use | Previous instance didn't clean up | `lsof -ti:7862 | xargs kill` |
 | Metal library not found | Build artifact missing | Rebuild with xcodebuild, copy `mlx.metallib` next to binary |
+
+## CI: Nightly Integration Runner
+
+Two test tiers exist (#332, #137):
+
+- **Unit tier** (`.github/workflows/ci.yml`) — `ZImageTests`, `ComfyBoxDesktopTests`, `ComfyBoxCatalogTests`. Runs on every push/PR on GitHub-hosted `macos-latest`. No model weights needed.
+- **Integration tier** (`.github/workflows/nightly-integration.yml`) — `ZImageIntegrationTests`, `ZImageE2ETests`. Needs real model weights, a GPU, and (for a few tests) network access to Hugging Face. Runs nightly on a cron plus `workflow_dispatch`, and **only** on a self-hosted runner Todd registers and opts in explicitly. Until that setup is done, the `integration` job shows as **skipped** on every run — this is expected, not a failure.
+
+### Why this can't run on GitHub-hosted runners
+
+GitHub-hosted macOS runners have no Apple-silicon GPU and no local copy of the model weights (`mzbac/z-image-turbo-8bit`, the LTX-2 `pinkcherry-v18-distill06-int8` checkpoint, the Gemma-3 text encoder, LoRA fixtures). `intent.md` is explicit that agents run the unit tier only; integration/E2E need Todd's Mac.
+
+### Registering the self-hosted runner
+
+**This is Todd's call — nothing here registers or configures a runner automatically.** Steps, when you're ready:
+
+1. Pick a Mac with the weights already present (or budget the disk/network to fetch them — see "Required weights" below). **Caution:** if this is the production Mac (10.0.100.134) that also runs the live ComfyBox engine, LM Studio, and the gallery service, a nightly integration run will contend for the same GPU/model memory as production traffic — this repo's working convention for agents on that Mac is unit tests only in CI; integration/E2E tests need model weights and a GPU and are run deliberately, not from an automated agent loop. Consider a dedicated/secondary Mac, or schedule the cron for a window (edit the `schedule:` cron in `nightly-integration.yml`) when production load is lowest, and be ready to cancel a run manually if it collides with live traffic.
+2. In the repo (Settings → Actions → Runners → New self-hosted runner), follow GitHub's generated `./config.sh` instructions for macOS/ARM64.
+3. When prompted for labels, add (in addition to the defaults GitHub adds): `macOS`, `comfybox-weights`. The workflow targets `runs-on: [self-hosted, macOS, comfybox-weights]` — the runner must carry all three labels (`self-hosted` is implicit).
+4. Install the runner as a persistent service (`./svc.sh install && ./svc.sh start`) so it survives reboots, matching this repo's launchd conventions (see "Keepalive with Screen" above).
+5. Once the runner is online (Settings → Actions → Runners shows it "Idle"), set the repository variable that arms the nightly job: Settings → Secrets and variables → Actions → Variables → New repository variable → `COMFYBOX_WEIGHTS_RUNNER_AVAILABLE` = `true`. (The job is gated on this variable rather than probing for the runner via the API, since listing self-hosted runners needs the "administration" token permission, which the workflow's `GITHUB_TOKEN` cannot hold.)
+
+### Runbook: runner registered but offline
+
+The `COMFYBOX_WEIGHTS_RUNNER_AVAILABLE` gate only covers "no runner was ever registered" (job shows **skipped**). It does not cover a runner that's registered but currently unreachable — asleep, its `svc` stopped, the Mac mid-reboot or off the network. In that case a scheduled or `workflow_dispatch` run still targets `[self-hosted, macOS, comfybox-weights]`, finds a matching-but-offline runner, and sits **queued** rather than skipping; GitHub's only automatic bound on a queued job is a 24h cancel, well past this workflow's `timeout-minutes: 150` (which only bounds run time once a runner has actually picked the job up).
+
+Before relying on a scheduled/dispatched run (or when a run has been queued suspiciously long):
+
+- Check the runner is online: `gh api repos/BarkadaBrew/comfybox/actions/runners --jq '.runners[] | {name, status, labels: [.labels[].name]}'` (needs a token with the "administration" repo permission — the default `GITHUB_TOKEN` can't do this, so run it with your own `gh auth`, not from inside a workflow). Look for `status: "online"` on the runner carrying the `comfybox-weights` label.
+- If a run is stuck queued because the runner is offline, cancel it manually (Actions tab → the run → "Cancel workflow") rather than waiting out the 24h auto-cancel.
+- When taking the runner Mac offline for maintenance (reboot, weights migration, etc.), flip `COMFYBOX_WEIGHTS_RUNNER_AVAILABLE` back to `false` first so scheduled runs skip cleanly instead of queuing against a Mac you know is about to disappear; flip it back to `true` once the runner is confirmed "Idle" again.
+- Running the runner as a `launchd` agent (rather than a foreground `./run.sh`) is recommended so it comes back automatically after a reboot — matching this repo's other keepalive conventions (see "Keepalive with Screen" above) — but that's a setup choice for Todd to make when registering it; nothing here does this automatically.
+
+### Required weights and env on the runner
+
+| Env var | Default | Used by |
+|---|---|---|
+| `LTX2_TEST_WEIGHTS_DIR` | `/Volumes/Bolt/Models/pinkcherry-v18-distill06-int8` (falls back to `/tmp/ltx2-local-weights` if present) | `LTX2PreemptionResumeTests` |
+| `ZIMAGE_TEST_LORA_PATH` | `ostris/z_image_turbo_childrens_drawings` (downloaded from Hugging Face) | `LoRAIntegrationTests` |
+
+Not overridable via env — must exist at these fixed paths on the runner:
+
+- Gemma-3 text encoder: `/Users/toddwalderman/LocalModels/gemma-3-12b-heretic-q8` (`LTX2PreemptionResumeTests`)
+- LTX-2 distilled checkpoint: `/Volumes/Bolt/Models/ltx2-distilled` (`LTX2IntegrationTest`, `LTX2MultiKeyframeSpike`)
+
+`PipelineIntegrationTests`, `ControlNetIntegrationTests`, `LoRAIntegrationTests`, `PerformanceTests` pull `mzbac/z-image-turbo-8bit` (~7.5GB) through the Hugging Face Hub client on first run and cache it locally — the runner needs network egress to Hugging Face the first time (or a pre-warmed cache) and ~10GB of free disk for it.
+
+`ZImageE2ETests` builds and runs the CLI binary directly (`swift build -c release --product ComfyBox` under the hood) — it does not need a running warm server or any port.
+
+**The `CI` environment variable must NOT be set when the tests run.** Most integration/E2E test classes gate GPU-needing tests on `ProcessInfo.processInfo.environment["CI"] != nil` — true for any value, including an empty string. Some route that check through a shared `skipIfNoGPU()` helper (`throw XCTSkip(...)` on a hit); others (e.g. `PipelineIntegrationTests`, `LoRAIntegrationTests` — see their `class func setUp()`) check `CI` inline to decide whether to even construct the shared pipeline in the first place. Both patterns key off the same env var and are covered the same way: GitHub Actions sets `CI=true` by default on every runner, hosted and self-hosted, so `nightly-integration.yml` strips it with `env -u CI` immediately before invoking `xcodebuild`. If you ever run this suite by hand on the runner outside the workflow, do the same (`env -u CI xcodebuild test ...`) or every GPU test will silently report as skipped rather than actually running.
+
+### Known state of the integration/E2E suites (as of #332/#137)
+
+- `LoRAIntegrationTests.testLoRAConfigurationScaleClamped` is quarantined (`XCTSkip`, not deleted) — it asserts a clamping contract the engine deliberately abandoned. Someone still needs to decide whether to delete it or rewrite it against the current no-clamp behavior.
+- `PipelineIntegrationTests.testDeterministicSeed` and `CLIEndToEndTests.testControlNetWithCanny`/`testControlNetWithHed` were red during the 2026-08-31 gate run but **not** quarantined here — the root cause (real nondeterminism vs. orphaned-process GPU contention) was never established (see #332). Quarantining them without evidence would hide a possible real bug; if the first real nightly run reproduces the failure, `#332`'s comment thread is the place to classify it before deciding whether to quarantine or fix.
+
+### What happens on failure
+
+The `nightly-integration.yml` job uploads the `.xcresult` bundle and full test log as a workflow artifact (14-day retention) and appends a comment to **#332** listing the failing test names, using `actions/upload-artifact` and `actions/github-script` — both need only the default `GITHUB_TOKEN`, no extra secrets.
+
+### Verifying the setup
+
+After registering the runner and setting the repo variable: Actions tab → "Nightly Integration" → "Run workflow" (`workflow_dispatch`). Confirm the `integration` job actually executes (not skipped) on the self-hosted runner, and — if you want to see the failure path exercised — check that a deliberately broken run produces both the artifact and the comment on #332.
