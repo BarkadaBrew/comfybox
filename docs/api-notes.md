@@ -69,6 +69,35 @@ For Krea-2 presets, Kroma belongs in the structured `kroma` object and must
 not be duplicated in `loras[]`. See
 [Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md).
 
+## Gallery output filenames
+
+Default render filenames (no `output_path` in the request) are built by
+`ComfyBoxOutputNaming.defaultFilename` (`Sources/ZImage/Server/ComfyBoxOutputNaming.swift`):
+
+```
+comfybox-<model>[-<preset>]-<tier>[-<source>]-<yyyyMMdd-HHmmss>-<4-hex-salt>.<ext>
+```
+
+e.g. `comfybox-krea2-avocado-20260904-143022-a3f2.png`. `<model>` is the
+short name of the active model spec (`krea2`, `kroma-v0.2`, `fibo`, …),
+`<tier>` is the request's content mode (`manual` when absent). This
+replaced the legacy `zimage-<uuid>.png` / `zimage-krea2-<uuid>.png` scheme
+in 2026-08 (commits `3ed1996`, `1cb123e`) — the model segment already
+carries the family, so **no code should reintroduce a hardcoded `zimage-`
+prefix on a persisted gallery file** (issue #251).
+
+Nothing in ComfyBox or the daemon (`coffeeshop-server`) parses this prefix
+to classify a render — model family, mode, preset etc. all come from the
+JSON metadata embedded in the PNG itself (`ComfyBoxCatalog/MetadataReader`)
+or from the request/response body, never from filename text. Existing
+`zimage-krea2-*` files on disk from before the 2026-08 change keep working
+unmodified — nothing needs to read or migrate them. `WarmServer.swift`'s
+`"zimage-…"` temp-file names (control image, mask, inpaint init, ESRGAN
+scratch files) are unrelated: they're process-local scratch paths deleted
+before the response returns, never a persisted gallery filename, and are
+unreachable for Krea-2 (`ControlNet is not supported for Flux 2 or
+Krea-2 models` — the route throws before any temp file is written).
+
 ## Startup imports
 
 - Character + preset legacy imports also run **once at server startup**
