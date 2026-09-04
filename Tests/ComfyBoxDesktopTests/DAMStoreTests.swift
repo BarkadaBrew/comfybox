@@ -2,6 +2,7 @@
 
 import Testing
 import Foundation
+import SQLite3
 import ComfyBoxCatalog
 @testable import ComfyBoxDesktop
 
@@ -520,6 +521,140 @@ struct DAMStoreTests {
         try? FileManager.default.removeItem(atPath: dbPath)
     }
 
+    // MARK: - Targeted id-based queries (#265)
+    //
+    // `assets(withIDs:)`, `assetIDs(withIDs:)` and `assetLocations(limit:offset:)`
+    // exist so a caller that already knows which handful of rows it needs
+    // (a restore's live-row lookup, a crash-recovery sweep, a folder's
+    // member set, a paged missing-file scan) never has to materialize the
+    // whole `assets` table to filter it in memory — see #265.
+
+    @Test("assets(withIDs:) returns exactly the requested rows, skipping ids that don't exist")
+    func assetsByIDs() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        for i in 0..<5 {
+            try await store.insertAsset(DAMAsset(id: "id-\(i)", filename: "f-\(i).png", absolutePath: "/tmp/f-\(i).png"))
+        }
+        let fetched = try await store.assets(withIDs: ["id-1", "id-3", "no-such-id"])
+        #expect(Set(fetched.map(\.id)) == ["id-1", "id-3"])
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assets(withIDs:) with an empty set returns no rows")
+    func assetsByIDsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        try await store.insertAsset(TestData.makeAsset(id: "solo"))
+        let fetched = try await store.assets(withIDs: [])
+        #expect(fetched.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assets(withIDs:) chunks an IN (...) list over 500 ids and returns every match")
+    func assetsByIDsChunking() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        var ids: Set<String> = []
+        for i in 0..<600 {
+            let id = "chunk-\(i)"
+            ids.insert(id)
+            try await store.insertAsset(DAMAsset(id: id, filename: "c-\(i).png", absolutePath: "/tmp/c-\(i).png"))
+        }
+        let fetched = try await store.assets(withIDs: ids)
+        #expect(fetched.count == 600)
+        #expect(Set(fetched.map(\.id)) == ids)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetIDs(withIDs:) returns only the ids that currently exist")
+    func assetIDsByIDs() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        for i in 0..<5 {
+            try await store.insertAsset(DAMAsset(id: "id-\(i)", filename: "f-\(i).png", absolutePath: "/tmp/f-\(i).png"))
+        }
+        let existing = try await store.assetIDs(withIDs: ["id-1", "id-3", "missing-id"])
+        #expect(existing == ["id-1", "id-3"])
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetIDs(withIDs:) with an empty set returns an empty set")
+    func assetIDsByIDsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        try await store.insertAsset(TestData.makeAsset(id: "solo"))
+        let existing = try await store.assetIDs(withIDs: [])
+        #expect(existing.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetIDs(withIDs:) chunks an IN (...) list over 500 ids and finds every existing one")
+    func assetIDsByIDsChunking() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        var ids: Set<String> = []
+        for i in 0..<600 {
+            let id = "chunk-\(i)"
+            ids.insert(id)
+            try await store.insertAsset(DAMAsset(id: id, filename: "c-\(i).png", absolutePath: "/tmp/c-\(i).png"))
+        }
+        let queried = ids.union(["definitely-not-there"])
+        let existing = try await store.assetIDs(withIDs: queried)
+        #expect(existing == ids)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetLocations pages through every row exactly once, in a stable order")
+    func assetLocationsPaging() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        var expected: [String: String] = [:]
+        for i in 0..<250 {
+            let id = "loc-\(String(format: "%03d", i))"
+            let path = "/tmp/loc-\(i).png"
+            expected[id] = path
+            try await store.insertAsset(DAMAsset(id: id, filename: "loc-\(i).png", absolutePath: path))
+        }
+
+        var seenIDs: [String] = []
+        var seenPaths: [String: String] = [:]
+        var offset = 0
+        let pageSize = 37 // not a divisor of 250 — exercises a partial last page
+        while true {
+            let page = try await store.assetLocations(limit: pageSize, offset: offset)
+            if page.isEmpty { break }
+            #expect(page.count <= pageSize)
+            for (id, path) in page { seenPaths[id] = path }
+            seenIDs.append(contentsOf: page.map(\.id))
+            offset += page.count
+            if page.count < pageSize { break }
+        }
+
+        #expect(seenIDs.count == 250, "every row visited")
+        #expect(Set(seenIDs).count == 250, "no row visited twice")
+        #expect(seenIDs == seenIDs.sorted(), "pages walk in a stable order")
+        #expect(seenPaths == expected)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
+    @Test("assetLocations on an empty store returns no rows on the first page")
+    func assetLocationsEmpty() async throws {
+        let tmpDir = NSTemporaryDirectory()
+        let dbPath = (tmpDir as NSString).appendingPathComponent("test-dam-\(UUID().uuidString).sqlite3")
+        let store = try await DAMStore.open(path: dbPath)
+        let page = try await store.assetLocations(limit: 100, offset: 0)
+        #expect(page.isEmpty)
+        try? FileManager.default.removeItem(atPath: dbPath)
+    }
+
     @Test("preserves all asset fields through insert and fetch")
     func allFields() async throws {
         let tmpDir = NSTemporaryDirectory()
@@ -575,5 +710,66 @@ struct DAMStoreErrorTests {
         let error = DAMStoreError.execFailed("CREATE TABLE", "table exists")
         #expect(error.errorDescription?.contains("CREATE TABLE") == true)
         #expect(error.errorDescription?.contains("table exists") == true)
+    }
+
+    @Test("stepFailed includes the sqlite code and message")
+    func stepFailed() {
+        let error = DAMStoreError.stepFailed(SQLITE_IOERR, "disk I/O error")
+        #expect(error.errorDescription?.contains("\(SQLITE_IOERR)") == true)
+        #expect(error.errorDescription?.contains("disk I/O error") == true)
+    }
+}
+
+/// #263: `while sqlite3_step(stmt) == SQLITE_ROW` cannot distinguish
+/// "the result set is finished" (`SQLITE_DONE`) from "the step itself
+/// failed partway through" (`SQLITE_BUSY`, `SQLITE_IOERR`,
+/// `SQLITE_CORRUPT`, …) — both fall out of the loop identically, silently
+/// truncating the result. `allAssetIds()`/`allAssetPaths()` and their
+/// destructive-chain neighbours (`securedAssetIds()`,
+/// `fetchAssets()`, `pruneOrphans()`'s `assetIDsHostedElsewhere()`) now
+/// route through `drainSQLiteRows`, which returns the terminal step code
+/// instead of swallowing it. Fault-injecting a real mid-iteration SQLite
+/// error into an actor-encapsulated connection is impractical to do
+/// deterministically, so this pins the shared draining primitive directly
+/// with a stubbed `step` closure, per the fallback the ticket allows.
+@Suite("drainSQLiteRows")
+struct DrainSQLiteRowsTests {
+    @Test("walks every row and returns SQLITE_DONE on a clean finish")
+    func cleanFinish() {
+        var remaining = [SQLITE_ROW, SQLITE_ROW, SQLITE_ROW, SQLITE_DONE]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_DONE)
+        #expect(seen == 3)
+    }
+
+    @Test("stops on a mid-iteration error and reports the failing code, not SQLITE_DONE")
+    func midIterationErrorStopsAndReportsCode() {
+        // Two good rows, then the step call itself fails — the historical
+        // bug treated this identically to "no more rows".
+        var remaining = [SQLITE_ROW, SQLITE_ROW, SQLITE_IOERR]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_IOERR)
+        #expect(rc != SQLITE_DONE)
+        #expect(seen == 2, "onRow must not fire for the failing step")
+    }
+
+    @Test("reports SQLITE_BUSY too — any non-ROW, non-DONE code must not look like end-of-set")
+    func busyIsNotTreatedAsDone() {
+        var remaining = [SQLITE_ROW, SQLITE_BUSY]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_BUSY)
+        #expect(seen == 1)
+    }
+
+    @Test("an empty result set still reports SQLITE_DONE, not an error")
+    func emptyResultIsNotAnError() {
+        var remaining = [SQLITE_DONE]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_DONE)
+        #expect(seen == 0)
     }
 }

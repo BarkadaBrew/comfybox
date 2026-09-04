@@ -9,6 +9,9 @@ import SwiftUI
 
 struct QueueView: View {
     @Bindable var engine: EngineService
+    /// Daemon-side queue (Kira cycles) — the engine list below only ever
+    /// shows the ONE dispatched job; the rest wait in the daemon.
+    @Bindable var kira: KiraClient
 
     @State private var queue: EngineService.QueueJobList?
     @State private var refreshTick = 0
@@ -22,6 +25,10 @@ struct QueueView: View {
                 if let error { Label(error, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
                 activeSection
                 pendingSection
+                // Daemon-side queue: everything the scheduler has booked that
+                // has NOT yet been dispatched to the engine (Todd 2026-08-30
+                // "the queue doesnt show all queued or pending jobs").
+                DaemonRenderQueuePanel(client: kira)
                 countsFooter
             }
             .padding(20)
@@ -61,6 +68,24 @@ struct QueueView: View {
 
     // MARK: - Active job
 
+    /// Map the engine's LTX-2 render phase to a user-facing stage label. The
+    /// base vs refine distinction is what makes a 2-pass render legible: you
+    /// see "Rendering — base pass" then "Refining — 2nd pass" instead of the
+    /// progress bar silently restarting.
+    static func stageLabel(_ phase: String?) -> String? {
+        switch phase {
+        case "modelLoad":    return "Loading models"
+        case "textEncode":   return "Encoding prompt"
+        case "baseDenoise":  return "Rendering — base pass"
+        case "refineDenoise": return "Refining — 2nd pass"
+        case "vaeDecode":    return "Decoding video"
+        case "vocoder":      return "Generating audio"
+        case "postProcess":  return "Finishing"
+        case .some(let p):   return p
+        case .none:          return nil
+        }
+    }
+
     @ViewBuilder private var activeSection: some View {
         if let q = queue, q.isRendering {
             VStack(alignment: .leading, spacing: 8) {
@@ -75,6 +100,12 @@ struct QueueView: View {
                 }
                 Text(q.activeSummary ?? "—").font(.callout).foregroundStyle(.secondary)
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                if let stage = Self.stageLabel(q.phase) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "wand.and.rays").font(.caption2).foregroundStyle(.secondary)
+                        Text(stage).font(.caption.weight(.semibold)).foregroundStyle(.primary)
+                    }
+                }
                 if let pct = q.progressPercent {
                     HStack(spacing: 8) {
                         ProgressView(value: Double(pct), total: 100)

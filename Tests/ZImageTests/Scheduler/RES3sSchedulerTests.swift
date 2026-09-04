@@ -131,12 +131,12 @@ final class RES3sSchedulerTests: XCTestCase {
   /// solution `x(σ) = D + (σ/σ₀)(x₀ − D)`. An exponential integrator whose
   /// weights sum to `φ₁(−h)` reproduces it in one step, and over the whole
   /// grid — this is the closed-form gate `res_3s` gets in place of a trace.
-  func testExactOnAConstantDataPrediction() {
+  func testExactOnAConstantDataPrediction() throws {
     let dConst: Float = -0.35
     let grid = Self.grid(steps: 4)
     var scheduler: any ZImageScheduler = RES3sScheduler(
       numInferenceSteps: 4, sigmaValues: grid, c2: 0.5)
-    let (out, stats) = Krea2DenoiseLoop.run(
+    let (out, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: MLXArray([Float(0.7)], [1])
     ) { latent, sigma in (latent - dConst) / sigma }
     let want = dConst + (grid.last! / grid.first!) * (0.7 - dConst)
@@ -150,7 +150,7 @@ final class RES3sSchedulerTests: XCTestCase {
   /// Third order on the scripted field, measured against a 200 000-step RK4
   /// reference — the exponential frame does not lose the order the anchored
   /// linear frame does (`ExplicitRKSchedulerTests` pins that contrast).
-  func testThirdOrderOnTheSyntheticODE() {
+  func testThirdOrderOnTheSyntheticODE() throws {
     let reference = ExplicitRKSchedulerTests.referenceSolution()
     var errors: [Double] = []
     // Coarser than the ralston sweep on purpose: `res_3s` converges fast
@@ -160,7 +160,7 @@ final class RES3sSchedulerTests: XCTestCase {
     // solver. 4 → 32 keeps every error two decades above the floor.
     for n in [4, 8, 16, 32] {
       let scheduler = RES3sScheduler(numInferenceSteps: n, sigmaValues: Self.grid(steps: n), c2: 0.5)
-      errors.append(abs(ExplicitRKSchedulerTests.runThroughDriver(scheduler) - reference))
+      errors.append(abs(try ExplicitRKSchedulerTests.runThroughDriver(scheduler) - reference))
     }
     // Minor 6: the whole Richardson sweep, not only the finest pair.
     let orders = ExplicitRKSchedulerTests.observedOrders(errors)
@@ -253,7 +253,7 @@ final class RES3sSchedulerTests: XCTestCase {
   /// A substep close to — but not at — the `b₃` pole is legal and finite. The
   /// guard refuses a singularity, not a neighbourhood, and `res_3s` still
   /// integrates the constant-x₀ closed form exactly there.
-  func testValidSubstepNearThePoleStillRuns() {
+  func testValidSubstepNearThePoleStillRuns() throws {
     let c2: Float = 0.95  // γ = −1.2384, γc₂ + c₃ = −0.1765
     XCTAssertNil(RES3sScheduler.unsupportedSubstepReason(c2: Double(c2), c3: 1.0))
     let table = RES3sScheduler.tableau(h: 0.5, c2: Double(c2), c3: 1.0)
@@ -263,7 +263,7 @@ final class RES3sSchedulerTests: XCTestCase {
     let grid = Self.grid(steps: 4)
     var scheduler: any ZImageScheduler = RES3sScheduler(
       numInferenceSteps: 4, sigmaValues: grid, c2: c2)
-    let (out, _) = Krea2DenoiseLoop.run(
+    let (out, _) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: MLXArray([Float(0.7)], [1])
     ) { latent, sigma in (latent - dConst) / sigma }
     let want = dConst + (grid.last! / grid.first!) * (0.7 - dConst)

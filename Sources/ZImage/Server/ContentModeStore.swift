@@ -364,9 +364,11 @@ public struct ContentModeStore: Codable, Equatable, Sendable {
 
   // MARK: - Paths & persistence
 
-  /// `~/.comfybox/content-modes.json`.
+  /// `~/.comfybox/content-modes.json`, or `$COMFYBOX_STATE_DIR/content-modes.json`
+  /// (K-FIX-1: must follow the same override `QueueStateStore`/
+  /// `ComfyBoxServerConfig` do, so a test never reads/writes the LIVE file).
   public static func defaultPath() -> URL {
-    ComfyBoxServerConfig.homeDirectory().appendingPathComponent(".comfybox/content-modes.json")
+    ComfyBoxServerConfig.stateDirectory().appendingPathComponent("content-modes.json")
   }
 
   /// Load `~/.comfybox/content-modes.json`. If absent or unreadable, ship built-in defaults,
@@ -393,6 +395,82 @@ public struct ContentModeStore: Codable, Equatable, Sendable {
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(self)
     try data.write(to: path, options: .atomic)
+  }
+
+  // MARK: - Mutation (FDD §3.3, D3 — PUT/DELETE /v1/content-modes/{mode})
+  //
+  // ContentModeStore.save() shipped uncalled (FDD §2.6): every mutation below is
+  // load→merge→save under one lock — the PromptRepositoryStore idiom — so two
+  // concurrent PUTs to different (or the same) mode can't interleave a
+  // torn read-modify-write.
+
+  private static let mutationLock = NSLock()
+
+  /// Valid range for `guidanceBoost` writes — generous enough for `avocado`'s
+  /// built-in 2.5 with headroom, tight enough to catch a fat-fingered request
+  /// (e.g. `250`) before it reaches a generation.
+  public static let guidanceBoostRange: ClosedRange<Double> = 0...10
+
+  /// Validation error naming the offending field (FDD §4.4 test list: "out-of-
+  /// range guidanceBoost ... → 400 naming the field" — the route handler maps
+  /// this straight to a `400` with `description` as the message).
+  public enum ValidationError: Error, CustomStringConvertible, Equatable {
+    case guidanceBoostOutOfRange(Double)
+
+    public var description: String {
+      switch self {
+      case .guidanceBoostOutOfRange(let value):
+        return "guidanceBoost must be between \(ContentModeStore.guidanceBoostRange.lowerBound) "
+          + "and \(ContentModeStore.guidanceBoostRange.upperBound) (got \(value))"
+      }
+    }
+  }
+
+  /// Update one mode's writable fields. Fields left `nil` keep their current
+  /// persisted value (a tolerant partial update, mirroring
+  /// ``ContentModeDefinition``'s own tolerant decode) — callers wanting to
+  /// clear `negativePromptAdditions` pass `[]` explicitly, not `nil`.
+  @discardableResult
+  public static func update(
+    mode: ContentMode,
+    guidanceBoost: Double? = nil,
+    promptHint: String? = nil,
+    negativePromptAdditions: [String]? = nil,
+    styleVariant: ContentStyleVariant? = nil,
+    at path: URL = ContentModeStore.defaultPath(),
+    fileManager: FileManager = .default
+  ) throws -> ContentModeDefinition {
+    if let guidanceBoost, !guidanceBoostRange.contains(guidanceBoost) {
+      throw ValidationError.guidanceBoostOutOfRange(guidanceBoost)
+    }
+    mutationLock.lock()
+    defer { mutationLock.unlock() }
+    var store = ContentModeStore.loadOrCreate(at: path, fileManager: fileManager)
+    var updated = store.definition(for: mode)
+    if let guidanceBoost { updated.guidanceBoost = guidanceBoost }
+    if let promptHint { updated.promptHint = promptHint }
+    if let negativePromptAdditions { updated.negativePromptAdditions = negativePromptAdditions }
+    if let styleVariant { updated.styleVariant = styleVariant }
+    store.modes = store.modes.map { $0.mode == mode ? updated : $0 }
+    try store.save(to: path, fileManager: fileManager)
+    return updated
+  }
+
+  /// Revert a mode to its built-in definition (never removes the entry — there
+  /// is always exactly one definition per ``ContentMode`` case).
+  @discardableResult
+  public static func reset(
+    mode: ContentMode,
+    at path: URL = ContentModeStore.defaultPath(),
+    fileManager: FileManager = .default
+  ) -> ContentModeDefinition {
+    mutationLock.lock()
+    defer { mutationLock.unlock() }
+    var store = ContentModeStore.loadOrCreate(at: path, fileManager: fileManager)
+    let builtin = ContentModeDefinition.builtin(mode)
+    store.modes = store.modes.map { $0.mode == mode ? builtin : $0 }
+    try? store.save(to: path, fileManager: fileManager)
+    return builtin
   }
 }
 

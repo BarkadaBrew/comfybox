@@ -88,7 +88,7 @@ final class Krea2StagedRenderTests: XCTestCase {
     var scheduler = try Krea2Pipeline.makeScheduler(
       sampler: request.sampler, sigmaSchedule: request.sigmaSchedule, steps: request.steps,
       shift: shift, seed: request.seed, c2: request.c2)
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: initial, startIndex: 0,
       modelEvalsPerEvaluate: request.guidance > 1 ? 2 : 1, evaluate: evaluate)
     let trace = Krea2RunTrace(

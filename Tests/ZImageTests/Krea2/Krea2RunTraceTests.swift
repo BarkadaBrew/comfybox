@@ -263,7 +263,7 @@ final class Krea2RunTraceTests: XCTestCase {
     let stepNoise = try m.steps.compactMap { $0.noiseStep }.map { try trace.tensor($0) }
     let substepNoise = try m.steps.flatMap { $0.substeps }.compactMap { $0.noise }
       .map { try trace.tensor($0) }
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &grid, initialSample: try trace.tensor(m.xInit),
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: RES4LYFSDENoiseInjector(

@@ -293,11 +293,16 @@ public final class LTX2Decoder3D: Module {
   ///   - maxRowsPerConv: Ceiling on frames x spatial positions per conv call
   ///     at any level (int32 offset budget: rows x 3456 must stay < 2^31).
   /// - Returns: Decoded video tensor `(B, 3, F, H, W)`.
+  ///
+  /// comfybox#322: `throws`. This is the production decode path for every clip
+  /// above the plain-decode volume gate — minutes of work on a long render —
+  /// so it checks for cancellation as each output volume is emitted and before
+  /// each piece is pushed down the block stack.
   public func decodeStreamed(
     _ sample: MLXArray,
     timestep: MLXArray? = nil,
     maxRowsPerConv: Int = 350_000
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     // Collect every stateful module, keyed per block for ended-marking.
     var allConvs: [CausalConv3d] = []
     var allUps: [LTX2DepthToSpaceUpsample] = []
@@ -355,7 +360,11 @@ public final class LTX2Decoder3D: Module {
       return pieces
     }
 
-    func runUp(_ idx: Int, _ input: MLXArray, _ ended: Bool) {
+    func runUp(_ idx: Int, _ input: MLXArray, _ ended: Bool) throws {
+      // comfybox#322: one check per piece at every level of the block stack.
+      // The recursion's leaves are the emitted output volumes, so a cancel is
+      // observed within one volume rather than at the end of the decode.
+      try Task.checkCancellation()
       if idx >= sortedKeys.count {
         // Final head: PixelNorm -> (mod) -> SiLU -> conv_out -> unpatchify.
         var x = pixelNorm(input)
@@ -397,7 +406,7 @@ public final class LTX2Decoder3D: Module {
 
       let pieces = splitByBudget(out)
       for (i, piece) in pieces.enumerated() {
-        runUp(idx + 1, piece, ended && i == pieces.count - 1)
+        try runUp(idx + 1, piece, ended && i == pieces.count - 1)
       }
     }
 
@@ -414,7 +423,7 @@ public final class LTX2Decoder3D: Module {
     eval(x)
     let entryPieces = splitByBudget(x)
     for (i, piece) in entryPieces.enumerated() {
-      runUp(0, piece, i == entryPieces.count - 1)
+      try runUp(0, piece, i == entryPieces.count - 1)
     }
 
     precondition(!outputs.isEmpty, "streamed decode emitted no frames")
@@ -430,6 +439,8 @@ public final class LTX2Decoder3D: Module {
       dtype: proto.dtype)
     var offset = 0
     for chunk in outputs {
+      // comfybox#322: the materialization walk is itself a per-volume loop.
+      try Task.checkCancellation()
       let n = chunk.dim(2)
       full[0..., 0..., offset..<(offset + n), 0..., 0...] = chunk
       eval(full)

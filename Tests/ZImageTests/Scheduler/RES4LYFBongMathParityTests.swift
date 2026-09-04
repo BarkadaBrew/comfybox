@@ -78,7 +78,7 @@ final class RES4LYFBongMathParityTests: XCTestCase {
     let (injector, stepNoise, substepNoise) = try recordedInjector(trace)
     let bong = bongMath(m)
 
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit),
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: injector, bongmath: bong)
@@ -187,7 +187,7 @@ final class RES4LYFBongMathParityTests: XCTestCase {
     let (injector, stepNoise, substepNoise) = try recordedInjector(trace)
     let bong = bongMath(m)
 
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit), startIndex: startIndex,
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: injector, bongmath: bong)
@@ -291,7 +291,7 @@ final class RES4LYFBongMathParityTests: XCTestCase {
     var scheduler = try RES4LYFTraceParityTests.productionRES2sScheduler()
     let (injector, _, _) = try recordedInjector(trace)
     let bong = bongMath(m)
-    _ = Krea2DenoiseLoop.run(
+    _ = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit),
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: injector, bongmath: bong)
@@ -442,7 +442,7 @@ final class RES4LYFBongMathParityTests: XCTestCase {
       scheduler = base
       startIndex = start
     }
-    let (x, _) = Krea2DenoiseLoop.run(
+    let (x, _) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit), startIndex: startIndex,
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: injector, bongmath: bongmath ? bongMath(m) : nil)
@@ -483,14 +483,14 @@ final class RES4LYFBongMathParityTests: XCTestCase {
 
     var omitted = try RES4LYFTraceParityTests.productionRES2sScheduler()
     let (omittedInjector, _, _) = try recordedInjector(trace)
-    let (baseline, baseStats) = Krea2DenoiseLoop.run(
+    let (baseline, baseStats) = try Krea2DenoiseLoop.run(
       scheduler: &omitted, initialSample: x0,
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: omittedInjector)
 
     var explicit = try RES4LYFTraceParityTests.productionRES2sScheduler()
     let (explicitInjector, _, _) = try recordedInjector(trace)
-    let (offed, offStats) = Krea2DenoiseLoop.run(
+    let (offed, offStats) = try Krea2DenoiseLoop.run(
       scheduler: &explicit, initialSample: x0,
       evaluate: { RES4LYFScriptedDenoiser.velocity($0, sigma: $1) },
       noise: explicitInjector,

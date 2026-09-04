@@ -195,4 +195,54 @@ extension LTX2ConfigResolverTests {
     XCTAssertEqual(resolved.refineSigmas, [0.85, 0.725, 0.4219, 0.0])
     XCTAssertEqual(resolved.provenance["refine_sigmas"], .preset)
   }
+
+  // MARK: - comfybox#307: `LTX2VideoTuning.merging` (top-level `two_pass`)
+
+  func testMergingNilTwoPassLeavesTuningUntouched() {
+    var base = LTX2VideoTuning(); base.refineScale = 1.35
+    let merged = LTX2VideoTuning.merging(base, twoPass: nil)
+    XCTAssertEqual(merged?.refineScale, 1.35)
+    XCTAssertNil(merged?.twoStage)
+  }
+
+  func testMergingNilTuningAndNilTwoPassStaysNil() {
+    XCTAssertNil(LTX2VideoTuning.merging(nil, twoPass: nil))
+  }
+
+  func testMergingTwoPassTrueOnNoTuningCreatesOne() {
+    let merged = LTX2VideoTuning.merging(nil, twoPass: true)
+    XCTAssertEqual(merged?.twoStage, true)
+  }
+
+  func testMergingTwoPassFalseOnNoTuningCreatesOne() {
+    let merged = LTX2VideoTuning.merging(nil, twoPass: false)
+    XCTAssertEqual(merged?.twoStage, false)
+  }
+
+  func testMergingTwoPassFillsInWhenTuningTwoStageUnset() {
+    var base = LTX2VideoTuning(); base.refineScale = 1.35  // some other field set, twoStage nil
+    let merged = LTX2VideoTuning.merging(base, twoPass: true)
+    XCTAssertEqual(merged?.twoStage, true)
+    XCTAssertEqual(merged?.refineScale, 1.35, "other fields on the existing tuning survive the merge")
+  }
+
+  /// The nested field is the more specific one — it wins on conflict.
+  func testMergingTuningTwoStageWinsOverConflictingTwoPass() {
+    var base = LTX2VideoTuning(); base.twoStage = false
+    let merged = LTX2VideoTuning.merging(base, twoPass: true)
+    XCTAssertEqual(merged?.twoStage, false, "explicit tuning.two_stage must not be overridden by two_pass")
+  }
+
+  /// End-to-end through the resolver: `two_pass` alone (no `tuning.two_stage`)
+  /// must reach `resolvedConfig.twoStage`, with `request` provenance — the
+  /// same as if the caller had sent `tuning.two_stage` directly. This is the
+  /// per-request control comfybox#307 asks for: no env var, no restart.
+  func testTwoPassAloneResolvesTwoStageAtRequestPrecedence() {
+    let merged = LTX2VideoTuning.merging(nil, twoPass: true)
+    let resolved = LTX2ConfigResolver.resolveTyped(
+      request: merged, preset: nil,
+      environment: ["LTX2_TWO_STAGE": "0"], configFile: [:])
+    XCTAssertEqual(resolved.twoStage, true, "two_pass must win over the env-global default")
+    XCTAssertEqual(resolved.provenance["two_stage"], .request)
+  }
 }

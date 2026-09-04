@@ -117,6 +117,45 @@ public struct KiraStateSnapshot: Equatable, Sendable {
     }
 }
 
+/// One daemon render-queue row (GET /v1/kira/render-queue). The ENGINE's own
+/// queue only ever holds the single dispatched job — this is where everything
+/// else actually waits (Todd 2026-08-30).
+public struct KiraQueueRow: Equatable, Sendable, Identifiable {
+    public var id: Int
+    public var kind: String
+    public var label: String
+    public var detail: String?
+    public var state: String      // "running" | "pending"
+    public var pos: Int
+    public var owner: String
+    public var enqueuedAtMs: Double
+    public var watchdogMs: Double?
+
+    static func parse(_ dict: [String: Any]) -> KiraQueueRow? {
+        guard let id = (dict["id"] as? NSNumber)?.intValue else { return nil }
+        return KiraQueueRow(
+            id: id,
+            kind: dict["kind"] as? String ?? "?",
+            label: dict["label"] as? String ?? "",
+            detail: dict["detail"] as? String,
+            state: dict["state"] as? String ?? "pending",
+            pos: (dict["pos"] as? NSNumber)?.intValue ?? 0,
+            owner: dict["owner"] as? String ?? "",
+            enqueuedAtMs: (dict["enqueuedAtMs"] as? NSNumber)?.doubleValue ?? 0,
+            watchdogMs: (dict["watchdogMs"] as? NSNumber)?.doubleValue)
+    }
+}
+
+/// One per-run LTX LoRA override entry (run overrides, Todd 2026-08-30).
+public struct KiraVideoLoRA: Equatable, Sendable {
+    public var name: String
+    public var scale: Double
+    public init(name: String, scale: Double = 1.0) {
+        self.name = name
+        self.scale = scale
+    }
+}
+
 /// `GET /v1/kira/content-scheduler/status` (A2).
 public struct KiraSchedulerStatus: Equatable, Sendable {
     public var paused: Bool
@@ -128,6 +167,18 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
     /// i2v share of a `videoMode == "mixed"` cycle, 0-1 (server default 0.5).
     /// nil when the config never set one — mixed then runs the 50/50 default.
     public var videoI2vRatio: Double?
+    /// Two-pass render tier for cycle videos (Todd 2026-08-30): "hq" = base →
+    /// latent upscale → refine, audio refined on pass 2. nil/"standard" =
+    /// single-pass.
+    public var videoQuality: String?
+    /// Run overrides (Todd 2026-08-30) — live policy knobs; nil/empty =
+    /// engine/mode defaults. videoLoras REPLACE the engine's preset/default
+    /// LTX stack per render; imagePreset fills only the explicit tiers' slot.
+    public var videoLoras: [KiraVideoLoRA] = []
+    public var videoFps: Int?
+    public var imagePreset: String?
+    public var imageKroma: Double?
+    public var imageAccelScale: Double?
     /// Unlimited-within-cycle images: renders chain until the cycle window
     /// closes; imageCount is ignored while true.
     public var unlimitedImages: Bool
@@ -160,6 +211,15 @@ public struct KiraSchedulerStatus: Equatable, Sendable {
             videoCount: (config?["videoCount"] as? NSNumber)?.intValue,
             videoMode: config?["videoMode"] as? String,
             videoI2vRatio: (config?["videoI2vRatio"] as? NSNumber)?.doubleValue,
+            videoQuality: config?["videoQuality"] as? String,
+            videoLoras: ((config?["videoLoras"] as? [[String: Any]]) ?? []).compactMap { entry in
+                guard let name = entry["name"] as? String, !name.isEmpty else { return nil }
+                return KiraVideoLoRA(name: name, scale: (entry["scale"] as? NSNumber)?.doubleValue ?? 1.0)
+            },
+            videoFps: (config?["videoFps"] as? NSNumber)?.intValue,
+            imagePreset: config?["imagePreset"] as? String,
+            imageKroma: (config?["imageKroma"] as? NSNumber)?.doubleValue,
+            imageAccelScale: (config?["imageAccelScale"] as? NSNumber)?.doubleValue,
             unlimitedImages: config?["unlimitedImages"] as? Bool ?? false,
             activeHoursStart: hours?["start"] as? String,
             activeHoursEnd: hours?["end"] as? String,
@@ -174,6 +234,9 @@ public struct KiraTierConfig: Equatable, Sendable {
     public var imageCount: Int
     public var unlimitedImages: Bool
     public var videoCount: Int
+    /// false = scheduled off, config retained (Todd 2026-08-30: toggling a
+    /// tier must not destroy its counts/window). true/absent = on.
+    public var enabled: Bool = true
 
     public static func parse(_ dict: [String: Any]) -> KiraTierConfig {
         let hours = dict["activeHours"] as? [String: Any]
@@ -182,7 +245,8 @@ public struct KiraTierConfig: Equatable, Sendable {
             activeHoursEnd: hours?["end"] as? String,
             imageCount: (dict["imageCount"] as? NSNumber)?.intValue ?? 2,
             unlimitedImages: dict["unlimitedImages"] as? Bool ?? false,
-            videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1)
+            videoCount: (dict["videoCount"] as? NSNumber)?.intValue ?? 1,
+            enabled: (dict["enabled"] as? Bool) ?? true)
     }
 
     /// PUT payload fragment. The tiers PUT is a FULL REPLACEMENT server-side,
@@ -197,6 +261,7 @@ public struct KiraTierConfig: Equatable, Sendable {
         out["imageCount"] = imageCount
         out["unlimitedImages"] = unlimitedImages
         if !isNeutral { out["videoCount"] = videoCount }
+        if !enabled { out["enabled"] = false }   // absent = on (server contract)
         return out
     }
 }
@@ -786,6 +851,36 @@ public final class KiraClient {
     }
 
     // MARK: - Controls (writes)
+
+    // ── Daemon render queue (Todd 2026-08-30: full visibility + control) ──
+
+    public var queueRows: [KiraQueueRow] = []
+
+    public func refreshRenderQueue() async {
+        guard let data = await fetch("v1/kira/render-queue") else { return }
+        guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rows = dict["rows"] as? [[String: Any]] else { return }
+        queueRows = rows.compactMap { KiraQueueRow.parse($0) }
+    }
+
+    /// delta < 0 moves the job up within its lane; > 0 down.
+    public func moveQueueJob(_ id: Int, delta: Int) async {
+        if await perform("v1/kira/render-queue/move", method: "POST", body: ["id": id, "delta": delta]) {
+            await refreshRenderQueue()
+        }
+    }
+
+    public func bumpQueueJob(_ id: Int) async {
+        if await perform("v1/kira/render-queue/move", method: "POST", body: ["id": id, "to": "top"]) {
+            await refreshRenderQueue()
+        }
+    }
+
+    public func removeQueueJob(_ id: Int) async {
+        if await perform("v1/kira/render-queue/remove", method: "POST", body: ["id": id]) {
+            await refreshRenderQueue()
+        }
+    }
 
     @discardableResult
     private func perform(_ path: String, method: String, body: [String: Any]? = nil) async -> Bool {

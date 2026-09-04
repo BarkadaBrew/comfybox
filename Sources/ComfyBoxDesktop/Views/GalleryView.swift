@@ -49,6 +49,11 @@ struct GalleryView: View {
     var onAnimate: ((DAMAsset) -> Void)?
     /// Send an image to the Inpaint tab.
     var onInpaint: ((DAMAsset) -> Void)?
+    /// Open an image in the Edit tab. Called with the asset and the LOCAL path
+    /// `mediaLocation(for:)` resolved for it — never the raw `absolutePath`,
+    /// which can differ from where the catalog actually found the file on
+    /// this Mac (see `AssetMediaSource`'s header comment).
+    var onEdit: ((DAMAsset, String) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
@@ -130,9 +135,18 @@ struct GalleryView: View {
     /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
     /// database, so leaving it out filed almost the whole library into a
     /// "Comfybox" persona section and left the main gallery showing 87 images.
-    static let mainSources: Set<String> = ["", "desktop", "comfyui", "comfybox"]
+    static let mainSources: Set<String> = ["", "desktop", "desktop-edit", "comfyui", "comfybox"]
     static func isMainSource(_ source: String?) -> Bool {
         mainSources.contains((source ?? "").lowercased())
+    }
+    /// The `personaFilter` value that makes an asset with this `source` visible —
+    /// nil (main gallery) for a main source, else the lowercased persona key
+    /// `filteredAssets` and the sidebar's persona sections both key on. Used by
+    /// "Edited from → Show" (X5) to land on the RIGHT section, not just "main":
+    /// setting `personaFilter = nil` for every reveal would leave a persona-section
+    /// original (e.g. a Kira/Bree render) still filtered out after "Show".
+    static func personaFilterKey(for source: String?) -> String? {
+        isMainSource(source) ? nil : (source ?? "").lowercased()
     }
     /// Distinct persona (non-main) sources present in the library, with counts.
     private var personaSources: [(name: String, count: Int)] {
@@ -314,7 +328,11 @@ struct GalleryView: View {
                     selectedAsset = nil
                     lightboxIndex = filteredAssets.firstIndex(where: { $0.id == target.id })
                 },
-                onSendToGenerate: onSendToGenerate
+                onSendToGenerate: onSendToGenerate,
+                onEdit: onEdit,
+                onSelectSource: { path, sourceAssetId in
+                    selectSource(path: path, sourceAssetId: sourceAssetId)
+                }
             )
             .frame(minWidth: 800, minHeight: 500)
         }
@@ -930,8 +948,11 @@ struct GalleryView: View {
                         if onAnimate != nil {
                             Button("Send to Motion (I2V)") { onAnimate?(asset) }
                         }
+                        if let onEdit, asset.isEditableImage, case .local(let localPath) = mediaSource(for: asset) {
+                            Button("Edit") { onEdit(asset, localPath) }
+                        }
                         if onInpaint != nil {
-                            Button("Edit / Inpaint") { onInpaint?(asset) }
+                            Button("Inpaint") { onInpaint?(asset) }
                         }
                         if mediaTools.hasMagick {
                             Menu("Export As") {
@@ -1063,6 +1084,43 @@ struct GalleryView: View {
         AssetMediaLocation(
             localPath: browser?.localPath(forID: asset.id) ?? asset.absolutePath,
             remoteURL: remoteURLs[asset.id])
+    }
+
+    /// `mediaLocation(for:)` resolved to the gate/disk/server answer — the
+    /// same decision `AssetDetailView.source` makes from the location this
+    /// view hands it, so Edit's local/remote gating never disagrees with the
+    /// detail pane's.
+    private func mediaSource(for asset: DAMAsset) -> AssetMediaSource {
+        AssetMediaSource.resolve(mediaLocation(for: asset), gateRevealed: contentGate.revealed)
+    }
+
+    /// "Edited from → Show": resolves the sidecar's recorded source (by asset id,
+    /// then by resolved local path) against the FULL asset list, then makes sure
+    /// it is actually visible before selecting it — the normal case for a
+    /// `desktop-edit` original is that today's search/persona/folder/favorite/
+    /// content-mode/character filter is hiding it, in which case the button would
+    /// otherwise silently do nothing (or, worse, `AssetDetailView`'s index lookup
+    /// would fall back to row 0 and show the wrong asset).
+    private func selectSource(path: String, sourceAssetId: String?) {
+        guard let match = Self.resolveSourceAsset(sourceAssetId: sourceAssetId, sourcePath: path, in: assets,
+                                                   localPath: { asset in
+                                                       if case .local(let lp) = mediaSource(for: asset) { return lp }
+                                                       return nil
+                                                   }) else { return }
+        if !filteredAssets.contains(where: { $0.id == match.id }) {
+            searchText = ""
+            // Not just "clear to main" — a persona-section original (source is
+            // Kira/Bree/etc., not one of `mainSources`) needs `personaFilter` SET
+            // to its own section, or it stays hidden behind the main-gallery view
+            // `personaFilter = nil` switches to.
+            personaFilter = Self.personaFilterKey(for: match.source)
+            folderFilter = .all
+            filterFavorites = false
+            filterContentMode = nil
+            filterCharacter = nil
+            filterLabel = nil
+        }
+        selectedAsset = match
     }
 
     /// Download a row whose bytes are on a server into the local output folder
@@ -1565,15 +1623,20 @@ struct GalleryView: View {
         do {
             // Self-heal: drop rows whose file was deleted out from under the
             // DAM before presenting (only worth it on a full, unfiltered load).
-            // This is an unattended destructive sweep, so its refusal is SHOWN,
-            // not swallowed: a circuit breaker trip means a volume is probably
-            // unmounted, and silently skipping it would leave the gallery
-            // looking half-empty with no explanation.
+            // This is an unattended destructive sweep, so ANY failure to run
+            // it is SHOWN via `pruneWarning`, never swallowed: a circuit
+            // breaker trip means a volume is probably unmounted, and a read
+            // failure mid-sweep (DAMStoreError.stepFailed, #263) means the
+            // sweep didn't run at all — either way, silently proceeding as if
+            // it ran clean would leave the gallery looking half-empty (or
+            // stale) with no explanation. Browsing itself is never blocked:
+            // the failure is only ever logged and banner-surfaced here.
             if searchText.isEmpty {
                 do { _ = try await ingestor.pruneOrphans() }
-                catch let error as DAMStoreError {
-                    if case .pruneRefused = error { pruneWarning = error.localizedDescription }
-                } catch { /* a prune failure must never block browsing */ }
+                catch {
+                    print("[GalleryView] loadAssets: orphan self-heal sweep failed: \(error.localizedDescription)")
+                    pruneWarning = Self.pruneSweepWarning(for: error)
+                }
             }
             folders = try await store.listFolders()
             folderCounts = try await store.folderCounts()
@@ -1612,8 +1675,11 @@ struct GalleryView: View {
         await browser.apply(filter: catalogQuery())
         if let message = browser.error { errorMessage = message } else { errorMessage = nil }
 
+        // Targeted to exactly the ids the catalog is showing (#265) — not a
+        // fetch of the whole shared table to look up this page's rows.
         var damByID: [String: DAMAsset] = [:]
-        for row in try await store.fetchAssets(limit: 20_000) { damByID[row.id] = row }
+        let neededIDs = Set(browser.items.map { $0.id })
+        for row in try await store.assets(withIDs: neededIDs) { damByID[row.id] = row }
 
         var rows: [DAMAsset] = []
         var urls: [String: URL] = [:]
@@ -2097,26 +2163,68 @@ struct GalleryView: View {
 
     /// "Archive Folder…" must include every asset filed in the folder, not
     /// just whichever page happens to be sitting in the view's own `assets`
-    /// array (capped at `fetchAssets(limit: 500)`) — fetch the full asset
-    /// set from the store and filter by id instead, so folders larger than
-    /// the page size still archive completely.
+    /// array (capped at `fetchAssets(limit: 500)`) — fetch exactly the
+    /// folder's own member ids from the store (#265), rather than the whole
+    /// table filtered by id, so folders larger than the page size still
+    /// archive completely.
     private func requestArchiveFolder(ids: Set<String>, folder: DAMFolder) async {
         guard !ids.isEmpty else { return }
         do {
-            let total = try await store.assetCount()
-            let allAssets = try await store.fetchAssets(limit: total, offset: 0)
-            requestArchive(Self.folderMembers(ids: ids, from: allAssets), folder: folder)
+            let members = try await store.assets(withIDs: ids)
+            // Belt and braces, same discipline as the secured-id filter
+            // above: re-filter against `ids` even though the query already
+            // scoped to them, so a future change to `assets(withIDs:)`
+            // can't silently widen what gets archived here.
+            requestArchive(Self.folderMembers(ids: ids, from: members), folder: folder)
         } catch {
             errorMessage = "Failed to load folder assets: \(error.localizedDescription)"
         }
     }
 
-    /// Given a folder's asset id set (from `folderAssignments()`) and the
-    /// full, unpaged asset list, returns exactly the assets that belong to
-    /// the folder. A pure, directly unit-testable helper isolating the
+    /// Given a folder's asset id set (from `folderAssignments()`) and a
+    /// candidate asset list, returns exactly the assets that belong to the
+    /// folder. A pure, directly unit-testable helper isolating the
     /// membership filter from the store fetch above it.
     static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
         allAssets.filter { ids.contains($0.id) }
+    }
+
+    /// Maps a `pruneOrphans()` failure to `pruneWarning` banner text.
+    /// `loadAssets`'s self-heal sweep must never look like it silently
+    /// succeeded when it didn't — this is a pure, directly unit-testable
+    /// decision isolated from the view's `catch` (PR #356 fix round 1:
+    /// `.stepFailed`, #263's new error, used to fall through that `catch`'s
+    /// unhandled-DAMStoreError-case and unmatched-non-DAMStoreError-case
+    /// paths with no banner and no log). `.pruneRefused` already explains
+    /// itself well (it names the candidate/total counts), so it passes
+    /// through verbatim; everything else — every other `DAMStoreError`
+    /// case and any non-DAMStoreError failure — is framed so the user knows
+    /// *what* didn't happen, not just the raw underlying message.
+    static func pruneSweepWarning(for error: Error) -> String {
+        if let damError = error as? DAMStoreError, case .pruneRefused = damError {
+            return damError.localizedDescription
+        }
+        return "Orphan cleanup skipped: \(error.localizedDescription)"
+    }
+
+    /// Resolves the "Edited from" source asset for an edit sidecar's `source_path`
+    /// (and, when present, its `source_asset_id`) against the FULL asset list — not
+    /// `filteredAssets`, which excludes whatever the active search/persona/folder/
+    /// favorite/content-mode/character filter is hiding, and given derived edits are
+    /// filed under `desktop-edit`, the original is routinely outside that filter.
+    /// Tries the id first (survives the original having moved), then falls back to
+    /// matching the RESOLVED local path (`localPath`, the same local/remote decision
+    /// the grid makes) against the sidecar's recorded path.
+    static func resolveSourceAsset(sourceAssetId: String?, sourcePath: String,
+                                   in allAssets: [DAMAsset], localPath: (DAMAsset) -> String?) -> DAMAsset? {
+        if let sourceAssetId, let match = allAssets.first(where: { $0.id == sourceAssetId }) {
+            return match
+        }
+        let target = (sourcePath as NSString).standardizingPath
+        return allAssets.first { asset in
+            guard let lp = localPath(asset) else { return false }
+            return (lp as NSString).standardizingPath == target
+        }
     }
 
     /// Runs the archive via `GalleryArchiver`, mirroring the import strip's

@@ -61,6 +61,87 @@ final class LoRAScannerCompatibilityTests: XCTestCase {
       ["krea2"])
   }
 
+  /// #313: production LTX-2.3 LoRAs trained with sd-scripts' `networks.lora_ltx2`
+  /// (`ic-lora-union-control-ref0.5`, `phool-realism-ltx-2.3-v1.0`,
+  /// `LTX2.3_reasoning_Sulphur-2_I2V_V4` — all read straight from
+  /// ~/Models/loras/library.json as `unknown` before this fix) carry no
+  /// `ss_base_model_version`/`modelspec.architecture` metadata at all and use
+  /// the diffusers-style `diffusion_model.transformer_blocks.N.attn1/attn2/ff`
+  /// layout — no `layers.` substring, no audio/video branch. LTX-2's real
+  /// module tree (LTX2TransformerBlock.swift) is the only architecture with
+  /// BOTH `attn1` (self) and `attn2` (cross) under one block — Z-Image has a
+  /// single `attention`, never a second `attn2` — so requiring both is a safe
+  /// signature distinct from any generic diffusers Z-Image export.
+  func testLTX2ComfyExportTransformerBlocksClassifyAsLTX() {
+    let keys = [
+      "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn1.to_k.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn1.to_v.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn2.to_q.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn2.to_k.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn2.to_v.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn2.to_out.0.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.ff.net.0.proj.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.ff.net.2.lora_A.weight",
+    ]
+    XCTAssertEqual(LoRAScanner.detectCompatibility(metadata: nil, sampleKeys: keys), ["ltx"])
+  }
+
+  /// A `transformer_blocks` LoRA with only `attn1` (single attention, no
+  /// cross-attn) is NOT LTX-2's signature — must not be swept into ["ltx"].
+  func testTransformerBlocksSingleAttentionDoesNotClassifyAsLTX() {
+    let keys = [
+      "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight",
+      "diffusion_model.transformer_blocks.0.attn1.to_k.lora_A.weight",
+    ]
+    XCTAssertNotEqual(LoRAScanner.detectCompatibility(metadata: nil, sampleKeys: keys), ["ltx"])
+  }
+
+  /// #313: `Anneliese_Zbase3.safetensors` (real vault file, `unknown` before
+  /// this fix) is a kohya/ComfyUI "comfy-export" LoRA: `lora_unet_` prefix,
+  /// `layers_N_...` — underscores throughout, no dots at all. `double_blocks_`
+  /// / `single_blocks_` already had an underscore fallback; `layers_` did not.
+  func testZImageComfyExportUnderscoreKeysClassifyAsZImage() {
+    let keys = [
+      "lora_unet_layers_0_attention_out.lora_down.weight",
+      "lora_unet_layers_0_attention_out.lora_up.weight",
+      "lora_unet_layers_0_attention_qkv.lora_down.weight",
+      "lora_unet_layers_0_attention_qkv.lora_up.weight",
+      "lora_unet_layers_0_feed_forward_w1.lora_down.weight",
+      "lora_unet_layers_0_feed_forward_w1.lora_up.weight",
+    ]
+    XCTAssertEqual(LoRAScanner.detectCompatibility(metadata: nil, sampleKeys: keys), ["z-image"])
+  }
+
+  /// #313: same file's real metadata — `ss_base_model_version: "z_image"`
+  /// (underscore, not the `"zimage"`/`"z-image"` the switch recognized) and
+  /// `modelspec.architecture: "Z-Image/lora"` (the architecture branch had no
+  /// z-image case at all, only klein/chroma/ltx/flux) — both metadata paths
+  /// fell through to key heuristics and, before the key fix above, to
+  /// `unknown`.
+  func testZImageMetadataVariantsClassifyAsZImage() {
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(metadata: ["ss_base_model_version": "z_image"], sampleKeys: []),
+      ["z-image"])
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(metadata: ["modelspec.architecture": "Z-Image/lora"], sampleKeys: []),
+      ["z-image"])
+  }
+
+  /// #313: synthetic — no real "control_" fixture exists in the vault, so
+  /// this is built straight from `ZImageControlTransformer2D`'s own module
+  /// keys (control_all_x_embedder / control_noise_refiner / control_layers).
+  func testZImageControlNetKeysClassifyAsZImage() {
+    let keys = [
+      "diffusion_model.control_layers.0.attention.to_q.lora_down.weight",
+      "diffusion_model.control_layers.0.attention.to_q.lora_up.weight",
+      "diffusion_model.control_noise_refiner.0.attention.to_q.lora_down.weight",
+      "diffusion_model.control_noise_refiner.0.attention.to_q.lora_up.weight",
+    ]
+    XCTAssertEqual(LoRAScanner.detectCompatibility(metadata: nil, sampleKeys: keys), ["z-image"])
+  }
+
   /// Metadata still wins, and other families are untouched by the new branch.
   func testOtherFamiliesUnaffected() {
     XCTAssertEqual(

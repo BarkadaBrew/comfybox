@@ -114,7 +114,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     let (base, startIndex, _, steps) = try Self.stage2Scheduler(order: .three)
     XCTAssertEqual(steps, 2)
     var scheduler = base
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: MLXArray([Float(0.4)], [1]), startIndex: startIndex
     ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
@@ -140,7 +140,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     XCTAssertEqual(scheduler.numInferenceSteps, 8)
 
     let grid = scheduler.sigmas.asArray(Float.self).map(Double.init)
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: MLXArray([Float(0.6)], [1])
     ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
@@ -180,7 +180,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
         kind: kind, sigmaSchedule: .bongTangent, numInferenceSteps: steps, config: config,
         mu: Self.tracedMu, res4lyfSigmaPreparation: true)
       let effective = scheduler.numInferenceSteps
-      let (_, stats) = Krea2DenoiseLoop.run(
+      let (_, stats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: MLXArray([Float(0.5)], [1])
       ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
@@ -204,7 +204,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     XCTAssertEqual(startIndex, 8)
     XCTAssertEqual(totalSteps, 10)
     var scheduler = base
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: MLXArray([Float(0.4)], [1]), startIndex: startIndex
     ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
     XCTAssertEqual(stats.evaluateCalls, 6, "3 rows on both steps — not multistep at grid index 8")
@@ -291,7 +291,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     let (base, startIndex, _, _) = try Self.stage2Scheduler(order: .three)
     var scheduler = base
 
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit), startIndex: startIndex
     ) { latent, sigma in
       RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma)
@@ -354,7 +354,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
   /// are NOT re-derived by this file: they exist so that the Swift multistep —
   /// the half the T1 trace cannot reach, because the published stage never
   /// leaves the warm-up — has an oracle of its own.
-  func testMultistepMatchesAnIndependentReferenceRun() {
+  func testMultistepMatchesAnIndependentReferenceRun() throws {
     let expected: [(DEISMultistepScheduler.Order, Int, Double)] = [
       (.two, 8, 0.198466466219), (.two, 12, 0.188801524265),
       (.three, 8, 0.194737552942), (.three, 12, 0.186273317320),
@@ -364,7 +364,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
       let grid = ExplicitRKSchedulerTests.linearGrid(steps: n)
       let scheduler = DEISMultistepScheduler(
         order: order, numInferenceSteps: n, sigmaValues: grid)
-      let got = ExplicitRKSchedulerTests.runThroughDriver(scheduler)
+      let got = try ExplicitRKSchedulerTests.runThroughDriver(scheduler)
       XCTAssertEqual(got, want, accuracy: 2e-5, "\(order.name) at \(n) steps")
     }
   }
@@ -374,13 +374,13 @@ final class DEISMultistepSchedulerTests: XCTestCase {
   /// `(x₀ − D)/σ` and `Σⱼ coeffⱼ = h`, so the step is the closed-form
   /// `x(σ) = D + (σ/σ₀)(x₀ − D)`. It exercises the multistep branch (the
   /// history is used) without depending on the field's curvature.
-  func testExactOnAConstantDataPrediction() {
+  func testExactOnAConstantDataPrediction() throws {
     let dConst: Float = -0.35
     let grid: [Float] = [1.0, 0.82, 0.61, 0.44, 0.29, 0.17, 0.08, 0.03, 0.008]
     for order in DEISMultistepScheduler.Order.allCases {
       var scheduler: any ZImageScheduler = DEISMultistepScheduler(
         order: order, numInferenceSteps: grid.count - 1, sigmaValues: grid)
-      let (out, stats) = Krea2DenoiseLoop.run(
+      let (out, stats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: MLXArray([Float(0.7)], [1])
       ) { latent, sigma in (latent - dConst) / sigma }
       let want = dConst + Float(grid[grid.count - 1] / grid[0]) * (0.7 - dConst)
@@ -412,7 +412,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
         mu: Self.tracedMu, res4lyfSigmaPreparation: true)
       let initial = MLXArray((0..<64).map { Float($0 % 7) * 0.11 - 0.3 }, [1, 1, 8, 8])
 
-      let (first, firstStats) = Krea2DenoiseLoop.run(
+      let (first, firstStats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: initial
       ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
@@ -421,7 +421,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
       let mid = try XCTUnwrap(scheduler as? DEISMultistepScheduler)
       XCTAssertGreaterThan(mid.multistepSteps, 0, "\(kind.rawValue): the ramp must have fired")
 
-      let (second, secondStats) = Krea2DenoiseLoop.run(
+      let (second, secondStats) = try Krea2DenoiseLoop.run(
         scheduler: &scheduler, initialSample: initial
       ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
@@ -445,11 +445,11 @@ final class DEISMultistepSchedulerTests: XCTestCase {
     let (base, startIndex, _, _) = try Self.stage2Scheduler(order: .three)
     var scheduler = base
     let initial = MLXArray([Float(0.4)], [1])
-    let (fresh, freshStats) = Krea2DenoiseLoop.run(
+    let (fresh, freshStats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: initial, startIndex: startIndex
     ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
-    let (again, againStats) = Krea2DenoiseLoop.run(
+    let (again, againStats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: initial, startIndex: startIndex
     ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 
@@ -489,7 +489,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
   /// round-off, so the measured slopes are the scheme's, not the arithmetic's —
   /// which the monotonicity assertion below would catch if it stopped being
   /// true.
-  func testMeasuredOrderIsTwoForEveryVariant() {
+  func testMeasuredOrderIsTwoForEveryVariant() throws {
     let reference = ExplicitRKSchedulerTests.referenceSolution()
     for order in DEISMultistepScheduler.Order.allCases {
       var errors: [Double] = []
@@ -497,7 +497,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
         let scheduler = DEISMultistepScheduler(
           order: order, numInferenceSteps: n,
           sigmaValues: ExplicitRKSchedulerTests.linearGrid(steps: n))
-        errors.append(abs(ExplicitRKSchedulerTests.runThroughDriver(scheduler) - reference))
+        errors.append(abs(try ExplicitRKSchedulerTests.runThroughDriver(scheduler) - reference))
       }
       let orders = ExplicitRKSchedulerTests.observedOrders(errors)
       let context = "\(order.name) orders \(orders) from errors \(errors)"
@@ -591,7 +591,7 @@ final class DEISMultistepSchedulerTests: XCTestCase {
   func testTraceCarriesTheWarmUpProvenance() throws {
     let (base, startIndex, _, _) = try Self.stage2Scheduler(order: .three)
     var scheduler = base
-    let (_, stats) = Krea2DenoiseLoop.run(
+    let (_, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: MLXArray([Float(0.4)], [1]), startIndex: startIndex
     ) { latent, sigma in RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma) }
 

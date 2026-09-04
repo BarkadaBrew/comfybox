@@ -60,6 +60,33 @@ final class LTX2AudioMuxTests: XCTestCase {
     XCTAssertEqual(audioDur, 2.0, accuracy: 0.1, "AAC priming/padding tolerance")
   }
 
+  // comfybox#334: the official 24kHz HiFi-GAN vocoder stalled the writer
+  // because the hardcoded 192kbps AAC bitrate exceeded the encoder ceiling at
+  // 24kHz. This mirrors the 48k test at the vocoder real rate and must produce
+  // a valid audio track rather than a 0-byte file / hung mux.
+  func testMuxedMP4At24kHzOfficialVocoderRate() throws {
+    let out = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mux24-\(UUID().uuidString).mp4").path
+    defer { try? FileManager.default.removeItem(atPath: out) }
+
+    let frames = (0..<49).map { _ in solidFrame(width: 128, height: 128) }
+    try LTX2PostProcess.writeMP4(
+      frames: frames, outputPath: out, fps: 24, width: 128, height: 128,
+      audio: LTX2PostProcess.AudioTrack(
+        samples: tone(seconds: 2.0, sampleRate: 24000), sampleRate: 24000))
+
+    let attrs = try FileManager.default.attributesOfItem(atPath: out)
+    XCTAssertGreaterThan((attrs[.size] as! Int), 0, "24kHz mux must not write a 0-byte file")
+
+    let asset = AVURLAsset(url: URL(fileURLWithPath: out))
+    let audioTracks = asset.tracks(withMediaType: .audio)
+    XCTAssertEqual(audioTracks.count, 1, "one audio track at 24kHz")
+    let fmt = audioTracks[0].formatDescriptions.first as! CMFormatDescription
+    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)!.pointee
+    XCTAssertEqual(asbd.mSampleRate, 24000, accuracy: 1)
+    XCTAssertEqual(asbd.mChannelsPerFrame, 2, "stereo")
+  }
+
   func testNoAudioProducesNoAudioTrackAndIdenticalFrameBehavior() throws {
     let out = FileManager.default.temporaryDirectory
       .appendingPathComponent("mux-silent-\(UUID().uuidString).mp4").path

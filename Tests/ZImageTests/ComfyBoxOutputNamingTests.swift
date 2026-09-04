@@ -55,4 +55,32 @@ final class ComfyBoxOutputNamingTests: XCTestCase {
     })
     XCTAssertGreaterThan(names.count, 1, "salt should differentiate same-second renders")
   }
+
+  /// Regression guard for #251: krea2 (and every other family) default
+  /// filenames must be model-family-based, never the legacy hardcoded
+  /// `zimage-` engine prefix. `runKrea2Generate` (WarmServer.swift) passes
+  /// `activePoolModelSpec ?? configuration.modelSpec ?? "krea2"` as
+  /// `modelSpec` — cover that literal fallback plus realistic pool specs
+  /// (bare alias, LocalModels directory path, quantized variant name).
+  func testKrea2NeverStampsLegacyZimagePrefix() {
+    let krea2Specs = [
+      "krea2",
+      "/Users/toddwalderman/LocalModels/krea2-raw-bf16",
+      "kroma-v0.2-turbo",
+      nil,
+    ]
+    for spec in krea2Specs {
+      let name = ComfyBoxOutputNaming.defaultFilename(
+        modelSpec: spec ?? "krea2", presetId: "krea-kira",
+        contentMode: "avocado", source: "bree", date: fixedDate)
+      XCTAssertFalse(name.hasPrefix("zimage-"), name)
+      XCTAssertFalse(name.contains("zimage-krea2"), name)
+      XCTAssertTrue(name.hasPrefix("comfybox-"), name)
+    }
+    // The exact fallback runKrea2Generate uses when no pool/config model
+    // spec is set: the bare literal "krea2".
+    let bareFallback = ComfyBoxOutputNaming.defaultFilename(
+      modelSpec: "krea2", contentMode: nil, date: fixedDate)
+    XCTAssertTrue(bareFallback.hasPrefix("comfybox-krea2-manual-"), bareFallback)
+  }
 }

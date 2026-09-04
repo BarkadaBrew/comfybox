@@ -62,6 +62,11 @@ public struct WarmServerConfiguration: Sendable {
   /// render when the request carries none — lets preset-only callers (daemon
   /// MCP) get e.g. a distill LoRA required by a non-distilled checkpoint.
   public var ltx2DefaultLoRA: String?
+  /// Explicit CivitAI API key — the top tier of `CivitAISecrets.resolve`'s
+  /// resolution order (--civitai-key flag > CIVITAI_API_KEY env > Keychain).
+  /// nil here just means "no explicit override"; the /v1/civitai/* routes
+  /// still fall through to env/Keychain before giving up (#234).
+  public var civitaiApiKey: String?
 
   public init(
     port: UInt16 = ComfyBoxServerConfig.canonicalPort,
@@ -76,7 +81,8 @@ public struct WarmServerConfiguration: Sendable {
     seedvr2WeightsPath: String? = nil,
     ltx2WeightsPath: String? = nil,
     ltx2GemmaPath: String? = nil,
-    ltx2DefaultLoRA: String? = nil
+    ltx2DefaultLoRA: String? = nil,
+    civitaiApiKey: String? = nil
   ) {
     self.port = port
     self.modelSpec = modelSpec
@@ -91,6 +97,7 @@ public struct WarmServerConfiguration: Sendable {
     self.ltx2WeightsPath = ltx2WeightsPath
     self.ltx2GemmaPath = ltx2GemmaPath
     self.ltx2DefaultLoRA = ltx2DefaultLoRA
+    self.civitaiApiKey = civitaiApiKey
   }
 }
 
@@ -191,6 +198,38 @@ public final class WarmServer {
   /// background task, never on the request path (review finding 3).
   private let localVideoReadinessMonitor: LocalVideoReadinessMonitor
   private let renderTraceStore = RenderTraceStore()
+  /// #339: in-progress + remaining-count for `recoverPersistedQueue()`'s
+  /// background replay. Gates submission of queue-job kinds that are never
+  /// persisted (see QueueRecoveryGate.swift) so a job that cannot survive a
+  /// second restart is refused with a retryable 503 (naming an estimated
+  /// `retry_after_seconds`) instead of silently lost.
+  private let queueRecoveryState = QueueRecoveryState()
+
+  /// 0.B-1 (v2.3 rework, FDD-ui-api-parity.md §3.1.3, comfybox#300): lifts the
+  /// async-internals route handlers (`/v1/enhance`, `/v1/civitai/search`,
+  /// `/v1/civitai/harvest`) off the Swift cooperative pool, so they keep
+  /// answering while a render saturates it (measured: 2964/2972 samples in
+  /// `__psynch_cvwait` on the pool during a render). v2.2 tried this on the
+  /// RENDER side instead and crashed LTX (native MLX mutex EINVAL from
+  /// cross-thread eval migration) — deleted. These route handlers only ever
+  /// `await` on network/disk/actor I/O (`PromptOptimizer.optimize`,
+  /// `CivitAIClient.searchModels`, `CivitAIHarvestRunner.run`); they are
+  /// verified MLX-free (§3.1.3), so thread migration is harmless and a plain
+  /// concurrent `RouteTaskExecutor` is correct and safe. `nil` on macOS <15
+  /// or with `COMFYBOX_RENDER_TASK_EXECUTOR=0`; `respondOnRouteExecutor`
+  /// falls back to running the handler inline (today's pre-0.B-1 behavior,
+  /// on whatever executor `respond(to:)` itself is running on) in that case.
+  ///
+  /// Typed `Any?` for the same reason the deleted `RenderTaskExecutor`
+  /// property was: `RouteTaskExecutor` conforms to `TaskExecutor`, which is
+  /// `@available(macOS 15.0, *)`, so a STORED property of that type would
+  /// force this class's availability down with it, below the package's
+  /// macOS 14 floor (`Package.swift:6`).
+  private let routeTaskExecutor: Any? = {
+    guard #available(macOS 15.0, *), RouteTaskExecutorFlag.isEnabled else { return nil }
+    return RouteTaskExecutor()
+  }()
+
   let comfyBridge: ComfyBridge
 
   /// Imported ComfyUI workflows (#238), file-backed at ~/.comfybox/workflows/.
@@ -380,11 +419,33 @@ public final class WarmServer {
     // load/activate cannot mutate the active pipeline while a queued render
     // is mid-flight.
     self.comfyBridge.modelSwitchHandler = { [unowned self] (modelId: String) async throws -> Bool in
-      try await self.coordinator.enqueueModelSwitch { [unowned self] in
+      return try await self.coordinator.enqueueModelSwitch { [unowned self] in
         // Check if this model is already active — no switch needed.
         let currentActive = await self.coordinator.modelPool.activeModelId()
         let requestedKey = ModelPool.poolKey(for: modelId)
-        if currentActive == requestedKey {
+        let isNoOpSwitch = currentActive == requestedKey
+        // #339 review r3, item 2: the gate lives HERE, after the no-op
+        // check — r2's version threw before this check ever ran, so every
+        // Krita prompt carrying a checkpoint node hard-failed during
+        // recovery even when the active model already matched and no
+        // switch was needed at all. A model switch closes over live
+        // in-memory state — never persisted (QueueRecoveryGate.swift) — so
+        // an ACTUAL switch is still refused while a persisted-queue replay
+        // is in flight, rather than risk a pool mutation a second restart
+        // could leave half-applied. #339 review r4, item 2 (comment fix):
+        // the caller (`handlePrompt`/`submitWorkflowGraph`) does NOT simply
+        // log-and-continue on this specific error — `ModelSwitchFailurePolicy`
+        // (review r2, item 1) recognizes `.queueRecoveryInProgress` and
+        // FAILS the prompt outright via `ComfyBridgeExecutor.failPrompt`,
+        // so a refused switch never silently renders on the wrong
+        // checkpoint. Log-and-continue remains the behavior for every
+        // OTHER model-switch failure.
+        let switchRecovery = self.queueRecoveryState.snapshot()
+        if ModelSwitchGate.shouldReject(isNoOpSwitch: isNoOpSwitch, recoveryInProgress: switchRecovery.inProgress) {
+          throw WarmServerError.queueRecoveryInProgress(retryAfterSeconds:
+            QueueRecoveryGate.retryAfterSeconds(remainingKinds: switchRecovery.remainingKinds))
+        }
+        if isNoOpSwitch {
           return false
         }
 
@@ -607,10 +668,31 @@ public final class WarmServer {
   private func accept(connection: NWConnection) {
     let handler = ConnectionHandler(
       connection: connection,
-      queue: DispatchQueue(label: "z-image.warm-server.connection.\(UUID().uuidString)"),
+      // #300: pin QoS explicitly. Without it the queue runs at whatever QoS
+      // is donated by whoever schedules onto it, which during a render is
+      // the coordinator's `.utility` render work — demoting control/HTTP
+      // responses on this connection right when they need to stay responsive.
+      queue: DispatchQueue(label: "z-image.warm-server.connection.\(UUID().uuidString)", qos: .userInitiated),
       server: self
     )
     handler.start()
+  }
+
+  /// 0.B-1 (v2.3 rework): runs `operation` under `routeTaskExecutor`'s
+  /// preference when available and enabled, otherwise runs it inline exactly
+  /// as before this change (pre-0.B-1 behavior — no executor involved at
+  /// all). Structured, not a new unstructured `Task {}`: `respond(to:)` is
+  /// already running inside the connection's own task, so this only needs to
+  /// redirect where ITS continuations resume, via `withTaskExecutorPreference`
+  /// (SE-0417) — no child task, no `.value` await, no change to cancellation
+  /// or the caller's control flow.
+  private func respondOnRouteExecutor(
+    _ operation: () async -> RoutedResponse
+  ) async -> RoutedResponse {
+    if #available(macOS 15.0, *), let executor = routeTaskExecutor as? RouteTaskExecutor {
+      return await withTaskExecutorPreference(executor, operation: operation)
+    }
+    return await operation()
   }
 
   fileprivate func respond(to request: HTTPRequest) async -> RoutedResponse {
@@ -637,23 +719,29 @@ public final class WarmServer {
 
     case ("POST", "/v1/generate"):
       do {
-        let payload = try decodedGeneratePayload(from: request.body)
+        // #286 (I5): `rawBody` is the EXPANDED request, so a crash-recovery
+        // replay repeats the stack this job was accepted with rather than
+        // re-resolving the preset against a store that may have changed.
+        let (payload, rawBody) = try decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
         // #1479: absent/false `preempt` (or no video rendering, or a nested
         // attempt) is `.notApplicable` — same call as before this feature.
-        switch await attemptPreemption(payload, source: source, rawBody: request.body) {
+        switch await attemptPreemption(payload, source: source, rawBody: rawBody) {
         case .notApplicable:
-          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
+          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
           return .json(status: 200, payload: result)
         case .ran(let result):
           return .json(status: 200, payload: result)
         case .ranFailed(let error):
           return .error(response(for: error))
         case .refused(let eta):
-          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
+          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
           let stamped = GenerateResponse(
             success: result.success, outputPath: result.outputPath, durationMs: result.durationMs,
-            preemptRefused: true, etaSec: eta, applied: result.applied)
+            preemptRefused: true, etaSec: eta, applied: result.applied,
+            appliedLoras: result.appliedLoras, presetUnresolved: result.presetUnresolved,
+            presetUnresolvedReason: result.presetUnresolvedReason,
+            presetStackMismatch: result.presetStackMismatch)
           return .json(status: 200, payload: stamped)
         }
       } catch {
@@ -667,16 +755,16 @@ public final class WarmServer {
     // /v1/generate call outliving the caller's own turn timeout.
     case ("POST", "/v1/generate/async"):
       do {
-        let payload = try decodedGeneratePayload(from: request.body)
+        let (payload, rawBody) = try decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
         // #1479: `submitPreempting` runs the SAME `attemptPreemption` check
         // inside the job's own detached Task, so a `preempt`-absent/false
         // submit takes the exact same `coordinator.enqueueGenerate` path as
         // before this feature.
         let status = imageJobTracker.submitPreempting(
-          payload, source: source, coordinator: coordinator, rawBody: request.body,
+          payload, source: source, coordinator: coordinator, rawBody: rawBody,
           preemptor: { [weak self] jobId in
-            await self?.attemptPreemption(payload, source: source, rawBody: request.body, jobId: jobId) ?? .notApplicable
+            await self?.attemptPreemption(payload, source: source, rawBody: rawBody, jobId: jobId) ?? .notApplicable
           })
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -762,29 +850,8 @@ public final class WarmServer {
       }
 
     case ("GET", "/v1/models"):
-      let models = ComfyBoxModelRegistry.allModels.map { model -> [String: Any] in
-        [
-          "id": model.id,
-          "family": model.family.rawValue,
-          "variant": model.variant.rawValue,
-          "quantization": model.quantization.rawValue,
-          "display_name": model.displayName,
-          "description": model.description,
-          "parameters_b": model.parametersBillions,
-          "default_steps": model.defaultSteps,
-          "default_guidance": model.defaultGuidance,
-          "supports_guidance": model.supportsGuidance,
-          "supports_lora": model.supportsLoRA,
-          "supports_controlnet": model.supportsControlNet,
-          "supports_img2img": model.supportsImg2Img,
-          "default_resolution": "\(model.defaultWidth)x\(model.defaultHeight)",
-          "estimated_vram_gb": model.estimatedVRAM_GB,
-          "huggingface_id": model.huggingFaceId,
-        ] as [String: Any]
-      }
-      if let data = try? JSONSerialization.data(
-        withJSONObject: ["models": models, "count": models.count]
-      ) {
+      // 0.B-2: shared with the sync control-plane path so both emit identical bytes.
+      if let data = Self.modelsPayloadData() {
         return .json(.rawJSON(status: 200, data: data))
       }
       return .error(.error(status: 500, message: "Failed to serialize models"))
@@ -804,26 +871,29 @@ public final class WarmServer {
     // convention used by the render/status routes.
 
     case ("GET", "/v1/config"):
-      let config = ComfyBoxServerConfig.loadOrMigrate()
-      let encoder = JSONEncoder()
-      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-      if let data = try? encoder.encode(config) {
-        return .json(.rawJSON(status: 200, data: data))
-      }
-      return .error(.error(status: 500, message: "Failed to serialize config"))
+      // 0.B-2: shared with the sync control-plane path so both emit identical bytes.
+      return Self.configGetResponse()
 
     case ("PUT", "/v1/config"):
-      do {
-        let updated = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: request.body)
-        try updated.save()
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(updated)
-        // Port/host changes take effect on next server start; the running listener is unchanged.
-        return .json(.rawJSON(status: 200, data: data))
-      } catch {
-        return .error(.error(status: 400, message: "Invalid config: \(error.localizedDescription)"))
-      }
+      // Full-document replace, routed through ServerConfigStore (FDD §3.3, D3).
+      // Port/host changes take effect on next server start; the running listener
+      // is unchanged. `If-Match` is advisory: honoured when present-and-stale
+      // (409), otherwise proceeds with a deprecation `Warning` — no current
+      // caller sends it, so requiring it would break every one of them on day one.
+      return Self.configPutResponse(request: request)
+
+    case ("PATCH", "/v1/config"):
+      // RFC 7386 JSON Merge Patch — the primary write path going forward
+      // (FDD §3.3). Merged INSIDE ServerConfigStore's lock against the CURRENT
+      // document, so two agents patching different pointers cannot conflict.
+      return Self.configPatchResponse(request: request)
+
+    case ("GET", "/v1/controls"):
+      // Phase 4 discovery (FDD §3.4, D4): every descriptor in the compile-time
+      // ControlRegistry plus its per-request resolved value — the registry
+      // never caches a copy. Shared with the sync control plane (0.B-2) so
+      // both paths emit identical bytes.
+      return .json(controlsResponse())
 
     case ("GET", "/v1/providers/status"):
       let config = ComfyBoxServerConfig.loadOrMigrate()
@@ -872,6 +942,16 @@ public final class WarmServer {
           }
           return .json(status: 200, payload: result)
         } else {
+          // #339: `wait: false` is exactly the "202 + job id nobody is
+          // waiting on" pattern — `enqueueModelOperationDetached` never
+          // persists (no rawBody, same as local video), so a submission that
+          // lands mid-replay and a second restart before it finishes would
+          // vanish with no trace. Refuse up front instead.
+          let loadRecovery = queueRecoveryState.snapshot()
+          if QueueRecoveryGate.shouldReject(kind: .modelLoad, recoveryInProgress: loadRecovery.inProgress) {
+            logger.warning("Model load: refused wait:false submission — persisted-queue replay in flight (#339)")
+            return .error(.queueRecovering(remainingKinds: loadRecovery.remainingKinds))
+          }
           // Fire-and-forget is now a TRACKED queue job, not a detached Task:
           // it is listed in /v1/queue under the id returned here, it can be
           // cancelled, and it still cannot begin under a render.
@@ -953,6 +1033,7 @@ public final class WarmServer {
           "id": entry.id,
           "filename": entry.filename,
           "model_compatibility": entry.modelCompatibility,
+          "compatibility_source": entry.compatibilitySource.rawValue,
           "format": entry.format.rawValue,
           "rank": entry.rank,
           "size_bytes": entry.sizeBytes,
@@ -998,6 +1079,7 @@ public final class WarmServer {
         "size_bytes": entry.sizeBytes,
         "size_formatted": entry.sizeFormatted,
         "model_compatibility": entry.modelCompatibility,
+        "compatibility_source": entry.compatibilitySource.rawValue,
         "format": entry.format.rawValue,
         "rank": entry.rank,
         "key_count": entry.keyCount,
@@ -1146,6 +1228,19 @@ public final class WarmServer {
         }
         krea2Relative = parsed
       }
+      // #313 (review round 1): model_compatibility is user-declared here,
+      // same as krea2_relative above — validated against the scanner's own
+      // vocabulary (400 naming the offending value, never silently accepted
+      // or silently dropped), then sets provenance to "manual" so a future
+      // scan() never overwrites it back to the auto-detected value.
+      var modelCompatibility: [String]?
+      if let raw = json["model_compatibility"] as? [String] {
+        do {
+          modelCompatibility = try WarmServer.validateModelCompatibilityTags(raw)
+        } catch {
+          return .error(response(for: error))
+        }
+      }
       let patch = LoRAEntryPatch(
         triggerwords: json["triggerwords"] as? [String],
         recommendedScale: (json["recommended_scale"] as? NSNumber)?.floatValue,
@@ -1154,7 +1249,8 @@ public final class WarmServer {
         notes: json["notes"] as? String,
         sourceURL: json["source_url"] as? String,
         civitaiModelId: json["civitai_model_id"] as? Int,
-        krea2Relative: krea2Relative
+        krea2Relative: krea2Relative,
+        modelCompatibility: modelCompatibility
       )
       do {
         try library.update(id, patch: patch)
@@ -1168,6 +1264,8 @@ public final class WarmServer {
           "recommended_scale": entry.recommendedScale,
           "tags": entry.tags,
           "notes": entry.notes,
+          "model_compatibility": entry.modelCompatibility,
+          "compatibility_source": entry.compatibilitySource.rawValue,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
           return .json(.rawJSON(status: 200, data: data))
@@ -1256,6 +1354,16 @@ public final class WarmServer {
         guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
           return .error(.error(status: 503, message: "Storyboard rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
         }
+        // #339: a storyboard is a chain of unpersisted local-video renders
+        // (`runStoryboard` -> `enqueueLocalVideo` per shot) tracked under one
+        // `videoJobTracker` id, exactly as vulnerable to a second restart as
+        // a single local video job — refuse up front rather than accept an
+        // orchestration that could vanish mid-shot.
+        let storyboardRecovery = queueRecoveryState.snapshot()
+        if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: storyboardRecovery.inProgress) {
+          logger.warning("Storyboard: refused render — persisted-queue replay in flight (#339)")
+          return .error(.queueRecovering(remainingKinds: storyboardRecovery.remainingKinds))
+        }
         let payload = try decode(StoryboardPayload.self, from: request.body)
         let spec = try storyboardSpec(from: payload)
         try spec.validate()
@@ -1279,61 +1387,20 @@ public final class WarmServer {
       // requested_config + derived render_plan out. GET (below) stays as the
       // no-context readout.
       do {
-        struct EffectiveQuery: Decodable {
-          let width: Int?
-          let height: Int?
-          let frames: Int?
-          let duration: Float?
-          let fps: Int?
-          let tuning: LTX2VideoTuning?
-          let preset: String?
-        }
-        let q = (try? decode(EffectiveQuery.self, from: request.body)) ?? EffectiveQuery(
-          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil)
+        let q = (try? decode(EffectiveVideoConfigQuery.self, from: request.body)) ?? EffectiveVideoConfigQuery(
+          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil, twoPass: nil)
         let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
+        let effectiveTuning = Self.effectiveVideoTuning(for: q)
         let resolvedTyped = LTX2ConfigResolver.resolveTyped(
-          request: q.tuning, preset: videoPreset?.videoTuning)
+          request: effectiveTuning, preset: videoPreset?.videoTuning)
 
-        // Derived plan, mirroring prepareLocalVideo's math step by step.
-        var plan: [[String: String]] = []
-        var w = q.width ?? videoPreset?.width ?? 704
-        var h = q.height ?? videoPreset?.height ?? 448
-        let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
-        if snappedW != w || snappedH != h {
-          plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
-          w = snappedW; h = snappedH
-        }
-        if resolvedTyped.twoStage {
-          let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
-          if s1.halved {
-            plan.append(["step": "two_stage_halving",
-                         "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
-          } else {
-            plan.append(["step": "stage1_floor",
-                         "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
-          }
-        }
-        let fps = q.fps ?? 24
-        var framesPerChunk = q.frames ?? 97
-        var extendSeconds = Self.extendSecondsFromDuration(q.duration, framesPerChunk: framesPerChunk, fps: fps)
-        if extendSeconds > 0 {
-          let targetFrames = Int((extendSeconds * Float(fps)).rounded())
-          if targetFrames <= 289 {
-            let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
-            framesPerChunk = max(framesPerChunk, singleFrames)
-            extendSeconds = 0
-            plan.append(["step": "single_pass_fold",
-                         "note": "\(q.duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
-          } else {
-            plan.append(["step": "chunked_continuation",
-                         "note": "\(q.duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
-          }
-        }
-        plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(fps)"])
-        if q.width == nil && q.height == nil {
-          plan.append(["step": "caveat",
-                       "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
-        }
+        // Derived plan, mirroring prepareLocalVideo's math step by step —
+        // including the config.videoDefaults layer (FDD §3.3, D3).
+        let plan = Self.effectiveVideoRenderPlan(
+          width: q.width, height: q.height, frames: q.frames, duration: q.duration, fps: q.fps,
+          presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
+          videoConfigDefaults: ServerConfigStore.shared.videoDefaults(),
+          resolvedTwoStage: resolvedTyped.twoStage)
 
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -1437,7 +1504,12 @@ public final class WarmServer {
       let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
       if videoIntent != .cloud {
         if let localResponse = await localVideoResponseIfConfigured(body: request.body) {
-          logger.info("video: routing to local LTX-2 (synchronous)")
+          // #339 review r1, item 6: don't log "routing to local" for a
+          // request the gate just refused (503) — `localVideoResponseIfConfigured`
+          // already logged the refusal with its own reason.
+          if case .error = localResponse {} else {
+            logger.info("video: routing to local LTX-2 (synchronous)")
+          }
           return localResponse
         }
         if videoIntent == .local {
@@ -1457,7 +1529,12 @@ public final class WarmServer {
       let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
       if videoIntent != .cloud {
         if let localResponse = await localVideoAsyncResponseIfConfigured(body: request.body) {
-          logger.info("video: async-submitting local LTX-2 job")
+          // #339 review r1, item 6: don't log "async-submitting" for a
+          // request the gate just refused (503) — the helper already logged
+          // the refusal with its own reason.
+          if case .error = localResponse {} else {
+            logger.info("video: async-submitting local LTX-2 job")
+          }
           return localResponse
         }
         if videoIntent == .local {
@@ -1598,7 +1675,8 @@ public final class WarmServer {
     // /v1/loras/ hasPrefix pattern.
 
     case ("POST", "/v1/enhance"):
-      return await enhancePromptResponse(body: request.body)
+      // 0.B-1 (v2.3): async-internals route, lifted off the cooperative pool.
+      return await respondOnRouteExecutor { await self.enhancePromptResponse(body: request.body) }
 
     // MARK: - Queue management
 
@@ -1691,6 +1769,19 @@ public final class WarmServer {
     case ("GET", "/v1/content-modes"):
       return contentModesResponse()
 
+    // FDD §3.3, D3 (Class E): writable content modes. PUT sets any of
+    // guidanceBoost/promptHint/negativePromptAdditions/styleVariant (fields
+    // omitted from the body keep their current value); DELETE reverts a mode
+    // to its built-in definition rather than removing it (there is always
+    // exactly one definition per ``ContentMode`` case).
+    case ("PUT", _) where request.path.hasPrefix("/v1/content-modes/"):
+      return putContentModeResponse(
+        rawMode: String(request.path.dropFirst("/v1/content-modes/".count)), body: request.body)
+
+    case ("DELETE", _) where request.path.hasPrefix("/v1/content-modes/"):
+      return deleteContentModeResponse(
+        rawMode: String(request.path.dropFirst("/v1/content-modes/".count)))
+
     // MARK: - Creative Layer: Stats / memory
 
     case ("GET", "/v1/stats"):
@@ -1704,16 +1795,31 @@ public final class WarmServer {
     case ("GET", "/v1/audit-log"):
       return auditLogResponse(query: request.queryParameters)
 
+    // MARK: - CivitAI conduit + prompt repository (#234)
+
+    case ("GET", "/v1/civitai/search"):
+      // 0.B-1 (v2.3): async-internals route, lifted off the cooperative pool.
+      return await respondOnRouteExecutor { await self.civitaiSearchRoute(request: request) }
+
+    case ("POST", "/v1/civitai/harvest"):
+      // 0.B-1 (v2.3): async-internals route, lifted off the cooperative pool.
+      return await respondOnRouteExecutor { await self.civitaiHarvestRoute(request: request) }
+
+    case ("GET", "/v1/civitai/repo"):
+      return civitaiRepoRoute(request: request)
+
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
           "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/video/generate/async", "/v1/upscale",
           "/v1/characters", "/v1/presets", "/v1/presets/resolve",
-          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log"
+          "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log", "/v1/config",
+          "/v1/controls"
       ].contains(request.path) || request.path.hasPrefix("/v1/loras/")
          || request.path.hasPrefix("/v1/video/status/")
          || request.path.hasPrefix("/v1/characters/")
-         || request.path.hasPrefix("/v1/presets/") {
+         || request.path.hasPrefix("/v1/presets/")
+         || request.path.hasPrefix("/v1/content-modes/") {
         return .error(.error(status: 405, message: "Method not allowed"))
       }
       return .error(.error(status: 404, message: "Not found"))
@@ -1805,6 +1911,28 @@ public final class WarmServer {
     return (try? data.write(to: URL(fileURLWithPath: path))) != nil ? path : nil
   }
 
+  /// Body for `POST /v1/video/config/effective` — a HYPOTHETICAL resolution
+  /// (Finding #16): request-shaped context in, `requested_config` +
+  /// `render_plan` out. Promoted out of the route case (was a locally-scoped
+  /// struct, untestable — comfybox#307 review r1, item 2) so a test can
+  /// decode a real wire body against it, the same way `LocalVideoRequest`
+  /// already is.
+  struct EffectiveVideoConfigQuery: Decodable {
+    let width: Int?
+    let height: Int?
+    let frames: Int?
+    let duration: Float?
+    let fps: Int?
+    let tuning: LTX2VideoTuning?
+    let preset: String?
+    /// comfybox#307 (review r1): this preflight must mirror the real
+    /// generate routes — a caller checking "will two_pass do what I expect"
+    /// via `two_pass` alone (no `tuning` block) previously got back the
+    /// env/preset/builtin answer, silently ignoring the very field it was
+    /// probing.
+    let twoPass: Bool?
+  }
+
   struct LocalVideoRequest: Decodable {
     let prompt: String
     let negativePrompt: String?
@@ -1845,6 +1973,15 @@ public final class WarmServer {
     let source: String?
     /// Tier A tuning overrides (snake_case JSON via decoder strategy).
     let tuning: LTX2VideoTuning?
+    /// comfybox#307: top-level convenience alias for `tuning.two_stage` — the
+    /// HQ two-pass quality tier, controllable per request/scheduler cycle
+    /// without a caller needing to know about the nested `tuning` object.
+    /// `true`/`false` sets the tier explicitly for this render; `null` (or
+    /// absent) defers to `tuning.two_stage`, then preset/configFile/env/
+    /// builtin — the existing resolution order (`LTX2ConfigResolver`) is
+    /// unchanged. When BOTH this and `tuning.two_stage` are set, the more
+    /// specific `tuning.two_stage` wins (see `LTX2VideoTuning.merging`).
+    let twoPass: Bool?
     /// Server-minted id from /v1/enhance binding this render to its
     /// optimization lineage (task #19, finding #6).
     let optimizationAttemptId: String?
@@ -1895,6 +2032,28 @@ public final class WarmServer {
     /// condition on "prefix, prefix, …"). The preset's LoRAs, negatives, dims
     /// and steps still apply; only the prompt wrap is skipped.
     let skipPresetPrompt: Bool?
+    /// Temporal beat scheduling (comfybox#310): structured multi-beat
+    /// content (snake_case `start_frac`/`end_frac` via the decoder
+    /// strategy). Each beat's `text` must be a verbatim substring of
+    /// `prompt` — the engine locates it there and drops (fail-open) any
+    /// beat it can't find. nil/empty is byte-identical to today's flat
+    /// (joined) behavior; unknown-field-ignored convention means older
+    /// engines simply drop this key.
+    ///
+    /// Decode strictness is INTENTIONALLY not fail-open (adversarial review
+    /// F11): a structurally malformed `beat_schedule` (wrong types, missing
+    /// keys) fails the whole request decode → clean 4xx, like every other
+    /// field. Per-beat fail-open applies only to WELL-FORMED beats the
+    /// engine can't act on (unlocatable text, degenerate fracs) — a caller
+    /// bug should be loud, a tokenizer merge should not.
+    ///
+    /// T2V ONLY (comfybox#328, see LTX2BeatSchedule.swift's header for why):
+    /// on an I2V request (`image_path` set) this is stripped before it
+    /// reaches the generator and the response/trace records
+    /// `beat_schedule_ignored: "i2v_unsupported"` instead. A non-empty
+    /// schedule also makes the server SKIP prompt enhancement for this
+    /// request — see `enhance`.
+    let beatSchedule: [BeatSegment]?
   }
 
   /// Map a named resolution + aspect to a width x height budget. Dims are
@@ -1920,6 +2079,16 @@ public final class WarmServer {
     let durationSeconds: Float
     let elapsedSeconds: Double
     let backend: String
+    /// comfybox#328: non-nil (`"beat_schedule"`) when prompt enhancement
+    /// was skipped so the request's beats would locate. Absent field on
+    /// older engines/clients is the byte-identical no-op case.
+    let enhancementSkipped: String?
+    /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
+    /// on this I2V request was dropped before reaching the generator.
+    let beatScheduleIgnored: String?
+    /// comfybox#307: non-nil only when `two_stage` was requested and the
+    /// refine pass could not run — see `LTX2RefineGate`.
+    let refineSkipped: String?
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -1975,6 +2144,15 @@ public final class WarmServer {
     let source: String
     /// Lineage reference from /v1/enhance, if the caller optimized first.
     let optimizationAttemptId: String?
+    /// comfybox#328: non-nil when prompt enhancement was skipped so a
+    /// `beat_schedule` would survive verbatim in the composed prompt —
+    /// stamped onto the response/trace as `enhancement_skipped`.
+    let enhancementSkippedReason: String?
+    /// comfybox#328 (Codex round 1, finding 5): non-nil (`"i2v_unsupported"`)
+    /// when a non-empty `beat_schedule` arrived on an I2V request and was
+    /// dropped before reaching the generator — stamped onto the
+    /// response/trace as `beat_schedule_ignored`.
+    let beatScheduleIgnoredReason: String?
   }
 
   /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
@@ -2113,6 +2291,237 @@ public final class WarmServer {
     return min(100, max(0, Int((Double(done) / Double(total)) * 100.0)))
   }
 
+  /// Outcome of `resolveVideoEnhancement`: the prompt to render with, and
+  /// whether/why enhancement did or didn't run.
+  struct VideoEnhancementOutcome: Equatable {
+    let effectivePrompt: String
+    let enhancedApplied: Bool
+    /// comfybox#328: non-nil (`"beat_schedule"`) ONLY when a non-empty,
+    /// ACTIVE beat_schedule caused enhancement to be skipped — i.e.
+    /// enhancement would otherwise actually have run. Never set when
+    /// enhancement was already not going to run for an unrelated reason
+    /// (`enhance:false`, no provider configured, kill switch off) — Codex
+    /// round 1, finding 3: a false "beat_schedule" marker is worse than none.
+    let enhancementSkippedReason: String?
+  }
+
+  /// comfybox#328 (Codex round 1, finding 1): the beat-schedule-vs-
+  /// enhancement decision AND the enhancement call itself, extracted so a
+  /// unit test can inject a spy `optimize` closure and prove — without any
+  /// network call, model weights, or running server — that the optimizer is
+  /// never invoked when beats are present, and that the composed prompt
+  /// retains every beat's exact text.
+  ///
+  /// `beat_schedule` beats are located as VERBATIM substrings of the
+  /// composed prompt (`LTX2BeatScheduleLocator`, matched against the exact
+  /// text the tokenizer receives — see `LTX2VideoGenerator`). LLM
+  /// enhancement rewrites the prompt wholesale, so none of the caller's beat
+  /// phrasing survives and every beat silently fails to locate (fail-open,
+  /// one warning each) whenever both would otherwise run together. Beats are
+  /// the more specific ask: a non-empty, ACTIVE `beat_schedule` skips
+  /// enhancement outright — but ONLY when enhancement would otherwise
+  /// actually run (`enhance != false`, a provider configured, and the
+  /// `beat_schedule_enabled` kill switch not set) — see finding 3 above.
+  static func resolveVideoEnhancement(
+    prompt: String,
+    enhance: Bool?,
+    beatSchedule: [BeatSegment]?,
+    beatScheduleEnabled: Bool,
+    characterName: String?,
+    characterDesc: String?,
+    contentMode: String,
+    mediaKind: String,
+    optimizerEndpoint: AIProviderEndpoint?,
+    logger: Logger,
+    optimize: (
+      _ endpoint: AIProviderEndpoint, _ prompt: String, _ character: String?,
+      _ characterDescription: String?, _ contentMode: String, _ mediaKind: String
+    ) async -> OptimizeResult
+  ) async -> VideoEnhancementOutcome {
+    let hasBeats = !(beatSchedule?.isEmpty ?? true)
+    let beatsActive = hasBeats && beatScheduleEnabled
+    let wouldEnhanceOtherwise = enhance != false && optimizerEndpoint != nil
+
+    if beatsActive && wouldEnhanceOtherwise {
+      logger.warning(
+        "Video: skipping prompt enhancement — beat_schedule present (\(beatSchedule?.count ?? 0) beat(s)); enhancement rewrites the prompt and would strand every beat (comfybox#328).")
+      return VideoEnhancementOutcome(effectivePrompt: prompt, enhancedApplied: false, enhancementSkippedReason: "beat_schedule")
+    }
+    guard enhance != false, let endpoint = optimizerEndpoint else {
+      return VideoEnhancementOutcome(effectivePrompt: prompt, enhancedApplied: false, enhancementSkippedReason: nil)
+    }
+    let result = await optimize(endpoint, prompt, characterName, characterDesc, contentMode, mediaKind)
+    if result.enhanced {
+      logger.info("Video: enhanced prompt via \(endpoint.model)\(characterName.map { " (character \($0))" } ?? "").")
+      return VideoEnhancementOutcome(effectivePrompt: result.prompt, enhancedApplied: true, enhancementSkippedReason: nil)
+    }
+    return VideoEnhancementOutcome(effectivePrompt: prompt, enhancedApplied: false, enhancementSkippedReason: nil)
+  }
+
+  /// Production `optimize` closure for `resolveVideoEnhancement` — builds the
+  /// PromptOptimizer and calls it. The ONLY place a network call happens;
+  /// unit tests inject a spy instead.
+  private func callPromptOptimizer(
+    endpoint: AIProviderEndpoint, prompt: String, character: String?,
+    characterDescription: String?, contentMode: String, mediaKind: String
+  ) async -> OptimizeResult {
+    var base = endpoint.baseUrl
+    while base.hasSuffix("/") { base.removeLast() }
+    if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+    while base.hasSuffix("/") { base.removeLast() }
+    let optimizer = PromptOptimizer(
+      configuration: PromptOptimizer.Configuration(
+        ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
+        timeoutSeconds: 90, enabled: true),
+      logger: logger)
+    // i2v: motion-only enhancement (the init image fixes subject/scene); t2v: full scene.
+    return await optimizer.optimize(
+      prompt: prompt, character: character, characterDescription: characterDescription,
+      contentMode: contentMode, mediaKind: mediaKind)
+  }
+
+  /// comfybox#307 (review r1, item 3a): the ACTUAL wiring `prepareLocalVideo`
+  /// runs to fold the top-level `two_pass` convenience into `tuning` — pulled
+  /// out to a static func (mirrors `localVideoProgressPercent` above) so a
+  /// test can decode a real wire-format `LocalVideoRequest` and assert on
+  /// this exact call, not a re-implementation of it.
+  static func effectiveVideoTuning(for req: LocalVideoRequest) -> LTX2VideoTuning? {
+    LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass)
+  }
+
+  /// Same merge, for the `/v1/video/config/effective` preflight's query
+  /// shape (comfybox#307 review r1, item 2) — one merge rule, two wire
+  /// shapes that both carry it.
+  static func effectiveVideoTuning(for query: EffectiveVideoConfigQuery) -> LTX2VideoTuning? {
+    LTX2VideoTuning.merging(query.tuning, twoPass: query.twoPass)
+  }
+
+  /// comfybox#307 (review r1, item 2): the derived render plan for
+  /// `POST /v1/video/config/effective` — pulled out of the route case,
+  /// mirroring `prepareLocalVideo`'s dims/frames math step by step, so
+  /// `resolvedTwoStage` (which the route now feeds from the `two_pass`-merged
+  /// tuning, not just `tuning.two_stage`) driving the `two_stage_halving`
+  /// step is directly testable without a decoder or a live server.
+  static func effectiveVideoRenderPlan(
+    width: Int?, height: Int?, frames: Int?, duration: Float?, fps: Int?,
+    presetWidth: Int?, presetHeight: Int?,
+    videoConfigDefaults: VideoDefaultValues,
+    resolvedTwoStage: Bool
+  ) -> [[String: String]] {
+    var plan: [[String: String]] = []
+    var w = width ?? presetWidth ?? videoConfigDefaults.width ?? 704
+    var h = height ?? presetHeight ?? videoConfigDefaults.height ?? 448
+    let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
+    if snappedW != w || snappedH != h {
+      plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
+      w = snappedW; h = snappedH
+    }
+    if resolvedTwoStage {
+      let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
+      if s1.halved {
+        plan.append(["step": "two_stage_halving",
+                     "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
+      } else {
+        plan.append(["step": "stage1_floor",
+                     "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
+      }
+    }
+    let effectiveFps = fps ?? 24
+    var framesPerChunk = frames ?? videoConfigDefaults.frames ?? 97
+    var extendSeconds = Self.extendSecondsFromDuration(duration, framesPerChunk: framesPerChunk, fps: effectiveFps)
+    if extendSeconds > 0 {
+      let targetFrames = Int((extendSeconds * Float(effectiveFps)).rounded())
+      if targetFrames <= 289 {
+        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
+        framesPerChunk = max(framesPerChunk, singleFrames)
+        extendSeconds = 0
+        plan.append(["step": "single_pass_fold",
+                     "note": "\(duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
+      } else {
+        plan.append(["step": "chunked_continuation",
+                     "note": "\(duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
+      }
+    }
+    plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(effectiveFps)"])
+    if width == nil && height == nil {
+      plan.append(["step": "caveat",
+                   "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
+    }
+    return plan
+  }
+
+  /// comfybox#307 (review r2, item 2a; tightened review r3, minor 3): the
+  /// ACTUAL `LTX2VideoRequest` construction `prepareLocalVideo` runs —
+  /// pulled out verbatim (every argument expression unchanged) so a test
+  /// can call the SAME site production code calls and inspect the
+  /// resulting request's `.tuning`.
+  ///
+  /// `tuning:` is derived HERE, from `req`, via `effectiveVideoTuning(for:)`
+  /// — not accepted as a separate parameter — so there is no longer a
+  /// caller-supplied value that could silently diverge from the merge (a
+  /// one-line revert at the call site used to be able to pass `req.tuning`
+  /// instead of the merged value and no test would catch it; now there is
+  /// no such parameter to revert). `prepareLocalVideo` still computes its
+  /// OWN `effectiveTuning` local separately, for the dims-calc two-stage
+  /// check earlier in that function — a harmless duplicate call of the same
+  /// pure merge, not a second source of truth for what reaches the request.
+  ///
+  /// All other parameters are already-resolved values `prepareLocalVideo`
+  /// computes before this call — nothing here re-derives anything else.
+  static func buildLocalVideoRequest(
+    req: LocalVideoRequest, videoPreset: ImagePreset?,
+    effectivePrompt: String, effectiveInitImage: String?,
+    renderWidth: Int, renderHeight: Int,
+    foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
+    resolvedLoRAs: [LTX2LoRAReference], effectiveBeatSchedule: [BeatSegment]?,
+    resolvedOutput: String
+  ) -> LTX2VideoRequest {
+    LTX2VideoRequest(
+      prompt: effectivePrompt,
+      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
+      initImagePath: effectiveInitImage,
+      width: renderWidth,
+      height: renderHeight,
+      framesPerChunk: foldedFramesPerChunk,
+      steps: req.steps ?? videoPreset?.steps ?? 8,
+      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
+      strength: req.strength ?? 1.0,
+      imgCompression: req.imgCompression,
+      guidance: req.guidance,
+      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
+      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
+      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
+      // (289f, no crash). Single-chunk renders don't anchor (nothing to
+      // drift); callers can still pass 0 to disable.
+      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
+      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
+      // faces without the multi-keyframe gap-collapse. Enable explicitly via
+      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
+      // it unless the interval is set below the frame count. Only the pre-existing
+      // extended/chunked anchor stays on by default (unchanged behavior).
+      identityAnchorStrength: req.identityAnchorStrength
+        ?? (Self.isExtendedRender(
+              extendToSeconds: req.extendToSeconds, duration: req.duration,
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
+            ? 0.5
+            : ((effectiveInitImage != nil
+                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
+                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
+               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
+      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
+      extendToSeconds: foldedExtendSeconds,
+      fps: req.fps ?? 24,
+      loraPath: req.loraPath,
+      loraStrength: req.loraStrength ?? 1.0,
+      loras: resolvedLoRAs,
+      outputPath: resolvedOutput,
+      tuning: Self.effectiveVideoTuning(for: req),
+      presetTuning: videoPreset?.videoTuning,
+      audio: req.audio ?? false,
+      beatSchedule: effectiveBeatSchedule
+    )
+  }
+
   /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
   /// local LTX-2 isn't configured (caller falls through to Replicate); throws for
   /// a malformed request or invalid output path.
@@ -2121,6 +2530,11 @@ public final class WarmServer {
       return nil
     }
     let req = try decode(LocalVideoRequest.self, from: body)
+    // comfybox#307: fold the top-level `two_pass` convenience into `tuning`
+    // before anything downstream reads it — every existing consumer
+    // (dims math, `LTX2ConfigResolver.resolveTyped`, the trace snapshot) then
+    // sees one authoritative tuning block, unchanged otherwise.
+    let effectiveTuning = Self.effectiveVideoTuning(for: req)
 
     // Video presets — same PresetStore as images (mediaKind "video"). A
     // preset is a named bundle: LoRAs (bare filenames resolve through the
@@ -2213,10 +2627,13 @@ public final class WarmServer {
     // conditioning frame and the render drifts off the image. The requested
     // width x height is kept only as a pixel-area budget for I2V.
     // Priority: explicit width/height > named resolution ("720p" etc., FIXED:
-    // previously silently dropped) > preset dims > 704x448 default.
+    // previously silently dropped) > preset dims > config.videoDefaults >
+    // 704x448 engine default (FDD §3.3, D3 — only width/height/frames migrate
+    // from the desktop's local settings; steps stays untouched below).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
-    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? 704
-    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? 448
+    let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
+    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? videoConfigDefaults.width ?? 704
+    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? videoConfigDefaults.height ?? 448
     if req.width == nil, let nd = namedDims {
       logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
     }
@@ -2249,7 +2666,7 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    if LTX2ConfigResolver.resolveTyped(request: req.tuning, preset: videoPreset?.videoTuning).twoStage {
+    if LTX2ConfigResolver.resolveTyped(request: effectiveTuning, preset: videoPreset?.videoTuning).twoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
       if s1.halved {
         logger.info(
@@ -2271,8 +2688,6 @@ public final class WarmServer {
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
     }
 
-    var effectivePrompt = req.prompt
-
     // Character identity + optional prompt enhancement. For T2V (no init image)
     // there is no other identity source, so default to "kira" when the caller
     // names no character. For I2V the init image already carries identity.
@@ -2285,34 +2700,64 @@ public final class WarmServer {
       characterDesc = entry.resolvedDescription(for: charMode)
     }
 
+    // comfybox#328 (Codex round 1, finding 5): temporal beat scheduling is
+    // T2V-only — `LTX2VideoGenerator` never forwards resolved beats into any
+    // I2V render path (its I2V branches don't take a beat parameter), so a
+    // `beat_schedule` on an I2V request was a SILENT no-op — locate could
+    // even succeed and the bias would still be thrown away downstream.
+    // Rather than wire beats into I2V in this PR (I2V's frame axis and
+    // keyframe chaining differ enough from T2V's single continuous timeline
+    // to need its own design), make the no-op loud: strip the schedule
+    // before it reaches the generator and record why.
+    var beatScheduleIgnoredReason: String? = nil
+    let effectiveBeatSchedule: [BeatSegment]?
+    if !isT2V, let beats = req.beatSchedule, !beats.isEmpty {
+      beatScheduleIgnoredReason = "i2v_unsupported"
+      effectiveBeatSchedule = nil
+      logger.warning(
+        "Video: beat_schedule ignored — I2V rendering doesn't support temporal beat scheduling yet (\(beats.count) beat(s) dropped, comfybox#328: T2V-only). Send a T2V request (no image_path) for beat_schedule.")
+    } else {
+      effectiveBeatSchedule = req.beatSchedule
+    }
+
     // Auto-enhance the video prompt through the configured prompt-optimization
     // provider (Dan's-PE via LM Studio). The optimizer weaves in the character
     // description AND enriches the scene, so it replaces the manual character
     // prepend. Opt out per request with enhance:false; falls back to the manual
     // prepend when no provider is configured or enhancement fails.
-    var enhancedApplied = false
+    //
+    // comfybox#328: `beat_schedule` beats are located as VERBATIM substrings
+    // of this same composed prompt (LTX2BeatScheduleLocator, matched against
+    // the exact text the tokenizer receives — see LTX2VideoGenerator). The
+    // dolphin enhancement rewrites the prompt wholesale, so none of the
+    // caller's beat phrasing survives and every beat silently fails to
+    // locate (fail-open, one warning each) whenever both would otherwise run
+    // together. Beats are the more specific ask: a non-empty, ACTIVE
+    // `beat_schedule` skips enhancement outright — but ONLY when enhancement
+    // would otherwise actually run (`enhance != false`, a provider
+    // configured, kill switch on), so the trace marker below is never a
+    // false claim (Codex round 1, finding 3). `effectiveBeatSchedule` (not
+    // `req.beatSchedule`) feeds this — an I2V-ignored schedule shouldn't
+    // also cost enhancement quality for beats that will never apply.
     let aiProviderConfig = ComfyBoxServerConfig.loadOrMigrate()
-    if req.enhance != false, let endpoint = aiProviderConfig.providers.promptOptimization {
-      var base = endpoint.baseUrl
-      while base.hasSuffix("/") { base.removeLast() }
-      if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
-      while base.hasSuffix("/") { base.removeLast() }
-      let optimizer = PromptOptimizer(
-        configuration: PromptOptimizer.Configuration(
-          ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
-          timeoutSeconds: 90, enabled: true),
-        logger: logger)
-      // i2v: motion-only enhancement (the init image fixes subject/scene); t2v: full scene.
-      let result = await optimizer.optimize(
-        prompt: req.prompt, character: characterName,
-        characterDescription: characterDesc, contentMode: charMode.rawValue,
-        mediaKind: isT2V ? "video" : "video-i2v")
-      if result.enhanced {
-        effectivePrompt = result.prompt
-        enhancedApplied = true
-        logger.info("Video: enhanced prompt via \(endpoint.model)\(characterName.map { " (character \($0))" } ?? "").")
-      }
-    }
+    let beatScheduleEnabled = LTX2ConfigResolver.resolveTyped(
+      request: req.tuning, preset: videoPreset?.videoTuning
+    ).beatScheduleEnabled
+    let enhancement = await Self.resolveVideoEnhancement(
+      prompt: req.prompt,
+      enhance: req.enhance,
+      beatSchedule: effectiveBeatSchedule,
+      beatScheduleEnabled: beatScheduleEnabled,
+      characterName: characterName,
+      characterDesc: characterDesc,
+      contentMode: charMode.rawValue,
+      mediaKind: isT2V ? "video" : "video-i2v",
+      optimizerEndpoint: aiProviderConfig.providers.promptOptimization,
+      logger: logger,
+      optimize: callPromptOptimizer)
+    var effectivePrompt = enhancement.effectivePrompt
+    let enhancedApplied = enhancement.enhancedApplied
+    let enhancementSkippedReason = enhancement.enhancementSkippedReason
 
     // Fallback: manual character prepend when enhancement didn't run/apply.
     // Skipped outright when the caller says it already wove the description in
@@ -2344,7 +2789,9 @@ public final class WarmServer {
     // moment two-stage went live: chunk 1 clean, chunk 2 psychedelic). The
     // daemon's rule only covers i2v, so fold ANY duration that fits the
     // trained window (289f = 12s) into ONE chunk here, t2v included.
-    var foldedFramesPerChunk = req.frames ?? 97
+    // FDD §3.3, D3: `videoDefaults.frames` (migrated from the desktop's
+    // `videoFrames`) slots between the request and the 97f engine default.
+    var foldedFramesPerChunk = req.frames ?? videoConfigDefaults.frames ?? 97
     var foldedExtendSeconds = req.extendToSeconds
       ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
     if foldedExtendSeconds > 0 {
@@ -2359,50 +2806,13 @@ public final class WarmServer {
       }
     }
 
-    let videoRequest = LTX2VideoRequest(
-      prompt: effectivePrompt,
-      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
-      initImagePath: effectiveInitImage,
-      width: renderWidth,
-      height: renderHeight,
-      framesPerChunk: foldedFramesPerChunk,
-      steps: req.steps ?? videoPreset?.steps ?? 8,
-      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
-      strength: req.strength ?? 1.0,
-      imgCompression: req.imgCompression,
-      guidance: req.guidance,
-      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
-      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
-      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
-      // (289f, no crash). Single-chunk renders don't anchor (nothing to
-      // drift); callers can still pass 0 to disable.
-      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
-      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
-      // faces without the multi-keyframe gap-collapse. Enable explicitly via
-      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
-      // it unless the interval is set below the frame count. Only the pre-existing
-      // extended/chunked anchor stays on by default (unchanged behavior).
-      identityAnchorStrength: req.identityAnchorStrength
-        ?? (Self.isExtendedRender(
-              extendToSeconds: req.extendToSeconds, duration: req.duration,
-              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
-            ? 0.5
-            : ((effectiveInitImage != nil
-                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
-                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
-               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
-      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
-      extendToSeconds: foldedExtendSeconds,
-      fps: req.fps ?? 24,
-      loraPath: req.loraPath,
-      loraStrength: req.loraStrength ?? 1.0,
-      loras: resolvedLoRAs,
-      outputPath: resolvedOutput
-,
-      tuning: req.tuning,
-      presetTuning: videoPreset?.videoTuning,
-      audio: req.audio ?? false
-    )
+    let videoRequest = Self.buildLocalVideoRequest(
+      req: req, videoPreset: videoPreset,
+      effectivePrompt: effectivePrompt, effectiveInitImage: effectiveInitImage,
+      renderWidth: renderWidth, renderHeight: renderHeight,
+      foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
+      resolvedLoRAs: resolvedLoRAs, effectiveBeatSchedule: effectiveBeatSchedule,
+      resolvedOutput: resolvedOutput)
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
 
@@ -2411,7 +2821,9 @@ public final class WarmServer {
       request: videoRequest,
       mode: (effectiveInitImage?.isEmpty == false) ? .i2v : .t2v,
       source: req.source ?? "api",
-      optimizationAttemptId: req.optimizationAttemptId)
+      optimizationAttemptId: req.optimizationAttemptId,
+      enhancementSkippedReason: enhancementSkippedReason,
+      beatScheduleIgnoredReason: beatScheduleIgnoredReason)
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -2420,6 +2832,18 @@ public final class WarmServer {
   /// path a long (multi-minute / multi-chunk) render must take — it never holds
   /// the HTTP connection open for the whole denoise.
   private func localVideoAsyncResponseIfConfigured(body: Data) async -> RoutedResponse? {
+    // #339: local video is never persisted (QueueRecoveryGate.swift) — refuse
+    // it explicitly while a post-restart queue replay is in flight rather
+    // than hand out a 202 that a second restart could silently lose. Checked
+    // only when local LTX-2 IS configured, so an unconfigured engine still
+    // falls through to the Replicate cloud path exactly as before (nil).
+    if configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil {
+      let recovery = queueRecoveryState.snapshot()
+      if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: recovery.inProgress) {
+        logger.warning("LTX-2: refused async local video submission — persisted-queue replay in flight (#339)")
+        return .error(.queueRecovering(remainingKinds: recovery.remainingKinds))
+      }
+    }
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
@@ -2431,6 +2855,16 @@ public final class WarmServer {
       }
       if let attemptId = prep.optimizationAttemptId {
         tracePayload["optimization_attempt_id"] = attemptId
+      }
+      // comfybox#328: visible on GET /v1/video/traces (RenderTraceStore.
+      // TraceSummary carries both fields explicitly — see finding 2) —
+      // confirms a beat_schedule request actually skipped enhancement
+      // instead of silently losing its beats to the rewrite.
+      if let reason = prep.enhancementSkippedReason {
+        tracePayload["enhancement_skipped"] = reason
+      }
+      if let reason = prep.beatScheduleIgnoredReason {
+        tracePayload["beat_schedule_ignored"] = reason
       }
       // Winner actions (2026-08-10): store the sanitized request + the
       // resolved seed/dims so this render_id is replayable — /v1/video/rerender
@@ -2481,6 +2915,18 @@ public final class WarmServer {
     let renderId: String?
     let path: String?
     let resolution: String?
+    /// Tier-A overrides applied ON TOP of the replayed request — the point is
+    /// "same seed, same prompt, but rendered differently". The daemon's hq
+    /// quality tier sends { two_stage, audio_refine } here so a cheap 480p
+    /// single-pass explore can be promoted to a two-pass keeper without
+    /// re-rolling the seed.
+    let tuning: LTX2VideoTuning?
+    /// comfybox#305 (review r1, item 3): same top-level convenience alias
+    /// the generate routes accept (comfybox#307/#355) — `LTX2VideoTuning.
+    /// merging` folds this into `tuning.two_stage` before it reaches
+    /// `VideoWinnerActions.rerenderBody`, so callers can promote a winner to
+    /// two-pass without knowing about the nested `tuning` shape.
+    let twoPass: Bool?
   }
 
   private struct VideoExtendBody: Decodable {
@@ -2536,9 +2982,16 @@ public final class WarmServer {
   }
 
   private func videoRerenderResponse(body: Data) async -> RoutedResponse {
-    guard let req = try? decode(VideoRerenderBody.self, from: body),
-      req.renderId != nil || req.path != nil
-    else {
+    // comfybox#305 (review r1, item 2): `try?` here swallowed a malformed
+    // `tuning` block behind the misleading "Body must include render_id or
+    // path" 400 — decode for real and name the actual parse failure.
+    let req: VideoRerenderBody
+    do {
+      req = try decode(VideoRerenderBody.self, from: body)
+    } catch {
+      return .error(response(for: error))
+    }
+    guard req.renderId != nil || req.path != nil else {
       return .error(.error(status: 400, message: "Body must include 'render_id' or 'path'"))
     }
     let resolution = req.resolution ?? "720p"
@@ -2560,9 +3013,20 @@ public final class WarmServer {
         resolvedSeed: trace.submitted["seed"],
         effectivePrompt: trace.submitted["prompt"],
         resolution: resolution,
-        initImagePath: trace.submitted["image_path"])
+        initImagePath: trace.submitted["image_path"],
+        // comfybox#305 (review r1, item 3): fold the top-level `two_pass`
+        // convenience alias into `tuning.two_stage` — the same merge the
+        // generate routes apply (comfybox#307/#355) — so a rerender caller
+        // doesn't need to know the nested `tuning` shape either.
+        tuningOverride: LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass))
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
-        logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
+        // #339 review r1, item 6: `routed` can now be a 503 (queue recovery
+        // gate) — don't log a "submitted" message for a request that was
+        // actually refused; `localVideoAsyncResponseIfConfigured` already
+        // logged the refusal with its own reason.
+        if case .error = routed {} else {
+          logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
+        }
         return routed
       }
       return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights)"))
@@ -2601,9 +3065,19 @@ public final class WarmServer {
         prompt: req.prompt,
         effectivePrompt: trace?.submitted["prompt"])
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
-        // The frame must OUTLIVE this request — the queued render reads it
-        // when its GPU turn comes. tmp is system-cleaned between boots.
-        logger.info("video: winner extend of \((clipPath as NSString).lastPathComponent) (+\(req.seconds ?? 4)s)")
+        // #339 review r1, item 6: `routed` can now be a 503 (queue recovery
+        // gate), not only a successful submission. Only the SUCCESS path
+        // keeps the frame alive (the queued render reads it when its GPU
+        // turn comes; tmp is system-cleaned between boots) and logs
+        // "submitted" — a refusal must clean the frame up immediately (no
+        // render was queued to ever read it) and must not log a false
+        // success (`localVideoAsyncResponseIfConfigured` already logged the
+        // refusal with its own reason).
+        if case .error = routed {
+          if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
+        } else {
+          logger.info("video: winner extend of \((clipPath as NSString).lastPathComponent) (+\(req.seconds ?? 4)s)")
+        }
         return routed
       }
       if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
@@ -2622,6 +3096,15 @@ public final class WarmServer {
   private func localVideoResponseIfConfigured(body: Data) async -> RoutedResponse? {
     guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
       return nil
+    }
+    // #339: same refusal as the async route — see its comment. The sync
+    // route holds the HTTP connection open for the whole render, but the
+    // job it starts is exactly as unpersisted, so it is exactly as unsafe
+    // to accept mid-replay.
+    let syncRecovery = queueRecoveryState.snapshot()
+    if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: syncRecovery.inProgress) {
+      logger.warning("LTX-2: refused sync local video submission — persisted-queue replay in flight (#339)")
+      return .error(.queueRecovering(remainingKinds: syncRecovery.remainingKinds))
     }
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
@@ -2644,11 +3127,24 @@ public final class WarmServer {
         frameCount: result.frameCount,
         durationSeconds: result.durationSeconds,
         elapsedSeconds: result.elapsedSeconds,
-        backend: "ltx2-local"
+        backend: "ltx2-local",
+        enhancementSkipped: prep.enhancementSkippedReason,
+        beatScheduleIgnored: prep.beatScheduleIgnoredReason,
+        refineSkipped: result.refineSkippedReason
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
     } catch {
+      // comfybox#322: an operator interrupt is not a server failure, but the
+      // STATUS CODE stays 500 (review r1 ruling): images and video must match,
+      // and introducing a 499 would be an unversioned HTTP-level change to a
+      // production contract (intent.md) — a separate decision from this fix.
+      // The message names the cause instead of the bare "CancellationError()",
+      // and the async status JSON carries `interrupted: true`.
+      if isRenderInterruption(error) {
+        logger.info("LTX-2: synchronous video render interrupted by /v1/queue/interrupt.")
+        return .error(.error(status: 500, message: "LTX-2 video interrupted by /v1/queue/interrupt"))
+      }
       return .error(.error(status: 500, message: "LTX-2 video failed: \(error.localizedDescription)"))
     }
   }
@@ -2780,7 +3276,19 @@ public final class WarmServer {
   /// also read `isRendering` off a stale field, so the tab showed an empty,
   /// not-rendering queue while a job was actually active.
   private func queueListResponse() async -> RoutedResponse {
+    guard let data = buildQueuePayloadData() else {
+      return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
+  }
+
+  /// GET /v1/queue payload, shared by the async arm and the sync control plane.
+  /// Composes the actor-authored snapshot with the lock store's UNDRAINED deltas
+  /// (§3.1.4a point 5), so a just-issued cancel/move is reflected IMMEDIATELY —
+  /// before the actor next drains — rather than after the in-flight render.
+  private func buildQueuePayloadData() -> Data? {
     let (snap, progress) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
     let iso = ISO8601DateFormatter()
     var payload: [String: Any] = [
       "is_rendering": snap.isRendering,
@@ -2788,7 +3296,7 @@ public final class WarmServer {
       "max_pending": snap.maxPending,
       "render_count": snap.renderCount,
       "failed_count": snap.failedRenderCount,
-      "pending": snap.pending.map { job in
+      "pending": pending.map { job in
         [
           "id": job.id,
           "kind": job.kind,
@@ -2803,16 +3311,280 @@ public final class WarmServer {
     if let source = snap.activeSource { payload["active_source"] = source }
     if let started = snap.activeRenderStartedAt { payload["active_started_at"] = iso.string(from: started) }
     if let pct = progress { payload["progress_percent"] = pct }
-    // #1479: LTX-2 phase telemetry — additive, lock-based (no actor hop), so
-    // this stays as responsive during a render as the rest of this route.
+    // #1479: LTX-2 phase telemetry — additive, lock-based (no actor hop).
     let tv = ltx2Telemetry.view()
     if let phase = tv.currentPhase { payload["phase"] = phase }
     if let m = tv.maxUninterruptibleSec { payload["max_uninterruptible_sec"] = m }
     payload["phase_timings"] = tv.phases.mapValues { ["mean_sec": $0.meanSec, "samples": $0.samples] }
-    guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-      return .error(.error(status: 500, message: "Failed to serialize queue snapshot"))
+    return try? JSONSerialization.data(withJSONObject: payload)
+  }
+
+  // MARK: - 0.B-2 sync control plane (FDD §3.1.4)
+
+  /// Serve the SYNC-SERVABLE control set on the caller's OWN connection queue,
+  /// synchronously — zero cooperative threads, no actor hop — so these routes
+  /// answer even when the pool is exhausted by a blocking render. Returns nil for
+  /// anything not classified (→ the async `respond` path). Consulted only when
+  /// `ControlPlaneSyncFlag.isEnabled`; with the flag off this is never called and
+  /// every route falls through to today's async dispatch byte-for-byte.
+  fileprivate func serveControlPlaneSync(_ request: HTTPRequest) -> HTTPResponse? {
+    guard ControlPlaneClassifier.isSyncServable(method: request.method, path: request.path) else {
+      return nil
     }
-    return .json(.rawJSON(status: 200, data: data))
+    switch (request.method, request.path) {
+    case ("GET", "/v1/queue"):     return syncQueueResponse()
+    case ("GET", "/v1/models"):    return syncModelsResponse()
+    case ("GET", "/v1/stats"):     return syncStatsResponse()
+    case ("GET", "/v1/config"):    return syncConfigResponse()
+    case ("GET", "/v1/controls"):  return controlsResponse()
+    case ("POST", "/v1/queue/pause"):     return syncPauseResponse(paused: true)
+    case ("POST", "/v1/queue/resume"):    return syncPauseResponse(paused: false)
+    case ("POST", "/v1/queue/clear"):     return syncClearResponse()
+    case ("POST", "/v1/queue/interrupt"): return syncInterruptResponse()
+    case ("POST", _) where request.path.hasPrefix("/v1/queue/") && request.path.hasSuffix("/move"):
+      return syncMoveResponse(request: request)
+    case ("DELETE", _) where request.path.hasPrefix("/v1/queue/"):
+      return syncCancelResponse(request: request)
+    default:
+      return nil
+    }
+  }
+
+  static func modelsPayloadData() -> Data? {
+    let models = ComfyBoxModelRegistry.allModels.map { model -> [String: Any] in
+      [
+        "id": model.id,
+        "family": model.family.rawValue,
+        "variant": model.variant.rawValue,
+        "quantization": model.quantization.rawValue,
+        "display_name": model.displayName,
+        "description": model.description,
+        "parameters_b": model.parametersBillions,
+        "default_steps": model.defaultSteps,
+        "default_guidance": model.defaultGuidance,
+        "supports_guidance": model.supportsGuidance,
+        "supports_lora": model.supportsLoRA,
+        "supports_controlnet": model.supportsControlNet,
+        "supports_img2img": model.supportsImg2Img,
+        "default_resolution": "\(model.defaultWidth)x\(model.defaultHeight)",
+        "estimated_vram_gb": model.estimatedVRAM_GB,
+        "huggingface_id": model.huggingFaceId,
+      ] as [String: Any]
+    }
+    return try? JSONSerialization.data(withJSONObject: ["models": models, "count": models.count])
+  }
+
+  /// GET /v1/config payload, shared by the async arm and the sync control plane
+  /// so both emit identical bytes. FDD §3.3, D3: reads the lock-serialized
+  /// ``ServerConfigStore`` (an in-memory snapshot) rather than the disk —
+  /// Phase-0-compatible (no I/O, no actor hop on the request path).
+  static func configPayloadData() -> (data: Data, etag: String)? {
+    let snapshot = ServerConfigStore.shared.current()
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(snapshot.config) else { return nil }
+    return (data, snapshot.etag)
+  }
+
+  /// GET /v1/config route handler (async path).
+  static func configGetResponse() -> RoutedResponse {
+    guard let (data, etag) = Self.configPayloadData() else {
+      return .error(.error(status: 500, message: "Failed to serialize config"))
+    }
+    var response = HTTPResponse.rawJSON(status: 200, data: data)
+    response.extraHeaders["ETag"] = etag
+    return .json(response)
+  }
+
+  /// PUT /v1/config route handler (async path): full-document replace through
+  /// ``ServerConfigStore``. `If-Match` is advisory — present-and-stale is `409`;
+  /// absent proceeds with a deprecation `Warning` (FDD §3.3).
+  static func configPutResponse(request: HTTPRequest) -> RoutedResponse {
+    do {
+      let updated = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: request.body)
+      let ifMatch = request.headers["if-match"]
+      let snapshot = try ServerConfigStore.shared.replace(with: updated, ifMatch: ifMatch)
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try encoder.encode(snapshot.config)
+      var response = HTTPResponse.rawJSON(status: 200, data: data)
+      response.extraHeaders["ETag"] = snapshot.etag
+      if ifMatch == nil {
+        response.extraHeaders["Warning"] =
+          "299 - \"PUT /v1/config without If-Match is deprecated; migrate to PATCH /v1/config\""
+      }
+      return .json(response)
+    } catch let error as ServerConfigStoreError {
+      if case .etagMismatch = error {
+        return .error(.error(status: 409, message: error.description))
+      }
+      return .error(.error(status: 400, message: error.description))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid config: \(error.localizedDescription)"))
+    }
+  }
+
+  /// PATCH /v1/config route handler (async path): RFC 7386 JSON Merge Patch,
+  /// merged inside ``ServerConfigStore``'s lock against the current document —
+  /// the primary write path going forward (FDD §3.3).
+  static func configPatchResponse(request: HTTPRequest) -> RoutedResponse {
+    do {
+      guard let patchObject = try JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
+        return .error(.error(status: 400, message: "Invalid merge-patch body: expected a JSON object"))
+      }
+      let ifMatch = request.headers["if-match"]
+      let snapshot = try ServerConfigStore.shared.applyMergePatch(patchObject, ifMatch: ifMatch)
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try encoder.encode(snapshot.config)
+      var response = HTTPResponse.rawJSON(status: 200, data: data)
+      response.extraHeaders["ETag"] = snapshot.etag
+      return .json(response)
+    } catch let error as ServerConfigStoreError {
+      if case .etagMismatch = error {
+        return .error(.error(status: 409, message: error.description))
+      }
+      return .error(.error(status: 400, message: error.description))
+    } catch {
+      return .error(.error(status: 400, message: "Invalid merge-patch: \(error.localizedDescription)"))
+    }
+  }
+
+  private func syncQueueResponse() -> HTTPResponse {
+    guard let data = buildQueuePayloadData() else {
+      return .error(status: 500, message: "Failed to serialize queue snapshot")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  private func syncModelsResponse() -> HTTPResponse {
+    guard let data = Self.modelsPayloadData() else {
+      return .error(status: 500, message: "Failed to serialize models")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  private func syncConfigResponse() -> HTTPResponse {
+    guard let (data, etag) = Self.configPayloadData() else {
+      return .error(status: 500, message: "Failed to serialize config")
+    }
+    var response = HTTPResponse.rawJSON(status: 200, data: data)
+    response.extraHeaders["ETag"] = etag
+    return response
+  }
+
+  /// GET /v1/controls — Phase 4 discovery (FDD §3.4, D4), served identically by
+  /// the async arm and the sync control plane (0.B-2 classified: a lock read of
+  /// ServerConfigStore, a small-file ContentModeStore read — the same cost the
+  /// config/content-mode routes already pay — and the lock-based queue
+  /// snapshot; no actor hop, no cooperative threads). Values are resolved
+  /// per-request by dereferencing each descriptor's `read.pointer`; the
+  /// registry never caches a copy (§3.4's one rule).
+  private func controlsResponse() -> HTTPResponse {
+    let queueDocument = buildQueuePayloadData()
+      .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    guard let data = ControlRegistry.controlsPayload(
+      config: ServerConfigStore.shared.current().config,
+      contentModes: ContentModeStore.loadOrCreate(),
+      queueDocument: queueDocument)
+    else {
+      return .error(status: 500, message: "Failed to serialize controls")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  /// Stats without an actor hop: the render counters come from the lock snapshot
+  /// (the same numbers `coordinator.queueStatus()` returns, published on every
+  /// transition), so this answers during a render.
+  private func syncStatsResponse() -> HTTPResponse {
+    let (snap, _) = liveHealth.read()
+    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let snapshot = statsProvider.snapshot(
+      memory: statsProvider.sampleMemoryStatus(),
+      uptimeSeconds: StatsProvider.uptimeSeconds(startTime: serverStartTime),
+      renderCount: snap.renderCount,
+      failedRenderCount: snap.failedRenderCount,
+      pendingCount: snap.pending.count,
+      config: config)
+    return .json(status: 200, payload: snapshot)
+  }
+
+  private func syncPauseResponse(paused: Bool) -> HTTPResponse {
+    struct PauseResult: Encodable { let success: Bool; let paused: Bool }
+    // Authoritative + persisted, immediately visible via LiveHealthState.read().
+    liveHealth.setPaused(paused)
+    if !paused {
+      // The wake (§3.1.4a point 1) — fire-and-forget, NEVER a mailbox command.
+      // resume's only job through the actor is to (re)start the parked loop;
+      // decoupling the ACK from that effect is what avoids the v1 wedge.
+      Task { await coordinator.setPaused(false) }
+    }
+    auditLog.append(kind: "queue.pause", message: paused ? "Queue paused" : "Queue resumed")
+    // F-1 (adversarial review): BOTH arms return 200. The authoritative
+    // lock-store write completes before this response is built (resume’s wake
+    // is fire-and-forget, but `isPaused` itself is already false), and clients
+    // guard pause/resume on 200 — a 202 here made every UI resume throw while
+    // the engine actually resumed.
+    return .json(status: 200, payload: PauseResult(success: true, paused: paused))
+  }
+
+  private func syncClearResponse() -> HTTPResponse {
+    struct ClearResult: Encodable { let success: Bool; let cleared: Int }
+    // Record a cancel delta for each currently-pending job (composed view), applied
+    // at the next drain; the jobs disappear from the composed GET /v1/queue at once.
+    let (snap, _) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
+    for job in pending { liveHealth.recordDelta(.cancel(job.id)) }
+    if !pending.isEmpty { Task { await coordinator.drainControlDeltas() } }
+    auditLog.append(kind: "queue.clear", message: "Cleared \(pending.count) pending job(s)")
+    return .json(status: 200, payload: ClearResult(success: true, cleared: pending.count))
+  }
+
+  private func syncInterruptResponse() -> HTTPResponse {
+    struct InterruptResult: Encodable { let success: Bool; let interrupted: Bool }
+    let cancelled = liveHealth.cancelActiveRender()
+    auditLog.append(kind: "queue.interrupt", message: cancelled ? "Interrupted active render" : "No active render")
+    return .json(status: 200, payload: InterruptResult(success: true, interrupted: cancelled))
+  }
+
+  private func syncMoveResponse(request: HTTPRequest) -> HTTPResponse {
+    struct MoveResult: Encodable { let success: Bool; let moved: Bool }
+    let mid = request.path.dropFirst("/v1/queue/".count).dropLast("/move".count)
+    guard let id = Self.pathIdComponent(String(mid)) else {
+      return .error(status: 400, message: "Invalid job id")
+    }
+    struct MoveBody: Decodable { let direction: String }
+    let direction = (try? JSONDecoder().decode(MoveBody.self, from: request.body))?.direction ?? "up"
+    let (snap, _) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
+    let present = pending.contains { $0.id == id }
+    if present {
+      liveHealth.recordDelta(.move(id, direction: direction))
+      Task { await coordinator.drainControlDeltas() }
+      auditLog.append(kind: "queue.move", message: "Moved job \(id) \(direction)", metadata: ["id": id, "direction": direction])
+    }
+    return .json(status: 200, payload: MoveResult(success: true, moved: present))
+  }
+
+  private func syncCancelResponse(request: HTTPRequest) -> HTTPResponse {
+    guard let id = Self.pathIdComponent(String(request.path.dropFirst("/v1/queue/".count))) else {
+      return .error(status: 400, message: "Invalid job id")
+    }
+    let (snap, _) = liveHealth.read()
+    let pending = QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id })
+    guard pending.contains(where: { $0.id == id }) else {
+      return .error(status: 404, message: "Job not pending: \(id)")
+    }
+    liveHealth.recordDelta(.cancel(id))
+    Task { await coordinator.drainControlDeltas() }
+    auditLog.append(kind: "queue.cancel", message: "Recorded cancel for pending job \(id)", metadata: ["id": id])
+    // F-3 (adversarial review): between the presence read above and the drain,
+    // the loop may dequeue-and-start this job — so the sync path must never
+    // claim `deleted: true`. Record the delta, ACK the recording, and let the
+    // composed GET /v1/queue (where the job is already absent) and job status
+    // tell the truth. The flag-off async arm still reports deleted:true
+    // because it actually removes the job before responding.
+    return .json(status: 202, payload: SyncCancelAccepted.ack(id: id))
   }
 
   // Prompt enhancement --------------------------------------------------------
@@ -3065,7 +3837,71 @@ public final class WarmServer {
   // Content modes ------------------------------------------------------------
 
   private func contentModesResponse() -> RoutedResponse {
-    .json(status: 200, payload: contentModeStore.listModes())
+    // Re-read fresh rather than the `let contentModeStore` snapshot captured at
+    // server start: PUT/DELETE below mutate the on-disk store directly (FDD
+    // §3.3), so a stale in-memory copy here would hide a write made moments
+    // earlier in the same process. `ContentModeStore.loadOrCreate` is cheap
+    // (small JSON, same cost the config route already pays per request).
+    .json(status: 200, payload: ContentModeStore.loadOrCreate().listModes())
+  }
+
+  /// PUT /v1/content-modes/{mode} — FDD §3.3, D3 (Class E). Sets any of
+  /// guidanceBoost/promptHint/negativePromptAdditions/styleVariant; fields the
+  /// body omits keep their current value (tolerant partial update, matching
+  /// `ContentModeDefinition`'s own tolerant decode). `400` on an unknown mode,
+  /// unknown `styleVariant`, or an out-of-range `guidanceBoost`.
+  private func putContentModeResponse(rawMode: String, body: Data) -> RoutedResponse {
+    guard let mode = ContentMode(rawValue: rawMode) else {
+      return .error(.error(status: 404, message: "Unknown content mode '\(rawMode)' (expected one of: neutral, banana, avocado)"))
+    }
+    struct ContentModePatchBody: Decodable {
+      let guidanceBoost: Double?
+      let promptHint: String?
+      let negativePromptAdditions: [String]?
+      let styleVariant: String?
+    }
+    let patch: ContentModePatchBody
+    do {
+      patch = try JSONDecoder().decode(ContentModePatchBody.self, from: body)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid content-mode body: \(error.localizedDescription)"))
+    }
+    var styleVariant: ContentStyleVariant?
+    if let rawVariant = patch.styleVariant {
+      guard let parsed = ContentStyleVariant(rawValue: rawVariant) else {
+        return .error(.error(status: 400, message: "Unknown styleVariant '\(rawVariant)' (expected one of: neutral, sensual, nsfw)"))
+      }
+      styleVariant = parsed
+    }
+    if let boost = patch.guidanceBoost, !ContentModeStore.guidanceBoostRange.contains(boost) {
+      return .error(.error(
+        status: 400,
+        message: "guidanceBoost must be between \(ContentModeStore.guidanceBoostRange.lowerBound) and \(ContentModeStore.guidanceBoostRange.upperBound) (got \(boost))"))
+    }
+    do {
+      let updated = try ContentModeStore.update(
+        mode: mode,
+        guidanceBoost: patch.guidanceBoost,
+        promptHint: patch.promptHint,
+        negativePromptAdditions: patch.negativePromptAdditions,
+        styleVariant: styleVariant)
+      auditLog.append(kind: "content_mode.change", message: "Updated content mode '\(mode.rawValue)'")
+      return .json(status: 200, payload: updated)
+    } catch {
+      return .error(.error(status: 400, message: "Failed to save content mode: \(error.localizedDescription)"))
+    }
+  }
+
+  /// DELETE /v1/content-modes/{mode} — reverts a mode to its built-in
+  /// definition rather than removing it (there is always exactly one
+  /// definition per ``ContentMode`` case).
+  private func deleteContentModeResponse(rawMode: String) -> RoutedResponse {
+    guard let mode = ContentMode(rawValue: rawMode) else {
+      return .error(.error(status: 404, message: "Unknown content mode '\(rawMode)' (expected one of: neutral, banana, avocado)"))
+    }
+    let reverted = ContentModeStore.reset(mode: mode)
+    auditLog.append(kind: "content_mode.change", message: "Reverted content mode '\(mode.rawValue)' to its built-in definition")
+    return .json(status: 200, payload: reverted)
   }
 
   // Stats / memory -----------------------------------------------------------
@@ -3177,6 +4013,15 @@ public final class WarmServer {
       let family = await coordinator.modelFamily
       if family == .flux2 || family == .krea2 {
         throw WarmServerError.controlNetNotSupported
+      }
+      // #339: ControlNet generate closes over resolved temp-file paths, so
+      // (like local video) it can never be persisted — refuse before writing
+      // any of those temp files rather than accept work that could vanish if
+      // the engine restarts again before this replay finishes.
+      let controlRecovery = queueRecoveryState.snapshot()
+      if QueueRecoveryGate.shouldReject(kind: .controlnet, recoveryInProgress: controlRecovery.inProgress) {
+        throw WarmServerError.queueRecoveryInProgress(retryAfterSeconds:
+          QueueRecoveryGate.retryAfterSeconds(remainingKinds: controlRecovery.remainingKinds))
       }
       logger.info("WarmServer: routing to ControlNet pipeline — model=\(controlnetModel), strength=\(request.controlnetStrength)")
 
@@ -3719,6 +4564,11 @@ public final class WarmServer {
   }
 
   private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    try Self.decode(type, from: data)
+  }
+
+  /// The wire decoder every route uses: snake_case in, camelCase properties.
+  static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     return try decoder.decode(type, from: data)
@@ -4054,6 +4904,11 @@ public final class WarmServer {
         } catch let error as StoryboardError {
           throw error
         } catch {
+          // comfybox#322: never launder an interrupt into a shot failure.
+          // `shotFailed` keeps only a message STRING, so wrapping destroys the
+          // `CancellationError` the trackers classify on — the storyboard job
+          // would report "failed: CancellationError()" instead of interrupted.
+          if ltx2IsCancellation(error) { throw error }
           throw StoryboardError.shotFailed(shot: i, stage: "insert", message: error.localizedDescription)
         }
       }
@@ -4100,6 +4955,11 @@ public final class WarmServer {
       } catch let error as StoryboardError {
         throw error
       } catch {
+        // comfybox#322: same as the insert stage above — an interrupted shot is
+        // an interrupted storyboard, not a failed one. This is also the path a
+        // cancelled `generate()` (non-preemptible) shot takes out of
+        // `LTX2Pipeline.nonPreemptible`.
+        if ltx2IsCancellation(error) { throw error }
         throw StoryboardError.shotFailed(shot: i, stage: "i2v", message: error.localizedDescription)
       }
       clips.append(shotResult.outputPath)
@@ -4279,7 +5139,34 @@ public final class WarmServer {
 
   /// Shared decode + validation for both the synchronous and queue-submit
   /// generate routes, so output-path containment can't drift between them.
-  private func decodedGeneratePayload(from body: Data) throws -> GeneratePayload {
+  ///
+  /// Round 2 (I6): this is a one-line forward to the static below. The static
+  /// is the WHOLE decode — parse, init-image, output-path containment, recipe
+  /// names AND #286's preset expansion — so there is no separate "expansion
+  /// call at the decode site" that could be removed while the decode survived,
+  /// and the tests that drive it are testing the route.
+  func decodedGeneratePayload(from body: Data) throws -> GeneratePayload {
+    try Self.decodedGeneratePayload(
+      from: body, store: presetStore, configuration: configuration,
+      stageNearline: { entries in self.stageNearlineLoras(in: LoRASwapPayload(loras: entries)).loras },
+      log: { line in self.logger.info("\(line)") })
+  }
+
+  /// The generate routes' decode, over an EXPLICIT store and configuration so
+  /// it is testable without a warm server (same shape as
+  /// ``WarmServer/upsertPreset(store:body:)``).
+  ///
+  /// The preset is read through ``PresetStore/lookup(_:)`` — one lock over the
+  /// preset AND its validity flag, the same read `POST /v1/presets/resolve`
+  /// makes — so the two routes cannot disagree about a given revision.
+  static func decodedGeneratePayload(
+    from body: Data,
+    store: PresetStore,
+    configuration: WarmServerConfiguration,
+    stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
+    loraExists: (LoRAEntry) -> Bool = WarmServer.loRASourceExists,
+    log: (String) -> Void = { _ in }
+  ) throws -> GeneratePayload {
     var payload = try decode(GeneratePayload.self, from: body)
     // Bytes-uploaded img2img init image (init_image_base64) — write it to a
     // temp file so remote clients don't need a pre-existing server path.
@@ -4296,7 +5183,182 @@ public final class WarmServer {
     // …) live in runKrea2Generate, NOT here: the family is unknown at this
     // point and Z-Image `eta` is a shipped parameter (D18, AC-28).
     _ = try payload.validateRecipeNames()
-    return payload
+    // #286: expand a named `preset` HERE — model, LoRA stack and declared
+    // steps/guidance — so /v1/generate, /v1/generate/async and persisted-queue
+    // replay all go through it and the existing per-job model/LoRA application
+    // at dequeue does the work. Before this, `preset` was a provenance label on
+    // the image path and a preset-by-name render used whatever adapters the
+    // warm pipeline happened to hold, on whatever base was active.
+    return try expandGeneratePayload(
+      payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+  }
+
+  /// #286 — the preset expansion half of the decode. Split out only so the
+  /// two halves read separately; `decodedGeneratePayload` is the entry point.
+  static func expandGeneratePayload(
+    _ payload: GeneratePayload,
+    store: PresetStore,
+    stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
+    loraExists: (LoRAEntry) -> Bool = WarmServer.loRASourceExists,
+    log: (String) -> Void = { _ in }
+  ) throws -> GeneratePayload {
+    var out = try GeneratePayload.expandingPreset(payload) { id in
+      let (found, invalidReason) = store.lookup(id)
+      guard let preset = found else { return .notFound }
+      if let reason = invalidReason { return .invalid(reason: reason) }
+      return .resolved(store.resolve(preset: preset), declared: preset)
+    } normalizeModelSpec: { spec in
+      WarmServer.parseModelSpec(from: spec)
+    } log: { line in log(line) }
+
+    // Nothing was expanded (no preset, an unresolvable one, or the request
+    // brought its own `loras`) — the two gates below apply only to a stack the
+    // ENGINE produced. An explicit `loras` entry that does not resolve keeps
+    // its long-standing 400 at dequeue; that contract is not this ticket's.
+    guard let expanded = out.loras, out.presetUnresolved == nil,
+          payload.loras == nil, let presetId = payload.preset
+    else { return out }
+
+    // I3: a preset may name an adapter that lives only on nearline storage.
+    // `/v1/lora/swap` stages those; the expanded stack must be staged the same
+    // way or a valid preset fails on a file that is merely archived.
+    let staged = expanded.isEmpty ? expanded : stageNearline(expanded)
+
+    // Round 2, finding 3: a preset naming a LoRA that is not on disk (and could
+    // not be staged) used to become a 400 at DEQUEUE — turning a harmless
+    // provenance label into a failed render for every caller of that preset.
+    // Resolve the sources here, while the request can still fall back, and
+    // treat an unresolvable one as an unexpandable preset like any other.
+    if let missing = staged.first(where: { !loraExists($0) }) {
+      let name = (missing.path as NSString).lastPathComponent
+      return payload.asUnresolvedPreset(
+        presetId,
+        PresetExpansion.Unresolved(
+          code: "missing_lora:\(name)",
+          message: "preset '\(presetId)' names LoRA '\(missing.path)', which is not on disk and "
+            + "could not be staged from nearline storage"),
+        log: log)
+    }
+
+    out.loras = staged
+    return out
+  }
+
+  /// #286 — decode AND expand, returning the body to persist alongside the
+  /// payload.
+  ///
+  /// I5: the queue snapshot must carry the EXPANDED request. A crash-recovery
+  /// replay of the original body would re-resolve the preset against whatever
+  /// the store says at replay time — so editing or deleting a preset after a
+  /// job was accepted could change or invalidate a queued render. The rewritten
+  /// body carries the accepted `loras`/`model`/`steps`/`guidance`, and because
+  /// it now has explicit `loras` the replay takes the request-wins branch and
+  /// resolves nothing again.
+  private func decodedGenerateRequest(from body: Data) throws -> (GeneratePayload, Data) {
+    let payload = try decodedGeneratePayload(from: body)
+    return (payload, Self.rawBody(body, expandedWith: payload))
+  }
+
+  /// #286 round 3 (minor 2): is this LoRA actually there?
+  ///
+  /// `LoRAEntry.makeConfiguration()` only *searches* for a bare filename; an
+  /// absolute, `~`-prefixed or relative path is taken at its word and returned
+  /// unchecked, so the missing-LoRA rule held for one source form and not the
+  /// others. Resolve first (which tilde-expands and searches the library
+  /// roots), then STAT the resolved local path.
+  ///
+  /// A HuggingFace reference is not a local file and is fetched at load time;
+  /// there is nothing to stat, so it passes here and fails loudly later if the
+  /// repo is wrong.
+  static func loRASourceExists(_ entry: LoRAEntry) -> Bool {
+    guard let configuration = try? entry.makeConfiguration() else { return false }
+    switch configuration.source {
+    case .local(let url):
+      return FileManager.default.fileExists(atPath: url.path)
+    case .huggingFace:
+      return true
+    }
+  }
+
+  /// Merge the fields #286's expansion may have filled in back into the raw
+  /// JSON, so the persisted job replays the stack that was accepted. Returns
+  /// the original bytes unchanged when nothing was expanded or the body is not
+  /// a JSON object.
+  static func rawBody(_ original: Data, expandedWith payload: GeneratePayload) -> Data {
+    guard payload.preset?.isEmpty == false,
+          var object = (try? JSONSerialization.jsonObject(with: original)) as? [String: Any]
+    else { return original }
+    var changed = false
+    if let loras = payload.loras, object["loras"] == nil {
+      object["loras"] = loras.map { entry -> [String: Any] in
+        var row: [String: Any] = ["path": entry.path, "scale": entry.scale ?? 1.0]
+        if let role = entry.role { row["role"] = role }
+        return row
+      }
+      changed = true
+    }
+    for (key, value) in [
+      ("model", payload.model as Any?), ("steps", payload.steps as Any?),
+      ("guidance", payload.guidance as Any?),
+    ] where object[key] == nil {
+      if let value {
+        object[key] = value
+        changed = true
+      }
+    }
+    guard changed, let data = try? JSONSerialization.data(withJSONObject: object) else {
+      return original
+    }
+    return data
+  }
+
+  /// #339 review r3, item 1b (corrected r4): races "the job becomes
+  /// observably admitted" — present as either the active job or somewhere
+  /// in `pending`, which happens the instant an `enqueueXxx` call's
+  /// synchronous append (`pending.append` + the `persistQueueState()` that
+  /// immediately follows it) runs — against "the enqueue Task itself
+  /// already finished" (an immediate `queueFull`/`shuttingDown` throw never
+  /// appends at all, so polling for admission alone would burn the whole
+  /// timeout every time recovery hits the capacity gate).
+  ///
+  /// r3's version narrowed the tail unconditionally after this call
+  /// returned, INCLUDING on a timeout — but the coordinator actor's
+  /// cooperative thread pool can legitimately be starved by an in-flight
+  /// render well past 5s (a documented, known risk in this codebase — see
+  /// the "#300" note on `WarmServerCoordinator`), so a timeout does not
+  /// mean the job failed to admit, only that admission was not YET
+  /// observed. The caller (`recoverPersistedQueue`) now uses the returned
+  /// `AdmissionRaceOutcome` via `AdmissionNarrowingPolicy` (pure, tested
+  /// directly) to decide whether narrowing now is safe — only `.admitted`
+  /// is. `.timedOut`/`.renderFinishedFirst` leave the tail as-is; the
+  /// caller's OWN next loop iteration narrows past this job safely once its
+  /// `renderTask.value` has been awaited (proving it is truly done, success
+  /// or failure, either way) — so the job is NEVER at risk of being dropped
+  /// from the tail before it is durably represented elsewhere.
+  private func waitForAdmissionOrCompletion<T>(
+    jobId: String, renderTask: Task<T, Error>, timeout: TimeInterval = 5.0
+  ) async -> AdmissionRaceOutcome {
+    let health = liveHealth
+    return await withTaskGroup(of: AdmissionRaceOutcome.self) { group in
+      group.addTask {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+          let (snapshot, _) = health.read()
+          if snapshot.activeJobId == jobId || snapshot.pending.contains(where: { $0.id == jobId }) {
+            return .admitted
+          }
+          try? await Task.sleep(nanoseconds: 2_000_000)  // 2ms — cheap; keeps the duplicate window tiny
+        }
+        return .timedOut
+      }
+      group.addTask {
+        _ = try? await renderTask.value
+        return .renderFinishedFirst
+      }
+      let outcome = await group.next() ?? .timedOut
+      group.cancelAll()
+      return outcome
+    }
   }
 
   /// Replay any queue jobs left over from before a crash (see
@@ -4308,24 +5370,106 @@ public final class WarmServer {
   /// restarts). Runs as a detached background task so a large recovered
   /// queue never delays the listener from coming up.
   private func recoverPersistedQueue() {
-    guard let state = QueueStateStore.load() else { return }
-    let jobs = (state.active.map { [$0] } ?? []) + state.pending
+    // 0.B-2 (FDD §3.1.4a point 4): fold any undrained deltas from the sidecar
+    // into the recovered set BEFORE re-enqueue, resolving them against the
+    // persisted snapshot (not the live actor `pending` mid-replay). This is what
+    // makes "cancel → bounce → stays cancelled" deterministic: a persisted cancel
+    // keeps its job from resurrecting, a persisted move survives the bounce, and
+    // the sidecar is cleared exactly once.
+    let deltas = QueueDeltaStore.load()
+    let state = QueueStateStore.load()
+    // #339 review r3, item 1a: dedupe by id (first occurrence wins, active
+    // before pending) — see `RecoverySnapshotMerger.deduplicated`'s doc
+    // comment for why a snapshot can (briefly) carry the same id twice, and
+    // why that must never turn into replaying it twice.
+    var jobs = RecoverySnapshotMerger.deduplicated((state?.active.map { [$0] } ?? []) + (state?.pending ?? []))
+    if !deltas.isEmpty {
+      let before = jobs.count
+      jobs = QueueDeltaApplier.apply(deltas, to: jobs, id: { $0.id })
+      logger.info("Queue recovery: folded \(deltas.count) undrained delta(s), \(before) -> \(jobs.count) job(s)")
+      QueueDeltaStore.clear()
+      liveHealth.clearDeltas()
+    }
     guard !jobs.isEmpty else { return }
     logger.info("Queue recovery: replaying \(jobs.count) job(s) left over from before a restart")
 
+    // #339: while this replay is in flight, a submission for a queue-job
+    // kind that is never persisted (local video, ControlNet generate, a
+    // Krita model switch, a detached model load) cannot be trusted — a
+    // second restart before it finishes would lose it with no trace. Gate
+    // those kinds at the route (QueueRecoveryGate) for the span of this
+    // Task; "generate"/"lora_swap" are unaffected, they queue durably
+    // behind this same backlog either way (and, per review r1 item 1, are
+    // now durable even against a SECOND restart mid-replay — see
+    // `setRecoveryUnadmittedTail`/`RecoverySnapshotMerger`).
+    queueRecoveryState.begin(jobKinds: jobs.map { QueueJobKind(rawValue: $0.kind) ?? .generate })
     Task {
-      for job in jobs {
+      // #339 review r2, item 5: both cleanup steps run in `defer`s (LIFO —
+      // the tail clears BEFORE `finish()` flips `inProgress` false) so a
+      // cancelled replay Task (not currently possible in production, but
+      // this Task is unstructured and nothing guarantees that stays true)
+      // never leaves either a ghost ungated window OR a ghost ungated ALLOW
+      // — ordering doesn't matter for correctness here since both only ever
+      // narrow what's refused, but clearing the tail first keeps the two
+      // signals consistent with each other for the single instant between them.
+      defer { queueRecoveryState.finish() }
+      defer { Task { await self.coordinator.setRecoveryUnadmittedTail([]) } }
+      for index in jobs.indices {
+        let job = jobs[index]
+        // #339 review r2, item 4: publish `jobs[index...]` — INCLUDING this
+        // job, not just what comes after it — as the still-unadmitted tail
+        // BEFORE attempting to admit `job`. Review r1's version excluded
+        // `job` itself here, on the theory that it was "about to be admitted
+        // anyway" — but decoding the payload, staging nearline LoRAs for a
+        // swap (a synchronous copy that can take real time), or even just
+        // the `enqueueGenerate`/`enqueueSwap` call's own brief window all
+        // happen AFTER this line and BEFORE `job` is actually durable in
+        // `pending`. A crash in that gap, with the tail already narrowed to
+        // exclude `job`, lost it — the exact "one-job admission window" r2
+        // found. Publishing `jobs[index...]` keeps `job` visible in the
+        // merged snapshot (`RecoverySnapshotMerger`) for that entire span;
+        // once `job` actually lands in `pending`/`active`, it may appear in
+        // BOTH the tail and the admitted state for a brief instant (a
+        // harmless, transient duplicate — never a loss) until the NEXT
+        // iteration narrows the tail to `jobs[(index+1)...]`.
+        await coordinator.setRecoveryUnadmittedTail(Array(jobs[index...]))
+        defer { queueRecoveryState.jobAdmitted() }
         do {
           switch job.kind {
-          case "generate":
+          case QueueJobKind.generate.rawValue:
             let payload = try decodedGeneratePayload(from: job.rawBody)
+            // #339 review r3, item 1b (corrected r4): run the render in a
+            // detached child Task and race admission against the Task's
+            // own completion (`waitForAdmissionOrCompletion`) instead of
+            // awaiting `enqueueGenerate` directly — which only returns once
+            // the render COMPLETES, so r2's version left the tail (still
+            // listing this job) and the admitted state (also listing it, as
+            // `active`) both carrying it for the render's ENTIRE duration.
+            // Only narrow when admission was actually OBSERVED
+            // (`AdmissionNarrowingPolicy`, pure, tested directly) — r3's
+            // version narrowed even on a timeout, which can drop the job
+            // from the tail before the coordinator actually holds it if a
+            // render blocks the actor's cooperative pool past 5s (#300).
+            let renderTask = Task { try await self.coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody, jobId: job.id) }
+            let outcome = await waitForAdmissionOrCompletion(jobId: job.id, renderTask: renderTask)
+            if AdmissionNarrowingPolicy.shouldNarrowNow(outcome) {
+              await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            }
             // AC-18: replay under the job's OWN id (the client-visible one for
             // an async job), so a second restart persists the same name.
-            _ = try await coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody, jobId: job.id)
+            _ = try await renderTask.value
             logger.info("Queue recovery: completed generate job \(job.id)")
-          case "lora_swap":
+          case QueueJobKind.loraSwap.rawValue:
             let payload = stageNearlineLoras(in: try decode(LoRASwapPayload.self, from: job.rawBody))
-            _ = try await coordinator.enqueueSwap(payload, rawBody: job.rawBody)
+            // Same admit-then-narrow fix as generate above. `jobId: job.id`
+            // (new — `enqueueSwap` had no way to name a job before r3) is
+            // what makes this job observable to `waitForAdmissionOrCompletion` at all.
+            let swapTask = Task { try await self.coordinator.enqueueSwap(payload, rawBody: job.rawBody, jobId: job.id) }
+            let swapOutcome = await waitForAdmissionOrCompletion(jobId: job.id, renderTask: swapTask)
+            if AdmissionNarrowingPolicy.shouldNarrowNow(swapOutcome) {
+              await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            }
+            _ = try await swapTask.value
             logger.info("Queue recovery: completed lora_swap job \(job.id)")
           default:
             logger.warning("Queue recovery: unknown job kind '\(job.kind)' for \(job.id), skipping")
@@ -4335,7 +5479,12 @@ public final class WarmServer {
           // FAILED with the reason on its own id (GET /v1/generate/status/{id})
           // and in the audit log — never rendered, never silently dropped.
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
-          if job.kind == "generate" {
+          // #339 review r4, item 3: a failed lora_swap replay is recorded
+          // here too, not just generate — there is no dedicated swap-job
+          // tracker, but `imageJobTracker` is keyed by id, not by kind, so
+          // `GET /v1/generate/status/{id}` still surfaces the failure
+          // reason instead of a bare 404 for a swap job's own id.
+          if job.kind == QueueJobKind.generate.rawValue || job.kind == QueueJobKind.loraSwap.rawValue {
             imageJobTracker.recordFailedReplay(jobId: job.id, source: job.source, error: error)
           }
           auditLog.append(
@@ -4344,11 +5493,96 @@ public final class WarmServer {
             metadata: ["job_id": job.id, "kind": job.kind, "source": job.source])
         }
       }
+      // Every job admitted (successfully or not) — no unadmitted remainder.
+      // (Also covered by the `defer` above; explicit here so the common,
+      // non-cancelled path clears it immediately rather than waiting on a
+      // second Task hop.)
+      await coordinator.setRecoveryUnadmittedTail([])
     }
   }
 
   private func response(for error: Error) -> HTTPResponse {
     Self.errorResponse(for: error)
+  }
+
+  // MARK: - CivitAI conduit (#234)
+
+  /// Message returned on every /v1/civitai/* route when no API key resolves
+  /// via CivitAISecrets — never crash/trap on a missing key.
+  private static let civitaiKeyMissingMessage =
+    "CivitAI API key not configured. Set --civitai-key on `serve`, export CIVITAI_API_KEY, " +
+    "or save a key in the Desktop app's CivitAI settings (shared Keychain entry, " +
+    "service com.barkadabrew.comfybox.desktop / account civitai)."
+
+  private func civitaiSearchRoute(request: HTTPRequest) async -> RoutedResponse {
+    guard let apiKey = CivitAISecrets.resolve(explicit: configuration.civitaiApiKey) else {
+      return .error(.error(status: 503, message: Self.civitaiKeyMissingMessage))
+    }
+    let q = CivitAISearchQuery(queryParameters: request.queryParameters)
+    // P1-1: the site allowlist (CivitAIHostAllowlist, shared with the
+    // harvest route) must pass BEFORE a client carrying the Bearer key is
+    // ever constructed — an unlisted host would receive the CivitAI key.
+    guard let baseURL = q.validatedBaseURL else {
+      return .error(.error(status: 400, message: CivitAIHostAllowlist.rejectionMessage(forSite: q.site)))
+    }
+    let client = CivitAIClient(baseURL: baseURL, apiKey: apiKey)
+    do {
+      let page = try await client.searchModels(
+        query: q.query, types: q.types, baseModel: q.baseModel,
+        sort: q.sort, period: q.period, nsfw: q.nsfw, cursor: q.cursor, limit: q.limit)
+      let payload = CivitAISearchResponse(
+        models: page.items.map(CivitAISearchResultModel.init),
+        count: page.items.count,
+        nextCursor: page.nextCursor)
+      return .json(status: 200, payload: payload)
+    } catch {
+      return .error(.error(status: 502, message: "CivitAI search failed: \(error.localizedDescription)"))
+    }
+  }
+
+  private func civitaiHarvestRoute(request: HTTPRequest) async -> RoutedResponse {
+    guard let apiKey = CivitAISecrets.resolve(explicit: configuration.civitaiApiKey) else {
+      return .error(.error(status: 503, message: Self.civitaiKeyMissingMessage))
+    }
+    let body: CivitAIHarvestRequestBody
+    do {
+      body = try request.body.isEmpty
+        ? CivitAIHarvestRequestBody()
+        : decode(CivitAIHarvestRequestBody.self, from: request.body)
+    } catch {
+      return .error(.error(status: 400, message: "Invalid harvest request: \(error.localizedDescription)"))
+    }
+    // P1-1: same shared allowlist as the search route, same reason.
+    guard let baseURL = body.validatedBaseURL else {
+      return .error(.error(status: 400, message: CivitAIHostAllowlist.rejectionMessage(forSite: body.site)))
+    }
+    let client = CivitAIClient(baseURL: baseURL, apiKey: apiKey)
+    do {
+      // Behavior notes (P1-2): the runner clamps body.limit to
+      // CivitAIHarvestRunner.maxModelsPerHarvest (200) models per call,
+      // upserts page-by-page, and stops after ~60s with truncated: true in
+      // the summary — partial results are already persisted.
+      let summary = try await CivitAIHarvestRunner.run(client: client, request: body)
+      return .json(status: 200, payload: summary)
+    } catch {
+      return .error(.error(status: 502, message: "CivitAI harvest failed: \(error.localizedDescription)"))
+    }
+  }
+
+  private func civitaiRepoRoute(request: HTTPRequest) -> RoutedResponse {
+    let q = CivitAIRepoQuery(queryParameters: request.queryParameters)
+    // Result cap (P2): default 100 entries, raisable via ?limit= up to 500 —
+    // never the whole store per request.
+    let entries = PromptRepositoryStore.query(
+      baseModel: q.baseModel, act: q.act, tag: q.tag, keyword: q.keyword, limit: q.limit)
+    let payload = CivitAIRepoResponse(entries: entries, count: entries.count)
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    encoder.dateEncodingStrategy = .iso8601
+    guard let data = try? encoder.encode(payload) else {
+      return .error(.error(status: 500, message: "Failed to serialize prompt repository"))
+    }
+    return .json(.rawJSON(status: 200, data: data))
   }
 
   /// Error → HTTP mapping, static so the 400/500 split is unit-testable
@@ -4396,16 +5630,30 @@ public final class WarmServer {
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      // #286: a preset/model contradiction is a CONFLICT, not a malformed
+      // request — the caller sent two valid things that cannot both hold.
+      case .presetModelConflict:
+        return .error(status: 409, message: error.localizedDescription ?? "Preset/model conflict")
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
-           .unsupportedSampler, .orphanField:
+           .unsupportedSampler, .orphanField, .projectorScaleOutOfRange, .unknownNoiseType,
+           .implicitStepsOutOfRange, .c2OutOfRange:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .flux2NotLoaded, .flux2DetectionFailed, .fiboNotLoaded, .fiboDetectionFailed,
            .chromaNotLoaded, .chromaDetectionFailed, .krea2NotLoaded, .krea2VariantUnknown:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      // comfybox#322: an operator interrupt is not a server fault, but it
+      // reports 500 like every other terminal error here (review r1 ruling —
+      // no unversioned HTTP change; images and video must match). The
+      // `interrupted: true` field on the job status is the machine-readable
+      // signal.
+      case .renderInterrupted:
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      case .queueRecoveryInProgress(let retryAfterSeconds):
+        return .queueRecovering(retryAfterSeconds: retryAfterSeconds)
       }
 
     case let error as Flux2Pipeline.Flux2PipelineError:
@@ -4462,6 +5710,28 @@ public final class WarmServer {
     default:
       return .error(status: 500, message: error.localizedDescription)
     }
+  }
+
+  /// #313 (review round 1): validate a caller-supplied `model_compatibility`
+  /// patch against `LoRAScanner.knownCompatibilityTags` — the same treatment
+  /// `krea2_relative` already gets on this route (an unrecognized value is a
+  /// 400 naming the offending value and the valid set, never silently
+  /// accepted). Also rejects an empty array: `model_compatibility: []` would
+  /// otherwise silently strip a LoRA's compatibility down to nothing.
+  /// Static and pure so the 400 is unit-testable without a listening server,
+  /// same as `errorResponse(for:)` above.
+  static func validateModelCompatibilityTags(_ tags: [String]) throws -> [String] {
+    guard !tags.isEmpty else {
+      throw WarmServerError.invalidRequest(message: "model_compatibility must not be empty")
+    }
+    for tag in tags {
+      guard LoRAScanner.knownCompatibilityTags.contains(tag.lowercased()) else {
+        throw WarmServerError.invalidRequest(
+          message: "Invalid model_compatibility tag '\(tag)': expected one of "
+            + "\(LoRAScanner.knownCompatibilityTags.sorted())")
+      }
+    }
+    return tags
   }
 
   private static func describe(decodingError: DecodingError) -> String {
@@ -4688,11 +5958,116 @@ private final class LiveHealthState: @unchecked Sendable {
   private var snapshot = HealthSnapshot.initial
   private var progressPercent: Int?
 
+  // 0.B-2 (FDD §3.1.5): `isPaused` and the undrained-delta list are
+  // AUTHORITATIVE here, not on the actor. Off-actor/sync control writes land
+  // here and are visible to the read path IMMEDIATELY (not after the actor
+  // catches up at the end of a render). The actor is a READER of `paused` (its
+  // between-items gate) and DRAINS `deltas` at its scheduling points.
+  private var paused: Bool
+  private var deltas: [QueueControlCommand] = []
+  /// The in-flight render's task, published here (Task is Sendable) so the SYNC
+  /// `/v1/queue/interrupt` can cancel it with no actor hop. Set/cleared by the
+  /// process loop around each render.
+  private var activeRenderTask: Task<Void, Never>?
+
+  /// Cap on undrained deltas. Deltas drain promptly (every processLoop
+  /// iteration + every startProcessingIfNeeded), so this is only reached under a
+  /// pathological flood while the loop is wedged; oldest is evicted so a flood
+  /// cannot grow memory unbounded. Set generously: a dropped cancel would
+  /// resurrect a job, so eviction must stay a pathological-only event.
+  static let maxDeltas = 512
+
+  init() {
+    // Seed the authoritative pause flag from the same sentinel the actor used to
+    // read directly, so a paused queue survives a restart exactly as before.
+    // Undrained deltas are NOT preloaded here: `recoverPersistedQueue` is the
+    // single startup consumer of the sidecar (§3.1.4a point 4); preloading would
+    // double-count.
+    self.paused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
+  }
+
   func publish(_ s: HealthSnapshot) { lock.lock(); snapshot = s; lock.unlock() }
   func setProgress(_ p: Int?) { lock.lock(); progressPercent = p; lock.unlock() }
+
+  /// Read the published snapshot with the AUTHORITATIVE pause overlaid (§3.1.5:
+  /// "the read path composes lockStore.isPaused with the actor-authored
+  /// remainder"). `publishHealth()` no longer writes `isPaused`, so this overlay
+  /// is the sole source of `is_paused` for /health and /v1/queue.
   func read() -> (HealthSnapshot, Int?) {
     lock.lock(); defer { lock.unlock() }
-    return (snapshot, progressPercent)
+    var s = snapshot
+    s.isPaused = paused
+    return (s, progressPercent)
+  }
+
+  // MARK: pause authority
+
+  func isPausedAuthoritative() -> Bool { lock.lock(); defer { lock.unlock() }; return paused }
+
+  /// Authoritative pause write + its persistence (the sentinel IS the on-disk
+  /// form of this flag). Idempotent, so the sync route and the actor's
+  /// `setPaused` can both call it without racing to an inconsistent sentinel.
+  func setPaused(_ value: Bool) {
+    lock.lock(); paused = value; lock.unlock()
+    if value {
+      FileManager.default.createFile(
+        atPath: WarmServerCoordinator.pauseSentinelPath,
+        contents: Data("paused \(Date())\n".utf8))
+    } else {
+      try? FileManager.default.removeItem(atPath: WarmServerCoordinator.pauseSentinelPath)
+    }
+  }
+
+  // MARK: delta mailbox
+
+  func recordDelta(_ delta: QueueControlCommand) {
+    lock.lock(); defer { lock.unlock() }
+    deltas.append(delta)
+    if deltas.count > Self.maxDeltas { deltas.removeFirst(deltas.count - Self.maxDeltas) }
+    QueueDeltaStore.save(deltas)  // under the lock: serialized, ordered
+  }
+
+  func undrainedDeltas() -> [QueueControlCommand] {
+    lock.lock(); defer { lock.unlock() }
+    return deltas
+  }
+
+  /// Snapshot the undrained deltas for the actor to apply — WITHOUT clearing
+  /// (F-2, WAL ordering): the sidecar must outlive the canonical
+  /// `persistQueueState()` write, so a kill mid-drain replays the deltas on the
+  /// next boot instead of resurrecting a cancelled job. The actor calls
+  /// `commitDrainedDeltas` only AFTER canonical state is on disk.
+  func peekDeltas() -> [QueueControlCommand] {
+    lock.lock(); defer { lock.unlock() }
+    return deltas
+  }
+
+  /// WAL commit point (F-2): canonical queue state is persisted; drop the first
+  /// `count` deltas — the ones the drain applied — and rewrite the sidecar to
+  /// the remainder, so deltas recorded DURING the drain survive to the next one.
+  func commitDrainedDeltas(_ count: Int) {
+    lock.lock(); defer { lock.unlock() }
+    deltas.removeFirst(min(count, deltas.count))
+    QueueDeltaStore.save(deltas)
+  }
+
+  /// Clear the in-memory deltas without a take (recovery already folded them into
+  /// the queue and cleared the sidecar).
+  func clearDeltas() { lock.lock(); deltas.removeAll(); lock.unlock() }
+
+  // MARK: active-render interrupt (sync /v1/queue/interrupt)
+
+  func setActiveRenderTask(_ task: Task<Void, Never>?) {
+    lock.lock(); activeRenderTask = task; lock.unlock()
+  }
+
+  /// Cancel the in-flight render if one is published. `Task.cancel` is Sendable,
+  /// so the sync interrupt route calls this with no actor hop.
+  func cancelActiveRender() -> Bool {
+    lock.lock(); let task = activeRenderTask; lock.unlock()
+    guard let task else { return false }
+    task.cancel()
+    return true
   }
 }
 
@@ -4888,6 +6263,14 @@ public struct ImageJobStatus: Codable, Sendable {
   /// persisted pre-upgrade JSON still decodes (AC-64); null for other
   /// families (D12) and until the job succeeds.
   public let applied: AppliedRecordSlot?
+  /// #286: the flat `applied_loras` stack the sync response carries, so an
+  /// async caller can verify its render the same way. Optional so persisted
+  /// pre-#286 JSON still decodes.
+  public let appliedLoras: [LoRAState]?
+  /// #286 (C2/I1): the same additive flags the sync response carries.
+  public let presetUnresolved: String?
+  public let presetUnresolvedReason: String?
+  public let presetStackMismatch: Bool?
 
   /// The record itself; see ``AppliedRecordSlot`` for absent-vs-null.
   public var appliedRecord: RenderRecipe? { applied?.record }
@@ -4895,7 +6278,9 @@ public struct ImageJobStatus: Codable, Sendable {
   public init(
     jobId: String, status: ImageJobState, source: String, outputPath: String?, durationMs: Int?,
     error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?,
-    applied: AppliedRecordSlot? = nil
+    applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
+    presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
+    presetStackMismatch: Bool? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -4907,6 +6292,10 @@ public struct ImageJobStatus: Codable, Sendable {
     self.preemptRefused = preemptRefused
     self.etaSec = etaSec
     self.applied = applied
+    self.appliedLoras = appliedLoras
+    self.presetUnresolved = presetUnresolved
+    self.presetUnresolvedReason = presetUnresolvedReason
+    self.presetStackMismatch = presetStackMismatch
   }
 }
 
@@ -4926,6 +6315,12 @@ private final class ImageJob: @unchecked Sendable {
   var etaSec: Double?
   /// WP-E10: set with the result on success (tri-state, see AppliedRecordSlot).
   var applied: AppliedRecordSlot?
+  /// #286: the flat applied stack, set with the result on success.
+  var appliedLoras: [LoRAState]?
+  /// #286: the preset flags, set with the result on success.
+  var presetUnresolved: String?
+  var presetUnresolvedReason: String?
+  var presetStackMismatch: Bool?
 
   init(id: String, source: String) {
     self.id = id
@@ -4941,7 +6336,10 @@ private final class ImageJob: @unchecked Sendable {
     ImageJobStatus(
       jobId: id, status: state, source: source, outputPath: outputPath,
       durationMs: durationMs, error: error, elapsedMs: elapsedMs,
-      preemptRefused: preemptRefused, etaSec: etaSec, applied: applied
+      preemptRefused: preemptRefused, etaSec: etaSec, applied: applied,
+      appliedLoras: appliedLoras, presetUnresolved: presetUnresolved,
+      presetUnresolvedReason: presetUnresolvedReason,
+      presetStackMismatch: presetStackMismatch
     )
   }
 }
@@ -5022,6 +6420,12 @@ final class ImageJobTracker: @unchecked Sendable {
   ) -> ImageJobStatus {
     let jobId = UUID().uuidString
     let job = ImageJob(id: jobId, source: source)
+    // #286: the preset flags are known at SUBMIT, not only on success — an
+    // async caller must see `preset_unresolved` on the 202 rather than having
+    // to poll for it, and a job that later fails must still report it.
+    job.presetUnresolved = payload.presetUnresolved
+    job.presetUnresolvedReason = payload.presetUnresolvedReason
+    job.presetStackMismatch = payload.presetStackMismatch
     lock.lock(); jobs[jobId] = job; lock.unlock()
 
     Task { [weak self] in
@@ -5086,6 +6490,10 @@ final class ImageJobTracker: @unchecked Sendable {
       job.outputPath = result.outputPath
       job.durationMs = result.durationMs
       job.applied = result.applied
+      job.appliedLoras = result.appliedLoras
+      job.presetUnresolved = result.presetUnresolved ?? job.presetUnresolved
+      job.presetUnresolvedReason = result.presetUnresolvedReason ?? job.presetUnresolvedReason
+      job.presetStackMismatch = result.presetStackMismatch ?? job.presetStackMismatch
       job.completedAt = Date()
     }
     lock.unlock()
@@ -5131,8 +6539,15 @@ private final class LocalVideoJob: @unchecked Sendable {
   var error: String?
   var progressPercent: Int?
   var completedAt: Date?
+  /// comfybox#322: this render was stopped by `/v1/queue/interrupt`, not by a
+  /// failure. Surfaced as the additive `interrupted` field on the status JSON
+  /// (see `VideoJobStatus.interrupted` for why `status` itself stays `failed`).
+  var interrupted = false
   /// Authoritative config snapshot, set at submit (finding #15).
   var resolvedConfig: [LTX2ResolvedParam]?
+  /// comfybox#307: set on success when `two_stage` was requested and the
+  /// refine could not run — see `LTX2RefineGate`.
+  var refineSkippedReason: String?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -5158,7 +6573,9 @@ private final class LocalVideoJob: @unchecked Sendable {
       elapsedMs: elapsedMs,
       progressPercent: progressPercent,
       resolvedConfig: resolvedConfig,
-      frameCount: frameCount
+      frameCount: frameCount,
+      interrupted: interrupted ? true : nil,
+      refineSkipped: refineSkippedReason
     )
   }
 }
@@ -5319,19 +6736,33 @@ final class VideoJobTracker: @unchecked Sendable {
       job.durationMs = Int(result.elapsedSeconds * 1000)
       job.progressPercent = 100
       job.completedAt = Date()
+      job.refineSkippedReason = result.refineSkippedReason
     }
     lock.unlock()
+    var payload = [
+      "status": "succeeded",
+      "output_path": result.outputPath,
+      "frames": String(result.frameCount),
+      "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
+    ]
+    // comfybox#307: durable on the trace even after the job itself prunes —
+    // `RenderTraceStore` outlives `pruneCompleted`'s 1h job TTL.
+    if let reason = result.refineSkippedReason {
+      payload["refine_skipped"] = reason
+    }
     traceStore?.append(RenderTraceEvent(
-      renderId: jobId, event: .terminal, taskKind: .videoRender,
-      payload: [
-        "status": "succeeded",
-        "output_path": result.outputPath,
-        "frames": String(result.frameCount),
-        "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
-      ]))
+      renderId: jobId, event: .terminal, taskKind: .videoRender, payload: payload))
   }
 
   func markFailed(_ jobId: String, error: Error) {
+    // comfybox#322: an operator interrupt is not a failure. Both spellings of
+    // it (a raw `CancellationError` out of a pipeline loop, and the named
+    // `WarmServerError.renderInterrupted` the video queue case substitutes)
+    // land here, because `submit`'s only terminal-error path is this method.
+    if isRenderInterruption(error) {
+      markInterrupted(jobId)
+      return
+    }
     lock.lock()
     if let job = jobs[jobId] {
       job.state = .failed
@@ -5342,6 +6773,27 @@ final class VideoJobTracker: @unchecked Sendable {
     traceStore?.append(RenderTraceEvent(
       renderId: jobId, event: .terminal, taskKind: .videoRender,
       payload: ["status": "failed", "error": error.localizedDescription]))
+  }
+
+  /// comfybox#322: terminal, but not a failure — `/v1/queue/interrupt` stopped
+  /// this render mid-flight.
+  ///
+  /// `state` stays `.failed` so every existing polling client still sees a
+  /// terminal status it knows (see `VideoJobStatus.interrupted`); the additive
+  /// `interrupted` flag and the trace's `status: interrupted` carry the real
+  /// outcome. The trace has no wire-compat constraint, so it says the truth.
+  func markInterrupted(_ jobId: String) {
+    lock.lock()
+    if let job = jobs[jobId] {
+      job.state = .failed
+      job.interrupted = true
+      job.error = "Render interrupted by /v1/queue/interrupt"
+      job.completedAt = Date()
+    }
+    lock.unlock()
+    traceStore?.append(RenderTraceEvent(
+      renderId: jobId, event: .terminal, taskKind: .videoRender,
+      payload: ["status": "interrupted", "interrupted": "true"]))
   }
 
   /// Drop completed/failed jobs older than `ttl`. Mirrors `ImageJobTracker`.
@@ -5365,6 +6817,21 @@ private actor WarmServerCoordinator {
     case shuttingDown
     /// The pending request was removed by a queue clear (not a server shutdown).
     case cancelled
+  }
+
+  /// #300: this actor's isolated work (including the synchronous render call)
+  /// otherwise runs on the Swift cooperative thread pool
+  /// (`com.apple.root.utility-qos.cooperative`), which is width-capped at
+  /// ~core count and does NOT grow when a worker blocks. A `sample` of the
+  /// live process during a render showed 2964/2972 samples parked in
+  /// `__psynch_cvwait` on that pool — starving every other actor hop,
+  /// including `Task { await respond(...) }` for async HTTP routes (HTTP 000
+  /// at 120s while sync routes stayed fine). Giving the coordinator its own
+  /// serial executor (SE-0392) moves its work off the shared cooperative pool
+  /// entirely; actor serialization semantics are unchanged.
+  private let executorQueue = DispatchSerialQueue(label: "z-image.warm-server.coordinator", qos: .userInitiated)
+  nonisolated var unownedExecutor: UnownedSerialExecutor {
+    executorQueue.asUnownedSerialExecutor()
   }
 
   private let configuration: WarmServerConfiguration
@@ -5424,14 +6891,12 @@ private actor WarmServerCoordinator {
   /// Source/app of the currently-running job.
   private var activeJobSource: String?
   private var isProcessing = false
-  /// When paused, the process loop finishes the current job (if any) but does
-  /// not start pending ones until resumed.
-  ///
-  /// PERSISTED across restarts via a sentinel file (2026-08-10): the flag was
-  /// in-memory only, so any engine restart — watchdog kickstart, crash,
-  /// deploy — silently resumed creation. "Paused" that un-pauses itself is
-  /// how the July mystery-GPU-usage class of incident happens.
-  private var isPaused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
+  // 0.B-2 (FDD §3.1.5): `isPaused` is no longer owned here. It is AUTHORITATIVE
+  // in the lock store (`LiveHealthState`), persisted by the same sentinel file
+  // (2026-08-10 rationale unchanged: a "paused" that un-pauses itself across a
+  // watchdog kickstart / crash / deploy is how the mystery-GPU-usage incidents
+  // happen). This actor is a READER of it — see the `processLoop` gate and
+  // `setPaused` below.
 
   /// Sentinel marking the queue paused; survives engine restarts. Computed
   /// from `QueueStateStore.stateDirectory` so it follows `COMFYBOX_STATE_DIR`
@@ -5449,6 +6914,47 @@ private actor WarmServerCoordinator {
   /// published into /health as `last_recipe`. Set only from a completed
   /// render (a failed one writes no record), never from a request.
   private var lastRecipe: AppliedRecordSlot?
+
+  /// comfybox#308: apply one render's terminal outcome to the counters
+  /// `/health` and `/v1/queue` publish. The six image `run*Generate` methods
+  /// still hand-increment inline (unchanged, working, and out of scope here);
+  /// this is for paths — currently just `.localVideo` — that had no
+  /// equivalent at all.
+  private func recordRenderCompletion(_ event: RenderCompletionEvent) {
+    var counters = RenderHealthCounters(
+      successCount: successfulRenderCount, failedCount: failedRenderCount,
+      lastDurationMs: lastRenderDurationMs)
+    counters.apply(event)
+    successfulRenderCount = counters.successCount
+    failedRenderCount = counters.failedCount
+    lastRenderDurationMs = counters.lastDurationMs
+  }
+
+  /// comfybox#308 (review r2, item 2b): the ONE place all `.localVideo`
+  /// completion bookkeeping goes through — consolidates what were three
+  /// independent `recordRenderCompletion(...); lastError = ...` pairs (one
+  /// per exit point: success, thrown error, memory-admission refusal) so
+  /// there is exactly one function a `#if DEBUG` seam
+  /// (`WarmServerQueueProbe.finishLocalVideoTestSeam`) can drive to prove
+  /// the counters move for all three outcomes.
+  private func finishLocalVideo(_ outcome: LocalVideoCompletionOutcome, lastError message: String?) {
+    recordRenderCompletion(.forLocalVideoCompletion(outcome))
+    lastError = message
+  }
+
+  /// comfybox#308/#322 (review r3): the `.localVideo` case's generic
+  /// `catch` — shared by the production catch block and the `#if DEBUG`
+  /// seam (`testSeamHandleLocalVideoCatch`) so both run the exact same
+  /// classify-then-finish decision. `localVideoCatchOutcome(for:)` returns
+  /// nil for an operator interrupt (including a WRAPPED cancellation) —
+  /// `finishLocalVideo` is not called at all in that case, matching the
+  /// sibling `catch is CancellationError` branch, which never touches the
+  /// counters either.
+  private func handleLocalVideoCatch(_ error: Error) {
+    if let outcome = localVideoCatchOutcome(for: error) {
+      finishLocalVideo(outcome, lastError: error.localizedDescription)
+    }
+  }
 
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
@@ -5519,6 +7025,15 @@ private actor WarmServerCoordinator {
   /// QueuePersistence.swift for why only these two kinds are recoverable).
   private var activeJobRawBody: Data?
   private var activeJobKindForPersistence: String?
+  /// #339 review r1: the not-yet-admitted remainder of a persisted-queue
+  /// replay in progress (see `RecoverySnapshotMerger`). `persistQueueState()`
+  /// merges this into every snapshot it writes so a SECOND restart mid-replay
+  /// does not lose it — the "deeper bug" review r1 found: the old sequential
+  /// one-job-at-a-time replay left jobs 2..N invisible to `queue-state.json`
+  /// until each was individually re-admitted. Set by
+  /// `WarmServer.recoverPersistedQueue` before each job's admission; cleared
+  /// to `[]` once the whole batch is admitted (`defer`, so it always clears).
+  private var recoveryUnadmittedTail: [PersistedQueueJob] = []
 
   /// True after the image models were released to make room for LTX-2 video —
   /// the next image render must reload before it can run (#218).
@@ -5727,6 +7242,29 @@ private actor WarmServerCoordinator {
     return (admitVideo, Int(availableForVideo >> 20), Int(ltx2Need >> 20))
   }
 
+  #if DEBUG
+  /// comfybox#322 test seam. The #218 admission gate needs ~65-80GB of real
+  /// free RAM, which no unit test can arrange on a machine that is also
+  /// serving production — so the coordinator seam tests (which exist to prove
+  /// the `.localVideo` case PUBLISHES a cancellable render task, not to
+  /// re-test admission) skip the gate. Same precedent as the `.synthetic`
+  /// queue kind: `#if DEBUG`, never compiled into the shipped engine, and only
+  /// `WarmServerQueueProbe` can set it.
+  var bypassVideoAdmissionForTests = false
+  func setBypassVideoAdmission(_ value: Bool) { bypassVideoAdmissionForTests = value }
+  #endif
+
+  /// The admission decision for a `.localVideo` job, in one place so the queue
+  /// case reads the same gate a resume does.
+  private func admitVideoForRender(
+    wantsAudio: Bool
+  ) async -> (admitted: Bool, availableMB: Int, neededMB: Int) {
+    #if DEBUG
+    if bypassVideoAdmissionForTests { return (true, 0, 0) }
+    #endif
+    return await vacateImageModelsAndAdmitVideo(wantsAudio: wantsAudio)
+  }
+
   /// Reload (if needed) and resume the checkpointed video render.
   ///
   /// Runs the full #218/#34 admission gate (`vacateImageModelsAndAdmitVideo`)
@@ -5803,6 +7341,30 @@ private actor WarmServerCoordinator {
   private func ltx2ModelLoadTotalSec() -> Double {
     guard let p = ltx2Telemetry.view().phases["modelLoad"] else { return 0 }
     return p.meanSec * Double(p.samples)
+  }
+
+  /// comfybox#322 (review r1, Critical): run `work` to completion regardless of
+  /// whether THIS task is cancelled.
+  ///
+  /// The one caller is the preemption episode's image job. Structured
+  /// concurrency would be wrong there: the episode is awaited from inside the
+  /// video's render task, so a child task inherits the video's cancellation and
+  /// an interrupt aimed at the video takes an unrelated image render down with
+  /// it. An unstructured task inherits no cancellation, and `.value` on a
+  /// `Task<Void, Never>` is non-throwing, so this returns only when `work` has
+  /// actually finished.
+  ///
+  /// Isolation note: `work` is a `@Sendable` closure, so it is nonisolated and
+  /// hops back onto this actor at its own `await`. The window that opens while
+  /// this task is suspended is the same one `runGenerate`'s own first `await`
+  /// already opened before this shield existed — no new reentrancy, and the
+  /// queue loop stays parked on the video render task throughout.
+  ///
+  /// Exposed to `WarmServerQueueProbe` (DEBUG) so a test can prove the shielded
+  /// work does NOT observe the caller's cancellation.
+  func runShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) async {
+    let shielded = Task { await work() }
+    await shielded.value
   }
 
   /// The full preemption episode: checkpoint received -> evict the video
@@ -5886,6 +7448,13 @@ private actor WarmServerCoordinator {
       // the signal was observed) — nothing left to run. Resume immediately.
       logger.warning("#1479: video yielded but no preemptor was waiting (checkpoint-fallback watchdog already handled it) — resuming immediately")
       clearEpisodeState()
+      // comfybox#322: …unless the video itself was interrupted. There is no
+      // preemptor to protect on this branch, so this is purely "do not bring
+      // a killed render back to life".
+      if LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo {
+        logger.info("#1479/#322: video interrupted with no preemptor pending — checkpoint dropped, no resume.")
+        throw CancellationError()
+      }
       return try await resumeCheckpointedVideo(state: state, wantsAudio: wantsAudio, report: report)
     }
 
@@ -5931,11 +7500,20 @@ private actor WarmServerCoordinator {
     // whenever a video is resident, #218) its own image-model reload. See
     // this function's doc comment (review I4) for why this is its own
     // do/catch rather than a bare call.
-    do {
-      await runGenerate(claimed.payload, continuation: claimed.continuation)
-    } catch {
-      logger.error("#1479: preempting image job threw past runGenerate's own boundary (\(error)) — resuming the video anyway")
-    }
+    // comfybox#322 (review r1, Critical): SHIELDED. This episode runs inside
+    // the video's render task, and `runGenerate` has been cancellation-aware
+    // since comfybox#304 — so the plain `await` that used to be here inherited
+    // the video's cancellation, and `/v1/queue/interrupt` aimed at the video
+    // killed the preempting IMAGE job mid-denoise. That is exactly the "died
+    // as cancel collateral with an opaque error" failure #322 exists to end.
+    // `runShieldedFromCancellation` runs it in an unstructured task, which
+    // does not inherit cancellation, and waits for it either way.
+    //
+    // This also replaces the old do/catch guardrail with a STATIC one: the
+    // shield takes a non-throwing closure, so if `runGenerate` ever grows a
+    // `throws` this stops compiling — louder than a `catch` that logs and
+    // carries on.
+    await runShieldedFromCancellation { await self.runGenerate(claimed.payload, continuation: claimed.continuation) }
 
     // Restore the video's identity — symmetric with the swap above, and done
     // BEFORE its (possibly long, synchronous) resume so /health, /v1/queue and
@@ -5954,6 +7532,20 @@ private actor WarmServerCoordinator {
 
     // Clear BEFORE the resume, not in the defer (review I2) — see doc comment.
     clearEpisodeState()
+
+    // comfybox#322 (review r1, Critical): the operator may have interrupted the
+    // video while the preemptor ran. The preemptor was protected above and has
+    // finished normally; the video's checkpoint is dropped here rather than
+    // resumed — carrying on for another 20 minutes would defeat the interrupt
+    // entirely. `clearEpisodeState()` above already released the checkpoint and
+    // the in-flight flag, and the video weights were evicted at the top of this
+    // episode and are deliberately NOT reloaded: an operator who interrupted to
+    // free the box gets the box. `CancellationError` propagates to the queue
+    // case, which reports the job interrupted.
+    if LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo {
+      logger.info("#1479/#322: video interrupted during the preemption episode — preemptor completed normally, video checkpoint dropped (no resume).")
+      throw CancellationError()
+    }
 
     // Review round 2, finding 1: snapshot the REAL instrument (modelLoad
     // phase telemetry), not a wall clock around the whole resume call — the
@@ -6474,7 +8066,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  func enqueueSwap(_ payload: LoRASwapPayload, rawBody: Data? = nil) async throws -> LoRASwapResponse {
+  func enqueueSwap(_ payload: LoRASwapPayload, rawBody: Data? = nil, jobId: String? = nil) async throws -> LoRASwapResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -6483,7 +8075,13 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .swap(payload, ContinuationBox(continuation)), rawBody: rawBody))
+      // #339 review r3, item 1b: `jobId` lets `recoverPersistedQueue` name
+      // this pending job with its ORIGINAL persisted id (mirroring
+      // `enqueueGenerate`'s AC-18 `jobId`), so the replay loop can poll for
+      // that exact id becoming admitted instead of a fresh random one it
+      // has no way to observe. nil (every live route) keeps the default
+      // fresh UUID, unchanged.
+      pending.append(PendingJob(id: jobId ?? UUID().uuidString, operation: .swap(payload, ContinuationBox(continuation)), rawBody: rawBody))
       startProcessingIfNeeded()
     }
   }
@@ -6639,6 +8237,51 @@ private actor WarmServerCoordinator {
     }
   }
 
+  #if DEBUG
+  /// 0.B-2 test seam: enqueue a synthetic loop-occupying operation. Mirrors
+  /// `enqueueModelSwitch`'s FIFO handling exactly.
+  func enqueueSynthetic(durationMs: Int, id: String = UUID().uuidString) async throws -> Bool {
+    if shuttingDown { throw ServerError.shuttingDown }
+    if pending.count >= configuration.maxPendingRequests {
+      throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      pending.append(PendingJob(id: id, operation: .synthetic(durationMs: durationMs, ContinuationBox(continuation))))
+      startProcessingIfNeeded()
+    }
+  }
+
+  /// comfybox#308 (review r2, item 2b) test seam: drives `finishLocalVideo`
+  /// directly — bypassing the queue, the memory-admission gate (real system
+  /// probing + up to ~18s of drain sleeps, unsafe to run in a unit test) and
+  /// the GPU render — and returns the counters + lastError afterward. Proves
+  /// the SAME function all three real `.localVideo` exit points call moves
+  /// them correctly for each outcome; deleting the call at one of those exit
+  /// points removes that outcome from ever reaching `finishLocalVideo` in
+  /// production without changing what this seam proves about the function
+  /// itself, which is the most a private, weights/GPU-dependent actor can
+  /// offer without a live engine (see intent.md: unit tests only).
+  func testSeamFinishLocalVideo(
+    _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
+  ) -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    finishLocalVideo(outcome, lastError: message)
+    return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
+  }
+
+  /// comfybox#308/#322 (review r3) test seam: drives `handleLocalVideoCatch`
+  /// directly against a REAL coordinator — the exact function the
+  /// production `.localVideo` generic `catch` calls — so a test can prove a
+  /// WRAPPED cancellation (or any error `isRenderInterruption` recognises)
+  /// leaves the counters and `lastError` untouched, while a genuine error
+  /// still counts as a failed render.
+  func testSeamHandleLocalVideoCatch(
+    _ error: Error
+  ) -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    handleLocalVideoCatch(error)
+    return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
+  }
+  #endif
+
   /// Publish the current health-relevant state into the lock-based
   /// ``LiveHealthState`` so GET /health reads it without hopping onto this
   /// actor (which blocks for a whole render). Call at every state transition:
@@ -6677,7 +8320,8 @@ private actor WarmServerCoordinator {
       activeJobId: activeJobId,
       lastRenderDurationMs: lastRenderDurationMs,
       lastError: lastError,
-      isPaused: isPaused,
+      // isPaused intentionally omitted (§3.1.5): LiveHealthState.read() overlays
+      // the AUTHORITATIVE value, so publishHealth no longer writes it.
       activeSummary: activeJobSummary,
       activeSource: activeJobSource,
       pending: pending.map { job in
@@ -6694,11 +8338,24 @@ private actor WarmServerCoordinator {
     liveHealth.publish(snap)
   }
 
+  /// #339 review r1: set (or clear, with `[]`) the not-yet-admitted tail of
+  /// an in-flight persisted-queue replay — see `recoveryUnadmittedTail`.
+  /// Persists immediately so the merged snapshot reflects the new tail right
+  /// away rather than waiting for the next unrelated mutation.
+  func setRecoveryUnadmittedTail(_ tail: [PersistedQueueJob]) {
+    recoveryUnadmittedTail = tail
+    persistQueueState()
+  }
+
   /// Mirror the recoverable slice of the queue (see QueuePersistence.swift)
   /// to disk so it survives a crash. Called at every mutation: enqueue,
   /// dequeue-into-active, job completion, cancel, reorder, clear. Cheap
   /// (small JSON, atomic write) relative to how rarely the queue actually
   /// changes compared to render duration.
+  ///
+  /// #339 review r1: merges in `recoveryUnadmittedTail` (the durability fix —
+  /// see its doc comment and `RecoverySnapshotMerger`) so a replay in
+  /// progress never narrows the file to just what has been admitted so far.
   private func persistQueueState() {
     let active: PersistedQueueJob? = {
       guard let rawBody = activeJobRawBody,
@@ -6714,7 +8371,8 @@ private actor WarmServerCoordinator {
         id: job.id, kind: Self.kind(of: job.operation), source: job.source,
         enqueuedAt: job.enqueuedAt, rawBody: rawBody)
     }
-    QueueStateStore.save(PersistedQueueState(active: active, pending: pendingJobs))
+    QueueStateStore.save(RecoverySnapshotMerger.merge(
+      admittedActive: active, admittedPending: pendingJobs, unadmittedTail: recoveryUnadmittedTail))
   }
 
   /// Queue status for the ComfyUI bridge /queue endpoint.
@@ -6781,6 +8439,10 @@ private actor WarmServerCoordinator {
       cont.resume(throwing: ServerError.cancelled)
     case .shutdown(let cont):
       cont.resume(throwing: ServerError.cancelled)
+    #if DEBUG
+    case .synthetic(_, let cont):
+      cont.resume(throwing: ServerError.cancelled)
+    #endif
     }
   }
 
@@ -6801,18 +8463,28 @@ private actor WarmServerCoordinator {
       return "LTX-2 video"
     case .shutdown:
       return "Shutdown"
+    #if DEBUG
+    case .synthetic(let durationMs, _):
+      return "Synthetic op (\(durationMs)ms)"
+    #endif
     }
   }
 
+  // #339 review r1, item 2: every case reads from `QueueJobKind`
+  // (QueueRecoveryGate.swift) — the single source of truth the recovery
+  // gate's allowlist also reads from, so the two cannot silently drift.
   private static func kind(of operation: QueuedOperation) -> String {
     switch operation {
-    case .generate: return "generate"
-    case .controlGenerate: return "controlnet"
-    case .swap: return "lora_swap"
-    case .modelSwitch: return "model_switch"
+    case .generate: return QueueJobKind.generate.rawValue
+    case .controlGenerate: return QueueJobKind.controlnet.rawValue
+    case .swap: return QueueJobKind.loraSwap.rawValue
+    case .modelSwitch: return QueueJobKind.modelSwitch.rawValue
     case .modelOperation(let op, _): return op.kind
-    case .localVideo: return "video"
-    case .shutdown: return "shutdown"
+    case .localVideo: return QueueJobKind.video.rawValue
+    case .shutdown: return QueueJobKind.shutdown.rawValue
+    #if DEBUG
+    case .synthetic: return QueueJobKind.synthetic.rawValue
+    #endif
     }
   }
 
@@ -6828,14 +8500,13 @@ private actor WarmServerCoordinator {
   // MARK: - Queue controls (pause / resume / reorder)
 
   func setPaused(_ paused: Bool) {
-    isPaused = paused
-    // Persist so a watchdog kickstart / crash / deploy cannot silently
-    // resume creation the user paused (see isPaused declaration).
-    if paused {
-      FileManager.default.createFile(atPath: Self.pauseSentinelPath, contents: Data("paused \(Date())\n".utf8))
-    } else {
-      try? FileManager.default.removeItem(atPath: Self.pauseSentinelPath)
-    }
+    // Authority + persistence (the sentinel is the on-disk form of the flag)
+    // live in the lock store now (§3.1.5). Idempotent, so this is safe whether or
+    // not the sync `/v1/queue/pause` route already wrote it.
+    liveHealth.setPaused(paused)
+    // The wake (§3.1.4a point 1): resume must still cause a PARKED loop to pick
+    // work up — the exact path v1's mailbox `resume` wedged. `resume` reaches
+    // here fire-and-forget; only the caller's ACK is decoupled, not this effect.
     if !paused { startProcessingIfNeeded() }
     publishHealth()
   }
@@ -6843,6 +8514,16 @@ private actor WarmServerCoordinator {
   /// Move a pending job within the queue. direction: up | down | top | bottom.
   /// Returns true if the job was found and moved.
   func movePending(id: String, direction: String) -> Bool {
+    let moved = reorderPending(id: id, direction: direction)
+    if moved { publishHealth(); persistQueueState() }
+    return moved
+  }
+
+  /// Reorder `pending` in place. Shared by `movePending` (the flag-off async arm)
+  /// and `drainQueueDeltas` (a `.move` delta from the sync path) so both use
+  /// identical top/bottom/up/down semantics.
+  @discardableResult
+  private func reorderPending(id: String, direction: String) -> Bool {
     guard let idx = pending.firstIndex(where: { $0.id == id }) else { return false }
     let job = pending.remove(at: idx)
     let target: Int
@@ -6854,12 +8535,61 @@ private actor WarmServerCoordinator {
     default: pending.insert(job, at: idx); return false
     }
     pending.insert(job, at: target)
-    publishHealth()
-    persistQueueState()
     return true
   }
 
+  /// 0.B-2: apply the lock store's undrained deltas against the live `pending`
+  /// array at a scheduling point. Called at the top of every `processLoop`
+  /// iteration AND from `startProcessingIfNeeded()`, so a delta lands whether the
+  /// loop is running or parked (FDD §3.1.4a point 3). A `.cancel` here resumes the
+  /// waiting continuation with `.cancelled`, exactly like `cancelPending`; a
+  /// `.move` reorders. WAL ordering (F-2, adversarial review): PEEK the deltas,
+  /// apply them, persist the canonical queue state, and only THEN commit (drop
+  /// the applied deltas and shrink the sidecar). A kill anywhere in that window
+  /// leaves the sidecar on disk, and replaying an already-applied cancel over
+  /// the persisted state is a no-op — the old take-and-clear-first order let a
+  /// kill between the clear and `persistQueueState()` resurrect a cancelled job.
+  private func drainQueueDeltas() {
+    let commands = liveHealth.peekDeltas()
+    guard !commands.isEmpty else { return }
+    for command in commands {
+      // Structural guard against the F1 wedge (§3.1.4a): a mailbox delta must
+      // never require a wake. `resume` is fire-and-forget, not a delta. (The type
+      // makes `requiresWake: true` unconstructable; this asserts it at the drain
+      // too, so a future factory that sets it fails here in test.)
+      assert(!command.requiresWake,
+             "queue delta must not require a wake — resume is fire-and-forget (FDD §3.1.4a)")
+      switch command.kind {
+      case .cancel(let id):
+        if let index = pending.firstIndex(where: { $0.id == id }) {
+          Self.cancel(pending[index].operation)
+          pending.remove(at: index)
+        }
+      case .move(let id, let direction):
+        _ = reorderPending(id: id, direction: direction)
+      }
+    }
+    publishHealth()
+    persistQueueState()
+    #if DEBUG
+    QueueDeltaStore.drainCrashWindowHook?()
+    #endif
+    liveHealth.commitDrainedDeltas(commands.count)
+  }
+
+  /// Best-effort prompt drain nudged by the sync cancel/move/clear routes so a
+  /// delta applies quickly when the pool is healthy (the actor is free during a
+  /// render — the render runs in a child task). If the nudge cannot run (pool
+  /// exhausted), the delta still applies at the next real scheduling point; the
+  /// composed `GET /v1/queue` reflects it immediately regardless.
+  func drainControlDeltas() { drainQueueDeltas() }
+
   private func startProcessingIfNeeded() {
+    // 0.B-2 drain point 2/2 (FDD §3.1.4a point 3): apply undrained deltas here
+    // too, so a delta lands even when the loop is PARKED (this is the only path
+    // that restarts a parked loop). Runs before publishHealth so the published
+    // pending count reflects the applied deltas.
+    drainQueueDeltas()
     // Every enqueue routes through here, so this is the one spot that reflects a
     // just-changed pending count into the lock-based health snapshot (#217).
     publishHealth()
@@ -6899,17 +8629,25 @@ private actor WarmServerCoordinator {
       return true
     case .generate, .controlGenerate, .swap, .modelSwitch, .localVideo:
       return false
+    #if DEBUG
+    case .synthetic:
+      return false
+    #endif
     }
   }
 
   private func processLoop() async {
     while true {
+      // 0.B-2 drain point 1/2 (FDD §3.1.4a point 3): apply undrained deltas at
+      // the top of every iteration — whether this iteration runs a job or parks,
+      // and crucially BEFORE dequeuing, so a cancelled job never runs.
+      drainQueueDeltas()
       // Paused: renders stay parked, but a model operation still runs (New-1).
       // Picking it out of the middle does not reorder anything that runs: the
       // jobs it passes are parked until resume, and they keep their relative
       // order for when it comes.
       let index: Int
-      if isPaused {
+      if liveHealth.isPausedAuthoritative() {
         guard let next = pending.firstIndex(where: { Self.runsWhilePaused($0.operation) }) else {
           isProcessing = false
           return
@@ -6953,15 +8691,38 @@ private actor WarmServerCoordinator {
           await self.runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
         }
         activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)  // 0.B-2: sync /interrupt handle
         await renderTask.value
         activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
       case .controlGenerate(let request, let continuation):
         let renderTask = Task {
           await self.runControlGenerate(request, continuation: continuation)
         }
         activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)  // 0.B-2: sync /interrupt handle
         await renderTask.value
         activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
+      #if DEBUG
+      case .synthetic(let durationMs, let continuation):
+        // 0.B-2 test seam (FDD §4.1). Runs through the retained-task path (so
+        // /interrupt can cancel it) and BLOCKS its thread for the duration —
+        // occupying a worker exactly like a real synchronous render, which is
+        // what makes the "sync control plane answers with zero cooperative
+        // threads" test meaningful.
+        let renderTask = Task {
+          if !Task.isCancelled {
+            Thread.sleep(forTimeInterval: Double(durationMs) / 1000.0)
+          }
+          continuation.resume(returning: !Task.isCancelled)
+        }
+        activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)
+        await renderTask.value
+        activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
+      #endif
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
       case .modelSwitch(let body, let continuation):
@@ -6993,40 +8754,76 @@ private actor WarmServerCoordinator {
         activeRenderStartedAt = Date()
         // activeJobId is set from job.id at the top of the loop.
         defer { activeRenderStartedAt = nil; activeJobId = nil }
-        // #218: single-heavy-model residency. Right before the ~65GB LTX-2
-        // stack loads inside body(), vacate ALL image models (pool + per-family
-        // pipelines), then verify there is enough physical RAM to proceed —
-        // refuse cleanly instead of OOM-killing the whole process. Doing this
-        // on the serial render queue guarantees no image render can re-load
-        // between the eviction and the video load. Extracted into
-        // `vacateImageModelsAndAdmitVideo` (#1479, review C2) so a preemption
-        // resume can run the EXACT SAME gate before resuming — the preempting
-        // image job loaded its own weights while the video was evicted, and
-        // resuming into whatever memory is left without re-checking is the
-        // documented SIGKILL condition this gate exists to prevent.
-        let admission = await vacateImageModelsAndAdmitVideo(wantsAudio: wantsAudio)
-        if !admission.admitted {
-          continuation.resume(throwing: WarmServerError.invalidRequest(
-            message: "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"))
-        } else {
-          videoHolder.beginRender()
-          // Stream render progress into the lock-based trackers /health + /queue
-          // read, exactly like the image path. Both trackers are Sendable, so the
-          // off-actor @Sendable report closure can update them without an actor
-          // hop. Cleared on completion via defer.
-          let progress = self.progressTracker
-          let health = self.liveHealth
+        // Stream render progress into the lock-based trackers /health + /queue
+        // read, exactly like the image path. Both trackers are Sendable, so the
+        // off-actor @Sendable report closure can update them without an actor
+        // hop. Cleared on completion via the defer inside the task.
+        let progress = self.progressTracker
+        let health = self.liveHealth
+        let report: @Sendable (Int) -> Void = { pct in
+          progress.set(pct)
+          health.setProgress(pct)
+        }
+        // comfybox#322: run the render in a RETAINED child task and publish it,
+        // exactly as `.generate` / `.controlGenerate` do above. Before this,
+        // `.localVideo` was the one render case that never published a handle,
+        // so `activeRenderTask` stayed nil for the whole 5-60 minute clip and
+        // `/v1/queue/interrupt` answered `interrupted: false` — the interrupt
+        // could only stop the NEXT queue item. The LTX-2 loops
+        // (`LTX2LoopBoundary` / `Task.checkCancellation`) observe the
+        // cancellation this handle delivers.
+        //
+        // The task inherits this actor's isolation, so the render is still
+        // serialized on the coordinator exactly as before; `await
+        // renderTask.value` keeps the queue loop parked until it finishes.
+        //
+        // comfybox#322 (review r1, Important): the #218 admission gate lives
+        // INSIDE this task, not before it. Hoisted out, `await renderTask.value`
+        // suspended the actor between the gate and the weight load — a
+        // reentrancy window in which another actor-isolated caller (an image
+        // route's `poolLoad`, a queued model operation) could change residency
+        // after the gate had passed and before the ~65GB stack loaded, which is
+        // the documented #218/#34 SIGKILL condition. Gate and load now sit in
+        // one uninterrupted synchronous run of this task: nothing suspends
+        // between `vacateImageModelsAndAdmitVideo` returning and `body(report)`
+        // being entered.
+        let renderTask = Task {
+          // An interrupt that arrived while this job waited its turn: refuse
+          // before evicting every image model for a render nobody wants.
+          if Task.isCancelled {
+            self.logger.info("LTX-2: render interrupted before admission — nothing loaded, nothing evicted.")
+            continuation.resume(throwing: WarmServerError.renderInterrupted)
+            return
+          }
+          // #218: single-heavy-model residency. Right before the ~65GB LTX-2
+          // stack loads inside body(), vacate ALL image models (pool +
+          // per-family pipelines), then verify there is enough physical RAM to
+          // proceed — refuse cleanly instead of OOM-killing the whole process.
+          // Doing this on the serial render queue guarantees no image render
+          // can re-load between the eviction and the video load. Extracted into
+          // `vacateImageModelsAndAdmitVideo` (#1479, review C2) so a preemption
+          // resume can run the EXACT SAME gate before resuming — the preempting
+          // image job loaded its own weights while the video was evicted, and
+          // resuming into whatever memory is left without re-checking is the
+          // documented SIGKILL condition this gate exists to prevent.
+          let admission = await self.admitVideoForRender(wantsAudio: wantsAudio)
+          guard admission.admitted else {
+            let message = "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"
+            // comfybox#308: this job DID reach the front of the queue and DID
+            // fail to run — a real completion, not a queue-full rejection
+            // (those throw before ever dequeuing, same as the image path).
+            self.finishLocalVideo(.admissionRefused, lastError: message)
+            continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
+            return
+          }
+          self.videoHolder.beginRender()
           progress.set(0)
           health.setProgress(0)
-          let report: @Sendable (Int) -> Void = { pct in
-            progress.set(pct)
-            health.setProgress(pct)
-          }
           defer {
-            videoHolder.endRender()
+            self.videoHolder.endRender()
             progress.set(nil)
             health.setProgress(nil)
-            ltx2StepPosition.clear()
+            self.ltx2StepPosition.clear()
             // #1479 (review C1): covers EVERY non-yielding exit from this
             // render's whole execution (initial body() completing/throwing,
             // a storyboard `.generate()` shot that never checks the signal
@@ -7036,7 +8833,7 @@ private actor WarmServerCoordinator {
             // hit the NEXT render's pre-load unwind point instantly (near-
             // zero-cost false checkpoint, bogus evict/reload sample). Clear
             // unconditionally; clearing an unraised signal is a no-op.
-            ltx2PreemptionSignal.clear()
+            self.ltx2PreemptionSignal.clear()
           }
           do {
             // #1479: body() may hand back a checkpoint instead of a finished
@@ -7045,15 +8842,45 @@ private actor WarmServerCoordinator {
             // later preemption), and each iteration is handled identically.
             var outcome = try body(report)
             while case .yielded(let state) = outcome {
-              outcome = try await runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
+              outcome = try await self.runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
             }
             if case .completed(let result) = outcome {
+              // comfybox#308: the `.localVideo` completion path never touched
+              // `/health`'s render counters — only the six image `run*Generate`
+              // methods did. Every video render (HQ two-pass included) was
+              // invisible to `render_count`/`last_render_duration_ms` no
+              // matter how many completed.
+              self.finishLocalVideo(.succeeded(elapsedSeconds: result.elapsedSeconds), lastError: nil)
               continuation.resume(returning: result)
             }
+          } catch is CancellationError {
+            // comfybox#322: an operator interrupt, not a failure. Named so
+            // the client sees why the render stopped instead of the opaque
+            // "CancellationError()" Todd reported on the 2026-08-30 incident.
+            // `VideoJobTracker.markFailed` recognises this case and reports
+            // the job interrupted rather than failed. Deliberately NOT routed
+            // through `recordRenderCompletion`/`failedRenderCount` — an
+            // operator interrupt is not a render failure (comfybox#322's own
+            // framing); there is no separate "interrupted" health counter.
+            self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
+            continuation.resume(throwing: WarmServerError.renderInterrupted)
           } catch {
+            // comfybox#308/#322 (review r3): a WRAPPED cancellation (e.g.
+            // ModelPoolError.loadFailed on a resume's model reload) lands
+            // here — `is CancellationError` above only matches the bare
+            // case. `handleLocalVideoCatch` re-classifies with the SAME
+            // `isRenderInterruption` check `VideoJobTracker.markFailed`
+            // uses on this same error, so an interrupt is never
+            // double-counted as a failed render.
+            self.handleLocalVideoCatch(error)
             continuation.resume(throwing: error)
           }
         }
+        activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)
+        await renderTask.value
+        activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
       case .shutdown(let continuation):
         continuation.resume(
           returning: ShutdownResponse(
@@ -7264,7 +9091,11 @@ private actor WarmServerCoordinator {
         returning: GenerateResponse(
           success: true,
           outputPath: outputURL.path,
-          durationMs: durationMs
+          durationMs: durationMs,
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetUnresolvedReason: payload.presetUnresolvedReason,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -7329,13 +9160,19 @@ private actor WarmServerCoordinator {
         resolvedDenoise = 1.0
       }
 
+      // FDD §3.3, D3: config-layer render defaults for flux2. Only width/height
+      // are seeded on first-run migration — `defaultSteps`/`defaultGuidance`
+      // above are already checkpoint-dependent (base vs. distilled), so an
+      // explicit config override is honoured when present but nothing is
+      // frozen into config.json for them (see ServerConfigStore.engineSeed).
+      let flux2ConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "flux2")
       let flux2Request = Flux2GenerationRequest(
         prompt: payload.prompt,
         negativePrompt: payload.negativePrompt,
-        width: payload.width ?? 1024,
-        height: payload.height ?? 1024,
-        steps: payload.steps ?? defaultSteps,
-        guidanceScale: payload.guidance ?? defaultGuidance,
+        width: payload.width ?? flux2ConfigDefaults.width ?? 1024,
+        height: payload.height ?? flux2ConfigDefaults.height ?? 1024,
+        steps: payload.steps ?? flux2ConfigDefaults.steps ?? defaultSteps,
+        guidanceScale: payload.guidance ?? flux2ConfigDefaults.guidance.map(Float.init) ?? defaultGuidance,
         seed: payload.seed,
         outputPath: outputURL,
         levelsMin: payload.levelsMin ?? 0.0,
@@ -7362,7 +9199,11 @@ private actor WarmServerCoordinator {
         returning: GenerateResponse(
           success: true,
           outputPath: result.path,
-          durationMs: durationMs
+          durationMs: durationMs,
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetUnresolvedReason: payload.presetUnresolvedReason,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -7400,6 +9241,14 @@ private actor WarmServerCoordinator {
       // sampler/schedule name on the STAGE throws here, before any model work,
       // exactly as it does for the render's own recipe.
       let stage2 = try payload.krea2Stage2Fields()
+      // ClownsharK wire dials, validated where they are applied (same
+      // fail-loud stance as an unknown sampler name): a non-finite or
+      // out-of-range projector_scale and an unknown noise_type are 400s here,
+      // before any model work — never a clamp, never a silent gaussian.
+      let projectorScale = try payload.validatedProjectorScale()
+      let noiseType = try payload.validatedNoiseType()
+      let implicitSteps = try payload.validatedImplicitSteps()
+      let c2 = try payload.validatedC2()
       let samplerAsked: String = recipe.samplerRequested ?? "-"
       let scheduleAsked: String = recipe.sigmaScheduleRequested ?? "-"
       let shiftLabel: String = recipe.shift.map { "\($0)" } ?? "dynamic"
@@ -7432,11 +9281,19 @@ private actor WarmServerCoordinator {
 
       let seed = payload.seed ?? UInt64.random(in: 1..<UInt64(UInt32.max))
       // Variant defaults (WP-E5, AC-5b): turbo 9 / 1.0, raw 30 / 1.0 — never 3.5.
+      // FDD §3.3, D3: the config layer slots BETWEEN the request and the
+      // variant's own default — `resolvedSteps`/`resolvedGuidance` already do
+      // `requested ?? variant.defaultX`, so passing a config default in place
+      // of `nil` preserves that exact fallback chain one layer further out.
+      // Only width/height are seeded on first-run migration (steps/guidance
+      // are physical-variant-dependent, not a fixed engine constant — see
+      // ServerConfigStore.engineSeed); an explicit override still applies.
+      let krea2ConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "krea2")
       let variant = k2.variant
-      let steps = variant.resolvedSteps(payload.steps)
-      let guidance = variant.resolvedGuidance(payload.guidance)
-      let width = payload.width ?? 1024
-      let height = payload.height ?? 1024
+      let steps = variant.resolvedSteps(payload.steps ?? krea2ConfigDefaults.steps)
+      let guidance = variant.resolvedGuidance(payload.guidance ?? krea2ConfigDefaults.guidance.map(Float.init))
+      let width = payload.width ?? krea2ConfigDefaults.width ?? 1024
+      let height = payload.height ?? krea2ConfigDefaults.height ?? 1024
       // Krea-2 builds its requests straight from the payload rather than going
       // through makePipelineRequest, so resolve DyPE explicitly here.
       let krea2DyPE = payload.resolvedDyPEConfig(width: width, height: height)
@@ -7521,7 +9378,12 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta, bongmath: recipe.bongmath),
+                eta: recipe.eta, bongmath: recipe.bongmath,
+                c2: c2,
+                projectorScale: projectorScale,
+                noiseType: noiseType,
+                noiseAlpha: payload.noiseAlpha ?? 0.0,
+                implicitStepsFull: implicitSteps),
           progress: publishProgress)
         traces = [trace1]
       } else {
@@ -7537,7 +9399,11 @@ private actor WarmServerCoordinator {
                 shift: recipe.shift,
                 sampler: recipe.sampler, sigmaSchedule: recipe.sigmaSchedule,
                 sigmaScheduleRequested: recipe.sigmaScheduleRequested,
-                eta: recipe.eta, bongmath: recipe.bongmath, stage2: stage2),
+                eta: recipe.eta, bongmath: recipe.bongmath, c2: c2, stage2: stage2,
+                projectorScale: projectorScale,
+                noiseType: noiseType,
+                noiseAlpha: payload.noiseAlpha ?? 0.0,
+                implicitStepsFull: implicitSteps),
           progress: publishProgress)
       }
       let trace = traces[0]
@@ -7614,7 +9480,10 @@ private actor WarmServerCoordinator {
       resumed = true
       // sink 1 — the response; sink 4 reads `applied` off this same value.
       continuation.resume(returning: GenerateResponse(
-        success: true, outputPath: outputURL.path, durationMs: durationMs, applied: applied))
+        success: true, outputPath: outputURL.path, durationMs: durationMs, applied: applied,
+        appliedLoras: appliedLoRAStates(), presetUnresolved: payload.presetUnresolved,
+        presetUnresolvedReason: payload.presetUnresolvedReason,
+        presetStackMismatch: payload.presetStackMismatch))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -7653,13 +9522,16 @@ private actor WarmServerCoordinator {
           contentMode: payload.contentMode, source: payload.source)
       )
 
+      // FDD §3.3, D3: config-layer render defaults for fibo (the "steps ?? 30"
+      // family-specific fallback the FDD's §2.5 finding cites).
+      let fiboConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "fibo")
       let fiboRequest = FiboGenerationRequest(
         prompt: payload.prompt,
         negativePrompt: payload.negativePrompt,
-        width: payload.width ?? 1024,
-        height: payload.height ?? 1024,
-        steps: payload.steps ?? 30,
-        guidanceScale: payload.guidance ?? 4.0,
+        width: payload.width ?? fiboConfigDefaults.width ?? 1024,
+        height: payload.height ?? fiboConfigDefaults.height ?? 1024,
+        steps: payload.steps ?? fiboConfigDefaults.steps ?? 30,
+        guidanceScale: payload.guidance ?? fiboConfigDefaults.guidance.map(Float.init) ?? 4.0,
         seed: payload.seed,
         outputPath: outputURL,
         levelsMin: payload.levelsMin ?? 0.0,
@@ -7680,7 +9552,11 @@ private actor WarmServerCoordinator {
         returning: GenerateResponse(
           success: true,
           outputPath: result.path,
-          durationMs: durationMs
+          durationMs: durationMs,
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetUnresolvedReason: payload.presetUnresolvedReason,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -7748,7 +9624,11 @@ private actor WarmServerCoordinator {
         returning: GenerateResponse(
           success: true,
           outputPath: outputURL.path,
-          durationMs: durationMs
+          durationMs: durationMs,
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetUnresolvedReason: payload.presetUnresolvedReason,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -7771,10 +9651,12 @@ private actor WarmServerCoordinator {
     outputURL: URL,
     loras: [LoRAConfiguration]
   ) async throws {
-    let width = payload.width ?? 1024
-    let height = payload.height ?? 1024
-    let steps = payload.steps ?? 28
-    let guidance = payload.guidance ?? 0.0
+    // FDD §3.3, D3: config-layer render defaults for chroma.
+    let chromaConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "chroma")
+    let width = payload.width ?? chromaConfigDefaults.width ?? 1024
+    let height = payload.height ?? chromaConfigDefaults.height ?? 1024
+    let steps = payload.steps ?? chromaConfigDefaults.steps ?? 28
+    let guidance = payload.guidance ?? chromaConfigDefaults.guidance.map(Float.init) ?? 0.0
     let seed = payload.seed ?? UInt64.random(in: 0...UInt64.max)
 
     // Tokenize prompt (unpadded — matches Python behavior)
@@ -7797,7 +9679,7 @@ private actor WarmServerCoordinator {
       sampler: names.scheduler, schedule: names.sigmaSchedule) ?? .euler
 
     // Generate — returns MLXArray in [B, H, W, C] (NHWC, values [0,1])
-    let result = pipeline.generate(
+    let result = try pipeline.generate(
       tokenIds: tokenIds,
       negativeTokenIds: negTokenIds,
       width: width,
@@ -7857,7 +9739,8 @@ private actor WarmServerCoordinator {
         controlPipeline = ZImageControlPipeline(logger: logger)
       }
 
-      let outputURL = try await controlPipeline!.generate(request)
+      let control = controlPipeline!
+      let outputURL = try await control.generate(request)
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
@@ -7869,7 +9752,9 @@ private actor WarmServerCoordinator {
         returning: GenerateResponse(
           success: true,
           outputPath: outputURL.path,
-          durationMs: durationMs
+          durationMs: durationMs,
+          // I4: the ControlNet pipeline is what rendered — read ITS adapters.
+          appliedLoras: appliedLoRAStates(from: control)
         )
       )
     } catch {
@@ -7891,12 +9776,44 @@ private actor WarmServerCoordinator {
     }
   }
 
+  /// #286: the resident LoRA stack for the `applied_loras` response field —
+  /// READ BACK from the pipeline that actually rendered, never from the
+  /// coordinator's intent, so a client can diff it against what
+  /// `POST /v1/presets/resolve` reported and catch a wrong stack itself.
+  ///
+  /// nil (key absent) for FIBO and Chroma, which have no LoRA path at all
+  /// (`/v1/lora/swap` refuses them), so an absent key can never read as
+  /// "rendered bare".
+  ///
+  /// I4 (review round 1): the ControlNet arm renders through `controlPipeline`,
+  /// a DIFFERENT instance from the family pipeline — reading the family's
+  /// configs there reported unrelated resident state. `pipeline` names the one
+  /// that rendered.
+  private func appliedLoRAStates(from pipeline: ZImageControlPipeline) -> [LoRAState]? {
+    pipeline.loadedLoRAConfigs.map(LoRAState.init)
+  }
+
+  private func appliedLoRAStates() -> [LoRAState]? {
+    if currentModelFamily == .fibo || currentModelFamily == .chroma { return nil }
+    return loadedLoRAConfigs(for: currentModelFamily).map(LoRAState.init)
+  }
+
   /// Apply LoRAs to whichever pipeline is active for `currentModelFamily`.
   /// Shared by POST /v1/lora/swap and per-job LoRA application at generate
   /// dequeue time (queue-submit race fix — see GeneratePayload.loras).
   private func applyActiveLoRAs(_ newLoRAs: [LoRAConfiguration]) async throws {
     if currentModelFamily == .flux2 {
       guard let f2 = flux2Pipeline else { throw WarmServerError.flux2NotLoaded }
+      // I2 (review round 1): Flux 2 and Krea 2 clear and reload every adapter
+      // on every call, unlike `ZImagePipeline.loadLoRAs`, which skips an
+      // identical stack. Now that a preset render applies its stack on EVERY
+      // request, a 5-10 adapter preset would otherwise reload the whole stack
+      // per render — pure latency and unified-memory churn on a 24/7 daemon.
+      if LoRAStackIdentity.isSameStack(f2.loadedLoRAConfigs, newLoRAs) {
+        logger.info("LoRA stack already resident (Flux 2) — skipping reload of \(newLoRAs.count) adapter(s)")
+        activeLoRAs = newLoRAs
+        return
+      }
       try await f2.loadLoRAs(newLoRAs)
       activeLoRAs = newLoRAs
     } else if currentModelFamily == .krea2 {
@@ -7911,6 +9828,13 @@ private actor WarmServerCoordinator {
         var out = cfg
         out.requiresBase = relative
         return out
+      }
+      // I2: compared AFTER relativity folding, so the comparison is against
+      // what would actually be loaded.
+      if LoRAStackIdentity.isSameStack(k2.loadedLoRAConfigs, declared) {
+        logger.info("LoRA stack already resident (Krea 2) — skipping reload of \(declared.count) adapter(s)")
+        activeLoRAs = declared
+        return
       }
       try await k2.loadLoRAs(declared)
       activeLoRAs = declared
@@ -8138,6 +10062,17 @@ private final class ConnectionHandler {
       return
     }
 
+    // 0.B-2 (FDD §3.1.4): serve the sync-servable control set synchronously on
+    // THIS connection's queue, before any Task — zero cooperative threads, no
+    // actor hop, so these routes answer even if the pool is exhausted by a
+    // render. Flag off (`COMFYBOX_CONTROL_PLANE_SYNC=0`) skips this entirely and
+    // every route falls through to the async path below, byte-for-byte as before.
+    if ControlPlaneSyncFlag.isEnabled,
+       let response = server.serveControlPlaneSync(request) {
+      finish(with: response)
+      return
+    }
+
     Task {
       let routed = await server.respond(to: request)
       switch routed {
@@ -8203,6 +10138,11 @@ struct HTTPResponse {
   let reasonPhrase: String
   let contentType: String
   let body: Data
+  /// Additional response headers (e.g. `ETag`, `Warning`) beyond the fixed
+  /// Content-Type/Content-Length/Connection trio `serialize()` always writes.
+  /// Empty for every pre-existing call site — additive, no behavior change
+  /// (FDD §3.3: advisory `ETag`/`If-Match` on `/v1/config`).
+  var extraHeaders: [String: String] = [:]
 
   static func json<T: Encodable>(status: Int, payload: T) -> HTTPResponse {
     let encoder = JSONEncoder()
@@ -8234,15 +10174,20 @@ struct HTTPResponse {
     // No CORS headers: all known clients (desktop app, Krita plugin, Telegram
     // bot, MCP) are native, so browser cross-origin access is intentionally
     // not enabled.
-    let header = [
+    var lines = [
       "HTTP/1.1 \(status) \(reasonPhrase)",
       "Content-Type: \(contentType)",
       "Content-Length: \(body.count)",
       "Connection: close",
-      "",
-      ""
-    ].joined(separator: "\r\n")
-    data.append(Data(header.utf8))
+    ]
+    // Deterministic order (sorted) so header emission is stable across runs —
+    // matters for tests asserting on exact serialized bytes.
+    for (name, value) in extraHeaders.sorted(by: { $0.key < $1.key }) {
+      lines.append("\(name): \(value)")
+    }
+    lines.append("")
+    lines.append("")
+    data.append(Data(lines.joined(separator: "\r\n").utf8))
     data.append(body)
     return data
   }
@@ -8258,6 +10203,7 @@ struct HTTPResponse {
     case 413: return "Payload Too Large"
     case 429: return "Too Many Requests"
     case 500: return "Internal Server Error"
+    case 502: return "Bad Gateway"
     case 503: return "Service Unavailable"
     default: return "OK"
     }
@@ -8357,8 +10303,11 @@ struct GeneratePayload: Sendable {
   let negativePrompt: String?
   let width: Int?
   let height: Int?
-  let steps: Int?
-  let guidance: Float?
+  /// `var` since #286: filled from the named `preset`'s DECLARED `steps` when
+  /// the request omitted them (never from `ResolvedPreset`, whose default is 4).
+  var steps: Int?
+  /// `var` since #286, same rule as `steps`.
+  var guidance: Float?
   let seed: UInt64?
   let outputPath: String?
   let levelsMin: Float?
@@ -8413,9 +10362,21 @@ struct GeneratePayload: Sendable {
   /// Submitting client/app (desktop, bree, api…) — for queue attribution.
   let source: String?
 
-  /// Preset id that produced this request, when one was resolved — a LABEL
-  /// only (image presets resolve DAEMON-side; the engine never expands it).
-  /// Carried into the gallery filename + PNG metadata (Todd 2026-08-11).
+  /// Preset id for this request. Carried into the gallery filename + PNG
+  /// metadata (Todd 2026-08-11), and — since #286 — EXPANDED into `model`,
+  /// `loras` and the preset's declared `steps`/`guidance`, through the same
+  /// `PresetStore` read that backs `POST /v1/presets/resolve`
+  /// (``WarmServer/expandGeneratePayload(_:store:stageNearline:log:)``).
+  ///
+  /// It used to be a label only, which meant a preset-by-name render used
+  /// whatever LoRA stack the warm pipeline happened to hold — stale adapters
+  /// from an earlier swap, or none at all after a restart — on whatever base
+  /// was active, and reported success either way.
+  ///
+  /// It is STILL a label whenever the engine cannot expand the preset
+  /// (`presetUnresolved`), which is never an error; and when the request
+  /// carries its own `loras`/`model`, those still win. The single hard failure
+  /// is a request `model` that contradicts the preset's (409).
   let preset: String?
 
   /// Fruit mode (neutral | banana | avocado) — stamped into render metadata.
@@ -8428,9 +10389,37 @@ struct GeneratePayload: Sendable {
   /// since a job's dequeue can happen well after another request changed
   /// the active model. nil preserves the old "caller activates first"
   /// behavior for direct /v1/generate callers.
-  let model: String?
+  ///
+  /// `var` since #286: filled from the named `preset`'s `model` when the
+  /// request named none. A preset's adapters must never be applied to a
+  /// different base — an explicit `model` that contradicts the preset's is a
+  /// 409 (``WarmServerError/presetModelConflict(preset:presetModel:requestModel:)``).
+  var model: String?
   /// Per-job LoRA override, applied the same way as `model` at dequeue time.
-  let loras: [LoRAEntry]?
+  ///
+  /// `var` since #286: ``WarmServer/expandGeneratePayload(_:store:stageNearline:log:)``
+  /// fills this in from the named `preset` when the request carried no `loras`
+  /// of its own, so the ONE place that applies a per-request stack
+  /// (`applyActiveLoRAs`, at dequeue) is also the one place a preset-by-name
+  /// render goes through. See ``PresetLoRAStack``.
+  var loras: [LoRAEntry]?
+
+  /// #286 (C2): set by the engine, never by the wire — the named preset could
+  /// not be expanded (unknown, flagged invalid, a video preset, a non-local
+  /// engine/provider, no model to load, a missing LoRA file, or a dial the
+  /// engine has no application path for). The render behaves exactly as it did
+  /// before #286 (the preset is a label) and the response says so via
+  /// `preset_unresolved`.
+  var presetUnresolved: String?
+  /// #286 (round 2): the machine-readable reason code beside
+  /// `presetUnresolved` — `engine:mflux`, `no_model`, `missing_lora:x`, … See
+  /// ``PresetExpansion/Unresolved``. Reaches the wire as
+  /// `preset_unresolved_reason`.
+  var presetUnresolvedReason: String?
+  /// #286 (I1): set by the engine — the request carried explicit `loras` that
+  /// differ from what the named preset resolves to. The explicit list still
+  /// wins; the response says so via `preset_stack_mismatch`.
+  var presetStackMismatch: Bool?
   // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
   let controlImageData: Data?
   let controlnetStrength: Float?
@@ -8463,6 +10452,23 @@ struct GeneratePayload: Sendable {
   let detailDenoise: Double?
 
   /// Default memberwise init for bridge-created payloads.
+  /// Projector-scale text-conditioning gain (wire: `projector_scale`). Krea 2
+  /// only; 1.0/absent = neutral. Forwarded verbatim to Krea2Pipeline.Request.
+  let projectorScale: Float?
+  /// RES4LYF spatial noise generator (wire: `noise_type`: gaussian|fractal|
+  /// pyramid). Krea 2 only; absent/`gaussian` = byte-identical to today.
+  let noiseType: String?
+  /// Fractal `alpha` exponent (wire: `noise_alpha`); only read for
+  /// `noise_type: fractal`. Absent = 0.0 (fractal ≡ gaussian).
+  let noiseAlpha: Float?
+  /// RES4LYF implicit-RK refinement (wire: `implicit_steps`). Krea 2 + the
+  /// RES4LYF explicit tableaus only; re-iterates the tableau this many extra
+  /// times as a fixed point. Absent/0 = byte-identical to today. Mirrors
+  /// `eta`/`bongmath`: decoded here, forwarded to Krea2Pipeline.Request.
+  let implicitSteps: Int?
+  /// RES4LYF `res_2s` / `res_3s` substep location (wire: `c2`). Krea 2
+  /// only; absent = 0.5, preserving the existing scheduler recipe.
+  let c2: Float?
   init(
     prompt: String, negativePrompt: String? = nil,
     width: Int? = nil, height: Int? = nil, steps: Int? = nil,
@@ -8481,19 +10487,30 @@ struct GeneratePayload: Sendable {
     model: String? = nil, loras: [LoRAEntry]? = nil,
     controlImageData: Data? = nil, controlnetStrength: Float? = nil, controlImage: String? = nil,
     preempt: Bool? = nil, vae: String? = nil,
-    stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil
+    stage2: Stage2Payload? = nil, detailPass: Bool? = nil, detailDenoise: Double? = nil,
+    projectorScale: Float? = nil,
+    noiseType: String? = nil, noiseAlpha: Float? = nil,
+    implicitSteps: Int? = nil, c2: Float? = nil
   ) {
     self.preempt = preempt
     self.vae = vae
     self.stage2 = stage2
     self.detailPass = detailPass
     self.detailDenoise = detailDenoise
+    self.projectorScale = projectorScale
+    self.noiseType = noiseType
+    self.noiseAlpha = noiseAlpha
+    self.implicitSteps = implicitSteps
+    self.c2 = c2
     self.source = source
     self.preset = nil
     self.contentMode = contentMode
     self.initImageData = initImageData
     self.model = model
     self.loras = loras
+    self.presetUnresolved = nil
+    self.presetUnresolvedReason = nil
+    self.presetStackMismatch = nil
     self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength; self.controlImage = controlImage
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -8551,6 +10568,14 @@ extension GeneratePayload: Decodable {
     case stage2
     case detailPass
     case detailDenoise
+    case projectorScale
+    // `noise_type` / `noise_alpha` arrive as these camelCase forms after
+    // `.convertFromSnakeCase`.
+    case noiseType
+    case noiseAlpha
+    // `implicit_steps` arrives as this camelCase form after .convertFromSnakeCase.
+    case implicitSteps
+    case c2
   }
 
   init(from decoder: Decoder) throws {
@@ -8575,6 +10600,7 @@ extension GeneratePayload: Decodable {
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
     eta = try c.decodeIfPresent(Float.self, forKey: .eta)
     bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
+    projectorScale = try c.decodeIfPresent(Float.self, forKey: .projectorScale)
     shift = try c.decodeIfPresent(Float.self, forKey: .shift)
     dype = try c.decodeIfPresent(String.self, forKey: .dype)
     // Inpaint image + mask arrive as base64 strings from the HTTP API.
@@ -8602,6 +10628,10 @@ extension GeneratePayload: Decodable {
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
+    // #286: engine-set, never decoded from the wire.
+    presetUnresolved = nil
+    presetUnresolvedReason = nil
+    presetStackMismatch = nil
     controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
@@ -8610,6 +10640,10 @@ extension GeneratePayload: Decodable {
     stage2 = try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
     detailPass = try c.decodeIfPresent(Bool.self, forKey: .detailPass)
     detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)
+    noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
+    noiseAlpha = try c.decodeIfPresent(Float.self, forKey: .noiseAlpha)
+    implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
+    c2 = try c.decodeIfPresent(Float.self, forKey: .c2)
   }
 
   /// Validate the D3 `shift` field for the family that will render it.
@@ -8698,9 +10732,16 @@ extension GeneratePayload: Decodable {
     let schedulerKind = names.scheduler ?? .euler
     let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
+    // FDD §3.3, D3: config-layer render defaults for the base Z-Image family
+    // ("flux1" internally — WarmModelFamily's default case), resolved fresh
+    // (lock, no disk I/O) and slotted BELOW request/preset, ABOVE the engine's
+    // own hardcoded fallback. An unmigrated/empty config resolves every field
+    // to nil, so `?? ZImageModelMetadata.recommendedX` below is unchanged.
+    let configDefaults = ServerConfigStore.shared.renderDefaults(family: "flux1")
+
     // Build DyPE config — auto-enable for high-res requests
-    let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
-    let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
+    let resolvedWidth = width ?? configDefaults.width ?? ZImageModelMetadata.recommendedWidth
+    let resolvedHeight = height ?? configDefaults.height ?? ZImageModelMetadata.recommendedHeight
     let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     return ZImageGenerationRequest(
@@ -8708,8 +10749,8 @@ extension GeneratePayload: Decodable {
       negativePrompt: negativePrompt,
       width: resolvedWidth,
       height: resolvedHeight,
-      steps: steps ?? ZImageModelMetadata.recommendedInferenceSteps,
-      guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
+      steps: steps ?? configDefaults.steps ?? ZImageModelMetadata.recommendedInferenceSteps,
+      guidanceScale: guidance ?? configDefaults.guidance.map(Float.init) ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
       levelsMin: levelsMin ?? 0.0,
@@ -8769,8 +10810,16 @@ extension GeneratePayload: Decodable {
     let schedulerKind = names.scheduler ?? .euler
     let sigmaScheduleKind = names.sigmaSchedule ?? .flow
 
-    let resolvedWidth = width ?? ZImageModelMetadata.recommendedWidth
-    let resolvedHeight = height ?? ZImageModelMetadata.recommendedHeight
+    // FDD §3.3, D3: same config-layer defaults as makePipelineRequest. Note
+    // width/height are passed through UNRESOLVED below (`width`/`height`, not
+    // `resolvedWidth`/`resolvedHeight`) — img2img's pipeline derives the actual
+    // output size from the source image when the request omits them, so
+    // injecting a config default there would silently override that behavior.
+    // Only the DyPE heuristic (which only ever affects an internal auto-enable
+    // decision, never the output size) and steps/guidance are config-aware here.
+    let configDefaults = ServerConfigStore.shared.renderDefaults(family: "flux1")
+    let resolvedWidth = width ?? configDefaults.width ?? ZImageModelMetadata.recommendedWidth
+    let resolvedHeight = height ?? configDefaults.height ?? ZImageModelMetadata.recommendedHeight
     let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
 
     let outputURL = try resolvedOutputURL(
@@ -8785,8 +10834,8 @@ extension GeneratePayload: Decodable {
       negativePrompt: negativePrompt,
       width: width,
       height: height,
-      steps: steps ?? ZImageModelMetadata.recommendedInferenceSteps,
-      guidanceScale: guidance ?? ZImageModelMetadata.recommendedGuidanceScale,
+      steps: steps ?? configDefaults.steps ?? ZImageModelMetadata.recommendedInferenceSteps,
+      guidanceScale: guidance ?? configDefaults.guidance.map(Float.init) ?? ZImageModelMetadata.recommendedGuidanceScale,
       seed: seed,
       outputPath: outputURL,
       levelsMin: levelsMin ?? 0.0,
@@ -8880,6 +10929,65 @@ extension GeneratePayload: Decodable {
           + "and applies to the RES4LYF samplers only; '\(sampler.rawValue)' is not one of "
           + "them. Send bongmath false, or a sampler from " + res4lyfList)
     }
+  }
+
+  /// The range the Desktop dial clamps to (`GenerationView`'s Projector Scale
+  /// slider, 0…3, 1.0 = neutral). The wire must not accept what the UI cannot
+  /// express: a NaN/inf or out-of-range scale multiplied into the projector's
+  /// text conditioning would render garbage (or something the caller did not
+  /// ask for) under a well-formed-looking record.
+  static let projectorScaleRange: ClosedRange<Float> = 0.0...3.0
+  static let implicitStepsRange: ClosedRange<Int> = 0...8
+  static let c2Pole: Float = 2.0 / 3.0
+
+  /// `projector_scale`, validated at the point of application: absent → the
+  /// neutral 1.0; present → finite and inside ``projectorScaleRange``, else a
+  /// 400 naming the value (never clamped, same fail-loud stance as an unknown
+  /// sampler name).
+  func validatedProjectorScale() throws -> Float {
+    guard let projectorScale else { return 1.0 }
+    guard projectorScale.isFinite, Self.projectorScaleRange.contains(projectorScale) else {
+      throw WarmServerError.projectorScaleOutOfRange(value: "\(projectorScale)")
+    }
+    return projectorScale
+  }
+
+  /// `noise_type`, validated at the point of application: absent → gaussian
+  /// (the default, not a coercion); present → a `RES4LYFNoiseType` raw value,
+  /// else a 400 naming the value and the valid set. The old
+  /// `RES4LYFNoiseType(rawValue:) ?? .gaussian` silently rendered gaussian
+  /// under whatever name the caller sent.
+  func validatedNoiseType() throws -> RES4LYFNoiseType {
+    guard let noiseType else { return .gaussian }
+    guard let kind = RES4LYFNoiseType(rawValue: noiseType) else {
+      throw WarmServerError.unknownNoiseType(
+        name: noiseType, valid: RES4LYFNoiseType.allCases.map(\.rawValue))
+    }
+    return kind
+  }
+
+  /// `implicit_steps`, validated at the point of application (implicit-RK
+  /// batch-2 review F1): absent -> 0 (today's explicit render, byte-identical).
+  /// Negative would trap the denoise loop's precondition and abort the warm
+  /// server; unbounded would hang a render (model evals scale with passes).
+  /// 0...8 covers every practical RES4LYF full_iter setting.
+  func validatedImplicitSteps() throws -> Int {
+    guard let implicitSteps else { return 0 }
+    guard Self.implicitStepsRange.contains(implicitSteps) else {
+      throw WarmServerError.implicitStepsOutOfRange(value: "\(implicitSteps)")
+    }
+    return implicitSteps
+  }
+
+  /// `c2`, validated before constructing a scheduler whose RES3S tableau has
+  /// a pole at 2/3. Absent keeps the established midpoint substep (0.5).
+  func validatedC2() throws -> Float {
+    guard let c2 else { return 0.5 }
+    guard c2.isFinite, c2 > 0, c2 <= 1,
+          abs(c2 - Self.c2Pole) >= 1e-6 else {
+      throw WarmServerError.c2OutOfRange(value: "\(c2)")
+    }
+    return c2
   }
 
   /// WP-E3 (§3.3, D11, D22, D25): the recipe fields a Krea 2 request carries,
@@ -9089,18 +11197,56 @@ struct GenerateResponse: Encodable, Sendable {
   /// drop it from the synthesized memberwise init.
   let applied: AppliedRecordSlot?
 
+  /// #286: `applied_loras` — the LoRA stack that was actually resident for
+  /// this render, READ BACK from the pipeline that rendered it: `name`, `path`
+  /// and `scale` per adapter. Additive; no existing field is renamed.
+  ///
+  /// `applied` above answers the same question far more fully, but only for
+  /// Krea 2 (D12). This one is a flat list a client can diff against what
+  /// `POST /v1/presets/resolve` reported for the preset it asked for — which
+  /// is what nobody could do while a preset-by-name render silently used
+  /// residency. The key is ABSENT for FIBO and Chroma, which have no LoRA path
+  /// at all, so it can never read as "rendered bare".
+  let appliedLoras: [LoRAState]?
+
+  /// #286 (C2): the named preset could not be expanded, so it behaved as the
+  /// provenance label it has always been and this render used the request's own
+  /// settings plus the resident stack. Names the preset. Absent = the preset
+  /// was expanded (or none was named). NOT an error — the pre-#286 contract is
+  /// preserved deliberately; this field is how it stops being silent.
+  let presetUnresolved: String?
+
+  /// #286 (round 2): `preset_unresolved_reason` — the machine-readable code
+  /// beside the name, so a daemon can branch on WHY: `unknown_preset`,
+  /// `invalid_preset`, `media_kind:video`, `engine:<x>`, `provider:<x>`,
+  /// `no_model`, `bypass_declared`, `kroma_file_missing`, `missing_lora:<name>`.
+  let presetUnresolvedReason: String?
+
+  /// #286 (I1): the request carried explicit `loras` that differ from what its
+  /// named `preset` resolves to. The explicit list won, as it always has; this
+  /// says the two disagreed. The production async client sends a FLAT `loras`
+  /// list that has already dropped structured kroma/bypass/role, which is
+  /// exactly the case this makes visible.
+  let presetStackMismatch: Bool?
+
   /// The record itself, for Swift readers that do not care about the
   /// absent-vs-null distinction.
   var appliedRecord: RenderRecipe? { applied?.record }
 
   init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
-       applied: AppliedRecordSlot? = nil) {
+       applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
+       presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
+       presetStackMismatch: Bool? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
     self.preemptRefused = preemptRefused
     self.etaSec = etaSec
     self.applied = applied
+    self.appliedLoras = appliedLoras
+    self.presetUnresolved = presetUnresolved
+    self.presetUnresolvedReason = presetUnresolvedReason
+    self.presetStackMismatch = presetStackMismatch
   }
 }
 
@@ -9176,8 +11322,9 @@ struct LoRAEntry: Codable, Sendable {
   let scale: Float?
   /// WP-E10 (FDD §3.10 `Applied.role`): the configuration SLOT this adapter
   /// fills — `kroma` | `accel` | `bypass` | `control`. Declared by the sender
-  /// that expanded the preset (the engine never expands image presets, so it
-  /// cannot infer the slot from a flat list); stored on the
+  /// that expanded the preset — since #286 that can be the engine itself,
+  /// which carries `LoraReference.role` through and labels the structured
+  /// kroma `"kroma"`; it is never inferred from a filename. Stored on the
   /// `LoRAConfiguration` the pipeline applies and READ BACK from there into
   /// `applied.loras[].role`. An unknown label is a 400, never stored.
   let role: String?
@@ -9336,11 +11483,26 @@ struct HealthResponse: Encodable, Sendable {
   let lastRecipe: AppliedRecordSlot?
 }
 
-struct LoRAState: Encodable, Sendable {
-  let source: String
-  let scale: Float
+public struct LoRAState: Codable, Sendable {
+  /// Unchanged since before #286: the absolute local path, or `repo/file` for
+  /// a HuggingFace reference. Kept as-is — `/health.loras` and
+  /// `/v1/lora/swap`'s response have always carried this spelling.
+  public let source: String
+  public let scale: Float
+  /// #286 (minor review point): the adapter's NAME — the last path component,
+  /// which is what a preset's `loras[].filename` and `/v1/presets/resolve`
+  /// carry. Diffing an applied stack against a resolved preset needs this, not
+  /// a machine-specific absolute path. Additive.
+  public let name: String
+  /// #286: the same value as `source`, under the spelling a caller reading
+  /// "name + path" expects. Additive; `source` is untouched for compatibility.
+  public let path: String
+  /// #286: the declared configuration slot (`kroma`/`accel`/`bypass`/
+  /// `control`), read back from the applied `LoRAConfiguration`. nil when the
+  /// sender declared none.
+  public let role: String?
 
-  init(_ configuration: LoRAConfiguration) {
+  public init(_ configuration: LoRAConfiguration) {
     switch configuration.source {
     case .local(let url):
       self.source = url.path
@@ -9348,6 +11510,22 @@ struct LoRAState: Encodable, Sendable {
       self.source = filename.map { "\(modelId)/\($0)" } ?? modelId
     }
     self.scale = configuration.scale
+    self.name = configuration.source.displayName
+    self.path = self.source
+    self.role = configuration.role
+  }
+
+  /// Tolerant decode: `name`/`path`/`role` postdate #286, so a persisted
+  /// pre-#286 job status still round-trips (`name`/`path` fall back to
+  /// `source`).
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    source = try c.decode(String.self, forKey: .source)
+    scale = try c.decode(Float.self, forKey: .scale)
+    name = try c.decodeIfPresent(String.self, forKey: .name)
+      ?? (source as NSString).lastPathComponent
+    path = try c.decodeIfPresent(String.self, forKey: .path) ?? source
+    role = try c.decodeIfPresent(String.self, forKey: .role)
   }
 }
 
@@ -9378,6 +11556,14 @@ private enum QueuedOperation: Sendable {
   /// job paused-for-preemption / resumed in `VideoJobTracker`.
   case localVideo(@Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome, ContinuationBox<LTX2VideoResult>, wantsAudio: Bool, videoJobId: String?)
   case shutdown(ContinuationBox<ShutdownResponse>)
+  #if DEBUG
+  /// 0.B-2 test seam (FDD §4.1): occupies the processing loop for a controlled
+  /// duration with no GPU. Its body BLOCKS its thread (Thread.sleep, not
+  /// Task.sleep), so it exercises the exact pool-exhaustion mechanism 0.B-1 fixes
+  /// — a render that holds a worker without suspending. DEBUG-only; the release
+  /// deploy never compiles it.
+  case synthetic(durationMs: Int, ContinuationBox<Bool>)
+  #endif
 }
 
 private final class ContinuationBox<Value>: @unchecked Sendable {
@@ -9462,6 +11648,32 @@ public enum WarmServerError: Error, LocalizedError {
   /// another field, sent without it. Silently dropping it made a request that
   /// asked for something render as if it had not.
   case orphanField(field: String, requires: String, reason: String)
+  /// A `projector_scale` the projector cannot honour: non-finite (NaN/inf) or
+  /// outside the Desktop dial's clamp range (`GenerationView`'s 0…3 slider).
+  /// Refused by value rather than clamped — a clamp would render something the
+  /// caller did not ask for under the number they sent.
+  case projectorScaleOutOfRange(value: String)
+  case implicitStepsOutOfRange(value: String)
+  case c2OutOfRange(value: String)
+  /// A `noise_type` that is not a `RES4LYFNoiseType` raw value. An unknown
+  /// name is a 400 naming the valid set — it must never silently degrade to
+  /// gaussian (absent stays gaussian; that is the default, not a coercion).
+  case unknownNoiseType(name: String, valid: [String])
+  /// #286: the request named a `preset` AND an explicit `model` that resolve
+  /// to different bases. Applying the preset's adapters to the requested base,
+  /// or the requested base under the preset's name, are both wrong — so it is
+  /// a 409 naming all three rather than a silent pick.
+  case presetModelConflict(preset: String, presetModel: String, requestModel: String)
+  /// comfybox#322: the in-flight render was cancelled by
+  /// `/v1/queue/interrupt`. Distinct from every failure above — nothing went
+  /// wrong, an operator asked for the box back. `VideoJobTracker` and the
+  /// video routes recognise it and report the job interrupted, not failed.
+  case renderInterrupted
+  /// #339 review r1: a non-recoverable-kind submission (ControlNet, a Krita
+  /// model switch) refused because `recoverPersistedQueue`'s replay is in
+  /// flight — see `QueueRecoveryGate`. `retryAfterSeconds` is this
+  /// throw-site's own estimate, mirrored into the 503 body + header.
+  case queueRecoveryInProgress(retryAfterSeconds: Int)
 
   public var errorDescription: String? {
     switch self {
@@ -9471,6 +11683,11 @@ public enum WarmServerError: Error, LocalizedError {
       return "Output path '\(path)' must be under allowed output directory '\(allowedDirectory)'"
     case .invalidRequest(let message):
       return message
+    case .presetModelConflict(let preset, let presetModel, let requestModel):
+      return "Preset '\(preset)' declares model '\(presetModel)' but the request asked for "
+        + "'\(requestModel)'. A preset's LoRA stack is only valid on its own base — send one or "
+        + "the other, or send the LoRAs explicitly in `loras` without the preset."
+
     case .flux2DetectionFailed(let model):
       return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"
     case .flux2NotLoaded:
@@ -9503,8 +11720,59 @@ public enum WarmServerError: Error, LocalizedError {
       return "sampler '\(name)' is not supported on the \(family) family: \(reason)"
     case .orphanField(let field, let requires, let reason):
       return "'\(field)' has no meaning without '\(requires)': \(reason)"
+    case .projectorScaleOutOfRange(let value):
+      return "projector_scale must be a finite number in 0.0...3.0 (got \(value)); "
+        + "1.0 is neutral — omit it for the default"
+    case .implicitStepsOutOfRange(let value):
+      return "implicit_steps must be an integer in 0...8 (got \(value)); "
+        + "0 is the explicit render — omit it for the default"
+    case .c2OutOfRange(let value):
+      return "c2 must be a finite number in (0, 1] other than 2/3 (got \(value)); "
+        + "0.5 is the default"
+    case .unknownNoiseType(let name, let valid):
+      return "Unknown noise_type '\(name)'. Valid noise types: \(valid.joined(separator: ", ")); "
+        + "omit it for gaussian"
+    case .renderInterrupted:
+      return "Render interrupted by /v1/queue/interrupt"
+    case .queueRecoveryInProgress:
+      return QueueRecoveryGate.reason
     }
   }
+}
+
+/// comfybox#322: is this error an operator interrupt rather than a failure?
+///
+/// Both spellings reach the trackers: `CancellationError` straight out of a
+/// pipeline loop (the image path's #304 contract — propagate unmodified), and
+/// `WarmServerError.renderInterrupted`, the named form the video queue case
+/// substitutes so the client sees a sentence instead of "CancellationError()".
+/// A wrapped cancellation counts (review r1): `ltx2IsCancellation` unwraps the
+/// `case x(String, Error)` wrappers this codebase uses on the load/render paths,
+/// so a `CancellationError` that arrives inside one is still reported as an
+/// interrupt rather than as a render failure.
+func isRenderInterruption(_ error: Error) -> Bool {
+  if ltx2IsCancellation(error) { return true }
+  if case WarmServerError.renderInterrupted = error { return true }
+  return false
+}
+
+/// comfybox#308/#322 (review r3): what the `.localVideo` case's generic
+/// `catch` should do with a caught error, as a pure decision. nil means "an
+/// operator interrupt — do not touch the health counters", using the SAME
+/// `isRenderInterruption` classification `VideoJobTracker.markFailed`
+/// already applies so the two never disagree about the same error.
+///
+/// This exists because the sibling `catch is CancellationError` branch (in
+/// `WarmServerCoordinator`'s process loop) only catches a BARE
+/// `CancellationError` thrown straight out of a pipeline loop — a WRAPPED
+/// one (e.g. `ModelPoolError.loadFailed("…", CancellationError())`, which a
+/// resume's model reload can throw) doesn't match `is CancellationError` and
+/// used to fall through to the generic catch, where it was counted as a
+/// failed render even though `VideoJobTracker.markFailed` (fed the same
+/// error via the continuation) correctly reported it as interrupted —
+/// `/health.failed_count` and the job status disagreed about the same event.
+func localVideoCatchOutcome(for error: Error) -> LocalVideoCompletionOutcome? {
+  isRenderInterruption(error) ? nil : .threw
 }
 
 #if DEBUG
@@ -9548,6 +11816,35 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// other job, one at a time.
   func enqueueFakeRender(_ body: @escaping @Sendable () async throws -> Bool) async throws -> Bool {
     try await coordinator.enqueueModelSwitch(body)
+  }
+
+  /// #339 review r3, item 3: the seam `recoverPersistedQueue`'s "generate"
+  /// replay uses. Callers must PAUSE the probe (`setPaused(true)`) before
+  /// calling this if they don't want the render to actually attempt to run
+  /// — `.generate` never runs while paused (`runsWhilePaused`), so the job
+  /// sits durably in `pending` without ever touching a real pipeline/model
+  /// weights, which is what makes it safe to drive from a unit test.
+  func enqueueGenerate(
+    _ payload: GeneratePayload, source: String = "api", rawBody: Data? = nil, jobId: String? = nil
+  ) async throws -> GenerateResponse {
+    try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody, jobId: jobId)
+  }
+
+  /// #339 review r3, item 3: the seam `recoverPersistedQueue` uses to
+  /// publish the not-yet-admitted tail (`RecoverySnapshotMerger`) so a
+  /// second restart mid-replay can't lose it.
+  func setRecoveryUnadmittedTail(_ tail: [PersistedQueueJob]) async {
+    await coordinator.setRecoveryUnadmittedTail(tail)
+  }
+
+  /// Cancel a pending job by id — the `DELETE /v1/queue/{id}` seam. Used by
+  /// the r3 probe test to clean up a `.generate` job admitted (then never
+  /// run, paused) via `enqueueGenerate` above, so the probe drains for
+  /// `makeQueueProbe`'s teardown guard without ever letting the render
+  /// actually attempt to start.
+  @discardableResult
+  func cancelPending(id: String) async -> Bool {
+    await coordinator.cancelPending(id: id)
   }
 
   /// The seam `/v1/model/load` (wait: true), `/v1/model/activate` and
@@ -9616,5 +11913,112 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   var pendingCount: Int { liveHealthSnapshot.pending.count }
 
   var isPaused: Bool { liveHealthSnapshot.isPaused }
+
+  // MARK: - 0.B-2 control-plane probe surface
+
+  /// Occupy the loop with a synthetic op that BLOCKS its thread for `durationMs`.
+  func enqueueSynthetic(durationMs: Int, id: String = UUID().uuidString) async throws -> Bool {
+    try await coordinator.enqueueSynthetic(durationMs: durationMs, id: id)
+  }
+
+  /// comfybox#308 (review r2, item 2b): the `.localVideo` completion
+  /// bookkeeping seam — see `WarmServerCoordinator.testSeamFinishLocalVideo`.
+  func finishLocalVideo(
+    _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
+  ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    await coordinator.testSeamFinishLocalVideo(outcome, lastError: message)
+  }
+
+  /// comfybox#308/#322 (review r3): the `.localVideo` generic-catch seam —
+  /// see `WarmServerCoordinator.testSeamHandleLocalVideoCatch`.
+  func handleLocalVideoCatch(
+    _ error: Error
+  ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    await coordinator.testSeamHandleLocalVideoCatch(error)
+  }
+
+  /// The sync `/v1/queue/pause` path: authoritative lock-store write.
+  func controlPause() { liveHealth.setPaused(true) }
+
+  /// The sync `/v1/queue/resume` path: authoritative write + fire-and-forget wake
+  /// (never a mailbox command — the F1 wedge guard).
+  func controlResume() {
+    liveHealth.setPaused(false)
+    Task { await coordinator.setPaused(false) }
+  }
+
+  /// Whether the AUTHORITATIVE (lock-store) pause flag is set — the value the
+  /// between-items gate and the read path both see.
+  var lockStorePaused: Bool { liveHealth.isPausedAuthoritative() }
+
+  /// The sync `DELETE /v1/queue/{id}` path: record a cancel delta + drain nudge.
+  func controlCancel(id: String) {
+    liveHealth.recordDelta(.cancel(id))
+    Task { await coordinator.drainControlDeltas() }
+  }
+
+  /// The sync `POST /v1/queue/{id}/move` path.
+  func controlMove(id: String, direction: String) {
+    liveHealth.recordDelta(.move(id, direction: direction))
+    Task { await coordinator.drainControlDeltas() }
+  }
+
+  /// The sync `/v1/queue/interrupt` path.
+  @discardableResult
+  func controlInterrupt() -> Bool { liveHealth.cancelActiveRender() }
+
+  /// Record a cancel delta WITHOUT the drain nudge — lets tests hold a delta
+  /// in the undrained window deterministically (F-2 crash-window test).
+  func recordCancelDeltaOnly(id: String) { liveHealth.recordDelta(.cancel(id)) }
+
+  /// Deterministically run one drain on the actor (the same
+  /// `drainControlDeltas` the sync routes nudge fire-and-forget).
+  func drainNow() async { await coordinator.drainControlDeltas() }
+
+  var undrainedDeltaCount: Int { liveHealth.undrainedDeltas().count }
+
+  /// Pending ids as `GET /v1/queue` composes them (snapshot + undrained deltas) —
+  /// a just-cancelled job is already absent here.
+  var composedPendingIds: [String] {
+    let (snap, _) = liveHealth.read()
+    return QueueDeltaApplier.apply(liveHealth.undrainedDeltas(), to: snap.pending, id: { $0.id }).map { $0.id }
+  }
+
+  /// Pending ids in the raw actor-published snapshot (no delta compose).
+  var snapshotPendingIds: [String] { liveHealth.read().0.pending.map { $0.id } }
+
+  // MARK: - comfybox#322 video-interrupt probe surface
+
+  /// Skip the #218 admission gate for `.localVideo` jobs (DEBUG only).
+  ///
+  /// The gate needs ~65-80GB of real free RAM. These tests exist to prove the
+  /// `.localVideo` queue case publishes a cancellable render task and that an
+  /// interrupt aimed at the video does not cancel a preemptor — not to re-test
+  /// admission, which `HeavyModelAdmissionTests` already covers with injected
+  /// byte figures.
+  func bypassVideoAdmission() async { await coordinator.setBypassVideoAdmission(true) }
+
+  /// Enqueue a `.localVideo` job through the REAL queue case — the same
+  /// `enqueueLocalVideo` seam `/v1/video/generate` uses. `body` receives the
+  /// progress reporter and runs on the coordinator's render task, so
+  /// `Task.isCancelled` inside it is what a real LTX-2 render observes.
+  func enqueueLocalVideo(
+    wantsAudio: Bool = false,
+    _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome
+  ) async throws -> LTX2VideoResult {
+    try await coordinator.enqueueLocalVideo(wantsAudio: wantsAudio, body)
+  }
+
+  /// Did this error come back as the named interrupt? `WarmServerError` is
+  /// public, but this keeps the test reading like the route does.
+  static func isInterrupted(_ error: Error) -> Bool { isRenderInterruption(error) }
+
+  /// The PRODUCTION shield the preemption episode wraps its image job in
+  /// (`runShieldedFromCancellation`) — the same function, not a copy — so a
+  /// test can cancel the caller and prove the shielded work neither observes
+  /// the cancellation nor stops early.
+  func runShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) async {
+    await coordinator.runShieldedFromCancellation(work)
+  }
 }
 #endif

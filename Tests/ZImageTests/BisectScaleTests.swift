@@ -38,7 +38,7 @@ final class BisectScaleTests: XCTestCase {
     // Production-like dims at plain-safe volume (7x20x12 = 1680), bf16.
     let latent = MLXRandom.normal([1, 128, 7, 20, 12]).asType(.bfloat16)
     let plain = decoder(latent)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(plain, streamed)
     XCTAssertEqual(plain.shape, streamed.shape)
     let r = rel(streamed, plain)
@@ -51,7 +51,7 @@ final class BisectScaleTests: XCTestCase {
     MLXRandom.seed(43)
     let latent = MLXRandom.normal([1, 128, 7, 20, 12]).asType(.float32)
     let plain = decoder(latent)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(plain, streamed)
     let r = rel(streamed, plain)
     print("SCALE f32 7x20x12 chunk1: rel \(r)")
@@ -65,7 +65,7 @@ final class BisectScaleTests: XCTestCase {
     let decoder = makeDecoder()
     MLXRandom.seed(47)
     let latent = MLXRandom.normal([1, 128, 7, 40, 24]).asType(.bfloat16)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(streamed)
     print("SCALE full 7x40x24 streamed shape \(streamed.shape)")
     let f = streamed.dim(2)
@@ -90,7 +90,7 @@ extension BisectScaleTests {
     let decoder = makeDecoder()
     MLXRandom.seed(53)
     let latent = MLXRandom.normal([1, 128, 7, 40, 24]).asType(.bfloat16)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(streamed)
     var bad = 0
     for i in stride(from: 0, to: streamed.dim(2), by: 4) {
@@ -115,7 +115,7 @@ extension BisectScaleTests {
     let decoder = makeDecoder()
     MLXRandom.seed(59)
     let latent = MLXRandom.normal([1, 128, 7, 40, 24]).asType(.bfloat16)
-    let streamed = decoder.decodeStreamed(latent)
+    let streamed = try decoder.decodeStreamed(latent)
     MLX.eval(streamed)
     var bad = 0
     for i in stride(from: 0, to: streamed.dim(2), by: 4) {

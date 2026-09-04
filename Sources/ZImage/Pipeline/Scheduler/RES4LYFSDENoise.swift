@@ -296,6 +296,47 @@ public final class RES4LYFSDENoiseInjector: SDENoiseInjector {
         seed: Self.substepNoiseSeed(stageSeed: stageSeed), layout: layout))
   }
 
+  /// The spatial convenience (fractal / pyramid opt-in): the same seeds, eta
+  /// and s_noise as the gaussian convenience, but building fractal or pyramid
+  /// streams when `noiseType` names one AND a token `grid` is supplied AND the
+  /// layout carries a channel count. `gaussian`, a nil `grid`, or a layout with
+  /// no channel count all fall back to the gaussian streams — so the default
+  /// path is byte-identical to the gaussian convenience above.
+  public convenience init(
+    eta: Double,
+    stageSeed: UInt64,
+    layout: RES4LYFNoiseLayout,
+    sigmaMax: Double = 1.0,
+    noiseType: RES4LYFNoiseType,
+    grid: (hTok: Int, wTok: Int)?,
+    noiseAlpha: Double
+  ) {
+    let stepSeed = Self.stepNoiseSeed(stageSeed: stageSeed)
+    let substepSeed = Self.substepNoiseSeed(stageSeed: stageSeed)
+
+    func makeStream(seed: UInt64) -> RES4LYFNoiseStream {
+      guard noiseType != .gaussian, let grid, let channels = layout.channelCount else {
+        return RES4LYFGaussianNoiseStream(seed: seed, layout: layout)
+      }
+      switch noiseType {
+      case .gaussian:
+        return RES4LYFGaussianNoiseStream(seed: seed, layout: layout)
+      case .fractal:
+        return RES4LYFFractalNoiseStream(
+          seed: seed, layout: layout, hTok: grid.hTok, wTok: grid.wTok,
+          channels: channels, alpha: noiseAlpha)
+      case .pyramid:
+        return RES4LYFPyramidNoiseStream(
+          seed: seed, layout: layout, hTok: grid.hTok, wTok: grid.wTok, channels: channels)
+      }
+    }
+
+    self.init(
+      eta: eta, etaSubstep: eta, sNoise: 1.0, sNoiseSubstep: 1.0, sigmaMax: sigmaMax,
+      stepNoise: makeStream(seed: stepSeed),
+      substepNoise: makeStream(seed: substepSeed))
+  }
+
   // MARK: Seeds
 
   /// `rk_sampler_beta.py:364` — `MAX_STEPS`, the offset upstream uses so the

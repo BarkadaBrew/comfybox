@@ -21,6 +21,17 @@ struct MotionView: View {
     @State private var isReferenceDropTargeted: Bool = false
     @State private var resolution: VideoResolution = .landscape
     @State private var frames: Int = 97
+    /// Clip length in SECONDS — the unit you actually think in. LTX renders
+    /// 1+8k frames on a 24fps playback basis, so `frames` (still the value the
+    /// request carries) is DERIVED from this and snapped to the nearest legal
+    /// count. Previously the only control was a fixed frame-count Picker that
+    /// merely *displayed* seconds — you could not ask for "6 seconds".
+    @State private var seconds: Double = 4.0
+    /// Temporal conditioning rate (`tuning.cond_fps`) — the real motion dial:
+    /// the same action spread over a LOWER cond_fps reads as MORE movement.
+    /// Independent of the 24fps playback basis. 0 = auto (engine picks, which
+    /// is the previous behaviour). The engine floors a set value at 6.
+    @State private var condFps: Double = 0
     @State private var steps: Double = 8
     @State private var didApplyDefaults = false
     @State private var seedText: String = ""
@@ -32,6 +43,53 @@ struct MotionView: View {
     @State private var selectedLoras: [LoRASelection] = []
     @State private var tuningOverrides: [String: Any] = [:]
     @State private var optimizationAttemptId: String?
+
+    // ── Advanced per-render tuning overrides ────────────────────────────────
+    // These knobs are otherwise only settable as LTX2_* environment variables
+    // in the launchd plist, which needs an edit + engine restart and applies
+    // GLOBALLY. Surfacing them here makes them per-render, which is what
+    // experimenting actually requires.
+    //
+    // Sentinel: -1 (or "" for strings) means INHERIT — the key is omitted from
+    // the request entirely, so the engine's env/plist default applies exactly
+    // as it does today. 0 is a meaningful value for several of these
+    // (guidance_rescale, color_anchor, nag_scale all default to 0), which is
+    // why the sentinel is -1 and not 0. Ranges mirror the engine's own
+    // registry in LTX2ConfigResolver.swift.
+    @State private var showAdvanced = false
+    @State private var advSampler: String = ""            // "" = inherit
+    @State private var advGuidanceRescale: Double = -1    // engine: 0...1
+    @State private var advImgCompression: Double = -1     // engine: 0...100 (i2v)
+    @State private var advColorAnchor: Double = -1        // engine: 0...1
+    @State private var advNagScale: Double = -1           // engine: 0...50
+    @State private var advNagAlpha: Double = -1           // engine: 0...1
+    @State private var advNagTau: Double = -1             // engine: 1...10
+    @State private var advTwoStage: Int = -1              // -1 inherit, 0 off, 1 on
+
+    /// Samplers the LTX-2 pipeline accepts. Empty tag = inherit.
+    private static let samplerOptions = ["", "euler", "euler_cfg_pp", "euler_ancestral_cfg_pp", "res_2s"]
+
+    /// Advanced overrides that are actually set (i.e. not inherit), as
+    /// snake_case wire keys matching the engine's LTX2VideoTuning. Single
+    /// source of truth for BOTH the request body and the on-screen summary, so
+    /// the badge can never claim something the render does not send.
+    private var advancedOverrides: [String: Any] {
+        var t: [String: Any] = [:]
+        if !advSampler.isEmpty { t["sampler"] = advSampler }
+        if advGuidanceRescale >= 0 { t["guidance_rescale"] = advGuidanceRescale }
+        if advImgCompression >= 0 { t["img_compression"] = Int(advImgCompression) }
+        if advColorAnchor >= 0 { t["color_anchor"] = advColorAnchor }
+        if advNagScale >= 0 { t["nag_scale"] = advNagScale }
+        if advNagAlpha >= 0 { t["nag_alpha"] = advNagAlpha }
+        if advNagTau >= 1 { t["nag_tau"] = advNagTau }   // engine range starts at 1
+        if advTwoStage >= 0 { t["two_stage"] = advTwoStage == 1 }
+        return t
+    }
+
+    /// Comma-joined key list for the "Overriding: …" badge.
+    private var activeOverrideSummary: String {
+        advancedOverrides.keys.sorted().joined(separator: ", ")
+    }
 
     @State private var isGenerating = false
     @State private var statusMessage: String?
@@ -61,6 +119,21 @@ struct MotionView: View {
     /// renders SINGLE-PASS — the old 97f ceiling was never real (2026-08-02:
     /// one 193f pass beat 97+97 chaining, 2x faster, no seam).
     private static let frameOptions = [25, 49, 97, 121, 145, 193, 241, 289]
+
+    /// Playback basis LTX renders against. Clip length = frames / 24. This is
+    /// NOT the motion dial — that is `cond_fps` (see `condFps`).
+    private static let playbackFps: Double = 24
+
+    /// Legal frame counts are 1+8k, from 25f (~1s) to the 289f (~12s)
+    /// single-pass cap. Snap a seconds request to the nearest one.
+    private static func framesForSeconds(_ s: Double) -> Int {
+        let k = ((s * playbackFps) - 1) / 8
+        return min(36, max(3, Int(k.rounded()))) * 8 + 1
+    }
+
+    private static func secondsForFrames(_ f: Int) -> Double {
+        (Double(f) / playbackFps * 10).rounded() / 10
+    }
 
     var body: some View {
         HSplitView {
@@ -105,15 +178,24 @@ struct MotionView: View {
                     }.labelsHidden()
                 }
 
-                HStack(spacing: 12) {
-                    labeled("Frames") {
-                        Picker("", selection: $frames) {
-                            ForEach(Self.frameOptions, id: \.self) { f in
-                                Text("\(f)  (\(String(format: "%.1fs", Double(f) / 24.0)))").tag(f)
-                            }
-                        }.labelsHidden()
+                // Duration is the primary length control; frames are derived
+                // and snapped to LTX's legal 1+8k counts. The read-out below
+                // shows exactly what will be rendered so the snap is visible.
+                NumericSliderField(label: "Duration (s)", value: $seconds, range: 1...12, step: 0.5, fractionDigits: 1)
+                    .help("Clip length. Snapped to the nearest legal LTX frame count (1+8k, 25–289f). 289f (~12s) is the single-pass cap.")
+                    .onChange(of: seconds) { _, s in
+                        frames = Self.framesForSeconds(s)
                     }
-                }
+
+                Text("→ \(frames) frames · \(String(format: "%.1fs", Self.secondsForFrames(frames))) at \(Int(Self.playbackFps))fps"
+                     + (frames >= 289 ? "  (single-pass cap)" : ""))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // The ACTUAL motion dial. Distinct from playback fps: spreading
+                // the same action over a lower cond_fps yields more movement.
+                NumericSliderField(label: "Motion FPS (0 = auto)", value: $condFps, range: 0...30, step: 1)
+                    .help("Temporal conditioning rate (cond_fps). Lower = more motion for the same action; higher = stiller. 0 leaves it to the engine (previous behaviour). Values below 6 are floored by the engine.")
 
                 NumericSliderField(label: "Steps", value: $steps, range: 1...30, step: 1)
                 if referencePath != nil {
@@ -124,6 +206,47 @@ struct MotionView: View {
 
                 labeled("Seed (empty = random)") {
                     TextField("Random", text: $seedText).textFieldStyle(.roundedBorder)
+                }
+
+                // Per-render overrides for knobs that otherwise live only in
+                // the launchd plist as LTX2_* env vars (global + restart).
+                // Everything here defaults to inherit, so leaving the group
+                // untouched sends exactly what it sends today.
+                DisclosureGroup("Advanced — per-render overrides", isExpanded: $showAdvanced) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        labeled("Sampler (blank = inherit)") {
+                            Picker("", selection: $advSampler) {
+                                ForEach(Self.samplerOptions, id: \.self) { s in
+                                    Text(s.isEmpty ? "inherit" : s).tag(s)
+                                }
+                            }.labelsHidden()
+                        }
+                        .help("LTX-2 sampler. Your engine default is LTX2_SAMPLER=euler_ancestral_cfg_pp (the PinkCherry-validated pairing).")
+
+                        NumericSliderField(label: "Guidance rescale (-1 = inherit)", value: $advGuidanceRescale, range: -1...1, step: 0.05, fractionDigits: 2)
+                        NumericSliderField(label: "Img compression, i2v (-1 = inherit)", value: $advImgCompression, range: -1...100, step: 1)
+                            .help("LTX2_I2V_COMPRESSION. Lower preserves more of the seed frame's detail.")
+                        NumericSliderField(label: "Color anchor (-1 = inherit)", value: $advColorAnchor, range: -1...1, step: 0.05, fractionDigits: 2)
+                        NumericSliderField(label: "NAG scale (-1 = inherit)", value: $advNagScale, range: -1...50, step: 0.5, fractionDigits: 1)
+                            .help("Normalized Attention Guidance — how PinkCherry gets prompt adherence at CFG 1.0.")
+                        NumericSliderField(label: "NAG alpha (-1 = inherit)", value: $advNagAlpha, range: -1...1, step: 0.05, fractionDigits: 2)
+                        NumericSliderField(label: "NAG tau (-1 = inherit)", value: $advNagTau, range: -1...10, step: 0.1, fractionDigits: 1)
+
+                        labeled("Two-stage refine") {
+                            Picker("", selection: $advTwoStage) {
+                                Text("inherit").tag(-1)
+                                Text("off").tag(0)
+                                Text("on").tag(1)
+                            }.pickerStyle(.segmented)
+                        }
+                        .help("Your engine default is LTX2_TWO_STAGE=0 (off) — refine renders SOFTER on this recipe.")
+
+                        if !activeOverrideSummary.isEmpty {
+                            Text("Overriding: \(activeOverrideSummary)")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                    .padding(.top, 6)
                 }
 
                 labeled("LoRAs") {
@@ -262,16 +385,46 @@ struct MotionView: View {
     }
 
     /// Prefill from Settings → Motion (once), matching a stored resolution to a
-    /// preset when possible.
+    /// preset when possible. Local `desktop-config.json` values apply
+    /// immediately (instant, works offline); the server's `videoDefaults` —
+    /// seeded from the ENGINE constants on first run, never from these local
+    /// values (engine-neutrality: FDD-ui-api-parity §3.3, review F1
+    /// 2026-08-30), and agent-editable via PATCH /v1/config from then on —
+    /// overlay a moment later if reachable. An unreachable server simply
+    /// leaves the local (last-known/cached) values in place.
     private func applyDefaults() {
         guard !didApplyDefaults else { return }
         didApplyDefaults = true
         let s = DesktopSettings.load()
         if let f = s.videoFrames, Self.frameOptions.contains(f) { frames = f }
+        // Keep the seconds control showing the same clip the saved frame count
+        // represents, so the derived read-out is never out of step on launch.
+        seconds = Self.secondsForFrames(frames)
         if let st = s.videoSteps { steps = Double(st) }
         if let w = s.videoWidth, let h = s.videoHeight,
            let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
             resolution = match
+        }
+        Task { await applyServerVideoDefaults() }
+    }
+
+    /// Best-effort overlay of the server's `videoDefaults` (FDD-ui-api-parity
+    /// §3.3) onto the Motion tab's initial state. Silently does nothing if the
+    /// server is unreachable or the block is unset (fresh/pre-migration
+    /// config) — the local values `applyDefaults()` already set stand as the
+    /// read-only cached fallback in that case.
+    private func applyServerVideoDefaults() async {
+        guard let config = try? await engine.fetchServerConfig() else { return }
+        let video = config.videoDefaults.resolved(family: "ltx2")
+        await MainActor.run {
+            if let f = video.frames, Self.frameOptions.contains(f) {
+                frames = f
+                seconds = Self.secondsForFrames(f)
+            }
+            if let w = video.width, let h = video.height,
+               let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
+                resolution = match
+            }
         }
     }
 
@@ -294,6 +447,15 @@ struct MotionView: View {
         resultURL = nil
         statusMessage = "Loading LTX-2 and generating \(frames) frames…"
 
+        // Merge the UI's motion dial into any tuning already staged (e.g. from
+        // a preset). An explicit control wins; 0 means "auto" so the key is
+        // omitted entirely and the engine keeps choosing, exactly as before.
+        var tuning = tuningOverrides
+        if condFps > 0 { tuning["cond_fps"] = condFps }
+        // Advanced group wins over staged tuning — it is the most explicit
+        // expression of intent for THIS render.
+        for (k, v) in advancedOverrides { tuning[k] = v }
+
         let request = EngineService.VideoRequest(
             prompt: prompt,
             initImagePath: referencePath,
@@ -302,7 +464,7 @@ struct MotionView: View {
             extendToSeconds: Float(extendSeconds),
             loras: selectedLoras,
             outputPath: outputPath,
-            tuning: tuningOverrides.isEmpty ? nil : tuningOverrides,
+            tuning: tuning.isEmpty ? nil : tuning,
             optimizationAttemptId: optimizationAttemptId
         )
 

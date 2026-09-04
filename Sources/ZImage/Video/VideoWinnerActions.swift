@@ -71,7 +71,8 @@ public enum VideoWinnerActions {
     resolvedSeed: String?,
     effectivePrompt: String?,
     resolution: String,
-    initImagePath: String? = nil
+    initImagePath: String? = nil,
+    tuningOverride: LTX2VideoTuning? = nil
   ) throws -> Data {
     guard var body = (try? JSONSerialization.jsonObject(with: Data(requestJSON.utf8))) as? [String: Any]
     else { throw ActionError.malformedRequestJSON }
@@ -102,6 +103,24 @@ public enum VideoWinnerActions {
     body["skip_character_injection"] = true
     body["skip_preset_prompt"] = true
     body["source"] = "winner-rerender"
+    // Tier-A overrides applied ON TOP of the replayed request, so a cheap
+    // single-pass explore can be promoted to a two-pass keeper on the SAME
+    // seed. Merged key-by-key over any tuning the original request carried:
+    // the override is the more specific intent for this replay.
+    if let tuningOverride,
+      let encoded = try? { () -> Data in
+        let enc = JSONEncoder()
+        // Mirrors WarmServer's .convertFromSnakeCase decode convention, so the
+        // merged keys match what the resolver reads (audio_refine, two_stage).
+        enc.keyEncodingStrategy = .convertToSnakeCase
+        return try enc.encode(tuningOverride)
+      }(),
+      let overrides = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any]
+    {
+      var merged = (body["tuning"] as? [String: Any]) ?? [:]
+      for (k, v) in overrides { merged[k] = v }
+      if !merged.isEmpty { body["tuning"] = merged }
+    }
     return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
   }
 
@@ -146,6 +165,18 @@ public enum VideoWinnerActions {
     body["image_path"] = framePath
     body["frames"] = snappedFrames(seconds: seconds, fps: fps)
     body["resolution"] = "480p"
+    // comfybox#328 (Codex round 1, finding 6): every beat's `text` is a
+    // verbatim substring of the OLD prompt's exact wording. A caller-
+    // supplied replacement prompt invalidates every beat's span — locating
+    // them against unrelated new text is a wash of drop warnings at best, a
+    // misplaced attention bias at worst. Extending with the SAME (stored)
+    // prompt keeps the schedule; only a fresh replacement prompt drops it.
+    // (extend is also I2V, so beat_schedule would already be dropped
+    // downstream per finding 5 — this keeps that intent visible here too,
+    // instead of silently relying on that separate guard.)
+    if callerPrompt != nil {
+      remove(["beat_schedule", "beatSchedule"], from: &body)
+    }
     // The local video path defaults a missing seed to a CONSTANT (42 or the
     // preset seed) — mint one or every extend of a clip renders identically.
     body["seed"] = Int(truncatingIfNeeded: freshSeed ?? UInt64.random(in: 0...0xFFFF_FFFF))

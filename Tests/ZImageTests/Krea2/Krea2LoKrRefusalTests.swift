@@ -16,6 +16,13 @@
 // These tests pin the guard itself (pure, no checkpoint), the refusal on a
 // REAL LoKr `.safetensors` file walked through `loadForKrea2`, that a
 // refused file leaves a model bit-identical, and the 400 mapping.
+//
+// comfybox#329 is that "own ticket": on the live pipeline, `LoKrDensifier`
+// now runs BEFORE this guard and converts provable full-matrix layers into
+// transactional `.diff` deltas, so those files reach the guard with
+// lokrLayerCount == 0 and pass. The guard's own behaviour — everything
+// pinned here — is unchanged: it refuses whatever the densifier could not
+// convert. The conversion itself is pinned in `Krea2LoKrDensifierTests`.
 
 import Foundation
 import MLX

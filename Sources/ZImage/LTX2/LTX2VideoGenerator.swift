@@ -79,6 +79,15 @@ public struct LTX2VideoRequest: Sendable {
     /// Generate synchronized audio (task #21). T2V single-chunk only in v1;
     /// loads the audio branch (+~11GiB) into the transformer on first use.
     public var audio: Bool
+    /// Temporal beat scheduling (comfybox#310): structured multi-beat
+    /// content, carried as its own top-level field rather than a `tuning`
+    /// key — tuning entries are scalar render knobs, this is structured
+    /// content the engine locates inside the composed prompt. Each beat's
+    /// `text` must be a verbatim substring of `prompt` (server-side
+    /// contract, Phase 2); beats that can't be located are dropped
+    /// fail-open at render time, never fail the render. nil/empty is
+    /// byte-identical to today's flat (joined) behavior.
+    public var beatSchedule: [BeatSegment]?
 
     /// `loras`, with the deprecated single `loraPath`/`loraStrength` (if set)
     /// prepended — the single field always applied first, matching the old
@@ -114,9 +123,11 @@ public struct LTX2VideoRequest: Sendable {
         outputPath: String,
         tuning: LTX2VideoTuning? = nil,
         presetTuning: LTX2VideoTuning? = nil,
-        audio: Bool = false
+        audio: Bool = false,
+        beatSchedule: [BeatSegment]? = nil
     ) {
         self.audio = audio
+        self.beatSchedule = beatSchedule
         self.prompt = prompt
         self.negativePrompt = negativePrompt
         self.initImagePath = initImagePath
@@ -146,6 +157,21 @@ public struct LTX2VideoResult: Sendable {
     public let frameCount: Int
     public let durationSeconds: Float
     public let elapsedSeconds: Double
+    /// comfybox#307: why the two-stage refine did not run, when `two_stage`
+    /// was requested for this render — nil when it ran, wasn't requested, or
+    /// (montage/storyboard assembly) doesn't apply. See `LTX2RefineGate`.
+    public let refineSkippedReason: String?
+
+    public init(
+        outputPath: String, frameCount: Int, durationSeconds: Float, elapsedSeconds: Double,
+        refineSkippedReason: String? = nil
+    ) {
+        self.outputPath = outputPath
+        self.frameCount = frameCount
+        self.durationSeconds = durationSeconds
+        self.elapsedSeconds = elapsedSeconds
+        self.refineSkippedReason = refineSkippedReason
+    }
 }
 
 /// #1479: what one generator-level render produced. The completed payload is
@@ -192,9 +218,47 @@ public final class LTX2RenderContext: LTX2ResumeContext {
     /// GPU time already spent on this render, across all segments — wall clock
     /// would otherwise bill the preemptor's runtime to this render.
     var accumulatedSeconds: Double = 0
+    /// comfybox#307 (review r1): why the two-stage refine did not run on some
+    /// chunk of THIS render, if any — carried on the context (not
+    /// `LTX2Pipeline.lastRefineSkipReason`) because a cold preemption resume
+    /// can rebuild the pipeline/generator from scratch (`VideoGeneratorHolder
+    /// .release()` deallocates them), which would otherwise silently drop a
+    /// skip reason recorded on an earlier chunk before the eviction. See
+    /// `LTX2VideoGenerator.render`.
+    var refineSkippedReason: String? = nil
 
     init(request: LTX2VideoRequest) {
         self.request = request
+    }
+
+    /// comfybox#307 (review r2, item 2c): the snapshot construction
+    /// `LTX2VideoGenerator.render`'s `checkpoint()` closure performs — pulled
+    /// out so a test can call the SAME code that actually produces a
+    /// checkpoint's context, not a hand re-implementation that could
+    /// silently diverge from it (e.g. a field added to the snapshot later
+    /// but never mirrored in a test's own copy). `elapsedThisSegment` is the
+    /// raw (possibly negative) wall-clock delta for the CURRENT segment only
+    /// — `ctx.accumulatedSeconds` from prior segments is added here, exactly
+    /// as the original inline code did.
+    static func checkpointSnapshot(
+        from ctx: LTX2RenderContext, chunk: Int, frames: [CGImage],
+        audio: MLXArray?, seedImage: MLXArray?, refineSkippedReason: String?,
+        elapsedThisSegment: Double
+    ) -> LTX2RenderContext {
+        let snapshot = LTX2RenderContext(request: ctx.request)
+        snapshot.chunkIndex = chunk
+        snapshot.frames = frames
+        snapshot.refineSkippedReason = refineSkippedReason
+        // Materialize on capture, same contract as LTX2ResumeState's own
+        // tensors — a cheap no-op when they are already evaluated, and the
+        // guarantee stops depending on what upstream call sites happen to do.
+        if let audio { eval(audio) }
+        snapshot.audioLatents = audio
+        let chained = chunk > 0 ? seedImage : nil
+        if let chained { eval(chained) }
+        snapshot.chunkSeedImage = chained
+        snapshot.accumulatedSeconds = ctx.accumulatedSeconds + max(0, elapsedThisSegment)
+        return snapshot
     }
 }
 #endif
@@ -313,6 +377,19 @@ public final class LTX2VideoGenerator {
         guard let raw = env?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return fallback }
         guard let n = Int(raw), n > 0, n % 128 == 0 else { return fallback }
         return n
+    }
+
+    /// Resolve the optional external 24 kHz HiFi-GAN override. A path alone is
+    /// deliberately insufficient: production historically carried a stale
+    /// `LTX2_VOCODER_PATH` that silently displaced the monolith's matched
+    /// BigVGAN+BWE. Both variables make the mismatch an explicit experiment.
+    public static func externalVocoderOverridePath(
+        environment: [String: String]
+    ) -> String? {
+        guard environment["LTX2_USE_EXTERNAL_VOCODER"] == "1" else { return nil }
+        guard let raw = environment["LTX2_VOCODER_PATH"] else { return nil }
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
     }
 
     /// fps must be positive and sane (chunk planning divides by it; the RoPE
@@ -457,6 +534,20 @@ public final class LTX2VideoGenerator {
                 "audio render requires a JoyAI-Echo monolithic checkpoint (audio branch tensors) — \(weightsURL.lastPathComponent) is per-component")
         }
 
+        // Unsupported int8 checkpoints (comfybox#256): some exports (e.g.
+        // PinkCherry v1.7) carry `int8`-dtype `.weight` tensors in a scheme
+        // `LTX2Quantizer`'s own MLX affine `.scales`/`.biases` packed-uint32
+        // format (and `applyQuantizedLayout`, which only recognises that
+        // format) does not implement — PinkCherry specifically is ComfyUI's
+        // `int8_tensorwise` with `convrot: true` (a rotated coordinate
+        // basis; plain int8×scale reconstruction measured cosine similarity
+        // ~0.008 against the real weights — not implementable as a scale
+        // multiply). Left unchecked, those raw int8 bytes would load
+        // straight into float weight parameters and render as noise. Fail
+        // loudly here, before any weight is touched, naming the exact
+        // unsupported format/tensor rather than silently producing noise.
+        try LTX2Quantizer.rejectUnsupportedInt8Weights(sanitized)
+
         // Merge each LoRA into the base weights in order (skip audio branches),
         // as the CLI does — multiple LoRAs simply accumulate their deltas.
         for lora in loras {
@@ -584,7 +675,15 @@ public final class LTX2VideoGenerator {
         }
         MLX.eval(vae.parameters())
 
-        logger.info("LTX-2: loading text encoder (Gemma 3 12B)…")
+        // comfybox#340: everything from here to "models ready." used to be a
+        // single unnamed span. When a render wedged (production 2026-09-01
+        // 00:16–08:26: six loads killed by the 15-minute watchdog, one that
+        // finally completed after 14m30s) the only evidence was this one line
+        // followed by silence — which stage was slow could not be told apart
+        // from a deadlock. Each stage is now timed and named, and anything
+        // over `slowLoadStageWarnSeconds` is called out explicitly, so the
+        // next occurrence names itself in the log instead of needing a repro.
+        logger.info("LTX-2: loading text encoder (Gemma 3 12B) from \(config.gemmaPath)…")
         let gemmaConfig = LTX2GemmaConfig(
             vocabSize: 262208, hiddenSize: 3840,
             numHiddenLayers: 48, numAttentionHeads: 16,
@@ -594,22 +693,31 @@ public final class LTX2VideoGenerator {
             slidingWindow: 1024, slidingWindowPattern: 6,
             quantization: nil
         )
-        let textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
-        if isMonolith {
-            // Connectors (model.diffusion_model.*_embeddings_connector) and the
-            // aggregate embeds (text_embedding_projection.*) live in the monolith;
-            // Gemma still loads from its own directory.
-            try textEncoder.loadWeightsFromMonolith(
-                gemmaPath: URL(fileURLWithPath: config.gemmaPath),
-                monolithTensors: rawWeights
-            )
-        } else {
-            try textEncoder.loadWeights(
-                modelPath: URL(fileURLWithPath: modelDir),
-                textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
-            )
+        let textEncoder = try timedLoadStage("text encoder construct") {
+            LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
         }
-        MLX.eval(textEncoder.parameters())
+        try timedLoadStage("text encoder bind weights (~14.5GB Gemma safetensors)") {
+            if isMonolith {
+                // Connectors (model.diffusion_model.*_embeddings_connector) and the
+                // aggregate embeds (text_embedding_projection.*) live in the monolith;
+                // Gemma still loads from its own directory.
+                try textEncoder.loadWeightsFromMonolith(
+                    gemmaPath: URL(fileURLWithPath: config.gemmaPath),
+                    monolithTensors: rawWeights
+                )
+            } else {
+                try textEncoder.loadWeights(
+                    modelPath: URL(fileURLWithPath: modelDir),
+                    textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
+                )
+            }
+        }
+        // The mmap'd Gemma tensors are only actually paged in here — this eval,
+        // not the bind above, is where a cold page cache or memory pressure is
+        // paid for, so it gets its own name in the log.
+        try timedLoadStage("text encoder materialize parameters (MLX.eval)") {
+            MLX.eval(textEncoder.parameters())
+        }
 
         // Reference ComfyUI-LTXVideo workflows always decode through
         // VAEDecodeTiled, never a plain single-pass decode — the decoder
@@ -619,11 +727,18 @@ public final class LTX2VideoGenerator {
         // uniform grid/mesh artifact seen in every local I2V test tonight.
         // Two-stage refine (Phase 3): load the spatial latent upsampler if enabled.
         // ltx-2.3-spatial-upscaler-x2-1.1 keys map 1:1 to LTX2LatentUpsampler.
+        //
+        // Codex r1: `loadUpsampler` does its own `MLX.loadArrays` + `MLX.eval`
+        // (a second paged read), so a stall here produces the exact same
+        // "after the text encoder, before models ready" symptom. It gets its
+        // own named stage rather than hiding inside the gap.
         var upsampler: LTX2LatentUpsampler? = nil
         if ProcessInfo.processInfo.environment["LTX2_TWO_STAGE"] == "1",
            let upPath = ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"],
            FileManager.default.fileExists(atPath: upPath) {
-            upsampler = Self.loadUpsampler(path: upPath, logger: logger)
+            upsampler = try timedLoadStage("two-stage upsampler load (loadArrays + eval)") {
+                Self.loadUpsampler(path: upPath, logger: logger)
+            }
         }
         // Tiled/chunked VAE decode is OOM-safe on long/large clips but seams on
         // fast motion (spatial-tile mosaic + temporal-window jitter). Plain
@@ -635,21 +750,186 @@ public final class LTX2VideoGenerator {
         // The temporal-RoPE conditioning fps (the motion dial) is therefore
         // controlled per-render via LTX2_COND_FPS (read fresh in createPositionGrid).
         let pipelineConfig = LTX2PipelineConfig(modelPath: modelDir, pipelineType: .distilled, hasPromptAdaLN: true, tiledDecode: tiled)
-        self.pipeline = LTX2Pipeline(vae: vae, textEncoder: textEncoder, transformer: transformer, config: pipelineConfig, upsampler: upsampler)
-        // 128 was a port artifact, NOT the trained recipe (discovered 2026-08-07):
-        // the official Lightricks pipeline tokenizes at max_length 1024, the
-        // ComfyUI Gemma loader defaults to 1024, and the reference PinkCherry
-        // workflow feeds 256-token enhancer output through this same encoder.
-        // The artifact silently truncated every long prompt for weeks — scene,
-        // camera and identity fell off the tail. Mirror upstream's env knob.
-        self.tokenizer = try LTX2GemmaTokenizer.load(
-          from: URL(fileURLWithPath: config.gemmaPath),
-          maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
-        isLoaded = true
-        loadedLoraKey = wantKey
+        // Codex r1: the pipeline and the tokenizer are published as ONE step,
+        // after every throwing stage has succeeded. Assigning `self.pipeline`
+        // before the (throwing) tokenizer load used to leave a failed attempt
+        // retaining a complete ~54GB model stack that `isLoaded == false`
+        // claimed was not there, so the retry built a second one beside it.
+        try Self.atomicallyPublishLoad(
+            build: { () throws -> (LTX2Pipeline, LTX2GemmaTokenizer) in
+                let builtPipeline = try timedLoadStage("pipeline construct") {
+                    LTX2Pipeline(
+                        vae: vae, textEncoder: textEncoder, transformer: transformer,
+                        config: pipelineConfig, upsampler: upsampler)
+                }
+                // 128 was a port artifact, NOT the trained recipe (discovered 2026-08-07):
+                // the official Lightricks pipeline tokenizes at max_length 1024, the
+                // ComfyUI Gemma loader defaults to 1024, and the reference PinkCherry
+                // workflow feeds 256-token enhancer output through this same encoder.
+                // The artifact silently truncated every long prompt for weeks — scene,
+                // camera and identity fell off the tail. Mirror upstream's env knob.
+                let builtTokenizer = try timedLoadStage("tokenizer load (tokenizer.json parse)") {
+                    try LTX2GemmaTokenizer.load(
+                      from: URL(fileURLWithPath: config.gemmaPath),
+                      maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
+                }
+                return (builtPipeline, builtTokenizer)
+            },
+            publish: { stack in
+                self.pipeline = stack.0
+                self.tokenizer = stack.1
+                self.isLoaded = true
+                self.loadedLoraKey = wantKey
+            },
+            discard: { self.unload() })
         logger.info("LTX-2: models ready.")
     }
 
+
+    // MARK: - Load-path stage timing (comfybox#340)
+
+    /// A load stage slower than this is reported as abnormally slow, and the
+    /// interval at which an in-flight stage repeats its heartbeat. A healthy
+    /// warm load runs single-digit seconds per stage (production text-encoder
+    /// loads: 3–17s end to end), so 30s is well clear of a cold start while
+    /// still firing ~30 times before the 15-minute watchdog kill.
+    static let slowLoadStageWarnSeconds: Double = 30
+
+    /// The operational note shared by the heartbeat and the slow-completion
+    /// warning. `/health` is called out explicitly as NOT a signal here: it
+    /// reads a lock-backed snapshot precisely so it stays answerable while the
+    /// coordinator is blocked (WarmServer, #217), so a green health check
+    /// during this stall means nothing. Getting this wrong would send the next
+    /// person reading the log to the wrong place.
+    private static let stalledLoadNote =
+        "The render queue is stalled for the whole stage (/health is snapshot-backed and stays "
+        + "green, so it will NOT show this), and a watchdog restart here loses the in-flight "
+        + "render (comfybox#340, #339). Suspect cold page cache, memory pressure, or a near-full "
+        + "disk rather than a deadlock."
+
+    /// Logged BEFORE a stage runs. Codex r1: a report emitted after `body()`
+    /// returns is exactly the report a wedge never produces — the six
+    /// 2026-09-01 loads were SIGTERM'd mid-stage. This line is the one that
+    /// survives the kill and names the stage that was active.
+    static func loadStageEntryMessage(stage: String) -> String {
+        "LTX-2 load: \(stage) — started"
+    }
+
+    /// Repeated every `slowLoadStageWarnSeconds` while a stage is still
+    /// running, so a wedge is visible WHILE it happens rather than only in
+    /// hindsight (and at all, when the process is killed before completion).
+    static func loadStageStillRunningMessage(
+        stage: String,
+        seconds: Double,
+        warnAfter: Double = LTX2VideoGenerator.slowLoadStageWarnSeconds
+    ) -> String {
+        let secs = String(format: "%.0f", seconds)
+        return "LTX-2 load: \(stage) STILL RUNNING after \(secs)s "
+            + "(healthy is under \(Int(warnAfter))s). \(stalledLoadNote)"
+    }
+
+    /// One-line verdict for a COMPLETED load stage. Honest scope: this fires
+    /// only once the stage returns — the entry line and the heartbeat above are
+    /// what cover a stage that never returns.
+    static func loadStageReport(
+        stage: String,
+        seconds: Double,
+        warnAfter: Double = LTX2VideoGenerator.slowLoadStageWarnSeconds
+    ) -> (message: String, isSlow: Bool) {
+        let secs = String(format: "%.2f", seconds)
+        guard seconds >= warnAfter else {
+            return ("LTX-2 load: \(stage) — \(secs)s", false)
+        }
+        return (
+            "LTX-2 load: \(stage) took \(secs)s — ABNORMALLY SLOW "
+                + "(healthy is under \(Int(warnAfter))s). \(stalledLoadNote)",
+            true
+        )
+    }
+
+    /// Logged when a stage throws. Names the stage, how long it burned before
+    /// failing, the cause, and that the partial load was dropped — so the next
+    /// line in the log (a retry) is understood to start from nothing.
+    static func loadStageFailureMessage(stage: String, seconds: Double, error: Error) -> String {
+        "LTX-2 load: \(stage) FAILED after \(String(format: "%.2f", seconds))s — \(error). "
+            + "Partial load discarded; nothing was published, so a retry starts clean."
+    }
+
+    /// Monotonic elapsed seconds. Wall-clock (`CFAbsoluteTimeGetCurrent`) can
+    /// step under NTP correction, which would make an incident's timings lie.
+    private static func elapsedSeconds(since start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000_000
+    }
+
+    /// Run one named load stage: entry line, in-flight heartbeat, then a
+    /// completion or failure line. Splits what used to be a single unnamed span
+    /// between "loading text encoder" and "models ready" into stages a log can
+    /// point at — including a stage that never finishes.
+    private func timedLoadStage<T>(_ stage: String, _ body: () throws -> T) throws -> T {
+        let started = DispatchTime.now()
+        logger.info("\(Self.loadStageEntryMessage(stage: stage))")
+
+        // Detached on purpose: `body()` blocks this thread for the whole stage
+        // (that IS the failure mode), so the heartbeat cannot live on it.
+        let interval = Self.slowLoadStageWarnSeconds
+        let heartbeat = Task.detached(priority: .utility) { [logger] in
+            var waited = 0.0
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                } catch {
+                    return  // cancelled while sleeping — the stage finished
+                }
+                waited += interval
+                logger.warning(
+                    "\(Self.loadStageStillRunningMessage(stage: stage, seconds: waited))")
+            }
+        }
+        defer { heartbeat.cancel() }
+
+        do {
+            let result = try body()
+            let report = Self.loadStageReport(
+                stage: stage, seconds: Self.elapsedSeconds(since: started))
+            if report.isSlow {
+                logger.warning("\(report.message)")
+            } else {
+                logger.info("\(report.message)")
+            }
+            return result
+        } catch {
+            let failure = Self.loadStageFailureMessage(
+                stage: stage, seconds: Self.elapsedSeconds(since: started), error: error)
+            logger.error("\(failure)")
+            throw error
+        }
+    }
+
+    /// Publish a freshly built model stack as ONE step.
+    ///
+    /// Codex review r1 (comfybox#340): `load()` used to assign `self.pipeline` —
+    /// the complete transformer + VAE + text encoder — and only THEN run the
+    /// throwing tokenizer stage. A tokenizer failure left `isLoaded == false`
+    /// while the generator still retained that whole stack, and since `load()`
+    /// unloads only when `isLoaded` is true, the retry built a SECOND stack
+    /// beside the first. At ~54GB a stack, that is an OOM, not a leak.
+    ///
+    /// `build` runs every throwing stage; `publish` runs only if all of them
+    /// succeed, and a throw runs `discard` instead.
+    static func atomicallyPublishLoad<Stack>(
+        build: () throws -> Stack,
+        publish: (Stack) -> Void,
+        discard: () -> Void
+    ) throws {
+        let stack: Stack
+        do {
+            stack = try build()
+        } catch {
+            discard()
+            throw error
+        }
+        publish(stack)
+    }
 
     /// Load + validate the spatial latent upsampler. Shared by the load-time
     /// path (env) and the per-request lazy path (finding #18). Returns nil —
@@ -775,6 +1055,29 @@ public final class LTX2VideoGenerator {
         // render's activations, via defer) EVERY render.
         GPU.clearCache()
         defer { GPU.clearCache() }
+        // comfybox#322 (claim corrected in review r1): what actually guarantees
+        // an interrupted render produces no clip is the `Task
+        // .checkCancellation()` immediately BEFORE `writeMP4` — the write is
+        // synchronous, so cancellation cannot preempt it part-way and there is
+        // no "cancel lands mid-write" case to catch.
+        //
+        // This defer covers the narrower real one: `writeMP4` unlinks
+        // `outputPath` and writes straight to it, so if it THROWS (an I/O
+        // error, a full disk) after the task was already cancelled, it leaves a
+        // truncated file that reads as finished output. The window is between
+        // the two flags, so this never deletes a file the render did not
+        // create: a cancel before the write leaves any pre-existing file alone,
+        // and a completed write is kept. A #1479 yield is not a cancellation,
+        // so a preempted render keeps everything and resumes.
+        var startedWrite = false
+        var wroteOutput = false
+        defer {
+            if Task.isCancelled, startedWrite, !wroteOutput,
+               FileManager.default.fileExists(atPath: request.outputPath) {
+                try? FileManager.default.removeItem(atPath: request.outputPath)
+                logger.info("LTX-2 comfybox#322: interrupted mid-write — removed partial output at \(request.outputPath).")
+            }
+        }
         try validate(request)
 
         // #1479: the continuation the resume came in with, READ-ONLY from here
@@ -785,6 +1088,13 @@ public final class LTX2VideoGenerator {
         // pre-#1479 code took its `start`, so a normal render's reported
         // `elapsedSeconds` keeps its old meaning exactly.
         var segmentStart = CFAbsoluteTimeGetCurrent()
+        // comfybox#307 (review r1): seeded from the resumed context (nil on a
+        // fresh render), then kept in sync with `pipeline.lastRefineSkipReason`
+        // after every chunk that completes within THIS render() call (see the
+        // chunk loop below) and snapshotted onto every checkpoint — so a skip
+        // recorded before a preemption survives a cold resume even if the
+        // pipeline/generator that recorded it was deallocated in between.
+        var refineSkippedReason: String? = ctx.refineSkippedReason
         /// Close out this render segment and hand the checkpoint up with its
         /// own snapshot of the generator-level continuation.
         ///
@@ -797,19 +1107,15 @@ public final class LTX2VideoGenerator {
             _ s: LTX2ResumeState, chunk: Int, frames: [CGImage],
             audio: MLXArray?, seedImage: MLXArray?
         ) -> LTX2RenderOutcome {
-            let snapshot = LTX2RenderContext(request: ctx.request)
-            snapshot.chunkIndex = chunk
-            snapshot.frames = frames
-            // Materialize on capture, same contract as LTX2ResumeState's own
-            // tensors — a cheap no-op when they are already evaluated, and the
-            // guarantee stops depending on what upstream call sites happen to do.
-            if let audio { eval(audio) }
-            snapshot.audioLatents = audio
-            let chained = chunk > 0 ? seedImage : nil
-            if let chained { eval(chained) }
-            snapshot.chunkSeedImage = chained
-            snapshot.accumulatedSeconds =
-                ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            // comfybox#307 (review r1 + r2 item 2c): the accumulated skip
+            // reason (captured from the enclosing `refineSkippedReason`
+            // local, kept in sync with `pipeline.lastRefineSkipReason` by
+            // the chunk loop) rides the snapshot via the SAME static builder
+            // a test calls directly — see `LTX2RenderContext.checkpointSnapshot`.
+            let snapshot = LTX2RenderContext.checkpointSnapshot(
+                from: ctx, chunk: chunk, frames: frames, audio: audio, seedImage: seedImage,
+                refineSkippedReason: refineSkippedReason,
+                elapsedThisSegment: CFAbsoluteTimeGetCurrent() - segmentStart)
             var stamped = s
             stamped.context = snapshot
             logger.info("LTX-2 #1479: yielded at chunk \(chunk), phase \(s.phase.rawValue), step \(s.stepIndex) (\(frames.count) frame(s) banked).")
@@ -845,6 +1151,12 @@ public final class LTX2VideoGenerator {
         // against a phantom phase. `LTX2PhaseTelemetry.end` removes the open
         // entry, so it is safe to call once per `begin` and a no-op after —
         // the `do` block scopes this one to exactly the load.
+        // comfybox#322 (review r1): the model load is the single most expensive
+        // non-denoise phase (tens of GB, tens of seconds, and uninterruptible
+        // once it starts). An interrupt that arrived while this job waited its
+        // turn, or during text encode, must not pay for it. #1479 already had a
+        // free unwind point here for preemption; this is its cancellation twin.
+        try Task.checkCancellation()
         telemetry?.begin(.modelLoad)
         do {
             defer { telemetry?.end(.modelLoad) }
@@ -860,6 +1172,14 @@ public final class LTX2VideoGenerator {
         // increment; until then this resolves configFile > env > builtin.
         let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
+        // comfybox#307 (review r1): unconditionally reset — `pipeline
+        // .lastRefineSkipReason` is now scoped to THIS render() invocation
+        // only (it may be a brand-new pipeline instance after an eviction, or
+        // the same instance carrying a stale value from an unrelated PRIOR
+        // render). Cross-invocation persistence (surviving a resume) is the
+        // `refineSkippedReason` local's job, seeded from `ctx` above and kept
+        // in sync with this property after every chunk below.
+        pipeline.lastRefineSkipReason = nil
         let resolved = typedConfig.params
         // Finding #18: two_stage was load-time only — a request could not turn
         // it on without a server restart. Lazy-load the upsampler on the first
@@ -917,6 +1237,30 @@ public final class LTX2VideoGenerator {
         }()
         let negBatch = negText.map { tokenizer.encode(prompt: $0, maxLength: tokenizer.maxLength) }
         if let negBatch { MLX.eval(negBatch.inputIds, negBatch.attentionMask) }
+
+        // Temporal beat scheduling (comfybox#310): locate each beat's text as
+        // a token span in the SAME composed prompt just tokenized above, once
+        // per render. Fail-open per beat (never per render) — a beat whose
+        // span can't be located just contributes zero bias, logged once.
+        // Absent field or the LTX2_BEAT_SCHEDULE=0 kill switch both resolve
+        // to an empty list, which builds nil bias downstream (byte-identical
+        // to before this feature existed).
+        let resolvedBeats: [LTX2ResolvedBeat] = {
+            guard typedConfig.beatScheduleEnabled,
+                  let beats = request.beatSchedule, !beats.isEmpty else { return [] }
+            let fullIds = tokenizer.untruncatedTokenIds(prompt: guardedPrompt.effectivePrompt)
+            return LTX2BeatScheduleLocator.locate(
+                beats: beats,
+                fullPromptTokenIds: fullIds,
+                maxLength: tokenizer.maxLength,
+                onDrop: { beat, reason in
+                    self.logger.warning("[LTX2] beat_schedule: dropping beat '\(beat.text.prefix(40))…' — \(reason)")
+                },
+                tokenize: { tokenizer.untruncatedTokenIds(prompt: $0) })
+        }()
+        if !resolvedBeats.isEmpty {
+            logger.info("[LTX2] beat_schedule: \(resolvedBeats.count)/\(request.beatSchedule?.count ?? 0) beat(s) located.")
+        }
 
         segmentStart = CFAbsoluteTimeGetCurrent()
         // #1479: frames and audio banked by chunks that finished before an
@@ -1114,6 +1458,11 @@ public final class LTX2VideoGenerator {
         let startChunk = resume != nil ? ctx.chunkIndex : 0
 
         for chunk in startChunk..<plan.totalChunks {
+            // comfybox#322: chunk boundary. Cancellation is evaluated BEFORE
+            // the #1479 unwind point below, so an interrupt arriving here
+            // aborts instead of banking a checkpoint that would be resumed.
+            try Task.checkCancellation()
+
             // The checkpoint being resumed belongs to `startChunk`; later chunks
             // start clean.
             let chunkResume: LTX2ResumeState? = (chunk == startChunk) ? resume : nil
@@ -1215,6 +1564,7 @@ public final class LTX2VideoGenerator {
                         ? Float(request.framesPerChunk) / Float(request.fps) : nil,
                     preemption: preemption, telemetry: telemetry,
                     resume: chunkResume, chunkIndex: chunk,
+                    beatSchedule: resolvedBeats,
                     progressCallback: { s, t in progress?(chunk, plan.totalChunks, s, t) })
             }
 
@@ -1223,11 +1573,25 @@ public final class LTX2VideoGenerator {
             case .completed(let o):
                 output = o
             case .yielded(let s):
+                // comfybox#307 (review r1): sync before checkpointing — this
+                // chunk may have recorded a skip (the refine gate returns
+                // `.completed` internally before any later phase yields) that
+                // must ride the snapshot, not just live on `pipeline`.
+                // (review r3, minor 2) Sync site 1 of 2 — reads whatever
+                // `LTX2Pipeline.recordRefineSkip` last wrote to
+                // `lastRefineSkipReason`; see that function's doc comment.
+                refineSkippedReason = pipeline.lastRefineSkipReason ?? refineSkippedReason
                 // #1479: propagate. Frames banked by EARLIER chunks ride in the
                 // context; this chunk's own progress is in the checkpoint.
                 return checkpoint(s, chunk: chunk, frames: allFrames,
                                   audio: audioLatents, seedImage: currentImage)
             }
+            // comfybox#307 (review r1): this chunk finished cleanly — fold in
+            // whatever it recorded so the NEXT chunk's between-chunk
+            // checkpoint (above) and the final result (below) both see it.
+            // (review r3, minor 2) Sync site 2 of 2 — same read as above; see
+            // `LTX2Pipeline.recordRefineSkip`'s doc comment for both sites.
+            refineSkippedReason = pipeline.lastRefineSkipReason ?? refineSkippedReason
 
             telemetry?.begin(.postProcess)
             let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded, colorAnchor: pipeline.resolvedConfig.colorAnchor)
@@ -1312,25 +1676,36 @@ public final class LTX2VideoGenerator {
         // to a video-only file rather than failing the render.
         var audioTrack: LTX2PostProcess.AudioTrack? = nil
         if let al = audioLatents {
+            // comfybox#322: audio decode (VAE + BigVGAN/BWE vocoder) is a
+            // single multi-second tensor pass with no inner loop, so this is
+            // its boundary. Deliberately OUTSIDE the `do` below, whose `catch`
+            // degrades to a video-only file — swallowing a cancel there would
+            // let an interrupted render go on to write an MP4.
+            try Task.checkCancellation()
             do {
                 if audioVAE == nil {
                     logger.info("LTX-2 audio: binding audio VAE + vocoder from monolith…")
                     audioVAE = try LTX2AudioVAE.load(path: resolveWeightsFileURL().path, logger: logger)
-                    // OFFICIAL vocoder override (Todd 2026-08-17 metallic fix):
-                    // the JoyAI BigVGAN is a foreign vocoder for our audio_vae →
-                    // metallic. When LTX2_VOCODER_PATH points at the official
-                    // LTX-2.3 HiFi-GAN weights, route audio decode through it.
-                    if let vp = ProcessInfo.processInfo.environment["LTX2_VOCODER_PATH"],
-                       !vp.isEmpty, let av = audioVAE {
-                        av.officialVocoder = try LTX2HiFiGANVocoder.load(path: vp, logger: logger)
-                        logger.info("LTX-2 audio: OFFICIAL HiFi-GAN vocoder bound from \(vp) (24 kHz).")
+                    // The monolith's `vocoder.*` BigVGAN+BWE is trained with its
+                    // `audio_vae.*` and is therefore the 48 kHz default. The
+                    // external Lightricks HiFi-GAN is a mismatched 24 kHz path;
+                    // keep it available for experiments, but require explicit
+                    // opt-in so a stale LTX2_VOCODER_PATH cannot replace the
+                    // checkpoint's matched vocoder.
+                    let env = ProcessInfo.processInfo.environment
+                    if let vp = Self.externalVocoderOverridePath(environment: env),
+                       let av = audioVAE {
+                        av.externalVocoder = try LTX2HiFiGANVocoder.load(path: vp, logger: logger)
+                        logger.warning("LTX-2 audio: external mismatched HiFi-GAN override bound from \(vp) (24 kHz, no BWE).")
+                    } else if let vp = env["LTX2_VOCODER_PATH"], !vp.isEmpty {
+                        logger.info("LTX-2 audio: ignoring LTX2_VOCODER_PATH=\(vp); bundled matched BigVGAN+BWE remains active. Set LTX2_USE_EXTERNAL_VOCODER=1 to opt in.")
                     }
                 }
                 if let av = audioVAE {
                     telemetry?.begin(.vocoder)
                     defer { telemetry?.end(.vocoder) }
-                    // Official HiFi-GAN outputs 24 kHz; the BigVGAN+BWE path 48 kHz.
-                    let audioSR = av.officialVocoder != nil ? 24000 : 48000
+                    // External HiFi-GAN outputs 24 kHz; bundled BigVGAN+BWE 48 kHz.
+                    let audioSR = av.externalVocoder != nil ? 24000 : 48000
                     let wav = av.decodeToWaveform(al.asType(.float32))  // (1, 2, N)
                     var clamped = MLX.clip(wav[0], min: MLXArray(Float(-1)), max: MLXArray(Float(1)))
                     // Trim to the actual video duration (ceil(s*25) latent
@@ -1342,9 +1717,8 @@ public final class LTX2VideoGenerator {
                     }
                     // In-engine mastering (task #26): rumble cut, BWE de-harsh,
                     // loudness raise with soft ceiling. The de-harsh dip targeted
-                    // the BigVGAN metallic — skip enhance for the clean official
-                    // vocoder. LTX2_AUDIO_ENHANCE=0 also disables it entirely.
-                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" && av.officialVocoder == nil {
+                    // the BigVGAN path. LTX2_AUDIO_ENHANCE=0 disables it.
+                    if ProcessInfo.processInfo.environment["LTX2_AUDIO_ENHANCE"] != "0" && av.externalVocoder == nil {
                         clamped = LTX2AudioEnhance.process(clamped, sampleRate: audioSR)
                         logger.info("LTX-2 audio: enhancement chain applied (hp50 + dip7.5k + loudnorm).")
                     }
@@ -1357,13 +1731,19 @@ public final class LTX2VideoGenerator {
             }
         }
 
+        // comfybox#322: last boundary before anything is written to disk, so a
+        // cancelled render never leaves a file at `outputPath` (the `defer`
+        // above is the backstop for a cancel that lands mid-write).
+        try Task.checkCancellation()
         telemetry?.begin(.postProcess)
+        startedWrite = true
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
             fps: request.fps, width: outW, height: outH,
             bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
             audio: audioTrack,
             deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+        wroteOutput = true
         telemetry?.end(.postProcess)
 
         return .completed(LTX2VideoResult(
@@ -1372,7 +1752,13 @@ public final class LTX2VideoGenerator {
             durationSeconds: Float(allFrames.count) / Float(request.fps),
             // #1479: RENDER time, summed across segments — wall clock from a
             // single start would bill the preemptor's runtime to this render.
-            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart),
+            // comfybox#307 (review r1): the local, accumulated across every
+            // chunk (and any cold resume) this render() call processed — NOT
+            // `pipeline.lastRefineSkipReason`, which only ever reflects THIS
+            // invocation and would drop an earlier chunk's reason if a
+            // preemption rebuilt the pipeline in between.
+            refineSkippedReason: refineSkippedReason
         ))
         #else
         throw LTX2VideoError.unsupportedPlatform

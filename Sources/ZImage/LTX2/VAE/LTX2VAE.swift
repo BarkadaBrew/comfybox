@@ -101,14 +101,17 @@ public final class LTX2VAE: Module {
   /// state carried between chunks — numerically identical to plain `decode`,
   /// peak memory bounded by chunk size, zero seams. See
   /// `LTX2Decoder3D.decodeStreamed`.
+  ///
+  /// comfybox#322: `throws` because the decoder checks for cancellation
+  /// between output volumes — a long clip's decode is minutes of work.
   public func decodeStreamed(
     _ z: MLXArray, timestep: MLXArray? = nil
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     var latent = z
     if latent.ndim == 4 {
       latent = latent.expandedDimensions(axis: 2)
     }
-    return decoder.decodeStreamed(latent, timestep: timestep)
+    return try decoder.decodeStreamed(latent, timestep: timestep)
   }
 
   /// Decodes latents using spatial tiling to reduce memory usage.
@@ -131,7 +134,7 @@ public final class LTX2VAE: Module {
     rampSize: Int = 2,
     timestep: MLXArray? = nil,
     frameWindow explicitFrameWindow: Int? = nil
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     var latent = z
     if latent.ndim == 4 {
       latent = latent.expandedDimensions(axis: 2)
@@ -145,7 +148,7 @@ public final class LTX2VAE: Module {
     let frameWindow = explicitFrameWindow
       ?? Int(ProcessInfo.processInfo.environment["LTX2_DECODE_FRAME_WINDOW"] ?? "") ?? 16
     if latent.dim(2) > frameWindow {
-      return decodeTemporalChunked(
+      return try decodeTemporalChunked(
         latent, frameWindow: frameWindow,
         tileSize: tileSize, tileStride: tileStride, rampSize: rampSize,
         timestep: timestep)
@@ -174,6 +177,9 @@ public final class LTX2VAE: Module {
       let hEnd = min(hStart + tileSize, hLat)
       var wStart = 0
       while wStart < wLat {
+        // comfybox#322: cancellation at the tile boundary — one tile is the
+        // decode's unit of work, so abort latency is bounded by one tile.
+        try Task.checkCancellation()
         let wEnd = min(wStart + tileSize, wLat)
 
         // Extract tile
@@ -248,7 +254,7 @@ public final class LTX2VAE: Module {
     tileStride: Int,
     rampSize: Int,
     timestep: MLXArray?
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     let fLat = latent.dim(2)
     let overlap = max(1, Int(ProcessInfo.processInfo.environment["LTX2_DECODE_FRAME_OVERLAP"] ?? "") ?? 2)
     let stride = max(1, frameWindow - overlap)
@@ -266,7 +272,9 @@ public final class LTX2VAE: Module {
     while s < fLat {
       let e = min(s + frameWindow, fLat)
       let window = latent[0..., 0..., s..<e, 0..., 0...]
-      var decoded = decodeTiled(
+      // comfybox#322: cancellation between temporal decode windows.
+      try Task.checkCancellation()
+      var decoded = try decodeTiled(
         window, tileSize: tileSize, tileStride: tileStride,
         rampSize: rampSize, timestep: timestep
       ).asType(.float32)

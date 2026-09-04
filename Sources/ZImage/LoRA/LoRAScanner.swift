@@ -53,6 +53,16 @@ public enum LoRAScannerError: Error, LocalizedError {
 /// Scans safetensors files and extracts LoRA metadata without loading tensor data.
 public enum LoRAScanner {
 
+  /// #313 (review round 1): the complete vocabulary `detectCompatibility`/
+  /// `detectCompatibilityFromKeys` can emit — every literal string returned
+  /// anywhere in this file, plus `"unknown"`. Single source of truth so the
+  /// `/v1/loras/{id}/update` route can reject a manually-supplied
+  /// `model_compatibility` tag the scanner itself could never produce,
+  /// mirroring how `krea2_relative` already 400s on an unrecognized value.
+  public static let knownCompatibilityTags: Set<String> = [
+    "z-image", "klein-9b", "klein-4b", "chroma", "flux1", "krea2", "ltx", "unknown",
+  ]
+
   /// Scan a safetensors file and extract all discoverable metadata.
   ///
   /// - Parameter url: Path to a .safetensors file.
@@ -152,7 +162,10 @@ public enum LoRAScanner {
     if let baseVersion = metadata?["ss_base_model_version"] {
       let lower = baseVersion.lowercased()
       switch lower {
-      case "zimage", "z-image", "lumina2":
+      // #313: sd-scripts' `networks.lora_zimage` (real vault file
+      // Anneliese_Zbase3.safetensors) writes `ss_base_model_version: "z_image"`
+      // — underscore, not one of the two forms this switch recognized.
+      case "zimage", "z-image", "z_image", "lumina2":
         return ["z-image"]
       case "flux_klein_9b":
         return ["klein-9b"]
@@ -178,6 +191,12 @@ public enum LoRAScanner {
     // 2. Check modelspec.architecture
     if let arch = metadata?["modelspec.architecture"] {
       let lower = arch.lowercased()
+      // #313: this branch had no z-image case at all (only klein/chroma/
+      // ltx/flux) — `modelspec.architecture: "Z-Image/lora"` (the same real
+      // file above) fell through to key heuristics unnecessarily.
+      if lower.contains("z-image") || lower.contains("zimage") || lower.contains("z_image") {
+        return ["z-image"]
+      }
       if lower.contains("klein_9b") || lower.contains("klein-9b") {
         return ["klein-9b"]
       }
@@ -213,6 +232,18 @@ public enum LoRAScanner {
     var hasTxtAttn = false
     var hasLTX2AudioVideoBranch = false
     var hasKrea2Signature = false
+    // #313: LTX2TransformerBlock (Sources/ZImage/LTX2/Transformer/LTX2TransformerBlock.swift)
+    // is the only architecture in this codebase with BOTH `attn1` (self) and
+    // `attn2` (cross) under one numbered block — Z-Image's block has a
+    // single `attention` and never an `attn2`, even under the generic
+    // diffusers-style `transformer_blocks` naming LoRAKeyMapper also accepts
+    // for Z-Image. Real vault files confirming the layout (all were
+    // `unknown` before this fix): phool-realism-ltx-2.3-v1.0,
+    // ltx-2.3-22b-ic-lora-union-control-ref0.5,
+    // LTX2.3_reasoning_Sulphur-2_I2V_V4 — plain `diffusion_model.
+    // transformer_blocks.N.attn1/attn2/ff...`, no audio branch, no metadata.
+    var hasTransformerBlocksAttn1 = false
+    var hasTransformerBlocksAttn2 = false
 
     for key in baseKeys {
       // Krea-2 SingleStreamDiT (WP-E6, FDD §3.6): `blocks.N.attn.w{q,k,v,o}`
@@ -229,13 +260,25 @@ public enum LoRAScanner {
           || key.contains("video_to_audio_attn") || key.contains("audio_to_video_attn") {
         hasLTX2AudioVideoBranch = true
       }
-      if key.contains("diffusion_model.layers.") || key.contains("layers.") {
+      if key.contains("transformer_blocks.") && key.contains(".attn1.") {
+        hasTransformerBlocksAttn1 = true
+      }
+      if key.contains("transformer_blocks.") && key.contains(".attn2.") {
+        hasTransformerBlocksAttn2 = true
+      }
+      // #313: comfy-export/kohya (`lora_unet_...`) keys are underscore-joined
+      // throughout, not dot-separated — `double_blocks_`/`single_blocks_`
+      // already had this fallback below; `layers_`/`context_refiner_`/
+      // `noise_refiner_` did not (real vault file confirming the gap, was
+      // `unknown` before this fix: Anneliese_Zbase3.safetensors —
+      // `lora_unet_layers_0_attention_out...`).
+      if key.contains("diffusion_model.layers.") || key.contains("layers.") || key.contains("layers_") {
         hasLayers = true
       }
-      if key.contains("context_refiner.") {
+      if key.contains("context_refiner.") || key.contains("context_refiner_") {
         hasContextRefiner = true
       }
-      if key.contains("noise_refiner.") {
+      if key.contains("noise_refiner.") || key.contains("noise_refiner_") {
         hasNoiseRefiner = true
       }
       if key.contains("double_blocks.") || key.contains("double_blocks_") {
@@ -259,11 +302,30 @@ public enum LoRAScanner {
       return ["ltx"]
     }
 
+    // #313: LTX-2 LoRAs that never touch the audio/video branch (T2V/I2V-only
+    // adapters, IC-LoRA reference/control adapters, sliders) still carry this
+    // block's OWN two-attention signature — see the field comment above.
+    //
+    // ORDERING IS LOAD-BEARING (review round 1, minor finding): this check
+    // must stay ABOVE the "Z-Image: layers + context_refiner/noise_refiner"
+    // check below. In practice `hasTransformerBlocksAttn1`/`Attn2` and
+    // `hasLayers` never both go true for the files this codebase has seen —
+    // `transformer_blocks.` never contains the `layers.`/`layers_` substring
+    // that check looks for — but that is a property of today's fixtures, not
+    // a Swift-enforced invariant. If a future signal broadens `hasLayers` (or
+    // a hybrid/mislabeled file ever satisfies both), whichever branch runs
+    // FIRST wins the classification: keep the LTX-2 signature first so such a
+    // file reads as `ltx`, not silently as `z-image`.
+    if hasTransformerBlocksAttn1 && hasTransformerBlocksAttn2 {
+      return ["ltx"]
+    }
+
     if hasKrea2Signature {
       return ["krea2"]
     }
 
-    // Z-Image: layers + context_refiner + noise_refiner
+    // Z-Image: layers + context_refiner + noise_refiner. Runs AFTER both
+    // LTX-2 checks above — see the ordering note there.
     if hasLayers && (hasContextRefiner || hasNoiseRefiner) {
       return ["z-image"]
     }

@@ -2,7 +2,7 @@
 
 import Testing
 import Foundation
-@testable import ComfyBoxDesktop
+@testable import ZImage
 
 @Suite("CivitAIModels")
 struct CivitAIModelsTests {

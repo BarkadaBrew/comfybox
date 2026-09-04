@@ -81,6 +81,15 @@ struct GenerationView: View {
     @SceneStorage("gen.customHeight") private var customHeight: Int = 1024
     @SceneStorage("gen.steps") private var steps: Double = 9
     @SceneStorage("gen.guidance") private var guidance: Double = 3.5
+    /// Krea2 projector-scale gain (CFG-free prompt adherence). 1.0 = neutral.
+    @SceneStorage("gen.projectorScale") private var projectorScale: Double = 1.0
+    /// RES4LYF SDE noise (eta) + bongmath — the Clownshark recipe knobs.
+    @SceneStorage("gen.eta") private var eta: Double = 0
+    @SceneStorage("gen.bongmath") private var bongmath: Bool = false
+    @SceneStorage("gen.noiseType") private var noiseType: String = "gaussian"
+    @SceneStorage("gen.noiseAlpha") private var noiseAlpha: Double = 0
+    @SceneStorage("gen.implicitSteps") private var implicitSteps: Double = 0
+    @SceneStorage("gen.c2") private var c2: Double = 0.5
     /// Empty = let the active model choose its native recipe.
     @SceneStorage("gen.sampler") private var sampler: String = ""
     @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
@@ -313,6 +322,11 @@ struct GenerationView: View {
                         negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
+                        projectorScale: projectorScale,
+                        noiseType: noiseType == "gaussian" ? nil : noiseType,
+                        noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
+                        implicitSteps: implicitSteps == 0 ? nil : Int(implicitSteps),
+                        c2: c2 == 0.5 ? nil : c2,
                         width: effectiveWidth,
                         height: effectiveHeight,
                         loras: selectedLoras.filter {
@@ -851,12 +865,54 @@ struct GenerationView: View {
             // Guidance
             NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
 
+            // Projector scale — CFG-free prompt-adherence gain (Krea2). 1.0 = off.
+            NumericSliderField(label: "Projector Scale", value: $projectorScale, range: 0...3, step: 0.05, fractionDigits: 2)
+
             // Sampler = solver; Scheduler = sigma/noise schedule. Options are
             // sourced from the engine's family capability matrix.
             SamplingRecipePicker(
                 sampler: $sampler,
                 sigmaSchedule: $sigmaSchedule,
                 modelFamily: samplingModelFamily
+            )
+            .disabled(backend != .local)
+
+            // RES4LYF SDE / bongmath (the Clownshark recipe): eta>0 turns on SDE
+            // noise re-injection, bongmath aligns substeps. Both need a RES4LYF
+            // sampler (res_*/ralston_*/deis_*) — harmless no-ops otherwise.
+            NumericSliderField(label: "Eta (SDE)", value: $eta, range: 0...1, step: 0.05, fractionDigits: 2)
+            Toggle("Bongmath", isOn: $bongmath)
+                .font(.caption)
+                .disabled(backend != .local)
+
+            HStack(spacing: 8) {
+                Text("Noise Type")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 76, alignment: .leading)
+                Picker("Noise Type", selection: $noiseType) {
+                    Text("Gaussian").tag("gaussian")
+                    Text("Fractal").tag("fractal")
+                    Text("Pyramid").tag("pyramid")
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(backend != .local)
+            NumericSliderField(
+                label: "Noise Alpha", value: $noiseAlpha,
+                range: -2...2, step: 0.1, fractionDigits: 1
+            )
+            .disabled(backend != .local)
+            NumericSliderField(
+                label: "Implicit Steps", value: $implicitSteps,
+                range: 0...8, step: 1
+            )
+            .disabled(backend != .local)
+            NumericSliderField(
+                label: "C2", value: $c2,
+                range: 0.05...1, step: 0.05, fractionDigits: 2
             )
             .disabled(backend != .local)
 
@@ -1208,6 +1264,13 @@ struct GenerationView: View {
             height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
+            projectorScale: Float(projectorScale),
+            eta: Float(eta),
+            bongmath: bongmath,
+            noiseType: noiseType,
+            noiseAlpha: Float(noiseAlpha),
+            implicitSteps: Int(implicitSteps),
+            c2: Float(c2),
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1258,6 +1321,13 @@ struct GenerationView: View {
             height: effectiveHeight,
             steps: Int(steps),
             guidance: Float(guidance),
+            projectorScale: Float(projectorScale),
+            eta: Float(eta),
+            bongmath: bongmath,
+            noiseType: noiseType,
+            noiseAlpha: Float(noiseAlpha),
+            implicitSteps: Int(implicitSteps),
+            c2: Float(c2),
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1783,6 +1853,11 @@ struct GenerationView: View {
         negativePrompt = preset.negativePrompt ?? ""
         steps = Double(preset.steps)
         guidance = Double(preset.guidance)
+        projectorScale = Double(preset.projectorScale ?? 1.0)
+        noiseType = preset.noiseType ?? "gaussian"
+        noiseAlpha = Double(preset.noiseAlpha ?? 0)
+        implicitSteps = Double(preset.implicitSteps ?? 0)
+        c2 = Double(preset.c2 ?? 0.5)
         sampler = preset.sampler ?? ""
         sigmaSchedule = preset.sigmaSchedule ?? ""
         kromaPolicy = preset.kroma

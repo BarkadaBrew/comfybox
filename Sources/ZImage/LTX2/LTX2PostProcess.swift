@@ -341,7 +341,11 @@ public enum LTX2PostProcess {
         AVFormatIDKey: kAudioFormatMPEG4AAC,
         AVSampleRateKey: audio.sampleRate,
         AVNumberOfChannelsKey: audio.samples.dim(0),
-        AVEncoderBitRateKey: 192_000,
+        // AAC bitrate must scale with sample rate: 192k is valid for 48kHz
+        // stereo but exceeds the encoder ceiling at the official vocoder's
+        // 24kHz, which stalls the writer (comfybox#334). ~4 bits/sample keeps
+        // 192k at 48k and drops to 96k at 24k.
+        AVEncoderBitRateKey: min(192_000, audio.sampleRate * 4),
       ]
       let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
       ai.expectsMediaDataInRealTime = false

@@ -45,7 +45,7 @@ final class LTX2RefinedLatentDecodeTests: XCTestCase {
     let latent = try MLX.loadArray(url: URL(fileURLWithPath: dumpPath)).asType(.bfloat16)
     print("DECODE input shape \(latent.shape)")
     let useStreamed = env["LTX2_TEST_STREAMED"] == "1"
-    let decoded = (useStreamed ? vae.decodeStreamed(latent) : vae.decode(latent)).asType(.float32)
+    let decoded = (useStreamed ? try vae.decodeStreamed(latent) : vae.decode(latent)).asType(.float32)
     MLX.eval(decoded)
     print("DECODE output shape \(decoded.shape) (\(useStreamed ? "streamed" : "plain"))")
 

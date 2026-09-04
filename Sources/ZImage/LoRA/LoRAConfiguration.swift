@@ -147,6 +147,25 @@ public struct LoRAWeights: @unchecked Sendable {
             layerAlphas: layerAlphas,
             deltas: deltas)
     }
+
+    /// A copy with a different LoKr/delta split and everything else preserved
+    /// EXACTLY — the LoKr twin of ``withPairsAndDeltas(weights:deltas:)``, for
+    /// the same reason: rebuilding through the public initialiser with
+    /// `alpha: self.alpha` would promote a defaulted alpha (`Float(rank)`)
+    /// into an explicit one and silently rescale every low-rank pair in the
+    /// same file. Used by ``LoKrDensifier/densify(_:for:name:)``.
+    public func withLoKrAndDeltas(
+        lokrWeights: [String: LoKrWeights],
+        deltas: [String: DeltaPatch]
+    ) -> LoRAWeights {
+        LoRAWeights(
+            weights: weights,
+            lokrWeights: lokrWeights,
+            rank: rank,
+            alpha: explicitAlpha,
+            layerAlphas: layerAlphas,
+            deltas: deltas)
+    }
 }
 
 /// A bare-parameter patch shipped inside a LoRA file (ComfyUI comfy/lora.py

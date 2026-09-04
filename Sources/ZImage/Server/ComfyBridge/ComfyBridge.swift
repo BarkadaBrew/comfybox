@@ -471,7 +471,7 @@ final class ComfyBridge {
       // accepted generation.
       let detectedModel = generateRequest.detectedModel
       let switchHandler = modelSwitchHandler
-      executor.enqueue(promptId: generateRequest.promptId) { [logger] in
+      executor.enqueue(promptId: generateRequest.promptId) { [logger, executor] in
         // Auto-switch model if the workflow specifies a different checkpoint.
         if let modelId = detectedModel, let handler = switchHandler {
           do {
@@ -480,8 +480,22 @@ final class ComfyBridge {
               logger.info("ComfyBridge: auto-switched to model '\(modelId)' for this render")
             }
           } catch {
-            logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
-            // Continue with current model rather than failing the entire render.
+            // #339 review r2, item 1: `ModelSwitchFailurePolicy` (pure,
+            // tested directly) decides whether this must FAIL the prompt —
+            // a queue-recovery refusal — or, as before, just log and
+            // continue rendering on the current model for any other
+            // transient switch failure. Continuing on a recovery refusal
+            // used to silently render under a stale checkpoint with no
+            // error the caller could see.
+            switch ModelSwitchFailurePolicy.decide(error) {
+            case .failPrompt(let message):
+              logger.warning("ComfyBridge: model switch to '\(modelId)' refused — failing prompt \(generateRequest.promptId) rather than risk a wrong-checkpoint render (#339 r2)")
+              executor.failPrompt(promptId: generateRequest.promptId, clientId: generateRequest.clientId, message: message)
+              return
+            case .continueOnCurrentModel:
+              logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
+              // Continue with current model rather than failing the entire render.
+            }
           }
         }
         await executor.execute(generateRequest)
@@ -531,7 +545,7 @@ final class ComfyBridge {
       let switchHandler = modelSwitchHandler
       let generateRequest = request
       logger.info("ComfyBridge: workflow-api [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, seed=\(generateRequest.seed.map(String.init) ?? "random")")
-      executor.enqueue(promptId: generateRequest.promptId) { [logger] in
+      executor.enqueue(promptId: generateRequest.promptId) { [logger, executor] in
         if let modelId = detectedModel, let handler = switchHandler {
           do {
             let switched = try await handler(modelId)
@@ -539,7 +553,15 @@ final class ComfyBridge {
               logger.info("ComfyBridge: auto-switched to model '\(modelId)' for workflow run")
             }
           } catch {
-            logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
+            // #339 review r2, item 1 — same fix as `handlePrompt` above.
+            switch ModelSwitchFailurePolicy.decide(error) {
+            case .failPrompt(let message):
+              logger.warning("ComfyBridge: model switch to '\(modelId)' refused — failing workflow run \(generateRequest.promptId) rather than risk a wrong-checkpoint render (#339 r2)")
+              executor.failPrompt(promptId: generateRequest.promptId, clientId: generateRequest.clientId, message: message)
+              return
+            case .continueOnCurrentModel:
+              logger.error("ComfyBridge: model switch to '\(modelId)' failed — \(error.localizedDescription)")
+            }
           }
         }
         await executor.execute(generateRequest)
