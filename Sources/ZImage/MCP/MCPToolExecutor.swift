@@ -509,13 +509,12 @@ public final class MCPToolExecutor: @unchecked Sendable {
       body["wait"] = wait
     }
     let jsonData = try JSONSerialization.data(withJSONObject: body)
-    let (status, data) = try await client.post("/v1/model/load", body: jsonData)
-    // 202 is valid (async load in progress)
-    if status == 200 || status == 202 {
-      let text = String(data: data, encoding: .utf8) ?? "{}"
-      return MCPToolResult(text: text)
-    }
-    return Self.mapHTTPResponse(status: status, data: data)
+    // #339 review r2, item 2: `wait: false` returns 202 (async load in
+    // progress) and is gated by the recovery gate the same as local video —
+    // retry that specific refusal with backoff instead of surfacing it on
+    // the first attempt. `wait: true` (200, synchronous, never gated) and
+    // any OTHER error return immediately either way.
+    return try await postWithQueueRecoveryRetry("/v1/model/load", body: jsonData)
   }
 
   /// switch_model -> POST /v1/model/activate
@@ -652,12 +651,11 @@ public final class MCPToolExecutor: @unchecked Sendable {
     // immediately (poll video_status), instead of blocking the MCP call for
     // the entire multi-minute render — which overran the daemon-side 300s
     // MCP tool timeout on every cold-start render (#219).
-    let (status, data) = try await client.post("/v1/video/generate/async", body: jsonData)
-    if status == 200 || status == 202 {
-      let text = String(data: data, encoding: .utf8) ?? "{}"
-      return MCPToolResult(text: text)
-    }
-    return Self.mapHTTPResponse(status: status, data: data)
+    // #339 review r1, item 4: local video can also be refused with a
+    // retryable 503 while the engine is replaying its persisted queue after
+    // a restart — retry that specific refusal with backoff rather than
+    // surfacing it as a bare tool error on the first attempt.
+    return try await postWithQueueRecoveryRetry("/v1/video/generate/async", body: jsonData)
   }
 
   /// rerender_video / extend_video -> POST /v1/video/{rerender,extend}
@@ -668,11 +666,55 @@ public final class MCPToolExecutor: @unchecked Sendable {
       return MCPToolResult(error: "Error: 'render_id' or 'path' is required")
     }
     let jsonData = try JSONEncoder().encode(params.raw)
-    let (status, data) = try await client.post(route, body: jsonData)
-    if status == 200 || status == 202 {
-      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    // #339 review r1, item 4: same queue-recovery retry as generate_video —
+    // both winner actions submit local video underneath.
+    return try await postWithQueueRecoveryRetry(route, body: jsonData)
+  }
+
+  /// #339 review r1, item 4: POST a request that can be refused by the
+  /// queue-recovery gate (`QueueRecoveryGate`: HTTP 503 + `error_code:
+  /// "queue_recovery_in_progress"`). Retries using the server's own
+  /// `retry_after_seconds` hint (`QueueRecoveryRetryPolicy`, pure and tested
+  /// separately) for up to 15 minutes total elapsed, then surfaces a clear
+  /// tool error naming why instead of retrying forever. Any OTHER response —
+  /// success, or a DIFFERENT non-retryable error/status — is mapped through
+  /// `mapHTTPResponse` immediately on the first attempt, unchanged.
+  private func postWithQueueRecoveryRetry(
+    _ path: String, body: Data, successStatuses: Set<Int> = [200, 202]
+  ) async throws -> MCPToolResult {
+    let start = Date()
+    while true {
+      let (status, data) = try await client.post(path, body: body)
+      if successStatuses.contains(status) {
+        return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+      }
+      guard status == 503, Self.isQueueRecoveryRefusal(data) else {
+        return Self.mapHTTPResponse(status: status, data: data)
+      }
+      let elapsed = Date().timeIntervalSince(start)
+      switch QueueRecoveryRetryPolicy.decide(elapsed: elapsed, retryAfterSeconds: Self.parseRetryAfterSeconds(from: data)) {
+      case .retry(let wait):
+        try await Task.sleep(nanoseconds: UInt64(max(0, wait) * 1_000_000_000))
+      case .giveUp(_, _, let reason):
+        // #339 review r2, item 3: `reason` already names `error_code` and
+        // `retry_after_seconds` in prose so the daemon can reschedule this
+        // call without re-parsing the earlier HTTP response.
+        return MCPToolResult(error: reason)
+      }
     }
-    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// Distinguishes the specific, retryable "engine is still replaying its
+  /// persisted queue" 503 from any OTHER 503 (e.g. "LTX-2 not configured",
+  /// which retrying can never fix).
+  private static func isQueueRecoveryRefusal(_ data: Data) -> Bool {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    return (json["error_code"] as? String) == QueueRecoveryGate.errorCode
+  }
+
+  private static func parseRetryAfterSeconds(from data: Data) -> Int? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return json["retry_after_seconds"] as? Int
   }
 
   /// compose_montage -> POST /v1/montage/compose (sync — compositing is cheap).
@@ -697,11 +739,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
       return MCPToolResult(error: "Error: 'shots' is required")
     }
     let jsonData = try JSONEncoder().encode(params.raw)
-    let (status, data) = try await client.post("/v1/storyboard/render", body: jsonData)
-    if status == 200 || status == 202 {
-      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
-    }
-    return Self.mapHTTPResponse(status: status, data: data)
+    // #339 review r1, item 4: storyboards are gated the same as local video.
+    return try await postWithQueueRecoveryRetry("/v1/storyboard/render", body: jsonData)
   }
 
   /// import_workflow -> POST /v1/workflows/import

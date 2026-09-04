@@ -703,6 +703,19 @@ final class ComfyBridgeExecutor {
     sendExecutingDone(to: clientId, promptId: promptId)
   }
 
+  /// #339 review r2, item 1: fail a prompt outright with an `execution_error`
+  /// — for something that must abort the WHOLE job before `execute()` even
+  /// starts, rather than continue degraded. Currently used when
+  /// `ComfyBridge.handlePrompt`'s enqueued auto-model-switch is refused by
+  /// the recovery gate: silently continuing on the CURRENT (wrong)
+  /// checkpoint would render output that looks fine but isn't what was
+  /// asked for, with no error anywhere — worse than failing loud. Public
+  /// (unlike `sendError`) because that switch happens outside this
+  /// executor's own `execute()`, in the closure `ComfyBridge` enqueues.
+  func failPrompt(promptId: String, clientId: String, message: String) {
+    sendError(promptId: promptId, clientId: clientId, message: message)
+  }
+
   private func jsonString(_ dict: [String: Any]) -> String {
     guard let data = try? JSONSerialization.data(withJSONObject: dict),
           let str = String(data: data, encoding: .utf8) else {

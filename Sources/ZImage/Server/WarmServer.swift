@@ -193,6 +193,12 @@ public final class WarmServer {
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
   private let renderTraceStore = RenderTraceStore()
+  /// #339: in-progress + remaining-count for `recoverPersistedQueue()`'s
+  /// background replay. Gates submission of queue-job kinds that are never
+  /// persisted (see QueueRecoveryGate.swift) so a job that cannot survive a
+  /// second restart is refused with a retryable 503 (naming an estimated
+  /// `retry_after_seconds`) instead of silently lost.
+  private let queueRecoveryState = QueueRecoveryState()
 
   /// 0.B-1 (v2.3 rework, FDD-ui-api-parity.md §3.1.3, comfybox#300): lifts the
   /// async-internals route handlers (`/v1/enhance`, `/v1/civitai/search`,
@@ -403,11 +409,33 @@ public final class WarmServer {
     // load/activate cannot mutate the active pipeline while a queued render
     // is mid-flight.
     self.comfyBridge.modelSwitchHandler = { [unowned self] (modelId: String) async throws -> Bool in
-      try await self.coordinator.enqueueModelSwitch { [unowned self] in
+      return try await self.coordinator.enqueueModelSwitch { [unowned self] in
         // Check if this model is already active — no switch needed.
         let currentActive = await self.coordinator.modelPool.activeModelId()
         let requestedKey = ModelPool.poolKey(for: modelId)
-        if currentActive == requestedKey {
+        let isNoOpSwitch = currentActive == requestedKey
+        // #339 review r3, item 2: the gate lives HERE, after the no-op
+        // check — r2's version threw before this check ever ran, so every
+        // Krita prompt carrying a checkpoint node hard-failed during
+        // recovery even when the active model already matched and no
+        // switch was needed at all. A model switch closes over live
+        // in-memory state — never persisted (QueueRecoveryGate.swift) — so
+        // an ACTUAL switch is still refused while a persisted-queue replay
+        // is in flight, rather than risk a pool mutation a second restart
+        // could leave half-applied. #339 review r4, item 2 (comment fix):
+        // the caller (`handlePrompt`/`submitWorkflowGraph`) does NOT simply
+        // log-and-continue on this specific error — `ModelSwitchFailurePolicy`
+        // (review r2, item 1) recognizes `.queueRecoveryInProgress` and
+        // FAILS the prompt outright via `ComfyBridgeExecutor.failPrompt`,
+        // so a refused switch never silently renders on the wrong
+        // checkpoint. Log-and-continue remains the behavior for every
+        // OTHER model-switch failure.
+        let switchRecovery = self.queueRecoveryState.snapshot()
+        if ModelSwitchGate.shouldReject(isNoOpSwitch: isNoOpSwitch, recoveryInProgress: switchRecovery.inProgress) {
+          throw WarmServerError.queueRecoveryInProgress(retryAfterSeconds:
+            QueueRecoveryGate.retryAfterSeconds(remainingKinds: switchRecovery.remainingKinds))
+        }
+        if isNoOpSwitch {
           return false
         }
 
@@ -903,6 +931,16 @@ public final class WarmServer {
           }
           return .json(status: 200, payload: result)
         } else {
+          // #339: `wait: false` is exactly the "202 + job id nobody is
+          // waiting on" pattern — `enqueueModelOperationDetached` never
+          // persists (no rawBody, same as local video), so a submission that
+          // lands mid-replay and a second restart before it finishes would
+          // vanish with no trace. Refuse up front instead.
+          let loadRecovery = queueRecoveryState.snapshot()
+          if QueueRecoveryGate.shouldReject(kind: .modelLoad, recoveryInProgress: loadRecovery.inProgress) {
+            logger.warning("Model load: refused wait:false submission — persisted-queue replay in flight (#339)")
+            return .error(.queueRecovering(remainingKinds: loadRecovery.remainingKinds))
+          }
           // Fire-and-forget is now a TRACKED queue job, not a detached Task:
           // it is listed in /v1/queue under the id returned here, it can be
           // cancelled, and it still cannot begin under a render.
@@ -1305,6 +1343,16 @@ public final class WarmServer {
         guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
           return .error(.error(status: 503, message: "Storyboard rendering needs local LTX-2 (--ltx2-weights/--ltx2-gemma)"))
         }
+        // #339: a storyboard is a chain of unpersisted local-video renders
+        // (`runStoryboard` -> `enqueueLocalVideo` per shot) tracked under one
+        // `videoJobTracker` id, exactly as vulnerable to a second restart as
+        // a single local video job — refuse up front rather than accept an
+        // orchestration that could vanish mid-shot.
+        let storyboardRecovery = queueRecoveryState.snapshot()
+        if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: storyboardRecovery.inProgress) {
+          logger.warning("Storyboard: refused render — persisted-queue replay in flight (#339)")
+          return .error(.queueRecovering(remainingKinds: storyboardRecovery.remainingKinds))
+        }
         let payload = try decode(StoryboardPayload.self, from: request.body)
         let spec = try storyboardSpec(from: payload)
         try spec.validate()
@@ -1445,7 +1493,12 @@ public final class WarmServer {
       let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
       if videoIntent != .cloud {
         if let localResponse = await localVideoResponseIfConfigured(body: request.body) {
-          logger.info("video: routing to local LTX-2 (synchronous)")
+          // #339 review r1, item 6: don't log "routing to local" for a
+          // request the gate just refused (503) — `localVideoResponseIfConfigured`
+          // already logged the refusal with its own reason.
+          if case .error = localResponse {} else {
+            logger.info("video: routing to local LTX-2 (synchronous)")
+          }
           return localResponse
         }
         if videoIntent == .local {
@@ -1465,7 +1518,12 @@ public final class WarmServer {
       let videoIntent = (try? decode(VideoGenerateRequest.self, from: request.body))?.backendIntent ?? .unspecified
       if videoIntent != .cloud {
         if let localResponse = await localVideoAsyncResponseIfConfigured(body: request.body) {
-          logger.info("video: async-submitting local LTX-2 job")
+          // #339 review r1, item 6: don't log "async-submitting" for a
+          // request the gate just refused (503) — the helper already logged
+          // the refusal with its own reason.
+          if case .error = localResponse {} else {
+            logger.info("video: async-submitting local LTX-2 job")
+          }
           return localResponse
         }
         if videoIntent == .local {
@@ -2763,6 +2821,18 @@ public final class WarmServer {
   /// path a long (multi-minute / multi-chunk) render must take — it never holds
   /// the HTTP connection open for the whole denoise.
   private func localVideoAsyncResponseIfConfigured(body: Data) async -> RoutedResponse? {
+    // #339: local video is never persisted (QueueRecoveryGate.swift) — refuse
+    // it explicitly while a post-restart queue replay is in flight rather
+    // than hand out a 202 that a second restart could silently lose. Checked
+    // only when local LTX-2 IS configured, so an unconfigured engine still
+    // falls through to the Replicate cloud path exactly as before (nil).
+    if configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil {
+      let recovery = queueRecoveryState.snapshot()
+      if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: recovery.inProgress) {
+        logger.warning("LTX-2: refused async local video submission — persisted-queue replay in flight (#339)")
+        return .error(.queueRecovering(remainingKinds: recovery.remainingKinds))
+      }
+    }
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
       logger.info("LTX-2: local video job submitted (\(prep.request.width)x\(prep.request.height), \(prep.request.framesPerChunk)f)")
@@ -2915,7 +2985,13 @@ public final class WarmServer {
         resolution: resolution,
         initImagePath: trace.submitted["image_path"])
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
-        logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
+        // #339 review r1, item 6: `routed` can now be a 503 (queue recovery
+        // gate) — don't log a "submitted" message for a request that was
+        // actually refused; `localVideoAsyncResponseIfConfigured` already
+        // logged the refusal with its own reason.
+        if case .error = routed {} else {
+          logger.info("video: winner re-render of \(trace.renderId) at \(resolution)")
+        }
         return routed
       }
       return .error(.error(status: 503, message: "Local LTX-2 video not configured (--ltx2-weights)"))
@@ -2954,9 +3030,19 @@ public final class WarmServer {
         prompt: req.prompt,
         effectivePrompt: trace?.submitted["prompt"])
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
-        // The frame must OUTLIVE this request — the queued render reads it
-        // when its GPU turn comes. tmp is system-cleaned between boots.
-        logger.info("video: winner extend of \((clipPath as NSString).lastPathComponent) (+\(req.seconds ?? 4)s)")
+        // #339 review r1, item 6: `routed` can now be a 503 (queue recovery
+        // gate), not only a successful submission. Only the SUCCESS path
+        // keeps the frame alive (the queued render reads it when its GPU
+        // turn comes; tmp is system-cleaned between boots) and logs
+        // "submitted" — a refusal must clean the frame up immediately (no
+        // render was queued to ever read it) and must not log a false
+        // success (`localVideoAsyncResponseIfConfigured` already logged the
+        // refusal with its own reason).
+        if case .error = routed {
+          if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
+        } else {
+          logger.info("video: winner extend of \((clipPath as NSString).lastPathComponent) (+\(req.seconds ?? 4)s)")
+        }
         return routed
       }
       if let framePath { try? FileManager.default.removeItem(atPath: framePath) }
@@ -2975,6 +3061,15 @@ public final class WarmServer {
   private func localVideoResponseIfConfigured(body: Data) async -> RoutedResponse? {
     guard configuration.ltx2WeightsPath != nil, configuration.ltx2GemmaPath != nil else {
       return nil
+    }
+    // #339: same refusal as the async route — see its comment. The sync
+    // route holds the HTTP connection open for the whole render, but the
+    // job it starts is exactly as unpersisted, so it is exactly as unsafe
+    // to accept mid-replay.
+    let syncRecovery = queueRecoveryState.snapshot()
+    if QueueRecoveryGate.shouldReject(kind: .video, recoveryInProgress: syncRecovery.inProgress) {
+      logger.warning("LTX-2: refused sync local video submission — persisted-queue replay in flight (#339)")
+      return .error(.queueRecovering(remainingKinds: syncRecovery.remainingKinds))
     }
     do {
       guard let prep = try await prepareLocalVideo(body: body) else { return nil }
@@ -3883,6 +3978,15 @@ public final class WarmServer {
       let family = await coordinator.modelFamily
       if family == .flux2 || family == .krea2 {
         throw WarmServerError.controlNetNotSupported
+      }
+      // #339: ControlNet generate closes over resolved temp-file paths, so
+      // (like local video) it can never be persisted — refuse before writing
+      // any of those temp files rather than accept work that could vanish if
+      // the engine restarts again before this replay finishes.
+      let controlRecovery = queueRecoveryState.snapshot()
+      if QueueRecoveryGate.shouldReject(kind: .controlnet, recoveryInProgress: controlRecovery.inProgress) {
+        throw WarmServerError.queueRecoveryInProgress(retryAfterSeconds:
+          QueueRecoveryGate.retryAfterSeconds(remainingKinds: controlRecovery.remainingKinds))
       }
       logger.info("WarmServer: routing to ControlNet pipeline — model=\(controlnetModel), strength=\(request.controlnetStrength)")
 
@@ -5173,6 +5277,54 @@ public final class WarmServer {
     return data
   }
 
+  /// #339 review r3, item 1b (corrected r4): races "the job becomes
+  /// observably admitted" — present as either the active job or somewhere
+  /// in `pending`, which happens the instant an `enqueueXxx` call's
+  /// synchronous append (`pending.append` + the `persistQueueState()` that
+  /// immediately follows it) runs — against "the enqueue Task itself
+  /// already finished" (an immediate `queueFull`/`shuttingDown` throw never
+  /// appends at all, so polling for admission alone would burn the whole
+  /// timeout every time recovery hits the capacity gate).
+  ///
+  /// r3's version narrowed the tail unconditionally after this call
+  /// returned, INCLUDING on a timeout — but the coordinator actor's
+  /// cooperative thread pool can legitimately be starved by an in-flight
+  /// render well past 5s (a documented, known risk in this codebase — see
+  /// the "#300" note on `WarmServerCoordinator`), so a timeout does not
+  /// mean the job failed to admit, only that admission was not YET
+  /// observed. The caller (`recoverPersistedQueue`) now uses the returned
+  /// `AdmissionRaceOutcome` via `AdmissionNarrowingPolicy` (pure, tested
+  /// directly) to decide whether narrowing now is safe — only `.admitted`
+  /// is. `.timedOut`/`.renderFinishedFirst` leave the tail as-is; the
+  /// caller's OWN next loop iteration narrows past this job safely once its
+  /// `renderTask.value` has been awaited (proving it is truly done, success
+  /// or failure, either way) — so the job is NEVER at risk of being dropped
+  /// from the tail before it is durably represented elsewhere.
+  private func waitForAdmissionOrCompletion<T>(
+    jobId: String, renderTask: Task<T, Error>, timeout: TimeInterval = 5.0
+  ) async -> AdmissionRaceOutcome {
+    let health = liveHealth
+    return await withTaskGroup(of: AdmissionRaceOutcome.self) { group in
+      group.addTask {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+          let (snapshot, _) = health.read()
+          if snapshot.activeJobId == jobId || snapshot.pending.contains(where: { $0.id == jobId }) {
+            return .admitted
+          }
+          try? await Task.sleep(nanoseconds: 2_000_000)  // 2ms — cheap; keeps the duplicate window tiny
+        }
+        return .timedOut
+      }
+      group.addTask {
+        _ = try? await renderTask.value
+        return .renderFinishedFirst
+      }
+      let outcome = await group.next() ?? .timedOut
+      group.cancelAll()
+      return outcome
+    }
+  }
 
   /// Replay any queue jobs left over from before a crash (see
   /// QueuePersistence.swift) — the "active" slot (if any) first, since it
@@ -5191,7 +5343,11 @@ public final class WarmServer {
     // the sidecar is cleared exactly once.
     let deltas = QueueDeltaStore.load()
     let state = QueueStateStore.load()
-    var jobs = (state?.active.map { [$0] } ?? []) + (state?.pending ?? [])
+    // #339 review r3, item 1a: dedupe by id (first occurrence wins, active
+    // before pending) — see `RecoverySnapshotMerger.deduplicated`'s doc
+    // comment for why a snapshot can (briefly) carry the same id twice, and
+    // why that must never turn into replaying it twice.
+    var jobs = RecoverySnapshotMerger.deduplicated((state?.active.map { [$0] } ?? []) + (state?.pending ?? []))
     if !deltas.isEmpty {
       let before = jobs.count
       jobs = QueueDeltaApplier.apply(deltas, to: jobs, id: { $0.id })
@@ -5202,19 +5358,83 @@ public final class WarmServer {
     guard !jobs.isEmpty else { return }
     logger.info("Queue recovery: replaying \(jobs.count) job(s) left over from before a restart")
 
+    // #339: while this replay is in flight, a submission for a queue-job
+    // kind that is never persisted (local video, ControlNet generate, a
+    // Krita model switch, a detached model load) cannot be trusted — a
+    // second restart before it finishes would lose it with no trace. Gate
+    // those kinds at the route (QueueRecoveryGate) for the span of this
+    // Task; "generate"/"lora_swap" are unaffected, they queue durably
+    // behind this same backlog either way (and, per review r1 item 1, are
+    // now durable even against a SECOND restart mid-replay — see
+    // `setRecoveryUnadmittedTail`/`RecoverySnapshotMerger`).
+    queueRecoveryState.begin(jobKinds: jobs.map { QueueJobKind(rawValue: $0.kind) ?? .generate })
     Task {
-      for job in jobs {
+      // #339 review r2, item 5: both cleanup steps run in `defer`s (LIFO —
+      // the tail clears BEFORE `finish()` flips `inProgress` false) so a
+      // cancelled replay Task (not currently possible in production, but
+      // this Task is unstructured and nothing guarantees that stays true)
+      // never leaves either a ghost ungated window OR a ghost ungated ALLOW
+      // — ordering doesn't matter for correctness here since both only ever
+      // narrow what's refused, but clearing the tail first keeps the two
+      // signals consistent with each other for the single instant between them.
+      defer { queueRecoveryState.finish() }
+      defer { Task { await self.coordinator.setRecoveryUnadmittedTail([]) } }
+      for index in jobs.indices {
+        let job = jobs[index]
+        // #339 review r2, item 4: publish `jobs[index...]` — INCLUDING this
+        // job, not just what comes after it — as the still-unadmitted tail
+        // BEFORE attempting to admit `job`. Review r1's version excluded
+        // `job` itself here, on the theory that it was "about to be admitted
+        // anyway" — but decoding the payload, staging nearline LoRAs for a
+        // swap (a synchronous copy that can take real time), or even just
+        // the `enqueueGenerate`/`enqueueSwap` call's own brief window all
+        // happen AFTER this line and BEFORE `job` is actually durable in
+        // `pending`. A crash in that gap, with the tail already narrowed to
+        // exclude `job`, lost it — the exact "one-job admission window" r2
+        // found. Publishing `jobs[index...]` keeps `job` visible in the
+        // merged snapshot (`RecoverySnapshotMerger`) for that entire span;
+        // once `job` actually lands in `pending`/`active`, it may appear in
+        // BOTH the tail and the admitted state for a brief instant (a
+        // harmless, transient duplicate — never a loss) until the NEXT
+        // iteration narrows the tail to `jobs[(index+1)...]`.
+        await coordinator.setRecoveryUnadmittedTail(Array(jobs[index...]))
+        defer { queueRecoveryState.jobAdmitted() }
         do {
           switch job.kind {
-          case "generate":
+          case QueueJobKind.generate.rawValue:
             let payload = try decodedGeneratePayload(from: job.rawBody)
+            // #339 review r3, item 1b (corrected r4): run the render in a
+            // detached child Task and race admission against the Task's
+            // own completion (`waitForAdmissionOrCompletion`) instead of
+            // awaiting `enqueueGenerate` directly — which only returns once
+            // the render COMPLETES, so r2's version left the tail (still
+            // listing this job) and the admitted state (also listing it, as
+            // `active`) both carrying it for the render's ENTIRE duration.
+            // Only narrow when admission was actually OBSERVED
+            // (`AdmissionNarrowingPolicy`, pure, tested directly) — r3's
+            // version narrowed even on a timeout, which can drop the job
+            // from the tail before the coordinator actually holds it if a
+            // render blocks the actor's cooperative pool past 5s (#300).
+            let renderTask = Task { try await self.coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody, jobId: job.id) }
+            let outcome = await waitForAdmissionOrCompletion(jobId: job.id, renderTask: renderTask)
+            if AdmissionNarrowingPolicy.shouldNarrowNow(outcome) {
+              await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            }
             // AC-18: replay under the job's OWN id (the client-visible one for
             // an async job), so a second restart persists the same name.
-            _ = try await coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody, jobId: job.id)
+            _ = try await renderTask.value
             logger.info("Queue recovery: completed generate job \(job.id)")
-          case "lora_swap":
+          case QueueJobKind.loraSwap.rawValue:
             let payload = stageNearlineLoras(in: try decode(LoRASwapPayload.self, from: job.rawBody))
-            _ = try await coordinator.enqueueSwap(payload, rawBody: job.rawBody)
+            // Same admit-then-narrow fix as generate above. `jobId: job.id`
+            // (new — `enqueueSwap` had no way to name a job before r3) is
+            // what makes this job observable to `waitForAdmissionOrCompletion` at all.
+            let swapTask = Task { try await self.coordinator.enqueueSwap(payload, rawBody: job.rawBody, jobId: job.id) }
+            let swapOutcome = await waitForAdmissionOrCompletion(jobId: job.id, renderTask: swapTask)
+            if AdmissionNarrowingPolicy.shouldNarrowNow(swapOutcome) {
+              await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            }
+            _ = try await swapTask.value
             logger.info("Queue recovery: completed lora_swap job \(job.id)")
           default:
             logger.warning("Queue recovery: unknown job kind '\(job.kind)' for \(job.id), skipping")
@@ -5224,7 +5444,12 @@ public final class WarmServer {
           // FAILED with the reason on its own id (GET /v1/generate/status/{id})
           // and in the audit log — never rendered, never silently dropped.
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
-          if job.kind == "generate" {
+          // #339 review r4, item 3: a failed lora_swap replay is recorded
+          // here too, not just generate — there is no dedicated swap-job
+          // tracker, but `imageJobTracker` is keyed by id, not by kind, so
+          // `GET /v1/generate/status/{id}` still surfaces the failure
+          // reason instead of a bare 404 for a swap job's own id.
+          if job.kind == QueueJobKind.generate.rawValue || job.kind == QueueJobKind.loraSwap.rawValue {
             imageJobTracker.recordFailedReplay(jobId: job.id, source: job.source, error: error)
           }
           auditLog.append(
@@ -5233,6 +5458,11 @@ public final class WarmServer {
             metadata: ["job_id": job.id, "kind": job.kind, "source": job.source])
         }
       }
+      // Every job admitted (successfully or not) — no unadmitted remainder.
+      // (Also covered by the `defer` above; explicit here so the common,
+      // non-cancelled path clears it immediately rather than waiting on a
+      // second Task hop.)
+      await coordinator.setRecoveryUnadmittedTail([])
     }
   }
 
@@ -5387,6 +5617,8 @@ public final class WarmServer {
       // signal.
       case .renderInterrupted:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
+      case .queueRecoveryInProgress(let retryAfterSeconds):
+        return .queueRecovering(retryAfterSeconds: retryAfterSeconds)
       }
 
     case let error as Flux2Pipeline.Flux2PipelineError:
@@ -6730,6 +6962,15 @@ private actor WarmServerCoordinator {
   /// QueuePersistence.swift for why only these two kinds are recoverable).
   private var activeJobRawBody: Data?
   private var activeJobKindForPersistence: String?
+  /// #339 review r1: the not-yet-admitted remainder of a persisted-queue
+  /// replay in progress (see `RecoverySnapshotMerger`). `persistQueueState()`
+  /// merges this into every snapshot it writes so a SECOND restart mid-replay
+  /// does not lose it — the "deeper bug" review r1 found: the old sequential
+  /// one-job-at-a-time replay left jobs 2..N invisible to `queue-state.json`
+  /// until each was individually re-admitted. Set by
+  /// `WarmServer.recoverPersistedQueue` before each job's admission; cleared
+  /// to `[]` once the whole batch is admitted (`defer`, so it always clears).
+  private var recoveryUnadmittedTail: [PersistedQueueJob] = []
 
   /// True after the image models were released to make room for LTX-2 video —
   /// the next image render must reload before it can run (#218).
@@ -7762,7 +8003,7 @@ private actor WarmServerCoordinator {
     }
   }
 
-  func enqueueSwap(_ payload: LoRASwapPayload, rawBody: Data? = nil) async throws -> LoRASwapResponse {
+  func enqueueSwap(_ payload: LoRASwapPayload, rawBody: Data? = nil, jobId: String? = nil) async throws -> LoRASwapResponse {
     if shuttingDown {
       throw ServerError.shuttingDown
     }
@@ -7771,7 +8012,13 @@ private actor WarmServerCoordinator {
     }
 
     return try await withCheckedThrowingContinuation { continuation in
-      pending.append(PendingJob(operation: .swap(payload, ContinuationBox(continuation)), rawBody: rawBody))
+      // #339 review r3, item 1b: `jobId` lets `recoverPersistedQueue` name
+      // this pending job with its ORIGINAL persisted id (mirroring
+      // `enqueueGenerate`'s AC-18 `jobId`), so the replay loop can poll for
+      // that exact id becoming admitted instead of a fresh random one it
+      // has no way to observe. nil (every live route) keeps the default
+      // fresh UUID, unchanged.
+      pending.append(PendingJob(id: jobId ?? UUID().uuidString, operation: .swap(payload, ContinuationBox(continuation)), rawBody: rawBody))
       startProcessingIfNeeded()
     }
   }
@@ -8028,11 +8275,24 @@ private actor WarmServerCoordinator {
     liveHealth.publish(snap)
   }
 
+  /// #339 review r1: set (or clear, with `[]`) the not-yet-admitted tail of
+  /// an in-flight persisted-queue replay — see `recoveryUnadmittedTail`.
+  /// Persists immediately so the merged snapshot reflects the new tail right
+  /// away rather than waiting for the next unrelated mutation.
+  func setRecoveryUnadmittedTail(_ tail: [PersistedQueueJob]) {
+    recoveryUnadmittedTail = tail
+    persistQueueState()
+  }
+
   /// Mirror the recoverable slice of the queue (see QueuePersistence.swift)
   /// to disk so it survives a crash. Called at every mutation: enqueue,
   /// dequeue-into-active, job completion, cancel, reorder, clear. Cheap
   /// (small JSON, atomic write) relative to how rarely the queue actually
   /// changes compared to render duration.
+  ///
+  /// #339 review r1: merges in `recoveryUnadmittedTail` (the durability fix —
+  /// see its doc comment and `RecoverySnapshotMerger`) so a replay in
+  /// progress never narrows the file to just what has been admitted so far.
   private func persistQueueState() {
     let active: PersistedQueueJob? = {
       guard let rawBody = activeJobRawBody,
@@ -8048,7 +8308,8 @@ private actor WarmServerCoordinator {
         id: job.id, kind: Self.kind(of: job.operation), source: job.source,
         enqueuedAt: job.enqueuedAt, rawBody: rawBody)
     }
-    QueueStateStore.save(PersistedQueueState(active: active, pending: pendingJobs))
+    QueueStateStore.save(RecoverySnapshotMerger.merge(
+      admittedActive: active, admittedPending: pendingJobs, unadmittedTail: recoveryUnadmittedTail))
   }
 
   /// Queue status for the ComfyUI bridge /queue endpoint.
@@ -8146,17 +8407,20 @@ private actor WarmServerCoordinator {
     }
   }
 
+  // #339 review r1, item 2: every case reads from `QueueJobKind`
+  // (QueueRecoveryGate.swift) — the single source of truth the recovery
+  // gate's allowlist also reads from, so the two cannot silently drift.
   private static func kind(of operation: QueuedOperation) -> String {
     switch operation {
-    case .generate: return "generate"
-    case .controlGenerate: return "controlnet"
-    case .swap: return "lora_swap"
-    case .modelSwitch: return "model_switch"
+    case .generate: return QueueJobKind.generate.rawValue
+    case .controlGenerate: return QueueJobKind.controlnet.rawValue
+    case .swap: return QueueJobKind.loraSwap.rawValue
+    case .modelSwitch: return QueueJobKind.modelSwitch.rawValue
     case .modelOperation(let op, _): return op.kind
-    case .localVideo: return "video"
-    case .shutdown: return "shutdown"
+    case .localVideo: return QueueJobKind.video.rawValue
+    case .shutdown: return QueueJobKind.shutdown.rawValue
     #if DEBUG
-    case .synthetic: return "synthetic"
+    case .synthetic: return QueueJobKind.synthetic.rawValue
     #endif
     }
   }
@@ -11342,6 +11606,11 @@ public enum WarmServerError: Error, LocalizedError {
   /// wrong, an operator asked for the box back. `VideoJobTracker` and the
   /// video routes recognise it and report the job interrupted, not failed.
   case renderInterrupted
+  /// #339 review r1: a non-recoverable-kind submission (ControlNet, a Krita
+  /// model switch) refused because `recoverPersistedQueue`'s replay is in
+  /// flight — see `QueueRecoveryGate`. `retryAfterSeconds` is this
+  /// throw-site's own estimate, mirrored into the 503 body + header.
+  case queueRecoveryInProgress(retryAfterSeconds: Int)
 
   public var errorDescription: String? {
     switch self {
@@ -11402,6 +11671,8 @@ public enum WarmServerError: Error, LocalizedError {
         + "omit it for gaussian"
     case .renderInterrupted:
       return "Render interrupted by /v1/queue/interrupt"
+    case .queueRecoveryInProgress:
+      return QueueRecoveryGate.reason
     }
   }
 }
@@ -11482,6 +11753,35 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// other job, one at a time.
   func enqueueFakeRender(_ body: @escaping @Sendable () async throws -> Bool) async throws -> Bool {
     try await coordinator.enqueueModelSwitch(body)
+  }
+
+  /// #339 review r3, item 3: the seam `recoverPersistedQueue`'s "generate"
+  /// replay uses. Callers must PAUSE the probe (`setPaused(true)`) before
+  /// calling this if they don't want the render to actually attempt to run
+  /// — `.generate` never runs while paused (`runsWhilePaused`), so the job
+  /// sits durably in `pending` without ever touching a real pipeline/model
+  /// weights, which is what makes it safe to drive from a unit test.
+  func enqueueGenerate(
+    _ payload: GeneratePayload, source: String = "api", rawBody: Data? = nil, jobId: String? = nil
+  ) async throws -> GenerateResponse {
+    try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody, jobId: jobId)
+  }
+
+  /// #339 review r3, item 3: the seam `recoverPersistedQueue` uses to
+  /// publish the not-yet-admitted tail (`RecoverySnapshotMerger`) so a
+  /// second restart mid-replay can't lose it.
+  func setRecoveryUnadmittedTail(_ tail: [PersistedQueueJob]) async {
+    await coordinator.setRecoveryUnadmittedTail(tail)
+  }
+
+  /// Cancel a pending job by id — the `DELETE /v1/queue/{id}` seam. Used by
+  /// the r3 probe test to clean up a `.generate` job admitted (then never
+  /// run, paused) via `enqueueGenerate` above, so the probe drains for
+  /// `makeQueueProbe`'s teardown guard without ever letting the render
+  /// actually attempt to start.
+  @discardableResult
+  func cancelPending(id: String) async -> Bool {
+    await coordinator.cancelPending(id: id)
   }
 
   /// The seam `/v1/model/load` (wait: true), `/v1/model/activate` and
