@@ -415,3 +415,13 @@ ComfyBox -p "a scene" --cache-limit 8192 -o scene.png
 - M1/M2 Pro (32 GB): BF16 models work fine, one at a time
 - M3 Max (128 GB): Multiple BF16 models simultaneously
 - Never run multiple GPU renders concurrently — sequential only
+
+## Edit tab
+
+Non-destructive tone, color, crop, local brush adjustments, and background removal for any PNG/JPEG/TIFF. Open from the sidebar (⌘U), from an asset's **Edit** button, or from the gallery context menu.
+
+- Sliders preview live; one drag is one undo step (⌘Z / ⇧⌘Z).
+- **Local** paints a mask; its sliders apply inside the mask only. **Feather** softens the edge.
+- **Subject → Find Subject** runs Vision; **Remove Background** saves a transparent PNG.
+- **Save** writes `edit-<time>.png` into your output folder as a new asset. The recipe is stored in the adjacent `.json`, so opening the saved asset in Edit reopens the original pixels with your settings.
+- **Save & Inpaint** saves, then opens the result in Inpaint with your local mask pre-painted.

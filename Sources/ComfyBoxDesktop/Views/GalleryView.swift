@@ -49,6 +49,8 @@ struct GalleryView: View {
     var onAnimate: ((DAMAsset) -> Void)?
     /// Send an image to the Inpaint tab.
     var onInpaint: ((DAMAsset) -> Void)?
+    /// Open an image in the Edit tab.
+    var onEdit: ((DAMAsset) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
@@ -314,7 +316,13 @@ struct GalleryView: View {
                     selectedAsset = nil
                     lightboxIndex = filteredAssets.firstIndex(where: { $0.id == target.id })
                 },
-                onSendToGenerate: onSendToGenerate
+                onSendToGenerate: onSendToGenerate,
+                onEdit: onEdit,
+                onSelectSource: { path in
+                    if let match = filteredAssets.first(where: { $0.absolutePath == path }) {
+                        selectedAsset = match
+                    }
+                }
             )
             .frame(minWidth: 800, minHeight: 500)
         }
@@ -930,8 +938,11 @@ struct GalleryView: View {
                         if onAnimate != nil {
                             Button("Send to Motion (I2V)") { onAnimate?(asset) }
                         }
+                        if onEdit != nil {
+                            Button("Edit") { onEdit?(asset) }
+                        }
                         if onInpaint != nil {
-                            Button("Edit / Inpaint") { onInpaint?(asset) }
+                            Button("Inpaint") { onInpaint?(asset) }
                         }
                         if mediaTools.hasMagick {
                             Menu("Export As") {

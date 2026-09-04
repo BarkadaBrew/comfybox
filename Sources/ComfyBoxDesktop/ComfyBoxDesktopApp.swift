@@ -37,6 +37,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingMotionReference: String?
     @State private var pendingInpaintImage: String?
     @State private var pendingInpaintMask: MaskStrokes?
+    @State private var pendingEdit: EditRequest?
     @State private var pendingContentMode: ContentMode?
 
     init() {
@@ -73,6 +74,7 @@ struct ComfyBoxDesktopApp: App {
         case decoupage = "Découpage"
         case face = "Face"
         case inpaint = "Inpaint"
+        case edit = "Edit"
         case bree = "Bree"
         case kira = "Kira"
         case canvas = "Canvas"
@@ -95,7 +97,7 @@ struct ComfyBoxDesktopApp: App {
 
         var section: Section {
             switch self {
-            case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .canvas, .assistant: return .create
+            case .generate, .motion, .mflux, .decoupage, .face, .inpaint, .edit, .canvas, .assistant: return .create
             case .gallery, .compare, .presets, .prompts, .characters, .civitai, .models, .remoteGallery, .archives: return .library
             case .dashboard, .applications, .queue: return .operate
             case .bree, .kira: return .suite
@@ -120,6 +122,7 @@ struct ComfyBoxDesktopApp: App {
             case .decoupage: return "square.3.layers.3d"
             case .face: return "person.crop.circle.badge.checkmark"
             case .inpaint: return "paintbrush.pointed"
+            case .edit: return "slider.horizontal.3"
             case .bree: return "brain.head.profile"
             case .kira: return "moon.stars"
             case .canvas: return "rectangle.on.rectangle.angled"
@@ -156,6 +159,7 @@ struct ComfyBoxDesktopApp: App {
             case .remoteGallery: return "r"
             case .face: return "f"
             case .inpaint: return "e"
+            case .edit: return "u"
             case .archives: return "7"
             }
         }
@@ -462,6 +466,10 @@ struct ComfyBoxDesktopApp: App {
                     pendingInpaintImage = asset.absolutePath
                     selectedTab = .inpaint
                 },
+                onEdit: { asset in
+                    pendingEdit = EditRequest(path: asset.absolutePath, asset: asset)
+                    selectedTab = .edit
+                },
                 canvasStore: canvasStore,
                 searchFocusRequests: $gallerySearchFocusRequests,
                 maintenanceRequests: $galleryMaintenanceRequests
@@ -545,6 +553,13 @@ struct ComfyBoxDesktopApp: App {
 
         case .inpaint:
             InpaintView(engine: engine, ingestor: ingestor, pendingImage: $pendingInpaintImage, pendingMask: $pendingInpaintMask)
+
+        case .edit:
+            EditTab(ingestor: ingestor, pending: $pendingEdit, onSendToInpaint: { path, mask in
+                pendingInpaintMask = mask
+                pendingInpaintImage = path
+                selectedTab = .inpaint
+            })
 
         case .bree:
             BreeView(bree: breeService)

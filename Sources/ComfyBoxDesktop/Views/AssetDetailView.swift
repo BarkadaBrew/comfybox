@@ -33,6 +33,10 @@ struct AssetDetailView: View {
     var onFullScreen: ((DAMAsset) -> Void)?
     /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
     var onSendToGenerate: ((DAMAsset) -> Void)?
+    /// Open this asset in the Edit tab.
+    var onEdit: ((DAMAsset) -> Void)?
+    /// Select the asset at the given path (used by the "Edited from" source link).
+    var onSelectSource: ((String) -> Void)?
 
     @State private var currentIndex: Int
     @State private var rating: Int = 0
@@ -57,6 +61,8 @@ struct AssetDetailView: View {
         self.onUpdate = onUpdate
         self.onFullScreen = nil
         self.onSendToGenerate = nil
+        self.onEdit = nil
+        self.onSelectSource = nil
         self._currentIndex = State(initialValue: 0)
     }
 
@@ -70,7 +76,9 @@ struct AssetDetailView: View {
         },
         onUpdate: @escaping (DAMAsset) -> Void,
         onFullScreen: ((DAMAsset) -> Void)? = nil,
-        onSendToGenerate: ((DAMAsset) -> Void)? = nil
+        onSendToGenerate: ((DAMAsset) -> Void)? = nil,
+        onEdit: ((DAMAsset) -> Void)? = nil,
+        onSelectSource: ((String) -> Void)? = nil
     ) {
         self.assets = assets
         self.thumbnailProvider = thumbnailProvider
@@ -78,6 +86,8 @@ struct AssetDetailView: View {
         self.onUpdate = onUpdate
         self.onFullScreen = onFullScreen
         self.onSendToGenerate = onSendToGenerate
+        self.onEdit = onEdit
+        self.onSelectSource = onSelectSource
         self._currentIndex = State(initialValue: index)
     }
 
@@ -163,6 +173,11 @@ struct AssetDetailView: View {
                 Button { onSendToGenerate(asset) } label: {
                     Label("Send to Generate", systemImage: "wand.and.stars")
                 }
+            }
+            if let onEdit {
+                Button { onEdit(asset) } label: { Label("Edit", systemImage: "slider.horizontal.3") }
+                    .disabled(localOnlyReason != nil)
+                    .help(localOnlyReason ?? "Open in the Edit tab")
             }
             if let onFullScreen {
                 Button { onFullScreen(asset) } label: {
@@ -319,6 +334,16 @@ struct AssetDetailView: View {
             Text(formattedDate(asset.createdAt))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if let sc = EditSidecar.read(forImageAt: asset.absolutePath) {
+                HStack(spacing: 6) {
+                    Label("Edited from \(URL(fileURLWithPath: sc.sourcePath).lastPathComponent)", systemImage: "link")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let onSelectSource {
+                        Button("Show") { onSelectSource(sc.sourcePath) }.controlSize(.mini)
+                    }
+                }
+            }
         }
     }
 
