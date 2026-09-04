@@ -174,4 +174,66 @@ struct EditRendererTests {
         let cg = Self.context.createCGImage(out, from: out.extent)!
         #expect(EditTestSupport.gray(cg, x: 0, y: 25) > 120)
     }
+
+    @Test("local layer with a left-half mask brightens only the masked half")
+    func localLayer() {
+        let src = EditTestSupport.solid(r: 100, g: 100, b: 100, width: 100, height: 40)
+        var r = EditRecipe()
+        var layer = EditLocalLayer()
+        // A wide vertical stroke covering x in 0…0.5 (size is a fraction of width).
+        layer.mask.append(MaskStroke(points: [CGPoint(x: 0.25, y: 0.0), CGPoint(x: 0.25, y: 1.0)], size: 0.5, erase: false))
+        layer.adjustments.exposure = 1.5
+        r.local = layer
+        let out = rendered(src, r)
+        #expect(EditTestSupport.gray(out, x: 10, y: 20) > 150)
+        #expect(abs(Int(EditTestSupport.gray(out, x: 90, y: 20)) - 100) <= 2)
+    }
+
+    @Test("local layer ignores fields outside the local subset")
+    func localRestricted() {
+        let src = EditTestSupport.solid(r: 100, g: 100, b: 100, width: 40, height: 40)
+        var r = EditRecipe()
+        var layer = EditLocalLayer()
+        layer.mask.append(MaskStroke(points: [CGPoint(x: 0.5, y: 0.5)], size: 2, erase: false))
+        layer.adjustments.vignette = 1   // not in the local subset
+        r.local = layer
+        let out = rendered(src, r)
+        #expect(abs(Int(EditTestSupport.gray(out, x: 2, y: 2)) - 100) <= 2)
+    }
+
+    @Test("subject removal makes the unmasked region transparent; invert flips it")
+    func subject() {
+        let src = EditTestSupport.solid(r: 50, g: 120, b: 200, width: 40, height: 40)
+        // Mask: left half white (subject), right half black.
+        var strokes = MaskStrokes()
+        strokes.append(MaskStroke(points: [CGPoint(x: 0.25, y: 0), CGPoint(x: 0.25, y: 1)], size: 0.5, erase: false))
+        let mask = CIImage(cgImage: MaskRasterizer.render(strokes, size: CGSize(width: 40, height: 40))!)
+        var r = EditRecipe(); r.subject.removeBackground = true
+        let out = rendered(src, r, mask: mask)
+        #expect(EditTestSupport.pixel(out, x: 5, y: 20).a == 255)
+        #expect(EditTestSupport.pixel(out, x: 35, y: 20).a == 0)
+        r.subject.invert = true
+        let inv = rendered(src, r, mask: mask)
+        #expect(EditTestSupport.pixel(inv, x: 5, y: 20).a == 0)
+        #expect(EditTestSupport.pixel(inv, x: 35, y: 20).a == 255)
+    }
+
+    @Test("subject flag without a mask is a no-op")
+    func subjectNoMask() {
+        let src = EditTestSupport.solid(r: 50, g: 120, b: 200, width: 8, height: 8)
+        var r = EditRecipe(); r.subject.removeBackground = true
+        #expect(EditTestSupport.pixel(rendered(src, r), x: 4, y: 4).a == 255)
+    }
+
+    @Test("subject mask follows geometry: flipH moves the transparent half")
+    func subjectFollowsGeometry() {
+        let src = EditTestSupport.solid(r: 50, g: 120, b: 200, width: 40, height: 40)
+        var strokes = MaskStrokes()
+        strokes.append(MaskStroke(points: [CGPoint(x: 0.25, y: 0), CGPoint(x: 0.25, y: 1)], size: 0.5, erase: false))
+        let mask = CIImage(cgImage: MaskRasterizer.render(strokes, size: CGSize(width: 40, height: 40))!)
+        var r = EditRecipe(); r.subject.removeBackground = true; r.geometry.flipH = true
+        let out = rendered(src, r, mask: mask)
+        #expect(EditTestSupport.pixel(out, x: 35, y: 20).a == 255)
+        #expect(EditTestSupport.pixel(out, x: 5, y: 20).a == 0)
+    }
 }

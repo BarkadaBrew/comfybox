@@ -212,10 +212,42 @@ public enum EditRenderer {
         return (fix.outputImage ?? base).cropped(to: base.extent)
     }
 
-    // MARK: - Local layer and subject (completed in Task 5)
+    // MARK: - Local layer
 
-    static func applyLocalLayer(_ image: CIImage, _ layer: EditLocalLayer?) -> CIImage { image }
+    static func applyLocalLayer(_ image: CIImage, _ layer: EditLocalLayer?) -> CIImage {
+        guard let layer, !layer.mask.isEmpty else { return image }
+        let extent = image.extent
+        guard let maskCG = MaskRasterizer.render(layer.mask, size: extent.size) else { return image }
+        var mask = CIImage(cgImage: maskCG)
+        if layer.feather > 0 {
+            let radius = Float(layer.feather * 0.05 * Double(min(extent.width, extent.height)))
+            let blur = CIFilter.gaussianBlur(); blur.inputImage = mask.clampedToExtent(); blur.radius = radius
+            mask = blur.outputImage?.cropped(to: extent) ?? mask
+        }
+        let adjusted = applyAdjustments(image, layer.adjustments.restrictedToLocal)
+        let blend = CIFilter.blendWithMask()
+        blend.inputImage = adjusted; blend.backgroundImage = image; blend.maskImage = mask
+        return blend.outputImage?.cropped(to: extent) ?? image
+    }
+
+    // MARK: - Subject alpha
 
     static func applySubject(_ image: CIImage, _ subject: EditSubject, mask: CIImage?,
-                             geometry: EditGeometry, sourceExtent: CGRect) -> CIImage { image }
+                             geometry: EditGeometry, sourceExtent: CGRect) -> CIImage {
+        guard subject.removeBackground, let mask else { return image }
+        // The mask is at source resolution; run it through the same geometry so it aligns.
+        var m = applyGeometry(mask, geometry)
+        if m.extent != image.extent {
+            m = m.transformed(by: CGAffineTransform(scaleX: image.extent.width / max(m.extent.width, 1),
+                                                    y: image.extent.height / max(m.extent.height, 1)))
+                .cropped(to: image.extent)
+        }
+        if subject.invert {
+            let inv = CIFilter.colorInvert(); inv.inputImage = m; m = inv.outputImage ?? m
+        }
+        let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: image.extent)
+        let blend = CIFilter.blendWithMask()
+        blend.inputImage = image; blend.backgroundImage = clear; blend.maskImage = m
+        return blend.outputImage?.cropped(to: image.extent) ?? image
+    }
 }
