@@ -91,36 +91,32 @@ public final class EditSession {
         // Parse only the envelope first — a sidecar written by a newer
         // ComfyBox can carry a `recipe` shape this build can't decode, and a
         // full `EditSidecar.read` would then fail outright, indistinguishable
-        // from "no sidecar at all". `rootSource` itself walks the chain via
-        // full decodes too, so it can't be trusted to advance past a node
-        // whose own recipe doesn't decode — an incompatible-version node is
-        // handled as a single envelope-only hop below, never via `rootSource`.
+        // from "no sidecar at all". `rootSource` itself is envelope-based (see
+        // its doc comment), so it survives an undecodable recipe anywhere in
+        // the chain, including at the opened file itself — only the FULL
+        // decode of the opened file's own sidecar (needed for the recipe, not
+        // just the path) has to wait on its version being supported.
         if let envelope = EditSidecar.readEnvelope(forImageAt: sourcePath) {
-            if envelope.version > EditRecipe.currentVersion {
-                if FileManager.default.fileExists(atPath: envelope.sourcePath) {
-                    path = envelope.sourcePath
-                }
-                warning = "This edit was saved by a newer ComfyBox (recipe v\(envelope.version)); opening pixels only."
-            } else {
-                let root = EditSidecar.rootSource(forImageAt: sourcePath)
-                if root.path == sourcePath {
-                    // `rootSource` reports a cycle by returning the starting path
-                    // itself with a nil asset id — the chain is malformed, so
-                    // keep the derived pixels already on disk and fall back to
-                    // an identity recipe rather than guessing at a root.
-                    warning = "This edit's history is malformed; editing the flattened image."
-                } else if FileManager.default.fileExists(atPath: root.path) {
-                    path = root.path
-                    if let sc = EditSidecar.read(forImageAt: sourcePath) {
-                        storedRecipe = sc.recipe
-                    } else {
-                        // Envelope parsed but the full recipe didn't decode despite a
-                        // compatible version — corrupt sidecar. Fall back to pixels-only.
-                        warning = "This edit's recipe could not be read; opening pixels only."
-                    }
+            let root = EditSidecar.rootSource(forImageAt: sourcePath)
+            if root.path == sourcePath {
+                // `rootSource` reports a cycle by returning the starting path
+                // itself with a nil asset id — the chain is malformed, so
+                // keep the derived pixels already on disk and fall back to
+                // an identity recipe rather than guessing at a root.
+                warning = "This edit's history is malformed; editing the flattened image."
+            } else if FileManager.default.fileExists(atPath: root.path) {
+                path = root.path
+                if envelope.version > EditRecipe.currentVersion {
+                    warning = "This edit was saved by a newer ComfyBox (recipe v\(envelope.version)); opening pixels only."
+                } else if let sc = EditSidecar.read(forImageAt: sourcePath) {
+                    storedRecipe = sc.recipe
                 } else {
-                    warning = "Original \(URL(fileURLWithPath: root.path).lastPathComponent) is missing; editing the flattened image."
+                    // Envelope parsed but the full recipe didn't decode despite a
+                    // compatible version — corrupt sidecar. Fall back to pixels-only.
+                    warning = "This edit's recipe could not be read; opening pixels only."
                 }
+            } else {
+                warning = "Original \(URL(fileURLWithPath: root.path).lastPathComponent) is missing; editing the flattened image."
             }
         }
         let loadPath = path
@@ -264,10 +260,18 @@ public final class EditSession {
         } else {
             warning = "Preview render failed; the last good preview is shown."
         }
+        // Recomputed (not appended to `warning`) every render so it clears itself the
+        // moment the condition no longer holds — e.g. the user turns Remove Background
+        // back off, or a mask finishes loading — rather than lingering as a stale
+        // one-shot warning that nothing else ever un-sets.
         if recipe.subject.removeBackground && subjectMask == nil {
-            warning = "Remove Background is on but no subject mask is loaded. Run Find Subject."
+            subjectStatus = Self.noSubjectMaskMessage
+        } else if subjectStatus == Self.noSubjectMaskMessage {
+            subjectStatus = nil
         }
     }
+
+    private static let noSubjectMaskMessage = "Remove Background is on but no subject mask is loaded. Run Find Subject."
 
     /// Subject mask resampled to the preview source size so it lines up before geometry.
     private func scaledSubjectMask() -> CIImage? {

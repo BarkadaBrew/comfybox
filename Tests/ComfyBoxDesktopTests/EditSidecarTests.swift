@@ -106,4 +106,30 @@ struct EditSidecarTests {
         #expect(envelope?.sourcePath == "/orig/root.png")
         #expect(envelope?.sourceAssetId == "R1")
     }
+
+    // MARK: - Fix round 2
+
+    @Test("rootSource reaches the true root through a middle node whose own recipe doesn't decode")
+    func rootSourceSurvivesUndecodableMiddleNode() throws {
+        let dir = tempDir()
+        let root = "/orig/root.png"
+        let middle = dir + "/edit-mid.png"
+        let leaf = dir + "/edit-leaf.png"
+        // leaf -> middle: fully valid.
+        let leafSc = EditSidecar(version: 1, sourcePath: middle, sourceAssetId: "MID1", recipe: EditRecipe(), editor: "x", createdAt: Date())
+        try JSONSerialization.data(withJSONObject: ["edit": try leafSc.jsonObject()]).write(to: URL(fileURLWithPath: dir + "/edit-leaf.json"))
+        // middle -> root: envelope fields valid, recipe undecodable by this build.
+        let obj: [String: Any] = [
+            "version": 1,
+            "source_path": root,
+            "source_asset_id": "ROOT1",
+            "recipe": ["bogus": true],
+            "editor": "x",
+            "created_at": ISO8601DateFormatter().string(from: Date())
+        ]
+        try JSONSerialization.data(withJSONObject: ["edit": obj]).write(to: URL(fileURLWithPath: dir + "/edit-mid.json"))
+        let r = EditSidecar.rootSource(forImageAt: leaf)
+        #expect(r.path == root)
+        #expect(r.assetId == "ROOT1")
+    }
 }

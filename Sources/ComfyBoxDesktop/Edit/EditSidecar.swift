@@ -89,18 +89,25 @@ public struct EditSidecar: Codable, Equatable, Sendable {
     /// itself with a `nil` asset id, which callers can treat as "sidecar
     /// exists but the chain is broken" rather than mistaking it for a real
     /// root.
+    ///
+    /// Walks via `readEnvelope`, not a full `read` — a chain can pass through
+    /// a node written by a newer ComfyBox whose `recipe` shape this build
+    /// can't decode. A full decode at that node would fail and silently stop
+    /// the walk there (indistinguishable from that node genuinely being the
+    /// root), so only the envelope fields (`version`/`source_path`/
+    /// `source_asset_id`) are ever read while traversing.
     public static func rootSource(forImageAt imagePath: String) -> (path: String, assetId: String?) {
         var path = imagePath
         var assetId: String? = nil
         var visited: Set<String> = [imagePath]
-        while let sc = read(forImageAt: path) {
-            let nextPath = sc.sourcePath
+        while let envelope = readEnvelope(forImageAt: path) {
+            let nextPath = envelope.sourcePath
             if visited.contains(nextPath) {
                 return (imagePath, nil)
             }
             visited.insert(nextPath)
             path = nextPath
-            assetId = sc.sourceAssetId
+            assetId = envelope.sourceAssetId
         }
         return (path, assetId)
     }

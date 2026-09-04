@@ -208,7 +208,7 @@ struct EditSessionTests {
         #expect(s.sourcePath == root)   // resolved through to the root pixels, not stuck on the derived file
     }
 
-    @Test("removeBackground without a subject mask warns after a preview render")
+    @Test("removeBackground without a subject mask sets subjectStatus after a preview render, and clears it once turned off")
     func removeBackgroundWithoutMaskWarnsAfterRender() async {
         let dir = tempDir(); let p = dir + "/src.png"
         writePNG(EditTestSupport.solid(r: 1, g: 1, b: 1, width: 8, height: 8), to: p)
@@ -216,7 +216,10 @@ struct EditSessionTests {
         await s.load()
         s.set { $0.subject.removeBackground = true }
         await s.renderNow()
-        #expect(s.warning == "Remove Background is on but no subject mask is loaded. Run Find Subject.")
+        #expect(s.subjectStatus == "Remove Background is on but no subject mask is loaded. Run Find Subject.")
+        s.set { $0.subject.removeBackground = false }
+        await s.renderNow()
+        #expect(s.subjectStatus == nil)
     }
 
     @Test("export refuses when removeBackground is on without a subject mask")
@@ -237,5 +240,35 @@ struct EditSessionTests {
         } catch {
             Issue.record("unexpected error type: \(error)")
         }
+    }
+
+    // MARK: - Fix round 2
+
+    @Test("a multi-hop chain through a newer, undecodable node still resolves to the true root")
+    func multiHopChainThroughIncompatibleNodeResolvesRoot() async throws {
+        let dir = tempDir()
+        let root = dir + "/root.png"; let prior = dir + "/edit-1.png"; let newer = dir + "/edit-2.png"
+        writePNG(EditTestSupport.solid(r: 5, g: 5, b: 5, width: 8, height: 8), to: root)
+        writePNG(EditTestSupport.solid(r: 5, g: 5, b: 5, width: 8, height: 8), to: prior)
+        writePNG(EditTestSupport.solid(r: 5, g: 5, b: 5, width: 8, height: 8), to: newer)
+        // prior -> root: fully valid, compatible version.
+        let priorSc = EditSidecar(version: 1, sourcePath: root, sourceAssetId: "ROOT1", recipe: EditRecipe(), editor: "x", createdAt: Date())
+        try JSONSerialization.data(withJSONObject: ["edit": try priorSc.jsonObject()]).write(to: URL(fileURLWithPath: dir + "/edit-1.json"))
+        // newer -> prior: version 99, recipe undecodable by this build.
+        let obj: [String: Any] = [
+            "version": 99,
+            "source_path": prior,
+            "source_asset_id": NSNull(),
+            "recipe": ["bogus": true],
+            "editor": "x",
+            "created_at": ISO8601DateFormatter().string(from: Date())
+        ]
+        try JSONSerialization.data(withJSONObject: ["edit": obj]).write(to: URL(fileURLWithPath: dir + "/edit-2.json"))
+        let s = EditSession(sourcePath: newer, sourceAsset: nil)
+        await s.load()
+        #expect(s.sourcePath == root)          // resolved through prior all the way to root, not just one hop
+        #expect(s.recipe.isIdentity)
+        #expect(s.warning != nil)
+        #expect(s.sourceImage != nil)
     }
 }
