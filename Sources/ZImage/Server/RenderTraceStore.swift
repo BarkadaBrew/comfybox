@@ -151,6 +151,16 @@ public final class RenderTraceStore: @unchecked Sendable {
     public let config: String?
     public let error: String?
     public let rating: String?
+    /// comfybox#328 (Codex round 1, finding 2): non-nil (`"beat_schedule"`)
+    /// when this render's prompt enhancement was skipped to let a
+    /// `beat_schedule` locate verbatim — GET /v1/video/traces was claiming
+    /// to surface this via the raw submitted payload, but this summary type
+    /// is what that endpoint actually returns, and it dropped the field.
+    public let enhancementSkipped: String?
+    /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
+    /// on this render's (I2V) request was dropped before reaching the
+    /// generator.
+    public let beatScheduleIgnored: String?
   }
 
   public func recentSummaries(limit: Int = 50) -> [TraceSummary] {
@@ -175,7 +185,9 @@ public final class RenderTraceStore: @unchecked Sendable {
         optimizationAttemptId: submitted?.payload["optimization_attempt_id"],
         config: submitted?.payload["config"],
         error: terminal?.payload["error"],
-        rating: rated.map { "\($0.payload["axis"] ?? "overall"):\($0.payload["vote"] ?? "?")" }
+        rating: rated.map { "\($0.payload["axis"] ?? "overall"):\($0.payload["vote"] ?? "?")" },
+        enhancementSkipped: submitted?.payload["enhancement_skipped"],
+        beatScheduleIgnored: submitted?.payload["beat_schedule_ignored"]
       )
     }
     return summaries

@@ -20,6 +20,26 @@
 // across base/refine, since refine's latent resolution differs). Absent
 // `beat_schedule` (empty resolved list) yields `nil` from both builders —
 // byte-identical to today's no-bias code path.
+//
+// SCOPE: T2V ONLY (comfybox#328, Codex round 1 finding 5). Resolved beats
+// are forwarded into the T2V render path only — every I2V branch omits
+// them, and `generateI2VResumable` has no beat parameter at all. That
+// omission used to be a SILENT no-op: a `beat_schedule` on an I2V request
+// could locate cleanly and still never affect the render. WarmServer now
+// strips `beat_schedule` before it reaches the generator on any I2V
+// request and records `beat_schedule_ignored: "i2v_unsupported"` on the
+// response/trace instead of rendering it invisible. Wiring beats into I2V
+// needs its own design (I2V's frame axis and keyframe chaining differ
+// enough from T2V's single continuous timeline) and is not part of this
+// fix — do not assume beat_schedule does anything on an I2V request.
+//
+// Also T2V-adjacent gotcha (comfybox#328, finding 3): a non-empty
+// `beat_schedule` makes WarmServer skip server-side prompt enhancement for
+// that request — enhancement rewrites the composed prompt wholesale, and
+// every beat's `text` must be a VERBATIM substring of it, so the two
+// features are mutually exclusive by construction. Send an already-
+// composed prompt when using `beat_schedule`, not a raw one expecting the
+// optimizer to enrich it.
 
 import Foundation
 import MLX

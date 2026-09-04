@@ -639,6 +639,13 @@ public final class MCPToolExecutor: @unchecked Sendable {
     if let enhance = params?.bool("enhance") {
       body["enhance"] = enhance
     }
+    // comfybox#328: another explicit-whitelist key — an unforwarded
+    // beat_schedule vanishes here exactly as skip_character_injection once
+    // did, and the daemon (coffeeshop-server#1753) never even reaches
+    // WarmServer with beats to lose to enhancement.
+    if let beatSchedule = params?.array("beat_schedule") {
+      body["beat_schedule"] = beatSchedule.map { $0.value }
+    }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
     // Async route for BOTH backends: local renders return 202 + job_id
