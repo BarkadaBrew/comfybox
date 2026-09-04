@@ -264,6 +264,28 @@ public enum ControlRegistry {
       summary: "Weights directory for the SeedVR2 creative upscaler.",
       scope: .engine, type: .string, requiresRestart: true))
 
+    // Image memory/resolution caps (#22, ImageMemoryPreflight) — read fresh
+    // on every /v1/generate and ComfyUI-bridge /prompt call, same hot-apply
+    // posture as renderDefaults.
+    controls.append(configControl(
+      id: "engine.imageMemoryCaps.maxLongEdge", pointer: "/imageMemoryCaps/maxLongEdge",
+      title: "Max image long edge",
+      summary: "Hard ceiling (px) on the longer of an image request's width/height — refused before any memory probing or model load.",
+      scope: .engine, type: .int, unit: "px",
+      defaultValue: .int(ImageMemoryCapsConfig.default.maxLongEdge), mutatesEngine: true))
+    controls.append(configControl(
+      id: "engine.imageMemoryCaps.maxPixels", pointer: "/imageMemoryCaps/maxPixels",
+      title: "Max image pixels",
+      summary: "Hard ceiling on an image request's width*height — refused before any memory probing or model load.",
+      scope: .engine, type: .int,
+      defaultValue: .int(ImageMemoryCapsConfig.default.maxPixels), mutatesEngine: true))
+    controls.append(configControl(
+      id: "engine.imageMemoryCaps.minAvailableHeadroomFraction", pointer: "/imageMemoryCaps/minAvailableHeadroomFraction",
+      title: "Min memory headroom fraction",
+      summary: "Fraction of live free system memory a render's estimated peak activation footprint must leave clear (0.10 = refuse above ~90% projected usage).",
+      scope: .engine, type: .double, range: 0...1,
+      defaultValue: .double(ImageMemoryCapsConfig.default.minAvailableHeadroomFraction), mutatesEngine: true))
+
     // AI provider registry.
     controls += providerControls(capability: "promptOptimization", title: "Prompt optimization")
     controls += providerControls(capability: "vision", title: "Vision")

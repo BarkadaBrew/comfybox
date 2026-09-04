@@ -416,6 +416,84 @@ ComfyBox -p "a scene" --cache-limit 8192 -o scene.png
 - M3 Max (128 GB): Multiple BF16 models simultaneously
 - Never run multiple GPU renders concurrently — sequential only
 
+### DyPE / high-resolution pre-flight (#22)
+
+A high-resolution request (DyPE-territory, i.e. above 1024px on the longer
+edge) is checked BEFORE the server loads or runs anything — a request the
+server can't honour fails fast with a clear error instead of running out of
+memory partway through denoising.
+
+Two gates run, in order:
+
+1. **Resolution cap** — a hard ceiling on the request itself, checked with no
+   memory probing at all: the longer edge must be at or under
+   `imageMemoryCaps.maxLongEdge` (default **4096px**), and total pixels
+   (`width * height`) must be at or under `imageMemoryCaps.maxPixels`
+   (default **16,777,216**, i.e. 4096²). A non-square request can still be
+   refused here even under the long-edge cap (e.g. 4096×4097).
+2. **Live memory budget** — the render's estimated peak activation memory
+   (transformer joint-attention + VAE decode, scaling with resolution and
+   whether DyPE is active) is compared against how much system memory is
+   actually free right now. The request is refused if the estimate would
+   leave less than `imageMemoryCaps.minAvailableHeadroomFraction` (default
+   **10%**) of that free memory clear.
+
+A refusal is HTTP **413** with an additive `error_code` field —
+`"resolution_cap"` for gate 1 (no estimate/available numbers — refused before
+any probing) or `"insufficient_memory"` for gate 2 (which also names
+`estimate_bytes`, `available_bytes` and `cap_bytes` in the response body).
+Existing error responses are unaffected — these fields are new and additive.
+
+```json
+{
+  "success": false,
+  "error": "[insufficient_memory] estimated 56464MB exceeds the 9216MB memory cap (10240MB available right now)",
+  "error_code": "insufficient_memory",
+  "estimate_bytes": 59194408960,
+  "available_bytes": 10737418240,
+  "cap_bytes": 9663676416
+}
+```
+
+**Config keys** (`~/.comfybox/config.json`, writable via `PATCH /v1/config`
+— see `engine.imageMemoryCaps.*` in [api-reference.md](api-reference.md)):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `imageMemoryCaps.maxLongEdge` | 4096 | Hard ceiling (px) on the longer of width/height. |
+| `imageMemoryCaps.maxPixels` | 16777216 | Hard ceiling on width×height. |
+| `imageMemoryCaps.minAvailableHeadroomFraction` | 0.10 | Fraction of live free memory a render's estimated footprint must leave clear. |
+
+Neither cap is a hardcoded per-device table — the live memory-budget gate
+adapts to whatever headroom your particular Mac has free right now (shared
+with LM Studio, a resident video model, etc. — see `intent.md`, "Memory is a
+shared resource"), which is stricter than a static table on a loaded machine
+and more permissive on an idle one. As a **rough expectation** at the
+shared-Mac defaults above (krea2, a lightly-loaded machine — i.e. little else
+resident):
+
+| Device | Memory | Expect DyPE renders up to about |
+|---|---|---|
+| M3 Pro | 36 GB | 1280px |
+| M4 Pro | 64 GB | 1536px |
+| M3 Max / M4 Max | 128 GB | 2048px |
+
+Actual behavior always follows the live gate, not this table — a machine with
+a resident video model or another heavy process will bind lower, and a truly
+idle one may go a little higher. Shrink the request (or, only if you know
+what else is resident, raise `imageMemoryCaps.minAvailableHeadroomFraction`)
+rather than fight a refusal.
+
+`--cache-limit` (the MLX buffer-cache ceiling) is orthogonal to these caps: it
+bounds how much *idle* buffer cache MLX is allowed to retain between calls, not
+what a single render is projected to need. Lowering it can reduce steady-state
+RSS between renders, but does not change what the pre-flight estimates for the
+render you are about to submit.
+
+Aggressive mid-render cache clearing and cross-step RoPE-frequency-table
+caching (the other two items from issue #22) are **not** part of this
+pre-flight — they remain open follow-up work.
+
 ## Edit tab
 
 Non-destructive tone, color, crop, local brush adjustments, and background removal for any PNG/JPEG/TIFF. Open from the sidebar (⌘U), from an asset's **Edit** button, or from the gallery context menu.

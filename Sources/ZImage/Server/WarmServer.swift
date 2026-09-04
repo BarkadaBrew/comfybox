@@ -5178,8 +5178,18 @@ public final class WarmServer {
     // at dequeue does the work. Before this, `preset` was a provenance label on
     // the image path and a preset-by-name render used whatever adapters the
     // warm pipeline happened to hold, on whatever base was active.
-    return try expandGeneratePayload(
+    let expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // #22: resolution/memory preflight — refuses an oversized DyPE/high-res
+    // request BEFORE it is enqueued (let alone before any model load), with
+    // the estimate/available/cap named in the refusal. Runs AFTER preset
+    // expansion so a preset that changes `model` (and therefore which
+    // transformer profile the estimate uses) is checked accurately — presets
+    // never touch width/height (#286: model/LoRA/steps/guidance only), so this
+    // does not change which requests are gated, only which family they are
+    // gated as. See `GeneratePayload.validateImageMemoryPreflight`.
+    try expanded.validateImageMemoryPreflight()
+    return expanded
   }
 
   /// #286 — the preset expansion half of the decode. Split out only so the
@@ -5615,6 +5625,13 @@ public final class WarmServer {
 
     case let error as WarmServerError:
       switch error {
+      // #22: image-memory preflight refusal — 413 (Payload Too Large), with
+      // the estimate/available/cap numbers as additive JSON fields so a
+      // client can branch on `error_code` without string-matching `error`.
+      case .imageMemoryPreflightRefused(let code, let reason, let estimate, let available, let cap):
+        return .json(status: 413, payload: ErrorPayload(
+          success: false, error: "[\(code)] \(reason)", errorCode: code,
+          estimateBytes: estimate, availableBytes: available, capBytes: cap))
       case .loraSwapNotSupported, .controlNetNotSupported:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
@@ -10678,6 +10695,38 @@ extension GeneratePayload: Decodable {
     return max(resolvedWidth, resolvedHeight) > 1024 ? .ntk : .disabled
   }
 
+  /// #22: memory/resolution preflight, run at `decodedGeneratePayload` — the
+  /// ONE decode+validate choke point both `/v1/generate` and
+  /// `/v1/generate/async` share — so it runs before any model load, exactly
+  /// like `validateOutputPath`/`validateRecipeNames` beside it. A SEPARATE
+  /// pure-ish method (rather than inlined into `decodedGeneratePayload`) so
+  /// it stays a single, obviously-reviewable diff independent of whatever
+  /// else that call site is doing.
+  ///
+  /// Skipped when either dimension is omitted: an omitted width/height either
+  /// resolves to the small 1024×1024 engine default (never DyPE territory —
+  /// see `resolvedDyPEConfig`'s own `> 1024` gate) or, for img2img, is
+  /// derived from the source image later in the pipeline — a case this
+  /// decode-time gate cannot see (`makeImg2ImgRequest`'s own comment on why
+  /// it does not inject a config-default width/height either).
+  ///
+  /// `caps`/`availableBytes` default to LIVE reads (the real config store,
+  /// the real machine's free memory) — evaluated fresh at each call with no
+  /// argument, exactly like `StatsProvider.uptimeSeconds(now: Date = Date())`
+  /// elsewhere in this file. Tests inject deterministic values instead of
+  /// depending on whatever config/memory happens to be live on the runner.
+  func validateImageMemoryPreflight(
+    caps: ImageMemoryCapsConfig = ServerConfigStore.shared.imageMemoryCaps(),
+    availableBytes: UInt64 = MemoryProbe.systemAvailableMemoryBytes()
+  ) throws {
+    guard let width, let height else { return }
+    let family = ImageMemoryPreflight.resolvedFamily(model: model)
+    let dype = resolvedDyPEConfig(width: width, height: height).enabled
+    try ImageMemoryPreflight.validate(
+      width: width, height: height, family: family, dype: dype,
+      caps: caps, availableBytes: availableBytes)
+  }
+
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
     activeLoRAs: [LoRAConfiguration]
@@ -11493,6 +11542,20 @@ public struct LoRAState: Codable, Sendable {
 struct ErrorPayload: Encodable {
   let success: Bool
   let error: String
+  /// Additive (#22): a machine-readable refusal code alongside the human
+  /// `error` string, so a client can branch without string-matching it.
+  /// `nil` for every pre-existing refusal — the synthesized `Encodable`
+  /// conformance calls `encodeIfPresent` for `Optional` properties, so a
+  /// `nil` field is OMITTED from the JSON body, not encoded as `null`.
+  /// Existing error responses are therefore byte-identical to before.
+  var errorCode: String? = nil
+  /// #22 image-memory-preflight numbers: the render's estimated peak
+  /// activation bytes, live free system bytes at decision time, and the
+  /// byte cap it was compared against. Present only on
+  /// `imageMemoryPreflightRefused`.
+  var estimateBytes: UInt64? = nil
+  var availableBytes: UInt64? = nil
+  var capBytes: UInt64? = nil
 }
 
 private enum QueuedOperation: Sendable {
@@ -11635,6 +11698,15 @@ public enum WarmServerError: Error, LocalizedError {
   /// flight — see `QueueRecoveryGate`. `retryAfterSeconds` is this
   /// throw-site's own estimate, mirrored into the 503 body + header.
   case queueRecoveryInProgress(retryAfterSeconds: Int)
+  /// #22: an image request `ImageMemoryPreflight.validate` refused before any
+  /// model load — either it exceeds the configured resolution cap
+  /// (`code: "resolution_cap"`, no memory numbers — refused before probing)
+  /// or its estimated peak activation memory does not fit the live headroom
+  /// budget (`code: "insufficient_memory"`). `errorResponse(for:)` maps this
+  /// to 413 with the numbers as additive JSON fields (`ErrorPayload`).
+  case imageMemoryPreflightRefused(
+    code: String, reason: String,
+    estimateBytes: UInt64?, availableBytes: UInt64?, capBytes: UInt64?)
 
   public var errorDescription: String? {
     switch self {
@@ -11697,6 +11769,8 @@ public enum WarmServerError: Error, LocalizedError {
       return "Render interrupted by /v1/queue/interrupt"
     case .queueRecoveryInProgress:
       return QueueRecoveryGate.reason
+    case .imageMemoryPreflightRefused(let code, let reason, _, _, _):
+      return "[\(code)] \(reason)"
     }
   }
 }
