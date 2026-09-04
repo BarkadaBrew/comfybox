@@ -1,0 +1,69 @@
+// EditRecipeTests.swift
+import Testing
+import Foundation
+@testable import ComfyBoxDesktop
+
+@Suite("EditRecipe")
+struct EditRecipeTests {
+    @Test("default recipe is identity and version 1")
+    func defaults() {
+        let r = EditRecipe()
+        #expect(r.isIdentity)
+        #expect(r.version == 1)
+        #expect(r.local == nil)
+    }
+
+    @Test("any change breaks identity")
+    func nonIdentity() {
+        var r = EditRecipe(); r.adjustments.exposure = 0.5; #expect(!r.isIdentity)
+        var g = EditRecipe(); g.geometry.flipH = true; #expect(!g.isIdentity)
+        var c = EditRecipe(); c.adjustments.curves.rgb = [CurvePoint(x: 0.5, y: 0.6)]; #expect(!c.isIdentity)
+        var s = EditRecipe(); s.subject.removeBackground = true; #expect(!s.isIdentity)
+        var l = EditRecipe(); l.local = EditLocalLayer(); #expect(!l.isIdentity)
+    }
+
+    @Test("JSON round trip preserves every field")
+    func roundTrip() throws {
+        var r = EditRecipe()
+        r.geometry.crop = CGRect(x: 0.1, y: 0.2, width: 0.5, height: 0.6)
+        r.geometry.straightenDegrees = -3.5; r.geometry.quarterTurns = 3; r.geometry.flipV = true
+        r.adjustments.exposure = 1.25; r.adjustments.temperature = -0.4
+        r.adjustments.curves.r = [CurvePoint(x: 0.25, y: 0.3)]
+        var layer = EditLocalLayer(); layer.feather = 0.3; layer.adjustments.shadows = 0.5
+        layer.mask.append(MaskStroke(points: [CGPoint(x: 0.1, y: 0.1)], size: 0.05, erase: false))
+        r.local = layer
+        r.subject = EditSubject(removeBackground: true, invert: true)
+        let data = try JSONEncoder().encode(r)
+        let back = try JSONDecoder().decode(EditRecipe.self, from: data)
+        #expect(back == r)
+    }
+
+    @Test("curve normalization sorts, clamps, and inserts endpoints")
+    func normalization() {
+        let pts = [CurvePoint(x: 0.8, y: 1.4), CurvePoint(x: 0.2, y: -0.1)]
+        let n = ToneCurves.normalized(pts)
+        #expect(n.first == CurvePoint(x: 0, y: 0))
+        #expect(n.last == CurvePoint(x: 1, y: 1))
+        #expect(n[1] == CurvePoint(x: 0.2, y: 0))
+        #expect(n[2] == CurvePoint(x: 0.8, y: 1))
+        #expect(ToneCurves.normalized([]) == [CurvePoint(x: 0, y: 0), CurvePoint(x: 1, y: 1)])
+    }
+
+    @Test("curve sampling is identity when empty and interpolates through points")
+    func sampling() {
+        #expect(abs(ToneCurves.sample([], at: 0.37) - 0.37) < 1e-9)
+        let pts = [CurvePoint(x: 0.5, y: 0.8)]
+        #expect(abs(ToneCurves.sample(pts, at: 0.5) - 0.8) < 1e-9)
+        #expect(ToneCurves.sample(pts, at: 0.25) > 0.25)     // lifted between 0 and the point
+        #expect(ToneCurves.sample(pts, at: 0.0) == 0 && ToneCurves.sample(pts, at: 1.0) == 1)
+    }
+
+    @Test("restrictedToLocal zeroes unsupported fields")
+    func restricted() {
+        var a = EditAdjustments()
+        a.exposure = 1; a.vibrance = 1; a.vignette = 1; a.blacks = 1; a.curves.rgb = [CurvePoint(x: 0.5, y: 0.7)]
+        let r = a.restrictedToLocal
+        #expect(r.exposure == 1)
+        #expect(r.vibrance == 0 && r.vignette == 0 && r.blacks == 0 && r.curves.isIdentity)
+    }
+}
