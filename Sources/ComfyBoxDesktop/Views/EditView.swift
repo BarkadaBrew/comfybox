@@ -32,13 +32,18 @@ struct EditView: View {
         }
         .toolbar {
             ToolbarItemGroup {
+                // The spec's error table says "Source unreadable → controls disabled";
+                // an unreadable source has no pixels for Undo/Redo/Reset/Before to act
+                // on, so all four are disabled alongside Save/Save & Inpaint rather than
+                // remaining live over a recipe that can neither preview nor export.
                 Button { session.undo() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
-                    .disabled(!session.canUndo).keyboardShortcut("z", modifiers: .command)
+                    .disabled(!session.canUndo || session.sourceImage == nil).keyboardShortcut("z", modifiers: .command)
                 Button { session.redo() } label: { Label("Redo", systemImage: "arrow.uturn.forward") }
-                    .disabled(!session.canRedo).keyboardShortcut("z", modifiers: [.command, .shift])
+                    .disabled(!session.canRedo || session.sourceImage == nil).keyboardShortcut("z", modifiers: [.command, .shift])
                 Button { session.reset() } label: { Label("Reset", systemImage: "arrow.counterclockwise") }
-                    .disabled(session.recipe.isIdentity)
+                    .disabled(session.recipe.isIdentity || session.sourceImage == nil)
                 Button { } label: { Label("Before", systemImage: "eye") }
+                    .disabled(session.sourceImage == nil)
                     .simultaneousGesture(DragGesture(minimumDistance: 0)
                         .onChanged { _ in session.showOriginal = true }
                         .onEnded { _ in session.showOriginal = false })
@@ -110,7 +115,11 @@ struct EditView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 panelHeader
+                // Spec: "Source unreadable → controls disabled" — every slider, curve,
+                // and crop control would otherwise remain live over a recipe with no
+                // image to render.
                 adjustmentGroups
+                    .disabled(session.sourceImage == nil)
 
                 if let status {
                     Label(status, systemImage: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -273,8 +282,20 @@ struct EditView: View {
                 Toggle("Erase", isOn: $erase).toggleStyle(.button).controlSize(.small)
                 Button("Undo Stroke") { session.set { $0.local?.mask.undoLast() }; session.commit() }
                     .controlSize(.small).disabled(session.recipe.local?.mask.isEmpty ?? true)
-                Button("Clear Mask") { session.set { $0.local = nil }; session.commit() }
-                    .controlSize(.small).disabled(session.recipe.local == nil)
+                Button("Clear Mask") {
+                    // "Clear Mask" clears the painted strokes, not the whole layer — a
+                    // feather value or local adjustments the user dialed in are not mask
+                    // strokes and shouldn't vanish with them. Drop the layer object itself
+                    // only once there's nothing left in it worth keeping.
+                    session.set { r in
+                        r.local?.mask.clear()
+                        if let layer = r.local, layer.adjustments.isIdentity, layer.feather == 0 {
+                            r.local = nil
+                        }
+                    }
+                    session.commit()
+                }
+                    .controlSize(.small).disabled(session.recipe.local?.mask.isEmpty ?? true)
             }
             NumericSliderField(label: "Feather", value: Binding(get: { session.recipe.local?.feather ?? 0 },
                                                                 set: { v in session.set { r in
@@ -306,6 +327,7 @@ struct EditView: View {
             Toggle("Invert (keep background)", isOn: Binding(get: { session.recipe.subject.invert },
                                                             set: { v in session.set { $0.subject.invert = v }; session.commit() }))
                 .disabled(session.subjectMask == nil || !session.recipe.subject.removeBackground)
+            if let w = session.subjectMaskWarning { Text(w).font(.caption).foregroundStyle(.orange) }
             Text("Saves a transparent PNG when Remove Background is on.").font(.caption2).foregroundStyle(.tertiary)
         }
     }
@@ -315,13 +337,19 @@ struct EditView: View {
     private func save(thenInpaint: Bool) async {
         isSaving = true; status = nil; isError = false
         defer { isSaving = false }
+        // Snapshot the mask that's actually about to be exported BEFORE the await
+        // below — `session.export` itself snapshots the recipe synchronously at
+        // its own call time, but controls stay enabled while its internal write
+        // is in flight, so reading `session.recipe.local?.mask` only after the
+        // await can hand Send-to-Inpaint a mask (or its absence) that no longer
+        // matches the PNG that was actually written.
+        let maskAtSaveTime = thenInpaint ? session.recipe.local?.mask : nil
         do {
             let dir = DesktopSettings.load().outputDirectory
             let path = try await session.export(outputDirectory: dir, ingestor: ingestor)
             status = "Saved → \(URL(fileURLWithPath: path).lastPathComponent)"
             if thenInpaint {
-                let mask = session.recipe.local?.mask
-                onSendToInpaint?(path, (mask?.isEmpty ?? true) ? nil : mask)
+                onSendToInpaint?(path, (maskAtSaveTime?.isEmpty ?? true) ? nil : maskAtSaveTime)
             }
         } catch {
             status = error.localizedDescription; isError = true

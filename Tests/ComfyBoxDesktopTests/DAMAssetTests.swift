@@ -71,4 +71,19 @@ struct DAMAssetTests {
         let _: any Sendable = asset
         _ = asset
     }
+
+    // MARK: - Fix wave (X8)
+
+    @Test("isEditableImage requires image kind and a supported extension")
+    func isEditableImage() {
+        #expect(DAMAsset(kind: "image", filename: "a.png", absolutePath: "/a.png").isEditableImage)
+        #expect(DAMAsset(kind: "image", filename: "a.JPG", absolutePath: "/a.JPG").isEditableImage)
+        #expect(DAMAsset(kind: "image", filename: "a.jpeg", absolutePath: "/a.jpeg").isEditableImage)
+        #expect(DAMAsset(kind: "image", filename: "a.TIFF", absolutePath: "/a.TIFF").isEditableImage)
+        #expect(DAMAsset(kind: "image", filename: "a.tif", absolutePath: "/a.tif").isEditableImage)
+        #expect(!DAMAsset(kind: "video", filename: "a.mp4", absolutePath: "/a.mp4").isEditableImage)
+        #expect(!DAMAsset(kind: "image", filename: "a.webp", absolutePath: "/a.webp").isEditableImage)
+        #expect(!DAMAsset(kind: "image", filename: "a.gif", absolutePath: "/a.gif").isEditableImage)
+        #expect(!DAMAsset(kind: "video", filename: "a.png", absolutePath: "/a.png").isEditableImage)
+    }
 }

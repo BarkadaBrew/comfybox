@@ -11,7 +11,7 @@ import AppKit
 struct InpaintView: View {
     @Bindable var engine: EngineService
     var ingestor: AssetIngestor?
-    /// Image queued from Gallery/Canvas "Edit / Inpaint"; consumed once.
+    /// Image queued from the Gallery/Canvas "Inpaint" action; consumed once.
     @Binding var pendingImage: String?
     /// Strokes queued from the Edit tab's "Send to Inpaint"; consumed with `pendingImage`.
     @Binding var pendingMask: MaskStrokes?

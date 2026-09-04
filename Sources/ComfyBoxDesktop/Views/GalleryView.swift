@@ -135,7 +135,7 @@ struct GalleryView: View {
     /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
     /// database, so leaving it out filed almost the whole library into a
     /// "Comfybox" persona section and left the main gallery showing 87 images.
-    static let mainSources: Set<String> = ["", "desktop", "comfyui", "comfybox"]
+    static let mainSources: Set<String> = ["", "desktop", "desktop-edit", "comfyui", "comfybox"]
     static func isMainSource(_ source: String?) -> Bool {
         mainSources.contains((source ?? "").lowercased())
     }
@@ -321,8 +321,8 @@ struct GalleryView: View {
                 },
                 onSendToGenerate: onSendToGenerate,
                 onEdit: onEdit,
-                onSelectSource: { path in
-                    if let match = assetWithLocalPath(path) { selectedAsset = match }
+                onSelectSource: { path, sourceAssetId in
+                    selectSource(path: path, sourceAssetId: sourceAssetId)
                 }
             )
             .frame(minWidth: 800, minHeight: 500)
@@ -939,7 +939,7 @@ struct GalleryView: View {
                         if onAnimate != nil {
                             Button("Send to Motion (I2V)") { onAnimate?(asset) }
                         }
-                        if let onEdit, case .local(let localPath) = mediaSource(for: asset) {
+                        if let onEdit, asset.isEditableImage, case .local(let localPath) = mediaSource(for: asset) {
                             Button("Edit") { onEdit(asset, localPath) }
                         }
                         if onInpaint != nil {
@@ -1085,19 +1085,29 @@ struct GalleryView: View {
         AssetMediaSource.resolve(mediaLocation(for: asset), gateRevealed: contentGate.revealed)
     }
 
-    /// The asset (among the ones currently filtered) whose RESOLVED local
-    /// path matches `path` — used by the detail pane's "Edited from → Show"
-    /// link, which hands back the sidecar's recorded source path, not any
-    /// particular asset's `absolutePath`.
-    private func assetWithLocalPath(_ path: String) -> DAMAsset? {
-        let target = (path as NSString).standardizingPath
-        for asset in filteredAssets {
-            if case .local(let localPath) = mediaSource(for: asset),
-               (localPath as NSString).standardizingPath == target {
-                return asset
-            }
+    /// "Edited from → Show": resolves the sidecar's recorded source (by asset id,
+    /// then by resolved local path) against the FULL asset list, then makes sure
+    /// it is actually visible before selecting it — the normal case for a
+    /// `desktop-edit` original is that today's search/persona/folder/favorite/
+    /// content-mode/character filter is hiding it, in which case the button would
+    /// otherwise silently do nothing (or, worse, `AssetDetailView`'s index lookup
+    /// would fall back to row 0 and show the wrong asset).
+    private func selectSource(path: String, sourceAssetId: String?) {
+        guard let match = Self.resolveSourceAsset(sourceAssetId: sourceAssetId, sourcePath: path, in: assets,
+                                                   localPath: { asset in
+                                                       if case .local(let lp) = mediaSource(for: asset) { return lp }
+                                                       return nil
+                                                   }) else { return }
+        if !filteredAssets.contains(where: { $0.id == match.id }) {
+            searchText = ""
+            personaFilter = nil
+            folderFilter = .all
+            filterFavorites = false
+            filterContentMode = nil
+            filterCharacter = nil
+            filterLabel = nil
         }
-        return nil
+        selectedAsset = match
     }
 
     /// Download a row whose bytes are on a server into the local output folder
@@ -2152,6 +2162,26 @@ struct GalleryView: View {
     /// membership filter from the store fetch above it.
     static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
         allAssets.filter { ids.contains($0.id) }
+    }
+
+    /// Resolves the "Edited from" source asset for an edit sidecar's `source_path`
+    /// (and, when present, its `source_asset_id`) against the FULL asset list — not
+    /// `filteredAssets`, which excludes whatever the active search/persona/folder/
+    /// favorite/content-mode/character filter is hiding, and given derived edits are
+    /// filed under `desktop-edit`, the original is routinely outside that filter.
+    /// Tries the id first (survives the original having moved), then falls back to
+    /// matching the RESOLVED local path (`localPath`, the same local/remote decision
+    /// the grid makes) against the sidecar's recorded path.
+    static func resolveSourceAsset(sourceAssetId: String?, sourcePath: String,
+                                   in allAssets: [DAMAsset], localPath: (DAMAsset) -> String?) -> DAMAsset? {
+        if let sourceAssetId, let match = allAssets.first(where: { $0.id == sourceAssetId }) {
+            return match
+        }
+        let target = (sourcePath as NSString).standardizingPath
+        return allAssets.first { asset in
+            guard let lp = localPath(asset) else { return false }
+            return (lp as NSString).standardizingPath == target
+        }
     }
 
     /// Runs the archive via `GalleryArchiver`, mirroring the import strip's

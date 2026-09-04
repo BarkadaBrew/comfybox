@@ -37,8 +37,9 @@ struct AssetDetailView: View {
     /// path `source` resolved for it (only ever invoked when `source` is
     /// `.local`, since the button is disabled otherwise) — never `asset.absolutePath`.
     var onEdit: ((DAMAsset, String) -> Void)?
-    /// Select the asset at the given path (used by the "Edited from" source link).
-    var onSelectSource: ((String) -> Void)?
+    /// Select the source asset for the "Edited from" link — the sidecar's
+    /// recorded `source_path` and (when present) `source_asset_id`.
+    var onSelectSource: ((String, String?) -> Void)?
 
     @State private var currentIndex: Int
     @State private var rating: Int = 0
@@ -53,6 +54,11 @@ struct AssetDetailView: View {
     @State private var player: AVPlayer?
     /// What went wrong fetching a server-side asset, shown instead of a blank pane.
     @State private var mediaError: String?
+    /// The current asset's `edit` sidecar (for "Edited from"), cached rather than
+    /// read from disk on every `body` evaluation — SwiftUI re-runs `body` on every
+    /// rating/favorite/label change and on navigation, and this is a synchronous
+    /// disk read. Refreshed by the same `.task(id:)` that loads the image.
+    @State private var editSidecar: EditSidecar?
     @Environment(\.dismiss) private var dismiss
     @Environment(AppContentGate.self) private var contentGate
 
@@ -62,7 +68,7 @@ struct AssetDetailView: View {
         thumbnailPath: String?,
         onUpdate: @escaping (DAMAsset) -> Void,
         onEdit: ((DAMAsset, String) -> Void)? = nil,
-        onSelectSource: ((String) -> Void)? = nil
+        onSelectSource: ((String, String?) -> Void)? = nil
     ) {
         self.assets = [asset]
         self.thumbnailProvider = { _ in thumbnailPath }
@@ -86,7 +92,7 @@ struct AssetDetailView: View {
         onFullScreen: ((DAMAsset) -> Void)? = nil,
         onSendToGenerate: ((DAMAsset) -> Void)? = nil,
         onEdit: ((DAMAsset, String) -> Void)? = nil,
-        onSelectSource: ((String) -> Void)? = nil
+        onSelectSource: ((String, String?) -> Void)? = nil
     ) {
         self.assets = assets
         self.thumbnailProvider = thumbnailProvider
@@ -131,6 +137,7 @@ struct AssetDetailView: View {
         // blur them, and opening it must then load what was withheld.
         .task(id: "\(asset.id)|\(contentGate.revealed)") {
             syncEditableState()
+            loadEditSidecar()
             await loadFullImage()
         }
         .onKeyPress(.leftArrow) { step(-1); return .handled }
@@ -182,7 +189,7 @@ struct AssetDetailView: View {
                     Label("Send to Generate", systemImage: "wand.and.stars")
                 }
             }
-            if let onEdit {
+            if let onEdit, asset.isEditableImage {
                 Button {
                     if case .local(let localPath) = source { onEdit(asset, localPath) }
                 } label: { Label("Edit", systemImage: "slider.horizontal.3") }
@@ -211,6 +218,14 @@ struct AssetDetailView: View {
         rating = asset.rating
         isFavorite = asset.favorite
         notes = ""
+    }
+
+    private func loadEditSidecar() {
+        if case .local(let localPath) = source {
+            editSidecar = EditSidecar.read(forImageAt: localPath)
+        } else {
+            editSidecar = nil
+        }
     }
 
     private func revealInFinder() {
@@ -345,12 +360,12 @@ struct AssetDetailView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            if case .local(let localPath) = source, let sc = EditSidecar.read(forImageAt: localPath) {
+            if let sc = editSidecar {
                 HStack(spacing: 6) {
                     Label("Edited from \(URL(fileURLWithPath: sc.sourcePath).lastPathComponent)", systemImage: "link")
                         .font(.caption).foregroundStyle(.secondary)
                     if let onSelectSource {
-                        Button("Show") { onSelectSource(sc.sourcePath) }.controlSize(.mini)
+                        Button("Show") { onSelectSource(sc.sourcePath, sc.sourceAssetId) }.controlSize(.mini)
                     }
                 }
             }
