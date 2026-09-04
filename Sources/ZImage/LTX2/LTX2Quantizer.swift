@@ -210,79 +210,107 @@ public enum LTX2Quantizer {
     return converted
   }
 
-  /// Sidecar suffixes recognised for FOREIGN (non-`LTX2Quantizer`) int8
-  /// exports — comfybox#256. PinkCherry v1.7's int8 checkpoint stores raw
-  /// (unpacked) `int8` `.weight` tensors plus an `F32 .weight_scale`
-  /// sidecar (torch-style, symmetric, per-output-channel — see
-  /// docs/HANDOFF-ltx-quality-2026-08-02.md §5). That is a different scheme
-  /// from `LTX2Quantizer`'s own MLX affine group-wise `.scales`/`.biases`
-  /// packed-uint32 output, and `applyQuantizedLayout` (which only looks for
-  /// `.scales`) does not recognise it. `.scale_weight`/`.absmax` are
-  /// accepted as aliases in case a differently-named export shows up;
-  /// `.weight_scale` is the confirmed PinkCherry v1.7 name.
-  static let foreignScaleSuffixes = [".weight_scale", ".scale_weight", ".absmax"]
+  /// Checkpoints carrying `int8`-dtype weight tensors that are NOT
+  /// `LTX2Quantizer`'s own MLX affine group-wise output (packed `uint32` +
+  /// `.scales`/`.biases`, never `int8`) use some other quantization scheme
+  /// ComfyBox does not implement. comfybox#256's first pass wrongly assumed
+  /// PinkCherry v1.7 was plain per-channel `int8 × scale` (an `F32
+  /// .weight_scale` sidecar IS present and correctly named — see
+  /// docs/HANDOFF-ltx-quality-2026-08-02.md §5) and dequantized it that way.
+  /// A follow-up review that opened the real checkpoint found 1,344
+  /// `.comfy_quant` sidecar records declaring ComfyUI's `int8_tensorwise`
+  /// format with `convrot: true`, `convrot_groupsize: 256` — a rotated
+  /// coordinate basis (see `comfy/ops.py` around `QUANT_ALGOS`/`convrot` in
+  /// a ComfyUI checkout). Plain `int8 × scale` reconstruction against that
+  /// format measured cosine similarity ~0.008 against the matching bf16
+  /// checkpoint — nowhere close to correct. ConvRot-aware dequantization is
+  /// a real feature (tracked as a #256 follow-up), not a plain scale
+  /// multiply, so this refuses to load ANY unrecognised int8 layout loudly
+  /// instead of guessing.
+  public enum UnsupportedInt8FormatError: Error, LocalizedError, Equatable {
+    /// `key`'s `.comfy_quant` sidecar names a ComfyUI quantization format
+    /// (`format`, e.g. "int8_tensorwise") this loader does not implement.
+    /// `convrot`/`groupSize` are parsed from the record when present.
+    case comfyQuantFormat(key: String, format: String, convrot: Bool, groupSize: Int)
+    /// `key` is `int8` with a `.weight_scale` sidecar but no `.comfy_quant`
+    /// record to identify which quantization scheme produced it — refused
+    /// rather than assumed to be a plain per-channel scale (comfybox#256's
+    /// mistake).
+    case unidentifiedWeightScaleSidecar(key: String, sidecarKey: String)
+    /// `key` is `int8` and ends in `.weight` but carries neither a
+    /// `.comfy_quant` record nor a `.weight_scale` sidecar — no known
+    /// layout applies at all.
+    case noRecognisedSidecar(key: String)
+    /// `key` is `int8` but isn't a `.weight` tensor (no sidecar naming
+    /// convention applies to a role that isn't a weight matrix — e.g. a
+    /// codebook, packed bias, or other quantization-scheme-specific
+    /// tensor).
+    case unsupportedInt8TensorRole(key: String)
 
-  public enum ForeignQuantError: Error, LocalizedError, Equatable {
-    /// An `int8` tensor was found with none of `foreignScaleSuffixes`
-    /// present as a sibling (and it isn't `LTX2Quantizer`'s own packed
-    /// `uint32` format, which is never `int8`). Loading it as-is would
-    /// silently feed raw quantized bytes into a float weight parameter —
-    /// the exact bug behind comfybox#256 (uniform noise output). Refuse
-    /// instead of guessing.
-    case missingScaleSidecar(String)
+    private static let seeIssue = "ComfyBox supports MLX affine int8 only (quantize-ltx2); see #256"
 
     public var errorDescription: String? {
       switch self {
-      case .missingScaleSidecar(let key):
-        let base = key.hasSuffix(".weight") ? String(key.dropLast(".weight".count)) : key
-        let tried = LTX2Quantizer.foreignScaleSuffixes.map { "'\(base)\($0)'" }.joined(separator: ", ")
-        return "LTX-2: '\(key)' is int8 with no recognised scale sidecar (looked for \(tried)) "
-          + "— refusing to load raw int8 bytes as float weights, which renders as noise. "
-          + "This checkpoint uses an unrecognised int8 export layout; if you know the real "
-          + "sidecar name, that is what needs adding here."
+      case .comfyQuantFormat(let key, let format, let convrot, let groupSize):
+        return "unsupported quantized checkpoint format at '\(key)': ComfyUI \(format) "
+          + "(convrot=\(convrot), group=\(groupSize)) — \(Self.seeIssue)"
+      case .unidentifiedWeightScaleSidecar(let key, let sidecarKey):
+        return "unsupported quantized checkpoint format at '\(key)': int8 weight with a "
+          + "'\(sidecarKey)' sidecar but no '.comfy_quant' record to identify the scheme — \(Self.seeIssue)"
+      case .noRecognisedSidecar(let key):
+        return "unsupported quantized checkpoint format at '\(key)': int8 weight with no "
+          + "'.comfy_quant' or '.weight_scale' sidecar of any kind — \(Self.seeIssue)"
+      case .unsupportedInt8TensorRole(let key):
+        return "unsupported quantized checkpoint format: '\(key)' is an int8 tensor that is not "
+          + "a '.weight' (no known sidecar convention applies to this role) — \(Self.seeIssue)"
       }
     }
   }
 
-  /// Detects and dequantizes a FOREIGN int8 checkpoint layout (comfybox#256)
-  /// — e.g. PinkCherry v1.7: raw `int8` `.weight` + `F32 .weight_scale`,
-  /// symmetric per-output-channel (scale shape `[out, 1]` or `[out]`,
-  /// broadcasting over the input dimension) — into plain dense `bfloat16`
-  /// tensors. Per-channel granularity (one scale per output row) isn't
-  /// representable in MLX's group-wise affine packed form without
-  /// re-deriving group boundaries that were never part of this export, so
-  /// this dequantizes to dense float rather than repacking into
-  /// `QuantizedLinear`; the resulting Linear layers are functionally
-  /// identical to loading an un-quantized bf16 checkpoint. Any `int8`
-  /// tensor with no recognised sidecar throws `.missingScaleSidecar` naming
-  /// the exact key, rather than silently loading raw bytes as float
-  /// (the root cause of the noise bug). Non-`int8` tensors pass through
-  /// unchanged. `LTX2Quantizer`'s own output (packed `uint32` + `.scales`)
-  /// never has `int8`-dtype `.weight` tensors, so it is untouched by this
-  /// function and continues through `applyQuantizedLayout` as before.
-  public static func dequantizeForeignInt8Weights(
-    _ weights: [String: MLXArray]
-  ) throws -> [String: MLXArray] {
-    var out = weights
+  /// Parses a ComfyUI `.comfy_quant` sidecar — stored as a `uint8` tensor
+  /// holding the raw UTF-8 bytes of a JSON object (`comfy/ops.py`:
+  /// `torch.tensor(list(json.dumps(quant_conf).encode("utf-8")),
+  /// dtype=torch.uint8)`) — into `(format, convrot, groupSize)`. Tolerant
+  /// of the `convrot`/`convrot_groupsize` keys living either at the top
+  /// level or nested under `"params"`; falls back to ComfyUI's own default
+  /// group size (256) and `convrot: false` if the record doesn't parse.
+  static func parseComfyQuantRecord(_ record: MLXArray) -> (format: String, convrot: Bool, groupSize: Int) {
+    MLX.eval(record)
+    let bytes = record.asType(.uint8).asArray(UInt8.self)
+    guard let json = try? JSONSerialization.jsonObject(with: Data(bytes)) as? [String: Any] else {
+      return ("unknown", false, 256)
+    }
+    let params = json["params"] as? [String: Any]
+    let format = (json["format"] as? String) ?? "unknown"
+    let convrot = (json["convrot"] as? Bool) ?? (params?["convrot"] as? Bool) ?? false
+    let groupSize = (json["convrot_groupsize"] as? Int) ?? (params?["convrot_groupsize"] as? Int) ?? 256
+    return (format, convrot, groupSize)
+  }
+
+  /// Fails loudly, before any weight is materialised, on any checkpoint
+  /// tensor whose layout this loader does not implement (comfybox#256).
+  /// `LTX2Quantizer`'s own output never has `int8`-dtype tensors (its
+  /// packed form is `uint32`), so this is a no-op for checkpoints produced
+  /// by `quantize-ltx2` — only foreign `int8` exports (ComfyUI's
+  /// ConvRot-rotated PinkCherry included) are rejected here.
+  public static func rejectUnsupportedInt8Weights(_ weights: [String: MLXArray]) throws {
     for key in weights.keys.sorted() {
       guard let tensor = weights[key], tensor.dtype == .int8 else { continue }
       guard key.hasSuffix(".weight") else {
-        throw ForeignQuantError.missingScaleSidecar(key)
+        throw UnsupportedInt8FormatError.unsupportedInt8TensorRole(key: key)
       }
       let base = String(key.dropLast(".weight".count))
-      guard let scaleKey = foreignScaleSuffixes.map({ base + $0 }).first(where: { weights[$0] != nil })
-      else {
-        throw ForeignQuantError.missingScaleSidecar(key)
+      if let record = weights["\(base).comfy_quant"] {
+        let (format, convrot, groupSize) = parseComfyQuantRecord(record)
+        throw UnsupportedInt8FormatError.comfyQuantFormat(
+          key: key, format: format, convrot: convrot, groupSize: groupSize)
       }
-      var scale = weights[scaleKey]!.asType(.float32)
-      if scale.ndim == 1 {
-        scale = scale.reshaped([scale.dim(0), 1])
+      let sidecarKey = "\(base).weight_scale"
+      if weights[sidecarKey] != nil {
+        throw UnsupportedInt8FormatError.unidentifiedWeightScaleSidecar(key: key, sidecarKey: sidecarKey)
       }
-      let dense = tensor.asType(.float32) * scale
-      out[key] = dense.asType(.bfloat16)
-      out.removeValue(forKey: scaleKey)
+      throw UnsupportedInt8FormatError.noRecognisedSidecar(key: key)
     }
-    return out
   }
 
   /// Dequantize one layer's packed weights back to a dense float tensor —

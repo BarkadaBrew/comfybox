@@ -481,21 +481,19 @@ public final class LTX2VideoGenerator {
                 "audio render requires a JoyAI-Echo monolithic checkpoint (audio branch tensors) — \(weightsURL.lastPathComponent) is per-component")
         }
 
-        // Foreign int8 checkpoints (comfybox#256): some exports (e.g.
-        // PinkCherry v1.7) carry raw int8 `.weight` tensors + an
-        // `F32 .weight_scale` sidecar rather than our own MLX affine
-        // `.scales`/`.biases` packed-uint32 layout, which
-        // `LTX2Quantizer.applyQuantizedLayout` below does not recognise.
-        // Left alone, those raw int8 bytes would load straight into float
-        // weight parameters and render as noise. Dequantize any such
-        // tensors to dense bf16 up front; any int8 tensor with no
-        // recognised sidecar fails loudly here instead.
-        do {
-            sanitized = try LTX2Quantizer.dequantizeForeignInt8Weights(sanitized)
-        } catch {
-            throw LTX2VideoError.weightsMissing(
-                "\(weightsURL.lastPathComponent): \(error.localizedDescription)")
-        }
+        // Unsupported int8 checkpoints (comfybox#256): some exports (e.g.
+        // PinkCherry v1.7) carry `int8`-dtype `.weight` tensors in a scheme
+        // `LTX2Quantizer`'s own MLX affine `.scales`/`.biases` packed-uint32
+        // format (and `applyQuantizedLayout`, which only recognises that
+        // format) does not implement — PinkCherry specifically is ComfyUI's
+        // `int8_tensorwise` with `convrot: true` (a rotated coordinate
+        // basis; plain int8×scale reconstruction measured cosine similarity
+        // ~0.008 against the real weights — not implementable as a scale
+        // multiply). Left unchecked, those raw int8 bytes would load
+        // straight into float weight parameters and render as noise. Fail
+        // loudly here, before any weight is touched, naming the exact
+        // unsupported format/tensor rather than silently producing noise.
+        try LTX2Quantizer.rejectUnsupportedInt8Weights(sanitized)
 
         // Merge each LoRA into the base weights in order (skip audio branches),
         // as the CLI does — multiple LoRAs simply accumulate their deltas.
