@@ -49,8 +49,11 @@ struct GalleryView: View {
     var onAnimate: ((DAMAsset) -> Void)?
     /// Send an image to the Inpaint tab.
     var onInpaint: ((DAMAsset) -> Void)?
-    /// Open an image in the Edit tab.
-    var onEdit: ((DAMAsset) -> Void)?
+    /// Open an image in the Edit tab. Called with the asset and the LOCAL path
+    /// `mediaLocation(for:)` resolved for it — never the raw `absolutePath`,
+    /// which can differ from where the catalog actually found the file on
+    /// this Mac (see `AssetMediaSource`'s header comment).
+    var onEdit: ((DAMAsset, String) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
@@ -319,9 +322,7 @@ struct GalleryView: View {
                 onSendToGenerate: onSendToGenerate,
                 onEdit: onEdit,
                 onSelectSource: { path in
-                    if let match = filteredAssets.first(where: { $0.absolutePath == path }) {
-                        selectedAsset = match
-                    }
+                    if let match = assetWithLocalPath(path) { selectedAsset = match }
                 }
             )
             .frame(minWidth: 800, minHeight: 500)
@@ -938,8 +939,8 @@ struct GalleryView: View {
                         if onAnimate != nil {
                             Button("Send to Motion (I2V)") { onAnimate?(asset) }
                         }
-                        if onEdit != nil {
-                            Button("Edit") { onEdit?(asset) }
+                        if let onEdit, case .local(let localPath) = mediaSource(for: asset) {
+                            Button("Edit") { onEdit(asset, localPath) }
                         }
                         if onInpaint != nil {
                             Button("Inpaint") { onInpaint?(asset) }
@@ -1074,6 +1075,29 @@ struct GalleryView: View {
         AssetMediaLocation(
             localPath: browser?.localPath(forID: asset.id) ?? asset.absolutePath,
             remoteURL: remoteURLs[asset.id])
+    }
+
+    /// `mediaLocation(for:)` resolved to the gate/disk/server answer — the
+    /// same decision `AssetDetailView.source` makes from the location this
+    /// view hands it, so Edit's local/remote gating never disagrees with the
+    /// detail pane's.
+    private func mediaSource(for asset: DAMAsset) -> AssetMediaSource {
+        AssetMediaSource.resolve(mediaLocation(for: asset), gateRevealed: contentGate.revealed)
+    }
+
+    /// The asset (among the ones currently filtered) whose RESOLVED local
+    /// path matches `path` — used by the detail pane's "Edited from → Show"
+    /// link, which hands back the sidecar's recorded source path, not any
+    /// particular asset's `absolutePath`.
+    private func assetWithLocalPath(_ path: String) -> DAMAsset? {
+        let target = (path as NSString).standardizingPath
+        for asset in filteredAssets {
+            if case .local(let localPath) = mediaSource(for: asset),
+               (localPath as NSString).standardizingPath == target {
+                return asset
+            }
+        }
+        return nil
     }
 
     /// Download a row whose bytes are on a server into the local output folder

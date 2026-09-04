@@ -33,8 +33,10 @@ struct AssetDetailView: View {
     var onFullScreen: ((DAMAsset) -> Void)?
     /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
     var onSendToGenerate: ((DAMAsset) -> Void)?
-    /// Open this asset in the Edit tab.
-    var onEdit: ((DAMAsset) -> Void)?
+    /// Open this asset in the Edit tab. Called with the asset and the LOCAL
+    /// path `source` resolved for it (only ever invoked when `source` is
+    /// `.local`, since the button is disabled otherwise) — never `asset.absolutePath`.
+    var onEdit: ((DAMAsset, String) -> Void)?
     /// Select the asset at the given path (used by the "Edited from" source link).
     var onSelectSource: ((String) -> Void)?
 
@@ -55,14 +57,20 @@ struct AssetDetailView: View {
     @Environment(AppContentGate.self) private var contentGate
 
     /// Single-asset convenience (no navigation).
-    init(asset: DAMAsset, thumbnailPath: String?, onUpdate: @escaping (DAMAsset) -> Void) {
+    init(
+        asset: DAMAsset,
+        thumbnailPath: String?,
+        onUpdate: @escaping (DAMAsset) -> Void,
+        onEdit: ((DAMAsset, String) -> Void)? = nil,
+        onSelectSource: ((String) -> Void)? = nil
+    ) {
         self.assets = [asset]
         self.thumbnailProvider = { _ in thumbnailPath }
         self.onUpdate = onUpdate
         self.onFullScreen = nil
         self.onSendToGenerate = nil
-        self.onEdit = nil
-        self.onSelectSource = nil
+        self.onEdit = onEdit
+        self.onSelectSource = onSelectSource
         self._currentIndex = State(initialValue: 0)
     }
 
@@ -77,7 +85,7 @@ struct AssetDetailView: View {
         onUpdate: @escaping (DAMAsset) -> Void,
         onFullScreen: ((DAMAsset) -> Void)? = nil,
         onSendToGenerate: ((DAMAsset) -> Void)? = nil,
-        onEdit: ((DAMAsset) -> Void)? = nil,
+        onEdit: ((DAMAsset, String) -> Void)? = nil,
         onSelectSource: ((String) -> Void)? = nil
     ) {
         self.assets = assets
@@ -175,7 +183,9 @@ struct AssetDetailView: View {
                 }
             }
             if let onEdit {
-                Button { onEdit(asset) } label: { Label("Edit", systemImage: "slider.horizontal.3") }
+                Button {
+                    if case .local(let localPath) = source { onEdit(asset, localPath) }
+                } label: { Label("Edit", systemImage: "slider.horizontal.3") }
                     .disabled(localOnlyReason != nil)
                     .help(localOnlyReason ?? "Open in the Edit tab")
             }
@@ -335,7 +345,7 @@ struct AssetDetailView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            if let sc = EditSidecar.read(forImageAt: asset.absolutePath) {
+            if case .local(let localPath) = source, let sc = EditSidecar.read(forImageAt: localPath) {
                 HStack(spacing: 6) {
                     Label("Edited from \(URL(fileURLWithPath: sc.sourcePath).lastPathComponent)", systemImage: "link")
                         .font(.caption).foregroundStyle(.secondary)

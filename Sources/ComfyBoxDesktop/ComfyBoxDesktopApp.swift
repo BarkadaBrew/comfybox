@@ -466,8 +466,8 @@ struct ComfyBoxDesktopApp: App {
                     pendingInpaintImage = asset.absolutePath
                     selectedTab = .inpaint
                 },
-                onEdit: { asset in
-                    pendingEdit = EditRequest(path: asset.absolutePath, asset: asset)
+                onEdit: { asset, localPath in
+                    pendingEdit = EditRequest(path: localPath, asset: asset)
                     selectedTab = .edit
                 },
                 canvasStore: canvasStore,
