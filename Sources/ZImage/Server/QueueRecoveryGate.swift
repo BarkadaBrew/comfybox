@@ -359,3 +359,45 @@ enum ModelSwitchGate {
     !isNoOpSwitch && QueueRecoveryGate.shouldReject(kind: .modelSwitch, recoveryInProgress: recoveryInProgress)
   }
 }
+
+// MARK: - 8) Admission-narrowing decision (review r4)
+
+/// Outcome of racing "the job became observably admitted" against "the
+/// enqueue Task itself already finished" (success or failure — an
+/// immediate `queueFull`/`shuttingDown` throw never appends the job at
+/// all, so waiting for admission alone would burn the FULL timeout for
+/// nothing every time recovery hits the capacity gate).
+enum AdmissionRaceOutcome: Equatable {
+  case admitted
+  case renderFinishedFirst
+  case timedOut
+}
+
+/// Whether `recoverPersistedQueue`'s loop should narrow the tail (drop this
+/// job from it, since `pending`/`active` now durably represents it instead)
+/// immediately after an admission race resolves. Only `.admitted` says yes.
+///
+/// r3's version narrowed unconditionally on ANY return from
+/// `waitUntilAdmitted`, including a timeout — but a render can legitimately
+/// block the coordinator actor's cooperative thread pool well past 5s (a
+/// DOCUMENTED, known risk in this codebase: see the "#300" note on
+/// `WarmServerCoordinator`), so a timeout does NOT mean the job failed to
+/// admit — it means we don't yet KNOW. Narrowing anyway would drop the job
+/// from the tail before the coordinator actually holds it durably,
+/// reopening the exact loss window this PR exists to close. `.timedOut`
+/// must leave the tail as-is; the caller's OWN next loop iteration narrows
+/// past this job safely once its `renderTask.value` has been awaited
+/// (proving it is truly done, success or failure, either way).
+///
+/// `.renderFinishedFirst` also must not narrow here: an immediate
+/// `queueFull`/`shuttingDown` throw never appended the job at all, so there
+/// is nothing to narrow past. (A render that both admits AND fully
+/// completes before the poll ever notices is vanishingly unlikely given the
+/// poll interval — but even then, not narrowing here is still SAFE: the job
+/// is done either way, and the next iteration's own narrow drops it
+/// correctly once `renderTask.value` has settled it.)
+enum AdmissionNarrowingPolicy {
+  static func shouldNarrowNow(_ outcome: AdmissionRaceOutcome) -> Bool {
+    outcome == .admitted
+  }
+}

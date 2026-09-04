@@ -562,6 +562,48 @@ final class ModelSwitchGateTests: XCTestCase {
   }
 }
 
+// MARK: - AdmissionNarrowingPolicy (review r4)
+
+/// The r4 regression: r3's `waitUntilAdmitted` narrowed the tail
+/// unconditionally on ANY return, including a timeout — but a render can
+/// legitimately block the coordinator actor's cooperative pool past 5s (a
+/// documented risk in this codebase), so a timeout does not mean the job
+/// failed to admit, only that admission was not YET observed. Narrowing
+/// then reopens the exact loss window this PR closes.
+final class AdmissionNarrowingPolicyTests: XCTestCase {
+
+  /// (a) admitted -> narrow.
+  func testAdmittedNarrowsNow() {
+    XCTAssertTrue(AdmissionNarrowingPolicy.shouldNarrowNow(.admitted))
+  }
+
+  /// (b) timeout -> no narrow — the actor may simply be busy; the job is
+  /// still fully protected by the (not-yet-narrowed) tail.
+  func testTimedOutDoesNotNarrow() {
+    XCTAssertFalse(AdmissionNarrowingPolicy.shouldNarrowNow(.timedOut))
+  }
+
+  /// (c) the enqueue Task finished before admission was ever observed
+  /// (typically an immediate queueFull/shuttingDown throw, which never
+  /// appends at all) -> no narrow, no wasted wait.
+  func testRenderFinishedFirstDoesNotNarrow() {
+    XCTAssertFalse(AdmissionNarrowingPolicy.shouldNarrowNow(.renderFinishedFirst))
+  }
+
+  /// Every outcome has an explicit ruling — a future case added to
+  /// `AdmissionRaceOutcome` without updating this policy fails loudly here
+  /// rather than silently defaulting to "narrow" (unsafe) or "never narrow"
+  /// (leaks the durability optimization, though still safe).
+  func testEveryOutcomeIsExplicitlyRuled() {
+    let expectedToNarrow: Set<AdmissionRaceOutcome> = [.admitted]
+    for outcome: AdmissionRaceOutcome in [.admitted, .timedOut, .renderFinishedFirst] {
+      XCTAssertEqual(
+        AdmissionNarrowingPolicy.shouldNarrowNow(outcome), expectedToNarrow.contains(outcome),
+        "\(outcome) ruling changed unexpectedly — update expectedToNarrow deliberately")
+    }
+  }
+}
+
 // MARK: - Route-wiring probe test (review r3, item 3)
 
 /// Review r2 item 7 asked for a route-wiring test "via the DEBUG coordinator
@@ -627,4 +669,22 @@ final class RouteWiringFeasibilityTests: XCTestCase {
     _ = await renderTask.value
     await probe.setPaused(false)
   }
+
+  // Note (review r4): a test attempting to reproduce the actual >5s
+  // admission delay live (two `enqueueSynthetic` ops, one blocking) was
+  // tried and removed — Swift actors are REENTRANT across `await` points
+  // (`processLoop` suspends at `await renderTask.value` while a synthetic
+  // op's own child Task sleeps, freeing the actor for a second call's fast,
+  // independent `pending.append`), so a single blocking op did not
+  // reproduce the delay: admission still landed in well under the polling
+  // window. The real "#300" risk this fix protects against is COOPERATIVE
+  // THREAD POOL width exhaustion under a genuine render's synchronous
+  // MLX/Metal work (measured in production: "2964/2972 samples parked in
+  // __psynch_cvwait" — see the `WarmServerCoordinator` "#300" doc comment),
+  // not actor reentrancy — and that specific exhaustion is not something a
+  // fast, deterministic unit test can safely reproduce without risking
+  // flakiness or starving the test runner itself. `AdmissionNarrowingPolicyTests`
+  // is the correct, complete coverage for the FIX itself: it locks in the
+  // right decision for all three possible race outcomes regardless of how
+  // often each occurs in practice.
 }

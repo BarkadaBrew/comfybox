@@ -422,9 +422,14 @@ public final class WarmServer {
         // in-memory state — never persisted (QueueRecoveryGate.swift) — so
         // an ACTUAL switch is still refused while a persisted-queue replay
         // is in flight, rather than risk a pool mutation a second restart
-        // could leave half-applied. The caller (`handlePrompt`) already
-        // logs-and-continues-with-current-model on any thrown error here,
-        // so this fails safe.
+        // could leave half-applied. #339 review r4, item 2 (comment fix):
+        // the caller (`handlePrompt`/`submitWorkflowGraph`) does NOT simply
+        // log-and-continue on this specific error — `ModelSwitchFailurePolicy`
+        // (review r2, item 1) recognizes `.queueRecoveryInProgress` and
+        // FAILS the prompt outright via `ComfyBridgeExecutor.failPrompt`,
+        // so a refused switch never silently renders on the wrong
+        // checkpoint. Log-and-continue remains the behavior for every
+        // OTHER model-switch failure.
         let switchRecovery = self.queueRecoveryState.snapshot()
         if ModelSwitchGate.shouldReject(isNoOpSwitch: isNoOpSwitch, recoveryInProgress: switchRecovery.inProgress) {
           throw WarmServerError.queueRecoveryInProgress(retryAfterSeconds:
@@ -5171,25 +5176,52 @@ public final class WarmServer {
     return data
   }
 
-  /// #339 review r3, item 1b: poll `liveHealth`'s published snapshot until
-  /// `jobId` is observably admitted — present as either the active job or
-  /// somewhere in `pending` — which happens the instant an `enqueueXxx`
-  /// call's synchronous append (`pending.append` + the `persistQueueState()`
-  /// that immediately follows it) runs, NOT when the render/swap itself
-  /// finishes. Bounded so a job that never gets appended at all (the queue
-  /// is full, or shutting down) can't spin forever — the caller narrows the
-  /// tail and awaits the underlying Task's result either way, so a timeout
-  /// here only means the tail narrows a few seconds later than ideal, never
-  /// that a job is lost (it is still fully protected by the tail the whole
-  /// time this is polling).
-  private func waitUntilAdmitted(jobId: String, timeout: TimeInterval = 5.0) async {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-      let (snapshot, _) = liveHealth.read()
-      if snapshot.activeJobId == jobId || snapshot.pending.contains(where: { $0.id == jobId }) {
-        return
+  /// #339 review r3, item 1b (corrected r4): races "the job becomes
+  /// observably admitted" — present as either the active job or somewhere
+  /// in `pending`, which happens the instant an `enqueueXxx` call's
+  /// synchronous append (`pending.append` + the `persistQueueState()` that
+  /// immediately follows it) runs — against "the enqueue Task itself
+  /// already finished" (an immediate `queueFull`/`shuttingDown` throw never
+  /// appends at all, so polling for admission alone would burn the whole
+  /// timeout every time recovery hits the capacity gate).
+  ///
+  /// r3's version narrowed the tail unconditionally after this call
+  /// returned, INCLUDING on a timeout — but the coordinator actor's
+  /// cooperative thread pool can legitimately be starved by an in-flight
+  /// render well past 5s (a documented, known risk in this codebase — see
+  /// the "#300" note on `WarmServerCoordinator`), so a timeout does not
+  /// mean the job failed to admit, only that admission was not YET
+  /// observed. The caller (`recoverPersistedQueue`) now uses the returned
+  /// `AdmissionRaceOutcome` via `AdmissionNarrowingPolicy` (pure, tested
+  /// directly) to decide whether narrowing now is safe — only `.admitted`
+  /// is. `.timedOut`/`.renderFinishedFirst` leave the tail as-is; the
+  /// caller's OWN next loop iteration narrows past this job safely once its
+  /// `renderTask.value` has been awaited (proving it is truly done, success
+  /// or failure, either way) — so the job is NEVER at risk of being dropped
+  /// from the tail before it is durably represented elsewhere.
+  private func waitForAdmissionOrCompletion<T>(
+    jobId: String, renderTask: Task<T, Error>, timeout: TimeInterval = 5.0
+  ) async -> AdmissionRaceOutcome {
+    let health = liveHealth
+    return await withTaskGroup(of: AdmissionRaceOutcome.self) { group in
+      group.addTask {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+          let (snapshot, _) = health.read()
+          if snapshot.activeJobId == jobId || snapshot.pending.contains(where: { $0.id == jobId }) {
+            return .admitted
+          }
+          try? await Task.sleep(nanoseconds: 2_000_000)  // 2ms — cheap; keeps the duplicate window tiny
+        }
+        return .timedOut
       }
-      try? await Task.sleep(nanoseconds: 2_000_000)  // 2ms — cheap; keeps the duplicate window tiny
+      group.addTask {
+        _ = try? await renderTask.value
+        return .renderFinishedFirst
+      }
+      let outcome = await group.next() ?? .timedOut
+      group.cancelAll()
+      return outcome
     }
   }
 
@@ -5270,18 +5302,23 @@ public final class WarmServer {
           switch job.kind {
           case QueueJobKind.generate.rawValue:
             let payload = try decodedGeneratePayload(from: job.rawBody)
-            // #339 review r3, item 1b: run the render in a detached child
-            // Task and await only ADMISSION (observable within a couple
-            // milliseconds — see `waitUntilAdmitted`), not full completion,
-            // before narrowing the tail. r2's version awaited
-            // `enqueueGenerate` directly, which only returns once the
-            // render COMPLETES — so the tail (still listing this job) and
-            // the admitted state (also listing it, as `active`) both
-            // carried it for the render's ENTIRE duration, a duplicate that
-            // could compound across further crashes during that window.
+            // #339 review r3, item 1b (corrected r4): run the render in a
+            // detached child Task and race admission against the Task's
+            // own completion (`waitForAdmissionOrCompletion`) instead of
+            // awaiting `enqueueGenerate` directly — which only returns once
+            // the render COMPLETES, so r2's version left the tail (still
+            // listing this job) and the admitted state (also listing it, as
+            // `active`) both carrying it for the render's ENTIRE duration.
+            // Only narrow when admission was actually OBSERVED
+            // (`AdmissionNarrowingPolicy`, pure, tested directly) — r3's
+            // version narrowed even on a timeout, which can drop the job
+            // from the tail before the coordinator actually holds it if a
+            // render blocks the actor's cooperative pool past 5s (#300).
             let renderTask = Task { try await self.coordinator.enqueueGenerate(payload, source: job.source, rawBody: job.rawBody, jobId: job.id) }
-            await waitUntilAdmitted(jobId: job.id)
-            await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            let outcome = await waitForAdmissionOrCompletion(jobId: job.id, renderTask: renderTask)
+            if AdmissionNarrowingPolicy.shouldNarrowNow(outcome) {
+              await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            }
             // AC-18: replay under the job's OWN id (the client-visible one for
             // an async job), so a second restart persists the same name.
             _ = try await renderTask.value
@@ -5290,10 +5327,12 @@ public final class WarmServer {
             let payload = stageNearlineLoras(in: try decode(LoRASwapPayload.self, from: job.rawBody))
             // Same admit-then-narrow fix as generate above. `jobId: job.id`
             // (new — `enqueueSwap` had no way to name a job before r3) is
-            // what makes this job observable to `waitUntilAdmitted` at all.
+            // what makes this job observable to `waitForAdmissionOrCompletion` at all.
             let swapTask = Task { try await self.coordinator.enqueueSwap(payload, rawBody: job.rawBody, jobId: job.id) }
-            await waitUntilAdmitted(jobId: job.id)
-            await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            let swapOutcome = await waitForAdmissionOrCompletion(jobId: job.id, renderTask: swapTask)
+            if AdmissionNarrowingPolicy.shouldNarrowNow(swapOutcome) {
+              await coordinator.setRecoveryUnadmittedTail(Array(jobs[jobs.index(after: index)...]))
+            }
             _ = try await swapTask.value
             logger.info("Queue recovery: completed lora_swap job \(job.id)")
           default:
@@ -5304,7 +5343,12 @@ public final class WarmServer {
           // FAILED with the reason on its own id (GET /v1/generate/status/{id})
           // and in the audit log — never rendered, never silently dropped.
           logger.error("Queue recovery: job \(job.id) (\(job.kind)) failed — \(error.localizedDescription)")
-          if job.kind == QueueJobKind.generate.rawValue {
+          // #339 review r4, item 3: a failed lora_swap replay is recorded
+          // here too, not just generate — there is no dedicated swap-job
+          // tracker, but `imageJobTracker` is keyed by id, not by kind, so
+          // `GET /v1/generate/status/{id}` still surfaces the failure
+          // reason instead of a bare 404 for a swap job's own id.
+          if job.kind == QueueJobKind.generate.rawValue || job.kind == QueueJobKind.loraSwap.rawValue {
             imageJobTracker.recordFailedReplay(jobId: job.id, source: job.source, error: error)
           }
           auditLog.append(
