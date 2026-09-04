@@ -2910,6 +2910,12 @@ public final class WarmServer {
     /// single-pass explore can be promoted to a two-pass keeper without
     /// re-rolling the seed.
     let tuning: LTX2VideoTuning?
+    /// comfybox#305 (review r1, item 3): same top-level convenience alias
+    /// the generate routes accept (comfybox#307/#355) — `LTX2VideoTuning.
+    /// merging` folds this into `tuning.two_stage` before it reaches
+    /// `VideoWinnerActions.rerenderBody`, so callers can promote a winner to
+    /// two-pass without knowing about the nested `tuning` shape.
+    let twoPass: Bool?
   }
 
   private struct VideoExtendBody: Decodable {
@@ -2965,9 +2971,16 @@ public final class WarmServer {
   }
 
   private func videoRerenderResponse(body: Data) async -> RoutedResponse {
-    guard let req = try? decode(VideoRerenderBody.self, from: body),
-      req.renderId != nil || req.path != nil
-    else {
+    // comfybox#305 (review r1, item 2): `try?` here swallowed a malformed
+    // `tuning` block behind the misleading "Body must include render_id or
+    // path" 400 — decode for real and name the actual parse failure.
+    let req: VideoRerenderBody
+    do {
+      req = try decode(VideoRerenderBody.self, from: body)
+    } catch {
+      return .error(response(for: error))
+    }
+    guard req.renderId != nil || req.path != nil else {
       return .error(.error(status: 400, message: "Body must include 'render_id' or 'path'"))
     }
     let resolution = req.resolution ?? "720p"
@@ -2990,7 +3003,11 @@ public final class WarmServer {
         effectivePrompt: trace.submitted["prompt"],
         resolution: resolution,
         initImagePath: trace.submitted["image_path"],
-        tuningOverride: req.tuning)
+        // comfybox#305 (review r1, item 3): fold the top-level `two_pass`
+        // convenience alias into `tuning.two_stage` — the same merge the
+        // generate routes apply (comfybox#307/#355) — so a rerender caller
+        // doesn't need to know the nested `tuning` shape either.
+        tuningOverride: LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass))
       if let routed = await localVideoAsyncResponseIfConfigured(body: newBody) {
         // #339 review r1, item 6: `routed` can now be a 503 (queue recovery
         // gate) — don't log a "submitted" message for a request that was
