@@ -565,6 +565,14 @@ public final class GalleryArchiver {
         watchDirectory: String,
         request: RestoreRequest
     ) async throws -> RestoreOutcome? {
+        // Validated once, up front, for both destination-path builders below
+        // (this comparison-only `destPathCandidate` and
+        // `resolveDestinationPath`'s copy target) — `entry.filename` is
+        // manifest-supplied and, unlike `relativePath`, is joined onto a
+        // *live* directory rather than the bundle root, so it needs its own
+        // guard rather than `ArchivePaths.resolveEntryPath`. See #264.
+        try ArchivePaths.validateFilename(entry.filename)
+
         let destDir = Self.destinationDirectory(
             for: entry, watchDirectory: watchDirectory, useOriginal: request.restoreToOriginalLocations
         )
