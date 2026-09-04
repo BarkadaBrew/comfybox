@@ -132,4 +132,24 @@ struct EditExporterTests {
         #expect(EditExportError.renderFailed.localizedDescription.isEmpty == false)
         #expect(EditExportError.writeFailed("disk full").localizedDescription.contains("disk full"))
     }
+
+    // MARK: - Fix round 2
+
+    @Test("cleanupReserved throws a message naming the path when removal fails")
+    func cleanupReservedReportsFailure() throws {
+        let dir = tempDir()
+        // No such file, and its parent directory doesn't exist either, so
+        // `FileManager.removeItem` is guaranteed to fail regardless of
+        // process privilege (unlike a permission-bit test, which root can
+        // bypass).
+        let path = dir + "/missing-parent/reserved.png"
+        var thrown: Error?
+        do {
+            try EditExporter.cleanupReserved(path)
+        } catch {
+            thrown = error
+        }
+        #expect(thrown != nil)
+        #expect(thrown?.localizedDescription.contains(path) == true)
+    }
 }

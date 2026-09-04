@@ -103,6 +103,21 @@ public enum EditExporter {
         throw EditExportError.writeFailed("could not find a free edit- output path in \(directory) after 100 attempts")
     }
 
+    /// Removes a reserved-but-unused output file — e.g. the empty file
+    /// `reserveOutputPath` left behind when the render meant to fill it
+    /// fails. Throws with the path folded into the message (rather than
+    /// relying on the underlying `FileManager` error's own wording, or
+    /// swallowing the failure) so a genuine cleanup failure is reported and
+    /// always identifies which file survived on disk. Internal, not
+    /// private, so tests can exercise it directly via `@testable import`.
+    static func cleanupReserved(_ path: String) throws {
+        do {
+            try FileManager.default.removeItem(atPath: path)
+        } catch {
+            throw EditExportError.writeFailed("could not remove reserved \(path): \(error.localizedDescription)")
+        }
+    }
+
     public static func export(sourceImage: CGImage, sourcePath: String, sourceAsset: DAMAsset?,
                               recipe: EditRecipe, subjectMask: CIImage?,
                               outputDirectory: String, ingestor: AssetIngestor?) async throws -> String {
@@ -115,7 +130,7 @@ public enum EditExporter {
 
         func cleanupReservedPng(appendingTo message: String) -> String {
             do {
-                try FileManager.default.removeItem(atPath: pngPath)
+                try Self.cleanupReserved(pngPath)
                 return message
             } catch {
                 return message + "; failed to remove \(pngPath): \(error.localizedDescription)"
@@ -126,7 +141,14 @@ public enum EditExporter {
                                           .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
         let output = EditRenderer.render(source: CIImage(cgImage: sourceImage), recipe: recipe, subjectMask: subjectMask)
         guard let cg = context.createCGImage(output, from: output.extent) else {
-            _ = cleanupReservedPng(appendingTo: "")
+            // Unlike the other failure points below, a render failure has no
+            // natural message to append cleanup detail to — report the
+            // cleanup outcome directly instead of discarding it.
+            do {
+                try Self.cleanupReserved(pngPath)
+            } catch {
+                throw EditExportError.writeFailed("render failed and could not remove reserved \(pngPath): \(error)")
+            }
             throw EditExportError.renderFailed
         }
 
