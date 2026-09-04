@@ -157,6 +157,21 @@ public struct LTX2VideoResult: Sendable {
     public let frameCount: Int
     public let durationSeconds: Float
     public let elapsedSeconds: Double
+    /// comfybox#307: why the two-stage refine did not run, when `two_stage`
+    /// was requested for this render — nil when it ran, wasn't requested, or
+    /// (montage/storyboard assembly) doesn't apply. See `LTX2RefineGate`.
+    public let refineSkippedReason: String?
+
+    public init(
+        outputPath: String, frameCount: Int, durationSeconds: Float, elapsedSeconds: Double,
+        refineSkippedReason: String? = nil
+    ) {
+        self.outputPath = outputPath
+        self.frameCount = frameCount
+        self.durationSeconds = durationSeconds
+        self.elapsedSeconds = elapsedSeconds
+        self.refineSkippedReason = refineSkippedReason
+    }
 }
 
 /// #1479: what one generator-level render produced. The completed payload is
@@ -203,9 +218,47 @@ public final class LTX2RenderContext: LTX2ResumeContext {
     /// GPU time already spent on this render, across all segments — wall clock
     /// would otherwise bill the preemptor's runtime to this render.
     var accumulatedSeconds: Double = 0
+    /// comfybox#307 (review r1): why the two-stage refine did not run on some
+    /// chunk of THIS render, if any — carried on the context (not
+    /// `LTX2Pipeline.lastRefineSkipReason`) because a cold preemption resume
+    /// can rebuild the pipeline/generator from scratch (`VideoGeneratorHolder
+    /// .release()` deallocates them), which would otherwise silently drop a
+    /// skip reason recorded on an earlier chunk before the eviction. See
+    /// `LTX2VideoGenerator.render`.
+    var refineSkippedReason: String? = nil
 
     init(request: LTX2VideoRequest) {
         self.request = request
+    }
+
+    /// comfybox#307 (review r2, item 2c): the snapshot construction
+    /// `LTX2VideoGenerator.render`'s `checkpoint()` closure performs — pulled
+    /// out so a test can call the SAME code that actually produces a
+    /// checkpoint's context, not a hand re-implementation that could
+    /// silently diverge from it (e.g. a field added to the snapshot later
+    /// but never mirrored in a test's own copy). `elapsedThisSegment` is the
+    /// raw (possibly negative) wall-clock delta for the CURRENT segment only
+    /// — `ctx.accumulatedSeconds` from prior segments is added here, exactly
+    /// as the original inline code did.
+    static func checkpointSnapshot(
+        from ctx: LTX2RenderContext, chunk: Int, frames: [CGImage],
+        audio: MLXArray?, seedImage: MLXArray?, refineSkippedReason: String?,
+        elapsedThisSegment: Double
+    ) -> LTX2RenderContext {
+        let snapshot = LTX2RenderContext(request: ctx.request)
+        snapshot.chunkIndex = chunk
+        snapshot.frames = frames
+        snapshot.refineSkippedReason = refineSkippedReason
+        // Materialize on capture, same contract as LTX2ResumeState's own
+        // tensors — a cheap no-op when they are already evaluated, and the
+        // guarantee stops depending on what upstream call sites happen to do.
+        if let audio { eval(audio) }
+        snapshot.audioLatents = audio
+        let chained = chunk > 0 ? seedImage : nil
+        if let chained { eval(chained) }
+        snapshot.chunkSeedImage = chained
+        snapshot.accumulatedSeconds = ctx.accumulatedSeconds + max(0, elapsedThisSegment)
+        return snapshot
     }
 }
 #endif
@@ -1035,6 +1088,13 @@ public final class LTX2VideoGenerator {
         // pre-#1479 code took its `start`, so a normal render's reported
         // `elapsedSeconds` keeps its old meaning exactly.
         var segmentStart = CFAbsoluteTimeGetCurrent()
+        // comfybox#307 (review r1): seeded from the resumed context (nil on a
+        // fresh render), then kept in sync with `pipeline.lastRefineSkipReason`
+        // after every chunk that completes within THIS render() call (see the
+        // chunk loop below) and snapshotted onto every checkpoint — so a skip
+        // recorded before a preemption survives a cold resume even if the
+        // pipeline/generator that recorded it was deallocated in between.
+        var refineSkippedReason: String? = ctx.refineSkippedReason
         /// Close out this render segment and hand the checkpoint up with its
         /// own snapshot of the generator-level continuation.
         ///
@@ -1047,19 +1107,15 @@ public final class LTX2VideoGenerator {
             _ s: LTX2ResumeState, chunk: Int, frames: [CGImage],
             audio: MLXArray?, seedImage: MLXArray?
         ) -> LTX2RenderOutcome {
-            let snapshot = LTX2RenderContext(request: ctx.request)
-            snapshot.chunkIndex = chunk
-            snapshot.frames = frames
-            // Materialize on capture, same contract as LTX2ResumeState's own
-            // tensors — a cheap no-op when they are already evaluated, and the
-            // guarantee stops depending on what upstream call sites happen to do.
-            if let audio { eval(audio) }
-            snapshot.audioLatents = audio
-            let chained = chunk > 0 ? seedImage : nil
-            if let chained { eval(chained) }
-            snapshot.chunkSeedImage = chained
-            snapshot.accumulatedSeconds =
-                ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            // comfybox#307 (review r1 + r2 item 2c): the accumulated skip
+            // reason (captured from the enclosing `refineSkippedReason`
+            // local, kept in sync with `pipeline.lastRefineSkipReason` by
+            // the chunk loop) rides the snapshot via the SAME static builder
+            // a test calls directly — see `LTX2RenderContext.checkpointSnapshot`.
+            let snapshot = LTX2RenderContext.checkpointSnapshot(
+                from: ctx, chunk: chunk, frames: frames, audio: audio, seedImage: seedImage,
+                refineSkippedReason: refineSkippedReason,
+                elapsedThisSegment: CFAbsoluteTimeGetCurrent() - segmentStart)
             var stamped = s
             stamped.context = snapshot
             logger.info("LTX-2 #1479: yielded at chunk \(chunk), phase \(s.phase.rawValue), step \(s.stepIndex) (\(frames.count) frame(s) banked).")
@@ -1116,6 +1172,14 @@ public final class LTX2VideoGenerator {
         // increment; until then this resolves configFile > env > builtin.
         let typedConfig = LTX2ConfigResolver.resolveTyped(request: request.tuning, preset: request.presetTuning)
         pipeline.resolvedConfig = typedConfig
+        // comfybox#307 (review r1): unconditionally reset — `pipeline
+        // .lastRefineSkipReason` is now scoped to THIS render() invocation
+        // only (it may be a brand-new pipeline instance after an eviction, or
+        // the same instance carrying a stale value from an unrelated PRIOR
+        // render). Cross-invocation persistence (surviving a resume) is the
+        // `refineSkippedReason` local's job, seeded from `ctx` above and kept
+        // in sync with this property after every chunk below.
+        pipeline.lastRefineSkipReason = nil
         let resolved = typedConfig.params
         // Finding #18: two_stage was load-time only — a request could not turn
         // it on without a server restart. Lazy-load the upsampler on the first
@@ -1509,11 +1573,25 @@ public final class LTX2VideoGenerator {
             case .completed(let o):
                 output = o
             case .yielded(let s):
+                // comfybox#307 (review r1): sync before checkpointing — this
+                // chunk may have recorded a skip (the refine gate returns
+                // `.completed` internally before any later phase yields) that
+                // must ride the snapshot, not just live on `pipeline`.
+                // (review r3, minor 2) Sync site 1 of 2 — reads whatever
+                // `LTX2Pipeline.recordRefineSkip` last wrote to
+                // `lastRefineSkipReason`; see that function's doc comment.
+                refineSkippedReason = pipeline.lastRefineSkipReason ?? refineSkippedReason
                 // #1479: propagate. Frames banked by EARLIER chunks ride in the
                 // context; this chunk's own progress is in the checkpoint.
                 return checkpoint(s, chunk: chunk, frames: allFrames,
                                   audio: audioLatents, seedImage: currentImage)
             }
+            // comfybox#307 (review r1): this chunk finished cleanly — fold in
+            // whatever it recorded so the NEXT chunk's between-chunk
+            // checkpoint (above) and the final result (below) both see it.
+            // (review r3, minor 2) Sync site 2 of 2 — same read as above; see
+            // `LTX2Pipeline.recordRefineSkip`'s doc comment for both sites.
+            refineSkippedReason = pipeline.lastRefineSkipReason ?? refineSkippedReason
 
             telemetry?.begin(.postProcess)
             let chunkFrames = LTX2PostProcess.framesToImages(from: output.decoded, colorAnchor: pipeline.resolvedConfig.colorAnchor)
@@ -1674,7 +1752,13 @@ public final class LTX2VideoGenerator {
             durationSeconds: Float(allFrames.count) / Float(request.fps),
             // #1479: RENDER time, summed across segments — wall clock from a
             // single start would bill the preemptor's runtime to this render.
-            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            elapsedSeconds: ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart),
+            // comfybox#307 (review r1): the local, accumulated across every
+            // chunk (and any cold resume) this render() call processed — NOT
+            // `pipeline.lastRefineSkipReason`, which only ever reflects THIS
+            // invocation and would drop an earlier chunk's reason if a
+            // preemption rebuilt the pipeline in between.
+            refineSkippedReason: refineSkippedReason
         ))
         #else
         throw LTX2VideoError.unsupportedPlatform

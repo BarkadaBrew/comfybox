@@ -240,6 +240,10 @@ public struct VideoJobStatus: Codable, Sendable {
   /// has no such compatibility constraint, records `status: interrupted`.
   /// Absent (nil, omitted from JSON) on every other outcome.
   public let interrupted: Bool?
+  /// comfybox#307: non-nil only when `two_stage` was requested for this
+  /// render and the refine pass could not run (upsampler unavailable, or the
+  /// volume gate) — see `LTX2RefineGate`. nil on the cloud path.
+  public let refineSkipped: String?
 
   public init(
     jobId: String,
@@ -258,7 +262,8 @@ public struct VideoJobStatus: Codable, Sendable {
     progressPercent: Int? = nil,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
     frameCount: Int? = nil,
-    interrupted: Bool? = nil
+    interrupted: Bool? = nil,
+    refineSkipped: String? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -277,5 +282,6 @@ public struct VideoJobStatus: Codable, Sendable {
     self.resolvedConfig = resolvedConfig
     self.frameCount = frameCount
     self.interrupted = interrupted
+    self.refineSkipped = refineSkipped
   }
 }

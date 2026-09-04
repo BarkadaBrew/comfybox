@@ -1328,63 +1328,20 @@ public final class WarmServer {
       // requested_config + derived render_plan out. GET (below) stays as the
       // no-context readout.
       do {
-        struct EffectiveQuery: Decodable {
-          let width: Int?
-          let height: Int?
-          let frames: Int?
-          let duration: Float?
-          let fps: Int?
-          let tuning: LTX2VideoTuning?
-          let preset: String?
-        }
-        let q = (try? decode(EffectiveQuery.self, from: request.body)) ?? EffectiveQuery(
-          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil)
+        let q = (try? decode(EffectiveVideoConfigQuery.self, from: request.body)) ?? EffectiveVideoConfigQuery(
+          width: nil, height: nil, frames: nil, duration: nil, fps: nil, tuning: nil, preset: nil, twoPass: nil)
         let videoPreset: ImagePreset? = q.preset.flatMap { presetStore.get($0) }
+        let effectiveTuning = Self.effectiveVideoTuning(for: q)
         let resolvedTyped = LTX2ConfigResolver.resolveTyped(
-          request: q.tuning, preset: videoPreset?.videoTuning)
+          request: effectiveTuning, preset: videoPreset?.videoTuning)
 
         // Derived plan, mirroring prepareLocalVideo's math step by step —
         // including the config.videoDefaults layer (FDD §3.3, D3).
-        let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
-        var plan: [[String: String]] = []
-        var w = q.width ?? videoPreset?.width ?? videoConfigDefaults.width ?? 704
-        var h = q.height ?? videoPreset?.height ?? videoConfigDefaults.height ?? 448
-        let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
-        if snappedW != w || snappedH != h {
-          plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
-          w = snappedW; h = snappedH
-        }
-        if resolvedTyped.twoStage {
-          let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
-          if s1.halved {
-            plan.append(["step": "two_stage_halving",
-                         "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
-          } else {
-            plan.append(["step": "stage1_floor",
-                         "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
-          }
-        }
-        let fps = q.fps ?? 24
-        var framesPerChunk = q.frames ?? videoConfigDefaults.frames ?? 97
-        var extendSeconds = Self.extendSecondsFromDuration(q.duration, framesPerChunk: framesPerChunk, fps: fps)
-        if extendSeconds > 0 {
-          let targetFrames = Int((extendSeconds * Float(fps)).rounded())
-          if targetFrames <= 289 {
-            let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
-            framesPerChunk = max(framesPerChunk, singleFrames)
-            extendSeconds = 0
-            plan.append(["step": "single_pass_fold",
-                         "note": "\(q.duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
-          } else {
-            plan.append(["step": "chunked_continuation",
-                         "note": "\(q.duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
-          }
-        }
-        plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(fps)"])
-        if q.width == nil && q.height == nil {
-          plan.append(["step": "caveat",
-                       "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
-        }
+        let plan = Self.effectiveVideoRenderPlan(
+          width: q.width, height: q.height, frames: q.frames, duration: q.duration, fps: q.fps,
+          presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
+          videoConfigDefaults: ServerConfigStore.shared.videoDefaults(),
+          resolvedTwoStage: resolvedTyped.twoStage)
 
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -1885,6 +1842,28 @@ public final class WarmServer {
     return (try? data.write(to: URL(fileURLWithPath: path))) != nil ? path : nil
   }
 
+  /// Body for `POST /v1/video/config/effective` — a HYPOTHETICAL resolution
+  /// (Finding #16): request-shaped context in, `requested_config` +
+  /// `render_plan` out. Promoted out of the route case (was a locally-scoped
+  /// struct, untestable — comfybox#307 review r1, item 2) so a test can
+  /// decode a real wire body against it, the same way `LocalVideoRequest`
+  /// already is.
+  struct EffectiveVideoConfigQuery: Decodable {
+    let width: Int?
+    let height: Int?
+    let frames: Int?
+    let duration: Float?
+    let fps: Int?
+    let tuning: LTX2VideoTuning?
+    let preset: String?
+    /// comfybox#307 (review r1): this preflight must mirror the real
+    /// generate routes — a caller checking "will two_pass do what I expect"
+    /// via `two_pass` alone (no `tuning` block) previously got back the
+    /// env/preset/builtin answer, silently ignoring the very field it was
+    /// probing.
+    let twoPass: Bool?
+  }
+
   struct LocalVideoRequest: Decodable {
     let prompt: String
     let negativePrompt: String?
@@ -1925,6 +1904,15 @@ public final class WarmServer {
     let source: String?
     /// Tier A tuning overrides (snake_case JSON via decoder strategy).
     let tuning: LTX2VideoTuning?
+    /// comfybox#307: top-level convenience alias for `tuning.two_stage` — the
+    /// HQ two-pass quality tier, controllable per request/scheduler cycle
+    /// without a caller needing to know about the nested `tuning` object.
+    /// `true`/`false` sets the tier explicitly for this render; `null` (or
+    /// absent) defers to `tuning.two_stage`, then preset/configFile/env/
+    /// builtin — the existing resolution order (`LTX2ConfigResolver`) is
+    /// unchanged. When BOTH this and `tuning.two_stage` are set, the more
+    /// specific `tuning.two_stage` wins (see `LTX2VideoTuning.merging`).
+    let twoPass: Bool?
     /// Server-minted id from /v1/enhance binding this render to its
     /// optimization lineage (task #19, finding #6).
     let optimizationAttemptId: String?
@@ -2029,6 +2017,9 @@ public final class WarmServer {
     /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
     /// on this I2V request was dropped before reaching the generator.
     let beatScheduleIgnored: String?
+    /// comfybox#307: non-nil only when `two_stage` was requested and the
+    /// refine pass could not run — see `LTX2RefineGate`.
+    let refineSkipped: String?
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2320,6 +2311,148 @@ public final class WarmServer {
       contentMode: contentMode, mediaKind: mediaKind)
   }
 
+  /// comfybox#307 (review r1, item 3a): the ACTUAL wiring `prepareLocalVideo`
+  /// runs to fold the top-level `two_pass` convenience into `tuning` — pulled
+  /// out to a static func (mirrors `localVideoProgressPercent` above) so a
+  /// test can decode a real wire-format `LocalVideoRequest` and assert on
+  /// this exact call, not a re-implementation of it.
+  static func effectiveVideoTuning(for req: LocalVideoRequest) -> LTX2VideoTuning? {
+    LTX2VideoTuning.merging(req.tuning, twoPass: req.twoPass)
+  }
+
+  /// Same merge, for the `/v1/video/config/effective` preflight's query
+  /// shape (comfybox#307 review r1, item 2) — one merge rule, two wire
+  /// shapes that both carry it.
+  static func effectiveVideoTuning(for query: EffectiveVideoConfigQuery) -> LTX2VideoTuning? {
+    LTX2VideoTuning.merging(query.tuning, twoPass: query.twoPass)
+  }
+
+  /// comfybox#307 (review r1, item 2): the derived render plan for
+  /// `POST /v1/video/config/effective` — pulled out of the route case,
+  /// mirroring `prepareLocalVideo`'s dims/frames math step by step, so
+  /// `resolvedTwoStage` (which the route now feeds from the `two_pass`-merged
+  /// tuning, not just `tuning.two_stage`) driving the `two_stage_halving`
+  /// step is directly testable without a decoder or a live server.
+  static func effectiveVideoRenderPlan(
+    width: Int?, height: Int?, frames: Int?, duration: Float?, fps: Int?,
+    presetWidth: Int?, presetHeight: Int?,
+    videoConfigDefaults: VideoDefaultValues,
+    resolvedTwoStage: Bool
+  ) -> [[String: String]] {
+    var plan: [[String: String]] = []
+    var w = width ?? presetWidth ?? videoConfigDefaults.width ?? 704
+    var h = height ?? presetHeight ?? videoConfigDefaults.height ?? 448
+    let snappedW = Self.snapDim64(w), snappedH = Self.snapDim64(h)
+    if snappedW != w || snappedH != h {
+      plan.append(["step": "snap_64", "note": "\(w)x\(h) -> \(snappedW)x\(snappedH)"])
+      w = snappedW; h = snappedH
+    }
+    if resolvedTwoStage {
+      let s1 = Self.stageOneDims(finalWidth: w, finalHeight: h)
+      if s1.halved {
+        plan.append(["step": "two_stage_halving",
+                     "note": "request dims are FINAL; stage 1 paints \(s1.width)x\(s1.height), refine doubles back"])
+      } else {
+        plan.append(["step": "stage1_floor",
+                     "note": "final \(w)x\(h) too small to halve (floor 512x320) — single-scale render"])
+      }
+    }
+    let effectiveFps = fps ?? 24
+    var framesPerChunk = frames ?? videoConfigDefaults.frames ?? 97
+    var extendSeconds = Self.extendSecondsFromDuration(duration, framesPerChunk: framesPerChunk, fps: effectiveFps)
+    if extendSeconds > 0 {
+      let targetFrames = Int((extendSeconds * Float(effectiveFps)).rounded())
+      if targetFrames <= 289 {
+        let singleFrames = min(289, ((max(targetFrames, 9) - 2) / 8) * 8 + 9)
+        framesPerChunk = max(framesPerChunk, singleFrames)
+        extendSeconds = 0
+        plan.append(["step": "single_pass_fold",
+                     "note": "\(duration ?? 0)s folds into one \(framesPerChunk)f chunk (continuation chunks degenerate)"])
+      } else {
+        plan.append(["step": "chunked_continuation",
+                     "note": "\(duration ?? 0)s exceeds the 289f window — continuation chunks with identity anchor"])
+      }
+    }
+    plan.append(["step": "final", "note": "\(w)x\(h) @ \(framesPerChunk)f, fps \(effectiveFps)"])
+    if width == nil && height == nil {
+      plan.append(["step": "caveat",
+                   "note": "i2v aspect-matching to a source image is not simulated here (no image supplied)"])
+    }
+    return plan
+  }
+
+  /// comfybox#307 (review r2, item 2a; tightened review r3, minor 3): the
+  /// ACTUAL `LTX2VideoRequest` construction `prepareLocalVideo` runs —
+  /// pulled out verbatim (every argument expression unchanged) so a test
+  /// can call the SAME site production code calls and inspect the
+  /// resulting request's `.tuning`.
+  ///
+  /// `tuning:` is derived HERE, from `req`, via `effectiveVideoTuning(for:)`
+  /// — not accepted as a separate parameter — so there is no longer a
+  /// caller-supplied value that could silently diverge from the merge (a
+  /// one-line revert at the call site used to be able to pass `req.tuning`
+  /// instead of the merged value and no test would catch it; now there is
+  /// no such parameter to revert). `prepareLocalVideo` still computes its
+  /// OWN `effectiveTuning` local separately, for the dims-calc two-stage
+  /// check earlier in that function — a harmless duplicate call of the same
+  /// pure merge, not a second source of truth for what reaches the request.
+  ///
+  /// All other parameters are already-resolved values `prepareLocalVideo`
+  /// computes before this call — nothing here re-derives anything else.
+  static func buildLocalVideoRequest(
+    req: LocalVideoRequest, videoPreset: ImagePreset?,
+    effectivePrompt: String, effectiveInitImage: String?,
+    renderWidth: Int, renderHeight: Int,
+    foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
+    resolvedLoRAs: [LTX2LoRAReference], effectiveBeatSchedule: [BeatSegment]?,
+    resolvedOutput: String
+  ) -> LTX2VideoRequest {
+    LTX2VideoRequest(
+      prompt: effectivePrompt,
+      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
+      initImagePath: effectiveInitImage,
+      width: renderWidth,
+      height: renderHeight,
+      framesPerChunk: foldedFramesPerChunk,
+      steps: req.steps ?? videoPreset?.steps ?? 8,
+      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
+      strength: req.strength ?? 1.0,
+      imgCompression: req.imgCompression,
+      guidance: req.guidance,
+      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
+      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
+      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
+      // (289f, no crash). Single-chunk renders don't anchor (nothing to
+      // drift); callers can still pass 0 to disable.
+      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
+      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
+      // faces without the multi-keyframe gap-collapse. Enable explicitly via
+      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
+      // it unless the interval is set below the frame count. Only the pre-existing
+      // extended/chunked anchor stays on by default (unchanged behavior).
+      identityAnchorStrength: req.identityAnchorStrength
+        ?? (Self.isExtendedRender(
+              extendToSeconds: req.extendToSeconds, duration: req.duration,
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
+            ? 0.5
+            : ((effectiveInitImage != nil
+                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
+                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
+               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
+      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
+      extendToSeconds: foldedExtendSeconds,
+      fps: req.fps ?? 24,
+      loraPath: req.loraPath,
+      loraStrength: req.loraStrength ?? 1.0,
+      loras: resolvedLoRAs,
+      outputPath: resolvedOutput,
+      tuning: Self.effectiveVideoTuning(for: req),
+      presetTuning: videoPreset?.videoTuning,
+      audio: req.audio ?? false,
+      beatSchedule: effectiveBeatSchedule
+    )
+  }
+
   /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
   /// local LTX-2 isn't configured (caller falls through to Replicate); throws for
   /// a malformed request or invalid output path.
@@ -2328,6 +2461,11 @@ public final class WarmServer {
       return nil
     }
     let req = try decode(LocalVideoRequest.self, from: body)
+    // comfybox#307: fold the top-level `two_pass` convenience into `tuning`
+    // before anything downstream reads it — every existing consumer
+    // (dims math, `LTX2ConfigResolver.resolveTyped`, the trace snapshot) then
+    // sees one authoritative tuning block, unchanged otherwise.
+    let effectiveTuning = Self.effectiveVideoTuning(for: req)
 
     // Video presets — same PresetStore as images (mediaKind "video"). A
     // preset is a named bundle: LoRAs (bare filenames resolve through the
@@ -2459,7 +2597,7 @@ public final class WarmServer {
     // and matches all validated two-stage renders (stage 1 at 448x256 etc.).
     // Typed resolution honors request/preset tuning overrides (finding #18):
     // a request can enable two-stage without the plist knowing.
-    if LTX2ConfigResolver.resolveTyped(request: req.tuning, preset: videoPreset?.videoTuning).twoStage {
+    if LTX2ConfigResolver.resolveTyped(request: effectiveTuning, preset: videoPreset?.videoTuning).twoStage {
       let s1 = Self.stageOneDims(finalWidth: renderWidth, finalHeight: renderHeight)
       if s1.halved {
         logger.info(
@@ -2599,51 +2737,13 @@ public final class WarmServer {
       }
     }
 
-    let videoRequest = LTX2VideoRequest(
-      prompt: effectivePrompt,
-      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
-      initImagePath: effectiveInitImage,
-      width: renderWidth,
-      height: renderHeight,
-      framesPerChunk: foldedFramesPerChunk,
-      steps: req.steps ?? videoPreset?.steps ?? 8,
-      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
-      strength: req.strength ?? 1.0,
-      imgCompression: req.imgCompression,
-      guidance: req.guidance,
-      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
-      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
-      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
-      // (289f, no crash). Single-chunk renders don't anchor (nothing to
-      // drift); callers can still pass 0 to disable.
-      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
-      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
-      // faces without the multi-keyframe gap-collapse. Enable explicitly via
-      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
-      // it unless the interval is set below the frame count. Only the pre-existing
-      // extended/chunked anchor stays on by default (unchanged behavior).
-      identityAnchorStrength: req.identityAnchorStrength
-        ?? (Self.isExtendedRender(
-              extendToSeconds: req.extendToSeconds, duration: req.duration,
-              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
-            ? 0.5
-            : ((effectiveInitImage != nil
-                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
-                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
-               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
-      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
-      extendToSeconds: foldedExtendSeconds,
-      fps: req.fps ?? 24,
-      loraPath: req.loraPath,
-      loraStrength: req.loraStrength ?? 1.0,
-      loras: resolvedLoRAs,
-      outputPath: resolvedOutput
-,
-      tuning: req.tuning,
-      presetTuning: videoPreset?.videoTuning,
-      audio: req.audio ?? false,
-      beatSchedule: effectiveBeatSchedule
-    )
+    let videoRequest = Self.buildLocalVideoRequest(
+      req: req, videoPreset: videoPreset,
+      effectivePrompt: effectivePrompt, effectiveInitImage: effectiveInitImage,
+      renderWidth: renderWidth, renderHeight: renderHeight,
+      foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
+      resolvedLoRAs: resolvedLoRAs, effectiveBeatSchedule: effectiveBeatSchedule,
+      resolvedOutput: resolvedOutput)
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
 
@@ -2899,7 +2999,8 @@ public final class WarmServer {
         elapsedSeconds: result.elapsedSeconds,
         backend: "ltx2-local",
         enhancementSkipped: prep.enhancementSkippedReason,
-        beatScheduleIgnored: prep.beatScheduleIgnoredReason
+        beatScheduleIgnored: prep.beatScheduleIgnoredReason,
+        refineSkipped: result.refineSkippedReason
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
@@ -6157,6 +6258,9 @@ private final class LocalVideoJob: @unchecked Sendable {
   var interrupted = false
   /// Authoritative config snapshot, set at submit (finding #15).
   var resolvedConfig: [LTX2ResolvedParam]?
+  /// comfybox#307: set on success when `two_stage` was requested and the
+  /// refine could not run — see `LTX2RefineGate`.
+  var refineSkippedReason: String?
 
   init(id: String, source: String, mode: VideoMode) {
     self.id = id
@@ -6183,7 +6287,8 @@ private final class LocalVideoJob: @unchecked Sendable {
       progressPercent: progressPercent,
       resolvedConfig: resolvedConfig,
       frameCount: frameCount,
-      interrupted: interrupted ? true : nil
+      interrupted: interrupted ? true : nil,
+      refineSkipped: refineSkippedReason
     )
   }
 }
@@ -6336,16 +6441,22 @@ final class VideoJobTracker: @unchecked Sendable {
       job.durationMs = Int(result.elapsedSeconds * 1000)
       job.progressPercent = 100
       job.completedAt = Date()
+      job.refineSkippedReason = result.refineSkippedReason
     }
     lock.unlock()
+    var payload = [
+      "status": "succeeded",
+      "output_path": result.outputPath,
+      "frames": String(result.frameCount),
+      "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
+    ]
+    // comfybox#307: durable on the trace even after the job itself prunes —
+    // `RenderTraceStore` outlives `pruneCompleted`'s 1h job TTL.
+    if let reason = result.refineSkippedReason {
+      payload["refine_skipped"] = reason
+    }
     traceStore?.append(RenderTraceEvent(
-      renderId: jobId, event: .terminal, taskKind: .videoRender,
-      payload: [
-        "status": "succeeded",
-        "output_path": result.outputPath,
-        "frames": String(result.frameCount),
-        "elapsed_ms": String(Int(result.elapsedSeconds * 1000)),
-      ]))
+      renderId: jobId, event: .terminal, taskKind: .videoRender, payload: payload))
   }
 
   func markFailed(_ jobId: String, error: Error) {
@@ -6508,6 +6619,47 @@ private actor WarmServerCoordinator {
   /// published into /health as `last_recipe`. Set only from a completed
   /// render (a failed one writes no record), never from a request.
   private var lastRecipe: AppliedRecordSlot?
+
+  /// comfybox#308: apply one render's terminal outcome to the counters
+  /// `/health` and `/v1/queue` publish. The six image `run*Generate` methods
+  /// still hand-increment inline (unchanged, working, and out of scope here);
+  /// this is for paths — currently just `.localVideo` — that had no
+  /// equivalent at all.
+  private func recordRenderCompletion(_ event: RenderCompletionEvent) {
+    var counters = RenderHealthCounters(
+      successCount: successfulRenderCount, failedCount: failedRenderCount,
+      lastDurationMs: lastRenderDurationMs)
+    counters.apply(event)
+    successfulRenderCount = counters.successCount
+    failedRenderCount = counters.failedCount
+    lastRenderDurationMs = counters.lastDurationMs
+  }
+
+  /// comfybox#308 (review r2, item 2b): the ONE place all `.localVideo`
+  /// completion bookkeeping goes through — consolidates what were three
+  /// independent `recordRenderCompletion(...); lastError = ...` pairs (one
+  /// per exit point: success, thrown error, memory-admission refusal) so
+  /// there is exactly one function a `#if DEBUG` seam
+  /// (`WarmServerQueueProbe.finishLocalVideoTestSeam`) can drive to prove
+  /// the counters move for all three outcomes.
+  private func finishLocalVideo(_ outcome: LocalVideoCompletionOutcome, lastError message: String?) {
+    recordRenderCompletion(.forLocalVideoCompletion(outcome))
+    lastError = message
+  }
+
+  /// comfybox#308/#322 (review r3): the `.localVideo` case's generic
+  /// `catch` — shared by the production catch block and the `#if DEBUG`
+  /// seam (`testSeamHandleLocalVideoCatch`) so both run the exact same
+  /// classify-then-finish decision. `localVideoCatchOutcome(for:)` returns
+  /// nil for an operator interrupt (including a WRAPPED cancellation) —
+  /// `finishLocalVideo` is not called at all in that case, matching the
+  /// sibling `catch is CancellationError` branch, which never touches the
+  /// counters either.
+  private func handleLocalVideoCatch(_ error: Error) {
+    if let outcome = localVideoCatchOutcome(for: error) {
+      finishLocalVideo(outcome, lastError: error.localizedDescription)
+    }
+  }
 
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
@@ -7788,6 +7940,36 @@ private actor WarmServerCoordinator {
       startProcessingIfNeeded()
     }
   }
+
+  /// comfybox#308 (review r2, item 2b) test seam: drives `finishLocalVideo`
+  /// directly — bypassing the queue, the memory-admission gate (real system
+  /// probing + up to ~18s of drain sleeps, unsafe to run in a unit test) and
+  /// the GPU render — and returns the counters + lastError afterward. Proves
+  /// the SAME function all three real `.localVideo` exit points call moves
+  /// them correctly for each outcome; deleting the call at one of those exit
+  /// points removes that outcome from ever reaching `finishLocalVideo` in
+  /// production without changing what this seam proves about the function
+  /// itself, which is the most a private, weights/GPU-dependent actor can
+  /// offer without a live engine (see intent.md: unit tests only).
+  func testSeamFinishLocalVideo(
+    _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
+  ) -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    finishLocalVideo(outcome, lastError: message)
+    return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
+  }
+
+  /// comfybox#308/#322 (review r3) test seam: drives `handleLocalVideoCatch`
+  /// directly against a REAL coordinator — the exact function the
+  /// production `.localVideo` generic `catch` calls — so a test can prove a
+  /// WRAPPED cancellation (or any error `isRenderInterruption` recognises)
+  /// leaves the counters and `lastError` untouched, while a genuine error
+  /// still counts as a failed render.
+  func testSeamHandleLocalVideoCatch(
+    _ error: Error
+  ) -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    handleLocalVideoCatch(error)
+    return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
+  }
   #endif
 
   /// Publish the current health-relevant state into the lock-based
@@ -8299,8 +8481,12 @@ private actor WarmServerCoordinator {
           // documented SIGKILL condition this gate exists to prevent.
           let admission = await self.admitVideoForRender(wantsAudio: wantsAudio)
           guard admission.admitted else {
-            continuation.resume(throwing: WarmServerError.invalidRequest(
-              message: "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"))
+            let message = "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"
+            // comfybox#308: this job DID reach the front of the queue and DID
+            // fail to run — a real completion, not a queue-full rejection
+            // (those throw before ever dequeuing, same as the image path).
+            self.finishLocalVideo(.admissionRefused, lastError: message)
+            continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
             return
           }
           self.videoHolder.beginRender()
@@ -8332,6 +8518,12 @@ private actor WarmServerCoordinator {
               outcome = try await self.runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
             }
             if case .completed(let result) = outcome {
+              // comfybox#308: the `.localVideo` completion path never touched
+              // `/health`'s render counters — only the six image `run*Generate`
+              // methods did. Every video render (HQ two-pass included) was
+              // invisible to `render_count`/`last_render_duration_ms` no
+              // matter how many completed.
+              self.finishLocalVideo(.succeeded(elapsedSeconds: result.elapsedSeconds), lastError: nil)
               continuation.resume(returning: result)
             }
           } catch is CancellationError {
@@ -8339,10 +8531,21 @@ private actor WarmServerCoordinator {
             // the client sees why the render stopped instead of the opaque
             // "CancellationError()" Todd reported on the 2026-08-30 incident.
             // `VideoJobTracker.markFailed` recognises this case and reports
-            // the job interrupted rather than failed.
+            // the job interrupted rather than failed. Deliberately NOT routed
+            // through `recordRenderCompletion`/`failedRenderCount` — an
+            // operator interrupt is not a render failure (comfybox#322's own
+            // framing); there is no separate "interrupted" health counter.
             self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
             continuation.resume(throwing: WarmServerError.renderInterrupted)
           } catch {
+            // comfybox#308/#322 (review r3): a WRAPPED cancellation (e.g.
+            // ModelPoolError.loadFailed on a resume's model reload) lands
+            // here — `is CancellationError` above only matches the bare
+            // case. `handleLocalVideoCatch` re-classifies with the SAME
+            // `isRenderInterruption` check `VideoJobTracker.markFailed`
+            // uses on this same error, so an interrupt is never
+            // double-counted as a failed render.
+            self.handleLocalVideoCatch(error)
             continuation.resume(throwing: error)
           }
         }
@@ -11219,6 +11422,25 @@ func isRenderInterruption(_ error: Error) -> Bool {
   return false
 }
 
+/// comfybox#308/#322 (review r3): what the `.localVideo` case's generic
+/// `catch` should do with a caught error, as a pure decision. nil means "an
+/// operator interrupt — do not touch the health counters", using the SAME
+/// `isRenderInterruption` classification `VideoJobTracker.markFailed`
+/// already applies so the two never disagree about the same error.
+///
+/// This exists because the sibling `catch is CancellationError` branch (in
+/// `WarmServerCoordinator`'s process loop) only catches a BARE
+/// `CancellationError` thrown straight out of a pipeline loop — a WRAPPED
+/// one (e.g. `ModelPoolError.loadFailed("…", CancellationError())`, which a
+/// resume's model reload can throw) doesn't match `is CancellationError` and
+/// used to fall through to the generic catch, where it was counted as a
+/// failed render even though `VideoJobTracker.markFailed` (fed the same
+/// error via the continuation) correctly reported it as interrupted —
+/// `/health.failed_count` and the job status disagreed about the same event.
+func localVideoCatchOutcome(for error: Error) -> LocalVideoCompletionOutcome? {
+  isRenderInterruption(error) ? nil : .threw
+}
+
 #if DEBUG
 /// K-FIX-1 / Codex C2 test seam — drives the coordinator's FIFO directly.
 ///
@@ -11334,6 +11556,22 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// Occupy the loop with a synthetic op that BLOCKS its thread for `durationMs`.
   func enqueueSynthetic(durationMs: Int, id: String = UUID().uuidString) async throws -> Bool {
     try await coordinator.enqueueSynthetic(durationMs: durationMs, id: id)
+  }
+
+  /// comfybox#308 (review r2, item 2b): the `.localVideo` completion
+  /// bookkeeping seam — see `WarmServerCoordinator.testSeamFinishLocalVideo`.
+  func finishLocalVideo(
+    _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
+  ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    await coordinator.testSeamFinishLocalVideo(outcome, lastError: message)
+  }
+
+  /// comfybox#308/#322 (review r3): the `.localVideo` generic-catch seam —
+  /// see `WarmServerCoordinator.testSeamHandleLocalVideoCatch`.
+  func handleLocalVideoCatch(
+    _ error: Error
+  ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    await coordinator.testSeamHandleLocalVideoCatch(error)
   }
 
   /// The sync `/v1/queue/pause` path: authoritative lock-store write.
