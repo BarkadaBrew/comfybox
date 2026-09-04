@@ -22,6 +22,23 @@ public final class EditSession {
     /// on the correct root path *and* root asset id, rather than treating
     /// an already-resolved root as if it had no history of its own.
     public private(set) var openedPath: String
+    /// The path `export()` hands `EditExporter` as the new sidecar's lineage
+    /// anchor. Defaults to `openedPath`; `load()` overrides it (see `followLineage`)
+    /// when the real chain couldn't be followed and pixels were flattened instead.
+    private var exportSourcePath: String
+    /// Whether `EditExporter` should re-walk `exportSourcePath`'s own sidecar chain
+    /// to find the true root (the normal case), or trust `exportSourcePath` as the
+    /// lineage anchor AS-IS with no further walking.
+    ///
+    /// `load()`'s missing-root and malformed-chain fallbacks both edit FLATTENED
+    /// pixels (the derived file itself, not a resolved root) while leaving
+    /// `openedPath` pointing at that same derived file. If `export()` still asked
+    /// `EditExporter` to walk the chain from `openedPath` in that case, it would
+    /// re-discover the exact same missing/broken root and record it as the new
+    /// sidecar's source — even though the pixels just edited and rendered were the
+    /// flattened ones, not that root. Setting this false on those two fallbacks
+    /// makes the new sidecar point at what was actually edited.
+    private var followLineage = true
     public private(set) var sourceImage: CGImage?
     public private(set) var sourceAsset: DAMAsset?
     public var recipe = EditRecipe()
@@ -34,7 +51,15 @@ public final class EditSession {
     /// there is exactly one source of truth: `recipe` vs. `savedRecipe`.
     public var isDirty: Bool { recipe != savedRecipe }
     public private(set) var subjectMask: CIImage?
+    /// Vision's own detection outcome ("Finding subject…", "No subject found.",
+    /// "Vision failed: …"), set only by `requestSubjectMask()`. Kept separate from
+    /// `subjectMaskWarning` so a subsequent preview render — which recomputes the
+    /// "Remove Background is on but no subject mask is loaded" warning on every
+    /// frame — can never clobber "No subject found." before the user has seen it.
     public private(set) var subjectStatus: String?
+    /// "Remove Background is on but no subject mask is loaded" — recomputed by
+    /// every render (see `render(generation:)`), independent of `subjectStatus`.
+    public private(set) var subjectMaskWarning: String?
     public var previewSize: CGSize = .zero
     /// When true, the preview is rendered with `recipe.geometry.crop` cleared
     /// (every other stage still applied) so a crop-overlay UI can draw its
@@ -78,6 +103,7 @@ public final class EditSession {
     public init(sourcePath: String, sourceAsset: DAMAsset?, previewMaxDimension: CGFloat = 2048) {
         self.sourcePath = sourcePath
         self.openedPath = sourcePath
+        self.exportSourcePath = sourcePath
         self.sourceAsset = sourceAsset
         self.previewMaxDimension = previewMaxDimension
     }
@@ -88,6 +114,8 @@ public final class EditSession {
         warning = nil
         var path = sourcePath
         var storedRecipe = EditRecipe()
+        followLineage = true
+        exportSourcePath = openedPath
         // Parse only the envelope first — a sidecar written by a newer
         // ComfyBox can carry a `recipe` shape this build can't decode, and a
         // full `EditSidecar.read` would then fail outright, indistinguishable
@@ -104,6 +132,7 @@ public final class EditSession {
                 // keep the derived pixels already on disk and fall back to
                 // an identity recipe rather than guessing at a root.
                 warning = "This edit's history is malformed; editing the flattened image."
+                followLineage = false; exportSourcePath = path
             } else if FileManager.default.fileExists(atPath: root.path) {
                 path = root.path
                 if envelope.version > EditRecipe.currentVersion {
@@ -117,6 +146,7 @@ public final class EditSession {
                 }
             } else {
                 warning = "Original \(URL(fileURLWithPath: root.path).lastPathComponent) is missing; editing the flattened image."
+                followLineage = false; exportSourcePath = path
             }
         }
         let loadPath = path
@@ -152,7 +182,7 @@ public final class EditSession {
         previewSource = ci
         recipe = storedRecipe; committed = storedRecipe; savedRecipe = storedRecipe
         undoStack.removeAll(); redoStack.removeAll()
-        subjectMask = nil; subjectStatus = nil
+        subjectMask = nil; subjectStatus = nil; subjectMaskWarning = nil
         scheduleRender()
     }
 
@@ -172,6 +202,11 @@ public final class EditSession {
     }
 
     public func undo() {
+        // An uncommitted live edit (e.g. mid-drag, before `onEditingEnded` calls
+        // `commit()`) must not be silently discarded by reaching straight into the
+        // undo stack — commit it first so it becomes the thing this undo reverts,
+        // and a subsequent redo can still bring it back.
+        if recipe != committed { commit() }
         guard let previous = undoStack.popLast() else { return }
         redoStack.append(committed)
         committed = previous; recipe = previous
@@ -201,6 +236,12 @@ public final class EditSession {
             subjectStatus = nil
         } catch SubjectMaskError.noSubject {
             subjectMask = nil; subjectStatus = "No subject found."
+        } catch SubjectMaskError.visionFailed(let message) {
+            // `SubjectMaskError` doesn't conform to `LocalizedError`, so
+            // `error.localizedDescription` on it (the generic catch below) produces
+            // Swift's default "operation couldn't be completed" text, not the
+            // underlying Vision error `message` this case actually carries.
+            subjectMask = nil; subjectStatus = "Vision failed: \(message)"
         } catch {
             subjectMask = nil; subjectStatus = "Vision failed: \(error.localizedDescription)"
         }
@@ -240,13 +281,18 @@ public final class EditSession {
         nonisolated(unsafe) let source = previewSource
         nonisolated(unsafe) let ctx = context
         nonisolated(unsafe) let subjectMaskForRender = mask
+        let scale = previewScale
         // Coalesce: cancel any still-running previous render before starting this
         // one. A render already inside Core Image is not interruptible mid-flight —
         // this only stops a worker that hasn't reached `EditRenderer.render` yet.
         renderWorker?.cancel()
         let worker = Task.detached(priority: .userInitiated) { () -> CGImage? in
             guard !Task.isCancelled else { return nil }
-            let out = EditRenderer.render(source: source, recipe: effectiveRecipe, subjectMask: subjectMaskForRender)
+            // The preview source was downscaled by `previewScale` on load, so an
+            // absolute-pixel filter parameter (sharpen's radius) must be scaled down to
+            // match, or the preview and a full-resolution export disagree — see
+            // `EditRenderer.sharpenRadius(scale:)`.
+            let out = EditRenderer.render(source: source, recipe: effectiveRecipe, subjectMask: subjectMaskForRender, renderScale: scale)
             guard !out.extent.isEmpty, !out.extent.isInfinite else { return nil }
             return ctx.createCGImage(out, from: out.extent)
         }
@@ -257,20 +303,22 @@ public final class EditSession {
         if let result {
             preview = result
             previewSize = CGSize(width: result.width, height: result.height)
+            // Only clear a warning THIS code set — a render succeeding says nothing
+            // about an unrelated warning (e.g. a stale-history message from `load()`).
+            if warning == Self.previewRenderFailedMessage { warning = nil }
         } else {
-            warning = "Preview render failed; the last good preview is shown."
+            warning = Self.previewRenderFailedMessage
         }
-        // Recomputed (not appended to `warning`) every render so it clears itself the
-        // moment the condition no longer holds — e.g. the user turns Remove Background
-        // back off, or a mask finishes loading — rather than lingering as a stale
-        // one-shot warning that nothing else ever un-sets.
-        if recipe.subject.removeBackground && subjectMask == nil {
-            subjectStatus = Self.noSubjectMaskMessage
-        } else if subjectStatus == Self.noSubjectMaskMessage {
-            subjectStatus = nil
-        }
+        // Recomputed every render so it clears itself the moment the condition no
+        // longer holds — e.g. the user turns Remove Background back off, or a mask
+        // finishes loading — rather than lingering as a stale one-shot warning that
+        // nothing else ever un-sets. Kept in its own field (`subjectMaskWarning`),
+        // separate from `subjectStatus`, so this can never clobber a Vision result
+        // ("No subject found.") that `requestSubjectMask()` just set.
+        subjectMaskWarning = (recipe.subject.removeBackground && subjectMask == nil) ? Self.noSubjectMaskMessage : nil
     }
 
+    private static let previewRenderFailedMessage = "Preview render failed; the last good preview is shown."
     private static let noSubjectMaskMessage = "Remove Background is on but no subject mask is loaded. Run Find Subject."
 
     /// Subject mask resampled to the preview source size so it lines up before geometry.
@@ -294,9 +342,10 @@ public final class EditSession {
         // exactly the recipe that was live at the moment export was requested,
         // not whatever `recipe` happens to read once the write completes.
         let exported = recipe
-        let path = try await EditExporter.export(sourceImage: sourceImage, sourcePath: openedPath, sourceAsset: sourceAsset,
+        let path = try await EditExporter.export(sourceImage: sourceImage, sourcePath: exportSourcePath, sourceAsset: sourceAsset,
                                                  recipe: exported, subjectMask: subjectMask,
-                                                 outputDirectory: outputDirectory, ingestor: ingestor)
+                                                 outputDirectory: outputDirectory, ingestor: ingestor,
+                                                 resolveLineage: followLineage)
         savedRecipe = exported
         return path
     }

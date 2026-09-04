@@ -40,6 +40,4 @@ public actor SubjectMasker {
         cache[cacheKey] = image
         return image
     }
-
-    public func invalidate(cacheKey: String) { cache[cacheKey] = nil }
 }

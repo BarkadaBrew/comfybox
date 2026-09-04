@@ -208,7 +208,7 @@ struct EditSessionTests {
         #expect(s.sourcePath == root)   // resolved through to the root pixels, not stuck on the derived file
     }
 
-    @Test("removeBackground without a subject mask sets subjectStatus after a preview render, and clears it once turned off")
+    @Test("removeBackground without a subject mask sets subjectMaskWarning after a preview render, and clears it once turned off")
     func removeBackgroundWithoutMaskWarnsAfterRender() async {
         let dir = tempDir(); let p = dir + "/src.png"
         writePNG(EditTestSupport.solid(r: 1, g: 1, b: 1, width: 8, height: 8), to: p)
@@ -216,10 +216,10 @@ struct EditSessionTests {
         await s.load()
         s.set { $0.subject.removeBackground = true }
         await s.renderNow()
-        #expect(s.subjectStatus == "Remove Background is on but no subject mask is loaded. Run Find Subject.")
+        #expect(s.subjectMaskWarning == "Remove Background is on but no subject mask is loaded. Run Find Subject.")
         s.set { $0.subject.removeBackground = false }
         await s.renderNow()
-        #expect(s.subjectStatus == nil)
+        #expect(s.subjectMaskWarning == nil)
     }
 
     @Test("export refuses when removeBackground is on without a subject mask")
@@ -270,5 +270,54 @@ struct EditSessionTests {
         #expect(s.recipe.isIdentity)
         #expect(s.warning != nil)
         #expect(s.sourceImage != nil)
+    }
+
+    // MARK: - Final fix wave
+
+    @Test("X2: export after a missing-root fallback points the new sidecar at the flattened file, not the missing root")
+    func missingRootExportPointsAtFlattenedFile() async throws {
+        let dir = tempDir(); let derived = dir + "/edit-9.png"
+        writePNG(EditTestSupport.solid(r: 5, g: 5, b: 5, width: 8, height: 8), to: derived)
+        let sc = EditSidecar(version: 1, sourcePath: dir + "/gone.png", sourceAssetId: nil, recipe: EditRecipe(), editor: "x", createdAt: Date())
+        try JSONSerialization.data(withJSONObject: ["edit": try sc.jsonObject()]).write(to: URL(fileURLWithPath: dir + "/edit-9.json"))
+        let s = EditSession(sourcePath: derived, sourceAsset: nil)
+        await s.load()
+        #expect(s.sourcePath == derived && s.warning != nil)   // load() already falls back correctly (pre-existing)
+        let out = try await s.export(outputDirectory: dir, ingestor: nil)
+        let outSc = EditSidecar.read(forImageAt: out)
+        // The bug: without `followLineage = false`, the exporter re-walks the SAME
+        // broken chain from `openedPath` and reports the missing, unreachable root
+        // as the new sidecar's source — even though the pixels actually rendered
+        // were the flattened ones at `derived`.
+        #expect(outSc?.sourcePath == derived)
+    }
+
+    @Test("M10: undo commits an uncommitted live edit first, so redo can restore it")
+    func undoCommitsLiveEditFirst() async {
+        let dir = tempDir(); let p = dir + "/src.png"
+        writePNG(EditTestSupport.solid(r: 1, g: 1, b: 1, width: 8, height: 8), to: p)
+        let s = EditSession(sourcePath: p, sourceAsset: nil)
+        await s.load()
+        s.set { $0.adjustments.exposure = 0.5 }; s.commit()
+        s.set { $0.adjustments.exposure = 0.9 }   // live drag, not yet committed
+        #expect(s.isDirty)
+        s.undo()
+        #expect(s.recipe.adjustments.exposure == 0.5)   // reverted to the last committed step, not silently dropped
+        s.redo()
+        #expect(s.recipe.adjustments.exposure == 0.9)   // the uncommitted drag is recoverable, not lost
+    }
+
+    @Test("M2: a subsequent successful render clears a stale 'Preview render failed' warning")
+    func previewRenderFailureWarningClears() async {
+        let dir = tempDir(); let p = dir + "/src.png"
+        writePNG(EditTestSupport.solid(r: 1, g: 1, b: 1, width: 8, height: 8), to: p)
+        let s = EditSession(sourcePath: p, sourceAsset: nil)
+        await s.load()
+        s.set { $0.geometry.crop = CGRect(x: 0, y: 0, width: 0, height: 0) }   // renders to an empty extent
+        await s.renderNow()
+        #expect(s.warning == "Preview render failed; the last good preview is shown.")
+        s.set { $0.geometry.crop = nil }
+        await s.renderNow()
+        #expect(s.warning == nil)
     }
 }

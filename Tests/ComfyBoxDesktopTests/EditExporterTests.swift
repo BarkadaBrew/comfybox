@@ -152,4 +152,66 @@ struct EditExporterTests {
         #expect(thrown != nil)
         #expect(thrown?.localizedDescription.contains(path) == true)
     }
+
+    // MARK: - Final fix wave (X1, X2, M13)
+
+    @Test("X1: a successful export leaves no .part temp file behind")
+    func exportLeavesNoPartFileOnSuccess() async throws {
+        let dir = tempDir()
+        let src = EditTestSupport.solid(r: 1, g: 2, b: 3, width: 8, height: 8)
+        let out = try await EditExporter.export(sourceImage: src, sourcePath: "/orig/g.png", sourceAsset: nil,
+                                                recipe: EditRecipe(), subjectMask: nil, outputDirectory: dir, ingestor: nil)
+        let contents = try FileManager.default.contentsOfDirectory(atPath: dir)
+        #expect(contents.contains { $0.hasSuffix(".part") } == false)
+        #expect(FileManager.default.fileExists(atPath: out))
+        #expect(FileManager.default.fileExists(atPath: EditSidecar.sidecarPath(forImageAt: out)))
+    }
+
+    @Test("X1: a sidecar failure leaves no .part temp file and no PNG behind")
+    func exportLeavesNoPartFileOnSidecarFailure() async throws {
+        let dir = tempDir()
+        let src = EditTestSupport.solid(r: 1, g: 2, b: 3, width: 4, height: 4)
+        var recipe = EditRecipe(); recipe.adjustments.exposure = .nan
+        var thrown: Error?
+        do {
+            _ = try await EditExporter.export(sourceImage: src, sourcePath: "/orig/n.png", sourceAsset: nil,
+                                              recipe: recipe, subjectMask: nil, outputDirectory: dir, ingestor: nil)
+        } catch {
+            thrown = error
+        }
+        #expect(thrown != nil)
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        #expect(contents.isEmpty)
+    }
+
+    @Test("X2: resolveLineage false anchors the sidecar at sourcePath itself, with no chain walk")
+    func sidecarObjectResolveLineageFalse() throws {
+        let asset = DAMAsset(id: "FLAT1", filename: "flat.png", absolutePath: "/orig/flat.png")
+        // sourcePath's own sidecar (if any existed) would normally be walked by
+        // rootSource; resolveLineage: false must skip that walk entirely and use
+        // sourcePath/asset id verbatim.
+        let obj = try EditExporter.sidecarObject(source: asset, sourcePath: "/orig/flat.png",
+                                                 recipe: EditRecipe(), now: Date(), resolveLineage: false)
+        let edit = obj["edit"] as? [String: Any]
+        #expect(edit?["source_path"] as? String == "/orig/flat.png")
+        #expect(edit?["source_asset_id"] as? String == "FLAT1")
+    }
+
+    @Test("M13: sidecarObject copies the source's own loras array through when present")
+    func sidecarObjectCopiesLoras() throws {
+        let dir = tempDir()
+        let sourcePath = dir + "/orig.png"
+        let sourceSidecar: [String: Any] = ["loras": [["name": "styleA", "scale": 0.8], ["name": "styleB", "scale": 1.0]]]
+        try JSONSerialization.data(withJSONObject: sourceSidecar).write(to: URL(fileURLWithPath: dir + "/orig.json"))
+        let obj = try EditExporter.sidecarObject(source: nil, sourcePath: sourcePath, recipe: EditRecipe(), now: Date())
+        let loras = obj["loras"] as? [[String: Any]]
+        #expect(loras?.count == 2)
+        #expect(loras?.first?["name"] as? String == "styleA")
+    }
+
+    @Test("M13: sidecarObject omits loras when the source has none")
+    func sidecarObjectOmitsLorasWhenAbsent() throws {
+        let obj = try EditExporter.sidecarObject(source: nil, sourcePath: "/orig/no-sidecar.png", recipe: EditRecipe(), now: Date())
+        #expect(obj["loras"] == nil)
+    }
 }
