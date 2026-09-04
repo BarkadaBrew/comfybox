@@ -254,20 +254,40 @@ struct ArchiveManifestTests {
     func acceptsWellFormedPath() throws {
         let root = URL(fileURLWithPath: "/tmp/some-bundle.cbarchive")
         let resolved = try ArchivePaths.resolveEntryPath("assets/9F3C/kira-0042.png", in: root)
+        // `resolvingSymlinksInPath()` leaves the classic BSD compatibility
+        // symlinks (/tmp, /var, /etc) as-is rather than rewriting them to
+        // /private/..., so a bundle root under /tmp resolves to the same
+        // literal path here — this pins that, not just documents it.
         #expect(resolved.path == "/tmp/some-bundle.cbarchive/assets/9F3C/kira-0042.png")
     }
 
-    @Test("traversal guard rejects percent-encoded traversal that only becomes '..' after decoding", arguments: [
+    @Test("traversal guard rejects percent-encoded traversal that only becomes '..' after decoding, including doubly-encoded", arguments: [
         "%2e%2e/%2e%2e/etc/passwd",
         "..%2f..%2fetc%2fpasswd",
         "%2e%2e%2Fetc%2Fpasswd",
         "assets/%2e%2e/%2e%2e/etc/passwd",
+        // Doubly-encoded: %252e -> %2e -> "." only after two decode passes.
+        "%252e%252e/%252e%252e/etc/passwd",
+        "%252e%252e%2Fetc%2Fpasswd",
     ])
     func rejectsPercentEncodedTraversal(_ relativePath: String) throws {
         let root = URL(fileURLWithPath: "/tmp/some-bundle.cbarchive")
         #expect(throws: (any Error).self) {
             _ = try ArchivePaths.resolveEntryPath(relativePath, in: root)
         }
+    }
+
+    @Test("traversal guard tolerates a value that stops being valid percent-encoding partway through decoding")
+    func toleratesRepeatedInvalidPercentEncoding() throws {
+        // "%25" decodes to a literal "%" (one pass); "%25%25%25%25.png"
+        // decodes once to "%%%%.png", which is no longer valid
+        // percent-encoding (a lone "%" isn't followed by two hex digits) —
+        // `fullyPercentDecoded` must stop cleanly on that `nil` rather than
+        // throw or loop, and since the result never becomes ".." or an
+        // absolute path, this must still be accepted.
+        let root = URL(fileURLWithPath: "/tmp/some-bundle.cbarchive")
+        let resolved = try ArchivePaths.resolveEntryPath("assets/%25%25%25%25.png", in: root)
+        #expect(resolved.path.hasPrefix("/tmp/some-bundle.cbarchive/assets/"))
     }
 
     @Test("traversal guard does not reject a filename that merely contains a literal, non-traversal '%'")
@@ -308,7 +328,7 @@ struct ArchiveManifestTests {
         }
     }
 
-    @Test("traversal guard accepts a symlink component that resolves inside the bundle root")
+    @Test("traversal guard accepts a symlink component that resolves inside the bundle root, and returns its resolved target path")
     func acceptsSymlinkStayingInsideBundle() throws {
         let fm = FileManager.default
         let base = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -319,9 +339,8 @@ struct ArchiveManifestTests {
         let bundleRoot = base.appendingPathComponent("bundle.cbarchive")
         let realAssetsDir = bundleRoot.appendingPathComponent("real-assets")
         try fm.createDirectory(at: realAssetsDir, withIntermediateDirectories: true)
-        try "file bytes".write(
-            to: realAssetsDir.appendingPathComponent("kira-0042.png"), atomically: true, encoding: .utf8
-        )
+        let realFile = realAssetsDir.appendingPathComponent("kira-0042.png")
+        try "file bytes".write(to: realFile, atomically: true, encoding: .utf8)
 
         // A symlink inside the bundle pointing at another directory that is
         // also inside the bundle — legitimate, must still resolve.
@@ -330,6 +349,13 @@ struct ArchiveManifestTests {
 
         let resolved = try ArchivePaths.resolveEntryPath("assets/kira-0042.png", in: bundleRoot)
         #expect(fm.fileExists(atPath: resolved.path))
+        // TOCTOU: the returned URL must be the already-resolved target
+        // (`real-assets/kira-0042.png`), not the lexical `assets/…` path
+        // through the symlink — a caller opening exactly what was checked,
+        // rather than re-traversing the symlink at open time, is the whole
+        // point of resolving before returning.
+        #expect(resolved.path == realFile.resolvingSymlinksInPath().path)
+        #expect(resolved.path != linkURL.appendingPathComponent("kira-0042.png").path)
     }
 
     // MARK: - Filename guard (write-side counterpart, entry.filename onto a live destination dir)
@@ -348,6 +374,8 @@ struct ArchiveManifestTests {
         "",
         "%2e%2e%2Fevil.png",
         "a%2Fb.png",
+        // Doubly-encoded: %252F -> %2F -> "/" only after two decode passes.
+        "%252Fevil.png",
     ])
     func filenameGuardRejectsTraversal(_ filename: String) {
         #expect(throws: (any Error).self) {
