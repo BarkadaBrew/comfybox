@@ -64,6 +64,27 @@ The generate response says which, in the additive `lora_stack_origin` field:
 which has always rendered its own request's stack). `GET /v1/generate/status/{id}`
 carries the same field once the job has dequeued.
 
+**The warm default is only valid for the base it was published under.** A swap
+records the family and model spec it applied to. A bare request that dequeues
+onto a *different* checkpoint does **not** take that default: it renders with
+**no adapters** and the response carries `warm_default_skipped`:
+
+| code | meaning |
+|---|---|
+| `family_mismatch` | the default was published under another model family |
+| `model_mismatch` | same family, different checkpoint |
+
+This is never a 4xx or 5xx — forcing another base's adapters is what could
+throw, and a request that always rendered must not start failing. An **empty**
+default (clear the adapters) and the engine's launch-time `--lora` stack are
+admitted everywhere; an unknown spec on either side is not a mismatch.
+
+**`lora_reload`** is set on the response when a job actually cleared the
+resident adapters and bound a different stack, rather than taking the
+same-stack shortcut. Alternating bare and preset renders (Krita + Kira at the
+same time) legitimately pay a full clear+reload per job; this field and a
+matching warning log are how that cost is measured rather than merely assumed.
+
 **What `POST /v1/lora/swap` now means.** The route, its payload and its
 response JSON are unchanged. What changed is its scope: a swap publishes the
 **warm default** — the stack a request carrying neither `preset` nor `loras`
@@ -97,8 +118,15 @@ prediction of the next one.
   be resident.
 - To keep a stack across bare requests, swap it (it becomes the warm default)
   or name it on every request.
-- FIBO and Chroma have no LoRA application path (`/v1/lora/swap` refuses them);
-  the warm default is not pushed at them, and their behaviour is unchanged.
+- FIBO and Chroma have **no LoRA application path at all**: `ChromaPipeline
+  .generate` takes no adapters, the model pool never forwards `initialLoRAs` to
+  either family, and `/v1/lora/swap` refuses them. They render with no adapters,
+  always. Nothing is applied for them now — a warm default *or* a stack the
+  request named — where the request-named case previously loaded into the
+  Flux-1 pipeline they do not render through. Nothing 4xx's that did not
+  before; the render is the same bare render it always was, and the Chroma PNG
+  now records the empty stack it actually used instead of the coordinator's
+  unrelated resident list.
 - The video path (`/v1/video/generate`) has always resolved its own stack per
   request (`loras` → the video preset's `loras` → `--ltx2-lora`) and is
   unchanged.

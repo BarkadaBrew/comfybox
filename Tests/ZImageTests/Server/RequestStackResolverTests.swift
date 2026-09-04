@@ -106,16 +106,17 @@ final class RequestStackResolverTests: XCTestCase {
 
   // MARK: - The family gate
 
-  /// FIBO and Chroma have no LoRA path (`/v1/lora/swap` refuses them). A stack
-  /// the JOB named is still applied there exactly as before #282; only a warm
-  /// default — which no such caller ever asked for — is skipped.
-  func testWarmDefaultIsNotPushedAtAFamilyWithNoLoRAPath() {
-    XCTAssertFalse(
-      RequestStackResolver.appliesAtDequeue(origin: .warmDefault, familyHasLoRAPath: false))
-    XCTAssertTrue(
-      RequestStackResolver.appliesAtDequeue(origin: .request, familyHasLoRAPath: false))
-    XCTAssertTrue(
-      RequestStackResolver.appliesAtDequeue(origin: .preset, familyHasLoRAPath: false))
+  /// Review r1 (M1): a family with no LoRA path applies NOTHING, whatever the
+  /// origin. The first cut skipped only the warm default, which left a
+  /// request-named stack being loaded into the Flux-1 pipeline that Chroma and
+  /// FIBO do not render through — no effect on the pixels, and `/health.loras`
+  /// plus the PNG then named adapters that took no part.
+  func testAFamilyWithNoLoRAPathAppliesNothingWhateverTheOrigin() {
+    for origin in RequestStackResolver.Origin.allCases {
+      XCTAssertFalse(
+        RequestStackResolver.appliesAtDequeue(origin: origin, familyHasLoRAPath: false),
+        "\(origin) must not be loaded into a pipeline the family does not render through")
+    }
   }
 
   func testEveryOriginAppliesOnAFamilyWithALoRAPath() {
@@ -143,5 +144,88 @@ final class RequestStackResolverTests: XCTestCase {
       requestLoras: nil, presetStack: nil, warmDefault: warm)
     XCTAssertEqual(bare.origin, .warmDefault)
     XCTAssertEqual(bare.stack, warm)
+  }
+
+  // MARK: - Review r1 (C1): the warm default is only valid for its own base
+
+  private func tag(_ family: String?, _ model: String? = nil)
+    -> RequestStackResolver.WarmDefaultTag {
+    .init(family: family, modelSpec: model)
+  }
+
+  /// The Critical: a stack published under krea2-raw must not be force-loaded
+  /// into a Flux-2 pipeline by a bare request that switched base. That load can
+  /// throw, which would turn a request that always rendered into a 500.
+  func testADifferentFamilySkipsTheWarmDefault() {
+    let decision = RequestStackResolver.admitWarmDefault(
+      isEmpty: false, tag: tag("krea2", "/m/krea2-raw"),
+      requestFamily: "flux2", requestModelSpec: "/m/flux2")
+    XCTAssertEqual(decision, .skip(reason: "family_mismatch"))
+    XCTAssertEqual(
+      RequestStackResolver.WarmDefaultAdmission.familyMismatch, "family_mismatch")
+  }
+
+  /// Same family, different checkpoint: still the wrong base for those
+  /// adapters — a krea2 stack on the wrong krea2 binds and looks subtly wrong,
+  /// which is exactly #286's silent-wrong-look defect.
+  func testTheSameFamilyOnADifferentCheckpointSkipsTheWarmDefault() {
+    let decision = RequestStackResolver.admitWarmDefault(
+      isEmpty: false, tag: tag("krea2", "/m/krea2-raw"),
+      requestFamily: "krea2", requestModelSpec: "/m/krea2-turbo")
+    XCTAssertEqual(decision, .skip(reason: "model_mismatch"))
+    XCTAssertEqual(
+      RequestStackResolver.WarmDefaultAdmission.modelMismatch, "model_mismatch")
+  }
+
+  func testTheSameBaseAdmitsTheWarmDefault() {
+    XCTAssertEqual(
+      RequestStackResolver.admitWarmDefault(
+        isEmpty: false, tag: tag("krea2", "/m/krea2-raw"),
+        requestFamily: "krea2", requestModelSpec: "/m/krea2-raw"),
+      .admit)
+  }
+
+  /// "Clear the adapters" is base-agnostic and cannot throw, so an empty
+  /// default is admitted even across a family change — otherwise a bare
+  /// request would be stuck with the previous job's stack, which is the very
+  /// inheritance this ticket retires.
+  func testAnEmptyWarmDefaultIsAdmittedEvenAcrossFamilies() {
+    XCTAssertEqual(
+      RequestStackResolver.admitWarmDefault(
+        isEmpty: true, tag: tag("krea2", "/m/krea2-raw"),
+        requestFamily: "flux1", requestModelSpec: "/m/z-image"),
+      .admit)
+  }
+
+  /// The launch-time `--lora` stack has no swap behind it. Refusing it would
+  /// change boot behaviour rather than protect anything.
+  func testAnUntaggedWarmDefaultIsAdmittedAnywhere() {
+    XCTAssertEqual(
+      RequestStackResolver.admitWarmDefault(
+        isEmpty: false, tag: .untagged, requestFamily: "krea2", requestModelSpec: "/m/anything"),
+      .admit)
+    XCTAssertNil(RequestStackResolver.WarmDefaultTag.untagged.family)
+    XCTAssertNil(RequestStackResolver.WarmDefaultTag.untagged.modelSpec)
+  }
+
+  /// An unknown spec on either side is not a mismatch: the family agreed, and
+  /// refusing on ignorance would strand the ordinary case where the engine
+  /// never recorded a spec.
+  func testAnUnknownSpecOnEitherSideIsNotAMismatch() {
+    XCTAssertEqual(
+      RequestStackResolver.admitWarmDefault(
+        isEmpty: false, tag: tag("krea2", nil),
+        requestFamily: "krea2", requestModelSpec: "/m/krea2-raw"),
+      .admit)
+    XCTAssertEqual(
+      RequestStackResolver.admitWarmDefault(
+        isEmpty: false, tag: tag("krea2", "/m/krea2-raw"),
+        requestFamily: "krea2", requestModelSpec: nil),
+      .admit)
+    XCTAssertEqual(
+      RequestStackResolver.admitWarmDefault(
+        isEmpty: false, tag: tag("krea2", ""),
+        requestFamily: "krea2", requestModelSpec: ""),
+      .admit)
   }
 }

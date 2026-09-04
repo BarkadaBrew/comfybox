@@ -95,17 +95,102 @@ public enum RequestStackResolver {
 
   /// Is the resolved stack APPLIED at dequeue for this family?
   ///
-  /// FIBO and Chroma have no LoRA application path of their own — they sit on
-  /// top of the Flux-1 `ZImagePipeline` instance, `POST /v1/lora/swap` refuses
-  /// them outright (``WarmServerError/loraSwapNotSupported``) and
-  /// `applied_loras` is deliberately ABSENT for them so it can never read as
-  /// "rendered bare". Pushing a WARM DEFAULT at them would reach a pipeline
-  /// they are not rendering through, which is a new behaviour, not a fix —
-  /// so for them a warm default is skipped and the pre-#282 contract stands.
-  /// A stack the job named explicitly is still applied exactly as it was
-  /// before this ticket.
+  /// **Review r1, M1 — the two answers are now the same one.** FIBO and Chroma
+  /// have no LoRA application path of their own: `ChromaPipeline.generate`
+  /// takes no adapters, `ModelPool` never forwards `initialLoRAs` to either
+  /// family (only the krea2 and flux1 branches do), and `/v1/lora/swap` refuses
+  /// them outright (``WarmServerError/loraSwapNotSupported``). They render
+  /// with **no adapters, always**.
+  ///
+  /// The first cut of this function skipped only a warm default there, which
+  /// left the inconsistency the review named: a request-NAMED stack still went
+  /// to `applyActiveLoRAs`'s default arm and was loaded into the Flux-1
+  /// `ZImagePipeline` — an instance those families are not rendering through.
+  /// It changed nothing about the pixels, and it corrupted `activeLoRAs`,
+  /// `/health.loras` and the PNG's `loras` list into naming adapters that had
+  /// no part in the render.
+  ///
+  /// So: on a family with no LoRA path, **nothing** is applied, whatever the
+  /// origin, and the render's own record says so (`applied_loras` stays absent
+  /// for them, and the Chroma PNG now records the empty stack it actually
+  /// rendered with). Nothing 4xx's that did not before — a caller sending
+  /// `loras` to Chroma gets the same bare render it always got, now honestly
+  /// reported and logged.
   public static func appliesAtDequeue(origin: Origin, familyHasLoRAPath: Bool) -> Bool {
-    familyHasLoRAPath || origin != .warmDefault
+    familyHasLoRAPath
+  }
+
+  // MARK: - The warm default is only valid for the base it was published under
+
+  /// #282 review r1 (C1) — what a warm default was published against.
+  ///
+  /// `POST /v1/lora/swap` applies its stack to whatever base is resident and
+  /// publishes it as the default. A bare request that arrives later may
+  /// activate a DIFFERENT checkpoint at dequeue (its own `model`, or a preset's
+  /// — the per-job model switch runs before the stack is applied). Force-loading
+  /// a krea2-raw stack into, say, a Flux-2 pipeline is at best a stack of
+  /// adapters that bind zero layers, and at worst a throw — turning a request
+  /// that always rendered into a 500. So the default carries its provenance.
+  public struct WarmDefaultTag: Sendable, Equatable {
+    /// `WarmModelFamily.rawValue` at the moment of publication. nil = untagged.
+    public let family: String?
+    /// The active model spec at publication, already normalised (alias →
+    /// directory, `~` expanded) so a spelling difference is not a mismatch.
+    public let modelSpec: String?
+
+    public init(family: String? = nil, modelSpec: String? = nil) {
+      self.family = family
+      self.modelSpec = modelSpec
+    }
+
+    /// The engine's launch-time `--lora` stack, which has no swap behind it.
+    /// Admitted everywhere: it is what the operator declared for this process,
+    /// and refusing it would change boot behaviour rather than protect anything.
+    public static let untagged = WarmDefaultTag()
+  }
+
+  /// May this job take the warm default?
+  public enum WarmDefaultAdmission: Sendable, Equatable {
+    case admit
+    /// Render with NO adapters, and say so. Never an error — the reason code
+    /// reaches the response as `warm_default_skipped`.
+    case skip(reason: String)
+
+    /// The published reason codes.
+    public static let familyMismatch = "family_mismatch"
+    public static let modelMismatch = "model_mismatch"
+  }
+
+  /// Decide whether a warm default published under `tag` may be applied to a
+  /// job that is rendering on `requestFamily` / `requestModelSpec`.
+  ///
+  /// - An EMPTY default is always admitted: "clear the adapters" is
+  ///   base-agnostic and cannot throw.
+  /// - An UNTAGGED default (the launch-time `--lora` stack) is always admitted.
+  /// - A different family ⇒ ``WarmDefaultAdmission/familyMismatch``.
+  /// - Same family, both model specs known and different ⇒
+  ///   ``WarmDefaultAdmission/modelMismatch``. Two krea2 checkpoints are the
+  ///   same family and still the wrong base for each other's adapters — that is
+  ///   the silent-wrong-look defect #286 spent three review rounds on, and a
+  ///   default nobody asked for is the last place to reintroduce it.
+  /// - An unknown spec on either side is not a mismatch: the family agreed, and
+  ///   refusing on ignorance would strand the ordinary case where the engine
+  ///   never recorded a spec.
+  public static func admitWarmDefault(
+    isEmpty: Bool,
+    tag: WarmDefaultTag,
+    requestFamily: String,
+    requestModelSpec: String?
+  ) -> WarmDefaultAdmission {
+    if isEmpty { return .admit }
+    guard let tagFamily = tag.family else { return .admit }
+    guard tagFamily == requestFamily else {
+      return .skip(reason: WarmDefaultAdmission.familyMismatch)
+    }
+    guard let tagSpec = tag.modelSpec, let requestSpec = requestModelSpec,
+          !tagSpec.isEmpty, !requestSpec.isEmpty
+    else { return .admit }
+    return tagSpec == requestSpec ? .admit : .skip(reason: WarmDefaultAdmission.modelMismatch)
   }
 }
 

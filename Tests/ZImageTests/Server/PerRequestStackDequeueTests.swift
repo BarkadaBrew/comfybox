@@ -242,6 +242,15 @@ final class PerRequestStackDequeueTests: XCTestCase {
   /// Absolute paths so `LoRAEntry.makeConfiguration()` takes them at their word
   /// (no library search, no file needed) — the resolver is what is under test,
   /// not source resolution.
+  ///
+  /// `kroma` is declared at strength **0** — the schema requires a krea2-family
+  /// preset to declare one (O4a: an absent kroma is a configuration error), and
+  /// strength 0 is the schema's own way to say "none", so it contributes
+  /// nothing to the stack. Deliberate: what a NON-zero `kroma` contributes is
+  /// `PresetLoRAStack.decide`'s business, pinned by `PresetLoRAStackTests`, and
+  /// is being changed by #365 (kroma becomes a regular LoRA). These tests are
+  /// about WHO OWNS the expanded stack at dequeue, which is independent of how
+  /// it was composed — so they pass on either side of #365.
   private func seedPreset(_ store: PresetStore) throws {
     try store.upsert(ImagePreset(
       id: "krea-kira", name: "Kira", mediaKind: "image", model: "krea2-raw",
@@ -250,7 +259,7 @@ final class PerRequestStackDequeueTests: XCTestCase {
         LoraReference(filename: "/tmp/polish.safetensors", scale: 0.4),
       ],
       checkpointFamily: "raw-accel",
-      kroma: KromaPolicy(strength: 0.6, file: "/tmp/kroma.safetensors")))
+      kroma: KromaPolicy(strength: 0)))
   }
 
   private func route(_ json: String, store: PresetStore) throws -> GeneratePayload {
@@ -278,8 +287,7 @@ final class PerRequestStackDequeueTests: XCTestCase {
     let resolved = try await probe.resolveJobStack(expanded)
     XCTAssertEqual(resolved.origin, "preset")
     XCTAssertEqual(
-      resolved.names,
-      ["kroma.safetensors", "accel.safetensors", "polish.safetensors"],
+      resolved.names, ["accel.safetensors", "polish.safetensors"],
       "a preset render fell back to the warm default")
   }
 
@@ -318,5 +326,149 @@ final class PerRequestStackDequeueTests: XCTestCase {
     let resolved = try await probe.resolveJobStack(expanded)
     XCTAssertEqual(resolved.origin, "warm_default")
     XCTAssertEqual(resolved.names, ["swapped.safetensors"])
+  }
+
+  // MARK: - Review r1 (C1): a warm default from another base is skipped, not forced
+
+  /// The Critical, at the dequeue. The probe's coordinator renders on `flux1`;
+  /// a default published under krea2 must NOT be pushed at it — that adapter
+  /// load can throw, and a bare request that always rendered would start 500ing.
+  func testAWarmDefaultFromAnotherFamilyIsSkippedNotForced() async throws {
+    let probe = makeQueueProbe()
+    let family = await probe.currentFamily()
+    XCTAssertEqual(family, "flux1")
+    await probe.adoptWarmDefaultStack(
+      [config("/tmp/krea2-accel.safetensors", 0.6)],
+      tag: .init(family: "krea2", modelSpec: "/models/krea2-raw"))
+
+    let resolved = try await probe.resolveJobStack(payload(loras: nil))
+    XCTAssertEqual(resolved.origin, "warm_default")
+    XCTAssertEqual(resolved.names, [], "the mismatched default was force-applied anyway")
+    XCTAssertEqual(resolved.warmDefaultSkipped, "family_mismatch")
+  }
+
+  func testAWarmDefaultFromAnotherCheckpointOfTheSameFamilyIsSkipped() async throws {
+    // The coordinator must KNOW its own base for this comparison to engage —
+    // an unknown spec on either side is deliberately not a mismatch.
+    let probe = makeQueueProbe(modelSpec: "/models/z-image-turbo")
+    await probe.adoptWarmDefaultStack(
+      [config("/tmp/style.safetensors", 0.8)],
+      tag: .init(family: "flux1", modelSpec: "/models/some-other-z-image"))
+
+    let resolved = try await probe.resolveJobStack(payload(loras: nil))
+    XCTAssertEqual(resolved.origin, "warm_default")
+    XCTAssertEqual(resolved.names, [])
+    XCTAssertEqual(resolved.warmDefaultSkipped, "model_mismatch")
+  }
+
+  /// A swap performed on the base the job renders on — the ordinary case — is
+  /// admitted, and nothing is marked skipped.
+  func testAWarmDefaultPublishedOnThisBaseIsAdmitted() async throws {
+    let probe = makeQueueProbe()
+    await probe.adoptWarmDefaultStack([config("/tmp/warm.safetensors", 0.5)])
+
+    let publishedTag = await probe.warmDefaultTag()
+    XCTAssertEqual(
+      publishedTag.family, "flux1",
+      "the swap must tag the default with the base it applied to")
+
+    let resolved = try await probe.resolveJobStack(payload(loras: nil))
+    XCTAssertEqual(resolved.names, ["warm.safetensors"])
+    XCTAssertNil(resolved.warmDefaultSkipped)
+  }
+
+  /// A job that named its own stack is never affected by the tag.
+  func testTheTagNeverAffectsARequestOrPresetOwnedStack() async throws {
+    let probe = makeQueueProbe()
+    await probe.adoptWarmDefaultStack(
+      [config("/tmp/krea2-accel.safetensors")],
+      tag: .init(family: "krea2", modelSpec: "/models/krea2-raw"))
+
+    let explicit = try await probe.resolveJobStack(
+      payload(loras: [entry("/tmp/mine.safetensors")]))
+    XCTAssertEqual(explicit.names, ["mine.safetensors"])
+    XCTAssertNil(explicit.warmDefaultSkipped)
+
+    let preset = try await probe.resolveJobStack(
+      payload(loras: [entry("/tmp/preset.safetensors")], presetOwned: true))
+    XCTAssertEqual(preset.names, ["preset.safetensors"])
+    XCTAssertNil(preset.warmDefaultSkipped)
+  }
+
+  // MARK: - Review r1 (I4): the apply call itself, through the real queue
+
+  /// The load-bearing line. A REAL `.generate` job goes through the queue and
+  /// the process loop; `applyJobLoRAStack` records what it was asked to apply
+  /// instead of touching a pipeline (a real application needs weights), and
+  /// `runGenerate` then fails the job before dispatching to a family — so no
+  /// model resolution and no download. Deleting
+  /// `try await applyJobLoRAStack(plan)` from `runGenerate` leaves the recorder
+  /// EMPTY and fails here.
+  func testTheDequeueActuallyAppliesTheJobsStack() async throws {
+    let probe = makeQueueProbe()
+    let recorder = StackApplicationRecorder()
+    await probe.setStackRecorder(recorder)
+    await probe.adoptWarmDefaultStack([config("/tmp/warm.safetensors", 0.5)])
+
+    // Each job stops at the seam, so each returns the seam's error.
+    await assertSeamStopped {
+      try await probe.enqueueGenerate(
+        self.payload(loras: [self.entry("/tmp/explicit.safetensors")]))
+    }
+    await assertSeamStopped { try await probe.enqueueGenerate(self.payload(loras: nil)) }
+
+    let calls = recorder.calls
+    // Read the count FIRST and bail out: with the application deleted the
+    // recorder is empty, and indexing it would trap instead of failing.
+    guard calls.count == 2 else {
+      return XCTFail(
+        "runGenerate did not apply a stack for every render — the dequeue application is gone "
+          + "(recorded \(calls.count) of 2)")
+    }
+    XCTAssertEqual(calls[0].origin, "request")
+    XCTAssertEqual(calls[0].names, ["explicit.safetensors"])
+    XCTAssertNil(calls[0].warmDefaultSkipped)
+    XCTAssertEqual(calls[1].origin, "warm_default")
+    XCTAssertEqual(
+      calls[1].names, ["warm.safetensors"],
+      "the bare job did not receive the warm default at dequeue")
+  }
+
+  /// The C1 skip, all the way through the real dequeue rather than only in the
+  /// resolver: nothing is applied and the job does not error on the skip.
+  func testTheDequeueAppliesNoAdaptersWhenTheWarmDefaultIsFromAnotherBase() async throws {
+    let probe = makeQueueProbe()
+    let recorder = StackApplicationRecorder()
+    await probe.setStackRecorder(recorder)
+    await probe.adoptWarmDefaultStack(
+      [config("/tmp/krea2-accel.safetensors", 0.6)],
+      tag: .init(family: "krea2", modelSpec: "/models/krea2-raw"))
+
+    await assertSeamStopped { try await probe.enqueueGenerate(self.payload(loras: nil)) }
+
+    let calls = recorder.calls
+    guard calls.count == 1 else {
+      return XCTFail("the dequeue applied no stack at all (recorded \(calls.count) of 1)")
+    }
+    XCTAssertEqual(calls[0].origin, "warm_default")
+    XCTAssertEqual(calls[0].names, [])
+    XCTAssertEqual(calls[0].warmDefaultSkipped, "family_mismatch")
+  }
+
+  /// The seam stops the job deliberately; anything else means the render was
+  /// dispatched for real, which a unit test must never do (it would resolve —
+  /// and download — model weights).
+  private func assertSeamStopped(
+    _ body: () async throws -> GenerateResponse,
+    file: StaticString = #filePath, line: UInt = #line
+  ) async {
+    do {
+      _ = try await body()
+      XCTFail("the job ran past the #282 test seam", file: file, line: line)
+    } catch {
+      XCTAssertTrue(
+        "\(error)".contains("stack recorded"),
+        "unexpected failure before the seam: \(error)", file: file, line: line)
+    }
   }
 }
