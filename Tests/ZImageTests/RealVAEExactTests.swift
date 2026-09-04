@@ -24,7 +24,7 @@ final class RealVAEExactTests: XCTestCase {
 
     let plain = vae.decode(latent)
     MLX.eval(plain)
-    let streamed = vae.decodeStreamed(latent)
+    let streamed = try vae.decodeStreamed(latent)
     MLX.eval(streamed)
     XCTAssertEqual(plain.shape, streamed.shape, "shape mismatch")
 

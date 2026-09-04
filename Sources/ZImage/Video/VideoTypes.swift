@@ -227,6 +227,20 @@ public struct VideoJobStatus: Codable, Sendable {
   /// backend; nil for the cloud path (which reports duration, not frame count).
   public let frameCount: Int?
 
+  /// comfybox#322: `true` when this render stopped because an operator called
+  /// `/v1/queue/interrupt`, rather than because anything went wrong.
+  ///
+  /// ADDITIVE, and deliberately a separate field rather than a new
+  /// `VideoJobState` case: `status` is the terminal-state signal every polling
+  /// client already switches on (Desktop's `isTerminal` checks
+  /// succeeded|failed; the Bree daemon decodes the same string), and a state
+  /// name none of them know would read as "not finished yet" and poll forever.
+  /// So an interrupted render still reports `status: failed` — terminal — with
+  /// this flag and a plain-English `error` saying why. The render TRACE, which
+  /// has no such compatibility constraint, records `status: interrupted`.
+  /// Absent (nil, omitted from JSON) on every other outcome.
+  public let interrupted: Bool?
+
   public init(
     jobId: String,
     status: VideoJobState,
@@ -243,7 +257,8 @@ public struct VideoJobStatus: Codable, Sendable {
     replicatePredictionId: String? = nil,
     progressPercent: Int? = nil,
     resolvedConfig: [LTX2ResolvedParam]? = nil,
-    frameCount: Int? = nil
+    frameCount: Int? = nil,
+    interrupted: Bool? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -261,5 +276,6 @@ public struct VideoJobStatus: Codable, Sendable {
     self.progressPercent = progressPercent
     self.resolvedConfig = resolvedConfig
     self.frameCount = frameCount
+    self.interrupted = interrupted
   }
 }

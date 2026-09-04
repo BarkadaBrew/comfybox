@@ -179,11 +179,24 @@ public final class LTX2Pipeline {
   /// (spec, Error handling: never hide a real bug behind a plausible output).
   private func nonPreemptible(
     _ site: String, _ body: () throws -> LTX2PipelineOutcome
-  ) -> LTX2PipelineOutput {
+  ) throws -> LTX2PipelineOutput {
     let outcome: LTX2PipelineOutcome
     do {
       outcome = try body()
     } catch {
+      // comfybox#322: an operator interrupt is the ONE error a non-preemptible
+      // render can legitimately throw now, and it is not a bug — rethrow it
+      // instead of tripping the precondition below, which would kill the whole
+      // process on every `/v1/queue/interrupt` that landed in a
+      // `generate()`-family render (the CLI paths, a storyboard shot).
+      //
+      // `ltx2IsCancellation` rather than `is CancellationError` (review r1):
+      // the load and weight-application paths this render walks wrap errors in
+      // `case x(String, Error)` enums, and a wrapped cancellation reaching the
+      // `preconditionFailure` below would be exactly the process kill this
+      // branch exists to prevent. Rethrown as a bare `CancellationError` so the
+      // #304 contract holds for everything downstream.
+      if ltx2IsCancellation(error) { throw CancellationError() }
       logger.error("\(site): non-preemptible render threw \(error) — impossible without a resume state.")
       preconditionFailure("\(site): non-preemptible render threw \(error)")
     }
@@ -284,8 +297,8 @@ public final class LTX2Pipeline {
     negativeAttentionMask: MLXArray? = nil,
     audioSeconds: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
-  ) -> LTX2PipelineOutput {
-    nonPreemptible("generateT2V") {
+  ) throws -> LTX2PipelineOutput {
+    try nonPreemptible("generateT2V") {
       try generateT2VResumable(
         inputIds: inputIds, attentionMask: attentionMask,
         width: width, height: height, numFrames: numFrames, steps: steps,
@@ -474,7 +487,7 @@ public final class LTX2Pipeline {
     // Step 6: Denoising loop
     if !skipBaseLoop {
       logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
-      switch denoisingLoop(
+      switch try denoisingLoop(
         latents: latents,
         positions: positions,
         precomputedPE: precomputedPE,
@@ -625,7 +638,7 @@ public final class LTX2Pipeline {
         refineAVState = LTX2AVDenoiseState(
           audioLatents: av.audioLatents, audioContext: av.audioContext, pe: avPE2)
       }
-      switch denoisingLoop(
+      switch try denoisingLoop(
         latents: refineInit, positions: refinePos, precomputedPE: refinePE,
         textEmbeddings: textOutput.videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
         sigmas: refineSigmas, cfgScale: cfgScale, state: nil, nagEmbeddings: nagEmbeddings, nag: nagConfig,
@@ -679,7 +692,7 @@ public final class LTX2Pipeline {
     // Step 7: Decode latents via VAE
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = decodeAdaptive(latents)
+    let decoded = try decodeAdaptive(latents)
     eval(decoded)
 
     // Convert from [-1, 1] to [0, 1] range (VAE outputs centered at 0)
@@ -731,8 +744,8 @@ public final class LTX2Pipeline {
     seed: UInt64? = nil,
     guidance: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
-  ) -> LTX2PipelineOutput {
-    nonPreemptible("generateT2VWithEmbeddings") {
+  ) throws -> LTX2PipelineOutput {
+    try nonPreemptible("generateT2VWithEmbeddings") {
       try generateT2VWithEmbeddingsResumable(
         videoEmbeddings: videoEmbeddings, negativeEmbeddings: negativeEmbeddings,
         width: width, height: height, numFrames: numFrames, steps: steps,
@@ -837,7 +850,7 @@ public final class LTX2Pipeline {
     // Denoising loop
     if !skipBaseLoop {
       logger.info("Denoising (\(config.sampler) sampler, \(sigmas.count - 1) steps)...")
-      switch denoisingLoop(
+      switch try denoisingLoop(
         latents: latents,
         positions: positions,
         precomputedPE: precomputedPE,
@@ -869,7 +882,7 @@ public final class LTX2Pipeline {
     // Decode latents via VAE
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = decodeAdaptive(latents)
+    let decoded = try decodeAdaptive(latents)
     eval(decoded)
 
     // Convert from [-1, 1] to [0, 1] range (VAE outputs centered at 0)
@@ -930,8 +943,8 @@ public final class LTX2Pipeline {
     refineAnchorImage: MLXArray? = nil,
     audioSeconds: Float? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
-  ) -> LTX2PipelineOutput {
-    nonPreemptible("generateI2V") {
+  ) throws -> LTX2PipelineOutput {
+    try nonPreemptible("generateI2V") {
       try generateI2VResumable(
         inputIds: inputIds, attentionMask: attentionMask, image: image, strength: strength,
         width: width, height: height, numFrames: numFrames, steps: steps,
@@ -1193,7 +1206,7 @@ public final class LTX2Pipeline {
       latentsAll = resumed
     } else {
       logger.info("Denoising with I2V conditioning...")
-      switch denoisingLoop(
+      switch try denoisingLoop(
         latents: resumedLatents ?? state.latent,
         positions: positions,
         precomputedPE: precomputedPE,
@@ -1259,7 +1272,7 @@ public final class LTX2Pipeline {
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = decodeAdaptive(latents)
+    let decoded = try decodeAdaptive(latents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -1329,8 +1342,8 @@ public final class LTX2Pipeline {
     negativeInputIds: MLXArray? = nil,
     negativeAttentionMask: MLXArray? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
-  ) -> LTX2PipelineOutput {
-    nonPreemptible("generateMultiKeyframe") {
+  ) throws -> LTX2PipelineOutput {
+    try nonPreemptible("generateMultiKeyframe") {
       try generateMultiKeyframeResumable(
         inputIds: inputIds, attentionMask: attentionMask, keyframes: keyframes,
         width: width, height: height, numFrames: numFrames, steps: steps,
@@ -1483,7 +1496,7 @@ public final class LTX2Pipeline {
       latents = resumed
     } else {
       logger.info("Denoising with \(keyframes.count)-keyframe conditioning...")
-      switch denoisingLoop(
+      switch try denoisingLoop(
         latents: resumedLatents ?? state.latent,
         positions: positions,
         precomputedPE: precomputedPE,
@@ -1544,7 +1557,7 @@ public final class LTX2Pipeline {
     // Step 7: Decode
     logger.info("Decoding latents via VAE...")
     telemetry?.begin(.vaeDecode)
-    let decoded = decodeAdaptive(refinedLatents)
+    let decoded = try decodeAdaptive(refinedLatents)
     eval(decoded)
 
     let rescaled = (decoded.asType(.float32) + 1.0) / 2.0
@@ -1611,7 +1624,7 @@ public final class LTX2Pipeline {
     // before this feature existed.
     beatSchedule: [LTX2ResolvedBeat] = [],
     progressCallback: ((Int, Int) -> Void)?
-  ) -> LTX2DenoiseResult {
+  ) throws -> LTX2DenoiseResult {
     // #1479 phase timing. `defer` so a yield closes the phase too: a preempted
     // pass then contributes two partial samples that sum to the true duration,
     // which is why the refusal guard reads `meanStepSec` (exact per step) for
@@ -1706,10 +1719,17 @@ public final class LTX2Pipeline {
     }()
 
     for i in startStep..<numSteps {
-      // #1479: yield at the step boundary. Checked first so a raised signal
-      // costs zero model passes. currentLatents at this point is the
-      // end-of-step-(i-1) state — exactly what resume needs to re-enter at i.
-      if let p = preemption, p.isRaised {
+      // comfybox#322 + #1479: the step boundary. Checked first so neither an
+      // interrupt nor a raised signal costs a model pass. `LTX2LoopBoundary`
+      // evaluates CANCELLATION FIRST — an interrupt arriving during a
+      // preemption handoff aborts instead of banking a resumable checkpoint —
+      // and throws `CancellationError` unmodified, exactly as the image path's
+      // `Krea2DenoiseLoop.run` does (comfybox#304). This one loop serves BOTH
+      // stages: the base pass and the 1.5x refine call it identically (see the
+      // `.refineDenoise` call sites), so both are bounded to one step.
+      // currentLatents at this point is the end-of-step-(i-1) state — exactly
+      // what resume needs to re-enter at i.
+      if try LTX2LoopBoundary.decide(preemption: preemption) == .yield {
         return .yielded(LTX2ResumeState(
           videoLatents: currentLatents,
           stepIndex: i,
@@ -2153,7 +2173,7 @@ public final class LTX2Pipeline {
   /// normal clips, exact streamed decode above the safety gate. Mode switch:
   /// LTX2_DECODE_MODE=auto|stream|tile|plain. Threshold tunable
   /// via LTX2_PLAIN_DECODE_MAX_LATF (latent frames; ~8x fewer than output frames).
-  private func decodeAdaptive(_ latents: MLXArray) -> MLXArray {
+  private func decodeAdaptive(_ latents: MLXArray) throws -> MLXArray {
     let latF = latents.dim(2)
     let latH = latents.dim(3)
     let latW = latents.dim(4)
@@ -2191,26 +2211,37 @@ public final class LTX2Pipeline {
     // constructed config could force a corrupting plain decode).
     let env = ProcessInfo.processInfo.environment
     let mode = (env["LTX2_DECODE_MODE"] ?? (env["LTX2_DECODE_STREAM"] == "0" ? "tile" : "auto")).lowercased()
+    // comfybox#322: phase boundary. Decode of a long clip is minutes of work;
+    // the streamed/tiled paths check again between volumes (LTX2Decoder3D,
+    // LTX2VAE), and plain single-pass decode is one kernel launch, so this is
+    // its only cancellation point.
+    try Task.checkCancellation()
     switch mode {
     case "plain":
       if volume > plainMaxVolume {
         logger.warning("VAE decode: FORCED plain above the safety gate (volume \(volume) > \(plainMaxVolume)) — output may be silently corrupt (mlx #3836).")
       }
       logger.info("VAE decode: plain single-pass (forced; volume \(volume) [\(latF)x\(latH)x\(latW)]).")
+      // comfybox#322 (review r1): plain decode is one uninterruptible kernel
+      // launch, so this check IS its whole cancellation story — the render
+      // stops here or not until the next phase boundary.
+      try Task.checkCancellation()
       return vae.decode(bf)
     case "tile":
       let tile = Int(env["LTX2_DECODE_TILE"] ?? "") ?? 16
       logger.info("VAE decode: tiled (mode=tile; volume \(volume) [\(latF)x\(latH)x\(latW)]) — tile \(tile).")
-      return vae.decodeTiled(bf, tileSize: tile, tileStride: tile - 2)
+      return try vae.decodeTiled(bf, tileSize: tile, tileStride: tile - 2)
     case "stream":
       logger.info("VAE decode: streamed exact chunked-io (mode=stream; volume \(volume) [\(latF)x\(latH)x\(latW)]) — zero seams.")
-      return vae.decodeStreamed(bf)
+      return try vae.decodeStreamed(bf)
     default:  // auto
       if volume > plainMaxVolume {
         logger.info("VAE decode: streamed exact chunked-io (volume \(volume) [\(latF)x\(latH)x\(latW)] > \(plainMaxVolume)) — zero seams.")
-        return vae.decodeStreamed(bf)
+        return try vae.decodeStreamed(bf)
       }
       logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — under the safety gate.")
+      // comfybox#322 (review r1): see the forced-plain branch above.
+      try Task.checkCancellation()
       return vae.decode(bf)
     }
   }
@@ -2429,7 +2460,7 @@ public final class LTX2Pipeline {
     }
     // base=euler_ancestral_cfg_pp -> refine=euler_cfg_pp (the author's pairing).
     var refined: MLXArray
-    switch denoisingLoop(
+    switch try denoisingLoop(
       latents: refineInit, positions: refinePos, precomputedPE: refinePE,
       textEmbeddings: textEmbeddings, negativeEmbeddings: negativeEmbeddings,
       sigmas: refineSigmas, cfgScale: cfgScale, state: refState,

@@ -39,12 +39,12 @@ final class RealVAEStreamTests: XCTestCase {
     }
 
     // Streamed decode of the REAL latent with REAL weights.
-    let streamed = vae.decodeStreamed(latent)
+    let streamed = try vae.decodeStreamed(latent)
     MLX.eval(streamed)
     let badStreamed = frameStats(streamed, tag: "streamed")
 
     // Tiled reference (known-valid path).
-    let tiled = vae.decodeTiled(latent)
+    let tiled = try vae.decodeTiled(latent)
     MLX.eval(tiled)
     let badTiled = frameStats(tiled, tag: "tiled")
 

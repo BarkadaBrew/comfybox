@@ -282,3 +282,124 @@ public struct LTX2ResumeState {
     self.context = context
   }
 }
+
+// MARK: - comfybox#322: step-boundary cancellation
+
+/// The ONE step-boundary gate every long LTX-2 loop calls.
+///
+/// comfybox#322: before this existed the LTX-2 render path had zero
+/// `Task.checkCancellation()` sites, so `/v1/queue/interrupt` could only stop
+/// the NEXT queue item — a bad 30-minute clip had to burn to completion. The
+/// image path got the same treatment in comfybox#304 (`Krea2DenoiseLoop.run`,
+/// `ChromaPipeline.denoise`), and this mirrors it exactly: one check per step,
+/// `CancellationError` propagating unmodified to the coordinator.
+///
+/// LTX-2 differs from the image path in one way that makes a shared function
+/// worth having: its loops ALSO carry the #1479 preemption signal, and the two
+/// mechanisms mean opposite things. A preemption yield parks a checkpoint so
+/// the render RESUMES later; a cancel must abandon the render. So the ordering
+/// is a correctness property, not a style choice — cancellation is evaluated
+/// FIRST, and a cancel arriving during a preemption handoff cancels cleanly
+/// instead of banking a checkpoint that would be resumed.
+public enum LTX2LoopBoundary {
+  /// What the loop should do once it is known not to be cancelled.
+  public enum Decision: Equatable {
+    /// Run the next step.
+    case proceed
+    /// Bank a #1479 checkpoint and hand it up (`.yielded`).
+    case yield
+  }
+
+  /// Pure form — the whole decision, with no ambient state. Kept separate from
+  /// the production entry so the ordering above is unit-testable without a
+  /// pipeline, weights, or a live task.
+  ///
+  /// - Throws: `CancellationError` when `cancelled` is true, regardless of
+  ///   `preemptionRaised`.
+  public static func decide(cancelled: Bool, preemptionRaised: Bool) throws -> Decision {
+    if cancelled { throw CancellationError() }
+    return preemptionRaised ? .yield : .proceed
+  }
+
+  /// Production entry: reads the ambient task's cancellation flag and the
+  /// render's preemption signal.
+  public static func decide(preemption: PreemptionSignal?) throws -> Decision {
+    try decide(cancelled: Task.isCancelled, preemptionRaised: preemption?.isRaised == true)
+  }
+}
+
+/// comfybox#322 (review r1, Critical): what a preemption episode does about the
+/// VIDEO when an interrupt lands while the preempting image job is running.
+///
+/// The #1479 episode is `checkpoint -> evict the video weights -> run the
+/// preempting image job -> resume the video`, and #322 made the video render
+/// cancellable. Two things follow, and they pull in opposite directions:
+///
+///   - The preemptor must NEVER be collateral. `runGenerate` has been
+///     cancellation-aware since comfybox#304, and the episode is awaited from
+///     inside the video's render task — so a plain structured `await` would
+///     inherit the video's cancellation and kill the image job mid-denoise.
+///     An interrupt aimed at the video killing an unrelated image render is
+///     precisely the "died as cancel collateral with an opaque error" failure
+///     issue #322 exists to end. The episode therefore runs the preemptor in
+///     an UNSTRUCTURED task (which does not inherit cancellation) and waits
+///     for it. That is a structural property of the call site, enforced by the
+///     coordinator seam test, not by this type.
+///
+///   - The video must not come back from the dead. Once the preemptor has
+///     finished, resuming a checkpoint the operator asked to kill would defeat
+///     the interrupt entirely — the render would simply carry on for another
+///     20 minutes. That decision is what this type owns, so it is testable
+///     without a coordinator, a queue, or weights.
+public enum LTX2PreemptionEpisode {
+  /// What to do with the checkpointed video once the preemptor has finished.
+  public enum Disposition: Equatable {
+    /// Nothing was interrupted: reload if needed and resume the checkpoint.
+    /// The pre-#322 behaviour, unchanged.
+    case resumeVideo
+    /// The video was interrupted while the preemptor ran. Drop the checkpoint
+    /// and report the video job interrupted. The video weights were already
+    /// evicted at the top of the episode and are NOT reloaded — which is
+    /// exactly what an operator who interrupted to free the box wants.
+    case abandonVideo
+  }
+
+  /// Sampled AFTER the preemptor has finished, so an interrupt arriving at any
+  /// point during the episode — including before it started — lands here.
+  public static func disposition(videoInterrupted: Bool) -> Disposition {
+    videoInterrupted ? .abandonVideo : .resumeVideo
+  }
+}
+
+/// comfybox#322 (review r1, Minor): is `error` a cancellation, even wrapped?
+///
+/// `CancellationError` propagates unmodified out of the LTX-2 loops (the #304
+/// contract), but it does not always reach a classifier that way: this codebase
+/// wraps errors freely on the paths a render touches — `LTX2WeightLoaderError
+/// .weightApplicationFailed(String, Error)`, `ModelPoolError.loadFailed(String,
+/// Error)`, `ZImageWeightsMapping.WeightApplicationError.updateFailed(prefix:
+/// underlying:)` and a dozen more of the same shape. Anywhere the answer to
+/// "was this an interrupt?" decides between *report it cleanly* and *crash /
+/// report a failure*, a wrapped cancellation must not be missed.
+///
+/// Structural rather than a fixed list of wrapper types: every one of those
+/// enums exposes its payload through `Mirror`, so this finds a cancellation
+/// nested at any of them without this file having to know their names — and a
+/// new wrapper added later is covered for free. Depth- and node-capped so a
+/// pathological payload cannot turn an error path into a walk; it only ever
+/// runs when something has already failed.
+public func ltx2IsCancellation(_ error: Error) -> Bool {
+  var budget = 256
+  return ltx2ContainsCancellation(error, depth: 0, budget: &budget)
+}
+
+private func ltx2ContainsCancellation(_ value: Any, depth: Int, budget: inout Int) -> Bool {
+  if value is CancellationError { return true }
+  guard depth < 4, budget > 0 else { return false }
+  for child in Mirror(reflecting: value).children {
+    budget -= 1
+    if budget <= 0 { return false }
+    if ltx2ContainsCancellation(child.value, depth: depth + 1, budget: &budget) { return true }
+  }
+  return false
+}

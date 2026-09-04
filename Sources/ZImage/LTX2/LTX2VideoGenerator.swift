@@ -1002,6 +1002,29 @@ public final class LTX2VideoGenerator {
         // render's activations, via defer) EVERY render.
         GPU.clearCache()
         defer { GPU.clearCache() }
+        // comfybox#322 (claim corrected in review r1): what actually guarantees
+        // an interrupted render produces no clip is the `Task
+        // .checkCancellation()` immediately BEFORE `writeMP4` — the write is
+        // synchronous, so cancellation cannot preempt it part-way and there is
+        // no "cancel lands mid-write" case to catch.
+        //
+        // This defer covers the narrower real one: `writeMP4` unlinks
+        // `outputPath` and writes straight to it, so if it THROWS (an I/O
+        // error, a full disk) after the task was already cancelled, it leaves a
+        // truncated file that reads as finished output. The window is between
+        // the two flags, so this never deletes a file the render did not
+        // create: a cancel before the write leaves any pre-existing file alone,
+        // and a completed write is kept. A #1479 yield is not a cancellation,
+        // so a preempted render keeps everything and resumes.
+        var startedWrite = false
+        var wroteOutput = false
+        defer {
+            if Task.isCancelled, startedWrite, !wroteOutput,
+               FileManager.default.fileExists(atPath: request.outputPath) {
+                try? FileManager.default.removeItem(atPath: request.outputPath)
+                logger.info("LTX-2 comfybox#322: interrupted mid-write — removed partial output at \(request.outputPath).")
+            }
+        }
         try validate(request)
 
         // #1479: the continuation the resume came in with, READ-ONLY from here
@@ -1072,6 +1095,12 @@ public final class LTX2VideoGenerator {
         // against a phantom phase. `LTX2PhaseTelemetry.end` removes the open
         // entry, so it is safe to call once per `begin` and a no-op after —
         // the `do` block scopes this one to exactly the load.
+        // comfybox#322 (review r1): the model load is the single most expensive
+        // non-denoise phase (tens of GB, tens of seconds, and uninterruptible
+        // once it starts). An interrupt that arrived while this job waited its
+        // turn, or during text encode, must not pay for it. #1479 already had a
+        // free unwind point here for preemption; this is its cancellation twin.
+        try Task.checkCancellation()
         telemetry?.begin(.modelLoad)
         do {
             defer { telemetry?.end(.modelLoad) }
@@ -1365,6 +1394,11 @@ public final class LTX2VideoGenerator {
         let startChunk = resume != nil ? ctx.chunkIndex : 0
 
         for chunk in startChunk..<plan.totalChunks {
+            // comfybox#322: chunk boundary. Cancellation is evaluated BEFORE
+            // the #1479 unwind point below, so an interrupt arriving here
+            // aborts instead of banking a checkpoint that would be resumed.
+            try Task.checkCancellation()
+
             // The checkpoint being resumed belongs to `startChunk`; later chunks
             // start clean.
             let chunkResume: LTX2ResumeState? = (chunk == startChunk) ? resume : nil
@@ -1564,6 +1598,12 @@ public final class LTX2VideoGenerator {
         // to a video-only file rather than failing the render.
         var audioTrack: LTX2PostProcess.AudioTrack? = nil
         if let al = audioLatents {
+            // comfybox#322: audio decode (VAE + BigVGAN/BWE vocoder) is a
+            // single multi-second tensor pass with no inner loop, so this is
+            // its boundary. Deliberately OUTSIDE the `do` below, whose `catch`
+            // degrades to a video-only file — swallowing a cancel there would
+            // let an interrupted render go on to write an MP4.
+            try Task.checkCancellation()
             do {
                 if audioVAE == nil {
                     logger.info("LTX-2 audio: binding audio VAE + vocoder from monolith…")
@@ -1613,13 +1653,19 @@ public final class LTX2VideoGenerator {
             }
         }
 
+        // comfybox#322: last boundary before anything is written to disk, so a
+        // cancelled render never leaves a file at `outputPath` (the `defer`
+        // above is the backstop for a cancel that lands mid-write).
+        try Task.checkCancellation()
         telemetry?.begin(.postProcess)
+        startedWrite = true
         try LTX2PostProcess.writeMP4(
             frames: allFrames, outputPath: request.outputPath,
             fps: request.fps, width: outW, height: outH,
             bitsPerPixelOverride: pipeline.resolvedConfig.videoBitsPerPx,
             audio: audioTrack,
             deliveryShortEdge: pipeline.resolvedConfig.deliveryShortEdge)
+        wroteOutput = true
         telemetry?.end(.postProcess)
 
         return .completed(LTX2VideoResult(

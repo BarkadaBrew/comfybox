@@ -3699,7 +3699,7 @@ struct ZImageCLI {
       stepNum += 1
 
       print("[\(stepNum)/\(totalSteps)] Generating I2V (\(denoiseSteps) steps, \(numFrames) frames)...")
-      output = pipeline.generateI2V(
+      output = try pipeline.generateI2V(
         inputIds: batch.inputIds,
         attentionMask: batch.attentionMask,
         image: imageForEncoder,
@@ -3717,7 +3717,7 @@ struct ZImageCLI {
     } else {
       // --- T2V ---
       print("[\(stepNum)/\(totalSteps)] Generating T2V (\(denoiseSteps) steps, \(numFrames) frames)...")
-      output = pipeline.generateT2V(
+      output = try pipeline.generateT2V(
         inputIds: batch.inputIds,
         attentionMask: batch.attentionMask,
         width: width, height: height,
@@ -4150,7 +4150,7 @@ struct ZImageCLI {
 
     print("[\(stepNum)/\(totalSteps)] Running denoising loop (\(steps) steps)...")
     let genStart = CFAbsoluteTimeGetCurrent()
-    let output = pipeline.generateT2VWithEmbeddings(
+    let output = try pipeline.generateT2VWithEmbeddings(
       videoEmbeddings: videoEmbeddings,
       width: width, height: height, numFrames: frames,
       steps: steps, seed: UInt64(seed),
@@ -4597,7 +4597,7 @@ struct ZImageCLI {
       print("--- Chunk \(chunk + 1)/\(totalChunks) (seed \(chunkSeed)) ---")
 
       let genStart = CFAbsoluteTimeGetCurrent()
-      let output = pipeline.generateI2V(
+      let output = try pipeline.generateI2V(
         inputIds: batch.inputIds,
         attentionMask: batch.attentionMask,
         image: currentImage,
