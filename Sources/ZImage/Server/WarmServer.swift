@@ -978,6 +978,7 @@ public final class WarmServer {
           "id": entry.id,
           "filename": entry.filename,
           "model_compatibility": entry.modelCompatibility,
+          "compatibility_source": entry.compatibilitySource.rawValue,
           "format": entry.format.rawValue,
           "rank": entry.rank,
           "size_bytes": entry.sizeBytes,
@@ -1023,6 +1024,7 @@ public final class WarmServer {
         "size_bytes": entry.sizeBytes,
         "size_formatted": entry.sizeFormatted,
         "model_compatibility": entry.modelCompatibility,
+        "compatibility_source": entry.compatibilitySource.rawValue,
         "format": entry.format.rawValue,
         "rank": entry.rank,
         "key_count": entry.keyCount,
@@ -1171,6 +1173,9 @@ public final class WarmServer {
         }
         krea2Relative = parsed
       }
+      // #313: model_compatibility is user-declared here, same as
+      // krea2_relative above — sets provenance to "manual" so a future
+      // scan() never overwrites it back to the auto-detected value.
       let patch = LoRAEntryPatch(
         triggerwords: json["triggerwords"] as? [String],
         recommendedScale: (json["recommended_scale"] as? NSNumber)?.floatValue,
@@ -1179,7 +1184,8 @@ public final class WarmServer {
         notes: json["notes"] as? String,
         sourceURL: json["source_url"] as? String,
         civitaiModelId: json["civitai_model_id"] as? Int,
-        krea2Relative: krea2Relative
+        krea2Relative: krea2Relative,
+        modelCompatibility: json["model_compatibility"] as? [String]
       )
       do {
         try library.update(id, patch: patch)
@@ -1193,6 +1199,8 @@ public final class WarmServer {
           "recommended_scale": entry.recommendedScale,
           "tags": entry.tags,
           "notes": entry.notes,
+          "model_compatibility": entry.modelCompatibility,
+          "compatibility_source": entry.compatibilitySource.rawValue,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
           return .json(.rawJSON(status: 200, data: data))

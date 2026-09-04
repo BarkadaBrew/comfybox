@@ -393,7 +393,13 @@ public final class LoRALibrary: @unchecked Sendable {
         updated.relativePath = relativePath
         updated.sizeBytes = fileSize
         updated.sha256 = nil  // Invalidate hash since file changed
-        updated.modelCompatibility = scanResult.compatibility
+        // #313: model_compatibility is file-derived UNLESS the user manually
+        // set it (POST /v1/loras/{id}/update) — a manual tag is sticky
+        // across every future rescan, even once the file changes. Every
+        // other field on this line remains unconditionally file-derived.
+        if updated.compatibilitySource != .manual {
+          updated.modelCompatibility = scanResult.compatibility
+        }
         updated.format = scanResult.format
         updated.rank = scanResult.rank
         updated.alpha = scanResult.alpha
@@ -422,6 +428,7 @@ public final class LoRALibrary: @unchecked Sendable {
           sizeBytes: fileSize,
           sha256: nil,
           modelCompatibility: scanResult.compatibility,
+          compatibilitySource: .auto,
           format: scanResult.format,
           rank: scanResult.rank,
           alpha: scanResult.alpha,
@@ -502,6 +509,12 @@ public final class LoRALibrary: @unchecked Sendable {
     if let url = patch.sourceURL { entry.sourceURL = url }
     if let civitaiId = patch.civitaiModelId { entry.civitaiModelId = civitaiId }
     if let relative = patch.krea2Relative { entry.krea2Relative = relative }
+    // #313: a manually-set compatibility tag is sticky — scan() must never
+    // overwrite it again, including after the file itself changes.
+    if let compat = patch.modelCompatibility {
+      entry.modelCompatibility = compat
+      entry.compatibilitySource = .manual
+    }
 
     entries[id] = entry
     try saveIndex()
