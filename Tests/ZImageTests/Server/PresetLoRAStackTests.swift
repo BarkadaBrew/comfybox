@@ -61,6 +61,12 @@ final class PresetLoRAStackTests: XCTestCase {
     .resolved(ResolvedPreset(preset: preset), declared: preset)
   }
 
+  /// The `unresolved` reason code, or nil when the preset expanded.
+  private func reason(_ decision: PresetLoRAStack) -> String? {
+    guard case .apply(let e) = decision else { return nil }
+    return e.unresolved?.code
+  }
+
   private func expansion(_ decision: PresetLoRAStack, _ file: StaticString = #filePath, _ line: UInt = #line)
     throws -> PresetExpansion
   {
@@ -136,15 +142,147 @@ final class PresetLoRAStackTests: XCTestCase {
       .modelConflict(preset: "krea-kira", presetModel: "krea2-raw", requestModel: "z-image-turbo"))
   }
 
-  /// A preset that names no model contributes none — the request's base stands.
-  func testPresetWithNoModelLeavesTheBaseAlone() throws {
+  // MARK: Round 2, finding 2 — a preset with no model of its own
+
+  /// A preset that names no model must NOT hand its adapters to whatever base
+  /// is resident — that is the original #286 defect wearing a different hat.
+  func testPresetWithNoModelAndNoRequestModelIsUnresolvable() throws {
     let bare = lookup(ImagePreset(
       id: "no-model", name: "x", mediaKind: "image",
       loras: [LoraReference(filename: "a.safetensors", scale: 0.5)]))
     let e = try expansion(PresetLoRAStack.decide(
-      presetId: "no-model", lookup: bare, requestLoras: nil, requestModel: "z-image-turbo"))
+      presetId: "no-model", lookup: bare, requestLoras: nil))
+    XCTAssertNil(e.loras)
     XCTAssertNil(e.model)
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "no_model")
+  }
+
+  /// `custom_model_path` is stored for the desktop app and never read by the
+  /// engine — it does not make a preset loadable. This is the shape of all 26
+  /// desktop-saved presets in the live store.
+  func testCustomModelPathAloneIsStillNoModel() throws {
+    let desktop = lookup(ImagePreset(
+      id: "788B45BC", name: "Desktop preset", model: nil,
+      customModelPath: "/Users/todd/LocalModels/krea2-raw",
+      loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
+      kroma: KromaPolicy(strength: 0)))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "788B45BC", lookup: desktop, requestLoras: nil))
+    XCTAssertNil(e.loras)
+    let reason = try XCTUnwrap(e.unresolved)
+    XCTAssertEqual(reason.code, "no_model")
+    XCTAssertTrue(reason.message.contains("custom_model_path"), reason.message)
+  }
+
+  /// The UNLESS: the request named the base, so it took responsibility for it —
+  /// expand the stack only, never a model.
+  func testPresetWithNoModelExpandsLorasWhenTheRequestNamesABase() throws {
+    let bare = lookup(ImagePreset(
+      id: "no-model", name: "x", mediaKind: "image",
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.5)]))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "no-model", lookup: bare, requestLoras: nil, requestModel: "krea2-raw"))
+    XCTAssertNil(e.model, "the request's own base stands")
     XCTAssertEqual(e.loras?.map(\.filename), ["a.safetensors"])
+    XCTAssertNil(e.unresolved)
+  }
+
+  /// …but where the preset's family IS knowable it still has to agree: krea2
+  /// adapters on a Z-Image base bind zero layers and only warn.
+  func testPresetWithNoModelRefusesAFamilyMismatch() throws {
+    let krea2Stack = lookup(ImagePreset(
+      id: "krea2-loras", name: "x", mediaKind: "image",
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea2-loras", lookup: krea2Stack, requestLoras: nil,
+      requestModel: "z-image-turbo"))
+    XCTAssertNil(e.loras)
+    let reason = try XCTUnwrap(e.unresolved)
+    XCTAssertEqual(reason.code, "no_model")
+    XCTAssertTrue(reason.message.contains("z-image-turbo"), reason.message)
+  }
+
+  func testPresetWithNoModelAcceptsAMatchingFamily() throws {
+    let krea2Stack = lookup(ImagePreset(
+      id: "krea2-loras", name: "x", mediaKind: "image",
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea2-loras", lookup: krea2Stack, requestLoras: nil, requestModel: "krea2-raw"))
+    XCTAssertNil(e.unresolved)
+    XCTAssertEqual(e.loras?.count, 1)
+  }
+
+  // MARK: Round 2, finding 1 — the engine/provider gate
+
+  /// The seeded default. `engine: "mflux"`, `model: "schnell"` — expanding it
+  /// turns a harmless label into a `poolLoad` of a model this engine cannot
+  /// serve.
+  func testSeededSchnellHQPresetIsUnresolvable() throws {
+    let schnell = try XCTUnwrap(PresetStore.defaultPresets.first { $0.id == "schnell-hq" })
+    XCTAssertEqual(schnell.engine, "mflux", "precondition: the seed still declares mflux")
+
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "schnell-hq", lookup: lookup(schnell), requestLoras: nil))
+    XCTAssertNil(e.loras)
+    XCTAssertNil(e.model, "nothing must reach poolLoad")
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "engine:mflux")
+  }
+
+  /// The other seeded default is this engine's own and must still expand.
+  func testSeededZImageChatPresetExpands() throws {
+    let chat = try XCTUnwrap(PresetStore.defaultPresets.first { $0.id == "zimage-chat" })
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "zimage-chat", lookup: lookup(chat), requestLoras: nil))
+    XCTAssertNil(e.unresolved)
+    XCTAssertEqual(e.model, "z-image-turbo")
+    XCTAssertEqual(e.loras, [], "an empty preset stack CLEARS the resident one — it is a declaration")
+    XCTAssertEqual(e.steps, 8)
+  }
+
+  func testRemoteProviderIsUnresolvable() throws {
+    let remote = lookup(ImagePreset(
+      id: "replicate-lane", name: "x", mediaKind: "image", provider: "replicate",
+      engine: "zimage", model: "krea2-raw",
+      loras: [LoraReference(filename: "a.safetensors", scale: 1)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "replicate-lane", lookup: remote, requestLoras: nil))
+    XCTAssertNil(e.loras)
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "provider:replicate")
+  }
+
+  /// An OMITTED engine is not a declaration. `ResolvedPreset` fills it from
+  /// `PresetDefaults`, whose default is literally "mflux" — reading the gate
+  /// off the resolved view would refuse every preset that simply leaves the
+  /// field out, which is 26 of the presets in the live store.
+  func testOmittedEngineIsNotAGate() throws {
+    XCTAssertEqual(
+      PresetDefaults.standard.engine, "mflux",
+      "precondition: the resolved default really is mflux, which is why the gate reads `declared`")
+    let preset = ImagePreset(
+      id: "no-engine", name: "x", mediaKind: "image", model: "krea2-raw",
+      loras: [LoraReference(filename: "a.safetensors", scale: 1)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0))
+    XCTAssertEqual(ResolvedPreset(preset: preset).engine, "mflux", "precondition")
+
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "no-engine", lookup: lookup(preset), requestLoras: nil))
+    XCTAssertNil(e.unresolved)
+    XCTAssertEqual(e.model, "krea2-raw")
+  }
+
+  /// The gate must never fire before the request/preset model contradiction is
+  /// even considered — an unresolvable preset contributes no model, so it can
+  /// never 409.
+  func testANonLocalEnginePresetNeverConflictsOnModel() {
+    let schnell = PresetStore.defaultPresets.first { $0.id == "schnell-hq" }!
+    XCTAssertEqual(
+      reason(PresetLoRAStack.decide(
+        presetId: "schnell-hq", lookup: lookup(schnell), requestLoras: nil,
+        requestModel: "krea2-raw")),
+      "engine:mflux")
   }
 
   // MARK: C1 — declared steps/guidance, and only declared
@@ -211,7 +349,8 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertNil(e.model)
     XCTAssertNil(e.steps)
     let reason = try XCTUnwrap(e.unresolved)
-    XCTAssertTrue(reason.contains("krea-kira-typo"), reason)
+    XCTAssertEqual(reason.code, "unknown_preset")
+    XCTAssertTrue(reason.message.contains("krea-kira-typo"), reason.message)
   }
 
   func testInvalidPresetIsALabelAndIsReported() throws {
@@ -220,8 +359,9 @@ final class PresetLoRAStackTests: XCTestCase {
       requestLoras: nil))
     XCTAssertNil(e.loras)
     let reason = try XCTUnwrap(e.unresolved)
-    XCTAssertTrue(reason.contains("krea-broken"), reason)
-    XCTAssertTrue(reason.contains("kroma"), reason)
+    XCTAssertEqual(reason.code, "invalid_preset")
+    XCTAssertTrue(reason.message.contains("krea-broken"), reason.message)
+    XCTAssertTrue(reason.message.contains("kroma"), reason.message)
   }
 
   /// A video preset on the image path would push LTX adapters at a Krea 2
@@ -233,7 +373,7 @@ final class PresetLoRAStackTests: XCTestCase {
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "kira-video-avocado", lookup: video, requestLoras: nil))
     XCTAssertNil(e.loras)
-    XCTAssertTrue(try XCTUnwrap(e.unresolved).contains("video"))
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "media_kind:video")
   }
 
   /// The engine has no family→default-kroma-file table (that policy lives in
@@ -247,7 +387,7 @@ final class PresetLoRAStackTests: XCTestCase {
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "kroma-no-file", lookup: preset, requestLoras: nil))
     XCTAssertNil(e.loras)
-    XCTAssertTrue(try XCTUnwrap(e.unresolved).contains("kroma.file"))
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "kroma_file_missing")
   }
 
   /// The bypass `.diff` adapter is a preset dial with no engine application
@@ -261,7 +401,7 @@ final class PresetLoRAStackTests: XCTestCase {
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "bypass-on", lookup: preset, requestLoras: nil))
     XCTAssertNil(e.loras)
-    XCTAssertTrue(try XCTUnwrap(e.unresolved).contains("bypass"))
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "bypass_declared")
   }
 
   func testUnresolvedNeverConflictsOnModel() throws {
@@ -433,14 +573,17 @@ final class PresetLoRAStackTests: XCTestCase {
       GenerateResponse(success: true, outputPath: "/tmp/x.png", durationMs: 1))
     XCTAssertNil(object["applied_loras"])
     XCTAssertNil(object["preset_unresolved"])
+    XCTAssertNil(object["preset_unresolved_reason"])
     XCTAssertNil(object["preset_stack_mismatch"])
   }
 
   func testPresetFlagsAreOnTheWire() throws {
     let object = try encodeToObject(GenerateResponse(
       success: true, outputPath: "/tmp/x.png", durationMs: 1,
-      presetUnresolved: "krea-kira-typo", presetStackMismatch: true))
-    XCTAssertEqual(object["preset_unresolved"] as? String, "krea-kira-typo")
+      presetUnresolved: "schnell-hq", presetUnresolvedReason: "engine:mflux",
+      presetStackMismatch: true))
+    XCTAssertEqual(object["preset_unresolved"] as? String, "schnell-hq")
+    XCTAssertEqual(object["preset_unresolved_reason"] as? String, "engine:mflux")
     XCTAssertEqual(object["preset_stack_mismatch"] as? Bool, true)
   }
 

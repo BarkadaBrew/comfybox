@@ -94,20 +94,17 @@ public enum PresetLoRAStack: Sendable, Equatable {
     guard let lookup else {
       // Named but never looked up — a wiring mistake here would silently
       // reopen #286, so it is reported rather than shrugged off.
-      return .apply(PresetExpansion(
-        presetId: id, unresolved: "preset '\(id)' was not resolved before dispatch"))
+      return unresolved(id, "not_resolved", "preset '\(id)' was not resolved before dispatch")
     }
 
     let resolved: ResolvedPreset
     let declared: ImagePreset
     switch lookup {
     case .notFound:
-      return .apply(PresetExpansion(
-        presetId: id,
-        unresolved: "unknown preset '\(id)' — not in this engine's store (GET /v1/presets)"))
+      return unresolved(id, "unknown_preset",
+        "unknown preset '\(id)' — not in this engine's store (GET /v1/presets)")
     case .invalid(let reason):
-      return .apply(PresetExpansion(
-        presetId: id, unresolved: "preset '\(id)' is flagged invalid: \(reason)"))
+      return unresolved(id, "invalid_preset", "preset '\(id)' is flagged invalid: \(reason)")
     case .resolved(let r, let d):
       resolved = r
       declared = d
@@ -118,44 +115,87 @@ public enum PresetLoRAStack: Sendable, Equatable {
     // A video preset on the image path would push LTX adapters at a Krea 2
     // pipeline.
     if resolved.mediaKind.lowercased() == "video" {
-      return .apply(PresetExpansion(
-        presetId: id,
-        unresolved: "preset '\(id)' is a video preset (media_kind \"\(resolved.mediaKind)\") "
-          + "— /v1/generate is the image path"))
+      return unresolved(id, "media_kind:video",
+        "preset '\(id)' is a video preset (media_kind \"\(resolved.mediaKind)\") "
+          + "— /v1/generate is the image path")
     }
+
+    // Round 2, finding 1: the ENGINE/PROVIDER gate. The seeded default
+    // `schnell-hq` declares `engine: "mflux"` / `model: "schnell"`, and a
+    // Replicate-routed preset declares a remote provider. Expanding either
+    // turns `model` into a `poolLoad` of something this engine cannot load —
+    // a render that fails where it used to be a harmless label.
+    //
+    // Read from the DECLARED preset, never from `ResolvedPreset`: the resolved
+    // view fills `engine` from `PresetDefaults`, whose default is literally
+    // "mflux", so every preset that simply omits the field would be refused.
+    // An omitted engine/provider is not a declaration and gates nothing.
+    if let engine = declared.engine?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !engine.isEmpty, !localEngines.contains(engine.lowercased()) {
+      return unresolved(id, "engine:\(engine)",
+        "preset '\(id)' declares engine '\(engine)', which is not this engine — "
+          + "expanding it would ask ComfyBox to load a model it does not serve")
+    }
+    if let provider = declared.provider?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !provider.isEmpty, !localProviders.contains(provider.lowercased()) {
+      return unresolved(id, "provider:\(provider)",
+        "preset '\(id)' declares provider '\(provider)', which is not local — "
+          + "ComfyBox renders locally or not at all")
+    }
+
     // The bypass `.diff` adapter is a preset-schema dial the engine has no
     // application path for (the expanding sender compiles it into `loras[]`).
     if let bypass = resolved.bypass, bypass.isActive {
-      return .apply(PresetExpansion(
-        presetId: id,
-        unresolved: "preset '\(id)' declares bypass.strength \(bypass.strength), which the engine "
-          + "cannot expand — send the resolved stack in `loras`"))
+      return unresolved(id, "bypass_declared",
+        "preset '\(id)' declares bypass.strength \(bypass.strength), which the engine "
+          + "cannot expand — send the resolved stack in `loras`")
     }
     // D14: kroma is a first-class field, and the engine has no
     // family→default-file table (that policy is client-side, FDD §3.17), so an
     // unnamed file is not guessed.
     if let kroma = resolved.kroma, kroma.strength > 0,
        (kroma.file ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      return .apply(PresetExpansion(
-        presetId: id,
-        unresolved: "preset '\(id)' declares kroma.strength \(kroma.strength) with no kroma.file, "
-          + "and the engine has no family-default kroma table"))
+      return unresolved(id, "kroma_file_missing",
+        "preset '\(id)' declares kroma.strength \(kroma.strength) with no kroma.file, "
+          + "and the engine has no family-default kroma table")
     }
 
     var expansion = PresetExpansion(presetId: id)
 
-    // --- Model: the half round 1 dropped. ----------------------------------
+    // --- Model ------------------------------------------------------------
 
     let presetModel = (resolved.model ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    if !presetModel.isEmpty {
-      let asked = (requestModel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-      if asked.isEmpty {
-        // Flows through the request's existing model-switch semantics exactly
-        // as if the client had sent it.
-        expansion.model = presetModel
-      } else if normalizeModelSpec(asked) != normalizeModelSpec(presetModel) {
-        return .modelConflict(preset: id, presetModel: presetModel, requestModel: asked)
+    let asked = (requestModel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if presetModel.isEmpty {
+      // Round 2, finding 2 (C1 residual): a preset that names no model must NOT
+      // hand its adapters to whatever base is resident — that is the original
+      // #286 defect wearing a different hat. `custom_model_path` does not
+      // count: it is stored and echoed, and the engine has never read it.
+      let hint = (resolved.customModelPath ?? "").isEmpty
+        ? "" : " (custom_model_path is stored for the desktop app; the engine never loads from it)"
+      guard !asked.isEmpty else {
+        return unresolved(id, "no_model",
+          "preset '\(id)' names no model\(hint), so the engine cannot know which base its LoRA "
+            + "stack belongs to — name a model on the preset, or send one on the request")
       }
+      // The request took responsibility for the base. Where the preset's family
+      // IS knowable, it still has to agree — krea2 adapters on a Z-Image base
+      // bind zero layers and only warn.
+      if let presetFamily = declaredFamily(declared),
+         let requestFamily = modelFamily(asked),
+         presetFamily != requestFamily {
+        return unresolved(id, "no_model",
+          "preset '\(id)' names no model and its declared \(presetFamily) LoRA stack does not "
+            + "belong on the requested '\(asked)' (\(requestFamily)) base")
+      }
+      // Expand the stack only — the request's own model stands.
+    } else if asked.isEmpty {
+      // Flows through the request's existing model-switch semantics exactly as
+      // if the client had sent it.
+      expansion.model = presetModel
+    } else if normalizeModelSpec(asked) != normalizeModelSpec(presetModel) {
+      return .modelConflict(preset: id, presetModel: presetModel, requestModel: asked)
     }
 
     // --- The stack ---------------------------------------------------------
@@ -184,6 +224,44 @@ public enum PresetLoRAStack: Sendable, Equatable {
     if requestGuidance == nil, let guidance = declared.guidance { expansion.guidance = guidance }
 
     return .apply(expansion)
+  }
+
+  // MARK: Gates
+
+  /// Engine labels that mean "this ComfyBox process". `zimage` is what the
+  /// engine's own presets and the FDD's image-preset discriminator use.
+  static let localEngines: Set<String> = ["zimage", "comfybox"]
+  /// Provider labels that mean "rendered here". Anything else (replicate, …)
+  /// is somebody else's renderer.
+  static let localProviders: Set<String> = ["local"]
+
+  /// The checkpoint family a preset's LoRA stack belongs to, when the preset
+  /// says enough to know. Declared `checkpoint_family` first (D14/O4a policy
+  /// label), then the `model` spec. Never guessed from a filename.
+  static func declaredFamily(_ preset: ImagePreset) -> String? {
+    if let family = preset.checkpointFamily?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !family.isEmpty {
+      if PresetStore.krea2CheckpointFamilies.contains(family) { return "krea2" }
+      if PresetStore.zimageCheckpointFamilies.contains(family) { return "z-image" }
+      return nil
+    }
+    guard let model = preset.model, !model.isEmpty else { return nil }
+    return modelFamily(model)
+  }
+
+  /// The family a model spec belongs to, when it is one the engine classifies.
+  static func modelFamily(_ spec: String) -> String? {
+    if Krea2ModelDetection.isKnownKrea2Model(spec) { return "krea2" }
+    if Krea2ModelDetection.specDirectory(spec) != nil { return "krea2" }
+    if spec.lowercased().contains("z-image") || spec.lowercased().contains("zimage") {
+      return "z-image"
+    }
+    return nil
+  }
+
+  private static func unresolved(_ id: String, _ code: String, _ message: String) -> PresetLoRAStack {
+    .apply(PresetExpansion(
+      presetId: id, unresolved: PresetExpansion.Unresolved(code: code, message: message)))
   }
 
   /// Are these the same stack? Compared as an ordered list of (file NAME,
@@ -223,8 +301,26 @@ public struct PresetExpansion: Sendable, Equatable {
   public var steps: Int?
   public var guidance: Double?
   /// C2: the engine could not expand this preset. It behaves as the label it
-  /// always was, and this reaches the response as `preset_unresolved`.
-  public var unresolved: String?
+  /// always was, and this reaches the response as `preset_unresolved` (the
+  /// preset's name) plus `preset_unresolved_reason` (the machine-readable
+  /// code).
+  public var unresolved: Unresolved?
+
+  /// Why a preset stayed a label.
+  ///
+  /// `code` is short and machine-readable so a daemon can branch on it:
+  /// `unknown_preset`, `invalid_preset`, `media_kind:video`, `engine:<x>`,
+  /// `provider:<x>`, `no_model`, `bypass_declared`, `kroma_file_missing`,
+  /// `missing_lora:<name>`, `not_resolved`. `message` is the full sentence
+  /// that goes in the engine log.
+  public struct Unresolved: Sendable, Equatable {
+    public let code: String
+    public let message: String
+    public init(code: String, message: String) {
+      self.code = code
+      self.message = message
+    }
+  }
   /// I1: the request's explicit `loras` differ from the preset's resolved
   /// stack. Explicit still wins; this reaches the response as
   /// `preset_stack_mismatch`.
@@ -232,7 +328,7 @@ public struct PresetExpansion: Sendable, Equatable {
 
   public init(
     presetId: String, loras: [LoraReference]? = nil, model: String? = nil,
-    steps: Int? = nil, guidance: Double? = nil, unresolved: String? = nil,
+    steps: Int? = nil, guidance: Double? = nil, unresolved: Unresolved? = nil,
     stackMismatch: Bool = false
   ) {
     self.presetId = presetId
@@ -296,12 +392,7 @@ extension GeneratePayload {
 
     case .apply(let expansion):
       if let reason = expansion.unresolved {
-        // C2: NOT a 400. Pre-#286 behaviour (label only) plus a warning and an
-        // additive response field, so nobody has to guess again.
-        out.presetUnresolved = expansion.presetId
-        log("WARNING: \(reason) — rendering with the request's own settings and the resident "
-          + "LoRA stack, exactly as before #286; response carries preset_unresolved")
-        return out
+        return out.asUnresolvedPreset(expansion.presetId, reason, log: log)
       }
       if let loras = expansion.loras {
         out.loras = loras.map { LoRAEntry(path: $0.filename, scale: Float($0.scale), role: $0.role) }
@@ -322,5 +413,20 @@ extension GeneratePayload {
       if let guidance = expansion.guidance { out.guidance = Float(guidance) }
       return out
     }
+  }
+
+  /// Pre-#286 behaviour, announced: the preset stays the provenance label it
+  /// always was, nothing it declared is applied, and the response carries
+  /// `preset_unresolved` + `preset_unresolved_reason`. Never a 400 — an
+  /// unexpandable preset was harmless for the daemon's whole life.
+  func asUnresolvedPreset(
+    _ presetId: String, _ reason: PresetExpansion.Unresolved, log: (String) -> Void
+  ) -> GeneratePayload {
+    var out = self
+    out.presetUnresolved = presetId
+    out.presetUnresolvedReason = reason.code
+    log("WARNING: \(reason.message) [\(reason.code)] — rendering with the request's own settings "
+      + "and the resident LoRA stack, exactly as before #286; response carries preset_unresolved")
+    return out
   }
 }

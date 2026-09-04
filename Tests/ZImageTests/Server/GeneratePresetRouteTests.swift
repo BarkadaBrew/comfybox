@@ -22,21 +22,30 @@ final class GeneratePresetRouteTests: XCTestCase {
     return PresetStore(path: dir.appendingPathComponent("presets.json"), seedDefaults: false)
   }
 
-  /// Mirrors `WarmServer.decode(_:from:)` — the generate routes decode with
-  /// `.convertFromSnakeCase`.
-  private func decode(_ json: String) throws -> GeneratePayload {
-    let d = JSONDecoder()
-    d.keyDecodingStrategy = .convertFromSnakeCase
-    return try d.decode(GeneratePayload.self, from: Data(json.utf8))
+  private var configuration: WarmServerConfiguration {
+    WarmServerConfiguration(allowedOutputDirectory: NSTemporaryDirectory())
   }
 
-  /// The production expansion, over an explicit store.
+  /// THE route function.
+  ///
+  /// Round 2 (I6): `WarmServer.decodedGeneratePayload(from:store:configuration:…)`
+  /// is the whole decode the `/v1/generate` and `/v1/generate/async` handlers
+  /// run — parse, init-image, output-path containment, recipe names AND the
+  /// #286 preset expansion, in one function. The instance method of the same
+  /// name is a one-line forward to it, so there is no separate "expansion call
+  /// at the decode site" that could be deleted while the decode survived: any
+  /// such deletion fails these tests.
+  ///
+  /// `loraExists` defaults to "everything resolves" so a test does not need
+  /// files on disk; the missing-LoRA tests below override it.
   private func expand(
     _ json: String, store: PresetStore,
-    stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 }
+    stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
+    loraExists: @escaping (LoRAEntry) -> Bool = { _ in true }
   ) throws -> GeneratePayload {
-    try WarmServer.expandGeneratePayload(
-      try decode(json), store: store, stageNearline: stageNearline)
+    try WarmServer.decodedGeneratePayload(
+      from: Data(json.utf8), store: store, configuration: configuration,
+      stageNearline: stageNearline, loraExists: loraExists)
   }
 
   /// Kira's live lane: krea2-raw, kroma 0.6 with a named file, accel + polish.
@@ -242,8 +251,8 @@ final class GeneratePresetRouteTests: XCTestCase {
     let store = try makeStore()
     try seedKreaKira(store)
     let original = Data(#"{"prompt":"x","preset":"krea-kira"}"#.utf8)
-    let accepted = try WarmServer.expandGeneratePayload(
-      try JSONDecoder.snakeCase.decode(GeneratePayload.self, from: original), store: store)
+    let accepted = try WarmServer.decodedGeneratePayload(
+      from: original, store: store, configuration: configuration, loraExists: { _ in true })
     let persisted = WarmServer.rawBody(original, expandedWith: accepted)
 
     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: persisted) as? [String: Any])
@@ -258,8 +267,8 @@ final class GeneratePresetRouteTests: XCTestCase {
       loras: [LoraReference(filename: "something_else.safetensors", scale: 1.0)],
       checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
 
-    let replayed = try WarmServer.expandGeneratePayload(
-      try JSONDecoder.snakeCase.decode(GeneratePayload.self, from: persisted), store: store)
+    let replayed = try WarmServer.decodedGeneratePayload(
+      from: persisted, store: store, configuration: configuration, loraExists: { _ in true })
     XCTAssertEqual(replayed.loras?.map(\.path), [
       "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
       "krea2_turbo_distill_r256.safetensors",
@@ -273,23 +282,149 @@ final class GeneratePresetRouteTests: XCTestCase {
     let store = try makeStore()
     try seedKreaKira(store)
     let original = Data(#"{"prompt":"x","preset":"krea-kira"}"#.utf8)
-    let accepted = try WarmServer.expandGeneratePayload(
-      try JSONDecoder.snakeCase.decode(GeneratePayload.self, from: original), store: store)
+    let accepted = try WarmServer.decodedGeneratePayload(
+      from: original, store: store, configuration: configuration, loraExists: { _ in true })
     let persisted = WarmServer.rawBody(original, expandedWith: accepted)
     try store.delete("krea-kira")
 
-    let replayed = try WarmServer.expandGeneratePayload(
-      try JSONDecoder.snakeCase.decode(GeneratePayload.self, from: persisted), store: store)
+    let replayed = try WarmServer.decodedGeneratePayload(
+      from: persisted, store: store, configuration: configuration, loraExists: { _ in true })
     XCTAssertEqual(replayed.loras?.count, 3)
     XCTAssertEqual(replayed.presetUnresolved, "krea-kira", "and the replay says the preset is gone")
+  }
+
+  // MARK: Round 2, finding 1 — the engine/provider gate at the route
+
+  /// The seeded default. Before this gate, `POST /v1/generate {"preset":
+  /// "schnell-hq"}` expanded `model: "schnell"` into a `poolLoad` of a model
+  /// this engine cannot serve — a failed render where the label used to be
+  /// harmless.
+  func testSeededSchnellHQPresetRendersAsALabel() throws {
+    let store = try makeStore()
+    _ = try store.upsert(try XCTUnwrap(PresetStore.defaultPresets.first { $0.id == "schnell-hq" }))
+
+    let payload = try expand(#"{"prompt":"x","preset":"schnell-hq"}"#, store: store)
+    XCTAssertNil(payload.model, "nothing must reach poolLoad")
+    XCTAssertNil(payload.loras)
+    XCTAssertNil(payload.steps)
+    XCTAssertEqual(payload.presetUnresolved, "schnell-hq")
+    XCTAssertEqual(payload.presetUnresolvedReason, "engine:mflux")
+  }
+
+  /// A store seeded with BOTH defaults: the engine's own preset still expands.
+  func testSeededZImageChatStillExpandsFromTheSameStore() throws {
+    let store = try makeStore()
+    for preset in PresetStore.defaultPresets { _ = try store.upsert(preset) }
+
+    let payload = try expand(#"{"prompt":"x","preset":"zimage-chat"}"#, store: store)
+    XCTAssertEqual(payload.model, "z-image-turbo")
+    XCTAssertEqual(payload.steps, 8)
+    // Round 2, finding 6: an EMPTY preset stack is a declaration — it clears
+    // the resident adapters. `zimage-chat` is exactly that shape.
+    XCTAssertEqual(payload.loras?.isEmpty, true)
+    XCTAssertNil(payload.presetUnresolved)
+  }
+
+  // MARK: Round 2, finding 2 — a preset with no model of its own
+
+  func testDesktopPresetWithOnlyCustomModelPathRendersAsALabel() throws {
+    let store = try makeStore()
+    _ = try store.upsert(ImagePreset(
+      id: "788B45BC", name: "Desktop preset",
+      customModelPath: "/Users/todd/LocalModels/krea2-raw",
+      loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
+      kroma: KromaPolicy(strength: 0)))
+
+    let payload = try expand(#"{"prompt":"x","preset":"788B45BC"}"#, store: store)
+    XCTAssertNil(payload.loras, "its stack must not land on whatever base is resident")
+    XCTAssertEqual(payload.presetUnresolvedReason, "no_model")
+  }
+
+  func testDesktopPresetExpandsWhenTheRequestNamesTheBase() throws {
+    let store = try makeStore()
+    _ = try store.upsert(ImagePreset(
+      id: "788B45BC", name: "Desktop preset",
+      customModelPath: "/Users/todd/LocalModels/krea2-raw",
+      loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
+      kroma: KromaPolicy(strength: 0)))
+
+    let payload = try expand(
+      #"{"prompt":"x","preset":"788B45BC","model":"krea2-raw"}"#, store: store)
+    XCTAssertEqual(payload.loras?.map(\.path), ["krea2_turbo_distill_r256.safetensors"])
+    XCTAssertEqual(payload.model, "krea2-raw", "the request's own base stands")
+    XCTAssertNil(payload.presetUnresolved)
+  }
+
+  // MARK: Round 2, finding 3 — a preset naming a LoRA that is not on disk
+
+  /// This used to become a 400 at DEQUEUE (`LoRAEntry.makeConfiguration`
+  /// throws on an unresolvable bare filename), turning a provenance label into
+  /// a failed render for every caller of that preset. Resolved at decode
+  /// instead, while the request can still fall back.
+  func testPresetNamingAMissingLoRARendersAsALabel() throws {
+    let store = try makeStore()
+    try seedKreaKira(store)
+
+    let payload = try expand(#"{"prompt":"x","preset":"krea-kira"}"#, store: store) { entry in
+      entry.path != "RealisticSnapshotKrea2.safetensors"
+    }
+    XCTAssertNil(payload.loras)
+    XCTAssertNil(payload.model)
+    XCTAssertEqual(payload.presetUnresolved, "krea-kira")
+    XCTAssertEqual(payload.presetUnresolvedReason, "missing_lora:RealisticSnapshotKrea2.safetensors")
+  }
+
+  /// The check runs AFTER nearline staging — an adapter that is merely
+  /// archived is staged, not refused.
+  func testNearlineStagedLoRAIsNotReportedMissing() throws {
+    let store = try makeStore()
+    try seedKreaKira(store)
+    let payload = try expand(
+      #"{"prompt":"x","preset":"krea-kira"}"#, store: store,
+      stageNearline: { entries in
+        entries.map { LoRAEntry(path: "/staged/\($0.path)", scale: $0.scale, role: $0.role) }
+      },
+      loraExists: { $0.path.hasPrefix("/staged/") })
+    XCTAssertNil(payload.presetUnresolved)
+    XCTAssertEqual(payload.loras?.count, 3)
+  }
+
+  /// An EXPLICIT `loras` entry that does not resolve keeps its long-standing
+  /// 400 at dequeue — that contract is not this ticket's to change.
+  func testExplicitLorasAreNotSubjectToTheMissingCheck() throws {
+    let store = try makeStore()
+    let payload = try expand(
+      #"{"prompt":"x","loras":[{"path":"nope.safetensors","scale":1}]}"#,
+      store: store, loraExists: { _ in false })
+    XCTAssertEqual(payload.loras?.map(\.path), ["nope.safetensors"])
+    XCTAssertNil(payload.presetUnresolved)
+  }
+
+  // MARK: I6 — the decode's other halves still run
+
+  /// The expansion lives INSIDE the route's decode, so the decode's own
+  /// validations must still fire around it.
+  func testOutputPathContainmentStillAppliesToAPresetRequest() throws {
+    let store = try makeStore()
+    try seedKreaKira(store)
+    XCTAssertThrowsError(
+      try expand(
+        #"{"prompt":"x","preset":"krea-kira","output_path":"/etc/passwd.png"}"#, store: store))
+  }
+
+  func testUnknownSamplerStillFailsBeforeExpansion() throws {
+    let store = try makeStore()
+    try seedKreaKira(store)
+    XCTAssertThrowsError(
+      try expand(#"{"prompt":"x","preset":"krea-kira","scheduler":"not-a-sampler"}"#, store: store))
   }
 
   /// Nothing to merge ⇒ the original bytes, untouched.
   func testUnexpandedBodyIsPersistedVerbatim() throws {
     let store = try makeStore()
     let original = Data(#"{"prompt":"x"}"#.utf8)
-    let payload = try WarmServer.expandGeneratePayload(
-      try JSONDecoder.snakeCase.decode(GeneratePayload.self, from: original), store: store)
+    let payload = try WarmServer.decodedGeneratePayload(
+      from: original, store: store, configuration: configuration, loraExists: { _ in true })
     XCTAssertEqual(WarmServer.rawBody(original, expandedWith: payload), original)
   }
 
@@ -302,21 +437,12 @@ final class GeneratePresetRouteTests: XCTestCase {
       {"prompt":"x","preset":"krea-kira","model":"krea2-raw",
        "loras":[{"path":"only.safetensors","scale":1}]}
       """#.utf8)
-    let payload = try WarmServer.expandGeneratePayload(
-      try JSONDecoder.snakeCase.decode(GeneratePayload.self, from: original), store: store)
+    let payload = try WarmServer.decodedGeneratePayload(
+      from: original, store: store, configuration: configuration, loraExists: { _ in true })
     let object = try XCTUnwrap(
       JSONSerialization.jsonObject(with: WarmServer.rawBody(original, expandedWith: payload))
         as? [String: Any])
     XCTAssertEqual((object["loras"] as? [[String: Any]])?.count, 1)
     XCTAssertEqual(object["model"] as? String, "krea2-raw")
-  }
-}
-
-extension JSONDecoder {
-  /// The generate routes' decoder.
-  static var snakeCase: JSONDecoder {
-    let d = JSONDecoder()
-    d.keyDecodingStrategy = .convertFromSnakeCase
-    return d
   }
 }
