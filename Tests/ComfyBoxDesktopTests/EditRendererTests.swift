@@ -123,6 +123,25 @@ struct EditRendererTests {
         #expect(s.width == 100 && s.height == 100)
         let t = EditRenderer.largestInscribedSize(width: 100, height: 50, angleRadians: .pi / 18)
         #expect(t.width < 100 && t.height < 50 && t.width > 60)
+        // whitesBlacksCurve's fixed x-coordinates (0, 0.25, 0.5, 0.75, 1) — the y
+        // assertions above already pin the endpoints' values; this pins that the
+        // curve moves the specific 0.25/0.75 control points the doc comment names,
+        // not some other pair.
+        let curve = EditRenderer.whitesBlacksCurve(whites: 0, blacks: 0, highlights: 0)
+        #expect(curve.map(\.x) == [0, 0.25, 0.5, 0.75, 1])
+    }
+
+    @Test("Detail-group mapping helpers pin their endpoints (X6)")
+    func detailMappingEndpoints() {
+        #expect(EditRenderer.sharpenSharpness(0) == 0 && EditRenderer.sharpenSharpness(1) == 2)
+        #expect(EditRenderer.sharpenRadius(scale: 1) == 1.69)
+        #expect(abs(EditRenderer.sharpenRadius(scale: 0.5) - 0.845) < 1e-9)
+        #expect(EditRenderer.sharpenRadius(scale: 0) == 0)
+        #expect(EditRenderer.noiseLevel(0) == 0 && abs(EditRenderer.noiseLevel(1) - 0.1) < 1e-9)
+        #expect(EditRenderer.vignetteIntensity(0) == 0 && EditRenderer.vignetteIntensity(1) == 1)
+        #expect(EditRenderer.featherRadius(0, shorterSide: 200) == 0)
+        #expect(EditRenderer.featherRadius(1, shorterSide: 200) == 10)   // 0.05 * 200
+        #expect(EditRenderer.featherRadius(0.5, shorterSide: 100) == 2.5)
     }
 
     @Test("per-channel r curve raises only red")
@@ -246,8 +265,85 @@ struct EditRendererTests {
         layer.adjustments.exposure = 1.5
         let out = EditRenderer.applyLocalLayer(translated, layer)
         let cg = Self.context.createCGImage(out, from: out.extent)!
-        #expect(EditTestSupport.gray(cg, x: 10, y: 20) > 150)
-        #expect(abs(Int(EditTestSupport.gray(cg, x: 90, y: 20)) - 100) <= 2)
+        // x=30/x=60 (not x=10/x=90): the untranslated pre-fix mask happens to still
+        // read as "masked" up to its own raw width (~50px) regardless of the image's
+        // real +37 translation, so x=10 and x=90 pass whether or not the mask is
+        // correctly translated to the image extent's origin — they don't actually
+        // exercise the alignment fix. x=30 sits inside the real (translated) mask
+        // region but outside the untranslated one, so it only passes once the mask
+        // is correctly translated to match `extent.minX`.
+        #expect(EditTestSupport.gray(cg, x: 30, y: 20) > 150)
+        #expect(abs(Int(EditTestSupport.gray(cg, x: 60, y: 20)) - 100) <= 2)
+    }
+
+    // MARK: - Fix wave (I2, M16)
+
+    @Test("sharpen increases edge contrast across a step")
+    func sharpenIncreasesEdgeContrast() {
+        // A hard step (not a smooth gradient) so unsharp masking produces visible
+        // overshoot/undershoot right at the edge.
+        var bytes = [UInt8](repeating: 255, count: 64 * 8 * 4)
+        for y in 0..<8 { for x in 0..<64 {
+            let v: UInt8 = x < 32 ? 60 : 200
+            let i = (y * 64 + x) * 4
+            bytes[i] = v; bytes[i + 1] = v; bytes[i + 2] = v; bytes[i + 3] = 255
+        } }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        var copy = bytes
+        let ctx = CGContext(data: &copy, width: 64, height: 8, bitsPerComponent: 8, bytesPerRow: 64 * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let src = ctx.makeImage()!
+        var r = EditRecipe(); r.adjustments.sharpen = 1.0
+        let out = rendered(src, r)
+        // Local contrast across the edge (bright side minus dark side, a few pixels
+        // out on each side so the comparison isn't reading the same clamped pixel):
+        // unsharp masking overshoots on both sides, so this must be strictly larger
+        // after sharpening than in the untouched source.
+        let srcContrast = Int(EditTestSupport.gray(src, x: 35, y: 4)) - Int(EditTestSupport.gray(src, x: 28, y: 4))
+        let outContrast = Int(EditTestSupport.gray(out, x: 35, y: 4)) - Int(EditTestSupport.gray(out, x: 28, y: 4))
+        #expect(outContrast > srcContrast)
+    }
+
+    @Test("sharpen radius is scaled down for a downscaled preview render")
+    func sharpenRenderScale() {
+        var bytes = [UInt8](repeating: 255, count: 64 * 8 * 4)
+        for y in 0..<8 { for x in 0..<64 {
+            let v: UInt8 = x < 32 ? 60 : 200
+            let i = (y * 64 + x) * 4
+            bytes[i] = v; bytes[i + 1] = v; bytes[i + 2] = v; bytes[i + 3] = 255
+        } }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        var copy = bytes
+        let ctx = CGContext(data: &copy, width: 64, height: 8, bitsPerComponent: 8, bytesPerRow: 64 * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let src = ctx.makeImage()!
+        var r = EditRecipe(); r.adjustments.sharpen = 1.0
+        let fullOut = EditRenderer.render(source: CIImage(cgImage: src), recipe: r, subjectMask: nil, renderScale: 1)
+        let halfOut = EditRenderer.render(source: CIImage(cgImage: src), recipe: r, subjectMask: nil, renderScale: 0.5)
+        let fullCG = Self.context.createCGImage(fullOut, from: fullOut.extent)!
+        let halfCG = Self.context.createCGImage(halfOut, from: halfOut.extent)!
+        // `renderScale` must actually reach the filter (a different radius produces a
+        // different amount of overshoot at the edge) — not merely that `render`
+        // accepts the argument.
+        #expect(EditTestSupport.rgbaBytes(fullCG) != EditTestSupport.rgbaBytes(halfCG))
+    }
+
+    @Test("noise reduction does not crash and preserves the source extent")
+    func noiseReductionPreservesExtent() {
+        let src = EditTestSupport.horizontalGradient(width: 40, height: 20)
+        var r = EditRecipe(); r.adjustments.noiseReduction = 1.0
+        let out = rendered(src, r)
+        #expect(out.width == 40 && out.height == 20)
+    }
+
+    @Test("vignette darkens the corners relative to the centre")
+    func vignetteDarkensCorners() {
+        let src = EditTestSupport.solid(r: 200, g: 200, b: 200, width: 80, height: 80)
+        var r = EditRecipe(); r.adjustments.vignette = 1.0
+        let out = rendered(src, r)
+        let centre = Int(EditTestSupport.gray(out, x: 40, y: 40))
+        let corner = Int(EditTestSupport.gray(out, x: 2, y: 2))
+        #expect(corner < centre)
     }
 
     @Test("subject mask aligns with a translated source extent")

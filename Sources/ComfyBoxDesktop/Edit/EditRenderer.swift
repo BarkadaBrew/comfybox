@@ -11,10 +11,17 @@ import CoreGraphics
 
 public enum EditRenderer {
 
-    public static func render(source: CIImage, recipe: EditRecipe, subjectMask: CIImage?) -> CIImage {
+    /// - Parameter renderScale: the scale of `source` relative to the full-resolution
+    ///   original (1 for a full-resolution export, `<1` for a downscaled preview). Most
+    ///   recipe→filter mappings are resolution-independent (fractions of the image size,
+    ///   or unitless amounts), but a couple of Core Image filters take an ABSOLUTE pixel
+    ///   radius — those must be scaled down for a downscaled preview source, or the
+    ///   preview and the full-resolution export disagree on how strong the effect looks.
+    ///   See `sharpenRadius(scale:)`.
+    public static func render(source: CIImage, recipe: EditRecipe, subjectMask: CIImage?, renderScale: CGFloat = 1) -> CIImage {
         var image = applyGeometry(source, recipe.geometry)
-        image = applyAdjustments(image, recipe.adjustments)
-        image = applyLocalLayer(image, recipe.local)
+        image = applyAdjustments(image, recipe.adjustments, renderScale: renderScale)
+        image = applyLocalLayer(image, recipe.local, renderScale: renderScale)
         image = applySubject(image, recipe.subject, mask: subjectMask, geometry: recipe.geometry, sourceExtent: source.extent)
         return image
     }
@@ -94,7 +101,7 @@ public enum EditRenderer {
 
     // MARK: - Global adjustments
 
-    static func applyAdjustments(_ input: CIImage, _ a: EditAdjustments) -> CIImage {
+    static func applyAdjustments(_ input: CIImage, _ a: EditAdjustments, renderScale: CGFloat = 1) -> CIImage {
         var image = input
         if a.exposure != 0 {
             let f = CIFilter.exposureAdjust(); f.inputImage = image; f.ev = Float(a.exposure); image = f.outputImage ?? image
@@ -124,15 +131,16 @@ public enum EditRenderer {
         }
         if !a.curves.isIdentity { image = applyCurves(image, a.curves) }
         if a.sharpen > 0 {
-            let f = CIFilter.sharpenLuminance(); f.inputImage = image; f.sharpness = Float(a.sharpen * 2); f.radius = 1.69
+            let f = CIFilter.sharpenLuminance(); f.inputImage = image
+            f.sharpness = Float(sharpenSharpness(a.sharpen)); f.radius = Float(sharpenRadius(scale: renderScale))
             image = f.outputImage?.cropped(to: input.extent) ?? image
         }
         if a.noiseReduction > 0 {
-            let f = CIFilter.noiseReduction(); f.inputImage = image; f.noiseLevel = Float(a.noiseReduction * 0.1); f.sharpness = 0.4
+            let f = CIFilter.noiseReduction(); f.inputImage = image; f.noiseLevel = Float(noiseLevel(a.noiseReduction)); f.sharpness = 0.4
             image = f.outputImage?.cropped(to: input.extent) ?? image
         }
         if a.vignette > 0 {
-            let f = CIFilter.vignette(); f.inputImage = image; f.intensity = Float(a.vignette); f.radius = 1.5
+            let f = CIFilter.vignette(); f.inputImage = image; f.intensity = Float(vignetteIntensity(a.vignette)); f.radius = 1.5
             image = f.outputImage ?? image
         }
         return image.cropped(to: input.extent)
@@ -140,6 +148,17 @@ public enum EditRenderer {
 
     static func contrastParameter(_ v: Double) -> Double { 1 + 0.5 * v }
     static func saturationParameter(_ v: Double) -> Double { 1 + v }
+    static func sharpenSharpness(_ v: Double) -> Double { v * 2 }
+    /// `CISharpenLuminance.radius` is an ABSOLUTE pixel radius, not a fraction of the
+    /// image size, so it must be scaled down for a downscaled preview render — 1.69 at
+    /// full resolution, `1.69 * scale` at `scale` — or the effect looks stronger on the
+    /// (smaller) preview than on the full-resolution export for the same recipe value.
+    static func sharpenRadius(scale: CGFloat) -> CGFloat { 1.69 * scale }
+    static func noiseLevel(_ v: Double) -> Double { v * 0.1 }
+    static func vignetteIntensity(_ v: Double) -> Double { v }
+    /// `layer.feather` is a fraction of the shorter side (already resolution-independent —
+    /// unlike `sharpenRadius`, this does not take a render scale).
+    static func featherRadius(_ v: Double, shorterSide: CGFloat) -> CGFloat { CGFloat(v) * 0.05 * shorterSide }
     /// Sign chosen so positive = warmer; the `warm` test pins the direction. If it fails, flip the sign here.
     static func temperatureTarget(_ v: Double) -> CGFloat { CGFloat(6500 - v * 3000) }
     static func tintTarget(_ v: Double) -> CGFloat { CGFloat(v * 150) }
@@ -214,7 +233,7 @@ public enum EditRenderer {
 
     // MARK: - Local layer
 
-    static func applyLocalLayer(_ image: CIImage, _ layer: EditLocalLayer?) -> CIImage {
+    static func applyLocalLayer(_ image: CIImage, _ layer: EditLocalLayer?, renderScale: CGFloat = 1) -> CIImage {
         guard let layer, !layer.mask.isEmpty else { return image }
         let extent = image.extent
         guard let maskCG = MaskRasterizer.render(layer.mask, size: extent.size) else { return image }
@@ -223,11 +242,11 @@ public enum EditRenderer {
         // lines up with `image` and `extent` pixel-for-pixel.
         var mask = CIImage(cgImage: maskCG).transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
         if layer.feather > 0 {
-            let radius = Float(layer.feather * 0.05 * Double(min(extent.width, extent.height)))
+            let radius = Float(featherRadius(layer.feather, shorterSide: min(extent.width, extent.height)))
             let blur = CIFilter.gaussianBlur(); blur.inputImage = mask.clampedToExtent(); blur.radius = radius
             mask = blur.outputImage?.cropped(to: extent) ?? mask
         }
-        let adjusted = applyAdjustments(image, layer.adjustments.restrictedToLocal)
+        let adjusted = applyAdjustments(image, layer.adjustments.restrictedToLocal, renderScale: renderScale)
         let blend = CIFilter.blendWithMask()
         blend.inputImage = adjusted; blend.backgroundImage = image; blend.maskImage = mask
         return blend.outputImage?.cropped(to: extent) ?? image

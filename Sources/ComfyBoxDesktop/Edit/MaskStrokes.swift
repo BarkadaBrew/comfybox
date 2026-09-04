@@ -31,7 +31,10 @@ public struct MaskStrokes: Codable, Equatable, Sendable {
 
 public enum MaskRasterizer {
     public static func render(_ strokes: MaskStrokes, size: CGSize) -> CGImage? {
-        let w = Int(size.width.rounded()), h = Int(size.height.rounded())
+        // A non-finite extent (e.g. an infinite CIImage extent handed in by a caller
+        // upstream) makes `Int(size.width.rounded())` trap rather than fail — this is
+        // `public` and pure, so a bad `size` should return nil, not crash the app.
+        guard let w = Int(exactly: size.width.rounded()), let h = Int(exactly: size.height.rounded()) else { return nil }
         guard w > 0, h > 0 else { return nil }
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceGray(),

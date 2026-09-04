@@ -2,6 +2,7 @@
 import Testing
 import Foundation
 import CoreGraphics
+import ImageIO
 import AppKit
 @testable import ComfyBoxDesktop
 
@@ -41,6 +42,32 @@ struct MaskRasterizerTests {
         let img = MaskRasterizer.render(MaskStrokes(), size: CGSize(width: 10, height: 10))!
         #expect(EditTestSupport.gray(img, x: 5, y: 5) == 0)
         #expect(MaskRasterizer.render(MaskStrokes(), size: .zero) == nil)
+    }
+
+    // MARK: - Fix wave (M1, M16)
+
+    @Test("a non-finite size returns nil instead of trapping")
+    func nonFiniteSizeReturnsNil() {
+        #expect(MaskRasterizer.render(MaskStrokes(), size: CGSize(width: CGFloat.infinity, height: 10)) == nil)
+        #expect(MaskRasterizer.render(MaskStrokes(), size: CGSize(width: 10, height: CGFloat.infinity)) == nil)
+        #expect(MaskRasterizer.render(MaskStrokes(), size: CGSize(width: CGFloat.nan, height: 10)) == nil)
+    }
+
+    @Test("pngData round-trips through PNG encode/decode to the same pixels as render")
+    func pngDataRoundTrips() throws {
+        var strokes = MaskStrokes()
+        strokes.append(MaskStroke(points: [CGPoint(x: 0.5, y: 0.5)], size: 0.2, erase: false))
+        let size = CGSize(width: 40, height: 40)
+        let direct = MaskRasterizer.render(strokes, size: size)!
+        let data = try #require(MaskRasterizer.pngData(strokes, size: size))
+        let src = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+        let decoded = try #require(CGImageSourceCreateImageAtIndex(src, 0, nil))
+        #expect(decoded.width == direct.width && decoded.height == direct.height)
+        for (x, y) in [(20, 20), (2, 2), (38, 38)] {
+            #expect(EditTestSupport.gray(decoded, x: x, y: y) == EditTestSupport.gray(direct, x: x, y: y))
+        }
+        #expect(EditTestSupport.gray(decoded, x: 20, y: 20) > 200)   // stroke centre
+        #expect(EditTestSupport.gray(decoded, x: 2, y: 2) < 20)      // untouched corner
     }
 
     @Test("MaskStrokes round-trips through JSON and undoLast/clear work")

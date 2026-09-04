@@ -26,6 +26,8 @@ struct EditRecipeTests {
     @Test("JSON round trip preserves every field")
     func roundTrip() throws {
         var r = EditRecipe()
+        r.version = 7   // a non-default value, so the round trip can't coincidentally
+                        // pass by comparing two recipes that both silently defaulted
         r.geometry.crop = CGRect(x: 0.1, y: 0.2, width: 0.5, height: 0.6)
         r.geometry.straightenDegrees = -3.5; r.geometry.quarterTurns = 3
         r.geometry.flipH = true; r.geometry.flipV = true
