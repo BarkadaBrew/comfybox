@@ -48,6 +48,61 @@ In particular, Krea-2 distillation files such as
 they fill the accelerator slot. Auto-staging may change `path`, but preserves
 `role`.
 
+## Per-request LoRA stacks and the warm default (#282)
+
+**Every render carries its own stack.** A job's adapters are resolved once, at
+submit, and applied at dequeue. There are three sources, in strict precedence:
+
+| # | Source | When it wins |
+|---|---|---|
+| 1 | the request's own `loras` | whenever the key is present — including `"loras": []`, which means *no adapters* |
+| 2 | the named `preset`'s expanded stack | when the request sent no `loras` and the preset was expandable (#286) |
+| 3 | the **warm default** | only when the request named neither `preset` nor `loras` |
+
+The generate response says which, in the additive `lora_stack_origin` field:
+`"request"`, `"preset"` or `"warm_default"` (absent on the ControlNet arm,
+which has always rendered its own request's stack). `GET /v1/generate/status/{id}`
+carries the same field once the job has dequeued.
+
+**What `POST /v1/lora/swap` now means.** The route, its payload and its
+response JSON are unchanged. What changed is its scope: a swap publishes the
+**warm default** — the stack a request carrying neither `preset` nor `loras`
+renders with — instead of mutating a shared resident stack that later jobs
+silently inherit. A swap still applies its stack to the resident pipeline
+(a swap-first client expects that, and `SwapResidencyRestore` exists so it can
+happen against an evicted pipeline), but no later job picks it up except
+through the default.
+
+Read the current warm default from `GET /v1/model/pool`, field
+`warm_default_stack` (additive, same per-entry shape as `/health.loras`):
+
+```json
+{
+  "active": "krea2-raw",
+  "warm_default_stack": [
+    {"name": "kroma.safetensors", "path": "/…/kroma.safetensors", "scale": 0.6, "role": "kroma"}
+  ]
+}
+```
+
+`/health.loras` answers a different question — what is **resident**, i.e. the
+last job's stack. Since #282 that is a consequence of the last render, not a
+prediction of the next one.
+
+**Consequences for daemon owners.**
+
+- A bare `/v1/generate` no longer inherits the previous job's adapters. On an
+  engine launched without `--lora` and with no swap yet, a bare request renders
+  with **no adapters** — deterministically, instead of on whatever happened to
+  be resident.
+- To keep a stack across bare requests, swap it (it becomes the warm default)
+  or name it on every request.
+- FIBO and Chroma have no LoRA application path (`/v1/lora/swap` refuses them);
+  the warm default is not pushed at them, and their behaviour is unchanged.
+- The video path (`/v1/video/generate`) has always resolved its own stack per
+  request (`loras` → the video preset's `loras` → `--ltx2-lora`) and is
+  unchanged.
+
 ## Preset LoRA references (Krea-2)
 
 Preset LoRA references use `filename` rather than `path` and preserve the
