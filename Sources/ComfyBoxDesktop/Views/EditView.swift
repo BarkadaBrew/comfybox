@@ -172,7 +172,18 @@ struct EditView: View {
 
     @ViewBuilder private func group<C: View>(_ g: Group, @ViewBuilder content: @escaping () -> C) -> some View {
         DisclosureGroup(isExpanded: Binding(get: { expanded.contains(g) },
-                                            set: { if $0 { expanded.insert(g) } else { expanded.remove(g) } })) {
+                                            set: { isOn in
+                                                if isOn {
+                                                    // Crop and Local are mutually exclusive: local strokes are
+                                                    // recorded against the uncropped frame, and the crop overlay
+                                                    // would otherwise steal the Local layer's paint drags.
+                                                    if g == .crop { expanded.remove(.local) }
+                                                    if g == .local { expanded.remove(.crop) }
+                                                    expanded.insert(g)
+                                                } else {
+                                                    expanded.remove(g)
+                                                }
+                                            })) {
             VStack(alignment: .leading, spacing: 8) { content() }.padding(.top, 6)
         } label: { Text(g.rawValue).font(.subheadline.weight(.medium)) }
     }
@@ -229,8 +240,19 @@ struct EditView: View {
     }
 
     /// Center a crop of the given width:height ratio (nil = the source's own ratio) inside the current frame.
+    ///
+    /// Computed synchronously from `session.sourceImage`, never from the async `previewSize` — the
+    /// preview may still be rendering (or reflect a stale generation) at the moment the aspect button
+    /// is tapped, and this must be right the first time.
     private func applyAspect(_ ratio: Double?) {
-        let w = Double(session.previewSize.width), h = Double(session.previewSize.height)
+        guard let source = session.sourceImage else { return }
+        var w = Double(source.width), h = Double(source.height)
+        if session.recipe.geometry.quarterTurns % 2 != 0 { swap(&w, &h) }
+        if session.recipe.geometry.straightenDegrees != 0 {
+            let angle = CGFloat(session.recipe.geometry.straightenDegrees) * .pi / 180
+            let fit = EditRenderer.largestInscribedSize(width: CGFloat(w), height: CGFloat(h), angleRadians: angle)
+            w = Double(fit.width); h = Double(fit.height)
+        }
         guard w > 0, h > 0 else { return }
         let target = ratio ?? (w / h)
         let frameRatio = w / h
@@ -280,7 +302,7 @@ struct EditView: View {
             }
             Toggle("Remove Background", isOn: Binding(get: { session.recipe.subject.removeBackground },
                                                      set: { v in session.set { $0.subject.removeBackground = v }; session.commit() }))
-                .disabled(session.subjectMask == nil)
+                .disabled(session.subjectMask == nil && !session.recipe.subject.removeBackground)
             Toggle("Invert (keep background)", isOn: Binding(get: { session.recipe.subject.invert },
                                                             set: { v in session.set { $0.subject.invert = v }; session.commit() }))
                 .disabled(session.subjectMask == nil || !session.recipe.subject.removeBackground)
@@ -297,7 +319,10 @@ struct EditView: View {
             let dir = DesktopSettings.load().outputDirectory
             let path = try await session.export(outputDirectory: dir, ingestor: ingestor)
             status = "Saved → \(URL(fileURLWithPath: path).lastPathComponent)"
-            if thenInpaint { onSendToInpaint?(path, session.recipe.local?.mask) }
+            if thenInpaint {
+                let mask = session.recipe.local?.mask
+                onSendToInpaint?(path, (mask?.isEmpty ?? true) ? nil : mask)
+            }
         } catch {
             status = error.localizedDescription; isError = true
         }
@@ -369,9 +394,18 @@ struct CropOverlay: View {
 
 // MARK: - Tab wrapper
 
+/// One request to open an image in the Edit tab. Carries the source `DAMAsset`
+/// (when the request originated from the DAM) so derived sidecars can record
+/// the source asset id and generation fields — a path-only open (e.g. the
+/// Open… panel) carries `asset: nil`.
+struct EditRequest: Equatable {
+    let path: String
+    let asset: DAMAsset?
+}
+
 struct EditTab: View {
     var ingestor: AssetIngestor?
-    @Binding var pendingImage: String?
+    @Binding var pending: EditRequest?
     var onSendToInpaint: ((String, MaskStrokes?) -> Void)?
 
     @State private var session: EditSession?
@@ -380,6 +414,10 @@ struct EditTab: View {
         Group {
             if let session {
                 EditView(session: session, ingestor: ingestor, onSendToInpaint: onSendToInpaint)
+                    // A new session in the same view must get fresh view state (expanded
+                    // groups, crop-suppression sync) rather than inheriting the prior
+                    // session's — `onAppear` then re-runs and re-syncs `suppressCropForPreview`.
+                    .id(ObjectIdentifier(session))
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "slider.horizontal.3").font(.system(size: 44)).foregroundStyle(.tertiary)
@@ -393,7 +431,7 @@ struct EditTab: View {
         .navigationTitle("Edit")
         .toolbar { ToolbarItem(placement: .navigation) { Button { pickImage() } label: { Label("Open", systemImage: "folder") } } }
         .onAppear { consumePending() }
-        .onChange(of: pendingImage) { _, _ in consumePending() }
+        .onChange(of: pending) { _, _ in consumePending() }
     }
 
     private func pickImage() {
@@ -404,9 +442,9 @@ struct EditTab: View {
     }
 
     private func consumePending() {
-        guard let p = pendingImage, !p.isEmpty else { return }
-        pendingImage = nil
-        open(p, asset: nil)
+        guard let req = pending, !req.path.isEmpty else { return }
+        pending = nil
+        open(req.path, asset: req.asset)
     }
 
     private func open(_ path: String, asset: DAMAsset?) {
