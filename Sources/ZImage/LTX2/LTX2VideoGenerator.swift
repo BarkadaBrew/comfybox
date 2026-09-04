@@ -481,6 +481,22 @@ public final class LTX2VideoGenerator {
                 "audio render requires a JoyAI-Echo monolithic checkpoint (audio branch tensors) — \(weightsURL.lastPathComponent) is per-component")
         }
 
+        // Foreign int8 checkpoints (comfybox#256): some exports (e.g.
+        // PinkCherry v1.7) carry raw int8 `.weight` tensors + an
+        // `F32 .weight_scale` sidecar rather than our own MLX affine
+        // `.scales`/`.biases` packed-uint32 layout, which
+        // `LTX2Quantizer.applyQuantizedLayout` below does not recognise.
+        // Left alone, those raw int8 bytes would load straight into float
+        // weight parameters and render as noise. Dequantize any such
+        // tensors to dense bf16 up front; any int8 tensor with no
+        // recognised sidecar fails loudly here instead.
+        do {
+            sanitized = try LTX2Quantizer.dequantizeForeignInt8Weights(sanitized)
+        } catch {
+            throw LTX2VideoError.weightsMissing(
+                "\(weightsURL.lastPathComponent): \(error.localizedDescription)")
+        }
+
         // Merge each LoRA into the base weights in order (skip audio branches),
         // as the CLI does — multiple LoRAs simply accumulate their deltas.
         for lora in loras {
