@@ -111,6 +111,29 @@ final class LTX2BeatScheduleLocatorRealTokenizerTests: XCTestCase {
                    "located token run must decode back to the beat text")
   }
 
+  /// comfybox#340 hypothesis (1), tested directly: the empty-string encode on
+  /// the REAL production Gemma tokenizer terminates and returns exactly the
+  /// standalone special-token prefix (BOS, id 2). It neither spins nor blocks,
+  /// so `tokenize("")` cannot be the source of a load-path wedge. (The locate
+  /// tests above already run it, but only as a side effect — this pins it.)
+  ///
+  /// Scope, stated plainly (Codex r1): this is an EXONERATION PROBE, not a
+  /// regression guard. It passes on unmodified main — that is the whole point —
+  /// and it skips rather than fails without the local Gemma snapshot, like its
+  /// neighbours in this file.
+  func testEmptyStringEncodeTerminatesAndYieldsOnlyBOS() throws {
+    let tokenizer = try loadTokenizer()
+
+    let started = Date()
+    let ids = tokenizer.untruncatedTokenIds(prompt: "")
+    let elapsed = Date().timeIntervalSince(started)
+
+    XCTAssertEqual(ids, [tokenizer.bosTokenId],
+                   "empty-string encode must be exactly the standalone prefix (Gemma: [2])")
+    XCTAssertLessThan(elapsed, 1.0,
+                      "empty-string encode must return immediately, not spin (comfybox#340)")
+  }
+
   /// A genuinely absent beat still fail-opens with the greppable warning.
   func testAbsentBeatFailOpensOnRealTokenizer() throws {
     let tokenizer = try loadTokenizer()

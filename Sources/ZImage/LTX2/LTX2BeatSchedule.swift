@@ -139,9 +139,22 @@ public enum LTX2BeatScheduleLocator {
   ) -> [LTX2ResolvedBeat] {
     let truncatedLen = min(fullPromptTokenIds.count, maxLength)
     let padOffset = max(0, maxLength - fullPromptTokenIds.count)
-    // Standalone-encode special-token prefix (Gemma: [2] — BOS). Computed
-    // once; empty for tokenizers that add nothing (e.g. the test fakes).
-    let standalonePrefix = tokenize("")
+    // Standalone-encode special-token prefix (Gemma: [2] — BOS). Empty for
+    // tokenizers that add nothing (e.g. the test fakes).
+    //
+    // comfybox#340: computed LAZILY — at the first beat that actually reaches
+    // tokenization — and memoized for the rest of the call. A render with no
+    // beat_schedule (or one whose beats all fail-open on frac hygiene first)
+    // must do NO tokenizer work here at all; nothing beat-schedule related may
+    // run on a render that did not ask for one. Still exactly one encode per
+    // call when beats ARE present.
+    var standalonePrefixCache: [Int]?
+    func standalonePrefix() -> [Int] {
+      if let cached = standalonePrefixCache { return cached }
+      let prefix = tokenize("")
+      standalonePrefixCache = prefix
+      return prefix
+    }
     var searchFrom = 0
     var resolved: [LTX2ResolvedBeat] = []
 
@@ -166,7 +179,7 @@ public enum LTX2BeatScheduleLocator {
       // wins so the left-to-right monotonic contract is preserved.
       var candidates: [[Int]] = []
       for form in [beat.text, " " + beat.text] {
-        let ids = strippingStandalonePrefix(tokenize(form), prefix: standalonePrefix)
+        let ids = strippingStandalonePrefix(tokenize(form), prefix: standalonePrefix())
         if !ids.isEmpty, !candidates.contains(ids) { candidates.append(ids) }
       }
       guard !candidates.isEmpty else {
