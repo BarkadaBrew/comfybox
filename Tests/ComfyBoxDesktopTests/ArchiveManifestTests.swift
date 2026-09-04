@@ -256,4 +256,102 @@ struct ArchiveManifestTests {
         let resolved = try ArchivePaths.resolveEntryPath("assets/9F3C/kira-0042.png", in: root)
         #expect(resolved.path == "/tmp/some-bundle.cbarchive/assets/9F3C/kira-0042.png")
     }
+
+    @Test("traversal guard rejects percent-encoded traversal that only becomes '..' after decoding", arguments: [
+        "%2e%2e/%2e%2e/etc/passwd",
+        "..%2f..%2fetc%2fpasswd",
+        "%2e%2e%2Fetc%2Fpasswd",
+        "assets/%2e%2e/%2e%2e/etc/passwd",
+    ])
+    func rejectsPercentEncodedTraversal(_ relativePath: String) throws {
+        let root = URL(fileURLWithPath: "/tmp/some-bundle.cbarchive")
+        #expect(throws: (any Error).self) {
+            _ = try ArchivePaths.resolveEntryPath(relativePath, in: root)
+        }
+    }
+
+    @Test("traversal guard does not reject a filename that merely contains a literal, non-traversal '%'")
+    func acceptsLiteralPercentInFilename() throws {
+        let root = URL(fileURLWithPath: "/tmp/some-bundle.cbarchive")
+        // "%" not followed by two hex digits isn't valid percent-encoding —
+        // `removingPercentEncoding` returns nil for it, which must skip the
+        // extra decode check rather than reject a legitimately named file.
+        let resolved = try ArchivePaths.resolveEntryPath("assets/9F3C/100% done.png", in: root)
+        #expect(resolved.path == "/tmp/some-bundle.cbarchive/assets/9F3C/100% done.png")
+    }
+
+    @Test("traversal guard rejects a symlink component that resolves outside the bundle root")
+    func rejectsSymlinkEscape() throws {
+        let fm = FileManager.default
+        let base = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("archive-symlink-guard-\(UUID().uuidString)")
+        try fm.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: base) }
+
+        let bundleRoot = base.appendingPathComponent("bundle.cbarchive")
+        try fm.createDirectory(at: bundleRoot, withIntermediateDirectories: true)
+
+        // A secret file that lives OUTSIDE the bundle entirely.
+        let outsideDir = base.appendingPathComponent("outside")
+        try fm.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        let secret = outsideDir.appendingPathComponent("secret.txt")
+        try "top secret".write(to: secret, atomically: true, encoding: .utf8)
+
+        // A symlink *inside* the bundle whose target is the outside directory.
+        // Lexically, "assets/secret.txt" never contains "..", so only the
+        // symlink-resolution pass can catch this.
+        let linkURL = bundleRoot.appendingPathComponent("assets")
+        try fm.createSymbolicLink(at: linkURL, withDestinationURL: outsideDir)
+
+        #expect(throws: (any Error).self) {
+            _ = try ArchivePaths.resolveEntryPath("assets/secret.txt", in: bundleRoot)
+        }
+    }
+
+    @Test("traversal guard accepts a symlink component that resolves inside the bundle root")
+    func acceptsSymlinkStayingInsideBundle() throws {
+        let fm = FileManager.default
+        let base = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("archive-symlink-guard-\(UUID().uuidString)")
+        try fm.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: base) }
+
+        let bundleRoot = base.appendingPathComponent("bundle.cbarchive")
+        let realAssetsDir = bundleRoot.appendingPathComponent("real-assets")
+        try fm.createDirectory(at: realAssetsDir, withIntermediateDirectories: true)
+        try "file bytes".write(
+            to: realAssetsDir.appendingPathComponent("kira-0042.png"), atomically: true, encoding: .utf8
+        )
+
+        // A symlink inside the bundle pointing at another directory that is
+        // also inside the bundle — legitimate, must still resolve.
+        let linkURL = bundleRoot.appendingPathComponent("assets")
+        try fm.createSymbolicLink(at: linkURL, withDestinationURL: realAssetsDir)
+
+        let resolved = try ArchivePaths.resolveEntryPath("assets/kira-0042.png", in: bundleRoot)
+        #expect(fm.fileExists(atPath: resolved.path))
+    }
+
+    // MARK: - Filename guard (write-side counterpart, entry.filename onto a live destination dir)
+
+    @Test("filename guard accepts an ordinary filename")
+    func filenameGuardAcceptsOrdinaryName() throws {
+        #expect(try ArchivePaths.validateFilename("kira-0042.png") == "kira-0042.png")
+    }
+
+    @Test("filename guard rejects a path masquerading as a filename", arguments: [
+        "../../../Library/LaunchAgents/evil.plist",
+        "/etc/passwd",
+        "subdir/evil.png",
+        "..",
+        ".",
+        "",
+        "%2e%2e%2Fevil.png",
+        "a%2Fb.png",
+    ])
+    func filenameGuardRejectsTraversal(_ filename: String) {
+        #expect(throws: (any Error).self) {
+            try ArchivePaths.validateFilename(filename)
+        }
+    }
 }
