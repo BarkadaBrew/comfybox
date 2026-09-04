@@ -523,10 +523,31 @@ machine. A simple recipe:
    individually documented with what it approximates and why) rather than
    just raising `minAvailableHeadroomFraction` to paper over it.
 
+**The estimate is activations-only.** It does not count the resident model's
+own weights — only the extra memory the RENDER's activations need on top of
+whatever is already loaded. That is deliberate (the model may already be
+warm, or may load as part of admission handled elsewhere — see
+`HeavyModelAdmission.swift`), but it means enforcement can UNDER-refuse right
+after a model swap: the first render on a newly-loaded family pays for that
+family's weights landing in memory (tens of GB) in addition to the
+activations this estimate covers, and `available_bytes` at that moment may
+not yet reflect it. If you calibrate with `enforceMemoryEstimate` on, include
+at least one "first render right after a model swap" sample in your test
+spread — don't only calibrate against a machine that's been rendering the
+same family for a while.
+
 Aggressive mid-render cache clearing and cross-step RoPE-frequency-table
 caching (the other two items from issue #22) are **not** part of this
 pre-flight — they remain open follow-up work. `POST /v1/upscale` is also not
 gated by this pre-flight yet — a separate follow-up.
+
+**Deploy note:** the resolution cap is wired into the Krita/ComfyUI bridge
+too (`POST /prompt`), including its inpaint/refine paths — a workflow whose
+canvas exceeds `imageMemoryCaps.maxLongEdge`/`maxPixels` (4096px /
+16,777,216px by default) now gets an HTTP 400 instead of running. This is
+operator-tunable: raise `imageMemoryCaps.maxLongEdge`/`maxPixels` via
+`PATCH /v1/config` if a real workflow needs a larger canvas than the
+defaults allow (bounded to `maxLongEdge <= 16384`, `maxPixels <= 2²⁸`).
 
 ## Edit tab
 

@@ -84,9 +84,15 @@ public final class ServerConfigStore: @unchecked Sendable {
     self.fileManager = fileManager
     self.auditLog = auditLog
 
-    let loaded = ComfyBoxServerConfig.loadOrMigrate(
+    var loaded = ComfyBoxServerConfig.loadOrMigrate(
       at: path, coffeeShopProviders: coffeeShopProviders, coffeeShopConfig: coffeeShopConfig,
       fileManager: fileManager)
+    // Fix round 2 (PR #363 review): repair, don't crash, on a hand-edited
+    // config.json with an invalid imageMemoryCaps block — see
+    // `sanitizeImageMemoryCaps` for why this is separate from `validate(_:)`.
+    Self.sanitizeImageMemoryCaps(&loaded) { message in
+      auditLog?.append(kind: "config.load.repaired", message: message, metadata: [:])
+    }
     self.document = loaded
     self.etag = Self.computeETag(loaded)
   }
@@ -246,17 +252,25 @@ public final class ServerConfigStore: @unchecked Sendable {
       try checkVideo(values, path: "videoDefaults.byFamily.\(family)")
     }
 
-    // #22: image memory/resolution caps — never non-positive, headroom fraction
-    // must stay a finite value in [0, 1) (1.0 would demand ALL of `available`
-    // stay free, refusing every render outright). I6 (PR #363 review): both
-    // caps are also BOUNDED above — `ImageMemoryPreflight.estimateBytes` is
-    // overflow-safe regardless, but an absurd cap (e.g. maxPixels = Int.max)
-    // would make the resolution-cap gate itself meaningless, defeating its
-    // whole "no probing needed" purpose. `maxImageMemoryCapsLongEdge`/
-    // `maxImageMemoryCapsPixels` are themselves generous — well above any
-    // resolution DyPE is remotely usable at today — this only rejects
-    // configuration nonsense, not real requests.
-    let caps = config.imageMemoryCaps
+    // #22: image memory/resolution caps.
+    try validateImageMemoryCaps(config.imageMemoryCaps)
+  }
+
+  /// Rejects a structurally-invalid `imageMemoryCaps` block: never
+  /// non-positive, headroom fraction must stay a finite value in [0, 1) (1.0
+  /// would demand ALL of `available` stay free, refusing every render
+  /// outright). I6 (PR #363 review): both caps are also BOUNDED above —
+  /// `ImageMemoryPreflight.estimateBytes` is overflow-safe regardless, but an
+  /// absurd cap (e.g. maxPixels = Int.max) would make the resolution-cap
+  /// gate itself meaningless, defeating its whole "no probing needed"
+  /// purpose. `maxImageMemoryCapsLongEdge`/`maxImageMemoryCapsPixels` are
+  /// themselves generous — well above any resolution DyPE is remotely usable
+  /// at today — this only rejects configuration nonsense, not real requests.
+  ///
+  /// Split out from `validate(_:)` (fix round 2) so `sanitizeImageMemoryCaps`
+  /// below can run the SAME check at load time, where the fix for a failure
+  /// is "repair, don't crash" rather than "reject the write" — see there.
+  static func validateImageMemoryCaps(_ caps: ImageMemoryCapsConfig) throws {
     if caps.maxLongEdge <= 0 {
       throw ServerConfigStoreError.validation("imageMemoryCaps.maxLongEdge must be > 0 (got \(caps.maxLongEdge))")
     }
@@ -275,6 +289,30 @@ public final class ServerConfigStore: @unchecked Sendable {
       || caps.minAvailableHeadroomFraction < 0 || caps.minAvailableHeadroomFraction >= 1 {
       throw ServerConfigStoreError.validation(
         "imageMemoryCaps.minAvailableHeadroomFraction must be in [0, 1) (got \(caps.minAvailableHeadroomFraction))")
+    }
+  }
+
+  /// Fix round 2 (PR #363 review): `PUT`/`PATCH /v1/config` reject a bad
+  /// `imageMemoryCaps` block with a 400 (`validateImageMemoryCaps` above, via
+  /// `validate(_:)`) — there is a caller to report that to. A document
+  /// LOADED FROM DISK has no such caller: `ServerConfigStore.init` never ran
+  /// `validate` at all, so a hand-edited `config.json` with `"maxPixels": -1`
+  /// or a NaN `minAvailableHeadroomFraction` loaded straight through into
+  /// `ImageMemoryPreflight`'s `UInt64` conversions — which is a crash on the
+  /// FIRST sized image request after the process starts, not a clean 400.
+  ///
+  /// Repairs `config.imageMemoryCaps` to `.default` IN PLACE when it fails
+  /// `validateImageMemoryCaps`, logging why — never throws, never touches
+  /// disk (K-FIX-1: constructing a store must not write `config.json`; the
+  /// repaired value is persisted only by the next explicit write, if any).
+  /// Scoped to `imageMemoryCaps` only, per the review — `renderDefaults`/
+  /// `videoDefaults` are unaffected.
+  static func sanitizeImageMemoryCaps(_ config: inout ComfyBoxServerConfig, log: (String) -> Void) {
+    do {
+      try validateImageMemoryCaps(config.imageMemoryCaps)
+    } catch {
+      log("config.json's imageMemoryCaps is invalid (\(error)) — falling back to defaults")
+      config.imageMemoryCaps = .default
     }
   }
 

@@ -135,6 +135,67 @@ final class ImageMemoryPreflightTests: XCTestCase {
     XCTAssertEqual(ImageMemoryPreflight.addSat(3, 4), 7)
   }
 
+  // MARK: - Fix round 2 (PR #363 review): point-of-use clamps
+
+  /// `caps` SHOULD always be validated (ServerConfigStore validates on
+  /// write and now sanitizes on load), but these are defense-in-depth for a
+  /// directly-constructed `ImageMemoryCapsConfig` bypassing the store
+  /// entirely — `UInt64(-1)` traps; `safeMaxPixels` must not.
+  func testSafeMaxPixelsClampsNegativeToZeroRatherThanTrapping() {
+    let caps = ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: -1, minAvailableHeadroomFraction: 0.1)
+    XCTAssertEqual(ImageMemoryPreflight.safeMaxPixels(caps), 0)
+  }
+
+  func testSafeMaxPixelsPassesThroughAnOrdinaryValue() {
+    let caps = ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: 12345, minAvailableHeadroomFraction: 0.1)
+    XCTAssertEqual(ImageMemoryPreflight.safeMaxPixels(caps), 12345)
+  }
+
+  /// `min`/`max` do not reliably filter NaN — see the file's own comment for
+  /// the empirical reason (`<`/`>` against NaN is always false). A NaN
+  /// headroom must fall back to the DEFAULT fraction (0.10), not propagate.
+  func testSafeHeadroomFractionFallsBackToDefaultOnNaN() {
+    let caps = ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: 100, minAvailableHeadroomFraction: .nan)
+    let result = ImageMemoryPreflight.safeHeadroomFraction(caps)
+    XCTAssertFalse(result.isNaN, "must never propagate NaN")
+    XCTAssertEqual(result, ImageMemoryCapsConfig.default.minAvailableHeadroomFraction)
+  }
+
+  func testSafeHeadroomFractionFallsBackToDefaultOnInfinity() {
+    let caps = ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: 100, minAvailableHeadroomFraction: .infinity)
+    XCTAssertEqual(ImageMemoryPreflight.safeHeadroomFraction(caps), ImageMemoryCapsConfig.default.minAvailableHeadroomFraction)
+  }
+
+  func testSafeHeadroomFractionClampsOutOfRangeFiniteValues() {
+    XCTAssertEqual(
+      ImageMemoryPreflight.safeHeadroomFraction(
+        ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: 100, minAvailableHeadroomFraction: -5.0)),
+      0.0)
+    XCTAssertEqual(
+      ImageMemoryPreflight.safeHeadroomFraction(
+        ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: 100, minAvailableHeadroomFraction: 5.0)),
+      1.0)
+  }
+
+  /// End-to-end: `decideResolution`/`validate` must not trap even given a
+  /// directly-constructed, unvalidated `ImageMemoryCapsConfig` with a
+  /// negative `maxPixels` or a NaN headroom — the point-of-use clamps are
+  /// what make that true regardless of whether the value ever passed
+  /// through `ServerConfigStore` at all.
+  func testDecideResolutionDoesNotTrapOnNegativeMaxPixels() {
+    let caps = ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: -1, minAvailableHeadroomFraction: 0.1)
+    let decision = ImageMemoryPreflight.decideResolution(width: 1024, height: 1024, caps: caps)
+    XCTAssertFalse(decision.allow, "a negative cap refuses everything rather than silently passing")
+  }
+
+  func testValidateDoesNotTrapOnNaNHeadroom() {
+    let caps = ImageMemoryCapsConfig(maxLongEdge: 4096, maxPixels: 16_777_216, minAvailableHeadroomFraction: .nan)
+    XCTAssertNoThrow(
+      try ImageMemoryPreflight.validate(
+        width: 1024, height: 1024, family: .flux1, dype: false,
+        caps: caps, availableBytes: 10 * gb))
+  }
+
   // MARK: - decide(estimate:available:cap:)
 
   func testDecideAllowsWhenEstimateFitsUnderCap() {
@@ -406,6 +467,34 @@ final class ImageMemoryPreflightTests: XCTestCase {
     _ = try payload.validateImageMemoryPreflight(warmFamily: .flux1, caps: .default, availableBytes: 100 * gb)
     XCTAssertEqual(payload.memoryEstimateBytes, 2_445_475_840)
     XCTAssertEqual(payload.memoryAvailableBytes, 100 * gb)
+  }
+
+  /// Fix round 2, minor item 2: the literal wire key names on a serialized
+  /// `GenerateResponse` — snake_case, matching the encoder every `/v1/generate`
+  /// response goes through (`HTTPResponse.json(status:payload:)`).
+  func testGenerateResponseSerializesMemoryFieldsUnderSnakeCaseKeys() throws {
+    let response = GenerateResponse(
+      success: true, outputPath: "/tmp/x.png", durationMs: 100,
+      memoryEstimateBytes: 3_854_761_984, memoryAvailableBytes: 100 * gb)
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let json = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: try encoder.encode(response)) as? [String: Any])
+    XCTAssertEqual((json["memory_estimate_bytes"] as? NSNumber)?.uint64Value, 3_854_761_984)
+    XCTAssertEqual((json["memory_available_bytes"] as? NSNumber)?.uint64Value, 100 * gb)
+  }
+
+  /// The absent case: a construction with no memory fields (every
+  /// pre-#22 call site, and the ControlNet path which is not wired to this
+  /// preflight) omits both keys rather than encoding `null`.
+  func testGenerateResponseOmitsMemoryFieldsWhenAbsent() throws {
+    let response = GenerateResponse(success: true, outputPath: "/tmp/x.png", durationMs: 100)
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let json = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: try encoder.encode(response)) as? [String: Any])
+    XCTAssertNil(json["memory_estimate_bytes"])
+    XCTAssertNil(json["memory_available_bytes"])
   }
 
   func testPayloadWiringLogsAWarningWhenAdvisoryBudgetIsExceeded() throws {

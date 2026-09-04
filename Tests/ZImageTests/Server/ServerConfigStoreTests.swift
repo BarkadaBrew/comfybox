@@ -409,4 +409,85 @@ final class ServerConfigStoreTests: XCTestCase {
     let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
     XCTAssertNoThrow(try JSONDecoder().decode(ComfyBoxServerConfig.self, from: data))
   }
+
+  // MARK: - Fix round 2 (PR #363 review): sanitize-on-load
+
+  /// A hand-edited `config.json` with a NEGATIVE `maxPixels` must not crash
+  /// `ServerConfigStore.init` (which never ran `validate` before this fix) —
+  /// it repairs to `.default` in memory instead. Regression pin: before the
+  /// fix, this value reached `UInt64(caps.maxPixels)` in
+  /// `ImageMemoryPreflight` and TRAPPED on the first sized request.
+  func testLoadWithNegativeMaxPixelsFallsBackToDefaultsWithoutTrapping() throws {
+    let dir = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("config.json")
+    try Data(#"{ "host": "h", "imageMemoryCaps": { "maxLongEdge": 4096, "maxPixels": -1, "minAvailableHeadroomFraction": 0.1 } }"#.utf8)
+      .write(to: path)
+
+    let store = ServerConfigStore(
+      path: path,
+      coffeeShopProviders: dir.appendingPathComponent("absent-providers.json"),
+      coffeeShopConfig: dir.appendingPathComponent("absent-config.json"),
+      auditLog: nil)
+
+    XCTAssertEqual(store.imageMemoryCaps(), .default, "an invalid on-disk block repairs to the default, not the garbage value")
+    // The repaired document is usable — decideResolution must not trap.
+    let decision = ImageMemoryPreflight.decideResolution(width: 2048, height: 2048, caps: store.imageMemoryCaps())
+    XCTAssertTrue(decision.allow)
+  }
+
+  /// The other half of the same failure mode: a NaN headroom fraction.
+  /// `min`/`max` do not reliably filter NaN out (comparisons against NaN are
+  /// always false), so before this fix a NaN reached
+  /// `UInt64(Double(availableBytes) * (1.0 - headroomFraction))` in
+  /// `ImageMemoryPreflight.validate` and TRAPPED.
+  func testLoadWithNaNHeadroomFallsBackToDefaultsWithoutTrapping() throws {
+    let dir = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("config.json")
+    // JSON has no NaN literal — the field decodes via Double's own JSON
+    // handling, so we go through Foundation's non-conforming-number escape
+    // hatch the same way a hand-edited file realistically could not; instead
+    // simulate the same in-memory shape `sanitizeImageMemoryCaps` must catch
+    // regardless of HOW a NaN got there.
+    try Data(#"{ "host": "h" }"#.utf8).write(to: path)
+
+    let store = ServerConfigStore(
+      path: path,
+      coffeeShopProviders: dir.appendingPathComponent("absent-providers.json"),
+      coffeeShopConfig: dir.appendingPathComponent("absent-config.json"),
+      auditLog: nil)
+
+    var config = store.current().config
+    config.imageMemoryCaps.minAvailableHeadroomFraction = .nan
+    var repaired = config
+    ServerConfigStore.sanitizeImageMemoryCaps(&repaired) { _ in }
+    XCTAssertEqual(repaired.imageMemoryCaps, .default)
+
+    // And the point-of-use clamp alone (defense in depth, PR #363 review):
+    // even an UN-repaired NaN must not trap `validate`.
+    XCTAssertNoThrow(
+      try ImageMemoryPreflight.validate(
+        width: 1024, height: 1024, family: .flux1, dype: false,
+        caps: config.imageMemoryCaps, availableBytes: 10 * 1024 * 1024 * 1024))
+  }
+
+  /// A config file that loads fine (imageMemoryCaps absent/valid) must NOT
+  /// be touched by the repair — no spurious audit entry, values pass through.
+  func testLoadWithValidImageMemoryCapsIsNotRepaired() throws {
+    let dir = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let path = dir.appendingPathComponent("config.json")
+    try Data(#"{ "host": "h", "imageMemoryCaps": { "maxLongEdge": 3072, "maxPixels": 9437184, "minAvailableHeadroomFraction": 0.2 } }"#.utf8)
+      .write(to: path)
+
+    let store = ServerConfigStore(
+      path: path,
+      coffeeShopProviders: dir.appendingPathComponent("absent-providers.json"),
+      coffeeShopConfig: dir.appendingPathComponent("absent-config.json"),
+      auditLog: nil)
+
+    XCTAssertEqual(store.imageMemoryCaps().maxLongEdge, 3072, "a VALID on-disk value must survive, not be reset to default")
+    XCTAssertEqual(store.imageMemoryCaps().maxPixels, 9_437_184)
+  }
 }

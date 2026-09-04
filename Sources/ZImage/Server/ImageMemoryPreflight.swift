@@ -303,12 +303,36 @@ enum ImageMemoryPreflight {
         reason: "\(width)x\(height): long edge \(longEdge)px exceeds the \(caps.maxLongEdge)px resolution cap")
     }
     let pixels = mulSat(UInt64(width), UInt64(height))
-    if pixels > UInt64(caps.maxPixels) {
+    if pixels > safeMaxPixels(caps) {
       return Decision(
         allow: false,
         reason: "\(width)x\(height) = \(pixels) pixels exceeds the \(caps.maxPixels)-pixel resolution cap")
     }
     return Decision(allow: true, reason: "\(width)x\(height) within resolution caps")
+  }
+
+  /// Point-of-use defensive clamp (fix round 2, PR #363 review): `caps`
+  /// SHOULD already be valid — `ServerConfigStore` validates on write and
+  /// now sanitizes on load (`sanitizeImageMemoryCaps`) — but this function is
+  /// also reachable with a directly-constructed `ImageMemoryCapsConfig`
+  /// (tests, or a future caller that bypasses the store), and `UInt64(-1)`
+  /// TRAPS. `max(0, …)` before the conversion turns a negative/garbage
+  /// `maxPixels` into "refuse everything" instead of a crash — never a
+  /// silent pass-through of nonsense.
+  static func safeMaxPixels(_ caps: ImageMemoryCapsConfig) -> UInt64 {
+    UInt64(max(0, caps.maxPixels))
+  }
+
+  /// Same defensive posture as `safeMaxPixels` for the headroom fraction:
+  /// `min`/`max` do NOT reliably filter out NaN (a `<`/`>` comparison against
+  /// NaN is always false, so `max(.nan, 0.0)` can return `.nan` right back
+  /// out) — an explicit `.isFinite` check is required, not just a range
+  /// clamp. A non-finite value falls back to `ImageMemoryCapsConfig.default`'s
+  /// headroom fraction, per the review.
+  static func safeHeadroomFraction(_ caps: ImageMemoryCapsConfig) -> Double {
+    let raw = caps.minAvailableHeadroomFraction
+    guard raw.isFinite else { return ImageMemoryCapsConfig.default.minAvailableHeadroomFraction }
+    return min(max(raw, 0.0), 1.0)
   }
 
   /// Pure memory-budget decision: does `estimate` fit under `cap` bytes, given
@@ -372,11 +396,11 @@ enum ImageMemoryPreflight {
     guard resolutionDecision.allow else {
       throw WarmServerError.imageMemoryPreflightRefused(
         code: "resolution_cap", reason: resolutionDecision.reason,
-        estimateBytes: nil, availableBytes: nil, capBytes: UInt64(caps.maxPixels))
+        estimateBytes: nil, availableBytes: nil, capBytes: safeMaxPixels(caps))
     }
 
     let estimate = estimateBytes(width: width, height: height, family: family, dype: dype)
-    let headroomFraction = min(max(caps.minAvailableHeadroomFraction, 0.0), 1.0)
+    let headroomFraction = safeHeadroomFraction(caps)
     let budgetCap = UInt64(Double(availableBytes) * (1.0 - headroomFraction))
     let memoryDecision = decide(estimate: estimate, available: availableBytes, cap: budgetCap)
     let outcome = Outcome(
