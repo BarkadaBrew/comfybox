@@ -83,4 +83,27 @@ struct EditSidecarTests {
         #expect(r.path == a)
         #expect(r.assetId == nil)
     }
+
+    // MARK: - Fix round 1 (EditSession review, finding 4)
+
+    @Test("readEnvelope parses version/source_path/source_asset_id even when recipe is not decodable")
+    func readEnvelopeSurvivesUndecodableRecipe() throws {
+        let dir = tempDir()
+        let obj: [String: Any] = [
+            "version": 99,
+            "source_path": "/orig/root.png",
+            "source_asset_id": "R1",
+            "recipe": ["bogus": true],
+            "editor": "x",
+            "created_at": ISO8601DateFormatter().string(from: Date())
+        ]
+        try JSONSerialization.data(withJSONObject: ["edit": obj]).write(to: URL(fileURLWithPath: dir + "/edit-9.json"))
+        // The full decode fails on the incompatible recipe shape...
+        #expect(EditSidecar.read(forImageAt: dir + "/edit-9.png") == nil)
+        // ...but the envelope still parses.
+        let envelope = EditSidecar.readEnvelope(forImageAt: dir + "/edit-9.png")
+        #expect(envelope?.version == 99)
+        #expect(envelope?.sourcePath == "/orig/root.png")
+        #expect(envelope?.sourceAssetId == "R1")
+    }
 }

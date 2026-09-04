@@ -15,6 +15,13 @@ import Observation
 @Observable
 public final class EditSession {
     public private(set) var sourcePath: String
+    /// The path this session was opened with — before `load()` may resolve
+    /// it forward to a root original. Exports pass this (not the resolved
+    /// `sourcePath`) to `EditExporter`, so the exporter's own sidecar-chain
+    /// walk starts from the file that actually carries the chain and lands
+    /// on the correct root path *and* root asset id, rather than treating
+    /// an already-resolved root as if it had no history of its own.
+    public private(set) var openedPath: String
     public private(set) var sourceImage: CGImage?
     public private(set) var sourceAsset: DAMAsset?
     public var recipe = EditRecipe()
@@ -22,7 +29,10 @@ public final class EditSession {
     public private(set) var isRendering = false
     public var showOriginal = false
     public private(set) var warning: String?
-    public private(set) var isDirty = false
+    /// Whether the live recipe differs from what was last loaded from disk
+    /// or successfully exported. Computed (not a manually-tracked flag) so
+    /// there is exactly one source of truth: `recipe` vs. `savedRecipe`.
+    public var isDirty: Bool { recipe != savedRecipe }
     public private(set) var subjectMask: CIImage?
     public private(set) var subjectStatus: String?
     public var previewSize: CGSize = .zero
@@ -36,6 +46,13 @@ public final class EditSession {
         }
     }
 
+    /// The recipe as it was when last loaded from disk, or as of the last
+    /// successful export — the baseline `isDirty` compares against. Distinct
+    /// from `committed`, which is the undo/redo baseline: undoing all the
+    /// way back to the loaded recipe clears `isDirty` even if the undo
+    /// stack itself is still non-empty (i.e. `canUndo` can be true while
+    /// `isDirty` is false).
+    private var savedRecipe = EditRecipe()
     private var committed = EditRecipe()
     private var undoStack: [EditRecipe] = []
     private var redoStack: [EditRecipe] = []
@@ -46,6 +63,11 @@ public final class EditSession {
     private var previewScale: CGFloat = 1
     private var renderTask: Task<Void, Never>?
     private var renderGeneration = 0
+    /// The in-flight (or most recently started) detached Core Image render.
+    /// Cancelled before a new one starts so at most one render is doing
+    /// real work at a time — coalescing, not true mid-render interruption:
+    /// a render already inside Core Image is not itself interruptible.
+    private var renderWorker: Task<CGImage?, Never>?
     private let context = CIContext(options: [.workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
                                               .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
     private let masker = SubjectMasker()
@@ -55,6 +77,7 @@ public final class EditSession {
 
     public init(sourcePath: String, sourceAsset: DAMAsset?, previewMaxDimension: CGFloat = 2048) {
         self.sourcePath = sourcePath
+        self.openedPath = sourcePath
         self.sourceAsset = sourceAsset
         self.previewMaxDimension = previewMaxDimension
     }
@@ -65,29 +88,59 @@ public final class EditSession {
         warning = nil
         var path = sourcePath
         var storedRecipe = EditRecipe()
-        if let sc = EditSidecar.read(forImageAt: sourcePath) {
-            let root = EditSidecar.rootSource(forImageAt: sourcePath)
-            if root.path == sourcePath {
-                // `rootSource` reports a cycle by returning the starting path
-                // itself with a nil asset id — the chain is malformed, so
-                // keep the derived pixels already on disk and fall back to
-                // an identity recipe rather than guessing at a root.
-                warning = "This edit's history is malformed; editing the flattened image."
-            } else if FileManager.default.fileExists(atPath: root.path) {
-                path = root.path
-                if sc.version > EditRecipe.currentVersion {
-                    warning = "This edit was saved by a newer ComfyBox (recipe v\(sc.version)); opening pixels only."
-                } else {
-                    storedRecipe = sc.recipe
+        // Parse only the envelope first — a sidecar written by a newer
+        // ComfyBox can carry a `recipe` shape this build can't decode, and a
+        // full `EditSidecar.read` would then fail outright, indistinguishable
+        // from "no sidecar at all". `rootSource` itself walks the chain via
+        // full decodes too, so it can't be trusted to advance past a node
+        // whose own recipe doesn't decode — an incompatible-version node is
+        // handled as a single envelope-only hop below, never via `rootSource`.
+        if let envelope = EditSidecar.readEnvelope(forImageAt: sourcePath) {
+            if envelope.version > EditRecipe.currentVersion {
+                if FileManager.default.fileExists(atPath: envelope.sourcePath) {
+                    path = envelope.sourcePath
                 }
+                warning = "This edit was saved by a newer ComfyBox (recipe v\(envelope.version)); opening pixels only."
             } else {
-                warning = "Original \(URL(fileURLWithPath: root.path).lastPathComponent) is missing; editing the flattened image."
+                let root = EditSidecar.rootSource(forImageAt: sourcePath)
+                if root.path == sourcePath {
+                    // `rootSource` reports a cycle by returning the starting path
+                    // itself with a nil asset id — the chain is malformed, so
+                    // keep the derived pixels already on disk and fall back to
+                    // an identity recipe rather than guessing at a root.
+                    warning = "This edit's history is malformed; editing the flattened image."
+                } else if FileManager.default.fileExists(atPath: root.path) {
+                    path = root.path
+                    if let sc = EditSidecar.read(forImageAt: sourcePath) {
+                        storedRecipe = sc.recipe
+                    } else {
+                        // Envelope parsed but the full recipe didn't decode despite a
+                        // compatible version — corrupt sidecar. Fall back to pixels-only.
+                        warning = "This edit's recipe could not be read; opening pixels only."
+                    }
+                } else {
+                    warning = "Original \(URL(fileURLWithPath: root.path).lastPathComponent) is missing; editing the flattened image."
+                }
             }
         }
         let loadPath = path
+        nonisolated(unsafe) let orientationContext = context
         let image = await Task.detached(priority: .userInitiated) { () -> CGImage? in
             guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: loadPath) as CFURL, nil) else { return nil }
-            return CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+            guard let cg = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+            // Honor EXIF orientation: ImageIO returns the pixels exactly as stored, not
+            // rotated/flipped to "display" orientation, so a sidecar/tag of anything but 1
+            // (normal) must be baked in now — every downstream stage (geometry, masks,
+            // preview sizing) assumes the pixels are already display-oriented.
+            var orientationValue: UInt32 = 1
+            if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+               let raw = props[kCGImagePropertyOrientation] as? NSNumber {
+                orientationValue = raw.uint32Value
+            }
+            guard orientationValue != 1, let cgOrientation = CGImagePropertyOrientation(rawValue: orientationValue) else { return cg }
+            var ci = CIImage(cgImage: cg).oriented(cgOrientation)
+            ci = ci.transformed(by: CGAffineTransform(translationX: -ci.extent.minX, y: -ci.extent.minY))
+            return orientationContext.createCGImage(ci, from: ci.extent) ?? cg
         }.value
         sourcePath = path
         sourceImage = image
@@ -101,8 +154,8 @@ public final class EditSession {
             ci = ci.transformed(by: CGAffineTransform(translationX: -ci.extent.minX, y: -ci.extent.minY))
         }
         previewSource = ci
-        recipe = storedRecipe; committed = storedRecipe
-        undoStack.removeAll(); redoStack.removeAll(); isDirty = false
+        recipe = storedRecipe; committed = storedRecipe; savedRecipe = storedRecipe
+        undoStack.removeAll(); redoStack.removeAll()
         subjectMask = nil; subjectStatus = nil
         scheduleRender()
     }
@@ -111,7 +164,6 @@ public final class EditSession {
 
     public func set(_ mutate: (inout EditRecipe) -> Void) {
         mutate(&recipe)
-        isDirty = recipe != committed || !undoStack.isEmpty
         scheduleRender()
     }
 
@@ -121,14 +173,12 @@ public final class EditSession {
         if undoStack.count > undoLimit { undoStack.removeFirst() }
         redoStack.removeAll()
         committed = recipe
-        isDirty = true
     }
 
     public func undo() {
         guard let previous = undoStack.popLast() else { return }
         redoStack.append(committed)
         committed = previous; recipe = previous
-        isDirty = true
         scheduleRender()
     }
 
@@ -136,7 +186,6 @@ public final class EditSession {
         guard let next = redoStack.popLast() else { return }
         undoStack.append(committed)
         committed = next; recipe = next
-        isDirty = true
         scheduleRender()
     }
 
@@ -195,11 +244,18 @@ public final class EditSession {
         nonisolated(unsafe) let source = previewSource
         nonisolated(unsafe) let ctx = context
         nonisolated(unsafe) let subjectMaskForRender = mask
-        let result = await Task.detached(priority: .userInitiated) { () -> CGImage? in
+        // Coalesce: cancel any still-running previous render before starting this
+        // one. A render already inside Core Image is not interruptible mid-flight —
+        // this only stops a worker that hasn't reached `EditRenderer.render` yet.
+        renderWorker?.cancel()
+        let worker = Task.detached(priority: .userInitiated) { () -> CGImage? in
+            guard !Task.isCancelled else { return nil }
             let out = EditRenderer.render(source: source, recipe: effectiveRecipe, subjectMask: subjectMaskForRender)
             guard !out.extent.isEmpty, !out.extent.isInfinite else { return nil }
             return ctx.createCGImage(out, from: out.extent)
-        }.value
+        }
+        renderWorker = worker
+        let result = await worker.value
         guard generation == renderGeneration else { return }
         isRendering = false
         if let result {
@@ -207,6 +263,9 @@ public final class EditSession {
             previewSize = CGSize(width: result.width, height: result.height)
         } else {
             warning = "Preview render failed; the last good preview is shown."
+        }
+        if recipe.subject.removeBackground && subjectMask == nil {
+            warning = "Remove Background is on but no subject mask is loaded. Run Find Subject."
         }
     }
 
@@ -222,11 +281,19 @@ public final class EditSession {
 
     public func export(outputDirectory: String, ingestor: AssetIngestor?) async throws -> String {
         guard let sourceImage else { throw EditExportError.renderFailed }
-        let path = try await EditExporter.export(sourceImage: sourceImage, sourcePath: sourcePath, sourceAsset: sourceAsset,
-                                                 recipe: recipe, subjectMask: subjectMask,
+        if recipe.subject.removeBackground && subjectMask == nil {
+            throw EditExportError.writeFailed("Remove Background is on but no subject mask is loaded; run Find Subject or turn it off")
+        }
+        // Snapshot the recipe synchronously, before the internal await below can
+        // yield the main actor to a concurrent `set(_:)` — the exported PNG and
+        // the session's own bookkeeping afterward (`savedRecipe`) must agree on
+        // exactly the recipe that was live at the moment export was requested,
+        // not whatever `recipe` happens to read once the write completes.
+        let exported = recipe
+        let path = try await EditExporter.export(sourceImage: sourceImage, sourcePath: openedPath, sourceAsset: sourceAsset,
+                                                 recipe: exported, subjectMask: subjectMask,
                                                  outputDirectory: outputDirectory, ingestor: ingestor)
-        committed = recipe
-        isDirty = false
+        savedRecipe = exported
         return path
     }
 }

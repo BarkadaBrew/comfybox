@@ -62,6 +62,24 @@ public struct EditSidecar: Codable, Equatable, Sendable {
         return try? decoder.decode(EditSidecar.self, from: editData)
     }
 
+    /// Parses only the envelope fields (`version`, `source_path`, `source_asset_id`) out of
+    /// the `edit` block, without decoding `recipe`. A sidecar written by a newer ComfyBox can
+    /// carry a `recipe` shape this build's `EditRecipe` cannot decode — `read(forImageAt:)`
+    /// would then fail outright and its caller could mistake "sidecar exists but is newer than
+    /// we understand" for "no sidecar at all". Callers should check this envelope's `version`
+    /// first and only fall through to `read(forImageAt:)` for a full decode once it is known to
+    /// be compatible.
+    public static func readEnvelope(forImageAt imagePath: String) -> (version: Int, sourcePath: String, sourceAssetId: String?)? {
+        guard let data = FileManager.default.contents(atPath: sidecarPath(forImageAt: imagePath)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let edit = obj["edit"] as? [String: Any],
+              let version = edit[CodingKeys.version.rawValue] as? Int,
+              let sourcePath = edit[CodingKeys.sourcePath.rawValue] as? String
+        else { return nil }
+        let sourceAssetId = edit[CodingKeys.sourceAssetId.rawValue] as? String
+        return (version, sourcePath, sourceAssetId)
+    }
+
     /// Follows the `source_path` chain to the root original. Unbounded in the
     /// number of hops it will follow (an edit chain has no fixed depth
     /// limit), but a chain that revisits a path it has already seen is
