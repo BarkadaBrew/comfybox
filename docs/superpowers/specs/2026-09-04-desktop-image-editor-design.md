@@ -54,8 +54,7 @@ source unchanged. `version: Int = 1`.
   coordinates (origin top-left, 0…1), `straightenDegrees: Double` in
   −45…45, `quarterTurns: Int` 0…3 clockwise, `flipH: Bool`, `flipV: Bool`.
 - **Adjustments** (`EditAdjustments`), one struct reused for global and
-  local: `exposure` (EV, −5…5), `contrast` (−1…1 mapped to CIColorControls
-  0…2), `highlights` (−1…1), `shadows` (−1…1), `whites` (−1…1),
+  local: `exposure` (EV, −5…5), `contrast` (−1…1 mapped to CIColorControls 0.5…1.5), `highlights` (−1…1), `shadows` (−1…1), `whites` (−1…1),
   `blacks` (−1…1), `temperature` (−1…1 mapped to ±3000 K around 6500),
   `tint` (−1…1 mapped to ±150), `vibrance` (−1…1), `saturation` (−1…1
   mapped to 0…2), `sharpen` (0…1), `noiseReduction` (0…1),
