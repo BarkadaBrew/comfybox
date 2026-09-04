@@ -218,7 +218,10 @@ public enum EditRenderer {
         guard let layer, !layer.mask.isEmpty else { return image }
         let extent = image.extent
         guard let maskCG = MaskRasterizer.render(layer.mask, size: extent.size) else { return image }
-        var mask = CIImage(cgImage: maskCG)
+        // The rasterized mask always starts at CGImage origin (0,0); translate it to the
+        // image extent's own origin (which may be non-zero after a prior crop/rotate) so it
+        // lines up with `image` and `extent` pixel-for-pixel.
+        var mask = CIImage(cgImage: maskCG).transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
         if layer.feather > 0 {
             let radius = Float(layer.feather * 0.05 * Double(min(extent.width, extent.height)))
             let blur = CIFilter.gaussianBlur(); blur.inputImage = mask.clampedToExtent(); blur.radius = radius
@@ -235,11 +238,22 @@ public enum EditRenderer {
     static func applySubject(_ image: CIImage, _ subject: EditSubject, mask: CIImage?,
                              geometry: EditGeometry, sourceExtent: CGRect) -> CIImage {
         guard subject.removeBackground, let mask else { return image }
-        // The mask is at source resolution; run it through the same geometry so it aligns.
-        var m = applyGeometry(mask, geometry)
+        // The mask is at source resolution but may not share the source image's own extent
+        // (origin or size) — map it onto `sourceExtent` first, THEN run it through the same
+        // geometry as the main image so the two stay aligned through crop/rotate/flip.
+        var m = mask
+        if m.extent.size != sourceExtent.size {
+            m = m.transformed(by: CGAffineTransform(scaleX: sourceExtent.width / max(m.extent.width, 1),
+                                                     y: sourceExtent.height / max(m.extent.height, 1)))
+        }
+        m = m.transformed(by: CGAffineTransform(translationX: sourceExtent.minX - m.extent.minX,
+                                                 y: sourceExtent.minY - m.extent.minY))
+        m = applyGeometry(m, geometry)
         if m.extent != image.extent {
             m = m.transformed(by: CGAffineTransform(scaleX: image.extent.width / max(m.extent.width, 1),
                                                     y: image.extent.height / max(m.extent.height, 1)))
+            m = m.transformed(by: CGAffineTransform(translationX: image.extent.minX - m.extent.minX,
+                                                     y: image.extent.minY - m.extent.minY))
                 .cropped(to: image.extent)
         }
         if subject.invert {

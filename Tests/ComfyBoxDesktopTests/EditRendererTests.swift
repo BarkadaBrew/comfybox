@@ -236,4 +236,31 @@ struct EditRendererTests {
         #expect(EditTestSupport.pixel(out, x: 35, y: 20).a == 255)
         #expect(EditTestSupport.pixel(out, x: 5, y: 20).a == 0)
     }
+
+    @Test("local layer aligns the mask when the image extent is not at the origin")
+    func localLayerTranslatedExtent() {
+        let src = EditTestSupport.solid(r: 100, g: 100, b: 100, width: 100, height: 40)
+        let translated = CIImage(cgImage: src).transformed(by: CGAffineTransform(translationX: 37, y: 19))
+        var layer = EditLocalLayer()
+        layer.mask.append(MaskStroke(points: [CGPoint(x: 0.25, y: 0.0), CGPoint(x: 0.25, y: 1.0)], size: 0.5, erase: false))
+        layer.adjustments.exposure = 1.5
+        let out = EditRenderer.applyLocalLayer(translated, layer)
+        let cg = Self.context.createCGImage(out, from: out.extent)!
+        #expect(EditTestSupport.gray(cg, x: 10, y: 20) > 150)
+        #expect(abs(Int(EditTestSupport.gray(cg, x: 90, y: 20)) - 100) <= 2)
+    }
+
+    @Test("subject mask aligns with a translated source extent")
+    func subjectTranslatedExtent() {
+        let src = EditTestSupport.solid(r: 50, g: 120, b: 200, width: 40, height: 40)
+        let translatedSource = CIImage(cgImage: src).transformed(by: CGAffineTransform(translationX: 37, y: 19))
+        var strokes = MaskStrokes()
+        strokes.append(MaskStroke(points: [CGPoint(x: 0.25, y: 0), CGPoint(x: 0.25, y: 1)], size: 0.5, erase: false))
+        let mask = CIImage(cgImage: MaskRasterizer.render(strokes, size: CGSize(width: 40, height: 40))!)
+        var r = EditRecipe(); r.subject.removeBackground = true
+        let out = EditRenderer.render(source: translatedSource, recipe: r, subjectMask: mask)
+        let cg = Self.context.createCGImage(out, from: out.extent)!
+        #expect(EditTestSupport.pixel(cg, x: 5, y: 20).a == 255)
+        #expect(EditTestSupport.pixel(cg, x: 35, y: 20).a == 0)
+    }
 }
