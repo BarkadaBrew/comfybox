@@ -11,19 +11,28 @@ import XCTest
 /// hold: an earlier `/v1/lora/swap`'s stack, an earlier job's per-job override,
 /// or none at all after a restart — and reported `success: true` either way.
 ///
-/// These pin the decision that closes it. Production shapes throughout: the
-/// presets are the live `~/.comfybox/presets.json` entries this was reported
-/// against (`krea-kira-avocado`, `krea-kira`, `kira-video-avocado`).
+/// Review round 1 added two rules that shape these tests:
+///
+/// - a preset is expanded as a WHOLE — its `model` travels with its `loras`,
+///   because adapters applied to the wrong base render wrong and still look
+///   successful (and an explicit `model` that contradicts the preset is a 409);
+/// - a preset the engine cannot expand is a LABEL, exactly as before, and says
+///   so through `preset_unresolved`. Never a 400: an unknown preset id was
+///   harmless provenance for the daemon's whole life, and the daemon contract
+///   is production.
+///
+/// Production shapes throughout: the presets are the live
+/// `~/.comfybox/presets.json` entries this was reported against.
 final class PresetLoRAStackTests: XCTestCase {
 
   // MARK: Fixtures — the live presets, as `/v1/presets/resolve` returns them
 
   /// The preset in the bug report: krea2 raw-stock, kroma declared OFF, five
   /// content LoRAs.
-  private func kreaKiraAvocado() -> ResolvedPreset {
-    ResolvedPreset(preset: ImagePreset(
+  private func kreaKiraAvocado(steps: Int? = nil, guidance: Double? = nil) -> PresetLoRAStack.Lookup {
+    lookup(ImagePreset(
       id: "krea-kira-avocado", name: "Kira Avocado", mediaKind: "image",
-      model: "krea2-raw",
+      model: "krea2-raw", steps: steps, guidance: guidance,
       loras: [
         LoraReference(filename: "snofs_krea_v1_3D.safetensors", scale: 0.8),
         LoraReference(filename: "Girly_Tiana.safetensors", scale: 0.6),
@@ -36,8 +45,8 @@ final class PresetLoRAStackTests: XCTestCase {
   }
 
   /// Kira's standard lane: kroma ON at 0.6 with a named file, accel + polish.
-  private func kreaKira() -> ResolvedPreset {
-    ResolvedPreset(preset: ImagePreset(
+  private func kreaKira() -> PresetLoRAStack.Lookup {
+    lookup(ImagePreset(
       id: "krea-kira", name: "Kira", mediaKind: "image",
       model: "krea2-raw",
       loras: [
@@ -48,49 +57,134 @@ final class PresetLoRAStackTests: XCTestCase {
       kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")))
   }
 
+  private func lookup(_ preset: ImagePreset) -> PresetLoRAStack.Lookup {
+    .resolved(ResolvedPreset(preset: preset), declared: preset)
+  }
+
+  private func expansion(_ decision: PresetLoRAStack, _ file: StaticString = #filePath, _ line: UInt = #line)
+    throws -> PresetExpansion
+  {
+    guard case .apply(let e) = decision else {
+      XCTFail("expected .apply, got \(decision)", file: file, line: line)
+      throw XCTSkip("not .apply")
+    }
+    return e
+  }
+
   // MARK: The bug: a named preset must supply the stack
 
-  func testNamedPresetSuppliesItsResolvedStack() {
-    let decision = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-kira-avocado",
-      lookup: .resolved(kreaKiraAvocado()))
+  func testNamedPresetSuppliesItsResolvedStack() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(), requestLoras: nil))
 
-    guard case .apply(let id, let loras) = decision else {
-      return XCTFail("preset-by-name must apply its resolved stack, got \(decision)")
-    }
-    XCTAssertEqual(id, "krea-kira-avocado")
+    XCTAssertEqual(e.presetId, "krea-kira-avocado")
+    XCTAssertNil(e.unresolved)
     XCTAssertEqual(
-      loras.map(\.filename),
+      e.loras?.map(\.filename),
       ["snofs_krea_v1_3D.safetensors", "Girly_Tiana.safetensors", "LARP_v0-5.safetensors",
        "snofs_photoSlider_000000200.safetensors", "Krea2_TextFusion_Refusal_Reduction.safetensors"])
-    XCTAssertEqual(loras.map(\.scale), [0.8, 0.6, 1.5, 1.25, 1.0])
+    XCTAssertEqual(e.loras?.map(\.scale), [0.8, 0.6, 1.5, 1.25, 1.0])
   }
 
   /// The render must NEVER silently keep the resident stack when a preset was
-  /// named — that is the whole defect (0 LoRAs after a restart, 2 stale ones
-  /// before it, `success: true` for both).
-  func testNamedPresetIsNeverUnchanged() {
-    for lookup: PresetLoRAStack.Lookup in [
-      .resolved(kreaKiraAvocado()), .resolved(kreaKira()), .notFound,
-      .invalid(reason: "missing kroma"),
-    ] {
-      let decision = PresetLoRAStack.decide(
-        requestHasLoras: false, presetId: "krea-kira-avocado", lookup: lookup)
-      XCTAssertNotEqual(
-        decision, .unchanged,
-        "a named preset must never leave the resident stack in place (lookup: \(lookup))")
+  /// named without saying so — that is the whole defect (0 LoRAs after a
+  /// restart, 2 stale ones before it, `success: true` for both). Either the
+  /// stack is expanded, or `unresolved` names the preset.
+  func testNamedPresetEitherExpandsOrSaysWhyNot() throws {
+    let lookups: [PresetLoRAStack.Lookup] = [
+      kreaKiraAvocado(), kreaKira(), .notFound, .invalid(reason: "missing kroma"),
+    ]
+    for lookup in lookups {
+      let e = try expansion(PresetLoRAStack.decide(
+        presetId: "krea-kira-avocado", lookup: lookup, requestLoras: nil))
+      XCTAssertTrue(
+        e.loras != nil || e.unresolved != nil,
+        "a named preset must either supply a stack or report why it could not (lookup: \(lookup))")
     }
+  }
+
+  // MARK: C1 — the preset's model travels with its LoRAs
+
+  /// Round 1's critical finding: expanding only the adapters lets a preset's
+  /// LoRAs be applied to whatever base is active, which renders wrong AND
+  /// reports success.
+  func testPresetModelIsAdoptedWithTheStack() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil))
+    XCTAssertEqual(e.model, "krea2-raw")
+    XCTAssertEqual(e.loras?.count, 3)
+  }
+
+  /// An explicit `model` that agrees with the preset is not a conflict, and the
+  /// request's spelling is left alone — an alias and the directory it names are
+  /// the same model.
+  func testMatchingExplicitModelIsNotAConflict() throws {
+    let normalize: (String) -> String = { $0 == "krea2-raw" ? "/models/krea2-raw" : $0 }
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil,
+      requestModel: "/models/krea2-raw", normalizeModelSpec: normalize))
+    XCTAssertNil(e.model, "the request already named the base; nothing to adopt")
+    XCTAssertEqual(e.loras?.count, 3)
+  }
+
+  func testContradictingExplicitModelIsAConflict() {
+    let decision = PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil,
+      requestModel: "z-image-turbo")
+    XCTAssertEqual(
+      decision,
+      .modelConflict(preset: "krea-kira", presetModel: "krea2-raw", requestModel: "z-image-turbo"))
+  }
+
+  /// A preset that names no model contributes none — the request's base stands.
+  func testPresetWithNoModelLeavesTheBaseAlone() throws {
+    let bare = lookup(ImagePreset(
+      id: "no-model", name: "x", mediaKind: "image",
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.5)]))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "no-model", lookup: bare, requestLoras: nil, requestModel: "z-image-turbo"))
+    XCTAssertNil(e.model)
+    XCTAssertEqual(e.loras?.map(\.filename), ["a.safetensors"])
+  }
+
+  // MARK: C1 — declared steps/guidance, and only declared
+
+  func testDeclaredStepsAndGuidanceAreAdoptedWhenTheRequestOmitsThem() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(steps: 52, guidance: 3.5),
+      requestLoras: nil))
+    XCTAssertEqual(e.steps, 52)
+    XCTAssertEqual(e.guidance, 3.5)
+  }
+
+  func testRequestStepsAndGuidanceWin() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(steps: 52, guidance: 3.5),
+      requestLoras: nil, requestSteps: 9, requestGuidance: 1.0))
+    XCTAssertNil(e.steps)
+    XCTAssertNil(e.guidance)
+  }
+
+  /// `ResolvedPreset.steps` falls back to `PresetDefaults.standard.steps` — **4**.
+  /// Adopting that would drop a 52-step raw-stock render to 4 steps under the
+  /// preset's own name, so only a DECLARED value is ever taken.
+  func testUndeclaredStepsAreNotAdoptedFromPresetDefaults() throws {
+    let undeclared = kreaKiraAvocado()
+    guard case .resolved(let resolved, _) = undeclared else { return XCTFail("fixture") }
+    XCTAssertEqual(resolved.steps, PresetDefaults.standard.steps, "precondition: resolve defaults it")
+
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: undeclared, requestLoras: nil))
+    XCTAssertNil(e.steps, "an undeclared steps must never arrive as the store's default of 4")
+    XCTAssertNil(e.guidance)
   }
 
   // MARK: D14 — kroma is a first-class field, prepended, never a `loras[]` row
 
-  func testKromaIsPrependedAtItsDeclaredStrength() {
-    let decision = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-kira", lookup: .resolved(kreaKira()))
-
-    guard case .apply(_, let loras) = decision else {
-      return XCTFail("expected .apply, got \(decision)")
-    }
+  func testKromaIsPrependedAtItsDeclaredStrength() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil))
+    let loras = try XCTUnwrap(e.loras)
     XCTAssertEqual(loras.count, 3)
     XCTAssertEqual(loras[0].filename, "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
     XCTAssertEqual(loras[0].scale, 0.6)
@@ -99,137 +193,168 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertEqual(loras[1].role, "accel")
   }
 
-  func testKromaStrengthZeroContributesNothing() {
-    let decision = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-kira-avocado",
-      lookup: .resolved(kreaKiraAvocado()))
-    guard case .apply(_, let loras) = decision else {
-      return XCTFail("expected .apply, got \(decision)")
-    }
-    XCTAssertFalse(loras.contains { $0.role == "kroma" })
+  func testKromaStrengthZeroContributesNothing() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(), requestLoras: nil))
+    XCTAssertFalse(e.loras?.contains { $0.role == "kroma" } ?? true)
+  }
+
+  // MARK: C2 — unexpandable presets stay LABELS, and say so
+
+  /// The pre-#286 contract: an unknown `preset` is harmless provenance. Round 1
+  /// ruled that a 400 here is a silent contract break, so the render behaves as
+  /// before and the response carries `preset_unresolved`.
+  func testUnknownPresetIsALabelAndIsReported() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-typo", lookup: .notFound, requestLoras: nil))
+    XCTAssertNil(e.loras, "nothing is applied — the request renders exactly as it did before #286")
+    XCTAssertNil(e.model)
+    XCTAssertNil(e.steps)
+    let reason = try XCTUnwrap(e.unresolved)
+    XCTAssertTrue(reason.contains("krea-kira-typo"), reason)
+  }
+
+  func testInvalidPresetIsALabelAndIsReported() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-broken", lookup: .invalid(reason: "must declare \"kroma\""),
+      requestLoras: nil))
+    XCTAssertNil(e.loras)
+    let reason = try XCTUnwrap(e.unresolved)
+    XCTAssertTrue(reason.contains("krea-broken"), reason)
+    XCTAssertTrue(reason.contains("kroma"), reason)
+  }
+
+  /// A video preset on the image path would push LTX adapters at a Krea 2
+  /// pipeline. Reported, not applied.
+  func testVideoPresetIsALabelAndIsReported() throws {
+    let video = lookup(ImagePreset(
+      id: "kira-video-avocado", name: "Kira video", mediaKind: "video",
+      loras: [LoraReference(filename: "ltx-2.3-i2v-t2v-video-reasoning-lora-vbvr.safetensors", scale: 1)]))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "kira-video-avocado", lookup: video, requestLoras: nil))
+    XCTAssertNil(e.loras)
+    XCTAssertTrue(try XCTUnwrap(e.unresolved).contains("video"))
   }
 
   /// The engine has no family→default-kroma-file table (that policy lives in
   /// the client layer, FDD §3.17). Declared-on with no file is unreproducible,
-  /// so it refuses rather than rendering a stack that is missing its kroma.
-  func testKromaOnWithNoFileRefuses() {
-    let preset = ResolvedPreset(preset: ImagePreset(
+  /// so nothing is applied rather than a stack that is missing its kroma.
+  func testKromaOnWithNoFileIsALabelAndIsReported() throws {
+    let preset = lookup(ImagePreset(
       id: "kroma-no-file", name: "x", mediaKind: "image", model: "krea2-raw",
       loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
       checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0.6)))
-
-    let decision = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "kroma-no-file", lookup: .resolved(preset))
-    guard case .refuse(let message) = decision else {
-      return XCTFail("expected .refuse, got \(decision)")
-    }
-    XCTAssertTrue(message.contains("kroma.file"), message)
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "kroma-no-file", lookup: preset, requestLoras: nil))
+    XCTAssertNil(e.loras)
+    XCTAssertTrue(try XCTUnwrap(e.unresolved).contains("kroma.file"))
   }
 
   /// The bypass `.diff` adapter is a preset dial with no engine application
-  /// path — dropping it silently is the same class of defect as #286 itself.
-  func testDeclaredBypassRefuses() {
-    let preset = ResolvedPreset(preset: ImagePreset(
+  /// path — applying a stack that quietly drops it is the same class of defect
+  /// as #286 itself.
+  func testDeclaredBypassIsALabelAndIsReported() throws {
+    let preset = lookup(ImagePreset(
       id: "bypass-on", name: "x", mediaKind: "image", model: "krea2-raw",
       loras: [], checkpointFamily: "raw-stock", kroma: KromaPolicy(strength: 0),
       bypass: BypassPolicy(strength: 2.0)))
-
-    guard case .refuse(let message) = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "bypass-on", lookup: .resolved(preset))
-    else { return XCTFail("expected .refuse") }
-    XCTAssertTrue(message.contains("bypass"), message)
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "bypass-on", lookup: preset, requestLoras: nil))
+    XCTAssertNil(e.loras)
+    XCTAssertTrue(try XCTUnwrap(e.unresolved).contains("bypass"))
   }
 
-  // MARK: Fail loud, never quietly
-
-  func testUnknownPresetRefuses() {
-    guard case .refuse(let message) = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-kira-typo", lookup: .notFound)
-    else { return XCTFail("an unresolvable preset must refuse, not render on residency") }
-    XCTAssertTrue(message.contains("krea-kira-typo"), message)
+  func testUnresolvedNeverConflictsOnModel() throws {
+    // A preset that could not be expanded contributes no model either, so it
+    // can never 409 a request that named its own base.
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "gone", lookup: .notFound, requestLoras: nil, requestModel: "z-image-turbo"))
+    XCTAssertNotNil(e.unresolved)
+    XCTAssertNil(e.model)
   }
 
-  func testInvalidPresetRefusesTheSameWayResolveDoes() {
-    guard case .refuse(let message) = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-broken",
-      lookup: .invalid(reason: "must declare \"kroma\""))
-    else { return XCTFail("expected .refuse") }
-    XCTAssertTrue(message.contains("krea-broken"), message)
-    XCTAssertTrue(message.contains("kroma"), message)
+  // MARK: I1 — explicit `loras` win, and a disagreement is reported
+
+  func testExplicitLorasWinAndMatchingStackRaisesNoFlag() throws {
+    guard case .resolved(let resolved, _) = kreaKira() else { return XCTFail("fixture") }
+    var same: [LoraReference] = [
+      LoraReference(filename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6),
+    ]
+    same.append(contentsOf: resolved.loras)
+
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: same))
+    XCTAssertNil(e.loras, "explicit loras stand — the engine does not overwrite them")
+    XCTAssertFalse(e.stackMismatch)
+    XCTAssertEqual(e.model, "krea2-raw", "the preset's base still travels")
   }
 
-  func testVideoPresetOnTheImagePathRefuses() {
-    let video = ResolvedPreset(preset: ImagePreset(
-      id: "kira-video-avocado", name: "Kira video", mediaKind: "video",
-      loras: [LoraReference(filename: "ltx-2.3-i2v-t2v-video-reasoning-lora-vbvr.safetensors", scale: 1)]))
-
-    guard case .refuse(let message) = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "kira-video-avocado", lookup: .resolved(video))
-    else { return XCTFail("a video preset must not push LTX adapters at the image pipeline") }
-    XCTAssertTrue(message.contains("video"), message)
+  /// The real async production path: the client sends `preset` AND a FLAT
+  /// `loras` list that has already dropped the structured kroma. Explicit still
+  /// wins (existing precedence), but the response now says the two disagreed.
+  func testFlatClientStackMissingKromaRaisesTheMismatchFlag() throws {
+    let flat = [
+      LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6),
+      LoraReference(filename: "RealisticSnapshotKrea2.safetensors", scale: 0.4),
+    ]
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: flat))
+    XCTAssertNil(e.loras)
+    XCTAssertTrue(e.stackMismatch, "kroma is missing from the client's flat list — say so")
   }
 
-  func testNamedPresetWithNoLookupRefuses() {
-    guard case .refuse = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-kira", lookup: nil)
-    else { return XCTFail("an unresolved lookup must refuse, never fall through to residency") }
+  func testExplicitEmptyListAgainstANonEmptyPresetIsAMismatch() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: []))
+    XCTAssertNil(e.loras)
+    XCTAssertTrue(e.stackMismatch)
   }
 
-  // MARK: No-regression — the shapes that already worked keep working
-
-  /// Explicit `loras` bound correctly every time (confirmed in the report) and
-  /// must stay untouched: the request wins, `preset` stays a label, and an id
-  /// the engine does not know is harmless because nothing is read from it.
-  func testExplicitLorasWinAndKeepPresetAsALabel() {
-    XCTAssertEqual(
-      PresetLoRAStack.decide(
-        requestHasLoras: true, presetId: "krea-kira-avocado",
-        lookup: .resolved(kreaKiraAvocado())),
-      .requestExplicit)
-    XCTAssertEqual(
-      PresetLoRAStack.decide(requestHasLoras: true, presetId: "some-daemon-label", lookup: .notFound),
-      .requestExplicit)
-    XCTAssertEqual(
-      PresetLoRAStack.decide(requestHasLoras: true, presetId: nil, lookup: nil),
-      .requestExplicit)
+  /// An absolute path and a bare filename name the same adapter.
+  func testStackComparisonIgnoresPathForm() {
+    XCTAssertTrue(PresetLoRAStack.isSameStack(
+      [LoraReference(filename: "/Volumes/Bolt/loras/a.safetensors", scale: 0.6)],
+      [LoraReference(filename: "a.safetensors", scale: 0.6)]))
+    XCTAssertFalse(PresetLoRAStack.isSameStack(
+      [LoraReference(filename: "a.safetensors", scale: 0.6)],
+      [LoraReference(filename: "a.safetensors", scale: 0.8)]))
+    XCTAssertFalse(PresetLoRAStack.isSameStack(
+      [LoraReference(filename: "a.safetensors", scale: 0.6)], []))
   }
 
-  /// A bare `/v1/generate` with neither field is the swap-first client's shape
+  // MARK: No-regression
+
+  /// A bare `/v1/generate` with no preset is the swap-first client's shape
   /// (`/v1/lora/swap` then generate) — it must still render on the stack the
   /// swap just installed.
-  func testNoPresetNoLorasLeavesResidencyAlone() {
-    XCTAssertEqual(
-      PresetLoRAStack.decide(requestHasLoras: false, presetId: nil, lookup: nil), .unchanged)
-    XCTAssertEqual(
-      PresetLoRAStack.decide(requestHasLoras: false, presetId: "", lookup: nil), .unchanged)
-    XCTAssertEqual(
-      PresetLoRAStack.decide(requestHasLoras: false, presetId: "   ", lookup: nil), .unchanged)
+  func testNoPresetIsUnchanged() {
+    for id in [nil, "", "   "] as [String?] {
+      XCTAssertEqual(
+        PresetLoRAStack.decide(presetId: id, lookup: nil, requestLoras: nil), .unchanged)
+      XCTAssertEqual(
+        PresetLoRAStack.decide(presetId: id, lookup: nil, requestLoras: []), .unchanged)
+    }
   }
 
   /// A preset that resolves to an empty stack applies an EMPTY stack — it does
   /// not mean "leave whatever is loaded". `krea-bree` is exactly this shape.
-  func testPresetWithNoLorasAppliesAnEmptyStack() {
-    let bare = ResolvedPreset(preset: ImagePreset(
+  func testPresetWithNoLorasAppliesAnEmptyStack() throws {
+    let bare = lookup(ImagePreset(
       id: "krea-bree", name: "Bree", mediaKind: "image", model: "kroma-v0.2-turbo",
       kroma: KromaPolicy(strength: 0)))
-    XCTAssertEqual(
-      PresetLoRAStack.decide(requestHasLoras: false, presetId: "krea-bree", lookup: .resolved(bare)),
-      .apply(presetId: "krea-bree", loras: []))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-bree", lookup: bare, requestLoras: nil))
+    XCTAssertEqual(e.loras, [])
+    XCTAssertEqual(e.model, "kroma-v0.2-turbo")
   }
 
   // MARK: Parity with /v1/presets/resolve
 
   /// The decision must consume exactly what `/v1/presets/resolve` publishes —
-  /// same store, same `resolve`, no parallel computation. Driven through a real
-  /// `PresetStore` to prove the two agree.
+  /// same store, same read, no parallel computation. Driven through a real
+  /// `PresetStore`.
   func testAgreesWithPresetStoreResolve() throws {
-    let dir = FileManager.default.temporaryDirectory
-      .appendingPathComponent("preset-lora-stack-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: dir) }
-
-    let store = PresetStore(
-      path: dir.appendingPathComponent("presets.json"), seedDefaults: false)
+    let store = try makeStore()
     let preset = ImagePreset(
       id: "krea-kira", name: "Kira", mediaKind: "image", model: "krea2-raw",
       loras: [
@@ -241,12 +366,14 @@ final class PresetLoRAStackTests: XCTestCase {
     _ = try store.upsert(preset)
 
     let resolved = try store.resolve("krea-kira")
-    guard case .apply(_, let loras) = PresetLoRAStack.decide(
-      requestHasLoras: false, presetId: "krea-kira", lookup: .resolved(resolved))
-    else { return XCTFail("expected .apply") }
+    let (declared, invalidReason) = store.lookup("krea-kira")
+    XCTAssertNil(invalidReason)
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira",
+      lookup: .resolved(resolved, declared: try XCTUnwrap(declared)),
+      requestLoras: nil))
 
-    // Every LoRA `/v1/presets/resolve` reports is in the applied stack, at the
-    // scale it reported, plus the structured kroma the same response declares.
+    let loras = try XCTUnwrap(e.loras)
     let appliedPairs: [String: Double] = Dictionary(
       uniqueKeysWithValues: loras.map { ($0.filename, $0.scale) })
     for reference in resolved.loras {
@@ -255,6 +382,15 @@ final class PresetLoRAStackTests: XCTestCase {
         "resolve reported \(reference.filename) but the applied stack disagrees")
     }
     XCTAssertEqual(loras.count, resolved.loras.count + 1)
+    XCTAssertEqual(e.model, resolved.model)
+  }
+
+  private func makeStore() throws -> PresetStore {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("preset-lora-stack-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+    return PresetStore(path: dir.appendingPathComponent("presets.json"), seedDefaults: false)
   }
 
   // MARK: The verification hook — `applied_loras` on the wire
@@ -262,21 +398,18 @@ final class PresetLoRAStackTests: XCTestCase {
   /// #286's other half: the daemon could not tell a wrong stack from a right
   /// one because the response said nothing about adapters for any family but
   /// Krea 2. `applied_loras` is the additive field it can diff against
-  /// `/v1/presets/resolve` — snake_case, names + scales, no existing field
-  /// renamed.
+  /// `/v1/presets/resolve` — snake_case, name + path + scale + role, no
+  /// existing field renamed.
   func testAppliedLorasIsOnTheWireAndAdditive() throws {
+    var kroma = LoRAConfiguration.local(
+      "/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6)
+    kroma.role = "kroma"
     let response = GenerateResponse(
       success: true, outputPath: "/tmp/x.png", durationMs: 1234,
-      appliedLoras: [
-        LoRAState(.local("/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6)),
-        LoRAState(.local("/loras/krea2_turbo_distill_r256.safetensors", scale: 0.6)),
-      ])
+      appliedLoras: [kroma, .local("/loras/krea2_turbo_distill_r256.safetensors", scale: 0.6)]
+        .map(LoRAState.init))
 
-    let encoder = JSONEncoder()
-    encoder.keyEncodingStrategy = .convertToSnakeCase
-    let object = try XCTUnwrap(
-      JSONSerialization.jsonObject(with: try encoder.encode(response)) as? [String: Any])
-
+    let object = try encodeToObject(response)
     // Every pre-#286 field keeps its name.
     XCTAssertEqual(object["success"] as? Bool, true)
     XCTAssertEqual(object["output_path"] as? String, "/tmp/x.png")
@@ -284,93 +417,48 @@ final class PresetLoRAStackTests: XCTestCase {
 
     let applied = try XCTUnwrap(object["applied_loras"] as? [[String: Any]])
     XCTAssertEqual(applied.count, 2)
-    XCTAssertEqual(
-      applied.first?["source"] as? String,
-      "/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
-    XCTAssertEqual(applied.first?["scale"] as? Double, 0.6)
-  }
-
-  // MARK: The seam — `/v1/generate`'s own decode, end to end
-
-  /// Mirrors `WarmServer.decode(_:from:)`.
-  private func decode(_ json: String) throws -> GeneratePayload {
-    let d = JSONDecoder()
-    d.keyDecodingStrategy = .convertFromSnakeCase
-    return try d.decode(GeneratePayload.self, from: Data(json.utf8))
-  }
-
-  /// THE regression: the exact body Kira's daemon posts. Before the fix
-  /// `loras` came out of the decode path nil, nothing was applied, and the
-  /// render used whatever the warm pipeline still held.
-  func testGenerateBodyWithOnlyAPresetGetsTheResolvedStack() throws {
-    let payload = try decode(#"{"prompt":"a portrait","preset":"krea-kira-avocado"}"#)
-    XCTAssertNil(payload.loras, "precondition: the wire body carries no `loras`")
-
-    let expanded = try GeneratePayload.expandingPresetLoRAs(payload) { id in
-      XCTAssertEqual(id, "krea-kira-avocado")
-      return .resolved(self.kreaKiraAvocado())
-    }
-
-    let applied = try XCTUnwrap(expanded.loras)
-    XCTAssertEqual(
-      applied.map(\.path),
-      ["snofs_krea_v1_3D.safetensors", "Girly_Tiana.safetensors", "LARP_v0-5.safetensors",
-       "snofs_photoSlider_000000200.safetensors", "Krea2_TextFusion_Refusal_Reduction.safetensors"])
-    XCTAssertEqual(applied.map(\.scale), [0.8, 0.6, 1.5, 1.25, 1.0])
-    // `preset` is still the provenance label it always was.
-    XCTAssertEqual(expanded.preset, "krea-kira-avocado")
-  }
-
-  func testGenerateBodyWithPresetAndKromaCarriesTheKromaRole() throws {
-    let payload = try decode(#"{"prompt":"a portrait","preset":"krea-kira"}"#)
-    let expanded = try GeneratePayload.expandingPresetLoRAs(payload) { _ in .resolved(self.kreaKira()) }
-    let applied = try XCTUnwrap(expanded.loras)
-    XCTAssertEqual(applied.first?.path, "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
-    XCTAssertEqual(applied.first?.role, "kroma")
-    XCTAssertEqual(applied.first?.scale, 0.6)
-  }
-
-  func testGenerateBodyWithAnUnknownPresetThrowsInsteadOfRendering() throws {
-    let payload = try decode(#"{"prompt":"a portrait","preset":"krea-kira-typo"}"#)
-    XCTAssertThrowsError(
-      try GeneratePayload.expandingPresetLoRAs(payload) { _ in .notFound }
-    ) { error in
-      XCTAssertTrue(
-        "\(error)".contains("krea-kira-typo"),
-        "the refusal must name the preset, got: \(error)")
-    }
-  }
-
-  /// Explicit `loras` still win and are left exactly as sent, even when the
-  /// request also names a preset the engine could have expanded.
-  func testGenerateBodyWithExplicitLorasIsUntouched() throws {
-    let payload = try decode(
-      #"{"prompt":"x","preset":"krea-kira","loras":[{"path":"purelens_krea2.safetensors","scale":1.0}]}"#)
-    let expanded = try GeneratePayload.expandingPresetLoRAs(payload) { _ in
-      XCTFail("a request with explicit `loras` must not consult the preset store")
-      return .notFound
-    }
-    XCTAssertEqual(expanded.loras?.map(\.path), ["purelens_krea2.safetensors"])
-  }
-
-  /// A bare body — the swap-first client's shape — is untouched.
-  func testGenerateBodyWithNeitherFieldIsUntouched() throws {
-    let payload = try decode(#"{"prompt":"x"}"#)
-    let expanded = try GeneratePayload.expandingPresetLoRAs(payload) { _ in
-      XCTFail("no preset named — the store must not be consulted")
-      return .notFound
-    }
-    XCTAssertNil(expanded.loras)
+    let first = try XCTUnwrap(applied.first)
+    XCTAssertEqual(first["name"] as? String, "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
+    XCTAssertEqual(first["path"] as? String, "/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
+    XCTAssertEqual(first["source"] as? String, "/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
+    XCTAssertEqual(first["scale"] as? Double, 0.6)
+    XCTAssertEqual(first["role"] as? String, "kroma")
   }
 
   /// A family with no LoRA path at all reports the key ABSENT, never an empty
-  /// array — "engine has no stack here" must not read as "rendered bare".
-  func testAbsentAppliedLorasIsNotAnEmptyArray() throws {
-    let response = GenerateResponse(success: true, outputPath: "/tmp/x.png", durationMs: 1)
+  /// array — "engine has no stack here" must not read as "rendered bare". The
+  /// two preset flags are absent the same way when nothing happened.
+  func testAbsentFieldsAreAbsentNotEmpty() throws {
+    let object = try encodeToObject(
+      GenerateResponse(success: true, outputPath: "/tmp/x.png", durationMs: 1))
+    XCTAssertNil(object["applied_loras"])
+    XCTAssertNil(object["preset_unresolved"])
+    XCTAssertNil(object["preset_stack_mismatch"])
+  }
+
+  func testPresetFlagsAreOnTheWire() throws {
+    let object = try encodeToObject(GenerateResponse(
+      success: true, outputPath: "/tmp/x.png", durationMs: 1,
+      presetUnresolved: "krea-kira-typo", presetStackMismatch: true))
+    XCTAssertEqual(object["preset_unresolved"] as? String, "krea-kira-typo")
+    XCTAssertEqual(object["preset_stack_mismatch"] as? Bool, true)
+  }
+
+  /// `LoRAState` gained `name`/`path`/`role` — a persisted pre-#286 job status
+  /// must still decode.
+  func testLoRAStateDecodesPre286JSON() throws {
+    let json = Data(#"{"source":"/loras/a.safetensors","scale":0.6}"#.utf8)
+    let state = try JSONDecoder().decode(LoRAState.self, from: json)
+    XCTAssertEqual(state.source, "/loras/a.safetensors")
+    XCTAssertEqual(state.path, "/loras/a.safetensors")
+    XCTAssertEqual(state.name, "a.safetensors")
+    XCTAssertNil(state.role)
+  }
+
+  private func encodeToObject<T: Encodable>(_ value: T) throws -> [String: Any] {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
-    let object = try XCTUnwrap(
-      JSONSerialization.jsonObject(with: try encoder.encode(response)) as? [String: Any])
-    XCTAssertNil(object["applied_loras"])
+    return try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try encoder.encode(value)) as? [String: Any])
   }
 }

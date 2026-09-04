@@ -680,24 +680,28 @@ public final class WarmServer {
 
     case ("POST", "/v1/generate"):
       do {
-        let payload = try decodedGeneratePayload(from: request.body)
+        // #286 (I5): `rawBody` is the EXPANDED request, so a crash-recovery
+        // replay repeats the stack this job was accepted with rather than
+        // re-resolving the preset against a store that may have changed.
+        let (payload, rawBody) = try decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
         // #1479: absent/false `preempt` (or no video rendering, or a nested
         // attempt) is `.notApplicable` — same call as before this feature.
-        switch await attemptPreemption(payload, source: source, rawBody: request.body) {
+        switch await attemptPreemption(payload, source: source, rawBody: rawBody) {
         case .notApplicable:
-          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
+          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
           return .json(status: 200, payload: result)
         case .ran(let result):
           return .json(status: 200, payload: result)
         case .ranFailed(let error):
           return .error(response(for: error))
         case .refused(let eta):
-          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: request.body)
+          let result = try await coordinator.enqueueGenerate(payload, source: source, rawBody: rawBody)
           let stamped = GenerateResponse(
             success: result.success, outputPath: result.outputPath, durationMs: result.durationMs,
             preemptRefused: true, etaSec: eta, applied: result.applied,
-            appliedLoras: result.appliedLoras)
+            appliedLoras: result.appliedLoras, presetUnresolved: result.presetUnresolved,
+            presetStackMismatch: result.presetStackMismatch)
           return .json(status: 200, payload: stamped)
         }
       } catch {
@@ -711,16 +715,16 @@ public final class WarmServer {
     // /v1/generate call outliving the caller's own turn timeout.
     case ("POST", "/v1/generate/async"):
       do {
-        let payload = try decodedGeneratePayload(from: request.body)
+        let (payload, rawBody) = try decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
         // #1479: `submitPreempting` runs the SAME `attemptPreemption` check
         // inside the job's own detached Task, so a `preempt`-absent/false
         // submit takes the exact same `coordinator.enqueueGenerate` path as
         // before this feature.
         let status = imageJobTracker.submitPreempting(
-          payload, source: source, coordinator: coordinator, rawBody: request.body,
+          payload, source: source, coordinator: coordinator, rawBody: rawBody,
           preemptor: { [weak self] jobId in
-            await self?.attemptPreemption(payload, source: source, rawBody: request.body, jobId: jobId) ?? .notApplicable
+            await self?.attemptPreemption(payload, source: source, rawBody: rawBody, jobId: jobId) ?? .notApplicable
           })
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -4886,33 +4890,101 @@ public final class WarmServer {
     // …) live in runKrea2Generate, NOT here: the family is unknown at this
     // point and Z-Image `eta` is a shipped parameter (D18, AC-28).
     _ = try payload.validateRecipeNames()
-    // #286: expand a named `preset` into the LoRA stack it resolves to, HERE,
-    // so /v1/generate, /v1/generate/async and persisted-queue replay all go
-    // through it and the existing per-job application at dequeue
-    // (`applyActiveLoRAs`) does the work. Before this, `preset` was a
-    // provenance label on the image path and a preset-by-name render used
-    // whatever adapters the warm pipeline happened to hold.
-    try expandPresetLoRAs(into: &payload)
-    return payload
+    // #286: expand a named `preset` HERE — model, LoRA stack and declared
+    // steps/guidance — so /v1/generate, /v1/generate/async and persisted-queue
+    // replay all go through it and the existing per-job model/LoRA application
+    // at dequeue does the work. Before this, `preset` was a provenance label on
+    // the image path and a preset-by-name render used whatever adapters the
+    // warm pipeline happened to hold, on whatever base was active.
+    return try Self.expandGeneratePayload(
+      payload, store: presetStore,
+      stageNearline: { entries in self.stageNearlineLoras(in: LoRASwapPayload(loras: entries)).loras },
+      log: { line in self.logger.info("\(line)") })
   }
 
-  /// #286 — resolve `payload.preset` to its LoRA stack, or refuse.
+  /// #286 — the preset expansion the generate routes run, over an EXPLICIT
+  /// store so it is testable without a warm server (same shape as
+  /// ``WarmServer/upsertPreset(store:body:)``).
   ///
-  /// The stack comes from the SAME ``PresetStore/resolve(_:)`` that backs
-  /// `POST /v1/presets/resolve`, so the two can never disagree.
-  private func expandPresetLoRAs(into payload: inout GeneratePayload) throws {
-    payload = try GeneratePayload.expandingPresetLoRAs(payload) { [presetStore] id in
-      do {
-        return .resolved(try presetStore.resolve(id))
-      } catch PresetStoreError.invalid(_, let reason) {
-        return .invalid(reason: reason)
-      } catch {
-        return .notFound
-      }
-    } log: { [logger] line in
-      logger.info("\(line)")
+  /// Round 1 of review found that every test could pass with the wiring
+  /// removed, because they all exercised the pure decision. This is the
+  /// function `decodedGeneratePayload` actually calls, so a test of it is a
+  /// test of the route.
+  ///
+  /// The preset is read through ``PresetStore/lookup(_:)`` — one lock over the
+  /// preset AND its validity flag, the same read `POST /v1/presets/resolve`
+  /// makes — so the two routes cannot disagree about a given revision.
+  static func expandGeneratePayload(
+    _ payload: GeneratePayload,
+    store: PresetStore,
+    stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
+    log: (String) -> Void = { _ in }
+  ) throws -> GeneratePayload {
+    var out = try GeneratePayload.expandingPreset(payload) { id in
+      let (found, invalidReason) = store.lookup(id)
+      guard let preset = found else { return .notFound }
+      if let reason = invalidReason { return .invalid(reason: reason) }
+      return .resolved(store.resolve(preset: preset), declared: preset)
+    } normalizeModelSpec: { spec in
+      WarmServer.parseModelSpec(from: spec)
+    } log: { line in log(line) }
+
+    // I3: a preset may name an adapter that lives only on nearline storage.
+    // `/v1/lora/swap` stages those; the expanded stack must be staged the same
+    // way or a valid preset fails on a file that is merely archived.
+    if let loras = out.loras, !loras.isEmpty {
+      out.loras = stageNearline(loras)
     }
+    return out
   }
+
+  /// #286 — decode AND expand, returning the body to persist alongside the
+  /// payload.
+  ///
+  /// I5: the queue snapshot must carry the EXPANDED request. A crash-recovery
+  /// replay of the original body would re-resolve the preset against whatever
+  /// the store says at replay time — so editing or deleting a preset after a
+  /// job was accepted could change or invalidate a queued render. The rewritten
+  /// body carries the accepted `loras`/`model`/`steps`/`guidance`, and because
+  /// it now has explicit `loras` the replay takes the request-wins branch and
+  /// resolves nothing again.
+  private func decodedGenerateRequest(from body: Data) throws -> (GeneratePayload, Data) {
+    let payload = try decodedGeneratePayload(from: body)
+    return (payload, Self.rawBody(body, expandedWith: payload))
+  }
+
+  /// Merge the fields #286's expansion may have filled in back into the raw
+  /// JSON, so the persisted job replays the stack that was accepted. Returns
+  /// the original bytes unchanged when nothing was expanded or the body is not
+  /// a JSON object.
+  static func rawBody(_ original: Data, expandedWith payload: GeneratePayload) -> Data {
+    guard payload.preset?.isEmpty == false,
+          var object = (try? JSONSerialization.jsonObject(with: original)) as? [String: Any]
+    else { return original }
+    var changed = false
+    if let loras = payload.loras, object["loras"] == nil {
+      object["loras"] = loras.map { entry -> [String: Any] in
+        var row: [String: Any] = ["path": entry.path, "scale": entry.scale ?? 1.0]
+        if let role = entry.role { row["role"] = role }
+        return row
+      }
+      changed = true
+    }
+    for (key, value) in [
+      ("model", payload.model as Any?), ("steps", payload.steps as Any?),
+      ("guidance", payload.guidance as Any?),
+    ] where object[key] == nil {
+      if let value {
+        object[key] = value
+        changed = true
+      }
+    }
+    guard changed, let data = try? JSONSerialization.data(withJSONObject: object) else {
+      return original
+    }
+    return data
+  }
+
 
   /// Replay any queue jobs left over from before a crash (see
   /// QueuePersistence.swift) — the "active" slot (if any) first, since it
@@ -5105,6 +5177,10 @@ public final class WarmServer {
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      // #286: a preset/model contradiction is a CONFLICT, not a malformed
+      // request — the caller sent two valid things that cannot both hold.
+      case .presetModelConflict:
+        return .error(status: 409, message: error.localizedDescription ?? "Preset/model conflict")
       // WP-E4: a bad recipe name / key conflict / unimplemented tier is the
       // caller's error, named in full (AC-15, AC-28).
       case .unknownSampler, .unknownSigmaSchedule, .mutuallyExclusive, .unsupportedRecipeField,
@@ -5709,6 +5785,9 @@ public struct ImageJobStatus: Codable, Sendable {
   /// async caller can verify its render the same way. Optional so persisted
   /// pre-#286 JSON still decodes.
   public let appliedLoras: [LoRAState]?
+  /// #286 (C2/I1): the same two additive flags the sync response carries.
+  public let presetUnresolved: String?
+  public let presetStackMismatch: Bool?
 
   /// The record itself; see ``AppliedRecordSlot`` for absent-vs-null.
   public var appliedRecord: RenderRecipe? { applied?.record }
@@ -5716,7 +5795,8 @@ public struct ImageJobStatus: Codable, Sendable {
   public init(
     jobId: String, status: ImageJobState, source: String, outputPath: String?, durationMs: Int?,
     error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?,
-    applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil
+    applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
+    presetUnresolved: String? = nil, presetStackMismatch: Bool? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -5729,6 +5809,8 @@ public struct ImageJobStatus: Codable, Sendable {
     self.etaSec = etaSec
     self.applied = applied
     self.appliedLoras = appliedLoras
+    self.presetUnresolved = presetUnresolved
+    self.presetStackMismatch = presetStackMismatch
   }
 }
 
@@ -5750,6 +5832,9 @@ private final class ImageJob: @unchecked Sendable {
   var applied: AppliedRecordSlot?
   /// #286: the flat applied stack, set with the result on success.
   var appliedLoras: [LoRAState]?
+  /// #286: the two preset flags, set with the result on success.
+  var presetUnresolved: String?
+  var presetStackMismatch: Bool?
 
   init(id: String, source: String) {
     self.id = id
@@ -5766,7 +5851,8 @@ private final class ImageJob: @unchecked Sendable {
       jobId: id, status: state, source: source, outputPath: outputPath,
       durationMs: durationMs, error: error, elapsedMs: elapsedMs,
       preemptRefused: preemptRefused, etaSec: etaSec, applied: applied,
-      appliedLoras: appliedLoras
+      appliedLoras: appliedLoras, presetUnresolved: presetUnresolved,
+      presetStackMismatch: presetStackMismatch
     )
   }
 }
@@ -5847,6 +5933,11 @@ final class ImageJobTracker: @unchecked Sendable {
   ) -> ImageJobStatus {
     let jobId = UUID().uuidString
     let job = ImageJob(id: jobId, source: source)
+    // #286: the preset flags are known at SUBMIT, not only on success — an
+    // async caller must see `preset_unresolved` on the 202 rather than having
+    // to poll for it, and a job that later fails must still report it.
+    job.presetUnresolved = payload.presetUnresolved
+    job.presetStackMismatch = payload.presetStackMismatch
     lock.lock(); jobs[jobId] = job; lock.unlock()
 
     Task { [weak self] in
@@ -5912,6 +6003,8 @@ final class ImageJobTracker: @unchecked Sendable {
       job.durationMs = result.durationMs
       job.applied = result.applied
       job.appliedLoras = result.appliedLoras
+      job.presetUnresolved = result.presetUnresolved ?? job.presetUnresolved
+      job.presetStackMismatch = result.presetStackMismatch ?? job.presetStackMismatch
       job.completedAt = Date()
     }
     lock.unlock()
@@ -8212,7 +8305,9 @@ private actor WarmServerCoordinator {
           success: true,
           outputPath: outputURL.path,
           durationMs: durationMs,
-          appliedLoras: appliedLoRAStates()
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -8317,7 +8412,9 @@ private actor WarmServerCoordinator {
           success: true,
           outputPath: result.path,
           durationMs: durationMs,
-          appliedLoras: appliedLoRAStates()
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -8595,7 +8692,8 @@ private actor WarmServerCoordinator {
       // sink 1 — the response; sink 4 reads `applied` off this same value.
       continuation.resume(returning: GenerateResponse(
         success: true, outputPath: outputURL.path, durationMs: durationMs, applied: applied,
-        appliedLoras: appliedLoRAStates()))
+        appliedLoras: appliedLoRAStates(), presetUnresolved: payload.presetUnresolved,
+        presetStackMismatch: payload.presetStackMismatch))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -8665,7 +8763,9 @@ private actor WarmServerCoordinator {
           success: true,
           outputPath: result.path,
           durationMs: durationMs,
-          appliedLoras: appliedLoRAStates()
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -8734,7 +8834,9 @@ private actor WarmServerCoordinator {
           success: true,
           outputPath: outputURL.path,
           durationMs: durationMs,
-          appliedLoras: appliedLoRAStates()
+          appliedLoras: appliedLoRAStates(),
+          presetUnresolved: payload.presetUnresolved,
+          presetStackMismatch: payload.presetStackMismatch
         )
       )
     } catch {
@@ -8845,7 +8947,8 @@ private actor WarmServerCoordinator {
         controlPipeline = ZImageControlPipeline(logger: logger)
       }
 
-      let outputURL = try await controlPipeline!.generate(request)
+      let control = controlPipeline!
+      let outputURL = try await control.generate(request)
       let durationMs = Int(Date().timeIntervalSince(start) * 1000.0)
       successfulRenderCount += 1
       lastRenderDurationMs = durationMs
@@ -8858,7 +8961,8 @@ private actor WarmServerCoordinator {
           success: true,
           outputPath: outputURL.path,
           durationMs: durationMs,
-          appliedLoras: appliedLoRAStates()
+          // I4: the ControlNet pipeline is what rendered — read ITS adapters.
+          appliedLoras: appliedLoRAStates(from: control)
         )
       )
     } catch {
@@ -8885,8 +8989,18 @@ private actor WarmServerCoordinator {
   /// coordinator's intent, so a client can diff it against what
   /// `POST /v1/presets/resolve` reported and catch a wrong stack itself.
   ///
-  /// nil (key absent) for the families with no LoRA path at all — the same two
-  /// `/v1/lora/swap` refuses — so an absent key can never read as "empty".
+  /// nil (key absent) for FIBO and Chroma, which have no LoRA path at all
+  /// (`/v1/lora/swap` refuses them), so an absent key can never read as
+  /// "rendered bare".
+  ///
+  /// I4 (review round 1): the ControlNet arm renders through `controlPipeline`,
+  /// a DIFFERENT instance from the family pipeline — reading the family's
+  /// configs there reported unrelated resident state. `pipeline` names the one
+  /// that rendered.
+  private func appliedLoRAStates(from pipeline: ZImageControlPipeline) -> [LoRAState]? {
+    pipeline.loadedLoRAConfigs.map(LoRAState.init)
+  }
+
   private func appliedLoRAStates() -> [LoRAState]? {
     if currentModelFamily == .fibo || currentModelFamily == .chroma { return nil }
     return loadedLoRAConfigs(for: currentModelFamily).map(LoRAState.init)
@@ -8898,6 +9012,16 @@ private actor WarmServerCoordinator {
   private func applyActiveLoRAs(_ newLoRAs: [LoRAConfiguration]) async throws {
     if currentModelFamily == .flux2 {
       guard let f2 = flux2Pipeline else { throw WarmServerError.flux2NotLoaded }
+      // I2 (review round 1): Flux 2 and Krea 2 clear and reload every adapter
+      // on every call, unlike `ZImagePipeline.loadLoRAs`, which skips an
+      // identical stack. Now that a preset render applies its stack on EVERY
+      // request, a 5-10 adapter preset would otherwise reload the whole stack
+      // per render — pure latency and unified-memory churn on a 24/7 daemon.
+      if LoRAStackIdentity.isSameStack(f2.loadedLoRAConfigs, newLoRAs) {
+        logger.info("LoRA stack already resident (Flux 2) — skipping reload of \(newLoRAs.count) adapter(s)")
+        activeLoRAs = newLoRAs
+        return
+      }
       try await f2.loadLoRAs(newLoRAs)
       activeLoRAs = newLoRAs
     } else if currentModelFamily == .krea2 {
@@ -8912,6 +9036,13 @@ private actor WarmServerCoordinator {
         var out = cfg
         out.requiresBase = relative
         return out
+      }
+      // I2: compared AFTER relativity folding, so the comparison is against
+      // what would actually be loaded.
+      if LoRAStackIdentity.isSameStack(k2.loadedLoRAConfigs, declared) {
+        logger.info("LoRA stack already resident (Krea 2) — skipping reload of \(declared.count) adapter(s)")
+        activeLoRAs = declared
+        return
       }
       try await k2.loadLoRAs(declared)
       activeLoRAs = declared
@@ -9380,8 +9511,11 @@ struct GeneratePayload: Sendable {
   let negativePrompt: String?
   let width: Int?
   let height: Int?
-  let steps: Int?
-  let guidance: Float?
+  /// `var` since #286: filled from the named `preset`'s DECLARED `steps` when
+  /// the request omitted them (never from `ResolvedPreset`, whose default is 4).
+  var steps: Int?
+  /// `var` since #286, same rule as `steps`.
+  var guidance: Float?
   let seed: UInt64?
   let outputPath: String?
   let levelsMin: Float?
@@ -9460,7 +9594,12 @@ struct GeneratePayload: Sendable {
   /// since a job's dequeue can happen well after another request changed
   /// the active model. nil preserves the old "caller activates first"
   /// behavior for direct /v1/generate callers.
-  let model: String?
+  ///
+  /// `var` since #286: filled from the named `preset`'s `model` when the
+  /// request named none. A preset's adapters must never be applied to a
+  /// different base — an explicit `model` that contradicts the preset's is a
+  /// 409 (``WarmServerError/presetModelConflict(preset:presetModel:requestModel:)``).
+  var model: String?
   /// Per-job LoRA override, applied the same way as `model` at dequeue time.
   ///
   /// `var` since #286: `decodedGeneratePayload` fills this in from the named
@@ -9469,6 +9608,17 @@ struct GeneratePayload: Sendable {
   /// the one place a preset-by-name render goes through. See
   /// ``PresetLoRAStack``.
   var loras: [LoRAEntry]?
+
+  /// #286 (C2): set by the engine, never by the wire — the named preset could
+  /// not be expanded (unknown, flagged invalid, a video preset, or a dial the
+  /// engine has no application path for). The render behaves exactly as it did
+  /// before #286 (the preset is a label) and the response says so via
+  /// `preset_unresolved`.
+  var presetUnresolved: String?
+  /// #286 (I1): set by the engine — the request carried explicit `loras` that
+  /// differ from what the named preset resolves to. The explicit list still
+  /// wins; the response says so via `preset_stack_mismatch`.
+  var presetStackMismatch: Bool?
   // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
   let controlImageData: Data?
   let controlnetStrength: Float?
@@ -9557,6 +9707,8 @@ struct GeneratePayload: Sendable {
     self.initImageData = initImageData
     self.model = model
     self.loras = loras
+    self.presetUnresolved = nil
+    self.presetStackMismatch = nil
     self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength; self.controlImage = controlImage
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -9674,6 +9826,9 @@ extension GeneratePayload: Decodable {
     contentMode = try c.decodeIfPresent(String.self, forKey: .contentMode)
     model = try c.decodeIfPresent(String.self, forKey: .model)
     loras = try c.decodeIfPresent([LoRAEntry].self, forKey: .loras)
+    // #286: engine-set, never decoded from the wire.
+    presetUnresolved = nil
+    presetStackMismatch = nil
     controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
@@ -10240,22 +10395,38 @@ struct GenerateResponse: Encodable, Sendable {
   let applied: AppliedRecordSlot?
 
   /// #286: `applied_loras` — the LoRA stack that was actually resident for
-  /// this render, names + scales, READ BACK from the pipeline. Additive; no
-  /// existing field is renamed.
+  /// this render, READ BACK from the pipeline that rendered it: `name`, `path`
+  /// and `scale` per adapter. Additive; no existing field is renamed.
   ///
   /// `applied` above answers the same question far more fully, but only for
-  /// Krea 2 (D12). This one is present on EVERY family and is a flat list, so
-  /// a client can diff it against what `POST /v1/presets/resolve` reported for
-  /// the preset it asked for and catch a wrong stack itself — which is what
-  /// nobody could do while a preset-by-name render silently used residency.
+  /// Krea 2 (D12). This one is a flat list a client can diff against what
+  /// `POST /v1/presets/resolve` reported for the preset it asked for — which
+  /// is what nobody could do while a preset-by-name render silently used
+  /// residency. The key is ABSENT for FIBO and Chroma, which have no LoRA path
+  /// at all, so it can never read as "rendered bare".
   let appliedLoras: [LoRAState]?
+
+  /// #286 (C2): the named preset could not be expanded, so it behaved as the
+  /// provenance label it has always been and this render used the request's own
+  /// settings plus the resident stack. Names the preset. Absent = the preset
+  /// was expanded (or none was named). NOT an error — the pre-#286 contract is
+  /// preserved deliberately; this field is how it stops being silent.
+  let presetUnresolved: String?
+
+  /// #286 (I1): the request carried explicit `loras` that differ from what its
+  /// named `preset` resolves to. The explicit list won, as it always has; this
+  /// says the two disagreed. The production async client sends a FLAT `loras`
+  /// list that has already dropped structured kroma/bypass/role, which is
+  /// exactly the case this makes visible.
+  let presetStackMismatch: Bool?
 
   /// The record itself, for Swift readers that do not care about the
   /// absent-vs-null distinction.
   var appliedRecord: RenderRecipe? { applied?.record }
 
   init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
-       applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil) {
+       applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
+       presetUnresolved: String? = nil, presetStackMismatch: Bool? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
@@ -10263,6 +10434,8 @@ struct GenerateResponse: Encodable, Sendable {
     self.etaSec = etaSec
     self.applied = applied
     self.appliedLoras = appliedLoras
+    self.presetUnresolved = presetUnresolved
+    self.presetStackMismatch = presetStackMismatch
   }
 }
 
@@ -10500,8 +10673,23 @@ struct HealthResponse: Encodable, Sendable {
 }
 
 public struct LoRAState: Codable, Sendable {
+  /// Unchanged since before #286: the absolute local path, or `repo/file` for
+  /// a HuggingFace reference. Kept as-is — `/health.loras` and
+  /// `/v1/lora/swap`'s response have always carried this spelling.
   public let source: String
   public let scale: Float
+  /// #286 (minor review point): the adapter's NAME — the last path component,
+  /// which is what a preset's `loras[].filename` and `/v1/presets/resolve`
+  /// carry. Diffing an applied stack against a resolved preset needs this, not
+  /// a machine-specific absolute path. Additive.
+  public let name: String
+  /// #286: the same value as `source`, under the spelling a caller reading
+  /// "name + path" expects. Additive; `source` is untouched for compatibility.
+  public let path: String
+  /// #286: the declared configuration slot (`kroma`/`accel`/`bypass`/
+  /// `control`), read back from the applied `LoRAConfiguration`. nil when the
+  /// sender declared none.
+  public let role: String?
 
   public init(_ configuration: LoRAConfiguration) {
     switch configuration.source {
@@ -10511,6 +10699,22 @@ public struct LoRAState: Codable, Sendable {
       self.source = filename.map { "\(modelId)/\($0)" } ?? modelId
     }
     self.scale = configuration.scale
+    self.name = configuration.source.displayName
+    self.path = self.source
+    self.role = configuration.role
+  }
+
+  /// Tolerant decode: `name`/`path`/`role` postdate #286, so a persisted
+  /// pre-#286 job status still round-trips (`name`/`path` fall back to
+  /// `source`).
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    source = try c.decode(String.self, forKey: .source)
+    scale = try c.decode(Float.self, forKey: .scale)
+    name = try c.decodeIfPresent(String.self, forKey: .name)
+      ?? (source as NSString).lastPathComponent
+    path = try c.decodeIfPresent(String.self, forKey: .path) ?? source
+    role = try c.decodeIfPresent(String.self, forKey: .role)
   }
 }
 
@@ -10644,6 +10848,11 @@ public enum WarmServerError: Error, LocalizedError {
   /// name is a 400 naming the valid set — it must never silently degrade to
   /// gaussian (absent stays gaussian; that is the default, not a coercion).
   case unknownNoiseType(name: String, valid: [String])
+  /// #286: the request named a `preset` AND an explicit `model` that resolve
+  /// to different bases. Applying the preset's adapters to the requested base,
+  /// or the requested base under the preset's name, are both wrong — so it is
+  /// a 409 naming all three rather than a silent pick.
+  case presetModelConflict(preset: String, presetModel: String, requestModel: String)
 
   public var errorDescription: String? {
     switch self {
@@ -10653,6 +10862,11 @@ public enum WarmServerError: Error, LocalizedError {
       return "Output path '\(path)' must be under allowed output directory '\(allowedDirectory)'"
     case .invalidRequest(let message):
       return message
+    case .presetModelConflict(let preset, let presetModel, let requestModel):
+      return "Preset '\(preset)' declares model '\(presetModel)' but the request asked for "
+        + "'\(requestModel)'. A preset's LoRA stack is only valid on its own base — send one or "
+        + "the other, or send the LoRAs explicitly in `loras` without the preset."
+
     case .flux2DetectionFailed(let model):
       return "Model '\(model)' was identified as Flux 2 but detection failed at the snapshot directory"
     case .flux2NotLoaded:
