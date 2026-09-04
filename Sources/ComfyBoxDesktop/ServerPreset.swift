@@ -7,6 +7,7 @@
 // (engine/mode/provider on the legacy image-service presets, prompt affixes…).
 
 import Foundation
+import ZImage
 
 public struct ServerPresetLora: Codable, Sendable, Equatable, Identifiable {
     public var filename: String
@@ -346,6 +347,58 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             sampler: sampler ?? scheduler,
             sigmaSchedule: sigmaSchedule,
             seed: seed.map { UInt64(truncatingIfNeeded: $0) }
+        )
+    }
+
+    /// Map to the engine's own `ImagePreset` — every field this mirror
+    /// carries, verbatim. This is what lets ``PresetEffectiveRecipePresenter``
+    /// run the SAME `ResolvedPreset`/`PresetLoRAStack` decision the engine
+    /// runs, on the editor's current (possibly unsaved) field values, with no
+    /// wire round trip (#277).
+    public func toImagePreset() -> ImagePreset {
+        ImagePreset(
+            id: id,
+            name: name,
+            description: description,
+            mediaKind: mediaKind,
+            provider: provider,
+            engine: engine,
+            mode: mode,
+            model: model,
+            customModelPath: customModelPath,
+            baseModel: baseModel,
+            prompt: prompt,
+            negativePrompt: negativePrompt,
+            promptPrefix: promptPrefix,
+            promptSuffix: promptSuffix,
+            injectedKeywords: injectedKeywords,
+            steps: steps,
+            guidance: guidance,
+            projectorScale: projectorScale,
+            noiseType: noiseType,
+            noiseAlpha: noiseAlpha,
+            implicitSteps: implicitSteps,
+            c2: c2,
+            seed: seed,
+            width: width,
+            height: height,
+            loras: loras.map { LoraReference(filename: $0.filename, scale: $0.scale, role: $0.role) },
+            scheduler: scheduler,
+            upscale: upscale.map { PresetUpscale(enabled: $0.enabled, mode: $0.mode, scale: $0.scale) },
+            vae: vae,
+            checkpointFamily: checkpointFamily,
+            kroma: kroma.map { KromaPolicy(strength: $0.strength, file: $0.file) },
+            bypass: bypass.map { BypassPolicy(strength: $0.strength, file: $0.file) },
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            shift: shift,
+            eta: eta,
+            bongmath: bongmath,
+            stage2: stage2.map {
+                PresetStage(
+                    sampler: $0.sampler, sigmaSchedule: $0.sigmaSchedule, steps: $0.steps,
+                    denoise: $0.denoise, eta: $0.eta, bongmath: $0.bongmath)
+            }
         )
     }
 }

@@ -159,9 +159,10 @@ struct GenerationView: View {
     /// Filtering first protects older scene state from reintroducing a second,
     /// untagged copy of the same file.
     private var generationLoras: [LoRASelection] {
-        var stack = selectedLoras.filter {
-            $0.role?.lowercased() != "kroma" && $0.filename != kromaPolicy?.file
-        }
+        var stack = PresetKromaSync.strippingKromaMirror(
+            from: selectedLoras, kromaFile: kromaPolicy?.file,
+            role: { $0.role }, filename: { $0.filename }
+        )
         guard let policy = kromaPolicy,
               let file = policy.file?.trimmingCharacters(in: .whitespacesAndNewlines),
               !file.isEmpty else { return stack }
@@ -329,9 +330,10 @@ struct GenerationView: View {
                         c2: c2 == 0.5 ? nil : c2,
                         width: effectiveWidth,
                         height: effectiveHeight,
-                        loras: selectedLoras.filter {
-                            $0.role?.lowercased() != "kroma" && $0.filename != kromaPolicy?.file
-                        }.map {
+                        loras: PresetKromaSync.strippingKromaMirror(
+                            from: selectedLoras, kromaFile: kromaPolicy?.file,
+                            role: { $0.role }, filename: { $0.filename }
+                        ).map {
                             ServerPresetLora(
                                 filename: $0.filename,
                                 scale: Double($0.scale),
@@ -1880,10 +1882,10 @@ struct GenerationView: View {
         // actual library id by filename; the picker's "selected" check keys
         // on id, and a mismatched id silently fails to show the checkmark
         // even though generation itself would still use the right file.
-        selectedLoras = preset.loras.filter { presetLora in
-            presetLora.role?.lowercased() != "kroma"
-                && presetLora.filename != preset.kroma?.file
-        }.map { presetLora in
+        selectedLoras = PresetKromaSync.strippingKromaMirror(
+            from: preset.loras, kromaFile: preset.kroma?.file,
+            role: { $0.role }, filename: { $0.filename }
+        ).map { presetLora in
             if let match = engine.availableLoras.first(where: { $0.filename == presetLora.filename }) {
                 return LoRASelection(
                     id: match.id,

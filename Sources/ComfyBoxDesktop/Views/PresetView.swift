@@ -60,6 +60,7 @@ struct PresetView: View {
                 original: preset,
                 isNew: isNew,
                 availableLoras: engine.availableLoras,
+                engine: engine,
                 onSave: { updated in Task { await save(updated) } },
                 onCancel: { editing = nil }
             )
@@ -321,8 +322,17 @@ private struct ServerPresetEditor: View {
     let original: ServerPreset
     let isNew: Bool
     let availableLoras: [LoRAInfo]
+    /// #277: lets the panel cross-check its local effective-recipe
+    /// computation against `POST /v1/presets/resolve` for an already-saved
+    /// preset. Optional so previews/tests can construct the editor without a
+    /// live server; the panel still shows the local computation.
+    let engine: EngineService?
     let onSave: (ServerPreset) -> Void
     let onCancel: () -> Void
+    /// Set once per sheet appearance if the live engine disagrees with (or
+    /// rejects) this preset — e.g. flagged invalid at load (WP-E20, AC-44c).
+    /// nil means either "matches" or "not checked yet".
+    @State private var serverResolveError: String?
 
     /// Editable LoRA row — stable identity for ForEach even when the same
     /// file appears twice while the user is rearranging.
@@ -352,11 +362,12 @@ private struct ServerPresetEditor: View {
     @State private var saveAsName: String = ""
     @State private var showingSaveAs = false
 
-    init(original: ServerPreset, isNew: Bool, availableLoras: [LoRAInfo],
+    init(original: ServerPreset, isNew: Bool, availableLoras: [LoRAInfo], engine: EngineService? = nil,
          onSave: @escaping (ServerPreset) -> Void, onCancel: @escaping () -> Void) {
         self.original = original
         self.isNew = isNew
         self.availableLoras = availableLoras
+        self.engine = engine
         self.onSave = onSave
         self.onCancel = onCancel
         _name = State(initialValue: original.name)
@@ -369,12 +380,15 @@ private struct ServerPresetEditor: View {
         _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
         _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
         _kromaStrength = State(initialValue: original.kroma?.strength ?? 0)
-        _editableLoras = State(initialValue: original.loras
-            .filter { lora in
-                guard let kromaFile = original.kroma?.file else { return true }
-                return lora.filename != kromaFile
-            }
-            .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
+        // #276: match GenerationView's role-OR-filename test (PresetKromaSync),
+        // not filename alone — a filename-only test is vacuously true whenever
+        // `kroma.file` is nil (the legitimate "off" or "engine-default file"
+        // case), so a legacy `role: "kroma"` duplicate in `loras[]` used to
+        // survive being opened here.
+        _editableLoras = State(initialValue: PresetKromaSync.strippingKromaMirror(
+            from: original.loras, kromaFile: original.kroma?.file,
+            role: { $0.role }, filename: { $0.filename }
+        ).map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
         _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
     }
@@ -435,6 +449,9 @@ private struct ServerPresetEditor: View {
                     addLoraMenu
                     presetLoraKeywordsRow
                 }
+                Section("Effective recipe") {
+                    effectiveRecipeView
+                }
             }
             .formStyle(.grouped)
             Divider()
@@ -455,6 +472,19 @@ private struct ServerPresetEditor: View {
             .padding()
         }
         .frame(minWidth: 560, idealWidth: 620, minHeight: 590, idealHeight: 680)
+        .task {
+            // #277: cross-check against the live engine once per sheet
+            // appearance. Only meaningful for an already-saved preset — the
+            // endpoint resolves by id, so it cannot see unsaved edits (the
+            // panel above is the live preview for those).
+            guard !isNew, !original.id.isEmpty, let engine else { return }
+            do {
+                _ = try await engine.resolvePreset(id: original.id)
+                serverResolveError = nil
+            } catch {
+                serverResolveError = error.localizedDescription
+            }
+        }
         .alert("Save as New Preset", isPresented: $showingSaveAs) {
             TextField("New preset name", text: $saveAsName)
             Button("Cancel", role: .cancel) { }
@@ -467,6 +497,65 @@ private struct ServerPresetEditor: View {
             .disabled(saveAsName.trimmingCharacters(in: .whitespaces).isEmpty || samplingValidationError != nil)
         } message: {
             Text("Creates a separate preset with these settings; “\(original.name)” is left unchanged.")
+        }
+    }
+
+    // MARK: - Effective recipe (#277)
+
+    /// What `POST /v1/generate {"preset": id}` would actually run for the
+    /// CURRENT field values — recomputed on every render, so it updates as
+    /// the user edits. See ``PresetEffectiveRecipePresenter``.
+    @ViewBuilder
+    private var effectiveRecipeView: some View {
+        let recipe = effectiveRecipe
+        VStack(alignment: .leading, spacing: 6) {
+            if let error = serverResolveError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.red)
+            }
+            if let unresolved = recipe.unresolved {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label("Label-only — the engine will not expand this preset", systemImage: "tag")
+                        .font(.caption).foregroundStyle(.orange)
+                    Text(unresolved.message)
+                        .font(.caption2).foregroundStyle(.secondary)
+                    if let hint = unresolved.hint {
+                        Text(hint)
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+            } else {
+                LabeledContent("Model", value: recipe.model?.isEmpty == false ? recipe.model! : "Model default")
+                if let family = recipe.checkpointFamily, !family.isEmpty {
+                    LabeledContent("Checkpoint family", value: family)
+                }
+                LabeledContent("Steps", value: "\(recipe.steps)")
+                LabeledContent("Guidance", value: recipe.guidance.map { String(format: "%.2g", $0) } ?? "Model default")
+                let recipeLine = [recipe.sampler, recipe.sigmaSchedule].compactMap { $0 }.joined(separator: " / ")
+                if !recipeLine.isEmpty {
+                    LabeledContent("Sampler / schedule", value: recipeLine)
+                }
+                if recipe.loraStack.isEmpty {
+                    Text("No LoRAs applied").font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    ForEach(recipe.loraStack) { lora in
+                        HStack(spacing: 6) {
+                            Text(lora.filename)
+                                .font(.caption2).lineLimit(1).truncationMode(.middle)
+                            if let role = lora.role {
+                                Text(role)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(.quaternary, in: Capsule())
+                            }
+                            Spacer()
+                            Text(String(format: "%.2f", lora.scale))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -677,13 +766,23 @@ private struct ServerPresetEditor: View {
             kroma.strength = min(max(kromaStrength, 0), 1.5)
             p.kroma = kroma
         }
-        let structuredKromaFile = p.kroma?.file
-        p.loras = editableLoras
-            .filter { !$0.filename.isEmpty && $0.filename != structuredKromaFile }
-            .map {
-                ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role)
-            }
+        // #276: PresetKromaSync.isKromaMirror, not a bare filename check — see
+        // its doc comment for why a filename-only test let a legacy `role:
+        // "kroma"` duplicate survive whenever `kroma.file` is nil.
+        p.loras = PresetKromaSync.strippingKromaMirror(
+            from: editableLoras.filter { !$0.filename.isEmpty },
+            kromaFile: p.kroma?.file, role: { $0.role }, filename: { $0.filename }
+        ).map {
+            ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role)
+        }
         return p
+    }
+
+    /// #277: what the engine would actually run for this preset's CURRENT
+    /// (possibly unsaved) field values — recomputed on every render, so
+    /// editing a field updates it live.
+    private var effectiveRecipe: EffectiveRecipe {
+        PresetEffectiveRecipePresenter.compute(declared: buildPreset().toImagePreset())
     }
 }
 

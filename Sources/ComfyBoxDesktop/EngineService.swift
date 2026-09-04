@@ -1658,6 +1658,25 @@ public final class EngineService {
 
     /// Create or update a server preset. Sends the full document (camelCase,
     /// tolerated by the server) — upsert replaces the stored preset.
+    /// `POST /v1/presets/resolve` — the preset merged onto system defaults,
+    /// exactly as the server computes it (#277). Used to cross-check the
+    /// editor's local, live-recomputed effective recipe
+    /// (``PresetEffectiveRecipePresenter``) against the actual engine for an
+    /// already-saved preset; it cannot see unsaved edits (the endpoint
+    /// resolves by id), which is why the editor's live panel is computed
+    /// locally and this is a verification, not the primary source.
+    public func resolvePreset(id: String) async throws -> ResolvedPreset {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONEncoder().encode(["id": id])
+        let (status, data) = try await client.post("/v1/presets/resolve", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Failed to resolve preset")
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(ResolvedPreset.self, from: data)
+    }
+
     public func savePreset(_ preset: ServerPreset) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
         let body = try JSONEncoder().encode(preset)

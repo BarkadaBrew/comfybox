@@ -1,0 +1,140 @@
+// PresetEffectiveRecipeTests.swift — the "effective recipe" view model (#277)
+
+import Testing
+import Foundation
+import ZImage
+@testable import ComfyBoxDesktop
+
+@Suite("PresetEffectiveRecipePresenter")
+struct PresetEffectiveRecipeTests {
+
+    /// The live `Krea-Kira` record from issue #277 — expandable (declares
+    /// both `model` and `checkpoint_family`), with a structured Kroma dial.
+    private static let kreaKira = ImagePreset(
+        id: "krea-kira", name: "Krea-Kira",
+        mediaKind: "image", provider: "local", engine: "zimage",
+        model: "krea2-raw",
+        steps: 12, guidance: 1.0,
+        width: 1024, height: 1536,
+        loras: [LoraReference(filename: "krea2_turbo_lora_rank_64_bf16.safetensors", scale: 1.0, role: "accel")],
+        checkpointFamily: "raw-accel",
+        kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"),
+        sampler: "res_2s", sigmaSchedule: "beta57", shift: 1.15, eta: 0.5
+    )
+
+    @Test("resolves an expandable preset: kroma prepended, sampler/schedule/shift/eta carried through")
+    func expandablePresetResolves() {
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: Self.kreaKira)
+        #expect(recipe.unresolved == nil)
+        #expect(recipe.model == "krea2-raw")
+        #expect(recipe.checkpointFamily == "raw-accel")
+        #expect(recipe.steps == 12)
+        #expect(recipe.guidance == 1.0)
+        #expect(recipe.sampler == "res_2s")
+        #expect(recipe.sigmaSchedule == "beta57")
+        #expect(recipe.shift == 1.15)
+        #expect(recipe.eta == 0.5)
+        // Kroma is PREPENDED as a role-tagged entry — the same order the
+        // engine's own expanding sender uses (PresetLoRAStack.decide).
+        #expect(recipe.loraStack.count == 2)
+        #expect(recipe.loraStack[0].role == "kroma")
+        #expect(recipe.loraStack[0].filename == "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
+        #expect(recipe.loraStack[0].scale == 0.6)
+        #expect(recipe.loraStack[1].role == "accel")
+    }
+
+    @Test("no model and no checkpoint_family: unresolved no_model, with the #359 hint")
+    func noModelIsUnresolvedWithHint() {
+        let preset = ImagePreset(
+            id: "desktop-saved", name: "Desktop Saved", engine: "zimage",
+            customModelPath: "/Models/some-checkpoint.safetensors")
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.unresolved?.code == "no_model")
+        #expect(recipe.unresolved?.hint == "Add checkpoint_family to make this preset expandable.")
+        #expect(recipe.loraStack.isEmpty)
+    }
+
+    @Test("declaring model alone (no checkpoint_family) is enough to be expandable")
+    func modelAloneIsExpandable() {
+        let preset = ImagePreset(
+            id: "model-only", name: "Model Only", engine: "zimage", model: "krea2-raw",
+            loras: [LoraReference(filename: "style.safetensors", scale: 0.7)])
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.unresolved == nil)
+        #expect(recipe.model == "krea2-raw")
+        #expect(recipe.loraStack.map(\.filename) == ["style.safetensors"])
+    }
+
+    /// `PresetLoRAStack.decide` only consults `checkpoint_family` to bridge a
+    /// preset that names no model onto a REQUEST's own model (#286 round 2).
+    /// The effective-recipe panel has no request context (there is no
+    /// accompanying render), so a preset that declares `checkpoint_family`
+    /// but not `model` still resolves `no_model` here — matching the real
+    /// `POST /v1/generate {"preset": id}` shape the daemon actually sends
+    /// with no other fields, not a false "this alone is enough" claim.
+    @Test("checkpoint_family alone, without model, is still no_model (there is no request model to bridge to)")
+    func checkpointFamilyAloneWithoutModelStillUnresolved() {
+        let preset = ImagePreset(id: "family-only", name: "Family Only", engine: "zimage", checkpointFamily: "raw-accel")
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.unresolved?.code == "no_model")
+        #expect(recipe.unresolved?.hint == "Add checkpoint_family to make this preset expandable.")
+    }
+
+    @Test("kroma.strength > 0 with no file: unresolved kroma_file_missing, no hint")
+    func kromaWithoutFileIsUnresolved() {
+        let preset = ImagePreset(
+            id: "krea2-x", name: "X", engine: "zimage", model: "krea2-raw",
+            kroma: KromaPolicy(strength: 0.5, file: nil))
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.unresolved?.code == "kroma_file_missing")
+        #expect(recipe.unresolved?.hint == nil)
+    }
+
+    @Test("a non-local engine is unresolved, never expanded onto this engine")
+    func nonLocalEngineIsUnresolved() {
+        let preset = ImagePreset(id: "mflux-preset", name: "Mflux", engine: "mflux", model: "schnell")
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.unresolved?.code == "engine:mflux")
+    }
+
+    /// The instruction-parity check: feed the presenter the shape
+    /// `POST /v1/presets/resolve` actually returns (snake_case, decoded with
+    /// `ResolvedPreset`'s own Codable conformance) rather than building a
+    /// `ResolvedPreset` by hand — this is what a network-driven refresh of
+    /// the panel would decode.
+    @Test("computes from a decoded /v1/presets/resolve response fixture")
+    func computesFromResolveResponseFixture() throws {
+        let json = #"""
+        {
+          "id": "krea-kira", "name": "Krea-Kira", "description": "",
+          "media_kind": "image", "provider": "local", "engine": "zimage",
+          "model": "krea2-raw", "checkpoint_family": "raw-accel",
+          "steps": 12, "guidance": 1.0, "width": 1024, "height": 1536,
+          "loras": [{"filename": "krea2_turbo_lora_rank_64_bf16.safetensors", "scale": 1.0, "role": "accel"}],
+          "kroma": {"strength": 0.6, "file": "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"},
+          "sampler": "res_2s", "sigma_schedule": "beta57", "shift": 1.15, "eta": 0.5,
+          "injected_keywords": []
+        }
+        """#
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let resolved = try decoder.decode(ResolvedPreset.self, from: Data(json.utf8))
+        #expect(resolved.checkpointFamily == "raw-accel")
+        #expect(resolved.sigmaSchedule == "beta57")
+
+        let recipe = PresetEffectiveRecipePresenter.compute(resolved: resolved, declared: Self.kreaKira)
+        #expect(recipe.unresolved == nil)
+        #expect(recipe.loraStack.first?.role == "kroma")
+        #expect(recipe.sigmaSchedule == "beta57")
+    }
+
+    @Test("an unsaved (empty-id) preset still resolves, so a new preset's panel is never blank")
+    func unsavedPresetStillResolves() {
+        let preset = ImagePreset(
+            id: "", name: "Draft", engine: "zimage", model: "krea2-raw",
+            checkpointFamily: "raw-accel")
+        let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
+        #expect(recipe.unresolved == nil)
+        #expect(recipe.model == "krea2-raw")
+    }
+}
