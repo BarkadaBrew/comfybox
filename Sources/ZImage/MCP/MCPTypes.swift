@@ -186,26 +186,93 @@ public struct RouteRef: Codable, Sendable, Hashable {
 
 // MARK: - MCP Tool Definition
 
+/// MCP safety hints advertised with a tool definition.
+///
+/// These are advisory metadata for clients, not an authorization boundary.
+/// ComfyBox emits both booleans explicitly because MCP's omitted defaults are
+/// deliberately conservative (`readOnlyHint: false`, `destructiveHint: true`).
+public struct MCPToolAnnotations: Sendable, Equatable {
+  public let readOnlyHint: Bool
+  public let destructiveHint: Bool
+
+  public init(readOnlyHint: Bool, destructiveHint: Bool) {
+    self.readOnlyHint = readOnlyHint
+    self.destructiveHint = destructiveHint
+  }
+
+  public static let readOnly = MCPToolAnnotations(
+    readOnlyHint: true,
+    destructiveHint: false
+  )
+  public static let additive = MCPToolAnnotations(
+    readOnlyHint: false,
+    destructiveHint: false
+  )
+  public static let destructive = MCPToolAnnotations(
+    readOnlyHint: false,
+    destructiveHint: true
+  )
+
+  public func responseJSON() -> [String: Any] {
+    [
+      "readOnlyHint": readOnlyHint,
+      "destructiveHint": destructiveHint,
+    ]
+  }
+}
+
 /// Tool definition for the MCP tools/list response.
 public struct MCPToolDefinition: Sendable {
   public let name: String
   public let description: String
   public let inputSchema: [String: Any]
+  public let annotations: MCPToolAnnotations?
   /// HTTP routes this tool proxies to (see ``RouteRef``). Defaults to empty
   /// so existing call sites are unaffected; populated for tools added
   /// starting Phase 1 of the headless-parity FDD (comfybox#300, §4.2).
   public let routes: [RouteRef]
 
-  public init(name: String, description: String, inputSchema: [String: Any], routes: [RouteRef] = []) {
+  public init(
+    name: String,
+    description: String,
+    inputSchema: [String: Any],
+    annotations: MCPToolAnnotations? = nil,
+    routes: [RouteRef] = []
+  ) {
     self.name = name
     self.description = description
     self.inputSchema = inputSchema
+    self.annotations = annotations
     self.routes = routes
   }
 
   /// Serialize inputSchema to JSON-compatible dictionary (for tools/list response).
   public func inputSchemaJSON() -> Any {
     return inputSchema
+  }
+
+  /// Return a copy with explicit safety metadata for the public registry.
+  public func annotated(_ annotations: MCPToolAnnotations) -> MCPToolDefinition {
+    MCPToolDefinition(
+      name: name,
+      description: description,
+      inputSchema: inputSchema,
+      annotations: annotations,
+      routes: routes
+    )
+  }
+
+  /// Serialize the complete definition for a `tools/list` response.
+  public func responseJSON() -> [String: Any] {
+    var result: [String: Any] = [
+      "name": name,
+      "description": description,
+      "inputSchema": inputSchema,
+    ]
+    if let annotations {
+      result["annotations"] = annotations.responseJSON()
+    }
+    return result
   }
 }
 
