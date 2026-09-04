@@ -23,8 +23,15 @@ public struct ToneCurves: Codable, Equatable, Sendable {
     public var isIdentity: Bool { rgb.isEmpty && r.isEmpty && g.isEmpty && b.isEmpty }
 
     public static func normalized(_ pts: [CurvePoint]) -> [CurvePoint] {
-        var out = pts.map { CurvePoint(x: min(max($0.x, 0), 1), y: min(max($0.y, 0), 1)) }
+        let clamped = pts.map { CurvePoint(x: min(max($0.x, 0), 1), y: min(max($0.y, 0), 1)) }
             .sorted { $0.x < $1.x }
+        // Coalesce duplicate x-values (stable sort keeps ties in input order), keeping the
+        // last point for a given x so later edits win and the sampler never sees a
+        // zero-width interval.
+        var out: [CurvePoint] = []
+        for p in clamped {
+            if out.last?.x == p.x { out[out.count - 1] = p } else { out.append(p) }
+        }
         if out.first?.x != 0 { out.insert(CurvePoint(x: 0, y: 0), at: 0) }
         if out.last?.x != 1 { out.append(CurvePoint(x: 1, y: 1)) }
         return out
@@ -121,7 +128,5 @@ public struct EditRecipe: Codable, Equatable, Sendable {
     public var subject = EditSubject()
     public init() {}
 
-    public var isIdentity: Bool {
-        geometry.isIdentity && adjustments.isIdentity && local == nil && subject == EditSubject()
-    }
+    public var isIdentity: Bool { self == EditRecipe() }
 }
