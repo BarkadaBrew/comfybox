@@ -170,4 +170,36 @@ final class VideoJobTrackerTests: XCTestCase {
     XCTAssertEqual(WarmServer.localVideoProgressPercent(chunk: 5, totalChunks: 0, step: 9, totalSteps: 0), 100)
     XCTAssertEqual(WarmServer.localVideoProgressPercent(chunk: -3, totalChunks: 4, step: -2, totalSteps: 8), 0)
   }
+
+  // MARK: - activeJobCount (#298 review finding 5: terminal jobs must not
+  // inflate /health.video.active_jobs during their TTL retention window)
+
+  func testActiveJobCountExcludesTerminalJobs() {
+    struct Boom: LocalizedError { var errorDescription: String? { "render blew up" } }
+    let tracker = VideoJobTracker()
+
+    XCTAssertEqual(tracker.activeJobCount, 0, "an empty tracker has no active jobs")
+
+    let (queuedId, _) = tracker.register(source: "api", mode: .t2v)
+    XCTAssertEqual(tracker.activeJobCount, 1, "a freshly-queued job is active")
+
+    let (processingId, _) = tracker.register(source: "api", mode: .t2v)
+    tracker.markProcessing(processingId)
+    XCTAssertEqual(tracker.activeJobCount, 2, "queued + processing both count")
+
+    let (succeededId, _) = tracker.register(source: "api", mode: .t2v)
+    tracker.markSucceeded(succeededId, result: result())
+    XCTAssertEqual(tracker.activeJobCount, 2, "a succeeded (terminal) job drops out immediately")
+
+    let (failedId, _) = tracker.register(source: "api", mode: .t2v)
+    tracker.markFailed(failedId, error: Boom())
+    XCTAssertEqual(tracker.activeJobCount, 2, "a failed (terminal) job drops out immediately")
+
+    // The terminal jobs are still queryable by id (TTL retention) even
+    // though they no longer count as active.
+    XCTAssertEqual(tracker.status(jobId: succeededId)?.status, .succeeded)
+    XCTAssertEqual(tracker.status(jobId: failedId)?.status, .failed)
+    XCTAssertEqual(tracker.status(jobId: queuedId)?.status, .queued)
+    XCTAssertEqual(tracker.status(jobId: processingId)?.status, .processing)
+  }
 }

@@ -1,4 +1,5 @@
 import XCTest
+import MLX
 @testable import ZImage
 
 /// WP-E10 — sink 3, `/health` (FDD §3.10; §7.3 smoke steps c/e; Addendum
@@ -64,54 +65,135 @@ final class HealthSinkTests: XCTestCase {
     XCTAssertEqual(with["model_alias"] as? String, "krea2-raw")
   }
 
-  func testHealthAdvertisesReadyLocalLTX2WithRequiredAndOptionalAssets() throws {
-    let root = FileManager.default.temporaryDirectory
-      .appendingPathComponent("comfybox-video-health-\(UUID().uuidString)", isDirectory: true)
-    let weights = root.appendingPathComponent("weights", isDirectory: true)
-    let gemma = root.appendingPathComponent("gemma", isDirectory: true)
-    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: gemma, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: root) }
-    try Data().write(to: weights.appendingPathComponent("local-monolith.safetensors"))
-    try Data().write(to: gemma.appendingPathComponent("model.safetensors"))
+  private func writeValidSafetensors(at url: URL) throws {
+    let values: [Float] = [1, 2, 3, 4]
+    try MLX.save(arrays: ["weight": MLXArray(values, [4]).asType(.bfloat16)], metadata: [:], url: url)
+  }
+
+  /// #298 review finding 4: `video.available`/`video.backend` keep their
+  /// pre-existing, Replicate-only meaning — local readiness must NEVER flip
+  /// them. The additive `local_*` keys carry local readiness instead. This
+  /// is the regression test for the review's core contract complaint: a
+  /// fully-ready local snapshot passed in alongside `videoAvailable: false`
+  /// must still report `available: false, backend: "none"`.
+  func testVideoAvailableAndBackendStayReplicateOnlyRegardlessOfLocalReadiness() throws {
+    let weights = try tempDir("replicate-only-weights")
+    let gemma = try tempDir("replicate-only-gemma")
+    defer {
+      try? FileManager.default.removeItem(at: weights)
+      try? FileManager.default.removeItem(at: gemma)
+    }
+    try writeValidSafetensors(at: weights.appendingPathComponent("local-monolith.safetensors"))
+    try writeValidSafetensors(at: gemma.appendingPathComponent("model.safetensors"))
     try Data("{}".utf8).write(to: gemma.appendingPathComponent("config.json"))
     try Data("{}".utf8).write(to: gemma.appendingPathComponent("tokenizer.json"))
+    let readyLocal = LocalVideoReadiness.compute(weightsPath: weights.path, gemmaPath: gemma.path, upsamplerPath: nil)
+    XCTAssertTrue(readyLocal.ready, "test setup must actually produce a ready local snapshot")
+
+    // No Replicate proxy configured (videoAvailable: false) even though local is ready.
+    let data = try XCTUnwrap(WarmServer.healthJSON(
+      sample(lastRecipe: nil, alias: nil), videoAvailable: false, activeVideoJobs: 0,
+      localVideoReadiness: readyLocal))
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let video = try XCTUnwrap(json["video"] as? [String: Any])
+    XCTAssertEqual(video["available"] as? Bool, false, "unchanged meaning: Replicate-only")
+    XCTAssertEqual(video["backend"] as? String, "none", "unchanged meaning: Replicate-only")
+    XCTAssertEqual(video["local_ready"] as? Bool, true)
+    XCTAssertEqual(video["local_backend"] as? String, "local_ltx2")
+    XCTAssertTrue(video["local_reason"] is NSNull)
+    XCTAssertNotNil(video["local_checked_at"] as? String)
+
+    // Replicate configured too: available/backend follow Replicate alone.
+    let bothData = try XCTUnwrap(WarmServer.healthJSON(
+      sample(lastRecipe: nil, alias: nil), videoAvailable: true, activeVideoJobs: 3,
+      localVideoReadiness: readyLocal))
+    let both = try XCTUnwrap(JSONSerialization.jsonObject(with: bothData) as? [String: Any])
+    let bothVideo = try XCTUnwrap(both["video"] as? [String: Any])
+    XCTAssertEqual(bothVideo["available"] as? Bool, true)
+    XCTAssertEqual(bothVideo["backend"] as? String, "replicate")
+    XCTAssertEqual(bothVideo["active_jobs"] as? Int, 3)
+    XCTAssertEqual(bothVideo["local_ready"] as? Bool, true, "additive key unaffected by Replicate's presence")
+  }
+
+  func testHealthAdvertisesReadyLocalLTX2WithRequiredAndOptionalAssets() throws {
+    let weights = try tempDir("weights")
+    let gemma = try tempDir("gemma")
+    defer {
+      try? FileManager.default.removeItem(at: weights)
+      try? FileManager.default.removeItem(at: gemma)
+    }
+    try writeValidSafetensors(at: weights.appendingPathComponent("local-monolith.safetensors"))
+    try writeValidSafetensors(at: gemma.appendingPathComponent("model.safetensors"))
+    try Data("{}".utf8).write(to: gemma.appendingPathComponent("config.json"))
+    try Data("{}".utf8).write(to: gemma.appendingPathComponent("tokenizer.json"))
+    let readiness = LocalVideoReadiness.compute(weightsPath: weights.path, gemmaPath: gemma.path, upsamplerPath: nil)
 
     let data = try XCTUnwrap(WarmServer.healthJSON(
       sample(lastRecipe: nil, alias: nil), videoAvailable: false, activeVideoJobs: 0,
-      localVideoWeightsPath: weights.path, localVideoGemmaPath: gemma.path,
-      localVideoUpsamplerPath: nil))
+      localVideoReadiness: readiness))
     let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     let video = try XCTUnwrap(json["video"] as? [String: Any])
-    XCTAssertEqual(video["available"] as? Bool, true)
-    XCTAssertEqual(video["backend"] as? String, "local_ltx2")
-    let readiness = try XCTUnwrap(video["readiness"] as? [String: Any])
-    XCTAssertEqual(readiness["ready"] as? Bool, true)
-    XCTAssertEqual((readiness["required_assets"] as? [[String: Any]])?.count, 2)
-    let optional = try XCTUnwrap((readiness["optional_assets"] as? [[String: Any]])?.first)
+    XCTAssertEqual(video["local_ready"] as? Bool, true)
+    XCTAssertEqual(video["local_backend"] as? String, "local_ltx2")
+    let assets = try XCTUnwrap(video["local_assets"] as? [String: Any])
+    XCTAssertEqual((assets["required"] as? [[String: Any]])?.count, 2)
+    let optional = try XCTUnwrap((assets["optional"] as? [[String: Any]])?.first)
     XCTAssertEqual(optional["name"] as? String, "ltx2_upsampler")
     XCTAssertEqual(optional["required"] as? Bool, false)
     XCTAssertEqual(optional["valid"] as? Bool, true, "an absent optional upsampler must not disable core video")
   }
 
   func testHealthRejectsIncompleteLocalLTX2Assets() throws {
-    let root = FileManager.default.temporaryDirectory
-      .appendingPathComponent("comfybox-video-health-missing-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let root = try tempDir("comfybox-video-health-missing")
     defer { try? FileManager.default.removeItem(at: root) }
+    let readiness = LocalVideoReadiness.compute(
+      weightsPath: root.appendingPathComponent("missing-weights").path,
+      gemmaPath: root.appendingPathComponent("missing-gemma").path,
+      upsamplerPath: nil)
 
     let data = try XCTUnwrap(WarmServer.healthJSON(
       sample(lastRecipe: nil, alias: nil), videoAvailable: false, activeVideoJobs: 0,
-      localVideoWeightsPath: root.appendingPathComponent("missing-weights").path,
-      localVideoGemmaPath: root.appendingPathComponent("missing-gemma").path))
+      localVideoReadiness: readiness))
     let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     let video = try XCTUnwrap(json["video"] as? [String: Any])
-    XCTAssertEqual(video["available"] as? Bool, false)
-    XCTAssertEqual(video["backend"] as? String, "none")
-    let readiness = try XCTUnwrap(video["readiness"] as? [String: Any])
-    XCTAssertEqual(readiness["ready"] as? Bool, false)
-    let required = try XCTUnwrap(readiness["required_assets"] as? [[String: Any]])
+    XCTAssertEqual(video["local_ready"] as? Bool, false)
+    XCTAssertTrue(video["local_backend"] is NSNull)
+    XCTAssertEqual(video["local_reason"] as? String, "path_not_found")
+    let assets = try XCTUnwrap(video["local_assets"] as? [String: Any])
+    let required = try XCTUnwrap(assets["required"] as? [[String: Any]])
     XCTAssertTrue(required.allSatisfy { ($0["valid"] as? Bool) == false })
+  }
+
+  func testHealthReportsTruncatedLocalShardByName() throws {
+    let weights = try tempDir("weights-truncated")
+    let gemma = try tempDir("gemma-ok")
+    defer {
+      try? FileManager.default.removeItem(at: weights)
+      try? FileManager.default.removeItem(at: gemma)
+    }
+    let shard = weights.appendingPathComponent("local-monolith.safetensors")
+    try writeValidSafetensors(at: shard)
+    let full = try Data(contentsOf: shard)
+    try full.dropLast(4).write(to: shard)
+    try writeValidSafetensors(at: gemma.appendingPathComponent("model.safetensors"))
+    try Data("{}".utf8).write(to: gemma.appendingPathComponent("config.json"))
+    try Data("{}".utf8).write(to: gemma.appendingPathComponent("tokenizer.json"))
+    let readiness = LocalVideoReadiness.compute(weightsPath: weights.path, gemmaPath: gemma.path, upsamplerPath: nil)
+
+    let data = try XCTUnwrap(WarmServer.healthJSON(
+      sample(lastRecipe: nil, alias: nil), videoAvailable: false, activeVideoJobs: 0,
+      localVideoReadiness: readiness))
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let video = try XCTUnwrap(json["video"] as? [String: Any])
+    XCTAssertEqual(video["local_ready"] as? Bool, false)
+    XCTAssertEqual(video["local_reason"] as? String, "truncated:local-monolith.safetensors")
+  }
+
+  private func tempDir(_ name: String) throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("health-\(name)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
   }
 
   /// `build_sha` is a git short sha (7–40 hex, optional `-dirty`) or the
