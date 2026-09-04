@@ -147,7 +147,7 @@ final class RalstonTraceParityTests: XCTestCase {
     let (base, startIndex, _, _) = try Self.stage2Scheduler()
 
     var scheduler = base
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit), startIndex: startIndex
     ) { latent, sigma in
       RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma)

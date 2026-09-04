@@ -1,21 +1,23 @@
 // Krea2BypassPolicyTests.swift — WP-E8, the strength policy (FDD §3.8, D10,
-// ledger ruling 17:35 / 17:52).
+// ledger ruling 17:35 / 17:52; revised per Todd's 2026-08-31 inline note).
 //
 // `bypass` is a DECLARED preset dial mirroring `kroma`: `{strength, file?}`,
 // where `strength: 0` is a declaration and not an absence. What differs from
-// kroma is the default when a preset declares nothing — it is DERIVED:
+// kroma is the default when a preset declares nothing — it is DERIVED, and
+// since Todd's 2026-08-31 note the derived default is OFF in every case:
 //
-//   kroma.strength >  0  ⇒  bypass 0            (kroma already unlocks)
-//   kroma.strength == 0  ⇒  bypass 1.0          (the WORKFLOW's strength)
+//   any kroma (on, off, or absent)  ⇒  bypass 0
 //
-// with an explicit preset `bypass`, and then a per-render override, winning
-// in that order. Since 17:52 put kroma on in every mode, the derived default
-// is OFF almost everywhere and the dial matters only for the rare kroma-free
-// preset — so these tests exercise both branches, not just the live one.
+// (The 17:35 rule derived the workflow's 1.0 when kroma was off; 2026-08-31
+// retired that — projector_scale + adherence make the auto-loaded bypass LoRA
+// unnecessary.) An explicit preset `bypass`, and then a per-render override,
+// still win in that order — the dial exists, it just never turns itself on.
 //
-// The 1.0 is QUOTED, never chosen: FDD §3.8 ("the preset default is 1.0 — the
-// workflow author's figure") and §3.15's `krea2-reference` stack line
-// `{ "filename": "krea2filterbypass_2vector.safetensors", "scale": 1.0 }`.
+// The 1.0 is QUOTED, never chosen — and now never applied by derivation:
+// FDD §3.8 ("the preset default is 1.0 — the workflow author's figure") and
+// §3.15's `krea2-reference` stack line
+// `{ "filename": "krea2filterbypass_2vector.safetensors", "scale": 1.0 }`
+// record where the constant comes from for callers who opt in explicitly.
 
 import Foundation
 import XCTest
@@ -47,7 +49,7 @@ final class Krea2BypassPolicyTests: XCTestCase {
       "the two published recommendations are not near each other — that is the point")
   }
 
-  // MARK: - The derived family default (17:35)
+  // MARK: - The derived family default (17:35, revised 2026-08-31: always off)
 
   func testKromaOnDerivesBypassOff() {
     for strength in [0.6, 1.0, 0.0001] {
@@ -57,12 +59,15 @@ final class Krea2BypassPolicyTests: XCTestCase {
     }
   }
 
-  func testKromaOffDerivesTheWorkflowStrength() {
+  func testKromaOffDerivesBypassOffToo() {
+    // Todd 2026-08-31: kroma=0 must NOT auto-load the bypass LoRA —
+    // projector_scale + adherence make it unnecessary. The derived default is
+    // OFF regardless of kroma; only an explicit bypass turns it on.
     let resolved = Krea2BypassPolicy.resolve(for: krea2Preset(kroma: KromaPolicy(strength: 0)))
-    XCTAssertEqual(resolved.strength, Krea2BypassPolicy.workflowStrength)
-    XCTAssertTrue(resolved.isActive)
+    XCTAssertEqual(resolved.strength, 0)
+    XCTAssertFalse(resolved.isActive)
     XCTAssertEqual(resolved.file, Krea2BypassPolicy.workflowFile,
-                   "the derived default names the WORKFLOW's artifact, not the substitute")
+                   "even inactive, the policy names the WORKFLOW's artifact, not the substitute")
   }
 
   // MARK: - Explicit beats derived
@@ -73,7 +78,7 @@ final class Krea2BypassPolicyTests: XCTestCase {
       for: krea2Preset(kroma: KromaPolicy(strength: 0.6), bypass: BypassPolicy(strength: 2.0)))
     XCTAssertEqual(on.strength, 2.0)
 
-    // kroma is OFF (derived would be 1.0) but the preset declares none.
+    // kroma is OFF (derived is 0 — 2026-08-31) and the preset declares 0 too.
     let off = Krea2BypassPolicy.resolve(
       for: krea2Preset(kroma: KromaPolicy(strength: 0), bypass: BypassPolicy(strength: 0)))
     XCTAssertEqual(off.strength, 0, "`strength: 0` is a DECLARATION, not an absence")
@@ -118,10 +123,12 @@ final class Krea2BypassPolicyTests: XCTestCase {
 
   // MARK: - Fail closed off the krea2 family
 
-  /// The derived rule reads "no kroma ⇒ bypass on". A `zimage-*` preset has
-  /// no kroma dial at all (D14 exempts it), so the preset-level entry point
-  /// must NOT read that absence as "kroma off" and switch a Krea-2-only
-  /// adapter on for a model that has no `txtfusion.projector`.
+  /// The derived rule is now "bypass off" everywhere (2026-08-31), so a
+  /// `zimage-*` preset — which has no kroma dial at all (D14 exempts it) —
+  /// trivially derives 0 as well. This test predates that revision (when
+  /// "no kroma" read as "kroma off ⇒ bypass on") and stays as the guard that
+  /// no future derivation switches a Krea-2-only adapter on for a model that
+  /// has no `txtfusion.projector`.
   func testANonKrea2PresetNeverDerivesABypass() {
     let zimage = ImagePreset(
       id: "z", name: "Z", model: "z-image-turbo", checkpointFamily: "zimage-turbo")
@@ -147,8 +154,8 @@ final class Krea2BypassPolicyTests: XCTestCase {
   func testThePureResolverMatchesTheTable() {
     let cases: [(KromaPolicy?, BypassPolicy?, Double?, Double)] = [
       (KromaPolicy(strength: 0.6), nil, nil, 0),
-      (KromaPolicy(strength: 0), nil, nil, 1.0),
-      (nil, nil, nil, 1.0),                                  // "no kroma dial" == kroma off
+      (KromaPolicy(strength: 0), nil, nil, 0),               // 2026-08-31: derived is ALWAYS off
+      (nil, nil, nil, 0),                                    // "no kroma dial" derives off too
       (KromaPolicy(strength: 0.6), BypassPolicy(strength: 5), nil, 5),
       (KromaPolicy(strength: 0.6), nil, 2.0, 2.0),
       (KromaPolicy(strength: 0), BypassPolicy(strength: 0), 3.0, 3.0),

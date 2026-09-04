@@ -56,6 +56,17 @@ final class GeneratePayloadDecodeTests: XCTestCase {
         XCTAssertNil(absent.shift, "absent = dynamic mu; nothing is defaulted in")
     }
 
+    func testC2DecodesAndDefaultsOnlyAtApplication() throws {
+        let p = try decode(#"{"prompt":"x","c2":0.35}"#)
+        XCTAssertEqual(p.c2, 0.35)
+        XCTAssertEqual(try p.validatedC2(), 0.35)
+
+        let absent = try decode(#"{"prompt":"x"}"#)
+        XCTAssertNil(absent.c2, "the optional wire field must remain absent after decode")
+        XCTAssertEqual(try absent.validatedC2(), 0.5, "application default remains the existing midpoint")
+        XCTAssertNil(GeneratePayload(prompt: "x").c2)
+    }
+
     /// A non-positive shift is a 400 naming the field, and so is `shift` on a
     /// family whose schedule does not consult it — never silently ignored.
     func testShiftValidation() {

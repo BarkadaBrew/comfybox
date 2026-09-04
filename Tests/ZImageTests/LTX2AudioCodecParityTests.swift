@@ -165,4 +165,46 @@ final class LTX2AudioCodecParityTests: XCTestCase {
     XCTAssertGreaterThan(corr.item(Float.self), 0.99,
       "waveforms must be near-identical up to numeric noise")
   }
+
+  /// Regression for the electrical buzz in non-voice regions: a near-zero
+  /// normalized latent must be restored to the training log-mel silence floor
+  /// before the matched BigVGAN+BWE chain sees it.
+  func testSilentLatentDecodesToNearSilence() throws {
+    try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath),
+      "reference audio VAE weights not on this machine")
+    let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
+    let latent = MLXArray.zeros([1, 8, 8, 16])
+    let decodedMel = vae.decodeToMel(latent)
+    let vocoderMel = vae.prepareMelForVocoder(decodedMel, normalizedLatent: latent)
+    let wav = vae.decodeToWaveform(latent)
+    MLX.eval(vocoderMel, wav)
+
+    XCTAssertEqual(
+      MLX.min(vocoderMel).item(Float.self), LTX2AudioVAE.logMelFloor,
+      accuracy: 1e-5)
+    XCTAssertEqual(
+      MLX.max(vocoderMel).item(Float.self), LTX2AudioVAE.logMelFloor,
+      accuracy: 1e-5)
+    let rms = MLX.sqrt(MLX.mean(wav * wav)).item(Float.self)
+    print("SILENT_LATENT_RMS=\(rms)")
+    XCTAssertTrue(rms.isFinite, "silent decode produced NaN/Inf")
+    XCTAssertLessThan(rms, 1e-4, "silent latent produced audible buzz (RMS \(rms))")
+  }
+
+  /// Exercise the monolith's actual `vocoder.vocoder.*` BigVGAN weights with
+  /// a pinned, deterministic mel rather than random synthetic parameters.
+  func testBundledBigVGANProducesFiniteNonDegenerateOutputFromKnownMel() throws {
+    try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.weightsPath),
+      "reference audio VAE weights not on this machine")
+    let g = try goldens()
+    let vae = try LTX2AudioVAE.load(path: Self.weightsPath)
+    let wav = vae.vocoder!.synthesize(g["gen_in"]!)
+    MLX.eval(wav)
+
+    let rms = MLX.sqrt(MLX.mean(wav * wav)).item(Float.self)
+    let maxAbs = MLX.max(MLX.abs(wav)).item(Float.self)
+    XCTAssertTrue(rms.isFinite && maxAbs.isFinite, "bundled BigVGAN produced NaN/Inf")
+    XCTAssertGreaterThan(rms, 1e-3, "bundled BigVGAN output is degenerate/silent")
+    XCTAssertGreaterThan(maxAbs, rms, "bundled BigVGAN output has no dynamic range")
+  }
 }

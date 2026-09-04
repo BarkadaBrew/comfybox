@@ -27,6 +27,7 @@ public final class MCPServer {
 
   /// Run the MCP server — blocks on stdin until it closes.
   public func run() {
+    startParentDeathWatchdog()
     log("Starting — bridging to WarmServer at \(client.host):\(client.port)")
 
     let decoder = JSONDecoder()
@@ -124,17 +125,9 @@ public final class MCPServer {
   // MARK: - Tools List
 
   private func handleToolsList(id: MCPRequestId) -> MCPResponse {
-    // Build tools list using JSONSerialization to ensure clean JSON output.
-    // MCPToolDefinition stores inputSchema as [String: Any] which serializes
-    // cleanly via JSONSerialization without AnyCodable debug descriptions.
-    var toolDicts: [[String: Any]] = []
-    for tool in MCPToolRegistry.tools {
-      toolDicts.append([
-        "name": tool.name,
-        "description": tool.description,
-        "inputSchema": tool.inputSchema,
-      ] as [String: Any])
-    }
+    // MCPToolDefinition owns its complete wire representation, including the
+    // safety hints clients use to distinguish read-only and destructive tools.
+    let toolDicts = MCPToolRegistry.tools.map { $0.responseJSON() }
     let result: [String: Any] = ["tools": toolDicts]
     return MCPResponse(id: id, result: AnyCodable(result))
   }
@@ -227,4 +220,42 @@ public final class MCPServer {
     let logLine = "[mcp-server:comfybox] \(message)\n"
     FileHandle.standardError.write(Data(logLine.utf8))
   }
+  // MARK: - Parent Death Watchdog
+
+  /// Start a background watchdog that exits the process when the parent dies.
+  ///
+  /// When the parent process (SSH session, Claude.app, etc.) exits, macOS
+  /// reparents this process to launchd (pid 1). Without this watchdog, the
+  /// MCP server keeps running indefinitely as an orphan — blocked on stdin
+  /// with no client to serve — leaking memory and file descriptors.
+  ///
+  /// Polls `getppid()` every 5 seconds. When the parent PID changes (parent
+  /// died → reparented to pid 1), the process exits cleanly.
+  private func startParentDeathWatchdog() {
+    let parentPid = getppid()
+    guard parentPid > 1 else {
+      // Already orphaned (parent is launchd) — no client to serve. Exit
+      // immediately rather than blocking on stdin with no one reading.
+      log("Parent is launchd (pid 1) at startup — no parent, exiting")
+      _exit(0)
+    }
+
+    DispatchQueue.global(qos: .utility).async {
+      while true {
+        sleep(5)
+        if getppid() != parentPid {
+          // Use _exit (not exit) to avoid atexit/stdio flush racing with
+          // the main thread's readLine(). Use raw write(2) for the same
+          // reason — FileHandle.standardError is not thread-safe with the
+          // main thread's log() calls.
+          let msg = "[mcp-server:comfybox] Parent process exited — shutting down\n"
+          msg.withCString { ptr in
+            _ = write(STDERR_FILENO, ptr, msg.utf8.count)
+          }
+          _exit(0)
+        }
+      }
+    }
+  }
+
 }

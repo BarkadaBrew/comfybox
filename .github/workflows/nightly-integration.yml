@@ -1,0 +1,131 @@
+name: Nightly Integration
+
+# #137 / #332: ZImageIntegrationTests and ZImageE2ETests need real model weights and a GPU
+# (intent.md: "Agents run unit tests only"), so they cannot run on GitHub-hosted runners.
+# This workflow targets a self-hosted runner Todd registers on a Mac with the weights present
+# (see docs/deployment.md, "CI: Nightly Integration Runner"). Until that runner exists AND the
+# `COMFYBOX_WEIGHTS_RUNNER_AVAILABLE` repository variable is set to "true", the `integration`
+# job below is skipped outright (not failed) — see the job's `if:`. That only covers "no runner
+# registered at all", though: once the variable is true, a run targeting a runner that IS
+# registered but currently offline (asleep, service stopped, mid-reboot) will sit queued waiting
+# for it — GitHub's only automatic bound on that is a 24h queue-cancel, well past this job's own
+# `timeout-minutes` (which bounds run time, not queue time). See docs/deployment.md's runbook for
+# how to check the runner is online before relying on a scheduled/dispatched run, and for when to
+# flip the variable back to false (Mac offline for maintenance).
+
+on:
+  schedule:
+    # 08:00 UTC daily. Adjust to a window when the runner Mac is otherwise idle — it shares
+    # GPU/model memory with the production ComfyBox engine (see docs/deployment.md).
+    - cron: '0 8 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  integration:
+    # Gate on a repo variable rather than probing for the runner via the API: listing
+    # self-hosted runners needs the "administration" permission, which GITHUB_TOKEN cannot
+    # hold. Default (variable unset) evaluates false, so this job shows as "skipped" until
+    # Todd registers the runner and flips the variable — never a red/failed check.
+    if: vars.COMFYBOX_WEIGHTS_RUNNER_AVAILABLE == 'true'
+    runs-on: [self-hosted, macOS, comfybox-weights]
+    # Bounds RUN time only, once a runner has picked the job up — see the queue-time caveat above
+    # and docs/deployment.md's runbook for the "registered but offline" case this can't cover.
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Enable PrepareMetalShaders plugin
+        run: defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
+
+      # `CI` must NOT be present in the environment xcodebuild/xctest run in: most of
+      # ZImageIntegrationTests and CLIEndToEndTests call skipIfNoGPU(), which does
+      # `throw XCTSkip(...)` whenever `ProcessInfo.processInfo.environment["CI"] != nil` —
+      # true for ANY value, including an empty string, so `env: CI: ''` would still trip it.
+      # GitHub Actions sets CI=true by default on every runner (hosted and self-hosted); `env -u CI`
+      # strips it from this specific child process so the GPU tests actually run instead of
+      # silently no-op-skipping and reporting green.
+      #
+      # Env this suite honors (see docs/deployment.md for the full table):
+      #   LTX2_TEST_WEIGHTS_DIR   - override for the LTX-2 checkpoint directory
+      #   ZIMAGE_TEST_LORA_PATH   - override for the LoRA integration fixture
+      - name: Run integration + E2E tests
+        id: run_tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/nightly-results"
+          env -u CI xcodebuild test \
+            -scheme comfybox-Package \
+            -destination 'platform=macOS' \
+            -enableCodeCoverage NO \
+            -only-testing:ZImageIntegrationTests \
+            -only-testing:ZImageE2ETests \
+            -resultBundlePath "$RUNNER_TEMP/nightly-results/nightly.xcresult" \
+            -derivedDataPath .build/xcode \
+            2>&1 | tee "$RUNNER_TEMP/nightly-results/nightly-test-output.log"
+
+      - name: Collect failing test names
+        if: steps.run_tests.outcome == 'failure'
+        id: failures
+        run: |
+          grep -E "Test Case '.*' failed \(" "$RUNNER_TEMP/nightly-results/nightly-test-output.log" \
+            | sed -E "s/^Test Case '(-\[[^]]*\])' failed.*/\1/" \
+            | sort -u \
+            > "$RUNNER_TEMP/nightly-results/failing-tests.txt" || true
+          if [ ! -s "$RUNNER_TEMP/nightly-results/failing-tests.txt" ]; then
+            echo "(xcodebuild exited non-zero but no 'Test Case ... failed' lines were found — check the uploaded log/xcresult; this may be a build or infrastructure failure rather than a test failure.)" \
+              > "$RUNNER_TEMP/nightly-results/failing-tests.txt"
+          fi
+          {
+            echo "list<<GH_EOF"
+            cat "$RUNNER_TEMP/nightly-results/failing-tests.txt"
+            echo "GH_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload xcresult artifact
+        if: steps.run_tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-integration-xcresult-${{ github.run_id }}
+          path: ${{ runner.temp }}/nightly-results
+          retention-days: 14
+
+      # #332: append the failing test names to the issue tracking integration/E2E suite health,
+      # rather than opening a new issue per night.
+      - name: Comment failing tests on #332
+        if: steps.run_tests.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failing = `${{ steps.failures.outputs.list }}`.trim();
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `Nightly integration run failed: ${runUrl}`,
+              '',
+              'Failing tests:',
+              '```',
+              failing || '(none captured)',
+              '```',
+              '',
+              'xcresult + full log uploaded as a workflow artifact on this run.'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 332,
+              body
+            });
+
+      - name: Fail the job if tests failed
+        if: steps.run_tests.outcome == 'failure'
+        run: exit 1

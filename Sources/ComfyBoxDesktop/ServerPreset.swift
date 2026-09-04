@@ -103,6 +103,12 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     // Parameters
     public var steps: Int?
     public var guidance: Double?
+    /// Krea2 projector-scale gain (CFG-free prompt adherence). nil = neutral (1.0).
+    public var projectorScale: Double?
+    public var noiseType: String?
+    public var noiseAlpha: Double?
+    public var implicitSteps: Int?
+    public var c2: Double?
     public var seed: Int?
     public var width: Int?
     public var height: Int?
@@ -148,6 +154,11 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         injectedKeywords: [String]? = nil,
         steps: Int? = nil,
         guidance: Double? = nil,
+        projectorScale: Double? = nil,
+        noiseType: String? = nil,
+        noiseAlpha: Double? = nil,
+        implicitSteps: Int? = nil,
+        c2: Double? = nil,
         seed: Int? = nil,
         width: Int? = nil,
         height: Int? = nil,
@@ -182,6 +193,11 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         self.injectedKeywords = injectedKeywords
         self.steps = steps
         self.guidance = guidance
+        self.projectorScale = projectorScale
+        self.noiseType = noiseType
+        self.noiseAlpha = noiseAlpha
+        self.implicitSteps = implicitSteps
+        self.c2 = c2
         self.seed = seed
         self.width = width
         self.height = height
@@ -205,7 +221,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case mediaKind, provider, engine, mode
         case model, customModelPath, baseModel
         case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
-        case steps, guidance, seed, width, height
+        case steps, guidance, projectorScale, noiseType, noiseAlpha, implicitSteps, c2, seed, width, height
         case loras, scheduler, upscale
         case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
         case bypass
@@ -231,6 +247,11 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(injectedKeywords, forKey: .injectedKeywords)
         try c.encodeIfPresent(steps, forKey: .steps)
         try c.encodeIfPresent(guidance, forKey: .guidance)
+        try c.encodeIfPresent(projectorScale, forKey: .projectorScale)
+        try c.encodeIfPresent(noiseType, forKey: .noiseType)
+        try c.encodeIfPresent(noiseAlpha, forKey: .noiseAlpha)
+        try c.encodeIfPresent(implicitSteps, forKey: .implicitSteps)
+        try c.encodeIfPresent(c2, forKey: .c2)
         try c.encodeIfPresent(seed, forKey: .seed)
         try c.encodeIfPresent(width, forKey: .width)
         try c.encodeIfPresent(height, forKey: .height)
@@ -269,6 +290,11 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         injectedKeywords = try c.decodeIfPresent([String].self, forKey: .injectedKeywords)
         steps = try c.decodeIfPresent(Int.self, forKey: .steps)
         guidance = try c.decodeIfPresent(Double.self, forKey: .guidance)
+        projectorScale = try c.decodeIfPresent(Double.self, forKey: .projectorScale)
+        noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
+        noiseAlpha = try c.decodeIfPresent(Double.self, forKey: .noiseAlpha)
+        implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
+        c2 = try c.decodeIfPresent(Double.self, forKey: .c2)
         seed = try c.decodeIfPresent(Int.self, forKey: .seed)
         width = try c.decodeIfPresent(Int.self, forKey: .width)
         height = try c.decodeIfPresent(Int.self, forKey: .height)
@@ -308,6 +334,11 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             kroma: kroma.map { PresetKroma(strength: $0.strength, file: $0.file) },
             steps: steps ?? 9,
             guidance: Float(guidance ?? 3.5),
+            projectorScale: projectorScale.map { Float($0) },
+            noiseType: noiseType,
+            noiseAlpha: noiseAlpha.map { Float($0) },
+            implicitSteps: implicitSteps,
+            c2: c2.map { Float($0) },
             width: width ?? 1024,
             height: height ?? 1024,
             // `scheduler` is the legacy preset spelling for the sampler.

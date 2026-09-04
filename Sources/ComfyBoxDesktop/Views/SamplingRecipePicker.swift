@@ -118,6 +118,8 @@ struct SamplingRecipePicker: View {
         case "ralston_2s": return "Ralston 2S"
         case "ralston_3s": return "Ralston 3S"
         case "ralston_4s": return "Ralston 4S"
+        case "heun_2s": return "Heun 2S"
+        case "heun_3s": return "Heun 3S"
         case "deis_2m": return "DEIS 2M"
         case "deis_3m": return "DEIS 3M"
         case "deis_4m": return "DEIS 4M"
@@ -128,6 +130,7 @@ struct SamplingRecipePicker: View {
         case "beta57": return "Beta 5.7"
         case "krea2": return "Krea 2 Native"
         case "bong_tangent": return "Bong Tangent"
+        case "simple": return "Simple"
         default: return raw.replacingOccurrences(of: "_", with: " ").capitalized
         }
     }

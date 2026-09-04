@@ -11,51 +11,61 @@ public enum MCPToolRegistry {
 
   /// All registered tool definitions.
   public static let tools: [MCPToolDefinition] = [
-    generateImage,
-    repairImage,
-    swapLoras,
-    listModels,
-    listStyles,
-    serverHealth,
-    queueStatus,
-    clearQueue,
-    pauseQueue,
-    resumeQueue,
-    listLoras,
-    shutdownServer,
-    systemStats,
-    applyStyle,
-    loraLibrary,
-    loraScan,
-    loraQuarantine,
-    loadModel,
-    switchModel,
-    modelPool,
-    unloadModel,
-    generateVideo,
-    videoStatus,
-    composeMontage,
-    renderStoryboard,
-    rerenderVideo,
-    extendVideo,
-    importWorkflow,
-    listWorkflows,
-    runWorkflow,
-    workflowRunStatus,
-    upscale,
-    enhancePrompt,
-    listCharacters,
-    listPresets,
-    importLegacyPresets,
-    queueList,
-    interruptRender,
-    cancelJob,
-    nearlineList,
-    nearlineScan,
-    nearlineStage,
-    nearlineEvict,
-    civitaiSearch,
-    civitaiPrompts,
+    generateImage.annotated(.additive),
+    repairImage.annotated(.additive),
+    swapLoras.annotated(.additive),
+    listModels.annotated(.readOnly),
+    listStyles.annotated(.readOnly),
+    serverHealth.annotated(.readOnly),
+    queueStatus.annotated(.readOnly),
+    clearQueue.annotated(.destructive),
+    pauseQueue.annotated(.additive),
+    resumeQueue.annotated(.additive),
+    listLoras.annotated(.readOnly),
+    shutdownServer.annotated(.destructive),
+    systemStats.annotated(.readOnly),
+    applyStyle.annotated(.readOnly),
+    loraLibrary.annotated(.readOnly),
+    loraScan.annotated(.additive),
+    loraQuarantine.annotated(.destructive),
+    loadModel.annotated(.additive),
+    switchModel.annotated(.additive),
+    modelPool.annotated(.readOnly),
+    unloadModel.annotated(.additive),
+    generateVideo.annotated(.additive),
+    videoStatus.annotated(.readOnly),
+    composeMontage.annotated(.additive),
+    renderStoryboard.annotated(.additive),
+    rerenderVideo.annotated(.additive),
+    extendVideo.annotated(.additive),
+    importWorkflow.annotated(.additive),
+    listWorkflows.annotated(.readOnly),
+    runWorkflow.annotated(.additive),
+    workflowRunStatus.annotated(.readOnly),
+    upscale.annotated(.additive),
+    enhancePrompt.annotated(.additive),
+    listCharacters.annotated(.readOnly),
+    listPresets.annotated(.readOnly),
+    importLegacyPresets.annotated(.additive),
+    queueList.annotated(.readOnly),
+    interruptRender.annotated(.destructive),
+    cancelJob.annotated(.destructive),
+    nearlineList.annotated(.readOnly),
+    nearlineScan.annotated(.additive),
+    nearlineStage.annotated(.additive),
+    nearlineEvict.annotated(.destructive),
+    civitaiSearch.annotated(.readOnly),
+    civitaiPrompts.annotated(.additive),
+    moveQueueJob.annotated(.additive),
+    updateLoraTriggerwords.annotated(.additive),
+    createPreset.annotated(.additive),
+    deletePreset.annotated(.destructive),
+    setWarmPreset.annotated(.additive),
+    createCharacter.annotated(.additive),
+    deleteCharacter.annotated(.destructive),
+    getConfig.annotated(.readOnly),
+    patchConfig.annotated(.additive),
+    updateConfig.annotated(.additive),
   ]
 
   // MARK: - Tool Definitions
@@ -80,7 +90,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["image_path"],
-    ]
+    ],
+    routes: [RouteRef(method: "POST", path: "/v1/generate")]
   )
 
   static let generateImage = MCPToolDefinition(
@@ -169,7 +180,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/generate")]
   )
 
   static let swapLoras = MCPToolDefinition(
@@ -198,7 +210,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["loras"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/lora/swap")]
   )
 
   static let listModels = MCPToolDefinition(
@@ -243,7 +256,12 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    // DECLARED REALITY (parity G1): the executor posts the ComfyUI-bridge
+    // queue-clear (`POST /queue {"clear": true}`, executeClearQueue), NOT the
+    // native `POST /v1/queue/clear` -- which is exempted in ParityExemptions.
+    // The tool<->executor parity assertion pins this claim to the source.
+    routes: [RouteRef(method: "POST", path: "/queue", surface: .comfyUICompat)]
   )
 
   static let pauseQueue = MCPToolDefinition(
@@ -252,7 +270,8 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/pause")]
   )
 
   static let resumeQueue = MCPToolDefinition(
@@ -261,7 +280,8 @@ public enum MCPToolRegistry {
     inputSchema: [
       "type": "object",
       "properties": [:] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/resume")]
   )
 
   static let listLoras = MCPToolDefinition(
@@ -285,7 +305,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["confirm"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/shutdown")]
   )
 
   static let systemStats = MCPToolDefinition(
@@ -350,7 +371,8 @@ public enum MCPToolRegistry {
           "description": "Force full rescan of all LoRA files. Default: false.",
         ] as [String: Any],
       ] as [String: Any],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/loras/scan")]
   )
 
   static let loraQuarantine = MCPToolDefinition(
@@ -373,7 +395,11 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["id", "quarantine"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/loras/{id}/quarantine"),
+      RouteRef(method: "DELETE", path: "/v1/loras/{id}/quarantine"),
+    ]
   )
 
 
@@ -401,7 +427,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/model/load")]
   )
 
   static let switchModel = MCPToolDefinition(
@@ -416,7 +443,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/model/activate")]
   )
 
   static let modelPool = MCPToolDefinition(
@@ -440,7 +468,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["model"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/model/unload")]
   )
 
 
@@ -513,6 +542,20 @@ public enum MCPToolRegistry {
           "type": "boolean",
           "description": "Skip the server-side character description prepend. Send TRUE when the caller has already woven the description into the prompt. Note `enhance:false` is NOT sufficient — it only stops the optimizer's injection, and on t2v the server still defaults the character to \u{22}kira\u{22} and prepends ~110 tokens, which overruns the 128-token cap and truncates the scene and camera direction off the end.",
         ] as [String: Any],
+        "loras": [
+          "type": "array",
+          "description": "Per-render LoRA stack override: [{path|name, scale}]. Request LoRAs REPLACE the preset/default stack for this render (precedence: request > preset > --ltx2-lora). Bare filenames resolve against the LoRA library.",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "beat_schedule": [
+          "type": "array",
+          "description": "T2V ONLY (comfybox#328) — ignored with a warning on I2V (image_path set). Temporal beat scheduling: [{text, start_frac, end_frac, strength?}]. Each beat's `text` must be a VERBATIM substring of `prompt` — the engine locates it there and drops (fail-open, logged) any beat it can't find. A non-empty beat_schedule makes the server SKIP prompt enhancement for this request (enhancement rewrites the prompt wholesale, which strands every beat) — send an already-composed prompt, not a raw one expecting server-side enhancement.",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "fps": [
+          "type": "integer",
+          "description": "Generation frame-rate basis (default 24). Lower = slower on-screen motion per generated frame; duration maps onto the frame grid at this rate.",
+        ] as [String: Any],
         "enhance": [
           "type": "boolean",
           "description": "Whether the server should optimize the prompt (default true). Send FALSE when the caller has ALREADY run its own prompt optimizer — a second rewrite drifts the prompt away from concrete staging (limb placement, figure count) and double-injects the character description.",
@@ -523,7 +566,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/generate/async")]
   )
 
   static let composeMontage = MCPToolDefinition(
@@ -552,7 +596,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["segments"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/montage/compose")]
   )
 
   static let rerenderVideo = MCPToolDefinition(
@@ -581,7 +626,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": [] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/rerender")]
   )
 
   static let extendVideo = MCPToolDefinition(
@@ -609,7 +655,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": [] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/video/extend")]
   )
 
   static let importWorkflow = MCPToolDefinition(
@@ -625,7 +672,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["workflow_json"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/workflows/import")]
   )
 
   static let listWorkflows = MCPToolDefinition(
@@ -662,7 +710,8 @@ public enum MCPToolRegistry {
         "output_path": ["type": "string", "description": "Output file path (within the allowed output directory). Omit to auto-generate."] as [String: Any],
       ] as [String: Any],
       "required": ["workflow_id"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/workflows/{id}/run")]
   )
 
   static let renderStoryboard = MCPToolDefinition(
@@ -692,7 +741,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["shots"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/storyboard/render")]
   )
 
   static let videoStatus = MCPToolDefinition(
@@ -745,7 +795,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
       ] as [String: Any],
       "required": ["image_path"] as [String],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/upscale")]
   )
 
   // MARK: - Creative layer & queue (added 2026-07)
@@ -761,7 +812,8 @@ public enum MCPToolRegistry {
         "content_mode": ["type": "string", "description": "neutral | banana | avocado (gates explicit tiers)."] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/enhance")]
   )
 
   static let listCharacters = MCPToolDefinition(
@@ -779,7 +831,8 @@ public enum MCPToolRegistry {
   static let importLegacyPresets = MCPToolDefinition(
     name: "import_legacy_presets",
     description: "Import presets from the old Coffee Shop image service (idempotent). Returns how many were newly imported.",
-    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/presets/import-legacy")]
   )
 
   static let queueList = MCPToolDefinition(
@@ -791,7 +844,8 @@ public enum MCPToolRegistry {
   static let interruptRender = MCPToolDefinition(
     name: "interrupt_render",
     description: "Cancel the in-flight render. Pending jobs continue.",
-    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/interrupt")]
   )
 
   static let cancelJob = MCPToolDefinition(
@@ -801,7 +855,8 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": ["id": ["type": "string", "description": "The pending job id."] as [String: Any]] as [String: Any],
       "required": ["id"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/queue/{id}")]
   )
 
   static let nearlineList = MCPToolDefinition(
@@ -813,7 +868,8 @@ public enum MCPToolRegistry {
   static let nearlineScan = MCPToolDefinition(
     name: "nearline_scan",
     description: "Rescan the configured attached-storage roots for models/LoRAs.",
-    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any]
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/scan")]
   )
 
   static let nearlineStage = MCPToolDefinition(
@@ -823,7 +879,8 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": ["name": ["type": "string", "description": "The item filename from nearline_list."] as [String: Any]] as [String: Any],
       "required": ["name"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/stage")]
   )
 
   static let nearlineEvict = MCPToolDefinition(
@@ -833,7 +890,8 @@ public enum MCPToolRegistry {
       "type": "object",
       "properties": ["name": ["type": "string", "description": "The item filename to evict."] as [String: Any]] as [String: Any],
       "required": ["name"],
-    ] as [String: Any]
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/evict")]
   )
 
   // MARK: - CivitAI conduit + prompt repository (#234)
@@ -924,7 +982,211 @@ public enum MCPToolRegistry {
           "description": "Query step: max repository entries to return (default 100, max 500).",
         ] as [String: Any],
       ] as [String: Any],
+    ],
+    routes: [RouteRef(method: "POST", path: "/v1/civitai/harvest")]
+  )
+
+  // MARK: - Headless parity Phase 1 (comfybox#300, FDD §4.2) — gap-set tools
+  // for mutating routes that had no MCP tool as of c9dd27d's route inventory
+  // (§2.6). Scope is intentionally the 6-item gap set only — update_config
+  // and the rest of §4.2's "New tools" list are other phases'/worktrees'
+  // territory (see FDD §0 row 10, §4 preamble).
+
+  static let moveQueueJob = MCPToolDefinition(
+    name: "move_queue_job",
+    description: "Reorder one pending job in the render queue: move it to the top, or one slot up/down from its current position.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "The pending job id (from queue_list)."] as [String: Any],
+        "direction": [
+          "type": "string",
+          "enum": ["top", "up", "down"],
+          "description": "Where to move the job: 'top' (front of queue), 'up' (one slot earlier), 'down' (one slot later). Any other value is rejected with a clean error.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "direction"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/queue/{id}/move")]
+  )
+
+  static let updateLoraTriggerwords = MCPToolDefinition(
+    name: "update_lora_triggerwords",
+    description: "Edit a LoRA's trigger-word list in the library index (does not modify the .safetensors file itself). Replaces the full list — pass every trigger word you want kept.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "LoRA identifier from the library (see lora_library)."] as [String: Any],
+        "triggerwords": [
+          "type": "array",
+          "items": ["type": "string"] as [String: Any],
+          "description": "Replacement trigger-word list. Pass an empty array to clear all trigger words.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "triggerwords"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/loras/{id}/update")]
+  )
+
+  static let createPreset = MCPToolDefinition(
+    name: "create_preset",
+    description: "Create or fully replace a saved generation preset (the canonical /v1/presets store). This is a full-document write, not a patch — fields you omit are absent from the saved preset, not preserved from any existing preset with the same id. Use list_presets first to see the current shape when updating an existing preset.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Stable preset id."] as [String: Any],
+        "name": ["type": "string", "description": "Display name."] as [String: Any],
+        "description": ["type": "string", "description": "Preset description."] as [String: Any],
+        "media_kind": [
+          "type": "string",
+          "enum": ["image", "video"],
+          "description": "Routes the preset to the image or video pipeline.",
+        ] as [String: Any],
+        "provider": ["type": "string", "description": "\"local\" | \"replicate\" | \"auto\"."] as [String: Any],
+        "engine": ["type": "string", "description": "\"mflux\" | \"zimage\"."] as [String: Any],
+        "model": ["type": "string", "description": "Model spec (e.g. \"z-image-turbo-bf16\")."] as [String: Any],
+        "prompt": ["type": "string"] as [String: Any],
+        "negative_prompt": ["type": "string"] as [String: Any],
+        "prompt_prefix": ["type": "string"] as [String: Any],
+        "prompt_suffix": ["type": "string"] as [String: Any],
+        "steps": ["type": "integer"] as [String: Any],
+        "guidance": ["type": "number"] as [String: Any],
+        "seed": ["type": "integer"] as [String: Any],
+        "width": ["type": "integer"] as [String: Any],
+        "height": ["type": "integer"] as [String: Any],
+        "scheduler": ["type": "string"] as [String: Any],
+        "loras": [
+          "type": "array",
+          "description": "LoRA stack for this preset: [{filename, scale}].",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["id", "name"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/presets"), RouteRef(method: "PUT", path: "/v1/presets")]
+  )
+
+  static let deletePreset = MCPToolDefinition(
+    name: "delete_preset",
+    description: "Delete a saved generation preset by id.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Preset id to delete (from list_presets)."] as [String: Any],
+      ] as [String: Any],
+      "required": ["id"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/presets/{id}")]
+  )
+
+  static let setWarmPreset = MCPToolDefinition(
+    name: "set_warm_preset",
+    description: "Make a model the server's warm-start default: activate it now (loading it into the pool first if it isn't already loaded there), then persist it as the server config's modelSpec so it survives the next restart. Mirrors the Desktop app's Preset 'Set as Warm' action exactly. If activation cannot succeed (even after a load attempt), the config is left untouched — this never partially applies.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "model": [
+          "type": "string",
+          "description": "Model spec to make the warm-start default — a preset's model or customModelPath (see list_presets).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["model"] as [String],
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "POST", path: "/v1/model/activate"),
+      RouteRef(method: "POST", path: "/v1/model/load"),
+      RouteRef(method: "GET", path: "/v1/config"),
+      RouteRef(method: "PUT", path: "/v1/config"),
     ]
+  )
+
+  static let createCharacter = MCPToolDefinition(
+    name: "create_character",
+    description: "Create or update a creative character/scene (the canonical /v1/characters store). Full-document upsert: fields you omit are absent from the saved entry, not preserved from any existing entry with the same id. Use list_characters first to see the current shape when updating. 'id' defaults to a slug of 'name' when omitted.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Stable id. Defaults to a slug of 'name' when omitted."] as [String: Any],
+        "name": ["type": "string", "description": "Display name."] as [String: Any],
+        "kind": [
+          "type": "string",
+          "enum": ["character", "scene"],
+          "description": "\"character\" (a subject) or \"scene\" (an environment/location). Default: character.",
+        ] as [String: Any],
+        "description": ["type": "string", "description": "Flat description (legacy/fallback; also used when no tiered 'base' is present)."] as [String: Any],
+        "base": ["type": "string", "description": "SFW physical appearance — always included when assembling a description."] as [String: Any],
+        "banana": ["type": "string", "description": "Suggestive additions — appended in banana + avocado content modes."] as [String: Any],
+        "avocado": ["type": "string", "description": "Explicit additions — appended in avocado content mode only."] as [String: Any],
+        "default_loras": [
+          "type": "array",
+          "description": "LoRAs applied by default when rendering this character: [{filename, scale}].",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
+        "prompt_snippet": ["type": "string", "description": "A reusable prompt fragment injected when this character is selected."] as [String: Any],
+        "negative_prompt": ["type": "string", "description": "Negative-prompt additions specific to this character."] as [String: Any],
+      ] as [String: Any],
+      "required": ["name"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/characters"), RouteRef(method: "PUT", path: "/v1/characters")]
+  )
+
+  static let deleteCharacter = MCPToolDefinition(
+    name: "delete_character",
+    description: "Delete a creative character/scene by id.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "id": ["type": "string", "description": "Character id to delete (from list_characters)."] as [String: Any],
+      ] as [String: Any],
+      "required": ["id"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "DELETE", path: "/v1/characters/{id}")]
+  )
+
+  // MARK: - Headless parity Phase 3 (comfybox#300, FDD §3.3/§4.4) — server-side
+  // settings. `patch_config` is the primary write path going forward (RFC 7386
+  // JSON Merge Patch, merged server-side against the current document);
+  // `update_config` is the full-replace tool held back from Phase 1 (FDD §0 row
+  // 10 — it would have proxied the clobbering whole-document PUT that this
+  // phase replaces) and now lands alongside PATCH.
+
+  static let getConfig = MCPToolDefinition(
+    name: "get_config",
+    description: "Read the full server configuration document (~/.comfybox/config.json): providers, replicate, krea2Models, renderDefaults (engine width/height/steps/guidance overrides, family-aware), videoDefaults (Motion tab width/height/frames), and content-mode preset mappings. Use this before update_config (a full replace) to see the current shape; patch_config does not need it.",
+    inputSchema: ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+    routes: [RouteRef(method: "GET", path: "/v1/config")]
+  )
+
+  static let patchConfig = MCPToolDefinition(
+    name: "patch_config",
+    description: "Apply an RFC 7386 JSON Merge Patch to the server configuration — the primary way to change one or a few settings (e.g. {\"renderDefaults\": {\"byFamily\": {\"fibo\": {\"steps\": 40}}}}). Fields you omit are left unchanged (unlike update_config); an explicit `null` on a field deletes it, reverting to the built-in default. Two agents patching different fields cannot conflict with each other.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "patch": [
+          "type": "object",
+          "description": "RFC 7386 JSON Merge Patch document — a partial config shape. Nested objects merge; a null value deletes that key.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["patch"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "PATCH", path: "/v1/config")]
+  )
+
+  static let updateConfig = MCPToolDefinition(
+    name: "update_config",
+    description: "Replace the ENTIRE server configuration document. This is a full-document write, not a patch — fields you omit are ABSENT from the saved document, not preserved from the current one. Call get_config first, edit the returned object, and pass it back whole. Prefer patch_config for changing one or a few fields.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "config": [
+          "type": "object",
+          "description": "The full config document, as returned by get_config (with your edits applied).",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["config"] as [String],
+    ] as [String: Any],
+    routes: [RouteRef(method: "PUT", path: "/v1/config")]
   )
 
   // MARK: - Lookup

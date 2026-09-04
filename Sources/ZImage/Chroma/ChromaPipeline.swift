@@ -81,7 +81,7 @@ public final class ChromaPipeline {
     firstNStepsWithoutCFG: Int = 0,
     schedulerType: ChromaSchedulerType = .euler,
     progressCallback: ((Int, Int) -> Void)? = nil
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     let batch = xT.dim(0)
     let imageSeqLen = xT.dim(1)
 
@@ -101,6 +101,10 @@ public final class ChromaPipeline {
 
     var x = xT
     for i in 0..<numSteps {
+      // comfybox#304: step-boundary cancellation check, matching the
+      // Flux2/Fibo idiom (Flux2Pipeline.swift, FiboPipeline.swift) — one
+      // check per sampler step, CancellationError propagates unmodified.
+      try Task.checkCancellation()
       let t = timesteps[i]
       let tPrev = timesteps[i + 1]
 
@@ -224,7 +228,7 @@ public final class ChromaPipeline {
     schedulerType: ChromaSchedulerType = .euler,
     seed: UInt64? = nil,
     progressCallback: ((Int, Int) -> Void)? = nil
-  ) -> MLXArray {
+  ) throws -> MLXArray {
     if let seed { MLXRandom.seed(seed) }
 
     let latentH = height / 8
@@ -253,7 +257,7 @@ public final class ChromaPipeline {
     let (packed, imgIds) = prepareLatentImages(noise)
 
     // Denoise
-    let denoised = denoise(
+    let denoised = try denoise(
       xT: packed,
       xIds: imgIds,
       txt: txtEmb,

@@ -342,12 +342,13 @@ public enum Krea2ScheduleError: Error, Equatable, CustomStringConvertible {
     case .etaUnsupportedSampler(let sampler, let value):
       return "eta=\(value) is RES4LYF's SDE and applies to the RES4LYF samplers only; "
         + "'\(sampler)' is not one of them. Send eta 0, or a sampler from "
-        + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / deis_3m / deis_4m"
+        + "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / heun_2s / heun_3s / "
+        + "deis_2m / deis_3m / deis_4m"
     case .bongmathUnsupportedSampler(let sampler):
       return "bongmath is RES4LYF's fixed point over its own tableau rows and applies to the "
         + "RES4LYF samplers only; '\(sampler)' is not one of them. Send bongmath false, or a "
-        + "sampler from res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / deis_2m / "
-        + "deis_3m / deis_4m"
+        + "sampler from res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / heun_2s / "
+        + "heun_3s / deis_2m / deis_3m / deis_4m"
     }
   }
 
@@ -470,8 +471,8 @@ public final class Krea2Pipeline {
     public var eta: Float = 0.0
     /// RES4LYF `bongmath` (parity tier T3, WP-E16). `true` throws until it lands.
     public var bongmath: Bool = false
-    /// `res_2s` / `res_3s` substep location in log-sigma space. Not on the
-    /// wire (D23) — a pipeline-level knob the reference recipe pins at 0.5.
+    /// `res_2s` / `res_3s` substep location in log-sigma space. The optional
+    /// wire field defaults here to the reference recipe's midpoint, 0.5.
     public var c2: Float = 0.5
     /// WP-E17 (§3.14, D4): the optional second stage of ONE render — the
     /// detail pass, which re-noises the latent to the stretched tail's first
@@ -479,6 +480,23 @@ public final class Krea2Pipeline {
     /// and seed. `nil` (the default) is today's single-stage render, statement
     /// for statement. See ``Krea2Pipeline/Stage2``.
     public var stage2: Stage2? = nil
+    /// Text-conditioning gain on the fusion projector (projector-scale trick).
+    /// 1.0 = neutral; >1 strengthens prompt adherence with no CFG cost. Applied
+    /// on the warm transformer for the whole render, stage 2 included.
+    public var projectorScale: Float = 1.0
+    /// RES4LYF spatial noise generator for the SDE re-noise (opt-in). `.gaussian`
+    /// (default) is byte-identical to today; `.fractal` / `.pyramid` are the
+    /// RES4LYF alternatives, active only when `eta != 0` on a RES4LYF sampler.
+    public var noiseType: RES4LYFNoiseType = .gaussian
+    /// Fractal `alpha` exponent (RES4LYF `FractalNoiseGenerator`). 0 makes
+    /// fractal byte-identical to gaussian; only read when `noiseType == .fractal`.
+    public var noiseAlpha: Float = 0.0
+    /// RES4LYF implicit-RK refinement: re-iterate the explicit tableau
+    /// `implicitStepsFull` extra times as a fixed point (upstream's `full_iter`
+    /// loop). 0 (default) is byte-identical to today's single explicit pass;
+    /// >0 re-anchors row 0 on the previous pass's x_next (see
+    /// ``Krea2DenoiseLoop``). Scoped to `heun_2s`, guides off, eta 0.
+    public var implicitStepsFull: Int = 0
     public init(prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
                 width: Int = 1024, height: Int = 1024, steps: Int = 9, seed: UInt64 = 0,
                 controlImagePixels: MLXArray? = nil, dyPE: DyPEConfig = .disabled,
@@ -486,7 +504,9 @@ public final class Krea2Pipeline {
                 sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
                 sigmaScheduleRequested: String? = nil,
                 eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
-                stage2: Stage2? = nil) {
+                stage2: Stage2? = nil, projectorScale: Float = 1.0,
+                noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0,
+                implicitStepsFull: Int = 0) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
       self.guidance = guidance
@@ -504,6 +524,10 @@ public final class Krea2Pipeline {
       self.bongmath = bongmath
       self.c2 = c2
       self.stage2 = stage2
+      self.projectorScale = projectorScale
+      self.noiseType = noiseType
+      self.noiseAlpha = noiseAlpha
+      self.implicitStepsFull = implicitStepsFull
     }
   }
 
@@ -606,13 +630,25 @@ public final class Krea2Pipeline {
         // with an exact restore instead of being reported as unbound and
         // taking the whole stack down with it. Inert for every adapter whose
         // keys all name Linears. See ``LoRABareParameterPairs``.
-        let weights = try LoRABareParameterPairs.split(
-          LoRAWeightLoader.loadForKrea2(from: url), for: transformer, name: name)
+        // Full-matrix LoKr layers become dense `.diff` deltas on their target
+        // weights (comfybox#329): ΔW = kron(w1, w2) · alpha-scale, applied
+        // through `patchSession` whose first-write-wins snapshots (exact
+        // packed q8 weight/scales/biases tuple included) give LoKr the
+        // exact-restore transactionality the C1 guard below demands. A layer
+        // the densifier cannot prove out (no bindable target module) stays
+        // LoKr-shaped and the guard still refuses the file whole.
+        let weights = try LoKrDensifier.densify(
+          LoRABareParameterPairs.split(
+            LoRAWeightLoader.loadForKrea2(from: url), for: transformer, name: name),
+          for: transformer, name: name)
         // K-FIX-1 / Codex C1 — the second half of the transactional contract,
         // and like the relativity guard it fires BEFORE any weight mutation:
-        // LoKr rewrites base parameters and `clearDynamicLoRA` (this block's
-        // rollback) cannot restore them, so the stack would accumulate across
-        // renders while `appliedLoRAs` reported none. Refuse instead.
+        // in-place LoKr rewrites base parameters and `clearDynamicLoRA` (this
+        // block's rollback) cannot restore them, so the stack would accumulate
+        // across renders while `appliedLoRAs` reported none. The densifier
+        // above converts every provable full-matrix layer to a transactional
+        // delta (lokrLayerCount 0); this guard is the backstop for whatever
+        // it could not convert. Refuse instead.
         try Krea2AdapterSupport.checkTransactional(
           lokrLayerCount: weights.lokrLayerCount, lora: name)
         logger.info("Applying Krea-2 LoRA: \(name) (rank=\(weights.rank), layers=\(weights.layerCount), deltas=\(weights.deltas.count), scale=\(config.scale), base=\(variant.rawValue))")
@@ -664,13 +700,16 @@ public final class Krea2Pipeline {
     do {
       for cfg in appliedLoRAs {
         let src = try await LoRAWeightLoader.resolveSource(cfg.source)
-        let weights = try LoRABareParameterPairs.split(
-          LoRAWeightLoader.loadForKrea2(from: src), for: transformer,
-          name: cfg.source.displayName)
-        // Belt and braces: nothing carrying LoKr can be in `appliedLoRAs`
-        // (loadLoRAs refuses it), but this loop re-reads the files from disk,
-        // so a file swapped underneath us is refused here too rather than
-        // mutating the base on a control toggle (C1's compounding path).
+        let weights = try LoKrDensifier.densify(
+          LoRABareParameterPairs.split(
+            LoRAWeightLoader.loadForKrea2(from: src), for: transformer,
+            name: cfg.source.displayName),
+          for: transformer, name: cfg.source.displayName)
+        // Belt and braces: same densify → guard sequence as `loadLoRAs`, so a
+        // file that passed there passes identically here. This loop re-reads
+        // the files from disk, so a file swapped underneath us for one whose
+        // LoKr layers can NOT all be densified is refused here too rather
+        // than mutating the base on a control toggle (C1's compounding path).
         try Krea2AdapterSupport.checkTransactional(
           lokrLayerCount: weights.lokrLayerCount, lora: cfg.source.displayName)
         try LoRAApplicator.applyDynamically(
@@ -702,6 +741,15 @@ public final class Krea2Pipeline {
       return
     }
     let cl = try Krea2ControlLoRA.load(from: url, layers: config.layers)
+    // comfybox#329 M2: this is the ONE Krea-2 `applyDynamically` the C1 guard
+    // did not front. The densifier only runs on the identity stack, so a
+    // LoKr-bearing control file must be refused HERE — before controlFirst is
+    // swapped in or any adapter binds — or its LoKr half would reach the
+    // ungated in-place path and mutate the warm model non-transactionally.
+    // `Krea2ControlLoRA.load` surfaces LoKr tensors precisely so this count
+    // is truthful.
+    try Krea2AdapterSupport.checkTransactional(
+      lokrLayerCount: cl.loraWeights.lokrLayerCount, lora: url.lastPathComponent)
     // assertBaseHalfMatches skipped: transformer.first is q8-quantized (weight access unsafe on QuantizedLinear)
     let cw = cl.firstWeight
     let cb = cl.firstBias
@@ -840,13 +888,20 @@ public final class Krea2Pipeline {
     eta: Float,
     sampler: SchedulerKind,
     stageSeed: UInt64,
-    layout: RES4LYFNoiseLayout
+    layout: RES4LYFNoiseLayout,
+    noiseType: RES4LYFNoiseType = .gaussian,
+    noiseGrid: (hTok: Int, wTok: Int)? = nil,
+    noiseAlpha: Double = 0.0
   ) throws -> RES4LYFSDENoiseInjector? {
     guard eta != 0 else { return nil }
     guard sampler.isRES4LYFFamily else {
       throw Krea2ScheduleError.etaUnsupportedSampler(sampler: sampler.rawValue, value: "\(eta)")
     }
-    return RES4LYFSDENoiseInjector(eta: Double(eta), stageSeed: stageSeed, layout: layout)
+    // `noiseType == .gaussian` with a nil `noiseGrid` reproduces the gaussian
+    // streams exactly — the default path is byte-identical to before.
+    return RES4LYFSDENoiseInjector(
+      eta: Double(eta), stageSeed: stageSeed, layout: layout,
+      noiseType: noiseType, grid: noiseGrid, noiseAlpha: noiseAlpha)
   }
 
   /// The layout ``Krea2DenoiseLoop`` sees: `(1, tokens, C·p·p)`, where the
@@ -923,7 +978,9 @@ public final class Krea2Pipeline {
     // before any model work for the same reason the tier gates are.
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
-      layout: Krea2Pipeline.sdeNoiseLayout)
+      layout: Krea2Pipeline.sdeNoiseLayout,
+      noiseType: request.noiseType, noiseGrid: (hTok: hTok, wTok: wTok),
+      noiseAlpha: Double(request.noiseAlpha))
     // WP-E17 (§3.14, D18): the SECOND stage's own gates, here — before the
     // noise draw and before the first transformer forward. A `stage2` field
     // that is going to be a 400 must not cost a stage-1 render first.
@@ -942,6 +999,10 @@ public final class Krea2Pipeline {
       bongmath: request.bongmath, sampler: request.sampler,
       sigmaSchedule: request.sigmaSchedule, shift: scheduleShift)
 
+    // Projector-scale trick: set the fusion gain on the warm transformer for
+    // this render — covers stage 1 and stage 2 (same transformer instance).
+    // Always assigned (default 1.0) so a prior render's value never leaks.
+    transformer.txtfusion.projectorScale = request.projectorScale
     // Noise in NCHW to match the reference RNG stream.
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
@@ -1015,11 +1076,12 @@ public final class Krea2Pipeline {
         }
       } ?? progress
 
-    let (denoised, stats) = Krea2DenoiseLoop.run(
+    let (denoised, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: img,
       startIndex: 0,
       modelEvalsPerEvaluate: useCFG ? 2 : 1,
+      implicitStepsFull: request.implicitStepsFull,
       evaluate: { [transformer] latent, sigma in
         // `sigma` IS Krea 2's `t`: it goes into the transformer with no
         // (1000 − t)/1000 renormalisation, exactly as the inline loop did.

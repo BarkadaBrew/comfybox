@@ -165,6 +165,18 @@ public enum VideoWinnerActions {
     body["image_path"] = framePath
     body["frames"] = snappedFrames(seconds: seconds, fps: fps)
     body["resolution"] = "480p"
+    // comfybox#328 (Codex round 1, finding 6): every beat's `text` is a
+    // verbatim substring of the OLD prompt's exact wording. A caller-
+    // supplied replacement prompt invalidates every beat's span — locating
+    // them against unrelated new text is a wash of drop warnings at best, a
+    // misplaced attention bias at worst. Extending with the SAME (stored)
+    // prompt keeps the schedule; only a fresh replacement prompt drops it.
+    // (extend is also I2V, so beat_schedule would already be dropped
+    // downstream per finding 5 — this keeps that intent visible here too,
+    // instead of silently relying on that separate guard.)
+    if callerPrompt != nil {
+      remove(["beat_schedule", "beatSchedule"], from: &body)
+    }
     // The local video path defaults a missing seed to a CONSTANT (42 or the
     // preset seed) — mint one or every extend of a clip renders identically.
     body["seed"] = Int(truncatingIfNeeded: freshSeed ?? UInt64.random(in: 0...0xFFFF_FFFF))

@@ -113,8 +113,38 @@ ComfyBox emulates the ComfyUI API on port 7870. Applications that already suppor
 | `/object_info` | GET | Node type registry (emulated) |
 | `/prompt` | POST | Submit a generation workflow |
 | `/queue` | GET | Queue status |
+| `/interrupt` | POST | Abort the in-flight render (see below) |
 | `/view` | GET | Retrieve generated images |
 | `/ws` | WebSocket | Real-time progress notifications |
+
+### `/interrupt` now aborts LTX-2 VIDEO renders too (comfybox#322)
+
+`POST /interrupt` (and its `/v1/queue/interrupt` twin) cancels whatever render
+is in flight, then broadcasts `execution_interrupted` for the active prompt(s).
+
+**This changed in comfybox#322, and the change is intended.** Before it, the
+interrupt reached image renders only: an in-flight LTX-2 video render published
+no cancellable handle, so `/interrupt` returned `interrupted: false` and the
+clip — 5 to 60 minutes of it — ran to completion. It now stops within one unit
+of work (one sampler step, one chunk, one decode volume).
+
+What a bridge client should know:
+
+- **An interrupt from Krita stops a video render started by anything else.**
+  The engine runs ONE render at a time across every surface (bridge, `/v1`,
+  MCP, Desktop), so the interrupt is not scoped to the caller's prompt. A
+  client that offers a Cancel button is offering it for whatever the box is
+  doing. This was already true for image renders; it now covers video.
+- **A video render started as a `/v1/video/generate/async` job reports
+  `status: failed` with an additive `interrupted: true` field**, and a
+  plain-English `error`, rather than a new status value — polling clients that
+  switch on `status` keep working unchanged. The synchronous route returns
+  HTTP 500 with `LTX-2 video interrupted by /v1/queue/interrupt`.
+- **A preempting image job is never collateral.** If the interrupt lands while
+  an engine-preemption episode (#1479) is running someone else's image render,
+  that image render finishes normally; only the video is abandoned.
+- **The queue proceeds immediately** to the next job, and the interrupted
+  render leaves no output file behind.
 
 ### Workflow Format
 

@@ -295,8 +295,108 @@ public enum ArchiveJSONL {
 /// anything that could escape it. The bundle root always comes from the URL
 /// the browser opened — never from anything inside the manifest — so a
 /// shared/tampered archive can only point at paths inside itself.
+///
+/// Rule (issue #264): no code path may join a manifest-supplied relative
+/// path onto a bundle root except through `resolveEntryPath` — manifests are
+/// untrusted input the moment archives are shareable.
 public enum ArchivePaths {
+    /// Rejects a manifest-supplied relative path before it is ever joined
+    /// onto `bundleRoot`, then re-checks containment after symlinks are
+    /// resolved — and returns the *resolved* URL, not the lexical one.
+    /// Three defenses, in order:
+    ///
+    /// 1. **Lexical**: an absolute path, or any `..` path component, is
+    ///    rejected outright — this alone stops the common case and matches
+    ///    what `standardizedFileURL` would collapse anyway.
+    /// 2. **Percent-encoding**: `relativePath` is never percent-decoded to
+    ///    build the candidate URL (`appendingPathComponent` treats it as a
+    ///    literal path component, so `%2e%2e` on its own is inert today),
+    ///    but a manifest could still carry an encoded — even doubly-encoded
+    ///    (`%252e%252e`) — traversal hoping a future or alternate call site
+    ///    decodes it first. `fullyPercentDecoded` decodes repeatedly until
+    ///    the string stops changing (capped, so a manifest can't force
+    ///    unbounded work) and the lexical check re-runs on the result,
+    ///    closing that off without changing behavior for any legitimately
+    ///    named file — a stray literal `%` that isn't valid
+    ///    percent-encoding just makes `removingPercentEncoding` return
+    ///    `nil`, which skips this extra check rather than rejecting the
+    ///    file.
+    /// 3. **Symlink escape**: `standardizedFileURL` only collapses `.` and
+    ///    `..` lexically — it does not follow symlinks. A bundle (e.g.
+    ///    extracted from a shared zip) could contain a symlink whose target
+    ///    lives outside the bundle; a `relativePath` through it would pass
+    ///    the lexical check yet resolve outside the bundle at open time.
+    ///    Resolving symlinks on both `root` and `candidate` and re-checking
+    ///    containment catches that.
+    ///
+    /// The function returns the **resolved** URL, not the lexical
+    /// `candidate` — returning the unresolved path would mean every caller
+    /// opens a different path than the one just checked, and a symlink
+    /// swapped into place between the check and the open (plausible on a
+    /// bundle living in a synced folder) would be followed anyway (TOCTOU).
+    /// Returning the resolved URL means callers open exactly what was
+    /// checked. `resolvingSymlinksInPath()` leaves the classic BSD
+    /// compatibility symlinks (`/tmp`, `/var`, `/etc`) as-is rather than
+    /// rewriting them to `/private/...`, so this doesn't surprise callers
+    /// or tests that build bundle roots under `/tmp`.
+    ///
+    /// Backslash is not treated as a path separator here — deliberately:
+    /// on APFS (this app's only supported filesystem) `\` is a legal
+    /// filename character, not a separator, so `assets\..\etc` is one
+    /// literal, harmless path component, never rejected.
     public static func resolveEntryPath(_ relativePath: String, in bundleRoot: URL) throws -> URL {
+        try rejectTraversal(in: relativePath)
+
+        let root = bundleRoot.standardizedFileURL
+        let candidate = root.appendingPathComponent(relativePath).standardizedFileURL
+        guard isContained(candidate, in: root) else {
+            throw ArchiveError.pathTraversal(relativePath)
+        }
+
+        let resolvedRoot = root.resolvingSymlinksInPath()
+        let resolvedCandidate = candidate.resolvingSymlinksInPath()
+        guard isContained(resolvedCandidate, in: resolvedRoot) else {
+            throw ArchiveError.pathTraversal(relativePath)
+        }
+
+        return resolvedCandidate
+    }
+
+    /// Validates a manifest-supplied bare `filename` before it is joined
+    /// onto a *live* destination directory during restore (the write-side
+    /// counterpart to `resolveEntryPath`'s bundle-root reads). Unlike a
+    /// `relativePath`, a `filename` must never contain a path separator at
+    /// all — it names one file directly inside the destination directory a
+    /// caller already chose (the watch directory, or a validated original
+    /// location), never a path relative to anything. A crafted
+    /// `entries.jsonl` line could otherwise set `filename` to something like
+    /// `"../../../Library/LaunchAgents/evil.plist"` and have restore's
+    /// destination-path join write outside the gallery entirely.
+    ///
+    /// No symlink resolution here — a bare filename never has intermediate
+    /// path components for a symlink to hide in, and it names a file that
+    /// generally doesn't exist yet at the destination.
+    @discardableResult
+    public static func validateFilename(_ filename: String) throws -> String {
+        guard isSafeFilename(filename) else {
+            throw ArchiveError.pathTraversal(filename)
+        }
+        if let decoded = fullyPercentDecoded(filename), decoded != filename {
+            guard isSafeFilename(decoded) else {
+                throw ArchiveError.pathTraversal(filename)
+            }
+        }
+        return filename
+    }
+
+    private static func isSafeFilename(_ filename: String) -> Bool {
+        !filename.isEmpty && !filename.contains("/") && filename != "." && filename != ".."
+    }
+
+    /// Lexical check shared by `resolveEntryPath`'s primary pass and its
+    /// percent-decoded re-check: absolute, or any path component exactly
+    /// `".."`.
+    private static func rejectTraversal(in relativePath: String) throws {
         guard !relativePath.hasPrefix("/") else {
             throw ArchiveError.pathTraversal(relativePath)
         }
@@ -304,14 +404,44 @@ public enum ArchivePaths {
         guard !components.contains("..") else {
             throw ArchiveError.pathTraversal(relativePath)
         }
-
-        let root = bundleRoot.standardizedFileURL
-        let candidate = root.appendingPathComponent(relativePath).standardizedFileURL
-
-        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
-        guard candidate.path == root.path || candidate.path.hasPrefix(rootPath) else {
-            throw ArchiveError.pathTraversal(relativePath)
+        // Defense-in-depth: a manifest could carry a percent-encoded, or
+        // even doubly-encoded (`%252e%252e`), traversal hoping some call
+        // site decodes it before use. `fullyPercentDecoded` returns `nil`
+        // when nothing decodes (e.g. a filename with a stray literal `%`),
+        // which harmlessly skips this extra check rather than rejecting a
+        // legitimately named file.
+        if let decoded = fullyPercentDecoded(relativePath), decoded != relativePath {
+            guard !decoded.hasPrefix("/") else {
+                throw ArchiveError.pathTraversal(relativePath)
+            }
+            let decodedComponents = decoded.split(separator: "/", omittingEmptySubsequences: false)
+            guard !decodedComponents.contains("..") else {
+                throw ArchiveError.pathTraversal(relativePath)
+            }
         }
-        return candidate
+    }
+
+    /// Percent-decodes `value` repeatedly until it stops changing (a single
+    /// pass only unwraps one layer of encoding, so `%252e%252e` — encoded
+    /// `%2e%2e`, itself encoded `..` — would otherwise slip past a
+    /// single-pass check), capped at 3 iterations so a manifest can't force
+    /// unbounded decode work. Returns `nil` if no iteration actually
+    /// changed the string (nothing to re-check) — including when
+    /// `removingPercentEncoding` itself returns `nil` because `value` isn't
+    /// valid percent-encoding at all.
+    private static func fullyPercentDecoded(_ value: String, maxIterations: Int = 3) -> String? {
+        var current = value
+        var decodedAtLeastOnce = false
+        for _ in 0..<maxIterations {
+            guard let decoded = current.removingPercentEncoding, decoded != current else { break }
+            current = decoded
+            decodedAtLeastOnce = true
+        }
+        return decodedAtLeastOnce ? current : nil
+    }
+
+    private static func isContained(_ candidate: URL, in root: URL) -> Bool {
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        return candidate.path == root.path || candidate.path.hasPrefix(rootPath)
     }
 }

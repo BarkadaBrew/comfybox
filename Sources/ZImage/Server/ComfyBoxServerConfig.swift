@@ -73,6 +73,141 @@ public struct ReplicateProviderConfig: Codable, Equatable, Sendable {
   }
 }
 
+/// One family's (or the cross-family default's) render-parameter overrides (FDD §3.3, D3).
+/// Every field is optional: an absent field means "no override here" and resolution falls
+/// through to the next layer. Width/height are pixels, steps is an integer step count,
+/// guidance is the CFG/guidance scale — kept `Double` for JSON portability across the families
+/// that model it as `Float` internally (converted at each call site).
+public struct RenderDefaultValues: Codable, Equatable, Sendable {
+  public var width: Int?
+  public var height: Int?
+  public var steps: Int?
+  public var guidance: Double?
+
+  public init(width: Int? = nil, height: Int? = nil, steps: Int? = nil, guidance: Double? = nil) {
+    self.width = width
+    self.height = height
+    self.steps = steps
+    self.guidance = guidance
+  }
+
+  public var isEmpty: Bool { width == nil && height == nil && steps == nil && guidance == nil }
+}
+
+/// `renderDefaults` document shape: a cross-family `default` plus per-family overrides,
+/// because the engine's own fallbacks are family-dependent (FDD §2.5) — a flat block would
+/// flatten real behavior. Resolution order (FDD §3.3): `request → preset →
+/// config.byFamily[family] → config.default → engine constant`. With every field absent
+/// (freshly-initialized or explicitly emptied), ``resolved(family:)`` returns an
+/// all-nil ``RenderDefaultValues``, so callers' existing `?? <engine constant>` fallback is
+/// unchanged — this is what makes an empty config bit-identical to today's behavior.
+public struct RenderDefaultsConfig: Codable, Equatable, Sendable {
+  public var `default`: RenderDefaultValues
+  public var byFamily: [String: RenderDefaultValues]
+
+  public init(default: RenderDefaultValues = RenderDefaultValues(), byFamily: [String: RenderDefaultValues] = [:]) {
+    self.default = `default`
+    self.byFamily = byFamily
+  }
+
+  private enum CodingKeys: String, CodingKey { case `default`, byFamily }
+
+  /// Tolerant decode: EITHER key absent falls back to empty, not a decode
+  /// failure. This is not just forward-compat hygiene — it is load-bearing
+  /// for `PATCH /v1/config` (RFC 7386 merge-patch, FDD §3.3): a patch that
+  /// introduces `renderDefaults.byFamily.<x>` on a document that never had a
+  /// `renderDefaults` block at all produces a merged fragment of exactly
+  /// `{"byFamily": {...}}`, with no `default` key — a REQUIRED-key
+  /// (synthesized) decode would reject that as malformed, when it is exactly
+  /// the shape a from-scratch single-family patch is supposed to produce.
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.default = try c.decodeIfPresent(RenderDefaultValues.self, forKey: .default) ?? RenderDefaultValues()
+    self.byFamily = try c.decodeIfPresent([String: RenderDefaultValues].self, forKey: .byFamily) ?? [:]
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(self.default, forKey: .default)
+    try c.encode(byFamily, forKey: .byFamily)
+  }
+
+  public var isEmpty: Bool { self.default.isEmpty && byFamily.isEmpty }
+
+  /// Config-layer resolution for one family: a byFamily field wins over the cross-family
+  /// default, per field independently (a family can override just `steps` and still inherit
+  /// `width`/`height` from `default`). Callers apply this ABOVE the engine's hardcoded
+  /// constant and BELOW whatever the request/preset already supplied.
+  public func resolved(family: String) -> RenderDefaultValues {
+    let fam = byFamily[family] ?? RenderDefaultValues()
+    return RenderDefaultValues(
+      width: fam.width ?? self.default.width,
+      height: fam.height ?? self.default.height,
+      steps: fam.steps ?? self.default.steps,
+      guidance: fam.guidance ?? self.default.guidance
+    )
+  }
+}
+
+/// The Motion tab's migrated video defaults (FDD §3.3): only `videoWidth/Height/Frames`
+/// genuinely migrate from the desktop's `desktop-config.json` (`MotionView.swift:393–398` is
+/// the only real reader) — NOT steps/backend, which either don't exist on `DesktopSettings`
+/// or have no client-side reader to preserve.
+public struct VideoDefaultValues: Codable, Equatable, Sendable {
+  public var width: Int?
+  public var height: Int?
+  public var frames: Int?
+
+  public init(width: Int? = nil, height: Int? = nil, frames: Int? = nil) {
+    self.width = width
+    self.height = height
+    self.frames = frames
+  }
+
+  public var isEmpty: Bool { width == nil && height == nil && frames == nil }
+}
+
+/// `videoDefaults` document shape — mirrors ``RenderDefaultsConfig``'s `{default, byFamily}`
+/// shape for API/discovery consistency (FDD §4's `ControlDescriptor` treats both uniformly),
+/// though today there is exactly one video engine (LTX-2) so `byFamily` is normally unused;
+/// the migrated Motion-tab values land in `default`.
+public struct VideoDefaultsConfig: Codable, Equatable, Sendable {
+  public var `default`: VideoDefaultValues
+  public var byFamily: [String: VideoDefaultValues]
+
+  public init(default: VideoDefaultValues = VideoDefaultValues(), byFamily: [String: VideoDefaultValues] = [:]) {
+    self.default = `default`
+    self.byFamily = byFamily
+  }
+
+  private enum CodingKeys: String, CodingKey { case `default`, byFamily }
+
+  /// Tolerant decode — see ``RenderDefaultsConfig/init(from:)``; the same
+  /// merge-patch partial-fragment hazard applies here.
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    self.default = try c.decodeIfPresent(VideoDefaultValues.self, forKey: .default) ?? VideoDefaultValues()
+    self.byFamily = try c.decodeIfPresent([String: VideoDefaultValues].self, forKey: .byFamily) ?? [:]
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    try c.encode(self.default, forKey: .default)
+    try c.encode(byFamily, forKey: .byFamily)
+  }
+
+  public var isEmpty: Bool { self.default.isEmpty && byFamily.isEmpty }
+
+  public func resolved(family: String) -> VideoDefaultValues {
+    let fam = byFamily[family] ?? VideoDefaultValues()
+    return VideoDefaultValues(
+      width: fam.width ?? self.default.width,
+      height: fam.height ?? self.default.height,
+      frames: fam.frames ?? self.default.frames
+    )
+  }
+}
+
 /// Persistent ComfyBox configuration, stored as a single `~/.comfybox/config.json`.
 ///
 /// Decoding tolerates missing keys (partial/older files load with defaults), so the
@@ -93,6 +228,13 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   /// (WP-E5). An alias that is in neither table fails the load loudly rather
   /// than falling back to the Krea-2-Turbo snapshot.
   public var krea2Models: [String: String]
+  /// Server-side engine render defaults (FDD §3.3, D3): family-aware width/height/steps/
+  /// guidance overrides, writable via `PATCH`/`PUT /v1/config`. Empty by default — an empty
+  /// document resolves identically to the engine's own hardcoded fallbacks.
+  public var renderDefaults: RenderDefaultsConfig
+  /// Server-side video (Motion tab) defaults migrated from the desktop's local config
+  /// (FDD §3.3): only `width`/`height`/`frames`.
+  public var videoDefaults: VideoDefaultsConfig
 
   /// The one true ComfyBox HTTP port.
   public static let canonicalPort: UInt16 = 7870
@@ -109,7 +251,9 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     providers: AIProviderRegistry = AIProviderRegistry(promptOptimization: AIProviderRegistry.lmStudioPromptDefault),
     replicate: ReplicateProviderConfig? = nil,
     contentModeDefaultPresets: [String: String] = [:],
-    krea2Models: [String: String] = [:]
+    krea2Models: [String: String] = [:],
+    renderDefaults: RenderDefaultsConfig = RenderDefaultsConfig(),
+    videoDefaults: VideoDefaultsConfig = VideoDefaultsConfig()
   ) {
     self.port = port
     self.host = host
@@ -120,12 +264,16 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     self.replicate = replicate
     self.contentModeDefaultPresets = contentModeDefaultPresets
     self.krea2Models = krea2Models
+    self.renderDefaults = renderDefaults
+    self.videoDefaults = videoDefaults
   }
 
   private enum CodingKeys: String, CodingKey {
     case port, host, modelSpec, allowedOutputDirectory, seedvr2WeightsPath, providers, replicate
     case contentModeDefaultPresets
     case krea2Models
+    case renderDefaults
+    case videoDefaults
     // Legacy keys written by the desktop AppConfig (read-only, for smooth upgrade).
     case serverPort, serverHost, outputDirectory
   }
@@ -149,6 +297,8 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     replicate = try c.decodeIfPresent(ReplicateProviderConfig.self, forKey: .replicate)
     contentModeDefaultPresets = try c.decodeIfPresent([String: String].self, forKey: .contentModeDefaultPresets) ?? [:]
     krea2Models = try c.decodeIfPresent([String: String].self, forKey: .krea2Models) ?? [:]
+    renderDefaults = try c.decodeIfPresent(RenderDefaultsConfig.self, forKey: .renderDefaults) ?? RenderDefaultsConfig()
+    videoDefaults = try c.decodeIfPresent(VideoDefaultsConfig.self, forKey: .videoDefaults) ?? VideoDefaultsConfig()
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -166,6 +316,12 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     if !krea2Models.isEmpty {
       try c.encode(krea2Models, forKey: .krea2Models)
     }
+    if !renderDefaults.isEmpty {
+      try c.encode(renderDefaults, forKey: .renderDefaults)
+    }
+    if !videoDefaults.isEmpty {
+      try c.encode(videoDefaults, forKey: .videoDefaults)
+    }
   }
 
   // MARK: - Paths
@@ -174,9 +330,26 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
   }
 
-  /// `~/.comfybox/config.json`.
+  /// The engine's state directory — `~/.comfybox`, or `COMFYBOX_STATE_DIR`
+  /// when set. Mirrors `QueueStateStore.stateDirectory` exactly (K-FIX-1: a
+  /// test that touches this path unguarded reads/writes/DELETES the LIVE
+  /// engine's config — see `ComfyBoxStateDirectoryIsolation.swift`). COMPUTED,
+  /// not a cached `static let`, so the override is honored even if it's set
+  /// after this type has already been touched once in the process.
+  public static func stateDirectory() -> URL {
+    if let override = ProcessInfo.processInfo.environment["COMFYBOX_STATE_DIR"], !override.isEmpty {
+      let dir = URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      return dir
+    }
+    let dir = homeDirectory().appendingPathComponent(".comfybox", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  /// `~/.comfybox/config.json`, or `$COMFYBOX_STATE_DIR/config.json`.
   public static func defaultPath() -> URL {
-    homeDirectory().appendingPathComponent(".comfybox/config.json")
+    stateDirectory().appendingPathComponent("config.json")
   }
 
   /// `~/.coffeeshop/providers.json` (retiring image service).

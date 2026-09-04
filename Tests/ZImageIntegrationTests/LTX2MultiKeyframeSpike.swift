@@ -69,7 +69,7 @@ final class LTX2MultiKeyframeSpike: XCTestCase {
 
     logger.info("Generating \(numFrames)-frame clip with keyframes at frame 0 and frame 32...")
     let genStart = CFAbsoluteTimeGetCurrent()
-    let output = pipeline.generateMultiKeyframe(
+    let output = try pipeline.generateMultiKeyframe(
       inputIds: batch.inputIds,
       attentionMask: batch.attentionMask,
       keyframes: [

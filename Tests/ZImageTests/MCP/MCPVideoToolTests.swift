@@ -36,8 +36,13 @@ final class MCPVideoToolTests: XCTestCase {
     // + lora_quarantine (model-pool work, 90e6f38) = 39;
     // + pause_queue/resume_queue (engine-wide Pause + Purge, 13e1c41) = 41;
     // + rerender_video/extend_video (winner actions, 2026-08-10) = 43;
-    // + civitai_search/civitai_prompts (CivitAI conduit + prompt repository, #234) = 45.
-    XCTAssertEqual(MCPToolRegistry.tools.count, 45, "Expected 45 registered MCP tools")
+    // + civitai_search/civitai_prompts (CivitAI conduit + prompt repository, #234) = 45;
+    // + move_queue_job/update_lora_triggerwords/create_preset/delete_preset/
+    //   set_warm_preset/create_character/delete_character (headless-parity
+    //   Phase 1 gap set, comfybox#300, FDD §4.2, 2026-08-30) = 52;
+    // + get_config/patch_config/update_config (headless-parity Phase 3,
+    //   comfybox#300, FDD §3.3/§4.4, 2026-08-30) = 55.
+    XCTAssertEqual(MCPToolRegistry.tools.count, 55, "Expected 55 registered MCP tools")
   }
 
   // MARK: - generate_video Schema (Story A1)
@@ -70,6 +75,35 @@ final class MCPVideoToolTests: XCTestCase {
     let skip = properties?["skip_character_injection"] as? [String: Any]
     XCTAssertNotNil(skip, "generate_video must expose skip_character_injection")
     XCTAssertEqual(skip?["type"] as? String, "boolean")
+  }
+
+  /// Run overrides (coffeeshop-server#1751): the executor body is an explicit
+  /// whitelist, so an undeclared/unforwarded key vanishes silently — exactly
+  /// how skip_character_injection was dropped once. Pin both keys.
+  func testGenerateVideoSchemaExposesRunOverrides() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    let loras = properties?["loras"] as? [String: Any]
+    XCTAssertNotNil(loras, "generate_video must expose loras (per-render stack override)")
+    XCTAssertEqual(loras?["type"] as? String, "array")
+    let fps = properties?["fps"] as? [String: Any]
+    XCTAssertNotNil(fps, "generate_video must expose fps")
+    XCTAssertEqual(fps?["type"] as? String, "integer")
+  }
+
+  /// comfybox#328 (Codex round 1, finding 4): daemon renders that go through
+  /// MCP (not the HTTP API directly) could never carry beat_schedule at
+  /// all — the schema didn't expose it and the executor's whitelist dropped
+  /// it, exactly how skip_character_injection was dropped once before.
+  func testGenerateVideoSchemaExposesBeatSchedule() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    let beatSchedule = properties?["beat_schedule"] as? [String: Any]
+    XCTAssertNotNil(beatSchedule, "generate_video must expose beat_schedule")
+    XCTAssertEqual(beatSchedule?["type"] as? String, "array")
+    let description = beatSchedule?["description"] as? String
+    XCTAssertTrue(description?.localizedCaseInsensitiveContains("T2V ONLY") == true,
+                  "the schema must document the T2V-only restriction (comfybox#328 finding 5)")
   }
 
   func testGenerateVideoSchemaOnlyPromptRequired() {

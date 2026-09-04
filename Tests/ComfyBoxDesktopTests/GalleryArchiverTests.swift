@@ -346,6 +346,96 @@ struct GalleryArchiverTests {
         #expect(count == 0)
     }
 
+    // MARK: - Restore: crafted manifest entries (#264 traversal guard)
+    //
+    // A `.cbarchive` bundle is untrusted the moment it's shareable — nothing
+    // stops a hand-edited `entries.jsonl` from carrying a `relativePath`
+    // that reads outside the bundle, or a `filename` that writes outside the
+    // destination directory, on restore. These two build a bundle by hand
+    // (no `archive()` call) with exactly one crafted entry each, run a real
+    // `restore()`, and assert the entry is reported failed rather than the
+    // escape succeeding.
+
+    /// Minimal well-formed `manifest.json` (schemaVersion 1, no folders) at
+    /// `bundlePath`, mirroring `restoreRejectsUnsupportedSchemaVersion`'s
+    /// hand-written manifest but accepted rather than rejected.
+    private func writeMinimalManifest(assetCount: Int, at bundlePath: String) throws {
+        let manifest: [String: Any] = [
+            "schemaVersion": 1, "archiveId": "x", "name": "Malicious", "createdAt": 0,
+            "producer": "test", "assetCount": assetCount, "totalBytes": 0, "folders": [],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: manifest)
+        try data.write(to: URL(fileURLWithPath: (bundlePath as NSString).appendingPathComponent("manifest.json")))
+    }
+
+    /// Writes a single hand-crafted `ArchivedAsset` JSON line to
+    /// `entries.jsonl`, filling in every non-optional field with an
+    /// innocuous default so only `overrides` need to be untrusted-looking.
+    private func writeEntriesLine(_ overrides: [String: Any], at bundlePath: String) throws {
+        var entry: [String: Any] = [
+            "id": "crafted-1", "relativePath": "assets/crafted-1/payload.png",
+            "kind": "image", "filename": "payload.png", "fileSize": 4,
+            "createdAt": 0, "modifiedAt": 0, "ingestedAt": 0,
+            "orphaned": false, "rating": 0, "favorite": false, "archivedAt": 0,
+        ]
+        for (key, value) in overrides { entry[key] = value }
+        var data = try JSONSerialization.data(withJSONObject: entry)
+        data.append(0x0A)
+        let entriesPath = (bundlePath as NSString).appendingPathComponent("entries.jsonl")
+        try data.write(to: URL(fileURLWithPath: entriesPath))
+    }
+
+    @Test("restore fails a crafted entry whose relativePath escapes the bundle, instead of reading the escaped file")
+    @MainActor
+    func restoreRejectsCraftedRelativePathEscape() async throws {
+        let env = try await makeEnvironment()
+        let bundlePath = (env.archiveRoot as NSString).appendingPathComponent("Malicious.cbarchive")
+        try FileManager.default.createDirectory(atPath: bundlePath, withIntermediateDirectories: true)
+
+        // A file outside the bundle that a successful escape would read.
+        let secretPath = (env.archiveRoot as NSString).appendingPathComponent("secret.txt")
+        FileManager.default.createFile(atPath: secretPath, contents: Data("top secret".utf8))
+
+        try writeMinimalManifest(assetCount: 1, at: bundlePath)
+        try writeEntriesLine(["relativePath": "../secret.txt", "filename": "stolen.txt"], at: bundlePath)
+
+        let result = try await env.archiver.restore(.init(bundlePath: bundlePath))
+        #expect(result.restored == 0)
+        #expect(result.failed == ["stolen.txt"])
+
+        let count = try await env.store.assetCount()
+        #expect(count == 0)
+        let leakedPath = (env.watchDir as NSString).appendingPathComponent("stolen.txt")
+        #expect(!FileManager.default.fileExists(atPath: leakedPath))
+    }
+
+    @Test("restore fails a crafted entry whose filename escapes the destination directory, instead of writing the escaped file")
+    @MainActor
+    func restoreRejectsCraftedFilenameEscape() async throws {
+        let env = try await makeEnvironment()
+        let bundlePath = (env.archiveRoot as NSString).appendingPathComponent("Malicious.cbarchive")
+        let assetDir = (bundlePath as NSString).appendingPathComponent("assets/crafted-1")
+        try FileManager.default.createDirectory(atPath: assetDir, withIntermediateDirectories: true)
+        // A real, legitimately reachable payload *inside* the bundle — only
+        // the destination filename is malicious here.
+        writeFile("payload.png", in: assetDir, contents: "payload-bytes")
+
+        try writeMinimalManifest(assetCount: 1, at: bundlePath)
+        let escapedName = "../../../../../../../../tmp/comfybox-264-escape-\(UUID().uuidString).png"
+        try writeEntriesLine(["filename": escapedName], at: bundlePath)
+
+        let result = try await env.archiver.restore(.init(bundlePath: bundlePath))
+        #expect(result.restored == 0)
+        #expect(result.failed == [escapedName])
+
+        let count = try await env.store.assetCount()
+        #expect(count == 0)
+        // Resolve the same way the (fixed) destination-path join would have,
+        // to prove the escaped file was never created anywhere.
+        let escapedDestination = (env.watchDir as NSString).appendingPathComponent(escapedName)
+        #expect(!FileManager.default.fileExists(atPath: (escapedDestination as NSString).standardizingPath))
+    }
+
     // MARK: - Restore: id collision — skip
 
     @Test("restore skips entirely when the live asset already occupies the archived id and path, preserving its rating")

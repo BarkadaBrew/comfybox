@@ -15,6 +15,19 @@ public enum LoRAFormat: String, Codable, Sendable {
   case slider  // Low key-count slider LoRA
 }
 
+// MARK: - Compatibility Provenance
+
+/// #313: provenance for `LoRALibraryEntry.modelCompatibility`. `scan()` may
+/// only overwrite the tag when it is still `.auto` — once a user sets it
+/// (`POST /v1/loras/{id}/update`), it is `.manual` and sticky across every
+/// future rescan, even after the file itself changes. Rescans still refresh
+/// every genuinely file-derived field (size, hash, format, rank, key count,
+/// layer targets) unconditionally.
+public enum LoRACompatibilitySource: String, Codable, Sendable {
+  case auto
+  case manual
+}
+
 // MARK: - Library Entry
 
 /// A single LoRA entry in the library index.
@@ -46,6 +59,13 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
 
   /// Model compatibility tags (e.g. ["z-image"], ["klein-9b"]).
   public var modelCompatibility: [String]
+
+  /// #313: whether `modelCompatibility` was auto-detected by the scanner or
+  /// manually set by the user via the update route. `scan()` only overwrites
+  /// `modelCompatibility` when this is `.auto` — a `.manual` tag is sticky
+  /// forever, across every future rescan. Defaults to `.auto` for entries
+  /// written before this field existed (see the tolerant decode below).
+  public var compatibilitySource: LoRACompatibilitySource
 
   /// Adapter format: lora, lokr, or slider.
   public var format: LoRAFormat
@@ -144,6 +164,7 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
     case sizeBytes = "size_bytes"
     case sha256
     case modelCompatibility = "model_compatibility"
+    case compatibilitySource = "compatibility_source"
     case format, rank, alpha
     case keyCount = "key_count"
     case layerTargets = "layer_targets"
@@ -172,6 +193,10 @@ extension LoRALibraryEntry {
     sizeBytes = try c.decode(UInt64.self, forKey: .sizeBytes)
     sha256 = try c.decodeIfPresent(String.self, forKey: .sha256)
     modelCompatibility = try c.decode([String].self, forKey: .modelCompatibility)
+    // Additive field (#313): absent (pre-existing library.json entries) or
+    // unrecognized ⇒ .auto, never a load failure.
+    compatibilitySource = (try? c.decodeIfPresent(LoRACompatibilitySource.self, forKey: .compatibilitySource))
+      .flatMap { $0 } ?? .auto
     format = try c.decode(LoRAFormat.self, forKey: .format)
     rank = try c.decode(Int.self, forKey: .rank)
     alpha = try c.decodeIfPresent(Float.self, forKey: .alpha)
@@ -229,6 +254,10 @@ public struct LoRAEntryPatch: Sendable {
   public var civitaiModelId: Int?
   /// WP-E6: declare the Krea-2 base this adapter is relative to.
   public var krea2Relative: Krea2Variant?
+  /// #313: manually setting compatibility (`POST /v1/loras/{id}/update` with
+  /// `model_compatibility`) marks the entry `.manual` — sticky across every
+  /// future `scan()`, even once the file itself changes.
+  public var modelCompatibility: [String]?
 
   public init(
     triggerwords: [String]? = nil,
@@ -238,7 +267,8 @@ public struct LoRAEntryPatch: Sendable {
     notes: String? = nil,
     sourceURL: String? = nil,
     civitaiModelId: Int? = nil,
-    krea2Relative: Krea2Variant? = nil
+    krea2Relative: Krea2Variant? = nil,
+    modelCompatibility: [String]? = nil
   ) {
     self.triggerwords = triggerwords
     self.recommendedScale = recommendedScale
@@ -248,5 +278,6 @@ public struct LoRAEntryPatch: Sendable {
     self.sourceURL = sourceURL
     self.civitaiModelId = civitaiModelId
     self.krea2Relative = krea2Relative
+    self.modelCompatibility = modelCompatibility
   }
 }

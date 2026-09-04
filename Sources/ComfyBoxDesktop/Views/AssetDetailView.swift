@@ -33,6 +33,13 @@ struct AssetDetailView: View {
     var onFullScreen: ((DAMAsset) -> Void)?
     /// Send this asset's full recipe (prompt, params, LoRAs, content mode) to Generate.
     var onSendToGenerate: ((DAMAsset) -> Void)?
+    /// Open this asset in the Edit tab. Called with the asset and the LOCAL
+    /// path `source` resolved for it (only ever invoked when `source` is
+    /// `.local`, since the button is disabled otherwise) — never `asset.absolutePath`.
+    var onEdit: ((DAMAsset, String) -> Void)?
+    /// Select the source asset for the "Edited from" link — the sidecar's
+    /// recorded `source_path` and (when present) `source_asset_id`.
+    var onSelectSource: ((String, String?) -> Void)?
 
     @State private var currentIndex: Int
     @State private var rating: Int = 0
@@ -47,16 +54,29 @@ struct AssetDetailView: View {
     @State private var player: AVPlayer?
     /// What went wrong fetching a server-side asset, shown instead of a blank pane.
     @State private var mediaError: String?
+    /// The current asset's `edit` sidecar (for "Edited from"), cached rather than
+    /// read from disk on every `body` evaluation — SwiftUI re-runs `body` on every
+    /// rating/favorite/label change and on navigation, and this is a synchronous
+    /// disk read. Refreshed by the same `.task(id:)` that loads the image.
+    @State private var editSidecar: EditSidecar?
     @Environment(\.dismiss) private var dismiss
     @Environment(AppContentGate.self) private var contentGate
 
     /// Single-asset convenience (no navigation).
-    init(asset: DAMAsset, thumbnailPath: String?, onUpdate: @escaping (DAMAsset) -> Void) {
+    init(
+        asset: DAMAsset,
+        thumbnailPath: String?,
+        onUpdate: @escaping (DAMAsset) -> Void,
+        onEdit: ((DAMAsset, String) -> Void)? = nil,
+        onSelectSource: ((String, String?) -> Void)? = nil
+    ) {
         self.assets = [asset]
         self.thumbnailProvider = { _ in thumbnailPath }
         self.onUpdate = onUpdate
         self.onFullScreen = nil
         self.onSendToGenerate = nil
+        self.onEdit = onEdit
+        self.onSelectSource = onSelectSource
         self._currentIndex = State(initialValue: 0)
     }
 
@@ -70,7 +90,9 @@ struct AssetDetailView: View {
         },
         onUpdate: @escaping (DAMAsset) -> Void,
         onFullScreen: ((DAMAsset) -> Void)? = nil,
-        onSendToGenerate: ((DAMAsset) -> Void)? = nil
+        onSendToGenerate: ((DAMAsset) -> Void)? = nil,
+        onEdit: ((DAMAsset, String) -> Void)? = nil,
+        onSelectSource: ((String, String?) -> Void)? = nil
     ) {
         self.assets = assets
         self.thumbnailProvider = thumbnailProvider
@@ -78,6 +100,8 @@ struct AssetDetailView: View {
         self.onUpdate = onUpdate
         self.onFullScreen = onFullScreen
         self.onSendToGenerate = onSendToGenerate
+        self.onEdit = onEdit
+        self.onSelectSource = onSelectSource
         self._currentIndex = State(initialValue: index)
     }
 
@@ -113,6 +137,7 @@ struct AssetDetailView: View {
         // blur them, and opening it must then load what was withheld.
         .task(id: "\(asset.id)|\(contentGate.revealed)") {
             syncEditableState()
+            loadEditSidecar()
             await loadFullImage()
         }
         .onKeyPress(.leftArrow) { step(-1); return .handled }
@@ -164,6 +189,13 @@ struct AssetDetailView: View {
                     Label("Send to Generate", systemImage: "wand.and.stars")
                 }
             }
+            if let onEdit, asset.isEditableImage {
+                Button {
+                    if case .local(let localPath) = source { onEdit(asset, localPath) }
+                } label: { Label("Edit", systemImage: "slider.horizontal.3") }
+                    .disabled(localOnlyReason != nil)
+                    .help(localOnlyReason ?? "Open in the Edit tab")
+            }
             if let onFullScreen {
                 Button { onFullScreen(asset) } label: {
                     Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right")
@@ -186,6 +218,14 @@ struct AssetDetailView: View {
         rating = asset.rating
         isFavorite = asset.favorite
         notes = ""
+    }
+
+    private func loadEditSidecar() {
+        if case .local(let localPath) = source {
+            editSidecar = EditSidecar.read(forImageAt: localPath)
+        } else {
+            editSidecar = nil
+        }
     }
 
     private func revealInFinder() {
@@ -319,6 +359,16 @@ struct AssetDetailView: View {
             Text(formattedDate(asset.createdAt))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if let sc = editSidecar {
+                HStack(spacing: 6) {
+                    Label("Edited from \(URL(fileURLWithPath: sc.sourcePath).lastPathComponent)", systemImage: "link")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let onSelectSource {
+                        Button("Show") { onSelectSource(sc.sourcePath, sc.sourceAssetId) }.controlSize(.mini)
+                    }
+                }
+            }
         }
     }
 

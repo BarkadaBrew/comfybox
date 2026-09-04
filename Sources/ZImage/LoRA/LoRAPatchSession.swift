@@ -52,10 +52,18 @@ public final class LoRAPatchSession {
     /// without mutating anything. Returns the number of resolved ops; throws
     /// ``LoRAError/partialApplication(lora:unbound:)`` listing every miss.
     /// Shape metadata only — safe on a lazily-initialized module.
+    ///
+    /// Shape validation matches `apply` exactly: a delta on a
+    /// `QuantizedLinear`'s weight is checked against the DEQUANTIZED
+    /// (out, in) shape — the stored packed array's last axis is bits-packed
+    /// and matches no float delta (densified LoKr layers target quantized
+    /// Linears, comfybox#329). `QuantizedLinear.shape` unpacks dimensions
+    /// from metadata without evaluating anything.
     @discardableResult
     public func preflight(weights: LoRAWeights) throws -> Int {
         guard !weights.deltas.isEmpty else { return 0 }
         let paramIndex = flattenedParameters()
+        let moduleIndex = flattenedModules()
         var missing: [String] = []
         var resolved = 0
         for (key, patch) in weights.deltas {
@@ -63,13 +71,28 @@ public final class LoRAPatchSession {
                 missing.append(key)
                 continue
             }
-            _ = try alignedPatchTensor(patch.tensor, to: paramIndex[path]!.shape, key: path)
+            let shape = targetShape(for: path, paramIndex: paramIndex, moduleIndex: moduleIndex)
+            _ = try alignedPatchTensor(patch.tensor, to: shape, key: path)
             resolved += 1
         }
         guard missing.isEmpty else {
             throw LoRAError.partialApplication(lora: nil, unbound: missing.sorted())
         }
         return resolved
+    }
+
+    /// The shape a patch must form for `path`: the dequantized (out, in) when
+    /// the target is a `QuantizedLinear`'s packed weight, else the parameter's
+    /// own stored shape.
+    private func targetShape(
+        for path: String, paramIndex: [String: MLXArray], moduleIndex: [String: Module]
+    ) -> [Int] {
+        if path.hasSuffix(".weight"),
+           let quantized = moduleIndex[String(path.dropLast(".weight".count))] as? QuantizedLinear {
+            let (out, input) = quantized.shape
+            return [out, input]
+        }
+        return paramIndex[path]!.shape
     }
 
     /// Preflights and applies all deltas in `weights`. Throws BEFORE any

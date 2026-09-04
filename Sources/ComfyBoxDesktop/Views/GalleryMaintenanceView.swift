@@ -244,23 +244,36 @@ struct GalleryMaintenanceView: View {
         }
     }
 
+    /// Page size for the paged walk below. Bounds how many `(id, path)`
+    /// pairs are held in memory at once regardless of library size (#265).
+    private static let missingScanPageSize = 1_000
+
     /// Mirrors `DAMStore.pruneOrphans()`'s selection (secured assets
     /// excluded, existence checked via `FileManager`) without touching the
     /// database — a pure preview count for the confirmation UI. No dry-run
     /// API exists on `AssetIngestor`/`DAMStore`, so this is computed
-    /// in-view; the stat loop runs off-main.
+    /// in-view, paging through lightweight `(id, path)` pairs
+    /// (`DAMStore.assetLocations`) rather than fetching every column of
+    /// every row up front; each page's stat loop still runs off-main.
     static func countMissingAssets(store: DAMStore) async throws -> Int {
         let secured = try await store.securedAssetIds()
-        let total = try await store.assetCount()
-        let all = try await store.fetchAssets(limit: total, offset: 0)
-        return await Task.detached(priority: .utility) {
-            var count = 0
-            let fm = FileManager.default
-            for asset in all where !secured.contains(asset.id) {
-                if !fm.fileExists(atPath: asset.absolutePath) { count += 1 }
-            }
-            return count
-        }.value
+        var count = 0
+        var offset = 0
+        while true {
+            let page = try await store.assetLocations(limit: missingScanPageSize, offset: offset)
+            if page.isEmpty { break }
+            count += await Task.detached(priority: .utility) {
+                let fm = FileManager.default
+                var pageCount = 0
+                for (id, path) in page where !secured.contains(id) {
+                    if !fm.fileExists(atPath: path) { pageCount += 1 }
+                }
+                return pageCount
+            }.value
+            offset += page.count
+            if page.count < missingScanPageSize { break }
+        }
+        return count
     }
 
     // MARK: - Regenerate all thumbnails section

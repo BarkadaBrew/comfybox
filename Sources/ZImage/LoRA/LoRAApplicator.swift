@@ -371,6 +371,18 @@ public struct LoRAApplicator {
         return scale
     }
 
+    /// Kronecker product of two 2-D matrices — the LoKr delta construction
+    /// ΔW = w1 ⊗ w2. Internal (not private) so ``LoKrDensifier`` materializes
+    /// its dense deltas with the SAME arithmetic this in-place path uses,
+    /// rather than a copy the two paths could drift apart on.
+    static func kron2D(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        let a0 = a.dim(0), a1 = a.dim(1)
+        let b0 = b.dim(0), b1 = b.dim(1)
+        let aExp = a.reshaped(a0, 1, a1, 1)
+        let bExp = b.reshaped(1, b0, 1, b1)
+        return (aExp * bExp).reshaped(a0 * b0, a1 * b1)
+    }
+
     private static func applyLoKrInternal<T: Module>(
         to transformer: T,
         loraWeights: LoRAWeights,
@@ -382,14 +394,6 @@ public struct LoRAApplicator {
         var layerUpdates: [String: MLXArray] = [:]
         var appliedCount = 0
         var quantizedCount = 0
-
-        func kron2D(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
-            let a0 = a.dim(0), a1 = a.dim(1)
-            let b0 = b.dim(0), b1 = b.dim(1)
-            let aExp = a.reshaped(a0, 1, a1, 1)
-            let bExp = b.reshaped(1, b0, 1, b1)
-            return (aExp * bExp).reshaped(a0 * b0, a1 * b1)
-        }
 
         for (key, module) in transformer.namedModules() {
             guard let lokr = loraWeights.lokrWeights[key] else { continue }
