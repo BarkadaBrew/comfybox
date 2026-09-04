@@ -271,4 +271,58 @@ final class VideoWinnerActionsTests: XCTestCase {
       requestJSON: nil, framePath: "/tmp/f.png",
       seconds: 4, prompt: nil, effectivePrompt: nil))
   }
+
+  // MARK: - extendBody beat_schedule (comfybox#328, Codex round 1 finding 6)
+
+  private let originalBodyWithBeats: [String: Any] = [
+    "prompt": "raw daemon prompt",
+    "image_path": "/tmp/seed.png",
+    "width": 480, "height": 832,
+    "frames": 97, "fps": 24, "seed": 4242,
+    "beat_schedule": [
+      ["text": "she walks closer", "start_frac": 0.0, "end_frac": 0.5] as [String: Any]
+    ],
+    "source": "api",
+  ]
+
+  private func originalJSONWithBeats() throws -> String {
+    let data = try JSONSerialization.data(withJSONObject: originalBodyWithBeats)
+    return try XCTUnwrap(String(data: data, encoding: .utf8))
+  }
+
+  func testExtendBodyDropsInheritedBeatScheduleWhenCallerSuppliesAReplacementPrompt() throws {
+    // The inherited beats' text is anchored to the OLD prompt's exact
+    // wording — a fresh caller prompt invalidates every span.
+    let body = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: originalJSONWithBeats(), framePath: "/tmp/f.png",
+        seconds: 4, prompt: "she turns and walks away", effectivePrompt: "old"))
+    XCTAssertNil(body["beat_schedule"], "a replacement prompt invalidates the inherited beats' spans")
+  }
+
+  func testExtendBodyKeepsInheritedBeatScheduleWhenPromptIsUnchanged() throws {
+    // No caller-supplied prompt: the effective prompt carries forward
+    // unchanged, so the beats' text still matches.
+    let body = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: originalJSONWithBeats(), framePath: "/tmp/f.png",
+        seconds: 4, prompt: nil, effectivePrompt: "raw daemon prompt"))
+    XCTAssertNotNil(body["beat_schedule"], "beats stay valid when the prompt they were anchored to is unchanged")
+  }
+
+  func testExtendBodyDropsCamelCaseBeatScheduleVariantToo() throws {
+    var original = originalBodyWithBeats
+    original.removeValue(forKey: "beat_schedule")
+    original["beatSchedule"] = [
+      ["text": "she walks closer", "start_frac": 0.0, "end_frac": 0.5] as [String: Any]
+    ]
+    let json = try XCTUnwrap(
+      String(data: try JSONSerialization.data(withJSONObject: original), encoding: .utf8))
+    let body = try obj(
+      try VideoWinnerActions.extendBody(
+        requestJSON: json, framePath: "/tmp/f.png",
+        seconds: 4, prompt: "she turns and walks away", effectivePrompt: "old"))
+    XCTAssertNil(body["beatSchedule"])
+    XCTAssertNil(body["beat_schedule"])
+  }
 }

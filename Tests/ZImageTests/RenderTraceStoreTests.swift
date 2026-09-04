@@ -76,6 +76,33 @@ final class RenderTraceStoreTests: XCTestCase {
     XCTAssertEqual(store.events(renderId: "burst").count, 50, "single serialized writer loses nothing")
   }
 
+  /// comfybox#328 (Codex round 1, finding 2): `GET /v1/video/traces` returns
+  /// `TraceSummary`, not the raw submitted payload — a field WarmServer only
+  /// stuffs into the payload dict never actually reaches that endpoint's
+  /// response unless `TraceSummary` also declares and copies it. Pins that
+  /// `enhancement_skipped`/`beat_schedule_ignored` survive the trip.
+  func testRecentSummariesSurfacesEnhancementAndBeatScheduleMarkers() throws {
+    let store = RenderTraceStore(directory: tempDir)
+    store.append(RenderTraceEvent(
+      renderId: "r-beats", event: .submitted, taskKind: .videoRender,
+      payload: ["prompt": "she walks closer", "enhancement_skipped": "beat_schedule"]))
+    store.append(RenderTraceEvent(
+      renderId: "r-i2v-beats", event: .submitted, taskKind: .videoRender,
+      payload: ["prompt": "a portrait", "beat_schedule_ignored": "i2v_unsupported"]))
+    store.append(RenderTraceEvent(
+      renderId: "r-plain", event: .submitted, taskKind: .videoRender,
+      payload: ["prompt": "no beats here"]))
+    store.flush()
+
+    let summaries = Dictionary(uniqueKeysWithValues: store.recentSummaries(limit: 10).map { ($0.renderId, $0) })
+    XCTAssertEqual(summaries["r-beats"]?.enhancementSkipped, "beat_schedule")
+    XCTAssertNil(summaries["r-beats"]?.beatScheduleIgnored)
+    XCTAssertEqual(summaries["r-i2v-beats"]?.beatScheduleIgnored, "i2v_unsupported")
+    XCTAssertNil(summaries["r-i2v-beats"]?.enhancementSkipped)
+    XCTAssertNil(summaries["r-plain"]?.enhancementSkipped)
+    XCTAssertNil(summaries["r-plain"]?.beatScheduleIgnored)
+  }
+
   func testJSONLLinesAreSelfDescribing() throws {
     let store = RenderTraceStore(directory: tempDir)
     store.append(RenderTraceEvent(

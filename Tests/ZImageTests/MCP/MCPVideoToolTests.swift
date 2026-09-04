@@ -91,6 +91,21 @@ final class MCPVideoToolTests: XCTestCase {
     XCTAssertEqual(fps?["type"] as? String, "integer")
   }
 
+  /// comfybox#328 (Codex round 1, finding 4): daemon renders that go through
+  /// MCP (not the HTTP API directly) could never carry beat_schedule at
+  /// all — the schema didn't expose it and the executor's whitelist dropped
+  /// it, exactly how skip_character_injection was dropped once before.
+  func testGenerateVideoSchemaExposesBeatSchedule() {
+    let tool = MCPToolRegistry.tool(named: "generate_video")!
+    let properties = tool.inputSchema["properties"] as? [String: Any]
+    let beatSchedule = properties?["beat_schedule"] as? [String: Any]
+    XCTAssertNotNil(beatSchedule, "generate_video must expose beat_schedule")
+    XCTAssertEqual(beatSchedule?["type"] as? String, "array")
+    let description = beatSchedule?["description"] as? String
+    XCTAssertTrue(description?.localizedCaseInsensitiveContains("T2V ONLY") == true,
+                  "the schema must document the T2V-only restriction (comfybox#328 finding 5)")
+  }
+
   func testGenerateVideoSchemaOnlyPromptRequired() {
     let tool = MCPToolRegistry.tool(named: "generate_video")!
     let required = tool.inputSchema["required"] as? [String]

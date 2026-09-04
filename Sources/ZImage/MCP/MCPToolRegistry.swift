@@ -547,6 +547,11 @@ public enum MCPToolRegistry {
           "description": "Per-render LoRA stack override: [{path|name, scale}]. Request LoRAs REPLACE the preset/default stack for this render (precedence: request > preset > --ltx2-lora). Bare filenames resolve against the LoRA library.",
           "items": ["type": "object"] as [String: Any],
         ] as [String: Any],
+        "beat_schedule": [
+          "type": "array",
+          "description": "T2V ONLY (comfybox#328) — ignored with a warning on I2V (image_path set). Temporal beat scheduling: [{text, start_frac, end_frac, strength?}]. Each beat's `text` must be a VERBATIM substring of `prompt` — the engine locates it there and drops (fail-open, logged) any beat it can't find. A non-empty beat_schedule makes the server SKIP prompt enhancement for this request (enhancement rewrites the prompt wholesale, which strands every beat) — send an already-composed prompt, not a raw one expecting server-side enhancement.",
+          "items": ["type": "object"] as [String: Any],
+        ] as [String: Any],
         "fps": [
           "type": "integer",
           "description": "Generation frame-rate basis (default 24). Lower = slower on-screen motion per generated frame; duration maps onto the frame grid at this rate.",

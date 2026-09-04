@@ -1965,6 +1965,13 @@ public final class WarmServer {
     /// field. Per-beat fail-open applies only to WELL-FORMED beats the
     /// engine can't act on (unlocatable text, degenerate fracs) — a caller
     /// bug should be loud, a tokenizer merge should not.
+    ///
+    /// T2V ONLY (comfybox#328, see LTX2BeatSchedule.swift's header for why):
+    /// on an I2V request (`image_path` set) this is stripped before it
+    /// reaches the generator and the response/trace records
+    /// `beat_schedule_ignored: "i2v_unsupported"` instead. A non-empty
+    /// schedule also makes the server SKIP prompt enhancement for this
+    /// request — see `enhance`.
     let beatSchedule: [BeatSegment]?
   }
 
@@ -1995,6 +2002,9 @@ public final class WarmServer {
     /// was skipped so the request's beats would locate. Absent field on
     /// older engines/clients is the byte-identical no-op case.
     let enhancementSkipped: String?
+    /// comfybox#328: non-nil (`"i2v_unsupported"`) when a `beat_schedule`
+    /// on this I2V request was dropped before reaching the generator.
+    let beatScheduleIgnored: String?
   }
 
   /// Submit a video render to the paid Replicate cloud proxy and return its 202
@@ -2054,6 +2064,11 @@ public final class WarmServer {
     /// `beat_schedule` would survive verbatim in the composed prompt —
     /// stamped onto the response/trace as `enhancement_skipped`.
     let enhancementSkippedReason: String?
+    /// comfybox#328 (Codex round 1, finding 5): non-nil (`"i2v_unsupported"`)
+    /// when a non-empty `beat_schedule` arrived on an I2V request and was
+    /// dropped before reaching the generator — stamped onto the
+    /// response/trace as `beat_schedule_ignored`.
+    let beatScheduleIgnoredReason: String?
   }
 
   /// Map the daemon/MCP `duration` field onto chunked continuation: 0 when
@@ -2192,17 +2207,93 @@ public final class WarmServer {
     return min(100, max(0, Int((Double(done) / Double(total)) * 100.0)))
   }
 
-  /// comfybox#328: pure decision of whether video-prompt enhancement should
-  /// be skipped for a request's `beat_schedule`. `beat_schedule` beats are
-  /// located as verbatim substrings of the composed prompt — enhancement
-  /// rewrites that prompt wholesale, so running both together silently
-  /// drops every beat. Beats are the more specific ask: a non-empty
-  /// `beat_schedule` always wins, independent of `enhance`. Returns the
-  /// skip reason (stamped onto the response/trace as `enhancement_skipped`)
-  /// or nil when enhancement should proceed as normal.
-  static func beatScheduleEnhancementSkip(beatSchedule: [BeatSegment]?) -> String? {
-    guard let beatSchedule, !beatSchedule.isEmpty else { return nil }
-    return "beat_schedule"
+  /// Outcome of `resolveVideoEnhancement`: the prompt to render with, and
+  /// whether/why enhancement did or didn't run.
+  struct VideoEnhancementOutcome: Equatable {
+    let effectivePrompt: String
+    let enhancedApplied: Bool
+    /// comfybox#328: non-nil (`"beat_schedule"`) ONLY when a non-empty,
+    /// ACTIVE beat_schedule caused enhancement to be skipped — i.e.
+    /// enhancement would otherwise actually have run. Never set when
+    /// enhancement was already not going to run for an unrelated reason
+    /// (`enhance:false`, no provider configured, kill switch off) — Codex
+    /// round 1, finding 3: a false "beat_schedule" marker is worse than none.
+    let enhancementSkippedReason: String?
+  }
+
+  /// comfybox#328 (Codex round 1, finding 1): the beat-schedule-vs-
+  /// enhancement decision AND the enhancement call itself, extracted so a
+  /// unit test can inject a spy `optimize` closure and prove — without any
+  /// network call, model weights, or running server — that the optimizer is
+  /// never invoked when beats are present, and that the composed prompt
+  /// retains every beat's exact text.
+  ///
+  /// `beat_schedule` beats are located as VERBATIM substrings of the
+  /// composed prompt (`LTX2BeatScheduleLocator`, matched against the exact
+  /// text the tokenizer receives — see `LTX2VideoGenerator`). LLM
+  /// enhancement rewrites the prompt wholesale, so none of the caller's beat
+  /// phrasing survives and every beat silently fails to locate (fail-open,
+  /// one warning each) whenever both would otherwise run together. Beats are
+  /// the more specific ask: a non-empty, ACTIVE `beat_schedule` skips
+  /// enhancement outright — but ONLY when enhancement would otherwise
+  /// actually run (`enhance != false`, a provider configured, and the
+  /// `beat_schedule_enabled` kill switch not set) — see finding 3 above.
+  static func resolveVideoEnhancement(
+    prompt: String,
+    enhance: Bool?,
+    beatSchedule: [BeatSegment]?,
+    beatScheduleEnabled: Bool,
+    characterName: String?,
+    characterDesc: String?,
+    contentMode: String,
+    mediaKind: String,
+    optimizerEndpoint: AIProviderEndpoint?,
+    logger: Logger,
+    optimize: (
+      _ endpoint: AIProviderEndpoint, _ prompt: String, _ character: String?,
+      _ characterDescription: String?, _ contentMode: String, _ mediaKind: String
+    ) async -> OptimizeResult
+  ) async -> VideoEnhancementOutcome {
+    let hasBeats = !(beatSchedule?.isEmpty ?? true)
+    let beatsActive = hasBeats && beatScheduleEnabled
+    let wouldEnhanceOtherwise = enhance != false && optimizerEndpoint != nil
+
+    if beatsActive && wouldEnhanceOtherwise {
+      logger.warning(
+        "Video: skipping prompt enhancement — beat_schedule present (\(beatSchedule?.count ?? 0) beat(s)); enhancement rewrites the prompt and would strand every beat (comfybox#328).")
+      return VideoEnhancementOutcome(effectivePrompt: prompt, enhancedApplied: false, enhancementSkippedReason: "beat_schedule")
+    }
+    guard enhance != false, let endpoint = optimizerEndpoint else {
+      return VideoEnhancementOutcome(effectivePrompt: prompt, enhancedApplied: false, enhancementSkippedReason: nil)
+    }
+    let result = await optimize(endpoint, prompt, characterName, characterDesc, contentMode, mediaKind)
+    if result.enhanced {
+      logger.info("Video: enhanced prompt via \(endpoint.model)\(characterName.map { " (character \($0))" } ?? "").")
+      return VideoEnhancementOutcome(effectivePrompt: result.prompt, enhancedApplied: true, enhancementSkippedReason: nil)
+    }
+    return VideoEnhancementOutcome(effectivePrompt: prompt, enhancedApplied: false, enhancementSkippedReason: nil)
+  }
+
+  /// Production `optimize` closure for `resolveVideoEnhancement` — builds the
+  /// PromptOptimizer and calls it. The ONLY place a network call happens;
+  /// unit tests inject a spy instead.
+  private func callPromptOptimizer(
+    endpoint: AIProviderEndpoint, prompt: String, character: String?,
+    characterDescription: String?, contentMode: String, mediaKind: String
+  ) async -> OptimizeResult {
+    var base = endpoint.baseUrl
+    while base.hasSuffix("/") { base.removeLast() }
+    if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
+    while base.hasSuffix("/") { base.removeLast() }
+    let optimizer = PromptOptimizer(
+      configuration: PromptOptimizer.Configuration(
+        ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
+        timeoutSeconds: 90, enabled: true),
+      logger: logger)
+    // i2v: motion-only enhancement (the init image fixes subject/scene); t2v: full scene.
+    return await optimizer.optimize(
+      prompt: prompt, character: character, characterDescription: characterDescription,
+      contentMode: contentMode, mediaKind: mediaKind)
   }
 
   /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
@@ -2366,8 +2457,6 @@ public final class WarmServer {
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
     }
 
-    var effectivePrompt = req.prompt
-
     // Character identity + optional prompt enhancement. For T2V (no init image)
     // there is no other identity source, so default to "kira" when the caller
     // names no character. For I2V the init image already carries identity.
@@ -2378,6 +2467,26 @@ public final class WarmServer {
     if let name = characterName,
        let entry = await characterStore.get(CharacterEntry.slug(name)) {
       characterDesc = entry.resolvedDescription(for: charMode)
+    }
+
+    // comfybox#328 (Codex round 1, finding 5): temporal beat scheduling is
+    // T2V-only — `LTX2VideoGenerator` never forwards resolved beats into any
+    // I2V render path (its I2V branches don't take a beat parameter), so a
+    // `beat_schedule` on an I2V request was a SILENT no-op — locate could
+    // even succeed and the bias would still be thrown away downstream.
+    // Rather than wire beats into I2V in this PR (I2V's frame axis and
+    // keyframe chaining differ enough from T2V's single continuous timeline
+    // to need its own design), make the no-op loud: strip the schedule
+    // before it reaches the generator and record why.
+    var beatScheduleIgnoredReason: String? = nil
+    let effectiveBeatSchedule: [BeatSegment]?
+    if !isT2V, let beats = req.beatSchedule, !beats.isEmpty {
+      beatScheduleIgnoredReason = "i2v_unsupported"
+      effectiveBeatSchedule = nil
+      logger.warning(
+        "Video: beat_schedule ignored — I2V rendering doesn't support temporal beat scheduling yet (\(beats.count) beat(s) dropped, comfybox#328: T2V-only). Send a T2V request (no image_path) for beat_schedule.")
+    } else {
+      effectiveBeatSchedule = req.beatSchedule
     }
 
     // Auto-enhance the video prompt through the configured prompt-optimization
@@ -2391,37 +2500,33 @@ public final class WarmServer {
     // the exact text the tokenizer receives — see LTX2VideoGenerator). The
     // dolphin enhancement rewrites the prompt wholesale, so none of the
     // caller's beat phrasing survives and every beat silently fails to
-    // locate (fail-open, one warning each) whenever both features are
-    // requested together — which is the default, since enhancement defaults
-    // on. Beats are the more specific ask: a non-empty `beat_schedule` skips
-    // enhancement outright rather than let it neutralize the schedule.
-    var enhancedApplied = false
-    let enhancementSkippedReason = Self.beatScheduleEnhancementSkip(beatSchedule: req.beatSchedule)
+    // locate (fail-open, one warning each) whenever both would otherwise run
+    // together. Beats are the more specific ask: a non-empty, ACTIVE
+    // `beat_schedule` skips enhancement outright — but ONLY when enhancement
+    // would otherwise actually run (`enhance != false`, a provider
+    // configured, kill switch on), so the trace marker below is never a
+    // false claim (Codex round 1, finding 3). `effectiveBeatSchedule` (not
+    // `req.beatSchedule`) feeds this — an I2V-ignored schedule shouldn't
+    // also cost enhancement quality for beats that will never apply.
     let aiProviderConfig = ComfyBoxServerConfig.loadOrMigrate()
-    if let reason = enhancementSkippedReason {
-      logger.warning(
-        "Video: skipping prompt enhancement — \(reason) present (\(req.beatSchedule?.count ?? 0) beat(s)); enhancement rewrites the prompt and would strand every beat (comfybox#328).")
-    } else if req.enhance != false, let endpoint = aiProviderConfig.providers.promptOptimization {
-      var base = endpoint.baseUrl
-      while base.hasSuffix("/") { base.removeLast() }
-      if base.hasSuffix("/v1") { base = String(base.dropLast(3)) }
-      while base.hasSuffix("/") { base.removeLast() }
-      let optimizer = PromptOptimizer(
-        configuration: PromptOptimizer.Configuration(
-          ollamaBaseURL: base, lmStudioBaseURL: nil, model: endpoint.model,
-          timeoutSeconds: 90, enabled: true),
-        logger: logger)
-      // i2v: motion-only enhancement (the init image fixes subject/scene); t2v: full scene.
-      let result = await optimizer.optimize(
-        prompt: req.prompt, character: characterName,
-        characterDescription: characterDesc, contentMode: charMode.rawValue,
-        mediaKind: isT2V ? "video" : "video-i2v")
-      if result.enhanced {
-        effectivePrompt = result.prompt
-        enhancedApplied = true
-        logger.info("Video: enhanced prompt via \(endpoint.model)\(characterName.map { " (character \($0))" } ?? "").")
-      }
-    }
+    let beatScheduleEnabled = LTX2ConfigResolver.resolveTyped(
+      request: req.tuning, preset: videoPreset?.videoTuning
+    ).beatScheduleEnabled
+    let enhancement = await Self.resolveVideoEnhancement(
+      prompt: req.prompt,
+      enhance: req.enhance,
+      beatSchedule: effectiveBeatSchedule,
+      beatScheduleEnabled: beatScheduleEnabled,
+      characterName: characterName,
+      characterDesc: characterDesc,
+      contentMode: charMode.rawValue,
+      mediaKind: isT2V ? "video" : "video-i2v",
+      optimizerEndpoint: aiProviderConfig.providers.promptOptimization,
+      logger: logger,
+      optimize: callPromptOptimizer)
+    var effectivePrompt = enhancement.effectivePrompt
+    let enhancedApplied = enhancement.enhancedApplied
+    let enhancementSkippedReason = enhancement.enhancementSkippedReason
 
     // Fallback: manual character prepend when enhancement didn't run/apply.
     // Skipped outright when the caller says it already wove the description in
@@ -2513,7 +2618,7 @@ public final class WarmServer {
       tuning: req.tuning,
       presetTuning: videoPreset?.videoTuning,
       audio: req.audio ?? false,
-      beatSchedule: req.beatSchedule
+      beatSchedule: effectiveBeatSchedule
     )
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
@@ -2524,7 +2629,8 @@ public final class WarmServer {
       mode: (effectiveInitImage?.isEmpty == false) ? .i2v : .t2v,
       source: req.source ?? "api",
       optimizationAttemptId: req.optimizationAttemptId,
-      enhancementSkippedReason: enhancementSkippedReason)
+      enhancementSkippedReason: enhancementSkippedReason,
+      beatScheduleIgnoredReason: beatScheduleIgnoredReason)
   }
 
   /// If LTX-2 is configured, ASYNC-submit the local render and return 202 + a
@@ -2545,11 +2651,15 @@ public final class WarmServer {
       if let attemptId = prep.optimizationAttemptId {
         tracePayload["optimization_attempt_id"] = attemptId
       }
-      // comfybox#328: visible on GET /v1/video/traces — confirms a
-      // beat_schedule request actually skipped enhancement instead of
-      // silently losing its beats to the rewrite.
+      // comfybox#328: visible on GET /v1/video/traces (RenderTraceStore.
+      // TraceSummary carries both fields explicitly — see finding 2) —
+      // confirms a beat_schedule request actually skipped enhancement
+      // instead of silently losing its beats to the rewrite.
       if let reason = prep.enhancementSkippedReason {
         tracePayload["enhancement_skipped"] = reason
+      }
+      if let reason = prep.beatScheduleIgnoredReason {
+        tracePayload["beat_schedule_ignored"] = reason
       }
       // Winner actions (2026-08-10): store the sanitized request + the
       // resolved seed/dims so this render_id is replayable — /v1/video/rerender
@@ -2764,7 +2874,8 @@ public final class WarmServer {
         durationSeconds: result.durationSeconds,
         elapsedSeconds: result.elapsedSeconds,
         backend: "ltx2-local",
-        enhancementSkipped: prep.enhancementSkippedReason
+        enhancementSkipped: prep.enhancementSkippedReason,
+        beatScheduleIgnored: prep.beatScheduleIgnoredReason
       ))
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
