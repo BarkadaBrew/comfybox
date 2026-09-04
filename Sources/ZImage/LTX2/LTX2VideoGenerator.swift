@@ -1002,16 +1002,20 @@ public final class LTX2VideoGenerator {
         // render's activations, via defer) EVERY render.
         GPU.clearCache()
         defer { GPU.clearCache() }
-        // comfybox#322: an interrupted render must leave no half-written clip
-        // behind. `writeMP4` writes STRAIGHT to `outputPath` (unlinking
-        // whatever was there first), so a cancel landing mid-write leaves a
-        // truncated MP4 that looks like a finished render.
+        // comfybox#322 (claim corrected in review r1): what actually guarantees
+        // an interrupted render produces no clip is the `Task
+        // .checkCancellation()` immediately BEFORE `writeMP4` — the write is
+        // synchronous, so cancellation cannot preempt it part-way and there is
+        // no "cancel lands mid-write" case to catch.
         //
-        // The window is deliberately narrow — between the two flags — so this
-        // never deletes a file the render did not create: a cancel BEFORE the
-        // write leaves any pre-existing file at that path alone, and a
-        // completed write is kept. A #1479 yield is not a cancellation, so a
-        // preempted render keeps everything and resumes.
+        // This defer covers the narrower real one: `writeMP4` unlinks
+        // `outputPath` and writes straight to it, so if it THROWS (an I/O
+        // error, a full disk) after the task was already cancelled, it leaves a
+        // truncated file that reads as finished output. The window is between
+        // the two flags, so this never deletes a file the render did not
+        // create: a cancel before the write leaves any pre-existing file alone,
+        // and a completed write is kept. A #1479 yield is not a cancellation,
+        // so a preempted render keeps everything and resumes.
         var startedWrite = false
         var wroteOutput = false
         defer {
@@ -1091,6 +1095,12 @@ public final class LTX2VideoGenerator {
         // against a phantom phase. `LTX2PhaseTelemetry.end` removes the open
         // entry, so it is safe to call once per `begin` and a no-op after —
         // the `do` block scopes this one to exactly the load.
+        // comfybox#322 (review r1): the model load is the single most expensive
+        // non-denoise phase (tens of GB, tens of seconds, and uninterruptible
+        // once it starts). An interrupt that arrived while this job waited its
+        // turn, or during text encode, must not pay for it. #1479 already had a
+        // free unwind point here for preemption; this is its cancellation twin.
+        try Task.checkCancellation()
         telemetry?.begin(.modelLoad)
         do {
             defer { telemetry?.end(.modelLoad) }

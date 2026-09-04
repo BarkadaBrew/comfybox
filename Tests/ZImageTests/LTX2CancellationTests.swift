@@ -189,6 +189,11 @@ final class LTX2CancellationTests: XCTestCase {
   func testInterruptClassification() {
     XCTAssertTrue(isRenderInterruption(CancellationError()))
     XCTAssertTrue(isRenderInterruption(WarmServerError.renderInterrupted))
+    XCTAssertTrue(
+      isRenderInterruption(
+        ZImageWeightsMapping.WeightApplicationError.updateFailed(
+          prefix: "transformer", underlying: CancellationError())),
+      "a WRAPPED cancellation is still an interrupt (review r1)")
     XCTAssertFalse(isRenderInterruption(WarmServerError.invalidRequest(message: "nope")))
     XCTAssertFalse(isRenderInterruption(LTX2VideoError.weightsMissing("/nowhere")))
     XCTAssertFalse(
@@ -236,6 +241,52 @@ final class LTX2CancellationTests: XCTestCase {
     XCTAssertEqual(status?.status, .failed)
     XCTAssertNil(status?.interrupted, "a genuine failure must not be relabelled")
     XCTAssertEqual(status?.error, "bad dims")
+  }
+
+  // MARK: - comfybox#322 review r1: wrapped cancellations
+
+  /// The load and weight-application paths a render walks wrap errors in
+  /// `case x(String, Error)` enums. A wrapped `CancellationError` reaching
+  /// `LTX2Pipeline.nonPreemptible`'s `preconditionFailure` would kill the whole
+  /// process on an interrupt, so the unwrapping is structural (`Mirror`) rather
+  /// than a list of wrapper types that a new one could fall outside of.
+  func testWrappedCancellationIsRecognised() {
+    XCTAssertTrue(ltx2IsCancellation(CancellationError()), "the bare case")
+
+    XCTAssertTrue(
+      ltx2IsCancellation(
+        ZImageWeightsMapping.WeightApplicationError.updateFailed(
+          prefix: "transformer", underlying: CancellationError())),
+      "labelled associated value")
+
+    XCTAssertTrue(
+      ltx2IsCancellation(ModelPoolError.loadFailed("krea2", CancellationError())),
+      "unlabelled tuple payload — the shape most of these wrappers use")
+
+    XCTAssertTrue(
+      ltx2IsCancellation(
+        ModelPoolError.loadFailed(
+          "outer",
+          ZImageWeightsMapping.WeightApplicationError.updateFailed(
+            prefix: "inner", underlying: CancellationError()))),
+      "nested two deep")
+  }
+
+  /// …and nothing else is mistaken for one. A real failure that merely CARRIES
+  /// another error must still be reported as a failure.
+  func testNonCancellationErrorsAreNotMisreadAsInterrupts() {
+    XCTAssertFalse(ltx2IsCancellation(WarmServerError.invalidRequest(message: "bad dims")))
+    XCTAssertFalse(ltx2IsCancellation(LTX2VideoError.weightsMissing("/nowhere")))
+    XCTAssertFalse(
+      ltx2IsCancellation(
+        ModelPoolError.loadFailed("krea2", LTX2VideoError.unsupportedPlatform)),
+      "a wrapper around a genuine failure is a genuine failure")
+    XCTAssertFalse(
+      ltx2IsCancellation(
+        LTX2ResumeError.sigmaScheduleMismatch(
+          checkpoint: Array(repeating: 1.0, count: 64),
+          current: Array(repeating: 2.0, count: 64), firstDifferingIndex: 0)),
+      "a large payload must not be walked into a false positive")
   }
 
   /// The additive field is absent from the JSON on every non-interrupted

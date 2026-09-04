@@ -2904,12 +2904,15 @@ public final class WarmServer {
     } catch let error as LTX2VideoError {
       return .error(.error(status: 400, message: error.localizedDescription))
     } catch {
-      // comfybox#322: an operator interrupt is not a server failure. 499
-      // (client-closed / cancelled) rather than 500, with a sentence naming
-      // the cause instead of the bare "CancellationError()".
+      // comfybox#322: an operator interrupt is not a server failure, but the
+      // STATUS CODE stays 500 (review r1 ruling): images and video must match,
+      // and introducing a 499 would be an unversioned HTTP-level change to a
+      // production contract (intent.md) — a separate decision from this fix.
+      // The message names the cause instead of the bare "CancellationError()",
+      // and the async status JSON carries `interrupted: true`.
       if isRenderInterruption(error) {
         logger.info("LTX-2: synchronous video render interrupted by /v1/queue/interrupt.")
-        return .error(.error(status: 499, message: "LTX-2 video interrupted by /v1/queue/interrupt"))
+        return .error(.error(status: 500, message: "LTX-2 video interrupted by /v1/queue/interrupt"))
       }
       return .error(.error(status: 500, message: "LTX-2 video failed: \(error.localizedDescription)"))
     }
@@ -4661,6 +4664,11 @@ public final class WarmServer {
         } catch let error as StoryboardError {
           throw error
         } catch {
+          // comfybox#322: never launder an interrupt into a shot failure.
+          // `shotFailed` keeps only a message STRING, so wrapping destroys the
+          // `CancellationError` the trackers classify on — the storyboard job
+          // would report "failed: CancellationError()" instead of interrupted.
+          if ltx2IsCancellation(error) { throw error }
           throw StoryboardError.shotFailed(shot: i, stage: "insert", message: error.localizedDescription)
         }
       }
@@ -4707,6 +4715,11 @@ public final class WarmServer {
       } catch let error as StoryboardError {
         throw error
       } catch {
+        // comfybox#322: same as the insert stage above — an interrupted shot is
+        // an interrupted storyboard, not a failed one. This is also the path a
+        // cancelled `generate()` (non-preemptible) shot takes out of
+        // `LTX2Pipeline.nonPreemptible`.
+        if ltx2IsCancellation(error) { throw error }
         throw StoryboardError.shotFailed(shot: i, stage: "i2v", message: error.localizedDescription)
       }
       clips.append(shotResult.outputPath)
@@ -5266,10 +5279,13 @@ public final class WarmServer {
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidPort:
         return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
-      // comfybox#322: an operator interrupt is not a server fault — 499
-      // (cancelled), the same code the synchronous video route reports.
+      // comfybox#322: an operator interrupt is not a server fault, but it
+      // reports 500 like every other terminal error here (review r1 ruling —
+      // no unversioned HTTP change; images and video must match). The
+      // `interrupted: true` field on the job status is the machine-readable
+      // signal.
       case .renderInterrupted:
-        return .error(status: 499, message: error.localizedDescription ?? error.localizedDescription)
+        return .error(status: 500, message: error.localizedDescription ?? error.localizedDescription)
       }
 
     case let error as Flux2Pipeline.Flux2PipelineError:
@@ -6770,6 +6786,29 @@ private actor WarmServerCoordinator {
     return (admitVideo, Int(availableForVideo >> 20), Int(ltx2Need >> 20))
   }
 
+  #if DEBUG
+  /// comfybox#322 test seam. The #218 admission gate needs ~65-80GB of real
+  /// free RAM, which no unit test can arrange on a machine that is also
+  /// serving production — so the coordinator seam tests (which exist to prove
+  /// the `.localVideo` case PUBLISHES a cancellable render task, not to
+  /// re-test admission) skip the gate. Same precedent as the `.synthetic`
+  /// queue kind: `#if DEBUG`, never compiled into the shipped engine, and only
+  /// `WarmServerQueueProbe` can set it.
+  var bypassVideoAdmissionForTests = false
+  func setBypassVideoAdmission(_ value: Bool) { bypassVideoAdmissionForTests = value }
+  #endif
+
+  /// The admission decision for a `.localVideo` job, in one place so the queue
+  /// case reads the same gate a resume does.
+  private func admitVideoForRender(
+    wantsAudio: Bool
+  ) async -> (admitted: Bool, availableMB: Int, neededMB: Int) {
+    #if DEBUG
+    if bypassVideoAdmissionForTests { return (true, 0, 0) }
+    #endif
+    return await vacateImageModelsAndAdmitVideo(wantsAudio: wantsAudio)
+  }
+
   /// Reload (if needed) and resume the checkpointed video render.
   ///
   /// Runs the full #218/#34 admission gate (`vacateImageModelsAndAdmitVideo`)
@@ -6846,6 +6885,30 @@ private actor WarmServerCoordinator {
   private func ltx2ModelLoadTotalSec() -> Double {
     guard let p = ltx2Telemetry.view().phases["modelLoad"] else { return 0 }
     return p.meanSec * Double(p.samples)
+  }
+
+  /// comfybox#322 (review r1, Critical): run `work` to completion regardless of
+  /// whether THIS task is cancelled.
+  ///
+  /// The one caller is the preemption episode's image job. Structured
+  /// concurrency would be wrong there: the episode is awaited from inside the
+  /// video's render task, so a child task inherits the video's cancellation and
+  /// an interrupt aimed at the video takes an unrelated image render down with
+  /// it. An unstructured task inherits no cancellation, and `.value` on a
+  /// `Task<Void, Never>` is non-throwing, so this returns only when `work` has
+  /// actually finished.
+  ///
+  /// Isolation note: `work` is a `@Sendable` closure, so it is nonisolated and
+  /// hops back onto this actor at its own `await`. The window that opens while
+  /// this task is suspended is the same one `runGenerate`'s own first `await`
+  /// already opened before this shield existed — no new reentrancy, and the
+  /// queue loop stays parked on the video render task throughout.
+  ///
+  /// Exposed to `WarmServerQueueProbe` (DEBUG) so a test can prove the shielded
+  /// work does NOT observe the caller's cancellation.
+  func runShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) async {
+    let shielded = Task { await work() }
+    await shielded.value
   }
 
   /// The full preemption episode: checkpoint received -> evict the video
@@ -6929,6 +6992,13 @@ private actor WarmServerCoordinator {
       // the signal was observed) — nothing left to run. Resume immediately.
       logger.warning("#1479: video yielded but no preemptor was waiting (checkpoint-fallback watchdog already handled it) — resuming immediately")
       clearEpisodeState()
+      // comfybox#322: …unless the video itself was interrupted. There is no
+      // preemptor to protect on this branch, so this is purely "do not bring
+      // a killed render back to life".
+      if LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo {
+        logger.info("#1479/#322: video interrupted with no preemptor pending — checkpoint dropped, no resume.")
+        throw CancellationError()
+      }
       return try await resumeCheckpointedVideo(state: state, wantsAudio: wantsAudio, report: report)
     }
 
@@ -6974,11 +7044,20 @@ private actor WarmServerCoordinator {
     // whenever a video is resident, #218) its own image-model reload. See
     // this function's doc comment (review I4) for why this is its own
     // do/catch rather than a bare call.
-    do {
-      await runGenerate(claimed.payload, continuation: claimed.continuation)
-    } catch {
-      logger.error("#1479: preempting image job threw past runGenerate's own boundary (\(error)) — resuming the video anyway")
-    }
+    // comfybox#322 (review r1, Critical): SHIELDED. This episode runs inside
+    // the video's render task, and `runGenerate` has been cancellation-aware
+    // since comfybox#304 — so the plain `await` that used to be here inherited
+    // the video's cancellation, and `/v1/queue/interrupt` aimed at the video
+    // killed the preempting IMAGE job mid-denoise. That is exactly the "died
+    // as cancel collateral with an opaque error" failure #322 exists to end.
+    // `runShieldedFromCancellation` runs it in an unstructured task, which
+    // does not inherit cancellation, and waits for it either way.
+    //
+    // This also replaces the old do/catch guardrail with a STATIC one: the
+    // shield takes a non-throwing closure, so if `runGenerate` ever grows a
+    // `throws` this stops compiling — louder than a `catch` that logs and
+    // carries on.
+    await runShieldedFromCancellation { await self.runGenerate(claimed.payload, continuation: claimed.continuation) }
 
     // Restore the video's identity — symmetric with the swap above, and done
     // BEFORE its (possibly long, synchronous) resume so /health, /v1/queue and
@@ -6997,6 +7076,20 @@ private actor WarmServerCoordinator {
 
     // Clear BEFORE the resume, not in the defer (review I2) — see doc comment.
     clearEpisodeState()
+
+    // comfybox#322 (review r1, Critical): the operator may have interrupted the
+    // video while the preemptor ran. The preemptor was protected above and has
+    // finished normally; the video's checkpoint is dropped here rather than
+    // resumed — carrying on for another 20 minutes would defeat the interrupt
+    // entirely. `clearEpisodeState()` above already released the checkpoint and
+    // the in-flight flag, and the video weights were evicted at the top of this
+    // episode and are deliberately NOT reloaded: an operator who interrupted to
+    // free the box gets the box. `CancellationError` propagates to the queue
+    // case, which reports the job interrupted.
+    if LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo {
+      logger.info("#1479/#322: video interrupted during the preemption episode — preemptor completed normally, video checkpoint dropped (no resume).")
+      throw CancellationError()
+    }
 
     // Review round 2, finding 1: snapshot the REAL instrument (modelLoad
     // phase telemetry), not a wall clock around the whole resume call — the
@@ -8152,40 +8245,72 @@ private actor WarmServerCoordinator {
         activeRenderStartedAt = Date()
         // activeJobId is set from job.id at the top of the loop.
         defer { activeRenderStartedAt = nil; activeJobId = nil }
-        // #218: single-heavy-model residency. Right before the ~65GB LTX-2
-        // stack loads inside body(), vacate ALL image models (pool + per-family
-        // pipelines), then verify there is enough physical RAM to proceed —
-        // refuse cleanly instead of OOM-killing the whole process. Doing this
-        // on the serial render queue guarantees no image render can re-load
-        // between the eviction and the video load. Extracted into
-        // `vacateImageModelsAndAdmitVideo` (#1479, review C2) so a preemption
-        // resume can run the EXACT SAME gate before resuming — the preempting
-        // image job loaded its own weights while the video was evicted, and
-        // resuming into whatever memory is left without re-checking is the
-        // documented SIGKILL condition this gate exists to prevent.
-        let admission = await vacateImageModelsAndAdmitVideo(wantsAudio: wantsAudio)
-        if !admission.admitted {
-          continuation.resume(throwing: WarmServerError.invalidRequest(
-            message: "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"))
-        } else {
-          videoHolder.beginRender()
-          // Stream render progress into the lock-based trackers /health + /queue
-          // read, exactly like the image path. Both trackers are Sendable, so the
-          // off-actor @Sendable report closure can update them without an actor
-          // hop. Cleared on completion via defer.
-          let progress = self.progressTracker
-          let health = self.liveHealth
+        // Stream render progress into the lock-based trackers /health + /queue
+        // read, exactly like the image path. Both trackers are Sendable, so the
+        // off-actor @Sendable report closure can update them without an actor
+        // hop. Cleared on completion via the defer inside the task.
+        let progress = self.progressTracker
+        let health = self.liveHealth
+        let report: @Sendable (Int) -> Void = { pct in
+          progress.set(pct)
+          health.setProgress(pct)
+        }
+        // comfybox#322: run the render in a RETAINED child task and publish it,
+        // exactly as `.generate` / `.controlGenerate` do above. Before this,
+        // `.localVideo` was the one render case that never published a handle,
+        // so `activeRenderTask` stayed nil for the whole 5-60 minute clip and
+        // `/v1/queue/interrupt` answered `interrupted: false` — the interrupt
+        // could only stop the NEXT queue item. The LTX-2 loops
+        // (`LTX2LoopBoundary` / `Task.checkCancellation`) observe the
+        // cancellation this handle delivers.
+        //
+        // The task inherits this actor's isolation, so the render is still
+        // serialized on the coordinator exactly as before; `await
+        // renderTask.value` keeps the queue loop parked until it finishes.
+        //
+        // comfybox#322 (review r1, Important): the #218 admission gate lives
+        // INSIDE this task, not before it. Hoisted out, `await renderTask.value`
+        // suspended the actor between the gate and the weight load — a
+        // reentrancy window in which another actor-isolated caller (an image
+        // route's `poolLoad`, a queued model operation) could change residency
+        // after the gate had passed and before the ~65GB stack loaded, which is
+        // the documented #218/#34 SIGKILL condition. Gate and load now sit in
+        // one uninterrupted synchronous run of this task: nothing suspends
+        // between `vacateImageModelsAndAdmitVideo` returning and `body(report)`
+        // being entered.
+        let renderTask = Task {
+          // An interrupt that arrived while this job waited its turn: refuse
+          // before evicting every image model for a render nobody wants.
+          if Task.isCancelled {
+            self.logger.info("LTX-2: render interrupted before admission — nothing loaded, nothing evicted.")
+            continuation.resume(throwing: WarmServerError.renderInterrupted)
+            return
+          }
+          // #218: single-heavy-model residency. Right before the ~65GB LTX-2
+          // stack loads inside body(), vacate ALL image models (pool +
+          // per-family pipelines), then verify there is enough physical RAM to
+          // proceed — refuse cleanly instead of OOM-killing the whole process.
+          // Doing this on the serial render queue guarantees no image render
+          // can re-load between the eviction and the video load. Extracted into
+          // `vacateImageModelsAndAdmitVideo` (#1479, review C2) so a preemption
+          // resume can run the EXACT SAME gate before resuming — the preempting
+          // image job loaded its own weights while the video was evicted, and
+          // resuming into whatever memory is left without re-checking is the
+          // documented SIGKILL condition this gate exists to prevent.
+          let admission = await self.admitVideoForRender(wantsAudio: wantsAudio)
+          guard admission.admitted else {
+            continuation.resume(throwing: WarmServerError.invalidRequest(
+              message: "Insufficient memory for LTX-2 video: only \(admission.availableMB)MB free after evicting image models (need ~\(admission.neededMB)MB)"))
+            return
+          }
+          self.videoHolder.beginRender()
           progress.set(0)
           health.setProgress(0)
-          let report: @Sendable (Int) -> Void = { pct in
-            progress.set(pct)
-            health.setProgress(pct)
-          }
           defer {
-            videoHolder.endRender()
+            self.videoHolder.endRender()
             progress.set(nil)
             health.setProgress(nil)
-            ltx2StepPosition.clear()
+            self.ltx2StepPosition.clear()
             // #1479 (review C1): covers EVERY non-yielding exit from this
             // render's whole execution (initial body() completing/throwing,
             // a storyboard `.generate()` shot that never checks the signal
@@ -8195,51 +8320,37 @@ private actor WarmServerCoordinator {
             // hit the NEXT render's pre-load unwind point instantly (near-
             // zero-cost false checkpoint, bogus evict/reload sample). Clear
             // unconditionally; clearing an unraised signal is a no-op.
-            ltx2PreemptionSignal.clear()
+            self.ltx2PreemptionSignal.clear()
           }
-          // comfybox#322: run the render in a RETAINED child task and publish
-          // it, exactly as `.generate` / `.controlGenerate` do above. Before
-          // this, `.localVideo` was the one render case that never published a
-          // handle, so `activeRenderTask` stayed nil for the whole 5-60 minute
-          // clip and `/v1/queue/interrupt` answered `interrupted: false` — the
-          // interrupt could only stop the NEXT queue item. The LTX-2 loops
-          // (`LTX2LoopBoundary` / `Task.checkCancellation`) observe the
-          // cancellation this handle delivers.
-          //
-          // The task inherits this actor's isolation, so the render is still
-          // serialized on the coordinator exactly as before; `await
-          // renderTask.value` keeps the queue loop parked until it finishes.
-          let renderTask = Task {
-            do {
-              // #1479: body() may hand back a checkpoint instead of a finished
-              // clip (a `preempt: true` image job raised the signal). Loop
-              // rather than recurse: a resume can itself yield again (a second,
-              // later preemption), and each iteration is handled identically.
-              var outcome = try body(report)
-              while case .yielded(let state) = outcome {
-                outcome = try await self.runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
-              }
-              if case .completed(let result) = outcome {
-                continuation.resume(returning: result)
-              }
-            } catch is CancellationError {
-              // comfybox#322: an operator interrupt, not a failure. Named so
-              // the client sees why the render stopped instead of the opaque
-              // "CancellationError()" Todd reported on the 2026-08-30 incident.
-              // `VideoJobTracker.markFailed` recognises this case and reports
-              // the job interrupted rather than failed.
-              self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
-              continuation.resume(throwing: WarmServerError.renderInterrupted)
-            } catch {
-              continuation.resume(throwing: error)
+          do {
+            // #1479: body() may hand back a checkpoint instead of a finished
+            // clip (a `preempt: true` image job raised the signal). Loop
+            // rather than recurse: a resume can itself yield again (a second,
+            // later preemption), and each iteration is handled identically.
+            var outcome = try body(report)
+            while case .yielded(let state) = outcome {
+              outcome = try await self.runPreemptionEpisode(state: state, videoJobId: videoJobId, wantsAudio: wantsAudio, report: report)
             }
+            if case .completed(let result) = outcome {
+              continuation.resume(returning: result)
+            }
+          } catch is CancellationError {
+            // comfybox#322: an operator interrupt, not a failure. Named so
+            // the client sees why the render stopped instead of the opaque
+            // "CancellationError()" Todd reported on the 2026-08-30 incident.
+            // `VideoJobTracker.markFailed` recognises this case and reports
+            // the job interrupted rather than failed.
+            self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
+            continuation.resume(throwing: WarmServerError.renderInterrupted)
+          } catch {
+            continuation.resume(throwing: error)
           }
-          activeRenderTask = renderTask
-          liveHealth.setActiveRenderTask(renderTask)
-          await renderTask.value
-          activeRenderTask = nil
-          liveHealth.setActiveRenderTask(nil)
         }
+        activeRenderTask = renderTask
+        liveHealth.setActiveRenderTask(renderTask)
+        await renderTask.value
+        activeRenderTask = nil
+        liveHealth.setActiveRenderTask(nil)
       case .shutdown(let continuation):
         continuation.resume(
           returning: ShutdownResponse(
@@ -11098,8 +11209,12 @@ public enum WarmServerError: Error, LocalizedError {
 /// pipeline loop (the image path's #304 contract — propagate unmodified), and
 /// `WarmServerError.renderInterrupted`, the named form the video queue case
 /// substitutes so the client sees a sentence instead of "CancellationError()".
+/// A wrapped cancellation counts (review r1): `ltx2IsCancellation` unwraps the
+/// `case x(String, Error)` wrappers this codebase uses on the load/render paths,
+/// so a `CancellationError` that arrives inside one is still reported as an
+/// interrupt rather than as a render failure.
 func isRenderInterruption(_ error: Error) -> Bool {
-  if error is CancellationError { return true }
+  if ltx2IsCancellation(error) { return true }
   if case WarmServerError.renderInterrupted = error { return true }
   return false
 }
@@ -11270,5 +11385,39 @@ final class WarmServerQueueProbe: @unchecked Sendable {
 
   /// Pending ids in the raw actor-published snapshot (no delta compose).
   var snapshotPendingIds: [String] { liveHealth.read().0.pending.map { $0.id } }
+
+  // MARK: - comfybox#322 video-interrupt probe surface
+
+  /// Skip the #218 admission gate for `.localVideo` jobs (DEBUG only).
+  ///
+  /// The gate needs ~65-80GB of real free RAM. These tests exist to prove the
+  /// `.localVideo` queue case publishes a cancellable render task and that an
+  /// interrupt aimed at the video does not cancel a preemptor — not to re-test
+  /// admission, which `HeavyModelAdmissionTests` already covers with injected
+  /// byte figures.
+  func bypassVideoAdmission() async { await coordinator.setBypassVideoAdmission(true) }
+
+  /// Enqueue a `.localVideo` job through the REAL queue case — the same
+  /// `enqueueLocalVideo` seam `/v1/video/generate` uses. `body` receives the
+  /// progress reporter and runs on the coordinator's render task, so
+  /// `Task.isCancelled` inside it is what a real LTX-2 render observes.
+  func enqueueLocalVideo(
+    wantsAudio: Bool = false,
+    _ body: @escaping @Sendable (@escaping @Sendable (Int) -> Void) throws -> LTX2RenderOutcome
+  ) async throws -> LTX2VideoResult {
+    try await coordinator.enqueueLocalVideo(wantsAudio: wantsAudio, body)
+  }
+
+  /// Did this error come back as the named interrupt? `WarmServerError` is
+  /// public, but this keeps the test reading like the route does.
+  static func isInterrupted(_ error: Error) -> Bool { isRenderInterruption(error) }
+
+  /// The PRODUCTION shield the preemption episode wraps its image job in
+  /// (`runShieldedFromCancellation`) — the same function, not a copy — so a
+  /// test can cancel the caller and prove the shielded work neither observes
+  /// the cancellation nor stops early.
+  func runShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) async {
+    await coordinator.runShieldedFromCancellation(work)
+  }
 }
 #endif

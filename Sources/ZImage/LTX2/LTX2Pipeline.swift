@@ -183,14 +183,20 @@ public final class LTX2Pipeline {
     let outcome: LTX2PipelineOutcome
     do {
       outcome = try body()
-    } catch is CancellationError {
+    } catch {
       // comfybox#322: an operator interrupt is the ONE error a non-preemptible
       // render can legitimately throw now, and it is not a bug — rethrow it
-      // unmodified (the #304 contract) instead of tripping the precondition
-      // below, which would kill the whole process on every `/v1/queue/interrupt`
-      // that landed in a `generate()`-family render.
-      throw CancellationError()
-    } catch {
+      // instead of tripping the precondition below, which would kill the whole
+      // process on every `/v1/queue/interrupt` that landed in a
+      // `generate()`-family render (the CLI paths, a storyboard shot).
+      //
+      // `ltx2IsCancellation` rather than `is CancellationError` (review r1):
+      // the load and weight-application paths this render walks wrap errors in
+      // `case x(String, Error)` enums, and a wrapped cancellation reaching the
+      // `preconditionFailure` below would be exactly the process kill this
+      // branch exists to prevent. Rethrown as a bare `CancellationError` so the
+      // #304 contract holds for everything downstream.
+      if ltx2IsCancellation(error) { throw CancellationError() }
       logger.error("\(site): non-preemptible render threw \(error) — impossible without a resume state.")
       preconditionFailure("\(site): non-preemptible render threw \(error)")
     }
@@ -2216,6 +2222,10 @@ public final class LTX2Pipeline {
         logger.warning("VAE decode: FORCED plain above the safety gate (volume \(volume) > \(plainMaxVolume)) — output may be silently corrupt (mlx #3836).")
       }
       logger.info("VAE decode: plain single-pass (forced; volume \(volume) [\(latF)x\(latH)x\(latW)]).")
+      // comfybox#322 (review r1): plain decode is one uninterruptible kernel
+      // launch, so this check IS its whole cancellation story — the render
+      // stops here or not until the next phase boundary.
+      try Task.checkCancellation()
       return vae.decode(bf)
     case "tile":
       let tile = Int(env["LTX2_DECODE_TILE"] ?? "") ?? 16
@@ -2230,6 +2240,8 @@ public final class LTX2Pipeline {
         return try vae.decodeStreamed(bf)
       }
       logger.info("VAE decode: plain single-pass (volume \(volume) [\(latF)x\(latH)x\(latW)]) — under the safety gate.")
+      // comfybox#322 (review r1): see the forced-plain branch above.
+      try Task.checkCancellation()
       return vae.decode(bf)
     }
   }
