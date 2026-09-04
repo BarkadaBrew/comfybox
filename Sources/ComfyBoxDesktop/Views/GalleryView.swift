@@ -49,6 +49,11 @@ struct GalleryView: View {
     var onAnimate: ((DAMAsset) -> Void)?
     /// Send an image to the Inpaint tab.
     var onInpaint: ((DAMAsset) -> Void)?
+    /// Open an image in the Edit tab. Called with the asset and the LOCAL path
+    /// `mediaLocation(for:)` resolved for it — never the raw `absolutePath`,
+    /// which can differ from where the catalog actually found the file on
+    /// this Mac (see `AssetMediaSource`'s header comment).
+    var onEdit: ((DAMAsset, String) -> Void)?
     /// Canvas projects images can be added to (Add to Canvas menu).
     var canvasStore: CanvasStore?
     /// Incremented by the app's Cmd+F command; consumed to focus search.
@@ -130,9 +135,18 @@ struct GalleryView: View {
     /// the catalog backfill stamps it on 2,907 of the 2,994 rows in the live
     /// database, so leaving it out filed almost the whole library into a
     /// "Comfybox" persona section and left the main gallery showing 87 images.
-    static let mainSources: Set<String> = ["", "desktop", "comfyui", "comfybox"]
+    static let mainSources: Set<String> = ["", "desktop", "desktop-edit", "comfyui", "comfybox"]
     static func isMainSource(_ source: String?) -> Bool {
         mainSources.contains((source ?? "").lowercased())
+    }
+    /// The `personaFilter` value that makes an asset with this `source` visible —
+    /// nil (main gallery) for a main source, else the lowercased persona key
+    /// `filteredAssets` and the sidebar's persona sections both key on. Used by
+    /// "Edited from → Show" (X5) to land on the RIGHT section, not just "main":
+    /// setting `personaFilter = nil` for every reveal would leave a persona-section
+    /// original (e.g. a Kira/Bree render) still filtered out after "Show".
+    static func personaFilterKey(for source: String?) -> String? {
+        isMainSource(source) ? nil : (source ?? "").lowercased()
     }
     /// Distinct persona (non-main) sources present in the library, with counts.
     private var personaSources: [(name: String, count: Int)] {
@@ -314,7 +328,11 @@ struct GalleryView: View {
                     selectedAsset = nil
                     lightboxIndex = filteredAssets.firstIndex(where: { $0.id == target.id })
                 },
-                onSendToGenerate: onSendToGenerate
+                onSendToGenerate: onSendToGenerate,
+                onEdit: onEdit,
+                onSelectSource: { path, sourceAssetId in
+                    selectSource(path: path, sourceAssetId: sourceAssetId)
+                }
             )
             .frame(minWidth: 800, minHeight: 500)
         }
@@ -930,8 +948,11 @@ struct GalleryView: View {
                         if onAnimate != nil {
                             Button("Send to Motion (I2V)") { onAnimate?(asset) }
                         }
+                        if let onEdit, asset.isEditableImage, case .local(let localPath) = mediaSource(for: asset) {
+                            Button("Edit") { onEdit(asset, localPath) }
+                        }
                         if onInpaint != nil {
-                            Button("Edit / Inpaint") { onInpaint?(asset) }
+                            Button("Inpaint") { onInpaint?(asset) }
                         }
                         if mediaTools.hasMagick {
                             Menu("Export As") {
@@ -1063,6 +1084,43 @@ struct GalleryView: View {
         AssetMediaLocation(
             localPath: browser?.localPath(forID: asset.id) ?? asset.absolutePath,
             remoteURL: remoteURLs[asset.id])
+    }
+
+    /// `mediaLocation(for:)` resolved to the gate/disk/server answer — the
+    /// same decision `AssetDetailView.source` makes from the location this
+    /// view hands it, so Edit's local/remote gating never disagrees with the
+    /// detail pane's.
+    private func mediaSource(for asset: DAMAsset) -> AssetMediaSource {
+        AssetMediaSource.resolve(mediaLocation(for: asset), gateRevealed: contentGate.revealed)
+    }
+
+    /// "Edited from → Show": resolves the sidecar's recorded source (by asset id,
+    /// then by resolved local path) against the FULL asset list, then makes sure
+    /// it is actually visible before selecting it — the normal case for a
+    /// `desktop-edit` original is that today's search/persona/folder/favorite/
+    /// content-mode/character filter is hiding it, in which case the button would
+    /// otherwise silently do nothing (or, worse, `AssetDetailView`'s index lookup
+    /// would fall back to row 0 and show the wrong asset).
+    private func selectSource(path: String, sourceAssetId: String?) {
+        guard let match = Self.resolveSourceAsset(sourceAssetId: sourceAssetId, sourcePath: path, in: assets,
+                                                   localPath: { asset in
+                                                       if case .local(let lp) = mediaSource(for: asset) { return lp }
+                                                       return nil
+                                                   }) else { return }
+        if !filteredAssets.contains(where: { $0.id == match.id }) {
+            searchText = ""
+            // Not just "clear to main" — a persona-section original (source is
+            // Kira/Bree/etc., not one of `mainSources`) needs `personaFilter` SET
+            // to its own section, or it stays hidden behind the main-gallery view
+            // `personaFilter = nil` switches to.
+            personaFilter = Self.personaFilterKey(for: match.source)
+            folderFilter = .all
+            filterFavorites = false
+            filterContentMode = nil
+            filterCharacter = nil
+            filterLabel = nil
+        }
+        selectedAsset = match
     }
 
     /// Download a row whose bytes are on a server into the local output folder
@@ -2117,6 +2175,26 @@ struct GalleryView: View {
     /// membership filter from the store fetch above it.
     static func folderMembers(ids: Set<String>, from allAssets: [DAMAsset]) -> [DAMAsset] {
         allAssets.filter { ids.contains($0.id) }
+    }
+
+    /// Resolves the "Edited from" source asset for an edit sidecar's `source_path`
+    /// (and, when present, its `source_asset_id`) against the FULL asset list — not
+    /// `filteredAssets`, which excludes whatever the active search/persona/folder/
+    /// favorite/content-mode/character filter is hiding, and given derived edits are
+    /// filed under `desktop-edit`, the original is routinely outside that filter.
+    /// Tries the id first (survives the original having moved), then falls back to
+    /// matching the RESOLVED local path (`localPath`, the same local/remote decision
+    /// the grid makes) against the sidecar's recorded path.
+    static func resolveSourceAsset(sourceAssetId: String?, sourcePath: String,
+                                   in allAssets: [DAMAsset], localPath: (DAMAsset) -> String?) -> DAMAsset? {
+        if let sourceAssetId, let match = allAssets.first(where: { $0.id == sourceAssetId }) {
+            return match
+        }
+        let target = (sourcePath as NSString).standardizingPath
+        return allAssets.first { asset in
+            guard let lp = localPath(asset) else { return false }
+            return (lp as NSString).standardizingPath == target
+        }
     }
 
     /// Runs the archive via `GalleryArchiver`, mirroring the import strip's
