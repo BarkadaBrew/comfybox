@@ -31,9 +31,21 @@ struct ModelPoolListResponse: Encodable, Sendable {
   let pool: [ModelPoolStatus]
   let totalVramMB: Int
   let budgetMB: Int
+  /// #282 (`warm_default_stack`) — the LoRA stack a request that carries
+  /// NEITHER `preset` NOR `loras` renders with, i.e. what the last
+  /// `POST /v1/lora/swap` published (or the engine's launch-time `--lora`
+  /// arguments before any swap).
+  ///
+  /// Additive, and the only way a daemon can see the warm default at all: a
+  /// swap no longer mutates a shared stack that later jobs inherit, so
+  /// `/health.loras` — which reports what is RESIDENT, i.e. the last job's
+  /// stack — is no longer the same question. nil (key absent) on a response
+  /// built by anything that does not know the coordinator's default.
+  var warmDefaultStack: [LoRAState]? = nil
 
   enum CodingKeys: String, CodingKey {
     case active, pool, totalVramMB = "total_vram_mb", budgetMB = "budget_mb"
+    case warmDefaultStack = "warm_default_stack"
   }
 }
 

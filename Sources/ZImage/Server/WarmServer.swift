@@ -742,7 +742,8 @@ public final class WarmServer {
             appliedLoras: result.appliedLoras, presetUnresolved: result.presetUnresolved,
             presetUnresolvedReason: result.presetUnresolvedReason,
             presetStackMismatch: result.presetStackMismatch,
-            memoryEstimateBytes: result.memoryEstimateBytes, memoryAvailableBytes: result.memoryAvailableBytes)
+            memoryEstimateBytes: result.memoryEstimateBytes, memoryAvailableBytes: result.memoryAvailableBytes,
+            loraStackOrigin: result.loraStackOrigin)
           return .json(status: 200, payload: stamped)
         }
       } catch {
@@ -6312,6 +6313,10 @@ public struct ImageJobStatus: Codable, Sendable {
   /// response carries, set at accept time (before the job runs).
   public let memoryEstimateBytes: UInt64?
   public let memoryAvailableBytes: UInt64?
+  /// #282: `lora_stack_origin` — `request` | `preset` | `warm_default`. Known
+  /// only once the job DEQUEUES (the warm default is read then, not at
+  /// submit), so it is absent on the 202 and on a job that never ran.
+  public let loraStackOrigin: String?
 
   /// The record itself; see ``AppliedRecordSlot`` for absent-vs-null.
   public var appliedRecord: RenderRecipe? { applied?.record }
@@ -6322,7 +6327,8 @@ public struct ImageJobStatus: Codable, Sendable {
     applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
     presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
     presetStackMismatch: Bool? = nil,
-    memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil
+    memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
+    loraStackOrigin: String? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -6340,6 +6346,7 @@ public struct ImageJobStatus: Codable, Sendable {
     self.presetStackMismatch = presetStackMismatch
     self.memoryEstimateBytes = memoryEstimateBytes
     self.memoryAvailableBytes = memoryAvailableBytes
+    self.loraStackOrigin = loraStackOrigin
   }
 }
 
@@ -6369,6 +6376,8 @@ private final class ImageJob: @unchecked Sendable {
   /// `job.memoryEstimateBytes = payload.memoryEstimateBytes` at submit.
   var memoryEstimateBytes: UInt64?
   var memoryAvailableBytes: UInt64?
+  /// #282: set from the result, since the origin is only decided at dequeue.
+  var loraStackOrigin: String?
 
   init(id: String, source: String) {
     self.id = id
@@ -6388,7 +6397,8 @@ private final class ImageJob: @unchecked Sendable {
       appliedLoras: appliedLoras, presetUnresolved: presetUnresolved,
       presetUnresolvedReason: presetUnresolvedReason,
       presetStackMismatch: presetStackMismatch,
-      memoryEstimateBytes: memoryEstimateBytes, memoryAvailableBytes: memoryAvailableBytes
+      memoryEstimateBytes: memoryEstimateBytes, memoryAvailableBytes: memoryAvailableBytes,
+      loraStackOrigin: loraStackOrigin
     )
   }
 }
@@ -6546,6 +6556,7 @@ final class ImageJobTracker: @unchecked Sendable {
       job.presetUnresolved = result.presetUnresolved ?? job.presetUnresolved
       job.presetUnresolvedReason = result.presetUnresolvedReason ?? job.presetUnresolvedReason
       job.presetStackMismatch = result.presetStackMismatch ?? job.presetStackMismatch
+      job.loraStackOrigin = result.loraStackOrigin ?? job.loraStackOrigin
       job.completedAt = Date()
     }
     lock.unlock()
@@ -6917,7 +6928,22 @@ private actor WarmServerCoordinator {
   /// Lazy-initialized ControlNet pipeline — only created when first ControlNet request arrives.
   private var controlPipeline: ZImageControlPipeline?
   private let startTime = Date()
+  /// What the ACTIVE pipeline currently holds — the engine's belief about
+  /// residency, reconciled from the pipeline on pool activation and published
+  /// as `/health.loras`. Since #282 this is a CONSEQUENCE of the last job's
+  /// resolved stack, never an input to the next one's.
   private var activeLoRAs: [LoRAConfiguration]
+  /// #282 — the WARM DEFAULT stack: the stack a request that named neither
+  /// `preset` nor `loras` renders with.
+  ///
+  /// This is the whole of what `POST /v1/lora/swap` now does. The route, its
+  /// payload and its response JSON are unchanged (the daemon contract is
+  /// production), but a swap no longer publishes a stack that later jobs
+  /// silently inherit — it publishes a DEFAULT, and a job picks it up only by
+  /// asking for nothing. Seeded from the engine's launch-time `--lora`
+  /// arguments so a bare render behaves identically to before on a boot that
+  /// declared them.
+  private var warmDefaultStack: [LoRAConfiguration]
   /// A queued operation tagged with identity + arrival time so the queue can
   /// be listed and individual pending jobs cancelled.
   private struct PendingJob {
@@ -7138,6 +7164,7 @@ private actor WarmServerCoordinator {
     self.pendingPreemptorBox = pendingPreemptorBox
     self.pipeline = ZImagePipeline(logger: logger, retentionPolicy: .keepLoaded)
     self.activeLoRAs = configuration.initialLoRAs
+    self.warmDefaultStack = configuration.initialLoRAs
     self.modelPool = ModelPool(
       textEncoderPath: configuration.textEncoderPath,
       maxSequenceLength: configuration.maxSequenceLength,
@@ -8085,7 +8112,11 @@ private actor WarmServerCoordinator {
       active: activeSpec,
       pool: entries,
       totalVramMB: await modelPool.totalVramMB(),
-      budgetMB: await modelPool.budget()
+      budgetMB: await modelPool.budget(),
+      // #282: the warm default is only visible from here — `/health.loras`
+      // reports what is RESIDENT (the last job's stack), which since #282 is a
+      // different question.
+      warmDefaultStack: warmDefaultStack.map(LoRAState.init)
     )
   }
 
@@ -8945,6 +8976,9 @@ private actor WarmServerCoordinator {
   }
 
   private func runGenerate(_ payload: GeneratePayload, continuation: ContinuationBox<GenerateResponse>, progressHandler: (@Sendable (ZImagePipeline.GenerationProgress) -> Void)? = nil, latentPreviewHandler: ZImagePipeline.LatentPreviewHandler? = nil) async {
+    // #282: `loraStackOrigin` is stamped on the payload below, once the job's
+    // own stack has been resolved, so every family's response can report it.
+    var payload = payload
     // Queue telemetry: tag this render with a job id and stream denoising
     // progress into the tracker that queueStatus() reads. Cleared on return
     // (success or failure) via defer. flux1 forwards the wrapped handler so the
@@ -9022,15 +9056,22 @@ private actor WarmServerCoordinator {
         }
       }
     }
-    if let loraEntries = payload.loras {
-      do {
-        let newLoRAs = try loraEntries.map { try $0.makeConfiguration() }
-        try await applyActiveLoRAs(newLoRAs)
-      } catch {
-        lastError = error.localizedDescription
-        continuation.resume(throwing: error)
-        return
-      }
+    // #282: EVERY render applies its own resolved stack here — the request's
+    // `loras`, else the named preset's expansion (#286 put it in the same
+    // field), else the WARM DEFAULT that `/v1/lora/swap` publishes. Before
+    // this, a request that carried neither rendered on whatever the previous
+    // job or an hours-old swap had left resident, which is the crosstalk this
+    // ticket exists to end. The application itself is unchanged
+    // (`applyActiveLoRAs`, with #286's same-stack shortcut), so a run of jobs
+    // that all want the same stack still re-binds nothing.
+    do {
+      let resolution = try resolveJobLoRAStack(payload)
+      payload.loraStackOrigin = resolution.origin.rawValue
+      try await applyJobLoRAStack(resolution)
+    } catch {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
+      return
     }
 
     // D3 `shift`: refuse before dispatch so no family can silently ignore it.
@@ -9119,6 +9160,9 @@ private actor WarmServerCoordinator {
 
     do {
       let outputURL: URL
+      // #282: `activeLoRAs` here is THIS job's stack — `runGenerate` resolved
+      // and applied it a few lines before dispatching, so the request carries
+      // what the pipeline is holding rather than "whatever is resident".
       if payload.imagePath != nil {
         let img2imgRequest = try payload.makeImg2ImgRequest(
           configuration: effectiveConfig,
@@ -9148,7 +9192,8 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
-          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
+          loraStackOrigin: payload.loraStackOrigin
         )
       )
     } catch {
@@ -9257,7 +9302,8 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
-          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
+          loraStackOrigin: payload.loraStackOrigin
         )
       )
     } catch {
@@ -9538,7 +9584,8 @@ private actor WarmServerCoordinator {
         appliedLoras: appliedLoRAStates(), presetUnresolved: payload.presetUnresolved,
         presetUnresolvedReason: payload.presetUnresolvedReason,
         presetStackMismatch: payload.presetStackMismatch,
-        memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes))
+        memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
+        loraStackOrigin: payload.loraStackOrigin))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -9612,7 +9659,8 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
-          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
+          loraStackOrigin: payload.loraStackOrigin
         )
       )
     } catch {
@@ -9685,7 +9733,8 @@ private actor WarmServerCoordinator {
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
           presetStackMismatch: payload.presetStackMismatch,
-          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
+          loraStackOrigin: payload.loraStackOrigin
         )
       )
     } catch {
@@ -9855,6 +9904,97 @@ private actor WarmServerCoordinator {
     return loadedLoRAConfigs(for: currentModelFamily).map(LoRAState.init)
   }
 
+  /// #282 — the per-job stack, resolved from the payload the loop dequeued.
+  ///
+  /// The ONE place `runGenerate` decides what a render's adapters are, kept
+  /// separate from the application so the decision can be driven from a unit
+  /// test (`WarmServerQueueProbe.resolveJobStack`) without weights or a GPU.
+  ///
+  /// Throws only what `LoRAEntry.makeConfiguration()` has always thrown — an
+  /// explicit `loras` entry that names an adapter the engine cannot resolve
+  /// keeps its long-standing 400 at dequeue. The warm default is already a
+  /// list of resolved configurations (it was resolved when the swap that set
+  /// it was accepted), so a bare request cannot fail here.
+  private func resolveJobLoRAStack(
+    _ payload: GeneratePayload
+  ) throws -> RequestStackResolver.Resolved<LoRAConfiguration> {
+    let carried: [LoRAConfiguration]? = try payload.loras.map {
+      try $0.map { try $0.makeConfiguration() }
+    }
+    let presetOwned = payload.presetStackApplied == true
+    return RequestStackResolver.resolve(
+      requestLoras: presetOwned ? nil : carried,
+      presetStack: presetOwned ? carried : nil,
+      warmDefault: warmDefaultStack)
+  }
+
+  /// #282 — apply exactly this job's stack, at dequeue, for every family that
+  /// has a LoRA path. Routes through ``applyActiveLoRAs``, so #286's
+  /// same-stack shortcut still skips a reload when the resident stack already
+  /// is this one — which is what keeps a 24/7 daemon rendering the same preset
+  /// back to back from re-binding 5-10 adapters per render.
+  private func applyJobLoRAStack(
+    _ resolution: RequestStackResolver.Resolved<LoRAConfiguration>
+  ) async throws {
+    let familyHasLoRAPath = !(currentModelFamily == .fibo || currentModelFamily == .chroma)
+    guard RequestStackResolver.appliesAtDequeue(
+      origin: resolution.origin, familyHasLoRAPath: familyHasLoRAPath)
+    else {
+      let skipped = "LoRA stack: \(currentModelFamily.rawValue) has no LoRA application path — "
+        + "the warm default is not pushed at it (pre-#282 behaviour preserved)"
+      logger.info("\(skipped)")
+      return
+    }
+    try await applyActiveLoRAs(resolution.stack)
+    let described = resolution.stack.isEmpty
+      ? "(none)"
+      : resolution.stack.map { "\($0.source.displayName)@\(String(format: "%.4g", $0.scale))" }
+        .joined(separator: ", ")
+    logger.info("LoRA stack for this job (origin: \(resolution.origin.rawValue)): \(described)")
+  }
+
+  /// #282 — publish the WARM DEFAULT stack: what a request that names neither
+  /// `preset` nor `loras` renders with.
+  ///
+  /// Called by `runSwap` and nowhere else. Per-job application
+  /// (``applyJobLoRAStack``) deliberately does NOT call it: a job's own stack
+  /// is that job's business and must never become the next job's default —
+  /// that inheritance is precisely what #282 retires.
+  private func adoptWarmDefaultStack(_ stack: [LoRAConfiguration]) {
+    warmDefaultStack = stack
+    let names = stack.isEmpty
+      ? "(none)" : stack.map { $0.source.displayName }.joined(separator: ", ")
+    let line = "/v1/lora/swap: warm default stack is now [\(names)] — it applies ONLY to a "
+      + "request that carries neither `preset` nor `loras`"
+    logger.info("\(line)")
+  }
+
+  #if DEBUG
+  /// #282 test seam. `resolveJobLoRAStack` is the function `runGenerate` calls
+  /// at dequeue; the coordinator is file-private and the application itself
+  /// needs model weights (intent.md: agents run unit tests only), so this
+  /// drives THE SAME function and reports what it decided.
+  func testSeamResolveJobStack(
+    _ payload: GeneratePayload
+  ) throws -> (origin: String, names: [String]) {
+    let resolved = try resolveJobLoRAStack(payload)
+    return (resolved.origin.rawValue, resolved.stack.map { $0.source.displayName })
+  }
+
+  /// #282 test seam: the warm-default adoption `runSwap` performs, so a test
+  /// can set a non-empty default without loading weights (applying a real
+  /// stack needs a model). `runSwap`'s own call to this is proved end-to-end
+  /// by an EMPTY swap, which is the one swap that succeeds with no pipeline.
+  func testSeamAdoptWarmDefaultStack(_ stack: [LoRAConfiguration]) {
+    adoptWarmDefaultStack(stack)
+  }
+
+  /// The warm default as `/v1/model/pool` reports it.
+  func testSeamWarmDefaultStackNames() -> [String] {
+    warmDefaultStack.map { $0.source.displayName }
+  }
+  #endif
+
   /// Apply LoRAs to whichever pipeline is active for `currentModelFamily`.
   /// Shared by POST /v1/lora/swap and per-job LoRA application at generate
   /// dequeue time (queue-submit race fix — see GeneratePayload.loras).
@@ -9949,6 +10089,13 @@ private actor WarmServerCoordinator {
 
       let newLoRAs = try payload.makeConfigurations()
       try await applyActiveLoRAs(newLoRAs)
+      // #282: this is now the WHOLE meaning of a swap — it publishes the
+      // default for requests that name neither `preset` nor `loras`. The
+      // application above stays (a swap-first client expects the pipeline to
+      // be holding the stack when it returns, and `SwapResidencyRestore` above
+      // exists precisely so that application can happen), but no later job
+      // inherits it except by asking for nothing. Response JSON unchanged.
+      adoptWarmDefaultStack(newLoRAs)
 
       lastError = nil
       resumed = true
@@ -10459,6 +10606,12 @@ struct GeneratePayload: Sendable {
   /// of its own, so the ONE place that applies a per-request stack
   /// (`applyActiveLoRAs`, at dequeue) is also the one place a preset-by-name
   /// render goes through. See ``PresetLoRAStack``.
+  ///
+  /// Since #282 the dequeue applies a stack for EVERY render, not only when
+  /// this field is non-nil: nil means "the warm default", which is what
+  /// `/v1/lora/swap` publishes. Which of the two owns a non-nil value is
+  /// recorded in ``presetStackApplied``; the whole decision is
+  /// ``RequestStackResolver``.
   var loras: [LoRAEntry]?
 
   /// #286 (C2): set by the engine, never by the wire — the named preset could
@@ -10490,6 +10643,26 @@ struct GeneratePayload: Sendable {
   /// computed, so the two numbers can be compared without a second `/health`
   /// call racing the render.
   var memoryAvailableBytes: UInt64?
+
+  /// #282: set by the engine, never by the wire — `loras` above was filled
+  /// from the named `preset`'s expansion rather than sent by the client. It is
+  /// the only way ``RequestStackResolver`` can tell a preset-owned stack from
+  /// a request-owned one once both live in the same field, and it is what
+  /// makes `lora_stack_origin` on the response honest.
+  ///
+  /// A persisted-queue REPLAY reads the rewritten body, which carries the
+  /// accepted stack as explicit `loras` (#286 I5) — so a replayed preset job
+  /// reports origin `request`. The stack it applies is byte-identical to the
+  /// one that was accepted; only the label differs, which is the price of
+  /// replaying a frozen body instead of re-resolving a preset that may have
+  /// been edited since.
+  var presetStackApplied: Bool?
+
+  /// #282: set at DEQUEUE by `runGenerate` — which of the three sources owned
+  /// this job's stack (``RequestStackResolver/Origin``). Reaches the response
+  /// as `lora_stack_origin`, so a daemon can confirm from the response alone
+  /// that a render used the stack it asked for and not one it inherited.
+  var loraStackOrigin: String?
   // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
   let controlImageData: Data?
   let controlnetStrength: Float?
@@ -10583,6 +10756,8 @@ struct GeneratePayload: Sendable {
     self.presetStackMismatch = nil
     self.memoryEstimateBytes = nil
     self.memoryAvailableBytes = nil
+    self.presetStackApplied = nil
+    self.loraStackOrigin = nil
     self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength; self.controlImage = controlImage
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -10707,6 +10882,11 @@ extension GeneratePayload: Decodable {
     // #22: engine-set (validateImageMemoryPreflight), never decoded from the wire.
     memoryEstimateBytes = nil
     memoryAvailableBytes = nil
+    // #282: engine-set, never decoded from the wire. A replayed persisted body
+    // carries its accepted stack as explicit `loras`, so it decodes here as a
+    // request-owned stack — the same adapters, under the honest label.
+    presetStackApplied = nil
+    loraStackOrigin = nil
     controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
@@ -11361,6 +11541,16 @@ struct GenerateResponse: Encodable, Sendable {
   /// `GeneratePayload.memoryEstimateBytes`.
   let memoryEstimateBytes: UInt64?
   let memoryAvailableBytes: UInt64?
+  /// #282: `lora_stack_origin` — WHERE this render's LoRA stack came from:
+  /// `"request"` (the request's own `loras`), `"preset"` (the named preset's
+  /// expansion) or `"warm_default"` (the stack `POST /v1/lora/swap` published,
+  /// which applies only to a request carrying neither).
+  ///
+  /// Additive, and the field that makes "did this job render with the stack it
+  /// asked for?" answerable from the response alone. Absent on the ControlNet
+  /// arm, which has always rendered its request's own stack through its own
+  /// pipeline instance and has neither a `preset` nor a warm default.
+  let loraStackOrigin: String?
 
   /// The record itself, for Swift readers that do not care about the
   /// absent-vs-null distinction.
@@ -11370,7 +11560,8 @@ struct GenerateResponse: Encodable, Sendable {
        applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
        presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
        presetStackMismatch: Bool? = nil,
-       memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil) {
+       memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
+       loraStackOrigin: String? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
@@ -11383,6 +11574,7 @@ struct GenerateResponse: Encodable, Sendable {
     self.presetStackMismatch = presetStackMismatch
     self.memoryEstimateBytes = memoryEstimateBytes
     self.memoryAvailableBytes = memoryAvailableBytes
+    self.loraStackOrigin = loraStackOrigin
   }
 }
 
@@ -12025,6 +12217,41 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   static func isQueueFull(_ error: Error) -> Bool {
     if case WarmServerCoordinator.ServerError.queueFull = error { return true }
     return false
+  }
+
+  // MARK: - #282 per-request preset stacks
+
+  /// What `runGenerate` would apply for this payload, and where it came from.
+  /// Drives `WarmServerCoordinator.resolveJobLoRAStack` — the same function
+  /// the dequeue path calls.
+  func resolveJobStack(_ payload: GeneratePayload) async throws -> (origin: String, names: [String]) {
+    try await coordinator.testSeamResolveJobStack(payload)
+  }
+
+  /// Publish a warm default without a swap (applying a real stack needs model
+  /// weights). Runs `runSwap`'s own `adoptWarmDefaultStack`.
+  func adoptWarmDefaultStack(_ stack: [LoRAConfiguration]) async {
+    await coordinator.testSeamAdoptWarmDefaultStack(stack)
+  }
+
+  /// The warm default the coordinator holds.
+  func warmDefaultStackNames() async -> [String] {
+    await coordinator.testSeamWarmDefaultStackNames()
+  }
+
+  /// The warm default as `GET /v1/model/pool` reports it (`warm_default_stack`).
+  func poolWarmDefaultStack() async -> [LoRAState]? {
+    await coordinator.poolList().warmDefaultStack
+  }
+
+  /// `POST /v1/lora/swap`, through the real queue (`LoRASwapPayload` is
+  /// file-private, so the probe builds it). Safe in a unit test ONLY with an
+  /// empty stack: `applyActiveLoRAs([])` unloads rather than loads, so no
+  /// model weights are touched — which is exactly what makes it a real
+  /// end-to-end proof that `runSwap` publishes the warm default.
+  @discardableResult
+  func enqueueSwap(loras: [LoRAEntry]) async throws -> Int {
+    try await coordinator.enqueueSwap(LoRASwapPayload(loras: loras), rawBody: nil).loraCount
   }
 
   /// The model-operation cap, distinct from the render queue's.
