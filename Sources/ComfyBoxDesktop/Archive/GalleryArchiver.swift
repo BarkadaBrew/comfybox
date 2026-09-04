@@ -277,8 +277,9 @@ public final class GalleryArchiver {
     /// any interrupted source removal: a bundle with `PENDING_REMOVAL.json`
     /// but **no** `INCOMPLETE.json` committed successfully (step 8) but
     /// crashed before source removal finished (steps 9-10). For every id in
-    /// the marker still present in `store.allAssetIds()`, this removes the
-    /// source via the same path `archive` uses at step 9
+    /// the marker still present in the store (checked via
+    /// `store.assetIDs(withIDs:)`, scoped to the marker's own ids — #265),
+    /// this removes the source via the same path `archive` uses at step 9
     /// (`ingestor.deleteAsset`), then deletes the marker.
     ///
     /// A bundle carrying `INCOMPLETE.json` is skipped entirely — it never
@@ -339,14 +340,20 @@ public final class GalleryArchiver {
     /// the fetched rows, or `ingestor.deleteAsset` throwing — is logged and
     /// leaves `PENDING_REMOVAL.json` in place. This is safe and idempotent
     /// by construction: whatever *did* get removed this pass has already
-    /// dropped out of `store.allAssetIds()`, so the next sweep only retries
-    /// the ids that are still actually live — no marker rewriting needed.
+    /// dropped out of the store, so the next sweep's `assetIDs(withIDs:)`
+    /// check only retries the ids that are still actually live — no marker
+    /// rewriting needed.
     private func finishPendingRemoval(assetIds: [String], pendingRemovalPath: String) async {
-        guard let liveIds = try? await store.allAssetIds() else {
+        // The marker's own id list is the query — a targeted "which of these
+        // specific ids are still live" lookup (#265), not a full-table scan
+        // filtered in memory. A marker names a handful of ids from one
+        // archive's commit, never the whole library.
+        guard let idsToRemoveSet = try? await store.assetIDs(withIDs: Set(assetIds)) else {
             print("[GalleryArchiver] resumePendingRemovals: could not read live asset ids, leaving \(pendingRemovalPath) for the next launch")
             return
         }
-        let idsToRemove = assetIds.filter { liveIds.contains($0) }
+        // Preserve the marker's own ordering for the delete loop below.
+        let idsToRemove = assetIds.filter { idsToRemoveSet.contains($0) }
 
         guard !idsToRemove.isEmpty else {
             // Every id in the marker is already gone — a fully clean pass.
@@ -354,9 +361,7 @@ public final class GalleryArchiver {
             return
         }
 
-        guard let count = try? await store.assetCount(),
-              let liveAssets = try? await store.fetchAssets(limit: count, offset: 0)
-        else {
+        guard let liveAssets = try? await store.assets(withIDs: Set(idsToRemove)) else {
             print("[GalleryArchiver] resumePendingRemovals: could not fetch live asset rows, leaving \(pendingRemovalPath) for the next launch")
             return
         }
@@ -473,8 +478,10 @@ public final class GalleryArchiver {
         var result = RestoreResult()
 
         // One-shot live snapshot (keyed by id) — never re-queried per entry.
-        let liveCount = try await store.assetCount()
-        let liveAssets = try await store.fetchAssets(limit: liveCount, offset: 0)
+        // Scoped to exactly the ids this restore touches (#265), not a fetch
+        // of the whole live table: `selected` is already the id-filtered
+        // subset (or everything, for a full restore) chosen above.
+        let liveAssets = try await store.assets(withIDs: Set(selected.map { $0.id }))
         let liveById = Dictionary(uniqueKeysWithValues: liveAssets.map { ($0.id, $0) })
 
         let watchDirectory = ingestor.watchDirectory

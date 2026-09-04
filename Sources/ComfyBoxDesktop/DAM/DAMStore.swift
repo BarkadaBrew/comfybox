@@ -48,6 +48,19 @@ func drainSQLiteRows(step: () -> Int32, onRow: () -> Void) -> Int32 {
     return rc
 }
 
+private extension Array {
+    /// Splits into consecutive chunks of at most `size` elements (the final
+    /// chunk may be shorter). Used to keep an `IN (...)` id list under
+    /// SQLite's bound-parameter ceiling (#265) — one query per chunk rather
+    /// than one giant query that can exceed SQLITE_MAX_VARIABLE_NUMBER.
+    func chunked(into size: Int) -> [[Element]] {
+        guard size > 0 else { return [self] }
+        return stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
+}
+
 public actor DAMStore {
     private var db: OpaquePointer?
     private let dbPath: String
@@ -263,25 +276,43 @@ public actor DAMStore {
     /// sweep may always remove at least this many.
     public static let pruneCircuitBreakerFloor = 5
 
+    /// Page size for `pruneOrphans()`'s existence-check walk over
+    /// `assetLocations`. Bounds how many `(id, path)` pairs are held at once
+    /// regardless of library size (#265) — the walk itself still covers
+    /// every row, just one page at a time instead of materializing the
+    /// whole table (previously capped at a flat 100,000 rows via
+    /// `fetchAssets`, which both wasted memory on the common case and quietly
+    /// stopped scanning past that many).
+    private static let pruneScanPageSize = 1_000
+
     @discardableResult
     public func pruneOrphans() throws -> [String] {
         let secured = try securedAssetIds()
         let elsewhere = try assetIDsHostedElsewhere()
-        let all = try fetchAssets(limit: 100_000)
+        let total = try assetCount()
 
-        // Decide the whole sweep before performing any of it.
+        // Decide the whole sweep before performing any of it. Walked a page
+        // of lightweight (id, path) pairs at a time rather than fetching
+        // every column of every row up front.
         var candidates: [String] = []
-        for asset in all {
-            guard !secured.contains(asset.id), !elsewhere.contains(asset.id) else { continue }
-            if !FileManager.default.fileExists(atPath: asset.absolutePath) {
-                candidates.append(asset.id)
+        var offset = 0
+        while true {
+            let page = try assetLocations(limit: Self.pruneScanPageSize, offset: offset)
+            if page.isEmpty { break }
+            for (id, path) in page {
+                guard !secured.contains(id), !elsewhere.contains(id) else { continue }
+                if !FileManager.default.fileExists(atPath: path) {
+                    candidates.append(id)
+                }
             }
+            offset += page.count
+            if page.count < Self.pruneScanPageSize { break }
         }
 
         let ceiling = max(Self.pruneCircuitBreakerFloor,
-                          Int(Double(all.count) * Self.pruneCircuitBreakerFraction))
+                          Int(Double(total) * Self.pruneCircuitBreakerFraction))
         guard candidates.count <= ceiling else {
-            throw DAMStoreError.pruneRefused(candidates: candidates.count, total: all.count)
+            throw DAMStoreError.pruneRefused(candidates: candidates.count, total: total)
         }
 
         for id in candidates {
@@ -408,6 +439,104 @@ public actor DAMStore {
         var results: [DAMAsset] = []
         let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             results.append(assetFromRow(stmt))
+        }
+        guard rc == SQLITE_DONE else {
+            throw DAMStoreError.stepFailed(rc, lastError)
+        }
+        return results
+    }
+
+    /// Number of bound parameters per `IN (...)` chunk for `assets(withIDs:)`
+    /// and `assetIDs(withIDs:)`. SQLite's default SQLITE_MAX_VARIABLE_NUMBER
+    /// is 999+ on most builds, but 500 keeps every chunk comfortably under
+    /// any build's ceiling without needing to probe it (#265).
+    private static let idChunkSize = 500
+
+    /// Full asset rows for exactly the given ids, skipping any id not
+    /// present. For a caller that already knows which handful of rows it
+    /// needs (a restore's live-row lookup, a folder's member set, a
+    /// crash-recovery sweep) instead of fetching the whole table to filter
+    /// in memory (#265). Chunks the `IN (...)` list at `idChunkSize`.
+    public func assets(withIDs ids: Set<String>) throws -> [DAMAsset] {
+        guard !ids.isEmpty else { return [] }
+        var results: [DAMAsset] = []
+        for chunk in Array(ids).chunked(into: Self.idChunkSize) {
+            let placeholders = chunk.map { _ in "?" }.joined(separator: ", ")
+            let sql = """
+                SELECT id, kind, filename, absolute_path, file_size, sha256,
+                       width, height, created_at, modified_at, ingested_at, orphaned,
+                       prompt, negative_prompt, seed, steps, guidance,
+                       model_family, rating, favorite, content_mode, character_name, source
+                FROM assets
+                WHERE id IN (\(placeholders))
+                """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DAMStoreError.prepareFailed(lastError)
+            }
+            defer { sqlite3_finalize(stmt) }
+            for (index, id) in chunk.enumerated() {
+                sqlite3_bind_text(stmt, Int32(index + 1), (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            }
+            let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+                results.append(assetFromRow(stmt))
+            }
+            guard rc == SQLITE_DONE else {
+                throw DAMStoreError.stepFailed(rc, lastError)
+            }
+        }
+        return results
+    }
+
+    /// Which of the given ids currently exist in the table — lighter than
+    /// `assets(withIDs:)` when only an existence check is needed (e.g. "is
+    /// this id still live" in a crash-recovery sweep), not the full row.
+    /// Same chunking as `assets(withIDs:)` (#265).
+    public func assetIDs(withIDs ids: Set<String>) throws -> Set<String> {
+        guard !ids.isEmpty else { return [] }
+        var results = Set<String>()
+        for chunk in Array(ids).chunked(into: Self.idChunkSize) {
+            let placeholders = chunk.map { _ in "?" }.joined(separator: ", ")
+            let sql = "SELECT id FROM assets WHERE id IN (\(placeholders))"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DAMStoreError.prepareFailed(lastError)
+            }
+            defer { sqlite3_finalize(stmt) }
+            for (index, id) in chunk.enumerated() {
+                sqlite3_bind_text(stmt, Int32(index + 1), (id as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            }
+            let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+                if let id = columnText(stmt, 0) { results.insert(id) }
+            }
+            guard rc == SQLITE_DONE else {
+                throw DAMStoreError.stepFailed(rc, lastError)
+            }
+        }
+        return results
+    }
+
+    /// Lightweight `(id, absolute_path)` pairs, one page at a time — for
+    /// scans that only need to existence-check a path (an orphan or
+    /// missing-file sweep) and would otherwise materialize the full
+    /// 20+-column row for every asset in the library just to read two
+    /// fields off it (#265). Ordered by `id` (unique) rather than
+    /// `created_at` (not unique enough on its own to page across safely).
+    public func assetLocations(limit: Int, offset: Int) throws -> [(id: String, absolutePath: String)] {
+        let sql = "SELECT id, absolute_path FROM assets ORDER BY id LIMIT ?1 OFFSET ?2"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DAMStoreError.prepareFailed(lastError)
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(limit))
+        sqlite3_bind_int(stmt, 2, Int32(offset))
+
+        var results: [(id: String, absolutePath: String)] = []
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+            if let id = columnText(stmt, 0), let path = columnText(stmt, 1) {
+                results.append((id: id, absolutePath: path))
+            }
         }
         guard rc == SQLITE_DONE else {
             throw DAMStoreError.stepFailed(rc, lastError)
