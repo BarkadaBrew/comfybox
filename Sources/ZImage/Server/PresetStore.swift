@@ -883,12 +883,25 @@ public final class PresetStore: @unchecked Sendable {
 
   // MARK: Resolve
 
+  /// The preset AS DECLARED plus its validation flag, read under ONE lock —
+  /// so a concurrent `upsert`/`delete` cannot hand back a preset with another
+  /// revision's flag. ``resolve(_:)`` and `/v1/generate`'s preset expansion
+  /// both go through it, which is what makes them agree.
+  ///
+  /// `preset` nil = unknown id. `invalidReason` non-nil = flagged at load
+  /// (WP-E20 AC-44c).
+  public func lookup(_ id: String) -> (preset: ImagePreset?, invalidReason: String?) {
+    lock.lock(); defer { lock.unlock() }
+    return (presets.first { $0.id == id }, invalidReasons[id])
+  }
+
   /// Merge the preset `id` onto the store's ``PresetDefaults`` and return the fully-populated
   /// parameter set. Port of the `/v1/presets/resolve` behavior. Throws ``PresetStoreError/notFound(_:)``.
   public func resolve(_ id: String) throws -> ResolvedPreset {
-    guard let preset = get(id) else { throw PresetStoreError.notFound(id) }
+    let (found, invalidReason) = lookup(id)
+    guard let preset = found else { throw PresetStoreError.notFound(id) }
     // WP-E20 (AC-44c): a flagged preset can never be selected.
-    if let reason = validationError(for: id) {
+    if let reason = invalidReason {
       throw PresetStoreError.invalid(id: id, reason: reason)
     }
     return ResolvedPreset(preset: preset, defaults: defaults)
