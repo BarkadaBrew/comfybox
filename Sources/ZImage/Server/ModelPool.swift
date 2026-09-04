@@ -87,11 +87,14 @@ enum ModelOperation: Sendable {
     }
   }
 
+  // #339 review r1, item 2: reads from `QueueJobKind` (QueueRecoveryGate.swift)
+  // — the single source of truth `QueueRecoveryGate`'s allowlist also reads
+  // from, so the wire vocabulary cannot silently drift between the two.
   var kind: String {
     switch self {
-    case .load: return "model_load"
-    case .activate: return "model_activate"
-    case .unload: return "model_unload"
+    case .load: return QueueJobKind.modelLoad.rawValue
+    case .activate: return QueueJobKind.modelActivate.rawValue
+    case .unload: return QueueJobKind.modelUnload.rawValue
     }
   }
 }
