@@ -36,6 +36,7 @@ struct ComfyBoxDesktopApp: App {
     @State private var pendingReferenceImage: String?
     @State private var pendingMotionReference: String?
     @State private var pendingInpaintImage: String?
+    @State private var pendingInpaintMask: MaskStrokes?
     @State private var pendingContentMode: ContentMode?
 
     init() {
@@ -543,7 +544,7 @@ struct ComfyBoxDesktopApp: App {
             FaceView(mflux: mfluxService, faceSwap: faceSwapService, ingestor: ingestor)
 
         case .inpaint:
-            InpaintView(engine: engine, ingestor: ingestor, pendingImage: $pendingInpaintImage)
+            InpaintView(engine: engine, ingestor: ingestor, pendingImage: $pendingInpaintImage, pendingMask: $pendingInpaintMask)
 
         case .bree:
             BreeView(bree: breeService)

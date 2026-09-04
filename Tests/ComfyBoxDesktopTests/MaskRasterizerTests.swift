@@ -2,6 +2,7 @@
 import Testing
 import Foundation
 import CoreGraphics
+import AppKit
 @testable import ComfyBoxDesktop
 
 @Suite("MaskRasterizer")
@@ -52,5 +53,50 @@ struct MaskRasterizerTests {
         #expect(back == s)
         s.undoLast(); #expect(s.isEmpty)
         s.append(MaskStroke(points: [], size: 0.05, erase: true)); s.clear(); #expect(s.isEmpty)
+    }
+
+    /// The pre-refactor Inpaint rasterizer, kept verbatim as the oracle.
+    private func legacyMaskPNG(_ strokes: MaskStrokes, pixelSize: CGSize) -> Data? {
+        let W = Int(pixelSize.width), H = Int(pixelSize.height)
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: H, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor.black.setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: W, height: H)).fill()
+        for stroke in strokes.strokes {
+            (stroke.erase ? NSColor.black : NSColor.white).setStroke()
+            let path = NSBezierPath()
+            path.lineWidth = CGFloat(stroke.size) * pixelSize.width
+            path.lineCapStyle = .round; path.lineJoinStyle = .round
+            for (i, pt) in stroke.points.enumerated() {
+                let x = pt.x * pixelSize.width
+                let y = pixelSize.height - pt.y * pixelSize.height
+                if i == 0 { path.move(to: NSPoint(x: x, y: y)) } else { path.line(to: NSPoint(x: x, y: y)) }
+            }
+            path.stroke()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    @Test("matches the legacy Inpaint rasterizer on a sampled grid")
+    func legacyParity() {
+        var s = MaskStrokes()
+        s.append(MaskStroke(points: [CGPoint(x: 0.2, y: 0.3), CGPoint(x: 0.7, y: 0.6)], size: 0.08, erase: false))
+        s.append(MaskStroke(points: [CGPoint(x: 0.5, y: 0.5)], size: 0.04, erase: true))
+        let size = CGSize(width: 120, height: 80)
+        let new = MaskRasterizer.render(s, size: size)!
+        let legacy = NSBitmapImageRep(data: legacyMaskPNG(s, pixelSize: size)!)!.cgImage!
+        var mismatches = 0
+        for y in stride(from: 2, to: 80, by: 4) {
+            for x in stride(from: 2, to: 120, by: 4) {
+                let a = EditTestSupport.gray(new, x: x, y: y) > 127
+                let b = EditTestSupport.gray(legacy, x: x, y: y) > 127
+                if a != b { mismatches += 1 }
+            }
+        }
+        #expect(mismatches <= 4)   // anti-aliasing at stroke edges only
     }
 }
