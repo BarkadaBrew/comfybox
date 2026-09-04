@@ -5,7 +5,13 @@ name: Nightly Integration
 # This workflow targets a self-hosted runner Todd registers on a Mac with the weights present
 # (see docs/deployment.md, "CI: Nightly Integration Runner"). Until that runner exists AND the
 # `COMFYBOX_WEIGHTS_RUNNER_AVAILABLE` repository variable is set to "true", the `integration`
-# job below is skipped (not failed, not queued indefinitely) — see the job's `if:`.
+# job below is skipped outright (not failed) — see the job's `if:`. That only covers "no runner
+# registered at all", though: once the variable is true, a run targeting a runner that IS
+# registered but currently offline (asleep, service stopped, mid-reboot) will sit queued waiting
+# for it — GitHub's only automatic bound on that is a 24h queue-cancel, well past this job's own
+# `timeout-minutes` (which bounds run time, not queue time). See docs/deployment.md's runbook for
+# how to check the runner is online before relying on a scheduled/dispatched run, and for when to
+# flip the variable back to false (Mac offline for maintenance).
 
 on:
   schedule:
@@ -26,7 +32,9 @@ jobs:
     # Todd registers the runner and flips the variable — never a red/failed check.
     if: vars.COMFYBOX_WEIGHTS_RUNNER_AVAILABLE == 'true'
     runs-on: [self-hosted, macOS, comfybox-weights]
-    timeout-minutes: 180
+    # Bounds RUN time only, once a runner has picked the job up — see the queue-time caveat above
+    # and docs/deployment.md's runbook for the "registered but offline" case this can't cover.
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4

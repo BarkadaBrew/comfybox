@@ -27,15 +27,25 @@ jobs:
       - name: Enable PrepareMetalShaders plugin
         run: defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
 
-      # Keyed on Package.resolved so a dependency bump invalidates the cache;
-      # restore-keys lets a partial hit still warm most of the build graph.
+      # xcode-version above floats ("latest-stable"), so a bare Package.resolved hash would let a
+      # runner image bump silently reuse DerivedData built by a different Xcode/Swift — resolve the
+      # actual toolchain and fold it into the key so that can't happen.
+      - name: Resolve toolchain version
+        id: toolchain
+        run: |
+          echo "version=$(xcodebuild -version | tr '\n' ' ' | tr -s ' ' | sed -E 's/[[:space:]]+$//; s/[^A-Za-z0-9. ]/_/g; s/ /-/g')" >> "$GITHUB_OUTPUT"
+
+      # Keyed on the resolved Xcode/Swift version + Package.resolved so a dependency bump or a
+      # toolchain upgrade both invalidate the cache; restore-keys falls back to the newest cache
+      # for the SAME toolchain (never across toolchains) so a partial hit still warms most of the
+      # build graph.
       - name: Cache DerivedData
         uses: actions/cache@v4
         with:
           path: .build/xcode
-          key: ${{ runner.os }}-derived-data-${{ hashFiles('Package.resolved') }}
+          key: ${{ runner.os }}-xcode-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Package.resolved') }}
           restore-keys: |
-            ${{ runner.os }}-derived-data-
+            ${{ runner.os }}-xcode-${{ steps.toolchain.outputs.version }}-
 
       - name: Type check
         run: |
