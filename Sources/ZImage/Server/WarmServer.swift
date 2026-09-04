@@ -722,7 +722,7 @@ public final class WarmServer {
         // #286 (I5): `rawBody` is the EXPANDED request, so a crash-recovery
         // replay repeats the stack this job was accepted with rather than
         // re-resolving the preset against a store that may have changed.
-        let (payload, rawBody) = try decodedGenerateRequest(from: request.body)
+        let (payload, rawBody) = try await decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
         // #1479: absent/false `preempt` (or no video rendering, or a nested
         // attempt) is `.notApplicable` — same call as before this feature.
@@ -741,7 +741,8 @@ public final class WarmServer {
             preemptRefused: true, etaSec: eta, applied: result.applied,
             appliedLoras: result.appliedLoras, presetUnresolved: result.presetUnresolved,
             presetUnresolvedReason: result.presetUnresolvedReason,
-            presetStackMismatch: result.presetStackMismatch)
+            presetStackMismatch: result.presetStackMismatch,
+            memoryEstimateBytes: result.memoryEstimateBytes, memoryAvailableBytes: result.memoryAvailableBytes)
           return .json(status: 200, payload: stamped)
         }
       } catch {
@@ -755,7 +756,7 @@ public final class WarmServer {
     // /v1/generate call outliving the caller's own turn timeout.
     case ("POST", "/v1/generate/async"):
       do {
-        let (payload, rawBody) = try decodedGenerateRequest(from: request.body)
+        let (payload, rawBody) = try await decodedGenerateRequest(from: request.body)
         let source = payload.source ?? "api"
         // #1479: `submitPreempting` runs the SAME `attemptPreemption` check
         // inside the job's own detached Task, so a `preempt`-absent/false
@@ -5145,11 +5146,21 @@ public final class WarmServer {
   /// names AND #286's preset expansion — so there is no separate "expansion
   /// call at the decode site" that could be removed while the decode survived,
   /// and the tests that drive it are testing the route.
-  func decodedGeneratePayload(from body: Data) throws -> GeneratePayload {
-    try Self.decodedGeneratePayload(
+  ///
+  /// #22 (PR #363 review, C2): `gateSubmission` defaults `true` — a live
+  /// `/v1/generate`/`/v1/generate/async` call. `recoverPersistedQueue`'s
+  /// crash-recovery replay is the ONE caller that passes `false`: a job
+  /// already accepted before a restart must never be re-refused by a gate
+  /// that did not exist (or had different config) when it was submitted —
+  /// `async` only to `await coordinator.modelFamily` for I4's warm-family
+  /// resolution, skipped entirely when not gating.
+  func decodedGeneratePayload(from body: Data, gateSubmission: Bool = true) async throws -> GeneratePayload {
+    let warmFamily: WarmModelFamily? = gateSubmission ? await coordinator.modelFamily : nil
+    return try Self.decodedGeneratePayload(
       from: body, store: presetStore, configuration: configuration,
       stageNearline: { entries in self.stageNearlineLoras(in: LoRASwapPayload(loras: entries)).loras },
-      log: { line in self.logger.info("\(line)") })
+      log: { line in self.logger.info("\(line)") },
+      gateSubmission: gateSubmission, warmFamily: warmFamily)
   }
 
   /// The generate routes' decode, over an EXPLICIT store and configuration so
@@ -5165,7 +5176,9 @@ public final class WarmServer {
     configuration: WarmServerConfiguration,
     stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
     loraExists: (LoRAEntry) -> Bool = WarmServer.loRASourceExists,
-    log: (String) -> Void = { _ in }
+    log: (String) -> Void = { _ in },
+    gateSubmission: Bool = true,
+    warmFamily: WarmModelFamily? = nil
   ) throws -> GeneratePayload {
     var payload = try decode(GeneratePayload.self, from: body)
     // Bytes-uploaded img2img init image (init_image_base64) — write it to a
@@ -5189,8 +5202,22 @@ public final class WarmServer {
     // at dequeue does the work. Before this, `preset` was a provenance label on
     // the image path and a preset-by-name render used whatever adapters the
     // warm pipeline happened to hold, on whatever base was active.
-    return try expandGeneratePayload(
+    var expanded = try expandGeneratePayload(
       payload, store: store, stageNearline: stageNearline, loraExists: loraExists, log: log)
+    // #22 (PR #363 review, C2): resolution/memory preflight — refuses an
+    // oversized request BEFORE it is enqueued (let alone before any model
+    // load), with the estimate/available/cap named in the refusal. Runs
+    // AFTER preset expansion so a preset that changes `model` (and therefore
+    // which transformer profile the estimate uses) is checked accurately —
+    // presets never touch width/height (#286: model/LoRA/steps/guidance
+    // only), so this does not change which requests are gated, only which
+    // family they are gated as. `gateSubmission: false` (replay) skips this
+    // entirely — deleting this call makes the 6000×6000 wiring test fail.
+    if gateSubmission {
+      try expanded.validateImageMemoryPreflight(
+        warmFamily: warmFamily, log: { line in log("ImageMemoryPreflight: \(line)") })
+    }
+    return expanded
   }
 
   /// #286 — the preset expansion half of the decode. Split out only so the
@@ -5254,8 +5281,8 @@ public final class WarmServer {
   /// body carries the accepted `loras`/`model`/`steps`/`guidance`, and because
   /// it now has explicit `loras` the replay takes the request-wins branch and
   /// resolves nothing again.
-  private func decodedGenerateRequest(from body: Data) throws -> (GeneratePayload, Data) {
-    let payload = try decodedGeneratePayload(from: body)
+  private func decodedGenerateRequest(from body: Data) async throws -> (GeneratePayload, Data) {
+    let payload = try await decodedGeneratePayload(from: body)
     return (payload, Self.rawBody(body, expandedWith: payload))
   }
 
@@ -5437,7 +5464,10 @@ public final class WarmServer {
         do {
           switch job.kind {
           case QueueJobKind.generate.rawValue:
-            let payload = try decodedGeneratePayload(from: job.rawBody)
+            // #22 (C2, PR #363 review): `gateSubmission: false` — a job the
+            // server already accepted before this restart must never be
+            // re-refused by the image-memory preflight on replay.
+            let payload = try await decodedGeneratePayload(from: job.rawBody, gateSubmission: false)
             // #339 review r3, item 1b (corrected r4): run the render in a
             // detached child Task and race admission against the Task's
             // own completion (`waitForAdmissionOrCompletion`) instead of
@@ -5626,6 +5656,13 @@ public final class WarmServer {
 
     case let error as WarmServerError:
       switch error {
+      // #22: image-memory preflight refusal — 413 (Payload Too Large), with
+      // the estimate/available/cap numbers as additive JSON fields so a
+      // client can branch on `error_code` without string-matching `error`.
+      case .imageMemoryPreflightRefused(let code, let reason, let estimate, let available, let cap):
+        return .json(status: 413, payload: ErrorPayload(
+          success: false, error: "[\(code)] \(reason)", errorCode: code,
+          estimateBytes: estimate, availableBytes: available, capBytes: cap))
       case .loraSwapNotSupported, .controlNetNotSupported:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
@@ -6271,6 +6308,10 @@ public struct ImageJobStatus: Codable, Sendable {
   public let presetUnresolved: String?
   public let presetUnresolvedReason: String?
   public let presetStackMismatch: Bool?
+  /// #22 (PR #363 review, C1b): the same memory-advisory numbers the sync
+  /// response carries, set at accept time (before the job runs).
+  public let memoryEstimateBytes: UInt64?
+  public let memoryAvailableBytes: UInt64?
 
   /// The record itself; see ``AppliedRecordSlot`` for absent-vs-null.
   public var appliedRecord: RenderRecipe? { applied?.record }
@@ -6280,7 +6321,8 @@ public struct ImageJobStatus: Codable, Sendable {
     error: String?, elapsedMs: Int, preemptRefused: Bool?, etaSec: Double?,
     applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
     presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
-    presetStackMismatch: Bool? = nil
+    presetStackMismatch: Bool? = nil,
+    memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -6296,6 +6338,8 @@ public struct ImageJobStatus: Codable, Sendable {
     self.presetUnresolved = presetUnresolved
     self.presetUnresolvedReason = presetUnresolvedReason
     self.presetStackMismatch = presetStackMismatch
+    self.memoryEstimateBytes = memoryEstimateBytes
+    self.memoryAvailableBytes = memoryAvailableBytes
   }
 }
 
@@ -6321,6 +6365,10 @@ private final class ImageJob: @unchecked Sendable {
   var presetUnresolved: String?
   var presetUnresolvedReason: String?
   var presetStackMismatch: Bool?
+  /// #22: set at accept time from the payload (before the job runs) — see
+  /// `job.memoryEstimateBytes = payload.memoryEstimateBytes` at submit.
+  var memoryEstimateBytes: UInt64?
+  var memoryAvailableBytes: UInt64?
 
   init(id: String, source: String) {
     self.id = id
@@ -6339,7 +6387,8 @@ private final class ImageJob: @unchecked Sendable {
       preemptRefused: preemptRefused, etaSec: etaSec, applied: applied,
       appliedLoras: appliedLoras, presetUnresolved: presetUnresolved,
       presetUnresolvedReason: presetUnresolvedReason,
-      presetStackMismatch: presetStackMismatch
+      presetStackMismatch: presetStackMismatch,
+      memoryEstimateBytes: memoryEstimateBytes, memoryAvailableBytes: memoryAvailableBytes
     )
   }
 }
@@ -6426,6 +6475,9 @@ final class ImageJobTracker: @unchecked Sendable {
     job.presetUnresolved = payload.presetUnresolved
     job.presetUnresolvedReason = payload.presetUnresolvedReason
     job.presetStackMismatch = payload.presetStackMismatch
+    // #22: same "known at submit" posture as the preset flags above.
+    job.memoryEstimateBytes = payload.memoryEstimateBytes
+    job.memoryAvailableBytes = payload.memoryAvailableBytes
     lock.lock(); jobs[jobId] = job; lock.unlock()
 
     Task { [weak self] in
@@ -9095,7 +9147,8 @@ private actor WarmServerCoordinator {
           appliedLoras: appliedLoRAStates(),
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
-          presetStackMismatch: payload.presetStackMismatch
+          presetStackMismatch: payload.presetStackMismatch,
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
         )
       )
     } catch {
@@ -9203,7 +9256,8 @@ private actor WarmServerCoordinator {
           appliedLoras: appliedLoRAStates(),
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
-          presetStackMismatch: payload.presetStackMismatch
+          presetStackMismatch: payload.presetStackMismatch,
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
         )
       )
     } catch {
@@ -9483,7 +9537,8 @@ private actor WarmServerCoordinator {
         success: true, outputPath: outputURL.path, durationMs: durationMs, applied: applied,
         appliedLoras: appliedLoRAStates(), presetUnresolved: payload.presetUnresolved,
         presetUnresolvedReason: payload.presetUnresolvedReason,
-        presetStackMismatch: payload.presetStackMismatch))
+        presetStackMismatch: payload.presetStackMismatch,
+        memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -9556,7 +9611,8 @@ private actor WarmServerCoordinator {
           appliedLoras: appliedLoRAStates(),
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
-          presetStackMismatch: payload.presetStackMismatch
+          presetStackMismatch: payload.presetStackMismatch,
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
         )
       )
     } catch {
@@ -9628,7 +9684,8 @@ private actor WarmServerCoordinator {
           appliedLoras: appliedLoRAStates(),
           presetUnresolved: payload.presetUnresolved,
           presetUnresolvedReason: payload.presetUnresolvedReason,
-          presetStackMismatch: payload.presetStackMismatch
+          presetStackMismatch: payload.presetStackMismatch,
+          memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes
         )
       )
     } catch {
@@ -10420,6 +10477,19 @@ struct GeneratePayload: Sendable {
   /// differ from what the named preset resolves to. The explicit list still
   /// wins; the response says so via `preset_stack_mismatch`.
   var presetStackMismatch: Bool?
+  /// #22 (PR #363 review, C1b): set by `validateImageMemoryPreflight`, never
+  /// by the wire — the render's estimated peak activation memory, in bytes.
+  /// nil when the preflight was skipped (width/height both omitted) or never
+  /// ran (replay, `gateSubmission: false`). ADVISORY: present even when the
+  /// estimate exceeded budget, as long as `imageMemoryCaps.enforceMemoryEstimate`
+  /// is false (the default) — that is the whole point of surfacing it, so an
+  /// operator can compare this number against real `/health` samples before
+  /// deciding whether to enforce.
+  var memoryEstimateBytes: UInt64?
+  /// #22: live free system memory at the moment the estimate above was
+  /// computed, so the two numbers can be compared without a second `/health`
+  /// call racing the render.
+  var memoryAvailableBytes: UInt64?
   // Depth Control-LoRA (docs/FDD-krea2-depth-controlnet.md)
   let controlImageData: Data?
   let controlnetStrength: Float?
@@ -10511,6 +10581,8 @@ struct GeneratePayload: Sendable {
     self.presetUnresolved = nil
     self.presetUnresolvedReason = nil
     self.presetStackMismatch = nil
+    self.memoryEstimateBytes = nil
+    self.memoryAvailableBytes = nil
     self.controlImageData = controlImageData; self.controlnetStrength = controlnetStrength; self.controlImage = controlImage
     self.prompt = prompt; self.negativePrompt = negativePrompt
     self.width = width; self.height = height; self.steps = steps
@@ -10632,6 +10704,9 @@ extension GeneratePayload: Decodable {
     presetUnresolved = nil
     presetUnresolvedReason = nil
     presetStackMismatch = nil
+    // #22: engine-set (validateImageMemoryPreflight), never decoded from the wire.
+    memoryEstimateBytes = nil
+    memoryAvailableBytes = nil
     controlImageData = (try c.decodeIfPresent(String.self, forKey: .controlImageData)).flatMap { Data(base64Encoded: $0) }
     controlnetStrength = try c.decodeIfPresent(Float.self, forKey: .controlnetStrength)
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
@@ -10715,6 +10790,56 @@ extension GeneratePayload: Decodable {
       }
     }
     return max(resolvedWidth, resolvedHeight) > 1024 ? .ntk : .disabled
+  }
+
+  /// #22: memory/resolution preflight, run at `decodedGeneratePayload` — the
+  /// ONE decode+validate choke point both `/v1/generate` and
+  /// `/v1/generate/async` share — so it runs before any model load, exactly
+  /// like `validateOutputPath`/`validateRecipeNames` beside it. A SEPARATE
+  /// pure-ish method (rather than inlined into `decodedGeneratePayload`) so
+  /// it stays a single, obviously-reviewable diff independent of whatever
+  /// else that call site is doing.
+  ///
+  /// Skipped when either dimension is omitted: an omitted width/height either
+  /// resolves to the small 1024×1024 engine default (never DyPE territory —
+  /// see `resolvedDyPEConfig`'s own `> 1024` gate) or, for img2img, is
+  /// derived from the source image later in the pipeline — a case this
+  /// decode-time gate cannot see (`makeImg2ImgRequest`'s own comment on why
+  /// it does not inject a config-default width/height either).
+  ///
+  /// `caps`/`availableBytes` default to LIVE reads (the real config store,
+  /// the real machine's free memory) — evaluated fresh at each call with no
+  /// argument, exactly like `StatsProvider.uptimeSeconds(now: Date = Date())`
+  /// elsewhere in this file. Tests inject deterministic values instead of
+  /// depending on whatever config/memory happens to be live on the runner.
+  ///
+  /// `warmFamily` — I4 (PR #363 review): the WARM/active family, when the
+  /// caller knows it (`await coordinator.modelFamily`), used only when the
+  /// request carries no explicit `model`. `log` — C1b: called with a warning
+  /// line when the live-memory budget would have refused but
+  /// `enforceMemoryEstimate` is false (the default), so the refusal is
+  /// visible in the server log even though the request proceeds. Mutates
+  /// `memoryEstimateBytes`/`memoryAvailableBytes` on success (or advisory
+  /// pass) so the caller can stamp them onto the eventual response.
+  @discardableResult
+  mutating func validateImageMemoryPreflight(
+    warmFamily: WarmModelFamily? = nil,
+    caps: ImageMemoryCapsConfig = ServerConfigStore.shared.imageMemoryCaps(),
+    availableBytes: UInt64 = MemoryProbe.systemAvailableMemoryBytes(),
+    log: (String) -> Void = { _ in }
+  ) throws -> ImageMemoryPreflight.Outcome? {
+    guard let width, let height else { return nil }
+    let family = ImageMemoryPreflight.resolvedFamily(model: model, warmFamily: warmFamily)
+    let dype = resolvedDyPEConfig(width: width, height: height).enabled
+    let outcome = try ImageMemoryPreflight.validate(
+      width: width, height: height, family: family, dype: dype,
+      caps: caps, availableBytes: availableBytes)
+    memoryEstimateBytes = outcome.estimateBytes
+    memoryAvailableBytes = outcome.availableBytes
+    if !outcome.withinBudget {
+      log("advisory (enforceMemoryEstimate=false, request proceeding) — \(outcome.reason)")
+    }
+    return outcome
   }
 
   func makePipelineRequest(
@@ -11229,6 +11354,14 @@ struct GenerateResponse: Encodable, Sendable {
   /// exactly the case this makes visible.
   let presetStackMismatch: Bool?
 
+  /// #22 (PR #363 review, C1b): the render's estimated peak activation
+  /// memory and the live free memory at the moment it was estimated —
+  /// present whenever the preflight ran (width/height both given, and not a
+  /// replay), regardless of whether the estimate was within budget. See
+  /// `GeneratePayload.memoryEstimateBytes`.
+  let memoryEstimateBytes: UInt64?
+  let memoryAvailableBytes: UInt64?
+
   /// The record itself, for Swift readers that do not care about the
   /// absent-vs-null distinction.
   var appliedRecord: RenderRecipe? { applied?.record }
@@ -11236,7 +11369,8 @@ struct GenerateResponse: Encodable, Sendable {
   init(success: Bool, outputPath: String, durationMs: Int, preemptRefused: Bool = false, etaSec: Double? = nil,
        applied: AppliedRecordSlot? = nil, appliedLoras: [LoRAState]? = nil,
        presetUnresolved: String? = nil, presetUnresolvedReason: String? = nil,
-       presetStackMismatch: Bool? = nil) {
+       presetStackMismatch: Bool? = nil,
+       memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
@@ -11247,6 +11381,8 @@ struct GenerateResponse: Encodable, Sendable {
     self.presetUnresolved = presetUnresolved
     self.presetUnresolvedReason = presetUnresolvedReason
     self.presetStackMismatch = presetStackMismatch
+    self.memoryEstimateBytes = memoryEstimateBytes
+    self.memoryAvailableBytes = memoryAvailableBytes
   }
 }
 
@@ -11532,6 +11668,20 @@ public struct LoRAState: Codable, Sendable {
 struct ErrorPayload: Encodable {
   let success: Bool
   let error: String
+  /// Additive (#22): a machine-readable refusal code alongside the human
+  /// `error` string, so a client can branch without string-matching it.
+  /// `nil` for every pre-existing refusal — the synthesized `Encodable`
+  /// conformance calls `encodeIfPresent` for `Optional` properties, so a
+  /// `nil` field is OMITTED from the JSON body, not encoded as `null`.
+  /// Existing error responses are therefore byte-identical to before.
+  var errorCode: String? = nil
+  /// #22 image-memory-preflight numbers: the render's estimated peak
+  /// activation bytes, live free system bytes at decision time, and the
+  /// byte cap it was compared against. Present only on
+  /// `imageMemoryPreflightRefused`.
+  var estimateBytes: UInt64? = nil
+  var availableBytes: UInt64? = nil
+  var capBytes: UInt64? = nil
 }
 
 private enum QueuedOperation: Sendable {
@@ -11674,6 +11824,15 @@ public enum WarmServerError: Error, LocalizedError {
   /// flight — see `QueueRecoveryGate`. `retryAfterSeconds` is this
   /// throw-site's own estimate, mirrored into the 503 body + header.
   case queueRecoveryInProgress(retryAfterSeconds: Int)
+  /// #22: an image request `ImageMemoryPreflight.validate` refused before any
+  /// model load — either it exceeds the configured resolution cap
+  /// (`code: "resolution_cap"`, no memory numbers — refused before probing)
+  /// or its estimated peak activation memory does not fit the live headroom
+  /// budget (`code: "insufficient_memory"`). `errorResponse(for:)` maps this
+  /// to 413 with the numbers as additive JSON fields (`ErrorPayload`).
+  case imageMemoryPreflightRefused(
+    code: String, reason: String,
+    estimateBytes: UInt64?, availableBytes: UInt64?, capBytes: UInt64?)
 
   public var errorDescription: String? {
     switch self {
@@ -11736,6 +11895,8 @@ public enum WarmServerError: Error, LocalizedError {
       return "Render interrupted by /v1/queue/interrupt"
     case .queueRecoveryInProgress:
       return QueueRecoveryGate.reason
+    case .imageMemoryPreflightRefused(let code, let reason, _, _, _):
+      return "[\(code)] \(reason)"
     }
   }
 }

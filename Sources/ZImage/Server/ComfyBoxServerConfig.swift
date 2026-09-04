@@ -208,6 +208,74 @@ public struct VideoDefaultsConfig: Codable, Equatable, Sendable {
   }
 }
 
+/// Resolution + memory caps for `ImageMemoryPreflight` (issue #22): a hard
+/// resolution ceiling (checked before any memory probing) plus how much live
+/// free system memory a render's estimated activation footprint must leave
+/// clear. Defaults are deliberately generous ceilings, NOT per-device
+/// recommendations — the live-memory check (`minAvailableHeadroomFraction`)
+/// is what actually adapts to whatever headroom a given Mac has right now;
+/// see `ImageMemoryPreflight.swift` for the estimate this gates.
+public struct ImageMemoryCapsConfig: Codable, Equatable, Sendable {
+  /// Hard ceiling (px) on the longer of width/height. Default 4096.
+  public var maxLongEdge: Int
+  /// Hard ceiling on width*height. Default 16,777,216 (4096²) — matches
+  /// `maxLongEdge` at the square case; a non-square request can still be
+  /// refused by this even under `maxLongEdge` (e.g. 4096x4097).
+  public var maxPixels: Int
+  /// Fraction of live free system memory (`MemoryProbe.systemAvailableMemoryBytes`)
+  /// that must remain clear after the render's estimated activation
+  /// footprint. Default 0.10 — mirrors issue #22's own proposed formula
+  /// ("refuse or warn if estimated usage exceeds ~90% of available memory").
+  /// Whether crossing this actually REFUSES the request is governed by
+  /// `enforceMemoryEstimate` below.
+  public var minAvailableHeadroomFraction: Double
+
+  /// PR #363 review, C1b: the byte-estimate formula in `ImageMemoryPreflight`
+  /// is UNCALIBRATED against any live memory trace. Default **false** — the
+  /// memory-budget check is ADVISORY: `ImageMemoryPreflight.validate` still
+  /// computes and returns it (and callers log a warning + stamp
+  /// `memory_estimate_bytes`/`memory_available_bytes` on the response) but
+  /// does not refuse the request. Set `true` only after calibrating the
+  /// estimate against real `/health` samples across a range of resolutions
+  /// (see `docs/user-guide.md`'s "DyPE / high-resolution pre-flight"
+  /// section) — at that point crossing the budget becomes a hard refusal,
+  /// same as it always has been for the resolution cap above.
+  public var enforceMemoryEstimate: Bool
+
+  public init(
+    maxLongEdge: Int = 4096,
+    maxPixels: Int = 16_777_216,
+    minAvailableHeadroomFraction: Double = 0.10,
+    enforceMemoryEstimate: Bool = false
+  ) {
+    self.maxLongEdge = maxLongEdge
+    self.maxPixels = maxPixels
+    self.minAvailableHeadroomFraction = minAvailableHeadroomFraction
+    self.enforceMemoryEstimate = enforceMemoryEstimate
+  }
+
+  public static let `default` = ImageMemoryCapsConfig()
+
+  public var isDefault: Bool { self == .default }
+
+  private enum CodingKeys: String, CodingKey {
+    case maxLongEdge, maxPixels, minAvailableHeadroomFraction, enforceMemoryEstimate
+  }
+
+  /// Tolerant decode: `enforceMemoryEstimate` is a field added after this
+  /// struct's first shape shipped — an old persisted document (or a
+  /// merge-patch fragment naming only the older three fields) must not fail
+  /// to decode over one missing key. Defaults false either way (never
+  /// silently starts enforcing).
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    maxLongEdge = try c.decodeIfPresent(Int.self, forKey: .maxLongEdge) ?? 4096
+    maxPixels = try c.decodeIfPresent(Int.self, forKey: .maxPixels) ?? 16_777_216
+    minAvailableHeadroomFraction = try c.decodeIfPresent(Double.self, forKey: .minAvailableHeadroomFraction) ?? 0.10
+    enforceMemoryEstimate = try c.decodeIfPresent(Bool.self, forKey: .enforceMemoryEstimate) ?? false
+  }
+}
+
 /// Persistent ComfyBox configuration, stored as a single `~/.comfybox/config.json`.
 ///
 /// Decoding tolerates missing keys (partial/older files load with defaults), so the
@@ -235,6 +303,13 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   /// Server-side video (Motion tab) defaults migrated from the desktop's local config
   /// (FDD §3.3): only `width`/`height`/`frames`.
   public var videoDefaults: VideoDefaultsConfig
+  /// Resolution + memory caps `ImageMemoryPreflight` gates image requests
+  /// against (issue #22). Defaults apply when absent — an unmigrated/older
+  /// config resolves identically to today's un-gated behavior only in the
+  /// sense that the defaults are generous ceilings, not a behavior bypass:
+  /// the preflight always runs, using `ImageMemoryCapsConfig.default` when
+  /// this key is absent.
+  public var imageMemoryCaps: ImageMemoryCapsConfig
 
   /// The one true ComfyBox HTTP port.
   public static let canonicalPort: UInt16 = 7870
@@ -253,7 +328,8 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     contentModeDefaultPresets: [String: String] = [:],
     krea2Models: [String: String] = [:],
     renderDefaults: RenderDefaultsConfig = RenderDefaultsConfig(),
-    videoDefaults: VideoDefaultsConfig = VideoDefaultsConfig()
+    videoDefaults: VideoDefaultsConfig = VideoDefaultsConfig(),
+    imageMemoryCaps: ImageMemoryCapsConfig = ImageMemoryCapsConfig()
   ) {
     self.port = port
     self.host = host
@@ -266,6 +342,7 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     self.krea2Models = krea2Models
     self.renderDefaults = renderDefaults
     self.videoDefaults = videoDefaults
+    self.imageMemoryCaps = imageMemoryCaps
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -274,6 +351,7 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     case krea2Models
     case renderDefaults
     case videoDefaults
+    case imageMemoryCaps
     // Legacy keys written by the desktop AppConfig (read-only, for smooth upgrade).
     case serverPort, serverHost, outputDirectory
   }
@@ -299,6 +377,7 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     krea2Models = try c.decodeIfPresent([String: String].self, forKey: .krea2Models) ?? [:]
     renderDefaults = try c.decodeIfPresent(RenderDefaultsConfig.self, forKey: .renderDefaults) ?? RenderDefaultsConfig()
     videoDefaults = try c.decodeIfPresent(VideoDefaultsConfig.self, forKey: .videoDefaults) ?? VideoDefaultsConfig()
+    imageMemoryCaps = try c.decodeIfPresent(ImageMemoryCapsConfig.self, forKey: .imageMemoryCaps) ?? ImageMemoryCapsConfig()
   }
 
   public func encode(to encoder: Encoder) throws {
@@ -322,6 +401,10 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
     if !videoDefaults.isEmpty {
       try c.encode(videoDefaults, forKey: .videoDefaults)
     }
+    // Unlike renderDefaults/videoDefaults/krea2Models (sparse — "empty" means
+    // "nothing set"), imageMemoryCaps always carries concrete values (there is
+    // no "unset" cap), so it is always encoded — same posture as `providers`.
+    try c.encode(imageMemoryCaps, forKey: .imageMemoryCaps)
   }
 
   // MARK: - Paths

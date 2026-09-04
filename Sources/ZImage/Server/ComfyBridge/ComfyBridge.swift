@@ -408,6 +408,20 @@ final class ComfyBridge {
 
   // MARK: - POST /prompt
 
+  /// M9 (PR #363 review): the ComfyUI wire protocol is 400-safe, not
+  /// 413-safe — `WarmServer.errorResponse(for:)` maps
+  /// `.imageMemoryPreflightRefused` to 413 for the REST `/v1/generate`
+  /// surface; the bridge downgrades that ONE case to 400 (same body) and
+  /// otherwise defers to the shared mapping.
+  static func bridgeErrorResponse(for error: WarmServerError) -> HTTPResponse {
+    if case let .imageMemoryPreflightRefused(code, reason, estimate, available, cap) = error {
+      return .json(status: 400, payload: ErrorPayload(
+        success: false, error: "[\(code)] \(reason)", errorCode: code,
+        estimateBytes: estimate, availableBytes: available, capBytes: cap))
+    }
+    return WarmServer.errorResponse(for: error)
+  }
+
   private func handlePrompt(_ request: HTTPRequest) -> RoutedResponse {
     guard let json = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any] else {
       return .error(.error(status: 400, message: "Invalid JSON body"))
@@ -459,6 +473,33 @@ final class ComfyBridge {
     // Route to the correct executor based on workflow type.
     switch parsedWorkflow {
     case .generate(let generateRequest):
+      // #22: same resolution/memory preflight `decodedGeneratePayload` runs
+      // for `/v1/generate` — BEFORE enqueue, let alone any model load. The
+      // bridge's `ComfyBridgeGenerateRequest` has no `dype` field of its own
+      // (Krita never sends one), so `dype` is derived with the identical
+      // auto-enable threshold `resolvedDyPEConfig` uses. `resolvedFamily`
+      // falls back to the lighter flux1 profile with no `detectedModel` (I4,
+      // PR #363 review) — the bridge has no warm-family hook of its own.
+      do {
+        let family = ImageMemoryPreflight.resolvedFamily(model: generateRequest.detectedModel)
+        let dype = ImageMemoryPreflight.autoDyPEEnabled(width: generateRequest.width, height: generateRequest.height)
+        let outcome = try ImageMemoryPreflight.validate(
+          width: generateRequest.width, height: generateRequest.height, family: family, dype: dype,
+          caps: ServerConfigStore.shared.imageMemoryCaps(),
+          availableBytes: MemoryProbe.systemAvailableMemoryBytes())
+        if !outcome.withinBudget {
+          logger.warning("ComfyBridge: /prompt [generate] advisory (enforceMemoryEstimate=false, request proceeding) — \(outcome.reason)")
+        }
+      } catch let error as WarmServerError {
+        // M9 (PR #363 review): the bridge is the ComfyUI wire protocol — 400,
+        // not the REST `/v1/generate` surface's 413, is what a ComfyUI-style
+        // client expects from a bad request.
+        logger.warning("ComfyBridge: /prompt [generate] refused by image-memory preflight — \(error.localizedDescription ?? "")")
+        return .error(Self.bridgeErrorResponse(for: error))
+      } catch {
+        return .error(WarmServer.errorResponse(for: error))
+      }
+
       logger.info("ComfyBridge: /prompt [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, cfg=\(generateRequest.guidance), seed=\(generateRequest.seed.map(String.init) ?? "random")")
 
       // Acknowledge immediately, but run the job through the executor's
@@ -544,6 +585,20 @@ final class ComfyBridge {
       let detectedModel = request.detectedModel
       let switchHandler = modelSwitchHandler
       let generateRequest = request
+      // #22: same preflight as POST /prompt — `submitWorkflowGraph` is
+      // `throws`, so a resolution-cap refusal here propagates to this call's
+      // caller (the `/v1/workflows/{id}/run` REST route, which keeps 413 —
+      // this is not the raw ComfyUI wire protocol) before any enqueue, let
+      // alone any model load.
+      let workflowOutcome = try ImageMemoryPreflight.validate(
+        width: generateRequest.width, height: generateRequest.height,
+        family: ImageMemoryPreflight.resolvedFamily(model: detectedModel),
+        dype: ImageMemoryPreflight.autoDyPEEnabled(width: generateRequest.width, height: generateRequest.height),
+        caps: ServerConfigStore.shared.imageMemoryCaps(),
+        availableBytes: MemoryProbe.systemAvailableMemoryBytes())
+      if !workflowOutcome.withinBudget {
+        logger.warning("ComfyBridge: workflow-api [generate] advisory (enforceMemoryEstimate=false, request proceeding) — \(workflowOutcome.reason)")
+      }
       logger.info("ComfyBridge: workflow-api [generate] — \(generateRequest.width)x\(generateRequest.height), \(generateRequest.steps) steps, seed=\(generateRequest.seed.map(String.init) ?? "random")")
       executor.enqueue(promptId: generateRequest.promptId) { [logger, executor] in
         if let modelId = detectedModel, let handler = switchHandler {

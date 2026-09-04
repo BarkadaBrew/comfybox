@@ -153,6 +153,10 @@ document (config writes: RFC 7386 merge patch via `PATCH /v1/config`).
 | `creative.contentMode.neutral.styleVariant` | creative | enum |  | `neutral` | PUT `/v1/content-modes/neutral` @ `/styleVariant` |  |  |
 | `creative.contentModeDefaultPresets` | creative | object |  |  | PATCH `/v1/config` @ `/contentModeDefaultPresets` | patch_config |  |
 | `engine.allowedOutputDirectory` | engine | string |  |  | PATCH `/v1/config` @ `/allowedOutputDirectory` | patch_config |  |
+| `engine.imageMemoryCaps.enforceMemoryEstimate` | engine | bool |  | false | PATCH `/v1/config` @ `/imageMemoryCaps/enforceMemoryEstimate` | patch_config |  |
+| `engine.imageMemoryCaps.maxLongEdge` | engine | int |  | 4096 | PATCH `/v1/config` @ `/imageMemoryCaps/maxLongEdge` | patch_config |  |
+| `engine.imageMemoryCaps.maxPixels` | engine | int |  | 16777216 | PATCH `/v1/config` @ `/imageMemoryCaps/maxPixels` | patch_config |  |
+| `engine.imageMemoryCaps.minAvailableHeadroomFraction` | engine | double | 0–1 | 0.1 | PATCH `/v1/config` @ `/imageMemoryCaps/minAvailableHeadroomFraction` | patch_config |  |
 | `engine.seedvr2WeightsPath` | engine | string |  |  | PATCH `/v1/config` @ `/seedvr2WeightsPath` | patch_config | yes |
 | `model.krea2Models` | model | object |  |  | PATCH `/v1/config` @ `/krea2Models` | patch_config | yes |
 | `model.spec` | model | string |  |  | PATCH `/v1/config` @ `/modelSpec` | patch_config | yes |
