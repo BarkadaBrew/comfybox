@@ -127,6 +127,26 @@ public struct LoRAWeights: @unchecked Sendable {
     public var hasLoKr: Bool {
         !lokrWeights.isEmpty
     }
+
+    /// A copy with a different pair/delta split and everything else preserved
+    /// EXACTLY — rank, LoKr, per-layer alphas, and crucially whether an alpha
+    /// was ever explicitly declared. Rebuilding via the public initialiser
+    /// with `alpha: self.alpha` would promote a defaulted alpha (`Float(rank)`)
+    /// into an explicit one and silently rescale every remaining pair, so the
+    /// re-split lives here, where `explicitAlpha` is visible.
+    /// Used by ``LoRABareParameterPairs/split(_:for:name:)``.
+    public func withPairsAndDeltas(
+        weights: [String: (down: MLXArray, up: MLXArray)],
+        deltas: [String: DeltaPatch]
+    ) -> LoRAWeights {
+        LoRAWeights(
+            weights: weights,
+            lokrWeights: lokrWeights,
+            rank: rank,
+            alpha: explicitAlpha,
+            layerAlphas: layerAlphas,
+            deltas: deltas)
+    }
 }
 
 /// A bare-parameter patch shipped inside a LoRA file (ComfyUI comfy/lora.py

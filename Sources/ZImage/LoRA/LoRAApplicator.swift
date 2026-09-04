@@ -45,7 +45,10 @@ public struct LoRAApplicationReport: Sendable, Equatable {
 
 public struct LoRAApplicator {
 
-    private static func linearDims(for module: Module) -> (out: Int, in: Int)? {
+    /// Internal (not private) so ``LoRABareParameterPairs`` can ask the
+    /// applicator's own question — "could the module walk bind this?" —
+    /// rather than keeping a second, driftable copy of the rule.
+    static func linearDims(for module: Module) -> (out: Int, in: Int)? {
         if let qlin = module as? QuantizedLinear {
             // qlin.weight is packed (bits-per-element < 32), so its last axis
             // is NOT the true input dimension — qlin.shape already unpacks it
@@ -118,7 +121,7 @@ public struct LoRAApplicator {
         return (down: normalized.down, up: slicedUp)
     }
 
-    private static func normalizedLoRAPair(
+    static func normalizedLoRAPair(
         down: MLXArray,
         up: MLXArray,
         targetShape: [Int]
@@ -316,7 +319,7 @@ public struct LoRAApplicator {
         return restored
     }
 
-    private static func computeDelta(up: MLXArray, down: MLXArray) -> MLXArray? {
+    static func computeDelta(up: MLXArray, down: MLXArray) -> MLXArray? {
         guard up.ndim == 2, down.ndim == 2, up.dim(1) == down.dim(0) else { return nil }
         return MLX.matmul(up, down)
     }
