@@ -26,6 +26,26 @@ public struct EditSidecar: Codable, Equatable, Sendable {
         case createdAt = "created_at"
     }
 
+    // Hand-written so `source_asset_id` always appears in the JSON — as an
+    // explicit `null` when absent — rather than being dropped by the
+    // synthesized `encodeIfPresent` an Optional stored property would get by
+    // default. The `edit` block is a fixed six-key contract; a caller
+    // scanning for `source_asset_id` should never have to distinguish
+    // "absent" from "null".
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(version, forKey: .version)
+        try c.encode(sourcePath, forKey: .sourcePath)
+        if let id = sourceAssetId {
+            try c.encode(id, forKey: .sourceAssetId)
+        } else {
+            try c.encodeNil(forKey: .sourceAssetId)
+        }
+        try c.encode(recipe, forKey: .recipe)
+        try c.encode(editor, forKey: .editor)
+        try c.encode(createdAt, forKey: .createdAt)
+    }
+
     static let decoder: JSONDecoder = { let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601; return d }()
     static let encoder: JSONEncoder = { let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; return e }()
 
@@ -42,19 +62,48 @@ public struct EditSidecar: Codable, Equatable, Sendable {
         return try? decoder.decode(EditSidecar.self, from: editData)
     }
 
+    /// Follows the `source_path` chain to the root original. Unbounded in the
+    /// number of hops it will follow (an edit chain has no fixed depth
+    /// limit), but a chain that revisits a path it has already seen is
+    /// malformed — a fixed-count hop cap would silently stop at an arbitrary
+    /// point in a cycle, so instead this tracks every path it has visited
+    /// and, on a repeat, reports the failure explicitly: the starting image
+    /// itself with a `nil` asset id, which callers can treat as "sidecar
+    /// exists but the chain is broken" rather than mistaking it for a real
+    /// root.
     public static func rootSource(forImageAt imagePath: String) -> (path: String, assetId: String?) {
         var path = imagePath
         var assetId: String? = nil
-        var hops = 0
-        while hops < 32, let sc = read(forImageAt: path) {
-            path = sc.sourcePath; assetId = sc.sourceAssetId; hops += 1
+        var visited: Set<String> = [imagePath]
+        while let sc = read(forImageAt: path) {
+            let nextPath = sc.sourcePath
+            if visited.contains(nextPath) {
+                return (imagePath, nil)
+            }
+            visited.insert(nextPath)
+            path = nextPath
+            assetId = sc.sourceAssetId
         }
         return (path, assetId)
     }
 
-    public var jsonObject: [String: Any] {
-        guard let data = try? Self.encoder.encode(self),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+    /// Failure building the `edit` block's JSON representation. In practice
+    /// only the "encoded to something other than a JSON object" branch below
+    /// is unreachable for this struct's shape; it exists so the guard has a
+    /// concrete error to throw rather than force-unwrapping.
+    public enum JSONObjectError: Error {
+        case notAnObject
+    }
+
+    /// JSON dictionary for the `edit` key. Throws (rather than swallowing
+    /// into `[:]`) so a genuinely unrepresentable recipe — e.g. a NaN
+    /// adjustment value, which `JSONEncoder` refuses to encode — surfaces to
+    /// the exporter instead of silently writing an empty/partial block.
+    public func jsonObject() throws -> [String: Any] {
+        let data = try Self.encoder.encode(self)
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw JSONObjectError.notAnObject
+        }
         return obj
     }
 }

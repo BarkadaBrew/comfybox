@@ -14,11 +14,11 @@ struct EditExporterTests {
     }
 
     @Test("sidecarObject copies generation fields and writes the edit block")
-    func sidecarObject() {
+    func sidecarObject() throws {
         let asset = DAMAsset(id: "A1", filename: "a.png", absolutePath: "/orig/a.png", prompt: "a cat", negativePrompt: "dog",
                              seed: 42, steps: 9, guidance: 3.5, modelFamily: "krea2", contentMode: "apple", characterName: "Kira")
         var recipe = EditRecipe(); recipe.adjustments.contrast = 0.3
-        let obj = EditExporter.sidecarObject(source: asset, sourcePath: "/orig/a.png", recipe: recipe, now: Date(timeIntervalSince1970: 0))
+        let obj = try EditExporter.sidecarObject(source: asset, sourcePath: "/orig/a.png", recipe: recipe, now: Date(timeIntervalSince1970: 0))
         #expect(obj["prompt"] as? String == "a cat")
         #expect(obj["negative_prompt"] as? String == "dog")
         #expect(obj["seed"] as? Int == 42 && obj["steps"] as? Int == 9)
@@ -69,5 +69,67 @@ struct EditExporterTests {
         let second = try await EditExporter.export(sourceImage: src, sourcePath: first, sourceAsset: nil,
                                                    recipe: EditRecipe(), subjectMask: nil, outputDirectory: dir, ingestor: nil)
         #expect(EditSidecar.read(forImageAt: second)?.sourcePath == "/orig/root.png")
+    }
+
+    // MARK: - Fix round 1
+
+    @Test("sidecarObject always writes source_asset_id, explicit JSON null when there is no source asset")
+    func sidecarObjectExplicitNullAssetId() throws {
+        let objNoSource = try EditExporter.sidecarObject(source: nil, sourcePath: "/orig/a.png", recipe: EditRecipe(), now: Date())
+        let editNoSource = objNoSource["edit"] as? [String: Any]
+        #expect((editNoSource?["source_asset_id"]).map { $0 is NSNull } == true)
+
+        let asset = DAMAsset(id: "A9", filename: "a.png", absolutePath: "/orig/a.png")
+        let objWithSource = try EditExporter.sidecarObject(source: asset, sourcePath: "/orig/a.png", recipe: EditRecipe(), now: Date())
+        let editWithSource = objWithSource["edit"] as? [String: Any]
+        #expect(editWithSource?["source_asset_id"] as? String == "A9")
+    }
+
+    @Test("outputPath treats a lone leftover sidecar as taken even without a paired PNG")
+    func outputPathSidecarOnlyCollision() throws {
+        let dir = tempDir()
+        FileManager.default.createFile(atPath: dir + "/edit-1234.json", contents: Data())
+        #expect(EditExporter.outputPath(in: dir, seconds: 1234) == dir + "/edit-1234-2.png")
+    }
+
+    @Test("export throws and leaves no files when the recipe cannot be encoded")
+    func exportUnencodableRecipeLeavesNoFiles() async throws {
+        let dir = tempDir()
+        let src = EditTestSupport.solid(r: 1, g: 2, b: 3, width: 4, height: 4)
+        var recipe = EditRecipe(); recipe.adjustments.exposure = .nan
+        var thrown: Error?
+        do {
+            _ = try await EditExporter.export(sourceImage: src, sourcePath: "/orig/n.png", sourceAsset: nil,
+                                              recipe: recipe, subjectMask: nil, outputDirectory: dir, ingestor: nil)
+        } catch {
+            thrown = error
+        }
+        #expect(thrown != nil)
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        #expect(contents.isEmpty)
+    }
+
+    @Test("export throws and creates nothing when the output directory cannot be created")
+    func exportUncreatableDirectoryLeavesNoFiles() async throws {
+        let dir = tempDir()
+        let blockingFile = dir + "/not-a-directory"
+        FileManager.default.createFile(atPath: blockingFile, contents: Data("x".utf8))
+        let badOutputDir = blockingFile + "/nested"
+        let src = EditTestSupport.solid(r: 1, g: 2, b: 3, width: 4, height: 4)
+        var thrown: Error?
+        do {
+            _ = try await EditExporter.export(sourceImage: src, sourcePath: "/orig/n.png", sourceAsset: nil,
+                                              recipe: EditRecipe(), subjectMask: nil, outputDirectory: badOutputDir, ingestor: nil)
+        } catch {
+            thrown = error
+        }
+        #expect(thrown != nil)
+        #expect(!FileManager.default.fileExists(atPath: badOutputDir))
+    }
+
+    @Test("EditExportError carries a useful localized description")
+    func localizedErrorDescriptions() {
+        #expect(EditExportError.renderFailed.localizedDescription.isEmpty == false)
+        #expect(EditExportError.writeFailed("disk full").localizedDescription.contains("disk full"))
     }
 }
