@@ -1577,6 +1577,9 @@ public final class LTX2VideoGenerator {
                 // chunk may have recorded a skip (the refine gate returns
                 // `.completed` internally before any later phase yields) that
                 // must ride the snapshot, not just live on `pipeline`.
+                // (review r3, minor 2) Sync site 1 of 2 — reads whatever
+                // `LTX2Pipeline.recordRefineSkip` last wrote to
+                // `lastRefineSkipReason`; see that function's doc comment.
                 refineSkippedReason = pipeline.lastRefineSkipReason ?? refineSkippedReason
                 // #1479: propagate. Frames banked by EARLIER chunks ride in the
                 // context; this chunk's own progress is in the checkpoint.
@@ -1586,6 +1589,8 @@ public final class LTX2VideoGenerator {
             // comfybox#307 (review r1): this chunk finished cleanly — fold in
             // whatever it recorded so the NEXT chunk's between-chunk
             // checkpoint (above) and the final result (below) both see it.
+            // (review r3, minor 2) Sync site 2 of 2 — same read as above; see
+            // `LTX2Pipeline.recordRefineSkip`'s doc comment for both sites.
             refineSkippedReason = pipeline.lastRefineSkipReason ?? refineSkippedReason
 
             telemetry?.begin(.postProcess)

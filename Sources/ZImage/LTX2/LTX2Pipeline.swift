@@ -128,6 +128,19 @@ public final class LTX2Pipeline {
   /// T2V inline refine, 5 in the shared `applyTwoStageRefine` and its debug
   /// bypasses) so there is exactly one function to test and one place a
   /// future skip path has to remember to call.
+  ///
+  /// comfybox#307 (review r3, minor 2): setting `lastRefineSkipReason` here
+  /// is only HALF the propagation — `LTX2VideoGenerator.render` has to read
+  /// it back out to keep its own cross-chunk/cross-resume
+  /// `refineSkippedReason` accumulator current (this pipeline may be
+  /// deallocated and rebuilt between chunks on a preemption, so the
+  /// generator can't just read this property once at the end). That
+  /// happens at exactly TWO hand-written sync sites in `render()`'s chunk
+  /// loop — search that file for "kept in sync with
+  /// `pipeline.lastRefineSkipReason`" — both reachable right after every
+  /// point a chunk's pipeline call can return. If a future skip path adds a
+  /// THIRD place `lastRefineSkipReason` changes, those two sites are what
+  /// must still observe it.
   private func recordRefineSkip(_ reason: String, logPrefix: String, logSuffix: String = "") {
     logger.warning("\(logPrefix): SKIPPED — \(reason)\(logSuffix).")
     lastRefineSkipReason = reason

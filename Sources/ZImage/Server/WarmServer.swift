@@ -2381,17 +2381,26 @@ public final class WarmServer {
     return plan
   }
 
-  /// comfybox#307 (review r2, item 2a): the ACTUAL `LTX2VideoRequest`
-  /// construction `prepareLocalVideo` runs — pulled out verbatim (every
-  /// argument expression unchanged) so a test can call the SAME site
-  /// production code calls and inspect the resulting request's `.tuning`,
-  /// rather than trusting that a separately-computed `effectiveTuning` value
-  /// is actually what reaches the request (round 1's test proved the MERGE;
-  /// this proves the merge's result is what gets WIRED into the request).
-  /// All parameters are already-resolved values `prepareLocalVideo` computes
-  /// before this call — nothing here re-derives anything.
+  /// comfybox#307 (review r2, item 2a; tightened review r3, minor 3): the
+  /// ACTUAL `LTX2VideoRequest` construction `prepareLocalVideo` runs —
+  /// pulled out verbatim (every argument expression unchanged) so a test
+  /// can call the SAME site production code calls and inspect the
+  /// resulting request's `.tuning`.
+  ///
+  /// `tuning:` is derived HERE, from `req`, via `effectiveVideoTuning(for:)`
+  /// — not accepted as a separate parameter — so there is no longer a
+  /// caller-supplied value that could silently diverge from the merge (a
+  /// one-line revert at the call site used to be able to pass `req.tuning`
+  /// instead of the merged value and no test would catch it; now there is
+  /// no such parameter to revert). `prepareLocalVideo` still computes its
+  /// OWN `effectiveTuning` local separately, for the dims-calc two-stage
+  /// check earlier in that function — a harmless duplicate call of the same
+  /// pure merge, not a second source of truth for what reaches the request.
+  ///
+  /// All other parameters are already-resolved values `prepareLocalVideo`
+  /// computes before this call — nothing here re-derives anything else.
   static func buildLocalVideoRequest(
-    req: LocalVideoRequest, effectiveTuning: LTX2VideoTuning?, videoPreset: ImagePreset?,
+    req: LocalVideoRequest, videoPreset: ImagePreset?,
     effectivePrompt: String, effectiveInitImage: String?,
     renderWidth: Int, renderHeight: Int,
     foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
@@ -2437,7 +2446,7 @@ public final class WarmServer {
       loraStrength: req.loraStrength ?? 1.0,
       loras: resolvedLoRAs,
       outputPath: resolvedOutput,
-      tuning: effectiveTuning,
+      tuning: Self.effectiveVideoTuning(for: req),
       presetTuning: videoPreset?.videoTuning,
       audio: req.audio ?? false,
       beatSchedule: effectiveBeatSchedule
@@ -2729,7 +2738,7 @@ public final class WarmServer {
     }
 
     let videoRequest = Self.buildLocalVideoRequest(
-      req: req, effectiveTuning: effectiveTuning, videoPreset: videoPreset,
+      req: req, videoPreset: videoPreset,
       effectivePrompt: effectivePrompt, effectiveInitImage: effectiveInitImage,
       renderWidth: renderWidth, renderHeight: renderHeight,
       foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
@@ -6638,6 +6647,20 @@ private actor WarmServerCoordinator {
     lastError = message
   }
 
+  /// comfybox#308/#322 (review r3): the `.localVideo` case's generic
+  /// `catch` — shared by the production catch block and the `#if DEBUG`
+  /// seam (`testSeamHandleLocalVideoCatch`) so both run the exact same
+  /// classify-then-finish decision. `localVideoCatchOutcome(for:)` returns
+  /// nil for an operator interrupt (including a WRAPPED cancellation) —
+  /// `finishLocalVideo` is not called at all in that case, matching the
+  /// sibling `catch is CancellationError` branch, which never touches the
+  /// counters either.
+  private func handleLocalVideoCatch(_ error: Error) {
+    if let outcome = localVideoCatchOutcome(for: error) {
+      finishLocalVideo(outcome, lastError: error.localizedDescription)
+    }
+  }
+
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
   ///
@@ -7934,6 +7957,19 @@ private actor WarmServerCoordinator {
     finishLocalVideo(outcome, lastError: message)
     return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
   }
+
+  /// comfybox#308/#322 (review r3) test seam: drives `handleLocalVideoCatch`
+  /// directly against a REAL coordinator — the exact function the
+  /// production `.localVideo` generic `catch` calls — so a test can prove a
+  /// WRAPPED cancellation (or any error `isRenderInterruption` recognises)
+  /// leaves the counters and `lastError` untouched, while a genuine error
+  /// still counts as a failed render.
+  func testSeamHandleLocalVideoCatch(
+    _ error: Error
+  ) -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    handleLocalVideoCatch(error)
+    return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
+  }
   #endif
 
   /// Publish the current health-relevant state into the lock-based
@@ -8502,7 +8538,14 @@ private actor WarmServerCoordinator {
             self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
             continuation.resume(throwing: WarmServerError.renderInterrupted)
           } catch {
-            self.finishLocalVideo(.threw, lastError: error.localizedDescription)
+            // comfybox#308/#322 (review r3): a WRAPPED cancellation (e.g.
+            // ModelPoolError.loadFailed on a resume's model reload) lands
+            // here — `is CancellationError` above only matches the bare
+            // case. `handleLocalVideoCatch` re-classifies with the SAME
+            // `isRenderInterruption` check `VideoJobTracker.markFailed`
+            // uses on this same error, so an interrupt is never
+            // double-counted as a failed render.
+            self.handleLocalVideoCatch(error)
             continuation.resume(throwing: error)
           }
         }
@@ -11379,6 +11422,25 @@ func isRenderInterruption(_ error: Error) -> Bool {
   return false
 }
 
+/// comfybox#308/#322 (review r3): what the `.localVideo` case's generic
+/// `catch` should do with a caught error, as a pure decision. nil means "an
+/// operator interrupt — do not touch the health counters", using the SAME
+/// `isRenderInterruption` classification `VideoJobTracker.markFailed`
+/// already applies so the two never disagree about the same error.
+///
+/// This exists because the sibling `catch is CancellationError` branch (in
+/// `WarmServerCoordinator`'s process loop) only catches a BARE
+/// `CancellationError` thrown straight out of a pipeline loop — a WRAPPED
+/// one (e.g. `ModelPoolError.loadFailed("…", CancellationError())`, which a
+/// resume's model reload can throw) doesn't match `is CancellationError` and
+/// used to fall through to the generic catch, where it was counted as a
+/// failed render even though `VideoJobTracker.markFailed` (fed the same
+/// error via the continuation) correctly reported it as interrupted —
+/// `/health.failed_count` and the job status disagreed about the same event.
+func localVideoCatchOutcome(for error: Error) -> LocalVideoCompletionOutcome? {
+  isRenderInterruption(error) ? nil : .threw
+}
+
 #if DEBUG
 /// K-FIX-1 / Codex C2 test seam — drives the coordinator's FIFO directly.
 ///
@@ -11502,6 +11564,14 @@ final class WarmServerQueueProbe: @unchecked Sendable {
     _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
   ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
     await coordinator.testSeamFinishLocalVideo(outcome, lastError: message)
+  }
+
+  /// comfybox#308/#322 (review r3): the `.localVideo` generic-catch seam —
+  /// see `WarmServerCoordinator.testSeamHandleLocalVideoCatch`.
+  func handleLocalVideoCatch(
+    _ error: Error
+  ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    await coordinator.testSeamHandleLocalVideoCatch(error)
   }
 
   /// The sync `/v1/queue/pause` path: authoritative lock-store write.

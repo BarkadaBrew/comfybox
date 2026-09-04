@@ -97,18 +97,21 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
     XCTAssertEqual(merged?.refineScale, 1.35)
   }
 
-  // MARK: - comfybox#307 (review r2, item 2a): the merge alone proves the
-  // MERGE function is correct, but nothing above proves its result is what
-  // actually reaches the `LTX2VideoRequest` the generator renders — a
-  // one-line revert (`tuning: effectiveTuning` → `tuning: req.tuning`) at
-  // the construction site would pass every test above. These call
-  // `WarmServer.buildLocalVideoRequest`, the ACTUAL construction
-  // `prepareLocalVideo` runs, with a real decoded request.
+  // MARK: - comfybox#307 (review r2, item 2a; tightened review r3, minor 3):
+  // the merge alone proves the MERGE function is correct, but nothing above
+  // proves its result is what actually reaches the `LTX2VideoRequest` the
+  // generator renders. These call `WarmServer.buildLocalVideoRequest`, the
+  // ACTUAL construction `prepareLocalVideo` runs, with a real decoded
+  // request — and since review r3, `buildLocalVideoRequest` derives
+  // `tuning:` internally from `req` (no separate `effectiveTuning`
+  // parameter a caller could pass a stale/wrong value for), so this is now
+  // the single, non-bypassable path from a decoded request to the
+  // constructed request's `.tuning`.
 
   private func buildRequest(_ json: String) throws -> LTX2VideoRequest {
     let req = try decodeLocalVideoRequest(json)
     return WarmServer.buildLocalVideoRequest(
-      req: req, effectiveTuning: WarmServer.effectiveVideoTuning(for: req), videoPreset: nil,
+      req: req, videoPreset: nil,
       effectivePrompt: req.prompt, effectiveInitImage: nil,
       renderWidth: 704, renderHeight: 448,
       foldedFramesPerChunk: 97, foldedExtendSeconds: 0,

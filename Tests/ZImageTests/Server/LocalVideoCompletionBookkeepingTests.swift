@@ -67,4 +67,71 @@ final class LocalVideoCompletionBookkeepingTests: XCTestCase {
     XCTAssertEqual(result.lastDurationMs, 30_000, "duration persists from the earlier success")
     XCTAssertEqual(result.lastError, "boom", "the latest completion's error wins")
   }
+
+  // MARK: - comfybox#308/#322 (review r3): the generic catch must not
+  // double-count an operator interrupt (bare OR wrapped) as a failed render.
+
+  func testLocalVideoCatchOutcomeIsNilForABareCancellation() {
+    XCTAssertNil(localVideoCatchOutcome(for: CancellationError()))
+  }
+
+  func testLocalVideoCatchOutcomeIsNilForTheNamedInterruptError() {
+    XCTAssertNil(localVideoCatchOutcome(for: WarmServerError.renderInterrupted))
+  }
+
+  /// The exact regression: a cancellation wrapped inside a load/reload
+  /// error, the shape a resume's model reload throws.
+  func testLocalVideoCatchOutcomeIsNilForAWrappedCancellation() {
+    XCTAssertNil(localVideoCatchOutcome(
+      for: ModelPoolError.loadFailed("krea2", CancellationError())))
+    XCTAssertNil(localVideoCatchOutcome(
+      for: ZImageWeightsMapping.WeightApplicationError.updateFailed(
+        prefix: "transformer", underlying: CancellationError())))
+  }
+
+  func testLocalVideoCatchOutcomeIsThrewForAGenuineFailure() {
+    XCTAssertEqual(localVideoCatchOutcome(for: WarmServerError.invalidRequest(message: "bad dims")), .threw)
+    XCTAssertEqual(localVideoCatchOutcome(for: LTX2VideoError.weightsMissing("/nowhere")), .threw)
+    XCTAssertEqual(
+      localVideoCatchOutcome(for: ModelPoolError.loadFailed("krea2", LTX2VideoError.unsupportedPlatform)),
+      .threw,
+      "a wrapper around a genuine failure is a genuine failure")
+  }
+
+  /// The seam: a WRAPPED cancellation, driven through the REAL coordinator's
+  /// `handleLocalVideoCatch` (the exact function the production `.localVideo`
+  /// generic catch calls) — counters and lastError must not move.
+  func testSeamWrappedCancellationDoesNotIncrementFailedCount() async throws {
+    let probe = makeQueueProbe()
+    let result = await probe.handleLocalVideoCatch(
+      ModelPoolError.loadFailed("krea2 reload on resume", CancellationError()))
+    XCTAssertEqual(result.successCount, 0)
+    XCTAssertEqual(result.failedCount, 0, "a wrapped cancellation must not count as a failed render")
+    XCTAssertNil(result.lastError)
+  }
+
+  func testSeamBareCancellationDoesNotIncrementFailedCount() async throws {
+    let probe = makeQueueProbe()
+    let result = await probe.handleLocalVideoCatch(CancellationError())
+    XCTAssertEqual(result.failedCount, 0)
+    XCTAssertNil(result.lastError)
+  }
+
+  /// The counterpart: a genuine failure through the SAME seam still counts.
+  func testSeamGenuineFailureIncrementsFailedCountAndSetsLastError() async throws {
+    let probe = makeQueueProbe()
+    let result = await probe.handleLocalVideoCatch(WarmServerError.invalidRequest(message: "bad dims"))
+    XCTAssertEqual(result.successCount, 0)
+    XCTAssertEqual(result.failedCount, 1)
+    XCTAssertEqual(result.lastError, "bad dims")
+  }
+
+  /// A wrapped cancellation followed by a genuine failure on the same
+  /// coordinator — only the genuine one counts.
+  func testSeamMixedWrappedInterruptThenGenuineFailure() async throws {
+    let probe = makeQueueProbe()
+    _ = await probe.handleLocalVideoCatch(ModelPoolError.loadFailed("krea2", CancellationError()))
+    let result = await probe.handleLocalVideoCatch(LTX2VideoError.weightsMissing("/nowhere"))
+    XCTAssertEqual(result.failedCount, 1, "only the genuine failure counts")
+  }
 }
