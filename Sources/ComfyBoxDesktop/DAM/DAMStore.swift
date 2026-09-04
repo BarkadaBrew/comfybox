@@ -15,6 +15,28 @@ import SQLite3
 /// pointers risks the buffer being released before the statement runs.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+/// Drives a `sqlite3_step` loop to completion, invoking `onRow` for every
+/// `SQLITE_ROW` and returning the terminal step code once rows are
+/// exhausted. A bare `while sqlite3_step(stmt) == SQLITE_ROW` cannot tell
+/// "the result set is finished" (`SQLITE_DONE`) from "the step itself
+/// failed partway through" (`SQLITE_BUSY`, `SQLITE_IOERR`,
+/// `SQLITE_CORRUPT`, …) — both look identical from inside the loop, so a
+/// mid-iteration error silently truncates the result instead of surfacing
+/// (#263). Callers must compare the returned code against `SQLITE_DONE`
+/// and throw on anything else.
+///
+/// `step` is a closure rather than a bound `OpaquePointer` so this can be
+/// unit-tested with a stub that fails after N rows, without standing up a
+/// real (and hard to fault-inject on purpose) SQLite connection.
+func drainSQLiteRows(step: () -> Int32, onRow: () -> Void) -> Int32 {
+    var rc = step()
+    while rc == SQLITE_ROW {
+        onRow()
+        rc = step()
+    }
+    return rc
+}
+
 public actor DAMStore {
     private var db: OpaquePointer?
     private let dbPath: String
@@ -276,8 +298,11 @@ public actor DAMStore {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
         var out: Set<String> = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let c = sqlite3_column_text(stmt, 0) { out.insert(String(cString: c)) }
+        }
+        guard rc == SQLITE_DONE else {
+            throw DAMStoreError.stepFailed(rc, lastError)
         }
         return out
     }
@@ -370,8 +395,11 @@ public actor DAMStore {
         sqlite3_bind_int(stmt, 2, Int32(offset))
 
         var results: [DAMAsset] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             results.append(assetFromRow(stmt))
+        }
+        guard rc == SQLITE_DONE else {
+            throw DAMStoreError.stepFailed(rc, lastError)
         }
         return results
     }
@@ -387,10 +415,13 @@ public actor DAMStore {
         defer { sqlite3_finalize(stmt) }
 
         var paths: [String] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let path = columnText(stmt, 0) {
                 paths.append(path)
             }
+        }
+        guard rc == SQLITE_DONE else {
+            throw DAMStoreError.stepFailed(rc, lastError)
         }
         return paths
     }
@@ -406,10 +437,13 @@ public actor DAMStore {
         defer { sqlite3_finalize(stmt) }
 
         var ids = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let id = columnText(stmt, 0) {
                 ids.insert(id)
             }
+        }
+        guard rc == SQLITE_DONE else {
+            throw DAMStoreError.stepFailed(rc, lastError)
         }
         return ids
     }
@@ -580,8 +614,11 @@ public actor DAMStore {
         }
         defer { sqlite3_finalize(stmt) }
         var ids = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             ids.insert(String(cString: sqlite3_column_text(stmt, 0)))
+        }
+        guard rc == SQLITE_DONE else {
+            throw DAMStoreError.stepFailed(rc, lastError)
         }
         return ids
     }
@@ -968,6 +1005,11 @@ public enum DAMStoreError: Error, LocalizedError {
     case prepareFailed(String)
     case insertFailed(String)
     case execFailed(String, String)
+    /// A `sqlite3_step` row-fetch loop ended on a code other than
+    /// `SQLITE_DONE` — e.g. `SQLITE_BUSY`, `SQLITE_IOERR`, `SQLITE_CORRUPT`.
+    /// Without this, that failure looks identical to "no more rows" and the
+    /// caller silently gets a truncated result instead of an error (#263).
+    case stepFailed(Int32, String)
     /// The orphan sweep would have removed an implausible share of the library
     /// and refused, deleting nothing. See `DAMStore.pruneCircuitBreakerFraction`.
     case pruneRefused(candidates: Int, total: Int)
@@ -982,6 +1024,8 @@ public enum DAMStoreError: Error, LocalizedError {
             return "Insert failed: \(msg)"
         case .execFailed(let sql, let msg):
             return "SQL exec failed (\(sql)): \(msg)"
+        case .stepFailed(let code, let msg):
+            return "SQL step failed (code \(code)): \(msg)"
         case .pruneRefused(let candidates, let total):
             return "\(candidates) of \(total) images look missing — that is usually an "
                 + "unmounted volume or a revoked folder permission, not deletions. "

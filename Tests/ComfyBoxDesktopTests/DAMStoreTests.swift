@@ -2,6 +2,7 @@
 
 import Testing
 import Foundation
+import SQLite3
 import ComfyBoxCatalog
 @testable import ComfyBoxDesktop
 
@@ -575,5 +576,66 @@ struct DAMStoreErrorTests {
         let error = DAMStoreError.execFailed("CREATE TABLE", "table exists")
         #expect(error.errorDescription?.contains("CREATE TABLE") == true)
         #expect(error.errorDescription?.contains("table exists") == true)
+    }
+
+    @Test("stepFailed includes the sqlite code and message")
+    func stepFailed() {
+        let error = DAMStoreError.stepFailed(SQLITE_IOERR, "disk I/O error")
+        #expect(error.errorDescription?.contains("\(SQLITE_IOERR)") == true)
+        #expect(error.errorDescription?.contains("disk I/O error") == true)
+    }
+}
+
+/// #263: `while sqlite3_step(stmt) == SQLITE_ROW` cannot distinguish
+/// "the result set is finished" (`SQLITE_DONE`) from "the step itself
+/// failed partway through" (`SQLITE_BUSY`, `SQLITE_IOERR`,
+/// `SQLITE_CORRUPT`, …) — both fall out of the loop identically, silently
+/// truncating the result. `allAssetIds()`/`allAssetPaths()` and their
+/// destructive-chain neighbours (`securedAssetIds()`,
+/// `fetchAssets()`, `pruneOrphans()`'s `assetIDsHostedElsewhere()`) now
+/// route through `drainSQLiteRows`, which returns the terminal step code
+/// instead of swallowing it. Fault-injecting a real mid-iteration SQLite
+/// error into an actor-encapsulated connection is impractical to do
+/// deterministically, so this pins the shared draining primitive directly
+/// with a stubbed `step` closure, per the fallback the ticket allows.
+@Suite("drainSQLiteRows")
+struct DrainSQLiteRowsTests {
+    @Test("walks every row and returns SQLITE_DONE on a clean finish")
+    func cleanFinish() {
+        var remaining = [SQLITE_ROW, SQLITE_ROW, SQLITE_ROW, SQLITE_DONE]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_DONE)
+        #expect(seen == 3)
+    }
+
+    @Test("stops on a mid-iteration error and reports the failing code, not SQLITE_DONE")
+    func midIterationErrorStopsAndReportsCode() {
+        // Two good rows, then the step call itself fails — the historical
+        // bug treated this identically to "no more rows".
+        var remaining = [SQLITE_ROW, SQLITE_ROW, SQLITE_IOERR]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_IOERR)
+        #expect(rc != SQLITE_DONE)
+        #expect(seen == 2, "onRow must not fire for the failing step")
+    }
+
+    @Test("reports SQLITE_BUSY too — any non-ROW, non-DONE code must not look like end-of-set")
+    func busyIsNotTreatedAsDone() {
+        var remaining = [SQLITE_ROW, SQLITE_BUSY]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_BUSY)
+        #expect(seen == 1)
+    }
+
+    @Test("an empty result set still reports SQLITE_DONE, not an error")
+    func emptyResultIsNotAnError() {
+        var remaining = [SQLITE_DONE]
+        var seen = 0
+        let rc = drainSQLiteRows(step: { remaining.removeFirst() }) { seen += 1 }
+        #expect(rc == SQLITE_DONE)
+        #expect(seen == 0)
     }
 }
