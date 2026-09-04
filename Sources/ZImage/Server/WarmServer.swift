@@ -192,6 +192,11 @@ public final class WarmServer {
   /// local render never holds an HTTP connection open. The Replicate cloud path
   /// keeps its own tracker inside `replicateVideoProxy`.
   private let videoJobTracker = VideoJobTracker()
+  /// Cached, periodically-refreshed verdict on LOCAL LTX-2 disk readiness
+  /// (#298: advertise it on `/health`). `/health` reads only
+  /// `localVideoReadinessMonitor.current()` — filesystem work happens on a
+  /// background task, never on the request path (review finding 3).
+  private let localVideoReadinessMonitor: LocalVideoReadinessMonitor
   private let renderTraceStore = RenderTraceStore()
   /// #339: in-progress + remaining-count for `recoverPersistedQueue()`'s
   /// background replay. Gates submission of queue-job kinds that are never
@@ -334,6 +339,11 @@ public final class WarmServer {
     self.configuration = configuration
     self.host = host
     self.logger = logger
+    self.localVideoReadinessMonitor = LocalVideoReadinessMonitor(
+      weightsPath: configuration.ltx2WeightsPath,
+      gemmaPath: configuration.ltx2GemmaPath,
+      upsamplerPath: ProcessInfo.processInfo.environment["LTX2_UPSAMPLER_PATH"])
+    self.localVideoReadinessMonitor.start()
     self.coordinator = WarmServerCoordinator(
       configuration: configuration, logger: logger, videoHolder: self.videoHolder, liveHealth: self.liveHealth,
       videoJobTracker: self.videoJobTracker, ltx2Telemetry: self.ltx2Telemetry,
@@ -701,7 +711,8 @@ public final class WarmServer {
       let health = liveHealthResponse(memoryBytes: memoryBytes)
       if let data = Self.healthJSON(
         health, videoAvailable: replicateVideoProxy != nil,
-        activeVideoJobs: replicateVideoProxy?.activeJobCount ?? 0) {
+        activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
+        localVideoReadiness: localVideoReadinessMonitor.current()) {
         return .json(.rawJSON(status: 200, data: data))
       }
       return .json(status: 200, payload: health)
@@ -5755,7 +5766,19 @@ public final class WarmServer {
   /// idle) so clients decode them unconditionally — `current_job_id`,
   /// `progress_percent`, and (WP-E10) `last_recipe`, `model_alias`,
   /// `model_variant`. Static so the contract is unit-testable (`HealthSinkTests`).
-  static func healthJSON(_ health: HealthResponse, videoAvailable: Bool, activeVideoJobs: Int) -> Data? {
+  ///
+  /// `video.available`/`video.backend` keep their pre-existing, Replicate-only
+  /// meaning (#298 review finding 4) — nothing routes on local readiness yet.
+  /// `localVideoReadiness` is an ADDITIVE, already-computed snapshot (from
+  /// `LocalVideoReadinessMonitor`, never touched synchronously on this path)
+  /// surfaced as `video.local_ready` / `local_reason` / `local_checked_at` /
+  /// `local_backend`, plus the detailed asset breakdown under `local_assets`.
+  static func healthJSON(
+    _ health: HealthResponse,
+    videoAvailable: Bool,
+    activeVideoJobs: Int,
+    localVideoReadiness: LocalVideoReadiness = .unchecked
+  ) -> Data? {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
     guard var healthJSON = try? JSONSerialization.jsonObject(with: encoder.encode(health)) as? [String: Any] else {
@@ -5770,6 +5793,14 @@ public final class WarmServer {
       "available": videoAvailable,
       "backend": videoAvailable ? "replicate" : "none",
       "active_jobs": activeVideoJobs,
+      "local_ready": localVideoReadiness.ready,
+      "local_reason": (localVideoReadiness.reason as Any?) ?? NSNull(),
+      "local_checked_at": localVideoReadiness.checkedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
+      "local_backend": localVideoReadiness.ready ? "local_ltx2" : NSNull(),
+      "local_assets": [
+        "required": localVideoReadiness.requiredAssets.map { $0.json },
+        "optional": localVideoReadiness.optionalAssets.map { $0.json },
+      ],
     ] as [String: Any]
     return try? JSONSerialization.data(withJSONObject: healthJSON, options: [.sortedKeys])
   }
@@ -6568,6 +6599,14 @@ final class VideoJobTracker: @unchecked Sendable {
   var traceStore: RenderTraceStore?
   private let lock = NSLock()
   private var jobs: [String: LocalVideoJob] = [:]
+
+  /// Queued/processing/paused jobs currently owned by this local tracker.
+  /// Terminal jobs carry `completedAt` and remain queryable for the TTL, but
+  /// must not inflate `/health.video.active_jobs` during that hour.
+  var activeJobCount: Int {
+    lock.lock(); defer { lock.unlock() }
+    return jobs.values.filter { $0.completedAt == nil }.count
+  }
 
   /// Create a tracked job in `.queued` and return (jobId, its status). Testable
   /// without a coordinator.
