@@ -46,25 +46,32 @@ public enum EditRenderer {
             t = t.translatedBy(x: -center.x, y: -center.y)
             let rotated = image.transformed(by: t)
             let fit = largestInscribedSize(width: w, height: h, angleRadians: angle)
-            // `largestInscribedSize` is tangent to the rotated quad's edges, so the crop
-            // rect must round INWARD (never outward, as `.integral` does) or the corner
-            // pixels sample past the rotated content into transparent extrapolation.
-            // Inset by an extra pixel on each side as a bilinear-sampling safety margin.
-            let margin: CGFloat = 1
-            let safeWidth = max(fit.width - margin * 2, 1)
-            let safeHeight = max(fit.height - margin * 2, 1)
-            let originX = (center.x - safeWidth / 2).rounded(.up)
-            let originY = (center.y - safeHeight / 2).rounded(.up)
-            let cropRect = CGRect(x: originX, y: originY, width: safeWidth.rounded(.down), height: safeHeight.rounded(.down))
+            // `largestInscribedSize` is tangent to the rotated quad's edges, so the crop rect
+            // must round INWARD (never outward, as `.integral` does) or the corner pixels
+            // sample past the rotated content into transparent extrapolation. Round each edge
+            // toward the interior independently (no blanket margin, so we keep the full extent
+            // the fit actually earns) rather than rounding a width/height pair, which can drift.
+            let minX = (center.x - fit.width / 2).rounded(.up)
+            let minY = (center.y - fit.height / 2).rounded(.up)
+            let maxX = (center.x + fit.width / 2).rounded(.down)
+            let maxY = (center.y + fit.height / 2).rounded(.down)
+            let cropRect = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
             image = rotated.cropped(to: cropRect)
             image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         }
         if let c = g.crop {
-            let w = image.extent.width, h = image.extent.height
-            // Normalized crop has a top-left origin; CI extents are bottom-up.
-            let rect = CGRect(x: (c.minX * w).rounded(), y: ((1 - c.maxY) * h).rounded(),
-                              width: (c.width * w).rounded(), height: (c.height * h).rounded())
-            image = image.cropped(to: rect.intersection(image.extent))
+            let extent = image.extent
+            let w = extent.width, h = extent.height
+            // Normalized crop has a top-left origin; CI extents are bottom-up. Edges are computed
+            // relative to the extent's own origin (never assumed to be (0,0) — a prior transform,
+            // e.g. a flip or rotation, can leave it elsewhere) and independently rounded per edge
+            // rather than rounding an origin/size pair, which can let the far edge drift a pixel.
+            let left = extent.minX + (c.minX * w).rounded()
+            let right = extent.minX + (c.maxX * w).rounded()
+            let bottom = extent.minY + ((1 - c.maxY) * h).rounded()
+            let top = extent.minY + ((1 - c.minY) * h).rounded()
+            let rect = CGRect(x: left, y: bottom, width: right - left, height: top - bottom)
+            image = image.cropped(to: rect.intersection(extent))
             image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
         }
         return image
@@ -173,6 +180,21 @@ public enum EditRenderer {
     }
 
     /// Take `channel` (0=r,1=g,2=b) from `donor`, the other two from `base`. Alpha from base.
+    ///
+    /// `CIColorMatrix` always unpremultiplies its input by the input's own alpha, applies the
+    /// matrix, then RE-premultiplies the result by whatever alpha the matrix just computed. That
+    /// means an output alpha of 0 forces the output color to 0 too, no matter what the matrix's
+    /// r/g/b rows compute — so the original "zero the donor side's alpha, then add" approach
+    /// silently discarded the very channel we meant to carry over (confirmed empirically: isolating
+    /// donor's channel with `take.aVector = (0,0,0,0)` always read back as (0,0,0,0)). Feeding
+    /// `unpremultiplyingAlpha()`-converted images into the same matrices doesn't help either, since
+    /// the *output* of `CIColorMatrix` is what gets re-premultiplied, regardless of the input's tag.
+    ///
+    /// Fix: never let a `CIColorMatrix` output alpha 0. Both `keep` and `take` keep their real,
+    /// identical alpha (base's), so `CIAdditionCompositing` sums two valid, undistorted images —
+    /// correct per-channel color, but alpha doubled (base.alpha + base.alpha). A final matrix then
+    /// corrects the doubled alpha back down (×0.5) while pre-compensating the RGB by ×2 to exactly
+    /// cancel that same internal re-premultiply step, so the already-correct color survives intact.
     static func replaceChannel(of base: CIImage, with donor: CIImage, channel: Int) -> CIImage {
         func vec(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat) -> CIVector { CIVector(x: r, y: g, z: b, w: a) }
         let keep = CIFilter.colorMatrix(); keep.inputImage = base
@@ -180,10 +202,14 @@ public enum EditRenderer {
         keep.rVector = vec(channel == 0 ? 0 : 1, 0, 0, 0); take.rVector = vec(channel == 0 ? 1 : 0, 0, 0, 0)
         keep.gVector = vec(0, channel == 1 ? 0 : 1, 0, 0); take.gVector = vec(0, channel == 1 ? 1 : 0, 0, 0)
         keep.bVector = vec(0, 0, channel == 2 ? 0 : 1, 0); take.bVector = vec(0, 0, channel == 2 ? 1 : 0, 0)
-        keep.aVector = vec(0, 0, 0, 1); take.aVector = vec(0, 0, 0, 0)
+        keep.aVector = vec(0, 0, 0, 1); take.aVector = vec(0, 0, 0, 1)
         let add = CIFilter.additionCompositing()
         add.inputImage = take.outputImage; add.backgroundImage = keep.outputImage
-        return add.outputImage?.cropped(to: base.extent) ?? base
+        guard let summed = add.outputImage else { return base }
+        let fix = CIFilter.colorMatrix(); fix.inputImage = summed
+        fix.rVector = vec(2, 0, 0, 0); fix.gVector = vec(0, 2, 0, 0); fix.bVector = vec(0, 0, 2, 0)
+        fix.aVector = vec(0, 0, 0, 0.5)
+        return (fix.outputImage ?? base).cropped(to: base.extent)
     }
 
     // MARK: - Local layer and subject (completed in Task 5)

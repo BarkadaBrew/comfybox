@@ -43,6 +43,22 @@ enum EditTestSupport {
         return make(bytes, width: width, height: height)
     }
 
+    /// Straight (non-premultiplied) alpha: `r/g/b` are the true channel values regardless of `a`,
+    /// so a partially transparent solid still reads back with its literal color under straight alpha.
+    /// CGBitmapContext only supports premultiplied/none alpha layouts, so this builds the CGImage
+    /// directly from a CGDataProvider instead of drawing through a context.
+    static func solidRGBA(r: UInt8, g: UInt8, b: UInt8, a: UInt8, width: Int, height: Int) -> CGImage {
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for p in 0..<(width * height) {
+            bytes[p * 4] = r; bytes[p * 4 + 1] = g; bytes[p * 4 + 2] = b; bytes[p * 4 + 3] = a
+        }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let provider = CGDataProvider(data: Data(bytes) as CFData)!
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                       space: cs, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+    }
+
     private static func make(_ bytes: [UInt8], width: Int, height: Int) -> CGImage {
         var copy = bytes
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!

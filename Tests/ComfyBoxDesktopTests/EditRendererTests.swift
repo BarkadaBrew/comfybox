@@ -100,13 +100,78 @@ struct EditRendererTests {
     @Test("parameter mappings pin their endpoints")
     func mappings() {
         #expect(EditRenderer.contrastParameter(-1) == 0.5 && EditRenderer.contrastParameter(1) == 1.5)
+        #expect(EditRenderer.contrastParameter(0) == 1)
         #expect(EditRenderer.saturationParameter(-1) == 0 && EditRenderer.saturationParameter(0) == 1)
+        #expect(EditRenderer.saturationParameter(1) == 2)
         #expect(EditRenderer.tintTarget(1) == 150)
+        #expect(EditRenderer.tintTarget(-1) == -150 && EditRenderer.tintTarget(0) == 0)
         #expect(EditRenderer.highlightAmount(-1) == 0.3 && EditRenderer.highlightAmount(1) == 1)
+        #expect(EditRenderer.highlightAmount(0) == 1)
         #expect(EditRenderer.shadowAmount(0.5) == 0.5)
+        #expect(EditRenderer.shadowAmount(-1) == -1 && EditRenderer.shadowAmount(1) == 1)
+        #expect(EditRenderer.temperatureTarget(0) == 6500)
+        // Pin both endpoints against the actual numbers the code's sign produces:
+        // 6500 - v*3000, so +1 -> 3500 (warmer / lower Kelvin target) and -1 -> 9500.
+        #expect(EditRenderer.temperatureTarget(1) == 3500)
+        #expect(EditRenderer.temperatureTarget(-1) == 9500)
+        let hi = EditRenderer.whitesBlacksCurve(whites: 1, blacks: -1, highlights: 0)
+        #expect(abs(hi[1].y - 0.10) < 1e-9)
+        #expect(abs(hi[3].y - 0.90) < 1e-9)
+        let hiHighlights = EditRenderer.whitesBlacksCurve(whites: 0, blacks: 0, highlights: 1)
+        #expect(abs(hiHighlights[3].y - 0.85) < 1e-9)
         let s = EditRenderer.largestInscribedSize(width: 100, height: 100, angleRadians: 0)
         #expect(s.width == 100 && s.height == 100)
         let t = EditRenderer.largestInscribedSize(width: 100, height: 50, angleRadians: .pi / 18)
         #expect(t.width < 100 && t.height < 50 && t.width > 60)
+    }
+
+    @Test("per-channel r curve raises only red")
+    func curveChannelR() {
+        let src = EditTestSupport.solid(r: 128, g: 128, b: 128, width: 16, height: 16)
+        var r = EditRecipe(); r.adjustments.curves.r = [CurvePoint(x: 0.5, y: 0.9)]
+        let p = EditTestSupport.pixel(rendered(src, r), x: 8, y: 8)
+        #expect(p.r > 190)
+        #expect(abs(Int(p.g) - 128) <= 2)
+        #expect(abs(Int(p.b) - 128) <= 2)
+    }
+
+    @Test("per-channel g curve raises only green")
+    func curveChannelG() {
+        let src = EditTestSupport.solid(r: 128, g: 128, b: 128, width: 16, height: 16)
+        var r = EditRecipe(); r.adjustments.curves.g = [CurvePoint(x: 0.5, y: 0.9)]
+        let p = EditTestSupport.pixel(rendered(src, r), x: 8, y: 8)
+        #expect(p.g > 190)
+        #expect(abs(Int(p.r) - 128) <= 2)
+        #expect(abs(Int(p.b) - 128) <= 2)
+    }
+
+    @Test("per-channel b curve raises only blue")
+    func curveChannelB() {
+        let src = EditTestSupport.solid(r: 128, g: 128, b: 128, width: 16, height: 16)
+        var r = EditRecipe(); r.adjustments.curves.b = [CurvePoint(x: 0.5, y: 0.9)]
+        let p = EditTestSupport.pixel(rendered(src, r), x: 8, y: 8)
+        #expect(p.b > 190)
+        #expect(abs(Int(p.r) - 128) <= 2)
+        #expect(abs(Int(p.g) - 128) <= 2)
+    }
+
+    @Test("per-channel red curve preserves alpha on a half-transparent image")
+    func curveChannelRPreservesAlpha() {
+        let src = EditTestSupport.solidRGBA(r: 128, g: 128, b: 128, a: 128, width: 16, height: 16)
+        var r = EditRecipe(); r.adjustments.curves.r = [CurvePoint(x: 0.5, y: 0.9)]
+        let p = EditTestSupport.pixel(rendered(src, r), x: 8, y: 8)
+        #expect(abs(Int(p.a) - 128) <= 1)
+        #expect(p.r > p.g)
+    }
+
+    @Test("crop is correct against a non-origin extent")
+    func cropTranslatedExtent() {
+        let src = EditTestSupport.horizontalGradient(width: 100, height: 50)
+        let translated = CIImage(cgImage: src).transformed(by: CGAffineTransform(translationX: 37, y: 19))
+        var g = EditGeometry(); g.crop = CGRect(x: 0.5, y: 0.0, width: 0.5, height: 1.0)
+        let out = EditRenderer.applyGeometry(translated, g)
+        #expect(out.extent.width == 50)
+        let cg = Self.context.createCGImage(out, from: out.extent)!
+        #expect(EditTestSupport.gray(cg, x: 0, y: 25) > 120)
     }
 }
