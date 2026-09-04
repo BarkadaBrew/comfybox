@@ -53,6 +53,16 @@ public enum LoRAScannerError: Error, LocalizedError {
 /// Scans safetensors files and extracts LoRA metadata without loading tensor data.
 public enum LoRAScanner {
 
+  /// #313 (review round 1): the complete vocabulary `detectCompatibility`/
+  /// `detectCompatibilityFromKeys` can emit — every literal string returned
+  /// anywhere in this file, plus `"unknown"`. Single source of truth so the
+  /// `/v1/loras/{id}/update` route can reject a manually-supplied
+  /// `model_compatibility` tag the scanner itself could never produce,
+  /// mirroring how `krea2_relative` already 400s on an unrecognized value.
+  public static let knownCompatibilityTags: Set<String> = [
+    "z-image", "klein-9b", "klein-4b", "chroma", "flux1", "krea2", "ltx", "unknown",
+  ]
+
   /// Scan a safetensors file and extract all discoverable metadata.
   ///
   /// - Parameter url: Path to a .safetensors file.
@@ -295,6 +305,17 @@ public enum LoRAScanner {
     // #313: LTX-2 LoRAs that never touch the audio/video branch (T2V/I2V-only
     // adapters, IC-LoRA reference/control adapters, sliders) still carry this
     // block's OWN two-attention signature — see the field comment above.
+    //
+    // ORDERING IS LOAD-BEARING (review round 1, minor finding): this check
+    // must stay ABOVE the "Z-Image: layers + context_refiner/noise_refiner"
+    // check below. In practice `hasTransformerBlocksAttn1`/`Attn2` and
+    // `hasLayers` never both go true for the files this codebase has seen —
+    // `transformer_blocks.` never contains the `layers.`/`layers_` substring
+    // that check looks for — but that is a property of today's fixtures, not
+    // a Swift-enforced invariant. If a future signal broadens `hasLayers` (or
+    // a hybrid/mislabeled file ever satisfies both), whichever branch runs
+    // FIRST wins the classification: keep the LTX-2 signature first so such a
+    // file reads as `ltx`, not silently as `z-image`.
     if hasTransformerBlocksAttn1 && hasTransformerBlocksAttn2 {
       return ["ltx"]
     }
@@ -303,7 +324,8 @@ public enum LoRAScanner {
       return ["krea2"]
     }
 
-    // Z-Image: layers + context_refiner + noise_refiner
+    // Z-Image: layers + context_refiner + noise_refiner. Runs AFTER both
+    // LTX-2 checks above — see the ordering note there.
     if hasLayers && (hasContextRefiner || hasNoiseRefiner) {
       return ["z-image"]
     }
