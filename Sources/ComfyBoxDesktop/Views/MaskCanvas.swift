@@ -43,7 +43,9 @@ struct MaskCanvas: View {
             if enabled {
                 Color.clear.contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                        let p = CGPoint(x: v.location.x / imageSize.width, y: v.location.y / imageSize.height)
+                        guard imageSize.width > 0, imageSize.height > 0 else { return }
+                        let p = CGPoint(x: min(max(v.location.x / imageSize.width, 0), 1),
+                                        y: min(max(v.location.y / imageSize.height, 0), 1))
                         if current == nil {
                             current = MaskStroke(points: [p], size: Double(brushPoints / imageSize.width), erase: erase)
                         } else { current?.points.append(p) }

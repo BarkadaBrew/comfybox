@@ -85,7 +85,9 @@ struct MaskRasterizerTests {
     func legacyParity() {
         var s = MaskStrokes()
         s.append(MaskStroke(points: [CGPoint(x: 0.2, y: 0.3), CGPoint(x: 0.7, y: 0.6)], size: 0.08, erase: false))
-        s.append(MaskStroke(points: [CGPoint(x: 0.5, y: 0.5)], size: 0.04, erase: true))
+        // A short line (not a single point) so the legacy oracle — which only strokes
+        // a lineto, not a lone moveto — actually draws the erase mark too.
+        s.append(MaskStroke(points: [CGPoint(x: 0.45, y: 0.5), CGPoint(x: 0.55, y: 0.5)], size: 0.12, erase: true))
         let size = CGSize(width: 120, height: 80)
         let new = MaskRasterizer.render(s, size: size)!
         let legacy = NSBitmapImageRep(data: legacyMaskPNG(s, pixelSize: size)!)!.cgImage!
@@ -98,5 +100,9 @@ struct MaskRasterizerTests {
             }
         }
         #expect(mismatches <= 4)   // anti-aliasing at stroke edges only
+        // Direct check at the erase centre: both rasterizers must agree the paint was erased.
+        let cx = Int(0.5 * size.width), cy = Int(0.5 * size.height)
+        #expect(EditTestSupport.gray(new, x: cx, y: cy) < 127)
+        #expect(EditTestSupport.gray(legacy, x: cx, y: cy) < 127)
     }
 }
