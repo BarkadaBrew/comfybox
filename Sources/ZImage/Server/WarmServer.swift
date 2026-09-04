@@ -978,6 +978,7 @@ public final class WarmServer {
           "id": entry.id,
           "filename": entry.filename,
           "model_compatibility": entry.modelCompatibility,
+          "compatibility_source": entry.compatibilitySource.rawValue,
           "format": entry.format.rawValue,
           "rank": entry.rank,
           "size_bytes": entry.sizeBytes,
@@ -1023,6 +1024,7 @@ public final class WarmServer {
         "size_bytes": entry.sizeBytes,
         "size_formatted": entry.sizeFormatted,
         "model_compatibility": entry.modelCompatibility,
+        "compatibility_source": entry.compatibilitySource.rawValue,
         "format": entry.format.rawValue,
         "rank": entry.rank,
         "key_count": entry.keyCount,
@@ -1171,6 +1173,19 @@ public final class WarmServer {
         }
         krea2Relative = parsed
       }
+      // #313 (review round 1): model_compatibility is user-declared here,
+      // same as krea2_relative above — validated against the scanner's own
+      // vocabulary (400 naming the offending value, never silently accepted
+      // or silently dropped), then sets provenance to "manual" so a future
+      // scan() never overwrites it back to the auto-detected value.
+      var modelCompatibility: [String]?
+      if let raw = json["model_compatibility"] as? [String] {
+        do {
+          modelCompatibility = try WarmServer.validateModelCompatibilityTags(raw)
+        } catch {
+          return .error(response(for: error))
+        }
+      }
       let patch = LoRAEntryPatch(
         triggerwords: json["triggerwords"] as? [String],
         recommendedScale: (json["recommended_scale"] as? NSNumber)?.floatValue,
@@ -1179,7 +1194,8 @@ public final class WarmServer {
         notes: json["notes"] as? String,
         sourceURL: json["source_url"] as? String,
         civitaiModelId: json["civitai_model_id"] as? Int,
-        krea2Relative: krea2Relative
+        krea2Relative: krea2Relative,
+        modelCompatibility: modelCompatibility
       )
       do {
         try library.update(id, patch: patch)
@@ -1193,6 +1209,8 @@ public final class WarmServer {
           "recommended_scale": entry.recommendedScale,
           "tags": entry.tags,
           "notes": entry.notes,
+          "model_compatibility": entry.modelCompatibility,
+          "compatibility_source": entry.compatibilitySource.rawValue,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: responseDict) {
           return .json(.rawJSON(status: 200, data: data))
@@ -5128,6 +5146,28 @@ public final class WarmServer {
     default:
       return .error(status: 500, message: error.localizedDescription)
     }
+  }
+
+  /// #313 (review round 1): validate a caller-supplied `model_compatibility`
+  /// patch against `LoRAScanner.knownCompatibilityTags` — the same treatment
+  /// `krea2_relative` already gets on this route (an unrecognized value is a
+  /// 400 naming the offending value and the valid set, never silently
+  /// accepted). Also rejects an empty array: `model_compatibility: []` would
+  /// otherwise silently strip a LoRA's compatibility down to nothing.
+  /// Static and pure so the 400 is unit-testable without a listening server,
+  /// same as `errorResponse(for:)` above.
+  static func validateModelCompatibilityTags(_ tags: [String]) throws -> [String] {
+    guard !tags.isEmpty else {
+      throw WarmServerError.invalidRequest(message: "model_compatibility must not be empty")
+    }
+    for tag in tags {
+      guard LoRAScanner.knownCompatibilityTags.contains(tag.lowercased()) else {
+        throw WarmServerError.invalidRequest(
+          message: "Invalid model_compatibility tag '\(tag)': expected one of "
+            + "\(LoRAScanner.knownCompatibilityTags.sorted())")
+      }
+    }
+    return tags
   }
 
   private static func describe(decodingError: DecodingError) -> String {
