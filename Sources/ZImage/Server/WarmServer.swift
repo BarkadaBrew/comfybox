@@ -4904,7 +4904,7 @@ public final class WarmServer {
     store: PresetStore,
     configuration: WarmServerConfiguration,
     stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
-    loraExists: (LoRAEntry) -> Bool = { (try? $0.makeConfiguration()) != nil },
+    loraExists: (LoRAEntry) -> Bool = WarmServer.loRASourceExists,
     log: (String) -> Void = { _ in }
   ) throws -> GeneratePayload {
     var payload = try decode(GeneratePayload.self, from: body)
@@ -4939,7 +4939,7 @@ public final class WarmServer {
     _ payload: GeneratePayload,
     store: PresetStore,
     stageNearline: ([LoRAEntry]) -> [LoRAEntry] = { $0 },
-    loraExists: (LoRAEntry) -> Bool = { (try? $0.makeConfiguration()) != nil },
+    loraExists: (LoRAEntry) -> Bool = WarmServer.loRASourceExists,
     log: (String) -> Void = { _ in }
   ) throws -> GeneratePayload {
     var out = try GeneratePayload.expandingPreset(payload) { id in
@@ -4997,6 +4997,27 @@ public final class WarmServer {
   private func decodedGenerateRequest(from body: Data) throws -> (GeneratePayload, Data) {
     let payload = try decodedGeneratePayload(from: body)
     return (payload, Self.rawBody(body, expandedWith: payload))
+  }
+
+  /// #286 round 3 (minor 2): is this LoRA actually there?
+  ///
+  /// `LoRAEntry.makeConfiguration()` only *searches* for a bare filename; an
+  /// absolute, `~`-prefixed or relative path is taken at its word and returned
+  /// unchecked, so the missing-LoRA rule held for one source form and not the
+  /// others. Resolve first (which tilde-expands and searches the library
+  /// roots), then STAT the resolved local path.
+  ///
+  /// A HuggingFace reference is not a local file and is fetched at load time;
+  /// there is nothing to stat, so it passes here and fails loudly later if the
+  /// repo is wrong.
+  static func loRASourceExists(_ entry: LoRAEntry) -> Bool {
+    guard let configuration = try? entry.makeConfiguration() else { return false }
+    switch configuration.source {
+    case .local(let url):
+      return FileManager.default.fileExists(atPath: url.path)
+    case .huggingFace:
+      return true
+    }
   }
 
   /// Merge the fields #286's expansion may have filled in back into the raw

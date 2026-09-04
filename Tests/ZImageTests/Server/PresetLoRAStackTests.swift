@@ -174,17 +174,49 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertTrue(reason.message.contains("custom_model_path"), reason.message)
   }
 
-  /// The UNLESS: the request named the base, so it took responsibility for it —
-  /// expand the stack only, never a model.
-  func testPresetWithNoModelExpandsLorasWhenTheRequestNamesABase() throws {
+  /// Round 3: a request model is NOT permission on its own. With neither
+  /// `model` nor `checkpoint_family` the preset's family is unknowable, and
+  /// unknowable is not a match — a krea2 stack pushed onto Z-Image binds zero
+  /// layers and only warns, which is #286's silent-wrong-look defect again.
+  func testPresetWithNeitherModelNorFamilyIsUnresolvableEvenWithARequestModel() throws {
     let bare = lookup(ImagePreset(
       id: "no-model", name: "x", mediaKind: "image",
       loras: [LoraReference(filename: "a.safetensors", scale: 0.5)]))
+    for requested in ["z-image-turbo", "krea2-raw", "something-nobody-classifies"] {
+      let e = try expansion(PresetLoRAStack.decide(
+        presetId: "no-model", lookup: bare, requestLoras: nil, requestModel: requested))
+      XCTAssertNil(e.loras, "no family to check against '\(requested)' — must not expand")
+      XCTAssertNil(e.model)
+      XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "no_model")
+    }
+  }
+
+  /// The UNLESS, as it now stands: the preset's family is KNOWN and the
+  /// requested base's family is KNOWN and they agree. Then the stack expands
+  /// and the request's own model stands.
+  func testPresetWithNoModelExpandsWhenBothFamiliesAreKnownAndAgree() throws {
+    let krea2 = lookup(ImagePreset(
+      id: "krea2-loras", name: "x", mediaKind: "image",
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
     let e = try expansion(PresetLoRAStack.decide(
-      presetId: "no-model", lookup: bare, requestLoras: nil, requestModel: "krea2-raw"))
+      presetId: "krea2-loras", lookup: krea2, requestLoras: nil, requestModel: "krea2-raw"))
     XCTAssertNil(e.model, "the request's own base stands")
     XCTAssertEqual(e.loras?.map(\.filename), ["a.safetensors"])
     XCTAssertNil(e.unresolved)
+  }
+
+  /// A base the engine does not classify is also unknowable — same rule.
+  func testPresetWithNoModelRefusesAnUnclassifiableRequestModel() throws {
+    let krea2 = lookup(ImagePreset(
+      id: "krea2-loras", name: "x", mediaKind: "image",
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea2-loras", lookup: krea2, requestLoras: nil,
+      requestModel: "/Volumes/Bolt/some-unclassified-checkpoint"))
+    XCTAssertNil(e.loras)
+    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "no_model")
   }
 
   /// …but where the preset's family IS knowable it still has to agree: krea2
@@ -203,15 +235,32 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertTrue(reason.message.contains("z-image-turbo"), reason.message)
   }
 
-  func testPresetWithNoModelAcceptsAMatchingFamily() throws {
-    let krea2Stack = lookup(ImagePreset(
-      id: "krea2-loras", name: "x", mediaKind: "image",
+  // MARK: Round 3, minor 3 — `~` in a model spec
+
+  /// `~/LocalModels/krea2-raw` and its expansion are the SAME base; a 409
+  /// between them would refuse a valid request.
+  func testTildeAndExpandedModelSpecsAreNotAConflict() throws {
+    let home = NSHomeDirectory()
+    let preset = lookup(ImagePreset(
+      id: "tilde", name: "x", mediaKind: "image", model: "~/LocalModels/krea2-raw",
       loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
       checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
     let e = try expansion(PresetLoRAStack.decide(
-      presetId: "krea2-loras", lookup: krea2Stack, requestLoras: nil, requestModel: "krea2-raw"))
+      presetId: "tilde", lookup: preset, requestLoras: nil,
+      requestModel: "\(home)/LocalModels/krea2-raw"))
     XCTAssertNil(e.unresolved)
+    XCTAssertNil(e.model, "the request already named the base")
     XCTAssertEqual(e.loras?.count, 1)
+  }
+
+  func testTildeSpecsThatDifferAreStillAConflict() {
+    let preset = lookup(ImagePreset(
+      id: "tilde", name: "x", mediaKind: "image", model: "~/LocalModels/krea2-raw",
+      loras: [], checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+    guard case .modelConflict = PresetLoRAStack.decide(
+      presetId: "tilde", lookup: preset, requestLoras: nil,
+      requestModel: "~/LocalModels/somewhere-else")
+    else { return XCTFail("different directories must still conflict") }
   }
 
   // MARK: Round 2, finding 1 — the engine/provider gate

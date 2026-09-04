@@ -179,22 +179,38 @@ public enum PresetLoRAStack: Sendable, Equatable {
           "preset '\(id)' names no model\(hint), so the engine cannot know which base its LoRA "
             + "stack belongs to — name a model on the preset, or send one on the request")
       }
-      // The request took responsibility for the base. Where the preset's family
-      // IS knowable, it still has to agree — krea2 adapters on a Z-Image base
-      // bind zero layers and only warn.
-      if let presetFamily = declaredFamily(declared),
-         let requestFamily = modelFamily(asked),
-         presetFamily != requestFamily {
+      // The request named a base, but that alone is not permission: round 3
+      // found that with neither `model` nor `checkpoint_family` the family
+      // check was SKIPPED, so any request model at all took the preset's stack
+      // — a krea2 stack onto Z-Image binds zero layers and only warns, which
+      // is #286's silent-wrong-look defect again.
+      //
+      // Unknowable is not a match. The stack expands ONLY when the preset's
+      // family is known AND the requested base's family is known AND they
+      // agree.
+      guard let presetFamily = declaredFamily(declared) else {
+        return unresolved(id, "no_model",
+          "preset '\(id)' names neither a model nor a checkpoint_family\(hint), so the engine "
+            + "cannot tell whether its LoRA stack belongs on the requested '\(asked)' — "
+            + "declare `model` or `checkpoint_family` on the preset")
+      }
+      guard let requestFamily = modelFamily(asked) else {
+        return unresolved(id, "no_model",
+          "preset '\(id)' names no model and the engine does not classify the requested base "
+            + "'\(asked)', so its \(presetFamily) LoRA stack cannot be shown to belong there")
+      }
+      guard presetFamily == requestFamily else {
         return unresolved(id, "no_model",
           "preset '\(id)' names no model and its declared \(presetFamily) LoRA stack does not "
             + "belong on the requested '\(asked)' (\(requestFamily)) base")
       }
-      // Expand the stack only — the request's own model stands.
+      // Both known and agreeing: expand the stack only — the request's own
+      // model stands.
     } else if asked.isEmpty {
       // Flows through the request's existing model-switch semantics exactly as
       // if the client had sent it.
       expansion.model = presetModel
-    } else if normalizeModelSpec(asked) != normalizeModelSpec(presetModel) {
+    } else if normalizedModel(asked, normalizeModelSpec) != normalizedModel(presetModel, normalizeModelSpec) {
       return .modelConflict(preset: id, presetModel: presetModel, requestModel: asked)
     }
 
@@ -257,6 +273,17 @@ public enum PresetLoRAStack: Sendable, Equatable {
       return "z-image"
     }
     return nil
+  }
+
+  /// Round 3 (minor 3): compare model specs with `~` expanded on both sides —
+  /// `~/LocalModels/krea2-raw` and `/Users/x/LocalModels/krea2-raw` are the
+  /// same base, and a 409 between them would refuse a valid request. Tilde
+  /// expansion happens BEFORE `normalizeModelSpec` (an alias has no tilde) and
+  /// again after it (the spec→directory table returns tilde-free paths, but a
+  /// spec that is already a path passes straight through).
+  static func normalizedModel(_ spec: String, _ normalize: (String) -> String) -> String {
+    let expanded = (spec as NSString).expandingTildeInPath
+    return (normalize(expanded) as NSString).expandingTildeInPath
   }
 
   private static func unresolved(_ id: String, _ code: String, _ message: String) -> PresetLoRAStack {

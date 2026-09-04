@@ -340,13 +340,35 @@ final class GeneratePresetRouteTests: XCTestCase {
     XCTAssertEqual(payload.presetUnresolvedReason, "no_model")
   }
 
-  func testDesktopPresetExpandsWhenTheRequestNamesTheBase() throws {
+  /// Round 3: naming a base on the request is not enough. The 26 desktop-saved
+  /// presets declare neither `model` nor `checkpoint_family`, so the engine
+  /// cannot tell whether their stack belongs on the requested base — and
+  /// "cannot tell" is not "yes". They need one of the two fields to expand
+  /// (desktop follow-up: save `checkpoint_family` at creation).
+  func testDesktopPresetStaysALabelEvenWhenTheRequestNamesTheBase() throws {
     let store = try makeStore()
     _ = try store.upsert(ImagePreset(
       id: "788B45BC", name: "Desktop preset",
       customModelPath: "/Users/todd/LocalModels/krea2-raw",
       loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
       kroma: KromaPolicy(strength: 0)))
+
+    let payload = try expand(
+      #"{"prompt":"x","preset":"788B45BC","model":"krea2-raw"}"#, store: store)
+    XCTAssertNil(payload.loras, "unknowable family — its stack must not ride the request's base")
+    XCTAssertEqual(payload.model, "krea2-raw", "the request's own base is untouched")
+    XCTAssertEqual(payload.presetUnresolvedReason, "no_model")
+  }
+
+  /// The same preset with a `checkpoint_family` declared DOES expand — which is
+  /// what the desktop follow-up needs to write.
+  func testDesktopPresetExpandsOnceItDeclaresACheckpointFamily() throws {
+    let store = try makeStore()
+    _ = try store.upsert(ImagePreset(
+      id: "788B45BC", name: "Desktop preset",
+      customModelPath: "/Users/todd/LocalModels/krea2-raw",
+      loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
 
     let payload = try expand(
       #"{"prompt":"x","preset":"788B45BC","model":"krea2-raw"}"#, store: store)
@@ -398,6 +420,69 @@ final class GeneratePresetRouteTests: XCTestCase {
       store: store, loraExists: { _ in false })
     XCTAssertEqual(payload.loras?.map(\.path), ["nope.safetensors"])
     XCTAssertNil(payload.presetUnresolved)
+  }
+
+  /// Round 3, minor 2: the missing-LoRA rule must hold for EVERY source form.
+  /// `LoRAEntry.makeConfiguration()` only searches for a bare filename — an
+  /// absolute, `~` or relative path used to be taken at its word, so the rule
+  /// held for one form and not the others. Driven through the PRODUCTION
+  /// `loraExists` (`WarmServer.loRASourceExists`), not a stub.
+  func testPresetNamingAnAbsolutePathThatIsNotOnDiskRendersAsALabel() throws {
+    let store = try makeStore()
+    let absent = "/Volumes/definitely-not-mounted-\(UUID().uuidString)/ghost.safetensors"
+    _ = try store.upsert(ImagePreset(
+      id: "abs-missing", name: "x", mediaKind: "image", model: "krea2-raw",
+      loras: [LoraReference(filename: absent, scale: 0.5)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+
+    let payload = try WarmServer.decodedGeneratePayload(
+      from: Data(#"{"prompt":"x","preset":"abs-missing"}"#.utf8),
+      store: store, configuration: configuration)
+    XCTAssertNil(payload.loras)
+    XCTAssertNil(payload.model, "nothing must reach poolLoad either")
+    XCTAssertEqual(payload.presetUnresolvedReason, "missing_lora:ghost.safetensors")
+  }
+
+  /// A `~`-prefixed source is expanded before the stat, and a real file passes.
+  func testPresetNamingATildePathThatExistsExpands() throws {
+    let store = try makeStore()
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("comfybox-lora-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("present.safetensors")
+    try Data("weights".utf8).write(to: file)
+
+    _ = try store.upsert(ImagePreset(
+      id: "abs-present", name: "x", mediaKind: "image", model: "krea2-raw",
+      loras: [LoraReference(filename: file.path, scale: 0.5)],
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+
+    let payload = try WarmServer.decodedGeneratePayload(
+      from: Data(#"{"prompt":"x","preset":"abs-present"}"#.utf8),
+      store: store, configuration: configuration)
+    XCTAssertEqual(payload.loras?.map(\.path), [file.path])
+    XCTAssertNil(payload.presetUnresolved)
+  }
+
+  /// The production check itself, on each source form.
+  func testProductionLoRAExistenceCheckCoversEverySourceForm() throws {
+    let dir = FileManager.default.temporaryDirectory
+      .appendingPathComponent("comfybox-lora-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+    let file = dir.appendingPathComponent("present.safetensors")
+    try Data("weights".utf8).write(to: file)
+
+    XCTAssertTrue(WarmServer.loRASourceExists(LoRAEntry(path: file.path, scale: 1)))
+    XCTAssertFalse(WarmServer.loRASourceExists(
+      LoRAEntry(path: dir.appendingPathComponent("absent.safetensors").path, scale: 1)))
+    XCTAssertFalse(WarmServer.loRASourceExists(
+      LoRAEntry(path: "~/definitely-absent-\(UUID().uuidString).safetensors", scale: 1)))
+    XCTAssertFalse(WarmServer.loRASourceExists(
+      LoRAEntry(path: "nobody-has-this-\(UUID().uuidString).safetensors", scale: 1)))
+    // A HuggingFace reference is fetched at load time — nothing to stat.
+    XCTAssertTrue(WarmServer.loRASourceExists(LoRAEntry(path: "org/some-lora-repo", scale: 1)))
   }
 
   // MARK: I6 — the decode's other halves still run
