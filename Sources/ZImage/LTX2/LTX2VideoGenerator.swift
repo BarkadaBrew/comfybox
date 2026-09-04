@@ -608,7 +608,15 @@ public final class LTX2VideoGenerator {
         }
         MLX.eval(vae.parameters())
 
-        logger.info("LTX-2: loading text encoder (Gemma 3 12B)…")
+        // comfybox#340: everything from here to "models ready." used to be a
+        // single unnamed span. When a render wedged (production 2026-09-01
+        // 00:16–08:26: six loads killed by the 15-minute watchdog, one that
+        // finally completed after 14m30s) the only evidence was this one line
+        // followed by silence — which stage was slow could not be told apart
+        // from a deadlock. Each stage is now timed and named, and anything
+        // over `slowLoadStageWarnSeconds` is called out explicitly, so the
+        // next occurrence names itself in the log instead of needing a repro.
+        logger.info("LTX-2: loading text encoder (Gemma 3 12B) from \(config.gemmaPath)…")
         let gemmaConfig = LTX2GemmaConfig(
             vocabSize: 262208, hiddenSize: 3840,
             numHiddenLayers: 48, numAttentionHeads: 16,
@@ -618,22 +626,31 @@ public final class LTX2VideoGenerator {
             slidingWindow: 1024, slidingWindowPattern: 6,
             quantization: nil
         )
-        let textEncoder = LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
-        if isMonolith {
-            // Connectors (model.diffusion_model.*_embeddings_connector) and the
-            // aggregate embeds (text_embedding_projection.*) live in the monolith;
-            // Gemma still loads from its own directory.
-            try textEncoder.loadWeightsFromMonolith(
-                gemmaPath: URL(fileURLWithPath: config.gemmaPath),
-                monolithTensors: rawWeights
-            )
-        } else {
-            try textEncoder.loadWeights(
-                modelPath: URL(fileURLWithPath: modelDir),
-                textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
-            )
+        let textEncoder = timedLoadStage("text encoder construct") {
+            LTX2TextEncoder(config: LTX2TextEncoderConfig(gemma: gemmaConfig, hasPromptAdaLN: true))
         }
-        MLX.eval(textEncoder.parameters())
+        try timedLoadStage("text encoder bind weights (~14.5GB Gemma safetensors)") {
+            if isMonolith {
+                // Connectors (model.diffusion_model.*_embeddings_connector) and the
+                // aggregate embeds (text_embedding_projection.*) live in the monolith;
+                // Gemma still loads from its own directory.
+                try textEncoder.loadWeightsFromMonolith(
+                    gemmaPath: URL(fileURLWithPath: config.gemmaPath),
+                    monolithTensors: rawWeights
+                )
+            } else {
+                try textEncoder.loadWeights(
+                    modelPath: URL(fileURLWithPath: modelDir),
+                    textEncoderPath: URL(fileURLWithPath: config.gemmaPath)
+                )
+            }
+        }
+        // The mmap'd Gemma tensors are only actually paged in here — this eval,
+        // not the bind above, is where a cold page cache or memory pressure is
+        // paid for, so it gets its own name in the log.
+        try timedLoadStage("text encoder materialize parameters (MLX.eval)") {
+            MLX.eval(textEncoder.parameters())
+        }
 
         // Reference ComfyUI-LTXVideo workflows always decode through
         // VAEDecodeTiled, never a plain single-pass decode — the decoder
@@ -666,14 +683,62 @@ public final class LTX2VideoGenerator {
         // workflow feeds 256-token enhancer output through this same encoder.
         // The artifact silently truncated every long prompt for weeks — scene,
         // camera and identity fell off the tail. Mirror upstream's env knob.
-        self.tokenizer = try LTX2GemmaTokenizer.load(
-          from: URL(fileURLWithPath: config.gemmaPath),
-          maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
+        self.tokenizer = try timedLoadStage("tokenizer load (tokenizer.json parse)") {
+            try LTX2GemmaTokenizer.load(
+              from: URL(fileURLWithPath: config.gemmaPath),
+              maxLength: Self.resolveGemmaMaxLength(env: ProcessInfo.processInfo.environment["LTX2_GEMMA_MAX_LENGTH"]))
+        }
         isLoaded = true
         loadedLoraKey = wantKey
         logger.info("LTX-2: models ready.")
     }
 
+
+    // MARK: - Load-path stage timing (comfybox#340)
+
+    /// A load stage slower than this is reported as abnormally slow. The whole
+    /// warm load normally runs in single-digit seconds per stage (production
+    /// text-encoder loads: 3–17s end to end); 30s is well clear of a healthy
+    /// cold start and far below the 15-minute watchdog kill.
+    static let slowLoadStageWarnSeconds: Double = 30
+
+    /// One-line verdict for a completed load stage. Pure and unit-tested: the
+    /// wording is the thing a future wedge gets diagnosed from, and it must not
+    /// need a live 15-minute hang to be exercised.
+    static func loadStageReport(
+        stage: String,
+        seconds: Double,
+        warnAfter: Double = LTX2VideoGenerator.slowLoadStageWarnSeconds
+    ) -> (message: String, isSlow: Bool) {
+        let secs = String(format: "%.2f", seconds)
+        guard seconds >= warnAfter else {
+            return ("LTX-2 load: \(stage) — \(secs)s", false)
+        }
+        return (
+            "LTX-2 load: \(stage) took \(secs)s — ABNORMALLY SLOW "
+                + "(healthy is under \(Int(warnAfter))s). The warm server is blocked for the whole "
+                + "stage, so /health and every queued job stall with it and a watchdog restart here "
+                + "loses the in-flight render (comfybox#340, #339). Suspect cold page cache, memory "
+                + "pressure, or a near-full disk rather than a deadlock.",
+            true
+        )
+    }
+
+    /// Run one named load stage, timing it and logging the verdict. Splits what
+    /// used to be a single unnamed span between "loading text encoder" and
+    /// "models ready" into stages a log can point at.
+    @discardableResult
+    private func timedLoadStage<T>(_ stage: String, _ body: () throws -> T) rethrows -> T {
+        let started = CFAbsoluteTimeGetCurrent()
+        let result = try body()
+        let report = Self.loadStageReport(stage: stage, seconds: CFAbsoluteTimeGetCurrent() - started)
+        if report.isSlow {
+            logger.warning("\(report.message)")
+        } else {
+            logger.info("\(report.message)")
+        }
+        return result
+    }
 
     /// Load + validate the spatial latent upsampler. Shared by the load-time
     /// path (env) and the per-request lazy path (finding #18). Returns nil —
