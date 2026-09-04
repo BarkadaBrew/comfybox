@@ -43,21 +43,22 @@ final class LTX2RenderContextRefineSkipTests: XCTestCase {
     XCTAssertEqual(ctx.refineSkippedReason, "volume_gate (pre-refine volume 30000 > refine_max_vol 26000)")
   }
 
-  /// The regression this task fixes, expressed as a pure round trip: a
-  /// context carrying a recorded skip reason, checkpointed into an
-  /// `LTX2ResumeState` (exactly as `LTX2VideoGenerator.render`'s `checkpoint`
-  /// closure does), handed to a SIMULATED "cold" resume that only has the
-  /// state — never the original pipeline — and downcasts `.context` back.
-  /// The reason must still be there.
+  /// The regression this task fixes, expressed as a round trip through the
+  /// REAL snapshot builder (`LTX2RenderContext.checkpointSnapshot` — comfybox
+  /// #307 review r2, item 2c: not a hand re-implementation of what
+  /// `LTX2VideoGenerator.render`'s `checkpoint()` closure does; this test
+  /// calls the exact function that closure calls, so deleting the
+  /// `snapshot.refineSkippedReason = ...` line inside it fails HERE), boxed
+  /// into an `LTX2ResumeState` and handed to a SIMULATED "cold" resume that
+  /// only has the state — never the original pipeline — downcasting
+  /// `.context` back. The reason must still be there.
   func testSkipReasonSurvivesACheckpointResumeRoundTrip() {
     let ctx = LTX2RenderContext(request: request())
     ctx.refineSkippedReason = "upsampler_unavailable (two_stage requested but no upsampler loaded — check LTX2_UPSAMPLER_PATH)"
 
-    // Simulate `checkpoint()`'s snapshot: a NEW context object, fields copied
-    // across — this is what actually crosses the eviction boundary.
-    let snapshot = LTX2RenderContext(request: ctx.request)
-    snapshot.chunkIndex = ctx.chunkIndex
-    snapshot.refineSkippedReason = ctx.refineSkippedReason
+    let snapshot = LTX2RenderContext.checkpointSnapshot(
+      from: ctx, chunk: 0, frames: [], audio: nil, seedImage: nil,
+      refineSkippedReason: ctx.refineSkippedReason, elapsedThisSegment: 1.5)
 
     let state = LTX2ResumeState(
       videoLatents: MLXArray([0 as Float]), stepIndex: 0, sigmas: [1.0, 0.0],
@@ -75,14 +76,41 @@ final class LTX2RenderContextRefineSkipTests: XCTestCase {
   }
 
   /// A checkpoint taken with NO skip recorded yet must not manufacture one —
-  /// the field survives the round trip as nil too.
+  /// the field survives the round trip (through the real builder) as nil too.
   func testNoSkipReasonSurvivesAsNil() {
     let ctx = LTX2RenderContext(request: request())
+    let snapshot = LTX2RenderContext.checkpointSnapshot(
+      from: ctx, chunk: 0, frames: [], audio: nil, seedImage: nil,
+      refineSkippedReason: nil, elapsedThisSegment: 1.5)
     let state = LTX2ResumeState(
       videoLatents: MLXArray([0 as Float]), stepIndex: 0, sigmas: [1.0, 0.0],
       phase: .baseDenoise, chunkIndex: 0, seed: 42,
       audioLatents: nil, audioNoiseKey: nil, configFingerprint: "fp",
-      context: ctx)
+      context: snapshot)
     XCTAssertNil((state.context as? LTX2RenderContext)?.refineSkippedReason)
+  }
+
+  /// `checkpointSnapshot` also carries `accumulatedSeconds` forward
+  /// correctly (prior segments + this one) — pinned here since this test is
+  /// now the one place exercising the real builder end to end.
+  func testCheckpointSnapshotAccumulatesSeconds() {
+    let ctx = LTX2RenderContext(request: request())
+    ctx.accumulatedSeconds = 10.0
+    let snapshot = LTX2RenderContext.checkpointSnapshot(
+      from: ctx, chunk: 1, frames: [], audio: nil, seedImage: nil,
+      refineSkippedReason: nil, elapsedThisSegment: 2.5)
+    XCTAssertEqual(snapshot.accumulatedSeconds, 12.5)
+    XCTAssertEqual(snapshot.chunkIndex, 1)
+  }
+
+  /// A negative segment delta (clock skew) must never subtract from the
+  /// accumulated total — matches the original inline `max(0, ...)`.
+  func testCheckpointSnapshotClampsNegativeElapsed() {
+    let ctx = LTX2RenderContext(request: request())
+    ctx.accumulatedSeconds = 10.0
+    let snapshot = LTX2RenderContext.checkpointSnapshot(
+      from: ctx, chunk: 1, frames: [], audio: nil, seedImage: nil,
+      refineSkippedReason: nil, elapsedThisSegment: -3.0)
+    XCTAssertEqual(snapshot.accumulatedSeconds, 10.0)
   }
 }

@@ -122,6 +122,17 @@ public final class LTX2Pipeline {
   /// same "pipeline is the source of truth" convention `resolvedConfig` uses.
   public var lastRefineSkipReason: String? = nil
 
+  /// comfybox#307 (review r2, item 2c): the ONE place every refine-gate skip
+  /// records itself — consolidates what were 7 independent, hand-written
+  /// `logger.warning(...); lastRefineSkipReason = reason` pairs (2 in the
+  /// T2V inline refine, 5 in the shared `applyTwoStageRefine` and its debug
+  /// bypasses) so there is exactly one function to test and one place a
+  /// future skip path has to remember to call.
+  private func recordRefineSkip(_ reason: String, logPrefix: String, logSuffix: String = "") {
+    logger.warning("\(logPrefix): SKIPPED — \(reason)\(logSuffix).")
+    lastRefineSkipReason = reason
+  }
+
   /// The 3D Video VAE (encode/decode).
   public let vae: LTX2VAE
 
@@ -572,8 +583,8 @@ public final class LTX2Pipeline {
         // single-passed left no trace anywhere a caller/dashboard could see.
         if case .skip(let reason) = LTX2RefineGate.decide(
           twoStage: true, upsamplerLoaded: true, preVolume: t2vPreVolume, maxVolume: t2vRefineMax) {
-          logger.warning("T2V two-stage refine: SKIPPED — \(reason) — native-size decode (gate-skip fix 2026-08-05).")
-          lastRefineSkipReason = reason
+          recordRefineSkip(reason, logPrefix: "T2V two-stage refine",
+                            logSuffix: " — native-size decode (gate-skip fix 2026-08-05)")
         }
       } else {
       var upLatent: MLXArray
@@ -597,8 +608,7 @@ public final class LTX2Pipeline {
         // the denoise once the actual (post-upsample) volume is known — a
         // real skip, own reason string (own `logger.warning`, not `.info`).
         let reason = "volume_gate_post_upsample (post-upsample volume \(t2vRefineVolume) > refine_max_vol \(t2vRefineMax), LTX2_REFINE_UPSCALE_ON_SKIP=1) — decoding upsampled (soft) latent, denoise skipped"
-        logger.warning("T2V two-stage refine: SKIPPED — \(reason).")
-        lastRefineSkipReason = reason
+        recordRefineSkip(reason, logPrefix: "T2V two-stage refine")
         latents = upLatent
       } else {
       let rLatH = sLatH, rLatW = sLatW
@@ -706,8 +716,7 @@ public final class LTX2Pipeline {
       // irrelevant here (unreachable branch of `decide`), so pass 0s.
       if case .skip(let reason) = LTX2RefineGate.decide(
         twoStage: true, upsamplerLoaded: false, preVolume: 0, maxVolume: 0) {
-        logger.warning("T2V two-stage refine: SKIPPED — \(reason).")
-        lastRefineSkipReason = reason
+        recordRefineSkip(reason, logPrefix: "T2V two-stage refine")
       }
     }
 
@@ -2328,8 +2337,7 @@ public final class LTX2Pipeline {
       if resolvedConfig.twoStage,
          case .skip(let reason) = LTX2RefineGate.decide(
            twoStage: true, upsamplerLoaded: false, preVolume: 0, maxVolume: 0) {
-        logger.warning("Two-stage refine: SKIPPED — \(reason).")
-        lastRefineSkipReason = reason
+        recordRefineSkip(reason, logPrefix: "Two-stage refine")
       }
       return .completed(latents)
     }
@@ -2359,8 +2367,8 @@ public final class LTX2Pipeline {
       // refine_scale=1.5 exceeds it and single-passes with no signal).
       if case .skip(let reason) = LTX2RefineGate.decide(
         twoStage: true, upsamplerLoaded: true, preVolume: preVolume, maxVolume: preMaxVolume) {
-        logger.warning("Two-stage refine: SKIPPED — \(reason) — native-size decode (gate-skip fix 2026-08-05).")
-        lastRefineSkipReason = reason
+        recordRefineSkip(reason, logPrefix: "Two-stage refine",
+                          logSuffix: " — native-size decode (gate-skip fix 2026-08-05)")
       }
       return .completed(latents)
     }
@@ -2410,8 +2418,7 @@ public final class LTX2Pipeline {
       // comfybox#307 (review r1, minor 4): explicit debug forcing — own
       // reason string, own warning, same as every other skip.
       let reason = "decode_only_debug (LTX2_REFINE_DECODE_ONLY=1) — decoding upsampled (soft) latent, denoise skipped unconditionally"
-      logger.warning("Two-stage refine: SKIPPED — \(reason).")
-      lastRefineSkipReason = reason
+      recordRefineSkip(reason, logPrefix: "Two-stage refine")
       return .completed(upLatent)
     }
     if resumeRefine == nil, refineVolume > refineMaxVolume {
@@ -2419,8 +2426,7 @@ public final class LTX2Pipeline {
       // pre-upsample estimate (the main gate above) let this proceed, but the
       // ACTUAL upsampled volume still can't afford the denoise.
       let reason = "volume_gate_post_upsample (post-upsample volume \(refineVolume) > refine_max_vol \(refineMaxVolume)) — decoding upsampled (soft) latent, denoise skipped (OOM guard)"
-      logger.warning("Two-stage refine: SKIPPED — \(reason).")
-      lastRefineSkipReason = reason
+      recordRefineSkip(reason, logPrefix: "Two-stage refine")
       return .completed(upLatent)
     }
     MLX.GPU.clearCache()

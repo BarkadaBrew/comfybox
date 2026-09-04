@@ -230,6 +230,36 @@ public final class LTX2RenderContext: LTX2ResumeContext {
     init(request: LTX2VideoRequest) {
         self.request = request
     }
+
+    /// comfybox#307 (review r2, item 2c): the snapshot construction
+    /// `LTX2VideoGenerator.render`'s `checkpoint()` closure performs — pulled
+    /// out so a test can call the SAME code that actually produces a
+    /// checkpoint's context, not a hand re-implementation that could
+    /// silently diverge from it (e.g. a field added to the snapshot later
+    /// but never mirrored in a test's own copy). `elapsedThisSegment` is the
+    /// raw (possibly negative) wall-clock delta for the CURRENT segment only
+    /// — `ctx.accumulatedSeconds` from prior segments is added here, exactly
+    /// as the original inline code did.
+    static func checkpointSnapshot(
+        from ctx: LTX2RenderContext, chunk: Int, frames: [CGImage],
+        audio: MLXArray?, seedImage: MLXArray?, refineSkippedReason: String?,
+        elapsedThisSegment: Double
+    ) -> LTX2RenderContext {
+        let snapshot = LTX2RenderContext(request: ctx.request)
+        snapshot.chunkIndex = chunk
+        snapshot.frames = frames
+        snapshot.refineSkippedReason = refineSkippedReason
+        // Materialize on capture, same contract as LTX2ResumeState's own
+        // tensors — a cheap no-op when they are already evaluated, and the
+        // guarantee stops depending on what upstream call sites happen to do.
+        if let audio { eval(audio) }
+        snapshot.audioLatents = audio
+        let chained = chunk > 0 ? seedImage : nil
+        if let chained { eval(chained) }
+        snapshot.chunkSeedImage = chained
+        snapshot.accumulatedSeconds = ctx.accumulatedSeconds + max(0, elapsedThisSegment)
+        return snapshot
+    }
 }
 #endif
 
@@ -1077,23 +1107,15 @@ public final class LTX2VideoGenerator {
             _ s: LTX2ResumeState, chunk: Int, frames: [CGImage],
             audio: MLXArray?, seedImage: MLXArray?
         ) -> LTX2RenderOutcome {
-            let snapshot = LTX2RenderContext(request: ctx.request)
-            snapshot.chunkIndex = chunk
-            snapshot.frames = frames
-            // comfybox#307 (review r1): carry the accumulated skip reason —
-            // captured from the enclosing `refineSkippedReason` local, which
-            // the chunk loop keeps in sync with `pipeline.lastRefineSkipReason`.
-            snapshot.refineSkippedReason = refineSkippedReason
-            // Materialize on capture, same contract as LTX2ResumeState's own
-            // tensors — a cheap no-op when they are already evaluated, and the
-            // guarantee stops depending on what upstream call sites happen to do.
-            if let audio { eval(audio) }
-            snapshot.audioLatents = audio
-            let chained = chunk > 0 ? seedImage : nil
-            if let chained { eval(chained) }
-            snapshot.chunkSeedImage = chained
-            snapshot.accumulatedSeconds =
-                ctx.accumulatedSeconds + max(0, CFAbsoluteTimeGetCurrent() - segmentStart)
+            // comfybox#307 (review r1 + r2 item 2c): the accumulated skip
+            // reason (captured from the enclosing `refineSkippedReason`
+            // local, kept in sync with `pipeline.lastRefineSkipReason` by
+            // the chunk loop) rides the snapshot via the SAME static builder
+            // a test calls directly — see `LTX2RenderContext.checkpointSnapshot`.
+            let snapshot = LTX2RenderContext.checkpointSnapshot(
+                from: ctx, chunk: chunk, frames: frames, audio: audio, seedImage: seedImage,
+                refineSkippedReason: refineSkippedReason,
+                elapsedThisSegment: CFAbsoluteTimeGetCurrent() - segmentStart)
             var stamped = s
             stamped.context = snapshot
             logger.info("LTX-2 #1479: yielded at chunk \(chunk), phase \(s.phase.rawValue), step \(s.stepIndex) (\(frames.count) frame(s) banked).")

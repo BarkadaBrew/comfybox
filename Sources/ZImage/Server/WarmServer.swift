@@ -2381,6 +2381,69 @@ public final class WarmServer {
     return plan
   }
 
+  /// comfybox#307 (review r2, item 2a): the ACTUAL `LTX2VideoRequest`
+  /// construction `prepareLocalVideo` runs — pulled out verbatim (every
+  /// argument expression unchanged) so a test can call the SAME site
+  /// production code calls and inspect the resulting request's `.tuning`,
+  /// rather than trusting that a separately-computed `effectiveTuning` value
+  /// is actually what reaches the request (round 1's test proved the MERGE;
+  /// this proves the merge's result is what gets WIRED into the request).
+  /// All parameters are already-resolved values `prepareLocalVideo` computes
+  /// before this call — nothing here re-derives anything.
+  static func buildLocalVideoRequest(
+    req: LocalVideoRequest, effectiveTuning: LTX2VideoTuning?, videoPreset: ImagePreset?,
+    effectivePrompt: String, effectiveInitImage: String?,
+    renderWidth: Int, renderHeight: Int,
+    foldedFramesPerChunk: Int, foldedExtendSeconds: Float,
+    resolvedLoRAs: [LTX2LoRAReference], effectiveBeatSchedule: [BeatSegment]?,
+    resolvedOutput: String
+  ) -> LTX2VideoRequest {
+    LTX2VideoRequest(
+      prompt: effectivePrompt,
+      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
+      initImagePath: effectiveInitImage,
+      width: renderWidth,
+      height: renderHeight,
+      framesPerChunk: foldedFramesPerChunk,
+      steps: req.steps ?? videoPreset?.steps ?? 8,
+      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
+      strength: req.strength ?? 1.0,
+      imgCompression: req.imgCompression,
+      guidance: req.guidance,
+      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
+      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
+      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
+      // (289f, no crash). Single-chunk renders don't anchor (nothing to
+      // drift); callers can still pass 0 to disable.
+      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
+      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
+      // faces without the multi-keyframe gap-collapse. Enable explicitly via
+      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
+      // it unless the interval is set below the frame count. Only the pre-existing
+      // extended/chunked anchor stays on by default (unchanged behavior).
+      identityAnchorStrength: req.identityAnchorStrength
+        ?? (Self.isExtendedRender(
+              extendToSeconds: req.extendToSeconds, duration: req.duration,
+              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
+            ? 0.5
+            : ((effectiveInitImage != nil
+                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
+                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
+               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
+      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
+      extendToSeconds: foldedExtendSeconds,
+      fps: req.fps ?? 24,
+      loraPath: req.loraPath,
+      loraStrength: req.loraStrength ?? 1.0,
+      loras: resolvedLoRAs,
+      outputPath: resolvedOutput,
+      tuning: effectiveTuning,
+      presetTuning: videoPreset?.videoTuning,
+      audio: req.audio ?? false,
+      beatSchedule: effectiveBeatSchedule
+    )
+  }
+
   /// Resolve LTX-2 weights, build + validate the render request. Returns nil when
   /// local LTX-2 isn't configured (caller falls through to Replicate); throws for
   /// a malformed request or invalid output path.
@@ -2665,51 +2728,13 @@ public final class WarmServer {
       }
     }
 
-    let videoRequest = LTX2VideoRequest(
-      prompt: effectivePrompt,
-      negativePrompt: req.negativePrompt ?? videoPreset?.negativePrompt,
-      initImagePath: effectiveInitImage,
-      width: renderWidth,
-      height: renderHeight,
-      framesPerChunk: foldedFramesPerChunk,
-      steps: req.steps ?? videoPreset?.steps ?? 8,
-      seed: req.seed ?? videoPreset?.seed.map(UInt64.init) ?? 42,
-      strength: req.strength ?? 1.0,
-      imgCompression: req.imgCompression,
-      guidance: req.guidance,
-      // Re-enabled by default for EXTENDED renders (#231, 2026-07-16): the
-      // 2026-07-13 MLX mutex crash on this path was memory pressure — with
-      // the int8 stack (#230) a 12s/3-chunk anchored render completed clean
-      // (289f, no crash). Single-chunk renders don't anchor (nothing to
-      // drift); callers can still pass 0 to disable.
-      // Mid-pass identity re-anchor is OPT-IN and default OFF — it was superseded
-      // by the face-region anchor (LTX2_FACE_ANCHOR_STRENGTH), which holds partner
-      // faces without the multi-keyframe gap-collapse. Enable explicitly via
-      // LTX2_REANCHOR_INTERVAL>0 (+ _STRENGTH); a standard 97f/4s render NEVER takes
-      // it unless the interval is set below the frame count. Only the pre-existing
-      // extended/chunked anchor stays on by default (unchanged behavior).
-      identityAnchorStrength: req.identityAnchorStrength
-        ?? (Self.isExtendedRender(
-              extendToSeconds: req.extendToSeconds, duration: req.duration,
-              framesPerChunk: req.frames ?? 97, fps: req.fps ?? 24)
-            ? 0.5
-            : ((effectiveInitImage != nil
-                && (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0) > 0
-                && (req.frames ?? 97) > (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0))
-               ? (Float(ProcessInfo.processInfo.environment["LTX2_REANCHOR_STRENGTH"] ?? "") ?? 0.4) : 0)),
-      identityReAnchorInterval: (Int(ProcessInfo.processInfo.environment["LTX2_REANCHOR_INTERVAL"] ?? "") ?? 0),
-      extendToSeconds: foldedExtendSeconds,
-      fps: req.fps ?? 24,
-      loraPath: req.loraPath,
-      loraStrength: req.loraStrength ?? 1.0,
-      loras: resolvedLoRAs,
-      outputPath: resolvedOutput
-,
-      tuning: effectiveTuning,
-      presetTuning: videoPreset?.videoTuning,
-      audio: req.audio ?? false,
-      beatSchedule: effectiveBeatSchedule
-    )
+    let videoRequest = Self.buildLocalVideoRequest(
+      req: req, effectiveTuning: effectiveTuning, videoPreset: videoPreset,
+      effectivePrompt: effectivePrompt, effectiveInitImage: effectiveInitImage,
+      renderWidth: renderWidth, renderHeight: renderHeight,
+      foldedFramesPerChunk: foldedFramesPerChunk, foldedExtendSeconds: foldedExtendSeconds,
+      resolvedLoRAs: resolvedLoRAs, effectiveBeatSchedule: effectiveBeatSchedule,
+      resolvedOutput: resolvedOutput)
     // Validate before enqueuing so bad frames/dims fail fast.
     try generator.validate(videoRequest)
 
@@ -6601,6 +6626,18 @@ private actor WarmServerCoordinator {
     lastRenderDurationMs = counters.lastDurationMs
   }
 
+  /// comfybox#308 (review r2, item 2b): the ONE place all `.localVideo`
+  /// completion bookkeeping goes through — consolidates what were three
+  /// independent `recordRenderCompletion(...); lastError = ...` pairs (one
+  /// per exit point: success, thrown error, memory-admission refusal) so
+  /// there is exactly one function a `#if DEBUG` seam
+  /// (`WarmServerQueueProbe.finishLocalVideoTestSeam`) can drive to prove
+  /// the counters move for all three outcomes.
+  private func finishLocalVideo(_ outcome: LocalVideoCompletionOutcome, lastError message: String?) {
+    recordRenderCompletion(.forLocalVideoCompletion(outcome))
+    lastError = message
+  }
+
   /// Re-decide whether `lastRecipe` may still be published, from what is
   /// resident RIGHT NOW (WP-E10 sink 3).
   ///
@@ -7880,6 +7917,23 @@ private actor WarmServerCoordinator {
       startProcessingIfNeeded()
     }
   }
+
+  /// comfybox#308 (review r2, item 2b) test seam: drives `finishLocalVideo`
+  /// directly — bypassing the queue, the memory-admission gate (real system
+  /// probing + up to ~18s of drain sleeps, unsafe to run in a unit test) and
+  /// the GPU render — and returns the counters + lastError afterward. Proves
+  /// the SAME function all three real `.localVideo` exit points call moves
+  /// them correctly for each outcome; deleting the call at one of those exit
+  /// points removes that outcome from ever reaching `finishLocalVideo` in
+  /// production without changing what this seam proves about the function
+  /// itself, which is the most a private, weights/GPU-dependent actor can
+  /// offer without a live engine (see intent.md: unit tests only).
+  func testSeamFinishLocalVideo(
+    _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
+  ) -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    finishLocalVideo(outcome, lastError: message)
+    return (successfulRenderCount, failedRenderCount, lastRenderDurationMs, lastError)
+  }
   #endif
 
   /// Publish the current health-relevant state into the lock-based
@@ -8395,8 +8449,7 @@ private actor WarmServerCoordinator {
             // comfybox#308: this job DID reach the front of the queue and DID
             // fail to run — a real completion, not a queue-full rejection
             // (those throw before ever dequeuing, same as the image path).
-            self.recordRenderCompletion(.forLocalVideoCompletion(.admissionRefused))
-            self.lastError = message
+            self.finishLocalVideo(.admissionRefused, lastError: message)
             continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
             return
           }
@@ -8434,8 +8487,7 @@ private actor WarmServerCoordinator {
               // methods did. Every video render (HQ two-pass included) was
               // invisible to `render_count`/`last_render_duration_ms` no
               // matter how many completed.
-              self.recordRenderCompletion(.forLocalVideoCompletion(.succeeded(elapsedSeconds: result.elapsedSeconds)))
-              self.lastError = nil
+              self.finishLocalVideo(.succeeded(elapsedSeconds: result.elapsedSeconds), lastError: nil)
               continuation.resume(returning: result)
             }
           } catch is CancellationError {
@@ -8450,8 +8502,7 @@ private actor WarmServerCoordinator {
             self.logger.info("LTX-2: render interrupted by /v1/queue/interrupt.")
             continuation.resume(throwing: WarmServerError.renderInterrupted)
           } catch {
-            self.recordRenderCompletion(.forLocalVideoCompletion(.threw))
-            self.lastError = error.localizedDescription
+            self.finishLocalVideo(.threw, lastError: error.localizedDescription)
             continuation.resume(throwing: error)
           }
         }
@@ -11443,6 +11494,14 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// Occupy the loop with a synthetic op that BLOCKS its thread for `durationMs`.
   func enqueueSynthetic(durationMs: Int, id: String = UUID().uuidString) async throws -> Bool {
     try await coordinator.enqueueSynthetic(durationMs: durationMs, id: id)
+  }
+
+  /// comfybox#308 (review r2, item 2b): the `.localVideo` completion
+  /// bookkeeping seam — see `WarmServerCoordinator.testSeamFinishLocalVideo`.
+  func finishLocalVideo(
+    _ outcome: LocalVideoCompletionOutcome, lastError message: String? = nil
+  ) async -> (successCount: Int, failedCount: Int, lastDurationMs: Int?, lastError: String?) {
+    await coordinator.testSeamFinishLocalVideo(outcome, lastError: message)
   }
 
   /// The sync `/v1/queue/pause` path: authoritative lock-store write.

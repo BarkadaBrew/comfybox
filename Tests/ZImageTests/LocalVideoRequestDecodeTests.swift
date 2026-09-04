@@ -96,4 +96,38 @@ final class LocalVideoRequestDecodeTests: XCTestCase {
     XCTAssertEqual(merged?.twoStage, true)
     XCTAssertEqual(merged?.refineScale, 1.35)
   }
+
+  // MARK: - comfybox#307 (review r2, item 2a): the merge alone proves the
+  // MERGE function is correct, but nothing above proves its result is what
+  // actually reaches the `LTX2VideoRequest` the generator renders — a
+  // one-line revert (`tuning: effectiveTuning` → `tuning: req.tuning`) at
+  // the construction site would pass every test above. These call
+  // `WarmServer.buildLocalVideoRequest`, the ACTUAL construction
+  // `prepareLocalVideo` runs, with a real decoded request.
+
+  private func buildRequest(_ json: String) throws -> LTX2VideoRequest {
+    let req = try decodeLocalVideoRequest(json)
+    return WarmServer.buildLocalVideoRequest(
+      req: req, effectiveTuning: WarmServer.effectiveVideoTuning(for: req), videoPreset: nil,
+      effectivePrompt: req.prompt, effectiveInitImage: nil,
+      renderWidth: 704, renderHeight: 448,
+      foldedFramesPerChunk: 97, foldedExtendSeconds: 0,
+      resolvedLoRAs: [], effectiveBeatSchedule: nil,
+      resolvedOutput: "/tmp/o.mp4")
+  }
+
+  func testBuildLocalVideoRequestCarriesTopLevelTwoPassIntoTuning() throws {
+    let request = try buildRequest(#"{"prompt":"x","two_pass":true}"#)
+    XCTAssertEqual(request.tuning?.twoStage, true, "the constructed LTX2VideoRequest must carry the merged tuning")
+  }
+
+  func testBuildLocalVideoRequestNoTwoPassLeavesTuningNil() throws {
+    let request = try buildRequest(#"{"prompt":"x"}"#)
+    XCTAssertNil(request.tuning)
+  }
+
+  func testBuildLocalVideoRequestNestedTuningStillWinsOnConflict() throws {
+    let request = try buildRequest(#"{"prompt":"x","two_pass":true,"tuning":{"two_stage":false}}"#)
+    XCTAssertEqual(request.tuning?.twoStage, false)
+  }
 }
