@@ -15,6 +15,12 @@ public enum SigmaScheduleKind: String, CaseIterable, Sendable {
   /// D6). Wire name is the upstream snake_case so a workflow value pastes
   /// verbatim. See ``SigmaSchedule/bongTangent(numSteps:)``.
   case bongTangent = "bong_tangent"
+  /// ComfyUI's `simple` scheduler: `steps` evenly-spaced indices into the
+  /// model's discrete sigma table, walked from the noisy (high-sigma) end
+  /// down, then a trailing 0. Model-dependent — uses the same family sigma
+  /// table `beta` does, so it needs `mu` under flux (Krea 2). Wire name
+  /// `simple` matches ComfyUI so a workflow value pastes verbatim.
+  case simple = "simple"
 }
 
 /// Pure-function sigma schedule generators.
@@ -268,6 +274,28 @@ public enum SigmaSchedule {
   ///     `σ_min`, the last entry `σ_max`), e.g. ``discreteFlowSigmaTable(shift:numTrainTimesteps:)``
   ///     or ``fluxSigmaTable(shift:tableSize:)``.
   ///   - alpha, betaParam: Beta-distribution shape. `beta` = (0.6, 0.6); `beta57` = (0.5, 0.7).
+  /// ComfyUI `simple_scheduler`, statement for statement:
+  ///   ss = len(sigmas) / steps
+  ///   for x in range(steps): out.append(sigmas[-(1 + int(x*ss))])
+  ///   out.append(0.0)
+  /// `sigmaTable` is ascending (index 0 = smallest), so `-(1+k)` is
+  /// `count-1-k`. No de-duplication (ComfyUI does none); with the flux table
+  /// (~10k entries) vs a dozen-odd steps the indices never collide anyway.
+  public static func simple(numSteps: Int, sigmaTable: [Float]) -> [Float] {
+    precondition(!sigmaTable.isEmpty, "simple schedule needs a non-empty sigma table")
+    guard numSteps > 0 else { return [0.0] }
+    let count = sigmaTable.count
+    let ss = Double(count) / Double(numSteps)
+    var sigmas: [Float] = []
+    sigmas.reserveCapacity(numSteps + 1)
+    for x in 0..<numSteps {
+      let idx = count - 1 - Int(Double(x) * ss)   // Int() truncates toward zero, == Python int()
+      sigmas.append(sigmaTable[max(0, min(count - 1, idx))])
+    }
+    sigmas.append(0.0)
+    return sigmas
+  }
+
   public static func beta(
     numSteps: Int,
     sigmaTable: [Float],

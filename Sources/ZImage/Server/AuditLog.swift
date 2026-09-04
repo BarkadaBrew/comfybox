@@ -79,9 +79,11 @@ public struct AuditEntry: Codable, Equatable, Sendable {
 /// Append-only JSONL audit log. Thread-safe: all file mutations run on a private
 /// serial queue so appends never interleave.
 public final class AuditLog: @unchecked Sendable {
-  /// `~/.comfybox/audit-log.jsonl`.
+  /// `~/.comfybox/audit-log.jsonl`, or `$COMFYBOX_STATE_DIR/audit-log.jsonl`
+  /// (K-FIX-1: same override every other `.comfybox` path honors, so a test
+  /// that constructs a default `AuditLog()` never appends to the LIVE file).
   public static func defaultPath() -> URL {
-    ComfyBoxServerConfig.homeDirectory().appendingPathComponent(".comfybox/audit-log.jsonl")
+    ComfyBoxServerConfig.stateDirectory().appendingPathComponent("audit-log.jsonl")
   }
 
   private let path: URL

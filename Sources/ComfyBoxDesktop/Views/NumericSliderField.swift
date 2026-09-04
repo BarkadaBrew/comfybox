@@ -13,6 +13,10 @@ struct NumericSliderField: View {
     let step: Double
     /// Digits shown/parsed after the decimal point (0 = integer semantics).
     var fractionDigits: Int = 0
+    /// Called when a slider drag ends or the text field commits — the
+    /// signal callers use to record one undo step per gesture rather than
+    /// per intermediate value.
+    var onEditingEnded: (() -> Void)? = nil
 
     @State private var text: String = ""
     @FocusState private var fieldFocused: Bool
@@ -35,7 +39,9 @@ struct NumericSliderField: View {
                         if !focused { commitText() }
                     }
             }
-            Slider(value: $value, in: range, step: step)
+            Slider(value: $value, in: range, step: step, onEditingChanged: { editing in
+                if !editing { onEditingEnded?() }
+            })
         }
         .onAppear { text = format(value) }
         .onChange(of: value) { _, newValue in
@@ -54,6 +60,7 @@ struct NumericSliderField: View {
         let normalized = text.replacingOccurrences(of: ",", with: ".")
         if let parsed = Double(normalized) {
             value = min(max(parsed, range.lowerBound), range.upperBound)
+            onEditingEnded?()
         }
         text = format(value)
     }

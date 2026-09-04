@@ -50,8 +50,17 @@ extension Krea2Pipeline {
     public var eta: Float = 0.0
     /// RES4LYF `bongmath` (T3, WP-E16); see `Krea2Pipeline.Request.bongmath`.
     public var bongmath: Bool = false
-    /// `res_2s` / `res_3s` substep, not on the wire (D23).
+    /// `res_2s` / `res_3s` substep; absent on the wire defaults to 0.5.
     public var c2: Float = 0.5
+    /// Text-conditioning gain on the fusion projector; see `Krea2Pipeline.Request.projectorScale`.
+    public var projectorScale: Float = 1.0
+    /// RES4LYF spatial noise generator; see `Krea2Pipeline.Request.noiseType`.
+    public var noiseType: RES4LYFNoiseType = .gaussian
+    /// Fractal `alpha`; see `Krea2Pipeline.Request.noiseAlpha`.
+    public var noiseAlpha: Float = 0.0
+    /// RES4LYF implicit-RK refinement; see `Krea2Pipeline.Request.implicitStepsFull`.
+    /// 0 (default) is byte-identical to today.
+    public var implicitStepsFull: Int = 0
 
     public init(
       prompt: String, negativePrompt: String? = nil, guidance: Float = 1.0,
@@ -60,7 +69,10 @@ extension Krea2Pipeline {
       dyPE: DyPEConfig = .disabled, shift: Float? = nil,
       sampler: SchedulerKind = .euler, sigmaSchedule: SigmaScheduleKind = .krea2,
       sigmaScheduleRequested: String? = nil,
-      eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5
+      eta: Float = 0.0, bongmath: Bool = false, c2: Float = 0.5,
+      projectorScale: Float = 1.0,
+      noiseType: RES4LYFNoiseType = .gaussian, noiseAlpha: Float = 0.0,
+      implicitStepsFull: Int = 0
     ) {
       self.prompt = prompt
       self.negativePrompt = negativePrompt
@@ -79,6 +91,10 @@ extension Krea2Pipeline {
       self.eta = eta
       self.bongmath = bongmath
       self.c2 = c2
+      self.projectorScale = projectorScale
+      self.noiseType = noiseType
+      self.noiseAlpha = noiseAlpha
+      self.implicitStepsFull = implicitStepsFull
     }
   }
 
@@ -119,7 +135,9 @@ extension Krea2Pipeline {
     // a refusal (never a silent drop) on a sampler it is not defined against.
     let sdeNoise = try Krea2Pipeline.makeSDEInjector(
       eta: request.eta, sampler: request.sampler, stageSeed: request.seed,
-      layout: Krea2Pipeline.sdeNoiseLayout)
+      layout: Krea2Pipeline.sdeNoiseLayout,
+      noiseType: request.noiseType, noiseGrid: (hTok: hTok, wTok: wTok),
+      noiseAlpha: Double(request.noiseAlpha))
     // WP-E16: the T3 fixed point. `nil` at bongmath false — the loop is then
     // handed no hook and is bit-identical to the run without one — and a
     // refusal naming the sampler when it is asked for with one RES4LYF's
@@ -129,6 +147,9 @@ extension Krea2Pipeline {
       bongmath: request.bongmath, sampler: request.sampler,
       sigmaSchedule: request.sigmaSchedule, shift: scheduleShift)
 
+    // Projector-scale trick: fusion gain on the warm transformer (always set,
+    // default 1.0, so no value leaks between renders).
+    transformer.txtfusion.projectorScale = request.projectorScale
     MLXRandom.seed(request.seed)
     let noise = MLXRandom.normal([1, Krea2VAE.latentChannels, latH, latW]).asType(dtype)
 
@@ -186,11 +207,12 @@ extension Krea2Pipeline {
       noise: noise, source: sourceLatent, sigma: scheduler.sigmas[startIndex], dtype: dtype)
     let img = Krea2Sampling.patchify(mixedNCHW, patch: patch)
 
-    let (denoised, stats) = Krea2DenoiseLoop.run(
+    let (denoised, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler,
       initialSample: img,
       startIndex: startIndex,
       modelEvalsPerEvaluate: useCFG ? 2 : 1,
+      implicitStepsFull: request.implicitStepsFull,
       evaluate: { [transformer] latent, sigma in
         let t = MLX.full([1], values: MLXArray(sigma)).asType(dtype)
         let vCond = transformer(img: latent, context: ctx, t: t, pos: pos, mask: fullMask,

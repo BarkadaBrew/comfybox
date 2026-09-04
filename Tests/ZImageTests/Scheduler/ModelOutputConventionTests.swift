@@ -36,6 +36,9 @@ final class ModelOutputConventionTests: XCTestCase {
       .ralston3s: .dataPrediction,
       .ralston4s: .dataPrediction,
       .res3s: .dataPrediction,
+      // RES4LYF heun family (claude/krea2-spatial-noise): same x0 anchoring.
+      .heun2s: .dataPrediction,
+      .heun3s: .dataPrediction,
       // WP-E14: the DEIS ramp is anchored in BOTH halves — the ralston warm-up
       // and the multistep, whose recycled history is re-anchored at the
       // current step's x₀ and σ.
@@ -64,7 +67,7 @@ final class ModelOutputConventionTests: XCTestCase {
     }
     XCTAssertEqual(
       dataPrediction,
-      [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s, .deis2m, .deis3m, .deis4m])
+      [.res2s, .ralston2s, .ralston3s, .ralston4s, .res3s, .heun2s, .heun3s, .deis2m, .deis3m, .deis4m])
   }
 
   /// The conversion helper the pipelines call: identity for velocity

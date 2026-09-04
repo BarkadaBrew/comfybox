@@ -4,7 +4,8 @@ import XCTest
 final class MCPToolAnnotationTests: XCTestCase {
   private let readOnlyTools: Set<String> = [
     "apply_style",
-    "enhance_prompt",
+    "civitai_search",
+    "get_config",
     "list_characters",
     "list_loras",
     "list_models",
@@ -25,6 +26,8 @@ final class MCPToolAnnotationTests: XCTestCase {
   private let destructiveTools: Set<String> = [
     "cancel_job",
     "clear_queue",
+    "delete_character",
+    "delete_preset",
     "interrupt_render",
     "lora_quarantine",
     "nearline_evict",

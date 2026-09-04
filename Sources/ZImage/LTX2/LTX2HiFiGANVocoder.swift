@@ -1,12 +1,10 @@
-// LTX2HiFiGANVocoder.swift — the OFFICIAL Lightricks LTX-2.3 vocoder (`LTX2Vocoder`
+// LTX2HiFiGANVocoder.swift — external Lightricks LTX-2.3 vocoder (`LTX2Vocoder`
 // class, HiFi-GAN generator). Todd 2026-08-17.
 //
-// WHY: the JoyAI/pinkcherry checkpoint bundled a FOREIGN BigVGAN-v2 vocoder
-// (LTX2Vocoder.swift, 1227 tensors) paired with the official audio_vae — the
-// mismatch is what makes the audio METALLIC. The official audio_vae was trained
-// matched to THIS HiFi-GAN vocoder (194 tensors, bf16). Loading it and routing
-// audio decode through it is the real fix (validated: our audio_vae shapes match
-// the official; only the vocoder differs).
+// This 194-tensor, 24 kHz HiFi-GAN has no BWE stage. It is not matched to the
+// JoyAI/pinkcherry monolith, which bundles its jointly trained 1,227-tensor
+// BigVGAN v2 + 48 kHz BWE stack under `vocoder.*`. It is retained only as an
+// explicitly enabled diagnostic override.
 //
 // Architecture (official vocoder/config.json, `_class_name: LTX2Vocoder`):
 //   in_channels 128 (mel) → conv_in(128→1024,k7) → 5 upsample stages

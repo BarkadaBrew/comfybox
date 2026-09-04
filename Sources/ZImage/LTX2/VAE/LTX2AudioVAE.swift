@@ -311,11 +311,11 @@ public final class LTX2AudioVAE: Module {
   /// Bound by `load(path:)` for full-chain decode; nil for VAE-only use.
   public var vocoder: LTX2Vocoder?
 
-  /// OFFICIAL LTX-2.3 HiFi-GAN vocoder (Todd 2026-08-17). When bound (via
-  /// LTX2_VOCODER_PATH), `decodeToWaveform` routes through THIS matched vocoder
-  /// instead of the foreign JoyAI BigVGAN — the fix for the metallic audio.
-  /// It decodes mel [B,128,T] → 24 kHz stereo directly (no BWE chain).
-  public var officialVocoder: LTX2HiFiGANVocoder?
+  /// Optional external Lightricks HiFi-GAN override. It is a 24 kHz vocoder
+  /// from a different checkpoint family and is not matched to the bundled
+  /// JoyAI-Echo Audio VAE. The monolith's `vocoder.*` BigVGAN+BWE chain remains
+  /// the default; see `LTX2_USE_EXTERNAL_VOCODER` in `LTX2VideoGenerator`.
+  public var externalVocoder: LTX2HiFiGANVocoder?
 
   public init(config: LTX2AudioVAEConfig = LTX2AudioVAEConfig()) {
     self.config = config
@@ -360,6 +360,14 @@ func ltx2AudioPixelNorm(_ x: MLXArray, eps: Float) -> MLXArray {
 // MARK: - Weight loading
 
 extension LTX2AudioVAE {
+  /// Training-time log-mel floor: `log(clamp(linearMel, min: 1e-5))`.
+  public static let logMelFloor = Float(log(1e-5))
+
+  /// A frame whose geometric-mean mel magnitude is at most 1e-4 is silence.
+  /// Restoring those VAE reconstruction tails to the training floor prevents
+  /// BigVGAN from interpreting low-level decoder error as electrical noise.
+  static let quietLogMelThreshold = Float(log(1e-4))
+
   /// Remap monolith `audio_vae.*` keys to this module's parameter namespace and
   /// transpose PyTorch conv weights `[O,I,H,W]` → MLX `[O,H,W,I]`.
   public static func remapKeys(_ tensors: [String: MLXArray]) -> [(String, MLXArray)] {
@@ -437,18 +445,60 @@ extension LTX2AudioVAE {
   /// AudioVAE.decode + run_vocoder: mel (B,2,T,F) transposes to (B,2,F,T),
   /// stereo-folds to [B,128,T], then the full BWE chain.
   public func decodeToWaveform(_ zNormalized: MLXArray) -> MLXArray {
-    let mel = decodeToMel(zNormalized)                 // (B, 2, T, F)
+    let decodedMel = decodeToMel(zNormalized)          // (B, 2, T, F)
+    let mel = prepareMelForVocoder(decodedMel, normalizedLatent: zNormalized)
     let bft = mel.transposed(0, 1, 3, 2)               // (B, 2, F, T)
     let folded = MLX.concatenated([bft[0..., 0], bft[0..., 1]], axis: 1)  // [B, 128, T]
-    // Prefer the OFFICIAL matched HiFi-GAN vocoder when bound (metallic fix):
-    // it decodes mel → 24 kHz stereo directly, no BWE chain.
-    if let officialVocoder {
-      return officialVocoder.synthesize(folded)        // [B, 2, T·120] @24k
+    // An explicitly enabled external override decodes directly at 24 kHz.
+    if let externalVocoder {
+      return externalVocoder.synthesize(folded)        // [B, 2, T·120] @24k
     }
     guard let vocoder else {
       fatalError("decodeToWaveform requires load(path:) — vocoder not bound")
     }
     return vocoder.synthesizeFull(folded)
+  }
+
+  /// Restore the exact training-time silence representation before synthesis.
+  ///
+  /// The Audio VAE decoder already emits log-mel values; no linear/log or
+  /// affine conversion belongs here. Its reconstruction error can, however,
+  /// lift true silence above `log(1e-5)`. BigVGAN then turns that low-level mel
+  /// residue into a steady buzz. Values below the training floor are clamped,
+  /// quiet frames/clips are snapped to the floor, and near-zero latent frames
+  /// are treated as silence. Normal speech/music mels are unchanged.
+  public func prepareMelForVocoder(
+    _ decodedMel: MLXArray, normalizedLatent: MLXArray
+  ) -> MLXArray {
+    let floor = MLXArray(Self.logMelFloor).asType(decodedMel.dtype)
+    let quietThreshold = MLXArray(Self.quietLogMelThreshold).asType(decodedMel.dtype)
+    let floored = MLX.maximum(decodedMel, floor)
+
+    // Mel layout is (B, stereo, T, 64). A low frame mean identifies the
+    // reconstruction tail around the log-mel floor; a low clip mean also
+    // catches short all-silent clips whose causal tail contains edge energy.
+    let quietMelFrames = floored.mean(axes: [1, 3], keepDims: true) .<= quietThreshold
+    let quietMelClip = floored.mean(axes: [1, 2, 3], keepDims: true) .<= quietThreshold
+
+    // Latent layout is (B, 8, T, 16). Map quiet latent frames through the
+    // causal 4x decoder geometry: repeat four times, then remove the first
+    // three frames, yielding exactly 4T-3 mel frames.
+    let latentMagnitude = MLX.abs(normalizedLatent).max(axes: [1, 3], keepDims: false)
+    var quietLatentFrames = latentMagnitude .<= MLXArray(Float(1e-4))
+    quietLatentFrames = MLX.repeated(quietLatentFrames, count: 4, axis: 1)[0..., 3...]
+      .expandedDimensions(axis: 1).expandedDimensions(axis: 3)
+
+    let quiet = quietMelFrames .|| quietMelClip .|| quietLatentFrames
+    return MLX.where(quiet, floor, floored)
+  }
+
+  /// Per-channel latent normalization: `(z - mean) / std`, using the same
+  /// flattened `(channel, frequency)` order as `denormalize`.
+  public func normalize(_ z: MLXArray) -> MLXArray {
+    let c = z.dim(1), f = z.dim(3)
+    let std = perChannelStatistics.std.reshaped([1, c, 1, f])
+    let mean = perChannelStatistics.mean.reshaped([1, c, 1, f])
+    return (z - mean) / std
   }
 
   /// Per-channel latent denormalization: `z * std + mean` where the 128-long

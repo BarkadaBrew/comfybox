@@ -130,9 +130,9 @@ public enum Krea2BypassPolicy {
   ///
   /// 1. a per-render override (`bypass_strength` on the request) wins;
   /// 2. an explicit preset `bypass` wins next;
-  /// 3. otherwise it is DERIVED from kroma — `kroma.strength > 0` ⇒ **0**
-  ///    (kroma already unlocks), `kroma.strength == 0` ⇒ the workflow's
-  ///    strength.
+  /// 3. otherwise the DERIVED default is **0** — always off (Todd 2026-08-31:
+  ///    projector_scale + adherence make the auto-loaded bypass unnecessary;
+  ///    this retires the 17:35 "kroma off ⇒ workflow strength" branch).
   ///
   /// The returned policy always names the effective `file`, so provenance can
   /// never be ambiguous about which of the two artifacts applied — even when
@@ -151,14 +151,20 @@ public enum Krea2BypassPolicy {
     // Derived. A krea2-family image preset must declare `kroma` (O4a), so
     // `nil` here is only reachable for a preset that has no kroma dial at
     // all — treated as "no kroma", the same as `strength: 0`.
-    let kromaStrength = kroma?.strength ?? 0
-    return BypassPolicy(strength: kromaStrength > 0 ? 0 : workflowStrength, file: file)
+    // Todd 2026-08-31: kroma=0 must NOT auto-load the bypass LoRA — projector_scale
+    // + adherence make it unnecessary. The DERIVED bypass is now always OFF; an
+    // explicit per-render bypass_strength or preset bypass (precedence 1 & 2 above)
+    // still turns it on when genuinely wanted. _ = kroma keeps the signature stable.
+    _ = kroma
+    return BypassPolicy(strength: 0, file: file)
   }
 
   /// The preset-level entry point. Fail-closed for anything that is not a
-  /// krea2-family image preset: the derived default never turns a bypass on
-  /// for a `zimage-*` preset that has no kroma dial (the resolver's `nil`
-  /// kroma case would otherwise read as "no kroma ⇒ bypass on").
+  /// krea2-family image preset: only an explicit `bypass` or a per-render
+  /// override ever turns the adapter on (since 2026-08-31 the derived default
+  /// is 0 everywhere, so the historical "no kroma ⇒ bypass on" hazard for
+  /// `zimage-*` presets no longer exists — the guard stays as belt and
+  /// braces against any future derivation).
   public static func resolve(
     for preset: ImagePreset, requestStrength: Double? = nil
   ) -> BypassPolicy {
@@ -239,6 +245,14 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   /// resolved between request fields and config.json/env.
   public var videoTuning: LTX2VideoTuning?
   public var guidance: Double?
+  /// Krea2 projector-scale gain (CFG-free prompt adherence). nil = neutral (1.0).
+  public var projectorScale: Double?
+  /// RES4LYF spatial-noise recipe. All four fields are opt-in; nil preserves
+  /// the engine's established gaussian/alpha-0/explicit-RK/c2-0.5 defaults.
+  public var noiseType: String?
+  public var noiseAlpha: Double?
+  public var implicitSteps: Int?
+  public var c2: Double?
   public var seed: Int?
   public var width: Int?
   public var height: Int?
@@ -296,6 +310,11 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     injectedKeywords: [String]? = nil,
     steps: Int? = nil,
     guidance: Double? = nil,
+    projectorScale: Double? = nil,
+    noiseType: String? = nil,
+    noiseAlpha: Double? = nil,
+    implicitSteps: Int? = nil,
+    c2: Double? = nil,
     seed: Int? = nil,
     width: Int? = nil,
     height: Int? = nil,
@@ -330,6 +349,11 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.injectedKeywords = injectedKeywords
     self.steps = steps
     self.guidance = guidance
+    self.projectorScale = projectorScale
+    self.noiseType = noiseType
+    self.noiseAlpha = noiseAlpha
+    self.implicitSteps = implicitSteps
+    self.c2 = c2
     self.seed = seed
     self.width = width
     self.height = height
@@ -352,7 +376,7 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     case id, name, description
     case mediaKind, provider, engine, mode, model, customModelPath, baseModel
     case prompt, negativePrompt, promptPrefix, promptSuffix, injectedKeywords
-    case steps, guidance, seed, width, height
+    case steps, guidance, projectorScale, noiseType, noiseAlpha, implicitSteps, c2, seed, width, height
     case loras, scheduler, upscale
     // Missing until 2026-08-07: with it absent, BOTH the custom decoder and
     // the synthesized encoder dropped videoTuning — every preset-level Tier-A
@@ -387,6 +411,11 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     injectedKeywords = try c.decodeIfPresent([String].self, forKey: .injectedKeywords)
     steps = try c.decodeIfPresent(Int.self, forKey: .steps)
     guidance = try c.decodeIfPresent(Double.self, forKey: .guidance)
+    projectorScale = try c.decodeIfPresent(Double.self, forKey: .projectorScale)
+    noiseType = try c.decodeIfPresent(String.self, forKey: .noiseType)
+    noiseAlpha = try c.decodeIfPresent(Double.self, forKey: .noiseAlpha)
+    implicitSteps = try c.decodeIfPresent(Int.self, forKey: .implicitSteps)
+    c2 = try c.decodeIfPresent(Double.self, forKey: .c2)
     seed = try c.decodeIfPresent(Int.self, forKey: .seed)
     width = try c.decodeIfPresent(Int.self, forKey: .width)
     height = try c.decodeIfPresent(Int.self, forKey: .height)
@@ -422,6 +451,11 @@ public struct PresetDefaults: Equatable, Sendable {
   public var width: Int
   public var height: Int
   public var guidance: Double?
+  public var projectorScale: Double?
+  public var noiseType: String?
+  public var noiseAlpha: Double?
+  public var implicitSteps: Int?
+  public var c2: Double?
 
   public init(
     mediaKind: String = "image",
@@ -430,7 +464,12 @@ public struct PresetDefaults: Equatable, Sendable {
     steps: Int = 4,
     width: Int = 512,
     height: Int = 512,
-    guidance: Double? = nil
+    guidance: Double? = nil,
+    projectorScale: Double? = nil,
+    noiseType: String? = nil,
+    noiseAlpha: Double? = nil,
+    implicitSteps: Int? = nil,
+    c2: Double? = nil
   ) {
     self.mediaKind = mediaKind
     self.provider = provider
@@ -439,6 +478,11 @@ public struct PresetDefaults: Equatable, Sendable {
     self.width = width
     self.height = height
     self.guidance = guidance
+    self.projectorScale = projectorScale
+    self.noiseType = noiseType
+    self.noiseAlpha = noiseAlpha
+    self.implicitSteps = implicitSteps
+    self.c2 = c2
   }
 
   public static let standard = PresetDefaults()
@@ -468,6 +512,12 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
 
   public var steps: Int
   public var guidance: Double?
+  /// Krea2 projector-scale gain (CFG-free prompt adherence). nil = neutral (1.0).
+  public var projectorScale: Double?
+  public var noiseType: String?
+  public var noiseAlpha: Double?
+  public var implicitSteps: Int?
+  public var c2: Double?
   public var seed: Int?
   public var width: Int
   public var height: Int
@@ -510,6 +560,11 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
     injectedKeywords = preset.injectedKeywords ?? []
     steps = preset.steps ?? defaults.steps
     guidance = preset.guidance ?? defaults.guidance
+    projectorScale = preset.projectorScale ?? defaults.projectorScale
+    noiseType = preset.noiseType ?? defaults.noiseType
+    noiseAlpha = preset.noiseAlpha ?? defaults.noiseAlpha
+    implicitSteps = preset.implicitSteps ?? defaults.implicitSteps
+    c2 = preset.c2 ?? defaults.c2
     seed = preset.seed
     width = preset.width ?? defaults.width
     height = preset.height ?? defaults.height
@@ -980,6 +1035,24 @@ public final class PresetStore: @unchecked Sendable {
     }
     if let eta = preset.eta, !(eta.isFinite && eta >= 0) {
       throw PresetStoreError.validation("preset \"\(preset.id)\": eta must be a finite number >= 0 (got \(eta))")
+    }
+    if let noiseType = preset.noiseType,
+       RES4LYFNoiseType(rawValue: noiseType) == nil {
+      throw PresetStoreError.validation(
+        "preset \"\(preset.id)\": noise_type must be one of gaussian, fractal, pyramid (got \(noiseType))")
+    }
+    if let noiseAlpha = preset.noiseAlpha, !noiseAlpha.isFinite {
+      throw PresetStoreError.validation(
+        "preset \"\(preset.id)\": noise_alpha must be a finite number (got \(noiseAlpha))")
+    }
+    if let implicitSteps = preset.implicitSteps, !(0...8).contains(implicitSteps) {
+      throw PresetStoreError.validation(
+        "preset \"\(preset.id)\": implicit_steps must be an integer in 0...8 (got \(implicitSteps))")
+    }
+    if let c2 = preset.c2,
+       !(c2.isFinite && c2 > 0 && c2 <= 1 && abs(c2 - (2.0 / 3.0)) >= 1e-6) {
+      throw PresetStoreError.validation(
+        "preset \"\(preset.id)\": c2 must be a finite number in (0, 1] other than 2/3 (got \(c2))")
     }
     if let vae = preset.vae, vae.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw PresetStoreError.validation("preset \"\(preset.id)\": vae is empty — omit it for the model directory's VAE")

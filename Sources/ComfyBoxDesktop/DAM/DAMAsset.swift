@@ -101,4 +101,14 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
             characterName: characterName
         )
     }
+
+    /// Shared editability predicate for the Edit action (gallery context menu and
+    /// asset detail view): image-kind assets in a format the editor can decode.
+    /// Both entry points use this one definition so they never disagree — offering
+    /// Edit for a video or an unsupported format dead-ends in "Couldn't read x.mp4".
+    public var isEditableImage: Bool {
+        guard kind == "image" else { return false }
+        let ext = (filename as NSString).pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "tif", "tiff"].contains(ext)
+    }
 }

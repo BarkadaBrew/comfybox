@@ -7,6 +7,7 @@
 // key in Settings unlocks auth-gated listings and downloads.
 
 import SwiftUI
+import ZImage
 
 /// A user-facing filter label mapped to the CivitAI API value (nil = no filter).
 struct CivitAIFilterOption: Hashable {

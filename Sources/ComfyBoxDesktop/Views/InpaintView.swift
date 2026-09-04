@@ -11,15 +11,16 @@ import AppKit
 struct InpaintView: View {
     @Bindable var engine: EngineService
     var ingestor: AssetIngestor?
-    /// Image queued from Gallery/Canvas "Edit / Inpaint"; consumed once.
+    /// Image queued from the Gallery/Canvas "Inpaint" action; consumed once.
     @Binding var pendingImage: String?
+    /// Strokes queued from the Edit tab's "Send to Inpaint"; consumed with `pendingImage`.
+    @Binding var pendingMask: MaskStrokes?
 
     @State private var basePath: String?
     @State private var baseImage: NSImage?
     @State private var pixelSize: CGSize = .zero      // full-res image size
 
-    @State private var strokes: [Stroke] = []
-    @State private var currentStroke: Stroke?
+    @State private var strokes = MaskStrokes()
     @State private var brush: CGFloat = 40
     @State private var erase = false
 
@@ -34,8 +35,6 @@ struct InpaintView: View {
     @State private var isError = false
     @State private var resultURL: URL?
 
-    struct Stroke: Identifiable { let id = UUID(); var points: [CGPoint]; var size: CGFloat; var erase: Bool }
-
     var body: some View {
         HSplitView {
             controls.frame(minWidth: 300, maxWidth: 380)
@@ -44,6 +43,7 @@ struct InpaintView: View {
         .navigationTitle("Inpaint")
         .onAppear { consumePending() }
         .onChange(of: pendingImage) { _, _ in consumePending() }
+        .onChange(of: pendingMask) { _, _ in consumePending() }
     }
 
     // MARK: - Controls
@@ -84,9 +84,8 @@ struct InpaintView: View {
                     }
                     HStack {
                         Toggle("Erase", isOn: $erase).toggleStyle(.button).controlSize(.small)
-                        Button("Undo") { if !strokes.isEmpty { strokes.removeLast() } }
-                            .controlSize(.small).disabled(strokes.isEmpty)
-                        Button("Clear") { strokes.removeAll() }
+                        Button("Undo") { strokes.undoLast() }.controlSize(.small).disabled(strokes.isEmpty)
+                        Button("Clear") { strokes.clear() }
                             .controlSize(.small).disabled(strokes.isEmpty)
                     }
                 }
@@ -125,38 +124,12 @@ struct InpaintView: View {
             ZStack {
                 Color(nsColor: .controlBackgroundColor)
                 if let img = baseImage {
-                    let rect = fitRect(imageSize: img.size, in: geo.size)
+                    let rect = ImageFit.rect(imageSize: img.size, in: geo.size)
                     Image(nsImage: img)
                         .resizable().frame(width: rect.width, height: rect.height)
                         .position(x: rect.midX, y: rect.midY)
-                    // Mask overlay (semi-transparent), strokes stored normalized.
-                    Canvas { ctx, _ in
-                        for stroke in strokes + (currentStroke.map { [$0] } ?? []) {
-                            var path = Path()
-                            path.addLines(stroke.points.map { CGPoint(x: $0.x * rect.width, y: $0.y * rect.height) })
-                            // Erase strokes subtract from the painted mask (destinationOut)
-                            // so the preview matches the exported black/white mask.
-                            ctx.blendMode = stroke.erase ? .destinationOut : .normal
-                            ctx.stroke(path, with: .color(stroke.erase ? .white : .red.opacity(0.45)),
-                                       style: StrokeStyle(lineWidth: stroke.size * rect.width, lineCap: .round, lineJoin: .round))
-                        }
-                    }
-                    .frame(width: rect.width, height: rect.height)
-                    .position(x: rect.midX, y: rect.midY)
-                    .allowsHitTesting(false)
-                    // Paint gesture over the image rect (capture normalized 0…1).
-                    Color.clear.contentShape(Rectangle())
-                        .frame(width: rect.width, height: rect.height)
+                    MaskCanvas(imageSize: rect.size, strokes: $strokes, brushPoints: brush, erase: erase)
                         .position(x: rect.midX, y: rect.midY)
-                        .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                            let p = CGPoint(x: (v.location.x - rect.minX) / rect.width,
-                                            y: (v.location.y - rect.minY) / rect.height)
-                            if currentStroke == nil {
-                                currentStroke = Stroke(points: [p], size: brush / rect.width, erase: erase)
-                            } else { currentStroke?.points.append(p) }
-                        }.onEnded { _ in
-                            if let s = currentStroke { strokes.append(s); currentStroke = nil }
-                        })
                     if let resultURL {
                         // Show the result over the editor when available.
                         AsyncImage(url: resultURL) { phase in
@@ -189,14 +162,6 @@ struct InpaintView: View {
         }
     }
 
-    /// Aspect-fit rect for `imageSize` centered in `container`.
-    private func fitRect(imageSize: CGSize, in container: CGSize) -> CGRect {
-        guard imageSize.width > 0, imageSize.height > 0 else { return .zero }
-        let scale = min(container.width / imageSize.width, container.height / imageSize.height)
-        let w = imageSize.width * scale, h = imageSize.height * scale
-        return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
-    }
-
     private func pickImage() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true; panel.allowsMultipleSelection = false
@@ -206,13 +171,14 @@ struct InpaintView: View {
 
     private func consumePending() {
         guard let p = pendingImage, !p.isEmpty else { return }
-        pendingImage = nil
-        load(p)
+        let mask = pendingMask
+        pendingImage = nil; pendingMask = nil
+        load(p, initialStrokes: mask)
     }
 
-    private func load(_ path: String) {
+    private func load(_ path: String, initialStrokes: MaskStrokes? = nil) {
         basePath = path
-        strokes.removeAll(); resultURL = nil; status = nil
+        strokes = initialStrokes ?? MaskStrokes(); resultURL = nil; status = nil
         Task {
             let img = await Task.detached { NSImage(contentsOfFile: path) }.value
             await MainActor.run {
@@ -231,31 +197,7 @@ struct InpaintView: View {
 
     /// Rasterize the normalized strokes to a full-resolution black/white mask PNG
     /// (white = inpaint region). Erase strokes paint black.
-    private func maskPNG() -> Data? {
-        guard pixelSize.width > 0, pixelSize.height > 0 else { return nil }
-        let W = Int(pixelSize.width), H = Int(pixelSize.height)
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: H, bitsPerSample: 8,
-            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        NSColor.black.setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: W, height: H)).fill()
-        for stroke in strokes {
-            (stroke.erase ? NSColor.black : NSColor.white).setStroke()
-            let path = NSBezierPath()
-            path.lineWidth = stroke.size * pixelSize.width
-            path.lineCapStyle = .round; path.lineJoinStyle = .round
-            for (i, pt) in stroke.points.enumerated() {
-                let x = pt.x * pixelSize.width
-                let y = pixelSize.height - pt.y * pixelSize.height   // flip Y (bitmap is bottom-up)
-                if i == 0 { path.move(to: NSPoint(x: x, y: y)) } else { path.line(to: NSPoint(x: x, y: y)) }
-            }
-            path.stroke()
-        }
-        NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .png, properties: [:])
-    }
+    private func maskPNG() -> Data? { MaskRasterizer.pngData(strokes, size: pixelSize) }
 
     private func runInpaint() async {
         guard baseImage != nil,

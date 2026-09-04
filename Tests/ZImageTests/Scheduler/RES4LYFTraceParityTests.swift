@@ -350,7 +350,7 @@ final class RES4LYFTraceParityTests: XCTestCase {
     let m = trace.manifest
     var scheduler = try Self.productionRES2sScheduler()
 
-    let (x, stats) = Krea2DenoiseLoop.run(
+    let (x, stats) = try Krea2DenoiseLoop.run(
       scheduler: &scheduler, initialSample: try trace.tensor(m.xInit)
     ) { latent, sigma in
       RES4LYFScriptedDenoiser.velocity(latent, sigma: sigma)

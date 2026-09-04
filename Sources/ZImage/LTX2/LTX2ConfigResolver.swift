@@ -62,6 +62,11 @@ public enum LTX2ConfigResolver {
     Entry(name: "stage1_sigmas", envKey: "LTX2_STAGE1_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "refine_sigmas", envKey: "LTX2_REFINE_SIGMAS", tier: "A", kind: .floatList, builtin: ""),
     Entry(name: "two_stage", envKey: "LTX2_TWO_STAGE", tier: "A", kind: .boolExactOne, builtin: "false"),
+    // Refine the AUDIO track on the second pass as well as the video. Was
+    // ProcessInfo-only (LTX2_AUDIO_REFINE=1), so it could not be set per
+    // render — only globally, with an engine restart. Tier A so it can ride
+    // the request `tuning` block with the two-pass quality tier.
+    Entry(name: "audio_refine", envKey: "LTX2_AUDIO_REFINE", tier: "A", kind: .boolExactOne, builtin: "false"),
     Entry(name: "cond_fps", envKey: "LTX2_COND_FPS", tier: "A", kind: .float(1...120), builtin: "model"),
     Entry(name: "delivery_short_edge", envKey: "LTX2_DELIVERY_SHORT_EDGE", tier: "A", kind: .int(0...4320), builtin: "0"),
     Entry(name: "refine_scale", envKey: "LTX2_REFINE_SCALE", tier: "A", kind: .float(1...2), builtin: "1.5"),
@@ -78,6 +83,13 @@ public enum LTX2ConfigResolver {
     Entry(name: "nag_tau", envKey: "LTX2_NAG_TAU", tier: "A", kind: .float(1...10), builtin: "2.5"),
     Entry(name: "reanchor_interval", envKey: "LTX2_REANCHOR_INTERVAL", tier: "A", kind: .int(0...10_000), builtin: "0"),
     Entry(name: "reanchor_strength", envKey: "LTX2_REANCHOR_STRENGTH", tier: "A", kind: .float(0...1), builtin: "0"),
+    // Temporal beat scheduling kill switch (comfybox#310): default ON —
+    // disabled only when the RAW env value is exactly "0", mirroring the
+    // renderer (LTX2Pipeline reads this via LTX2ResolvedVideoConfig, never
+    // ProcessInfo directly). A request with no `beat_schedule` field costs
+    // nothing regardless of this switch; it exists to kill the feature
+    // globally without a request-shape change if it misbehaves live.
+    Entry(name: "beat_schedule_enabled", envKey: "LTX2_BEAT_SCHEDULE", tier: "A", kind: .boolNotZero, builtin: "true"),
     // Tier B — machine-shaped
     Entry(name: "plain_decode_max_vol", envKey: "LTX2_PLAIN_DECODE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "4500"),
     Entry(name: "refine_max_vol", envKey: "LTX2_REFINE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "12000"),
@@ -222,6 +234,7 @@ public struct LTX2VideoTuning: Codable, Sendable, Equatable {
   public var stage1Sigmas: [Float]?
   public var refineSigmas: [Float]?
   public var twoStage: Bool?
+  public var audioRefine: Bool?
   public var condFps: Float?
   public var imgCompression: Int?
   /// Delivery downscale: mux output short edge (0 = off). Render runs the
@@ -256,6 +269,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let stage1Sigmas: [Float]
   public let refineSigmas: [Float]
   public let twoStage: Bool
+  public let audioRefine: Bool
   public let condFps: Float?          // nil = model default fps
   public let imgCompression: Int
   public let deliveryShortEdge: Int
@@ -272,6 +286,10 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   public let nagTau: Float
   public let reanchorInterval: Int
   public let reanchorStrength: Float
+  /// Temporal beat scheduling (comfybox#310) global kill switch. No
+  /// request/preset override — `beat_schedule` presence/absence on the
+  /// request is the per-render knob; this is only the emergency-off env.
+  public let beatScheduleEnabled: Bool
   // Tier B
   public let plainDecodeMaxVol: Int
   public let refineMaxVol: Int
@@ -311,6 +329,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "stage1_sigmas": return stage1Sigmas.map(fmt).joined(separator: ",")
     case "refine_sigmas": return refineSigmas.map(fmt).joined(separator: ",")
     case "two_stage": return twoStage ? "true" : "false"
+    case "audio_refine": return audioRefine ? "true" : "false"
     case "cond_fps": return condFps.map(fmt) ?? "model"
     case "img_compression": return String(imgCompression)
     case "delivery_short_edge": return String(deliveryShortEdge)
@@ -327,6 +346,7 @@ public struct LTX2ResolvedVideoConfig: Sendable {
     case "nag_tau": return fmt(nagTau)
     case "reanchor_interval": return String(reanchorInterval)
     case "reanchor_strength": return fmt(reanchorStrength)
+    case "beat_schedule_enabled": return beatScheduleEnabled ? "true" : "false"
     default: return nil
     }
   }
@@ -375,6 +395,7 @@ extension LTX2ConfigResolver {
       stage1Sigmas: pick("stage1_sigmas", list("stage1_sigmas"), preset?.stage1Sigmas, request?.stage1Sigmas),
       refineSigmas: pick("refine_sigmas", list("refine_sigmas"), preset?.refineSigmas, request?.refineSigmas),
       twoStage: pick("two_stage", b("two_stage"), preset?.twoStage, request?.twoStage),
+      audioRefine: pick("audio_refine", b("audio_refine"), preset?.audioRefine, request?.audioRefine),
       condFps: pick("cond_fps", condFpsBase, preset?.condFps, request?.condFps),
       imgCompression: pick("img_compression", i("img_compression"), preset?.imgCompression, request?.imgCompression),
       deliveryShortEdge: pick("delivery_short_edge", i("delivery_short_edge"), preset?.deliveryShortEdge, request?.deliveryShortEdge),
@@ -391,6 +412,7 @@ extension LTX2ConfigResolver {
       nagTau: pick("nag_tau", f("nag_tau"), preset?.nagTau, request?.nagTau),
       reanchorInterval: pick("reanchor_interval", i("reanchor_interval"), preset?.reanchorInterval, request?.reanchorInterval),
       reanchorStrength: pick("reanchor_strength", f("reanchor_strength"), preset?.reanchorStrength, request?.reanchorStrength),
+      beatScheduleEnabled: b("beat_schedule_enabled"),
       plainDecodeMaxVol: i("plain_decode_max_vol"),
       refineMaxVol: i("refine_max_vol"),
       decodeMode: str("decode_mode"),

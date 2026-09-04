@@ -32,6 +32,22 @@ public struct GenerationRequest: Sendable {
     public var imageStrength: Float?
     /// DyPE high-resolution scaling method: "ntk", "yarn", or nil/"none".
     public var dype: String?
+    /// Text-conditioning gain on the Krea2 fusion projector (projector-scale
+    /// trick). 1.0 = neutral; >1 strengthens prompt adherence with no CFG cost.
+    public var projectorScale: Float
+    /// RES4LYF SDE noise re-injection (eta). 0 = deterministic ODE (default);
+    /// >0 = SDE mode. Only bites with a RES4LYF sampler (res_*/ralston_*/deis_*).
+    public var eta: Float
+    /// RES4LYF bongmath: forward/backward substep alignment (free accuracy).
+    /// Only bites with a RES4LYF sampler.
+    public var bongmath: Bool
+    /// RES4LYF SDE noise generator and its fractal exponent.
+    public var noiseType: String
+    public var noiseAlpha: Float
+    /// Extra implicit fixed-point passes over the RES4LYF tableau.
+    public var implicitSteps: Int
+    /// RES4LYF `res_2s` / `res_3s` substep location.
+    public var c2: Float
 
     public init(
         prompt: String = "",
@@ -40,6 +56,13 @@ public struct GenerationRequest: Sendable {
         height: Int = 1024,
         steps: Int = 9,
         guidance: Float = 3.5,
+        projectorScale: Float = 1.0,
+        eta: Float = 0.0,
+        bongmath: Bool = false,
+        noiseType: String = "gaussian",
+        noiseAlpha: Float = 0.0,
+        implicitSteps: Int = 0,
+        c2: Float = 0.5,
         sampler: String? = nil,
         sigmaSchedule: String? = nil,
         seed: UInt64 = 0,
@@ -63,6 +86,13 @@ public struct GenerationRequest: Sendable {
         self.loras = loras
         self.initImagePath = initImagePath
         self.imageStrength = imageStrength
+        self.projectorScale = projectorScale
+        self.eta = eta
+        self.bongmath = bongmath
+        self.noiseType = noiseType
+        self.noiseAlpha = noiseAlpha
+        self.implicitSteps = implicitSteps
+        self.c2 = c2
     }
 }
 
@@ -433,6 +463,31 @@ public final class EngineService {
         if let dype = request.dype, dype != "none", !dype.isEmpty {
             payloadDict["dype"] = dype
         }
+        // Projector-scale trick: CFG-free prompt-adherence gain. 1.0 = omit
+        // (byte-identical); the engine also treats absent as neutral.
+        if request.projectorScale != 1.0 {
+            payloadDict["projector_scale"] = request.projectorScale
+        }
+        // RES4LYF SDE / bongmath (Clownshark recipe) — emitted only when active
+        // so an ODE render stays byte-identical.
+        if request.eta > 0 {
+            payloadDict["eta"] = request.eta
+        }
+        if request.bongmath {
+            payloadDict["bongmath"] = true
+        }
+        if request.noiseType != "gaussian" {
+            payloadDict["noise_type"] = request.noiseType
+        }
+        if request.noiseAlpha != 0 {
+            payloadDict["noise_alpha"] = request.noiseAlpha
+        }
+        if request.implicitSteps != 0 {
+            payloadDict["implicit_steps"] = request.implicitSteps
+        }
+        if request.c2 != 0.5 {
+            payloadDict["c2"] = request.c2
+        }
 
         payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)
 
@@ -657,7 +712,10 @@ public final class EngineService {
             throw EngineServiceError.notConnected
         }
         let (status, responseData) = try await client.post(paused ? "/v1/queue/pause" : "/v1/queue/resume", body: Data())
-        guard status == 200 else {
+        // F-1 (adversarial review): accept the whole success range — a 2xx here
+        // means the engine applied the gate; guarding ==200 turned a successful
+        // resume into a thrown error.
+        guard (200...299).contains(status) else {
             let errorMessage = parseErrorMessage(from: responseData) ?? "Server returned status \(status)"
             throw EngineServiceError.serverError(status, errorMessage)
         }
@@ -1471,6 +1529,8 @@ public final class EngineService {
         public var isPaused: Bool = false
         public var activeJobId: String?
         public var activeSummary: String?
+        /// LTX-2 render phase from /v1/queue (baseDenoise, refineDenoise, ...).
+        public var phase: String?
         public var activeSource: String?
         public var progressPercent: Int?
         public var pending: [QueueJob] = []
@@ -1492,6 +1552,7 @@ public final class EngineService {
             list.isPaused = (dict["is_paused"] as? Bool) ?? false
             list.activeJobId = dict["active_job_id"] as? String
             list.activeSummary = dict["active_summary"] as? String
+            list.phase = dict["phase"] as? String
             list.activeSource = dict["active_source"] as? String
             list.progressPercent = dict["progress_percent"] as? Int
             list.renderCount = (dict["render_count"] as? Int) ?? 0
@@ -1526,7 +1587,9 @@ public final class EngineService {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
         let enc = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         let (status, data) = try await client.delete("/v1/queue/\(enc)")
-        guard status == 200 else {
+        // F-3 companion: the sync engine path ACKs a recorded cancel with 202
+        // (it cannot guarantee deletion); any 2xx is success.
+        guard (200...299).contains(status) else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Cancel failed")
         }
     }
@@ -1545,7 +1608,7 @@ public final class EngineService {
     public func setQueuePaused(_ paused: Bool) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
         let (status, data) = try await client.post("/v1/queue/\(paused ? "pause" : "resume")", body: Data("{}".utf8))
-        guard status == 200 else {
+        guard (200...299).contains(status) else {  // F-1: 2xx is success
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Pause failed")
         }
     }

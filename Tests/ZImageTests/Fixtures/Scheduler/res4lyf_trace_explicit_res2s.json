@@ -1,0 +1,199 @@
+{
+ "provenance": {
+  "generator": "scripts/oracles/gen_scheduler_fixtures.py",
+  "generated_at": "2026-09-01T00:10:42+00:00",
+  "comfyui_url": "https://github.com/comfyanonymous/ComfyUI.git",
+  "comfyui_sha": "783545f689a0af730065994b46b382ae24844c99",
+  "res4lyf_url": "https://github.com/ClownsharkBatwing/RES4LYF.git",
+  "res4lyf_sha": "26036f647ca15d3048a193daf99a40cecfc3820d",
+  "python": "3.12.14",
+  "torch": "2.13.0.dev20260503",
+  "numpy": "2.4.4",
+  "scipy": "1.17.1",
+  "mpmath": "1.3.0",
+  "note": "ComfyUI/RES4LYF are validation oracles only (FDD-krea2-raw-recipe \u00a75.2); never a ComfyBox backend."
+ },
+ "recipe": {
+  "tier": "T1",
+  "sampler": "res_2s",
+  "scheduler": "beta",
+  "steps": 4,
+  "denoise": 1.0,
+  "eta": 0.0,
+  "eta_substep": 0.0,
+  "bongmath": false,
+  "implicit_steps_full": 0,
+  "implicit_steps_diag": 0,
+  "shift": 1.15,
+  "model_sampling": "ModelSamplingFlux",
+  "seed": 4242,
+  "noise_seed_sde": 4243,
+  "note": "RES4LYF sample_rk_beta full_iter loop; explicit res_2s re-iterated implicit_steps_full+1 times as a fixed point. row_offset=1, so pass>0 re-anchors row 0 on the previous pass's x_next at sigma_next. res_2s is exponential-frame (data-prediction); with noise_anchor=1 the __call__ returns the raw denoised, so the re-anchor is the exponential analogue of the linear heun case."
+ },
+ "denoiser": "0.5*tanh(x) + 0.25*sigma - 0.1*x",
+ "latent_shape": [
+  1,
+  16,
+  8,
+  8
+ ],
+ "sigmas_schedule": [
+  1.0,
+  0.9367757439613342,
+  0.7595839500427246,
+  0.4024982750415802,
+  0.0
+ ],
+ "sigmas_run": [
+  1.0,
+  0.9367757439613342,
+  0.7595839500427246,
+  0.4024982750415802,
+  0.00031575115281157196,
+  0.0
+ ],
+ "sigma_min": 0.00031575115281157196,
+ "sigma_max": 1.0,
+ "latent_image": "latent_image",
+ "noise_init": "noise_init",
+ "x_init": "x_init",
+ "steps": [
+  {
+   "index": 0,
+   "sigma": 1.0,
+   "sigma_next": 0.9367757439613342,
+   "h": 0.06531135947477722,
+   "full_iters": [
+    {
+     "pass_index": 0,
+     "model_calls": [
+      {
+       "row": 0,
+       "s_eval": 1.0,
+       "sigma_anchor": 1.0,
+       "x_in": "step00/pass0/call0/x_in",
+       "x0": "step00/pass0/call0/x_0",
+       "denoised": "step00/pass0/call0/denoised",
+       "eps": "step00/pass0/call0/eps"
+      },
+      {
+       "row": 1,
+       "s_eval": 0.9678717600805048,
+       "sigma_anchor": 1.0,
+       "x_in": "step00/pass0/call1/x_in",
+       "x0": "step00/pass0/call1/x_0",
+       "denoised": "step00/pass0/call1/denoised",
+       "eps": "step00/pass0/call1/eps"
+      }
+     ],
+     "x0": "step00/pass0/x_0",
+     "x_next": "step00/pass0/x_next"
+    }
+   ]
+  },
+  {
+   "index": 1,
+   "sigma": 0.9367757439613342,
+   "sigma_next": 0.7595839500427246,
+   "h": 0.20967307027807772,
+   "full_iters": [
+    {
+     "pass_index": 0,
+     "model_calls": [
+      {
+       "row": 0,
+       "s_eval": 0.9367757439613342,
+       "sigma_anchor": 0.9367757439613342,
+       "x_in": "step01/pass0/call0/x_in",
+       "x0": "step01/pass0/call0/x_0",
+       "denoised": "step01/pass0/call0/denoised",
+       "eps": "step01/pass0/call0/eps"
+      },
+      {
+       "row": 1,
+       "s_eval": 0.8435400523403511,
+       "sigma_anchor": 0.9367757439613342,
+       "x_in": "step01/pass0/call1/x_in",
+       "x0": "step01/pass0/call1/x_0",
+       "denoised": "step01/pass0/call1/denoised",
+       "eps": "step01/pass0/call1/eps"
+      }
+     ],
+     "x0": "step01/pass0/x_0",
+     "x_next": "step01/pass0/x_next"
+    }
+   ]
+  },
+  {
+   "index": 2,
+   "sigma": 0.7595839500427246,
+   "sigma_next": 0.4024982750415802,
+   "h": 0.6350800379908281,
+   "full_iters": [
+    {
+     "pass_index": 0,
+     "model_calls": [
+      {
+       "row": 0,
+       "s_eval": 0.7595839500427246,
+       "sigma_anchor": 0.7595839500427246,
+       "x_in": "step02/pass0/call0/x_in",
+       "x0": "step02/pass0/call0/x_0",
+       "denoised": "step02/pass0/call0/denoised",
+       "eps": "step02/pass0/call0/eps"
+      },
+      {
+       "row": 1,
+       "s_eval": 0.5529296787489947,
+       "sigma_anchor": 0.7595839500427246,
+       "x_in": "step02/pass0/call1/x_in",
+       "x0": "step02/pass0/call1/x_0",
+       "denoised": "step02/pass0/call1/denoised",
+       "eps": "step02/pass0/call1/eps"
+      }
+     ],
+     "x0": "step02/pass0/x_0",
+     "x_next": "step02/pass0/x_next"
+    }
+   ]
+  },
+  {
+   "index": 3,
+   "sigma": 0.4024982750415802,
+   "sigma_next": 0.00031575115281157196,
+   "h": 7.150491677970299,
+   "full_iters": [
+    {
+     "pass_index": 0,
+     "model_calls": [
+      {
+       "row": 0,
+       "s_eval": 0.4024982750415802,
+       "sigma_anchor": 0.4024982750415802,
+       "x_in": "step03/pass0/call0/x_in",
+       "x0": "step03/pass0/call0/x_0",
+       "denoised": "step03/pass0/call0/denoised",
+       "eps": "step03/pass0/call0/eps"
+      },
+      {
+       "row": 1,
+       "s_eval": 0.011273388769533682,
+       "sigma_anchor": 0.4024982750415802,
+       "x_in": "step03/pass0/call1/x_in",
+       "x0": "step03/pass0/call1/x_0",
+       "denoised": "step03/pass0/call1/denoised",
+       "eps": "step03/pass0/call1/eps"
+      }
+     ],
+     "x0": "step03/pass0/x_0",
+     "x_next": "step03/pass0/x_next"
+    }
+   ]
+  }
+ ],
+ "final": {
+  "x": "final/x",
+  "eps_last": "final/eps_last",
+  "linear_tail_from_sigma_min": true
+ }
+}

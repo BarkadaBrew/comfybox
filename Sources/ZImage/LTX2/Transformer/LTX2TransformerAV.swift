@@ -159,7 +159,13 @@ extension LTX2Transformer {
     pe: (videoPE: (cos: MLXArray, sin: MLXArray),
          audioPE: (cos: MLXArray, sin: MLXArray),
          crossVideoPE: (cos: MLXArray, sin: MLXArray),
-         crossAudioPE: (cos: MLXArray, sin: MLXArray))
+         crossAudioPE: (cos: MLXArray, sin: MLXArray)),
+    // Temporal beat scheduling (comfybox#310): forwarded unchanged to every
+    // block's text cross-attentions (video attn2 / audio audio_attn2); the
+    // a2v/v2a cross-modal attentions are untouched. Callers pass these ONLY
+    // on the positive pass. Nil (default) is byte-identical to before.
+    beatBias: MLXArray? = nil,
+    audioBeatBias: MLXArray? = nil
   ) -> (video: MLXArray, audio: MLXArray) {
     precondition(hasAudio, "callAV requires hasAudio")
     let batchSize = latent.dim(0)
@@ -214,7 +220,9 @@ extension LTX2Transformer {
         crossGateTimestep: av.crossGateTimestep,
         audioCrossGateTimestep: av.audioCrossGateTimestep,
         promptTimestep: promptTS,
-        audioPromptTimestep: av.audioPromptTimestep)
+        audioPromptTimestep: av.audioPromptTimestep,
+        beatBias: beatBias,
+        audioBeatBias: audioBeatBias)
     }
 
     // ---- Outputs ----

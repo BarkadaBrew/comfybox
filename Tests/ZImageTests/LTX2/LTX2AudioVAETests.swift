@@ -174,6 +174,33 @@ final class LTX2AudioVAETests: XCTestCase {
     XCTAssertEqual(matched, 102)
   }
 
+  /// The real monolith names are remapped into the top-level statistics module,
+  /// and decode-time denormalization must actually use the loaded values.
+  func testPerChannelStatisticsAreLoadedAndAppliedBeforeDecode() throws {
+    let vae = LTX2AudioVAE()
+    var checkpoint = syntheticCheckpoint()
+    checkpoint["audio_vae.per_channel_statistics.mean-of-means"] =
+      MLXArray.ones([128]) * MLXArray(Float(2))
+    checkpoint["audio_vae.per_channel_statistics.std-of-means"] =
+      MLXArray.ones([128]) * MLXArray(Float(3))
+
+    _ = try vae.loadWeightsFromTensors(
+      tensors: checkpoint, logger: Logger(label: "test.audiovae.statistics"))
+    let normalized = MLXArray.ones([1, 8, 2, 16])
+    let denormalized = vae.denormalize(normalized)
+    MLX.eval(vae.perChannelStatistics.mean, vae.perChannelStatistics.std, denormalized)
+
+    XCTAssertEqual(vae.perChannelStatistics.mean[0].item(Float.self), 2, accuracy: 1e-6)
+    XCTAssertEqual(vae.perChannelStatistics.std[0].item(Float.self), 3, accuracy: 1e-6)
+    XCTAssertEqual(MLX.min(denormalized).item(Float.self), 5, accuracy: 1e-6)
+    XCTAssertEqual(MLX.max(denormalized).item(Float.self), 5, accuracy: 1e-6)
+
+    let roundTrip = vae.normalize(denormalized)
+    MLX.eval(roundTrip)
+    XCTAssertEqual(MLX.min(roundTrip).item(Float.self), 1, accuracy: 1e-6)
+    XCTAssertEqual(MLX.max(roundTrip).item(Float.self), 1, accuracy: 1e-6)
+  }
+
   /// The guard throws (not silently succeeds) when almost nothing matches.
   func testLoadThrowsOnNearZeroCoverage() {
     let vae = LTX2AudioVAE()
