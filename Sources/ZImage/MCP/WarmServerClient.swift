@@ -154,28 +154,28 @@ public final class WarmServerClient: WarmServerTransport, @unchecked Sendable {
       return (data, httpResponse)
     } catch let error as URLError where error.code == .cannotConnectToHost || error.code == .networkConnectionLost {
       throw WarmServerClientError.connectionRefused(host: host, port: port)
-    } catch let error as URLError
-      where error.code == .timedOut || (error.code == .cannotFindHost && Self.isLoopbackHost(host))
-    {
+    } catch let error as URLError where error.code == .timedOut {
       // comfybox#389: a mid-boot engine (socket accepting, slow to answer
-      // /health) throws `.timedOut`; a transient DNS blip resolving
-      // localhost throws `.cannotFindHost`. Both mean "the engine is not
-      // answering yet" — the same actionable situation as
-      // `.connectionRefused` above — but kept as a DISTINCT case rather
-      // than folded into it, because `.connectionRefused`'s meaning must
-      // not change for other consumers (ComfyBoxDesktop, the Telegram
-      // bot). `MCPBridgeStartupPolicy.nothingListeningMessage(for:)`
-      // classifies both cases and gives each its own hint wording.
+      // /health) throws `.timedOut` — the same actionable situation as
+      // `.connectionRefused` above ("the engine is not answering yet"),
+      // but kept as a DISTINCT case rather than folded into it, because
+      // `.connectionRefused`'s meaning must not change for other
+      // consumers (ComfyBoxDesktop, the Telegram bot).
+      // `MCPBridgeStartupPolicy.nothingListeningMessage(for:)` classifies
+      // both cases and gives each its own hint wording.
+      //
+      // Deliberately NOT included here: `.cannotFindHost`. A DNS/resolver
+      // failure for "localhost" (comfybox#389 review, 2026-09-05 Pi-hole
+      // outage precedent) is a broken resolver, not a not-yet-booted
+      // engine — `launchctl kickstart`ing the managed engine cannot fix a
+      // resolver problem, so it must not get that hint. It falls through
+      // to `.networkError` below, unchanged from pre-#389 behavior.
       throw WarmServerClientError.timedOut(host: host, port: port)
     } catch let error as WarmServerClientError {
       throw error
     } catch {
       throw WarmServerClientError.networkError(error.localizedDescription)
     }
-  }
-
-  private static func isLoopbackHost(_ host: String) -> Bool {
-    host == "127.0.0.1" || host == "localhost" || host == "::1"
   }
 }
 
@@ -185,13 +185,13 @@ public enum WarmServerClientError: Error, LocalizedError {
   case invalidURL(String)
   case invalidResponse
   case connectionRefused(host: String, port: UInt16)
-  /// The port answered (or DNS resolved) but no response came back in
-  /// time — a mid-boot engine, or a transient localhost DNS blip
-  /// (comfybox#389). Kept distinct from `.connectionRefused`: that case's
-  /// meaning must not change for other consumers (ComfyBoxDesktop, the
-  /// Telegram bot), so timeouts get their own case rather than being
-  /// folded into it. `MCPBridgeStartupPolicy.nothingListeningMessage(for:)`
-  /// treats both as "engine unreachable" with distinct hint wording.
+  /// The port answered but no response came back in time — a mid-boot
+  /// engine (comfybox#389). Kept distinct from `.connectionRefused`: that
+  /// case's meaning must not change for other consumers (ComfyBoxDesktop,
+  /// the Telegram bot), so timeouts get their own case rather than being
+  /// folded into it. Deliberately does NOT cover `.cannotFindHost` (a DNS/
+  /// resolver failure) — that is a broken resolver, not a not-yet-booted
+  /// engine, and stays `.networkError` (see `perform()`).
   case timedOut(host: String, port: UInt16)
   case networkError(String)
 
