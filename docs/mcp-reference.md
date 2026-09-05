@@ -110,16 +110,15 @@ share.
 
 **Returns:**
 ```json
-{
-  "job_id": "3F2A…",
-  "kind": "image",
-  "state": "running",
-  "progress": 42,
-  "result": {"output_path": "/Users/…/render.png", "duration_ms": 41200},
-  "error": null,
-  "retry_after_seconds": null
-}
+{"job_id": "3F2A…", "kind": "image", "state": "running", "progress": 42}
 ```
+```json
+{"job_id": "3F2A…", "kind": "image", "state": "completed", "progress": 100,
+ "result": {"output_path": "/Users/…/render.png", "duration_ms": 41200}}
+```
+
+`result`, `error` and `retry_after_seconds` are **omitted** when they do not
+apply — they are never present as `null`.
 
 | Field | Notes |
 |-------|-------|
