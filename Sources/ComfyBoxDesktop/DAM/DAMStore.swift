@@ -15,38 +15,9 @@ import SQLite3
 /// pointers risks the buffer being released before the statement runs.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-/// Drives a `sqlite3_step` loop to completion, invoking `onRow` for every
-/// `SQLITE_ROW` and returning the terminal step code once rows are
-/// exhausted. A bare `while sqlite3_step(stmt) == SQLITE_ROW` cannot tell
-/// "the result set is finished" (`SQLITE_DONE`) from "the step itself
-/// failed partway through" (`SQLITE_BUSY`, `SQLITE_IOERR`,
-/// `SQLITE_CORRUPT`, …) — both look identical from inside the loop, so a
-/// mid-iteration error silently truncates the result instead of surfacing
-/// (#263). Callers must compare the returned code against `SQLITE_DONE`
-/// and throw on anything else.
-///
-/// `step` is a closure rather than a bound `OpaquePointer` so this can be
-/// unit-tested with a stub that fails after N rows, without standing up a
-/// real (and hard to fault-inject on purpose) SQLite connection.
-///
-/// Out of scope here, deliberately: this file's `defer { sqlite3_finalize(stmt) }`
-/// calls (including every one of this function's callers) never check
-/// `sqlite3_finalize`'s own return code. `sqlite3_finalize` can surface an
-/// error that occurred during the statement's *last* `sqlite3_step` call —
-/// which, for every loop this function now guards, is already caught by the
-/// `rc != SQLITE_DONE` check below before `finalize` ever runs; the residual
-/// gap is prepared-but-never-stepped and single-shot (INSERT/UPDATE/DELETE)
-/// statements elsewhere in this file, where a step failure is already
-/// checked separately and finalize is unlikely to add new information.
-/// Tracked, not fixed here — see #357.
-func drainSQLiteRows(step: () -> Int32, onRow: () -> Void) -> Int32 {
-    var rc = step()
-    while rc == SQLITE_ROW {
-        onRow()
-        rc = step()
-    }
-    return rc
-}
+// `drainSQLiteRows` moved to ComfyBoxCatalog/SQLiteRowDrain.swift (#357) so the
+// DAM store and the catalog store share one implementation. This file already
+// imports ComfyBoxCatalog above, so the shared symbol is in scope unchanged.
 
 private extension Array {
     /// Splits into consecutive chunks of at most `size` elements (the final
