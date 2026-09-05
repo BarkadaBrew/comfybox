@@ -107,10 +107,10 @@ struct PresetView: View {
                 Button("Import from Image Service") { Task { await importLegacy() } }
                 Divider()
                 // #359: batch version of a row's "Make Expandable" — every
-                // preset currently label-only for `no_model` (declares
-                // neither `model` nor `checkpoint_family`), not just the 26
-                // this shipped against.
-                Button("Backfill Checkpoint Family (\(backfillCandidateCount))…") {
+                // preset currently label-only for `no_model` (declares no
+                // `model` the engine can expand), not just the 26 this
+                // shipped against.
+                Button("Make All Expandable (\(backfillCandidateCount))…") {
                     Task { await runBackfillAll() }
                 }
                 .disabled(backfillCandidateCount == 0 || backfillViewModel.isRunning)
@@ -120,7 +120,7 @@ struct PresetView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .disabled(!engine.connectionState.isConnected)
-            .help("Import presets, or backfill checkpoint_family on label-only presets")
+            .help("Import presets, or fill in the model spec on label-only presets so /v1/generate can expand them")
             Button {
                 Task { await beginEditing(ServerPreset(name: ""), asNew: true) }
             } label: { Label("New Preset", systemImage: "plus") }
@@ -243,16 +243,20 @@ struct PresetView: View {
             detectFamily: { spec in await engine.fetchModelFamily(forSpec: spec) },
             save: { updated in try await engine.savePreset(updated) }
         )
-        if case .failed(let message) = outcome.status {
+        switch outcome.status {
+        case .failed(let message):
             loadError = "Could not make '\(preset.name)' expandable: \(message)"
-        } else {
+        case .needsReview(let message):
+            // Not an error — a question. Same wording the batch sheet uses.
+            loadError = "'\(preset.name)' needs review first: \(message)"
+        case .updated, .skipped:
             loadError = nil
         }
         await reload()
     }
 
-    /// The header menu's "Backfill Checkpoint Family (N)…" — every candidate
-    /// in the current list, reported per-preset.
+    /// The header menu's "Make All Expandable (N)…" — every candidate in the
+    /// current list, reported per-preset.
     private func runBackfillAll() async {
         let results = await backfillViewModel.backfillAll(
             presets,
@@ -385,7 +389,7 @@ private struct ServerPresetRow: View {
                 .padding(.horizontal, 5).padding(.vertical, 1)
                 .background(.quaternary, in: Capsule())
                 .help(isBackfillable
-                    ? "This preset names no model/checkpoint_family, so it will not expand — use \u{201C}Make Expandable\u{201D}."
+                    ? "This preset names no model the engine can expand, so /v1/generate renders it on whatever is already resident — use \u{201C}Make Expandable\u{201D}."
                     : "This preset will not expand on POST /v1/generate {preset} — see the editor's Effective recipe panel for why.")
         }
     }
@@ -842,19 +846,20 @@ private struct ServerPresetEditor: View {
         let loras = editableLoras
             .filter { !$0.filename.isEmpty }
             .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }
-        // #359: `checkpoint_family` (and `model`, when the field is an
-        // engine-known alias rather than a path) so `/v1/generate {preset}`
-        // can expand this preset instead of leaving it a `no_model` label —
-        // see `PresetModelFieldBuilder`. `detectedModelFamily` is the
-        // engine's answer (`GET /v1/model/family`) for the CURRENT `model`
-        // text, kept fresh by `.task(id: model)`; a miss falls back to
-        // whatever `checkpoint_family` this preset already had, so a
-        // transient detection failure never erases a valid declaration.
+        // #359: `model` — the field `PresetLoRAStack.decide` reads FIRST —
+        // plus `checkpoint_family`, so `/v1/generate {preset}` can expand
+        // this preset instead of leaving it a `no_model` label. For a typed
+        // PATH the canonical engine spec goes in `model` and the path itself
+        // stays in `custom_model_path`; see `PresetModelFieldBuilder`.
+        // `detectedModelFamily` is the engine's answer (`GET
+        // /v1/model/family`) for the CURRENT `model` text, kept fresh by
+        // `.task(id: model)`; a miss leaves `model` alone for a path and
+        // falls back to whatever `checkpoint_family` this preset already had,
+        // so a transient detection failure never erases a valid declaration.
         let modelFields = PresetModelFieldBuilder.build(
             modelText: model,
             loras: loras,
-            detectedFamily: detectedModelFamily?.family,
-            detectedVariant: detectedModelFamily?.variant,
+            detection: detectedModelFamily,
             fallbackCheckpointFamily: original.checkpointFamily
         )
         p.model = modelFields.model
@@ -982,9 +987,11 @@ struct SavePresetSheet: View {
 // MARK: - #359: backfill results
 
 /// One-shot summary sheet for "Make Expandable" (a single-item list) and
-/// "Backfill Checkpoint Family (N)…" (the whole batch) — per-preset
-/// updated/skipped/failed, so a batch run is auditable rather than a single
-/// toast.
+/// "Make All Expandable (N)…" (the whole batch) — per-preset
+/// updated/skipped/needs-review/failed, so a batch run is auditable rather
+/// than a single toast. `needsReview` is its own bucket on purpose: those
+/// presets were NOT written and are waiting on Todd to declare an
+/// accelerator LoRA's role.
 private struct BackfillResultsView: View {
     let results: [PresetBackfillViewModel.Outcome]
     let onDismiss: () -> Void
@@ -992,14 +999,14 @@ private struct BackfillResultsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Checkpoint Family Backfill").font(.headline)
+                Text("Make Presets Expandable").font(.headline)
                 Spacer()
                 Button("Done", action: onDismiss).keyboardShortcut(.defaultAction)
             }
             .padding()
             Divider()
             if results.isEmpty {
-                Text("No label-only presets needed a checkpoint_family backfill.")
+                Text("No label-only presets needed a model backfill.")
                     .font(.subheadline).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -1025,6 +1032,11 @@ private struct BackfillResultsView: View {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
         case .skipped:
             Image(systemName: "minus.circle").foregroundStyle(.secondary)
+        case .needsReview:
+            // A question, not a failure — nothing was written, and Todd has
+            // to set the accelerator LoRA's role before this preset can be
+            // labelled raw-accel vs raw-stock.
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         case .failed:
             Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
@@ -1032,8 +1044,11 @@ private struct BackfillResultsView: View {
 
     private func detail(for status: PresetBackfillViewModel.Outcome.Status) -> String {
         switch status {
-        case .updated(let family): return "checkpoint_family set to \"\(family)\""
+        case .updated(let model, let family):
+            let familyPart = family.map { ", checkpoint_family \"\($0)\"" } ?? ""
+            return "model set to \"\(model)\"\(familyPart) — now expands"
         case .skipped(let reason): return reason
+        case .needsReview(let reason): return "Needs review: \(reason)"
         case .failed(let reason): return reason
         }
     }

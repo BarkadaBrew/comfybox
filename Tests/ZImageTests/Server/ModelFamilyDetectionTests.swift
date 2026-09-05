@@ -109,4 +109,126 @@ final class ModelFamilyDetectionTests: XCTestCase {
     XCTAssertEqual(result.family, "krea2")
     XCTAssertEqual(result.variant, "turbo")
   }
+
+  // MARK: - spec / loadable (fix round 1)
+  //
+  // The whole point of the route: `checkpoint_family` alone changes NOTHING
+  // for a preset that names no `model` — `PresetLoRAStack.decide` returns
+  // `no_model` before it is ever read. The desktop has to write `model`, so
+  // the route must hand back a spec the engine would actually accept.
+
+  func testDeclaredAliasDirectoryComesBackAsTheAliasNotThePath() throws {
+    let root = try makeKrea2Root("aliased-raw", transformer: "raw.safetensors")
+    let original = Krea2ModelDetection.specDirectories
+    defer { Krea2ModelDetection.configureSpecDirectories(original, replace: true) }
+    Krea2ModelDetection.configureSpecDirectories(["krea2-raw": root.path], replace: true)
+
+    // The desktop stores the literal path; the canonical engine spec for it
+    // is the declared alias.
+    let result = ModelFamilyDetector.detect(spec: root.path)
+    XCTAssertEqual(result.spec, "krea2-raw")
+    XCTAssertTrue(result.loadable)
+    XCTAssertNil(result.reason)
+  }
+
+  func testTurboAliasIsLoadableAndCanonicalizesToItself() {
+    let result = ModelFamilyDetector.detect(spec: "krea-2-turbo")
+    XCTAssertEqual(result.spec, "krea-2-turbo")
+    XCTAssertTrue(result.loadable)
+  }
+
+  func testUndeclaredKrea2DirectoryComesBackAsItsOwnAbsolutePath() throws {
+    let root = try makeKrea2Root("undeclared-raw", transformer: "raw.safetensors")
+    let original = Krea2ModelDetection.specDirectories
+    defer { Krea2ModelDetection.configureSpecDirectories(original, replace: true) }
+    Krea2ModelDetection.configureSpecDirectories([:], replace: true)
+
+    let result = ModelFamilyDetector.detect(spec: root.path)
+    XCTAssertEqual(result.spec, root.standardizedFileURL.path)
+    XCTAssertTrue(result.loadable, "an existing krea2 directory is exactly what Krea2ModelDetection.resolve accepts")
+  }
+
+  func testPathSpecIsStandardizedForTheCanonicalSpec() throws {
+    // ModelResolution.resolve does NOT expand `~`, and neither does
+    // parseModelSpec for a path — a tilde spec written into `model` would
+    // throw modelNotFound, so the canonical spec is always tilde-expanded,
+    // standardized and free of a trailing slash.
+    let root = try makeKrea2Root("tilde-raw", transformer: "raw.safetensors")
+    let original = Krea2ModelDetection.specDirectories
+    defer { Krea2ModelDetection.configureSpecDirectories(original, replace: true) }
+    Krea2ModelDetection.configureSpecDirectories([:], replace: true)
+
+    let result = ModelFamilyDetector.detect(spec: root.path + "/")
+    XCTAssertEqual(result.spec, root.standardizedFileURL.path, "no trailing slash, standardized")
+    XCTAssertTrue(result.loadable)
+  }
+
+  func testNonexistentPathIsNotLoadableAndSaysWhy() {
+    let missing = scratch.appending(path: "does-not-exist").path
+    let result = ModelFamilyDetector.detect(spec: missing)
+    XCTAssertFalse(result.loadable)
+    XCTAssertNotNil(result.reason)
+    XCTAssertTrue(result.reason?.contains("does not exist") == true, result.reason ?? "nil")
+  }
+
+  func testDeclaredAliasWithAMissingDirectoryIsNotLoadable() {
+    let original = Krea2ModelDetection.specDirectories
+    defer { Krea2ModelDetection.configureSpecDirectories(original, replace: true) }
+    Krea2ModelDetection.configureSpecDirectories(
+      ["krea2-ghost": scratch.appending(path: "ghost").path], replace: true)
+
+    let result = ModelFamilyDetector.detect(spec: "krea2-ghost")
+    XCTAssertFalse(result.loadable, "Krea2ModelDetection.resolve would throw for this alias")
+    XCTAssertNotNil(result.reason)
+  }
+
+  func testExistingDirectoryThatIsNotKrea2IsStillLoadableAsASnapshot() throws {
+    // ModelResolution.resolve returns any existing path as-is, and
+    // ModelPool.detectFamily then falls through to flux1 (Z-Image). The
+    // engine accepts it; the route says so without pretending to know the
+    // family.
+    let dir = scratch.appending(path: "plain-snapshot")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let result = ModelFamilyDetector.detect(spec: dir.path)
+    XCTAssertNil(result.family)
+    XCTAssertTrue(result.loadable)
+    XCTAssertEqual(result.spec, dir.standardizedFileURL.path)
+  }
+
+  func testExistingSafetensorsFileIsLoadable() throws {
+    let file = scratch.appending(path: "checkpoint.safetensors")
+    FileManager.default.createFile(atPath: file.path, contents: Data([0]))
+    let result = ModelFamilyDetector.detect(spec: file.path)
+    XCTAssertTrue(result.loadable)
+    XCTAssertEqual(result.spec, file.standardizedFileURL.path)
+  }
+
+  func testExistingNonModelFileIsNotLoadable() throws {
+    let file = scratch.appending(path: "notes.txt")
+    FileManager.default.createFile(atPath: file.path, contents: Data([0]))
+    let result = ModelFamilyDetector.detect(spec: file.path)
+    XCTAssertFalse(result.loadable)
+    XCTAssertNotNil(result.reason)
+  }
+
+  func testKnownEngineSpecsAreLoadable() {
+    for spec in ["z-image-turbo", "z-image-base", "briaai/FIBO", "klein-4b", "chroma-8.9b"] {
+      let result = ModelFamilyDetector.detect(spec: spec)
+      XCTAssertTrue(result.loadable, spec)
+      XCTAssertEqual(result.spec, spec, spec)
+    }
+  }
+
+  func testAnUnknownBareSpecIsNotLoadable() {
+    let result = ModelFamilyDetector.detect(spec: "some-other-checkpoint")
+    XCTAssertFalse(result.loadable)
+    XCTAssertNotNil(result.reason)
+  }
+
+  func testWhitespaceIsTrimmedOutOfTheCanonicalSpec() {
+    let result = ModelFamilyDetector.detect(spec: "  krea2  ")
+    XCTAssertEqual(result.model, "  krea2  ", "echoed verbatim")
+    XCTAssertEqual(result.spec, "krea2")
+    XCTAssertTrue(result.loadable)
+  }
 }

@@ -6162,26 +6162,33 @@ public final class WarmServer {
   /// Parse the model spec from a pool-style model ID.
   /// Strips quantization suffixes since poolLoad takes them separately.
   /// e.g. "z-image-turbo-q8" -> "z-image-turbo", "briaai/FIBO" -> "briaai/FIBO"
-  static func parseModelSpec(from modelId: String) -> String {
-    let knownSpecs = [
-      "briaai/FIBO",
-      "chroma-8.9b",
-      "z-image-turbo",
-      "z-image-turbo-bf16",
-      "klein-4b",
-      "klein-9b",
-    ]
-    if knownSpecs.contains(modelId) { return modelId }
+  /// Specs this function passes through untouched — engine-known model ids.
+  /// Exposed (comfybox#359) so `ModelFamilyDetector` can answer "would
+  /// `/v1/generate` accept this as `model`?" from THIS list rather than
+  /// growing a second copy of it.
+  static let knownModelSpecs: Set<String> = [
+    "briaai/FIBO",
+    "chroma-8.9b",
+    "z-image-turbo",
+    "z-image-turbo-bf16",
+    "klein-4b",
+    "klein-9b",
+  ]
 
-    // CivitAI checkpoint path mappings (Moody family)
-    let civitaiPaths: [String: String] = [
-      "moody-wild-v4": "~/Models-working/moody-wild-mix/moody-wild-v4-fp16-full.safetensors",
-      "moody-wild-v4-distilled": "~/Models-working/moody-wild-mix/moody-wild-v4-distilled-10step-fp16.safetensors",
-      "moody-wild-v4-fp8": "~/Models-working/moody-wild-mix/moody-wild-v4-fp8.safetensors",
-      "moody-real-v6": "~/Models-working/moody-real-v6/moody-real-v6.safetensors",
-      "cyberrealistic-v5": "~/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors",
-    ]
-    if let path = civitaiPaths[modelId] {
+  /// CivitAI checkpoint path mappings (Moody family). Same reason as
+  /// `knownModelSpecs` for being a stored table rather than a local.
+  static let civitaiCheckpointPaths: [String: String] = [
+    "moody-wild-v4": "~/Models-working/moody-wild-mix/moody-wild-v4-fp16-full.safetensors",
+    "moody-wild-v4-distilled": "~/Models-working/moody-wild-mix/moody-wild-v4-distilled-10step-fp16.safetensors",
+    "moody-wild-v4-fp8": "~/Models-working/moody-wild-mix/moody-wild-v4-fp8.safetensors",
+    "moody-real-v6": "~/Models-working/moody-real-v6/moody-real-v6.safetensors",
+    "cyberrealistic-v5": "~/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors",
+  ]
+
+  static func parseModelSpec(from modelId: String) -> String {
+    if knownModelSpecs.contains(modelId) { return modelId }
+
+    if let path = civitaiCheckpointPaths[modelId] {
       return NSString(string: path).expandingTildeInPath
     }
     // Krea-2 family installs (kroma-v0.2-turbo, krea2-raw, …) live in ONE

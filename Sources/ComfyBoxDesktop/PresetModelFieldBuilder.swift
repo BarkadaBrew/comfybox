@@ -8,6 +8,16 @@
 // and the save button never blocks on network — the engine's answer
 // (`ModelFamilyInfo`, from `GET /v1/model/family`) is fetched ahead of time
 // (`.task(id: model)`) and handed in already resolved.
+//
+// FIX ROUND 1: a typed PATH now also populates `model` (with the canonical
+// engine spec the engine returned — a declared alias where one matches,
+// otherwise the standardized absolute path), not just `custom_model_path`.
+// That is the field `PresetLoRAStack.decide` reads first; without it a
+// path-only preset stays a `no_model` label no matter what
+// `checkpoint_family` says. `custom_model_path` is still written so the
+// desktop's own Apply/Set-as-Warm path is unchanged, and `model` is only
+// written when the engine said the spec is `loadable` — a preset that names
+// a base the engine would refuse is worse than one that names none.
 
 import Foundation
 
@@ -29,12 +39,12 @@ public enum PresetModelFieldBuilder {
     ///   - modelText: the editor's `model` field, as typed.
     ///   - loras: the preset's current LoRA rows — only their `role` matters
     ///     here (accel vs not), for `CheckpointFamilyResolver`.
-    ///   - detectedFamily / detectedVariant: the engine's answer for the spec
-    ///     THIS builder is about to derive from `modelText` (or, when
-    ///     `modelText` is empty, whatever the caller last resolved for the
-    ///     preset's existing `customModelPath` — see
-    ///     `ServerPresetEditor.detectedModelFamily`). nil/nil when not yet
-    ///     resolved, or the engine could not classify it.
+    ///   - detection: the engine's answer (`GET /v1/model/family`) for the
+    ///     spec THIS builder is about to derive from `modelText`, kept fresh
+    ///     by `ServerPresetEditor`'s `.task(id: model)`. nil when not yet
+    ///     resolved or the engine was unreachable — in which case a typed
+    ///     path is stored as `custom_model_path` only, exactly as before this
+    ///     change, and the preset's existing `checkpoint_family` survives.
     ///   - fallbackCheckpointFamily: `original.checkpointFamily` — carried
     ///     through UNCHANGED when detection can't resolve one, so an already
     ///     valid, manually-declared value (or one an earlier backfill wrote)
@@ -42,23 +52,30 @@ public enum PresetModelFieldBuilder {
     public static func build(
         modelText: String,
         loras: [ServerPresetLora],
-        detectedFamily: String?,
-        detectedVariant: String?,
+        detection: ModelFamilyInfo?,
         fallbackCheckpointFamily: String?
     ) -> Result {
         let modelValue = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let model: String?
-        let customModelPath: String?
-        if modelValue.hasPrefix("/") || modelValue.hasPrefix("~") {
+        let isPath = modelValue.hasPrefix("/") || modelValue.hasPrefix("~")
+
+        var model: String?
+        var customModelPath: String?
+        if isPath {
             customModelPath = modelValue
-            model = nil
+            // The canonical spec the engine gave us for THIS path — an alias
+            // when the path is a declared install, else the standardized
+            // absolute path. Only when the engine said it would load it.
+            if let detection, detection.loadable {
+                let spec = detection.spec.trimmingCharacters(in: .whitespacesAndNewlines)
+                model = spec.isEmpty ? nil : spec
+            }
         } else {
             model = modelValue.isEmpty ? nil : modelValue
             customModelPath = nil
         }
 
         let resolvedFamily = CheckpointFamilyResolver.resolve(
-            family: detectedFamily, variant: detectedVariant, loras: loras)
+            family: detection?.family, variant: detection?.variant, loras: loras)
 
         return Result(
             model: model,

@@ -227,11 +227,46 @@ public struct ModelFamilyInfo: Sendable, Equatable, Decodable {
     public let model: String
     public let family: String?
     public let variant: String?
+    /// The canonical engine model spec for the probed value — a declared
+    /// krea2 alias where the path matches one, otherwise the standardized
+    /// absolute path. This is what goes in a preset's `model`: writing only
+    /// `checkpoint_family` cannot make a preset expandable, because
+    /// `PresetLoRAStack.decide` returns `no_model` before it ever reads that
+    /// field (see `PresetBackfillViewModel`).
+    public let spec: String
+    /// Would `/v1/generate` accept `spec` as `model`? False ⇒ do not write
+    /// it; `reason` says why.
+    public let loadable: Bool
+    /// Why `loadable` is false. nil when it is true.
+    public let reason: String?
 
-    public init(model: String, family: String?, variant: String?) {
+    public init(model: String, family: String?, variant: String?,
+                spec: String? = nil, loadable: Bool = false, reason: String? = nil) {
         self.model = model
         self.family = family
         self.variant = variant
+        self.spec = spec ?? model
+        self.loadable = loadable
+        self.reason = reason
+    }
+
+    /// `spec`/`loadable`/`reason` are decoded leniently so a desktop build
+    /// talking to an engine that predates them degrades to "not loadable"
+    /// (the backfill then refuses and says so) instead of failing to decode
+    /// the whole response.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decode(String.self, forKey: .model)
+        family = try c.decodeIfPresent(String.self, forKey: .family)
+        variant = try c.decodeIfPresent(String.self, forKey: .variant)
+        spec = try c.decodeIfPresent(String.self, forKey: .spec) ?? model
+        loadable = try c.decodeIfPresent(Bool.self, forKey: .loadable) ?? false
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+            ?? (c.contains(.loadable) ? nil : "this engine build does not report model loadability")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case model, family, variant, spec, loadable, reason
     }
 }
 

@@ -54,7 +54,11 @@ struct PresetEffectiveRecipeTests {
             customModelPath: "/Models/some-checkpoint.safetensors")
         let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
         #expect(recipe.unresolved?.code == "no_model")
-        #expect(recipe.unresolved?.hint == "Add checkpoint_family to make this preset expandable.")
+        // Fix round 1: the hint must point at `model`. Telling the user to
+        // add `checkpoint_family` here was wrong — `decide` never reads it
+        // for a `{preset}`-only request.
+        #expect(recipe.unresolved?.hint == PresetEffectiveRecipePresenter.noModelHint)
+        #expect(recipe.unresolved?.hint?.contains("model") == true)
         #expect(recipe.loraStack.isEmpty)
     }
 
@@ -81,7 +85,7 @@ struct PresetEffectiveRecipeTests {
         let preset = ImagePreset(id: "family-only", name: "Family Only", engine: "zimage", checkpointFamily: "raw-accel")
         let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
         #expect(recipe.unresolved?.code == "no_model")
-        #expect(recipe.unresolved?.hint == "Add checkpoint_family to make this preset expandable.")
+        #expect(recipe.unresolved?.hint == PresetEffectiveRecipePresenter.noModelHint)
     }
 
     /// Todd 2026-09-04: the `kroma_file_missing` gate is retired along with
