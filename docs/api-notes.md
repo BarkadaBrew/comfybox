@@ -218,6 +218,64 @@ before the response returns, never a persisted gallery filename, and are
 unreachable for Krea-2 (`ControlNet is not supported for Flux 2 or
 Krea-2 models` — the route throws before any temp file is written).
 
+## Queue lifecycle ledger (comfybox#283 / comfybox#217)
+
+`GET /v1/queue/lifecycle?job_id=&limit=` — read-only, append-only record of
+what actually happened to queue jobs: `enqueued`, `admitted`, `started`,
+`progress` (bounded rate — see below), `checkpointed`, `resumed`,
+`interrupted`, `completed`, `failed`, `replayed_after_restart`, `dropped`.
+Built as the TELEMETRY that #283 (a restart re-enqueues the active job and
+re-renders it from step 1, and nothing reported that accurately) and #217
+(the Desktop queue/progress UI goes stale during a render) need before either
+issue's proposed behavior changes can be evaluated safely — it changes
+nothing about queue behavior itself.
+
+Query params: `job_id` (optional — filter to one job) and `limit` (optional,
+default 200, clamped to 1–2000). Response:
+
+```json
+{"boot_id": "…", "count": 3, "events": [
+  {"sequence": 41, "boot_id": "…", "wall_time": "2026-09-04T…Z", "job_id": "…",
+   "kind": "admitted", "job_kind": "generate", "source": "api"}
+]}
+```
+
+`boot_id` is a fresh UUID generated once per process start — two events with
+different `boot_id`s straddle a restart, which is the direct answer to
+#283's "nothing distinguishes a recovered job from a new one." `sequence` is
+a process-wide (not per-job) monotonic counter, reseeded from the JSONL tail
+on restart so it never resets to 0.
+
+Additive fields on existing routes, `null`/absent-safe for older clients:
+
+- `GET /v1/queue`: each `pending[]` entry gains `last_event`; the response
+  gains `active_last_event` when a job is active. Both are one
+  `QueueLifecycleEvent` object (see above), or absent if the ledger has
+  never seen that job (e.g. a snapshot recovered from before this instrument
+  shipped).
+- `GET /v1/generate/status/{id}`: gains `lifecycle_tail`, the last 5 events
+  recorded for that job id, or absent if none.
+
+**Diagnosing #283 from the ledger**: after a bounce, `GET
+/v1/queue/lifecycle?job_id=<the id from queue-state.json>` shows the pre-crash
+history ending mid-render (no `completed`/`failed`), followed by a
+`replayed_after_restart` event under a NEW `boot_id` — `from_step1: true`
+(image generate/LoRA swap never checkpoint today, so this is currently
+always the answer) confirms the render actually restarted from step 1 rather
+than resuming, and `original_job_id` names the job. This is the
+operator-visible signal #283 finding 1 says is missing; it does not by
+itself change whether a restart drops or resumes the job — that is #283's
+open decision, not this instrument's.
+
+Storage: an in-memory ring (default last 4000 events, actor-hop-free reads)
+plus `~/.comfybox/queue-lifecycle.jsonl` (append-only, survives a restart;
+honors `COMFYBOX_STATE_DIR` like every other engine state path). `progress`
+events are throttled to at most one per job per second — a fast-ticking
+render cannot flood either store.
+
+See `Sources/ZImage/Server/QueueLifecycleLedger.swift` for the full event
+schema and `ReplayClassifier`'s pure from-step-1-vs-resumed logic.
+
 ## Startup imports
 
 - Character + preset legacy imports also run **once at server startup**
