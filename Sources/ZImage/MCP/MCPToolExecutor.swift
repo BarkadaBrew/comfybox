@@ -150,9 +150,16 @@ public final class MCPToolExecutor: @unchecked Sendable {
       // anyway. Every tool call made before the engine comes up must fail
       // with that SAME message (port + launchctl kickstart command), not
       // the generic "WarmServer not running" text, via the one shared
-      // builder both call sites use.
-      if case .connectionRefused(let host, let port) = error {
-        return MCPToolResult(error: MCPBridgeStartupPolicy.nothingListeningMessage(host: host, port: port))
+      // builder every call site uses.
+      //
+      // comfybox#389: that round-2 fix special-cased only
+      // `.connectionRefused` (outright refusal), so a mid-boot engine
+      // whose port already accepts connections but hasn't answered
+      // `/health` yet (`.timedOut`) fell through to the generic text
+      // instead. `nothingListeningMessage(for:)` classifies every
+      // "engine unreachable" case — refused or timed out — in one place.
+      if let message = MCPBridgeStartupPolicy.nothingListeningMessage(for: error) {
+        return MCPToolResult(error: message)
       }
       return MCPToolResult(error: "Error: \(error.errorDescription ?? String(describing: error))")
     } catch {
