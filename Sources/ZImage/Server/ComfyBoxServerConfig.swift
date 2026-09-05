@@ -414,20 +414,31 @@ public struct ComfyBoxServerConfig: Codable, Equatable, Sendable {
   }
 
   /// The engine's state directory — `~/.comfybox`, or `COMFYBOX_STATE_DIR`
-  /// when set. Mirrors `QueueStateStore.stateDirectory` exactly (K-FIX-1: a
-  /// test that touches this path unguarded reads/writes/DELETES the LIVE
-  /// engine's config — see `ComfyBoxStateDirectoryIsolation.swift`). COMPUTED,
-  /// not a cached `static let`, so the override is honored even if it's set
-  /// after this type has already been touched once in the process.
+  /// when set. Mirrors `QueueStateStore.stateDirectory`'s PATH resolution
+  /// exactly (K-FIX-1: a test that touches this path unguarded reads/writes/
+  /// DELETES the LIVE engine's config — see `ComfyBoxStateDirectoryIsolation.
+  /// swift`). COMPUTED, not a cached `static let`, so the override is
+  /// honored even if it's set after this type has already been touched once
+  /// in the process.
+  ///
+  /// F6 (comfybox#324, adversarial review of Phase 3 config): this is
+  /// read-shaped — every caller (including `defaultPath()` below, and every
+  /// OTHER `.comfybox`-hosted path built on it — `ContentModeStore.
+  /// defaultPath()`, `AuditLog.defaultPath()`) uses it just to learn where a
+  /// file lives, often only to check whether it exists. It must not have a
+  /// write side effect: creating `~/.comfybox` — a real mutation of a real
+  /// machine's filesystem — merely because someone asked "what path is
+  /// this?" (e.g. printing it, or a test asserting on it with no state-dir
+  /// override) is a surprise no read-shaped accessor should spring. Nothing
+  /// depends on the directory pre-existing here: every actual WRITER
+  /// (`ComfyBoxServerConfig.save`, `ContentModeStore.save`, `AuditLog.
+  /// append`) already does its own `createDirectory(withIntermediateDirectories:
+  /// true)` on the target file's parent immediately before writing.
   public static func stateDirectory() -> URL {
     if let override = ProcessInfo.processInfo.environment["COMFYBOX_STATE_DIR"], !override.isEmpty {
-      let dir = URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
-      try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-      return dir
+      return URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
     }
-    let dir = homeDirectory().appendingPathComponent(".comfybox", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir
+    return homeDirectory().appendingPathComponent(".comfybox", isDirectory: true)
   }
 
   /// `~/.comfybox/config.json`, or `$COMFYBOX_STATE_DIR/config.json`.

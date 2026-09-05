@@ -228,4 +228,66 @@ final class ComfyBoxServerConfigTests: XCTestCase {
     let decoded = try JSONDecoder().decode(ComfyBoxServerConfig.self, from: data)
     XCTAssertTrue(decoded.imageMemoryCaps.enforceMemoryEstimate)
   }
+
+  // MARK: - State directory is read-shaped (F6, comfybox#324)
+
+  private func withStateDirOverride(_ path: String, _ body: () throws -> Void) rethrows {
+    let previous = ProcessInfo.processInfo.environment["COMFYBOX_STATE_DIR"]
+    setenv("COMFYBOX_STATE_DIR", path, 1)
+    defer {
+      if let previous {
+        setenv("COMFYBOX_STATE_DIR", previous, 1)
+      } else {
+        unsetenv("COMFYBOX_STATE_DIR")
+      }
+    }
+    try body()
+  }
+
+  /// `stateDirectory()` must be a pure query: resolving "what path is this?"
+  /// (e.g. displaying it, or a test merely asserting on it) must never mkdir
+  /// a real machine's filesystem. Every real WRITER (`ComfyBoxServerConfig.
+  /// save`, `ContentModeStore.save`, `AuditLog.append`) creates its own
+  /// directory immediately before writing, so nothing needs this side effect.
+  func testStateDirectoryDoesNotCreateTheDirectoryAsASideEffect() throws {
+    let base = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let notYetCreated = base.appendingPathComponent("not-yet-created-\(UUID().uuidString)", isDirectory: true)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: notYetCreated.path))
+
+    try withStateDirOverride(notYetCreated.path) {
+      let resolved = ComfyBoxServerConfig.stateDirectory()
+      XCTAssertEqual(resolved.standardizedFileURL.path, notYetCreated.standardizedFileURL.path)
+      XCTAssertFalse(
+        FileManager.default.fileExists(atPath: notYetCreated.path),
+        "stateDirectory() must not create the directory as a side effect of a read-shaped query")
+
+      _ = ComfyBoxServerConfig.defaultPath()
+      XCTAssertFalse(
+        FileManager.default.fileExists(atPath: notYetCreated.path),
+        "defaultPath() (built directly on stateDirectory()) must not create it either")
+    }
+  }
+
+  /// The flip side: merely constructing a `ServerConfigStore` over a path
+  /// under an as-yet-nonexistent directory (the exact shape `.shared` uses
+  /// on a brand-new install) still works — `loadOrMigrate`'s own `save()`
+  /// creates the directory it needs, independent of `stateDirectory()`'s
+  /// side effects (or lack thereof).
+  func testConstructingAStoreOverANonexistentDirectoryStillPersists() throws {
+    let base = try makeTempDir()
+    defer { try? FileManager.default.removeItem(at: base) }
+    let stateDir = base.appendingPathComponent("fresh-install", isDirectory: true)
+    let configPath = stateDir.appendingPathComponent("config.json")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: stateDir.path))
+
+    let store = ServerConfigStore(
+      path: configPath,
+      coffeeShopProviders: stateDir.appendingPathComponent("absent-providers.json"),
+      coffeeShopConfig: stateDir.appendingPathComponent("absent-config.json"),
+      auditLog: nil
+    )
+    XCTAssertTrue(FileManager.default.fileExists(atPath: configPath.path))
+    XCTAssertEqual(store.current().config.port, ComfyBoxServerConfig.canonicalPort)
+  }
 }
