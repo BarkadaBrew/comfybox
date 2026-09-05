@@ -54,6 +54,7 @@ public enum MCPToolRegistry {
     nearlineList.annotated(.readOnly),
     nearlineScan.annotated(.additive),
     nearlineStage.annotated(.additive),
+    nearlineAnchor.annotated(.additive),
     nearlineEvict.annotated(.destructive),
     civitaiSearch.annotated(.readOnly),
     civitaiPrompts.annotated(.additive),
@@ -942,6 +943,23 @@ public enum MCPToolRegistry {
       "required": ["name"],
     ] as [String: Any],
     routes: [RouteRef(method: "POST", path: "/v1/nearline/stage")]
+  )
+
+  static let nearlineAnchor = MCPToolDefinition(
+    name: "nearline_anchor",
+    description: "Pin (or unpin) a nearline model or LoRA to internal storage. Pinning stages it"
+      + " in immediately if it isn't already local; the eviction planner then never selects it,"
+      + " even under LRU pressure. Unpinning just clears the flag — it does not itself evict.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "kind": ["type": "string", "enum": ["lora", "model"], "description": "The item's kind, from nearline_list."] as [String: Any],
+        "id": ["type": "string", "description": "The item filename from nearline_list."] as [String: Any],
+        "anchored": ["type": "boolean", "description": "true to pin (stage in and keep resident); false to unpin."] as [String: Any],
+      ] as [String: Any],
+      "required": ["kind", "id", "anchored"],
+    ] as [String: Any],
+    routes: [RouteRef(method: "POST", path: "/v1/nearline/anchor")]
   )
 
   static let nearlineEvict = MCPToolDefinition(
