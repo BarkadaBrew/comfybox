@@ -88,14 +88,27 @@ public enum HTTPKit {
     /// `%` not followed by two hex digits) falls back to the raw substring
     /// rather than dropping the parameter — `removingPercentEncoding`
     /// returns nil for those, and nil must not read as "empty value".
+    ///
+    /// The split below deliberately mirrors the engine's
+    /// (`pair.split(separator: "=", maxSplits: 1)`, default
+    /// `omittingEmptySubsequences: true`) rather than passing `false`: with
+    /// `false`, a bare `=` (empty key AND empty value) used to parse as
+    /// `["": ""]` here while the engine dropped it entirely, and `=value`
+    /// used to parse as `["": "value"]` here vs. the engine's
+    /// `["value": ""]` — two more ways the services disagreed. Matching the
+    /// engine's split call byte-for-byte, plus its `parts.count == 1 || 2`
+    /// guard, was the only way to make every edge case agree rather than
+    /// patching this one by hand and risking a fourth divergence later.
     public static func queryParameters(of target: String) -> [String: String] {
         guard let qIndex = target.firstIndex(of: "?") else { return [:] }
         let raw = String(target[target.index(after: qIndex)...])
+        guard !raw.isEmpty else { return [:] }
         var out: [String: String] = [:]
         for pair in raw.split(separator: "&") {
-            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 1 || parts.count == 2 else { continue }
             let rawKey = String(parts[0])
-            let rawValue = parts.count > 1 ? String(parts[1]) : ""
+            let rawValue = parts.count == 2 ? String(parts[1]) : ""
             let key = rawKey.removingPercentEncoding ?? rawKey
             let value = rawValue.removingPercentEncoding ?? rawValue
             out[key] = value

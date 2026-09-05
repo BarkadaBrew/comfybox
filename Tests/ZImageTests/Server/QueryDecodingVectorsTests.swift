@@ -27,11 +27,18 @@ struct QueryDecodingVector {
     let name: String
     let query: String
     let key: String
-    let expected: String
+    /// `nil` means `key` must be ABSENT from the decoded output entirely
+    /// (not merely present with an empty value) — the empty-key-drop cases.
+    let expected: String?
 }
 
 /// One vector per case in the #387 ruling: space, `#`, `%25`, non-ASCII, `+`
-/// (both percent-encoded and literal), malformed escape, and key decoding.
+/// (both percent-encoded and literal), malformed escape, key decoding, and
+/// (round 2, PR #390 review) the empty-key edge cases where the catalog's
+/// `omittingEmptySubsequences: false` used to disagree with the engine's
+/// default-`true` split: a leading `=` promotes the remainder to the key
+/// rather than pairing with an empty one, and a bare `=` yields no
+/// parameter at all.
 let queryDecodingVectors: [QueryDecodingVector] = [
     .init(name: "space", query: "model=a%20b", key: "model", expected: "a b"),
     .init(name: "hash", query: "model=track%231.safetensors", key: "model", expected: "track#1.safetensors"),
@@ -43,24 +50,34 @@ let queryDecodingVectors: [QueryDecodingVector] = [
     .init(name: "keyDecoding", query: "mod%65l=krea2", key: "model", expected: "krea2"),
     .init(name: "malformedTrailingPercent", query: "model=abc%", key: "model", expected: "abc%"),
     .init(name: "malformedNonHex", query: "model=50%zz", key: "model", expected: "50%zz"),
+    .init(name: "leadingEqualsPromotesTheRemainderToTheKey", query: "=value", key: "value", expected: ""),
+    .init(name: "bareEqualsYieldsNoParameterAtAll", query: "=", key: "", expected: nil),
+    .init(name: "trailingEqualsYieldsAnEmptyValue", query: "a=", key: "a", expected: ""),
+    .init(name: "bareKeyWithNoEqualsYieldsAnEmptyValue", query: "a", key: "a", expected: ""),
 ]
 
 /// Deterministic FNV-1a 64-bit over the table's canonical text form. NOT
 /// Swift's `Hashable`/`hashValue` — those are seeded per process (hash
 /// randomization) and would differ between the two test binaries even for
 /// byte-identical content, which would defeat the whole point of this check.
+/// `expected == nil` is mixed in distinctly from any real string (a `\0`
+/// vs. `\u{1}` prefix) so "absent" can never collide with an expected value.
 func hashQueryDecodingVectors(_ vectors: [QueryDecodingVector]) -> UInt64 {
     var hash: UInt64 = 0xcbf29ce484222325
     let prime: UInt64 = 0x100000001b3
-    for v in vectors {
-        for field in [v.name, v.query, v.key, v.expected] {
-            for byte in field.utf8 {
-                hash ^= UInt64(byte)
-                hash = hash &* prime
-            }
-            hash ^= 0xFF
+    func mix(_ s: String) {
+        for byte in s.utf8 {
+            hash ^= UInt64(byte)
             hash = hash &* prime
         }
+        hash ^= 0xFF
+        hash = hash &* prime
+    }
+    for v in vectors {
+        mix(v.name)
+        mix(v.query)
+        mix(v.key)
+        mix(v.expected == nil ? "\u{0}ABSENT" : "\u{1}" + v.expected!)
     }
     return hash
 }
@@ -72,7 +89,7 @@ final class QueryDecodingVectorsTests: XCTestCase {
     /// literals together whenever the table changes.
     func testVectorTableHashMatchesItsTwin() {
         XCTAssertEqual(
-            hashQueryDecodingVectors(queryDecodingVectors), 0x9895a01037f4c6ec,
+            hashQueryDecodingVectors(queryDecodingVectors), 0x01a350cf8bf0367c,
             "queryDecodingVectors diverged from its twin in "
             + "Tests/ComfyBoxCatalogTests/QueryDecodingVectorsTests.swift — "
             + "update both tables and both hash literals together")
@@ -84,7 +101,11 @@ final class QueryDecodingVectorsTests: XCTestCase {
     func testHTTPRequestDecodesEveryVector() {
         for v in queryDecodingVectors {
             let request = HTTPRequest(method: "GET", path: "/x", queryString: v.query, headers: [:], body: Data())
-            XCTAssertEqual(request.queryParameters[v.key], v.expected, v.name)
+            if let expected = v.expected {
+                XCTAssertEqual(request.queryParameters[v.key], expected, v.name)
+            } else {
+                XCTAssertNil(request.queryParameters[v.key], v.name)
+            }
         }
     }
 }
