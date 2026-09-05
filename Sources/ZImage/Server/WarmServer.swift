@@ -5673,7 +5673,12 @@ public final class WarmServer {
       let before = jobs.count
       jobs = QueueDeltaApplier.apply(deltas, to: jobs, id: { $0.id })
       logger.info("Queue recovery: folded \(deltas.count) undrained delta(s), \(before) -> \(jobs.count) job(s)")
-      QueueDeltaStore.clear()
+      // comfybox#386 review round 2, item 3: `clearDeltas()` now persists the
+      // empty snapshot itself, through the same generation-guarded path as
+      // every other sidecar write — a bare `QueueDeltaStore.clear()` here
+      // raced an in-flight sync cancel/move (the listener is already up
+      // while this recovery task runs) and could let a write from BEFORE
+      // this clear land AFTER it, resurrecting what was just folded in.
       liveHealth.clearDeltas()
     }
     guard !jobs.isEmpty else { return }
@@ -6317,7 +6322,7 @@ private final class LiveHealthState: @unchecked Sendable {
   // catches up at the end of a render). The actor is a READER of `paused` (its
   // between-items gate) and DRAINS `deltas` at its scheduling points.
   private var paused: Bool
-  private var deltas: [QueueControlCommand] = []
+  private var deltas: [StampedDelta] = []
   /// The in-flight render's task AND the identity that names it, published
   /// here (both `Sendable`) so the SYNC `/v1/queue/interrupt` can resolve and
   /// cancel with no actor hop. Set/cleared by the process loop around each
@@ -6443,60 +6448,110 @@ private final class LiveHealthState: @unchecked Sendable {
 
   // MARK: delta mailbox
 
+  /// One undrained delta plus the generation it was recorded at (review round
+  /// 2, item 1). The generation is what lets the drain distinguish a delta
+  /// that is merely visible in memory from one that is actually durable on
+  /// disk — see `peekDeltas` below.
+  private struct StampedDelta {
+    let generation: Int
+    let command: QueueControlCommand
+  }
+
   /// comfybox#386: the sidecar write below must never run while holding
   /// `lock` — `lock` is also what `read()` (the sync-servable `/health` and
   /// `/v1/queue` routes' only dependency) needs, and `QueueDeltaStore.save` is
   /// disk I/O that can stall on a slow or nearly-full volume. Every mutator
   /// here follows the same shape: mutate + snapshot + stamp a generation
   /// number while holding `lock`, release it, THEN persist through
-  /// `persistDeltaSidecar`, which uses a SEPARATE lock (`sidecarLock`) that
-  /// `read()` never touches.
+  /// `persistDeltaSidecar`.
   ///
   /// `recordDelta` (off-actor, the sync cancel/move routes — can run
-  /// concurrently on several connection threads) and `commitDrainedDeltas`
-  /// (the coordinator actor's drain) both write this same sidecar file and can
-  /// genuinely race each other. Ordering fix, chosen per the #386 ruling: a
-  /// dedicated writer lock (`sidecarLock`) plus a monotonic generation counter
-  /// (`deltaGeneration`, itself stamped under `lock` so it is ordered exactly
-  /// like the mutations are) rather than a background queue — a background
-  /// queue would make these methods return before the sidecar reflects their
-  /// effect, which the existing WAL/recovery tests assert synchronously.
-  /// Inside `sidecarLock`, a write only actually happens if its generation is
-  /// still newer than the last one THIS lock persisted; a write that lost the
-  /// race to reach the lock is therefore a stale no-op rather than a
-  /// regression — it can never clobber a fresher write with older content.
-  /// Because each snapshot is the FULL undrained-delta list (never an
-  /// increment), the worst a stale skip can do is leave a transient state
-  /// unpersisted: the on-disk content always converges on the true latest
-  /// state, so no delta is ever lost or double-applied.
+  /// concurrently on several connection threads), `commitDrainedDeltas` (the
+  /// coordinator actor's drain), and `clearDeltas` (the recovery boot path,
+  /// which runs as a background task WHILE the listener is already accepting
+  /// connections — see its doc comment) all write this same sidecar file and
+  /// can genuinely race each other. Two invariants, both restored in review
+  /// round 2 after round 1's lock-scoping fix traded them away:
+  ///
+  /// 1. **No lost/double-applied delta on a crash (WAL).** Round 1 let
+  ///    `peekDeltas` (the drain's read) return a delta the instant it was
+  ///    appended in memory — BEFORE its sidecar write reached disk. If the
+  ///    drain then applied that delta and `persistQueueState()` ran, and the
+  ///    process died before the sidecar write landed, the delta was durable
+  ///    in NEITHER file: gone from memory (the crash) and never written to
+  ///    the sidecar — a cancelled job could resurrect. Fixed by stamping each
+  ///    delta with its own generation and having `peekDeltas` (drain-only)
+  ///    return only the PREFIX whose generation is already `<=
+  ///    lastPersistedDeltaGeneration` — only deltas the drain could also
+  ///    recover from disk if the process died right after applying them.
+  ///    `undrainedDeltas` (the sync `/health`/`/v1/queue` read) is
+  ///    deliberately NOT gated this way: it is a display of what has been
+  ///    accepted, not a "safe for the drain to act on" signal, so it still
+  ///    shows every recorded delta the instant it is recorded.
+  /// 2. **No stale write ever looks durable.** `sidecarLock` serializes the
+  ///    ENTIRE check-then-write-then-publish span for one write (not just the
+  ///    write itself), so two concurrent writers can never both decide
+  ///    they're allowed to write and then race each other to the rename —
+  ///    the loser's write is a no-op instead of clobbering fresher content.
+  ///    And `lastPersistedDeltaGeneration` (read/written under `lock`, in
+  ///    short non-blocking hops from inside that span) never claims a
+  ///    generation is durable unless `QueueDeltaStore.save` actually reported
+  ///    success for it — a failed write must never advance the marker (item
+  ///    2: `save`'s old silent `try?` swallow is now a `Bool` result).
+  ///
+  /// A background/async writer queue was rejected: it would let these
+  /// methods return before the sidecar reflects their effect, which the
+  /// existing WAL (`testSidecarSurvivesUntilCanonicalStatePersists`) and
+  /// recovery-replay tests assert synchronously.
   private let sidecarLock = NSLock()
   private var deltaGeneration = 0
-  private var lastPersistedDeltaGeneration = 0  // touched ONLY under sidecarLock
+  /// The highest delta generation `QueueDeltaStore.save` has actually
+  /// confirmed on disk. Read/written under `lock` — never under `sidecarLock`
+  /// while `save` itself runs — so `peekDeltas`/`read()`/`undrainedDeltas`
+  /// never wait on disk; only `persistDeltaSidecar` (wrapped in `sidecarLock`
+  /// for its whole span) advances it, and only after a successful write.
+  private var lastPersistedDeltaGeneration = 0
+  private let sidecarLogger = Logger(label: "z-image.live-health.sidecar")
+  /// Edge-triggered so a stuck-full-disk episode logs once, not once per
+  /// mutation — but a NEW failure streak (after an intervening success) logs
+  /// again.
+  private var hasLoggedSidecarWriteFailure = false
 
   func recordDelta(_ delta: QueueControlCommand) {
     lock.lock()
-    deltas.append(delta)
-    if deltas.count > Self.maxDeltas { deltas.removeFirst(deltas.count - Self.maxDeltas) }
     deltaGeneration += 1
     let generation = deltaGeneration
-    let snapshot = deltas
+    deltas.append(StampedDelta(generation: generation, command: delta))
+    if deltas.count > Self.maxDeltas { deltas.removeFirst(deltas.count - Self.maxDeltas) }
+    let snapshot = deltas.map { $0.command }
     lock.unlock()
     persistDeltaSidecar(generation: generation, snapshot: snapshot)
   }
 
+  /// Every recorded delta, durable or not — what `/health` and `/v1/queue`
+  /// (and the sync cancel/move routes' own present-check) compose against.
+  /// Deliberately NOT gated on durability — see the class-level comment above
+  /// `sidecarLock`.
   func undrainedDeltas() -> [QueueControlCommand] {
     lock.lock(); defer { lock.unlock() }
-    return deltas
+    return deltas.map { $0.command }
   }
 
-  /// Snapshot the undrained deltas for the actor to apply — WITHOUT clearing
-  /// (F-2, WAL ordering): the sidecar must outlive the canonical
-  /// `persistQueueState()` write, so a kill mid-drain replays the deltas on the
-  /// next boot instead of resurrecting a cancelled job. The actor calls
+  /// Snapshot the DURABLE undrained deltas for the actor to apply — WITHOUT
+  /// clearing (F-2, WAL ordering): the sidecar must outlive the canonical
+  /// `persistQueueState()` write, so a kill mid-drain replays the deltas on
+  /// the next boot instead of resurrecting a cancelled job. The actor calls
   /// `commitDrainedDeltas` only AFTER canonical state is on disk.
+  ///
+  /// comfybox#386 review round 2: filtered to `generation <=
+  /// lastPersistedDeltaGeneration` — a delta the sidecar hasn't confirmed yet
+  /// is invisible to the drain, so the drain can never act on something that
+  /// wouldn't also survive a crash right now. Deltas are appended (and
+  /// generations assigned) in order, so "durable" is always a PREFIX of
+  /// `deltas` — exactly what `commitDrainedDeltas`'s prefix-drop assumes.
   func peekDeltas() -> [QueueControlCommand] {
     lock.lock(); defer { lock.unlock() }
-    return deltas
+    return deltas.filter { $0.generation <= lastPersistedDeltaGeneration }.map { $0.command }
   }
 
   /// WAL commit point (F-2): canonical queue state is persisted; drop the first
@@ -6507,27 +6562,69 @@ private final class LiveHealthState: @unchecked Sendable {
     deltas.removeFirst(min(count, deltas.count))
     deltaGeneration += 1
     let generation = deltaGeneration
-    let snapshot = deltas
+    let snapshot = deltas.map { $0.command }
     lock.unlock()
     persistDeltaSidecar(generation: generation, snapshot: snapshot)
   }
 
-  /// Persist `snapshot` to the sidecar — OUTSIDE `lock`, so nothing blocked on
-  /// `lock` (in particular `read()`) ever waits on this disk write, however
-  /// slow. `sidecarLock` is a dedicated lock touched ONLY here, so it is what
-  /// makes the generation check-then-persist atomic relative to any other
-  /// in-flight sidecar write, without involving `lock` at all — see the
-  /// class-level comment on `recordDelta` for the race this closes.
+  /// Persist `snapshot` to the sidecar. `sidecarLock` wraps the WHOLE
+  /// check-then-write-then-publish span (not just the write) so two
+  /// concurrent callers can never both pass the staleness check and then race
+  /// each other to the actual write — the loser would otherwise clobber
+  /// fresher content with stale, or (worse) leave
+  /// `lastPersistedDeltaGeneration` claiming durability for content that
+  /// isn't actually the latest thing on disk. The brief `lock` hops inside
+  /// are pure in-memory reads/writes of a single `Int` — never wrapping
+  /// `QueueDeltaStore.save` itself — so nothing blocked on `lock` (`read()`,
+  /// `undrainedDeltas`, `peekDeltas`) ever waits on this disk write, however
+  /// slow or stuck.
+  ///
+  /// comfybox#386 review round 2, item 2: the marker advances ONLY on a
+  /// successful write. The delta is never lost on a failure: it stays in
+  /// `deltas` and rides along, unchanged, in the FULL snapshot the next
+  /// successful write sends (every snapshot is the whole undrained list,
+  /// never an increment) — so a later write recovers everything a failed one
+  /// missed.
   private func persistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) {
     sidecarLock.lock(); defer { sidecarLock.unlock() }
-    guard generation > lastPersistedDeltaGeneration else { return }
-    QueueDeltaStore.save(snapshot)
-    lastPersistedDeltaGeneration = generation
+    lock.lock()
+    let isStale = generation <= lastPersistedDeltaGeneration
+    lock.unlock()
+    guard !isStale else { return }
+
+    let succeeded = QueueDeltaStore.save(snapshot)
+
+    lock.lock()
+    if succeeded { lastPersistedDeltaGeneration = generation }
+    lock.unlock()
+
+    if succeeded {
+      hasLoggedSidecarWriteFailure = false
+    } else if !hasLoggedSidecarWriteFailure {
+      hasLoggedSidecarWriteFailure = true
+      sidecarLogger.error(
+        "comfybox#386: failed to persist queue-deltas.json sidecar (generation \(generation)) — undrained deltas will not survive a restart until a write succeeds")
+    }
   }
 
-  /// Clear the in-memory deltas without a take (recovery already folded them into
-  /// the queue and cleared the sidecar).
-  func clearDeltas() { lock.lock(); deltas.removeAll(); lock.unlock() }
+  /// Clear the in-memory deltas (recovery already folded them into the
+  /// recovered queue). comfybox#386 review round 2, item 3: a clear is now a
+  /// PERSIST of the empty snapshot at a new generation, through the same
+  /// `sidecarLock`/generation machinery as every other mutation — not a bare,
+  /// unprotected `QueueDeltaStore.clear()` call. `recoverPersistedQueue` runs
+  /// as a background task WHILE the listener is already accepting
+  /// connections, so a sync cancel/move racing this clear is real: without
+  /// the generation guard, an in-flight write from BEFORE the clear could
+  /// land AFTER it and resurrect the very sidecar content recovery just
+  /// folded into the recovered queue and cleared.
+  func clearDeltas() {
+    lock.lock()
+    deltas.removeAll()
+    deltaGeneration += 1
+    let generation = deltaGeneration
+    lock.unlock()
+    persistDeltaSidecar(generation: generation, snapshot: [])
+  }
 
   // MARK: active-render interrupt (sync /v1/queue/interrupt)
 
@@ -13771,11 +13868,22 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// in the undrained window deterministically (F-2 crash-window test).
   func recordCancelDeltaOnly(id: String) { liveHealth.recordDelta(.cancel(id)) }
 
+  /// comfybox#386 review round 2, item 3: the exact call `recoverPersistedQueue`
+  /// makes after folding undrained deltas into the recovered queue — exposed
+  /// so a test can drive it concurrently with an in-flight older sidecar
+  /// write and prove the clear can't be resurrected.
+  func clearAllDeltas() { liveHealth.clearDeltas() }
+
   /// Deterministically run one drain on the actor (the same
   /// `drainControlDeltas` the sync routes nudge fire-and-forget).
   func drainNow() async { await coordinator.drainControlDeltas() }
 
   var undrainedDeltaCount: Int { liveHealth.undrainedDeltas().count }
+
+  /// comfybox#386 review round 2, item 1: the DURABLE-only view `peekDeltas`
+  /// exposes to the drain — distinct from `undrainedDeltaCount`, which shows
+  /// every recorded delta regardless of whether its sidecar write landed.
+  var peekedDrainableDeltaCount: Int { liveHealth.peekDeltas().count }
 
   /// Pending ids as `GET /v1/queue` composes them (snapshot + undrained deltas) —
   /// a just-cancelled job is already absent here.
