@@ -1,6 +1,6 @@
 // DAMAssetConstructionSiteLintTests.swift — #372.
 //
-// `DAMAsset.init` defaults all 22 parameters, so a hand-rebuilt
+// `DAMAsset.init` defaults all 23 parameters, so a hand-rebuilt
 // `DAMAsset(...)` literal that forgets a field compiles silently instead of
 // failing to build — `source` was dropped this way at three separate call
 // sites, twice (#268). `DAMAsset.copy(with:)` fixes the call sites that are
@@ -46,14 +46,49 @@ struct DAMAssetConstructionSiteLintTests {
         "Archive/ArchiveManifest.swift": 1   // toDAMAsset — deserializes an archived manifest entry.
     ]
 
-    /// Matches a `DAMAsset(` construction literal but not a suffixed
+    /// Matches a `DAMAsset(` construction literal, including `DAMAsset.init(`
+    /// and any amount of whitespace/newlines between `DAMAsset` and the
+    /// paren (e.g. a call broken across lines) — but not a suffixed
     /// identifier like `toDAMAsset(` or a member access like
     /// `DAMAsset.Mutation(`: the character immediately before "DAMAsset"
-    /// must not be a letter, digit, or underscore, and "DAMAsset" must be
-    /// followed directly by "(".
+    /// must not be a letter, digit, or underscore, and the only thing
+    /// allowed between "DAMAsset" and "(" is an optional literal ".init"
+    /// plus whitespace. `constructionPatternMatchesAllConstructionForms`
+    /// tests this pattern directly against each of these forms.
     private static let constructionPattern = try! NSRegularExpression(
-        pattern: "(?<![A-Za-z0-9_])DAMAsset\\("
+        pattern: "(?<![A-Za-z0-9_])DAMAsset(?:\\.init)?\\s*\\("
     )
+
+    @Test("construction pattern matches DAMAsset(, DAMAsset.init(, and whitespace/newline before the paren, but not toDAMAsset( or DAMAsset.Mutation(")
+    func constructionPatternMatchesAllConstructionForms() {
+        let shouldMatch = [
+            "DAMAsset(",
+            "DAMAsset.init(",
+            "DAMAsset (",
+            "DAMAsset\n(",
+            "DAMAsset.init\n(",
+            "  return DAMAsset(\n    id: id\n  )",
+        ]
+        for sample in shouldMatch {
+            let range = NSRange(sample.startIndex..<sample.endIndex, in: sample)
+            let matches = Self.constructionPattern.numberOfMatches(in: sample, range: range)
+            #expect(matches == 1, Comment(rawValue: "expected exactly one match in \(sample.debugDescription), found \(matches)"))
+        }
+
+        let shouldNotMatch = [
+            "toDAMAsset(",
+            "entry.toDAMAsset(absolutePath: path)",
+            "DAMAsset.Mutation(",
+            "DAMAsset.Mutation()",
+            "someDAMAsset(",
+            "-> DAMAsset {",
+        ]
+        for sample in shouldNotMatch {
+            let range = NSRange(sample.startIndex..<sample.endIndex, in: sample)
+            let matches = Self.constructionPattern.numberOfMatches(in: sample, range: range)
+            #expect(matches == 0, Comment(rawValue: "expected no match in \(sample.debugDescription), found \(matches)"))
+        }
+    }
 
     @Test("no DAMAsset(...) construction literal outside the allowlist")
     func onlyAllowlistedSitesConstructDAMAssetDirectly() throws {

@@ -107,6 +107,78 @@ struct DAMAssetTests {
         #expect(asset.copy(with: DAMAsset.Mutation()) == asset)
     }
 
+    // MARK: - Structural guards against a field DAMAsset gains but
+    // copy(with:)/Mutation never wires up
+    //
+    // `copy(with:)` itself hand-rebuilds `DAMAsset` exactly once (the one
+    // allowlisted site in DAMAssetConstructionSiteLintTests) — a field added
+    // to DAMAsset in the future but never added to `Mutation` (or added to
+    // `Mutation` but never wired into `copy(with:)`'s own construction call)
+    // would fall back to `DAMAsset.init`'s default for that field on every
+    // `copy(with:)` call, silently reintroducing exactly this issue's bug
+    // class one level down. These two tests catch that structurally, not by
+    // re-deriving the field list by hand (which would rot the same way):
+
+    @Test("Mutation has exactly one field per DAMAsset stored property (no more, no fewer)")
+    func mutationFieldSetMatchesDAMAssetFieldSet() {
+        let assetFieldNames = Set(Mirror(reflecting: Self.everyFieldSetFixture()).children.compactMap { $0.label })
+        let mutationFieldNames = Set(Mirror(reflecting: DAMAsset.Mutation()).children.compactMap { $0.label })
+        #expect(assetFieldNames == mutationFieldNames)
+    }
+
+    @Test("fixture used by the copy(with:) tests sets every field to a non-default value")
+    func everyFieldSetFixtureHasNoDefaultLookingValues() {
+        // If this fails, a field was added to DAMAsset and the fixture below
+        // was not updated to give it a distinctive value — do that before
+        // trusting any other copy(with:) test, including the one right
+        // below this, which relies on every field here being distinguishable
+        // from what `DAMAsset.init`'s default for that field would produce.
+        for child in Mirror(reflecting: Self.everyFieldSetFixture()).children {
+            guard let label = child.label else { continue }
+            #expect(
+                !Self.looksLikeADefaultValue(child.value),
+                Comment(rawValue: "fixture field '\(label)' looks like a default value (nil/0/false/empty) — "
+                    + "give it a distinctive one")
+            )
+        }
+    }
+
+    @Test("copy(with: Mutation()) preserves every field of the non-default fixture, checked via Mirror not ==")
+    func copyEmptyMutationPreservesEveryFieldViaMirror() {
+        // Same assertion as copyWithEmptyMutationIsIdentity, but via the
+        // Mirror-based per-field comparison rather than DAMAsset's
+        // synthesized Equatable, so it doesn't depend on == having been
+        // updated for a new field either.
+        let asset = Self.everyFieldSetFixture()
+        let updated = asset.copy(with: DAMAsset.Mutation())
+        Self.assertFieldsEqual(asset, updated, excluding: [])
+    }
+
+    /// True if `value` looks like a plain Swift default — nil, an empty
+    /// String/Array/Dictionary, numeric zero, or `false` — the same values
+    /// `DAMAsset.init`'s parameters fall back to. Unwraps one level of
+    /// Optional before checking, since every optional `DAMAsset` field's
+    /// default is `nil`.
+    private static func looksLikeADefaultValue(_ value: Any) -> Bool {
+        let mirror = Mirror(reflecting: value)
+        if mirror.displayStyle == .optional {
+            guard let child = mirror.children.first else { return true } // nil
+            return looksLikeADefaultValue(child.value)
+        }
+        switch value {
+        case let v as String: return v.isEmpty
+        case let v as Int: return v == 0
+        case let v as Int64: return v == 0
+        case let v as Double: return v == 0
+        case let v as Bool: return v == false
+        default:
+            if mirror.displayStyle == .collection || mirror.displayStyle == .dictionary || mirror.displayStyle == .set {
+                return mirror.children.isEmpty
+            }
+            return false
+        }
+    }
+
     @Test("overriding one field leaves every other field untouched (Mirror-checked)")
     func copyOverridingOneFieldPreservesRest() {
         let asset = Self.everyFieldSetFixture()

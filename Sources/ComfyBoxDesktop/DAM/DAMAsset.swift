@@ -94,7 +94,7 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
 
     // MARK: - copy(with:)
     //
-    // #372: `DAMAsset.init` defaults all 22 parameters, so a hand-rebuilt
+    // #372: `DAMAsset.init` defaults all 23 parameters, so a hand-rebuilt
     // construction literal that forgets a field compiles silently instead
     // of failing to build — `source` was dropped this way at three separate
     // call sites, twice (#268). Every call site that is a COPY of an
