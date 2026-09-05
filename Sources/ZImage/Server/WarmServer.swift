@@ -6169,6 +6169,10 @@ public final class WarmServer {
       shuttingDown: snap.shuttingDown,
       activeRenderAgeMs: activeAgeMs,
       staleThresholdMs: healthRenderStaleThresholdMs)
+    // comfybox#386 review round 3, item 1c: additive — surfaces the
+    // liveness-over-durability tradeoff `drainQueueDeltas` makes when the
+    // undrained-delta sidecar is unwritable.
+    let deltaStatus = liveHealth.deltaDurabilityStatus()
     return HealthResponse(
       status: status,
       model: snap.model.isEmpty ? (configuration.modelSpec ?? ZImageRepository.id) : snap.model,
@@ -6193,7 +6197,9 @@ public final class WarmServer {
       memoryUsageMB: memoryBytes / (1024 * 1024),
       lastRenderDurationMs: snap.lastRenderDurationMs,
       lastError: snap.lastError,
-      lastRecipe: snap.lastRecipe
+      lastRecipe: snap.lastRecipe,
+      queueDeltaSidecarDegraded: deltaStatus.isDegraded,
+      queueDeltaNonDurableCount: deltaStatus.nonDurableCount
     )
   }
 
@@ -6516,6 +6522,47 @@ private final class LiveHealthState: @unchecked Sendable {
   /// mutation — but a NEW failure streak (after an intervening success) logs
   /// again.
   private var hasLoggedSidecarWriteFailure = false
+  /// When the CURRENT unresolved failure streak began — `nil` while writes
+  /// are succeeding. Read/written under `lock` alongside
+  /// `consecutiveFailureCount` (review round 3, item 1b): both are the input
+  /// to `deltaDurabilityStatus().isDegraded`.
+  private var firstUnresolvedFailureAt: Date?
+  private var consecutiveFailureCount = 0
+
+  /// comfybox#386 review round 3, item 1b: once the sidecar has been failing
+  /// continuously for this long, OR for this many consecutive attempts —
+  /// whichever comes first — the drain applies non-durable deltas anyway
+  /// rather than starve a cancel forever behind a broken disk (see
+  /// `WarmServerCoordinator.drainQueueDeltas`). Liveness wins past this
+  /// point, matching the pre-comfybox#386 behavior (which had no durability
+  /// gate at all) — but the tradeoff is now OBSERVABLE via `/health`'s
+  /// `queue_delta_sidecar_degraded` instead of a cancel silently vanishing
+  /// from `/v1/queue` while the job keeps rendering. Both bounds are
+  /// deliberately small: a real outage (nearly-full disk) fails fast and
+  /// repeatedly, so genuine liveness needs are met within a couple of
+  /// scheduling points, and a merely-slow (not broken) disk keeps making
+  /// progress well under either bound.
+  static let degradedModeWindowSeconds: TimeInterval = 5.0
+  static let degradedModeFailureCountThreshold = 3
+
+  /// Total undrained deltas, how many are durable, and whether the drain
+  /// should apply the rest anyway (review round 3, item 1). One atomic read
+  /// under `lock` so `/health`'s telemetry and the drain's own decision never
+  /// disagree with each other.
+  struct DeltaDurabilityStatus {
+    let totalCount: Int
+    let durableCount: Int
+    let isDegraded: Bool
+    var nonDurableCount: Int { totalCount - durableCount }
+  }
+
+  func deltaDurabilityStatus() -> DeltaDurabilityStatus {
+    lock.lock(); defer { lock.unlock() }
+    let durableCount = deltas.filter { $0.generation <= lastPersistedDeltaGeneration }.count
+    let degraded = consecutiveFailureCount >= Self.degradedModeFailureCountThreshold
+      || (firstUnresolvedFailureAt.map { Date().timeIntervalSince($0) >= Self.degradedModeWindowSeconds } ?? false)
+    return DeltaDurabilityStatus(totalCount: deltas.count, durableCount: durableCount, isDegraded: degraded)
+  }
 
   func recordDelta(_ delta: QueueControlCommand) {
     lock.lock()
@@ -6587,6 +6634,50 @@ private final class LiveHealthState: @unchecked Sendable {
   /// missed.
   private func persistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) {
     sidecarLock.lock(); defer { sidecarLock.unlock() }
+    persistDeltaSidecarLocked(generation: generation, snapshot: snapshot)
+  }
+
+  /// Non-blocking sibling of `persistDeltaSidecar`, used ONLY by
+  /// `retryPendingSidecarWrite`. That retry can run on the coordinator
+  /// ACTOR ITSELF (`drainQueueDeltas`'s item-1a liveness retry) — actor code
+  /// must never block waiting for `sidecarLock`, or a single slow/stuck disk
+  /// write (from a totally unrelated `recordDelta`/`commitDrainedDeltas`
+  /// call, or the retry's own previous attempt) stalls the ENTIRE render
+  /// loop behind it, trading a `/health`-only liveness bug for a much worse
+  /// one. `NSLock.try()` gives up immediately if another write already holds
+  /// `sidecarLock`; the drain simply tries again at its next scheduling
+  /// point (which arrive frequently — every `processLoop` iteration and
+  /// every `startProcessingIfNeeded`), so nothing is lost by not blocking.
+  @discardableResult
+  private func tryPersistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) -> Bool {
+    guard sidecarLock.`try`() else { return false }
+    defer { sidecarLock.unlock() }
+    persistDeltaSidecarLocked(generation: generation, snapshot: snapshot)
+    return true
+  }
+
+  /// The check-then-write-then-publish body shared by `persistDeltaSidecar`
+  /// and `tryPersistDeltaSidecar` — the CALLER must already hold
+  /// `sidecarLock` for its whole span (not just the write) so two concurrent
+  /// callers can never both pass the staleness check and then race each
+  /// other to the actual write — the loser would otherwise clobber fresher
+  /// content with stale, or (worse) leave `lastPersistedDeltaGeneration`
+  /// claiming durability for content that isn't actually the latest thing on
+  /// disk. The brief `lock` hops inside are pure in-memory reads/writes of a
+  /// few small values — never wrapping `QueueDeltaStore.save` itself — so
+  /// nothing blocked on `lock` (`read()`, `undrainedDeltas`, `peekDeltas`,
+  /// `deltaDurabilityStatus`) ever waits on this disk write, however slow or
+  /// stuck.
+  ///
+  /// comfybox#386 review round 2, item 2: the durability marker advances
+  /// ONLY on a successful write. The delta is never lost on a failure: it
+  /// stays in `deltas` and rides along, unchanged, in the FULL snapshot the
+  /// next successful write sends (every snapshot is the whole undrained
+  /// list, never an increment) — so a later write recovers everything a
+  /// failed one missed. Review round 3, item 1b: failures also update
+  /// `firstUnresolvedFailureAt`/`consecutiveFailureCount`, the input to
+  /// `deltaDurabilityStatus().isDegraded`.
+  private func persistDeltaSidecarLocked(generation: Int, snapshot: [QueueControlCommand]) {
     lock.lock()
     let isStale = generation <= lastPersistedDeltaGeneration
     lock.unlock()
@@ -6595,7 +6686,14 @@ private final class LiveHealthState: @unchecked Sendable {
     let succeeded = QueueDeltaStore.save(snapshot)
 
     lock.lock()
-    if succeeded { lastPersistedDeltaGeneration = generation }
+    if succeeded {
+      lastPersistedDeltaGeneration = generation
+      firstUnresolvedFailureAt = nil
+      consecutiveFailureCount = 0
+    } else {
+      if firstUnresolvedFailureAt == nil { firstUnresolvedFailureAt = Date() }
+      consecutiveFailureCount += 1
+    }
     lock.unlock()
 
     if succeeded {
@@ -6607,23 +6705,74 @@ private final class LiveHealthState: @unchecked Sendable {
     }
   }
 
+  /// comfybox#386 review round 3, item 1a: re-attempt persisting whatever is
+  /// CURRENTLY undrained, at the CURRENT generation — no new mutation, no new
+  /// delta, just another try at the same content a previous attempt failed
+  /// to land. Used by the drain (`WarmServerCoordinator.drainQueueDeltas`)
+  /// when `peekDeltas` comes back empty but deltas still exist: the
+  /// durability marker is stuck behind a prior failure, and nothing will
+  /// move it forward unless someone tries the write again.
+  ///
+  /// NON-BLOCKING (`tryPersistDeltaSidecar`): this can run on the actor
+  /// itself, which must never stall behind `sidecarLock` contention — if
+  /// another write is already in flight, this attempt is simply skipped
+  /// (`false`) rather than parked, and the drain's own guard falls through to
+  /// the degraded-mode check or gives up for this pass, trying again next
+  /// time. Returns whether the current generation is durable once this call
+  /// returns (`true` also when there was nothing to persist, it was already
+  /// durable, or this attempt won the race and actually wrote it).
+  @discardableResult
+  func retryPendingSidecarWrite() -> Bool {
+    lock.lock()
+    let generation = deltaGeneration
+    let alreadyDurable = generation <= lastPersistedDeltaGeneration
+    let snapshot = deltas.map { $0.command }
+    lock.unlock()
+    guard !alreadyDurable else { return true }
+    _ = tryPersistDeltaSidecar(generation: generation, snapshot: snapshot)
+    lock.lock(); defer { lock.unlock() }
+    return generation <= lastPersistedDeltaGeneration
+  }
+
   /// Clear the in-memory deltas (recovery already folded them into the
-  /// recovered queue). comfybox#386 review round 2, item 3: a clear is now a
-  /// PERSIST of the empty snapshot at a new generation, through the same
-  /// `sidecarLock`/generation machinery as every other mutation — not a bare,
-  /// unprotected `QueueDeltaStore.clear()` call. `recoverPersistedQueue` runs
-  /// as a background task WHILE the listener is already accepting
-  /// connections, so a sync cancel/move racing this clear is real: without
-  /// the generation guard, an in-flight write from BEFORE the clear could
-  /// land AFTER it and resurrect the very sidecar content recovery just
-  /// folded into the recovered queue and cleared.
+  /// recovered queue) — but ONLY once the empty snapshot is CONFIRMED
+  /// durable. comfybox#386 review round 2, item 3: a clear persists the empty
+  /// snapshot at a new generation through the same `sidecarLock`/generation
+  /// machinery as every other mutation, instead of a bare, unprotected
+  /// `QueueDeltaStore.clear()` call — `recoverPersistedQueue` runs as a
+  /// background task WHILE the listener is already accepting connections, so
+  /// a sync cancel/move racing this clear is real, and without the
+  /// generation guard an in-flight write from BEFORE the clear could land
+  /// AFTER it and resurrect what recovery just folded away.
+  ///
+  /// Review round 3, item 2: memory is stripped only AFTER
+  /// `persistDeltaSidecar` confirms the write (`generation <=
+  /// lastPersistedDeltaGeneration` afterward — true whether THIS call's own
+  /// write succeeded or a later, superseding write already covers it). Round
+  /// 2's version cleared `deltas` unconditionally up front: on a failed
+  /// write, disk kept the STALE pre-clear content while memory had already
+  /// forgotten it, so a crash before any later write happened to overwrite
+  /// the sidecar left the next boot's `recoverPersistedQueue` re-folding
+  /// deltas it had already applied this session — `.move` is not idempotent,
+  /// so a repeat could silently reorder the queue wrong. On failure here,
+  /// nothing is lost: `deltas` (and disk) are untouched, and the very next
+  /// successful write ANYWHERE (`recordDelta`, `commitDrainedDeltas`, or a
+  /// later `clearDeltas`) resends the full current snapshot and corrects the
+  /// stale disk content — there is no separate retry loop to maintain.
+  /// `removeAll(where:)` (not a blind `removeAll()`) so a delta that was
+  /// recorded concurrently, strictly AFTER this clear's generation was
+  /// stamped, survives — it was never part of what this clear persisted.
   func clearDeltas() {
     lock.lock()
-    deltas.removeAll()
     deltaGeneration += 1
     let generation = deltaGeneration
     lock.unlock()
+
     persistDeltaSidecar(generation: generation, snapshot: [])
+
+    lock.lock(); defer { lock.unlock() }
+    guard generation <= lastPersistedDeltaGeneration else { return }
+    deltas.removeAll { $0.generation <= generation }
   }
 
   // MARK: active-render interrupt (sync /v1/queue/interrupt)
@@ -9608,8 +9757,42 @@ private actor WarmServerCoordinator {
   /// the persisted state is a no-op — the old take-and-clear-first order let a
   /// kill between the clear and `persistQueueState()` resurrect a cancelled job.
   private func drainQueueDeltas() {
-    let commands = liveHealth.peekDeltas()
+    var commands = liveHealth.peekDeltas()
+    var degradedLiveness = false
+
+    if commands.isEmpty {
+      // comfybox#386 review round 3, item 1a: `peekDeltas` can come back
+      // empty while deltas still exist — the durability marker is stuck
+      // behind a previous failed write. Retry once before giving up: the
+      // common case (one transient disk hiccup) resolves right here and the
+      // drain proceeds normally in this same pass, instead of a cancel
+      // silently vanishing from `/v1/queue` (via the ungated
+      // `undrainedDeltas`) while never actually reaching the render loop.
+      if liveHealth.retryPendingSidecarWrite() {
+        commands = liveHealth.peekDeltas()
+      }
+    }
+
+    if commands.isEmpty {
+      // Item 1b: writes are STILL failing. Once they've failed continuously
+      // past `LiveHealthState.degradedModeWindowSeconds` /
+      // `degradedModeFailureCountThreshold`, apply the non-durable deltas
+      // anyway rather than starve a cancel forever behind a broken disk —
+      // pre-comfybox#386 had no durability gate at all, so this restores
+      // that liveness guarantee, but makes the tradeoff OBSERVABLE via
+      // `/health`'s `queue_delta_sidecar_degraded`/`queue_delta_non_durable_count`
+      // instead of silent. This trades the WAL guarantee for liveness (a
+      // kill right here could resurrect the drained delta) — acceptable only
+      // because the sidecar has demonstrably been broken for a while, not on
+      // the first failure.
+      let status = liveHealth.deltaDurabilityStatus()
+      guard status.isDegraded, status.nonDurableCount > 0 else { return }
+      commands = liveHealth.undrainedDeltas()
+      degradedLiveness = true
+    }
+
     guard !commands.isEmpty else { return }
+
     for command in commands {
       // Structural guard against the F1 wedge (§3.1.4a): a mailbox delta must
       // never require a wake. `resume` is fire-and-forget, not a delta. (The type
@@ -9625,7 +9808,9 @@ private actor WarmServerCoordinator {
           // `cancelPending`'s own `.dropped` record above.
           lifecycleLedger.record(
             jobId: id, kind: .dropped, jobKind: Self.kind(of: pending[index].operation), source: pending[index].source,
-            reason: "cancelled while pending (sync control plane)")
+            reason: degradedLiveness
+              ? "cancelled while pending (sync control plane, degraded — sidecar unwritable)"
+              : "cancelled while pending (sync control plane)")
           pending.remove(at: index)
         }
       case .move(let id, let direction):
@@ -13102,6 +13287,21 @@ struct HealthResponse: Encodable, Sendable {
   /// (and for other families, D12), literal `null` when the last Krea 2
   /// render's record was refused, the object otherwise.
   let lastRecipe: AppliedRecordSlot?
+  /// comfybox#386 review round 3, item 1c: additive telemetry for the
+  /// liveness-over-durability tradeoff in `WarmServerCoordinator.drainQueueDeltas`
+  /// — `true` once the undrained-delta sidecar has failed continuously long
+  /// enough that the drain has started (or will start) applying deltas it
+  /// could not confirm durable on disk. `var` (not `let`) with a default is
+  /// what makes it an OPTIONAL parameter on the synthesized memberwise init
+  /// (Swift excludes a defaulted `let` from the init parameter list
+  /// entirely), so every existing `HealthResponse(...)` call site keeps
+  /// compiling unchanged.
+  var queueDeltaSidecarDegraded: Bool = false
+  /// How many currently-undrained deltas are not yet confirmed durable —
+  /// `queue_delta_non_durable_count` on the wire. Nonzero without
+  /// `queue_delta_sidecar_degraded` just means a write is in flight or
+  /// recently failed but hasn't crossed the degraded-mode threshold yet.
+  var queueDeltaNonDurableCount: Int = 0
 }
 
 /// #282 — what one dequeued job renders with, and why.
@@ -13884,6 +14084,24 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// exposes to the drain — distinct from `undrainedDeltaCount`, which shows
   /// every recorded delta regardless of whether its sidecar write landed.
   var peekedDrainableDeltaCount: Int { liveHealth.peekDeltas().count }
+
+  /// comfybox#386 review round 3, item 1: re-attempt the sidecar write for
+  /// whatever's currently undrained, without adding a new delta — the same
+  /// primitive `drainQueueDeltas`'s liveness retry (item 1a) uses.
+  @discardableResult
+  func retrySidecarWrite() -> Bool { liveHealth.retryPendingSidecarWrite() }
+
+  /// Whether the sidecar has failed long/often enough that the drain applies
+  /// non-durable deltas anyway (item 1b).
+  var isDeltaSidecarDegraded: Bool { liveHealth.deltaDurabilityStatus().isDegraded }
+
+  /// How many currently-undrained deltas are not yet confirmed durable —
+  /// what `/health`'s additive `queue_delta_non_durable_count` reports.
+  var nonDurableDeltaCount: Int { liveHealth.deltaDurabilityStatus().nonDurableCount }
+
+  /// The consecutive-failure count that trips degraded mode — exposed so a
+  /// test can drive exactly to the threshold without duplicating the constant.
+  static var degradedModeFailureCountThreshold: Int { LiveHealthState.degradedModeFailureCountThreshold }
 
   /// Pending ids as `GET /v1/queue` composes them (snapshot + undrained deltas) —
   /// a just-cancelled job is already absent here.

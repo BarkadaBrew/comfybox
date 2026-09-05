@@ -195,10 +195,6 @@ enum QueueDeltaStore {
     guard let raw = try? decoder.decode([PersistedQueueDelta].self, from: data) else { return [] }
     return raw.map(QueueControlCommand.init)
   }
-
-  static func clear() {
-    try? FileManager.default.removeItem(at: path)
-  }
 }
 
 // MARK: - Route classifier

@@ -598,4 +598,107 @@ final class ControlPlaneTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: QueueDeltaStore.path.path),
                    "the sidecar file must not be resurrected by the older, now-stale write")
   }
+
+  // MARK: - comfybox#386 review round 3: drain liveness + safer clear
+
+  /// item 1a: with the sidecar unwritable, `peekDeltas` can come back empty
+  /// forever even though a delta is genuinely recorded — `drainQueueDeltas`
+  /// must retry the write once before giving up, instead of returning early
+  /// and leaving a 200-acked cancel permanently unapplied while the job keeps
+  /// rendering. Force one failed write, let the disk "recover" before the
+  /// drain runs, and confirm the drain's own retry notices and applies the
+  /// delta in the SAME pass — no second external trigger needed.
+  func testDrainRetriesAStuckWriteBeforeGivingUp() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlPause()   // between-items gate: the job stays pending
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "retry-a") }
+    try await waitUntil("job parked pending") { probe.snapshotPendingIds.contains("retry-a") }
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "retry-a")
+    XCTAssertEqual(probe.undrainedDeltaCount, 1)
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0, "not durable yet — the forced write failed")
+
+    QueueDeltaStore.forcedSaveResult = nil   // disk recovers before the drain's next attempt
+
+    await probe.drainNow()   // must retry the write (item 1a) and apply it in this same pass
+
+    XCTAssertFalse(probe.composedPendingIds.contains("retry-a"),
+                   "the drain's retry succeeded and it applied the now-durable cancel")
+    probe.controlResume()
+    do { _ = try await jobA.value; XCTFail("retry-a should have been cancelled") } catch {}
+  }
+
+  /// item 1b/1c: once the sidecar has been failing continuously past the
+  /// degraded-mode threshold, the drain applies non-durable deltas anyway —
+  /// liveness wins, matching pre-comfybox#386 behavior, but now observable
+  /// via `deltaDurabilityStatus`/`/health`'s additive fields. One failure
+  /// alone must NOT trip it; recovery must clear it.
+  func testDegradedModeAppliesNonDurableDeltasAfterSustainedFailuresAndClearsOnRecovery() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlPause()
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "degraded-a") }
+    try await waitUntil("job parked pending") { probe.snapshotPendingIds.contains("degraded-a") }
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "degraded-a")
+    XCTAssertFalse(probe.isDeltaSidecarDegraded, "one failure alone must not trip degraded mode")
+    XCTAssertEqual(probe.nonDurableDeltaCount, 1)
+
+    // Drive the consecutive-failure count up to the threshold by retrying the
+    // SAME still-undurable write — exactly what the drain's own item-1a retry
+    // does, just called directly here for a deterministic count instead of
+    // sleeping out the time-based half of the threshold. Bounded by the
+    // threshold itself, so this can never spin.
+    for _ in 0..<WarmServerQueueProbe.degradedModeFailureCountThreshold {
+      guard !probe.isDeltaSidecarDegraded else { break }
+      probe.retrySidecarWrite()
+    }
+    XCTAssertTrue(probe.isDeltaSidecarDegraded, "sustained failures trip degraded mode")
+
+    await probe.drainNow()   // liveness wins: applies the still-non-durable cancel
+    XCTAssertFalse(probe.composedPendingIds.contains("degraded-a"),
+                   "degraded mode applies the cancel even though it never became durable")
+
+    QueueDeltaStore.forcedSaveResult = nil   // writer recovers
+    // `commitDrainedDeltas` (inside the drain above) already tried and
+    // failed once more with the writer still broken at that moment — nothing
+    // retries on its own initiative once `deltas` is empty, so the recovery
+    // needs one more scheduling point (item 1a's retry) to notice the writer
+    // is healthy again, exactly like production: the drain runs at every
+    // `processLoop` iteration and `startProcessingIfNeeded`.
+    await probe.drainNow()
+    try await waitUntil("degraded flag clears once a write succeeds") { !probe.isDeltaSidecarDegraded }
+    XCTAssertEqual(probe.nonDurableDeltaCount, 0)
+
+    probe.controlResume()
+    do { _ = try await jobA.value; XCTFail("degraded-a should have been cancelled") } catch {}
+  }
+
+  /// item 2: `clearDeltas` must not drop anything from MEMORY until its own
+  /// empty-snapshot write is confirmed durable — otherwise a failed write
+  /// leaves disk holding stale (already-applied) deltas while memory has
+  /// already forgotten them, and the next boot's recovery re-folds deltas
+  /// this session already applied (`.move` is not idempotent). A failed
+  /// clear must change nothing; the next successful write (here, a retried
+  /// clear) must finish the job.
+  func testClearDeltasKeepsMemoryOnAFailedPersistAndTheNextWriteHeals() {
+    let probe = makeQueueProbe()
+
+    probe.recordCancelDeltaOnly(id: "keep-me")   // a genuine, already-durable delta
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 1)
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.clearAllDeltas()   // the clear's own persist fails
+    XCTAssertEqual(probe.undrainedDeltaCount, 1, "a failed clear must not drop anything from memory")
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 1,
+                   "the pre-existing delta is exactly as durable as it was — the failed clear changed nothing")
+
+    QueueDeltaStore.forcedSaveResult = nil   // disk recovers
+    probe.clearAllDeltas()   // retried — this time it succeeds
+    XCTAssertEqual(probe.undrainedDeltaCount, 0, "clear finally took effect once its write actually landed")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: QueueDeltaStore.path.path))
+  }
 }
