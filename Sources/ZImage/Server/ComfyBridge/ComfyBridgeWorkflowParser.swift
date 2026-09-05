@@ -30,8 +30,9 @@ struct ComfyBridgeGenerateRequest: Sendable {
   /// Sigma schedule extracted from BasicScheduler node (e.g. "normal", "karras", "exponential").
   let sigmaSchedule: String?
   /// comfybox#154 — explicit flow-matching schedule shift, extracted from a
-  /// `ModelSamplingAuraFlow` node's `shift` input. nil = the workflow has no
-  /// such node and the model's own schedule runs, exactly as before #154.
+  /// `ModelSamplingAuraFlow` (or `ModelSamplingSD3`) node's `shift` input; the
+  /// two produce the same sigma grid from the same value. nil = the workflow
+  /// has no such node and the model's own schedule runs, as before #154.
   var shift: Float?
   /// Levels min (black point) for contrast adjustment. Default 0.0.
   let levelsMin: Float?
@@ -293,27 +294,43 @@ enum ComfyBridgeWorkflowParser {
     // ComfyUI's `ModelSamplingAuraFlow` node patches the model's
     // `model_sampling` with a linear shift (`comfy/model_sampling.py`
     // `time_snr_shift`). Zeta Chroma's published workflow carries one at 3.00.
-    // Sorted by node id so a multi-pass graph resolves deterministically —
-    // the same rule the scheduler and ZImageFunControlnet extraction use.
-    // `ModelSamplingSD3` is deliberately NOT read here: same sigma warp, but a
-    // different timestep `multiplier` (1000 vs AuraFlow's 1.0) that the engine
-    // has no seam for, and reading it as AuraFlow would be a silent
-    // substitution.
-    let auraFlowNodes = nodes.values
-      .filter { $0.classType == "ModelSamplingAuraFlow" }
+    //
+    // `ModelSamplingSD3` is read the SAME way, and that is not a shortcut:
+    // `ModelSamplingAuraFlow` IS a `ModelSamplingSD3` subclass upstream
+    // (`comfy_extras/nodes_model_advanced.py:148`), differing only in the
+    // `multiplier` it passes (1.0 vs 1000) — and the multiplier CANCELS out of
+    // the sigma grid, because `normal_scheduler` walks
+    // `linspace(timestep(σ_max) → timestep(σ_min))` and maps each point back
+    // through `sigma(t) = time_snr_shift(shift, t / multiplier)` while
+    // `timestep(σ) = σ · multiplier`. Same `shift`, same sigmas. What the
+    // multiplier scales is the timestep the MODEL is fed, which is a property
+    // of the checkpoint, not of this node, and is untouched here. Dropping the
+    // SD3 node silently would have been the substitution to avoid, not
+    // reading it.
+    //
+    // `ModelSamplingFlux` is still NOT read: its shift is a LOG-shift feeding
+    // `e^shift / (e^shift + 1/t − 1)`, a genuinely different curve.
+    //
+    // Sorted by node id so a multi-pass graph resolves deterministically — the
+    // same rule the scheduler and ZImageFunControlnet extraction use.
+    let shiftNodes = nodes.values
+      .filter { $0.classType == "ModelSamplingAuraFlow" || $0.classType == "ModelSamplingSD3" }
       .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
     var modelSamplingShift: Float?
-    if let auraFlow = auraFlowNodes.first, let raw = floatValue(auraFlow.inputs["shift"]) {
+    if let shiftNode = shiftNodes.first, let raw = floatValue(shiftNode.inputs["shift"]) {
       // A non-positive or non-finite value is dropped rather than carried to a
       // 400 the Krita user would never see: the graph renders on the model's
       // own schedule and the engine says so.
       if raw.isFinite && raw > 0 {
         modelSamplingShift = raw
+        if shiftNode.classType == "ModelSamplingSD3" {
+          print("[ComfyBridge] \(shiftNode.classType) node \(shiftNode.id): shift \(raw) applied as the flow schedule's linear shift — its timestep multiplier (1000, vs ModelSamplingAuraFlow's 1.0) cancels out of the sigma grid and does not change the schedule")
+        }
       } else {
-        print("[ComfyBridge] ignoring ModelSamplingAuraFlow shift \(raw) on node \(auraFlow.id) — not a positive finite number; rendering on the model's own schedule")
+        print("[ComfyBridge] ignoring \(shiftNode.classType) shift \(raw) on node \(shiftNode.id) — not a positive finite number; rendering on the model's own schedule")
       }
-      if auraFlowNodes.count > 1 {
-        print("[ComfyBridge] warning: \(auraFlowNodes.count) ModelSamplingAuraFlow nodes in workflow — only node \(auraFlow.id) is applied")
+      if shiftNodes.count > 1 {
+        print("[ComfyBridge] warning: \(shiftNodes.count) ModelSampling shift nodes in workflow — only node \(shiftNode.id) (\(shiftNode.classType)) is applied")
       }
     }
 

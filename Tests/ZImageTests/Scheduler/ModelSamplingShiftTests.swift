@@ -34,9 +34,9 @@ final class ModelSamplingShiftTests: XCTestCase {
     let config = FlowMatchSchedulerTests.makeConfig(shift: 3.0)
     for steps in [4, 9, 20, 50] {
       let before = SigmaSchedule.flow(numSteps: steps, config: config)
-      let after = SigmaSchedule.flow(numSteps: steps, config: config, explicitShift: nil)
+      let after = SigmaSchedule.flow(numSteps: steps, config: config.applyingExplicitShift(nil))
       XCTAssertEqual(before.map { $0.bitPattern }, after.map { $0.bitPattern },
-                     "explicitShift: nil moved the grid at \(steps) steps")
+                     "applyingExplicitShift(nil) moved the grid at \(steps) steps")
     }
   }
 
@@ -47,9 +47,9 @@ final class ModelSamplingShiftTests: XCTestCase {
     let mu: Float = 0.8
     for steps in [4, 9, 20] {
       let before = SigmaSchedule.flow(numSteps: steps, config: config, mu: mu)
-      let after = SigmaSchedule.flow(numSteps: steps, config: config, mu: mu, explicitShift: nil)
+      let after = SigmaSchedule.flow(numSteps: steps, config: config.applyingExplicitShift(nil), mu: mu)
       XCTAssertEqual(before.map { $0.bitPattern }, after.map { $0.bitPattern },
-                     "explicitShift: nil moved the dynamic grid at \(steps) steps")
+                     "applyingExplicitShift(nil) moved the dynamic grid at \(steps) steps")
     }
   }
 
@@ -62,12 +62,12 @@ final class ModelSamplingShiftTests: XCTestCase {
       baseShift: 0.5, maxShift: 1.15, baseImageSeqLen: 256, maxImageSeqLen: 4096)
     let staticConfig = FlowMatchSchedulerTests.makeConfig(shift: 3.0)
 
-    let explicit = SigmaSchedule.flow(numSteps: 9, config: dynamic, mu: 0.8, explicitShift: 3.0)
+    let explicit = SigmaSchedule.flow(numSteps: 9, config: dynamic.applyingExplicitShift(3.0), mu: 0.8)
     let baseline = SigmaSchedule.flow(numSteps: 9, config: staticConfig)
     XCTAssertEqual(explicit.map { $0.bitPattern }, baseline.map { $0.bitPattern })
 
     // And mu genuinely does not matter once a shift is explicit.
-    let otherMu = SigmaSchedule.flow(numSteps: 9, config: dynamic, mu: -2.0, explicitShift: 3.0)
+    let otherMu = SigmaSchedule.flow(numSteps: 9, config: dynamic.applyingExplicitShift(3.0), mu: -2.0)
     XCTAssertEqual(explicit.map { $0.bitPattern }, otherMu.map { $0.bitPattern })
   }
 
@@ -122,7 +122,7 @@ final class ModelSamplingShiftTests: XCTestCase {
   ///   sigmas   = [1.0, 0.667, 0.334, 0.001] (no warp; alpha == 1)
   func testIdentityShiftGridByHand() {
     let config = FlowMatchSchedulerTests.makeConfig(shift: 1.0)
-    let sigmas = SigmaSchedule.flow(numSteps: 4, config: config, explicitShift: 1.0)
+    let sigmas = SigmaSchedule.flow(numSteps: 4, config: config.applyingExplicitShift(1.0))
     let expected: [Float] = [1.0, 0.667, 0.334, 0.001, 0.0]
     XCTAssertEqual(sigmas.count, expected.count)
     for (i, e) in expected.enumerated() {
@@ -142,7 +142,7 @@ final class ModelSamplingShiftTests: XCTestCase {
     let config = FlowMatchSchedulerTests.makeConfig(shift: 1.0, useDynamicShifting: true,
                                                    baseShift: 0.5, maxShift: 1.15,
                                                    baseImageSeqLen: 256, maxImageSeqLen: 4096)
-    let sigmas = SigmaSchedule.flow(numSteps: 4, config: config, mu: 0.8, explicitShift: 3.0)
+    let sigmas = SigmaSchedule.flow(numSteps: 4, config: config.applyingExplicitShift(3.0), mu: 0.8)
     let expected: [Float] = [1.0, 0.857692308, 0.602150538, 0.008928571, 0.0]
     XCTAssertEqual(sigmas.count, expected.count)
     for (i, e) in expected.enumerated() {
@@ -158,8 +158,8 @@ final class ModelSamplingShiftTests: XCTestCase {
                                                    baseImageSeqLen: 256, maxImageSeqLen: 4096)
     for shift in [Float(0.25), 1.0, 1.73, 3.0, 6.0, 12.0] {
       for steps in [4, 9, 20, 28, 50] {
-        let sigmas = SigmaSchedule.flow(numSteps: steps, config: config, mu: 0.8,
-                                        explicitShift: shift)
+        let sigmas = SigmaSchedule.flow(
+          numSteps: steps, config: config.applyingExplicitShift(shift), mu: 0.8)
         XCTAssertEqual(sigmas.count, steps + 1, "shift \(shift), steps \(steps)")
         // sigma_max is preserved exactly: shift·1 / (1 + (shift − 1)·1) == 1.
         XCTAssertEqual(sigmas[0], 1.0, accuracy: 1e-6, "shift \(shift) moved sigma_max")
@@ -180,11 +180,117 @@ final class ModelSamplingShiftTests: XCTestCase {
   /// interior sigma is strictly greater under shift 3 than under shift 1.
   func testHigherShiftRaisesEveryInteriorSigma() {
     let config = FlowMatchSchedulerTests.makeConfig(shift: 1.0)
-    let low = SigmaSchedule.flow(numSteps: 9, config: config, explicitShift: 1.0)
-    let high = SigmaSchedule.flow(numSteps: 9, config: config, explicitShift: 3.0)
+    let low = SigmaSchedule.flow(numSteps: 9, config: config.applyingExplicitShift(1.0))
+    let high = SigmaSchedule.flow(numSteps: 9, config: config.applyingExplicitShift(3.0))
     XCTAssertEqual(low[0], high[0], accuracy: 1e-6)
     for i in 1..<9 {
       XCTAssertGreaterThan(high[i], low[i], "index \(i)")
+    }
+  }
+
+  // MARK: - The `multiplier` cancels out of the sigma grid
+
+  /// Why `ModelSamplingAuraFlow` (multiplier 1.0) and `ModelSamplingSD3`
+  /// (multiplier 1000) are the SAME schedule for the same `shift`, and why the
+  /// bridge therefore reads both.
+  ///
+  /// ComfyUI's `normal_scheduler` (`comfy/samplers.py`) does:
+  ///
+  /// ```python
+  /// start = model_sampling.timestep(model_sampling.sigma_max)   # σ_max · M
+  /// end   = model_sampling.timestep(model_sampling.sigma_min)   # σ_min · M
+  /// for ts in torch.linspace(start, end, steps):
+  ///     sigs.append(float(model_sampling.sigma(ts)))            # snr(shift, ts / M)
+  /// ```
+  ///
+  /// `M` enters only through the endpoints and is divided straight back out by
+  /// `sigma(t)`, so the grid is multiplier-INVARIANT. This reproduces that walk
+  /// at both multipliers and asserts the grids agree — and agree with the
+  /// engine's own `SigmaSchedule.flow`, which is the M-free form of the same
+  /// computation.
+  ///
+  /// The multiplier is NOT inert everywhere: it scales the timestep the MODEL
+  /// is fed. That is a property of the checkpoint, unchanged by #154 — the
+  /// Z-Image pipelines feed `σ · numTrainTimesteps` as they always have, which
+  /// `testFlowMatchEulerSchedulerHonoursExplicitShift` below pins.
+  func testMultiplierCancelsOutOfTheSigmaGrid() {
+    let shift: Float = 3.0
+    let trainTimesteps = 1000
+    let steps = 9
+
+    /// ComfyUI's `normal_scheduler` at an arbitrary multiplier.
+    func comfyNormalScheduler(multiplier: Double) -> [Float] {
+      let table = SigmaSchedule.discreteFlowSigmaTable(
+        shift: shift, numTrainTimesteps: trainTimesteps)
+      let sigmaMin = Double(table[0]), sigmaMax = Double(table[table.count - 1])
+      let start = sigmaMin * multiplier, end = sigmaMax * multiplier
+      // linspace(timestep(σ_max) → timestep(σ_min)) — upstream walks high→low.
+      let hi = end, lo = start
+      var out: [Float] = (0..<steps).map { i in
+        let t = hi + (lo - hi) * Double(i) / Double(steps - 1)
+        let x = t / multiplier                       // model_sampling.sigma(t)
+        return Float(Double(shift) * x / (1 + (Double(shift) - 1) * x))
+      }
+      out.append(0.0)
+      return out
+    }
+
+    let aura = comfyNormalScheduler(multiplier: 1.0)      // ModelSamplingAuraFlow
+    let sd3 = comfyNormalScheduler(multiplier: 1000.0)    // ModelSamplingSD3
+    XCTAssertEqual(aura.count, sd3.count)
+    for i in 0..<aura.count {
+      XCTAssertEqual(aura[i], sd3[i], accuracy: 1e-6,
+                     "multiplier changed the grid at index \(i) — it must cancel")
+    }
+
+    // …and both are the engine's grid.
+    let config = FlowMatchSchedulerTests.makeConfig(numTrainTimesteps: trainTimesteps)
+    let engine = SigmaSchedule.flow(
+      numSteps: steps, config: config.applyingExplicitShift(shift))
+    XCTAssertEqual(engine.count, aura.count)
+    for i in 0..<engine.count {
+      XCTAssertEqual(engine[i], aura[i], accuracy: 1e-6, "engine grid differs at index \(i)")
+    }
+  }
+
+  // MARK: - Schedules that would DROP the shift
+
+  /// A shift only means something to a schedule that reads `config.shift`.
+  /// `krea2` is mu, `bong_tangent` is index arithmetic, and under `.flux` model
+  /// sampling the table-backed schedules build from mu — those must be
+  /// REFUSED, not accepted and ignored.
+  func testHonoursExplicitShiftPredicate() {
+    for schedule in [SigmaScheduleKind.flow, .simple, .beta, .beta57, .karras, .exponential] {
+      XCTAssertTrue(
+        SchedulerFactory.honoursExplicitShift(schedule: schedule, modelSampling: .discreteFlow),
+        "\(schedule.rawValue) reads config.shift under discreteFlow")
+    }
+    for schedule in [SigmaScheduleKind.krea2, .bongTangent] {
+      XCTAssertFalse(
+        SchedulerFactory.honoursExplicitShift(schedule: schedule, modelSampling: .discreteFlow),
+        "\(schedule.rawValue) is not defined by config.shift")
+    }
+    // Under `.flux` only `.flow` still reads it; the tables are built from mu.
+    XCTAssertTrue(SchedulerFactory.honoursExplicitShift(
+      schedule: .flow, modelSampling: .flux(tableSize: 10000)))
+    for schedule in [SigmaScheduleKind.simple, .beta, .beta57, .karras, .exponential] {
+      XCTAssertFalse(
+        SchedulerFactory.honoursExplicitShift(
+          schedule: schedule, modelSampling: .flux(tableSize: 10000)),
+        "\(schedule.rawValue) builds from mu under .flux, not config.shift")
+    }
+  }
+
+  /// And the predicate is not merely a table — the grids really do ignore it.
+  func testDroppingSchedulesReallyIgnoreTheShift() throws {
+    let config = FlowMatchSchedulerTests.makeConfig()
+    for schedule in [SigmaScheduleKind.krea2, .bongTangent] {
+      let plain = try SchedulerFactory.resolveSigmas(
+        schedule: schedule, numSteps: 9, config: config, mu: 0.8)
+      let shifted = try SchedulerFactory.resolveSigmas(
+        schedule: schedule, numSteps: 9, config: config.applyingExplicitShift(3.0), mu: 0.8)
+      XCTAssertEqual(plain.map { $0.bitPattern }, shifted.map { $0.bitPattern },
+                     "\(schedule.rawValue) must be provably shift-blind")
     }
   }
 
@@ -225,7 +331,8 @@ final class ModelSamplingShiftTests: XCTestCase {
     let flow = try SchedulerFactory.resolveSigmas(
       schedule: .flow, numSteps: 4, config: patched, mu: 0.8)
     XCTAssertEqual(flow.map { $0.bitPattern },
-                   SigmaSchedule.flow(numSteps: 4, config: config, mu: 0.8, explicitShift: 3.0)
+                   SigmaSchedule.flow(
+                     numSteps: 4, config: config.applyingExplicitShift(3.0), mu: 0.8)
                      .map { $0.bitPattern })
 
     // `simple` walks the discrete-flow table, which the patch rebuilds at

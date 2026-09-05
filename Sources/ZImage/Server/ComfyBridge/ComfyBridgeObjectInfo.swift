@@ -314,6 +314,17 @@ enum ComfyBridgeObjectInfo {
       requiredOrder: ["model", "shift"],
       outputs: ["MODEL"]
     )
+    // ComfyUI's own default for `ModelSamplingSD3` is 3.0
+    // (`nodes_model_advanced.py:123`); its `shift` produces the same sigma grid
+    // as AuraFlow's, so the bridge reads either.
+    info["ModelSamplingSD3"] = nodeDefinition(
+      required: [
+        "model": modelInput(),
+        "shift": floatInput(default: 3.0),
+      ],
+      requiredOrder: ["model", "shift"],
+      outputs: ["MODEL"]
+    )
     info["KSamplerSelect"] = nodeDefinition(
       required: [
         "sampler_name": optionInput(RecipeNameResolver.advertisedSamplerNames),
@@ -731,7 +742,7 @@ enum ComfyBridgeObjectInfo {
     // comfybox#154: upstream's own category for this node
     // (`comfy_extras/nodes_model_advanced.py`, `ModelSamplingAuraFlow.CATEGORY`),
     // so a client's node browser files it where its user expects.
-    case "ModelSamplingAuraFlow":
+    case "ModelSamplingAuraFlow", "ModelSamplingSD3":
       return "model/patch"
 
     case "ETN_LoadImageCache", "ETN_SaveImageCache", "INPAINT_ShrinkMask",

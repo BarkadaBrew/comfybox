@@ -336,15 +336,44 @@ composing them would double-warp a grid whose `mu` the caller cannot see:
 | # | Source | When it wins |
 |---|---|---|
 | 1 | the request's own `shift` | whenever the key is present |
-| 2 | the named `preset`'s DECLARED `shift` | when the request sent none and the preset was expandable |
+| 2 | the named `preset`'s DECLARED `shift` | when the request sent none, the preset was expandable, **and the preset's declared family is Z-Image** |
 | 3 | the model's own schedule | `use_dynamic_shifting` + the resolution-dependent `mu`, else `scheduler_config.json`'s `shift` — the no-regression default |
 
-Omitting `shift` is **byte-identical** to the pre-#154 engine: the same sigma
-grid, bit for bit (`ModelSamplingShiftTests`). Because the shift is applied to
-the scheduler CONFIG rather than to one schedule's formula, the schedules that
-index the model's discrete sigma table — `simple`, `beta`, `beta57`, and the
-`karras`/`exponential` bounds — pick it up too, exactly as they read the patched
-`model_sampling` in ComfyUI.
+**Row 2 is Z-Image-only, on purpose.** A preset declares its family with
+`checkpoint_family` (`zimage-base` / `zimage-turbo`) or with a `model` spec the
+engine classifies; a preset that says neither has its `shift` ignored (fails
+closed). The gate exists because four live krea2 presets — `krea-kira`,
+`krea-kira-sfw`, `krea-kira-avocado`, `krea2-base` — already declare
+`shift: 1.15`, which was desktop-display-only before #154. **Krea 2 takes its
+shift from the REQUEST only, exactly as it did**, so those renders are unchanged.
+
+Omitting `shift` on the Z-Image family is **byte-identical** to the pre-#154
+engine: the same sigma grid, bit for bit (`ModelSamplingShiftTests`). **Krea 2
+is unchanged either way** — this ticket adds nothing to its shift path. Because
+the shift is applied to the scheduler CONFIG rather than to one schedule's
+formula, the schedules that index the model's discrete sigma table — `simple`,
+`beta`, `beta57`, and the `karras`/`exponential` bounds — pick it up too,
+exactly as they read the patched `model_sampling` in ComfyUI.
+
+**A shift a schedule would ignore is REFUSED (400), not accepted.** Three
+schedules are defined by something other than the model's shift and would drop
+it silently: `krea2` (which is `mu`), `bong_tangent` (model-free index
+arithmetic), and — under Krea 2's `ModelSamplingFlux` sampling — the
+table-backed ones. Asking for `shift` alongside one of those on the Z-Image
+family returns a 400 naming the schedule. This is what keeps `applied_shift`
+honest: it only ever reports a number that reached the sigma grid.
+
+**The ComfyUI `multiplier` cancels out of the sigma grid**, which is why the
+bridge reads `ModelSamplingSD3` (multiplier 1000) exactly as it reads
+`ModelSamplingAuraFlow` (multiplier 1.0) — same `shift`, same sigmas.
+`normal_scheduler` walks `linspace(timestep(σ_max) → timestep(σ_min))` and maps
+each point back through `sigma(t) = time_snr_shift(shift, t / M)` while
+`timestep(σ) = σ · M`, so the `M` introduced by the endpoints is divided straight
+back out (pinned by
+`ModelSamplingShiftTests.testMultiplierCancelsOutOfTheSigmaGrid`). What the
+multiplier DOES scale is the timestep the model itself is fed — a property of how
+the checkpoint was trained, **not changed by this field**: the Z-Image pipelines
+feed `σ × num_train_timesteps` exactly as they always have.
 
 **The response says what applied**, as a flat `applied_shift` on both
 `POST /v1/generate` and `GET /v1/generate/status/{id}`:
@@ -354,14 +383,20 @@ index the model's discrete sigma table — `simple`, `beta`, `beta57`, and the
 ```
 
 The key is **absent** when the render used the model's own schedule — which is
-every render that names no shift, so its absence is the unchanged contract.
-Krea 2 additionally carries the full `applied.shift` / `applied.shift_source`
-recipe echo (`RenderRecipe` is Krea 2 only, D12); the flat field exists so the
-question has one answer on every family that honours it.
+every render that names no shift, so its absence is the unchanged contract. It
+is set on the Z-Image and ControlNet arms only; **Krea 2 answers through its
+full recipe instead** (`applied.shift`, `applied.shift_source`, and
+`applied.stages[].shift_applied`, which is `false` for a schedule such as
+`bong_tangent` that ignores it — `RenderRecipe` is Krea 2 only, D12). A flat
+field beside that richer record would be a second, weaker claim about the same
+render.
 
 **Bridge (Krita / ComfyUI clients).** A workflow carrying a
-`ModelSamplingAuraFlow` node has its `shift` input read and applied — see
-`bridge-developer-guide.md`.
+`ModelSamplingAuraFlow` (or `ModelSamplingSD3`) node has its `shift` input read
+and applied — but only when the resident family is Z-Image. On any other family
+the workflow is **refused** with a 400 naming the node and the family, because
+the node's linear shift and Krea 2's log-shift `mu` are different quantities
+wearing the same number. See `bridge-developer-guide.md`.
 
 ## Gallery output filenames
 

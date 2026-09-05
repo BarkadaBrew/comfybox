@@ -56,7 +56,7 @@
 | Capability | Status |
 |---|---|
 | Euler (FlowMatch), DDIM, DEIS, DPM++ 2M, DPM++ 2S-ancestral, Heun, RES2s | ✅ Working set |
-| `ModelSamplingAuraFlow` / SD3 schedule shift (`shift`, `time_snr_shift`) | ✅ Working — request/preset/bridge (#154); unit-pinned, live-unverified |
+| `ModelSamplingAuraFlow` / `ModelSamplingSD3` schedule shift (`shift`, `time_snr_shift`) | ✅ Working — request/preset/bridge, Z-Image family (#154); unit-pinned, live-unverified |
 | `ModelSamplingFlux` log-shift (`mu`) | ✅ Working (Krea 2, same `shift` field) |
 | CFG++ / `euler_ancestral_cfg_pp` (video) | ✅ Working |
 | STG (spatiotemporal guidance) | 🟡 Optional; +50% motion but artifact-prone |

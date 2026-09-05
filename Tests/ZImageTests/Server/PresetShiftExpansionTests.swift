@@ -17,13 +17,35 @@ import XCTest
 final class PresetShiftExpansionTests: XCTestCase {
 
   /// A Z-Image preset shaped like the one Zeta Chroma wants: euler, shift 3.0.
-  private func zetaChroma(shift: Double? = 3.0) -> PresetLoRAStack.Lookup {
+  /// `checkpoint_family` is what makes the shift expandable — see
+  /// `testKrea2PresetShiftIsNotExpanded` for why the gate exists.
+  private func zetaChroma(shift: Double? = 3.0, checkpointFamily: String? = "zimage-base")
+    -> PresetLoRAStack.Lookup
+  {
     let preset = ImagePreset(
       id: "zeta-chroma", name: "Zeta Chroma", mediaKind: "image",
-      model: "zeta-chroma", steps: 28, guidance: 5.0,
+      model: "z-image-zeta-chroma", steps: 28, guidance: 5.0,
       loras: [],
-      checkpointFamily: "z-image",
+      checkpointFamily: checkpointFamily,
       sampler: "euler", sigmaSchedule: "simple", shift: shift)
+    return .resolved(ResolvedPreset(preset: preset), declared: preset)
+  }
+
+  /// `krea-kira-avocado` as it stands in the live `~/.comfybox/presets.json`
+  /// TODAY: a krea2 raw-stock preset that declares `shift: 1.15`.
+  ///
+  /// On `main` that number is desktop-display-only — nothing on the image path
+  /// reads it. Expanding it for every family would silently turn it into a real
+  /// `ModelSamplingFlux` `mu` on Kira's production renders the moment this
+  /// deploys. Four live presets are in this state (krea-kira, krea-kira-sfw,
+  /// krea-kira-avocado, krea2-base).
+  private func kreaKiraAvocado(shift: Double? = 1.15) -> PresetLoRAStack.Lookup {
+    let preset = ImagePreset(
+      id: "krea-kira-avocado", name: "Kira Avocado", mediaKind: "image",
+      model: "krea2-raw", steps: 30, guidance: 3.5,
+      loras: [LoraReference(filename: "Girly_Tiana.safetensors", scale: 0.6)],
+      checkpointFamily: "raw-stock",
+      sampler: "res_2s", sigmaSchedule: "krea2", shift: shift)
     return .resolved(ResolvedPreset(preset: preset), declared: preset)
   }
 
@@ -46,6 +68,85 @@ final class PresetShiftExpansionTests: XCTestCase {
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "zeta-chroma", lookup: zetaChroma(), requestLoras: nil, requestShift: 1.73))
     XCTAssertNil(e.shift, "the preset's shift is not adopted — the request already named one")
+  }
+
+  /// CRITICAL, review r1 (1): a krea2 preset's declared `shift` must NOT be
+  /// expanded. `shift` is `mu` on that family — a log-shift into
+  /// `ModelSamplingFlux` — and applying the four live presets' 1.15 would
+  /// change Kira's renders on deploy. Krea 2 keeps taking its shift from the
+  /// REQUEST only, exactly as it did before #154.
+  func testKrea2PresetShiftIsNotExpanded() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(), requestLoras: nil))
+    XCTAssertNil(e.shift, "a krea2 preset's shift must never become mu behind the caller")
+    // Everything else the preset contributes is unaffected by the gate.
+    XCTAssertEqual(e.model, "krea2-raw")
+    XCTAssertEqual(e.steps, 30)
+    XCTAssertEqual(e.guidance, 3.5)
+    XCTAssertEqual(e.loras?.count, 1)
+  }
+
+  /// End-to-end at the `/v1/generate` seam: the payload's mu path is untouched
+  /// and nothing can echo an `applied_shift` for that render.
+  func testKrea2PresetLeavesThePayloadMuPathUntouched() throws {
+    let payload = try decode(#"{"prompt":"a portrait","preset":"krea-kira-avocado"}"#)
+    let out = try GeneratePayload.expandingPreset(payload) { _ in self.kreaKiraAvocado() }
+    XCTAssertNil(out.shift, "no shift on the payload ⇒ Krea 2's resolution-dependent mu stands")
+    XCTAssertNil(out.presetUnresolved, "the preset still expands — only its shift is gated")
+    XCTAssertEqual(out.model, "krea2-raw")
+
+    // And the replay body is not rewritten with a shift either.
+    let original = #"{"prompt":"a portrait","preset":"krea-kira-avocado"}"#.data(using: .utf8)!
+    let rewritten = WarmServer.rawBody(original, expandedWith: out)
+    let object = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: rewritten) as? [String: Any])
+    XCTAssertNil(object["shift"])
+
+    // The response for such a render carries no `applied_shift` key at all.
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    let response = GenerateResponse(
+      success: true, outputPath: "/tmp/a.png", durationMs: 10, appliedShift: out.shift)
+    let json = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: encoder.encode(response)) as? [String: Any])
+    XCTAssertNil(json["applied_shift"])
+  }
+
+  /// A krea2 preset's shift is gated whichever way the family is declared —
+  /// by `checkpoint_family` (above) or by the `model` spec alone.
+  func testKrea2PresetShiftIsNotExpandedWithoutACheckpointFamily() throws {
+    let preset = ImagePreset(
+      id: "krea2-base", name: "Krea 2 base", mediaKind: "image",
+      model: "krea2-raw", loras: [], shift: 1.15)
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea2-base",
+      lookup: .resolved(ResolvedPreset(preset: preset), declared: preset),
+      requestLoras: nil))
+    XCTAssertNil(e.shift)
+  }
+
+  /// Either declaration route works: `checkpoint_family` (the fixture above)
+  /// or a `model` spec the engine classifies as z-image.
+  func testZImageModelSpecAloneIsEnoughToExpandTheShift() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "zeta-chroma",
+      lookup: zetaChroma(checkpointFamily: nil),   // model "z-image-zeta-chroma"
+      requestLoras: nil))
+    XCTAssertEqual(e.shift, 3.0)
+  }
+
+  /// Fails CLOSED: a preset that declares neither `checkpoint_family` nor a
+  /// model spec the engine classifies contributes no shift, because the engine
+  /// cannot tell which of the two meanings the number carries.
+  func testUnclassifiableFamilyPresetShiftIsNotExpanded() throws {
+    let preset = ImagePreset(
+      id: "mystery", name: "Mystery", mediaKind: "image",
+      model: "some-community-checkpoint", loras: [], shift: 3.0)
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "mystery",
+      lookup: .resolved(ResolvedPreset(preset: preset), declared: preset),
+      requestLoras: nil))
+    XCTAssertNil(e.shift, "an unclassifiable preset must not have its shift adopted")
   }
 
   func testUndeclaredShiftContributesNothing() throws {

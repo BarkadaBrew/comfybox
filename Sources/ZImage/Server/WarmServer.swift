@@ -4370,8 +4370,16 @@ public final class WarmServer {
         },
         enhancePrompt: false,
         enhanceMaxTokens: 512,
-        // #154: the workflow's ModelSamplingAuraFlow shift reaches the
-        // ControlNet arm too — it runs the same flow schedule.
+        // #154: the workflow's ModelSamplingAuraFlow / SD3 shift reaches the
+        // ControlNet arm too.
+        //
+        // This arm returns before `bridgeGenerate`'s family switch and its
+        // `auraFlowNodeGate`, and does not need it: it renders through
+        // `ZImageControlPipeline` whatever family happens to be resident, so
+        // the shift is always the Z-Image LINEAR one the node means — there is
+        // no krea2 `mu` reading to guard against. It also leaves
+        // `sigmaSchedule` at its `.flow` default, which reads the shift, so
+        // `applied_shift` here always reports a value that reached the grid.
         shift: request.shift
       )
 
@@ -4483,11 +4491,19 @@ public final class WarmServer {
     if let error = GeneratePayload.validateFamilyRecipe(recipeNames, family: family) {
       throw error
     }
-    // #154: the bridge can now carry a `ModelSamplingAuraFlow` shift, so it
-    // runs the same per-family shift gate the REST dispatch does — a workflow
-    // that names a shift the resident family does not honour is refused,
+    // #154: the bridge can now carry a `ModelSamplingAuraFlow` shift. The node
+    // is honoured ONLY on the Z-Image family, whose `shift` is the same linear
+    // warp the node applies; on any other family (Krea 2's `shift` is a
+    // log-shift `mu`, the rest read none) the workflow is REFUSED by name,
     // never silently rendered on the model's own schedule.
+    if let error = GeneratePayload.auraFlowNodeGate(payload.shift, family: family) {
+      throw error
+    }
     if let message = GeneratePayload.validateShift(payload.shift, family: family) {
+      throw WarmServerError.invalidRequest(message: message)
+    }
+    if let message = GeneratePayload.validateShiftSchedule(
+      payload.shift, sigmaSchedule: recipeNames.sigmaSchedule, family: family) {
       throw WarmServerError.invalidRequest(message: message)
     }
     // WP-E17: the bridge builds its payload directly too, so it runs the same
@@ -10593,6 +10609,16 @@ private actor WarmServerCoordinator {
       continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
       return
     }
+    // #154: and refuse a shift the requested SCHEDULE would drop — otherwise
+    // `applied_shift` would report a number that never reached the grid.
+    if let message = GeneratePayload.validateShiftSchedule(
+      payload.shift,
+      sigmaSchedule: (try? payload.validateRecipeNames())?.sigmaSchedule,
+      family: currentModelFamily) {
+      lastError = message
+      continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
+      return
+    }
     // WP-E10 "E9b": `vae` on a non-krea2 family is refused, never ignored.
     if let error = GeneratePayload.vaeGate(payload.vae, family: currentModelFamily) {
       lastError = error.localizedDescription
@@ -11129,11 +11155,12 @@ private actor WarmServerCoordinator {
         memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
         loraStackOrigin: payload.loraStackOrigin,
         warmDefaultSkipped: payload.warmDefaultSkipped,
-        loraReload: payload.loraReload,
-        // #154: the same flat answer the other families give. On Krea 2 the
-        // value is `mu` (ModelSamplingFlux), and `applied.shift` /
-        // `applied.shift_source` beside it carry the full provenance.
-        appliedShift: payload.shift))
+        loraReload: payload.loraReload))
+        // #154 deliberately sets no `applied_shift` here: Krea 2 already reads
+        // back a full `applied` recipe (`shift`, `shift_source`, and
+        // `stages[].shift_applied`, which is false for `bong_tangent`), and a
+        // flat field duplicating it would be a second, weaker claim about the
+        // same render — and would say "applied" for a schedule that ignored it.
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -12669,6 +12696,67 @@ extension GeneratePayload: Decodable {
     return nil
   }
 
+  /// comfybox#154 — the SIGMA-SCHEDULE half of the shift gate: refuse a shift
+  /// the requested schedule would drop on the floor.
+  ///
+  /// `validateShift` above answers "does this family read `shift` at all?".
+  /// This answers the narrower question the family cannot: three schedules are
+  /// defined by something other than `config.shift` and ignore it completely —
+  /// `krea2` (which is `mu`), `bong_tangent` (model-free by construction, D6),
+  /// and, under Krea 2's `.flux` model sampling, the table-backed
+  /// `simple`/`beta`/`beta57`/`karras`/`exponential`. Accepting a shift into
+  /// one of those and reporting success is precisely the silent substitution
+  /// the recipe gates exist to stop, and it is what would make the response's
+  /// `applied_shift` a lie.
+  ///
+  /// Scoped to `.flux1`, whose scheduler configs are always `.discreteFlow`
+  /// (the `scheduler_config.json` decoder hardcodes it), so the model sampling
+  /// is known here without loading anything. Krea 2 has its own `shift`
+  /// semantics and its own `applied.stages[].shift_applied` record and is left
+  /// alone.
+  ///
+  /// Returns the 400 message, or nil.
+  static func validateShiftSchedule(
+    _ shift: Float?, sigmaSchedule: SigmaScheduleKind?, family: WarmModelFamily
+  ) -> String? {
+    guard shift != nil, family == .flux1 else { return nil }
+    let schedule = sigmaSchedule ?? .flow
+    guard !SchedulerFactory.honoursExplicitShift(
+      schedule: schedule, modelSampling: .discreteFlow)
+    else { return nil }
+    return "shift is not read by sigma schedule '\(schedule.rawValue)' "
+      + "(it is defined by mu / by index arithmetic, not by the model's shift) — "
+      + "the render would silently ignore it; drop `shift`, or ask for a schedule that "
+      + "honours it (flow/normal, simple, beta, beta57, karras, exponential)"
+  }
+
+  /// comfybox#154 — the BRIDGE's gate on a `ModelSamplingAuraFlow` node.
+  ///
+  /// The node's `shift` is a LINEAR warp (`σ' = shift·σ / (1 + (shift−1)·σ)`).
+  /// The engine's `shift` request field means that on `.flux1` and something
+  /// else entirely on Krea 2 — `mu`, a LOG-shift feeding
+  /// `ModelSamplingFlux`'s `e^mu / (e^mu + 1/σ − 1)` — so forwarding the node's
+  /// number into a Krea 2 render would apply a wildly different grid under the
+  /// caller's number (`shift 3.0` as mu is `e³ ≈ 20`, not 3).
+  ///
+  /// Refused, not ignored: a Krita workflow that PLACED the node asked for
+  /// something, and rendering as if it had not is the failure mode this repo
+  /// treats as worse than an error. The 400 names the node and the family.
+  static func auraFlowNodeGate(_ shift: Float?, family: WarmModelFamily) -> WarmServerError? {
+    guard shift != nil, family != .flux1 else { return nil }
+    return .unsupportedRecipeField(
+      field: "ModelSamplingAuraFlow.shift",
+      value: shift.map { "\($0)" } ?? "",
+      family: family.rawValue,
+      reason: family == .krea2
+        ? "this workflow's ModelSamplingAuraFlow node sets a LINEAR schedule shift, but the "
+          + "resident krea2 model is sampled by ModelSamplingFlux, whose shift is a LOG-shift "
+          + "(mu) — the same number means a different grid. Remove the node, or send `shift` on "
+          + "/v1/generate where the krea2 meaning is documented"
+        : "this workflow's ModelSamplingAuraFlow node sets a schedule shift, and the resident "
+          + "'\(family.rawValue)' model runs a fixed schedule that does not read one. Remove the node")
+  }
+
   /// WP-E10 "E9b" (Addendum A.2, E9 review MAJOR): `vae` is a Krea 2 request
   /// field. On any other family it used to be silently ignored — the caller
   /// named a decoder and got the family's default with no error. Refused
@@ -13344,16 +13432,25 @@ struct GenerateResponse: Encodable, Sendable {
   ///
   /// A flat field rather than a second `applied` block: `applied`
   /// (``RenderRecipe``) is Krea 2 only by D12, and the family this ticket is
-  /// about (`.flux1`, where Zeta Chroma runs) emits none. Krea 2 sets BOTH —
-  /// `applied.shift` with its `applied.shift_source`, and this — so "did my
-  /// shift apply?" has one answer on every family that honours the field.
+  /// about (`.flux1`, where Zeta Chroma runs) emits none.
   ///
-  /// There is deliberately no `applied_shift_source` twin here: on the flat
-  /// path the server cannot see the model's `scheduler_config.json` without a
-  /// new return channel from the pipeline, and a guessed `"dynamic"` label
-  /// would be exactly the confident-but-unverified claim this codebase keeps
-  /// out of its records. `applied.shift_source` remains the place that
-  /// question is answered, for the family that reads back a full recipe.
+  /// **Set on the `.flux1` and ControlNet arms only.** Krea 2 reads back the
+  /// full recipe instead (`applied.shift`, `applied.shift_source`, and
+  /// `applied.stages[].shift_applied`, which is false for a schedule like
+  /// `bong_tangent` that ignores it); a flat field beside that would be a
+  /// second, weaker claim about the same render.
+  ///
+  /// The number here always REACHED THE SIGMA GRID: a shift the requested
+  /// schedule would drop is refused up front by
+  /// ``GeneratePayload/validateShiftSchedule(_:sigmaSchedule:family:)``, so
+  /// this is never "what you asked for" — it is what applied.
+  ///
+  /// There is deliberately no `applied_shift_source` twin: on the flat path
+  /// the server cannot see the model's `scheduler_config.json` without a new
+  /// return channel from the pipeline, and a guessed `"dynamic"` label would
+  /// be exactly the confident-but-unverified claim this codebase keeps out of
+  /// its records. `applied.shift_source` remains the place that question is
+  /// answered, for the family that reads back a full recipe.
   let appliedShift: Float?
 
   /// The record itself, for Swift readers that do not care about the

@@ -101,8 +101,10 @@ public final class WorkflowStore: @unchecked Sendable {
     "ModelPatchLoader", "ZImageFunControlnet", "UpscaleModelLoader",
     "ImageUpscaleWithModel", "UNETLoader", "NunchakuZImageDiTLoader",
     "CheckpointLoaderSimple", "VAEEncode",
-    // comfybox#154: the parser reads this node's `shift` input.
-    "ModelSamplingAuraFlow",
+    // comfybox#154: the parser reads these nodes' `shift` input. AuraFlow IS an
+    // SD3 subclass upstream and they differ only in a timestep `multiplier`
+    // that cancels out of the sigma grid, so both map to the same field.
+    "ModelSamplingAuraFlow", "ModelSamplingSD3",
     // Normalized away at import:
     "LoadImage", "SaveImage",
   ]
@@ -112,12 +114,12 @@ public final class WorkflowStore: @unchecked Sendable {
   static let glueNodeTypes: Set<String> = [
     "VAEDecode", "VAELoader", "CLIPLoader", "DualCLIPLoader", "TripleCLIPLoader",
     "ConditioningZeroOut", "ConditioningCombine", "ConditioningConcat",
-    // comfybox#154 moved `ModelSamplingAuraFlow` out of here and into
-    // `mappedNodeTypes` — its `shift` is now read, not ignored. `SD3` and
-    // `Flux` stay glue: same sigma warp, different parameterisations
-    // (a 1000× timestep `multiplier`, and a log-shift) that the engine has no
-    // seam for, and mapping either as AuraFlow would be a silent substitution.
-    "ModelSamplingSD3", "ModelSamplingFlux",
+    // comfybox#154 moved `ModelSamplingAuraFlow` and `ModelSamplingSD3` out of
+    // here and into `mappedNodeTypes` — their `shift` is now read, not
+    // ignored. `ModelSamplingFlux` stays glue: its shift is a LOG-shift
+    // feeding a genuinely different curve, not the same warp under another
+    // name.
+    "ModelSamplingFlux",
     "FluxGuidance", "Note", "MarkdownNote", "PrimitiveNode", "Reroute",
   ]
 

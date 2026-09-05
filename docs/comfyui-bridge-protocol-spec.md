@@ -76,9 +76,16 @@ The plugin queries options from these nodes to discover available models:
   "output": ["MODEL"], "category": "model/patch"}}
 ```
 
-It maps to the engine's `shift` request field (the flow schedule's linear
-shift). `ModelSamplingSD3` / `ModelSamplingFlux` are accepted in a graph but
-NOT read — different parameterisations, no seam.
+`ModelSamplingSD3` is advertised and read identically (upstream default `3.0`):
+it is the same class with a different timestep `multiplier`, and the multiplier
+cancels out of the sigma grid, so the same `shift` gives the same schedule.
+
+Both map to the engine's `shift` request field (the flow schedule's linear
+shift), and are honoured **only when the resident model family is Z-Image** —
+on any other family `/prompt` returns a 400 naming the node and the family.
+
+`ModelSamplingFlux` is accepted in a graph but NOT read: its shift is a
+log-shift, a different curve.
 
 ### Response format per node
 
