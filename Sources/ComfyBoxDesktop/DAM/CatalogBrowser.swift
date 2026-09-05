@@ -122,6 +122,19 @@ public final class CatalogBrowser {
         await apply(filter: activeFilter)
     }
 
+    /// `allMatchingIDs()`'s answer: ids AND whether `CatalogStore.idsHardCap`
+    /// cut them off. Mirrors `CatalogStore.AssetIDsResult` one layer up, after
+    /// `hiddenAssetIDs` has been subtracted.
+    public struct SelectAllResult: Sendable, Equatable {
+        public let ids: Set<String>
+        /// True when the filter matched more than `CatalogStore.idsHardCap`
+        /// assets — `ids` is a PREFIX, not everything the filter matched, and
+        /// the caller must tell the user rather than silently selecting less
+        /// than "all" (R1 review correction: this used to be silent, which is
+        /// the exact failure #271 exists to fix, one layer down).
+        public let truncated: Bool
+    }
+
     /// Every id matching the CURRENT filter, ignoring `pageSize`/paging
     /// entirely — what Select All actually needs (#271).
     ///
@@ -136,13 +149,14 @@ public final class CatalogBrowser {
     /// `hiddenAssetIDs` (the vault carve-out) is subtracted the same way
     /// `resolve(_:)` does for the visible page, so Select All cannot select a
     /// secured asset the grid never showed.
-    public func allMatchingIDs() async -> Set<String> {
+    public func allMatchingIDs() async -> SelectAllResult {
         do {
-            let ids = try await store.assetIDs(matching: activeFilter)
-            return Set(ids).subtracting(hiddenAssetIDs)
+            let result = try await store.assetIDs(matching: activeFilter)
+            let ids = Set(result.ids).subtracting(hiddenAssetIDs)
+            return SelectAllResult(ids: ids, truncated: result.truncated)
         } catch {
             self.error = error.localizedDescription
-            return []
+            return SelectAllResult(ids: [], truncated: false)
         }
     }
 

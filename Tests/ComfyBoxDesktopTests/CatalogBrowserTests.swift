@@ -211,9 +211,10 @@ final class CatalogBrowserTests: XCTestCase {
         await b.apply(filter: CatalogQuery(lane: "select-all-fixture", limit: b.pageSize))
         XCTAssertEqual(b.items.count, 500, "precondition: the loaded PAGE is still clamped")
 
-        let allIDs = await b.allMatchingIDs()
-        XCTAssertEqual(allIDs.count, 1200, "allMatchingIDs must not inherit the page's limit")
-        XCTAssertEqual(allIDs, Set((0..<1200).map { "select-all-\($0)" }))
+        let result = await b.allMatchingIDs()
+        XCTAssertEqual(result.ids.count, 1200, "allMatchingIDs must not inherit the page's limit")
+        XCTAssertEqual(result.ids, Set((0..<1200).map { "select-all-\($0)" }))
+        XCTAssertFalse(result.truncated, "1,200 rows is well under idsHardCap")
     }
 
     /// `allMatchingIDs` subtracts `hiddenAssetIDs` the same way the loaded
@@ -230,8 +231,9 @@ final class CatalogBrowserTests: XCTestCase {
         b.hiddenAssetIDs = ["vaulted"]
         await b.apply(filter: CatalogQuery(lane: "vault-fixture"))
 
-        let allIDs = await b.allMatchingIDs()
-        XCTAssertEqual(allIDs, ["visible"])
+        let result = await b.allMatchingIDs()
+        XCTAssertEqual(result.ids, ["visible"])
+        XCTAssertFalse(result.truncated)
     }
 
     func testAPathWithASpaceStreamsAsAValidURL() async throws {

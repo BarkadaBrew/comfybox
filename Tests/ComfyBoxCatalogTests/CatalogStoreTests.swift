@@ -620,9 +620,36 @@ final class CatalogStoreTests: XCTestCase {
             try await store.upsert(make("select-all-\(i)", realm: .shared, lane: "select-all-fixture"),
                                    explicitCollectionIDs: [])
         }
-        let ids = try await store.assetIDs(matching: CatalogQuery(lane: "select-all-fixture"))
-        XCTAssertEqual(ids.count, 1200)
-        XCTAssertEqual(Set(ids), Set((0..<1200).map { "select-all-\($0)" }))
+        let result = try await store.assetIDs(matching: CatalogQuery(lane: "select-all-fixture"))
+        XCTAssertEqual(result.ids.count, 1200)
+        XCTAssertEqual(Set(result.ids), Set((0..<1200).map { "select-all-\($0)" }))
+        XCTAssertFalse(result.truncated, "1,200 rows is well under idsHardCap")
+    }
+
+    /// R1 review correction: the hard cap must not truncate silently. `cap:`
+    /// lets this pin the behaviour without inserting `idsHardCap + 1` real
+    /// rows.
+    func testAssetIDsMatchingReportsTruncationWhenTheCapCutsRows() async throws {
+        for i in 0..<10 {
+            try await store.upsert(make("cap-\(i)", realm: .shared, lane: "cap-fixture"),
+                                   explicitCollectionIDs: [])
+        }
+        let result = try await store.assetIDs(matching: CatalogQuery(lane: "cap-fixture"), cap: 5)
+        XCTAssertTrue(result.truncated)
+        XCTAssertEqual(result.ids.count, 5, "truncated to exactly the cap, not the cap-plus-lookahead row")
+    }
+
+    /// The negative case for the same knob: a filter that matches EXACTLY the
+    /// cap is complete, not truncated — the "+1 lookahead row" must not turn
+    /// an exact fit into a false truncation report.
+    func testAssetIDsMatchingIsNotTruncatedWhenCountExactlyMeetsTheCap() async throws {
+        for i in 0..<5 {
+            try await store.upsert(make("exact-\(i)", realm: .shared, lane: "exact-fixture"),
+                                   explicitCollectionIDs: [])
+        }
+        let result = try await store.assetIDs(matching: CatalogQuery(lane: "exact-fixture"), cap: 5)
+        XCTAssertFalse(result.truncated)
+        XCTAssertEqual(result.ids.count, 5)
     }
 
     /// Unlike `search`, which pages, `assetIDs(matching:)` ignores
@@ -636,8 +663,8 @@ final class CatalogStoreTests: XCTestCase {
         var q = CatalogQuery(lane: "ignore-limit")
         q.limit = 1
         q.offset = 5
-        let ids = try await store.assetIDs(matching: q)
-        XCTAssertEqual(ids.count, 10, "limit/offset must not clamp the ids-only query")
+        let result = try await store.assetIDs(matching: q)
+        XCTAssertEqual(result.ids.count, 10, "limit/offset must not clamp the ids-only query")
     }
 
     /// The realm lock applies here exactly as it does to `search` — an
@@ -646,8 +673,8 @@ final class CatalogStoreTests: XCTestCase {
     func testAssetIDsMatchingHonoursRealmScope() async throws {
         try await store.upsert(make("kira-only", realm: .kira, lane: "mixed"), explicitCollectionIDs: [])
         try await store.upsert(make("shared-only", realm: .shared, lane: "mixed"), explicitCollectionIDs: [])
-        let kiraIDs = try await store.assetIDs(matching: CatalogQuery(scope: .kira, lane: "mixed"))
-        XCTAssertEqual(kiraIDs, ["kira-only"])
+        let result = try await store.assetIDs(matching: CatalogQuery(scope: .kira, lane: "mixed"))
+        XCTAssertEqual(result.ids, ["kira-only"])
     }
 
     /// Built from the same `whereClause` helper as `search` (#271), so a
@@ -658,7 +685,7 @@ final class CatalogStoreTests: XCTestCase {
         try await store.upsert(make("agree-2", realm: .shared, tier: "avocado"), explicitCollectionIDs: [])
         let query = CatalogQuery(tier: "neutral")
         let searchIDs = Set(try await store.search(query).map(\.id))
-        let idsOnly = Set(try await store.assetIDs(matching: query))
+        let idsOnly = Set(try await store.assetIDs(matching: query).ids)
         XCTAssertEqual(searchIDs, idsOnly)
     }
 

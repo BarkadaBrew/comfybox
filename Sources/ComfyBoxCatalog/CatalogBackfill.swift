@@ -358,7 +358,18 @@ public enum CatalogBackfill {
         // (or the reverse) purely because two files happen to share a name.
         let base = (remote as NSString).lastPathComponent
         guard !base.isEmpty else { return nil }
-        let ids = try await store.assetIDs(forFilename: base, scope: scope)
+        // `assetIDs(forFilename:)` now THROWS on a step failure rather than
+        // returning a possibly-truncated list (#357 R1 review): a dropped
+        // second match would otherwise make an ambiguous filename look
+        // unique here and mint a wrong edge. Treat the failure exactly like
+        // an ambiguous match — skip this edge — rather than letting it abort
+        // the whole backfill sweep over one unreadable row.
+        let ids: [String]
+        do {
+            ids = try await store.assetIDs(forFilename: base, scope: scope)
+        } catch {
+            return nil
+        }
         return ids.count == 1 ? ids[0] : nil
     }
 

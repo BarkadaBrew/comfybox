@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import ComfyBoxCatalog
 
 final class CatalogBackfillTests: XCTestCase {
@@ -406,6 +407,38 @@ final class CatalogBackfillTests: XCTestCase {
         let stillID = try XCTUnwrap(foundStillID)
         let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.toAssetID, stillID)
+    }
+
+    /// Critical R1 review fix: `assetIDs(forFilename:)` now THROWS on a query
+    /// failure instead of returning a possibly-truncated list, because a
+    /// truncated list there would make an AMBIGUOUS filename look UNIQUE and
+    /// mint a WRONG i2v edge. `resolveSource` must treat that thrown error
+    /// exactly like genuine ambiguity — return nil — not propagate it and
+    /// abort the whole sweep over one unreadable lookup.
+    ///
+    /// Deterministic without fault-injecting `sqlite3_step`: dropping the
+    /// `filename` column via a separate raw connection to the same file makes
+    /// the fallback query's PREPARE fail with a real error, isolated to
+    /// exactly that query. `assetID(forPath:)` — which `resolveSource` tries
+    /// first, and which must still run and correctly return nil, since no
+    /// exact path matches — never references `filename`, so it is unaffected.
+    func testResolveSourceTreatsAQueryFailureAsAmbiguousNotFatal() async throws {
+        try await store.upsert(CatalogAsset(
+            id: "still-1", filename: "unresolvable-still.png",
+            absolutePath: root + "/kira/gallery/Kira/generated/unresolvable-still.png",
+            realm: .kira), explicitCollectionIDs: [])
+
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(dbPath, &raw), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(raw, "ALTER TABLE assets DROP COLUMN filename", nil, nil, nil),
+                       SQLITE_OK, "precondition: the fallback query's column must actually be gone")
+        sqlite3_close(raw)
+
+        let resolved = try await CatalogBackfill.resolveSource(
+            "/home/todd/.kira/studio/gallery/Deep/Elsewhere/unresolvable-still.png",
+            scope: .kira, trees: trees(), store: store)
+        XCTAssertNil(resolved, "a query failure must be treated exactly like ambiguity, "
+                     + "not propagate or crash the sweep")
     }
 
     // MARK: - Provenance and precedence

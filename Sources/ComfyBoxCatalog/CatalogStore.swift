@@ -693,6 +693,21 @@ public actor CatalogStore {
     /// desktop library is nowhere near six figures today.
     public static let idsHardCap = 100_000
 
+    /// The result of `assetIDs(matching:)` — ids AND whether the hard cap cut
+    /// them off. R1 review correction: the cap used to truncate silently,
+    /// which is exactly the bug #271 exists to fix, just moved one layer
+    /// down — a caller cannot tell "this filter matched `idsHardCap` rows on
+    /// the nose" from "this filter matched more and got cut", so `truncated`
+    /// has to travel with the ids rather than being inferred from the count.
+    public struct AssetIDsResult: Sendable, Equatable {
+        public let ids: [String]
+        /// True when more rows matched `query` than `idsHardCap` allows
+        /// through. `ids` is a PREFIX in that case, not the whole filtered
+        /// set, and callers (the HTTP route, Select All) must say so rather
+        /// than presenting it as complete.
+        public let truncated: Bool
+    }
+
     /// Every asset id matching `query`, ignoring `query.limit`/`query.offset`
     /// entirely — deliberately, not merely widened. A "select all" that pages
     /// is the exact bug this exists to fix (#271: the gallery raised its page
@@ -708,13 +723,20 @@ public actor CatalogStore {
     /// means, so a mid-iteration step failure throws rather than silently
     /// handing back a truncated selection that LOOKS like the whole filtered
     /// set.
-    public func assetIDs(matching query: CatalogQuery) throws -> [String] {
+    ///
+    /// `cap` defaults to `idsHardCap` for every real caller; it is a
+    /// parameter (not a hardcoded `Self.idsHardCap` in the SQL) only so a test
+    /// can pin the truncation behaviour without inserting 100,001 rows.
+    public func assetIDs(matching query: CatalogQuery, cap: Int = CatalogStore.idsHardCap) throws -> AssetIDsResult {
         let (whereSQL, binds) = whereClause(for: query)
+        // Ask for one more than the cap: if it comes back, more than `cap`
+        // rows matched and the result is genuinely truncated, not merely
+        // exactly-the-cap-sized.
         let sql = """
             SELECT a.id FROM assets a
             \(whereSQL)
             ORDER BY a.created_at DESC
-            LIMIT \(Self.idsHardCap)
+            LIMIT \(cap + 1)
             """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -730,7 +752,9 @@ public actor CatalogStore {
         guard rc == SQLITE_DONE else {
             throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
-        return ids
+        let truncated = ids.count > cap
+        if truncated { ids.removeLast(ids.count - cap) }
+        return AssetIDsResult(ids: ids, truncated: truncated)
     }
 
     /// Turn free text into an FTS5 MATCH expression that cannot be a syntax
@@ -1209,16 +1233,22 @@ public actor CatalogStore {
         sqlite3_bind_int64(stmt, 2, Int64(limit))
         bindText(stmt, 3, scope?.rawValue)
         var out: [String] = []
-        // Read-only, already `LIMIT`-capped heuristic lookup (#357): a step
-        // failure logs and returns whatever ids were already collected. Worst
-        // case, backfill sees an ambiguous filename as unambiguous and skips
-        // an edge it might otherwise have created — not data loss.
+        // THROWS on a non-DONE step (#357 R1 review correction — this was
+        // classified log-and-partial, which is wrong). `CatalogBackfill
+        // .resolveSource` decides "is this filename unambiguous?" from
+        // `ids.count == 1`: a truncated drain that drops a second real match
+        // makes an AMBIGUOUS filename look UNIQUE and creates a WRONG i2v
+        // edge — the opposite of, and worse than, the missing edge a merely
+        // partial result would cause. Only a caller that gets the true count
+        // (or knows it could not) can tell "one match" from "one match found
+        // before the step broke", so this cannot be log-and-partial.
+        // `resolveSource` treats the thrown error the same as an ambiguous
+        // filename: skip the edge rather than risk a wrong one.
         let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let id = text(stmt, 0) { out.append(id) }
         }
-        if rc != SQLITE_DONE {
-            FileHandle.standardError.write(
-                Data("CatalogStore.assetIDs(forFilename:): step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
+        guard rc == SQLITE_DONE else {
+            throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
         return out
     }

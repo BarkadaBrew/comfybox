@@ -75,6 +75,11 @@ struct GalleryView: View {
     /// Separate from `errorMessage`, which a successful load clears: a refused
     /// orphan sweep is the one thing the user must still see afterwards.
     @State private var pruneWarning: String?
+    /// Set when Select All's filter matched more than
+    /// `CatalogStore.idsHardCap` assets — the selection is a prefix, not
+    /// everything, and that must be visible rather than presented as complete
+    /// (R1 review correction on #271).
+    @State private var selectAllTruncatedWarning: String?
 
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
@@ -238,6 +243,9 @@ struct GalleryView: View {
                 }
                 if let warning = pruneWarning {
                     errorBanner(warning) { pruneWarning = nil }
+                }
+                if let warning = selectAllTruncatedWarning {
+                    errorBanner(warning) { selectAllTruncatedWarning = nil }
                 }
 
                 // Gallery grid
@@ -1960,16 +1968,25 @@ struct GalleryView: View {
     /// `.intersection(ids)` keeps the final selection to exactly what the
     /// server said matched, belt and braces alongside those client filters.
     ///
+    /// `result.truncated` (R1 review correction): `idsHardCap` itself can cut
+    /// off a filter matching more than 100k assets. That must surface as a
+    /// visible warning, not a selection that quietly looks complete — the
+    /// same silent-truncation failure #271 exists to fix, one layer down.
+    ///
     /// Local-store fallback (no catalog): unchanged — raise to the full scope
     /// and reload first, since there is no ids-only query to ask instead.
     private func selectAll() async {
         if let browser {
-            let ids = await browser.allMatchingIDs()
-            if loadLimit < ids.count {
-                loadLimit = ids.count
+            let result = await browser.allMatchingIDs()
+            if loadLimit < result.ids.count {
+                loadLimit = result.ids.count
                 await loadAssets()
             }
-            selectedIds = Set(filteredAssets.map(\.id)).intersection(ids)
+            selectedIds = Set(filteredAssets.map(\.id)).intersection(result.ids)
+            selectAllTruncatedWarning = result.truncated
+                ? "Select All matched more than \(CatalogStore.idsHardCap) assets — "
+                  + "only the first \(CatalogStore.idsHardCap) are selected."
+                : nil
             return
         }
         if loadLimit < Self.fullScopeLimit && assets.count >= loadLimit {

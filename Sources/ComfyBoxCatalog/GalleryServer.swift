@@ -96,8 +96,14 @@ public enum GalleryServer {
             // ignores them by design and caps at `idsHardCap` (100k) instead.
             case ("GET", "/v1/catalog/asset-ids"):
                 let q = query(from: request, scope: scope, ceiling: ceiling)
-                let ids = try await store.assetIDs(matching: q)
-                return .json(["count": ids.count, "ids": ids])
+                let result = try await store.assetIDs(matching: q)
+                // `truncated` (R1 review correction): the 100k hard cap can
+                // still cut off a filter matching more than that — silently
+                // is no better than the 500-row clamp this route exists to
+                // route around. A caller MUST be able to tell "this is
+                // everything" from "this is the first 100k".
+                return .json(["count": result.ids.count, "ids": result.ids,
+                              "truncated": result.truncated])
 
             case ("GET", "/v1/catalog/facets"):
                 let f = try await store.facets(scope: scope)
