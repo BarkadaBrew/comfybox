@@ -124,6 +124,61 @@ final class GeneratePresetRouteTests: XCTestCase {
     XCTAssertEqual(try expand(#"{"prompt":"x","preset":"krea-kira","steps":9}"#, store: store).steps, 9)
   }
 
+  // MARK: #285 — declared `vae` travels with the preset, request-first
+
+  /// Kira's live lane, plus a declared `vae` — the shape #285 exists for:
+  /// `POST /v1/generate {"preset":"krea-kira"}` with no `vae` of its own must
+  /// pick up the preset's, exactly as it already does for `model`/`loras`.
+  @discardableResult
+  private func seedKreaKira(_ store: PresetStore, vae: String) throws -> ImagePreset {
+    try store.upsert(ImagePreset(
+      id: "krea-kira", name: "Kira", mediaKind: "image", model: "krea2-raw",
+      loras: [LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel")],
+      vae: vae,
+      checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0)))
+  }
+
+  func testDeclaredVAETravelsOnlyWhenTheRequestOmitsIt() throws {
+    let store = try makeStore()
+    let wan = "/Users/toddwalderman/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"
+    try seedKreaKira(store, vae: wan)
+
+    let bare = try expand(#"{"prompt":"x","preset":"krea-kira"}"#, store: store)
+    XCTAssertEqual(bare.vae, wan)
+    XCTAssertEqual(bare.presetVAEApplied, true, "so the response can record vae_source: preset")
+
+    let other = "/Users/toddwalderman/LocalModels/vae/other.safetensors"
+    let overridden = try expand(
+      #"{"prompt":"x","preset":"krea-kira","vae":"\#(other)"}"#, store: store)
+    XCTAssertEqual(overridden.vae, other, "the request's own vae wins")
+    XCTAssertNil(overridden.presetVAEApplied, "the request's own vae is not preset-owned")
+  }
+
+  /// A preset that declares no `vae` contributes nothing — the render falls
+  /// through to the model directory's default exactly as it does today.
+  func testPresetWithNoDeclaredVAELeavesTheFieldAbsent() throws {
+    let store = try makeStore()
+    try seedKreaKira(store)
+    let payload = try expand(#"{"prompt":"x","preset":"krea-kira"}"#, store: store)
+    XCTAssertNil(payload.vae)
+    XCTAssertNil(payload.presetVAEApplied)
+  }
+
+  /// The persisted (crash-recovery) body carries the resolved `vae` the same
+  /// way it already carries `model`/`loras`, so a replay after a restart
+  /// renders with the same decoder without re-resolving the preset.
+  func testPersistedBodyCarriesTheExpandedVAE() throws {
+    let store = try makeStore()
+    let wan = "/Users/toddwalderman/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"
+    try seedKreaKira(store, vae: wan)
+    let original = Data(#"{"prompt":"x","preset":"krea-kira"}"#.utf8)
+    let accepted = try WarmServer.decodedGeneratePayload(
+      from: original, store: store, configuration: configuration, loraExists: { _ in true })
+    let persisted = WarmServer.rawBody(original, expandedWith: accepted)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: persisted) as? [String: Any])
+    XCTAssertEqual(object["vae"] as? String, wan)
+  }
+
   // MARK: I6 — preset + explicit loras
 
   /// Explicit `loras` keep their precedence, and a disagreement is REPORTED.

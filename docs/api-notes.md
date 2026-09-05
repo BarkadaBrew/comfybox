@@ -189,6 +189,63 @@ working unmodified during the compatibility window; new code should read
 [Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md) (some
 of that document's structured-kroma framing predates this reversal).
 
+## VAE selection (Krea-2) — external decoder swap (#285, WP-E9)
+
+Krea 2 can decode (and encode) through a VAE file other than the one bundled
+in the model directory — e.g. the Wan 2.1 FP32 decoder the RAW bf16 reference
+stack was validated with (`docs/FDD-krea2-raw-recipe.md` §3.9), or a
+Krea2-specific fine-tune such as `krea2RealVae_v10.safetensors`. Krea 2 only;
+any other family refuses the field outright (400, naming the field and the
+family) rather than silently ignoring it.
+
+**Precedence, the same three-source shape LoRAs use (`RequestStackResolver`,
+above), collapsed onto one field since a VAE is a single file, not a stack:**
+
+| # | Source | When it wins |
+|---|---|---|
+| 1 | the request's own `vae` | whenever the key is present |
+| 2 | the named `preset`'s declared `vae` | when the request sent no `vae` and the preset was expandable (#286's `PresetLoRAStack`) |
+| 3 | the model directory's own VAE | `model_index.json`'s `"vae_file"`, else `vae/diffusion_pytorch_model.safetensors` — the no-regression default |
+
+```json
+{"prompt": "…", "vae": "~/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"}
+```
+
+`vae` is a path (tilde allowed). **A named file that does not exist FAILS the
+render** — there is no fallback to the model directory's VAE; a bad name is a
+bad request, not "use the default". The layout (Qwen-Image `diffusers` vs Wan
+2.1 native module names) is sniffed from the file's own tensor keys, never
+from its filename, and an unrecognised layout is the same kind of hard
+failure. A file that is short a parameter the module needs (a truncated
+download, or a genuinely different architecture) is refused before any
+weight is written — never a decoder left half-swapped.
+
+**The decoder is swapped IN PLACE, never pool-keyed.** A resident Krea 2
+pipeline is ~22.5 GB against a 40 GB pool budget; keying the ~500 MB VAE into
+the pool would turn every VAE change into a full pipeline evict+reload
+(measured ~67 s) for a decoder swap that itself takes a fraction of a second.
+Instead the one resident `Krea2VAE` instance reloads its weights in place —
+the same object serves both encode and decode before and after, so an
+img2img request can never have its encoder and decoder disagree — and a
+reload counter tracks how often it actually happened.
+
+**The response always says what decoded**, in the `applied` recipe echo
+(both the sync `/v1/generate` response and `/health`'s `last_recipe`):
+
+```json
+{"applied": {"vae": "/Users/todd/LocalModels/vae/Wan2_1_VAE_fp32.safetensors",
+             "vae_layout": "wanNative", "vae_source": "preset"}}
+```
+
+`vae_source` is `"payload"`, `"preset"` or `"model_dir"` — never guessed, and
+never `"preset"` unless the render actually took the preset's declared value
+(a request `vae` always wins, even against a preset that also declares one).
+A crash-recovery replay of a persisted job carries its accepted `vae` as an
+explicit request field (the same #286-era rewrite `model`/`loras`/`steps`
+already go through), so a replay reports `vae_source: "payload"` even for an
+originally preset-sourced render — the price of replaying a frozen body
+instead of re-resolving a preset that may have changed since.
+
 ## Gallery output filenames
 
 Default render filenames (no `output_path` in the request) are built by
