@@ -2693,8 +2693,10 @@ struct ZImageCLI {
     // starts before the engine must keep serving — exiting here would make
     // the MCP host mark it dead until someone manually restarts it. Every
     // tool call made before the engine comes up fails with this same
-    // message (MCPToolExecutor maps WarmServerClientError.connectionRefused
-    // to it), so the client sees one consistent, actionable error either way.
+    // message (MCPToolExecutor maps every WarmServerClientError meaning
+    // "unreachable" — refused outright, or timed out mid-boot,
+    // comfybox#389 — to it), so the client sees one consistent, actionable
+    // error either way.
     let portOccupied = MCPPortProbe.isOccupied(host: host, port: port)
     let decision = MCPBridgeStartupPolicy.decide(host: host, port: port, portOccupied: portOccupied)
 
@@ -2746,45 +2748,11 @@ struct ZImageCLI {
   }
 
   private static func printMCPUsage() {
-    print("""
-    Start MCP (Model Context Protocol) server mode.
-    Bridges stdio JSON-RPC 2.0 to WarmServer HTTP API.
-
-    Usage: ComfyBox mcp [options]
-      --port                    WarmServer port to connect to (default: 7870)
-      --host                    WarmServer host to connect to (default: 127.0.0.1)
-      --help, -h                Show help
-
-    The MCP server reads JSON-RPC requests from stdin and writes responses
-    to stdout. All logging goes to stderr. Runs until stdin closes.
-
-    This bridge NEVER starts a server (comfybox#153): launchd
-    (com.barkadabrew.comfybox) owns the engine lifecycle. If a server is
-    already listening on --port, healthy or not, the bridge connects to it.
-    If nothing is listening, the bridge does NOT exit — launchd's
-    RunAtLoad and the MCP host commonly race at login, so a bridge that
-    starts before the engine must keep serving. It prints one warning to
-    stderr (naming --port and the launchctl command below) and starts
-    anyway; every tool call fails with that same message until the engine
-    answers. Start the managed engine with:
-      launchctl kickstart -k gui/$(id -u)/com.barkadabrew.comfybox
-
-    Registration:
-      claude mcp add comfybox -- comfybox mcp --port 7870
-
-    Tools:
-      generate_image    Text-to-image / img2img generation
-      swap_loras        Hot-swap active LoRA weights
-      list_models       List supported model families
-      list_styles       List style presets
-      server_health     Server health and loaded model info
-      queue_status      Generation queue status
-      clear_queue       Cancel pending generation jobs
-      list_loras        List available LoRA files
-      shutdown_server   Graceful server shutdown
-      system_stats      Hardware and system info
-      apply_style       Apply style preset to prompt
-    """)
+    // comfybox#389: the text (including the kickstart command) lives in
+    // MCPBridgeStartupPolicy.mcpHelpText() — it used to be hand-duplicated
+    // here with that command spelled out literally, which could silently
+    // drift from launchctlKickstartCommand().
+    print(MCPBridgeStartupPolicy.mcpHelpText())
   }
 
 

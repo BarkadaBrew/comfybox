@@ -154,11 +154,28 @@ public final class WarmServerClient: WarmServerTransport, @unchecked Sendable {
       return (data, httpResponse)
     } catch let error as URLError where error.code == .cannotConnectToHost || error.code == .networkConnectionLost {
       throw WarmServerClientError.connectionRefused(host: host, port: port)
+    } catch let error as URLError
+      where error.code == .timedOut || (error.code == .cannotFindHost && Self.isLoopbackHost(host))
+    {
+      // comfybox#389: a mid-boot engine (socket accepting, slow to answer
+      // /health) throws `.timedOut`; a transient DNS blip resolving
+      // localhost throws `.cannotFindHost`. Both mean "the engine is not
+      // answering yet" — the same actionable situation as
+      // `.connectionRefused` above — but kept as a DISTINCT case rather
+      // than folded into it, because `.connectionRefused`'s meaning must
+      // not change for other consumers (ComfyBoxDesktop, the Telegram
+      // bot). `MCPBridgeStartupPolicy.nothingListeningMessage(for:)`
+      // classifies both cases and gives each its own hint wording.
+      throw WarmServerClientError.timedOut(host: host, port: port)
     } catch let error as WarmServerClientError {
       throw error
     } catch {
       throw WarmServerClientError.networkError(error.localizedDescription)
     }
+  }
+
+  private static func isLoopbackHost(_ host: String) -> Bool {
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
   }
 }
 
@@ -168,6 +185,14 @@ public enum WarmServerClientError: Error, LocalizedError {
   case invalidURL(String)
   case invalidResponse
   case connectionRefused(host: String, port: UInt16)
+  /// The port answered (or DNS resolved) but no response came back in
+  /// time — a mid-boot engine, or a transient localhost DNS blip
+  /// (comfybox#389). Kept distinct from `.connectionRefused`: that case's
+  /// meaning must not change for other consumers (ComfyBoxDesktop, the
+  /// Telegram bot), so timeouts get their own case rather than being
+  /// folded into it. `MCPBridgeStartupPolicy.nothingListeningMessage(for:)`
+  /// treats both as "engine unreachable" with distinct hint wording.
+  case timedOut(host: String, port: UInt16)
   case networkError(String)
 
   public var errorDescription: String? {
@@ -178,6 +203,8 @@ public enum WarmServerClientError: Error, LocalizedError {
       return "Invalid HTTP response"
     case .connectionRefused(let host, let port):
       return "WarmServer not running at \(host):\(port)"
+    case .timedOut(let host, let port):
+      return "WarmServer at \(host):\(port) did not respond in time"
     case .networkError(let message):
       return "Network error: \(message)"
     }
