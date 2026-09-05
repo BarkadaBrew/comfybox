@@ -9,7 +9,12 @@
 // trashes the bundle directory outright (it's a plain folder on disk, not a
 // DAMStore-tracked asset). Export as Zip (T12) shells `ditto` via
 // ArchiveStore.exportAsZip — destination chosen with an NSSavePanel on
-// the main actor, the Process work off it.
+// the main actor, the Process work off it. Compress (#223 (b)) also shells
+// `ditto`, but IN PLACE and atomically (`.part` then rename, never deleting
+// the directory bundle until the zip is reopened and verified readable) —
+// the resulting `<name>.cbarchive.zip` is picked back up by
+// `ArchiveStore.scan()` as a `Summary.isCompressed` row with Restore/Export/
+// Compress-again withheld (decompress-then-restore is a follow-up).
 
 import SwiftUI
 import AppKit
@@ -42,6 +47,22 @@ struct ArchiveBrowserView: View {
 
     @State private var exportingBundleIds: Set<String> = []
     @State private var exportSummary: String?
+
+    @State private var compressingBundleIds: Set<String> = []
+    @State private var compressSummary: String?
+
+    /// Bundles `GalleryArchiver.restore` is CURRENTLY reading/writing,
+    /// tracked per-bundle by `bundlePath` (the same string `Summary.id` is)
+    /// — see `runRestore`. Distinct from `archiver.isRunning`, which is
+    /// true for the whole app the instant ANY restore or archive is in
+    /// flight, anywhere.
+    @State private var restoringBundleIds: Set<String> = []
+
+    /// Bundles CURRENTLY being deleted — see `deleteBundle`. Round-1
+    /// re-review: Compress must not race a Delete on the SAME bundle any
+    /// more than Delete may race a Compress on it (which `deleteAllowed`
+    /// already guarded); `compressAllowed` checks this set, symmetrically.
+    @State private var deletingBundleIds: Set<String> = []
 
     var body: some View {
         HStack(spacing: 0) {
@@ -152,6 +173,17 @@ struct ArchiveBrowserView: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }
+            if bundle.isCompressed {
+                if bundle.compressionCleanupPending {
+                    Label("Compressed — cleanup pending", systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                } else {
+                    Label("Compressed", systemImage: "doc.zipper")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .padding(.vertical, 2)
         .contextMenu {
@@ -163,13 +195,32 @@ struct ArchiveBrowserView: View {
                 selectBundle(bundle)
                 restoreAll(bundle)
             }
-            .disabled(bundle.isIncomplete)
+            .disabled(bundle.isIncomplete || bundle.isCompressed)
             Button("Reveal in Finder") { revealInFinder(bundle) }
             Button("Export as Zip…") { exportAsZip(bundle) }
-                .disabled(exportingBundleIds.contains(bundle.id))
+                .disabled(exportingBundleIds.contains(bundle.id) || bundle.isCompressed)
+            // Label reads "Finish Compressing" for the recoverable orphan-pair
+            // case (verified zip + leftover directory from a prior removal
+            // failure) — same action (`compress(_:)`), which re-enters
+            // through the idempotent `finishPendingCleanup` path for it.
+            Button(bundle.compressionCleanupPending ? "Finish Compressing" : "Compress") {
+                selectedBundleId = bundle.id
+                selectBundle(bundle)
+                compress(bundle)
+            }
+            .disabled(!Self.compressAllowed(
+                isIncomplete: bundle.isIncomplete, isCompressed: bundle.isCompressed,
+                compressionCleanupPending: bundle.compressionCleanupPending,
+                isCompressingThisBundle: compressingBundleIds.contains(bundle.id),
+                isRestoringThisBundle: restoringBundleIds.contains(bundle.id),
+                isDeletingThisBundle: deletingBundleIds.contains(bundle.id)
+            ))
             Divider()
             Button("Delete Archive…", role: .destructive) { requestDeleteBundle(bundle) }
-                .disabled(archiver.isRunning)
+                .disabled(!Self.deleteAllowed(
+                    isCompressingThisBundle: compressingBundleIds.contains(bundle.id),
+                    archiverIsRunning: archiver.isRunning
+                ))
         }
     }
 
@@ -204,10 +255,18 @@ struct ArchiveBrowserView: View {
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 10)
                         .padding(.top, 6)
+                } else if let compressSummary {
+                    Text(compressSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.top, 6)
                 }
 
                 if bundle.isIncomplete {
                     incompleteNotice
+                } else if bundle.isCompressed {
+                    compressedNotice
                 } else if isLoadingEntries && entries.isEmpty {
                     VStack(spacing: 12) {
                         ProgressView()
@@ -241,9 +300,9 @@ struct ArchiveBrowserView: View {
             }
 
             Button("Restore Selected") { restoreSelected(bundle) }
-                .disabled(selectedAssetIds.isEmpty || archiver.isRunning || bundle.isIncomplete)
+                .disabled(selectedAssetIds.isEmpty || archiver.isRunning || bundle.isIncomplete || bundle.isCompressed)
             Button("Restore All") { restoreAll(bundle) }
-                .disabled(archiver.isRunning || bundle.isIncomplete)
+                .disabled(archiver.isRunning || bundle.isIncomplete || bundle.isCompressed)
         }
         .font(.callout)
     }
@@ -290,6 +349,23 @@ struct ArchiveBrowserView: View {
             Text("Its assets were never removed from the gallery. Delete this bundle to discard it.")
                 .font(.body)
                 .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var compressedNotice: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.zipper")
+                .font(.system(size: 40))
+                .foregroundStyle(.secondary)
+            Text("This archive is compressed")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            Text("Its assets aren't browsable here while compressed. Reveal it in Finder to decompress it by hand, or delete it to discard it for good.")
+                .font(.body)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -365,8 +441,12 @@ struct ArchiveBrowserView: View {
         selectedAssetIds = []
         restoreSummary = nil
         exportSummary = nil
+        compressSummary = nil
         errorMessage = nil
-        guard !bundle.isIncomplete else { return }
+        // A compressed row's bundlePath is the `.zip` FILE, not a directory —
+        // there's no `entries.jsonl` sitting next to it to page through (its
+        // own copy lives inside the zip; see `compressedNotice`).
+        guard !bundle.isIncomplete, !bundle.isCompressed else { return }
         Task { await loadNextPage() }
     }
 
@@ -446,6 +526,12 @@ struct ArchiveBrowserView: View {
         restoreSummary = nil
         errorMessage = nil
         restoreProgress = (0, max(total, 1))
+        // Tracked per-bundle (by bundlePath, the same string `Summary.id`
+        // is) so Compress on a DIFFERENT row isn't blocked by a restore
+        // running elsewhere — only the bundle actually being read/written
+        // right now disables Compress (review round 2, replacing the old
+        // blanket `archiver.isRunning` check on every row).
+        restoringBundleIds.insert(bundlePath)
         let request = GalleryArchiver.RestoreRequest(
             bundlePath: bundlePath,
             assetIds: assetIds,
@@ -465,6 +551,7 @@ struct ArchiveBrowserView: View {
                 restoreProgress = nil
                 errorMessage = "Restore failed: \(error.localizedDescription)"
             }
+            restoringBundleIds.remove(bundlePath)
         }
     }
 
@@ -507,6 +594,100 @@ struct ArchiveBrowserView: View {
         }
     }
 
+    // MARK: - Compress (#223 (b))
+
+    /// Re-checks eligibility at the mutation point (not just whichever menu
+    /// item happened to be disabled) — the same discipline `deleteBundle`
+    /// already applies against a racing archive/restore. Keyed to
+    /// `restoringBundleIds` (per-bundle), not `archiver.isRunning` (global) —
+    /// a restore against a DIFFERENT bundle must not block this one.
+    private func compress(_ bundle: ArchiveStore.Summary) {
+        guard Self.compressAllowed(
+            isIncomplete: bundle.isIncomplete, isCompressed: bundle.isCompressed,
+            compressionCleanupPending: bundle.compressionCleanupPending,
+            isCompressingThisBundle: compressingBundleIds.contains(bundle.id),
+            isRestoringThisBundle: restoringBundleIds.contains(bundle.id),
+            isDeletingThisBundle: deletingBundleIds.contains(bundle.id)
+        ) else { return }
+        compressSummary = nil
+        errorMessage = nil
+        compressingBundleIds.insert(bundle.id)
+        Task {
+            do {
+                let result = try await archives.compress(bundle)
+                compressSummary = Self.compressSummaryLine(result)
+                if selectedBundle?.id == bundle.id {
+                    entries = []
+                    hasMoreEntries = false
+                }
+                await archives.reload()
+            } catch {
+                errorMessage = "Compress failed: \(error.localizedDescription)"
+            }
+            compressingBundleIds.remove(bundle.id)
+        }
+    }
+
+    /// "Compressed to N MB (was M MB)" — pure so it's directly unit-testable.
+    static func compressSummaryLine(_ result: ArchiveStore.CompressResult) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useGB, .useMB, .useKB, .useBytes]
+        let compressed = formatter.string(fromByteCount: result.compressedBytes)
+        let original = formatter.string(fromByteCount: result.originalBytes)
+        return "Compressed to \(compressed) (was \(original))"
+    }
+
+    // MARK: - Per-bundle race guards (review round 2)
+    //
+    // Compress and Delete Archive… both mutate the SAME bundle's files on
+    // disk, so each must be refused while the other (or a restore) is
+    // touching that specific bundle. Pure and directly unit-testable —
+    // there is no ViewInspector in this repo.
+
+    /// Whether "Compress" may run for `bundle` right now. Deliberately
+    /// keyed to `isRestoringThisBundle` — a per-bundle flag the view tracks
+    /// itself (`restoringBundleIds`) — rather than the OLD blanket
+    /// `archiver.isRunning` check, which disabled Compress on every row in
+    /// the browser the instant any restore anywhere was in flight. A
+    /// restore reading/writing bundle A must not block compressing bundle B.
+    ///
+    /// `compressionCleanupPending` is the one case where `isCompressed` does
+    /// NOT mean "already done, nothing to do" — the orphan-pair row (#223 (b)
+    /// review round 2: a verified rename whose directory removal then
+    /// failed) is still eligible, so Compress re-enters as an idempotent
+    /// finish rather than being refused.
+    ///
+    /// `isDeletingThisBundle` (round-1 re-review) is the symmetric
+    /// counterpart to `deleteAllowed`'s `isCompressingThisBundle`: Delete
+    /// removes the bundle's directory outright, so a Compress starting
+    /// mid-delete would either `ditto` a directory being trashed out from
+    /// under it or race the traversal-guard read against files that are
+    /// disappearing — refused here for the same reason Delete refuses a
+    /// concurrent Compress.
+    static func compressAllowed(
+        isIncomplete: Bool, isCompressed: Bool, compressionCleanupPending: Bool,
+        isCompressingThisBundle: Bool, isRestoringThisBundle: Bool, isDeletingThisBundle: Bool
+    ) -> Bool {
+        let alreadyDoneAndClean = isCompressed && !compressionCleanupPending
+        return !isIncomplete && !alreadyDoneAndClean
+            && !isCompressingThisBundle && !isRestoringThisBundle && !isDeletingThisBundle
+    }
+
+    /// Whether "Delete Archive…" may run for `bundle` right now. Delete
+    /// removes the bundle's files outright — it must never race a Compress
+    /// that is mid-`ditto`/mid-verify on the SAME bundle, or it could yank
+    /// the source directory out from under it. `archiver.isRunning` is kept
+    /// too (unchanged behavior: a restore anywhere still blocks every
+    /// delete) — only `isCompressingThisBundle` is new. (Delete does not
+    /// need its own `isDeletingThisBundle` check — a second delete on a
+    /// bundle already mid-delete is a no-op race at worst, not a
+    /// destructive one, and the confirmation dialog itself already prevents
+    /// a double-click from issuing two delete Tasks for the same row.)
+    static func deleteAllowed(isCompressingThisBundle: Bool, archiverIsRunning: Bool) -> Bool {
+        !isCompressingThisBundle && !archiverIsRunning
+    }
+
     // MARK: - Reveal / delete bundle
 
     private func revealInFinder(_ bundle: ArchiveStore.Summary) {
@@ -524,14 +705,24 @@ struct ArchiveBrowserView: View {
 
     private func deleteBundle(_ bundle: ArchiveStore.Summary) async {
         // Re-check at the mutation point, not just when the menu item was
-        // shown — an archive/restore operation could have started between
+        // shown — an archive/restore/compress could have started between
         // the click and the confirm dialog's "Move to Trash" tap. Deleting
         // the bundle out from under an in-flight restore (reading
-        // entries.jsonl, copying thumbnails) would fail it mid-flight.
-        guard !archiver.isRunning else {
+        // entries.jsonl, copying thumbnails) or a Compress mid-`ditto`/
+        // mid-verify on this SAME bundle would fail it mid-flight.
+        guard Self.deleteAllowed(
+            isCompressingThisBundle: compressingBundleIds.contains(bundle.id),
+            archiverIsRunning: archiver.isRunning
+        ) else {
             errorMessage = Self.archiveInProgressMessage
             return
         }
+        // Tracked per-bundle for the same reason compressingBundleIds/
+        // restoringBundleIds are: compressAllowed checks this set so a
+        // Compress on THIS bundle can't start while a Delete is mid-flight
+        // on it.
+        deletingBundleIds.insert(bundle.id)
+        defer { deletingBundleIds.remove(bundle.id) }
         let path = bundle.bundlePath
         let success = await Task.detached(priority: .utility) {
             Self.trashOrRemoveBundle(atPath: path)

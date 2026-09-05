@@ -114,4 +114,29 @@ final class AssetMediaSourceTests: XCTestCase {
         XCTAssertTrue(RemoteMediaCache.directory.path.hasPrefix(FileManager.default.temporaryDirectory.path),
                       "this is a cache; keeping a file is what “Save to this Mac” is for")
     }
+
+    // MARK: - FetchError classification (#223 (a))
+
+    /// 401 and 403 are BOTH "the session/credential this request carried is
+    /// no good" from the caller's point of view — neither should ever render
+    /// as a raw status number in the browse view.
+    func testClassifyMapsAuthCodesToUnauthorized() {
+        XCTAssertEqual(RemoteMediaCache.FetchError.classify(statusCode: 401), .unauthorized)
+        XCTAssertEqual(RemoteMediaCache.FetchError.classify(statusCode: 403), .unauthorized)
+    }
+
+    func testClassifyMapsNotFoundAndFallsThroughToServerForEverythingElse() {
+        XCTAssertEqual(RemoteMediaCache.FetchError.classify(statusCode: 404), .notFound)
+        XCTAssertEqual(RemoteMediaCache.FetchError.classify(statusCode: 500), .server(500))
+        XCTAssertEqual(RemoteMediaCache.FetchError.classify(statusCode: 400), .server(400))
+    }
+
+    func testFetchErrorDescriptionsNeverLeakARawStatusCodeAlone() {
+        // Every description is a sentence, not a bare number — "Server
+        // returned 401" (the bug this exists to fix) is the one shape these
+        // must never take again.
+        XCTAssertFalse((RemoteMediaCache.FetchError.unauthorized.errorDescription ?? "").isEmpty)
+        XCTAssertNotEqual(RemoteMediaCache.FetchError.unauthorized.errorDescription, "401")
+        XCTAssertNotEqual(RemoteMediaCache.FetchError.server(401).errorDescription, "Server returned 401")
+    }
 }

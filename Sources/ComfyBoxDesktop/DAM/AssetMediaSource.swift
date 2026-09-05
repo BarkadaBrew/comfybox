@@ -119,6 +119,42 @@ public enum RemoteMediaCache {
         return directory.appendingPathComponent(name)
     }
 
+    /// A remote fetch failure, classified — never a raw HTTP status number
+    /// surfaced to the browse view (#223 (a)).
+    ///
+    /// `.unauthorized` (401/403) is NOT currently reachable through this
+    /// call path: `/v1/gallery/file` (the only route a remote fetch here
+    /// ever hits) carries no auth and can only 400 on a disallowed path.
+    /// It's kept — rather than merged into `.server` — because it IS a
+    /// real, documented status in HTTP and the one other real 401/403 in
+    /// this codebase (the catalog service's realm lock on :7871) could
+    /// plausibly sit behind a future auth-bearing gallery route; when that
+    /// day comes, this already renders a clean sentence instead of a bare
+    /// code, with no caller-side change needed.
+    public enum FetchError: Error, LocalizedError, Equatable {
+        case unauthorized
+        case notFound
+        case server(Int)
+
+        /// Classifies an HTTP status code. A pure, directly unit-testable
+        /// mapping.
+        public static func classify(statusCode: Int) -> FetchError {
+            switch statusCode {
+            case 401, 403: return .unauthorized
+            case 404: return .notFound
+            default: return .server(statusCode)
+            }
+        }
+
+        public var errorDescription: String? {
+            switch self {
+            case .unauthorized: return "Not authorized by the server."
+            case .notFound: return "The server no longer has this file."
+            case .server(let code): return "The server couldn't provide this file (code \(code))."
+            }
+        }
+    }
+
     /// Fetch `remote` into the cache (or reuse the copy already there).
     public static func localCopy(of remote: URL, filename: String) async throws -> URL {
         let dir = directory
@@ -129,9 +165,7 @@ public enum RemoteMediaCache {
         let (tmp, response) = try await URLSession.shared.download(from: remote)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             try? fm.removeItem(at: tmp)
-            throw NSError(domain: "RemoteMediaCache", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "Server returned \(http.statusCode)"
-            ])
+            throw FetchError.classify(statusCode: http.statusCode)
         }
         // Another view may have won the race while this download ran.
         if fm.fileExists(atPath: dest.path) {

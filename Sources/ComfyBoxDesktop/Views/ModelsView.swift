@@ -85,9 +85,7 @@ struct ModelsView: View {
     // MARK: - Import LoRA… (spec 2026-08-10)
 
     /// The /v1/loras/import route copies from a path on the ENGINE's disk.
-    private var engineIsLocal: Bool {
-        ["127.0.0.1", "localhost", "::1"].contains(engine.serverHost)
-    }
+    private var engineIsLocal: Bool { engine.isLocalHost }
 
     private func pickLorasToImport() {
         let panel = NSOpenPanel()

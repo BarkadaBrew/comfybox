@@ -90,6 +90,24 @@ struct EngineServiceTests {
         let engine = EngineService()
         #expect(engine.queueInfo == nil)
     }
+
+    // MARK: - isLocalHost (#223 (c): Archive Gallery is local-server-only)
+
+    @Test("a freshly constructed EngineService (default 127.0.0.1) reports isLocalHost true")
+    func defaultEngineIsLocal() {
+        let engine = EngineService()
+        engine.serverHost = "127.0.0.1"
+        #expect(engine.isLocalHost)
+    }
+
+    @Test("EngineService.isLocalHost tracks serverHost changes")
+    func isLocalHostTracksServerHostChanges() {
+        let engine = EngineService()
+        engine.serverHost = "127.0.0.1"
+        #expect(engine.isLocalHost)
+        engine.serverHost = "10.0.100.232"
+        #expect(!engine.isLocalHost)
+    }
 }
 
 @Suite("Server response decoding")
@@ -449,5 +467,112 @@ struct QueueInfoTests {
         )
         #expect(info.currentJobId == "job-1")
         #expect(info.progressPercent == 42.0)
+    }
+}
+
+// MARK: - isLocalHost (#223 (c): Archive Gallery is local-server-only)
+//
+// The static check is pure — needs no MainActor and no EngineService
+// instance — so it stands alone here rather than inside the `@MainActor`
+// `EngineServiceTests` suite above (which also carries the two
+// instance-level `isLocalHost` tests, since those construct an
+// `EngineService` and do need that isolation).
+
+@Suite("EngineService.isLocalHost")
+struct EngineServiceIsLocalHostTests {
+    // `interfaceAddresses: []` is passed explicitly everywhere below —
+    // deterministic, independent of whatever real interfaces the machine
+    // running this test happens to have (never the live `getifaddrs()`
+    // default), per review round 2.
+
+    @Test("recognizes every loopback spelling this Mac actually reports")
+    func recognizesLoopback() {
+        #expect(EngineService.isLocalHost("127.0.0.1", interfaceAddresses: []))
+        #expect(EngineService.isLocalHost("localhost", interfaceAddresses: []))
+        #expect(EngineService.isLocalHost("::1", interfaceAddresses: []))
+    }
+
+    @Test("treats a host that is neither loopback nor a known interface address as remote")
+    func treatsOtherHostsAsRemote() {
+        #expect(!EngineService.isLocalHost("10.0.100.232", interfaceAddresses: []))
+        #expect(!EngineService.isLocalHost("192.168.1.50", interfaceAddresses: []))
+        #expect(!EngineService.isLocalHost("comfybox.local", interfaceAddresses: []))
+        #expect(!EngineService.isLocalHost("", interfaceAddresses: []))
+    }
+
+    // MARK: - This Mac's own interface addresses (#223 (c) review round 2)
+
+    @Test("a host matching an injected interface address is local — a LAN IP of this same Mac")
+    func matchesInjectedLANAddress() {
+        let interfaces = ["10.0.100.232", "192.168.1.14"]
+        #expect(EngineService.isLocalHost("10.0.100.232", interfaceAddresses: interfaces))
+        #expect(EngineService.isLocalHost("192.168.1.14", interfaceAddresses: interfaces))
+    }
+
+    @Test("a Tailscale-shaped address matches too — it's just another interface address")
+    func matchesInjectedTailscaleAddress() {
+        #expect(EngineService.isLocalHost("100.101.102.103", interfaceAddresses: ["100.101.102.103"]))
+    }
+
+    @Test("a host absent from the injected interface list stays remote")
+    func hostNotInInjectedListStaysRemote() {
+        #expect(!EngineService.isLocalHost("10.0.100.232", interfaceAddresses: ["192.168.1.14"]))
+    }
+
+    @Test("loopback spellings are recognized regardless of what interface list is injected")
+    func loopbackWinsRegardlessOfInterfaceList() {
+        #expect(EngineService.isLocalHost("127.0.0.1", interfaceAddresses: ["192.168.1.14"]))
+    }
+
+    @Test("currentInterfaceAddresses never includes a loopback address")
+    func currentInterfaceAddressesExcludesLoopback() {
+        let addresses = EngineService.currentInterfaceAddresses()
+        #expect(!addresses.contains("127.0.0.1"))
+        #expect(!addresses.contains("::1"))
+    }
+
+    @Test("currentInterfaceAddresses never includes a link-local address either")
+    func currentInterfaceAddressesExcludesLinkLocal() {
+        // Can't force a link-local interface to exist on the test machine —
+        // this just confirms none of whatever IS real ever slips through.
+        // isLinkLocalAddress (below) is where the actual filtering logic
+        // is pinned with injected addresses.
+        let addresses = EngineService.currentInterfaceAddresses()
+        #expect(!addresses.contains { EngineService.isLinkLocalAddress($0) })
+    }
+
+    // MARK: - isLinkLocalAddress (round-1 re-review)
+
+    @Test("isLinkLocalAddress recognizes the whole IPv4 169.254.0.0/16 block")
+    func recognizesIPv4LinkLocal() {
+        #expect(EngineService.isLinkLocalAddress("169.254.0.1"))
+        #expect(EngineService.isLinkLocalAddress("169.254.255.254"))
+        #expect(EngineService.isLinkLocalAddress("169.254.1.5"))
+    }
+
+    @Test("isLinkLocalAddress does not flag an ordinary LAN or Tailscale IPv4 address")
+    func doesNotFlagOrdinaryIPv4() {
+        #expect(!EngineService.isLinkLocalAddress("10.0.100.232"))
+        #expect(!EngineService.isLinkLocalAddress("192.168.1.14"))
+        #expect(!EngineService.isLinkLocalAddress("100.101.102.103"))
+        #expect(!EngineService.isLinkLocalAddress("169.253.1.1"), "one below the block — must not be flagged")
+        #expect(!EngineService.isLinkLocalAddress("169.255.1.1"), "one above the block — must not be flagged")
+    }
+
+    @Test("isLinkLocalAddress recognizes fe80::/10, including with a zone index appended")
+    func recognizesIPv6LinkLocal() {
+        #expect(EngineService.isLinkLocalAddress("fe80::1"))
+        #expect(EngineService.isLinkLocalAddress("fe80::abcd:1234:5678:9abc"))
+        #expect(EngineService.isLinkLocalAddress("FE80::1"), "case-insensitive")
+        #expect(EngineService.isLinkLocalAddress("fe80::1%en0"), "zone index stripped before checking")
+        #expect(EngineService.isLinkLocalAddress("febf::1"), "top of the /10 range")
+    }
+
+    @Test("isLinkLocalAddress does not flag an ordinary IPv6 address, even one starting with fe")
+    func doesNotFlagOrdinaryIPv6() {
+        #expect(!EngineService.isLinkLocalAddress("fec0::1"), "one above the /10 range")
+        #expect(!EngineService.isLinkLocalAddress("fe70::1"), "one below the /10 range")
+        #expect(!EngineService.isLinkLocalAddress("::1"), "loopback, not link-local")
+        #expect(!EngineService.isLinkLocalAddress("2001:db8::1"), "an ordinary global-unicast address")
     }
 }

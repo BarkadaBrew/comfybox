@@ -232,3 +232,71 @@ struct GalleryViewPruneSweepWarningTests {
         #expect(warning.contains("Orphan cleanup skipped"))
     }
 }
+
+// MARK: - remoteLoadOutcome (#223 (a): optimistic client-side password lock)
+//
+// Review round 2: the earlier version of this function also decided whether
+// to re-lock AppContentGate on `.unauthorized`. That's removed — every
+// remote read here resolves to the engine's unauthenticated
+// `/v1/gallery/file`, so a 401/403 is not actually reachable through this
+// path, and re-locking the LOCAL content gate in response to the CATALOG
+// service's realm lock (:7871, a route this view never calls) would have
+// been the wrong prompt. What's left, and still worth pinning: no raw HTTP
+// status code ever reaches the message shown to the user.
+
+@Suite("GalleryView.remoteLoadOutcome")
+struct GalleryViewRemoteLoadOutcomeTests {
+    @Test("an unauthorized remote fetch never shows a raw status code")
+    func unauthorizedIsFriendly() {
+        let message = GalleryView.remoteLoadOutcome(for: RemoteMediaCache.FetchError.unauthorized)
+        #expect(!message.contains("401"))
+        #expect(!message.isEmpty)
+        #expect(message == "Not authorized by the server.")
+    }
+
+    @Test("a 403 (classified the same as 401) is shown the same friendly way")
+    func forbiddenIsFriendlyToo() {
+        let message = GalleryView.remoteLoadOutcome(
+            for: RemoteMediaCache.FetchError.classify(statusCode: 403)
+        )
+        #expect(message == "Not authorized by the server.")
+    }
+
+    @Test("a not-found or generic server failure is shown, never as a bare code")
+    func nonAuthFailuresAreFriendlyToo() {
+        let notFound = GalleryView.remoteLoadOutcome(for: RemoteMediaCache.FetchError.notFound)
+        #expect(!notFound.isEmpty)
+
+        let serverError = GalleryView.remoteLoadOutcome(for: RemoteMediaCache.FetchError.server(500))
+        #expect(serverError != "500", "the 500 rendered as part of a sentence, not a bare code")
+    }
+
+    @Test("a non-FetchError (e.g. a network failure) is shown via its own description")
+    func genericErrorUsesItsOwnDescription() {
+        struct OtherError: LocalizedError {
+            var errorDescription: String? { "The Internet connection appears to be offline." }
+        }
+        let message = GalleryView.remoteLoadOutcome(for: OtherError())
+        #expect(message == "The Internet connection appears to be offline.")
+    }
+}
+
+// MARK: - archiveAllowed (#223 (c): Archive Gallery is local-server-only)
+
+@Suite("GalleryView.archiveAllowed")
+struct GalleryViewArchiveAllowedTests {
+    @Test("allowed when the connected engine is local")
+    func allowedWhenLocal() {
+        #expect(GalleryView.archiveAllowed(engineIsLocal: true))
+    }
+
+    @Test("refused — not a silent no-op — when the connected engine is remote")
+    func refusedWhenRemote() {
+        #expect(!GalleryView.archiveAllowed(engineIsLocal: false))
+    }
+
+    @Test("no EngineService attached (previews, tests) defaults to allowed")
+    func defaultsToAllowedWithNoEngine() {
+        #expect(GalleryView.archiveAllowed(engineIsLocal: nil))
+    }
+}
