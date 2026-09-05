@@ -182,6 +182,9 @@ struct GenerationView: View {
     /// Set when a LoRA swap fails at generate time, so it's visible instead of
     /// silently rendering with no LoRAs.
     @State private var loraSwapWarning: String?
+    /// Debounce for the Cancel button, so a double-tap cannot fire two
+    /// interrupts at the same job.
+    @State private var isCancellingRender = false
     /// SeedVR2 upscale of the render (0 = off, else target long-side px).
     @State private var seedvrUpscale: Int = 0
     @State private var showAssistant: Bool = true
@@ -959,6 +962,12 @@ struct GenerationView: View {
             if let warn = loraSwapWarning {
                 Text(warn).foregroundStyle(.orange)
             }
+            // PR #384 review, item 1: `preset_unresolved` / `preempt_refused`
+            // (and "queued behind N") arrive on the async status body and used
+            // to be parsed and dropped. They are notices, not errors.
+            if let notice = engine.generationNotice {
+                Label(notice, systemImage: "info.circle").foregroundStyle(.secondary)
+            }
         }
         .font(.caption2)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1004,6 +1013,21 @@ struct GenerationView: View {
             .buttonStyle(.borderedProminent)
             .disabled(!canGenerate)
             .keyboardShortcut(.return, modifiers: .command)
+
+            // PR #384 review, item 2a: with generate() on the queue-submit path
+            // the app holds its own job id, so it can stop ITS render (by
+            // `target`, comfybox#362) instead of whatever is active. Local
+            // backend only — a cloud render has no engine job to cancel.
+            if engine.isGenerating, backend == .local {
+                Button(role: .destructive) { cancelGeneration() } label: {
+                    Label("Cancel render", systemImage: "stop.circle")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
+                }
+                .buttonStyle(.bordered)
+                .disabled(engine.activeImageJobId == nil || isCancellingRender)
+                .help("Stop this render on the engine. Other queued jobs continue.")
+            }
 
             // Add to Queue — submits without taking over the preview, so you
             // can queue several variants (e.g. via Seed Walk) back to back.
@@ -1165,6 +1189,26 @@ struct GenerationView: View {
     }
 
     // MARK: - Actions
+
+    /// Stop THIS app's in-flight render. The engine cancels the job we named,
+    /// so other queued work — including Bree's and Kira's — is untouched. The
+    /// generate loop's own poll then sees the job terminate and unwinds.
+    private func cancelGeneration() {
+        guard !isCancellingRender else { return }
+        isCancellingRender = true
+        Task {
+            defer { isCancellingRender = false }
+            do {
+                // A clean stop has no message; `alreadyFinished` / `abandoned`
+                // carry one. The generate loop unwinds as `.cancelled` on its
+                // own, so a cancel the user asked for never paints an error.
+                let result = try await engine.cancelActiveGeneration()
+                if let message = result.message { engine.setGenerationNotice(message) }
+            } catch {
+                engine.lastError = "Cancel failed: \(error.localizedDescription)"
+            }
+        }
+    }
 
     private func submitGeneration() {
         if let error = samplingValidationError {
@@ -1346,7 +1390,14 @@ struct GenerationView: View {
                 batchPaths.append(finalPath)
                 onGenerated?(finalPath, req)
             } catch {
-                await MainActor.run { engine.lastError = error.localizedDescription }
+                // PR #384 review r3, item 1: a cancel the user asked for must
+                // not paint the error banner. `failureReport` is the pure rule
+                // (unit-tested); everything that is not a cancel still reports.
+                let report = EngineService.failureReport(for: error)
+                await MainActor.run {
+                    if let banner = report.banner { engine.lastError = banner }
+                    if let notice = report.notice { engine.setGenerationNotice(notice) }
+                }
                 break
             }
         }

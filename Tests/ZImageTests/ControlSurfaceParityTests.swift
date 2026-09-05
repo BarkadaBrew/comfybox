@@ -39,7 +39,14 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// `ControlPlaneClassifier` serves it without an actor hop. That is the
   /// established pattern for actor-free GETs (`/v1/models`, `/v1/stats`,
   /// `/v1/config` … all cost two tuples each); it is not a duplicate arm.
-  private static let expectedWarmServerTuples = 96
+  ///
+  /// comfybox#217 moved it by ONE for NO new route: `GET /health` now also
+  /// appears in the sync control-plane arm (`serveControlPlaneSync`), because
+  /// `ControlPlaneClassifier` serves it without an actor hop or a cooperative
+  /// thread. Same established two-tuples-per-actor-free-GET pattern as
+  /// `/v1/models` and `/v1/model/family`; the ROUTE SET is unchanged, so
+  /// `docs/api-reference.md` is byte-identical.
+  private static let expectedWarmServerTuples = 97
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {

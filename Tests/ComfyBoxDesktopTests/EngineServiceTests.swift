@@ -116,27 +116,6 @@ struct ServerResponseDecodingTests {
     // JSONEncoder.keyEncodingStrategy = .convertToSnakeCase, so client
     // structs must decode snake_case keys.
 
-    @Test("generate response decodes snake_case keys")
-    func generateResponseSnakeCase() throws {
-        let json = Data("""
-            {"success": true, "output_path": "/tmp/out/comfybox-123.png", "duration_ms": 4211}
-            """.utf8)
-        let response = try JSONDecoder().decode(ServerGenerateResponse.self, from: json)
-        #expect(response.success)
-        #expect(response.outputPath == "/tmp/out/comfybox-123.png")
-        #expect(response.durationMs == 4211)
-    }
-
-    @Test("generate response fails without snake_case keys decoded")
-    func generateResponseRejectsMissingKeys() {
-        let json = Data("""
-            {"success": true}
-            """.utf8)
-        #expect(throws: DecodingError.self) {
-            _ = try JSONDecoder().decode(ServerGenerateResponse.self, from: json)
-        }
-    }
-
     @Test("health response decodes snake_case keys including progress telemetry")
     func healthResponseSnakeCase() throws {
         let json = Data("""

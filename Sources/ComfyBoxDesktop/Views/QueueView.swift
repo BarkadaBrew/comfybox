@@ -94,9 +94,19 @@ struct QueueView: View {
                     Text("Rendering").font(.headline)
                     sourceBadge(q.activeSource ?? "api")
                     Spacer()
-                    Button(role: .destructive) { Task { await interrupt() } } label: {
+                    // PR #384 review, item 2b: name the row's own job as the
+                    // interrupt `target` (comfybox#362). Without it, "stop this
+                    // render" stopped whatever happened to be active by the time
+                    // the request landed — which, on a queue shared with Bree and
+                    // Kira, can be someone else's render.
+                    Button(role: .destructive) { Task { await interrupt(q) } } label: {
                         Label("Interrupt", systemImage: "stop.fill")
                     }.controlSize(.small).disabled(busy)
+                        .help(EngineService.interruptTarget(
+                                activeJobId: q.activeJobId, activeSource: q.activeSource,
+                                ourInFlightJobId: engine.activeImageJobId)
+                              .map { "Cancel this render (job \($0.prefix(8)))" }
+                              ?? "Cancel whichever render is active")
                 }
                 Text(q.activeSummary ?? "—").font(.callout).foregroundStyle(.secondary)
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
@@ -215,7 +225,28 @@ struct QueueView: View {
     }
     private func toggle(pause: Bool) async { await run { try await engine.setQueuePaused(pause) } }
     private func clearAll() async { await run { try await engine.clearQueue() } }
-    private func interrupt() async { await run { try await engine.interruptRender() } }
+    /// Stop the active render. Routed through `cancelRender` (PR #384 review r4,
+    /// item 1) rather than calling `interruptRender` directly, so this path gets
+    /// the same 3s bound the Generate tab's Cancel button has — a wedged engine
+    /// would otherwise hold the button on the 300s HTTP timeout — plus the
+    /// dequeued fallback and the honest `CancelResult` wording.
+    private func interrupt(_ q: EngineService.QueueJobList) async {
+        busy = true; error = nil
+        do {
+            // `active_job_id` can be absent; when the queue says the active
+            // render is ours, our own in-flight id is the right target.
+            let target = EngineService.interruptTarget(
+                activeJobId: q.activeJobId, activeSource: q.activeSource,
+                ourInFlightJobId: engine.activeImageJobId)
+            // `interrupted`/`dequeued` are clean stops with nothing to say;
+            // `alreadyFinished` and `abandoned` carry their own wording.
+            error = try await engine.cancelRender(jobId: target).message
+        } catch {
+            self.error = error.localizedDescription
+        }
+        busy = false
+        refreshTick += 1
+    }
     private func cancel(_ job: EngineService.QueueJob) async { await run { try await engine.cancelQueueJob(id: job.id) } }
     private func move(_ job: EngineService.QueueJob, _ dir: String) async { await run { try await engine.moveQueueJob(id: job.id, direction: dir) } }
 }

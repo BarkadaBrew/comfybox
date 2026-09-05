@@ -78,8 +78,20 @@ struct QueuePanel: View {
                     if jobs.isRendering {
                         Button {
                             Task {
-                                do { try await engine.interruptRender(); await reloadJobs() }
-                                catch { actionError = error.localizedDescription }
+                                // PR #384 review r2 item 2b / r4 item 1: target
+                                // the row's own job (comfybox#362) so this cannot
+                                // stop Bree's or Kira's render by racing the
+                                // queue, and route it through `cancelRender` so
+                                // it is BOUNDED (3s) and gets the dequeued
+                                // fallback and the honest result wording.
+                                do {
+                                    let target = EngineService.interruptTarget(
+                                        activeJobId: jobs.activeJobId, activeSource: jobs.activeSource,
+                                        ourInFlightJobId: engine.activeImageJobId)
+                                    let result = try await engine.cancelRender(jobId: target)
+                                    await reloadJobs()
+                                    actionError = result.message
+                                } catch { actionError = error.localizedDescription }
                             }
                         } label: {
                             Label("Interrupt", systemImage: "stop.circle")
@@ -87,7 +99,11 @@ struct QueuePanel: View {
                         }
                         .buttonStyle(.borderless)
                         .foregroundStyle(.orange)
-                        .help("Cancel the in-flight render")
+                        .help(EngineService.interruptTarget(
+                                activeJobId: jobs.activeJobId, activeSource: jobs.activeSource,
+                                ourInFlightJobId: engine.activeImageJobId)
+                              .map { "Cancel this render (job \($0.prefix(8)))" }
+                              ?? "Cancel whichever render is active")
                     }
                     if !jobs.pending.isEmpty {
                         Button {
