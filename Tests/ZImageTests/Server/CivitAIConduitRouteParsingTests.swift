@@ -46,10 +46,13 @@ final class CivitAIConduitRouteParsingTests: XCTestCase {
     XCTAssertEqual(q.validatedBaseURL?.absoluteString, "https://civitai.red")
   }
 
-  func testSearchQueryDecodesPercentEncodedFreeText() {
-    // MCPToolExecutor percent-encodes free-text params (a raw space can't
-    // survive an HTTP request line); the query struct must decode it back.
-    let q = CivitAISearchQuery(queryParameters: ["query": "anime%20girl"])
+  func testSearchQueryPassesAnAlreadyDecodedValueThroughUnchanged() {
+    // comfybox#380: `request.queryParameters` (WarmServer.swift) now
+    // percent-decodes centrally, so by the time this struct sees the dict,
+    // "anime girl" (not "anime%20girl") is what's in it — decoding again
+    // here would risk a double-decode. This struct's job is just to pass
+    // the already-decoded value through.
+    let q = CivitAISearchQuery(queryParameters: ["query": "anime girl"])
     XCTAssertEqual(q.query, "anime girl")
   }
 
@@ -152,8 +155,10 @@ final class CivitAIConduitRouteParsingTests: XCTestCase {
     XCTAssertNil(q.keyword)
   }
 
-  func testRepoQueryDecodesPercentEncodedKeyword() {
-    let q = CivitAIRepoQuery(queryParameters: ["keyword": "anime%20girl"])
+  func testRepoQueryPassesAnAlreadyDecodedKeywordThroughUnchanged() {
+    // comfybox#380: see testSearchQueryPassesAnAlreadyDecodedValueThroughUnchanged —
+    // decoding now happens once, centrally, in `request.queryParameters`.
+    let q = CivitAIRepoQuery(queryParameters: ["keyword": "anime girl"])
     XCTAssertEqual(q.keyword, "anime girl")
   }
 

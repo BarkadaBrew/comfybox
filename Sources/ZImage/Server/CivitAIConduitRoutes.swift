@@ -8,14 +8,18 @@
 // it's a thin wrapper around CivitAIClient.searchModels() + the extraction
 // function below.
 //
-// `request.queryParameters` (HTTPRequest.swift) does not percent-decode
-// values, and HTTP request lines can't carry literal spaces — so query
-// params never spell CivitAI's raw sort/period values ("Most Downloaded")
-// exactly. `CivitAISortPeriodParsing` accepts snake_case/kebab-case/any-case
-// forms instead ("most_downloaded", "Most Downloaded", "MOST-DOWNLOADED", …)
-// and falls back to the default on anything unrecognized — used for both the
-// GET query string and the POST JSON body, so the two routes behave
-// identically.
+// `request.queryParameters` (HTTPRequest.swift) percent-decodes values as of
+// comfybox#380 — but HTTP request lines still can't carry a literal space, so
+// callers must percent-encode it either way, and the decode is now handled
+// once, centrally, before these types ever see the dict (this file no longer
+// decodes on its own — doing so on top of an already-decoded value risked a
+// double-decode). `CivitAISortPeriodParsing` still accepts snake_case/kebab-
+// case/any-case forms instead of CivitAI's raw sort/period values
+// ("most_downloaded", "Most Downloaded", "MOST-DOWNLOADED", …) and falls back
+// to the default on anything unrecognized — used for both the GET query
+// string and the POST JSON body, so the two routes behave identically; this
+// leniency is about the wire format callers choose to send, independent of
+// percent-decoding.
 
 import Foundation
 
@@ -91,16 +95,19 @@ struct CivitAISearchQuery: Equatable {
   var site: String
 
   init(queryParameters params: [String: String]) {
-    query = CivitAIQueryDecoding.decode(params["query"]) ?? ""
-    types = (CivitAIQueryDecoding.decode(params["types"]) ?? "")
+    // comfybox#380: `params` is `request.queryParameters`, already
+    // percent-decoded centrally — do not decode again here (see the file
+    // header comment).
+    query = params["query"] ?? ""
+    types = (params["types"] ?? "")
       .split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    baseModel = Self.nonEmpty(CivitAIQueryDecoding.decode(params["base_model"]))
+    baseModel = Self.nonEmpty(params["base_model"])
     sort = CivitAISortPeriodParsing.parseSort(params["sort"])
     period = CivitAISortPeriodParsing.parsePeriod(params["period"])
     nsfw = (params["nsfw"] ?? "false").lowercased() == "true"
-    cursor = Self.nonEmpty(CivitAIQueryDecoding.decode(params["cursor"]))
+    cursor = Self.nonEmpty(params["cursor"])
     limit = params["limit"].flatMap(Int.init) ?? 24
-    site = Self.nonEmpty(CivitAIQueryDecoding.decode(params["site"])) ?? "civitai.com"
+    site = Self.nonEmpty(params["site"]) ?? "civitai.com"
   }
 
   /// `nil` for any site outside `CivitAIHostAllowlist` — the route returns
@@ -111,21 +118,6 @@ struct CivitAISearchQuery: Equatable {
   private static func nonEmpty(_ s: String?) -> String? {
     guard let s, !s.isEmpty else { return nil }
     return s
-  }
-}
-
-/// `HTTPRequest.queryParameters` (WarmServer.swift) splits the raw query
-/// string on `&`/`=` WITHOUT percent-decoding — fine for the simple
-/// identifiers/paths other routes pass, but civitai_search/civitai_prompts
-/// (MCPToolExecutor.swift) build query strings from free text (e.g. a
-/// multi-word search query) and DO percent-encode them, since an
-/// unencoded space can't survive an HTTP request line at all. Decode here,
-/// at the one place that needs it, rather than changing shared
-/// query-parsing behavior every other route already depends on.
-enum CivitAIQueryDecoding {
-  static func decode(_ raw: String?) -> String? {
-    guard let raw else { return nil }
-    return raw.removingPercentEncoding ?? raw
   }
 }
 
@@ -190,10 +182,12 @@ struct CivitAIRepoQuery: Equatable {
   var limit: Int
 
   init(queryParameters params: [String: String]) {
-    baseModel = Self.nonEmpty(CivitAIQueryDecoding.decode(params["base_model"]))
-    act = Self.nonEmpty(CivitAIQueryDecoding.decode(params["act"]))
-    tag = Self.nonEmpty(CivitAIQueryDecoding.decode(params["tag"]))
-    keyword = Self.nonEmpty(CivitAIQueryDecoding.decode(params["keyword"]))
+    // comfybox#380: `params` is `request.queryParameters`, already
+    // percent-decoded centrally — do not decode again here.
+    baseModel = Self.nonEmpty(params["base_model"])
+    act = Self.nonEmpty(params["act"])
+    tag = Self.nonEmpty(params["tag"])
+    keyword = Self.nonEmpty(params["keyword"])
     limit = min(max(params["limit"].flatMap(Int.init) ?? Self.defaultLimit, 1), Self.maxLimit)
   }
 
