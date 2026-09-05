@@ -441,6 +441,78 @@ final class CatalogBackfillTests: XCTestCase {
                      + "not propagate or crash the sweep")
     }
 
+    /// R1 re-review: the previous test covers a PREPARE failure (the query
+    /// never runs at all). This covers the MID-DRAIN case specifically —
+    /// `sqlite3_step` returns a real row and only THEN fails — via
+    /// `resolveSource`'s `filenameLookup` test seam, since forcing a live
+    /// SQLite connection to fail mid-step deterministically is impractical
+    /// (see `SQLiteRowDrainTests`'s header comment; this is the same
+    /// established reason `drainSQLiteRows` itself takes `step` as a
+    /// closure). The stub drives the REAL `drainSQLiteRows` primitive through
+    /// a fabricated `[SQLITE_ROW, SQLITE_IOERR]` sequence, so this exercises
+    /// exactly the code path `assetIDs(forFilename:)` would hit for a genuine
+    /// mid-iteration failure — only the sqlite mechanics are faked, not
+    /// `resolveSource`'s own catch-and-log logic.
+    ///
+    /// Asserts both halves of the R1 re-review ask: no edge is resolved from
+    /// the row seen before the failure, AND the failure is actually logged
+    /// (naming the filename and the error) rather than swallowed — the exact
+    /// gap flagged: "a real query failure is indistinguishable from genuine
+    /// ambiguity" without this.
+    func testResolveSourceLogsAndSkipsOnAMidDrainStepFailure() async throws {
+        var stepsRemaining = [SQLITE_ROW, SQLITE_IOERR]
+        let stubbedLookup: (String, CatalogRealm?) async throws -> [String] = { _, _ in
+            var ids: [String] = []
+            let rc = drainSQLiteRows(step: { stepsRemaining.removeFirst() }) {
+                // Must never surface as the resolved id: a mid-drain failure
+                // has to look like ambiguity, never like the one row it
+                // happened to see before failing.
+                ids.append("row-seen-before-the-failure")
+            }
+            guard rc == SQLITE_DONE else {
+                throw CatalogError.stepFailed("stubbed SQLITE_IOERR after one row")
+            }
+            return ids
+        }
+
+        var resolved: String?
+        let logged = try await Self.capturingStderr {
+            resolved = try await CatalogBackfill.resolveSource(
+                "/home/todd/.kira/studio/gallery/Deep/Elsewhere/mid-drain-still.png",
+                scope: .kira, trees: trees(), store: store, filenameLookup: stubbedLookup)
+        }
+
+        XCTAssertNil(resolved, "no edge — a step failure must not resolve to the row seen before it")
+        XCTAssertTrue(logged.contains("mid-drain-still.png"),
+                      "the warning must name the filename; got: \(logged)")
+        XCTAssertTrue(logged.contains("stepFailed") || logged.contains("stubbed SQLITE_IOERR"),
+                      "the warning must carry the underlying error; got: \(logged)")
+    }
+
+    /// Redirects fd 2 to a pipe for the duration of `body`, returning
+    /// whatever was written to stderr. Used only to prove a warning was
+    /// actually logged, not swallowed — `resolveSource` writes via
+    /// `FileHandle.standardError`, same as every other log-and-partial site
+    /// in this module, so this is the only way to observe it from a test.
+    private static func capturingStderr(_ body: () async throws -> Void) async rethrows -> String {
+        let pipe = Pipe()
+        let savedStderr = dup(2)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, 2)
+        do {
+            try await body()
+        } catch {
+            dup2(savedStderr, 2)
+            close(savedStderr)
+            pipe.fileHandleForWriting.closeFile()
+            throw error
+        }
+        dup2(savedStderr, 2)
+        close(savedStderr)
+        pipe.fileHandleForWriting.closeFile()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(decoding: data, as: UTF8.self)
+    }
+
     // MARK: - Provenance and precedence
 
     /// `EXIF:Software` is a human display string ("CoffeeShop Desktop

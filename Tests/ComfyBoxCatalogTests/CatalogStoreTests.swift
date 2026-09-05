@@ -630,7 +630,11 @@ final class CatalogStoreTests: XCTestCase {
     /// lets this pin the behaviour without inserting `idsHardCap + 1` real
     /// rows.
     func testAssetIDsMatchingReportsTruncationWhenTheCapCutsRows() async throws {
-        for i in 0..<10 {
+        // Exactly cap + 1: the smallest input that can possibly be truncated,
+        // and the exact boundary the `LIMIT cap + 1` lookahead trick exists to
+        // get right — a larger margin could pass even if the lookahead were
+        // off by more than one.
+        for i in 0..<6 {
             try await store.upsert(make("cap-\(i)", realm: .shared, lane: "cap-fixture"),
                                    explicitCollectionIDs: [])
         }
