@@ -101,6 +101,11 @@ extension ComfyBridgeGenerateRequest {
       levelsMax: levelsMax,
       scheduler: sampler,
       sigmaSchedule: sigmaSchedule,
+      // comfybox#154: the workflow's `ModelSamplingAuraFlow` shift, forwarded
+      // verbatim on every family arm. `validateShift(_:family:)` — which
+      // `bridgeGenerate` already runs beside the recipe gates — decides whether
+      // the resident family honours it; nil is unchanged behaviour.
+      shift: shift,
       inpaintImageData: inpaintImageData,
       maskData: maskImageData,
       denoise: denoise,

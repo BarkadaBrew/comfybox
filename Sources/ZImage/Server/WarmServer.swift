@@ -4369,7 +4369,10 @@ public final class WarmServer {
           }
         },
         enhancePrompt: false,
-        enhanceMaxTokens: 512
+        enhanceMaxTokens: 512,
+        // #154: the workflow's ModelSamplingAuraFlow shift reaches the
+        // ControlNet arm too — it runs the same flow schedule.
+        shift: request.shift
       )
 
       let start = Date()
@@ -4480,6 +4483,13 @@ public final class WarmServer {
     if let error = GeneratePayload.validateFamilyRecipe(recipeNames, family: family) {
       throw error
     }
+    // #154: the bridge can now carry a `ModelSamplingAuraFlow` shift, so it
+    // runs the same per-family shift gate the REST dispatch does — a workflow
+    // that names a shift the resident family does not honour is refused,
+    // never silently rendered on the model's own schedule.
+    if let message = GeneratePayload.validateShift(payload.shift, family: family) {
+      throw WarmServerError.invalidRequest(message: message)
+    }
     // WP-E17: the bridge builds its payload directly too, so it runs the same
     // stage-2 gate. It never SETS `stage2` today; the gate is here so that
     // adding it later cannot skip the family check.
@@ -4525,6 +4535,7 @@ public final class WarmServer {
             levelsMax: payload.levelsMax,
             scheduler: payload.scheduler,
             sigmaSchedule: payload.sigmaSchedule,
+            shift: payload.shift,
             inpaintImageData: payload.inpaintImageData,
             maskData: payload.maskData,
             denoise: payload.denoise,
@@ -12585,19 +12596,37 @@ extension GeneratePayload: Decodable {
     c2 = try c.decodeIfPresent(Float.self, forKey: .c2)
   }
 
-  /// Validate the D3 `shift` field for the family that will render it.
+  /// Validate the `shift` field for the family that will render it.
   ///
   /// Returns a 400 message, or nil when the request is acceptable. `shift` is
-  /// a Krea 2 schedule field: it must be a positive finite number, and it is
-  /// refused — not ignored — on any other family, whose schedules never read
-  /// it (FDD-krea2-raw-recipe D3; "fail loud, never silently substitute").
+  /// always a positive finite number, and it is refused — not ignored — on a
+  /// family whose schedules do not read it ("fail loud, never silently
+  /// substitute").
+  ///
+  /// Two families honour it, and they mean DIFFERENT things by it — which is
+  /// why this gate is per-family and not a decoder check:
+  ///
+  /// - `.krea2` (FDD-krea2-raw-recipe D3, Addendum A.1): the value IS `mu`,
+  ///   ComfyUI's `ModelSamplingFlux(shift=…)` **log**-shift. `1.15` reproduces
+  ///   the published grid.
+  /// - `.flux1` — the Z-Image / Flux-1 family, and the one Zeta Chroma runs on
+  ///   (comfybox#154): the value is the LINEAR shift of ComfyUI's
+  ///   `ModelSamplingAuraFlow` / `ModelSamplingSD3`,
+  ///   `σ' = shift·σ / (1 + (shift − 1)·σ)`. `1.0` is the identity; Zeta
+  ///   Chroma's author recommends `3.0`. It replaces the model's own shift and
+  ///   the resolution-dependent `mu` for that render
+  ///   (``ZImageSchedulerConfig/applyingExplicitShift(_:)``).
+  ///
+  /// The remaining families (`.flux2`, `.fibo`, `.chroma`) run fixed schedules
+  /// that never consult it, so they still refuse it by name.
   static func validateShift(_ shift: Float?, family: WarmModelFamily) -> String? {
     guard let shift else { return nil }
     guard shift.isFinite, shift > 0 else {
       return "shift must be a positive number (got \(shift)); omit it for the resolution-dependent default"
     }
-    guard family == .krea2 else {
-      return "shift is a Krea 2 request field and is not honoured by model family '\(family.rawValue)'; remove it"
+    guard family == .krea2 || family == .flux1 else {
+      return "shift is a schedule field for the krea2 and flux1 (Z-Image) families and is not "
+        + "honoured by model family '\(family.rawValue)'; remove it"
     }
     return nil
   }
@@ -12765,6 +12794,10 @@ extension GeneratePayload: Decodable {
       schedulerKind: schedulerKind,
       sigmaSchedule: sigmaScheduleKind,
       eta: eta,
+      // #154: the explicit ModelSamplingAuraFlow shift, already validated for
+      // this family by `validateShift` at dispatch. nil = the model's own
+      // resolution-dependent schedule, unchanged.
+      shift: shift,
       dyPE: dyPEConfig,
       inpaintImageData: inpaintImageData,
       maskData: maskData,
@@ -12848,6 +12881,9 @@ extension GeneratePayload: Decodable {
       schedulerKind: schedulerKind,
       sigmaSchedule: sigmaScheduleKind,
       eta: eta,
+      // #154: the explicit ModelSamplingAuraFlow shift, forwarded on the
+      // img2img path too — the schedule is the same one.
+      shift: shift,
       dyPE: dyPEConfig,
       sourceImagePath: imagePath,
       strength: resolvedStrength,

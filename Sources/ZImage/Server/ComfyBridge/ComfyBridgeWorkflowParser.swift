@@ -29,6 +29,10 @@ struct ComfyBridgeGenerateRequest: Sendable {
   let sampler: String?
   /// Sigma schedule extracted from BasicScheduler node (e.g. "normal", "karras", "exponential").
   let sigmaSchedule: String?
+  /// comfybox#154 — explicit flow-matching schedule shift, extracted from a
+  /// `ModelSamplingAuraFlow` node's `shift` input. nil = the workflow has no
+  /// such node and the model's own schedule runs, exactly as before #154.
+  var shift: Float?
   /// Levels min (black point) for contrast adjustment. Default 0.0.
   let levelsMin: Float?
   /// Levels max (white point) for contrast adjustment. Default 1.0.
@@ -285,6 +289,34 @@ enum ComfyBridgeWorkflowParser {
     // Extract the scheduler field from BasicScheduler (normal, karras, exponential, beta, sgm_uniform).
     let sigmaScheduleName = schedulerNode?.inputs["scheduler"] as? String
 
+    // --- Explicit schedule shift (comfybox#154) ---
+    // ComfyUI's `ModelSamplingAuraFlow` node patches the model's
+    // `model_sampling` with a linear shift (`comfy/model_sampling.py`
+    // `time_snr_shift`). Zeta Chroma's published workflow carries one at 3.00.
+    // Sorted by node id so a multi-pass graph resolves deterministically —
+    // the same rule the scheduler and ZImageFunControlnet extraction use.
+    // `ModelSamplingSD3` is deliberately NOT read here: same sigma warp, but a
+    // different timestep `multiplier` (1000 vs AuraFlow's 1.0) that the engine
+    // has no seam for, and reading it as AuraFlow would be a silent
+    // substitution.
+    let auraFlowNodes = nodes.values
+      .filter { $0.classType == "ModelSamplingAuraFlow" }
+      .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending }
+    var modelSamplingShift: Float?
+    if let auraFlow = auraFlowNodes.first, let raw = floatValue(auraFlow.inputs["shift"]) {
+      // A non-positive or non-finite value is dropped rather than carried to a
+      // 400 the Krita user would never see: the graph renders on the model's
+      // own schedule and the engine says so.
+      if raw.isFinite && raw > 0 {
+        modelSamplingShift = raw
+      } else {
+        print("[ComfyBridge] ignoring ModelSamplingAuraFlow shift \(raw) on node \(auraFlow.id) — not a positive finite number; rendering on the model's own schedule")
+      }
+      if auraFlowNodes.count > 1 {
+        print("[ComfyBridge] warning: \(auraFlowNodes.count) ModelSamplingAuraFlow nodes in workflow — only node \(auraFlow.id) is applied")
+      }
+    }
+
     // --- Output node ---
     let outputNodeId: String
     if let saveNode = nodes.values.first(where: { $0.classType == "ETN_SaveImageCache" }) {
@@ -459,6 +491,7 @@ enum ComfyBridgeWorkflowParser {
       outputNodeId: outputNodeId,
       sampler: samplerName,
       sigmaSchedule: sigmaScheduleName,
+      shift: modelSamplingShift,
       levelsMin: nil,
       levelsMax: nil,
       inpaintImageId: inpaintImageId,
