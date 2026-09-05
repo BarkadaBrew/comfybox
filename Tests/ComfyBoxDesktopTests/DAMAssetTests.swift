@@ -99,6 +99,230 @@ struct DAMAssetTests {
         #expect(moved.source == nil)
     }
 
+    // MARK: - #372: copy(with:) preserves every field not named
+
+    @Test("empty mutation returns a field-for-field identical copy")
+    func copyWithEmptyMutationIsIdentity() {
+        let asset = Self.everyFieldSetFixture()
+        #expect(asset.copy(with: DAMAsset.Mutation()) == asset)
+    }
+
+    // MARK: - Structural guards against a field DAMAsset gains but
+    // copy(with:)/Mutation never wires up
+    //
+    // `copy(with:)` itself hand-rebuilds `DAMAsset` exactly once (the one
+    // allowlisted site in DAMAssetConstructionSiteLintTests) — a field added
+    // to DAMAsset in the future but never added to `Mutation` (or added to
+    // `Mutation` but never wired into `copy(with:)`'s own construction call)
+    // would fall back to `DAMAsset.init`'s default for that field on every
+    // `copy(with:)` call, silently reintroducing exactly this issue's bug
+    // class one level down. These two tests catch that structurally, not by
+    // re-deriving the field list by hand (which would rot the same way):
+
+    @Test("Mutation has exactly one field per DAMAsset stored property (no more, no fewer)")
+    func mutationFieldSetMatchesDAMAssetFieldSet() {
+        let assetFieldNames = Set(Mirror(reflecting: Self.everyFieldSetFixture()).children.compactMap { $0.label })
+        let mutationFieldNames = Set(Mirror(reflecting: DAMAsset.Mutation()).children.compactMap { $0.label })
+        #expect(assetFieldNames == mutationFieldNames)
+    }
+
+    @Test("fixture used by the copy(with:) tests sets every field to a non-default value")
+    func everyFieldSetFixtureHasNoDefaultLookingValues() {
+        // If this fails, a field was added to DAMAsset and the fixture below
+        // was not updated to give it a distinctive value — do that before
+        // trusting any other copy(with:) test, including the one right
+        // below this, which relies on every field here being distinguishable
+        // from what `DAMAsset.init`'s default for that field would produce.
+        for child in Mirror(reflecting: Self.everyFieldSetFixture()).children {
+            guard let label = child.label else { continue }
+            #expect(
+                !Self.looksLikeADefaultValue(child.value),
+                Comment(rawValue: "fixture field '\(label)' looks like a default value (nil/0/false/empty) — "
+                    + "give it a distinctive one")
+            )
+        }
+    }
+
+    @Test("copy(with: Mutation()) preserves every field of the non-default fixture, checked via Mirror not ==")
+    func copyEmptyMutationPreservesEveryFieldViaMirror() {
+        // Same assertion as copyWithEmptyMutationIsIdentity, but via the
+        // Mirror-based per-field comparison rather than DAMAsset's
+        // synthesized Equatable, so it doesn't depend on == having been
+        // updated for a new field either.
+        let asset = Self.everyFieldSetFixture()
+        let updated = asset.copy(with: DAMAsset.Mutation())
+        Self.assertFieldsEqual(asset, updated, excluding: [])
+    }
+
+    /// True if `value` looks like a plain Swift default — nil, an empty
+    /// String/Array/Dictionary, numeric zero, or `false` — the same values
+    /// `DAMAsset.init`'s parameters fall back to. Unwraps one level of
+    /// Optional before checking, since every optional `DAMAsset` field's
+    /// default is `nil`.
+    private static func looksLikeADefaultValue(_ value: Any) -> Bool {
+        let mirror = Mirror(reflecting: value)
+        if mirror.displayStyle == .optional {
+            guard let child = mirror.children.first else { return true } // nil
+            return looksLikeADefaultValue(child.value)
+        }
+        switch value {
+        case let v as String: return v.isEmpty
+        case let v as Int: return v == 0
+        case let v as Int64: return v == 0
+        case let v as Double: return v == 0
+        case let v as Bool: return v == false
+        default:
+            if mirror.displayStyle == .collection || mirror.displayStyle == .dictionary || mirror.displayStyle == .set {
+                return mirror.children.isEmpty
+            }
+            return false
+        }
+    }
+
+    @Test("overriding one field leaves every other field untouched (Mirror-checked)")
+    func copyOverridingOneFieldPreservesRest() {
+        let asset = Self.everyFieldSetFixture()
+        let updated = asset.copy(with: DAMAsset.Mutation(rating: .value(5)))
+        #expect(updated.rating == 5)
+        Self.assertFieldsEqual(asset, updated, excluding: ["rating"])
+    }
+
+    @Test("overriding a different field still leaves everything else untouched (Mirror-checked)")
+    func copyOverridingSourcePreservesRest() {
+        let asset = Self.everyFieldSetFixture()
+        let updated = asset.copy(with: DAMAsset.Mutation(source: .value("bree")))
+        #expect(updated.source == "bree")
+        Self.assertFieldsEqual(asset, updated, excluding: ["source"])
+    }
+
+    @Test("each field can be overridden independently, including to an explicit nil")
+    func copyEachFieldOverridesIndependently() {
+        let asset = Self.everyFieldSetFixture()
+
+        #expect(asset.copy(with: .init(id: .value("new-id"))).id == "new-id")
+        #expect(asset.copy(with: .init(kind: .value("image"))).kind == "image")
+        #expect(asset.copy(with: .init(filename: .value("new.png"))).filename == "new.png")
+        #expect(asset.copy(with: .init(absolutePath: .value("/new/path.png"))).absolutePath == "/new/path.png")
+        #expect(asset.copy(with: .init(fileSize: .value(42))).fileSize == 42)
+        #expect(asset.copy(with: .init(sha256: .value("newsha"))).sha256 == "newsha")
+        #expect(asset.copy(with: .init(sha256: .value(nil))).sha256 == nil)
+        #expect(asset.copy(with: .init(width: .value(100))).width == 100)
+        #expect(asset.copy(with: .init(width: .value(nil))).width == nil)
+        #expect(asset.copy(with: .init(height: .value(100))).height == 100)
+        #expect(asset.copy(with: .init(height: .value(nil))).height == nil)
+        let newDate = Date(timeIntervalSince1970: 9)
+        #expect(asset.copy(with: .init(createdAt: .value(newDate))).createdAt == newDate)
+        #expect(asset.copy(with: .init(modifiedAt: .value(newDate))).modifiedAt == newDate)
+        #expect(asset.copy(with: .init(ingestedAt: .value(newDate))).ingestedAt == newDate)
+        #expect(asset.copy(with: .init(orphaned: .value(!asset.orphaned))).orphaned == !asset.orphaned)
+        #expect(asset.copy(with: .init(prompt: .value("new prompt"))).prompt == "new prompt")
+        #expect(asset.copy(with: .init(prompt: .value(nil))).prompt == nil)
+        #expect(asset.copy(with: .init(negativePrompt: .value("new neg"))).negativePrompt == "new neg")
+        #expect(asset.copy(with: .init(negativePrompt: .value(nil))).negativePrompt == nil)
+        #expect(asset.copy(with: .init(seed: .value(99))).seed == 99)
+        #expect(asset.copy(with: .init(seed: .value(nil))).seed == nil)
+        #expect(asset.copy(with: .init(steps: .value(99))).steps == 99)
+        #expect(asset.copy(with: .init(steps: .value(nil))).steps == nil)
+        #expect(asset.copy(with: .init(guidance: .value(9.9))).guidance == 9.9)
+        #expect(asset.copy(with: .init(guidance: .value(nil))).guidance == nil)
+        #expect(asset.copy(with: .init(modelFamily: .value("sdxl"))).modelFamily == "sdxl")
+        #expect(asset.copy(with: .init(modelFamily: .value(nil))).modelFamily == nil)
+        #expect(asset.copy(with: .init(rating: .value(1))).rating == 1)
+        #expect(asset.copy(with: .init(favorite: .value(!asset.favorite))).favorite == !asset.favorite)
+        #expect(asset.copy(with: .init(contentMode: .value("apple"))).contentMode == "apple")
+        #expect(asset.copy(with: .init(contentMode: .value(nil))).contentMode == nil)
+        #expect(asset.copy(with: .init(characterName: .value("Someone"))).characterName == "Someone")
+        #expect(asset.copy(with: .init(characterName: .value(nil))).characterName == nil)
+        #expect(asset.copy(with: .init(source: .value("bree"))).source == "bree")
+        #expect(asset.copy(with: .init(source: .value(nil))).source == nil)
+    }
+
+    @Test("a merge expression (incoming ?? existing) passed through .value(...) actually falls back to existing, not just re-wraps incoming")
+    func copyMergeFallbackFallsBackToExisting() {
+        let existing = Self.everyFieldSetFixture()
+        // An "incoming" asset with nil generation metadata, as a bare
+        // re-ingest with no sidecar would produce.
+        let incoming = existing.copy(with: DAMAsset.Mutation(
+            sha256: .value(nil), prompt: .value(nil), source: .value(nil)
+        ))
+
+        let merged = incoming.copy(with: DAMAsset.Mutation(
+            sha256: .value(incoming.sha256 ?? existing.sha256),
+            prompt: .value(incoming.prompt ?? existing.prompt),
+            source: .value(incoming.source ?? existing.source)
+        ))
+
+        // This is the exact shape of DAMStore.mergedWithExisting's fallback.
+        // With Mutation.<field> typed as a doubly-nested Optional instead of
+        // `Override<T>`, this expression compiles but silently discards
+        // `existing.*` and returns `nil` — the fallback never happens.
+        #expect(merged.prompt == existing.prompt)
+        #expect(merged.source == existing.source)
+        #expect(merged.sha256 == existing.sha256)
+    }
+
+    /// A fixture where every field has a distinct, non-default, non-nil
+    /// value, so a dropped field shows up as a genuine difference rather
+    /// than coincidentally matching a shared default (nil / 0 / false).
+    private static func everyFieldSetFixture() -> DAMAsset {
+        DAMAsset(
+            id: "fixture-id",
+            kind: "video",
+            filename: "fixture.mp4",
+            absolutePath: "/vault/fixture.mp4",
+            fileSize: 123_456,
+            sha256: "deadbeef",
+            width: 640,
+            height: 480,
+            createdAt: Date(timeIntervalSince1970: 1_000),
+            modifiedAt: Date(timeIntervalSince1970: 2_000),
+            ingestedAt: Date(timeIntervalSince1970: 3_000),
+            orphaned: true,
+            prompt: "a fixture prompt",
+            negativePrompt: "a fixture negative",
+            seed: 7,
+            steps: 30,
+            guidance: 4.5,
+            modelFamily: "krea2",
+            rating: 3,
+            favorite: true,
+            contentMode: "banana",
+            characterName: "Fixture",
+            source: "kira"
+        )
+    }
+
+    /// Compares every stored property of `a` and `b` by name via `Mirror`,
+    /// except those in `excluding`. Reflection (rather than a hand-picked
+    /// list of `#expect`s) means a field added to `DAMAsset` in the future is
+    /// picked up automatically — there is no second list to forget to update.
+    private static func assertFieldsEqual(
+        _ a: DAMAsset, _ b: DAMAsset, excluding: Set<String>,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        let childrenA = Dictionary(uniqueKeysWithValues: Mirror(reflecting: a).children.compactMap {
+            child -> (String, Any)? in
+            guard let label = child.label else { return nil }
+            return (label, child.value)
+        })
+        let childrenB = Dictionary(uniqueKeysWithValues: Mirror(reflecting: b).children.compactMap {
+            child -> (String, Any)? in
+            guard let label = child.label else { return nil }
+            return (label, child.value)
+        })
+        #expect(Set(childrenA.keys) == Set(childrenB.keys), sourceLocation: sourceLocation)
+        for key in childrenA.keys where !excluding.contains(key) {
+            // `Any` isn't Equatable; DAMAsset's fields are all String / Int /
+            // Int64 / Double / Bool / Date and their Optionals, for which
+            // `String(describing:)` is a stable, faithful comparison.
+            #expect(
+                String(describing: childrenA[key] as Any) == String(describing: childrenB[key] as Any),
+                "field '\(key)' differs after a mutation that did not name it",
+                sourceLocation: sourceLocation
+            )
+        }
+    }
+
     @Test("isEditableImage requires image kind and a supported extension")
     func isEditableImage() {
         #expect(DAMAsset(kind: "image", filename: "a.png", absolutePath: "/a.png").isEditableImage)
