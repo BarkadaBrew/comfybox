@@ -62,6 +62,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | GET | `/v1/models` |  |  |
 | POST | `/v1/montage/compose` | compose_montage |  |
 | GET | `/v1/nearline` |  |  |
+| POST | `/v1/nearline/anchor` | nearline_anchor |  |
 | POST | `/v1/nearline/evict` | nearline_evict |  |
 | POST | `/v1/nearline/scan` | nearline_scan |  |
 | POST | `/v1/nearline/stage` | nearline_stage |  |

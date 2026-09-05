@@ -841,6 +841,28 @@ public final class WarmServer {
         return .error(.error(status: 500, message: "Stage failed: \(error.localizedDescription)"))
       }
 
+    case ("POST", "/v1/nearline/anchor"):
+      do {
+        let body = try decode(NearlineAnchorBody.self, from: request.body)
+        guard let existing = nearlineLibrary.item(named: body.id) else {
+          return .error(.error(status: 404, message: "Nearline item not in catalog: \(body.id) (rescan?)"))
+        }
+        guard existing.kind == body.kind else {
+          return .error(.error(
+            status: 400,
+            message: "Kind mismatch for \(body.id): catalog has \(existing.kind), request said \(body.kind)"))
+        }
+        try nearlineLibrary.setAnchored(name: body.id, anchored: body.anchored)
+        auditLog.append(
+          kind: "nearline.anchor",
+          message: "\(body.anchored ? "Anchored" : "Un-anchored") \(body.id)")
+        return nearlineListResponse()
+      } catch let error as NearlineError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: "Anchor failed: \(error.localizedDescription)"))
+      }
+
     case ("POST", "/v1/nearline/evict"):
       struct NameBody: Decodable { let name: String }
       do {
@@ -1884,6 +1906,31 @@ public final class WarmServer {
 
   // Nearline -------------------------------------------------------------------
 
+  /// #273: request body for `POST /v1/nearline/anchor`. A file-scope (not
+  /// switch-arm-local) type so its wire shape is directly unit-testable.
+  struct NearlineAnchorBody: Decodable {
+    let kind: String
+    let id: String
+    let anchored: Bool
+  }
+
+  /// The per-item JSON shape for `GET /v1/nearline`'s `items` array. A pure
+  /// function (no server, no lock) so the wire shape — notably the additive
+  /// `anchored` key (#273) — is directly unit-testable.
+  static func nearlineItemJSON(_ item: NearlineItem, iso: ISO8601DateFormatter) -> [String: Any] {
+    var dict: [String: Any] = [
+      "name": item.name,
+      "path": item.path,
+      "size_mb": item.sizeMB,
+      "kind": item.kind,
+      "staged": item.staged,
+      "anchored": item.anchored,
+    ]
+    if let stagedPath = item.stagedPath { dict["staged_path"] = stagedPath }
+    if let lastUsed = item.lastUsedAt { dict["last_used_at"] = iso.string(from: lastUsed) }
+    return dict
+  }
+
   /// GET /v1/nearline payload: config + full catalog with staging state.
   private func nearlineListResponse() -> RoutedResponse {
     let iso = ISO8601DateFormatter()
@@ -1892,18 +1939,7 @@ public final class WarmServer {
       "roots": config.roots,
       "cache_limit_gb": config.cacheLimitGB,
       "staged_mb": nearlineLibrary.stagedMB,
-      "items": nearlineLibrary.list().map { item -> [String: Any] in
-        var dict: [String: Any] = [
-          "name": item.name,
-          "path": item.path,
-          "size_mb": item.sizeMB,
-          "kind": item.kind,
-          "staged": item.staged,
-        ]
-        if let stagedPath = item.stagedPath { dict["staged_path"] = stagedPath }
-        if let lastUsed = item.lastUsedAt { dict["last_used_at"] = iso.string(from: lastUsed) }
-        return dict
-      },
+      "items": nearlineLibrary.list().map { Self.nearlineItemJSON($0, iso: iso) },
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return .error(.error(status: 500, message: "Failed to serialize nearline catalog"))
