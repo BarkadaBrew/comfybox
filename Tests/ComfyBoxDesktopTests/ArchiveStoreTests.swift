@@ -291,4 +291,164 @@ struct ArchiveStoreTests {
             try await store.exportAsZip(bundlePath: missingBundle, destination: destination)
         }
     }
+
+    // MARK: - Compress (#223 (b))
+
+    /// A real bundle directory (manifest.json, entries.jsonl with one
+    /// well-formed entry whose asset file actually exists, per the traversal
+    /// guard's `resolveEntryPath` needing something to `standardizedFileURL`
+    /// resolve, not decode) — close enough to what `GalleryArchiver.archive`
+    /// actually writes for `compress` to operate on.
+    private func makeCompressibleBundle(in root: String, dirName: String, name: String) throws -> String {
+        let bundlePath = try makeBundle(
+            in: root, dirName: dirName,
+            manifest: manifest(name: name, createdAt: 100, assetCount: 1, totalBytes: 3)
+        )
+        let assetDir = (bundlePath as NSString).appendingPathComponent("assets/a1")
+        try FileManager.default.createDirectory(atPath: assetDir, withIntermediateDirectories: true)
+        try Data("hi!".utf8).write(to: URL(fileURLWithPath: (assetDir as NSString).appendingPathComponent("a.png")))
+        let entry = ArchivedAsset(
+            from: DAMAsset(
+                id: "a1", kind: "image", filename: "a.png",
+                absolutePath: (assetDir as NSString).appendingPathComponent("a.png"),
+                fileSize: 3, sha256: nil, width: nil, height: nil,
+                createdAt: Date(), modifiedAt: Date(), ingestedAt: Date(), orphaned: false,
+                prompt: nil, negativePrompt: nil, seed: nil, steps: nil, guidance: nil,
+                modelFamily: nil, rating: 0, favorite: false, contentMode: nil,
+                characterName: nil, source: nil
+            ),
+            folderId: nil, relativeRoot: "assets/a1"
+        )
+        let entriesPath = (bundlePath as NSString).appendingPathComponent("entries.jsonl")
+        FileManager.default.createFile(atPath: entriesPath, contents: try ArchiveJSONL.encodeLine(entry))
+        return bundlePath
+    }
+
+    @Test("compress replaces the bundle directory with a verified, readable .zip and deletes the source")
+    @MainActor
+    func compressReplacesDirectoryWithVerifiedZip() async throws {
+        let root = makeTempDir("compress-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "comp-20260101-000000.cbarchive", name: "Comp")
+
+        let store = ArchiveStore(roots: [root])
+        await store.reload()
+        let bundle = try #require(store.archives.first)
+
+        let result = try await store.compress(bundle)
+
+        #expect(!FileManager.default.fileExists(atPath: bundlePath), "the uncompressed directory must be gone")
+        #expect(result.zipPath == bundlePath + ".zip")
+        #expect(FileManager.default.fileExists(atPath: result.zipPath))
+        #expect(result.compressedBytes > 0)
+        #expect(result.originalBytes > 0)
+
+        let listing = try Self.unzipListing(at: result.zipPath)
+        #expect(listing.contains("manifest.json"))
+        #expect(listing.contains("entries.jsonl"))
+    }
+
+    @Test("scan() lists a compressed archive with its manifest read out of the zip, isCompressed = true")
+    @MainActor
+    func scanListsCompressedArchive() async throws {
+        let root = makeTempDir("compress-scan-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        _ = try makeCompressibleBundle(in: root, dirName: "comp2-20260101-000000.cbarchive", name: "CompScan")
+
+        let store = ArchiveStore(roots: [root])
+        await store.reload()
+        let uncompressed = try #require(store.archives.first)
+        #expect(!uncompressed.isCompressed)
+
+        _ = try await store.compress(uncompressed)
+        await store.reload()
+
+        #expect(store.archives.count == 1)
+        let compressed = try #require(store.archives.first)
+        #expect(compressed.isCompressed)
+        #expect(compressed.manifest.name == "CompScan")
+        #expect(compressed.manifest.assetCount == 1)
+        #expect(compressed.bundlePath.hasSuffix(".cbarchive.zip"))
+        #expect(store.error == nil)
+    }
+
+    @Test("compress refuses (and deletes nothing) for an incomplete, pending-removal, or already-compressed bundle")
+    @MainActor
+    func compressRefusesIneligibleBundles() async throws {
+        let root = makeTempDir("compress-ineligible-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        let incomplete = try makeBundle(
+            in: root, dirName: "incomplete-20260101-000000.cbarchive",
+            manifest: manifest(name: "Incomplete", createdAt: 100), incomplete: true
+        )
+        let pending = try makeBundle(
+            in: root, dirName: "pending-20260101-000000.cbarchive",
+            manifest: manifest(name: "Pending", createdAt: 200), pendingRemoval: true
+        )
+
+        let store = ArchiveStore(roots: [root])
+        await store.reload()
+        let byName = Dictionary(uniqueKeysWithValues: store.archives.map { ($0.manifest.name, $0) })
+
+        await #expect(throws: ArchiveStore.CompressError.self) {
+            try await store.compress(byName["Incomplete"]!)
+        }
+        #expect(FileManager.default.fileExists(atPath: incomplete), "nothing was deleted")
+
+        await #expect(throws: ArchiveStore.CompressError.self) {
+            try await store.compress(byName["Pending"]!)
+        }
+        #expect(FileManager.default.fileExists(atPath: pending), "nothing was deleted")
+
+        var alreadyCompressed = byName["Pending"]!
+        alreadyCompressed.isCompressed = true
+        alreadyCompressed.isIncomplete = false
+        alreadyCompressed.hasPendingRemoval = false
+        await #expect(throws: ArchiveStore.CompressError.self) {
+            try await store.compress(alreadyCompressed)
+        }
+    }
+
+    @Test("compress refuses a bundle whose entries.jsonl escapes its own root (#264 traversal guard) and deletes nothing")
+    @MainActor
+    func compressRefusesTraversalEntry() async throws {
+        let root = makeTempDir("compress-traversal-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeBundle(
+            in: root, dirName: "evil-20260101-000000.cbarchive",
+            manifest: manifest(name: "Evil", createdAt: 100, assetCount: 1)
+        )
+        // A hand-crafted entries.jsonl whose relativePath tries to escape the
+        // bundle root — the exact shape #264 exists to reject.
+        let evilEntry = """
+        {"id":"e1","relativePath":"../../etc/passwd","kind":"image","filename":"a.png","fileSize":1,"createdAt":0,"modifiedAt":0,"ingestedAt":0,"orphaned":false,"rating":0,"favorite":false,"archivedAt":0}\n
+        """
+        try Data(evilEntry.utf8).write(
+            to: URL(fileURLWithPath: (bundlePath as NSString).appendingPathComponent("entries.jsonl"))
+        )
+
+        let store = ArchiveStore(roots: [root])
+        await store.reload()
+        let bundle = try #require(store.archives.first)
+
+        await #expect(throws: ArchiveStore.CompressError.self) {
+            try await store.compress(bundle)
+        }
+        #expect(FileManager.default.fileExists(atPath: bundlePath), "nothing was deleted")
+        #expect(!FileManager.default.fileExists(atPath: bundlePath + ".zip"), "no zip was ever written")
+    }
+
+    @Test("compressedZipPath is the bundle path with .zip appended")
+    func compressedZipPathIsSuffixed() {
+        #expect(ArchiveStore.compressedZipPath(for: "/root/foo-20260101-000000.cbarchive")
+                == "/root/foo-20260101-000000.cbarchive.zip")
+    }
+
+    @Test("isCompressedArchivePath recognizes only the .cbarchive.zip spelling")
+    func isCompressedArchivePathRecognizesSpelling() {
+        #expect(ArchiveStore.isCompressedArchivePath("/root/foo-20260101-000000.cbarchive.zip"))
+        #expect(!ArchiveStore.isCompressedArchivePath("/root/foo-20260101-000000.cbarchive"))
+        #expect(!ArchiveStore.isCompressedArchivePath("/root/stray.zip"))
+    }
 }

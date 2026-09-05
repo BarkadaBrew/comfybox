@@ -9,7 +9,12 @@
 // trashes the bundle directory outright (it's a plain folder on disk, not a
 // DAMStore-tracked asset). Export as Zip (T12) shells `ditto` via
 // ArchiveStore.exportAsZip — destination chosen with an NSSavePanel on
-// the main actor, the Process work off it.
+// the main actor, the Process work off it. Compress (#223 (b)) also shells
+// `ditto`, but IN PLACE and atomically (`.part` then rename, never deleting
+// the directory bundle until the zip is reopened and verified readable) —
+// the resulting `<name>.cbarchive.zip` is picked back up by
+// `ArchiveStore.scan()` as a `Summary.isCompressed` row with Restore/Export/
+// Compress-again withheld (decompress-then-restore is a follow-up).
 
 import SwiftUI
 import AppKit
@@ -42,6 +47,9 @@ struct ArchiveBrowserView: View {
 
     @State private var exportingBundleIds: Set<String> = []
     @State private var exportSummary: String?
+
+    @State private var compressingBundleIds: Set<String> = []
+    @State private var compressSummary: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -152,6 +160,11 @@ struct ArchiveBrowserView: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }
+            if bundle.isCompressed {
+                Label("Compressed", systemImage: "doc.zipper")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.vertical, 2)
         .contextMenu {
@@ -163,10 +176,17 @@ struct ArchiveBrowserView: View {
                 selectBundle(bundle)
                 restoreAll(bundle)
             }
-            .disabled(bundle.isIncomplete)
+            .disabled(bundle.isIncomplete || bundle.isCompressed)
             Button("Reveal in Finder") { revealInFinder(bundle) }
             Button("Export as Zip…") { exportAsZip(bundle) }
-                .disabled(exportingBundleIds.contains(bundle.id))
+                .disabled(exportingBundleIds.contains(bundle.id) || bundle.isCompressed)
+            Button("Compress") {
+                selectedBundleId = bundle.id
+                selectBundle(bundle)
+                compress(bundle)
+            }
+            .disabled(bundle.isIncomplete || bundle.isCompressed
+                      || compressingBundleIds.contains(bundle.id) || archiver.isRunning)
             Divider()
             Button("Delete Archive…", role: .destructive) { requestDeleteBundle(bundle) }
                 .disabled(archiver.isRunning)
@@ -204,10 +224,18 @@ struct ArchiveBrowserView: View {
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 10)
                         .padding(.top, 6)
+                } else if let compressSummary {
+                    Text(compressSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.top, 6)
                 }
 
                 if bundle.isIncomplete {
                     incompleteNotice
+                } else if bundle.isCompressed {
+                    compressedNotice
                 } else if isLoadingEntries && entries.isEmpty {
                     VStack(spacing: 12) {
                         ProgressView()
@@ -241,9 +269,9 @@ struct ArchiveBrowserView: View {
             }
 
             Button("Restore Selected") { restoreSelected(bundle) }
-                .disabled(selectedAssetIds.isEmpty || archiver.isRunning || bundle.isIncomplete)
+                .disabled(selectedAssetIds.isEmpty || archiver.isRunning || bundle.isIncomplete || bundle.isCompressed)
             Button("Restore All") { restoreAll(bundle) }
-                .disabled(archiver.isRunning || bundle.isIncomplete)
+                .disabled(archiver.isRunning || bundle.isIncomplete || bundle.isCompressed)
         }
         .font(.callout)
     }
@@ -290,6 +318,23 @@ struct ArchiveBrowserView: View {
             Text("Its assets were never removed from the gallery. Delete this bundle to discard it.")
                 .font(.body)
                 .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var compressedNotice: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.zipper")
+                .font(.system(size: 40))
+                .foregroundStyle(.secondary)
+            Text("This archive is compressed")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+            Text("Its assets aren't browsable here while compressed. Reveal it in Finder to decompress it by hand, or delete it to discard it for good.")
+                .font(.body)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 40)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -365,8 +410,12 @@ struct ArchiveBrowserView: View {
         selectedAssetIds = []
         restoreSummary = nil
         exportSummary = nil
+        compressSummary = nil
         errorMessage = nil
-        guard !bundle.isIncomplete else { return }
+        // A compressed row's bundlePath is the `.zip` FILE, not a directory —
+        // there's no `entries.jsonl` sitting next to it to page through (its
+        // own copy lives inside the zip; see `compressedNotice`).
+        guard !bundle.isIncomplete, !bundle.isCompressed else { return }
         Task { await loadNextPage() }
     }
 
@@ -505,6 +554,44 @@ struct ArchiveBrowserView: View {
             }
             exportingBundleIds.remove(bundle.id)
         }
+    }
+
+    // MARK: - Compress (#223 (b))
+
+    /// Re-checks eligibility at the mutation point (not just whichever menu
+    /// item happened to be disabled) — the same discipline `deleteBundle`
+    /// already applies against a racing archive/restore.
+    private func compress(_ bundle: ArchiveStore.Summary) {
+        guard !bundle.isIncomplete, !bundle.isCompressed, !archiver.isRunning,
+              !compressingBundleIds.contains(bundle.id)
+        else { return }
+        compressSummary = nil
+        errorMessage = nil
+        compressingBundleIds.insert(bundle.id)
+        Task {
+            do {
+                let result = try await archives.compress(bundle)
+                compressSummary = Self.compressSummaryLine(result)
+                if selectedBundle?.id == bundle.id {
+                    entries = []
+                    hasMoreEntries = false
+                }
+                await archives.reload()
+            } catch {
+                errorMessage = "Compress failed: \(error.localizedDescription)"
+            }
+            compressingBundleIds.remove(bundle.id)
+        }
+    }
+
+    /// "Compressed to N MB (was M MB)" — pure so it's directly unit-testable.
+    static func compressSummaryLine(_ result: ArchiveStore.CompressResult) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useGB, .useMB, .useKB, .useBytes]
+        let compressed = formatter.string(fromByteCount: result.compressedBytes)
+        let original = formatter.string(fromByteCount: result.originalBytes)
+        return "Compressed to \(compressed) (was \(original))"
     }
 
     // MARK: - Reveal / delete bundle

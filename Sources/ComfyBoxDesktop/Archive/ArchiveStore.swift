@@ -20,13 +20,22 @@ public final class ArchiveStore {
         public var manifest: ArchiveManifest
         public var isIncomplete: Bool
         public var hasPendingRemoval: Bool
+        /// True for a `<name>.cbarchive.zip` FILE produced by `compress(_:)`
+        /// (#223 (b)) — the uncompressed `.cbarchive` DIRECTORY it replaced no
+        /// longer exists. Restore/Export/Compress-again are not offered for
+        /// these rows (decompress-then-restore is a follow-up; see the PR body).
+        public var isCompressed: Bool
 
-        public init(id: String, bundlePath: String, manifest: ArchiveManifest, isIncomplete: Bool, hasPendingRemoval: Bool) {
+        public init(
+            id: String, bundlePath: String, manifest: ArchiveManifest,
+            isIncomplete: Bool, hasPendingRemoval: Bool, isCompressed: Bool = false
+        ) {
             self.id = id
             self.bundlePath = bundlePath
             self.manifest = manifest
             self.isIncomplete = isIncomplete
             self.hasPendingRemoval = hasPendingRemoval
+            self.isCompressed = isCompressed
         }
     }
 
@@ -73,34 +82,49 @@ public final class ArchiveStore {
 
         for root in roots {
             guard let entries = try? fm.contentsOfDirectory(atPath: root) else { continue }
-            for entry in entries.sorted() where entry.hasSuffix(".cbarchive") {
-                let bundlePath = (root as NSString).appendingPathComponent(entry)
+            for entry in entries.sorted() {
+                let fullPath = (root as NSString).appendingPathComponent(entry)
                 var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: bundlePath, isDirectory: &isDir), isDir.boolValue else { continue }
+                guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else { continue }
 
-                let manifestPath = (bundlePath as NSString).appendingPathComponent("manifest.json")
-                let incompletePath = (bundlePath as NSString).appendingPathComponent("INCOMPLETE.json")
-                let pendingRemovalPath = (bundlePath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
+                if entry.hasSuffix(".cbarchive"), isDir.boolValue {
+                    let manifestPath = (fullPath as NSString).appendingPathComponent("manifest.json")
+                    let incompletePath = (fullPath as NSString).appendingPathComponent("INCOMPLETE.json")
+                    let pendingRemovalPath = (fullPath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
 
-                let isIncomplete = fm.fileExists(atPath: incompletePath)
-                let hasPendingRemoval = fm.fileExists(atPath: pendingRemovalPath)
+                    let isIncomplete = fm.fileExists(atPath: incompletePath)
+                    let hasPendingRemoval = fm.fileExists(atPath: pendingRemovalPath)
 
-                if let data = fm.contents(atPath: manifestPath),
-                   let manifest = try? ArchiveManifest.decode(data) {
-                    summaries.append(Summary(
-                        id: bundlePath, bundlePath: bundlePath, manifest: manifest,
-                        isIncomplete: isIncomplete, hasPendingRemoval: hasPendingRemoval
-                    ))
-                } else if isIncomplete {
-                    // Marker present, no readable manifest yet (or ever) —
-                    // still list it so the browser can offer "Discard".
-                    summaries.append(Summary(
-                        id: bundlePath, bundlePath: bundlePath,
-                        manifest: synthesizedManifest(bundleName: entry, bundlePath: bundlePath),
-                        isIncomplete: true, hasPendingRemoval: hasPendingRemoval
-                    ))
-                } else {
-                    errors.append("Could not read manifest for \(entry)")
+                    if let data = fm.contents(atPath: manifestPath),
+                       let manifest = try? ArchiveManifest.decode(data) {
+                        summaries.append(Summary(
+                            id: fullPath, bundlePath: fullPath, manifest: manifest,
+                            isIncomplete: isIncomplete, hasPendingRemoval: hasPendingRemoval
+                        ))
+                    } else if isIncomplete {
+                        // Marker present, no readable manifest yet (or ever) —
+                        // still list it so the browser can offer "Discard".
+                        summaries.append(Summary(
+                            id: fullPath, bundlePath: fullPath,
+                            manifest: synthesizedManifest(bundleName: entry, bundlePath: fullPath),
+                            isIncomplete: true, hasPendingRemoval: hasPendingRemoval
+                        ))
+                    } else {
+                        errors.append("Could not read manifest for \(entry)")
+                    }
+                } else if isCompressedArchivePath(entry), !isDir.boolValue {
+                    // A `compress(_:)` (#223 (b)) output: the directory bundle
+                    // it replaced is gone, so there is no manifest.json to
+                    // read off disk directly — read it out of the zip itself.
+                    let bundleDirName = (entry as NSString).deletingPathExtension
+                    if let manifest = try? readManifestFromZip(zipPath: fullPath, bundleDirName: bundleDirName) {
+                        summaries.append(Summary(
+                            id: fullPath, bundlePath: fullPath, manifest: manifest,
+                            isIncomplete: false, hasPendingRemoval: false, isCompressed: true
+                        ))
+                    } else {
+                        errors.append("Could not read manifest for \(entry)")
+                    }
                 }
             }
         }
@@ -170,5 +194,203 @@ public final class ArchiveStore {
             let output = String(data: data, encoding: .utf8) ?? ""
             throw ExportError.failed(proc.terminationStatus, output)
         }
+    }
+
+    // MARK: - Compress (#223 (b))
+    //
+    // "Delete exists, compress does not" — an archived gallery bundle is a
+    // directory of raw copied files (GalleryArchiver's writer never
+    // compresses anything; that was never its job). Compress turns an
+    // eligible bundle into cold storage: a single verified `.zip` replacing
+    // the directory, written atomically (`.part` then rename) and NEVER
+    // deleting the uncompressed source until the zip has been reopened and
+    // proven readable. Reuses the exact `ditto`/`dittoArguments` writer
+    // `exportAsZip` (T12) already shells — the difference is atomicity,
+    // verify-before-delete, and writing IN PLACE rather than to a
+    // caller-chosen export destination that leaves the original untouched.
+    //
+    // Restore/Export/Compress-again are not offered for a compressed row in
+    // ArchiveBrowserView (`Summary.isCompressed`) — decompressing back to a
+    // browsable bundle is a follow-up, not part of this change (see the PR
+    // body); the zip is fully valid cold storage on its own (`ditto -x` or
+    // Archive Utility opens it) even without that follow-up.
+
+    public struct CompressResult: Sendable, Equatable {
+        public var zipPath: String
+        public var originalBytes: Int64
+        public var compressedBytes: Int64
+
+        public init(zipPath: String, originalBytes: Int64, compressedBytes: Int64) {
+            self.zipPath = zipPath
+            self.originalBytes = originalBytes
+            self.compressedBytes = compressedBytes
+        }
+    }
+
+    public enum CompressError: Error, LocalizedError, Equatable {
+        /// The bundle isn't in a state that's safe to compress (incomplete,
+        /// mid-removal, already compressed, or a `.zip` already sits at the
+        /// destination path).
+        case notEligible(String)
+        /// The bundle's `entries.jsonl` points outside its own root — the
+        /// traversal guard (#264) tripped, so this bundle is refused rather
+        /// than compressed (and thereby preserved/propagated) as-is.
+        case unsafeEntry(String)
+        /// The `.part` zip `ditto` produced could not be reopened and
+        /// decoded back to the same manifest — nothing was deleted.
+        case verifyFailed(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .notEligible(let reason): return reason
+            case .unsafeEntry(let path): return "Archive entry path escapes the bundle: \(path)"
+            case .verifyFailed(let reason): return reason
+            }
+        }
+    }
+
+    /// Compresses `bundle`'s directory into a `.zip` in place, deleting the
+    /// directory only once the zip is verified readable. Throws
+    /// `CompressError.notEligible` up front for a bundle that shouldn't be
+    /// touched (mirrors the same safety class `deleteBundle` already checks
+    /// in `ArchiveBrowserView` — incomplete / mid-removal — plus "already
+    /// compressed").
+    @discardableResult
+    public func compress(_ bundle: Summary) async throws -> CompressResult {
+        guard !bundle.isIncomplete else {
+            throw CompressError.notEligible("This archive never finished writing — delete it instead of compressing it.")
+        }
+        guard !bundle.hasPendingRemoval else {
+            throw CompressError.notEligible("This archive is still finishing a prior operation — try again shortly.")
+        }
+        guard !bundle.isCompressed else {
+            throw CompressError.notEligible("This archive is already compressed.")
+        }
+        let bundlePath = bundle.bundlePath
+        return try await Task.detached(priority: .utility) {
+            try Self.performCompress(bundlePath: bundlePath)
+        }.value
+    }
+
+    private nonisolated static func performCompress(bundlePath: String) throws -> CompressResult {
+        // Respect the traversal guard (#264) before anything else: refuse a
+        // bundle whose entries.jsonl resolves outside its own root rather
+        // than compressing (and thereby legitimizing) it.
+        try validateEntriesForCompress(bundlePath: bundlePath)
+
+        let fm = FileManager.default
+        let zipPath = compressedZipPath(for: bundlePath)
+        guard !fm.fileExists(atPath: zipPath) else {
+            throw CompressError.notEligible("A compressed archive already exists at \(zipPath).")
+        }
+        let originalBytes = directorySize(atPath: bundlePath)
+
+        // Atomic: write to `.part`, verify, THEN rename into place.
+        let partialPath = zipPath + ".part"
+        if fm.fileExists(atPath: partialPath) {
+            try? fm.removeItem(atPath: partialPath)
+        }
+        try runDitto(bundlePath: bundlePath, destination: partialPath)
+
+        // Verify readable BEFORE the source is touched: reopen the `.part`
+        // zip and decode its manifest.json back out.
+        let bundleDirName = (bundlePath as NSString).lastPathComponent
+        guard (try? readManifestFromZip(zipPath: partialPath, bundleDirName: bundleDirName)) != nil else {
+            try? fm.removeItem(atPath: partialPath)
+            throw CompressError.verifyFailed(
+                "The compressed archive could not be verified readable — nothing was deleted."
+            )
+        }
+
+        try fm.moveItem(atPath: partialPath, toPath: zipPath)
+
+        // Only now — the destination is a verified-readable zip — remove the
+        // uncompressed source.
+        try fm.removeItem(atPath: bundlePath)
+
+        let compressedBytes = (try? fm.attributesOfItem(atPath: zipPath))?[.size] as? Int64 ?? 0
+        return CompressResult(zipPath: zipPath, originalBytes: originalBytes, compressedBytes: compressedBytes)
+    }
+
+    /// `<bundlePath>.zip` — kept alongside the (about-to-be-removed)
+    /// directory bundle rather than in a caller-chosen destination, so
+    /// `ArchiveStore.scan()` picks it back up as the same archive under
+    /// `isCompressedArchivePath`.
+    nonisolated static func compressedZipPath(for bundlePath: String) -> String {
+        bundlePath + ".zip"
+    }
+
+    /// True for a `<name>.cbarchive.zip` path — a compressed archive's own
+    /// on-disk spelling, distinct from a plain `.zip` a user happened to
+    /// place in an archive root (which is left alone) and from the directory
+    /// `.cbarchive` bundle format.
+    nonisolated static func isCompressedArchivePath(_ path: String) -> Bool {
+        path.hasSuffix(".cbarchive.zip")
+    }
+
+    /// Reads every entry in `bundlePath`'s `entries.jsonl` (when present —
+    /// hand-built test fixtures often omit it, matching the existing
+    /// header-only `scan()` behavior) purely to run each locator through
+    /// `ArchivePaths.resolveEntryPath`, the traversal guard from #264.
+    /// Throws `CompressError.unsafeEntry` for the first entry that fails it;
+    /// never writes anything.
+    nonisolated static func validateEntriesForCompress(bundlePath: String) throws {
+        let entriesPath = (bundlePath as NSString).appendingPathComponent("entries.jsonl")
+        guard FileManager.default.fileExists(atPath: entriesPath) else { return }
+        let bundleRoot = URL(fileURLWithPath: bundlePath)
+        do {
+            _ = try ArchiveJSONL.read(at: entriesPath) { entry in
+                _ = try ArchivePaths.resolveEntryPath(entry.relativePath, in: bundleRoot)
+                if let sidecar = entry.sidecarRelativePath {
+                    _ = try ArchivePaths.resolveEntryPath(sidecar, in: bundleRoot)
+                }
+                if let thumb = entry.thumbnailRelativePath {
+                    _ = try ArchivePaths.resolveEntryPath(thumb, in: bundleRoot)
+                }
+            }
+        } catch let error as ArchiveError {
+            if case .pathTraversal(let path) = error {
+                throw CompressError.unsafeEntry(path)
+            }
+            throw error
+        }
+    }
+
+    /// Shells `unzip -p <zipPath> "<bundleDirName>/manifest.json"` and decodes
+    /// the result — both the verify-before-delete step in `performCompress`
+    /// and how `scan()` lists a compressed row without a directory bundle
+    /// left on disk to read `manifest.json` from directly. `bundleDirName` is
+    /// the entry prefix `ditto --keepParent` wrote every path under.
+    nonisolated static func readManifestFromZip(zipPath: String, bundleDirName: String) throws -> ArchiveManifest {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        proc.arguments = ["-p", zipPath, "\(bundleDirName)/manifest.json"]
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = Pipe()   // discard — never let stderr chatter into the captured bytes
+        try proc.run()
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0, !data.isEmpty else {
+            throw CompressError.verifyFailed("Could not read manifest.json from the compressed archive.")
+        }
+        return try ArchiveManifest.decode(data)
+    }
+
+    /// Sum of every regular file's on-disk size under `path`, recursively.
+    /// Used only for `CompressResult.originalBytes` — a summary figure, not a
+    /// safety check, so a stat failure on one file just doesn't count it
+    /// rather than aborting the whole compress.
+    nonisolated static func directorySize(atPath path: String) -> Int64 {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(atPath: path) else { return 0 }
+        var total: Int64 = 0
+        for case let relative as String in enumerator {
+            let full = (path as NSString).appendingPathComponent(relative)
+            if let size = (try? fm.attributesOfItem(atPath: full))?[.size] as? Int64 {
+                total += size
+            }
+        }
+        return total
     }
 }
