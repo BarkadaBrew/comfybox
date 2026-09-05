@@ -144,6 +144,10 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     // of a `loras[]` entry, for one release, not something this client can
     // write back independently.
     public var kromaDeprecated: Bool?
+    /// Read-only, engine-generated. See the server's `ImagePreset.migrationNotes`
+    /// — currently only `"kroma_dropped_no_file"` (a `kroma` declared active
+    /// with no file, which nothing can be migrated into). Never sent back.
+    public var migrationNotes: [String]?
 
     public init(
         id: String = UUID().uuidString,
@@ -235,7 +239,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
         case bypass
         case invalid, invalidReason
-        case kromaDeprecated
+        case kromaDeprecated, migrationNotes
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -270,7 +274,12 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(upscale, forKey: .upscale)
         try c.encodeIfPresent(vae, forKey: .vae)
         try c.encodeIfPresent(checkpointFamily, forKey: .checkpointFamily)
-        try c.encodeIfPresent(kroma, forKey: .kroma)
+        // Review r2, C1 (Critical): `kroma` is NEVER sent back — like
+        // `invalid`/`invalidReason`, it is a deprecated, derived,
+        // engine-recomputed echo. Encoding it (even when the in-memory
+        // value is just an unedited passthrough of what GET returned) lets
+        // the server's compatibility shim fold it back into `loras[]` and
+        // resurrect a row the user just deleted.
         try c.encodeIfPresent(bypass, forKey: .bypass)
         try c.encodeIfPresent(sampler, forKey: .sampler)
         try c.encodeIfPresent(sigmaSchedule, forKey: .sigmaSchedule)
@@ -324,6 +333,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         invalid = try c.decodeIfPresent(Bool.self, forKey: .invalid)
         invalidReason = try c.decodeIfPresent(String.self, forKey: .invalidReason)
         kromaDeprecated = try c.decodeIfPresent(Bool.self, forKey: .kromaDeprecated)
+        migrationNotes = try c.decodeIfPresent([String].self, forKey: .migrationNotes)
     }
 
     /// Map to the local apply-to-Generate shape.
@@ -342,7 +352,6 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
                     role: $0.role
                 )
             },
-            kroma: kroma.map { PresetKroma(strength: $0.strength, file: $0.file) },
             steps: steps ?? 9,
             guidance: Float(guidance ?? 3.5),
             projectorScale: projectorScale.map { Float($0) },

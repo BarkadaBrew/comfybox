@@ -3813,9 +3813,10 @@ public final class WarmServer {
   }
 
   /// `POST`/`PUT /v1/presets` (WP-E20, AC-44b): decode, validate through
-  /// `PresetStore.upsert` (O4a kroma rule, recipe-name resolution, ranges)
-  /// and persist. A refused preset is a 400 naming the preset and the field;
-  /// nothing is stored. Returns the saved preset for the audit log.
+  /// `PresetStore.upsert` (recipe-name resolution, range checks, the
+  /// deprecated-kroma migration) and persist. A refused preset is a 400
+  /// naming the preset and the field; nothing is stored. Returns the saved
+  /// preset for the audit log.
   static func upsertPreset(store: PresetStore, body: Data) -> (RoutedResponse, saved: ImagePreset?) {
     do {
       let decoder = JSONDecoder()
@@ -11746,14 +11747,14 @@ struct GenerateResponse: Encodable, Sendable {
   /// #286 (round 2): `preset_unresolved_reason` — the machine-readable code
   /// beside the name, so a daemon can branch on WHY: `unknown_preset`,
   /// `invalid_preset`, `media_kind:video`, `engine:<x>`, `provider:<x>`,
-  /// `no_model`, `bypass_declared`, `kroma_file_missing`, `missing_lora:<name>`.
+  /// `no_model`, `bypass_declared`, `missing_lora:<name>`.
   let presetUnresolvedReason: String?
 
   /// #286 (I1): the request carried explicit `loras` that differ from what its
   /// named `preset` resolves to. The explicit list won, as it always has; this
   /// says the two disagreed. The production async client sends a FLAT `loras`
-  /// list that has already dropped structured kroma/bypass/role, which is
-  /// exactly the case this makes visible.
+  /// list that has already dropped `bypass`/`role`, which is exactly the case
+  /// this makes visible.
   let presetStackMismatch: Bool?
 
   /// #22 (PR #363 review, C1b): the render's estimated peak activation

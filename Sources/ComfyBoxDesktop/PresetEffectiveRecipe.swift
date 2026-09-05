@@ -34,7 +34,7 @@ public struct EffectiveLoRA: Equatable, Identifiable, Sendable {
 /// Why the engine would render this preset as a label only, never expanding
 /// its model/LoRA stack — `PresetExpansion.Unresolved`, mirrored for the UI.
 public struct EffectiveRecipeUnresolved: Equatable, Sendable {
-  /// Machine-readable code (`no_model`, `kroma_file_missing`, `engine:mflux`, …).
+  /// Machine-readable code (`no_model`, `engine:mflux`, `bypass_declared`, …).
   public var code: String
   /// Full sentence, the same one the engine logs.
   public var message: String

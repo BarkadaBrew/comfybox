@@ -22,8 +22,11 @@ struct GenerationPresetTests {
 
     @Test("codable round-trip")
     func codable() throws {
+        // Todd 2026-09-04: kroma is a regular LoRA — `GenerationPreset.kroma`
+        // was dead state (review r2 M) and is removed; a role: "kroma" entry
+        // round-trips through `loras` like any other.
         var preset = TestData.makePreset(name: "My Preset", promptTemplate: "a test prompt", steps: 20, guidance: 7.5)
-        preset.kroma = PresetKroma(strength: 0.6, file: "kroma.safetensors")
+        preset.loras = [PresetLoRA(id: "k", filename: "kroma.safetensors", scale: 0.6, role: "kroma")]
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(preset)
@@ -35,7 +38,7 @@ struct GenerationPresetTests {
         #expect(decoded.steps == 20)
         #expect(decoded.guidance == 7.5)
         #expect(decoded.id == preset.id)
-        #expect(decoded.kroma == preset.kroma)
+        #expect(decoded.loras.first?.role == "kroma")
     }
 
     @Test("identifiable via id")

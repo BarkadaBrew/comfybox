@@ -67,7 +67,7 @@ final class WarmServerPresetValidationTests: XCTestCase {
     let stored = try XCTUnwrap(store.get("krea-kira"))
     XCTAssertEqual(stored.checkpointFamily, "turbo")
     XCTAssertEqual(stored.kroma, KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
-    XCTAssertTrue(stored.kromaDeprecated)
+    XCTAssertEqual(stored.kromaDeprecated, true)
     XCTAssertEqual(stored.loras, [
       LoraReference(filename: "kroma-v0.3-base.safetensors", scale: 0.6, role: "kroma"),
     ])
@@ -82,9 +82,9 @@ final class WarmServerPresetValidationTests: XCTestCase {
   }
 
   /// A structured `kroma` with no file (the old "engine-default file" case)
-  /// has nothing concrete to become a LoRA of — it migrates to nothing, and
-  /// the derived view is nil. This is the one real loss the deprecation
-  /// accepts: there is no such thing as a filename-less regular LoRA.
+  /// has nothing concrete to become a LoRA of — it migrates to nothing, the
+  /// derived view is nil, and the loss is recorded in `migrationNotes`
+  /// rather than silently swallowed (review r2, I3).
   func testDeclaredKromaWithNoFileMigratesToNothing() throws {
     let store = try makeStore()
     let payload = Data(#"""
@@ -94,8 +94,9 @@ final class WarmServerPresetValidationTests: XCTestCase {
     XCTAssertEqual(response.status, 200, body(response))
     let stored = try XCTUnwrap(store.get("krea-kira"))
     XCTAssertNil(stored.kroma)
-    XCTAssertFalse(stored.kromaDeprecated)
+    XCTAssertNil(stored.kromaDeprecated)
     XCTAssertEqual(stored.loras, [])
+    XCTAssertEqual(stored.migrationNotes, ["kroma_dropped_no_file"])
   }
 
   /// The recipe-name resolver the generate path uses guards the preset too:

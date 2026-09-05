@@ -206,19 +206,21 @@ final class PresetStoreTests: XCTestCase {
 
     // Todd 2026-09-04: `kroma` is deprecated — `upsert` folds it into
     // `loras[]` as a regular, role-tagged entry (`ImagePreset.
-    // migratingKromaDeprecation`), appended after the declared accel entry.
-    // The accel role must survive that migration unchanged.
+    // migratingKromaDeprecation`). Review r2 (I4): inserted at the FRONT,
+    // not appended — render parity with the pre-deprecation prepend
+    // behavior for a preset migrating for the first time. The accel role
+    // must survive that migration unchanged regardless of position.
     let migratedKroma = LoraReference(
       filename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6, role: "kroma")
     let reopened = PresetStore(path: path, seedDefaults: false)
-    XCTAssertEqual(reopened.get("krea-kira")?.loras, [r256, migratedKroma])
-    XCTAssertEqual(try reopened.resolve("krea-kira").loras, [r256, migratedKroma])
+    XCTAssertEqual(reopened.get("krea-kira")?.loras, [migratedKroma, r256])
+    XCTAssertEqual(try reopened.resolve("krea-kira").loras, [migratedKroma, r256])
 
     let root = try XCTUnwrap(
       JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
     let presets = try XCTUnwrap(root["presets"] as? [[String: Any]])
     let loras = try XCTUnwrap(presets.first?["loras"] as? [[String: Any]])
-    XCTAssertEqual(loras.first?["role"] as? String, "accel")
+    XCTAssertEqual(loras.last?["role"] as? String, "accel")
   }
 
   func testPresetRejectsUnknownLoraRole() throws {
@@ -505,9 +507,11 @@ extension PresetStoreTests {
     // `loras[]` (`ImagePreset.migratingKromaDeprecation`) — the stored
     // preset differs from the one passed in by exactly that fold, plus the
     // now-true `kromaDeprecated` marker.
+    // Review r2 (I4): the migrated entry is inserted at the FRONT, not
+    // appended — render parity with the pre-deprecation prepend behavior.
     var migrated = preset
-    migrated.loras.append(LoraReference(
-      filename: "kroma-v0.2-base-lora-rank-384-fro-0985.safetensors", scale: 0.3, role: "kroma"))
+    migrated.loras.insert(LoraReference(
+      filename: "kroma-v0.2-base-lora-rank-384-fro-0985.safetensors", scale: 0.3, role: "kroma"), at: 0)
     migrated.kromaDeprecated = true
     XCTAssertEqual(reopened.get("ref"), migrated)
     let resolved = try reopened.resolve("ref")
@@ -593,7 +597,7 @@ extension PresetStoreTests {
     // no loras entry and no derived view — there is nothing to be a LoRA of.
     XCTAssertEqual(loaded.get("krea-bree")?.loras, [])
     XCTAssertNil(loaded.get("krea-bree")?.kroma)
-    XCTAssertEqual(loaded.get("krea-bree")?.kromaDeprecated, false)
+    XCTAssertNil(loaded.get("krea-bree")?.kromaDeprecated)
   }
 
   /// PR #365 review r1 → redirect (Todd 2026-09-04): the migration itself,
@@ -608,7 +612,7 @@ extension PresetStoreTests {
       LoraReference(filename: "kroma-v0.3-base.safetensors", scale: 0.6, role: "kroma"),
     ])
     XCTAssertEqual(migrated.kroma, KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
-    XCTAssertTrue(migrated.kromaDeprecated)
+    XCTAssertEqual(migrated.kromaDeprecated, true)
   }
 
   /// A preset with BOTH a structured `kroma` AND an already-present matching
@@ -655,6 +659,79 @@ extension PresetStoreTests {
     try store.upsert(try XCTUnwrap(store.get("derived-view")))
     XCTAssertEqual(store.get("derived-view")?.kroma, expected)
     XCTAssertEqual(store.get("derived-view")?.loras.count, 1)
+  }
+
+  /// Review r2, C1 (Critical): a client that deletes the kroma row and
+  /// re-saves — sending `loras[]` without it and NO `kroma` field at all
+  /// (the fixed desktop's shape, `ServerPreset.encode` never emits `kroma`)
+  /// — must not have it resurrected. Nothing to migrate: the deletion wins.
+  func testDeleteRowRoundTrip() throws {
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    let original = ImagePreset(
+      id: "delete-me", name: "x", model: "krea2-raw",
+      kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    try store.upsert(original)
+    XCTAssertEqual(store.get("delete-me")?.loras.count, 1, "sanity: it migrated in")
+
+    // The client re-saves with the kroma row removed from `loras[]` and no
+    // `kroma` field sent at all.
+    let edited = ImagePreset(id: "delete-me", name: "x", model: "krea2-raw", loras: [])
+    try store.upsert(edited)
+    XCTAssertEqual(store.get("delete-me")?.loras, [])
+    XCTAssertNil(store.get("delete-me")?.kroma)
+    XCTAssertNil(store.get("delete-me")?.kromaDeprecated)
+  }
+
+  /// Review r2, C1: swapping which file is tagged `role: "kroma"` — the
+  /// preset already has a NEW kroma-role entry in `loras[]`, but still
+  /// carries the OLD structured `kroma.file` (a stale echo a naive
+  /// round-trip could resend) — must not resurrect the old file as a
+  /// second entry. Exactly one `role: "kroma"` row survives, and it is
+  /// the new one.
+  func testSwapFileRoundTripYieldsOneRow() {
+    let preset = ImagePreset(
+      id: "swap", name: "x", model: "krea2-raw",
+      loras: [LoraReference(filename: "kroma-v0.4-new.safetensors", scale: 0.5, role: "kroma")],
+      kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-old.safetensors"))
+    let migrated = ImagePreset.migratingKromaDeprecation(preset)
+    XCTAssertEqual(migrated.loras.filter { ($0.role ?? "").lowercased() == "kroma" }.count, 1,
+                   "exactly one kroma-role row")
+    XCTAssertEqual(migrated.loras.map(\.filename), ["kroma-v0.4-new.safetensors"])
+    XCTAssertEqual(migrated.kroma, KromaPolicy(strength: 0.5, file: "kroma-v0.4-new.safetensors"),
+                   "the derived view reflects the NEW row, not the stale structured field")
+  }
+
+  /// Review r2, I3: the warning is actually logged, not just recorded in
+  /// `migrationNotes`.
+  func testMigrationLogsAWarningWhenKromaHasNoFile() {
+    let preset = ImagePreset(id: "no-file", name: "x", model: "krea2-raw", kroma: KromaPolicy(strength: 0.6))
+    var logged: [String] = []
+    let migrated = ImagePreset.migratingKromaDeprecation(preset, log: { logged.append($0) })
+    XCTAssertEqual(migrated.migrationNotes, ["kroma_dropped_no_file"])
+    XCTAssertTrue(logged.contains { $0.contains("kroma_dropped_no_file") }, "\(logged)")
+  }
+
+  /// Review r2, I2: `ResolvedPreset` must decode a payload from an
+  /// older engine that predates `kromaDeprecated`/`migrationNotes` entirely
+  /// — a non-optional `Bool` would fail this decode outright.
+  func testResolvedPresetDecodesWithoutKromaDeprecatedKey() throws {
+    let json = #"""
+    {"id":"old","name":"Old","description":"","mediaKind":"image","provider":"local","engine":"zimage",
+     "steps":8,"width":512,"height":512,"loras":[],"injectedKeywords":[]}
+    """#
+    let decoded = try JSONDecoder().decode(ResolvedPreset.self, from: Data(json.utf8))
+    XCTAssertNil(decoded.kromaDeprecated)
+    XCTAssertNil(decoded.migrationNotes)
+  }
+
+  /// Review r2, I2: an ordinary preset with no kroma at all never emits
+  /// `"kromaDeprecated": false` on the wire — the key is simply absent.
+  func testKromaDeprecatedIsOmittedWhenFalse() throws {
+    let preset = ImagePreset(id: "plain", name: "Plain", model: "z-image-turbo")
+    let data = try JSONEncoder().encode(preset)
+    let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+    XCTAssertFalse(text.contains("kromaDeprecated"), text)
+    XCTAssertFalse(text.contains("migrationNotes"), text)
   }
 
   /// The recipe fields are validated with the same resolver `/v1/generate`

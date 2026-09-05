@@ -333,6 +333,11 @@ private struct ServerPresetEditor: View {
     /// rejects) this preset — e.g. flagged invalid at load (WP-E20, AC-44c).
     /// nil means either "matches" or "not checked yet".
     @State private var serverResolveError: String?
+    /// Review r2 (I5): the `.task` cross-check must actually COMPARE the
+    /// engine's resolved stack against the local computation, not merely
+    /// confirm the request succeeded. Set when they disagree (names, scales,
+    /// roles, or order) for the saved (as-loaded) preset.
+    @State private var serverMismatch: String?
 
     /// Editable LoRA row — stable identity for ForEach even when the same
     /// file appears twice while the user is rearranging.
@@ -460,16 +465,28 @@ private struct ServerPresetEditor: View {
         }
         .frame(minWidth: 560, idealWidth: 620, minHeight: 590, idealHeight: 680)
         .task {
-            // #277: cross-check against the live engine once per sheet
-            // appearance. Only meaningful for an already-saved preset — the
-            // endpoint resolves by id, so it cannot see unsaved edits (the
-            // panel above is the live preview for those).
+            // #277 / review r2 (I5): cross-check against the live engine
+            // once per sheet appearance, by actually COMPARING its resolved
+            // stack (names, scales, roles, order) to the local computation
+            // for the SAME (as-loaded, unedited) preset — not merely
+            // confirming the request succeeded. Only meaningful for an
+            // already-saved preset — the endpoint resolves by id, so it
+            // cannot see unsaved edits (the panel above is the live preview
+            // for those, and is not what this checks).
             guard !isNew, !original.id.isEmpty, let engine else { return }
             do {
-                _ = try await engine.resolvePreset(id: original.id)
+                let serverResolved = try await engine.resolvePreset(id: original.id)
                 serverResolveError = nil
+                let declared = original.toImagePreset()
+                let serverStack = PresetEffectiveRecipePresenter.compute(
+                    resolved: serverResolved, declared: declared).loraStack
+                let localStack = PresetEffectiveRecipePresenter.compute(declared: declared).loraStack
+                serverMismatch = serverStack == localStack
+                    ? nil
+                    : "Local preview disagrees with the live engine's resolved stack for this preset."
             } catch {
                 serverResolveError = error.localizedDescription
+                serverMismatch = nil
             }
         }
         .alert("Save as New Preset", isPresented: $showingSaveAs) {
@@ -499,6 +516,10 @@ private struct ServerPresetEditor: View {
             if let error = serverResolveError {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(.caption2).foregroundStyle(.red)
+            }
+            if let mismatch = serverMismatch {
+                Label(mismatch, systemImage: "arrow.triangle.2.circlepath.circle")
+                    .font(.caption2).foregroundStyle(.orange)
             }
             if let unresolved = recipe.unresolved {
                 VStack(alignment: .leading, spacing: 3) {
@@ -568,6 +589,7 @@ private struct ServerPresetEditor: View {
                     Button("Style / unassigned") { lora.role = nil }
                     Divider()
                     Button("Accelerator") { lora.role = "accel" }
+                    Button("Kroma") { lora.role = "kroma" }
                     Button("Bypass") { lora.role = "bypass" }
                     Button("Control") { lora.role = "control" }
                 } label: {
@@ -652,6 +674,7 @@ private struct ServerPresetEditor: View {
     private func roleLabel(for role: String?) -> String {
         switch role {
         case "accel": return "Accelerator"
+        case "kroma": return "Kroma"
         case "bypass": return "Bypass"
         case "control": return "Control"
         case .some(let role): return role.capitalized
@@ -715,9 +738,14 @@ private struct ServerPresetEditor: View {
         // consumers; modern engine validation and Generate use `sampler`.
         p.scheduler = p.sampler
         // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` (editableLoras)
-        // is the single source; `p.kroma` passes through untouched, like
-        // `bypass`/`upscale`. The server normalises it on save (it is a
-        // deprecated, derived, read-only compatibility echo).
+        // is the single source. Review r2, C1 (Critical): `p.kroma` is a
+        // DEPRECATED, derived, read-only echo — carrying `original.kroma`
+        // through unedited (as `bypass`/`upscale` legitimately do) resurrects
+        // a row the user just deleted, because the server's compatibility
+        // shim folds a non-nil `kroma` back into `loras[]` on the next save.
+        // The desktop must NEVER send it; `ServerPreset.encode` also never
+        // emits it, belt and braces.
+        p.kroma = nil
         p.loras = editableLoras
             .filter { !$0.filename.isEmpty }
             .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }
