@@ -278,7 +278,18 @@ public final class LoRALibrary: @unchecked Sendable {
     guard let entry = entry(for: identifier) else {
       throw LoRALibraryError.entryNotFound(identifier)
     }
-    return libraryRoot.appendingPathComponent(entry.relativePath)
+    return Self.absoluteURL(for: entry, libraryRoot: libraryRoot)
+  }
+
+  /// The entry's file location. `relativePath` is normally relative to
+  /// `libraryRoot`, but #273 fix round 1 (C1) anchoring rewrites it to an
+  /// absolute path when the staged copy lives outside `libraryRoot` (the
+  /// nearline cache directory) — `appendingPathComponent` would silently
+  /// mis-concatenate an absolute string, so detect and use it directly.
+  static func absoluteURL(for entry: LoRALibraryEntry, libraryRoot: URL) -> URL {
+    entry.relativePath.hasPrefix("/")
+      ? URL(fileURLWithPath: entry.relativePath)
+      : libraryRoot.appendingPathComponent(entry.relativePath)
   }
 
   /// Get the library root URL.
@@ -515,6 +526,10 @@ public final class LoRALibrary: @unchecked Sendable {
       entry.modelCompatibility = compat
       entry.compatibilitySource = .manual
     }
+    // #273 fix round 1 (C1): anchoring rewrites where the file lives —
+    // through this API, never by editing library.json directly.
+    if let relativePath = patch.relativePath { entry.relativePath = relativePath }
+    if let anchored = patch.anchored { entry.anchored = anchored }
 
     entries[id] = entry
     try saveIndex()
@@ -667,7 +682,7 @@ public final class LoRALibrary: @unchecked Sendable {
     }
     lock.unlock()
 
-    let fileURL = libraryRoot.appendingPathComponent(entry.relativePath)
+    let fileURL = Self.absoluteURL(for: entry, libraryRoot: libraryRoot)
     let hash = try sha256Hash(of: fileURL)
 
     lock.lock()
