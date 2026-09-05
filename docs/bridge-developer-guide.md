@@ -280,8 +280,55 @@ The bridge recognizes these ComfyUI node types:
 | `LoadImage` | Img2img source |
 | `LoraLoader` | LoRA path and scale |
 | `ImageUpscaleWithModel` | SeedVR2/ESRGAN upscale |
+| `ModelSamplingAuraFlow` / `ModelSamplingSD3` | Flow-matching schedule `shift` (comfybox#154) |
 
 Unsupported nodes are silently ignored — the bridge extracts what it can and generates with those parameters.
+
+#### `ModelSamplingAuraFlow` — schedule shift (comfybox#154)
+
+A workflow carrying a `ModelSamplingAuraFlow` node has its `shift` input read
+and applied as the flow schedule's linear shift,
+`σ' = shift·σ / (1 + (shift − 1)·σ)` — ComfyUI's `time_snr_shift`
+(`comfy/model_sampling.py`). It is what Zeta Chroma needs (its author publishes
+**shift 3.00**, Euler, `simple`/`normal`, CFG 4.5–5.5); `1.0` is the exact
+identity, and a workflow with no such node renders exactly as it did before.
+
+- **`ModelSamplingSD3` is read the same way.** `ModelSamplingAuraFlow` IS an
+  `ModelSamplingSD3` subclass upstream; they differ only in the timestep
+  `multiplier` they pass (1.0 vs 1000), and **the multiplier cancels out of the
+  sigma grid** — `normal_scheduler` walks
+  `linspace(timestep(σ_max) → timestep(σ_min))` and maps each point back through
+  `sigma(t) = time_snr_shift(shift, t / M)` while `timestep(σ) = σ · M`. Same
+  `shift`, same schedule. The multiplier scales the timestep the *model* is fed,
+  which is a property of the checkpoint and is unchanged by this field.
+- Both nodes are advertised in `GET /object_info` under category `model/patch`
+  with their own upstream defaults (`1.73` for AuraFlow, `3.0` for SD3).
+- **`ModelSamplingFlux` is still NOT read.** Its shift is a LOG-shift feeding
+  `e^shift / (e^shift + 1/t − 1)` — a genuinely different curve, not the same
+  warp under another name. It stays structural glue.
+- **The node is honoured only when the resident model family is Z-Image.** On
+  any other family the workflow is **refused with a 400 naming the node and the
+  family** — never silently rendered without it. Krea 2 is the case that
+  matters: its `shift` is a log-shift `mu`, so the node's `3.0` would mean
+  `e³ ≈ 20`, and applying it would be a different grid under the caller's
+  number.
+- **The ControlNet path returns a different error.** A workflow that also
+  carries a ControlNet node takes an earlier branch, which refuses every
+  non-Z-Image family outright with `controlNetNotSupported` before any render.
+  So a Krea-2-resident client sending a ControlNet + `ModelSamplingAuraFlow`
+  graph sees the ControlNet refusal, not the node-named 400 above. That is
+  pre-existing behaviour of the ControlNet arm, not something the shift field
+  introduced — and it means the only family that can reach a ControlNet render
+  is Z-Image, where the node's shift is exactly what `shift` means.
+- A `shift` asked for alongside a sigma schedule that ignores it (`krea2`,
+  `bong_tangent`) is likewise a 400 — see the `shift` section in
+  [`api-notes.md`](api-notes.md).
+- On a multi-pass graph the **lowest node id wins**, the same deterministic rule
+  the bridge uses for schedulers and controlnets; the others are logged and
+  ignored.
+- A `shift` that is not a positive finite number is logged and DROPPED — the
+  graph renders on the model's own schedule rather than failing with a 400 a
+  Krita user would never see.
 
 ## Path 3: MCP (For AI Assistants)
 

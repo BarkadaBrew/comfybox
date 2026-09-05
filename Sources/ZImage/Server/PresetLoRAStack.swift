@@ -80,6 +80,13 @@ public enum PresetLoRAStack: Sendable, Equatable {
   ///     declared `vae` is not adopted — same "declared, and only when the
   ///     request said nothing" rule as steps/guidance, so an undeclared VAE
   ///     is never manufactured from some other default.
+  ///   - requestShift: the request's own `shift` (#154). Same rule again: a
+  ///     preset's DECLARED `shift` is adopted only when the request named
+  ///     none — and, additionally, only when the preset's declared family is
+  ///     Z-Image, because `shift` means a different quantity on Krea 2 and
+  ///     four live krea2 presets already declare one (see the expansion site
+  ///     below). `ResolvedPreset.shift` has no `PresetDefaults` fallback, so
+  ///     there is no manufactured-default hazard here either.
   ///   - normalizeModelSpec: how two model strings are compared — production
   ///     passes `WarmServer.parseModelSpec`, so an alias and the directory it
   ///     names are the same model, not a conflict.
@@ -91,6 +98,7 @@ public enum PresetLoRAStack: Sendable, Equatable {
     requestSteps: Int? = nil,
     requestGuidance: Double? = nil,
     requestVAE: String? = nil,
+    requestShift: Double? = nil,
     normalizeModelSpec: (String) -> String = { $0 }
   ) -> PresetLoRAStack {
     let id = presetId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -244,6 +252,32 @@ public enum PresetLoRAStack: Sendable, Equatable {
 
     if requestVAE == nil, let vae = declared.vae { expansion.vae = vae }
 
+    // --- Declared schedule shift (#154) — DECLARED, only when the request
+    // said nothing, and ONLY for a preset whose declared family is Z-Image.
+    //
+    // The family gate is not cosmetic and it is not a "safety margin": `shift`
+    // means two different things on the two families that read it (the linear
+    // `ModelSamplingAuraFlow` warp on Z-Image, the `ModelSamplingFlux`
+    // LOG-shift `mu` on Krea 2), and four live krea2 presets in
+    // `~/.comfybox/presets.json` — krea-kira, krea-kira-sfw, krea-kira-avocado,
+    // krea2-base — declare `shift: 1.15` today. Before #154 nothing on the
+    // image path read that value; expanding it for every family would turn it
+    // into a real `mu` on Kira's production renders the moment this deploys.
+    // Krea 2 keeps taking its shift from the REQUEST only, exactly as it did.
+    //
+    // Fails closed: `declaredFamily` answers from `checkpoint_family` first and
+    // the `model` spec second, and returns nil when the preset says neither —
+    // in which case nothing is adopted. A preset that wants its shift applied
+    // must SAY it is Z-Image (`checkpoint_family: zimage-base` /
+    // `zimage-turbo`, or a z-image model spec).
+    //
+    // `PresetStore.validate` already refuses a non-positive or non-finite
+    // `shift`, so an adopted value is always one `validateShift` can accept.
+
+    if requestShift == nil, let shift = declared.shift, declaredFamily(declared) == "z-image" {
+      expansion.shift = shift
+    }
+
     return .apply(expansion)
   }
 
@@ -336,6 +370,12 @@ public struct PresetExpansion: Sendable, Equatable {
   /// omitted its own. nil = the request named one, the preset declared none,
   /// or the preset could not be expanded.
   public var vae: String?
+  /// #154: the preset's declared schedule `shift`, adopted only where the
+  /// request omitted its own. On the Z-Image family this is ComfyUI's
+  /// `ModelSamplingAuraFlow` linear shift; on Krea 2 it is `mu`
+  /// (`ModelSamplingFlux`). Same field, family-dependent meaning — the
+  /// per-family gate is `GeneratePayload.validateShift(_:family:)`.
+  public var shift: Double?
   /// C2: the engine could not expand this preset. It behaves as the label it
   /// always was, and this reaches the response as `preset_unresolved` (the
   /// preset's name) plus `preset_unresolved_reason` (the machine-readable
@@ -365,6 +405,7 @@ public struct PresetExpansion: Sendable, Equatable {
   public init(
     presetId: String, loras: [LoraReference]? = nil, model: String? = nil,
     steps: Int? = nil, guidance: Double? = nil, vae: String? = nil,
+    shift: Double? = nil,
     unresolved: Unresolved? = nil,
     stackMismatch: Bool = false
   ) {
@@ -374,6 +415,7 @@ public struct PresetExpansion: Sendable, Equatable {
     self.steps = steps
     self.guidance = guidance
     self.vae = vae
+    self.shift = shift
     self.unresolved = unresolved
     self.stackMismatch = stackMismatch
   }
@@ -419,6 +461,7 @@ extension GeneratePayload {
       requestSteps: payload.steps,
       requestGuidance: payload.guidance.map(Double.init),
       requestVAE: payload.vae,
+      requestShift: payload.shift.map(Double.init),
       normalizeModelSpec: normalizeModelSpec)
 
     switch decision {
@@ -455,6 +498,16 @@ extension GeneratePayload {
       }
       if let steps = expansion.steps { out.steps = steps }
       if let guidance = expansion.guidance { out.guidance = Float(guidance) }
+      if let shift = expansion.shift {
+        // #154: no `presetShiftApplied` twin of `presetVAEApplied` — nothing
+        // downstream needs to tell a preset-owned shift from a request-owned
+        // one (the VAE flag exists only so `Krea2VAESelector` can record
+        // `vae_source`). The response's `applied_shift` reports the value that
+        // reached the sigma grid whichever source it came from, which is the
+        // question a caller actually asks.
+        out.shift = Float(shift)
+        log("Preset '\(expansion.presetId)': applying its declared schedule shift \(shift)")
+      }
       if let vae = expansion.vae {
         out.vae = vae
         // #285: the ONLY way `Krea2VAESelector.resolve` (called later, at

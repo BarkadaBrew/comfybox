@@ -39,6 +39,9 @@ public struct Img2ImgRequest: Sendable {
   public var schedulerKind: SchedulerKind
   public var sigmaSchedule: SigmaScheduleKind
   public var eta: Float?
+  /// comfybox#154 — explicit `ModelSamplingAuraFlow` schedule shift; nil = the
+  /// model's own schedule. Forwarded verbatim to ``ZImageGenerationRequest``.
+  public var shift: Float?
   public var dyPE: DyPEConfig
 
   /// The source image file path.
@@ -105,6 +108,7 @@ public struct Img2ImgRequest: Sendable {
     schedulerKind: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .flow,
     eta: Float? = nil,
+    shift: Float? = nil,
     dyPE: DyPEConfig = .disabled,
     sourceImagePath: String,
     strength: Float = 0.3,
@@ -137,6 +141,7 @@ public struct Img2ImgRequest: Sendable {
     self.schedulerKind = schedulerKind
     self.sigmaSchedule = sigmaSchedule
     self.eta = eta
+    self.shift = shift
     self.dyPE = dyPE
     self.sourceImagePath = sourceImagePath
     self.strength = strength
@@ -408,6 +413,7 @@ extension ZImagePipeline {
       schedulerKind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       eta: request.eta,
+      shift: request.shift,
       dyPE: dyPEConfig,
       inpaintImageData: imageData,
       maskData: maskData,

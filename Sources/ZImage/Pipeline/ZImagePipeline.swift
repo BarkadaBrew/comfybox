@@ -60,6 +60,13 @@ public struct ZImageGenerationRequest: Sendable {
   /// Also used by DPM++ 2S-A. Ignored by other samplers.
   public var eta: Float?
 
+  /// comfybox#154 — the explicit flow-matching schedule shift, ComfyUI's
+  /// `ModelSamplingAuraFlow` node. `nil` (the default) is the model's own
+  /// schedule, unchanged. A value patches the scheduler config through
+  /// ``ZImageSchedulerConfig/applyingExplicitShift(_:)`` and REPLACES the
+  /// resolution-dependent `mu` shift for this render. Zeta Chroma wants 3.0.
+  public var shift: Float?
+
   /// DyPE (Dynamic Position Extrapolation) config for native high-resolution generation.
   /// When enabled, modifies RoPE frequencies to support resolutions above training scale.
   public var dyPE: DyPEConfig
@@ -105,6 +112,7 @@ public struct ZImageGenerationRequest: Sendable {
     schedulerKind: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .flow,
     eta: Float? = nil,
+    shift: Float? = nil,
     dyPE: DyPEConfig = .disabled,
     inpaintImageData: Data? = nil,
     maskData: Data? = nil,
@@ -136,6 +144,7 @@ public struct ZImageGenerationRequest: Sendable {
     self.schedulerKind = schedulerKind
     self.sigmaSchedule = sigmaSchedule
     self.eta = eta
+    self.shift = shift
     self.dyPE = dyPE
     self.inpaintImageData = inpaintImageData
     self.maskData = maskData
@@ -1089,11 +1098,20 @@ public final class ZImagePipeline {
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
 
+    // #154: an explicit `shift` patches the scheduler config the way ComfyUI's
+    // `ModelSamplingAuraFlow` patches `model_sampling` — it replaces the
+    // model's shift AND the resolution-dependent `mu` shift for this render.
+    // `nil` returns the config unchanged, so `mu` still governs by default.
+    let schedulerConfig = modelConfigs.scheduler.applyingExplicitShift(request.shift)
+    if let requestedShift = request.shift {
+      logger.info("Schedule shift: explicit \(requestedShift) (ModelSamplingAuraFlow) — replaces dynamic mu \(mu)")
+    }
+
     var scheduler = try SchedulerFactory.create(
       kind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,
-      config: modelConfigs.scheduler,
+      config: schedulerConfig,
       mu: mu,
       seed: request.seed,
       eta: request.eta

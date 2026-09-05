@@ -301,6 +301,30 @@ enum ComfyBridgeObjectInfo {
       requiredOrder: ["model", "scheduler", "steps", "denoise"],
       outputs: ["SIGMAS"]
     )
+    // comfybox#154 — ComfyUI's `ModelSamplingAuraFlow`. Advertised so Krita and
+    // other bridge clients can place the node and set its `shift`; the parser
+    // reads that input and the render applies it as the flow schedule's linear
+    // shift. Upstream's own default is 1.73; the value Zeta Chroma's author
+    // publishes is 3.00.
+    info["ModelSamplingAuraFlow"] = nodeDefinition(
+      required: [
+        "model": modelInput(),
+        "shift": floatInput(default: 1.73),
+      ],
+      requiredOrder: ["model", "shift"],
+      outputs: ["MODEL"]
+    )
+    // ComfyUI's own default for `ModelSamplingSD3` is 3.0
+    // (`nodes_model_advanced.py:123`); its `shift` produces the same sigma grid
+    // as AuraFlow's, so the bridge reads either.
+    info["ModelSamplingSD3"] = nodeDefinition(
+      required: [
+        "model": modelInput(),
+        "shift": floatInput(default: 3.0),
+      ],
+      requiredOrder: ["model", "shift"],
+      outputs: ["MODEL"]
+    )
     info["KSamplerSelect"] = nodeDefinition(
       required: [
         "sampler_name": optionInput(RecipeNameResolver.advertisedSamplerNames),
@@ -714,6 +738,12 @@ enum ComfyBridgeObjectInfo {
     case "SamplerCustomAdvanced", "BasicScheduler", "KSamplerSelect", "RandomNoise",
          "DifferentialDiffusion", "KSampler", "KSamplerAdvanced", "SplitSigmas":
       return "sampling"
+
+    // comfybox#154: upstream's own category for this node
+    // (`comfy_extras/nodes_model_advanced.py`, `ModelSamplingAuraFlow.CATEGORY`),
+    // so a client's node browser files it where its user expects.
+    case "ModelSamplingAuraFlow", "ModelSamplingSD3":
+      return "model/patch"
 
     case "ETN_LoadImageCache", "ETN_SaveImageCache", "INPAINT_ShrinkMask",
          "INPAINT_StabilizeMask", "INPAINT_ColorMatch", "INPAINT_ExpandMask",

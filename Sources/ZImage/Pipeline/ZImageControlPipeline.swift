@@ -68,6 +68,9 @@ public struct ZImageControlGenerationRequest {
   public var sigmaSchedule: SigmaScheduleKind
   /// Stochasticity parameter for DDIM / DPM++ 2S-A. Ignored by other samplers.
   public var eta: Float?
+  /// comfybox#154 — explicit `ModelSamplingAuraFlow` schedule shift; nil = the
+  /// model's own schedule (the resolution-dependent `mu`), unchanged.
+  public var shift: Float?
   public init(
     prompt: String,
     negativePrompt: String? = nil,
@@ -95,7 +98,8 @@ public struct ZImageControlGenerationRequest {
     enhanceMaxTokens: Int = 512,
     schedulerKind: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .flow,
-    eta: Float? = nil
+    eta: Float? = nil,
+    shift: Float? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -123,6 +127,7 @@ public struct ZImageControlGenerationRequest {
     self.schedulerKind = schedulerKind
     self.sigmaSchedule = sigmaSchedule
     self.eta = eta
+    self.shift = shift
   }
   #if canImport(CoreGraphics)
   public init(
@@ -152,7 +157,8 @@ public struct ZImageControlGenerationRequest {
     enhanceMaxTokens: Int = 512,
     schedulerKind: SchedulerKind = .euler,
     sigmaSchedule: SigmaScheduleKind = .flow,
-    eta: Float? = nil
+    eta: Float? = nil,
+    shift: Float? = nil
   ) {
     self.prompt = prompt
     self.negativePrompt = negativePrompt
@@ -183,6 +189,7 @@ public struct ZImageControlGenerationRequest {
     self.schedulerKind = schedulerKind
     self.sigmaSchedule = sigmaSchedule
     self.eta = eta
+    self.shift = shift
   }
   #endif
 }
@@ -1020,11 +1027,14 @@ public class ZImageControlPipeline {
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
+    // #154: an explicit `shift` patches the scheduler config the way ComfyUI's
+    // `ModelSamplingAuraFlow` patches `model_sampling` — replacing the model's
+    // shift AND the resolution-dependent `mu` shift. nil = unchanged.
     var scheduler = try SchedulerFactory.create(
       kind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,
-      config: modelConfigs.scheduler,
+      config: modelConfigs.scheduler.applyingExplicitShift(request.shift),
       mu: mu,
       seed: request.seed,
       eta: request.eta
@@ -1351,11 +1361,14 @@ public class ZImageControlPipeline {
       baseShift: modelConfigs.scheduler.baseShift ?? 0.5,
       maxShift: modelConfigs.scheduler.maxShift ?? 1.15
     )
+    // #154: an explicit `shift` patches the scheduler config the way ComfyUI's
+    // `ModelSamplingAuraFlow` patches `model_sampling` — replacing the model's
+    // shift AND the resolution-dependent `mu` shift. nil = unchanged.
     var scheduler = try SchedulerFactory.create(
       kind: request.schedulerKind,
       sigmaSchedule: request.sigmaSchedule,
       numInferenceSteps: request.steps,
-      config: modelConfigs.scheduler,
+      config: modelConfigs.scheduler.applyingExplicitShift(request.shift),
       mu: mu,
       seed: request.seed,
       eta: request.eta

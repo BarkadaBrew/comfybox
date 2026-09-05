@@ -347,6 +347,44 @@ public enum SchedulerFactory {
     }
   }
 
+  /// comfybox#154 — does this `(schedule, model sampling)` pair actually READ
+  /// `config.shift`, i.e. would a `ModelSamplingAuraFlow` shift reach the sigma
+  /// grid at all?
+  ///
+  /// Three of the schedules here are defined by something else entirely and
+  /// would drop an explicit shift on the floor:
+  ///
+  /// - `.krea2` is `mu` and only `mu` (FDD-krea2-raw-recipe §3.1);
+  /// - `.bong_tangent` is model-free by construction — upstream takes
+  ///   `model_sampling` and never reads it (D6), which is why `RenderRecipe`
+  ///   records `shift_applied: false` for it;
+  /// - under `.flux` model sampling (Krea 2's family) the table-backed
+  ///   schedules — `simple`, `beta`, `beta57`, and the `karras`/`exponential`
+  ///   BOUNDS — build from `mu`, not from `config.shift` (Addendum A.1); see
+  ///   ``sigmaTable(schedule:config:mu:)`` just below.
+  ///
+  /// `.flow` is the one schedule that always reads `config.shift` directly,
+  /// whatever the model sampling.
+  ///
+  /// Callers use this to REFUSE a shift that would be silently ignored rather
+  /// than accept it and report success — and it is what makes the response's
+  /// `applied_shift` honest: the field is only ever echoed for a shift that
+  /// reached the grid.
+  static func honoursExplicitShift(
+    schedule: SigmaScheduleKind,
+    modelSampling: ZImageSchedulerConfig.ModelSampling
+  ) -> Bool {
+    switch schedule {
+    case .flow:
+      return true
+    case .krea2, .bongTangent:
+      return false
+    case .karras, .exponential, .beta, .beta57, .simple:
+      if case .discreteFlow = modelSampling { return true }
+      return false
+    }
+  }
+
   /// ComfyUI's `model_sampling.sigma_min` — the first (smallest) entry of the
   /// ACTIVE model-sampling table, which is what RES4LYF's `prepare_sigmas`
   /// inserts before the trailing zero (`SIGMA_MIN` in
