@@ -836,7 +836,7 @@ public final class WarmServer {
         auditLog.append(kind: "nearline.stage", message: "Staged \(body.name)", metadata: ["path": staged])
         return nearlineListResponse()
       } catch let error as NearlineError {
-        return .error(.error(status: 404, message: error.localizedDescription))
+        return .error(.error(status: Self.httpStatus(for: error), message: error.localizedDescription))
       } catch {
         return .error(.error(status: 500, message: "Stage failed: \(error.localizedDescription)"))
       }
@@ -852,12 +852,24 @@ public final class WarmServer {
             status: 400,
             message: "Kind mismatch for \(body.id): catalog has \(existing.kind), request said \(body.kind)"))
         }
-        try nearlineLibrary.setAnchored(name: body.id, anchored: body.anchored)
+        // #273 fix round 1 (C1): a "lora" kind also rewrites the matching
+        // LoRALibraryEntry's relativePath — the issue's actual problem —
+        // through LoRALibrary's own update API. "model" kind has no
+        // equivalent per-file registry today, so only the nearline flag
+        // applies.
+        if body.kind == "lora" {
+          try NearlineLoRAAnchoring.setAnchored(
+            name: body.id, anchored: body.anchored, loraLibrary: loraLibrary, nearlineLibrary: nearlineLibrary)
+        } else {
+          try nearlineLibrary.setAnchored(name: body.id, anchored: body.anchored)
+        }
         auditLog.append(
           kind: "nearline.anchor",
           message: "\(body.anchored ? "Anchored" : "Un-anchored") \(body.id)")
         return nearlineListResponse()
       } catch let error as NearlineError {
+        return .error(.error(status: Self.httpStatus(for: error), message: error.localizedDescription))
+      } catch let error as LoRALibraryError {
         return .error(.error(status: 404, message: error.localizedDescription))
       } catch {
         return .error(.error(status: 500, message: "Anchor failed: \(error.localizedDescription)"))
@@ -1912,6 +1924,17 @@ public final class WarmServer {
     let kind: String
     let id: String
     let anchored: Bool
+  }
+
+  /// #273 fix round 1 (C2): the HTTP status a `NearlineError` maps to
+  /// across the nearline routes — a pure function so the mapping (notably
+  /// `.insufficientCapacity` -> 507) is directly unit-tested without a
+  /// live server.
+  static func httpStatus(for error: NearlineError) -> Int {
+    switch error {
+    case .insufficientCapacity: return 507
+    case .unknownItem, .sourceMissing: return 404
+    }
   }
 
   /// The per-item JSON shape for `GET /v1/nearline`'s `items` array. A pure
@@ -10989,6 +11012,7 @@ struct HTTPResponse {
     case 500: return "Internal Server Error"
     case 502: return "Bad Gateway"
     case 503: return "Service Unavailable"
+    case 507: return "Insufficient Storage"
     default: return "OK"
     }
   }

@@ -69,4 +69,20 @@ final class NearlineAnchorRouteTests: XCTestCase {
     let dict = WarmServer.nearlineItemJSON(item, iso: ISO8601DateFormatter())
     XCTAssertTrue(JSONSerialization.isValidJSONObject(dict))
   }
+
+  // MARK: - #273 fix round 1 (C2): error -> HTTP status mapping
+
+  func testInsufficientCapacityMapsTo507() {
+    let status = WarmServer.httpStatus(
+      for: .insufficientCapacity(needMB: 100, freeMB: 10, anchoredMB: 90))
+    XCTAssertEqual(status, 507)
+  }
+
+  func testUnknownItemMapsTo404() {
+    XCTAssertEqual(WarmServer.httpStatus(for: .unknownItem("x")), 404)
+  }
+
+  func testSourceMissingMapsTo404() {
+    XCTAssertEqual(WarmServer.httpStatus(for: .sourceMissing("/vol/x")), 404)
+  }
 }

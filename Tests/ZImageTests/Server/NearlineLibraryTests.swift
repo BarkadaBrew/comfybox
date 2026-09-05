@@ -220,6 +220,132 @@ final class NearlineLibraryTests: XCTestCase {
     XCTAssertEqual(toEvict, [])
   }
 
+  // MARK: - #273 fix round 1 (C2): stage() throws instead of silently over-filling
+
+  func testStageThrowsInsufficientCapacityWhenAllStagedItemsAreAnchored() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 2.0 / 1024.0))  // 2 MB budget
+    try writeSource("pinned.safetensors", megabytes: 2)
+    try writeSource("incoming.safetensors", megabytes: 2)
+    library.scan()
+
+    _ = try library.setAnchored(name: "pinned.safetensors", anchored: true)  // fills the entire budget
+
+    XCTAssertThrowsError(try library.stage(name: "incoming.safetensors")) { error in
+      guard case NearlineError.insufficientCapacity(let needMB, let freeMB, let anchoredMB) = error else {
+        return XCTFail("expected insufficientCapacity, got \(error)")
+      }
+      XCTAssertEqual(needMB, 2, accuracy: 0.01)
+      XCTAssertEqual(freeMB, 0, accuracy: 0.01)
+      XCTAssertEqual(anchoredMB, 2, accuracy: 0.01)
+    }
+    // The failed stage must not have copied the file (no silent over-fill).
+    XCTAssertEqual(library.item(named: "incoming.safetensors")?.staged, false)
+    XCTAssertLessThanOrEqual(library.stagedMB, 2.0)
+  }
+
+  func testStageThrowsInsufficientCapacityWhenIncomingIsBiggerThanTheWholeBudget() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 1.0 / 1024.0))  // 1 MB budget
+    try writeSource("huge.safetensors", megabytes: 5)
+    library.scan()
+
+    XCTAssertThrowsError(try library.stage(name: "huge.safetensors")) { error in
+      guard case NearlineError.insufficientCapacity = error else {
+        return XCTFail("expected insufficientCapacity, got \(error)")
+      }
+    }
+  }
+
+  // MARK: - #273 fix round 1 (M): setAnchored persists only after stage() succeeds
+
+  func testSetAnchoredDoesNotPersistTheFlagWhenStagingFails() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 1.0 / 1024.0))
+    try writeSource("wont_fit.safetensors", megabytes: 5)
+    library.scan()
+
+    XCTAssertThrowsError(try library.setAnchored(name: "wont_fit.safetensors", anchored: true))
+
+    XCTAssertEqual(library.item(named: "wont_fit.safetensors")?.anchored, false,
+                    "a failed anchor-and-stage must not leave nearline.json claiming the item is anchored")
+    XCTAssertEqual(library.item(named: "wont_fit.safetensors")?.staged, false)
+  }
+
+  // MARK: - #273 fix round 1 (I3): lock released across the copy
+
+  func testStageForADifferentNameIsNotBlockedByAnInFlightCopy() throws {
+    try writeSource("slow.safetensors", megabytes: 1)
+    try writeSource("fast.safetensors", megabytes: 1)
+    library.scan()
+
+    let copyStarted = XCTestExpectation(description: "slow copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { item in
+      guard item.name == "slow.safetensors" else { return }
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    let slowStageDone = XCTestExpectation(description: "slow stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "slow.safetensors")
+      slowStageDone.fulfill()
+    }
+
+    wait(for: [copyStarted], timeout: 5.0)
+
+    // While "slow" is mid-copy (blocked on releaseCopy), staging a
+    // DIFFERENT item must complete promptly — the lock must not be held
+    // across the copy.
+    let start = Date()
+    let fastPath = try library.stage(name: "fast.safetensors")
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: fastPath))
+    XCTAssertLessThan(elapsed, 2.0, "stage() for an unrelated item must not block on another item's in-flight copy")
+
+    releaseCopy.signal()
+    wait(for: [slowStageDone], timeout: 5.0)
+    XCTAssertEqual(library.item(named: "slow.safetensors")?.staged, true)
+  }
+
+  func testConcurrentStageOfTheSameNameWaitsForTheInFlightCopyInsteadOfRacingIt() throws {
+    try writeSource("shared.safetensors", megabytes: 1)
+    library.scan()
+
+    let copyStarted = XCTestExpectation(description: "copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    var copyCount = 0
+    let copyCountLock = NSLock()
+    library.testCopyDelayHook = { _ in
+      copyCountLock.lock(); copyCount += 1; copyCountLock.unlock()
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    var firstResult: String?
+    var secondResult: String?
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    let secondDone = XCTestExpectation(description: "second stage finished")
+
+    DispatchQueue.global().async {
+      firstResult = try? self.library.stage(name: "shared.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [copyStarted], timeout: 5.0)
+
+    DispatchQueue.global().async {
+      secondResult = try? self.library.stage(name: "shared.safetensors")
+      secondDone.fulfill()
+    }
+    // Give the second caller a moment to reach the "wait for in-flight
+    // group" branch before releasing the copy.
+    Thread.sleep(forTimeInterval: 0.1)
+    releaseCopy.signal()
+
+    wait(for: [firstDone, secondDone], timeout: 5.0)
+    XCTAssertEqual(copyCount, 1, "only one copy of the same file should ever run concurrently")
+    XCTAssertNotNil(firstResult)
+    XCTAssertEqual(firstResult, secondResult)
+  }
+
   func testLRUEvictionNeverEvictsAnAnchoredItemEvenWhenOldest() throws {
     library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 5.0 / 1024.0))
     try writeSource("keep_anchored.safetensors", megabytes: 2)
