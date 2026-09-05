@@ -5519,7 +5519,7 @@ public final class WarmServer {
     }
     for (key, value) in [
       ("model", payload.model as Any?), ("steps", payload.steps as Any?),
-      ("guidance", payload.guidance as Any?),
+      ("guidance", payload.guidance as Any?), ("vae", payload.vae as Any?),
     ] where object[key] == nil {
       if let value {
         object[key] = value
@@ -9841,7 +9841,8 @@ private actor WarmServerCoordinator {
       // different file than the resident one reloads the decoder IN PLACE on
       // the one Krea2VAE (never a pool eviction), and the selection is
       // recorded on the pipeline for the response record (WP-E10).
-      let vaeChoice = try Krea2VAESelector.resolve(requested: payload.vae, paths: k2.paths)
+      let vaeChoice = try Krea2VAESelector.resolve(
+        requested: payload.vae, paths: k2.paths, fromPreset: payload.presetVAEApplied == true)
       try k2.ensureVAE(path: vaeChoice.file, source: vaeChoice.source)
       logger.info("Krea2: VAE \(k2.currentVAE.layout.rawValue) \(k2.currentVAE.file.path) (source=\(k2.currentVAE.source.rawValue), reloads=\(k2.vaeReloadCount))")
       let outputURL = try payload.resolvedOutputURL(
@@ -11295,7 +11296,19 @@ struct GeneratePayload: Sendable {
   /// the model directory's VAE. A path that is not on disk FAILS the render
   /// (AC-56); the layout is sniffed from the file's keys, never its name.
   /// Krea 2 only today (the other families ignore it).
-  let vae: String?
+  ///
+  /// `var` since #285: `WarmServer.expandGeneratePayload` fills this in from
+  /// the named `preset`'s declared `vae` when the request carried none of its
+  /// own — the same request > preset > model-dir precedence
+  /// `RequestStackResolver` established for LoRAs. See ``PresetLoRAStack``.
+  var vae: String?
+  /// #285: set by the engine, never by the wire — `vae` above was filled from
+  /// the named `preset`'s declared value rather than sent by the client. The
+  /// only way `Krea2VAESelector.resolve` (called at dispatch, once `vae`'s
+  /// two sources have collapsed onto this one field) can still tell them
+  /// apart and record an honest `vae_source: "preset"` instead of
+  /// `"payload"`. Mirrors ``presetStackApplied`` for LoRAs.
+  var presetVAEApplied: Bool?
 
   /// WP-E17 (§3.14, D4): the second stage of this render. Krea 2 only —
   /// refused, never ignored, on any other family (``stage2Gate(_:family:)``).
@@ -11354,6 +11367,7 @@ struct GeneratePayload: Sendable {
   ) {
     self.preempt = preempt
     self.vae = vae
+    self.presetVAEApplied = nil
     self.stage2 = stage2
     self.detailPass = detailPass
     self.detailDenoise = detailDenoise
@@ -11513,6 +11527,8 @@ extension GeneratePayload: Decodable {
     controlImage = try c.decodeIfPresent(String.self, forKey: .controlImage)
     preempt = try c.decodeIfPresent(Bool.self, forKey: .preempt)
     vae = try c.decodeIfPresent(String.self, forKey: .vae)
+    // #285: engine-set, never decoded from the wire — see its doc comment.
+    presetVAEApplied = nil
     stage2 = try c.decodeIfPresent(Stage2Payload.self, forKey: .stage2)
     detailPass = try c.decodeIfPresent(Bool.self, forKey: .detailPass)
     detailDenoise = try c.decodeIfPresent(Double.self, forKey: .detailDenoise)

@@ -76,6 +76,10 @@ public enum PresetLoRAStack: Sendable, Equatable {
   ///     ("no adapters"), not an absence, and still wins.
   ///   - requestModel: the request's own `model`.
   ///   - requestSteps / requestGuidance: present ⇒ the preset's are not adopted.
+  ///   - requestVAE: the request's own `vae` (#285). Present ⇒ the preset's
+  ///     declared `vae` is not adopted — same "declared, and only when the
+  ///     request said nothing" rule as steps/guidance, so an undeclared VAE
+  ///     is never manufactured from some other default.
   ///   - normalizeModelSpec: how two model strings are compared — production
   ///     passes `WarmServer.parseModelSpec`, so an alias and the directory it
   ///     names are the same model, not a conflict.
@@ -86,6 +90,7 @@ public enum PresetLoRAStack: Sendable, Equatable {
     requestModel: String? = nil,
     requestSteps: Int? = nil,
     requestGuidance: Double? = nil,
+    requestVAE: String? = nil,
     normalizeModelSpec: (String) -> String = { $0 }
   ) -> PresetLoRAStack {
     let id = presetId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -231,6 +236,14 @@ public enum PresetLoRAStack: Sendable, Equatable {
     if requestSteps == nil, let steps = declared.steps { expansion.steps = steps }
     if requestGuidance == nil, let guidance = declared.guidance { expansion.guidance = guidance }
 
+    // --- Declared VAE (#285), same rule: declared, and only when the request
+    // said nothing. `declared.vae` and `resolved.vae` are always identical
+    // (`ResolvedPreset.vae = preset.vae`, no `PresetDefaults` fallback for
+    // it) so there is no "undeclared default" hazard the steps/guidance
+    // comment above warns about — but the request still wins outright. -----
+
+    if requestVAE == nil, let vae = declared.vae { expansion.vae = vae }
+
     return .apply(expansion)
   }
 
@@ -319,6 +332,10 @@ public struct PresetExpansion: Sendable, Equatable {
   /// DECLARED steps/guidance, adopted only where the request omitted them.
   public var steps: Int?
   public var guidance: Double?
+  /// #285: the preset's declared `vae`, adopted only where the request
+  /// omitted its own. nil = the request named one, the preset declared none,
+  /// or the preset could not be expanded.
+  public var vae: String?
   /// C2: the engine could not expand this preset. It behaves as the label it
   /// always was, and this reaches the response as `preset_unresolved` (the
   /// preset's name) plus `preset_unresolved_reason` (the machine-readable
@@ -347,7 +364,8 @@ public struct PresetExpansion: Sendable, Equatable {
 
   public init(
     presetId: String, loras: [LoraReference]? = nil, model: String? = nil,
-    steps: Int? = nil, guidance: Double? = nil, unresolved: Unresolved? = nil,
+    steps: Int? = nil, guidance: Double? = nil, vae: String? = nil,
+    unresolved: Unresolved? = nil,
     stackMismatch: Bool = false
   ) {
     self.presetId = presetId
@@ -355,6 +373,7 @@ public struct PresetExpansion: Sendable, Equatable {
     self.model = model
     self.steps = steps
     self.guidance = guidance
+    self.vae = vae
     self.unresolved = unresolved
     self.stackMismatch = stackMismatch
   }
@@ -399,6 +418,7 @@ extension GeneratePayload {
       requestModel: payload.model,
       requestSteps: payload.steps,
       requestGuidance: payload.guidance.map(Double.init),
+      requestVAE: payload.vae,
       normalizeModelSpec: normalizeModelSpec)
 
     switch decision {
@@ -435,6 +455,15 @@ extension GeneratePayload {
       }
       if let steps = expansion.steps { out.steps = steps }
       if let guidance = expansion.guidance { out.guidance = Float(guidance) }
+      if let vae = expansion.vae {
+        out.vae = vae
+        // #285: the ONLY way `Krea2VAESelector.resolve` (called later, at
+        // dispatch, once `payload.vae` and `payload.preset` have long since
+        // collapsed onto the same field) can record `vae_source: "preset"`
+        // instead of `"payload"` — mirrors `presetStackApplied` for LoRAs.
+        out.presetVAEApplied = true
+        log("Preset '\(expansion.presetId)': applying its declared VAE '\(vae)'")
+      }
       return out
     }
   }

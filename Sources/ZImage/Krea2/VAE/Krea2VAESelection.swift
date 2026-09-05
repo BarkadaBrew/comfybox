@@ -55,17 +55,26 @@ public enum Krea2VAESelectionError: Error, Equatable, LocalizedError {
 
 /// The precedence rule as a pure, weight-free function.
 public enum Krea2VAESelector {
-  /// `requested` is `payload.vae` (tilde allowed). Absent → the model dir's
-  /// file (`paths.vaeFile`, which already honours `model_index.json`
-  /// `"vae_file"`). Existence is checked here so a bad name fails BEFORE any
-  /// pipeline work; an empty string is a bad selection, not "no selection".
+  /// `requested` is `payload.vae` — either sent directly on the request, or
+  /// filled in by `PresetLoRAStack`'s expansion of a named `preset` (#285:
+  /// request > preset > model dir, the same precedence `RequestStackResolver`
+  /// uses for LoRAs). Absent → the model dir's file (`paths.vaeFile`, which
+  /// already honours `model_index.json` `"vae_file"`). Existence is checked
+  /// here so a bad name fails BEFORE any pipeline work; an empty string is a
+  /// bad selection, not "no selection".
+  ///
+  /// `fromPreset` says which of the two non-default sources filled
+  /// `requested` — by the time it reaches here both have collapsed onto the
+  /// same field, so the caller (`WarmServer`, from
+  /// `payload.presetVAEApplied`) is what still knows. It only changes the
+  /// recorded ``Krea2VAESelection/Source``, never the resolution itself.
   public static func resolve(
-    requested: String?, paths: Krea2ModelPaths
+    requested: String?, paths: Krea2ModelPaths, fromPreset: Bool = false
   ) throws -> (file: URL, source: Krea2VAESelection.Source) {
     let file: URL
     let source: Krea2VAESelection.Source
     if let requested {
-      source = .payload
+      source = fromPreset ? .preset : .payload
       let trimmed = requested.trimmingCharacters(in: .whitespacesAndNewlines)
       // "" would resolve to the working directory — a bad selection, not "none".
       guard !trimmed.isEmpty else {

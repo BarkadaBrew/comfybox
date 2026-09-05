@@ -29,7 +29,9 @@ final class PresetLoRAStackTests: XCTestCase {
 
   /// The preset in the bug report: krea2 raw-stock, kroma declared OFF, five
   /// content LoRAs.
-  private func kreaKiraAvocado(steps: Int? = nil, guidance: Double? = nil) -> PresetLoRAStack.Lookup {
+  private func kreaKiraAvocado(
+    steps: Int? = nil, guidance: Double? = nil, vae: String? = nil
+  ) -> PresetLoRAStack.Lookup {
     lookup(ImagePreset(
       id: "krea-kira-avocado", name: "Kira Avocado", mediaKind: "image",
       model: "krea2-raw", steps: steps, guidance: guidance,
@@ -40,6 +42,7 @@ final class PresetLoRAStackTests: XCTestCase {
         LoraReference(filename: "snofs_photoSlider_000000200.safetensors", scale: 1.25),
         LoraReference(filename: "Krea2_TextFusion_Refusal_Reduction.safetensors", scale: 1.0),
       ],
+      vae: vae,
       checkpointFamily: "raw-stock",
       kroma: KromaPolicy(strength: 0)))
   }
@@ -367,6 +370,31 @@ final class PresetLoRAStackTests: XCTestCase {
       presetId: "krea-kira-avocado", lookup: undeclared, requestLoras: nil))
     XCTAssertNil(e.steps, "an undeclared steps must never arrive as the store's default of 4")
     XCTAssertNil(e.guidance)
+  }
+
+  // MARK: #285 — declared `vae`, and only declared, request-first
+
+  func testDeclaredVAEIsAdoptedWhenTheRequestOmitsIt() throws {
+    let wan = "/Users/toddwalderman/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(vae: wan),
+      requestLoras: nil))
+    XCTAssertEqual(e.vae, wan)
+  }
+
+  func testRequestVAEWins() throws {
+    let wan = "/Users/toddwalderman/LocalModels/vae/Wan2_1_VAE_fp32.safetensors"
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(vae: wan),
+      requestLoras: nil, requestVAE: "/Users/toddwalderman/LocalModels/vae/other.safetensors"))
+    XCTAssertNil(e.vae, "the preset's vae is not adopted — the request already named one")
+  }
+
+  func testUndeclaredVAEContributesNothing() throws {
+    let e = try expansion(PresetLoRAStack.decide(
+      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(),
+      requestLoras: nil))
+    XCTAssertNil(e.vae)
   }
 
   // MARK: Todd 2026-09-04 — kroma has NO special semantics; it is a regular

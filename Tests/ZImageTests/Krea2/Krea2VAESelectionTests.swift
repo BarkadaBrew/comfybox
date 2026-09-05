@@ -83,6 +83,50 @@ final class Krea2VAESelectionTests: XCTestCase {
     XCTAssertEqual(sel.source, .payload)
   }
 
+  /// #285: `fromPreset` is the only thing that changes when the same
+  /// resolution came from `PresetLoRAStack` expanding a named preset's
+  /// declared `vae` onto `payload.vae` rather than the request sending one
+  /// directly — the file/existence resolution is byte-identical either way.
+  func testFromPresetRecordsPresetSourceForTheSameFile() throws {
+    let root = try makeRoot("preset-sourced", extraVAE: "vae/other.safetensors")
+    let paths = try Krea2ModelDetection.detect(at: root)
+    let requested = root.appending(path: "vae/other.safetensors").path
+
+    let byRequest = try Krea2VAESelector.resolve(requested: requested, paths: paths)
+    XCTAssertEqual(byRequest.source, .payload)
+
+    let byPreset = try Krea2VAESelector.resolve(requested: requested, paths: paths, fromPreset: true)
+    XCTAssertEqual(byPreset.file, byRequest.file)
+    XCTAssertEqual(byPreset.source, .preset)
+  }
+
+  /// `fromPreset` never changes the model-dir fallback: absent `requested`
+  /// is still `.modelDir`, whichever caller asked.
+  func testFromPresetIsIgnoredWhenNoVAEWasRequested() throws {
+    let root = try makeRoot("preset-absent")
+    let paths = try Krea2ModelDetection.detect(at: root)
+    let sel = try Krea2VAESelector.resolve(requested: nil, paths: paths, fromPreset: true)
+    XCTAssertEqual(sel.source, .modelDir)
+  }
+
+  /// A preset naming a VAE that is not on disk fails exactly like a request
+  /// naming one — fail loud, never a silent fallback to the model dir — and
+  /// the error still says which source asked.
+  func testFromPresetMissingVAEStillFailsNamingThePresetSource() throws {
+    let root = try makeRoot("preset-missing")
+    let paths = try Krea2ModelDetection.detect(at: root)
+    let missing = root.appending(path: "vae/nope.safetensors").path
+    XCTAssertThrowsError(
+      try Krea2VAESelector.resolve(requested: missing, paths: paths, fromPreset: true)
+    ) { error in
+      guard case Krea2VAESelectionError.vaeNotFound(let path, let source) = error else {
+        return XCTFail("expected vaeNotFound, got \(error)")
+      }
+      XCTAssertEqual(path, missing)
+      XCTAssertEqual(source, .preset)
+    }
+  }
+
   /// AC-56: a VAE not on disk fails with a path-naming error — never the model dir's VAE.
   func testMissingVAEFailsTheRenderNamingThePath() throws {
     let root = try makeRoot("missing")
