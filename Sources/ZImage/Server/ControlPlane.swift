@@ -129,6 +129,38 @@ enum QueueDeltaStore {
   /// `persistQueueState()` write and the sidecar commit — the crash window the
   /// WAL ordering protects. Tests assert queue-deltas.json still exists here.
   nonisolated(unsafe) static var drainCrashWindowHook: (@Sendable () -> Void)?
+
+  /// comfybox#386 test seam: fires synchronously at the top of `save`, before
+  /// any encoding or I/O. A test can make this block (simulating a slow or
+  /// nearly-full disk) to prove that whatever runs `save` under
+  /// `LiveHealthState`'s dedicated sidecar lock never blocks `read()`, which
+  /// only ever needs the separate state lock.
+  ///
+  /// review round 2, item 4: `save` can run more than once while a test has
+  /// this hook installed (a second `recordDelta`/`commitDrainedDeltas`/
+  /// `clearDeltas` call, or a retry after a forced failure below) — a hook
+  /// built on a plain semaphore that is only ever signalled once will park
+  /// the SECOND call forever, holding `LiveHealthState.sidecarLock` and
+  /// wedging every write after it. Tests must use a gate that stays open once
+  /// released (broadcast/idempotent), not a one-shot semaphore, and must
+  /// reset this to `nil` in `tearDown` so a failure mid-test can't leak a
+  /// blocked hook into the next test.
+  nonisolated(unsafe) static var blockingWriteHook: (@Sendable () -> Void)?
+
+  /// comfybox#386 test seam: when set, `save` returns this value INSTEAD of
+  /// performing the real encode/write — lets a test simulate a disk write
+  /// failure (full volume, permission error, …) deterministically, to prove
+  /// `LiveHealthState.persistDeltaSidecar` never advances
+  /// `lastPersistedDeltaGeneration` on a failed write (review round 2, item 2).
+  nonisolated(unsafe) static var forcedSaveResult: Bool?
+
+  /// comfybox#386 review round 5 test seam: like `forcedSaveResult`, but
+  /// invoked FRESH on every `save` call and takes precedence over it — a
+  /// fixed `forcedSaveResult` can't model "fails N times then recovers"
+  /// (the exact shape of a real transient outage), which is what pins the
+  /// round-5 critical fix (`runBackgroundHeal` retrying through more than
+  /// one real write failure, not just lost try-lock races).
+  nonisolated(unsafe) static var forcedSaveResultProvider: (@Sendable () -> Bool)?
   #endif
 
   static var path: URL {
@@ -137,15 +169,33 @@ enum QueueDeltaStore {
 
   /// Persist the WHOLE undrained set (small JSON, atomic). An empty set deletes
   /// the file, exactly like `QueueStateStore.save` — no stale sidecar survives a
-  /// clean drain.
-  static func save(_ deltas: [QueueControlCommand]) {
+  /// clean drain. Returns whether the write actually succeeded (review round
+  /// 2, item 2: previously swallowed every failure with `try?`, so a caller
+  /// had no way to avoid treating a failed write as durable).
+  @discardableResult
+  static func save(_ deltas: [QueueControlCommand]) -> Bool {
+    #if DEBUG
+    blockingWriteHook?()
+    if let provider = forcedSaveResultProvider { return provider() }
+    if let forced = forcedSaveResult { return forced }
+    #endif
     guard !deltas.isEmpty else {
-      try? FileManager.default.removeItem(at: path)
-      return
+      guard FileManager.default.fileExists(atPath: path.path) else { return true }
+      do {
+        try FileManager.default.removeItem(at: path)
+        return true
+      } catch {
+        return false
+      }
     }
     let encoder = JSONEncoder()
-    guard let data = try? encoder.encode(deltas.map { $0.persisted }) else { return }
-    try? data.write(to: path, options: .atomic)
+    guard let data = try? encoder.encode(deltas.map { $0.persisted }) else { return false }
+    do {
+      try data.write(to: path, options: .atomic)
+      return true
+    } catch {
+      return false
+    }
   }
 
   static func load() -> [QueueControlCommand] {
@@ -153,10 +203,6 @@ enum QueueDeltaStore {
     let decoder = JSONDecoder()
     guard let raw = try? decoder.decode([PersistedQueueDelta].self, from: data) else { return [] }
     return raw.map(QueueControlCommand.init)
-  }
-
-  static func clear() {
-    try? FileManager.default.removeItem(at: path)
   }
 }
 

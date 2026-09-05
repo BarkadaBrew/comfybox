@@ -19,6 +19,22 @@ final class ControlPlaneTests: XCTestCase {
     try isolateComfyBoxStateDirectory()
   }
 
+  /// comfybox#386 review round 2, item 4: reset every sidecar test seam here,
+  /// not just in a per-test `defer` — a test that fails before reaching its
+  /// own cleanup must not leak a blocked hook or a forced result into the
+  /// next test.
+  override func tearDown() {
+    QueueDeltaStore.blockingWriteHook = nil
+    QueueDeltaStore.forcedSaveResult = nil
+    QueueDeltaStore.forcedSaveResultProvider = nil
+    // comfybox#386 review round 5, item 2: a safety net alongside each
+    // test's own `defer` — `backgroundHealRetryDelaySeconds` has no
+    // per-instance override, so a test that lowers it and fails before its
+    // own restore must not leak a fast delay into every later test.
+    WarmServerQueueProbe.backgroundHealRetryDelaySeconds = 1.0
+    super.tearDown()
+  }
+
   /// Poll until `predicate` holds or the deadline passes; fail loudly on timeout.
   private func waitUntil(
     _ description: String, timeout: TimeInterval = 6,
@@ -394,5 +410,497 @@ final class ControlPlaneTests: XCTestCase {
     let finished = try await started.value
     XCTAssertTrue(finished, "started job completed — a cancel delta for an active id no-ops")
     try await waitUntil("delta consumed") { probe.undrainedDeltaCount == 0 }
+  }
+
+  // MARK: - comfybox#386: sidecar write must never block read()
+
+  /// A release that stays open once opened — unlike a `DispatchSemaphore`
+  /// signalled exactly once, ANY number of `waitUntilOpen()` calls (issued
+  /// before or after `open()`) resolve correctly. Review round 2, item 4: a
+  /// one-shot semaphore parks a SECOND `QueueDeltaStore.save` call forever if
+  /// `blockingWriteHook` is still installed when it runs (a retry, a second
+  /// mutator call racing in, …), wedging `LiveHealthState.sidecarLock` for
+  /// the rest of the process. This gate is deliberately idempotent/broadcast
+  /// instead, and `open()` is safe to call more than once (e.g. once inline
+  /// and once from a `defer`).
+  private final class OneShotGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var isOpen = false
+
+    func open() {
+      condition.lock()
+      isOpen = true
+      condition.broadcast()
+      condition.unlock()
+    }
+
+    func waitUntilOpen() {
+      condition.lock()
+      while !isOpen { condition.wait() }
+      condition.unlock()
+    }
+  }
+
+  /// `LiveHealthState.recordDelta`/`commitDrainedDeltas` persist the
+  /// undrained-delta sidecar (`queue-deltas.json`). Before the fix that write
+  /// ran while holding the SAME `NSLock` `read()` needs — so a slow or
+  /// nearly-full disk stalls the sync-servable `/health` and `/v1/queue`
+  /// routes behind unrelated disk I/O. Block the sidecar writer mid-write
+  /// (via `QueueDeltaStore.blockingWriteHook`, simulating that slow disk) and
+  /// prove `read()` (driven here through `probe.isPaused`, which calls
+  /// straight into `LiveHealthState.read()`) still returns within a tight
+  /// bound instead of queuing behind the stuck writer.
+  func testReadNeverBlocksBehindAStuckSidecarWrite() throws {
+    let probe = makeQueueProbe()
+
+    let writerEntered = DispatchSemaphore(value: 0)
+    let releaseWriter = OneShotGate()
+    defer { releaseWriter.open() }  // never leave the writer thread parked past this test
+    QueueDeltaStore.blockingWriteHook = {
+      writerEntered.signal()
+      releaseWriter.waitUntilOpen()
+    }
+
+    // Off the test thread: record a delta. The in-memory mutation completes
+    // immediately; the sidecar write it triggers blocks in the hook above,
+    // simulating a disk stuck mid-write.
+    Thread.detachNewThread {
+      probe.recordCancelDeltaOnly(id: "comfybox-386-blocked-write")
+    }
+    XCTAssertEqual(writerEntered.wait(timeout: .now() + 5), .success,
+                   "the sidecar writer must have entered the blocking hook")
+
+    // read() must not queue behind the stuck writer — run it on its own
+    // thread and bound the wait so a regression fails instead of hanging CI.
+    //
+    // Bound raised to 2s (review round 2, item 5; comfybox#379 flake
+    // history): `DispatchSemaphore.wait(timeout:)`'s wall-clock return can
+    // overshoot a tight bound under scheduler/QoS contention even though
+    // read() itself is instant post-fix — the pre-fix failure this pins
+    // measured ~1.9s, comfortably caught well under 2s, so the wider bound
+    // stays tight enough to fail on a real regression without flaking on a
+    // merely slow CI box. The separate elapsed-time assertion this replaced
+    // was redundant with this one: a `.success` result already bounds the
+    // wall-clock time to (approximately) the timeout.
+    let readDone = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+      _ = probe.isPaused   // LiveHealthState.read() — the only thing /health and /v1/queue need
+      readDone.signal()
+    }
+
+    XCTAssertEqual(readDone.wait(timeout: .now() + 2.0), .success,
+                   "read() must return within a tight bound while the sidecar writer is stuck on disk")
+  }
+
+  // MARK: - comfybox#386 review round 2: WAL restored + failure/clear safety
+
+  /// item 1: a delta must be DURABLE (its sidecar write confirmed) before the
+  /// drain may act on it — otherwise a crash between "visible in memory" and
+  /// "written to disk" loses it from both files, and a cancelled job can
+  /// resurrect. Block the sidecar writer, record a delta, and prove the
+  /// drain does not see/apply it until the write completes; `/health`'s
+  /// undrained-delta view (`undrainedDeltaCount`) is unaffected — deltas are
+  /// visible there the instant they're recorded, durable or not.
+  func testDrainIgnoresANonDurableDeltaUntilItsSidecarWriteCompletes() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlPause()   // between-items gate: the job stays pending, not active
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "wal2-a") }
+    try await waitUntil("job parked pending") { probe.snapshotPendingIds.contains("wal2-a") }
+
+    let writerEntered = DispatchSemaphore(value: 0)
+    let releaseWriter = OneShotGate()
+    defer { releaseWriter.open() }
+    QueueDeltaStore.blockingWriteHook = {
+      writerEntered.signal()
+      releaseWriter.waitUntilOpen()
+    }
+
+    Thread.detachNewThread {
+      probe.recordCancelDeltaOnly(id: "wal2-a")
+    }
+    XCTAssertEqual(writerEntered.wait(timeout: .now() + 5), .success,
+                   "the sidecar writer must have entered the blocking hook")
+
+    XCTAssertEqual(probe.undrainedDeltaCount, 1,
+                   "recorded delta is visible to /health & /v1/queue reads immediately, durable or not")
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0,
+                   "the drain must not see a delta before its sidecar write is durable")
+
+    await probe.drainNow()
+    XCTAssertTrue(probe.snapshotPendingIds.contains("wal2-a"),
+                  "drain must not cancel the job while the delta isn't durable yet")
+
+    releaseWriter.open()
+    try await waitUntil("delta becomes durable") { probe.peekedDrainableDeltaCount == 1 }
+
+    await probe.drainNow()
+    XCTAssertFalse(probe.composedPendingIds.contains("wal2-a"), "now-durable delta is applied")
+
+    probe.controlResume()
+    do { _ = try await jobA.value; XCTFail("wal2-a should have been cancelled") } catch {}
+  }
+
+  /// item 2: `QueueDeltaStore.save` now reports success/failure instead of
+  /// swallowing errors with `try?`; `persistDeltaSidecar` must only advance
+  /// `lastPersistedDeltaGeneration` on success — otherwise a failed write
+  /// (generation N+1) could make a later check treat N+1 as already durable
+  /// while the file on disk silently still holds N-1's content.
+  func testFailedSidecarWriteNeverAdvancesDurabilityAndTheDeltaSurvivesForTheNextWrite() {
+    let probe = makeQueueProbe()
+
+    QueueDeltaStore.forcedSaveResult = false   // simulate a disk write failure
+    probe.recordCancelDeltaOnly(id: "fail-1")
+    XCTAssertEqual(probe.undrainedDeltaCount, 1, "recorded in memory regardless of the disk outcome")
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0,
+                   "a failed write must not advance the durability marker")
+
+    QueueDeltaStore.forcedSaveResult = nil   // disk recovers
+    probe.recordCancelDeltaOnly(id: "fail-2")   // resends the FULL undrained list
+    XCTAssertEqual(probe.undrainedDeltaCount, 2)
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 2,
+                   "once a write succeeds it carries everything undrained so far — the earlier failed attempt's delta is not lost")
+  }
+
+  /// item 3: `clearDeltas` (the recovery boot path) now goes through the same
+  /// generation/`sidecarLock` scheme as every other mutation.
+  /// `recoverPersistedQueue` runs as a background task while the listener
+  /// already accepts connections, so an in-flight OLDER write racing the
+  /// clear is real — it must never land on disk AFTER the clear and
+  /// resurrect what was just folded away.
+  func testClearDeltasCannotBeResurrectedByAnOlderInFlightWrite() throws {
+    let probe = makeQueueProbe()
+
+    let writerEntered = DispatchSemaphore(value: 0)
+    let releaseOlderWrite = OneShotGate()
+    defer { releaseOlderWrite.open() }
+    QueueDeltaStore.blockingWriteHook = {
+      writerEntered.signal()
+      releaseOlderWrite.waitUntilOpen()
+    }
+
+    // The older write starts first and gets stuck mid-write, holding sidecarLock.
+    Thread.detachNewThread {
+      probe.recordCancelDeltaOnly(id: "stale-before-clear")
+    }
+    XCTAssertEqual(writerEntered.wait(timeout: .now() + 5), .success,
+                   "the older write must have entered the hook first")
+
+    // The clear races in behind it — exactly the call `recoverPersistedQueue`
+    // makes. Its generation stamp (under the main lock) is assigned the
+    // instant this runs, strictly after the older write's own stamp (proven
+    // by `writerEntered` above), even though its actual persist has to queue
+    // behind the older write's still-held `sidecarLock`.
+    let clearDone = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+      probe.clearAllDeltas()
+      clearDone.signal()
+    }
+
+    releaseOlderWrite.open()   // let the older, lower-generation write proceed
+
+    XCTAssertEqual(clearDone.wait(timeout: .now() + 5), .success, "clear completed")
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0, "the clear's empty snapshot is what's durable")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: QueueDeltaStore.path.path),
+                   "the sidecar file must not be resurrected by the older, now-stale write")
+  }
+
+  // MARK: - comfybox#386 review round 3: drain liveness + safer clear
+
+  /// item 1a: with the sidecar unwritable, `peekDeltas` can come back empty
+  /// forever even though a delta is genuinely recorded — `drainQueueDeltas`
+  /// must retry the write once before giving up, instead of returning early
+  /// and leaving a 200-acked cancel permanently unapplied while the job keeps
+  /// rendering. Force one failed write, let the disk "recover" before the
+  /// drain runs, and confirm the drain's own retry notices and applies the
+  /// delta in the SAME pass — no second external trigger needed.
+  func testDrainRetriesAStuckWriteBeforeGivingUp() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlPause()   // between-items gate: the job stays pending
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "retry-a") }
+    try await waitUntil("job parked pending") { probe.snapshotPendingIds.contains("retry-a") }
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "retry-a")
+    XCTAssertEqual(probe.undrainedDeltaCount, 1)
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0, "not durable yet — the forced write failed")
+
+    QueueDeltaStore.forcedSaveResult = nil   // disk recovers before the drain's next attempt
+
+    await probe.drainNow()   // must retry the write (item 1a) and apply it in this same pass
+
+    XCTAssertFalse(probe.composedPendingIds.contains("retry-a"),
+                   "the drain's retry succeeded and it applied the now-durable cancel")
+    probe.controlResume()
+    do { _ = try await jobA.value; XCTFail("retry-a should have been cancelled") } catch {}
+  }
+
+  /// item 1b/1c: once the sidecar has been failing continuously past the
+  /// degraded-mode threshold, the drain applies non-durable deltas anyway —
+  /// liveness wins, matching pre-comfybox#386 behavior, but now observable
+  /// via `deltaDurabilityStatus`/`/health`'s additive fields. One failure
+  /// alone must NOT trip it; recovery must clear it.
+  func testDegradedModeAppliesNonDurableDeltasAfterSustainedFailuresAndClearsOnRecovery() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlPause()
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "degraded-a") }
+    try await waitUntil("job parked pending") { probe.snapshotPendingIds.contains("degraded-a") }
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "degraded-a")
+    XCTAssertFalse(probe.isDeltaSidecarDegraded, "one failure alone must not trip degraded mode")
+    XCTAssertEqual(probe.nonDurableDeltaCount, 1)
+
+    // Drive the consecutive-failure count up to the threshold by retrying the
+    // SAME still-undurable write — exactly what the drain's own item-1a retry
+    // does, just called directly here for a deterministic count instead of
+    // sleeping out the time-based half of the threshold. Bounded by the
+    // threshold itself, so this can never spin.
+    for _ in 0..<WarmServerQueueProbe.degradedModeFailureCountThreshold {
+      guard !probe.isDeltaSidecarDegraded else { break }
+      probe.retrySidecarWrite()
+    }
+    XCTAssertTrue(probe.isDeltaSidecarDegraded, "sustained failures trip degraded mode")
+
+    await probe.drainNow()   // liveness wins: applies the still-non-durable cancel
+    XCTAssertFalse(probe.composedPendingIds.contains("degraded-a"),
+                   "degraded mode applies the cancel even though it never became durable")
+
+    QueueDeltaStore.forcedSaveResult = nil   // writer recovers
+    // `commitDrainedDeltas` (inside the drain above) already tried and
+    // failed once more with the writer still broken at that moment — nothing
+    // retries on its own initiative once `deltas` is empty, so the recovery
+    // needs one more scheduling point (item 1a's retry) to notice the writer
+    // is healthy again, exactly like production: the drain runs at every
+    // `processLoop` iteration and `startProcessingIfNeeded`.
+    await probe.drainNow()
+    try await waitUntil("degraded flag clears once a write succeeds") { !probe.isDeltaSidecarDegraded }
+    XCTAssertEqual(probe.nonDurableDeltaCount, 0)
+
+    probe.controlResume()
+    do { _ = try await jobA.value; XCTFail("degraded-a should have been cancelled") } catch {}
+  }
+
+  /// item 2: `clearDeltas` must not drop anything from MEMORY until its own
+  /// empty-snapshot write is confirmed durable — otherwise a failed write
+  /// leaves disk holding stale (already-applied) deltas while memory has
+  /// already forgotten them, and the next boot's recovery re-folds deltas
+  /// this session already applied (`.move` is not idempotent). A failed
+  /// clear must change nothing; the next successful write (here, a retried
+  /// clear) must finish the job.
+  func testClearDeltasKeepsMemoryOnAFailedPersistAndTheNextWriteHeals() {
+    let probe = makeQueueProbe()
+
+    probe.recordCancelDeltaOnly(id: "keep-me")   // a genuine, already-durable delta
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 1)
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.clearAllDeltas()   // the clear's own persist fails
+    XCTAssertEqual(probe.undrainedDeltaCount, 1, "a failed clear must not drop anything from memory")
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 1,
+                   "the pre-existing delta is exactly as durable as it was — the failed clear changed nothing")
+
+    QueueDeltaStore.forcedSaveResult = nil   // disk recovers
+    probe.clearAllDeltas()   // retried — this time it succeeds
+    XCTAssertEqual(probe.undrainedDeltaCount, 0, "clear finally took effect once its write actually landed")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: QueueDeltaStore.path.path))
+  }
+
+  // MARK: - comfybox#386 review round 4: commitDrainedDeltas liveness, decay, background heal
+
+  /// item 1: `commitDrainedDeltas` — the one mutator the coordinator actor
+  /// calls directly, from `drainQueueDeltas` — must never block on
+  /// `sidecarLock` either. Get a real delta durable, then let an UNRELATED
+  /// second delta's write get stuck holding `sidecarLock`, then drive a real
+  /// drain (which applies the first delta and reaches `commitDrainedDeltas`
+  /// at the end) and prove it returns promptly instead of parking behind the
+  /// stuck write.
+  func testCommitDrainedDeltasDoesNotBlockOnAStuckSidecarWrite() async throws {
+    let probe = makeQueueProbe()
+
+    probe.controlPause()
+    let jobA = Task { try await probe.enqueueSynthetic(durationMs: 30, id: "commit-a") }
+    try await waitUntil("job parked pending") { probe.snapshotPendingIds.contains("commit-a") }
+
+    probe.recordCancelDeltaOnly(id: "commit-a")   // real write, succeeds immediately — durable
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 1)
+
+    let writerEntered = DispatchSemaphore(value: 0)
+    let releaseWriter = OneShotGate()
+    defer { releaseWriter.open() }
+    QueueDeltaStore.blockingWriteHook = {
+      writerEntered.signal()
+      releaseWriter.waitUntilOpen()
+    }
+
+    // An UNRELATED delta's write gets stuck holding sidecarLock — simulating
+    // "another write already in flight" for whatever `commitDrainedDeltas`
+    // does at the end of the drain below.
+    Thread.detachNewThread {
+      probe.recordCancelDeltaOnly(id: "unrelated-stuck-write")
+    }
+    XCTAssertEqual(writerEntered.wait(timeout: .now() + 5), .success,
+                   "the unrelated write must be stuck holding sidecarLock")
+
+    // Bounded, off the test's own async context so a regression (a
+    // reintroduced blocking call) fails cleanly instead of hanging the run.
+    let drainDone = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+      Task { await probe.drainNow(); drainDone.signal() }
+    }
+    XCTAssertEqual(drainDone.wait(timeout: .now() + 2.0), .success,
+                   "commitDrainedDeltas must not block behind the unrelated stuck write")
+
+    XCTAssertFalse(probe.composedPendingIds.contains("commit-a"), "the durable delta was still applied")
+    probe.controlResume()
+    do { _ = try await jobA.value; XCTFail("commit-a should have been cancelled") } catch {}
+  }
+
+  /// item 2 (first half): the TIME-based half of the degraded window must
+  /// require at least 2 consecutive failures — a single transient failure
+  /// must never trip degraded mode no matter how long it sits unresolved.
+  /// Uses the injectable-clock seam so the test doesn't need a real 5s sleep.
+  func testLoneFailureDoesNotTripDegradedModeEvenAfterTheWindowElapses() {
+    let probe = makeQueueProbe()
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "lone-hiccup")
+    XCTAssertFalse(probe.isDeltaSidecarDegraded, "one failure must never trip degraded mode immediately")
+
+    let farFuture = Date().addingTimeInterval(WarmServerQueueProbe.degradedModeWindowSeconds + 1)
+    XCTAssertFalse(probe.isDeltaSidecarDegraded(asOf: farFuture),
+                   "the time-based half must not trip on a SINGLE failure no matter how long it's been unresolved")
+  }
+
+  /// item 2 (second half): a failure streak "ages out" once nothing has
+  /// failed/retried in the window — a lone hiccup on a PARKED loop must not
+  /// stay degraded forever, and a later failure that arrives long after must
+  /// start a FRESH streak rather than accumulate onto ancient history.
+  func testAgedOutFailureStreakStartsFreshRatherThanAccumulating() {
+    let probe = makeQueueProbe()
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "hiccup-1")   // failure #1 of what would be a streak
+
+    let farFuture = Date().addingTimeInterval(WarmServerQueueProbe.degradedModeWindowSeconds + 1)
+    XCTAssertFalse(probe.isDeltaSidecarDegraded(asOf: farFuture),
+                   "ages out — a parked loop must not stay degraded forever")
+
+    // That stale read reset the streak. A second REAL failure now is only
+    // failure #1 of a FRESH streak (not #2 of the old one) — still below the
+    // count threshold, so still not degraded.
+    probe.recordCancelDeltaOnly(id: "hiccup-2")
+    XCTAssertFalse(probe.isDeltaSidecarDegraded,
+                   "the aged-out reset means this is a fresh streak's first failure, not a second")
+  }
+
+  /// item 3: stale-sidecar healing must not depend on an enqueue or a drain.
+  /// Force one failed write, let the disk "recover," and NEVER call
+  /// `drainNow()`/`retrySidecarWrite()`/`recordCancelDeltaOnly` again — only
+  /// the background self-heal (a detached task, delayed, off the actor) can
+  /// possibly make this durable.
+  func testBackgroundSelfHealRecoversWithoutAnyDrainOrEnqueueActivity() async throws {
+    let probe = makeQueueProbe()
+    let originalDelay = WarmServerQueueProbe.backgroundHealRetryDelaySeconds
+    WarmServerQueueProbe.backgroundHealRetryDelaySeconds = 0.05
+    defer { WarmServerQueueProbe.backgroundHealRetryDelaySeconds = originalDelay }
+
+    QueueDeltaStore.forcedSaveResult = false
+    probe.recordCancelDeltaOnly(id: "parked-heal")
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0, "not durable — the forced write failed")
+
+    QueueDeltaStore.forcedSaveResult = nil   // disk recovers; nothing else ever touches the mailbox again
+
+    try await waitUntil(
+      "background heal lands with no drain/enqueue activity",
+      timeout: WarmServerQueueProbe.backgroundHealRetryDelaySeconds * Double(WarmServerQueueProbe.backgroundHealMaxAttempts) + 5
+    ) { probe.peekedDrainableDeltaCount == 1 }
+  }
+
+  // MARK: - comfybox#386 review round 5 (critical): the heal must branch on wroteOK
+
+  /// Thread-safe call counter that fails the first `failuresBeforeSuccess`
+  /// calls and succeeds every call after — models a real transient outage
+  /// (fails for a while, then recovers), which a fixed `forcedSaveResult`
+  /// cannot: it's the same value on every call.
+  private final class CountingResultProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private let failuresBeforeSuccess: Int
+    init(failuresBeforeSuccess: Int) { self.failuresBeforeSuccess = failuresBeforeSuccess }
+    func next() -> Bool {
+      lock.lock(); defer { lock.unlock() }
+      callCount += 1
+      return callCount > failuresBeforeSuccess
+    }
+    var attempts: Int { lock.lock(); defer { lock.unlock() }; return callCount }
+  }
+
+  /// THE regression test for the round-5 critical: `tryPersistDeltaSidecar`
+  /// used to return a plain `Bool` that was `true` whenever `sidecarLock` was
+  /// merely ACQUIRED — `runBackgroundHeal`'s `if tryPersistDeltaSidecar(...)`
+  /// then treated a failed-but-attempted write as "done", so a sustained
+  /// outage (lock always free, write always failing) got exactly ONE real
+  /// retry before the chain incorrectly declared victory and stopped; the
+  /// ≤5 cap only ever applied to lost try-lock races, never to real write
+  /// failures. This test fails a real save N times (via
+  /// `forcedSaveResultProvider`, which — unlike `forcedSaveResult` — can
+  /// change its answer across calls) then lets it succeed, and asserts the
+  /// heal chain actually retries through all N failures to land the
+  /// (N+1)th, with the marker advancing to prove it. Against the pre-fix
+  /// `Bool`-returning `tryPersistDeltaSidecar`, this fails: the chain stops
+  /// after the second overall `save` call (the first heal attempt), leaving
+  /// `provider.attempts == 2` regardless of `failuresBeforeSuccess`, and
+  /// `peekedDrainableDeltaCount` never reaches 1 (`waitUntil` times out).
+  func testBackgroundHealRetriesThroughMultipleFailuresBeforeSucceeding() async throws {
+    let probe = makeQueueProbe()
+    let originalDelay = WarmServerQueueProbe.backgroundHealRetryDelaySeconds
+    WarmServerQueueProbe.backgroundHealRetryDelaySeconds = 0.05
+    defer {
+      WarmServerQueueProbe.backgroundHealRetryDelaySeconds = originalDelay
+      QueueDeltaStore.forcedSaveResultProvider = nil
+    }
+
+    let failuresBeforeSuccess = 3
+    let provider = CountingResultProvider(failuresBeforeSuccess: failuresBeforeSuccess)
+    QueueDeltaStore.forcedSaveResultProvider = { provider.next() }
+
+    probe.recordCancelDeltaOnly(id: "sustained-outage")   // attempt #1 (fails) — also schedules the heal chain
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0, "attempt #1 (recordDelta's own) failed")
+
+    // No further recordDelta/drainNow/retrySidecarWrite calls — only the
+    // background heal chain (attempts #2, #3, #4 — the last one succeeds)
+    // can possibly land this.
+    try await waitUntil(
+      "the heal chain retries through every failure and eventually lands",
+      timeout: WarmServerQueueProbe.backgroundHealRetryDelaySeconds * Double(WarmServerQueueProbe.backgroundHealMaxAttempts + 2) + 5
+    ) { probe.peekedDrainableDeltaCount == 1 }
+
+    XCTAssertEqual(provider.attempts, failuresBeforeSuccess + 1,
+                   "exactly N failures then the (N+1)th succeeds — no early stop on a failed-but-attempted write")
+  }
+
+  /// A positive test for the TIME half of the degraded window, filling the
+  /// gap the round-4 tests left (lone failure never trips it; a stale streak
+  /// ages out) — the one case that SHOULD trip it: the first failure is past
+  /// the window, the most recent failure is still within it (so the streak
+  /// has NOT aged out), and there have been at least 2 failures. Uses the
+  /// direct state-stamp seam since `persistDeltaSidecarLocked` always
+  /// records real failures with the real clock — there is no way to make a
+  /// REAL first failure "old" and a REAL last failure "recent" without
+  /// actually waiting close to the window.
+  func testTimeHalfOfDegradedWindowTripsWhenFirstFailureIsOldButLastIsRecent() {
+    let probe = makeQueueProbe()
+    let now = Date()
+    let firstFailure = now.addingTimeInterval(-(WarmServerQueueProbe.degradedModeWindowSeconds + 1))
+    let lastFailure = now.addingTimeInterval(-1)
+
+    probe.stampFailureStreak(first: firstFailure, last: lastFailure, count: 2)
+
+    XCTAssertTrue(
+      probe.isDeltaSidecarDegraded(asOf: now),
+      "first failure older than the window + last failure within it (not aged out) + count >= 2 -> degraded via the time half")
   }
 }
