@@ -122,4 +122,121 @@ final class NearlineLibraryTests: XCTestCase {
   func testStageUnknownThrows() {
     XCTAssertThrowsError(try library.stage(name: "never-scanned.safetensors"))
   }
+
+  // MARK: - #273 anchoring
+
+  func testAnchoredDefaultsFalseAndDecodesTolerantlyFromLegacyJSON() throws {
+    // Legacy nearline.json entries (written before #273) have no "anchored"
+    // key at all — must decode to false, not fail the whole file.
+    let legacyJSON = """
+      {"name":"legacy.safetensors","path":"/x/legacy.safetensors","sizeMB":2.0,"kind":"lora"}
+      """
+    let decoded = try JSONDecoder().decode(NearlineItem.self, from: Data(legacyJSON.utf8))
+    XCTAssertEqual(decoded.anchored, false)
+  }
+
+  func testAnchoredRoundTripsThroughEncodeDecode() throws {
+    let item = NearlineItem(name: "a.safetensors", path: "/x/a.safetensors", sizeMB: 1, kind: "lora", anchored: true)
+    let encoder = JSONEncoder()
+    let data = try encoder.encode(item)
+    let decoded = try JSONDecoder().decode(NearlineItem.self, from: data)
+    XCTAssertEqual(decoded.anchored, true)
+  }
+
+  func testSetAnchoredStagesAnUnstagedItemSynchronously() throws {
+    try writeSource("anchor_me.safetensors", megabytes: 1)
+    library.scan()
+    XCTAssertEqual(library.item(named: "anchor_me.safetensors")?.staged, false)
+
+    let result = try library.setAnchored(name: "anchor_me.safetensors", anchored: true)
+    XCTAssertTrue(result.anchored)
+    XCTAssertTrue(result.staged)
+    XCTAssertEqual(library.item(named: "anchor_me.safetensors")?.anchored, true)
+    XCTAssertEqual(library.item(named: "anchor_me.safetensors")?.staged, true)
+  }
+
+  func testSetAnchoredOnAlreadyStagedItemJustSetsFlag() throws {
+    try writeSource("already.safetensors", megabytes: 1)
+    library.scan()
+    let staged = try library.stage(name: "already.safetensors")
+
+    let result = try library.setAnchored(name: "already.safetensors", anchored: true)
+    XCTAssertEqual(result.stagedPath, staged)
+    XCTAssertTrue(result.anchored)
+  }
+
+  func testUnanchoringOnlyClearsFlagAndDoesNotEvict() throws {
+    try writeSource("stay.safetensors", megabytes: 1)
+    library.scan()
+    _ = try library.setAnchored(name: "stay.safetensors", anchored: true)
+
+    let result = try library.setAnchored(name: "stay.safetensors", anchored: false)
+    XCTAssertFalse(result.anchored)
+    XCTAssertTrue(result.staged, "un-anchoring must not itself evict")
+  }
+
+  func testSetAnchoredOnUnknownItemThrows() {
+    XCTAssertThrowsError(try library.setAnchored(name: "never-scanned.safetensors", anchored: true)) { error in
+      XCTAssertTrue(error is NearlineError)
+    }
+  }
+
+  func testAnchoredSurvivesRescan() throws {
+    try writeSource("pinned.safetensors", megabytes: 1)
+    library.scan()
+    _ = try library.setAnchored(name: "pinned.safetensors", anchored: true)
+
+    library.scan()
+    XCTAssertEqual(library.item(named: "pinned.safetensors")?.anchored, true)
+  }
+
+  func testPlanEvictionSkipsAnchoredItems() {
+    let old = Date(timeIntervalSince1970: 0)
+    let newer = Date(timeIntervalSince1970: 1000)
+    let anchoredOld = NearlineItem(
+      name: "anchored.safetensors", path: "/x/anchored.safetensors", sizeMB: 4, kind: "lora",
+      stagedPath: "/cache/anchored.safetensors", lastUsedAt: old, anchored: true)
+    let unanchoredNewer = NearlineItem(
+      name: "free.safetensors", path: "/x/free.safetensors", sizeMB: 4, kind: "lora",
+      stagedPath: "/cache/free.safetensors", lastUsedAt: newer, anchored: false)
+
+    // Budget can't fit the incoming file without evicting something. Even
+    // though `anchoredOld` is the LRU candidate, it must never be selected —
+    // the non-anchored (newer-used) item is evicted instead.
+    let toEvict = NearlineLibrary.planEviction(
+      stagedItems: [anchoredOld, unanchoredNewer], limitMB: 5, incomingMB: 4)
+
+    XCTAssertEqual(toEvict.map(\.name), ["free.safetensors"])
+  }
+
+  func testPlanEvictionReturnsEmptyWhenAllStagedAreAnchoredAndOverBudget() {
+    let anchored = NearlineItem(
+      name: "anchored.safetensors", path: "/x/anchored.safetensors", sizeMB: 10, kind: "lora",
+      stagedPath: "/cache/anchored.safetensors", anchored: true)
+
+    // Nothing evictable — anchored items are the only staged items, and an
+    // over-budget incoming file must not evict them.
+    let toEvict = NearlineLibrary.planEviction(stagedItems: [anchored], limitMB: 5, incomingMB: 4)
+    XCTAssertEqual(toEvict, [])
+  }
+
+  func testLRUEvictionNeverEvictsAnAnchoredItemEvenWhenOldest() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 5.0 / 1024.0))
+    try writeSource("keep_anchored.safetensors", megabytes: 2)
+    try writeSource("second.safetensors", megabytes: 2)
+    try writeSource("third.safetensors", megabytes: 2)
+    library.scan()
+
+    _ = try library.setAnchored(name: "keep_anchored.safetensors", anchored: true)  // oldest use
+    Thread.sleep(forTimeInterval: 0.02)
+    _ = try library.stage(name: "second.safetensors")
+    Thread.sleep(forTimeInterval: 0.02)
+    _ = try library.stage(name: "third.safetensors")  // forces an eviction
+
+    let items = library.list()
+    XCTAssertEqual(items.first { $0.name == "keep_anchored.safetensors" }?.staged, true,
+                    "anchored item must survive LRU pressure despite being the oldest use")
+    XCTAssertEqual(items.first { $0.name == "second.safetensors" }?.staged, false, "the non-anchored LRU item is evicted instead")
+    XCTAssertEqual(items.first { $0.name == "third.safetensors" }?.staged, true)
+  }
 }

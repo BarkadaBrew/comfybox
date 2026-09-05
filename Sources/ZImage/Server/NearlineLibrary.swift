@@ -22,7 +22,47 @@ public struct NearlineItem: Codable, Equatable, Sendable {
   public var stagedAt: Date?
   public var lastUsedAt: Date?
 
+  /// #273: pin so the eviction planner (``NearlineLibrary/planEviction``)
+  /// never selects this item, and ``NearlineLibrary/setAnchored`` stages it
+  /// in synchronously when set. Additive; absent (or malformed) in
+  /// nearline.json ⇒ false, never a load failure — same tolerant-decode
+  /// posture as `LoRALibraryEntry.compatibilitySource` (#353).
+  public var anchored: Bool
+
   public var staged: Bool { stagedPath != nil }
+
+  public init(
+    name: String, path: String, sizeMB: Double, kind: String,
+    stagedPath: String? = nil, stagedAt: Date? = nil, lastUsedAt: Date? = nil,
+    anchored: Bool = false
+  ) {
+    self.name = name
+    self.path = path
+    self.sizeMB = sizeMB
+    self.kind = kind
+    self.stagedPath = stagedPath
+    self.stagedAt = stagedAt
+    self.lastUsedAt = lastUsedAt
+    self.anchored = anchored
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case name, path, sizeMB, kind, stagedPath, stagedAt, lastUsedAt, anchored
+  }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    name = try c.decode(String.self, forKey: .name)
+    path = try c.decode(String.self, forKey: .path)
+    sizeMB = try c.decode(Double.self, forKey: .sizeMB)
+    kind = try c.decode(String.self, forKey: .kind)
+    stagedPath = try c.decodeIfPresent(String.self, forKey: .stagedPath)
+    stagedAt = try c.decodeIfPresent(Date.self, forKey: .stagedAt)
+    lastUsedAt = try c.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+    // Additive field (#273): absent (pre-existing nearline.json entries) or
+    // unrecognized ⇒ false, never a load failure.
+    anchored = (try? c.decodeIfPresent(Bool.self, forKey: .anchored)).flatMap { $0 } ?? false
+  }
 }
 
 public final class NearlineLibrary: @unchecked Sendable {
@@ -130,13 +170,15 @@ public final class NearlineLibrary: @unchecked Sendable {
           sizeMB: sizeMB,
           kind: sizeMB >= Self.modelSizeThresholdMB ? "model" : "lora"
         )
-        // Keep staging bookkeeping across rescans (verify the copy exists).
-        if let existing = state.items.first(where: { $0.name == name }),
-           let stagedPath = existing.stagedPath,
-           fm.fileExists(atPath: stagedPath) {
-          item.stagedPath = stagedPath
-          item.stagedAt = existing.stagedAt
-          item.lastUsedAt = existing.lastUsedAt
+        // Keep staging + anchor bookkeeping across rescans (verify the copy
+        // exists before trusting a stale staged path).
+        if let existing = state.items.first(where: { $0.name == name }) {
+          if let stagedPath = existing.stagedPath, fm.fileExists(atPath: stagedPath) {
+            item.stagedPath = stagedPath
+            item.stagedAt = existing.stagedAt
+            item.lastUsedAt = existing.lastUsedAt
+          }
+          item.anchored = existing.anchored
         }
         found.append(item)
       }
@@ -195,6 +237,35 @@ public final class NearlineLibrary: @unchecked Sendable {
     return destination.path
   }
 
+  /// #273: pin (or unpin) an item so ``planEviction`` never selects it.
+  /// Pinning ("anchor") synchronously stages the item in first if it is not
+  /// already staged locally — anchoring means "always resident on internal
+  /// storage," not merely "don't evict once staged." Un-anchoring only
+  /// clears the flag; it does not itself evict (a later staging pass may).
+  ///
+  /// Throws `NearlineError.unknownItem` if `name` is not in the catalog, or
+  /// whatever `stage(name:)` throws if the synchronous pull-in fails (e.g.
+  /// the source volume is unmounted).
+  @discardableResult
+  public func setAnchored(name: String, anchored: Bool) throws -> NearlineItem {
+    lock.lock()
+    guard let index = state.items.firstIndex(where: { $0.name == name }) else {
+      lock.unlock()
+      throw NearlineError.unknownItem(name)
+    }
+    state.items[index].anchored = anchored
+    let needsStage = anchored && state.items[index].stagedPath == nil
+    persistLocked()
+    lock.unlock()
+
+    // stage(name:) takes the lock itself — must not be called while held.
+    if needsStage {
+      _ = try stage(name: name)
+    }
+    guard let result = item(named: name) else { throw NearlineError.unknownItem(name) }
+    return result
+  }
+
   /// Remove a staged copy (the attached-storage original is untouched).
   @discardableResult
   public func evict(name: String) -> Bool {
@@ -224,18 +295,36 @@ public final class NearlineLibrary: @unchecked Sendable {
     state.items.filter(\.staged).reduce(0) { $0 + $1.sizeMB }
   }
 
+  /// #273: pure eviction planner — given the currently staged items, the
+  /// staging budget (MB), and an incoming item's size, returns (in eviction
+  /// order) the staged items that must be freed to make room. Anchored
+  /// items are never selected: anchoring pins an asset to internal storage
+  /// regardless of LRU pressure. A free function (no lock, no I/O) so it is
+  /// directly unit-testable.
+  static func planEviction(
+    stagedItems: [NearlineItem], limitMB: Double, incomingMB: Double
+  ) -> [NearlineItem] {
+    var used = stagedItems.reduce(0.0) { $0 + $1.sizeMB }
+    guard used + incomingMB > limitMB else { return [] }
+
+    let lruOrder = stagedItems
+      .filter { !$0.anchored }
+      .sorted { ($0.lastUsedAt ?? .distantPast) < ($1.lastUsedAt ?? .distantPast) }
+
+    var toEvict: [NearlineItem] = []
+    for candidate in lruOrder {
+      guard used + incomingMB > limitMB else { break }
+      used -= candidate.sizeMB
+      toEvict.append(candidate)
+    }
+    return toEvict
+  }
+
   /// Evict LRU staged items until the incoming file fits the budget.
   private func ensureCapacityLocked(forIncomingMB incoming: Double) {
     let limitMB = state.config.cacheLimitGB * 1024
-    var used = stagedMBLocked
-    guard used + incoming > limitMB else { return }
-
-    let lruOrder = state.items
-      .filter(\.staged)
-      .sorted { ($0.lastUsedAt ?? .distantPast) < ($1.lastUsedAt ?? .distantPast) }
-    for candidate in lruOrder {
-      guard used + incoming > limitMB else { break }
-      used -= candidate.sizeMB
+    let staged = state.items.filter(\.staged)
+    for candidate in Self.planEviction(stagedItems: staged, limitMB: limitMB, incomingMB: incoming) {
       _ = evictLocked(name: candidate.name)
     }
   }
