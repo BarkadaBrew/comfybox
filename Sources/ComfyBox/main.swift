@@ -18,9 +18,22 @@ LoggingSystem.bootstrap { label in
   handler.logLevel = .info
   return handler
 }
+/// Thread-safe mutable box. `value` is guarded by a lock because callers
+/// (e.g. `fetchHealthSummary`) write it from a detached `Task` while
+/// reading it from a different thread after a semaphore timeout — an
+/// unsynchronized `var` there is a data race whenever the write and the
+/// timeout-driven read land close together (comfybox#153 review round 2,
+/// point 2).
 private final class Box<T>: @unchecked Sendable {
-  var value: T
-  init(_ value: T) { self.value = value }
+  private let lock = NSLock()
+  private var _value: T
+
+  var value: T {
+    get { lock.lock(); defer { lock.unlock() }; return _value }
+    set { lock.lock(); defer { lock.unlock() }; _value = newValue }
+  }
+
+  init(_ value: T) { self._value = value }
 }
 
 struct ZImageCLI {
@@ -2674,19 +2687,24 @@ struct ZImageCLI {
 
     // comfybox#153: this bridge NEVER starts a server — launchd
     // (com.barkadabrew.comfybox) owns the engine lifecycle. Connect to
-    // whatever answers on --port (healthy or not); fail loudly instead of
-    // spawning anything when nothing does.
+    // whatever answers on --port (healthy or not). If nothing does, warn
+    // once and keep running anyway (review round 2, point 1): launchd's
+    // RunAtLoad and the MCP host commonly race at login, so a bridge that
+    // starts before the engine must keep serving — exiting here would make
+    // the MCP host mark it dead until someone manually restarts it. Every
+    // tool call made before the engine comes up fails with this same
+    // message (MCPToolExecutor maps WarmServerClientError.connectionRefused
+    // to it), so the client sees one consistent, actionable error either way.
     let portOccupied = MCPPortProbe.isOccupied(host: host, port: port)
-    let decision = MCPBridgeStartupPolicy.decide(port: port, portOccupied: portOccupied)
+    let decision = MCPBridgeStartupPolicy.decide(host: host, port: port, portOccupied: portOccupied)
 
     switch decision.action {
     case .connect:
       fputs("[comfybox-mcp] \(decision.detail)\n", stderr)
       fputs("[comfybox-mcp] \(host):\(port) — \(fetchHealthSummary(host: host, port: port))\n", stderr)
 
-    case .failLoudly:
+    case .warnAndServe:
       fputs("[comfybox-mcp] \(decision.detail)\n", stderr)
-      _exit(1)
     }
 
     // Print server info to stderr (stdout is reserved for JSON-RPC)
@@ -2743,8 +2761,12 @@ struct ZImageCLI {
     This bridge NEVER starts a server (comfybox#153): launchd
     (com.barkadabrew.comfybox) owns the engine lifecycle. If a server is
     already listening on --port, healthy or not, the bridge connects to it.
-    If nothing is listening, the bridge fails loudly to stderr and exits —
-    it does not spawn one. Start the managed engine with:
+    If nothing is listening, the bridge does NOT exit — launchd's
+    RunAtLoad and the MCP host commonly race at login, so a bridge that
+    starts before the engine must keep serving. It prints one warning to
+    stderr (naming --port and the launchctl command below) and starts
+    anyway; every tool call fails with that same message until the engine
+    answers. Start the managed engine with:
       launchctl kickstart -k gui/$(id -u)/com.barkadabrew.comfybox
 
     Registration:

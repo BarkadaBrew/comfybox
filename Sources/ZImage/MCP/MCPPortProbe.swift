@@ -18,6 +18,12 @@ public enum MCPPortProbe {
   /// Returns true if a TCP connect to host:port succeeds within `timeoutMs`.
   /// Non-blocking connect + poll() so an unreachable/firewalled target can't
   /// hang the bridge's startup.
+  ///
+  /// IPv4-only by design, not by oversight: `WarmServer` defaults to (and
+  /// the bridge's own `--host` default is) the literal `"127.0.0.1"`, never
+  /// `"localhost"` — so there is no dual-stack ambiguity to resolve here.
+  /// A caller that points this at an IPv6-only or hostname target gets
+  /// `false` (via the `inet_pton` guard below), i.e. reported as free.
   public static func isOccupied(host: String = "127.0.0.1", port: UInt16, timeoutMs: Int32 = 250) -> Bool {
     let fd = socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else { return false }
