@@ -256,3 +256,110 @@ struct SyncCancelAccepted: Codable, Sendable {
       note: "cancel recorded; job may start if dequeue raced — poll status")
   }
 }
+
+// MARK: - comfybox#362: /v1/queue/interrupt targeting
+//
+// During a #1479 preemption episode, `/health` and `/v1/queue` show the
+// preempting IMAGE job as active (the identity swap in `runPreemptionEpisode`
+// predates this ticket), but `/v1/queue/interrupt` had no `target` concept —
+// it always cancelled whichever `Task` happened to be published as "the
+// active render", which before this ticket's task-publishing fix was always
+// the checkpointed VIDEO's own outer task, no matter what health showed.
+// Interrupting during an episode therefore silently abandoned the video while
+// the visibly-active image render kept going.
+//
+// The fix has two parts: (1) `runAsPublishedActiveRender` (WarmServer.swift)
+// republishes the PREEMPTOR's own task as "active" for the episode's
+// duration, so the default interrupt target agrees with health; (2) `target`
+// becomes an explicit, additive request field so an operator (or the
+// checkpoint-fallback tooling) can still reach the video specifically. This
+// section is the PURE decision the two `/v1/queue/interrupt` implementations
+// (`LiveHealthState.cancelActiveRender`, the sync no-actor-hop path, and
+// `WarmServerCoordinator.cancelActiveRender`, the async fallback used when
+// `ControlPlaneSyncFlag` is off) both consult, so they cannot disagree.
+
+/// What `/v1/queue/interrupt` should stop, resolved from the request's
+/// `target` against what is actually running. Pure — no `Task` in sight — so
+/// it is unit-testable without a render anywhere near it.
+enum InterruptTargetResolution: Equatable {
+  /// Whatever `/health` currently reports as the active render — the
+  /// preempting image job during a preemption episode, the video otherwise.
+  case active
+  /// The checkpointed/running video specifically, even while an episode has
+  /// swapped `active` to the preempting image job.
+  case video
+  /// `target` named a job id that is neither the active job nor the
+  /// checkpointed video. Distinct from "nothing to cancel": a client that
+  /// named a real (but wrong, or no-longer-running) id gets a 404, not a
+  /// silent `interrupted: false` — pending jobs are cancelled via
+  /// `DELETE /v1/queue/{id}`, not this route, so a pending job's id lands
+  /// here too.
+  case unknownJobId
+}
+
+enum InterruptTarget {
+  /// `target` is the request body's raw (optional) field, verbatim. `nil` and
+  /// the literal `"active"` both mean "whatever health shows as active";
+  /// `"video"` is reserved for the checkpointed video; any other string is
+  /// treated as a job id and matched against what is actually running.
+  static func resolve(
+    target: String?, activeJobId: String?, checkpointedVideoJobId: String?
+  ) -> InterruptTargetResolution {
+    switch target {
+    case nil, "active":
+      return .active
+    case "video":
+      return .video
+    case let jobId?:
+      if let activeJobId, jobId == activeJobId { return .active }
+      if let checkpointedVideoJobId, jobId == checkpointedVideoJobId { return .video }
+      return .unknownJobId
+    }
+  }
+}
+
+/// The result of actually cancelling (or not) per an `InterruptTargetResolution`
+/// — the shared shape both `/v1/queue/interrupt` implementations return, so
+/// their JSON responses cannot drift apart.
+enum InterruptCancelOutcome: Equatable {
+  /// Something was cancelled. `kind` is a `QueueJobKind` raw value.
+  case cancelled(jobId: String?, kind: String?)
+  /// The resolved target (default "active", or an explicit "video") named a
+  /// real category but nothing is currently running there — not an error,
+  /// same as the pre-#362 `interrupted: false`.
+  case nothingToCancel
+  /// `target` was a job id that matched neither the active job nor the
+  /// checkpointed video — a 404, not a silent false.
+  case unknownTarget
+}
+
+/// `/v1/queue/interrupt` request body. Entirely optional — an absent body (the
+/// pre-#362 shape) or an absent/`null` `target` both mean `target: "active"`.
+struct InterruptRequestBody: Decodable {
+  let target: String?
+}
+
+/// `/v1/queue/interrupt` response. `interrupted_job_id`/`interrupted_kind` are
+/// additive: present only when something was actually cancelled, so a client
+/// that only reads `success`/`interrupted` sees no change from before #362.
+struct InterruptResponseBody: Encodable {
+  let success: Bool
+  let interrupted: Bool
+  let interruptedJobId: String?
+  let interruptedKind: String?
+}
+
+/// Maps an `InterruptCancelOutcome` to the HTTP status + body both
+/// `/v1/queue/interrupt` implementations serve, so they cannot drift apart.
+enum InterruptRouteResponse {
+  static func build(from outcome: InterruptCancelOutcome) -> (status: Int, body: InterruptResponseBody) {
+    switch outcome {
+    case .cancelled(let jobId, let kind):
+      return (200, InterruptResponseBody(success: true, interrupted: true, interruptedJobId: jobId, interruptedKind: kind))
+    case .nothingToCancel:
+      return (200, InterruptResponseBody(success: true, interrupted: false, interruptedJobId: nil, interruptedKind: nil))
+    case .unknownTarget:
+      return (404, InterruptResponseBody(success: false, interrupted: false, interruptedJobId: nil, interruptedKind: nil))
+    }
+  }
+}

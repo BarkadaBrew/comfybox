@@ -92,6 +92,12 @@ extension XCTestCase {
       maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps,
       modelSpec: modelSpec)
     addTeardownBlock {
+      // comfybox#362: reset the DEBUG-only #218 admission bypass. Each probe
+      // owns a fresh coordinator (so this never leaked ACROSS tests), but
+      // nothing previously reset it WITHIN a test that flips it on for one
+      // assertion and needs the real gate for a later one — do it
+      // defensively here so no future test has to remember.
+      await probe.bypassVideoAdmission(false)
       // Bounded wait: a job that is legitimately finishing gets a moment; a
       // test that forgot to await its own work fails loudly rather than
       // silently reaching through to the live path.
