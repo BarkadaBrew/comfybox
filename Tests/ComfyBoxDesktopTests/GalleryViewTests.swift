@@ -139,6 +139,52 @@ struct GalleryViewResolveSourceAssetTests {
     }
 }
 
+// MARK: - #268: toggleFavorite must not drop `source`
+
+@Suite("GalleryView.toggledFavorite")
+struct GalleryViewToggledFavoriteTests {
+    @Test("flips favorite and preserves source (regression: rebuild omitted source)")
+    func preservesSource() {
+        let asset = TestData.makeAsset(id: "kira-1", favorite: false, source: "kira")
+        let updated = GalleryView.toggledFavorite(asset)
+
+        #expect(updated.favorite == true)
+        #expect(updated.source == "kira")
+    }
+
+    @Test("toggling twice restores the original favorite state, source intact throughout")
+    func togglingTwiceRestores() {
+        let asset = TestData.makeAsset(id: "bree-1", favorite: false, source: "bree")
+        let once = GalleryView.toggledFavorite(asset)
+        let twice = GalleryView.toggledFavorite(once)
+
+        #expect(twice.favorite == false)
+        #expect(twice.source == "bree")
+    }
+
+    @Test("preserves a nil source (main-gallery asset is unaffected)")
+    func preservesNilSource() {
+        let asset = TestData.makeAsset(id: "main-1", favorite: false, source: nil)
+        let updated = GalleryView.toggledFavorite(asset)
+        #expect(updated.source == nil)
+        #expect(updated.favorite == true)
+    }
+
+    @Test("every other field is carried over unchanged")
+    func preservesOtherFields() {
+        let asset = TestData.makeAsset(
+            id: "asset-1", prompt: "a sunset", rating: 4, contentMode: "banana",
+            characterName: "Alice", source: "kira"
+        )
+        let updated = GalleryView.toggledFavorite(asset)
+        #expect(updated.id == asset.id)
+        #expect(updated.prompt == asset.prompt)
+        #expect(updated.rating == asset.rating)
+        #expect(updated.contentMode == asset.contentMode)
+        #expect(updated.characterName == asset.characterName)
+    }
+}
+
 // MARK: - PR #356 fix round 1: pruneOrphans() failures must never be
 // silently swallowed in loadAssets()'s self-heal sweep.
 

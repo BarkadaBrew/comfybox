@@ -42,6 +42,15 @@ struct GalleryMaintenanceView: View {
     /// opened (the button's own `.disabled` is a courtesy, not the guard).
     private static let lockedMessage = "Archive operation in progress — try again when it finishes."
 
+    /// The one gate all three destructive/expensive actions (purge, discard,
+    /// regenerate) re-check immediately before mutating, rather than trusting
+    /// that their button was disabled — a restore can start after the button
+    /// was drawn and before the action closure runs. Pure and directly
+    /// testable without a `GalleryArchiver` instance (#267).
+    static func mutationBlockedMessage(actionsLocked: Bool) -> String? {
+        actionsLocked ? lockedMessage : nil
+    }
+
     // MARK: - Orphan thumbnails
 
     @State private var orphanReport: ThumbnailOrphanReport?
@@ -174,8 +183,8 @@ struct GalleryMaintenanceView: View {
         // Re-check at the mutation point, not just when the confirmation
         // dialog was opened — a restore can start while the dialog is open,
         // and the button closure alone can't catch that race.
-        guard !actionsLocked else {
-            orphanError = Self.lockedMessage
+        if let blocked = Self.mutationBlockedMessage(actionsLocked: actionsLocked) {
+            orphanError = blocked
             return
         }
         orphanPurging = true
@@ -333,6 +342,13 @@ struct GalleryMaintenanceView: View {
 
     private func regenerateAll() async {
         guard let total = assetTotal else { return }
+        // Re-check at the mutation point, not just when the button was
+        // enabled — purge and discard already do this (#267); a restore can
+        // start between the button being drawn and this closure running.
+        if let blocked = Self.mutationBlockedMessage(actionsLocked: actionsLocked) {
+            regenError = blocked
+            return
+        }
         regenRunning = true
         regenSummary = nil
         regenProgress = (0, total)
@@ -404,8 +420,8 @@ struct GalleryMaintenanceView: View {
         // present by design, so an in-flight bundle is indistinguishable
         // from a crashed one by marker alone; discarding it mid-write would
         // delete a bundle the archiver is actively populating.
-        guard !actionsLocked else {
-            incompleteError = Self.lockedMessage
+        if let blocked = Self.mutationBlockedMessage(actionsLocked: actionsLocked) {
+            incompleteError = blocked
             return
         }
         incompleteDiscarding = true

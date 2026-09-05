@@ -752,6 +752,90 @@ struct GalleryArchiverTests {
         }
     }
 
+    // MARK: - Restore: restoreToOriginalLocations per-asset fallback (#266)
+
+    /// `restoreToOriginalLocations` targets each entry's own recorded
+    /// directory, falling back to the watch directory *per asset* when that
+    /// directory is missing (GalleryArchiver.destinationDirectory) — the one
+    /// destination branch #266 found untested. Three assets, three original
+    /// directories: one survives untouched, one is removed outright before
+    /// restore, one is left in place but made unwritable. Only the two
+    /// broken ones should land in the watch directory; the third must land
+    /// in its own original directory, and the result must report the
+    /// success as ordinary "restored" (no failure), not a silent divergence.
+    @Test("restoreToOriginalLocations restores to each asset's own directory, falling back to the watch dir only for the asset whose original directory is missing or unwritable")
+    @MainActor
+    func restoreToOriginalLocationsPerAssetFallback() async throws {
+        let env = try await makeEnvironment()
+        let base = (env.watchDir as NSString).deletingLastPathComponent
+
+        let survivingDir = (base as NSString).appendingPathComponent("original-surviving")
+        let missingDir = (base as NSString).appendingPathComponent("original-missing")
+        let unwritableDir = (base as NSString).appendingPathComponent("original-unwritable")
+        for dir in [survivingDir, missingDir, unwritableDir] {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+
+        let survivingPath = writeFile("surviving.png", in: survivingDir, contents: "surviving")
+        let missingPath = writeFile("missing.png", in: missingDir, contents: "missing")
+        let unwritablePath = writeFile("unwritable.png", in: unwritableDir, contents: "unwritable")
+
+        let survivingAsset = try await env.ingestor.ingestFile(at: survivingPath)
+        let missingAsset = try await env.ingestor.ingestFile(at: missingPath)
+        let unwritableAsset = try await env.ingestor.ingestFile(at: unwritablePath)
+        for asset in [survivingAsset, missingAsset, unwritableAsset] {
+            makeThumbnail(for: asset.id, ingestor: env.ingestor)
+        }
+
+        let archiveResult = try await env.archiver.archive(
+            .init(name: "OriginalLocationsTest", destinationRoot: env.archiveRoot,
+                  assets: [survivingAsset, missingAsset, unwritableAsset])
+        )
+
+        // Break two of the three original directories AFTER archiving (the
+        // source files were already trashed by archive() itself; it's the
+        // directories' existence/writability that restore's fallback checks).
+        try FileManager.default.removeItem(atPath: missingDir)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: unwritableDir)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: unwritableDir)
+            try? FileManager.default.removeItem(atPath: survivingDir)
+            try? FileManager.default.removeItem(atPath: unwritableDir)
+        }
+
+        let restoreResult = try await env.archiver.restore(
+            .init(bundlePath: archiveResult.bundlePath, restoreToOriginalLocations: true)
+        )
+
+        // The fallback is a normal, successful restore — never a failure.
+        #expect(restoreResult.restored == 3)
+        #expect(restoreResult.failed.isEmpty)
+
+        let fm = FileManager.default
+
+        // Surviving directory: restored to its own original location.
+        let survivingRestoredPath = (survivingDir as NSString).appendingPathComponent("surviving.png")
+        #expect(fm.fileExists(atPath: survivingRestoredPath))
+        let survivingRow = try await env.store.fetchAsset(byPath: survivingRestoredPath)
+        #expect(survivingRow?.id == survivingAsset.id)
+
+        // Missing directory: fell back to the watch directory, for THIS
+        // asset only.
+        let missingFallbackPath = (env.watchDir as NSString).appendingPathComponent("missing.png")
+        #expect(fm.fileExists(atPath: missingFallbackPath))
+        #expect(!fm.fileExists(atPath: (missingDir as NSString).appendingPathComponent("missing.png")))
+        let missingRow = try await env.store.fetchAsset(byPath: missingFallbackPath)
+        #expect(missingRow?.id == missingAsset.id)
+
+        // Unwritable directory: also fell back to the watch directory, for
+        // THIS asset only — the surviving asset was unaffected by it.
+        let unwritableFallbackPath = (env.watchDir as NSString).appendingPathComponent("unwritable.png")
+        #expect(fm.fileExists(atPath: unwritableFallbackPath))
+        #expect(!fm.fileExists(atPath: (unwritableDir as NSString).appendingPathComponent("unwritable.png")))
+        let unwritableRow = try await env.store.fetchAsset(byPath: unwritableFallbackPath)
+        #expect(unwritableRow?.id == unwritableAsset.id)
+    }
+
     // MARK: - Restore: poller registration (C1)
 
     @Test("a restored file is registered with the ingestor so the next poller scan does not re-ingest it, losing source")

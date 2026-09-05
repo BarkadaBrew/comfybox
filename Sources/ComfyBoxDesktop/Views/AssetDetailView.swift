@@ -638,7 +638,18 @@ struct AssetDetailView: View {
     }
 
     private func saveChanges() {
-        let updated = DAMAsset(
+        let updated = Self.withEdits(asset, rating: rating, favorite: isFavorite)
+        onUpdate(updated)
+    }
+
+    /// `asset` with `rating`/`favorite` replaced by the edited values and
+    /// `modifiedAt` bumped, every other field — including `source` — carried
+    /// over unchanged. This rebuild used to omit `source` (found alongside
+    /// #268's two named sites: an edit here silently dropped a Kira/Bree
+    /// render's persona attribution back to the main gallery). A static,
+    /// pure transform so field preservation is directly unit-testable.
+    static func withEdits(_ asset: DAMAsset, rating: Int, favorite: Bool, now: Date = Date()) -> DAMAsset {
+        DAMAsset(
             id: asset.id,
             kind: asset.kind,
             filename: asset.filename,
@@ -648,7 +659,7 @@ struct AssetDetailView: View {
             width: asset.width,
             height: asset.height,
             createdAt: asset.createdAt,
-            modifiedAt: Date(),
+            modifiedAt: now,
             ingestedAt: asset.ingestedAt,
             orphaned: asset.orphaned,
             prompt: asset.prompt,
@@ -658,10 +669,10 @@ struct AssetDetailView: View {
             guidance: asset.guidance,
             modelFamily: asset.modelFamily,
             rating: rating,
-            favorite: isFavorite,
+            favorite: favorite,
             contentMode: asset.contentMode,
-            characterName: asset.characterName
+            characterName: asset.characterName,
+            source: asset.source
         )
-        onUpdate(updated)
     }
 }

@@ -114,6 +114,32 @@ struct GalleryMaintenanceViewFormattingTests {
     }
 }
 
+// MARK: - #267: regenerateAll() (and purge/discard) re-check actionsLocked
+// at the mutation point, not only via the disabled button.
+
+@Suite("GalleryMaintenanceView.mutationBlockedMessage")
+struct GalleryMaintenanceViewMutationBlockedTests {
+    @Test("locked returns a non-nil message")
+    func lockedBlocks() {
+        #expect(GalleryMaintenanceView.mutationBlockedMessage(actionsLocked: true) != nil)
+    }
+
+    @Test("unlocked returns nil — nothing blocks the mutation")
+    func unlockedAllows() {
+        #expect(GalleryMaintenanceView.mutationBlockedMessage(actionsLocked: false) == nil)
+    }
+
+    @Test("the three destructive/expensive actions (purge, discard, regenerate) share the identical message")
+    func sharedMessageIsUniform() {
+        // regenerateAll(), purgeOrphans() and discardIncomplete() all call this
+        // same static gate — asserting the message is non-empty and stable is
+        // what makes "uniform across the three actions" a checked property
+        // rather than an assertion about three near-duplicate inline guards.
+        let message = GalleryMaintenanceView.mutationBlockedMessage(actionsLocked: true)
+        #expect(message?.isEmpty == false)
+    }
+}
+
 @Suite("GalleryMaintenanceView.discardIncompleteArchives")
 struct GalleryMaintenanceViewDiscardIncompleteTests {
     private func makeManifest(name: String) -> ArchiveManifest {

@@ -74,6 +74,31 @@ struct DAMAssetTests {
 
     // MARK: - Fix wave (X8)
 
+    // MARK: - #268: withLocation must not drop `source`
+
+    @Test("withLocation preserves source across a secure/unsecure path move (regression: rebuild omitted source)")
+    func withLocationPreservesSource() {
+        let asset = TestData.makeAsset(id: "kira-1", filename: "kira-render.png", source: "kira")
+        let moved = asset.withLocation(path: "/vault/secured/kira-render.png")
+
+        #expect(moved.source == "kira")
+        #expect(moved.absolutePath == "/vault/secured/kira-render.png")
+        #expect(moved.filename == "kira-render.png")
+        // Every other field is unchanged, not just source.
+        #expect(moved.id == asset.id)
+        #expect(moved.prompt == asset.prompt)
+        #expect(moved.rating == asset.rating)
+        #expect(moved.favorite == asset.favorite)
+        #expect(moved.characterName == asset.characterName)
+    }
+
+    @Test("withLocation preserves a nil source (main-gallery asset stays main-gallery)")
+    func withLocationPreservesNilSource() {
+        let asset = TestData.makeAsset(id: "main-1", filename: "render.png", source: nil)
+        let moved = asset.withLocation(path: "/tmp/test-images/renamed.png")
+        #expect(moved.source == nil)
+    }
+
     @Test("isEditableImage requires image kind and a supported extension")
     func isEditableImage() {
         #expect(DAMAsset(kind: "image", filename: "a.png", absolutePath: "/a.png").isEditableImage)

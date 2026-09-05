@@ -98,7 +98,7 @@ public struct DAMAsset: Identifiable, Sendable, Equatable {
             seed: seed, steps: steps, guidance: guidance,
             modelFamily: modelFamily, rating: rating,
             favorite: favorite, contentMode: contentMode,
-            characterName: characterName
+            characterName: characterName, source: source
         )
     }
 
