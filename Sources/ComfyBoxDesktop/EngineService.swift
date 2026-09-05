@@ -1076,6 +1076,10 @@ public final class EngineService {
         public let sizeMB: Double
         public let kind: String
         public let staged: Bool
+        /// #273: pinned to internal storage — the eviction planner never
+        /// selects this item, and it was (or will be) synchronously staged
+        /// in on anchor.
+        public let anchored: Bool
         public var id: String { name }
 
         public var sizeLabel: String {
@@ -1090,7 +1094,7 @@ public final class EngineService {
         public var items: [NearlineEntry] = []
     }
 
-    private func parseNearline(_ data: Data) -> NearlineCatalog? {
+    func parseNearline(_ data: Data) -> NearlineCatalog? {
         guard let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         var catalog = NearlineCatalog()
         catalog.roots = (dict["roots"] as? [String]) ?? []
@@ -1103,7 +1107,9 @@ public final class EngineService {
                 path: (item["path"] as? String) ?? "",
                 sizeMB: (item["size_mb"] as? Double) ?? 0,
                 kind: (item["kind"] as? String) ?? "lora",
-                staged: (item["staged"] as? Bool) ?? false
+                staged: (item["staged"] as? Bool) ?? false,
+                // Additive (#273): absent (older server) ⇒ false, never a parse failure.
+                anchored: (item["anchored"] as? Bool) ?? false
             )
         }
         return catalog
@@ -1133,6 +1139,19 @@ public final class EngineService {
         let (status, data) = try await client.post("/v1/nearline/\(action)", body: body)
         guard status == 200 else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Nearline \(action) failed")
+        }
+        return parseNearline(data)
+    }
+
+    /// #273: pin (or unpin) a nearline model/LoRA to internal storage. Pinning
+    /// stages it in immediately if it isn't already local; the eviction
+    /// planner then never selects it. Unpinning only clears the flag.
+    public func setNearlineAnchor(kind: String, id: String, anchored: Bool) async throws -> NearlineCatalog? {
+        guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
+        let body = try JSONSerialization.data(withJSONObject: ["kind": kind, "id": id, "anchored": anchored])
+        let (status, data) = try await client.post("/v1/nearline/anchor", body: body)
+        guard status == 200 else {
+            throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Nearline anchor failed")
         }
         return parseNearline(data)
     }
