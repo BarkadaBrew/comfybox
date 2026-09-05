@@ -7,6 +7,7 @@
 // (engine/mode/provider on the legacy image-service presets, prompt affixes…).
 
 import Foundation
+import ZImage
 
 public struct ServerPresetLora: Codable, Sendable, Equatable, Identifiable {
     public var filename: String
@@ -136,6 +137,18 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var invalid: Bool?
     public var invalidReason: String?
 
+    // Todd 2026-09-04: `kroma` is deprecated on the engine — a regular LoRA
+    // now, not an independent declaration. This marker (like `invalid`
+    // above) is read-only and never sent back; a non-nil `kroma` alongside
+    // `kromaDeprecated == true` means the engine is echoing a DERIVED view
+    // of a `loras[]` entry, for one release, not something this client can
+    // write back independently.
+    public var kromaDeprecated: Bool?
+    /// Read-only, engine-generated. See the server's `ImagePreset.migrationNotes`
+    /// — currently only `"kroma_dropped_no_file"` (a `kroma` declared active
+    /// with no file, which nothing can be migrated into). Never sent back.
+    public var migrationNotes: [String]?
+
     public init(
         id: String = UUID().uuidString,
         name: String,
@@ -226,6 +239,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
         case bypass
         case invalid, invalidReason
+        case kromaDeprecated, migrationNotes
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -260,7 +274,12 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(upscale, forKey: .upscale)
         try c.encodeIfPresent(vae, forKey: .vae)
         try c.encodeIfPresent(checkpointFamily, forKey: .checkpointFamily)
-        try c.encodeIfPresent(kroma, forKey: .kroma)
+        // Review r2, C1 (Critical): `kroma` is NEVER sent back — like
+        // `invalid`/`invalidReason`, it is a deprecated, derived,
+        // engine-recomputed echo. Encoding it (even when the in-memory
+        // value is just an unedited passthrough of what GET returned) lets
+        // the server's compatibility shim fold it back into `loras[]` and
+        // resurrect a row the user just deleted.
         try c.encodeIfPresent(bypass, forKey: .bypass)
         try c.encodeIfPresent(sampler, forKey: .sampler)
         try c.encodeIfPresent(sigmaSchedule, forKey: .sigmaSchedule)
@@ -313,6 +332,8 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         stage2 = try c.decodeIfPresent(ServerPresetStage.self, forKey: .stage2)
         invalid = try c.decodeIfPresent(Bool.self, forKey: .invalid)
         invalidReason = try c.decodeIfPresent(String.self, forKey: .invalidReason)
+        kromaDeprecated = try c.decodeIfPresent(Bool.self, forKey: .kromaDeprecated)
+        migrationNotes = try c.decodeIfPresent([String].self, forKey: .migrationNotes)
     }
 
     /// Map to the local apply-to-Generate shape.
@@ -331,7 +352,6 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
                     role: $0.role
                 )
             },
-            kroma: kroma.map { PresetKroma(strength: $0.strength, file: $0.file) },
             steps: steps ?? 9,
             guidance: Float(guidance ?? 3.5),
             projectorScale: projectorScale.map { Float($0) },
@@ -346,6 +366,58 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             sampler: sampler ?? scheduler,
             sigmaSchedule: sigmaSchedule,
             seed: seed.map { UInt64(truncatingIfNeeded: $0) }
+        )
+    }
+
+    /// Map to the engine's own `ImagePreset` — every field this mirror
+    /// carries, verbatim. This is what lets ``PresetEffectiveRecipePresenter``
+    /// run the SAME `ResolvedPreset`/`PresetLoRAStack` decision the engine
+    /// runs, on the editor's current (possibly unsaved) field values, with no
+    /// wire round trip (#277).
+    public func toImagePreset() -> ImagePreset {
+        ImagePreset(
+            id: id,
+            name: name,
+            description: description,
+            mediaKind: mediaKind,
+            provider: provider,
+            engine: engine,
+            mode: mode,
+            model: model,
+            customModelPath: customModelPath,
+            baseModel: baseModel,
+            prompt: prompt,
+            negativePrompt: negativePrompt,
+            promptPrefix: promptPrefix,
+            promptSuffix: promptSuffix,
+            injectedKeywords: injectedKeywords,
+            steps: steps,
+            guidance: guidance,
+            projectorScale: projectorScale,
+            noiseType: noiseType,
+            noiseAlpha: noiseAlpha,
+            implicitSteps: implicitSteps,
+            c2: c2,
+            seed: seed,
+            width: width,
+            height: height,
+            loras: loras.map { LoraReference(filename: $0.filename, scale: $0.scale, role: $0.role) },
+            scheduler: scheduler,
+            upscale: upscale.map { PresetUpscale(enabled: $0.enabled, mode: $0.mode, scale: $0.scale) },
+            vae: vae,
+            checkpointFamily: checkpointFamily,
+            kroma: kroma.map { KromaPolicy(strength: $0.strength, file: $0.file) },
+            bypass: bypass.map { BypassPolicy(strength: $0.strength, file: $0.file) },
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            shift: shift,
+            eta: eta,
+            bongmath: bongmath,
+            stage2: stage2.map {
+                PresetStage(
+                    sampler: $0.sampler, sigmaSchedule: $0.sigmaSchedule, steps: $0.steps,
+                    denoise: $0.denoise, eta: $0.eta, bongmath: $0.bongmath)
+            }
         )
     }
 }

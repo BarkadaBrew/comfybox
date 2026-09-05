@@ -60,6 +60,7 @@ struct PresetView: View {
                 original: preset,
                 isNew: isNew,
                 availableLoras: engine.availableLoras,
+                engine: engine,
                 onSave: { updated in Task { await save(updated) } },
                 onCancel: { editing = nil }
             )
@@ -321,8 +322,22 @@ private struct ServerPresetEditor: View {
     let original: ServerPreset
     let isNew: Bool
     let availableLoras: [LoRAInfo]
+    /// #277: lets the panel cross-check its local effective-recipe
+    /// computation against `POST /v1/presets/resolve` for an already-saved
+    /// preset. Optional so previews/tests can construct the editor without a
+    /// live server; the panel still shows the local computation.
+    let engine: EngineService?
     let onSave: (ServerPreset) -> Void
     let onCancel: () -> Void
+    /// Set once per sheet appearance if the live engine disagrees with (or
+    /// rejects) this preset — e.g. flagged invalid at load (WP-E20, AC-44c).
+    /// nil means either "matches" or "not checked yet".
+    @State private var serverResolveError: String?
+    /// Review r2 (I5): the `.task` cross-check must actually COMPARE the
+    /// engine's resolved stack against the local computation, not merely
+    /// confirm the request succeeded. Set when they disagree (names, scales,
+    /// roles, or order) for the saved (as-loaded) preset.
+    @State private var serverMismatch: String?
 
     /// Editable LoRA row — stable identity for ForEach even when the same
     /// file appears twice while the user is rearranging.
@@ -342,21 +357,18 @@ private struct ServerPresetEditor: View {
     @State private var heightText: String
     @State private var stepsText: String
     @State private var guidanceText: String
-    /// Kroma is a first-class recipe field, never a generic `loras[]` row.
-    /// Keep it visible beside the additional LoRAs while saving edits back to
-    /// `kroma.strength`, which is the engine's single source of truth.
-    @State private var kromaStrength: Double
     @State private var editableLoras: [EditableLora]
     @State private var sampler: String
     @State private var sigmaSchedule: String
     @State private var saveAsName: String = ""
     @State private var showingSaveAs = false
 
-    init(original: ServerPreset, isNew: Bool, availableLoras: [LoRAInfo],
+    init(original: ServerPreset, isNew: Bool, availableLoras: [LoRAInfo], engine: EngineService? = nil,
          onSave: @escaping (ServerPreset) -> Void, onCancel: @escaping () -> Void) {
         self.original = original
         self.isNew = isNew
         self.availableLoras = availableLoras
+        self.engine = engine
         self.onSave = onSave
         self.onCancel = onCancel
         _name = State(initialValue: original.name)
@@ -368,12 +380,9 @@ private struct ServerPresetEditor: View {
         _heightText = State(initialValue: original.height.map(String.init) ?? "")
         _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
         _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
-        _kromaStrength = State(initialValue: original.kroma?.strength ?? 0)
+        // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` is the single
+        // source the editor shows, verbatim, no special-casing.
         _editableLoras = State(initialValue: original.loras
-            .filter { lora in
-                guard let kromaFile = original.kroma?.file else { return true }
-                return lora.filename != kromaFile
-            }
             .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
         _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
@@ -428,12 +437,12 @@ private struct ServerPresetEditor: View {
                     )
                 }
                 Section("LoRAs") {
-                    if original.kroma != nil {
-                        structuredKromaRow
-                    }
                     loraRows
                     addLoraMenu
                     presetLoraKeywordsRow
+                }
+                Section("Effective recipe") {
+                    effectiveRecipeView
                 }
             }
             .formStyle(.grouped)
@@ -455,6 +464,31 @@ private struct ServerPresetEditor: View {
             .padding()
         }
         .frame(minWidth: 560, idealWidth: 620, minHeight: 590, idealHeight: 680)
+        .task {
+            // #277 / review r2 (I5): cross-check against the live engine
+            // once per sheet appearance, by actually COMPARING its resolved
+            // stack (names, scales, roles, order) to the local computation
+            // for the SAME (as-loaded, unedited) preset — not merely
+            // confirming the request succeeded. Only meaningful for an
+            // already-saved preset — the endpoint resolves by id, so it
+            // cannot see unsaved edits (the panel above is the live preview
+            // for those, and is not what this checks).
+            guard !isNew, !original.id.isEmpty, let engine else { return }
+            do {
+                let serverResolved = try await engine.resolvePreset(id: original.id)
+                serverResolveError = nil
+                let declared = original.toImagePreset()
+                let serverStack = PresetEffectiveRecipePresenter.compute(
+                    resolved: serverResolved, declared: declared).loraStack
+                let localStack = PresetEffectiveRecipePresenter.compute(declared: declared).loraStack
+                serverMismatch = serverStack == localStack
+                    ? nil
+                    : "Local preview disagrees with the live engine's resolved stack for this preset."
+            } catch {
+                serverResolveError = error.localizedDescription
+                serverMismatch = nil
+            }
+        }
         .alert("Save as New Preset", isPresented: $showingSaveAs) {
             TextField("New preset name", text: $saveAsName)
             Button("Cancel", role: .cancel) { }
@@ -470,48 +504,78 @@ private struct ServerPresetEditor: View {
         }
     }
 
-    // MARK: - LoRA editing
+    // MARK: - Effective recipe (#277)
 
-    /// Kroma looks and behaves like an adjustable LoRA in the editor, but it
-    /// writes the structured recipe field. Showing it here avoids the tempting
-    /// (and invalid) workaround of also adding its file to `loras[]`.
+    /// What `POST /v1/generate {"preset": id}` would actually run for the
+    /// CURRENT field values — recomputed on every render, so it updates as
+    /// the user edits. See ``PresetEffectiveRecipePresenter``.
     @ViewBuilder
-    private var structuredKromaRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Text("Kroma")
-                    Text("Recipe")
-                        .font(.caption2)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.15), in: Capsule())
-                }
-                .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
-                Slider(value: $kromaStrength, in: 0...1.5, step: 0.05)
-                TextField("", value: Binding(
-                    get: { kromaStrength },
-                    set: { kromaStrength = min(max($0, 0), 1.5) }
-                ), format: .number.precision(.fractionLength(0...2)))
-                    .font(.system(.caption, design: .monospaced))
-                    .multilineTextAlignment(.trailing)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 52)
+    private var effectiveRecipeView: some View {
+        let recipe = effectiveRecipe
+        VStack(alignment: .leading, spacing: 6) {
+            if let error = serverResolveError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.red)
             }
-            Text(original.kroma?.file ?? "Engine-default Kroma file")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help("Saved as kroma.strength; this file is excluded from the generic LoRA stack.")
+            if let mismatch = serverMismatch {
+                Label(mismatch, systemImage: "arrow.triangle.2.circlepath.circle")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+            if let unresolved = recipe.unresolved {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label("Label-only — the engine will not expand this preset", systemImage: "tag")
+                        .font(.caption).foregroundStyle(.orange)
+                    Text(unresolved.message)
+                        .font(.caption2).foregroundStyle(.secondary)
+                    if let hint = unresolved.hint {
+                        Text(hint)
+                            .font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+            } else {
+                LabeledContent("Model", value: recipe.model?.isEmpty == false ? recipe.model! : "Model default")
+                if let family = recipe.checkpointFamily, !family.isEmpty {
+                    LabeledContent("Checkpoint family", value: family)
+                }
+                LabeledContent("Steps", value: "\(recipe.steps)")
+                LabeledContent("Guidance", value: recipe.guidance.map { String(format: "%.2g", $0) } ?? "Model default")
+                let recipeLine = [recipe.sampler, recipe.sigmaSchedule].compactMap { $0 }.joined(separator: " / ")
+                if !recipeLine.isEmpty {
+                    LabeledContent("Sampler / schedule", value: recipeLine)
+                }
+                if recipe.loraStack.isEmpty {
+                    Text("No LoRAs applied").font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    ForEach(recipe.loraStack) { lora in
+                        HStack(spacing: 6) {
+                            Text(lora.filename)
+                                .font(.caption2).lineLimit(1).truncationMode(.middle)
+                            if let role = lora.role {
+                                Text(role)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(.quaternary, in: Capsule())
+                            }
+                            Spacer()
+                            Text(String(format: "%.2f", lora.scale))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
         }
     }
 
+    // MARK: - LoRA editing
+
     /// One row per selected LoRA: name, scale slider, numeric value, remove.
+    /// Todd 2026-09-04: kroma is a regular LoRA — it shows here like any
+    /// other row, with whatever role (or none) it was declared with.
     @ViewBuilder
     private var loraRows: some View {
         if editableLoras.isEmpty {
-            Text(original.kroma == nil ? "No LoRAs — add one below." : "No additional LoRAs — add one below.")
+            Text("No LoRAs — add one below.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         ForEach($editableLoras) { $lora in
@@ -525,6 +589,7 @@ private struct ServerPresetEditor: View {
                     Button("Style / unassigned") { lora.role = nil }
                     Divider()
                     Button("Accelerator") { lora.role = "accel" }
+                    Button("Kroma") { lora.role = "kroma" }
                     Button("Bypass") { lora.role = "bypass" }
                     Button("Control") { lora.role = "control" }
                 } label: {
@@ -568,12 +633,10 @@ private struct ServerPresetEditor: View {
     @ViewBuilder
     private var addLoraMenu: some View {
         let added = Set(editableLoras.map(\.filename))
-        let structuredKromaFile = original.kroma?.file
         let candidates = availableLoras
             .filter {
                 !$0.quarantined
                     && !added.contains($0.filename)
-                    && $0.filename != structuredKromaFile
             }
             .sorted { $0.filename.localizedCaseInsensitiveCompare($1.filename) == .orderedAscending }
         Menu {
@@ -611,6 +674,7 @@ private struct ServerPresetEditor: View {
     private func roleLabel(for role: String?) -> String {
         switch role {
         case "accel": return "Accelerator"
+        case "kroma": return "Kroma"
         case "bypass": return "Bypass"
         case "control": return "Control"
         case .some(let role): return role.capitalized
@@ -673,17 +737,26 @@ private struct ServerPresetEditor: View {
         // Keep the legacy sampler spelling synchronized for older preset
         // consumers; modern engine validation and Generate use `sampler`.
         p.scheduler = p.sampler
-        if var kroma = p.kroma {
-            kroma.strength = min(max(kromaStrength, 0), 1.5)
-            p.kroma = kroma
-        }
-        let structuredKromaFile = p.kroma?.file
+        // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` (editableLoras)
+        // is the single source. Review r2, C1 (Critical): `p.kroma` is a
+        // DEPRECATED, derived, read-only echo — carrying `original.kroma`
+        // through unedited (as `bypass`/`upscale` legitimately do) resurrects
+        // a row the user just deleted, because the server's compatibility
+        // shim folds a non-nil `kroma` back into `loras[]` on the next save.
+        // The desktop must NEVER send it; `ServerPreset.encode` also never
+        // emits it, belt and braces.
+        p.kroma = nil
         p.loras = editableLoras
-            .filter { !$0.filename.isEmpty && $0.filename != structuredKromaFile }
-            .map {
-                ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role)
-            }
+            .filter { !$0.filename.isEmpty }
+            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }
         return p
+    }
+
+    /// #277: what the engine would actually run for this preset's CURRENT
+    /// (possibly unsaved) field values — recomputed on every render, so
+    /// editing a field updates it live.
+    private var effectiveRecipe: EffectiveRecipe {
+        PresetEffectiveRecipePresenter.compute(declared: buildPreset().toImagePreset())
     }
 }
 

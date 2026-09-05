@@ -24,10 +24,13 @@ final class ImageRecipeTests: XCTestCase {
         XCTAssertEqual(r.preset.height, 1152)
         XCTAssertEqual(r.preset.modelId, "cyberrealisticZImage_v50")
         XCTAssertEqual(r.contentMode, .banana)
-        XCTAssertEqual(r.preset.loras.map(\.filename),
-                       ["Anneliese_Zbase3.safetensors", "Z-Breast-Slider.safetensors"])
-        XCTAssertEqual(r.preset.loras.map(\.scale), [0.8, -3])
-        XCTAssertEqual(r.preset.kroma, PresetKroma(strength: 0.55, file: "kroma-v0.3.safetensors"))
+        // Todd 2026-09-04: kroma is a regular LoRA — the `role: "kroma"` wire
+        // entry stays in `loras[]`, in declared order, like any other role.
+        XCTAssertEqual(r.preset.loras.map(\.filename), [
+            "Anneliese_Zbase3.safetensors", "kroma-v0.3.safetensors", "Z-Breast-Slider.safetensors",
+        ])
+        XCTAssertEqual(r.preset.loras.map(\.scale), [0.8, 0.55, -3])
+        XCTAssertEqual(r.preset.loras[1].role, "kroma")
     }
 
     func testFromParamsEmptyReturnsNil() {

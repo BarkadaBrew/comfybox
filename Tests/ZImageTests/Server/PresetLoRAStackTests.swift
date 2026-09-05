@@ -118,7 +118,10 @@ final class PresetLoRAStackTests: XCTestCase {
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil))
     XCTAssertEqual(e.model, "krea2-raw")
-    XCTAssertEqual(e.loras?.count, 3)
+    // Todd 2026-09-04: kroma has no special semantics — `decide` no longer
+    // prepends a structured `kroma` declaration, so the stack is exactly the
+    // two DECLARED `loras[]` entries, not three.
+    XCTAssertEqual(e.loras?.count, 2)
   }
 
   /// An explicit `model` that agrees with the preset is not a conflict, and the
@@ -130,7 +133,7 @@ final class PresetLoRAStackTests: XCTestCase {
       presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil,
       requestModel: "/models/krea2-raw", normalizeModelSpec: normalize))
     XCTAssertNil(e.model, "the request already named the base; nothing to adopt")
-    XCTAssertEqual(e.loras?.count, 3)
+    XCTAssertEqual(e.loras?.count, 2)  // declared stack only — see testPresetModelIsAdoptedWithTheStack
   }
 
   func testContradictingExplicitModelIsAConflict() {
@@ -366,24 +369,44 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertNil(e.guidance)
   }
 
-  // MARK: D14 — kroma is a first-class field, prepended, never a `loras[]` row
+  // MARK: Todd 2026-09-04 — kroma has NO special semantics; it is a regular
+  // LoRA. `decide` never reads the (deprecated) structured `kroma` field —
+  // only `loras[]`, applied exactly as declared. (Was: "D14 — kroma is a
+  // first-class field, prepended, never a `loras[]` row" — reversed.)
 
-  func testKromaIsPrependedAtItsDeclaredStrength() throws {
+  /// The structured `kroma` field on `kreaKira()` is declared (strength 0.6,
+  /// a named file) but contributes NOTHING here — `decide` reads only
+  /// `resolved.loras`, in declared order. `PresetStore.migratingKromaDeprecation`
+  /// is what would fold that structured field into `loras[]` on save/load;
+  /// this test's `lookup()` helper builds `ResolvedPreset` directly and
+  /// deliberately bypasses it, to prove `decide` itself has no kroma-specific
+  /// path left to bypass.
+  func testStructuredKromaFieldContributesNothingToTheStack() throws {
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "krea-kira", lookup: kreaKira(), requestLoras: nil))
     let loras = try XCTUnwrap(e.loras)
-    XCTAssertEqual(loras.count, 3)
-    XCTAssertEqual(loras[0].filename, "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
-    XCTAssertEqual(loras[0].scale, 0.6)
-    XCTAssertEqual(loras[0].role, "kroma")
-    XCTAssertEqual(loras[1].filename, "krea2_turbo_distill_r256.safetensors")
-    XCTAssertEqual(loras[1].role, "accel")
+    XCTAssertEqual(loras.count, 2, "declared loras[] only — the structured kroma field is not consulted")
+    XCTAssertEqual(loras[0].filename, "krea2_turbo_distill_r256.safetensors")
+    XCTAssertEqual(loras[0].role, "accel")
+    XCTAssertEqual(loras[1].filename, "RealisticSnapshotKrea2.safetensors")
+    XCTAssertFalse(loras.contains { $0.role == "kroma" })
   }
 
-  func testKromaStrengthZeroContributesNothing() throws {
-    let e = try expansion(PresetLoRAStack.decide(
-      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(), requestLoras: nil))
-    XCTAssertFalse(e.loras?.contains { $0.role == "kroma" } ?? true)
+  /// A `role: "kroma"` entry declared directly in `loras[]` (the now-canonical
+  /// way to declare it) is a REGULAR adapter: applied at its own position and
+  /// scale, same as any other role.
+  func testKromaDeclaredAsARegularLoraAppliesInPlace() throws {
+    let preset = lookup(ImagePreset(
+      id: "kroma-as-lora", name: "x", mediaKind: "image", model: "krea2-raw",
+      loras: [
+        LoraReference(filename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6, role: "kroma"),
+        LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel"),
+      ]))
+    let e = try expansion(PresetLoRAStack.decide(presetId: "kroma-as-lora", lookup: preset, requestLoras: nil))
+    let loras = try XCTUnwrap(e.loras)
+    XCTAssertEqual(loras.map(\.filename), [
+      "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", "krea2_turbo_distill_r256.safetensors",
+    ], "declared order, unchanged — no reordering by role")
   }
 
   // MARK: C2 — unexpandable presets stay LABELS, and say so
@@ -425,18 +448,19 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "media_kind:video")
   }
 
-  /// The engine has no family→default-kroma-file table (that policy lives in
-  /// the client layer, FDD §3.17). Declared-on with no file is unreproducible,
-  /// so nothing is applied rather than a stack that is missing its kroma.
-  func testKromaOnWithNoFileIsALabelAndIsReported() throws {
+  /// Todd 2026-09-04: the `kroma_file_missing` gate is RETIRED along with
+  /// kroma's special semantics — a structured `kroma` with no file is simply
+  /// irrelevant to `decide` now (nothing to migrate, nothing to gate on). A
+  /// preset in this exact shape expands normally on its declared `loras[]`.
+  func testStructuredKromaWithNoFileNoLongerGatesExpansion() throws {
     let preset = lookup(ImagePreset(
       id: "kroma-no-file", name: "x", mediaKind: "image", model: "krea2-raw",
       loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
       checkpointFamily: "raw-accel", kroma: KromaPolicy(strength: 0.6)))
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "kroma-no-file", lookup: preset, requestLoras: nil))
-    XCTAssertNil(e.loras)
-    XCTAssertEqual(try XCTUnwrap(e.unresolved).code, "kroma_file_missing")
+    XCTAssertNil(e.unresolved)
+    XCTAssertEqual(e.loras?.map(\.filename), ["a.safetensors"])
   }
 
   /// The bypass `.diff` adapter is a preset dial with no engine application
@@ -466,10 +490,9 @@ final class PresetLoRAStackTests: XCTestCase {
 
   func testExplicitLorasWinAndMatchingStackRaisesNoFlag() throws {
     guard case .resolved(let resolved, _) = kreaKira() else { return XCTFail("fixture") }
-    var same: [LoraReference] = [
-      LoraReference(filename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6),
-    ]
-    same.append(contentsOf: resolved.loras)
+    // Todd 2026-09-04: the declared stack IS `resolved.loras` now — no
+    // structured kroma to separately prepend before comparing.
+    let same = resolved.loras
 
     let e = try expansion(PresetLoRAStack.decide(
       presetId: "krea-kira", lookup: kreaKira(), requestLoras: same))
@@ -478,18 +501,19 @@ final class PresetLoRAStackTests: XCTestCase {
     XCTAssertEqual(e.model, "krea2-raw", "the preset's base still travels")
   }
 
-  /// The real async production path: the client sends `preset` AND a FLAT
-  /// `loras` list that has already dropped the structured kroma. Explicit still
-  /// wins (existing precedence), but the response now says the two disagreed.
-  func testFlatClientStackMissingKromaRaisesTheMismatchFlag() throws {
-    let flat = [
-      LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6),
-      LoraReference(filename: "RealisticSnapshotKrea2.safetensors", scale: 0.4),
+  /// A client's explicit `loras` that genuinely differ from the preset's
+  /// declared stack (not a kroma-specific case — kroma has no special
+  /// treatment to differ over) still raises the mismatch flag; explicit still
+  /// wins.
+  func testExplicitLorasDifferingFromDeclaredRaisesTheMismatchFlag() throws {
+    let different = [
+      LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel"),
+      // Missing "RealisticSnapshotKrea2.safetensors" entirely — a genuine disagreement.
     ]
     let e = try expansion(PresetLoRAStack.decide(
-      presetId: "krea-kira", lookup: kreaKira(), requestLoras: flat))
+      presetId: "krea-kira", lookup: kreaKira(), requestLoras: different))
     XCTAssertNil(e.loras)
-    XCTAssertTrue(e.stackMismatch, "kroma is missing from the client's flat list — say so")
+    XCTAssertTrue(e.stackMismatch)
   }
 
   func testExplicitEmptyListAgainstANonEmptyPresetIsAMismatch() throws {
@@ -570,7 +594,11 @@ final class PresetLoRAStackTests: XCTestCase {
         appliedPairs[reference.filename], reference.scale,
         "resolve reported \(reference.filename) but the applied stack disagrees")
     }
-    XCTAssertEqual(loras.count, resolved.loras.count + 1)
+    // Todd 2026-09-04: no separate kroma prepend — `PresetStore.upsert`
+    // already folded the structured `kroma` field into `loras[]` on save
+    // (`ImagePreset.migratingKromaDeprecation`), so `resolve()`'s count and
+    // `decide`'s applied count are now the SAME number, not off by one.
+    XCTAssertEqual(loras.count, resolved.loras.count)
     XCTAssertEqual(e.model, resolved.model)
   }
 

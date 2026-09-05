@@ -150,16 +150,6 @@ public enum PresetLoRAStack: Sendable, Equatable {
         "preset '\(id)' declares bypass.strength \(bypass.strength), which the engine "
           + "cannot expand — send the resolved stack in `loras`")
     }
-    // D14: kroma is a first-class field, and the engine has no
-    // family→default-file table (that policy is client-side, FDD §3.17), so an
-    // unnamed file is not guessed.
-    if let kroma = resolved.kroma, kroma.strength > 0,
-       (kroma.file ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      return unresolved(id, "kroma_file_missing",
-        "preset '\(id)' declares kroma.strength \(kroma.strength) with no kroma.file, "
-          + "and the engine has no family-default kroma table")
-    }
-
     var expansion = PresetExpansion(presetId: id)
 
     // --- Model ------------------------------------------------------------
@@ -216,19 +206,21 @@ public enum PresetLoRAStack: Sendable, Equatable {
 
     // --- The stack ---------------------------------------------------------
 
-    var stack: [LoraReference] = []
-    if let kroma = resolved.kroma, kroma.strength > 0, let file = kroma.file {
-      // D14: the expanding sender PREPENDS the structured kroma.
-      stack.append(LoraReference(filename: file, scale: kroma.strength, role: "kroma"))
-    }
-    stack.append(contentsOf: resolved.loras)
+    // Todd 2026-09-04: kroma has no special semantics here (or anywhere else
+    // in the engine) — it is a regular LoRA. `resolved.loras` is applied
+    // exactly as declared, in order; no prepend, no strip, no reordering.
+    // (This reverses the #350/#276-era structured-kroma expansion. See
+    // `ImagePreset.migratingKromaDeprecation` in PresetStore.swift for the
+    // one-release compatibility shim that keeps an already-declared
+    // structured `kroma` field working as a derived, read-only view.)
+    let stack = resolved.loras
 
     if let requestLoras {
       // Explicit `loras` keep their precedence — but a disagreement is
       // reported rather than absorbed. The production async client sends BOTH
-      // `preset` and a FLAT `loras` list that has already dropped the
-      // structured kroma/bypass/role, so this is the flag that makes that
-      // visible from the response.
+      // `preset` and a FLAT `loras` list that has already dropped `bypass`/
+      // `role`, so this is the flag that makes that visible from the
+      // response.
       expansion.stackMismatch = !isSameStack(requestLoras, stack)
     } else {
       expansion.loras = stack
@@ -337,7 +329,7 @@ public struct PresetExpansion: Sendable, Equatable {
   ///
   /// `code` is short and machine-readable so a daemon can branch on it:
   /// `unknown_preset`, `invalid_preset`, `media_kind:video`, `engine:<x>`,
-  /// `provider:<x>`, `no_model`, `bypass_declared`, `kroma_file_missing`,
+  /// `provider:<x>`, `no_model`, `bypass_declared`,
   /// `missing_lora:<name>`, `not_resolved`. `message` is the full sentence
   /// that goes in the engine log.
   public struct Unresolved: Sendable, Equatable {

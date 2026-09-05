@@ -58,12 +58,14 @@ public struct PresetUpscale: Codable, Equatable, Sendable {
 
 // MARK: - Kroma policy (WP-E20, D14)
 
-/// Kroma as a FIRST-CLASS preset field, never a `loras[]` entry (D14): absence
-/// from a list is indistinguishable from "off", which is exactly what O4a
-/// forbids. `strength: 0` is a declaration ("no kroma") and validates;
-/// an absent `kroma` on a krea2-family image preset is a configuration error.
-/// `file` nil = the family-correct default (resolved by the client policy
-/// layer, §3.17); set it to pin a specific artifact (e.g. `kroma-v0.1`).
+/// DEPRECATED (Todd 2026-09-04): kroma is a regular LoRA now, not a
+/// first-class field — see ``ImagePreset/kroma`` and
+/// ``ImagePreset/migratingKromaDeprecation(_:)``. This type only still
+/// exists as the shape of the one-release compatibility shim: a client may
+/// still PUT `{"kroma": {...}}`, which migrates into `loras[]`; every GET
+/// echoes it back as a DERIVED, read-only view (never an independent
+/// value), alongside `kromaDeprecated: true`. O4a (a krea2-family image
+/// preset must declare `kroma`) is retired along with the rest of this.
 public struct KromaPolicy: Codable, Equatable, Sendable {
   public var strength: Double
   public var file: String?
@@ -148,9 +150,10 @@ public enum Krea2BypassPolicy {
     if let bypass {
       return BypassPolicy(strength: bypass.strength, file: file)
     }
-    // Derived. A krea2-family image preset must declare `kroma` (O4a), so
-    // `nil` here is only reachable for a preset that has no kroma dial at
-    // all — treated as "no kroma", the same as `strength: 0`.
+    // Derived. `nil` here means a preset with no kroma dial at all —
+    // treated as "no kroma", the same as `strength: 0`. (O4a, the rule that
+    // used to make this case rare for krea2-family presets, is retired —
+    // `nil` is now exactly as common as any other absent adapter.)
     // Todd 2026-08-31: kroma=0 must NOT auto-load the bypass LoRA — projector_scale
     // + adherence make it unnecessary. The DERIVED bypass is now always OFF; an
     // explicit per-render bypass_strength or preset bypass (precedence 1 & 2 above)
@@ -273,8 +276,25 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
   /// "zimage-turbo" | "zimage-base". Never a physical fact — that is
   /// `Krea2Variant`, which is reported, not requested.
   public var checkpointFamily: String?
-  /// Required of krea2-family image presets (O4a, D14).
+  /// DEPRECATED (Todd 2026-09-04 — kroma has no special engine semantics;
+  /// it is a regular LoRA, applied via `loras[]` like any other). Kept for
+  /// one release as a compatibility shim: no longer an independent
+  /// declaration a client can set — `PresetStore` recomputes it as a
+  /// DERIVED, read-only mirror of whichever `loras[]` entry carries
+  /// `role: "kroma"` (nil when none does). See
+  /// `ImagePreset.migratingKromaDeprecation` and ``kromaDeprecated``.
   public var kroma: KromaPolicy?
+  /// Present and `true` only when ``kroma`` is non-nil — omitted otherwise,
+  /// so an ordinary (non-krea2) preset's JSON is not littered with
+  /// `"kroma_deprecated": false`. Client input is ignored; the engine always
+  /// recomputes it.
+  public var kromaDeprecated: Bool?
+  /// Additive, engine-generated notes about what the kroma-deprecation
+  /// migration could not preserve — currently only `"kroma_dropped_no_file"`
+  /// (a structured `kroma` declared active with no `file`: there is no
+  /// engine-side family→default-file table, FDD §3.17, so nothing concrete
+  /// exists to become a LoRA of). nil when migration had nothing to report.
+  public var migrationNotes: [String]?
   /// WP-E8 (§3.8, D10): the bypass `.diff` LoRA as a declared dial. ABSENT is
   /// legal and means the kroma-derived default —
   /// ``Krea2BypassPolicy/resolve(for:requestStrength:)``.
@@ -324,6 +344,8 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     vae: String? = nil,
     checkpointFamily: String? = nil,
     kroma: KromaPolicy? = nil,
+    kromaDeprecated: Bool? = nil,
+    migrationNotes: [String]? = nil,
     bypass: BypassPolicy? = nil,
     sampler: String? = nil,
     sigmaSchedule: String? = nil,
@@ -363,6 +385,8 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     self.vae = vae
     self.checkpointFamily = checkpointFamily
     self.kroma = kroma
+    self.kromaDeprecated = kromaDeprecated
+    self.migrationNotes = migrationNotes
     self.bypass = bypass
     self.sampler = sampler
     self.sigmaSchedule = sigmaSchedule
@@ -388,6 +412,8 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     case vae
     // WP-E20: the nine recipe/policy fields (AC-58 round-trips every one).
     case checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
+    // Todd 2026-09-04: additive deprecation marker for `kroma` — see its doc comment.
+    case kromaDeprecated, migrationNotes
     // WP-E8: the tenth. Same regression class — listed here AND decoded below.
     case bypass
   }
@@ -427,6 +453,10 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     vae = try c.decodeIfPresent(String.self, forKey: .vae)
     checkpointFamily = try c.decodeIfPresent(String.self, forKey: .checkpointFamily)
     kroma = try c.decodeIfPresent(KromaPolicy.self, forKey: .kroma)
+    // Decoded but never trusted from input — `migratingKromaDeprecation`
+    // always recomputes it. A benign placeholder keeps the decode tolerant.
+    kromaDeprecated = try c.decodeIfPresent(Bool.self, forKey: .kromaDeprecated)
+    migrationNotes = try c.decodeIfPresent([String].self, forKey: .migrationNotes)
     bypass = try c.decodeIfPresent(BypassPolicy.self, forKey: .bypass)
     sampler = try c.decodeIfPresent(String.self, forKey: .sampler)
     sigmaSchedule = try c.decodeIfPresent(String.self, forKey: .sigmaSchedule)
@@ -434,6 +464,72 @@ public struct ImagePreset: Codable, Equatable, Sendable, Identifiable {
     eta = try c.decodeIfPresent(Double.self, forKey: .eta)
     bongmath = try c.decodeIfPresent(Bool.self, forKey: .bongmath)
     stage2 = try c.decodeIfPresent(PresetStage.self, forKey: .stage2)
+  }
+}
+
+// MARK: - Kroma deprecation shim (Todd 2026-09-04)
+//
+// Reverses the #350/#276-era structured-kroma special-casing:
+// `PresetLoRAStack.decide` no longer prepends, strips, or otherwise treats
+// `kroma` specially — it applies `loras[]` exactly as declared. This is the
+// one-release compatibility shim (intent.md: "version or shim, never
+// silently change") so a daemon/desktop client still reading `.kroma` does
+// not break outright while it migrates off the structured field.
+extension ImagePreset {
+  /// Fold an active structured `kroma` declaration into `loras[]`, then
+  /// replace `kroma`/`kromaDeprecated`/`migrationNotes` with the DERIVED,
+  /// read-only view of whatever `role: "kroma"` entry now exists. Called on
+  /// load and on every `upsert`, so both an already-migrated preset and a
+  /// legacy one still carrying only the structured field converge on the
+  /// same canonical form.
+  ///
+  /// - A `loras[]` entry already tagged `role: "kroma"` — by ANY filename,
+  ///   not just the structured field's — means the fold already happened
+  ///   (or the caller declared it directly, the now-canonical way): nothing
+  ///   is appended, so swapping which file a preset tags `kroma` and
+  ///   re-saving never leaves the OLD file behind as a second entry.
+  ///   Filenames are compared by `lastPathComponent`, matching
+  ///   `PresetLoRAStack.isSameStack`.
+  /// - Otherwise the migrated entry is inserted at the FRONT of `loras[]`,
+  ///   not appended — this is a render-parity concern, not a style choice:
+  ///   before this deprecation, the engine's expanding sender always
+  ///   PREPENDED kroma, so a preset migrating for the first time renders
+  ///   with the same LoRA application order it always had. A `loras[]`
+  ///   entry a caller declares directly (the canonical path going forward)
+  ///   is never reordered — only THIS one-time fold inserts at the front.
+  /// - A `kroma` declared active (`strength > 0`) with no `file` has
+  ///   nothing concrete to become a LoRA of — there is no engine-side
+  ///   family→default-file table (FDD §3.17, client policy only). It
+  ///   migrates to nothing, the preset stays loadable, and
+  ///   `"kroma_dropped_no_file"` is recorded in `migrationNotes` (and
+  ///   logged via `log`) so the loss is visible instead of silent.
+  static func migratingKromaDeprecation(_ preset: ImagePreset, log: (String) -> Void = { _ in }) -> ImagePreset {
+    var out = preset
+    out.migrationNotes = nil
+    if let kroma = preset.kroma, kroma.strength > 0 {
+      let file = kroma.file?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let hasKromaRole = preset.loras.contains { ($0.role ?? "").lowercased() == "kroma" }
+      let hasMatchingFile = !file.isEmpty && preset.loras.contains {
+        ($0.filename as NSString).lastPathComponent == (file as NSString).lastPathComponent
+      }
+      if file.isEmpty {
+        let note = "kroma_dropped_no_file"
+        out.migrationNotes = [note]
+        log("WARNING: preset '\(preset.id)' declares kroma.strength \(kroma.strength) with no "
+          + "kroma.file — the engine has no family-default kroma table, so this migrates to "
+          + "nothing (\(note))")
+      } else if !hasKromaRole && !hasMatchingFile {
+        out.loras.insert(LoraReference(filename: file, scale: kroma.strength, role: "kroma"), at: 0)
+      }
+    }
+    if let entry = out.loras.first(where: { ($0.role ?? "").lowercased() == "kroma" }) {
+      out.kroma = KromaPolicy(strength: entry.scale, file: entry.filename)
+      out.kromaDeprecated = true
+    } else {
+      out.kroma = nil
+      out.kromaDeprecated = nil
+    }
+    return out
   }
 }
 
@@ -531,7 +627,15 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
   // system default; absent means "the engine's default for the variant",
   // which the record (RenderRecipe, WP-E10) then names.
   public var checkpointFamily: String?
+  /// DEPRECATED — see ``ImagePreset/kroma``. A derived, read-only view.
   public var kroma: KromaPolicy?
+  /// Optional: present and `true` only when ``kroma`` is non-nil — see
+  /// ``ImagePreset/kromaDeprecated``. A non-optional `Bool` here would force
+  /// every response to carry `"kroma_deprecated": false` and would fail to
+  /// decode an older engine's response that predates this field entirely.
+  public var kromaDeprecated: Bool?
+  /// See ``ImagePreset/migrationNotes``.
+  public var migrationNotes: [String]?
   /// WP-E8: nil = the kroma-derived default (§3.8), which the record then
   /// names as applied.
   public var bypass: BypassPolicy?
@@ -574,6 +678,8 @@ public struct ResolvedPreset: Codable, Equatable, Sendable {
     vae = preset.vae
     checkpointFamily = preset.checkpointFamily
     kroma = preset.kroma
+    kromaDeprecated = preset.kromaDeprecated
+    migrationNotes = preset.migrationNotes
     bypass = preset.bypass
     sampler = preset.sampler
     sigmaSchedule = preset.sigmaSchedule
@@ -678,7 +784,7 @@ public final class PresetStore: @unchecked Sendable {
     self.logger = logger
 
     if fileManager.fileExists(atPath: path.path), let data = try? Data(contentsOf: path) {
-      let loaded = PresetStore.decodeEntries(data)
+      let loaded = PresetStore.decodeEntries(data, log: { logger.warning("\($0)") })
       self.presets = loaded.presets
       self.invalidReasons = loaded.undecodable
     } else if seedDefaults {
@@ -777,7 +883,7 @@ public final class PresetStore: @unchecked Sendable {
   /// the store is persisted atomically. Returns the (validated) stored preset.
   @discardableResult
   public func upsert(_ preset: ImagePreset) throws -> ImagePreset {
-    let validated = try PresetStore.validate(preset)
+    let validated = try PresetStore.validate(preset, log: { [logger] in logger.warning("\($0)") })
     lock.lock(); defer { lock.unlock() }
     if let idx = presets.firstIndex(where: { $0.id == validated.id }) {
       presets[idx] = validated
@@ -917,7 +1023,7 @@ public final class PresetStore: @unchecked Sendable {
   /// Port of `validatePreset` (service.ts): required non-empty `id`/`name`; when present,
   /// `steps`/`width`/`height` must be positive integers, and every LoRA scale must be finite.
   /// Kept lenient on the string enum fields (like the tolerant decode) — the client owns them.
-  static func validate(_ preset: ImagePreset) throws -> ImagePreset {
+  static func validate(_ preset: ImagePreset, log: (String) -> Void = { _ in }) throws -> ImagePreset {
     if preset.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw PresetStoreError.validation(#"required field "id" is missing or empty"#)
     }
@@ -944,7 +1050,10 @@ public final class PresetStore: @unchecked Sendable {
     }
     try validateRecipeFields(preset)
     try validateKromaPolicy(preset)
-    return preset
+    // Todd 2026-09-04: fold a structured `kroma` declaration into `loras[]`
+    // and replace it with the derived, read-only view — see
+    // `ImagePreset.migratingKromaDeprecation`.
+    return ImagePreset.migratingKromaDeprecation(preset, log: log)
   }
 
   // MARK: Checkpoint family + kroma (WP-E20, D7, D14, O4a)
@@ -984,10 +1093,10 @@ public final class PresetStore: @unchecked Sendable {
     preset.mediaKind?.lowercased() != "video"
   }
 
-  /// O4a on the engine (FDD §3.15, AC-44b/44c): a krea2-family image preset
-  /// must declare `kroma` — `{strength: 0}` is a declaration; absence is a
-  /// configuration error naming the preset and the field. Scoped by family:
-  /// the `zimage-*` presets are exempt (D14).
+  /// Range/shape checks on the deprecated `kroma`/`bypass` dials, WHEN a
+  /// client sends one. O4a (FDD §3.15, AC-44b/44c — a krea2-family image
+  /// preset must declare `kroma`) is RETIRED (Todd 2026-09-04): kroma has
+  /// no special semantics, so its absence gates nothing here any more.
   static func validateKromaPolicy(_ preset: ImagePreset) throws {
     if let family = preset.checkpointFamily,
        !krea2CheckpointFamilies.contains(family), !zimageCheckpointFamilies.contains(family) {
@@ -1004,9 +1113,11 @@ public final class PresetStore: @unchecked Sendable {
         throw PresetStoreError.validation("preset \"\(preset.id)\": kroma.file is empty — omit it for the family default")
       }
     }
-    // WP-E8 (§3.8, D10): the same ranges as kroma. Note what is NOT here —
-    // an absent `bypass` is legal and means the kroma-derived default
-    // (ledger 17:35), where an absent `kroma` is a configuration error.
+    // WP-E8 (§3.8, D10): the bypass dial's own ranges. An absent `bypass` is
+    // legal and means the kroma-derived default (ledger 17:35) — that
+    // derivation is itself always-off since 2026-08-31 (see
+    // `Krea2BypassPolicy.resolve`), independent of whether `kroma` is
+    // present at all.
     if let bypass = preset.bypass {
       if !bypass.strength.isFinite || bypass.strength < 0 {
         throw PresetStoreError.validation(
@@ -1018,13 +1129,10 @@ public final class PresetStore: @unchecked Sendable {
             + "(\(Krea2BypassPolicy.workflowFile))")
       }
     }
-    if isImagePreset(preset), resolvesToKrea2Family(preset), preset.kroma == nil {
-      throw PresetStoreError.validation(
-        "preset \"\(preset.id)\": krea2-family image preset (model \"\(preset.model ?? "")\""
-          + (preset.checkpointFamily.map { ", checkpointFamily \"\($0)\"" } ?? "")
-          + ") must declare \"kroma\" ({\"strength\": <number>, \"file\": <optional>}) — "
-          + "an absent kroma is a configuration error (O4a); declare {\"strength\": 0} for none")
-    }
+    // O4a (the krea2-family-must-declare-kroma requirement) is RETIRED (Todd
+    // 2026-09-04): kroma is a regular LoRA now, not an independent
+    // declaration, so a krea2-family preset with none is exactly as legal as
+    // one missing any other specific adapter.
   }
 
   /// The recipe fields go through the SAME resolver `/v1/generate` uses
@@ -1099,7 +1207,9 @@ public final class PresetStore: @unchecked Sendable {
   /// gone until the file was hand-fixed. Now each entry decodes on its own;
   /// one that fails is kept as an `id`/`name` placeholder with its reason in
   /// `undecodable`, so it is listed, flagged and never silently dropped.
-  static func decodeEntries(_ data: Data) -> (presets: [ImagePreset], undecodable: [String: String]) {
+  static func decodeEntries(
+    _ data: Data, log: (String) -> Void = { _ in }
+  ) -> (presets: [ImagePreset], undecodable: [String: String]) {
     guard let root = try? JSONSerialization.jsonObject(with: data) else { return ([], [:]) }
     let rawEntries: [Any]
     if let envelope = root as? [String: Any], let array = envelope["presets"] as? [Any] {
@@ -1117,7 +1227,11 @@ public final class PresetStore: @unchecked Sendable {
             let entryData = try? JSONSerialization.data(withJSONObject: object)
       else { continue }
       do {
-        presets.append(try decoder.decode(ImagePreset.self, from: entryData))
+        // Todd 2026-09-04: migrate a structured `kroma` declaration on
+        // EVERY load, not just the next save — a preset a client never
+        // re-saves must still converge on the derived, single-source form.
+        let decoded = try decoder.decode(ImagePreset.self, from: entryData)
+        presets.append(ImagePreset.migratingKromaDeprecation(decoded, log: log))
       } catch {
         let id = (object["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "#\(index)"
         let name = (object["name"] as? String) ?? id

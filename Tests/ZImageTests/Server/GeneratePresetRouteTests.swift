@@ -72,6 +72,12 @@ final class GeneratePresetRouteTests: XCTestCase {
 
     let payload = try expand(#"{"prompt":"a portrait","preset":"krea-kira"}"#, store: store)
 
+    // Todd 2026-09-04: kroma has no special semantics in `decide` — but
+    // `decide` still applies `loras[]` exactly as `seedKreaKira`'s
+    // `store.upsert` migrated it, and review r2 (I4) inserts the migrated
+    // entry at the FRONT (render parity with the pre-deprecation prepend),
+    // so the migrated order is kroma-first here even though nothing in
+    // `decide` itself treats it specially.
     let loras = try XCTUnwrap(payload.loras)
     XCTAssertEqual(loras.map(\.path), [
       "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
@@ -79,7 +85,7 @@ final class GeneratePresetRouteTests: XCTestCase {
       "RealisticSnapshotKrea2.safetensors",
     ])
     XCTAssertEqual(loras.map { $0.scale ?? -1 }, [0.6, 0.6, 0.4])
-    XCTAssertEqual(loras.first?.role, "kroma")
+    XCTAssertEqual(loras[0].role, "kroma")
     XCTAssertEqual(loras[1].role, "accel")
     // C1: the preset's base travels with its adapters.
     XCTAssertEqual(payload.model, "krea2-raw")
@@ -104,7 +110,10 @@ final class GeneratePresetRouteTests: XCTestCase {
         match?.scale, Float(reference.scale),
         "resolve reported \(reference.filename)@\(reference.scale); the route disagrees")
     }
-    XCTAssertEqual(applied.count, resolved.loras.count + 1, "plus the structured kroma")
+    // Todd 2026-09-04: `resolve()` already reflects the migrated stack (the
+    // structured kroma is folded into `loras[]` on save) — no separate
+    // prepend at the route, so the counts now agree exactly.
+    XCTAssertEqual(applied.count, resolved.loras.count)
     XCTAssertEqual(payload.model, resolved.model)
   }
 
@@ -143,6 +152,10 @@ final class GeneratePresetRouteTests: XCTestCase {
   func testPresetPlusMatchingExplicitLorasRaisesNoFlag() throws {
     let store = try makeStore()
     try seedKreaKira(store)
+    // Todd 2026-09-04 / review r2 (I4): order must match the migrated
+    // order — kroma FIRST (inserted at the front for render parity with
+    // the pre-deprecation prepend), then the declared entries — `isSameStack`
+    // compares positionally.
     let payload = try expand(#"""
       {"prompt":"x","preset":"krea-kira","loras":[
         {"path":"/Volumes/Bolt/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors","scale":0.6},
@@ -227,6 +240,8 @@ final class GeneratePresetRouteTests: XCTestCase {
       return entries.map { LoRAEntry(path: "/nearline/\($0.path)", scale: $0.scale, role: $0.role) }
     }
     XCTAssertEqual(staged.count, 3, "the whole expanded stack is offered for staging")
+    // Review r2 (I4): the migration inserts kroma at the FRONT (render
+    // parity with the pre-deprecation prepend), so it is the FIRST entry.
     XCTAssertEqual(payload.loras?.map(\.path).first, "/nearline/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
     XCTAssertEqual(payload.loras?.first?.role, "kroma", "staging must not drop the slot")
   }
@@ -269,6 +284,7 @@ final class GeneratePresetRouteTests: XCTestCase {
 
     let replayed = try WarmServer.decodedGeneratePayload(
       from: persisted, store: store, configuration: configuration, loraExists: { _ in true })
+    // Review r2 (I4): the migrated entry is FRONT-inserted.
     XCTAssertEqual(replayed.loras?.map(\.path), [
       "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
       "krea2_turbo_distill_r256.safetensors",

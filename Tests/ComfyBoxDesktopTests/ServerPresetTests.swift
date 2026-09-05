@@ -60,21 +60,27 @@ struct ServerPresetTests {
 
     @Test("maps to a GenerationPreset for apply")
     func toGenerationPreset() throws {
+        // Todd 2026-09-04: kroma is a regular LoRA — a role: "kroma" entry
+        // in `loras[]` maps like any other, with no separate `kroma` field
+        // on `GenerationPreset` (removed, review r2 M: dead state).
         let p = ServerPreset(
             id: "x", name: "X", model: "z-image-turbo",
             prompt: "a test", steps: 12, guidance: 4.0,
             width: 1280, height: 1280,
-            loras: [ServerPresetLora(filename: "a.safetensors", scale: 0.6)],
-            scheduler: "euler",
-            kroma: ServerPresetKroma(strength: 0.45, file: "kroma.safetensors")
+            loras: [
+                ServerPresetLora(filename: "a.safetensors", scale: 0.6),
+                ServerPresetLora(filename: "kroma.safetensors", scale: 0.45, role: "kroma"),
+            ],
+            scheduler: "euler"
         )
         let g = p.toGenerationPreset()
         #expect(g.promptTemplate == "a test")
         #expect(g.modelId == "z-image-turbo")
         #expect(g.steps == 12)
         #expect(g.width == 1280)
+        #expect(g.loras.map(\.filename) == ["a.safetensors", "kroma.safetensors"])
         #expect(g.loras.first?.scale == 0.6)
-        #expect(g.kroma == PresetKroma(strength: 0.45, file: "kroma.safetensors"))
+        #expect(g.loras.last?.role == "kroma")
         #expect(g.sampler == "euler")
     }
 
@@ -117,8 +123,11 @@ struct ServerPresetTests {
     /// WP-E20: the engine's nine recipe/policy fields (+ WP-E9 `vae`) and the
     /// read-only validity flag. Upsert replaces the whole document, so a
     /// desktop edit-and-save must carry every one of them back — and must NOT
-    /// send the flag, which the engine recomputes.
-    @Test("round-trip preserves the krea2 recipe fields; the validity flag is read-only")
+    /// send the flag, which the engine recomputes. Review r2, C1 (Critical):
+    /// `kroma` is the SAME kind of read-only, engine-recomputed value as
+    /// `invalid` — sending it back would let the server's compatibility
+    /// shim resurrect a row the user just deleted from `loras[]`, so it must
+    /// NEVER be encoded, decoded value or not.
     func roundTripPreservesRecipeFieldsAndReadsValidity() throws {
         let wire = #"""
         {"id":"krea2-reference","name":"Reference","model":"krea2-raw","engine":"zimage",
@@ -147,8 +156,8 @@ struct ServerPresetTests {
         p.name = "Renamed"
         let dict = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(p)) as? [String: Any])
         #expect(dict["checkpointFamily"] as? String == "raw-accel")
-        #expect((dict["kroma"] as? [String: Any])?["strength"] as? Double == 0.6)
-        #expect((dict["kroma"] as? [String: Any])?["file"] as? String == "kroma-v0.1.safetensors")
+        // Never encoded — read-only, engine-recomputed (review r2, C1).
+        #expect(dict["kroma"] == nil)
         #expect(dict["vae"] as? String == "/vae/Wan2_1_VAE_fp32.safetensors")
         #expect(dict["sampler"] as? String == "res_2s")
         #expect(dict["sigmaSchedule"] as? String == "beta")
@@ -167,6 +176,27 @@ struct ServerPresetTests {
         #expect(!p.id.isEmpty)
         #expect(p.loras.isEmpty)
         #expect(p.steps == nil)
+    }
+
+    /// Review r2, C1 (Critical): `kroma` is never encoded, even when a value
+    /// is freshly SET in memory (not merely a decoded passthrough) —
+    /// belt-and-braces against `buildPreset()` (or any other call site) ever
+    /// forgetting to nil it out before save.
+    @Test("kroma is never encoded, decoded or freshly assigned")
+    func kromaNeverEncoded() throws {
+        var p = ServerPreset(id: "x", name: "X")
+        p.kroma = ServerPresetKroma(strength: 0.6, file: "kroma.safetensors")
+        let dict = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(p)) as? [String: Any])
+        #expect(dict["kroma"] == nil)
+    }
+
+    /// Review r2, I2: decoding a payload from an engine that predates
+    /// `kromaDeprecated`/`migrationNotes` must still succeed.
+    @Test("decodes without kromaDeprecated/migrationNotes keys")
+    func decodesWithoutDeprecationKeys() throws {
+        let p = try snakeDecoder().decode(ServerPreset.self, from: Data(#"{"id":"old","name":"Old"}"#.utf8))
+        #expect(p.kromaDeprecated == nil)
+        #expect(p.migrationNotes == nil)
     }
 }
 
