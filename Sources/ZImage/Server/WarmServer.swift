@@ -3683,6 +3683,22 @@ public final class WarmServer {
   /// comfybox#359: shared with the async arm (`GET /v1/model/family`) so
   /// both emit identical bytes — pure file-existence detection, no actor hop.
   private func syncModelFamilyResponse(request: HTTPRequest) -> HTTPResponse {
+    Self.modelFamilyRouteResponse(request: request)
+  }
+
+  /// The whole sync `GET /v1/model/family` route as a pure function of the
+  /// request — no `WarmServer` state needed (pure file-existence detection),
+  /// so `WarmServerQueueProbe.syncModelFamilyRoute` can drive it directly in
+  /// a unit test without constructing a `WarmServer` (`init` starts the
+  /// local-video readiness monitor and scans the LIVE `~/Models/loras`
+  /// library, which agents must not touch — same reason `interruptRouteResponse`
+  /// is static).
+  ///
+  /// comfybox#380: this is what exercises the real `request.queryParameters`
+  /// percent-decoding for a query value with a space/`#`/`%25`/non-ASCII text,
+  /// rather than calling `ModelFamilyDetector.detect` directly and skipping
+  /// the query-parsing layer the bug actually lived in.
+  fileprivate static func modelFamilyRouteResponse(request: HTTPRequest) -> HTTPResponse {
     guard let spec = request.queryParameters["model"]?.trimmingCharacters(in: .whitespacesAndNewlines),
           !spec.isEmpty else {
       return .error(status: 400, message: "model query parameter is required")
@@ -11339,16 +11355,38 @@ struct HTTPRequest {
   let body: Data
 
   /// Parse query parameters from the query string.
+  ///
+  /// comfybox#380: percent-decodes both keys and values. A custom model path
+  /// (or any other free-text query value — a CivitAI search term, a prompt
+  /// fragment) can contain a space, `#`, a literal `%`, or non-ASCII text,
+  /// none of which can survive an HTTP request line unencoded — the caller
+  /// percent-encodes, and this was returning the still-encoded literal, so
+  /// e.g. `GET /v1/model/family?model=...` stat'ed a path that never existed
+  /// on disk (`loadable: false`) for any such spec.
+  ///
+  /// Deliberately `removingPercentEncoding`, NOT `+` → space: this is a URI
+  /// query per RFC 3986 (`%XX` triplets only), not `application/x-www-form-
+  /// urlencoded` — a literal `+` in a model path or search term must stay a
+  /// `+`, not become a space. `removingPercentEncoding` already has that
+  /// exact behavior (it only touches `%XX`, never `+`), so no extra handling
+  /// is needed to keep `+` literal.
+  ///
+  /// Falls back to the raw (still-encoded) substring on a malformed escape
+  /// (e.g. a trailing `%` or `%` followed by non-hex) rather than dropping
+  /// the parameter — `removingPercentEncoding` returns `nil` for those, and
+  /// the pre-existing behavior of returning SOMETHING for every `key=value`
+  /// pair is preserved.
   var queryParameters: [String: String] {
     guard let qs = queryString, !qs.isEmpty else { return [:] }
     var params: [String: String] = [:]
     for pair in qs.split(separator: "&") {
       let parts = pair.split(separator: "=", maxSplits: 1)
-      if parts.count == 2 {
-        params[String(parts[0])] = String(parts[1])
-      } else if parts.count == 1 {
-        params[String(parts[0])] = ""
-      }
+      guard parts.count == 1 || parts.count == 2 else { continue }
+      let rawKey = String(parts[0])
+      let rawValue = parts.count == 2 ? String(parts[1]) : ""
+      let key = rawKey.removingPercentEncoding ?? rawKey
+      let value = rawValue.removingPercentEncoding ?? rawValue
+      params[key] = value
     }
     return params
   }
@@ -13782,6 +13820,15 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   func syncInterruptRoute(request: HTTPRequest) -> HTTPResponse {
     WarmServer.interruptRouteResponse(
       request: request, liveHealth: liveHealth, auditLog: probeAuditLog)
+  }
+
+  /// comfybox#380: the PRODUCTION sync `GET /v1/model/family` route
+  /// (`WarmServer.syncModelFamilyResponse`, which `WarmServer.modelFamilyRouteResponse`
+  /// is a one-line call to) driven with a full `HTTPRequest`, so a test
+  /// exercises the real `request.queryParameters` percent-decoding rather
+  /// than calling `ModelFamilyDetector.detect` directly.
+  func syncModelFamilyRoute(request: HTTPRequest) -> HTTPResponse {
+    WarmServer.modelFamilyRouteResponse(request: request)
   }
 
   /// Audit events this probe's route calls recorded, so a route test can
