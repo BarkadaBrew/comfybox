@@ -33,15 +33,52 @@ public enum SigmaSchedule {
 
   // MARK: - Flow-Match (current ZImage default)
 
+  /// ComfyUI's `time_snr_shift` (`comfy/model_sampling.py:279-282`), the
+  /// flow-matching "simple" shift `ModelSamplingAuraFlow` / `ModelSamplingSD3`
+  /// apply:
+  ///
+  /// ```python
+  /// def time_snr_shift(alpha, t):
+  ///     if alpha == 1.0:
+  ///         return t
+  ///     return alpha * t / (1 + (alpha - 1) * t)
+  /// ```
+  ///
+  /// `alpha == 1.0` is upstream's exact identity branch, not an optimisation:
+  /// it is what makes "shift 1.0" mean "the unwarped grid" bit for bit.
+  ///
+  /// Distinct from the resolution-dependent DYNAMIC shift
+  /// (`exp(mu) / (exp(mu) + (1/σ − 1))`, `ModelSamplingFlux`) that ``flow``
+  /// applies when `config.useDynamicShifting`. The two never compose — see
+  /// ``ZImageSchedulerConfig/applyingExplicitShift(_:)``.
+  ///
+  /// ``flow(numSteps:config:mu:explicitShift:)`` inlines this same expression
+  /// (with an extra `denominator > 0` guard) rather than calling here, so its
+  /// float operation order is provably the pre-#154 one; this function is the
+  /// named, testable statement of the formula and the one
+  /// ``discreteFlowSigmaTable(shift:numTrainTimesteps:)`` semantics match.
+  public static func timeSNRShift(alpha: Float, t: Float) -> Float {
+    if alpha == 1.0 { return t }
+    return alpha * t / (1 + (alpha - 1) * t)
+  }
+
   /// Flow-matching sigma schedule with optional dynamic shifting.
   ///
   /// This reproduces the existing `FlowMatchEulerScheduler` sigma computation
   /// exactly, preserving identical output for the default path.
+  ///
+  /// - Parameter explicitShift: comfybox#154 — the per-request
+  ///   `ModelSamplingAuraFlow` shift. `nil` (the default) is the pre-#154 path,
+  ///   byte for byte. A value patches `config` through
+  ///   ``ZImageSchedulerConfig/applyingExplicitShift(_:)``, which REPLACES the
+  ///   mu-based dynamic shift for this grid.
   public static func flow(
     numSteps: Int,
-    config: ZImageSchedulerConfig,
-    mu: Float? = nil
+    config unpatchedConfig: ZImageSchedulerConfig,
+    mu: Float? = nil,
+    explicitShift: Float? = nil
   ) -> [Float] {
+    let config = unpatchedConfig.applyingExplicitShift(explicitShift)
     let numTrainTimesteps = Float(config.numTrainTimesteps)
     let shift = config.shift
 

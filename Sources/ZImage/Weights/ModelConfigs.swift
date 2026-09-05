@@ -192,6 +192,46 @@ public struct ZImageSchedulerConfig: Decodable {
     self.modelSampling = modelSampling
   }
 
+  /// comfybox#154 — ComfyUI's `ModelSamplingAuraFlow` node, as a value.
+  ///
+  /// The node (`comfy_extras/nodes_model_advanced.py:148`, a `ModelSamplingSD3`
+  /// subclass) patches the model's whole `model_sampling` object with
+  /// `ModelSamplingDiscreteFlow.set_parameters(shift:)`, so from the sampler's
+  /// point of view the model simply HAS a different shift for that run. This is
+  /// that patch: `nil` returns `self` untouched — the caller's grid is
+  /// byte-identical to what it was before #154 — and a value returns a copy
+  /// whose `shift` is the caller's and whose `useDynamicShifting` is **false**.
+  ///
+  /// **Precedence (documented, and pinned by `ModelSamplingShiftTests`):** an
+  /// explicit shift REPLACES the resolution-dependent `mu` dynamic shift for
+  /// that request; the two are never composed. That is what the node does —
+  /// ComfyUI has no path where `ModelSamplingAuraFlow` and `ModelSamplingFlux`
+  /// both apply — and composing them would silently double-warp a grid whose
+  /// mu the caller cannot see.
+  ///
+  /// Everything else (`numTrainTimesteps`, the `base/max_shift` seq-len ramp
+  /// that produced `mu`, `modelSampling`) is carried over, so the schedules
+  /// that index the model's discrete sigma table (`simple`, `beta`, `beta57`,
+  /// and the `karras`/`exponential` bounds) pick the new shift up for free —
+  /// as they do in ComfyUI, where they read the patched `model_sampling`.
+  ///
+  /// Krea 2 is NOT on this path: its `modelSampling` is `.flux`, whose table is
+  /// built from `mu`, and on that family the wire's `shift` IS mu
+  /// (FDD-krea2-raw-recipe Addendum A.1). `Krea2Pipeline` never calls this.
+  public func applyingExplicitShift(_ explicitShift: Float?) -> ZImageSchedulerConfig {
+    guard let explicitShift else { return self }
+    return ZImageSchedulerConfig(
+      numTrainTimesteps: numTrainTimesteps,
+      shift: explicitShift,
+      useDynamicShifting: false,
+      baseShift: baseShift,
+      maxShift: maxShift,
+      baseImageSeqLen: baseImageSeqLen,
+      maxImageSeqLen: maxImageSeqLen,
+      modelSampling: modelSampling
+    )
+  }
+
   public init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     self.init(
