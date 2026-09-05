@@ -21,6 +21,9 @@ struct PresetView: View {
     /// so a preset whose model matches can show a "Warm" badge instead of the
     /// user having to hand-edit ~/.comfybox/config.json or a launchd plist arg.
     @State private var warmModelSpec: String?
+    /// #359: "Make expandable" (one preset) / "Backfill all" (below).
+    @State private var backfillViewModel = PresetBackfillViewModel()
+    @State private var backfillResults: [PresetBackfillViewModel.Outcome]?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -65,6 +68,23 @@ struct PresetView: View {
                 onCancel: { editing = nil }
             )
         }
+        .sheet(item: backfillResultsBinding) { results in
+            BackfillResultsView(results: results.items) { backfillResults = nil }
+        }
+    }
+
+    /// `.sheet(item:)` needs an `Identifiable` — wraps the array so an empty
+    /// (but non-nil) result set still shows "nothing to backfill" instead of
+    /// silently not presenting.
+    private struct BackfillResultsBox: Identifiable {
+        let id = UUID()
+        let items: [PresetBackfillViewModel.Outcome]
+    }
+    private var backfillResultsBinding: Binding<BackfillResultsBox?> {
+        Binding(
+            get: { backfillResults.map(BackfillResultsBox.init) },
+            set: { backfillResults = $0?.items }
+        )
     }
 
     private var header: some View {
@@ -85,13 +105,22 @@ struct PresetView: View {
                 .buttonStyle(.borderless)
             Menu {
                 Button("Import from Image Service") { Task { await importLegacy() } }
+                Divider()
+                // #359: batch version of a row's "Make Expandable" — every
+                // preset currently label-only for `no_model` (declares
+                // neither `model` nor `checkpoint_family`), not just the 26
+                // this shipped against.
+                Button("Backfill Checkpoint Family (\(backfillCandidateCount))…") {
+                    Task { await runBackfillAll() }
+                }
+                .disabled(backfillCandidateCount == 0 || backfillViewModel.isRunning)
             } label: {
                 Image(systemName: "square.and.arrow.down")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
             .disabled(!engine.connectionState.isConnected)
-            .help("Import presets from the old image-service")
+            .help("Import presets, or backfill checkpoint_family on label-only presets")
             Button {
                 Task { await beginEditing(ServerPreset(name: ""), asNew: true) }
             } label: { Label("New Preset", systemImage: "plus") }
@@ -109,11 +138,14 @@ struct PresetView: View {
                     ServerPresetRow(
                         preset: preset,
                         isWarm: presetModelSpec(preset) != nil && presetModelSpec(preset) == warmModelSpec,
+                        isExpandable: PresetBackfillViewModel.isExpandable(preset),
+                        isBackfillable: PresetBackfillViewModel.isBackfillable(preset),
                         onApply: { onApply?(preset.toGenerationPreset()) },
                         onEdit: { Task { await beginEditing(preset, asNew: false) } },
                         onDuplicate: { Task { await duplicate(preset) } },
                         onDelete: { Task { await delete(preset) } },
-                        onSetWarm: presetModelSpec(preset) != nil ? { Task { await setAsWarm(preset) } } : nil
+                        onSetWarm: presetModelSpec(preset) != nil ? { Task { await setAsWarm(preset) } } : nil,
+                        onMakeExpandable: { Task { await makeExpandable(preset) } }
                     )
                 }
             }
@@ -195,10 +227,40 @@ struct PresetView: View {
     /// A preset's effective model spec, matching how Apply/applyPreset already
     /// resolve it (custom path takes precedence over a catalog/CivitAI id).
     private func presetModelSpec(_ preset: ServerPreset) -> String? {
-        let path = preset.customModelPath?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let path, !path.isEmpty { return path }
-        let model = preset.model?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (model?.isEmpty == false) ? model : nil
+        preset.effectiveModelSpec
+    }
+
+    // MARK: - #359: checkpoint_family backfill
+
+    private var backfillCandidateCount: Int {
+        PresetBackfillViewModel.backfillCandidates(presets).count
+    }
+
+    /// One row's "Make Expandable".
+    private func makeExpandable(_ preset: ServerPreset) async {
+        let outcome = await backfillViewModel.backfill(
+            preset,
+            detectFamily: { spec in await engine.fetchModelFamily(forSpec: spec) },
+            save: { updated in try await engine.savePreset(updated) }
+        )
+        if case .failed(let message) = outcome.status {
+            loadError = "Could not make '\(preset.name)' expandable: \(message)"
+        } else {
+            loadError = nil
+        }
+        await reload()
+    }
+
+    /// The header menu's "Backfill Checkpoint Family (N)…" — every candidate
+    /// in the current list, reported per-preset.
+    private func runBackfillAll() async {
+        let results = await backfillViewModel.backfillAll(
+            presets,
+            detectFamily: { spec in await engine.fetchModelFamily(forSpec: spec) },
+            save: { updated in try await engine.savePreset(updated) }
+        )
+        backfillResults = results
+        await reload()
     }
 
     /// Make a preset's model the server's warm-start default: load + activate
@@ -228,11 +290,20 @@ struct PresetView: View {
 private struct ServerPresetRow: View {
     let preset: ServerPreset
     var isWarm: Bool = false
+    /// #359: would `/v1/generate {"preset": id}` expand this preset's model +
+    /// LoRA stack, or does it stay a provenance label? Same decision the
+    /// editor's Effective-recipe panel runs (`PresetLoRAStack.decide`).
+    var isExpandable: Bool = true
+    /// Label-only specifically for a model-family reason ("Make Expandable"
+    /// can plausibly fix it) — other unresolved reasons (video, bypass,
+    /// unknown engine/provider) are not shown the action.
+    var isBackfillable: Bool = false
     var onApply: () -> Void
     var onEdit: () -> Void
     var onDuplicate: () -> Void
     var onDelete: () -> Void
     var onSetWarm: (() -> Void)?
+    var onMakeExpandable: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -256,6 +327,7 @@ private struct ServerPresetRow: View {
                             .background(.orange.opacity(0.15), in: Capsule())
                             .help("This preset's model loads by default on server startup.")
                     }
+                    expandableBadge
                 }
                 if !preset.description.isEmpty {
                     Text(preset.description)
@@ -277,6 +349,9 @@ private struct ServerPresetRow: View {
                 if let onSetWarm, !isWarm {
                     Button("Set as Warm", action: onSetWarm)
                 }
+                if let onMakeExpandable, isBackfillable {
+                    Button("Make Expandable", action: onMakeExpandable)
+                }
                 Button("Duplicate", action: onDuplicate)
                 Button("Delete", role: .destructive, action: onDelete)
             } label: {
@@ -287,6 +362,32 @@ private struct ServerPresetRow: View {
         }
         .padding(12)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// #359: "Expandable" (green) when `/v1/generate {"preset": id}` would
+    /// apply this preset's model + LoRA stack as a whole; "Label only" (the
+    /// state all 26 desktop-saved presets shipped in) when the engine has
+    /// nothing to expand it with and it renders on whatever's already
+    /// resident — same signal as the editor's Effective-recipe panel.
+    @ViewBuilder
+    private var expandableBadge: some View {
+        if isExpandable {
+            Label("Expandable", systemImage: "checkmark.seal.fill")
+                .font(.caption2)
+                .foregroundStyle(.green)
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(.green.opacity(0.12), in: Capsule())
+                .help("POST /v1/generate {\"preset\": \"\(preset.id)\"} applies this preset's model + LoRA stack.")
+        } else {
+            Label("Label only", systemImage: "tag")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5).padding(.vertical, 1)
+                .background(.quaternary, in: Capsule())
+                .help(isBackfillable
+                    ? "This preset names no model/checkpoint_family, so it will not expand — use \u{201C}Make Expandable\u{201D}."
+                    : "This preset will not expand on POST /v1/generate {preset} — see the editor's Effective recipe panel for why.")
+        }
     }
 
     private var summaryLine: String {
@@ -338,6 +439,11 @@ private struct ServerPresetEditor: View {
     /// confirm the request succeeded. Set when they disagree (names, scales,
     /// roles, or order) for the saved (as-loaded) preset.
     @State private var serverMismatch: String?
+    /// #359: `GET /v1/model/family`'s answer for the CURRENT `model` field —
+    /// refreshed by `.task(id: model)` below, so it tracks edits without
+    /// blocking `buildPreset()` (a plain, synchronous function) on a network
+    /// call. nil while unresolved or when the field is empty.
+    @State private var detectedModelFamily: ModelFamilyInfo?
 
     /// Editable LoRA row — stable identity for ForEach even when the same
     /// file appears twice while the user is rearranging.
@@ -488,6 +594,18 @@ private struct ServerPresetEditor: View {
                 serverResolveError = error.localizedDescription
                 serverMismatch = nil
             }
+        }
+        .task(id: model) {
+            // #359: re-resolve whenever the model field changes — `.task(id:)`
+            // cancels the previous in-flight lookup, so fast typing does not
+            // pile up requests. Runs even for a brand-new preset (`isNew`):
+            // the "engine-known alias" / `checkpoint_family` decision belongs
+            // to `buildPreset()` on every save, not just an edit of one that
+            // already exists.
+            guard let engine else { detectedModelFamily = nil; return }
+            let spec = model.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !spec.isEmpty else { detectedModelFamily = nil; return }
+            detectedModelFamily = await engine.fetchModelFamily(forSpec: spec)
         }
         .alert("Save as New Preset", isPresented: $showingSaveAs) {
             TextField("New preset name", text: $saveAsName)
@@ -721,13 +839,27 @@ private struct ServerPresetEditor: View {
         p.description = descriptionText.trimmingCharacters(in: .whitespacesAndNewlines)
         p.prompt = prompt.isEmpty ? nil : prompt
         p.negativePrompt = negativePrompt.isEmpty ? nil : negativePrompt
-        let modelValue = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        if modelValue.hasPrefix("/") || modelValue.hasPrefix("~") {
-            p.customModelPath = modelValue
-        } else {
-            p.model = modelValue.isEmpty ? nil : modelValue
-            p.customModelPath = nil
-        }
+        let loras = editableLoras
+            .filter { !$0.filename.isEmpty }
+            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }
+        // #359: `checkpoint_family` (and `model`, when the field is an
+        // engine-known alias rather than a path) so `/v1/generate {preset}`
+        // can expand this preset instead of leaving it a `no_model` label —
+        // see `PresetModelFieldBuilder`. `detectedModelFamily` is the
+        // engine's answer (`GET /v1/model/family`) for the CURRENT `model`
+        // text, kept fresh by `.task(id: model)`; a miss falls back to
+        // whatever `checkpoint_family` this preset already had, so a
+        // transient detection failure never erases a valid declaration.
+        let modelFields = PresetModelFieldBuilder.build(
+            modelText: model,
+            loras: loras,
+            detectedFamily: detectedModelFamily?.family,
+            detectedVariant: detectedModelFamily?.variant,
+            fallbackCheckpointFamily: original.checkpointFamily
+        )
+        p.model = modelFields.model
+        p.customModelPath = modelFields.customModelPath
+        p.checkpointFamily = modelFields.checkpointFamily
         p.width = Int(widthText)
         p.height = Int(heightText)
         p.steps = Int(stepsText)
@@ -746,9 +878,7 @@ private struct ServerPresetEditor: View {
         // The desktop must NEVER send it; `ServerPreset.encode` also never
         // emits it, belt and braces.
         p.kroma = nil
-        p.loras = editableLoras
-            .filter { !$0.filename.isEmpty }
-            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }
+        p.loras = loras
         return p
     }
 
@@ -845,6 +975,66 @@ struct SavePresetSheet: View {
                 editedNegative = negativePrompt
                 didSeedNegative = true
             }
+        }
+    }
+}
+
+// MARK: - #359: backfill results
+
+/// One-shot summary sheet for "Make Expandable" (a single-item list) and
+/// "Backfill Checkpoint Family (N)…" (the whole batch) — per-preset
+/// updated/skipped/failed, so a batch run is auditable rather than a single
+/// toast.
+private struct BackfillResultsView: View {
+    let results: [PresetBackfillViewModel.Outcome]
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Checkpoint Family Backfill").font(.headline)
+                Spacer()
+                Button("Done", action: onDismiss).keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            if results.isEmpty {
+                Text("No label-only presets needed a checkpoint_family backfill.")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(results) { outcome in
+                    HStack(alignment: .top, spacing: 8) {
+                        icon(for: outcome.status)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(outcome.name).font(.subheadline)
+                            Text(detail(for: outcome.status))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 420, idealWidth: 460, minHeight: 320, idealHeight: 420)
+    }
+
+    @ViewBuilder
+    private func icon(for status: PresetBackfillViewModel.Outcome.Status) -> some View {
+        switch status {
+        case .updated:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .skipped:
+            Image(systemName: "minus.circle").foregroundStyle(.secondary)
+        case .failed:
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+        }
+    }
+
+    private func detail(for status: PresetBackfillViewModel.Outcome.Status) -> String {
+        switch status {
+        case .updated(let family): return "checkpoint_family set to \"\(family)\""
+        case .skipped(let reason): return reason
+        case .failed(let reason): return reason
         }
     }
 }
