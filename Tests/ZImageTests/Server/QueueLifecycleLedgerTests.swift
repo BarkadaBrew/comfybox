@@ -338,18 +338,42 @@ final class QueueLifecycleLedgerTests: XCTestCase {
 
   // MARK: - PR #370 review round 1, C2: bounded disk footprint + lazy tail reseed
 
+  /// comfybox#379: this used to flush ONCE, after all 20 `record()` calls,
+  /// relying on the writer queue happening to have drained at least TWICE by
+  /// then (so a later batch's write saw a non-empty on-disk file and
+  /// actually exercised `rotateIfNeeded`'s `currentSize > 0` branch). Whether
+  /// that was true depended entirely on how the background `writerQueue`
+  /// thread got scheduled relative to this test's tight, synchronous loop —
+  /// under normal load the OS never ran it until the loop finished, coalescing
+  /// every event into ONE batch; under CPU contention (a parallel build) it
+  /// sometimes got a slice early enough to drain in between calls, splitting
+  /// the events across two-plus batches instead. A single batch of all 20
+  /// events writes a BRAND NEW file in one shot — `rotateIfNeeded` never fires
+  /// for a brand-new file (nothing to preserve, see its doc comment) — so the
+  /// assertion below failed exactly when the single-batch case occurred
+  /// (confirmed directly: instrumenting the `writer` seam showed `[20]` with
+  /// `.1` absent on one run, `[10, 10]`/`[4, 16]`/`[12, 8]` with `.1` present
+  /// on others, from nothing but re-running the same test).
+  ///
+  /// Fixed by flushing after EVERY `record()` call instead of once at the
+  /// end, via the existing `waitForPendingWritesForTesting()` test seam —
+  /// this makes each event its OWN batch deterministically, independent of
+  /// however the writer queue happens to get scheduled, so the file exists
+  /// and is non-empty by the second record and every later one's write
+  /// deterministically re-checks `rotateIfNeeded` against it.
   func testRotationMovesTheCurrentFileAsideOnceItWouldExceedTheLimit() {
     let path = tempJSONLPath()
     defer {
       try? FileManager.default.removeItem(at: path)
       try? FileManager.default.removeItem(at: path.appendingPathExtension("1"))
     }
-    // A tiny limit so two small batches are enough to trigger rotation.
+    // A tiny limit so two small single-event batches are enough to trigger
+    // rotation once flushed deterministically (see the doc comment above).
     let ledger = QueueLifecycleLedger(jsonlURL: path, rotateAtBytes: 200, keepGenerations: 2)
     for i in 0..<20 {
       ledger.record(jobId: "job-\(i)", kind: .enqueued, jobKind: "generate", source: "api")
+      ledger.waitForPendingWritesForTesting()
     }
-    ledger.waitForPendingWritesForTesting()
 
     let rotated = path.appendingPathExtension("1")
     XCTAssertTrue(FileManager.default.fileExists(atPath: rotated.path), "expected a rotated backup once the live file crossed the limit")
