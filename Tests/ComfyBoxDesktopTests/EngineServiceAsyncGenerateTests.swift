@@ -222,13 +222,14 @@ struct EngineServiceAsyncGenerateTests {
         #expect(engine.lastError == "Render interrupted by /v1/queue/interrupt")
     }
 
-    /// The engine refuses on the SUBMIT for anything its shared decode/validate
-    /// choke point rejects — 409 preset/model conflict, 413 memory preflight,
-    /// 429 queue full. The status and the message must survive unchanged.
-    @Test("submit refusals keep their status and message", arguments: [
+    /// What actually lands on the SUBMIT: only what the engine's shared
+    /// decode/validate choke point (`decodedGenerateRequest`) rejects BEFORE the
+    /// 202 — a 400 bad recipe name, a 409 preset/model conflict, a 413 memory
+    /// preflight refusal. These keep their status AND message, so the mapping to
+    /// `.serverError(status, message)` is identical to the blocking route's.
+    @Test("submit-time refusals keep their status and message", arguments: [
         (409, "Preset 'kira' names model 'krea2-raw' but the request names 'z-image-turbo'"),
         (413, "[image_memory_preflight] estimate 41.2GB exceeds the 38.0GB cap"),
-        (429, "Queue full (10 pending max)"),
         (400, "Unknown sampler 'nope'"),
     ])
     func submitRefusalsPreserveShape(status: Int, message: String) async throws {
@@ -250,7 +251,41 @@ struct EngineServiceAsyncGenerateTests {
         #expect(gotStatus == status)
         #expect(gotMessage == message)
         #expect(engine.lastError == message)
-        #expect(transport.requestCount("GET", "/v1/generate/status/") == 0)
+    }
+
+    /// The refusals that do NOT land on the submit, contrary to what this PR's
+    /// first description claimed. `ServerError.queueFull` (429) and
+    /// `ServerError.cancelled` (409, queue cleared) are thrown inside
+    /// `enqueueGenerate` — which the async route calls from `ImageJobTracker`'s
+    /// own detached Task, AFTER the 202 has already gone out. They therefore
+    /// arrive as a FAILED JOB carrying the engine's message, and map to
+    /// `.generationFailed`, not `.serverError(429/409, …)`.
+    @Test("post-202 refusals arrive as a failed job, not a submit error", arguments: [
+        "Queue full (10 pending max)",
+        "Request cancelled (queue cleared)",
+        "Server is shutting down",
+    ])
+    func postSubmitRefusalsArriveAsFailedJobs(message: String) async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"Q","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        let status = try JSONSerialization.data(withJSONObject: [
+            "job_id": "Q", "status": "failed", "source": "desktop", "error": message, "elapsed_ms": 12,
+        ])
+        transport.script("/v1/generate/status/Q", [.init(200, String(decoding: status, as: UTF8.self))])
+
+        var thrown: EngineServiceError?
+        do {
+            _ = try await engine.generate(GenerationRequest(prompt: "x"))
+        } catch let error as EngineServiceError {
+            thrown = error
+        }
+        guard case .generationFailed(let gotMessage)? = thrown else {
+            Issue.record("expected .generationFailed, got \(String(describing: thrown))")
+            return
+        }
+        #expect(gotMessage == message)
+        #expect(engine.lastError == message)
     }
 
     @Test("an empty prompt is rejected before any request is made")
@@ -386,6 +421,185 @@ struct EngineServiceAsyncGenerateTests {
         #expect(job.presetUnresolved == "kira")
         #expect(job.presetUnresolvedReason == "no_model")
         #expect(job.preemptRefused == true)
+    }
+
+    // MARK: - Poll-loop resilience (PR #384 review, item 3)
+
+    /// A blip is not a dead engine: consecutive transient failures are tolerated
+    /// up to the limit, and a later good poll resets the count.
+    @Test("transient status failures are retried and a good poll resets the count")
+    func transientFailuresAreTolerated() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusTransientFailureLimit = 3
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"T","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/T", [
+            .init(503, #"{"error":"engine busy"}"#),
+            .init(500, "garbage"),
+            .init(200, #"{"job_id":"T","status":"processing","source":"desktop","elapsed_ms":50}"#),  // resets
+            .init(502, #"{"error":"blip"}"#),
+            .init(200, #"{"job_id":"T","status":"succeeded","source":"desktop","output_path":"/tmp/t.png","elapsed_ms":90}"#),
+        ])
+
+        let path = try await engine.generate(GenerationRequest(prompt: "x"))
+        #expect(path == "/tmp/t.png")
+        #expect(transport.requestCount("GET", "/v1/generate/status/T") == 5)
+    }
+
+    /// …but it must not retry forever. After N consecutive failures the render
+    /// is declared lost, naming the last error.
+    @Test("the poll loop gives up after the consecutive-failure limit")
+    func transientFailuresEventuallyGiveUp() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusTransientFailureLimit = 3
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"D","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/D", [.init(503, #"{"error":"engine unreachable"}"#)])
+
+        var thrown: EngineServiceError?
+        do { _ = try await engine.generate(GenerationRequest(prompt: "x")) }
+        catch let error as EngineServiceError { thrown = error }
+
+        guard case .generationFailed(let message)? = thrown else {
+            Issue.record("expected .generationFailed, got \(String(describing: thrown))")
+            return
+        }
+        #expect(message.contains("engine unreachable"))
+        #expect(message.contains("3 consecutive"))
+        // Exactly the limit — not one more, not unbounded.
+        #expect(transport.requestCount("GET", "/v1/generate/status/D") == 3)
+    }
+
+    /// A 404 is not transient: the engine does not know the id (pruned, or it
+    /// restarted). Retrying can only 404 again, so it fails at once.
+    @Test("a 404 from the status route fails immediately with a clear message")
+    func unknownJobFailsImmediately() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusTransientFailureLimit = 5
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"GONE","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/GONE", [.init(404, #"{"error":"Image job not found: GONE"}"#)])
+
+        var thrown: EngineServiceError?
+        do { _ = try await engine.generate(GenerationRequest(prompt: "x")) }
+        catch let error as EngineServiceError { thrown = error }
+
+        guard case .serverError(let status, let message)? = thrown else {
+            Issue.record("expected .serverError, got \(String(describing: thrown))")
+            return
+        }
+        #expect(status == 404)
+        #expect(message.contains("Image job not found: GONE"))
+        #expect(transport.requestCount("GET", "/v1/generate/status/GONE") == 1, "no retry on 404")
+    }
+
+    /// An unrecognised non-terminal state must not be spun on forever.
+    @Test("an unrecognised job state is reported, not spun on")
+    func unknownStateIsReported() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"W","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/W", [.init(200, #"{"job_id":"W","status":"hibernating","source":"desktop","elapsed_ms":1}"#)])
+
+        var thrown: EngineServiceError?
+        do { _ = try await engine.generate(GenerationRequest(prompt: "x")) }
+        catch let error as EngineServiceError { thrown = error }
+
+        guard case .generationFailed(let message)? = thrown else {
+            Issue.record("expected .generationFailed, got \(String(describing: thrown))")
+            return
+        }
+        #expect(message.contains("hibernating"))
+        #expect(transport.requestCount("GET", "/v1/generate/status/W") == 1)
+    }
+
+    /// Cancelling the owning Task must not leave the GPU burning: the server job
+    /// is cancelled best-effort, and the caller sees `.cancelled`, not a failure.
+    @Test("Task cancellation cancels the server job and throws .cancelled")
+    func taskCancellationCancelsTheServerJob() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusPollInterval = 0.05
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"CANCELME","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.always("/v1/generate/status/CANCELME", .init(200, #"{"job_id":"CANCELME","status":"processing","source":"desktop","elapsed_ms":10}"#))
+        transport.always("/v1/queue/interrupt", .init(200, #"{"interrupted":true,"interrupted_job_id":"CANCELME"}"#))
+
+        let render = Task { try await engine.generate(GenerationRequest(prompt: "x")) }
+        var waited = 0
+        while engine.activeImageJobId == nil && waited < 400 {
+            try await Task.sleep(for: .milliseconds(5)); waited += 1
+        }
+        // Our job is the active render, so the cancel goes via the targeted
+        // interrupt rather than a queue delete.
+        engine.queueInfo = QueueInfo(
+            isRendering: true, pendingCount: 0, renderCount: 0, uptimeSeconds: 1,
+            lastRenderDurationMs: nil, lastError: nil, memoryUsageMB: 0,
+            currentJobId: "CANCELME", progressPercent: 20)
+
+        render.cancel()
+
+        var thrown: Error?
+        do { _ = try await render.value } catch { thrown = error }
+        guard case EngineServiceError.cancelled(let jobId)? = thrown as? EngineServiceError else {
+            Issue.record("expected .cancelled, got \(String(describing: thrown))")
+            return
+        }
+        #expect(jobId == "CANCELME")
+        #expect(transport.body(of: "POST", "/v1/queue/interrupt")?["target"] as? String == "CANCELME")
+        // A cancel is not an error the UI should shout about.
+        #expect(engine.lastError == nil)
+    }
+
+    // MARK: - Notices (PR #384 review, item 1)
+
+    @Test("statusNotice surfaces queue depth, unresolved presets and refused preemption")
+    func noticeWording() {
+        func job(_ status: String, preset: String? = nil, reason: String? = nil,
+                 refused: Bool? = nil, eta: Double? = nil) -> EngineService.ImageJobStatus {
+            EngineService.ImageJobStatus(
+                jobId: "J", status: status, outputPath: nil, error: nil, durationMs: nil,
+                elapsedMs: nil, presetUnresolved: preset, presetUnresolvedReason: reason,
+                preemptRefused: refused, etaSec: eta)
+        }
+
+        #expect(EngineService.statusNotice(for: job("processing"), pendingCount: 3) == nil)
+        #expect(EngineService.statusNotice(for: job("queued"), pendingCount: 3) == "Queued behind 3 jobs")
+        #expect(EngineService.statusNotice(for: job("queued"), pendingCount: 1) == "Queued behind 1 job")
+        #expect(EngineService.statusNotice(for: job("queued"), pendingCount: 0) == "Queued")
+
+        let preset = EngineService.statusNotice(
+            for: job("succeeded", preset: "kira", reason: "no_model"), pendingCount: nil)
+        #expect(preset == "Preset 'kira' could not be resolved (no_model) — rendered without it")
+
+        let refused = EngineService.statusNotice(
+            for: job("succeeded", refused: true, eta: 42.4), pendingCount: nil)
+        #expect(refused == "Preempt refused — queued behind the running video (~42s left)")
+    }
+
+    @Test("a render that resolved no preset publishes the notice to the UI")
+    func noticePublished() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"N","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/N", [
+            .init(200, #"{"job_id":"N","status":"succeeded","source":"desktop","output_path":"/tmp/n.png","preset_unresolved":"kira","preset_unresolved_reason":"no_model","elapsed_ms":9}"#)
+        ])
+
+        _ = try await engine.generate(GenerationRequest(prompt: "x"))
+        #expect(engine.generationNotice == "Preset 'kira' could not be resolved (no_model) — rendered without it")
+        #expect(engine.lastError == nil, "a notice is not an error")
+    }
+
+    @Test("a clean render leaves no notice behind")
+    func noticeClearedOnCleanRender() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"C","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/C", [
+            .init(200, #"{"job_id":"C","status":"succeeded","source":"desktop","output_path":"/tmp/c.png","elapsed_ms":9}"#)
+        ])
+        _ = try await engine.generate(GenerationRequest(prompt: "x"))
+        #expect(engine.generationNotice == nil)
     }
 
     @Test("a malformed status body is a server error, not a crash")

@@ -13432,18 +13432,18 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// loaded at construction (`prepare()` is a separate call this probe never
   /// makes), so it is safe in a unit test and is what lets the #282 review-r1
   /// `model_mismatch` case be driven for real.
-  /// comfybox#217: kept so the probe's `/health` payload is built from the
-  /// SAME configuration the probe's coordinator runs under.
+  /// comfybox#217: the coordinator's OWN configuration value (PR #384 review,
+  /// item 7 — the probe used to build a second one), so the probe's `/health`
+  /// payload can never describe different limits than the queue it reads.
   private let configuration: WarmServerConfiguration
 
   init(maxPendingRequests: Int = 10, maxPendingModelOps: Int = 8, modelSpec: String? = nil) {
-    self.configuration = WarmServerConfiguration(
+    let configuration = WarmServerConfiguration(
       modelSpec: modelSpec,
       maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps)
+    self.configuration = configuration
     self.coordinator = WarmServerCoordinator(
-      configuration: WarmServerConfiguration(
-        modelSpec: modelSpec,
-        maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps),
+      configuration: configuration,
       logger: Logger(label: "z-image.queue-probe"),
       videoHolder: VideoGeneratorHolder(),
       liveHealth: liveHealth,

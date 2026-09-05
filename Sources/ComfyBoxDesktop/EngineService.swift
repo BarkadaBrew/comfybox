@@ -112,20 +112,6 @@ public struct LoRASelection: Sendable, Identifiable, Equatable, Codable {
     }
 }
 
-/// Decoded generation response from the server.
-/// The server encodes all /v1/* responses with `.convertToSnakeCase`.
-struct ServerGenerateResponse: Decodable {
-    let success: Bool
-    let outputPath: String
-    let durationMs: Int
-
-    enum CodingKeys: String, CodingKey {
-        case success
-        case outputPath = "output_path"
-        case durationMs = "duration_ms"
-    }
-}
-
 /// Decoded health response from the server.
 struct ServerHealthResponse: Decodable {
     let status: String
@@ -348,6 +334,12 @@ public final class EngineService {
     /// `cancelActiveGeneration` is documented as cancelling THIS app's current
     /// render rather than a specific one.
     public private(set) var activeImageJobId: String?
+    /// Human-readable notice about the CURRENT (or just-finished) render that is
+    /// not an error: still queued behind N jobs, a preset that could not be
+    /// resolved, a refused preemption. These arrive on the async status body and
+    /// used to be parsed and dropped (PR #384 review, item 1). nil when there is
+    /// nothing to say.
+    public private(set) var generationNotice: String?
 
     // Model pool state
     public var availableModels: [ModelInfo] = []
@@ -381,6 +373,10 @@ public final class EngineService {
     /// rather than a literal so tests drive the submit→poll loop without
     /// sleeping for real seconds.
     public var imageStatusPollInterval: Double = 1.0
+    /// How many CONSECUTIVE failed status polls are tolerated before a render is
+    /// declared lost (#217 / PR #384 review item 3). A render can outlive a
+    /// transient blip; it must not outlive a dead engine forever.
+    public var imageStatusTransientFailureLimit: Int = 5
 
     /// Whether the connected engine is running on this Mac, vs. a remote
     /// server reached over the network. Several desktop-local operations
@@ -668,6 +664,9 @@ public final class EngineService {
         public let presetUnresolved: String?
         public let presetUnresolvedReason: String?
         public let preemptRefused: Bool?
+        /// Projected seconds left on the render this job asked to preempt, set
+        /// alongside `preempt_refused` (#1479).
+        public let etaSec: Double?
 
         public var isTerminal: Bool { status == "succeeded" || status == "failed" }
     }
@@ -690,7 +689,8 @@ public final class EngineService {
             elapsedMs: json["elapsed_ms"] as? Int,
             presetUnresolved: json["preset_unresolved"] as? String,
             presetUnresolvedReason: json["preset_unresolved_reason"] as? String,
-            preemptRefused: json["preempt_refused"] as? Bool
+            preemptRefused: json["preempt_refused"] as? Bool,
+            etaSec: json["eta_sec"] as? Double
         )
     }
 
@@ -725,25 +725,144 @@ public final class EngineService {
 
     /// Poll `GET /v1/generate/status/{id}` until the job reaches a terminal
     /// state. `onProgress` fires on every poll. Mirrors `pollVideoStatus`.
+    /// One `GET /v1/generate/status/{id}` attempt, classified. A separate,
+    /// exhaustive result (rather than throwing sentinels) so the poll loop's
+    /// three branches — keep going, give up now, retry — are impossible to
+    /// confuse (PR #384 review, item 3).
+    enum ImageStatusPoll: Sendable {
+        /// The engine answered with a decodable status.
+        case job(ImageJobStatus)
+        /// The engine does not know this id: it never existed, or the tracker's
+        /// hourly prune dropped it. TERMINAL — retrying can only 404 again.
+        case unknownJob(String)
+        /// A transport blip, a non-200 that is not 404, or an undecodable body.
+        /// Retried up to `imageStatusTransientFailureLimit` consecutive times.
+        case transient(String)
+    }
+
+    private func pollImageStatusOnce(path: String) async -> ImageStatusPoll {
+        guard let client = client else { return .transient("Not connected to the engine") }
+        do {
+            let (status, data) = try await client.get(path)
+            if status == 404 {
+                return .unknownJob(
+                    parseErrorMessage(from: data)
+                    ?? "The engine no longer knows this render job. It may have been pruned, "
+                       + "or the engine restarted while it was in flight.")
+            }
+            guard status == 200, let job = Self.parseImageJobStatus(data) else {
+                return .transient(parseErrorMessage(from: data) ?? "Image status poll returned \(status)")
+            }
+            return .job(job)
+        } catch {
+            return .transient(error.localizedDescription)
+        }
+    }
+
+    /// The notice a job's status deserves, as a pure function so the wording is
+    /// unit-testable (PR #384 review, item 1: `preset_unresolved` and
+    /// `preempt_refused` were parsed and then dropped on the floor).
+    ///
+    /// `pendingCount` is /health's queue depth, which is what turns "still
+    /// queued" into something a user can act on.
+    nonisolated static func statusNotice(for job: ImageJobStatus, pendingCount: Int?) -> String? {
+        var parts: [String] = []
+        if job.status == "queued" {
+            if let pendingCount, pendingCount > 0 {
+                parts.append("Queued behind \(pendingCount) job\(pendingCount == 1 ? "" : "s")")
+            } else {
+                parts.append("Queued")
+            }
+        }
+        if let preset = job.presetUnresolved {
+            let reason = job.presetUnresolvedReason.map { " (\($0))" } ?? ""
+            parts.append("Preset '\(preset)' could not be resolved\(reason) — rendered without it")
+        }
+        if job.preemptRefused == true {
+            let eta = job.etaSec.map { " (~\(Int($0.rounded()))s left)" } ?? ""
+            parts.append("Preempt refused — queued behind the running video\(eta)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    /// Poll `GET /v1/generate/status/{id}` until the job reaches a terminal
+    /// state. `onProgress` fires on every successful poll. Mirrors
+    /// `pollVideoStatus`, with the resilience a minutes-long render needs
+    /// (PR #384 review, item 3):
+    ///
+    /// - a transient transport error or non-404 non-200 is retried, up to
+    ///   `imageStatusTransientFailureLimit` CONSECUTIVE times, then fails with
+    ///   the last error rather than hanging forever;
+    /// - a 404 means the engine does not know the job — terminal immediately,
+    ///   since retrying can only 404 again;
+    /// - Task cancellation best-effort cancels the SERVER job (so it does not
+    ///   run on, burning GPU for a result nobody is waiting for) and throws
+    ///   `EngineServiceError.cancelled`;
+    /// - the loop continues only while the job is `queued` or `processing`; any
+    ///   other non-terminal state is reported rather than spun on.
     public func pollImageStatus(
         jobId: String,
         pollInterval: Double? = nil,
+        transientFailureLimit: Int? = nil,
         onProgress: @MainActor (ImageJobStatus) -> Void = { _ in }
     ) async throws -> ImageJobStatus {
-        guard let client = client else { throw EngineServiceError.notConnected }
+        guard client != nil else { throw EngineServiceError.notConnected }
         let encoded = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
+        let path = "/v1/generate/status/\(encoded)"
         let interval = pollInterval ?? imageStatusPollInterval
+        let limit = max(1, transientFailureLimit ?? imageStatusTransientFailureLimit)
+        var consecutiveFailures = 0
+
         while true {
-            let (status, data) = try await client.get("/v1/generate/status/\(encoded)")
-            guard status == 200, let job = Self.parseImageJobStatus(data) else {
-                let msg = parseErrorMessage(from: data) ?? "Image status poll failed"
-                lastError = msg
-                throw EngineServiceError.serverError(status, msg)
+            if Task.isCancelled { throw await cancelledDuringPoll(jobId: jobId) }
+
+            switch await pollImageStatusOnce(path: path) {
+            case .unknownJob(let message):
+                lastError = message
+                throw EngineServiceError.serverError(404, message)
+
+            case .transient(let message):
+                consecutiveFailures += 1
+                if consecutiveFailures >= limit {
+                    let msg = "Lost contact with the engine while rendering "
+                        + "(\(limit) consecutive failed status polls): \(message)"
+                    lastError = msg
+                    throw EngineServiceError.generationFailed(msg)
+                }
+
+            case .job(let job):
+                consecutiveFailures = 0
+                onProgress(job)
+                generationNotice = Self.statusNotice(for: job, pendingCount: queueInfo?.pendingCount)
+                if job.isTerminal { return job }
+                guard job.status == "queued" || job.status == "processing" else {
+                    let msg = "Engine reported an unrecognised job state '\(job.status)'"
+                    lastError = msg
+                    throw EngineServiceError.generationFailed(msg)
+                }
             }
-            onProgress(job)
-            if job.isTerminal { return job }
-            try await Task.sleep(for: .seconds(interval))
+
+            do {
+                try await Task.sleep(for: .seconds(interval))
+            } catch {
+                throw await cancelledDuringPoll(jobId: jobId)
+            }
         }
+    }
+
+    /// The Task was cancelled mid-render. Best-effort stop the SERVER job too —
+    /// otherwise the GPU keeps burning on a render nobody is waiting for — then
+    /// report the cancellation as such rather than as a generation failure.
+    ///
+    /// The cancel runs in a DETACHED task so it is not itself cancelled by the
+    /// very cancellation that triggered it.
+    private func cancelledDuringPoll(jobId: String) async -> EngineServiceError {
+        let isActive = queueInfo?.currentJobId == jobId
+        await Task.detached { @MainActor [weak self] in
+            try? await self?.cancelImageJob(id: jobId, isActiveRender: isActive)
+        }.value
+        lastError = nil
+        return EngineServiceError.cancelled(jobId)
     }
 
     /// Submit a generation request to the server. Returns the output file path on success.
@@ -766,6 +885,7 @@ public final class EngineService {
 
         activeGenerateCount += 1
         lastError = nil
+        generationNotice = nil
         // Clear any stale frame from a previous render so the preview pane
         // doesn't briefly show the last render's final denoising step.
         livePreviewImage = nil
@@ -1898,22 +2018,32 @@ public final class EngineService {
         }
     }
 
+    /// Cancel ONE image job by id — the shape both the Cancel button and the
+    /// poll loop's Task-cancellation path use (#217).
+    ///
+    /// `isActiveRender` decides the route, and it must: `/v1/queue/interrupt`
+    /// with an explicit `target` answers 404 when that id is not the running
+    /// render (comfybox#362 — an explicit target that names nothing is a client
+    /// error), and `DELETE /v1/queue/{id}` is the route for a job that has not
+    /// started.
+    public func cancelImageJob(id: String, isActiveRender: Bool) async throws {
+        if isActiveRender {
+            try await interruptRender(target: id)
+        } else {
+            try await cancelQueueJob(id: id)
+        }
+    }
+
     /// Cancel THIS app's in-flight render (#217).
     ///
     /// With `generate()` on the queue-submit path the desktop holds a job id, so
-    /// the cancel can name it rather than stopping whichever render happens to
-    /// be active — which, on a queue shared with Bree and Kira, may not be ours.
-    /// Returns false when nothing of ours is in flight. A job still QUEUED is
-    /// cancelled through `DELETE /v1/queue/{id}`, which is what the 404 from an
-    /// interrupt aimed at a pending id means.
+    /// the cancel names it rather than stopping whichever render happens to be
+    /// active — which, on a queue shared with Bree and Kira, may not be ours.
+    /// Returns false when nothing of ours is in flight.
     @discardableResult
     public func cancelActiveGeneration() async throws -> Bool {
         guard let jobId = activeImageJobId else { return false }
-        if queueInfo?.currentJobId == jobId {
-            try await interruptRender(target: jobId)
-        } else {
-            try await cancelQueueJob(id: jobId)
-        }
+        try await cancelImageJob(id: jobId, isActiveRender: queueInfo?.currentJobId == jobId)
         return true
     }
 
@@ -2140,6 +2270,10 @@ public enum EngineServiceError: Error, LocalizedError {
     case emptyPrompt
     case serverError(Int, String)
     case generationFailed(String)
+    /// The caller cancelled the render (a Cancel button, or the owning Task
+    /// going away). The server job is cancelled best-effort before this is
+    /// thrown, so it is NOT a failure to report as one.
+    case cancelled(String)
 
     public var errorDescription: String? {
         switch self {
@@ -2151,6 +2285,8 @@ public enum EngineServiceError: Error, LocalizedError {
             return "Server error (\(status)): \(msg)"
         case .generationFailed(let msg):
             return "Generation failed: \(msg)"
+        case .cancelled:
+            return "Render cancelled"
         }
     }
 }

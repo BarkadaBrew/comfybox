@@ -94,9 +94,16 @@ struct QueueView: View {
                     Text("Rendering").font(.headline)
                     sourceBadge(q.activeSource ?? "api")
                     Spacer()
-                    Button(role: .destructive) { Task { await interrupt() } } label: {
+                    // PR #384 review, item 2b: name the row's own job as the
+                    // interrupt `target` (comfybox#362). Without it, "stop this
+                    // render" stopped whatever happened to be active by the time
+                    // the request landed — which, on a queue shared with Bree and
+                    // Kira, can be someone else's render.
+                    Button(role: .destructive) { Task { await interrupt(jobId: q.activeJobId) } } label: {
                         Label("Interrupt", systemImage: "stop.fill")
                     }.controlSize(.small).disabled(busy)
+                        .help(q.activeJobId.map { "Cancel this render (job \($0.prefix(8)))" }
+                              ?? "Cancel whichever render is active")
                 }
                 Text(q.activeSummary ?? "—").font(.callout).foregroundStyle(.secondary)
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
@@ -215,7 +222,10 @@ struct QueueView: View {
     }
     private func toggle(pause: Bool) async { await run { try await engine.setQueuePaused(pause) } }
     private func clearAll() async { await run { try await engine.clearQueue() } }
-    private func interrupt() async { await run { try await engine.interruptRender() } }
+    /// `jobId` nil = the legacy default target ("whatever /health shows as
+    /// active"); non-nil = that job specifically, so we cannot stop someone
+    /// else's render by racing the queue.
+    private func interrupt(jobId: String?) async { await run { try await engine.interruptRender(target: jobId) } }
     private func cancel(_ job: EngineService.QueueJob) async { await run { try await engine.cancelQueueJob(id: job.id) } }
     private func move(_ job: EngineService.QueueJob, _ dir: String) async { await run { try await engine.moveQueueJob(id: job.id, direction: dir) } }
 }
