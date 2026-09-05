@@ -709,6 +709,148 @@ struct EngineServiceAsyncGenerateTests {
         #expect(!engine.isGenerating, "isGenerating must be released promptly")
     }
 
+    /// PR #384 review r3, item 2: the CANCEL BUTTON's path
+    /// (`cancelActiveGeneration` → `cancelImageJob` → `interruptRender`) must be
+    /// bounded too, not just the poll loop's Task-cancellation path. A wedged
+    /// engine would otherwise freeze the button on `WarmServerClient`'s 300s
+    /// request timeout.
+    @Test("the Cancel button path returns promptly against a wedged engine")
+    func cancelButtonPathIsBounded() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusPollInterval = 0.02
+        engine.cancelBestEffortTimeout = 0.15
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"STUCK","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.always("/v1/generate/status/STUCK", .init(200, #"{"job_id":"STUCK","status":"processing","source":"desktop","elapsed_ms":10}"#))
+        transport.always("/v1/queue/interrupt", .init(200, #"{"interrupted":true}"#))
+        transport.hangs("/v1/queue/interrupt")
+
+        let render = Task { try await engine.generate(GenerationRequest(prompt: "x")) }
+        var waited = 0
+        while engine.activeImageJobId == nil && waited < 400 {
+            try await Task.sleep(for: .milliseconds(5)); waited += 1
+        }
+
+        let started = Date()
+        let result = try await engine.cancelActiveGeneration()
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(result == .abandoned(jobId: "STUCK"), "the request was sent; the engine never answered")
+        #expect(elapsed < 3.0, "took \(elapsed)s — the button must not inherit the HTTP timeout")
+        #expect(result.message != nil, "an abandoned cancel must say so")
+        #expect(transport.requestCount("POST", "/v1/queue/interrupt") == 1)
+
+        render.cancel()
+        _ = try? await render.value
+    }
+
+    /// PR #384 review r3, item 3: the job finished in the window between the
+    /// interrupt (404 — not the active render) and the queue delete. Reporting
+    /// "Cancel failed: Server error (404)" is a lie; nothing was left to cancel.
+    @Test("a job that finishes between interrupt and delete reports alreadyFinished")
+    func raceBetweenInterruptAndDeleteIsAlreadyFinished() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"RACE","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.always("/v1/generate/status/RACE", .init(200, #"{"job_id":"RACE","status":"processing","source":"desktop","elapsed_ms":10}"#))
+        transport.always("/v1/queue/interrupt", .init(404, #"{"error":"No such interrupt target: RACE"}"#))
+        transport.always("/v1/queue/RACE", .init(404, #"{"error":"Job not found"}"#))
+
+        let render = Task { try await engine.generate(GenerationRequest(prompt: "x")) }
+        var waited = 0
+        while engine.activeImageJobId == nil && waited < 400 {
+            try await Task.sleep(for: .milliseconds(5)); waited += 1
+        }
+
+        #expect(try await engine.cancelActiveGeneration() == .alreadyFinished(jobId: "RACE"))
+        #expect(transport.requestCount("POST", "/v1/queue/interrupt") == 1)
+        #expect(transport.requestCount("DELETE", "/v1/queue/RACE") == 1)
+
+        render.cancel()
+        _ = try? await render.value
+    }
+
+    /// PR #384 review r3, item 4: the QUEUE TAB's per-row stop of our own active
+    /// render is a user cancel too — `interruptRender` records it, so no surface
+    /// can forget and the generate loop unwinds as `.cancelled`.
+    @Test("a Queue-tab interrupt of our own job unwinds as .cancelled")
+    func queueTabInterruptOfOwnJobUnwindsAsCancelled() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusPollInterval = 0.02
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"OURS","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.always("/v1/queue/interrupt", .init(200, #"{"interrupted":true,"interrupted_job_id":"OURS"}"#))
+        transport.script("/v1/generate/status/OURS", [
+            .init(200, #"{"job_id":"OURS","status":"processing","source":"desktop","elapsed_ms":10}"#),
+            .init(200, #"{"job_id":"OURS","status":"failed","source":"desktop","error":"Render interrupted by /v1/queue/interrupt","elapsed_ms":300}"#),
+        ])
+
+        let render = Task { try await engine.generate(GenerationRequest(prompt: "x")) }
+        var waited = 0
+        while engine.activeImageJobId == nil && waited < 400 {
+            try await Task.sleep(for: .milliseconds(5)); waited += 1
+        }
+
+        // Exactly what QueueView/QueuePanel do: interrupt the row's job id.
+        _ = try await engine.interruptRender(target: "OURS")
+
+        var thrown: Error?
+        do { _ = try await render.value } catch { thrown = error }
+        guard case EngineServiceError.cancelled? = thrown as? EngineServiceError else {
+            Issue.record("expected .cancelled, got \(String(describing: thrown))")
+            return
+        }
+        #expect(engine.lastError == nil, "a stop the user pressed is not an error")
+    }
+
+    // MARK: - Reporting rule (PR #384 review r3, item 1)
+
+    /// The batch loop used to set `engine.lastError` unconditionally, so a
+    /// cancel the user asked for still painted a "Render cancelled" banner.
+    /// `failureReport` is the pure rule the loop now consults.
+    @Test("failureReport suppresses the banner for a cancel and keeps it for a failure")
+    func failureReportRule() {
+        let cancelled = EngineService.failureReport(for: EngineServiceError.cancelled("J"))
+        #expect(cancelled.banner == nil, "a user cancel must not paint the error banner")
+        #expect(cancelled.notice == "Render cancelled.", "but it still says something neutral")
+
+        let failed = EngineService.failureReport(for: EngineServiceError.generationFailed("LoRA missing"))
+        #expect(failed.banner == "Generation failed: LoRA missing")
+        #expect(failed.notice == nil)
+
+        let server = EngineService.failureReport(for: EngineServiceError.serverError(413, "too big"))
+        #expect(server.banner == "Server error (413): too big")
+        #expect(server.notice == nil)
+
+        // Anything non-EngineServiceError still reports.
+        struct Boom: Error, LocalizedError { var errorDescription: String? { "boom" } }
+        #expect(EngineService.failureReport(for: Boom()).banner == "boom")
+    }
+
+    /// The user-cancel ledger evicts OLDEST-first. A Set's `removeFirst()`
+    /// dropped an arbitrary element, which could silently turn a later real
+    /// cancel into a failure banner.
+    @Test("the user-cancel ledger is bounded and evicts oldest-first")
+    func userCancelLedgerIsFIFO() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        // Overflow the 32-entry bound; the NEWEST id must survive.
+        for i in 0..<40 { engine.noteUserCancelled("job-\(i)") }
+
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"job-39","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.script("/v1/generate/status/job-39", [
+            .init(200, #"{"job_id":"job-39","status":"failed","source":"desktop","error":"Render interrupted by /v1/queue/interrupt","elapsed_ms":9}"#)
+        ])
+
+        var thrown: Error?
+        do { _ = try await engine.generate(GenerationRequest(prompt: "x")) } catch { thrown = error }
+        guard case EngineServiceError.cancelled? = thrown as? EngineServiceError else {
+            Issue.record("newest noted id must still be recognised as a user cancel, got \(String(describing: thrown))")
+            return
+        }
+        #expect(engine.lastError == nil)
+    }
+
     // MARK: - Notices (PR #384 review, item 1)
 
     @Test("statusNotice surfaces queue depth, unresolved presets and refused preemption")
@@ -786,6 +928,8 @@ struct EngineServiceAsyncGenerateTests {
             return
         }
         #expect(message.contains("budget"))
+        #expect(message.contains("did not decode"), "name the real fault, not \"returned 200\"")
+        #expect(!message.contains("returned 200"))
         #expect(transport.requestCount("GET", "/v1/generate/status/M") > 1, "retried before giving up")
     }
 }

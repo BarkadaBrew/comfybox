@@ -1199,14 +1199,11 @@ struct GenerationView: View {
         Task {
             defer { isCancellingRender = false }
             do {
-                switch try await engine.cancelActiveGeneration() {
-                case .interrupted, .dequeued, .nothingInFlight:
-                    // The generate loop unwinds as `.cancelled` on its own; a
-                    // cancel the user asked for is not an error banner.
-                    break
-                case .alreadyFinished:
-                    engine.lastError = EngineService.InterruptOutcome.alreadyFinishedMessage
-                }
+                // A clean stop has no message; `alreadyFinished` / `abandoned`
+                // carry one. The generate loop unwinds as `.cancelled` on its
+                // own, so a cancel the user asked for never paints an error.
+                let result = try await engine.cancelActiveGeneration()
+                if let message = result.message { engine.setGenerationNotice(message) }
             } catch {
                 engine.lastError = "Cancel failed: \(error.localizedDescription)"
             }
@@ -1393,7 +1390,14 @@ struct GenerationView: View {
                 batchPaths.append(finalPath)
                 onGenerated?(finalPath, req)
             } catch {
-                await MainActor.run { engine.lastError = error.localizedDescription }
+                // PR #384 review r3, item 1: a cancel the user asked for must
+                // not paint the error banner. `failureReport` is the pure rule
+                // (unit-tested); everything that is not a cancel still reports.
+                let report = EngineService.failureReport(for: error)
+                await MainActor.run {
+                    if let banner = report.banner { engine.lastError = banner }
+                    if let notice = report.notice { engine.setGenerationNotice(notice) }
+                }
                 break
             }
         }

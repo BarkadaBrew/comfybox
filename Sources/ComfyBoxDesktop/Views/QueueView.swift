@@ -226,15 +226,22 @@ struct QueueView: View {
     /// active"); non-nil = that job specifically, so we cannot stop someone
     /// else's render by racing the queue.
     private func interrupt(jobId: String?) async {
-        await run {
+        busy = true; error = nil
+        do {
             let outcome = try await engine.interruptRender(target: jobId)
             // comfybox#378: a 200 with `interrupted: false` stopped NOTHING —
             // the render finished while the button was being pressed. Saying
             // nothing there reads as "cancelled" (PR #384 review r2, item 5).
+            // Reported as its own message rather than dressed up as a fake
+            // `serverError(200, …)` (r3, minor).
             if !outcome.interrupted {
-                throw EngineServiceError.serverError(200, EngineService.InterruptOutcome.alreadyFinishedMessage)
+                error = EngineService.InterruptOutcome.alreadyFinishedMessage
             }
+        } catch {
+            self.error = error.localizedDescription
         }
+        busy = false
+        refreshTick += 1
     }
     private func cancel(_ job: EngineService.QueueJob) async { await run { try await engine.cancelQueueJob(id: job.id) } }
     private func move(_ job: EngineService.QueueJob, _ dir: String) async { await run { try await engine.moveQueueJob(id: job.id, direction: dir) } }
