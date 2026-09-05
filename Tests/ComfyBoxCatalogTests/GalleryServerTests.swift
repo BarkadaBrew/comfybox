@@ -67,6 +67,21 @@ final class GalleryServerTests: XCTestCase {
         XCTAssertEqual(body["count"] as? Int, 3)
     }
 
+    /// #387 round 2 review: `HTTPKit.queryParameters` falls back to the RAW
+    /// substring (not "") for a malformed percent-escape, matching the engine.
+    /// `query(from:scope:ceiling:)`'s `s(k)` helper below treats "" as "filter
+    /// absent" — so if the fallback had instead been "", `q=abc%` would have
+    /// silently DROPPED the text filter and returned every asset in scope
+    /// (3, per the baseline above), not zero. The ruling keeps the raw
+    /// fallback deliberately (engine parity: a bad value must fail visibly —
+    /// an empty result set — rather than the query silently widening), so pin
+    /// that a malformed escape becomes a real, if useless, filter value.
+    func testAMalformedPercentEscapeInATextFilterIsUsedAsALiteralValueNotIgnored() async throws {
+        let body = try await get("/v1/catalog/search?q=abc%")
+        XCTAssertEqual(body["count"] as? Int, 0,
+                       "a malformed escape must search literally (and match nothing), not be ignored")
+    }
+
     func testKiraActorHeaderScopesToHerRealm() async throws {
         let body = try await get("/v1/catalog/search?limit=100", actor: "kira")
         let items = try XCTUnwrap(body["items"] as? [[String: Any]])

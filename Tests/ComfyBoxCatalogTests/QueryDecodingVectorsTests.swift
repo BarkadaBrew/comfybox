@@ -1,0 +1,110 @@
+// QueryDecodingVectorsTests.swift — comfybox#387.
+//
+// The catalog's own query decoder (`HTTPKit.queryParameters`) used to treat a
+// literal `+` as a space (`application/x-www-form-urlencoded` behavior) while
+// the engine's `HTTPRequest.queryParameters` (comfybox#380/#381) decodes per
+// RFC 3986, where `+` stays literal. Ruling on #387: one convention for both
+// services — RFC 3986, matching the engine.
+//
+// TWIN FILE — keep byte-for-byte identical (except this header comment and
+// the target-specific decode call at the bottom):
+//   Tests/ZImageTests/Server/QueryDecodingVectorsTests.swift
+//
+// `ZImageTests` and `ComfyBoxCatalogTests` share no common module — `ZImage`
+// and `ComfyBoxCatalog` do not depend on each other — so this vector table
+// cannot be a single `import`ed source file. It is duplicated verbatim
+// instead. `testVectorTableHashMatchesItsTwin` below is the drift guard: it
+// hashes this file's table with a hard-coded literal that is copied
+// identically into the twin. Change the vectors in ONE of these files
+// without updating the other (table AND hash literal, in both places) and
+// that file's hash test fails.
+
+import XCTest
+@testable import ComfyBoxCatalog
+
+struct QueryDecodingVector {
+    let name: String
+    let query: String
+    let key: String
+    /// `nil` means `key` must be ABSENT from the decoded output entirely
+    /// (not merely present with an empty value) — the empty-key-drop cases.
+    let expected: String?
+}
+
+/// One vector per case in the #387 ruling: space, `#`, `%25`, non-ASCII, `+`
+/// (both percent-encoded and literal), malformed escape, key decoding, and
+/// (round 2, PR #390 review) the empty-key edge cases where the catalog's
+/// `omittingEmptySubsequences: false` used to disagree with the engine's
+/// default-`true` split: a leading `=` promotes the remainder to the key
+/// rather than pairing with an empty one, and a bare `=` yields no
+/// parameter at all.
+let queryDecodingVectors: [QueryDecodingVector] = [
+    .init(name: "space", query: "model=a%20b", key: "model", expected: "a b"),
+    .init(name: "hash", query: "model=track%231.safetensors", key: "model", expected: "track#1.safetensors"),
+    .init(name: "percent25", query: "model=100%25off.safetensors", key: "model", expected: "100%off.safetensors"),
+    .init(name: "nonASCII", query: "model=caf%C3%A9.safetensors", key: "model", expected: "café.safetensors"),
+    .init(name: "plusEncoded", query: "model=z-image%2Bextra.safetensors", key: "model",
+          expected: "z-image+extra.safetensors"),
+    .init(name: "plusLiteral", query: "model=a+b", key: "model", expected: "a+b"),
+    .init(name: "keyDecoding", query: "mod%65l=krea2", key: "model", expected: "krea2"),
+    .init(name: "malformedTrailingPercent", query: "model=abc%", key: "model", expected: "abc%"),
+    .init(name: "malformedNonHex", query: "model=50%zz", key: "model", expected: "50%zz"),
+    .init(name: "leadingEqualsPromotesTheRemainderToTheKey", query: "=value", key: "value", expected: ""),
+    .init(name: "bareEqualsYieldsNoParameterAtAll", query: "=", key: "", expected: nil),
+    .init(name: "trailingEqualsYieldsAnEmptyValue", query: "a=", key: "a", expected: ""),
+    .init(name: "bareKeyWithNoEqualsYieldsAnEmptyValue", query: "a", key: "a", expected: ""),
+]
+
+/// Deterministic FNV-1a 64-bit over the table's canonical text form. NOT
+/// Swift's `Hashable`/`hashValue` — those are seeded per process (hash
+/// randomization) and would differ between the two test binaries even for
+/// byte-identical content, which would defeat the whole point of this check.
+/// `expected == nil` is mixed in distinctly from any real string (a `\0`
+/// vs. `\u{1}` prefix) so "absent" can never collide with an expected value.
+func hashQueryDecodingVectors(_ vectors: [QueryDecodingVector]) -> UInt64 {
+    var hash: UInt64 = 0xcbf29ce484222325
+    let prime: UInt64 = 0x100000001b3
+    func mix(_ s: String) {
+        for byte in s.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* prime
+        }
+        hash ^= 0xFF
+        hash = hash &* prime
+    }
+    for v in vectors {
+        mix(v.name)
+        mix(v.query)
+        mix(v.key)
+        mix(v.expected == nil ? "\u{0}ABSENT" : "\u{1}" + v.expected!)
+    }
+    return hash
+}
+
+final class QueryDecodingVectorsTests: XCTestCase {
+
+    /// The drift guard. This literal must be identical to the one in the twin
+    /// file named above. Recompute (see the twin's comment) and update BOTH
+    /// literals together whenever the table changes.
+    func testVectorTableHashMatchesItsTwin() {
+        XCTAssertEqual(
+            hashQueryDecodingVectors(queryDecodingVectors), 0x01a350cf8bf0367c,
+            "queryDecodingVectors diverged from its twin in "
+            + "Tests/ZImageTests/Server/QueryDecodingVectorsTests.swift — "
+            + "update both tables and both hash literals together")
+    }
+
+    /// The catalog side of the shared contract: `HTTPKit.queryParameters`
+    /// must decode every vector exactly like the engine's
+    /// `HTTPRequest.queryParameters` (pinned on its own copy of this table).
+    func testHTTPKitDecodesEveryVector() {
+        for v in queryDecodingVectors {
+            let params = HTTPKit.queryParameters(of: "/x?\(v.query)")
+            if let expected = v.expected {
+                XCTAssertEqual(params[v.key], expected, v.name)
+            } else {
+                XCTAssertNil(params[v.key], v.name)
+            }
+        }
+    }
+}
