@@ -231,6 +231,47 @@ final class ControlPlaneTests: XCTestCase {
     XCTAssertFalse(servable("POST", "/v1/generate"))
   }
 
+  // MARK: - comfybox#217: /health is sync-servable
+
+  /// `/health` is what the Desktop queue/progress UI polls. It stopped hopping
+  /// the coordinator actor when `LiveHealthState` landed, but it still entered
+  /// `ConnectionHandler`'s `Task {}` — so the cooperative-pool saturation a
+  /// blocking synchronous GPU render produces could still delay it. The whole
+  /// payload is lock-based, so the WHOLE route is classified sync-servable
+  /// (no `/v1/health/live` subset route was needed).
+  func testHealthIsClassifiedSyncServable() {
+    func servable(_ m: String, _ p: String) -> Bool { ControlPlaneClassifier.isSyncServable(method: m, path: p) }
+
+    XCTAssertTrue(servable("GET", "/health"))
+    // Only GET. A stray POST must still take the async path (and 404 there).
+    XCTAssertFalse(servable("POST", "/health"))
+    // The `/api` prefix is the BRIDGE's namespace and the bridge never claims
+    // `/health`; the classifier matches the raw path, so this stays async.
+    XCTAssertFalse(servable("GET", "/api/health"))
+    XCTAssertFalse(servable("GET", "/healthz"))
+  }
+
+  /// The #217 claim itself: the progress-adjacent fields the Desktop polls are
+  /// readable from the lock store WHILE the coordinator actor is occupied by a
+  /// render. Drives the PRODUCTION payload assembly (`WarmServer.liveHealthPayload`,
+  /// via the probe seam) against a real busy coordinator.
+  func testHealthProgressFieldsAreReadableWhileTheCoordinatorIsBusy() async throws {
+    let probe = makeQueueProbe()
+
+    async let op: Bool = probe.enqueueSynthetic(durationMs: 1200, id: "busy")
+    try await waitUntil("synthetic op running") { probe.activeJobSummary != nil }
+    probe.publishProgress(42)
+
+    // Synchronous call — no await, no actor hop — while the actor is busy.
+    let json = probe.liveHealthJSON()
+    XCTAssertEqual(json["is_rendering"] as? Bool, true, "render visible mid-render")
+    XCTAssertEqual(json["progress_percent"] as? Int, 42)
+    XCTAssertNotNil(json["pending_count"], "pending_count present")
+    XCTAssertEqual(json["current_job_id"] as? String, "busy", "names the running job")
+
+    _ = try await op
+  }
+
   // MARK: - Scenario 6: flag-off byte-identical dispatch
 
   /// `COMFYBOX_CONTROL_PLANE_SYNC` defaults ON; "0" is the rollback lever that

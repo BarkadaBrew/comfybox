@@ -712,19 +712,13 @@ public final class WarmServer {
 
     switch (request.method, request.path) {
     case ("GET", "/health"):
-      let memoryBytes = Self.currentMemoryFootprintBytes()
       // #217: read from the lock-based snapshot instead of `await
       // coordinator.health()`. The coordinator actor is blocked for a whole
       // synchronous render, so awaiting it made /health hang (HTTP 000) for the
       // render's duration. The snapshot is published on every state transition.
-      let health = liveHealthResponse(memoryBytes: memoryBytes)
-      if let data = Self.healthJSON(
-        health, videoAvailable: replicateVideoProxy != nil,
-        activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
-        localVideoReadiness: localVideoReadinessMonitor.current()) {
-        return .json(.rawJSON(status: 200, data: data))
-      }
-      return .json(status: 200, payload: health)
+      // The SAME builder serves the sync control plane (`serveControlPlaneSync`),
+      // so both arms emit identical bytes.
+      return .json(healthRouteResponse())
 
     case ("POST", "/v1/generate"):
       do {
@@ -3538,6 +3532,7 @@ public final class WarmServer {
       return nil
     }
     switch (request.method, request.path) {
+    case ("GET", "/health"):       return healthRouteResponse()
     case ("GET", "/v1/queue"):     return syncQueueResponse()
     case ("GET", "/v1/queue/lifecycle"): return syncQueueLifecycleResponse(request: request)
     case ("GET", "/v1/models"):    return syncModelsResponse()
@@ -6125,16 +6120,50 @@ public final class WarmServer {
   /// Max render age (ms) before /health flags the render as likely deadlocked.
   private static let healthRenderStaleThresholdMs = 300_000  // 5 minutes (#141)
 
+  /// The WHOLE `GET /health` response, assembled SYNCHRONOUSLY (#217).
+  ///
+  /// Every input is lock-based or an immutable value — `LiveHealthState.read()`,
+  /// `VideoJobTracker.activeJobCount`, `ReplicateVideoProxy.activeJobCount`,
+  /// `LocalVideoReadinessMonitor.current()`, `currentMemoryFootprintBytes()` and
+  /// the configuration — so there is nothing to await and no subset of the
+  /// payload has to be split onto a separate route. Shared by the async dispatch
+  /// arm and `serveControlPlaneSync`, so the two cannot emit different bytes.
+  fileprivate func healthRouteResponse() -> HTTPResponse {
+    let memoryBytes = Self.currentMemoryFootprintBytes()
+    let health = liveHealthResponse(memoryBytes: memoryBytes)
+    if let data = Self.healthJSON(
+      health, videoAvailable: replicateVideoProxy != nil,
+      activeVideoJobs: videoJobTracker.activeJobCount + (replicateVideoProxy?.activeJobCount ?? 0),
+      localVideoReadiness: localVideoReadinessMonitor.current()) {
+      return .rawJSON(status: 200, data: data)
+    }
+    return .json(status: 200, payload: health)
+  }
+
   /// Assemble the /health payload from the lock-based ``LiveHealthState``
   /// snapshot — NO actor hop — so /health stays responsive during a render (#217).
   private func liveHealthResponse(memoryBytes: UInt64) -> HealthResponse {
+    Self.liveHealthPayload(
+      liveHealth: liveHealth, configuration: configuration,
+      serverStartTime: serverStartTime, memoryBytes: memoryBytes)
+  }
+
+  /// The pure payload assembly, split out of `liveHealthResponse` so the
+  /// no-actor-hop claim can be driven from a unit test (`WarmServerQueueProbe`)
+  /// against a real coordinator that is BUSY — the exact condition #217 is
+  /// about. Depends on nothing but the lock store, the immutable configuration
+  /// and two clocks.
+  fileprivate static func liveHealthPayload(
+    liveHealth: LiveHealthState, configuration: WarmServerConfiguration,
+    serverStartTime: Date, memoryBytes: UInt64, now: Date = Date()
+  ) -> HealthResponse {
     let (snap, progress) = liveHealth.read()
-    let uptimeSeconds = Int(Date().timeIntervalSince(serverStartTime))
-    let activeAgeMs = snap.activeRenderStartedAt.map { Int(Date().timeIntervalSince($0) * 1000.0) }
+    let uptimeSeconds = Int(now.timeIntervalSince(serverStartTime))
+    let activeAgeMs = snap.activeRenderStartedAt.map { Int(now.timeIntervalSince($0) * 1000.0) }
     let status = WarmServerHealthStatus.derive(
       shuttingDown: snap.shuttingDown,
       activeRenderAgeMs: activeAgeMs,
-      staleThresholdMs: Self.healthRenderStaleThresholdMs)
+      staleThresholdMs: healthRenderStaleThresholdMs)
     return HealthResponse(
       status: status,
       model: snap.model.isEmpty ? (configuration.modelSpec ?? ZImageRepository.id) : snap.model,
@@ -13403,7 +13432,14 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// loaded at construction (`prepare()` is a separate call this probe never
   /// makes), so it is safe in a unit test and is what lets the #282 review-r1
   /// `model_mismatch` case be driven for real.
+  /// comfybox#217: kept so the probe's `/health` payload is built from the
+  /// SAME configuration the probe's coordinator runs under.
+  private let configuration: WarmServerConfiguration
+
   init(maxPendingRequests: Int = 10, maxPendingModelOps: Int = 8, modelSpec: String? = nil) {
+    self.configuration = WarmServerConfiguration(
+      modelSpec: modelSpec,
+      maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps)
     self.coordinator = WarmServerCoordinator(
       configuration: WarmServerConfiguration(
         modelSpec: modelSpec,
@@ -13855,6 +13891,36 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   func bypassVideoAdmissionValueForTest() async -> Bool {
     await coordinator.bypassVideoAdmissionForTestsValue
   }
+
+  // MARK: - comfybox#217 /health sync-servability probe surface
+
+  /// The PRODUCTION payload assembly `GET /health` runs
+  /// (`WarmServer.liveHealthPayload`) — the same function, not a copy — driven
+  /// against THIS probe's lock store while its coordinator is busy. Calling it
+  /// is synchronous by construction: a test that gets a value back here has
+  /// proved the route needs no actor hop and no cooperative thread.
+  func liveHealthPayload(memoryBytes: UInt64 = 0) -> HealthResponse {
+    WarmServer.liveHealthPayload(
+      liveHealth: liveHealth,
+      configuration: configuration,
+      serverStartTime: Date(), memoryBytes: memoryBytes)
+  }
+
+  /// The serialized `/health` body the route emits, from the same payload —
+  /// so a test can assert the progress-adjacent fields the Desktop UI polls
+  /// (`is_rendering`, `progress_percent`, `pending_count`, `current_job_id`)
+  /// are present and correct mid-render.
+  func liveHealthJSON() -> [String: Any] {
+    guard let data = WarmServer.healthJSON(
+      liveHealthPayload(), videoAvailable: false, activeVideoJobs: 0),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return [:] }
+    return object
+  }
+
+  /// Publish live denoising progress exactly as the off-actor progress callback
+  /// does, so a test can assert `/health` reports it without the actor.
+  func publishProgress(_ percent: Int) { liveHealth.setProgress(percent) }
 
   /// comfybox#362 review r1, finding 2: reproduce the `runGenerate`-defer
   /// window (actor `activeJobId` nil, published snapshot still naming the

@@ -172,7 +172,20 @@ enum QueueDeltaStore {
 enum ControlPlaneClassifier {
   static func isSyncServable(method: String, path: String) -> Bool {
     switch (method, path) {
-    case ("GET", "/v1/queue"),
+    case ("GET", "/health"),
+         // comfybox#217: `/health` stopped hopping the coordinator actor when
+         // `LiveHealthState` landed, but it still entered `ConnectionHandler`'s
+         // `Task {}` — so a saturated cooperative pool (what a blocking
+         // synchronous GPU render produces) still delayed the very fields the
+         // Desktop queue/progress UI polls. Every input the route reads is
+         // lock-based or a plain value: `LiveHealthState.read()`,
+         // `VideoJobTracker.activeJobCount`, `ReplicateVideoProxy.activeJobCount`,
+         // `LocalVideoReadinessMonitor.current()` and the immutable
+         // configuration. Nothing awaits, so the WHOLE payload is servable here
+         // — no subset route was needed. `/api/health` is deliberately NOT
+         // matched: only the bridge strips that prefix, and the bridge never
+         // claims `/health`.
+         ("GET", "/v1/queue"),
          // comfybox#283/#217 review I5: must answer during a render exactly
          // like `/v1/queue` — the ledger it reads is lock-based with no
          // actor hop and no disk I/O under its lock (see
