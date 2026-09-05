@@ -101,6 +101,31 @@ public enum Krea2ModelDetection {
     (try? detect(at: url)) != nil
   }
 
+  /// Best-effort PHYSICAL variant for a model spec, resolved the same way
+  /// `resolve(spec:)` would (a declared alias → its directory's contents; an
+  /// existing path → its own contents) but WITHOUT the Turbo-snapshot
+  /// fallback for an unmapped alias — file-existence checks only, no HF
+  /// download. nil when the spec is neither a turbo alias, a declared alias,
+  /// nor an existing, detectable directory.
+  ///
+  /// comfybox#359: powers `GET /v1/model/family`, which the desktop uses to
+  /// backfill `checkpoint_family` on presets that carry only
+  /// `custom_model_path` — never a weight load, so safe to call for every
+  /// row in a batch backfill.
+  public static func detectVariant(spec: String, specDirectories table: [String: String]? = nil) -> Krea2Variant? {
+    let lower = spec.lowercased()
+    if turboAliases.contains(lower) { return .turbo }
+    if let dir = specDirectory(spec, table: table) {
+      return (try? detect(at: dir))?.variant
+    }
+    let expanded = (spec as NSString).expandingTildeInPath
+    var isDir: ObjCBool = false
+    if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir), isDir.boolValue {
+      return (try? detect(at: URL(fileURLWithPath: expanded, isDirectory: true)))?.variant
+    }
+    return nil
+  }
+
   /// Detect a Krea-2 model root and its variant. Fail-closed:
   /// 1. `raw.safetensors` → `.raw`; `turbo.safetensors` → `.turbo`. Both →
   ///    `ambiguousVariant`. Never guess.

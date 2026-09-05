@@ -96,8 +96,15 @@ public enum PresetEffectiveRecipePresenter {
 
   /// #359: the one hint the UI adds to the engine's `no_model` reason —
   /// naming the specific fix, not just the symptom.
-  static let checkpointFamilyHint =
-    "Add checkpoint_family to make this preset expandable."
+  ///
+  /// Fix round 1: this used to say "add checkpoint_family", which is wrong.
+  /// `PresetLoRAStack.decide` returns `no_model` before it reads
+  /// `checkpoint_family` at all whenever the preset's `model` is empty and
+  /// the request names none — the shape every `{preset}`-only client sends.
+  /// `model` is the field that fixes it.
+  static let noModelHint =
+    "Name a model on this preset (Make Expandable fills it in from the engine) — "
+      + "checkpoint_family alone will not expand it."
 
   /// Compute the effective recipe purely from the declared preset — no
   /// network round trip needed: `ResolvedPreset(preset:)` and
@@ -141,7 +148,7 @@ public enum PresetEffectiveRecipePresenter {
 
     case .apply(let expansion):
       if let reason = expansion.unresolved {
-        let hint = reason.code == "no_model" ? checkpointFamilyHint : nil
+        let hint = reason.code == "no_model" ? noModelHint : nil
         return EffectiveRecipe(
           model: resolved.model, checkpointFamily: resolved.checkpointFamily,
           mediaKind: resolved.mediaKind, loraStack: [], steps: resolved.steps,

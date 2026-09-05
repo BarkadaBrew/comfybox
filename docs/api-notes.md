@@ -189,6 +189,62 @@ working unmodified during the compatibility window; new code should read
 [Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md) (some
 of that document's structured-kroma framing predates this reversal).
 
+## Model detection — `GET /v1/model/family` (comfybox#359)
+
+`GET /v1/model/family?model=<spec>` answers, for one model spec, what the
+engine thinks it is and whether it would load it. Read-only: file-existence
+checks plus a `model_index.json` read inside a model root. It never loads
+weights, never mutates the model pool, and never returns file contents, so it
+is safe to call once per preset in a batch.
+
+```json
+{
+  "model":   "~/LocalModels/krea2-raw",   // echoed verbatim
+  "family":  "krea2",                     // "krea2" | "z-image" | null
+  "variant": "raw",                       // krea2: turbo|raw; z-image: turbo|base; null
+  "spec":    "krea2-raw",                 // canonical engine spec — write this into a preset's `model`
+  "loadable": true,                       // would POST /v1/generate {"model": spec} be accepted?
+  "reason":  null                         // why not, when loadable is false
+}
+```
+
+**`spec` is the load-bearing field.** `PresetLoRAStack.decide` returns
+`no_model` whenever a preset's `model` is empty and the request names none —
+*before* it ever reads `checkpoint_family`. So a preset that carries only
+`custom_model_path` cannot be made expandable by writing a
+`checkpoint_family` label; the fix is to write `model`. `spec` is the
+declared krea2 alias when the probed path matches one (`krea2-raw`,
+`kroma-v0.2-turbo`, or a `config.json` `krea2Models` entry), otherwise the
+tilde-expanded, standardized absolute path — `ModelResolution.resolve` does
+not expand `~`, so an unexpanded tilde path in `model` would fail to load.
+
+`loadable` mirrors the real acceptance path (`WarmServer.parseModelSpec` →
+`ModelPool.detectFamily` → `Krea2ModelDetection.resolve` /
+`ModelResolution.resolve`) by file existence only. `loadable: true` means the
+engine would accept the spec, not that the render will succeed — a truncated
+or incomplete checkpoint still reads as loadable here.
+
+`family`/`variant` are the broad half, and `variant` is **never guessed from
+text**. Only a declared alias (after the `-q4`/`-q8`/`-bf16` suffixes
+`parseModelSpec` strips) or a readable Krea-2 model root yields a variant; a
+checkpoint that merely *names* z-image comes back `family: "z-image",
+variant: null`. `cyberrealisticZImage_v50.safetensors` is served as BASE and
+its filename says neither "base" nor "turbo" — reading turbo off the spelling
+put the wrong recipe under the right name, which is what F3 and #286 exist to
+prevent.
+
+A null `variant` costs nothing that matters: the five `checkpoint_family`
+policy labels are a CLIENT decision (the `raw-accel` vs `raw-stock` split
+within Krea-2 "raw" depends on whether the preset's own `loras[]` declares
+`role: "accel"`, which the engine does not see here), and
+`PresetLoRAStack.declaredFamily` maps `raw-accel` and `raw-stock` to the same
+`"krea2"`. The label is a record; `model` is what makes a preset expandable,
+and it is written either way.
+
+**Scope note (deliberate):** `model` may be any local path, and the route will
+stat it. The warm server is a localhost-trusted process on the Mac; the probe
+reveals only existence and Krea-2-shape, never contents.
+
 ## VAE selection (Krea-2) — external decoder swap (#285, WP-E9)
 
 Krea 2 can decode (and encode) through a VAE file other than the one bundled

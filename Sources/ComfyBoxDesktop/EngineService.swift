@@ -217,6 +217,73 @@ public struct PoolModelInfo: Sendable, Identifiable {
     public let lastUsed: String
 }
 
+/// `GET /v1/model/family` (comfybox#359): the engine's own detection for a
+/// model spec — alias, catalog id, or a literal `custom_model_path`
+/// directory. Powers `checkpoint_family` on save and the preset backfill;
+/// see `CheckpointFamilyResolver`, which turns this plus a preset's own
+/// declared LoRA roles into one of the five `checkpoint_family` labels the
+/// server accepts.
+public struct ModelFamilyInfo: Sendable, Equatable, Decodable {
+    public let model: String
+    public let family: String?
+    public let variant: String?
+    /// The canonical engine model spec for the probed value — a declared
+    /// krea2 alias where the path matches one, otherwise the standardized
+    /// absolute path. This is what goes in a preset's `model`: writing only
+    /// `checkpoint_family` cannot make a preset expandable, because
+    /// `PresetLoRAStack.decide` returns `no_model` before it ever reads that
+    /// field (see `PresetBackfillViewModel`).
+    public let spec: String
+    /// Would `/v1/generate` accept `spec` as `model`? False ⇒ do not write
+    /// it; `reason` says why.
+    public let loadable: Bool
+    /// Why `loadable` is false. nil when it is true.
+    public let reason: String?
+
+    public init(model: String, family: String?, variant: String?,
+                spec: String? = nil, loadable: Bool = false, reason: String? = nil) {
+        self.model = model
+        self.family = family
+        self.variant = variant
+        self.spec = spec ?? model
+        self.loadable = loadable
+        self.reason = reason
+    }
+
+    /// `spec`/`loadable`/`reason` are decoded leniently so a desktop build
+    /// talking to an engine that predates them degrades to "not loadable"
+    /// (the backfill then refuses and says so) instead of failing to decode
+    /// the whole response.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decode(String.self, forKey: .model)
+        family = try c.decodeIfPresent(String.self, forKey: .family)
+        variant = try c.decodeIfPresent(String.self, forKey: .variant)
+        spec = try c.decodeIfPresent(String.self, forKey: .spec) ?? model
+        loadable = try c.decodeIfPresent(Bool.self, forKey: .loadable) ?? false
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+            ?? (c.contains(.loadable) ? nil : "this engine build does not report model loadability")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case model, family, variant, spec, loadable, reason
+    }
+
+    /// Is this answer about `spec`? `model` is the engine's verbatim echo of
+    /// what was queried, so a STALE `ModelFamilyInfo` — the reply for the path
+    /// a preset pointed at before the user repointed it — can be told apart
+    /// from a fresh one with no extra bookkeeping (comfybox#359, round 3).
+    /// Applying a stale one paired the new `custom_model_path` with the old
+    /// `model`: a base nobody chose, written silently.
+    ///
+    /// Compared trimmed — the caller queries with a trimmed spec, and the
+    /// editor's text field is trimmed before it is used.
+    public func answers(_ spec: String) -> Bool {
+        model.trimmingCharacters(in: .whitespacesAndNewlines)
+            == spec.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 // MARK: - LoRA Info
 
 /// Information about a LoRA in the server's library.
@@ -1694,6 +1761,47 @@ public final class EngineService {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(ResolvedPreset.self, from: data)
+    }
+
+    /// `GET /v1/model/family?model=<spec>` (comfybox#359): what family/variant
+    /// the engine detects for a model spec (alias, catalog id, or a literal
+    /// `custom_model_path` directory) — file-existence checks only, safe to
+    /// call once per preset in a batch backfill.
+    ///
+    /// Round 2, ruling 7: nil means UNREACHABLE and nothing else — no client,
+    /// a transport error, or a body that will not decode. An engine that
+    /// answered with an error status has said something useful, so its
+    /// message is returned as a non-loadable `ModelFamilyInfo` and surfaces
+    /// verbatim in the backfill's Failed row instead of being flattened into
+    /// "could not reach the engine".
+    ///
+    /// A decoded result with nil `family` means the engine could not classify
+    /// the spec; `loadable == false` means it would not accept it as `model`.
+    public func fetchModelFamily(forSpec spec: String) async -> ModelFamilyInfo? {
+        guard let client = client, connectionState.isConnected else { return nil }
+        let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+")
+        let enc = trimmed.addingPercentEncoding(withAllowedCharacters: allowed) ?? trimmed
+        do {
+            let (status, data) = try await client.get("/v1/model/family?model=\(enc)")
+            if status == 200 {
+                return try JSONDecoder().decode(ModelFamilyInfo.self, from: data)
+            }
+            return Self.refusal(spec: trimmed, status: status,
+                                message: parseErrorMessage(from: data))
+        } catch {
+            return nil
+        }
+    }
+
+    /// The engine answered, but not with a detection — keep its own words.
+    static func refusal(spec: String, status: Int, message: String?) -> ModelFamilyInfo {
+        ModelFamilyInfo(
+            model: spec, family: nil, variant: nil, spec: spec, loadable: false,
+            reason: message.map { "the engine refused to classify '\(spec)' (HTTP \(status)): \($0)" }
+                ?? "the engine refused to classify '\(spec)' (HTTP \(status))")
     }
 
     public func savePreset(_ preset: ServerPreset) async throws {

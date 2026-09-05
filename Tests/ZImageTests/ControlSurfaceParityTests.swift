@@ -32,7 +32,14 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// assertions demand. (Counting tuples, not lines: `:1641`-style multi-tuple
   /// arms count once per tuple — the v1 line-count pin would have silently
   /// dropped `/v1/queue/resume`.)
-  private static let expectedWarmServerTuples = 94
+  ///
+  /// comfybox#359 moved this by TWO for ONE route: `GET /v1/model/family`
+  /// appears in both `WarmServer` dispatch switches — the async arm and the
+  /// sync control-plane arm (`syncModelFamilyResponse`), because
+  /// `ControlPlaneClassifier` serves it without an actor hop. That is the
+  /// established pattern for actor-free GETs (`/v1/models`, `/v1/stats`,
+  /// `/v1/config` … all cost two tuples each); it is not a duplicate arm.
+  private static let expectedWarmServerTuples = 96
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {
