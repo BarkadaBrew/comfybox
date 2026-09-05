@@ -9,20 +9,24 @@ import ZImage
 struct PresetEffectiveRecipeTests {
 
     /// The live `Krea-Kira` record from issue #277 — expandable (declares
-    /// both `model` and `checkpoint_family`), with a structured Kroma dial.
+    /// both `model` and `checkpoint_family`). Todd 2026-09-04: kroma is a
+    /// regular LoRA now, declared directly in `loras[]` (the canonical form
+    /// post-migration) rather than a separate structured field.
     private static let kreaKira = ImagePreset(
         id: "krea-kira", name: "Krea-Kira",
         mediaKind: "image", provider: "local", engine: "zimage",
         model: "krea2-raw",
         steps: 12, guidance: 1.0,
         width: 1024, height: 1536,
-        loras: [LoraReference(filename: "krea2_turbo_lora_rank_64_bf16.safetensors", scale: 1.0, role: "accel")],
+        loras: [
+            LoraReference(filename: "krea2_turbo_lora_rank_64_bf16.safetensors", scale: 1.0, role: "accel"),
+            LoraReference(filename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6, role: "kroma"),
+        ],
         checkpointFamily: "raw-accel",
-        kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"),
         sampler: "res_2s", sigmaSchedule: "beta57", shift: 1.15, eta: 0.5
     )
 
-    @Test("resolves an expandable preset: kroma prepended, sampler/schedule/shift/eta carried through")
+    @Test("resolves an expandable preset: declared loras[] order, sampler/schedule/shift/eta carried through")
     func expandablePresetResolves() {
         let recipe = PresetEffectiveRecipePresenter.compute(declared: Self.kreaKira)
         #expect(recipe.unresolved == nil)
@@ -34,13 +38,13 @@ struct PresetEffectiveRecipeTests {
         #expect(recipe.sigmaSchedule == "beta57")
         #expect(recipe.shift == 1.15)
         #expect(recipe.eta == 0.5)
-        // Kroma is PREPENDED as a role-tagged entry — the same order the
-        // engine's own expanding sender uses (PresetLoRAStack.decide).
+        // Todd 2026-09-04: no prepend, no special ordering — the stack is
+        // `loras[]` exactly as declared.
         #expect(recipe.loraStack.count == 2)
-        #expect(recipe.loraStack[0].role == "kroma")
-        #expect(recipe.loraStack[0].filename == "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
-        #expect(recipe.loraStack[0].scale == 0.6)
-        #expect(recipe.loraStack[1].role == "accel")
+        #expect(recipe.loraStack[0].role == "accel")
+        #expect(recipe.loraStack[1].role == "kroma")
+        #expect(recipe.loraStack[1].filename == "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
+        #expect(recipe.loraStack[1].scale == 0.6)
     }
 
     @Test("no model and no checkpoint_family: unresolved no_model, with the #359 hint")
@@ -80,14 +84,18 @@ struct PresetEffectiveRecipeTests {
         #expect(recipe.unresolved?.hint == "Add checkpoint_family to make this preset expandable.")
     }
 
-    @Test("kroma.strength > 0 with no file: unresolved kroma_file_missing, no hint")
-    func kromaWithoutFileIsUnresolved() {
+    /// Todd 2026-09-04: the `kroma_file_missing` gate is retired along with
+    /// kroma's special semantics — a structured `kroma` field (deprecated,
+    /// derived) never gates expansion; only `loras[]` matters.
+    @Test("a deprecated structured kroma field never gates expansion")
+    func deprecatedKromaFieldDoesNotGateExpansion() {
         let preset = ImagePreset(
             id: "krea2-x", name: "X", engine: "zimage", model: "krea2-raw",
+            loras: [LoraReference(filename: "a.safetensors", scale: 0.5)],
             kroma: KromaPolicy(strength: 0.5, file: nil))
         let recipe = PresetEffectiveRecipePresenter.compute(declared: preset)
-        #expect(recipe.unresolved?.code == "kroma_file_missing")
-        #expect(recipe.unresolved?.hint == nil)
+        #expect(recipe.unresolved == nil)
+        #expect(recipe.loraStack.map(\.filename) == ["a.safetensors"])
     }
 
     @Test("a non-local engine is unresolved, never expanded onto this engine")
@@ -110,8 +118,12 @@ struct PresetEffectiveRecipeTests {
           "media_kind": "image", "provider": "local", "engine": "zimage",
           "model": "krea2-raw", "checkpoint_family": "raw-accel",
           "steps": 12, "guidance": 1.0, "width": 1024, "height": 1536,
-          "loras": [{"filename": "krea2_turbo_lora_rank_64_bf16.safetensors", "scale": 1.0, "role": "accel"}],
+          "loras": [
+            {"filename": "krea2_turbo_lora_rank_64_bf16.safetensors", "scale": 1.0, "role": "accel"},
+            {"filename": "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", "scale": 0.6, "role": "kroma"}
+          ],
           "kroma": {"strength": 0.6, "file": "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors"},
+          "kroma_deprecated": true,
           "sampler": "res_2s", "sigma_schedule": "beta57", "shift": 1.15, "eta": 0.5,
           "injected_keywords": []
         }
@@ -121,10 +133,12 @@ struct PresetEffectiveRecipeTests {
         let resolved = try decoder.decode(ResolvedPreset.self, from: Data(json.utf8))
         #expect(resolved.checkpointFamily == "raw-accel")
         #expect(resolved.sigmaSchedule == "beta57")
+        #expect(resolved.kromaDeprecated == true)
 
         let recipe = PresetEffectiveRecipePresenter.compute(resolved: resolved, declared: Self.kreaKira)
         #expect(recipe.unresolved == nil)
-        #expect(recipe.loraStack.first?.role == "kroma")
+        // Todd 2026-09-04: declared loras[] order, not kroma-first.
+        #expect(recipe.loraStack.map(\.role) == ["accel", "kroma"])
         #expect(recipe.sigmaSchedule == "beta57")
     }
 

@@ -137,6 +137,14 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     public var invalid: Bool?
     public var invalidReason: String?
 
+    // Todd 2026-09-04: `kroma` is deprecated on the engine — a regular LoRA
+    // now, not an independent declaration. This marker (like `invalid`
+    // above) is read-only and never sent back; a non-nil `kroma` alongside
+    // `kromaDeprecated == true` means the engine is echoing a DERIVED view
+    // of a `loras[]` entry, for one release, not something this client can
+    // write back independently.
+    public var kromaDeprecated: Bool?
+
     public init(
         id: String = UUID().uuidString,
         name: String,
@@ -227,6 +235,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         case vae, checkpointFamily, kroma, sampler, sigmaSchedule, shift, eta, bongmath, stage2
         case bypass
         case invalid, invalidReason
+        case kromaDeprecated
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -314,6 +323,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         stage2 = try c.decodeIfPresent(ServerPresetStage.self, forKey: .stage2)
         invalid = try c.decodeIfPresent(Bool.self, forKey: .invalid)
         invalidReason = try c.decodeIfPresent(String.self, forKey: .invalidReason)
+        kromaDeprecated = try c.decodeIfPresent(Bool.self, forKey: .kromaDeprecated)
     }
 
     /// Map to the local apply-to-Generate shape.

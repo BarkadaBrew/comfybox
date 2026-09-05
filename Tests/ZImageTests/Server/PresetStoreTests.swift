@@ -204,9 +204,15 @@ final class PresetStoreTests: XCTestCase {
 
     try store.upsert(preset)
 
+    // Todd 2026-09-04: `kroma` is deprecated — `upsert` folds it into
+    // `loras[]` as a regular, role-tagged entry (`ImagePreset.
+    // migratingKromaDeprecation`), appended after the declared accel entry.
+    // The accel role must survive that migration unchanged.
+    let migratedKroma = LoraReference(
+      filename: "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors", scale: 0.6, role: "kroma")
     let reopened = PresetStore(path: path, seedDefaults: false)
-    XCTAssertEqual(reopened.get("krea-kira")?.loras, [r256])
-    XCTAssertEqual(try reopened.resolve("krea-kira").loras, [r256])
+    XCTAssertEqual(reopened.get("krea-kira")?.loras, [r256, migratedKroma])
+    XCTAssertEqual(try reopened.resolve("krea-kira").loras, [r256, migratedKroma])
 
     let root = try XCTUnwrap(
       JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any])
@@ -495,7 +501,15 @@ extension PresetStoreTests {
     let store = PresetStore(path: path, seedDefaults: false)
     try store.upsert(preset)
     let reopened = PresetStore(path: path, seedDefaults: false)
-    XCTAssertEqual(reopened.get("ref"), preset)
+    // Todd 2026-09-04: `upsert` migrates the structured `kroma` onto
+    // `loras[]` (`ImagePreset.migratingKromaDeprecation`) — the stored
+    // preset differs from the one passed in by exactly that fold, plus the
+    // now-true `kromaDeprecated` marker.
+    var migrated = preset
+    migrated.loras.append(LoraReference(
+      filename: "kroma-v0.2-base-lora-rank-384-fro-0985.safetensors", scale: 0.3, role: "kroma"))
+    migrated.kromaDeprecated = true
+    XCTAssertEqual(reopened.get("ref"), migrated)
     let resolved = try reopened.resolve("ref")
     XCTAssertEqual(resolved.checkpointFamily, "raw-accel")
     XCTAssertEqual(resolved.kroma, preset.kroma)
@@ -513,70 +527,51 @@ extension PresetStoreTests {
     XCTAssertNil(bareResolved.bongmath); XCTAssertNil(bareResolved.stage2)
   }
 
-  /// AC-44b (store half) + AC-44c — O4a is not a daemon-only rule. A
-  /// krea2-family image preset with no `kroma` is refused on save (naming
-  /// the preset and the field), is flagged `invalid` on load (logged, kept in
-  /// the list so nothing is silently dropped, un-resolvable), and a
-  /// `zimage-*` preset is untouched (D14).
-  func testKrea2ImagePresetRequiresKroma() throws {
+  /// Todd 2026-09-04: O4a (a krea2-family image preset must declare `kroma`)
+  /// is RETIRED — kroma is a regular LoRA now, not an independent
+  /// declaration, so its absence is exactly as legal as any other specific
+  /// adapter's absence. (Was: "AC-44b/AC-44c — a krea2-family preset with no
+  /// kroma is refused on save / flagged invalid on load".) The kroma FIELD's
+  /// own range checks (finite non-negative strength, non-empty file) still
+  /// apply when a client does send one — this is the compatibility shim,
+  /// not a green light for garbage.
+  func testKrea2ImagePresetNoLongerRequiresKroma() throws {
     let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
 
-    // Save: refused, naming preset + field.
-    let missing = ImagePreset(id: "krea-kira", name: "Kira", engine: "zimage", model: "krea2", steps: 12)
-    XCTAssertThrowsError(try store.upsert(missing)) { error in
-      guard case .validation(let message)? = error as? PresetStoreError else {
-        return XCTFail("expected .validation, got \(error)")
-      }
-      XCTAssertTrue(message.contains("krea-kira"), message)
-      XCTAssertTrue(message.contains("kroma"), message)
-    }
-    XCTAssertNil(store.get("krea-kira"), "a refused preset must not be stored")
-
-    // The family can be declared by `checkpointFamily` even when the model is a
-    // spec the alias table does not know.
-    var declared = missing
-    declared.id = "declared-raw"
-    declared.model = "some-custom-raw-install"
-    declared.checkpointFamily = "raw-stock"
-    XCTAssertThrowsError(try store.upsert(declared))
-
-    // The four turbo aliases and the declared-table specs all count as krea2.
-    for model in ["krea2", "krea-2", "krea-2-turbo", "krea/krea-2-turbo", "krea2-raw", "kroma-v0.2-turbo"] {
-      var p = missing; p.id = "m"; p.model = model
-      XCTAssertThrowsError(try store.upsert(p), "\(model) must require kroma")
-    }
-
-    // `{strength: 0}` validates (explicit zero is a declaration, not an absence).
-    var zero = missing
-    zero.kroma = KromaPolicy(strength: 0)
-    XCTAssertNoThrow(try store.upsert(zero))
-    XCTAssertEqual(store.get("krea-kira")?.kroma, KromaPolicy(strength: 0))
+    // A krea2-family preset with no `kroma` at all now saves cleanly.
+    let noKroma = ImagePreset(id: "krea-kira", name: "Kira", engine: "zimage", model: "krea2", steps: 12)
+    XCTAssertNoThrow(try store.upsert(noKroma))
     XCTAssertNil(store.validationError(for: "krea-kira"))
+    XCTAssertEqual(store.get("krea-kira")?.kroma, nil)
 
-    // A Z-Image preset (the five imported-cs-* entries) needs no kroma.
-    let zimage = ImagePreset(id: "imported-cs-neutral", name: "Neutral", mediaKind: "image",
-                             engine: "zimage", model: "Tongyi-MAI/Z-Image-Turbo-BF16", steps: 9, guidance: 3.5)
-    XCTAssertNoThrow(try store.upsert(zimage))
-    var zimageFamily = zimage; zimageFamily.id = "zf"; zimageFamily.checkpointFamily = "zimage-turbo"
-    XCTAssertNoThrow(try store.upsert(zimageFamily))
+    // Every family shape that used to be gated: turbo aliases, the
+    // declared-table specs, and an explicit `checkpointFamily` — all save.
+    for model in ["krea2", "krea-2", "krea-2-turbo", "krea/krea-2-turbo", "krea2-raw", "kroma-v0.2-turbo"] {
+      var p = noKroma; p.id = "m-\(model)"; p.model = model
+      XCTAssertNoThrow(try store.upsert(p), "\(model) no longer requires kroma")
+    }
+    var declaredFamily = noKroma
+    declaredFamily.id = "declared-raw"
+    declaredFamily.model = "some-custom-raw-install"
+    declaredFamily.checkpointFamily = "raw-stock"
+    XCTAssertNoThrow(try store.upsert(declaredFamily))
 
-    // A video preset is never subject to the rule.
-    XCTAssertNoThrow(try store.upsert(ImagePreset(id: "kira-video-neutral", name: "V", mediaKind: "video")))
-
-    // Kroma strength must be a finite, non-negative number; a declared file must be non-empty.
-    var nan = zero; nan.kroma = KromaPolicy(strength: .nan)
+    // Kroma strength must still be a finite, non-negative number; a declared
+    // file must still be non-empty — the FIELD's own validity, independent
+    // of whether it is required.
+    var nan = noKroma; nan.id = "nan"; nan.kroma = KromaPolicy(strength: .nan)
     XCTAssertThrowsError(try store.upsert(nan))
-    var negative = zero; negative.kroma = KromaPolicy(strength: -0.1)
+    var negative = noKroma; negative.id = "neg"; negative.kroma = KromaPolicy(strength: -0.1)
     XCTAssertThrowsError(try store.upsert(negative))
-    var emptyFile = zero; emptyFile.kroma = KromaPolicy(strength: 0.6, file: "  ")
+    var emptyFile = noKroma; emptyFile.id = "empty"; emptyFile.kroma = KromaPolicy(strength: 0.6, file: "  ")
     XCTAssertThrowsError(try store.upsert(emptyFile))
 
-    // Load: an invalid preset already on disk is flagged, not dropped, and cannot resolve.
+    // A preset already on disk in the old shape (krea2 family, no kroma) is
+    // no longer flagged invalid — it is exactly as valid as it looks.
     let path = try makeTempPath()
     let onDisk = """
     {"presets":[
-      {"id":"krea-film-apple","name":"Apple","engine":"zimage","model":"krea2","steps":8,
-       "loras":[{"filename":"kroma-v0.1.safetensors","scale":1.0}]},
+      {"id":"krea-film-apple","name":"Apple","engine":"zimage","model":"krea2","steps":8},
       {"id":"krea-bree","name":"Bree","engine":"zimage","model":"kroma-v0.2-turbo","kroma":{"strength":0}},
       {"id":"imported-cs-vector","name":"Vector","mediaKind":"image","engine":"zimage",
        "model":"Tongyi-MAI/Z-Image-Turbo-BF16","steps":16,"guidance":4.0}
@@ -585,38 +580,81 @@ extension PresetStoreTests {
     try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
     try Data(onDisk.utf8).write(to: path)
     let loaded = PresetStore(path: path, seedDefaults: false)
-    XCTAssertEqual(loaded.list().map(\.id), ["krea-film-apple", "krea-bree", "imported-cs-vector"],
-                   "an invalid entry stays in the list — flagged, never silently dropped")
-    let reason = try XCTUnwrap(loaded.validationError(for: "krea-film-apple"))
-    XCTAssertTrue(reason.contains("krea-film-apple"), reason)
-    XCTAssertTrue(reason.contains("kroma"), reason)
+    XCTAssertEqual(loaded.list().map(\.id), ["krea-film-apple", "krea-bree", "imported-cs-vector"])
+    XCTAssertNil(loaded.validationError(for: "krea-film-apple"))
     XCTAssertNil(loaded.validationError(for: "krea-bree"))
     XCTAssertNil(loaded.validationError(for: "imported-cs-vector"))
-    XCTAssertEqual(loaded.invalidPresetIds, ["krea-film-apple"])
-    // The listing the API serves carries the flag.
-    let listing = loaded.listing()
-    XCTAssertEqual(listing.map(\.invalid), [true, false, false])
-    XCTAssertEqual(listing[0].invalidReason, reason)
-    XCTAssertNil(listing[1].invalidReason)
-    // Nothing downstream can select it.
-    XCTAssertThrowsError(try loaded.resolve("krea-film-apple")) { error in
-      XCTAssertEqual(error as? PresetStoreError, .invalid(id: "krea-film-apple", reason: reason))
-    }
-    XCTAssertNoThrow(try loaded.resolve("krea-bree"))
-    // Fixing it through the store clears the flag (the desktop app's edit path).
-    var fixed = try XCTUnwrap(loaded.get("krea-film-apple"))
-    fixed.kroma = KromaPolicy(strength: 1.0, file: "kroma-v0.1.safetensors")
-    fixed.loras = fixed.loras.filter { !$0.filename.hasPrefix("kroma") }
-    try loaded.upsert(fixed)
-    XCTAssertNil(loaded.validationError(for: "krea-film-apple"))
     XCTAssertTrue(loaded.invalidPresetIds.isEmpty)
+    let listing = loaded.listing()
+    XCTAssertEqual(listing.map(\.invalid), [false, false, false])
     XCTAssertNoThrow(try loaded.resolve("krea-film-apple"))
-    // Deleting an invalid preset clears it as well.
-    try Data(onDisk.utf8).write(to: path)
-    let again = PresetStore(path: path, seedDefaults: false)
-    XCTAssertEqual(again.invalidPresetIds, ["krea-film-apple"])
-    try again.delete("krea-film-apple")
-    XCTAssertTrue(again.invalidPresetIds.isEmpty)
+    XCTAssertNoThrow(try loaded.resolve("krea-bree"))
+    // `krea-bree`'s `kroma: {strength: 0}` (an explicit "off") migrates to
+    // no loras entry and no derived view — there is nothing to be a LoRA of.
+    XCTAssertEqual(loaded.get("krea-bree")?.loras, [])
+    XCTAssertNil(loaded.get("krea-bree")?.kroma)
+    XCTAssertEqual(loaded.get("krea-bree")?.kromaDeprecated, false)
+  }
+
+  /// PR #365 review r1 → redirect (Todd 2026-09-04): the migration itself,
+  /// in isolation. A preset with ONLY a structured `kroma` (no matching
+  /// `loras[]` entry yet) migrates to exactly one `loras[]` entry.
+  func testMigrationFoldsStructuredKromaIntoExactlyOneLorasEntry() {
+    let preset = ImagePreset(
+      id: "only-structured", name: "x", model: "krea2-raw",
+      kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    let migrated = ImagePreset.migratingKromaDeprecation(preset)
+    XCTAssertEqual(migrated.loras, [
+      LoraReference(filename: "kroma-v0.3-base.safetensors", scale: 0.6, role: "kroma"),
+    ])
+    XCTAssertEqual(migrated.kroma, KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    XCTAssertTrue(migrated.kromaDeprecated)
+  }
+
+  /// A preset with BOTH a structured `kroma` AND an already-present matching
+  /// `loras[]` entry (the shape a client mid-migration, or an already-fixed
+  /// preset, would send) migrates to exactly ONE entry — no duplicate.
+  func testMigrationDoesNotDuplicateAnAlreadyPresentMirror() {
+    let preset = ImagePreset(
+      id: "already-mirrored", name: "x", model: "krea2-raw",
+      loras: [
+        LoraReference(filename: "krea2_turbo_distill_r256.safetensors", scale: 0.6, role: "accel"),
+        LoraReference(filename: "kroma-v0.3-base.safetensors", scale: 0.6, role: "kroma"),
+      ],
+      kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    let migrated = ImagePreset.migratingKromaDeprecation(preset)
+    XCTAssertEqual(migrated.loras.count, 2, "no duplicate kroma entry")
+    XCTAssertEqual(migrated.loras.filter { $0.filename == "kroma-v0.3-base.safetensors" }.count, 1)
+  }
+
+  /// Idempotent: migrating an already-migrated preset again is a no-op —
+  /// running it twice (once on load, once on the next save) must not drift.
+  func testMigrationIsIdempotent() {
+    let preset = ImagePreset(
+      id: "idempotent", name: "x", model: "krea2-raw",
+      kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    let once = ImagePreset.migratingKromaDeprecation(preset)
+    let twice = ImagePreset.migratingKromaDeprecation(once)
+    XCTAssertEqual(once, twice)
+  }
+
+  /// The derived `kroma` view round-trips: saved, reopened, and resolved, the
+  /// value is byte-identical to what a client that only ever reads `.kroma`
+  /// (never `loras[]`) would have seen before the deprecation.
+  func testDerivedKromaViewRoundTrips() throws {
+    let store = PresetStore(path: try makeTempPath(), seedDefaults: false)
+    let preset = ImagePreset(
+      id: "derived-view", name: "x", model: "krea2-raw",
+      kroma: KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    try store.upsert(preset)
+    let expected = KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors")
+    XCTAssertEqual(store.get("derived-view")?.kroma, expected)
+    XCTAssertEqual(try store.resolve("derived-view").kroma, expected)
+    // A second save (the desktop editor round-tripping the GET response
+    // verbatim) does not drift or duplicate.
+    try store.upsert(try XCTUnwrap(store.get("derived-view")))
+    XCTAssertEqual(store.get("derived-view")?.kroma, expected)
+    XCTAssertEqual(store.get("derived-view")?.loras.count, 1)
   }
 
   /// The recipe fields are validated with the same resolver `/v1/generate`
@@ -700,11 +738,11 @@ extension PresetStoreTests {
 
   /// Deploy-day evidence (FDD §7.3 ordering: E20 → presets.json edit → C3/C6).
   /// A COPY of the live store is loaded through the new per-entry decoder:
-  /// every entry is listed (none dropped), no video or Z-Image preset is
-  /// flagged, and anything flagged is a krea2-family image preset — before
-  /// the migration that is the eight Krea entries without `kroma`; after it,
-  /// nothing. The assertion holds on both sides of the migration.
-  func testLiveStoreLoadsWholeAndFlagsOnlyKrea2Presets() throws {
+  /// every entry is listed (none dropped). Todd 2026-09-04: O4a is retired,
+  /// so — unlike before — a krea2-family preset with no `kroma` is no longer
+  /// flagged; nothing in the live store is expected to be flagged for kroma
+  /// reasons any more, regardless of family.
+  func testLiveStoreLoadsWholeAndFlagsNothingForKroma() throws {
     let live = PresetStore.defaultPath()
     try XCTSkipUnless(FileManager.default.fileExists(atPath: live.path), "no live presets.json")
     let path = try makeTempPath()
@@ -719,17 +757,7 @@ extension PresetStoreTests {
 
     for preset in store.list() {
       let flagged = store.validationError(for: preset.id)
-      let krea2 = PresetStore.resolvesToKrea2Family(preset)
-      if preset.mediaKind == "video" || !krea2 {
-        XCTAssertNil(flagged, "\(preset.id) is not a krea2 image preset and must not be flagged: \(flagged ?? "")")
-      }
-      if let flagged {
-        XCTAssertTrue(krea2, "\(preset.id) flagged but not krea2-family: \(flagged)")
-        XCTAssertTrue(flagged.contains("kroma"), flagged)
-        XCTAssertNil(preset.kroma, "\(preset.id) declares kroma yet is flagged: \(flagged)")
-      } else if krea2, preset.mediaKind != "video" {
-        XCTAssertNotNil(preset.kroma, "\(preset.id) is krea2-family, unflagged, yet declares no kroma")
-      }
+      XCTAssertFalse(flagged?.contains("kroma") ?? false, "\(preset.id) flagged for kroma — O4a is retired: \(flagged ?? "")")
     }
   }
 }

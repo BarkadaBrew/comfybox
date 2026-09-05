@@ -148,9 +148,46 @@ same optional `role`:
 }
 ```
 
-For Krea-2 presets, Kroma belongs in the structured `kroma` object and must
-not be duplicated in `loras[]`. See
-[Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md).
+### Kroma is a regular LoRA (structured `kroma` is DEPRECATED, 2026-09-04)
+
+Todd reversed the #276/#350-era design: kroma has no special engine
+semantics anywhere. `PresetLoRAStack.decide` (the `POST /v1/generate
+{"preset": id}` expansion) applies a preset's `loras[]` exactly as declared,
+in order — no prepend, no strip, no reordering for a `role: "kroma"` entry.
+Declare kroma the same way as any other adapter:
+
+```json
+{
+  "loras": [
+    {
+      "filename": "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
+      "scale": 0.6,
+      "role": "kroma"
+    }
+  ]
+}
+```
+
+**One-release compatibility shim.** The structured `kroma` object
+(`{"kroma": {"strength": <number>, "file": <optional>}}`) still decodes on
+`PUT /v1/presets`, but `PresetStore` migrates it on every load and save
+(`ImagePreset.migratingKromaDeprecation`): a declared `kroma` with an
+explicit, non-empty `file` folds into `loras[]` as a `role: "kroma"` entry
+(idempotently — a matching entry already present is never duplicated), and
+the structured field itself becomes a DERIVED, read-only echo of that
+`loras[]` entry, never an independent value a client can set. A `kroma`
+with no `file` (the old "engine-default file" case) has nothing concrete to
+become a LoRA of — it migrates to nothing, and the echo is `nil`. Every
+response that carries a non-nil `kroma` also carries an additive
+`"kroma_deprecated": true` marker. The krea2-family "a preset must declare
+kroma" validation rule (O4a) is retired along with this — its absence is as
+legal as any other adapter's.
+
+Existing consumers that read `.kroma` (the daemon, the desktop app) keep
+working unmodified during the compatibility window; new code should read
+`loras[]` and stop relying on the structured field. See
+[Krea-2 Raw + r256 preset stack](methods/krea2-r256-preset-stack.md) (some
+of that document's structured-kroma framing predates this reversal).
 
 ## Gallery output filenames
 

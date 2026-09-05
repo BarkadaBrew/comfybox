@@ -126,18 +126,8 @@ struct GenerationView: View {
 
     // LoRA selections
     @State private var selectedLoras: [LoRASelection] = []
-    /// Kroma remains a first-class preset field, but Generate composes it into
-    /// the live swap payload with role `kroma` so this dial controls the next
-    /// render without creating an invalid duplicate `loras[]` preset row.
-    @State private var kromaPolicy: PresetKroma?
     /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
     @SceneStorage("gen.lorasJSON") private var lorasJSON: String = ""
-
-    private var currentModelIsKrea2: Bool {
-        [engine.currentModelFamily, engine.currentModel]
-            .compactMap { $0?.lowercased() }
-            .contains { $0.contains("krea2") || $0.contains("krea-2") }
-    }
 
     private var samplingModelFamily: String? {
         engine.currentModelFamily ?? engine.currentModel
@@ -152,37 +142,6 @@ struct GenerationView: View {
         ) else { return nil }
         let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "the active model"
         return "Sampler '\(sampler.isEmpty ? "Model Default" : sampler)' and scheduler '\(sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)' are not supported together by \(family)."
-    }
-
-    /// Runtime stack for the next render. The persisted preset keeps Kroma in
-    /// `kroma`; the swap wire represents that same slot as a role-tagged entry.
-    /// Filtering first protects older scene state from reintroducing a second,
-    /// untagged copy of the same file.
-    private var generationLoras: [LoRASelection] {
-        var stack = PresetKromaSync.strippingKromaMirror(
-            from: selectedLoras, kromaFile: kromaPolicy?.file,
-            role: { $0.role }, filename: { $0.filename }
-        )
-        guard let policy = kromaPolicy,
-              let file = policy.file?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !file.isEmpty else { return stack }
-        let catalogID = engine.availableLoras.first(where: { $0.filename == file })?.id
-        stack.append(LoRASelection(
-            id: catalogID ?? "structured-kroma:\(file)",
-            filename: file,
-            scale: Float(min(max(policy.strength, 0), 1.5)),
-            role: "kroma"
-        ))
-        return stack
-    }
-
-    private var kromaRenderValidationError: String? {
-        guard let policy = kromaPolicy, policy.strength > 0 else { return nil }
-        guard let file = policy.file?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !file.isEmpty else {
-            return "This preset uses an engine-default Kroma file. Choose an explicit Kroma file in Presets before adjusting it from Generate."
-        }
-        return nil
     }
 
     // Sidebar sections
@@ -314,9 +273,10 @@ struct GenerationView: View {
                 onSave: { name, editedNegative in
                     // Save to the canonical server preset store (shared with
                     // Bree/Telegram), not the old device-local list.
-                    let savedKroma = kromaPolicy.map {
-                        ServerPresetKroma(strength: min(max($0.strength, 0), 1.5), file: $0.file)
-                    } ?? (currentModelIsKrea2 ? ServerPresetKroma(strength: 0) : nil)
+                    // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` is
+                    // the single source; no separate structured field to
+                    // compose here (the server's `kroma` is a deprecated,
+                    // derived, read-only echo it recomputes on save).
                     let preset = ServerPreset(
                         name: name,
                         prompt: prompt.isEmpty ? nil : prompt,
@@ -330,10 +290,7 @@ struct GenerationView: View {
                         c2: c2 == 0.5 ? nil : c2,
                         width: effectiveWidth,
                         height: effectiveHeight,
-                        loras: PresetKromaSync.strippingKromaMirror(
-                            from: selectedLoras, kromaFile: kromaPolicy?.file,
-                            role: { $0.role }, filename: { $0.filename }
-                        ).map {
+                        loras: selectedLoras.map {
                             ServerPresetLora(
                                 filename: $0.filename,
                                 scale: Double($0.scale),
@@ -344,7 +301,6 @@ struct GenerationView: View {
                         // preset consumers while the structured fields remain
                         // the authoritative Krea 2 recipe.
                         scheduler: sampler.isEmpty ? nil : sampler,
-                        kroma: savedKroma,
                         sampler: sampler.isEmpty ? nil : sampler,
                         sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule
                     )
@@ -918,39 +874,6 @@ struct GenerationView: View {
             )
             .disabled(backend != .local)
 
-            // Kroma is structured recipe state, not an ordinary LoRA row.
-            if kromaPolicy != nil {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        NumericSliderField(
-                            label: "Kroma",
-                            value: Binding(
-                                get: { kromaPolicy?.strength ?? 0 },
-                                set: { value in
-                                    guard var policy = kromaPolicy else { return }
-                                    policy.strength = min(max(value, 0), 1.5)
-                                    kromaPolicy = policy
-                                }
-                            ),
-                            range: 0...1.5,
-                            step: 0.05,
-                            fractionDigits: 2
-                        )
-                        Text("Recipe")
-                            .font(.caption2)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.accentColor.opacity(0.15), in: Capsule())
-                    }
-                    Text(kromaPolicy?.file ?? "Engine-default Kroma file")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .help("Adjusts the structured Kroma adapter for the next render; it is not saved as a duplicate generic LoRA.")
-            }
-
             // Seed field
             VStack(alignment: .leading, spacing: 4) {
                 Text("Seed (empty = random)")
@@ -1244,10 +1167,6 @@ struct GenerationView: View {
     // MARK: - Actions
 
     private func submitGeneration() {
-        if let error = kromaRenderValidationError {
-            engine.lastError = error
-            return
-        }
         if let error = samplingValidationError {
             engine.lastError = error
             return
@@ -1277,7 +1196,7 @@ struct GenerationView: View {
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
             modelId: engine.currentModel,
-            loras: generationLoras,
+            loras: selectedLoras,
             initImagePath: referenceImagePath,
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
             dype: dype == "none" ? nil : dype
@@ -1301,10 +1220,6 @@ struct GenerationView: View {
     /// through the same server queue as Generate; still results land in the
     /// Gallery/Compare tab via onGenerated/onBatchComplete.
     private func queueVariant() {
-        if let error = kromaRenderValidationError {
-            engine.lastError = error
-            return
-        }
         if let error = samplingValidationError {
             engine.lastError = error
             return
@@ -1334,7 +1249,7 @@ struct GenerationView: View {
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
             modelId: engine.currentModel,
-            loras: generationLoras,
+            loras: selectedLoras,
             initImagePath: referenceImagePath,
             imageStrength: referenceImagePath != nil ? Float(imageStrength) : nil,
             dype: dype == "none" ? nil : dype
@@ -1862,7 +1777,6 @@ struct GenerationView: View {
         c2 = Double(preset.c2 ?? 0.5)
         sampler = preset.sampler ?? ""
         sigmaSchedule = preset.sigmaSchedule ?? ""
-        kromaPolicy = preset.kroma
 
         // Find a matching resolution preset, else carry the preset's exact
         // dimensions through the custom fields.
@@ -1882,10 +1796,9 @@ struct GenerationView: View {
         // actual library id by filename; the picker's "selected" check keys
         // on id, and a mismatched id silently fails to show the checkmark
         // even though generation itself would still use the right file.
-        selectedLoras = PresetKromaSync.strippingKromaMirror(
-            from: preset.loras, kromaFile: preset.kroma?.file,
-            role: { $0.role }, filename: { $0.filename }
-        ).map { presetLora in
+        // Todd 2026-09-04: kroma is a regular LoRA — `preset.loras` is shown
+        // verbatim, no special-casing of any row by role or filename.
+        selectedLoras = preset.loras.map { presetLora in
             if let match = engine.availableLoras.first(where: { $0.filename == presetLora.filename }) {
                 return LoRASelection(
                     id: match.id,

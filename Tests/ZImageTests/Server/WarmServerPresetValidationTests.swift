@@ -2,12 +2,17 @@ import XCTest
 
 @testable import ZImage
 
-/// WP-E20 (FDD §3.15, AC-44b, AC-44c) — O4a on the engine's own HTTP surface,
-/// so the desktop app, the Krita bridge and MCP callers (all of which read
-/// this preset store) cannot save or select a krea2 image preset that does
-/// not declare its kroma strength. The route handlers are thin wrappers over
-/// the static functions exercised here (`WarmServer.upsertPreset`,
-/// `presetsList`, `resolvePreset`), which take the store explicitly.
+/// WP-E20 (FDD §3.15, AC-44b, AC-44c) — the engine's own HTTP surface for
+/// preset save/list/resolve, so the desktop app, the Krita bridge and MCP
+/// callers (all of which read this preset store) see consistent behavior.
+/// The route handlers are thin wrappers over the static functions exercised
+/// here (`WarmServer.upsertPreset`, `presetsList`, `resolvePreset`), which
+/// take the store explicitly.
+///
+/// Todd 2026-09-04: O4a (a krea2-family image preset must declare `kroma`)
+/// is RETIRED — kroma is a regular LoRA, not an independent declaration —
+/// so several tests below assert the OPPOSITE of what they used to: saving
+/// and resolving now succeed where they used to 400/flag-invalid.
 final class WarmServerPresetValidationTests: XCTestCase {
 
   private func makeStore() throws -> PresetStore {
@@ -30,35 +35,42 @@ final class WarmServerPresetValidationTests: XCTestCase {
     try XCTUnwrap(try JSONSerialization.jsonObject(with: r.body) as? [[String: Any]])
   }
 
-  /// AC-44b: `PUT /v1/presets` with a krea2-family image preset lacking
-  /// `kroma` is a 400 naming the preset and the field; nothing is stored.
-  func testPutKrea2PresetWithoutKromaIs400NamingPresetAndField() throws {
+  /// A krea2-family image preset with no structured `kroma` at all now
+  /// saves (200) — O4a is retired. Its `loras[]` (a generic, undeclared-role
+  /// "kroma-lora" row) is left completely alone: nothing migrates or
+  /// reinterprets a plain LoRA just because its filename contains "kroma".
+  func testPutKrea2PresetWithoutKromaFieldSaves() throws {
     let store = try makeStore()
     let payload = Data(#"""
     {"id":"krea-kira","name":"Kira","engine":"zimage","model":"krea2","steps":12,"guidance":1,
      "loras":[{"filename":"kroma-lora-v0.3.safetensors","scale":0.6}]}
     """#.utf8)
     let response = try http(WarmServer.upsertPreset(store: store, body: payload).0)
-    XCTAssertEqual(response.status, 400)
-    let text = body(response)
-    XCTAssertTrue(text.contains("krea-kira"), text)
-    XCTAssertTrue(text.contains("kroma"), text)
-    XCTAssertNil(store.get("krea-kira"))
-    XCTAssertTrue(store.list().isEmpty)
+    XCTAssertEqual(response.status, 200, body(response))
+    let stored = try XCTUnwrap(store.get("krea-kira"))
+    XCTAssertNil(stored.kroma)
+    XCTAssertEqual(stored.loras, [LoraReference(filename: "kroma-lora-v0.3.safetensors", scale: 0.6)])
   }
 
-  /// AC-44b: the same preset WITH a declared kroma saves (200), and a
-  /// `zimage-*` preset without one is accepted (D14).
-  func testPutDeclaredKromaAndZImagePresetsAreAccepted() throws {
+  /// A structured `kroma` with an explicit FILE migrates into `loras[]` as a
+  /// regular, role-tagged entry and is echoed back as a derived view
+  /// (`kromaDeprecated: true`). A `zimage-*` preset needs no kroma at all
+  /// (unaffected by any of this, D14).
+  func testDeclaredKromaMigratesAndZImagePresetsAreUnaffected() throws {
     let store = try makeStore()
     let krea = Data(#"""
     {"id":"krea-kira","name":"Kira","engine":"zimage","model":"krea2","checkpoint_family":"turbo",
-     "kroma":{"strength":0.6},"steps":12,"guidance":1}
+     "kroma":{"strength":0.6,"file":"kroma-v0.3-base.safetensors"},"steps":12,"guidance":1}
     """#.utf8)
     let kreaResponse = try http(WarmServer.upsertPreset(store: store, body: krea).0)
     XCTAssertEqual(kreaResponse.status, 200, body(kreaResponse))
-    XCTAssertEqual(store.get("krea-kira")?.kroma, KromaPolicy(strength: 0.6))
-    XCTAssertEqual(store.get("krea-kira")?.checkpointFamily, "turbo")
+    let stored = try XCTUnwrap(store.get("krea-kira"))
+    XCTAssertEqual(stored.checkpointFamily, "turbo")
+    XCTAssertEqual(stored.kroma, KromaPolicy(strength: 0.6, file: "kroma-v0.3-base.safetensors"))
+    XCTAssertTrue(stored.kromaDeprecated)
+    XCTAssertEqual(stored.loras, [
+      LoraReference(filename: "kroma-v0.3-base.safetensors", scale: 0.6, role: "kroma"),
+    ])
 
     let zimage = Data(#"""
     {"id":"imported-cs-neutral","name":"Neutral","media_kind":"image","engine":"zimage",
@@ -67,6 +79,23 @@ final class WarmServerPresetValidationTests: XCTestCase {
     let zimageResponse = try http(WarmServer.upsertPreset(store: store, body: zimage).0)
     XCTAssertEqual(zimageResponse.status, 200, body(zimageResponse))
     XCTAssertNil(store.get("imported-cs-neutral")?.kroma)
+  }
+
+  /// A structured `kroma` with no file (the old "engine-default file" case)
+  /// has nothing concrete to become a LoRA of — it migrates to nothing, and
+  /// the derived view is nil. This is the one real loss the deprecation
+  /// accepts: there is no such thing as a filename-less regular LoRA.
+  func testDeclaredKromaWithNoFileMigratesToNothing() throws {
+    let store = try makeStore()
+    let payload = Data(#"""
+    {"id":"krea-kira","name":"Kira","engine":"zimage","model":"krea2","kroma":{"strength":0.6}}
+    """#.utf8)
+    let response = try http(WarmServer.upsertPreset(store: store, body: payload).0)
+    XCTAssertEqual(response.status, 200, body(response))
+    let stored = try XCTUnwrap(store.get("krea-kira"))
+    XCTAssertNil(stored.kroma)
+    XCTAssertFalse(stored.kromaDeprecated)
+    XCTAssertEqual(stored.loras, [])
   }
 
   /// The recipe-name resolver the generate path uses guards the preset too:
@@ -102,18 +131,19 @@ final class WarmServerPresetValidationTests: XCTestCase {
     XCTAssertEqual(json["c2"] as? Double, 0.4)
   }
 
-  /// AC-44c: an invalid preset already on disk is served by `GET /v1/presets`
-  /// with `invalid: true` and the reason, beside valid entries carrying
-  /// `invalid: false` — so a client can show it and refuse to select it.
-  func testListFlagsInvalidPresetOnDisk() throws {
+  /// Todd 2026-09-04: `GET /v1/presets` no longer flags ANY of these entries
+  /// invalid — O4a (the reason this fixture used to trip on "krea-film-apple")
+  /// is retired. `invalid: false` across the board, and every entry resolves.
+  /// (Was: "AC-44c — an invalid preset already on disk is served ... with
+  /// invalid: true and the reason".)
+  func testListFlagsNothingInvalidForKromaOnDisk() throws {
     let dir = FileManager.default.temporaryDirectory
       .appendingPathComponent("comfybox-preset-route-tests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     let path = dir.appendingPathComponent("presets.json")
     try Data("""
     {"presets":[
-      {"id":"krea-film-apple","name":"Apple","engine":"zimage","model":"krea2","steps":8,
-       "loras":[{"filename":"kroma-v0.1.safetensors","scale":1.0}]},
+      {"id":"krea-film-apple","name":"Apple","engine":"zimage","model":"krea2","steps":8},
       {"id":"krea2-base","name":"Base","engine":"zimage","model":"kroma-v0.2-turbo","kroma":{"strength":0}},
       {"id":"imported-cs-control","name":"Control","mediaKind":"image","engine":"zimage","model":"z-image-turbo-bf16"}
     ]}
@@ -124,21 +154,18 @@ final class WarmServerPresetValidationTests: XCTestCase {
     XCTAssertEqual(response.status, 200)
     let entries = try jsonArray(response)
     XCTAssertEqual(entries.map { $0["id"] as? String }, ["krea-film-apple", "krea2-base", "imported-cs-control"])
-    XCTAssertEqual(entries[0]["invalid"] as? Bool, true)
-    let reason = try XCTUnwrap(entries[0]["invalid_reason"] as? String)
-    XCTAssertTrue(reason.contains("kroma"), reason)
-    XCTAssertEqual(entries[1]["invalid"] as? Bool, false)
-    XCTAssertNil(entries[1]["invalid_reason"])
-    XCTAssertEqual(entries[2]["invalid"] as? Bool, false)
+    XCTAssertEqual(entries.map { $0["invalid"] as? Bool }, [false, false, false])
+    XCTAssertNil(entries[0]["invalid_reason"])
+    // `kroma: {strength: 0}` migrates to no loras entry and no derived view —
+    // the key is absent, not merely zeroed.
+    XCTAssertNil(entries[1]["kroma"])
     // The preset's own fields are still there beside the flag (flat, not nested).
     XCTAssertEqual(entries[0]["model"] as? String, "krea2")
-    XCTAssertEqual((entries[1]["kroma"] as? [String: Any])?["strength"] as? Double, 0)
 
-    // And `POST /v1/presets/resolve` on the flagged one is a 400 naming it.
-    let resolve = try http(WarmServer.resolvePreset(store: store, body: Data(#"{"id":"krea-film-apple"}"#.utf8)))
-    XCTAssertEqual(resolve.status, 400)
-    XCTAssertTrue(body(resolve).contains("krea-film-apple"), body(resolve))
-    let resolveOK = try http(WarmServer.resolvePreset(store: store, body: Data(#"{"id":"krea2-base"}"#.utf8)))
-    XCTAssertEqual(resolveOK.status, 200, body(resolveOK))
+    // Every entry resolves now — none is refused.
+    for id in ["krea-film-apple", "krea2-base", "imported-cs-control"] {
+      let resolve = try http(WarmServer.resolvePreset(store: store, body: Data(#"{"id":"\#(id)"}"#.utf8)))
+      XCTAssertEqual(resolve.status, 200, "\(id): \(body(resolve))")
+    }
   }
 }

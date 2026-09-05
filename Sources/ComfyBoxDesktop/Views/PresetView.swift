@@ -352,10 +352,6 @@ private struct ServerPresetEditor: View {
     @State private var heightText: String
     @State private var stepsText: String
     @State private var guidanceText: String
-    /// Kroma is a first-class recipe field, never a generic `loras[]` row.
-    /// Keep it visible beside the additional LoRAs while saving edits back to
-    /// `kroma.strength`, which is the engine's single source of truth.
-    @State private var kromaStrength: Double
     @State private var editableLoras: [EditableLora]
     @State private var sampler: String
     @State private var sigmaSchedule: String
@@ -379,16 +375,10 @@ private struct ServerPresetEditor: View {
         _heightText = State(initialValue: original.height.map(String.init) ?? "")
         _stepsText = State(initialValue: original.steps.map(String.init) ?? "")
         _guidanceText = State(initialValue: original.guidance.map { String(format: "%g", $0) } ?? "")
-        _kromaStrength = State(initialValue: original.kroma?.strength ?? 0)
-        // #276: match GenerationView's role-OR-filename test (PresetKromaSync),
-        // not filename alone — a filename-only test is vacuously true whenever
-        // `kroma.file` is nil (the legitimate "off" or "engine-default file"
-        // case), so a legacy `role: "kroma"` duplicate in `loras[]` used to
-        // survive being opened here.
-        _editableLoras = State(initialValue: PresetKromaSync.strippingKromaMirror(
-            from: original.loras, kromaFile: original.kroma?.file,
-            role: { $0.role }, filename: { $0.filename }
-        ).map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
+        // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` is the single
+        // source the editor shows, verbatim, no special-casing.
+        _editableLoras = State(initialValue: original.loras
+            .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
         _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
     }
@@ -442,9 +432,6 @@ private struct ServerPresetEditor: View {
                     )
                 }
                 Section("LoRAs") {
-                    if original.kroma != nil {
-                        structuredKromaRow
-                    }
                     loraRows
                     addLoraMenu
                     presetLoraKeywordsRow
@@ -561,46 +548,13 @@ private struct ServerPresetEditor: View {
 
     // MARK: - LoRA editing
 
-    /// Kroma looks and behaves like an adjustable LoRA in the editor, but it
-    /// writes the structured recipe field. Showing it here avoids the tempting
-    /// (and invalid) workaround of also adding its file to `loras[]`.
-    @ViewBuilder
-    private var structuredKromaRow: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Text("Kroma")
-                    Text("Recipe")
-                        .font(.caption2)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color.accentColor.opacity(0.15), in: Capsule())
-                }
-                .frame(minWidth: 120, maxWidth: 180, alignment: .leading)
-                Slider(value: $kromaStrength, in: 0...1.5, step: 0.05)
-                TextField("", value: Binding(
-                    get: { kromaStrength },
-                    set: { kromaStrength = min(max($0, 0), 1.5) }
-                ), format: .number.precision(.fractionLength(0...2)))
-                    .font(.system(.caption, design: .monospaced))
-                    .multilineTextAlignment(.trailing)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 52)
-            }
-            Text(original.kroma?.file ?? "Engine-default Kroma file")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help("Saved as kroma.strength; this file is excluded from the generic LoRA stack.")
-        }
-    }
-
     /// One row per selected LoRA: name, scale slider, numeric value, remove.
+    /// Todd 2026-09-04: kroma is a regular LoRA — it shows here like any
+    /// other row, with whatever role (or none) it was declared with.
     @ViewBuilder
     private var loraRows: some View {
         if editableLoras.isEmpty {
-            Text(original.kroma == nil ? "No LoRAs — add one below." : "No additional LoRAs — add one below.")
+            Text("No LoRAs — add one below.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         ForEach($editableLoras) { $lora in
@@ -657,12 +611,10 @@ private struct ServerPresetEditor: View {
     @ViewBuilder
     private var addLoraMenu: some View {
         let added = Set(editableLoras.map(\.filename))
-        let structuredKromaFile = original.kroma?.file
         let candidates = availableLoras
             .filter {
                 !$0.quarantined
                     && !added.contains($0.filename)
-                    && $0.filename != structuredKromaFile
             }
             .sorted { $0.filename.localizedCaseInsensitiveCompare($1.filename) == .orderedAscending }
         Menu {
@@ -762,19 +714,13 @@ private struct ServerPresetEditor: View {
         // Keep the legacy sampler spelling synchronized for older preset
         // consumers; modern engine validation and Generate use `sampler`.
         p.scheduler = p.sampler
-        if var kroma = p.kroma {
-            kroma.strength = min(max(kromaStrength, 0), 1.5)
-            p.kroma = kroma
-        }
-        // #276: PresetKromaSync.isKromaMirror, not a bare filename check — see
-        // its doc comment for why a filename-only test let a legacy `role:
-        // "kroma"` duplicate survive whenever `kroma.file` is nil.
-        p.loras = PresetKromaSync.strippingKromaMirror(
-            from: editableLoras.filter { !$0.filename.isEmpty },
-            kromaFile: p.kroma?.file, role: { $0.role }, filename: { $0.filename }
-        ).map {
-            ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role)
-        }
+        // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` (editableLoras)
+        // is the single source; `p.kroma` passes through untouched, like
+        // `bypass`/`upscale`. The server normalises it on save (it is a
+        // deprecated, derived, read-only compatibility echo).
+        p.loras = editableLoras
+            .filter { !$0.filename.isEmpty }
+            .map { ServerPresetLora(filename: $0.filename, scale: $0.scale, role: $0.role) }
         return p
     }
 

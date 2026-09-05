@@ -72,15 +72,19 @@ final class GeneratePresetRouteTests: XCTestCase {
 
     let payload = try expand(#"{"prompt":"a portrait","preset":"krea-kira"}"#, store: store)
 
+    // Todd 2026-09-04: kroma has no special semantics — `decide` applies
+    // `loras[]` exactly as `seedKreaKira`'s `store.upsert` migrated it:
+    // the two declared entries, THEN the structured kroma folded on at the
+    // end (`ImagePreset.migratingKromaDeprecation` appends, never prepends).
     let loras = try XCTUnwrap(payload.loras)
     XCTAssertEqual(loras.map(\.path), [
-      "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
       "krea2_turbo_distill_r256.safetensors",
       "RealisticSnapshotKrea2.safetensors",
+      "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
     ])
-    XCTAssertEqual(loras.map { $0.scale ?? -1 }, [0.6, 0.6, 0.4])
-    XCTAssertEqual(loras.first?.role, "kroma")
-    XCTAssertEqual(loras[1].role, "accel")
+    XCTAssertEqual(loras.map { $0.scale ?? -1 }, [0.6, 0.4, 0.6])
+    XCTAssertEqual(loras[0].role, "accel")
+    XCTAssertEqual(loras[2].role, "kroma")
     // C1: the preset's base travels with its adapters.
     XCTAssertEqual(payload.model, "krea2-raw")
     XCTAssertNil(payload.presetUnresolved)
@@ -104,7 +108,10 @@ final class GeneratePresetRouteTests: XCTestCase {
         match?.scale, Float(reference.scale),
         "resolve reported \(reference.filename)@\(reference.scale); the route disagrees")
     }
-    XCTAssertEqual(applied.count, resolved.loras.count + 1, "plus the structured kroma")
+    // Todd 2026-09-04: `resolve()` already reflects the migrated stack (the
+    // structured kroma is folded into `loras[]` on save) — no separate
+    // prepend at the route, so the counts now agree exactly.
+    XCTAssertEqual(applied.count, resolved.loras.count)
     XCTAssertEqual(payload.model, resolved.model)
   }
 
@@ -143,11 +150,14 @@ final class GeneratePresetRouteTests: XCTestCase {
   func testPresetPlusMatchingExplicitLorasRaisesNoFlag() throws {
     let store = try makeStore()
     try seedKreaKira(store)
+    // Todd 2026-09-04: order must match the migrated declared order —
+    // turbo, snapshot, THEN kroma appended (no prepend) — `isSameStack`
+    // compares positionally.
     let payload = try expand(#"""
       {"prompt":"x","preset":"krea-kira","loras":[
-        {"path":"/Volumes/Bolt/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors","scale":0.6},
         {"path":"/Volumes/Bolt/loras/krea2_turbo_distill_r256.safetensors","scale":0.6},
-        {"path":"/Volumes/Bolt/loras/RealisticSnapshotKrea2.safetensors","scale":0.4}]}
+        {"path":"/Volumes/Bolt/loras/RealisticSnapshotKrea2.safetensors","scale":0.4},
+        {"path":"/Volumes/Bolt/loras/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors","scale":0.6}]}
       """#, store: store)
     XCTAssertNil(payload.presetStackMismatch, "same adapters by name and scale — no disagreement")
   }
@@ -227,8 +237,10 @@ final class GeneratePresetRouteTests: XCTestCase {
       return entries.map { LoRAEntry(path: "/nearline/\($0.path)", scale: $0.scale, role: $0.role) }
     }
     XCTAssertEqual(staged.count, 3, "the whole expanded stack is offered for staging")
-    XCTAssertEqual(payload.loras?.map(\.path).first, "/nearline/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
-    XCTAssertEqual(payload.loras?.first?.role, "kroma", "staging must not drop the slot")
+    // Todd 2026-09-04: kroma is appended (migrated), not prepended, so it is
+    // the LAST entry of the declared+migrated stack, not the first.
+    XCTAssertEqual(payload.loras?.map(\.path).last, "/nearline/kroma-v0.3-base-lora-rank-384-fro-0985.safetensors")
+    XCTAssertEqual(payload.loras?.last?.role, "kroma", "staging must not drop the slot")
   }
 
   func testNearlineStagingIsNotConsultedWhenNothingWasExpanded() throws {
@@ -270,9 +282,9 @@ final class GeneratePresetRouteTests: XCTestCase {
     let replayed = try WarmServer.decodedGeneratePayload(
       from: persisted, store: store, configuration: configuration, loraExists: { _ in true })
     XCTAssertEqual(replayed.loras?.map(\.path), [
-      "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
       "krea2_turbo_distill_r256.safetensors",
       "RealisticSnapshotKrea2.safetensors",
+      "kroma-v0.3-base-lora-rank-384-fro-0985.safetensors",
     ], "the replay must repeat the ACCEPTED stack, not re-resolve the edited preset")
     XCTAssertEqual(replayed.presetStackMismatch, true, "and it says the preset has since diverged")
   }
