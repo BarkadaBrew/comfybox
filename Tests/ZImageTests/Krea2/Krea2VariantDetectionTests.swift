@@ -240,6 +240,47 @@ final class Krea2VariantDetectionTests: XCTestCase {
     }
   }
 
+  // MARK: comfybox#359 — detectVariant (GET /v1/model/family), no HF fallback
+
+  func testDetectVariantResolvesTurboAliasesWithoutTouchingTheTable() {
+    for alias in ["krea2", "krea-2", "krea-2-turbo", "krea/krea-2-turbo", "Krea2"] {
+      XCTAssertEqual(Krea2ModelDetection.detectVariant(spec: alias, specDirectories: [:]), .turbo, alias)
+    }
+  }
+
+  func testDetectVariantResolvesADeclaredAliasFromItsDirectoryContents() throws {
+    let rawRoot = try makeRoot("detect-alias-raw", transformers: ["raw.safetensors"])
+    let table = ["krea2-raw": rawRoot.path]
+    XCTAssertEqual(Krea2ModelDetection.detectVariant(spec: "krea2-raw", specDirectories: table), .raw)
+    XCTAssertEqual(Krea2ModelDetection.detectVariant(spec: "KREA2-RAW", specDirectories: table), .raw,
+      "case-insensitive, like specDirectory")
+
+    let turboRoot = try makeRoot("detect-alias-turbo", transformers: ["turbo.safetensors"])
+    let kromaTable = ["kroma-v0.2-turbo": turboRoot.path]
+    XCTAssertEqual(Krea2ModelDetection.detectVariant(spec: "kroma-v0.2-turbo", specDirectories: kromaTable), .turbo)
+  }
+
+  func testDetectVariantResolvesAnExplicitExistingPath() throws {
+    let root = try makeRoot("detect-explicit-raw", transformers: ["raw.safetensors"])
+    // Not in the table at all — an on-disk path is detected from its own
+    // contents, exactly like `resolve(spec:)`'s first branch.
+    XCTAssertEqual(Krea2ModelDetection.detectVariant(spec: root.path, specDirectories: [:]), .raw)
+  }
+
+  func testDetectVariantIsNilForAnUnmappedAliasOrUndetectableDirectory() throws {
+    // An alias with no table entry never falls through to the HF snapshot
+    // (there is no snapshot parameter here at all) — it is simply unknown.
+    XCTAssertNil(Krea2ModelDetection.detectVariant(spec: "krea-2-ultra", specDirectories: [:]))
+    XCTAssertNil(Krea2ModelDetection.detectVariant(spec: "z-image-turbo", specDirectories: [:]))
+
+    // An existing directory with no recognisable DiT is not a silent Turbo —
+    // it is nil, same fail-closed posture as `detect(at:)` throwing.
+    let empty = try makeRoot("detect-no-dit", transformers: [])
+    XCTAssertNil(Krea2ModelDetection.detectVariant(spec: empty.path, specDirectories: [:]))
+
+    XCTAssertNil(Krea2ModelDetection.detectVariant(spec: "/nonexistent/path", specDirectories: [:]))
+  }
+
   func testDefaultSpecDirectoryTableCoversRawAndKroma() {
     // The single table WarmServer.parseModelSpec consults (no second table).
     let raw = Krea2ModelDetection.specDirectory("krea2-raw")

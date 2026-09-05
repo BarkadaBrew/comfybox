@@ -56,6 +56,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | POST | `/v1/loras/{id}/update` | update_lora_triggerwords |  |
 | GET | `/v1/memory` |  |  |
 | POST | `/v1/model/activate` | set_warm_preset, switch_model |  |
+| GET | `/v1/model/family` |  |  |
 | POST | `/v1/model/load` | load_model, set_warm_preset |  |
 | GET | `/v1/model/pool` |  |  |
 | POST | `/v1/model/unload` | unload_model |  |

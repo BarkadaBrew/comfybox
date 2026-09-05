@@ -179,6 +179,9 @@ enum ControlPlaneClassifier {
          // QueueLifecycleLedger.swift's C1 fix), so it is safe to serve here.
          ("GET", "/v1/queue/lifecycle"),
          ("GET", "/v1/models"),
+         // comfybox#359: pure file-existence detection (Krea2ModelDetection),
+         // no actor hop, no GPU/pool state — same class as /v1/models above.
+         ("GET", "/v1/model/family"),
          ("GET", "/v1/stats"),
          ("GET", "/v1/config"),
          ("GET", "/v1/controls"),

@@ -1053,6 +1053,18 @@ public final class WarmServer {
       let result = await coordinator.poolList()
       return .json(status: 200, payload: result)
 
+    case ("GET", "/v1/model/family"):
+      // comfybox#359: file-existence detection only (no weight load, no
+      // pool mutation) — safe to call for every row in a "Backfill" batch.
+      // The desktop derives `checkpoint_family` from this answer plus its
+      // own knowledge of the preset's declared LoRA roles (accel vs not),
+      // which the engine has no reason to see here.
+      guard let spec = request.queryParameters["model"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !spec.isEmpty else {
+        return .error(.error(status: 400, message: "model query parameter is required"))
+      }
+      return .json(status: 200, payload: ModelFamilyDetector.detect(spec: spec))
+
     case ("POST", "/v1/model/unload"):
       do {
         let payload = try decode(ModelUnloadRequest.self, from: request.body)
@@ -1890,6 +1902,7 @@ public final class WarmServer {
     default:
       if ["/v1/generate", "/v1/lora/swap", "/v1/shutdown", "/health",
           "/v1/model/load", "/v1/model/activate", "/v1/model/pool", "/v1/model/unload",
+          "/v1/model/family",
           "/v1/loras", "/v1/loras/scan", "/v1/video/generate", "/v1/video/generate/async", "/v1/upscale",
           "/v1/characters", "/v1/presets", "/v1/presets/resolve",
           "/v1/content-modes", "/v1/stats", "/v1/memory", "/v1/audit-log", "/v1/config",
@@ -3528,6 +3541,7 @@ public final class WarmServer {
     case ("GET", "/v1/queue"):     return syncQueueResponse()
     case ("GET", "/v1/queue/lifecycle"): return syncQueueLifecycleResponse(request: request)
     case ("GET", "/v1/models"):    return syncModelsResponse()
+    case ("GET", "/v1/model/family"): return syncModelFamilyResponse(request: request)
     case ("GET", "/v1/stats"):     return syncStatsResponse()
     case ("GET", "/v1/config"):    return syncConfigResponse()
     case ("GET", "/v1/controls"):  return controlsResponse()
@@ -3664,6 +3678,16 @@ public final class WarmServer {
       return .error(status: 500, message: "Failed to serialize models")
     }
     return .rawJSON(status: 200, data: data)
+  }
+
+  /// comfybox#359: shared with the async arm (`GET /v1/model/family`) so
+  /// both emit identical bytes — pure file-existence detection, no actor hop.
+  private func syncModelFamilyResponse(request: HTTPRequest) -> HTTPResponse {
+    guard let spec = request.queryParameters["model"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !spec.isEmpty else {
+      return .error(status: 400, message: "model query parameter is required")
+    }
+    return .json(status: 200, payload: ModelFamilyDetector.detect(spec: spec))
   }
 
   private func syncConfigResponse() -> HTTPResponse {
