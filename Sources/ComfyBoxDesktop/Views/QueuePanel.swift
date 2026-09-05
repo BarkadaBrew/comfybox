@@ -81,8 +81,15 @@ struct QueuePanel: View {
                                 // PR #384 review, item 2b: target the row's own
                                 // job (comfybox#362) so this cannot stop Bree's
                                 // or Kira's render by racing the queue.
-                                do { try await engine.interruptRender(target: jobs.activeJobId); await reloadJobs() }
-                                catch { actionError = error.localizedDescription }
+                                do {
+                                    let outcome = try await engine.interruptRender(target: jobs.activeJobId)
+                                    await reloadJobs()
+                                    // comfybox#378: `interrupted: false` stopped
+                                    // nothing — say so rather than implying success.
+                                    if !outcome.interrupted {
+                                        actionError = EngineService.InterruptOutcome.alreadyFinishedMessage
+                                    }
+                                } catch { actionError = error.localizedDescription }
                             }
                         } label: {
                             Label("Interrupt", systemImage: "stop.circle")

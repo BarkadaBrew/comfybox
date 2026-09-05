@@ -340,6 +340,10 @@ public final class EngineService {
     /// used to be parsed and dropped (PR #384 review, item 1). nil when there is
     /// nothing to say.
     public private(set) var generationNotice: String?
+    /// Jobs THIS app asked the engine to stop. A render that fails because of a
+    /// cancel the user requested is not an error to shout about; one interrupted
+    /// by somebody else still is (PR #384 review r2, item 6).
+    private var userCancelledJobIds: Set<String> = []
 
     // Model pool state
     public var availableModels: [ModelInfo] = []
@@ -373,10 +377,18 @@ public final class EngineService {
     /// rather than a literal so tests drive the submit→poll loop without
     /// sleeping for real seconds.
     public var imageStatusPollInterval: Double = 1.0
-    /// How many CONSECUTIVE failed status polls are tolerated before a render is
-    /// declared lost (#217 / PR #384 review item 3). A render can outlive a
-    /// transient blip; it must not outlive a dead engine forever.
-    public var imageStatusTransientFailureLimit: Int = 5
+    /// How long a run of CONSECUTIVE failed status polls is tolerated before a
+    /// render is declared lost, in seconds (#217; PR #384 review r1 item 3, r2
+    /// item 3 — a wall-clock budget rather than a poll count, so the tolerance
+    /// does not silently shrink when the poll interval is raised). Reset by any
+    /// successful poll. A render can outlive a transient blip; it must not
+    /// outlive a dead engine forever.
+    public var imageStatusTransientFailureBudget: Double = 60.0
+    /// How long the best-effort SERVER-side cancel may take before the caller
+    /// gives up waiting on it (PR #384 review r2, item 1). A user cancels
+    /// precisely when the engine is wedged, so this must never inherit
+    /// `WarmServerClient`'s 300s request timeout.
+    public var cancelBestEffortTimeout: Double = 3.0
 
     /// Whether the connected engine is running on this Mac, vs. a remote
     /// server reached over the network. Several desktop-local operations
@@ -701,11 +713,17 @@ public final class EngineService {
     /// held the actor for the whole render, which is what made `/health` (and so
     /// the Desktop queue/progress UI) go stale mid-render (#217).
     ///
-    /// Refusals are raised here with the SAME `(status, message)` mapping the
-    /// blocking call used, because both routes share the engine's one
-    /// decode/validate choke point (`decodedGenerateRequest`): a 409
-    /// preset/model conflict, a 413 memory-preflight refusal, a 429 full queue
-    /// and a 400 bad recipe name all arrive on the submit exactly as before.
+    /// Only what the engine's shared decode/validate choke point
+    /// (`decodedGenerateRequest`) rejects arrives HERE, and those keep the same
+    /// `(status, message)` the blocking call produced: a 400 bad recipe
+    /// name/dimensions/LoRA, a 409 preset/model conflict, a 413
+    /// memory-preflight refusal.
+    ///
+    /// A 429 full queue, a 409 queue-cleared cancel and a 503 shutdown do NOT
+    /// arrive here: they are thrown by `enqueueGenerate`, which the async route
+    /// runs inside `ImageJobTracker`'s own detached Task AFTER this 202 has
+    /// already gone out. They surface as a FAILED JOB on the status route
+    /// instead — see `generate()`.
     public func submitImageJob(
         _ request: GenerationRequest, outputPath: String, contentMode: ContentMode = .neutral
     ) async throws -> ImageJobStatus {
@@ -768,8 +786,13 @@ public final class EngineService {
     nonisolated static func statusNotice(for job: ImageJobStatus, pendingCount: Int?) -> String? {
         var parts: [String] = []
         if job.status == "queued" {
-            if let pendingCount, pendingCount > 0 {
-                parts.append("Queued behind \(pendingCount) job\(pendingCount == 1 ? "" : "s")")
+            // /health's `pending_count` COUNTS this job, so "behind N" must
+            // subtract it — otherwise a lone queued render reports being behind
+            // itself (PR #384 review r2, item 4). Clamped: health is polled on
+            // its own cadence and can lag the status route either way.
+            let ahead = max(0, (pendingCount ?? 0) - 1)
+            if ahead > 0 {
+                parts.append("Queued behind \(ahead) job\(ahead == 1 ? "" : "s")")
             } else {
                 parts.append("Queued")
             }
@@ -790,9 +813,10 @@ public final class EngineService {
     /// `pollVideoStatus`, with the resilience a minutes-long render needs
     /// (PR #384 review, item 3):
     ///
-    /// - a transient transport error or non-404 non-200 is retried, up to
-    ///   `imageStatusTransientFailureLimit` CONSECUTIVE times, then fails with
-    ///   the last error rather than hanging forever;
+    /// - a transient transport error or non-404 non-200 is retried for up to
+    ///   `imageStatusTransientFailureBudget` seconds of CONSECUTIVE failure
+    ///   (any good poll resets the clock), then fails with the last error
+    ///   rather than hanging forever;
     /// - a 404 means the engine does not know the job — terminal immediately,
     ///   since retrying can only 404 again;
     /// - Task cancellation best-effort cancels the SERVER job (so it does not
@@ -803,15 +827,15 @@ public final class EngineService {
     public func pollImageStatus(
         jobId: String,
         pollInterval: Double? = nil,
-        transientFailureLimit: Int? = nil,
+        transientFailureBudget: Double? = nil,
         onProgress: @MainActor (ImageJobStatus) -> Void = { _ in }
     ) async throws -> ImageJobStatus {
         guard client != nil else { throw EngineServiceError.notConnected }
         let encoded = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
         let path = "/v1/generate/status/\(encoded)"
         let interval = pollInterval ?? imageStatusPollInterval
-        let limit = max(1, transientFailureLimit ?? imageStatusTransientFailureLimit)
-        var consecutiveFailures = 0
+        let budget = max(0, transientFailureBudget ?? imageStatusTransientFailureBudget)
+        var firstFailureAt: Date?
 
         while true {
             if Task.isCancelled { throw await cancelledDuringPoll(jobId: jobId) }
@@ -822,16 +846,19 @@ public final class EngineService {
                 throw EngineServiceError.serverError(404, message)
 
             case .transient(let message):
-                consecutiveFailures += 1
-                if consecutiveFailures >= limit {
+                let startedFailing = firstFailureAt ?? Date()
+                firstFailureAt = startedFailing
+                let failingFor = Date().timeIntervalSince(startedFailing)
+                if failingFor >= budget {
                     let msg = "Lost contact with the engine while rendering "
-                        + "(\(limit) consecutive failed status polls): \(message)"
+                        + "(status polls have failed for \(Int(failingFor.rounded()))s, "
+                        + "budget \(Int(budget.rounded()))s): \(message)"
                     lastError = msg
                     throw EngineServiceError.generationFailed(msg)
                 }
 
             case .job(let job):
-                consecutiveFailures = 0
+                firstFailureAt = nil
                 onProgress(job)
                 generationNotice = Self.statusNotice(for: job, pendingCount: queueInfo?.pendingCount)
                 if job.isTerminal { return job }
@@ -855,14 +882,50 @@ public final class EngineService {
     /// report the cancellation as such rather than as a generation failure.
     ///
     /// The cancel runs in a DETACHED task so it is not itself cancelled by the
-    /// very cancellation that triggered it.
+    /// very cancellation that triggered it, and it is BOUNDED by
+    /// `cancelBestEffortTimeout` (PR #384 review r2, item 1). Awaiting it
+    /// unbounded meant inheriting `WarmServerClient`'s 300s request timeout — so
+    /// a wedged engine, which is exactly when a user cancels, held `generate()`
+    /// (and `isGenerating`, and the Cancel button's own spinner) for five
+    /// minutes. Best-effort means best-effort: if the budget runs out the
+    /// request is abandoned and the caller is told the render was cancelled
+    /// anyway.
     private func cancelledDuringPoll(jobId: String) async -> EngineServiceError {
-        let isActive = queueInfo?.currentJobId == jobId
-        await Task.detached { @MainActor [weak self] in
-            try? await self?.cancelImageJob(id: jobId, isActiveRender: isActive)
-        }.value
+        await bestEffortCancel(jobId: jobId)
         lastError = nil
         return EngineServiceError.cancelled(jobId)
+    }
+
+    /// Issue the server-side cancel for `jobId`, waiting at most
+    /// `cancelBestEffortTimeout` seconds for it. Never throws: the caller has
+    /// already decided the render is over.
+    private func bestEffortCancel(jobId: String) async {
+        noteUserCancelled(jobId)
+        let budget = cancelBestEffortTimeout
+        await Task.detached { [weak self] in
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { @MainActor in
+                    _ = try? await self?.cancelImageJob(id: jobId)
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(budget))
+                }
+                // Whichever lands first wins; cancelling the group tears down
+                // the loser (the in-flight URLSession request included).
+                await group.next()
+                group.cancelAll()
+            }
+        }.value
+    }
+
+    /// Remember that WE asked for this job to stop, so the failure the status
+    /// route reports for it unwinds as `.cancelled` rather than as a render
+    /// failure the user never caused (PR #384 review r2, item 6). An interrupt
+    /// someone ELSE issued is not in this set and stays an error.
+    private func noteUserCancelled(_ jobId: String) {
+        userCancelledJobIds.insert(jobId)
+        // Bounded: only ever a handful of in-flight desktop renders.
+        if userCancelledJobIds.count > 32 { userCancelledJobIds.removeFirst() }
     }
 
     /// Submit a generation request to the server. Returns the output file path on success.
@@ -921,10 +984,22 @@ public final class EngineService {
             // A failed job carries the engine's own message — including the
             // operator-interrupt sentence `/v1/queue/interrupt` produces, which
             // is how a cancelled render reports itself on this path.
+            //
+            // If WE asked for that interrupt, it is not a failure: unwind as
+            // `.cancelled` and leave `lastError` clear, so pressing Cancel does
+            // not raise an error banner about a render the user chose to stop
+            // (PR #384 review r2, item 6). An interrupt somebody ELSE issued is
+            // not in the set and stays an error the user should see.
+            if userCancelledJobIds.remove(submitted.jobId) != nil {
+                lastError = nil
+                generationNotice = nil
+                throw EngineServiceError.cancelled(submitted.jobId)
+            }
             let msg = job.error ?? "Generation reported failure"
             lastError = msg
             throw EngineServiceError.generationFailed(msg)
         }
+        userCancelledJobIds.remove(submitted.jobId)
 
         lastGeneratedImagePath = path
         lastDurationMs = job.durationMs
@@ -1997,14 +2072,29 @@ public final class EngineService {
         }
     }
 
+    /// What `/v1/queue/interrupt` actually did. `interrupted == false` is the
+    /// engine's "there was nothing running there" answer (comfybox#378) — a
+    /// SUCCESSFUL request that stopped nothing, usually because the render had
+    /// already finished in the time it took to press the button. Reporting it as
+    /// a plain success is a lie the UI used to tell (PR #384 review r2, item 5).
+    public struct InterruptOutcome: Sendable {
+        public let interrupted: Bool
+        public let jobId: String?
+        public let kind: String?
+
+        /// UI wording for the "nothing to stop" case.
+        public static let alreadyFinishedMessage = "That render had already finished — nothing to cancel."
+    }
+
     /// Cancel the in-flight render (pending jobs continue).
     ///
     /// `target` (comfybox#362, additive) names WHAT to stop; omitting it keeps
     /// the historical body `{}` and the historical meaning — "whatever /health
-    /// shows as active" — which is what the Queue tab's stop button wants. An
-    /// explicit target that names nothing running answers 404, so only pass one
-    /// when you know the job is the active render.
-    public func interruptRender(target: String? = nil) async throws {
+    /// shows as active". An explicit target that names nothing RUNNING answers
+    /// 404 (a pending job is cancelled with `DELETE /v1/queue/{id}` instead), so
+    /// the 404 is given a message that says which of the two it is.
+    @discardableResult
+    public func interruptRender(target: String? = nil) async throws -> InterruptOutcome {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
         let body: Data
         if let target, !target.isEmpty {
@@ -2013,24 +2103,57 @@ public final class EngineService {
             body = Data("{}".utf8)
         }
         let (status, data) = try await client.post("/v1/queue/interrupt", body: body)
+        if status == 404 {
+            let named = target.map { "'\($0)'" } ?? "that target"
+            throw EngineServiceError.serverError(
+                404,
+                parseErrorMessage(from: data)
+                ?? "The engine is not rendering \(named) — it has finished, or it is still queued "
+                   + "(a queued job is cancelled from the queue, not interrupted).")
+        }
         guard status == 200 else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Interrupt failed")
         }
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return InterruptOutcome(
+            // Absent `interrupted` predates comfybox#362; a 200 then meant it did stop something.
+            interrupted: (json?["interrupted"] as? Bool) ?? true,
+            jobId: json?["interrupted_job_id"] as? String,
+            kind: json?["interrupted_kind"] as? String)
     }
 
-    /// Cancel ONE image job by id — the shape both the Cancel button and the
-    /// poll loop's Task-cancellation path use (#217).
+    /// What a cancel actually achieved, so the UI can tell the three apart.
+    public enum CancelResult: Sendable, Equatable {
+        /// The engine stopped a running render.
+        case interrupted(jobId: String)
+        /// The job had not started; it was dropped from the queue.
+        case dequeued(jobId: String)
+        /// Nothing to stop — it had already finished (comfybox#378's
+        /// `interrupted: false`).
+        case alreadyFinished(jobId: String)
+        /// Nothing of ours was in flight.
+        case nothingInFlight
+    }
+
+    /// Cancel ONE image job by id — the shape the Cancel button, the Queue tab
+    /// and the poll loop's Task-cancellation path all use (#217).
     ///
-    /// `isActiveRender` decides the route, and it must: `/v1/queue/interrupt`
-    /// with an explicit `target` answers 404 when that id is not the running
-    /// render (comfybox#362 — an explicit target that names nothing is a client
-    /// error), and `DELETE /v1/queue/{id}` is the route for a job that has not
-    /// started.
-    public func cancelImageJob(id: String, isActiveRender: Bool) async throws {
-        if isActiveRender {
-            try await interruptRender(target: id)
-        } else {
+    /// Route choice is DISCOVERED, not guessed (PR #384 review r2, item 7): try
+    /// the targeted interrupt first, and fall back to `DELETE /v1/queue/{id}`
+    /// only on the 404 that means "that id is not the running render". Deciding
+    /// up front from `queueInfo?.currentJobId` raced the queue — health is
+    /// polled every 700ms-3s, so a job that started rendering in between was
+    /// sent a queue-delete that quietly did nothing.
+    @discardableResult
+    public func cancelImageJob(id: String) async throws -> CancelResult {
+        noteUserCancelled(id)
+        do {
+            let outcome = try await interruptRender(target: id)
+            return outcome.interrupted ? .interrupted(jobId: id) : .alreadyFinished(jobId: id)
+        } catch EngineServiceError.serverError(404, _) {
+            // Not the active render — so it is still queued (or already gone).
             try await cancelQueueJob(id: id)
+            return .dequeued(jobId: id)
         }
     }
 
@@ -2039,12 +2162,10 @@ public final class EngineService {
     /// With `generate()` on the queue-submit path the desktop holds a job id, so
     /// the cancel names it rather than stopping whichever render happens to be
     /// active — which, on a queue shared with Bree and Kira, may not be ours.
-    /// Returns false when nothing of ours is in flight.
     @discardableResult
-    public func cancelActiveGeneration() async throws -> Bool {
-        guard let jobId = activeImageJobId else { return false }
-        try await cancelImageJob(id: jobId, isActiveRender: queueInfo?.currentJobId == jobId)
-        return true
+    public func cancelActiveGeneration() async throws -> CancelResult {
+        guard let jobId = activeImageJobId else { return .nothingInFlight }
+        return try await cancelImageJob(id: jobId)
     }
 
     /// Cancel one pending job by id.

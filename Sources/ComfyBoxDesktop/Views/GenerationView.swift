@@ -1199,7 +1199,14 @@ struct GenerationView: View {
         Task {
             defer { isCancellingRender = false }
             do {
-                _ = try await engine.cancelActiveGeneration()
+                switch try await engine.cancelActiveGeneration() {
+                case .interrupted, .dequeued, .nothingInFlight:
+                    // The generate loop unwinds as `.cancelled` on its own; a
+                    // cancel the user asked for is not an error banner.
+                    break
+                case .alreadyFinished:
+                    engine.lastError = EngineService.InterruptOutcome.alreadyFinishedMessage
+                }
             } catch {
                 engine.lastError = "Cancel failed: \(error.localizedDescription)"
             }
