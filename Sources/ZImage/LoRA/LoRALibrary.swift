@@ -466,8 +466,36 @@ public final class LoRALibrary: @unchecked Sendable {
       logger.info("  \(existingEntry != nil ? "Updated" : "Added"): \(relativePath) [\(scanResult.compatibility.joined(separator: ", ")), \(scanResult.format.rawValue)]")
     }
 
-    // Calculate removed count
-    let removedCount = existingEntries.count - (updatedCount + unchangedCount)
+    // #273 fix round 2 (N1): an anchored entry's file lives outside
+    // `libraryRoot` (the nearline-staged internal path), so the walk above
+    // never matches it — by relativePath (it isn't under libraryRoot) or,
+    // worse, by id if an unrelated file with the same slug still exists
+    // under libraryRoot (the original, pre-anchor copy, say). Left alone
+    // that either silently overwrites the anchored entry's stored internal
+    // path with whatever the walk found, or drops the entry from the index
+    // entirely. Reconcile anchored entries AFTER the walk: the stored entry
+    // wins outright as long as its internal file is still there; if that
+    // file is gone (evicted or deleted out of band), un-anchor with a
+    // warning and fall back to whatever (if anything) the walk found for
+    // that id — the same "gone ⇒ removed" fate as any other missing file.
+    for (id, existing) in existingEntries where existing.anchored {
+      let internalURL = Self.absoluteURL(for: existing, libraryRoot: libraryRoot)
+      if fm.fileExists(atPath: internalURL.path) {
+        newEntries[id] = existing
+      } else {
+        logger.warning("Anchored LoRA \(existing.filename) missing at \(existing.relativePath) — un-anchoring")
+        if var fallback = newEntries[id] {
+          fallback.anchored = false
+          newEntries[id] = fallback
+        }
+      }
+    }
+
+    // Calculate removed count against the FINAL merged index (the anchor
+    // reconciliation above can keep or drop ids the walk-only counters
+    // above never saw).
+    let finalIds = Set(newEntries.keys)
+    let removedCount = existingEntries.keys.filter { !finalIds.contains($0) }.count
 
     // Commit the new index
     lock.lock()
