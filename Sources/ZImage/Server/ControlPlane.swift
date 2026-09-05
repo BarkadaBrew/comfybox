@@ -173,6 +173,11 @@ enum ControlPlaneClassifier {
   static func isSyncServable(method: String, path: String) -> Bool {
     switch (method, path) {
     case ("GET", "/v1/queue"),
+         // comfybox#283/#217 review I5: must answer during a render exactly
+         // like `/v1/queue` — the ledger it reads is lock-based with no
+         // actor hop and no disk I/O under its lock (see
+         // QueueLifecycleLedger.swift's C1 fix), so it is safe to serve here.
+         ("GET", "/v1/queue/lifecycle"),
          ("GET", "/v1/models"),
          ("GET", "/v1/stats"),
          ("GET", "/v1/config"),

@@ -1706,21 +1706,16 @@ public final class WarmServer {
     case ("GET", "/v1/queue"):
       return await queueListResponse()
 
-    // comfybox#283/#217: additive — see QueueLifecycleLedger.swift. Not
-    // sync-servable (ControlPlaneClassifier only lists exact "/v1/queue"),
-    // so this always takes the async dispatch path below; the ledger itself
-    // is lock-based, so that adds no actor hop either.
+    // comfybox#283/#217: additive — see QueueLifecycleLedger.swift. Sync-
+    // servable (PR #370 review I5) exactly like `/v1/queue`, so this arm is
+    // only reached when the sync control plane's classifier is disabled;
+    // `queueLifecyclePayloadData` is shared with `syncQueueLifecycleResponse`
+    // so both emit identical bytes.
     case ("GET", "/v1/queue/lifecycle"):
-      let jobId = request.queryParameters["job_id"]
-      let requestedLimit = request.queryParameters["limit"].flatMap { Int($0) }
-      let limit = max(1, min(requestedLimit ?? 200, 2000))
-      struct LifecycleListResponse: Encodable {
-        let bootId: String
-        let count: Int
-        let events: [QueueLifecycleEvent]
+      guard let data = queueLifecyclePayloadData(request: request) else {
+        return .error(.error(status: 500, message: "Failed to serialize queue lifecycle"))
       }
-      let events = lifecycleLedger.events(jobId: jobId, limit: limit)
-      return .json(status: 200, payload: LifecycleListResponse(bootId: lifecycleLedger.bootId, count: events.count, events: events))
+      return .json(.rawJSON(status: 200, data: data))
 
     case ("POST", "/v1/queue/interrupt"):
       struct InterruptResult: Encodable { let success: Bool; let interrupted: Bool }
@@ -3363,15 +3358,36 @@ public final class WarmServer {
   /// JSON dictionary, for embedding into the raw `[String: Any]` payloads
   /// this route (and `/health`) build via `JSONSerialization` rather than
   /// `Codable`. `nil` fields are simply absent, matching every other
-  /// dictionary this route already builds by hand.
+  /// dictionary this route already builds by hand. No `dateEncodingStrategy`
+  /// override needed (PR #370 review I4): `QueueLifecycleEvent` formats its
+  /// own `wallTime` field as ISO8601 regardless of the ambient encoder.
   private static func lifecycleEventDict(_ event: QueueLifecycleEvent) -> [String: Any]? {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
-    encoder.dateEncodingStrategy = .iso8601
     guard let data = try? encoder.encode(event),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return nil }
     return obj
+  }
+
+  /// comfybox#283/#217: `GET /v1/queue/lifecycle` payload, shared by the
+  /// async arm and the sync control plane (review I5) so both emit
+  /// identical bytes — same pattern as `buildQueuePayloadData` above.
+  private struct QueueLifecycleListResponse: Encodable {
+    let bootId: String
+    let count: Int
+    let events: [QueueLifecycleEvent]
+  }
+
+  private func queueLifecyclePayloadData(request: HTTPRequest) -> Data? {
+    let jobId = request.queryParameters["job_id"]
+    let requestedLimit = request.queryParameters["limit"].flatMap { Int($0) }
+    let limit = max(1, min(requestedLimit ?? 200, 2000))
+    let events = lifecycleLedger.events(jobId: jobId, limit: limit)
+    let payload = QueueLifecycleListResponse(bootId: lifecycleLedger.bootId, count: events.count, events: events)
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    return try? encoder.encode(payload)
   }
 
   private func buildQueuePayloadData() -> Data? {
@@ -3437,6 +3453,7 @@ public final class WarmServer {
     }
     switch (request.method, request.path) {
     case ("GET", "/v1/queue"):     return syncQueueResponse()
+    case ("GET", "/v1/queue/lifecycle"): return syncQueueLifecycleResponse(request: request)
     case ("GET", "/v1/models"):    return syncModelsResponse()
     case ("GET", "/v1/stats"):     return syncStatsResponse()
     case ("GET", "/v1/config"):    return syncConfigResponse()
@@ -3557,6 +3574,14 @@ public final class WarmServer {
   private func syncQueueResponse() -> HTTPResponse {
     guard let data = buildQueuePayloadData() else {
       return .error(status: 500, message: "Failed to serialize queue snapshot")
+    }
+    return .rawJSON(status: 200, data: data)
+  }
+
+  /// comfybox#283/#217 review I5.
+  private func syncQueueLifecycleResponse(request: HTTPRequest) -> HTTPResponse {
+    guard let data = queueLifecyclePayloadData(request: request) else {
+      return .error(status: 500, message: "Failed to serialize queue lifecycle")
     }
     return .rawJSON(status: 200, data: data)
   }
@@ -7664,7 +7689,15 @@ private actor WarmServerCoordinator {
     publishHealth()
 
     var resolved = false
-    func clearEpisodeState() {
+    // PR #370 review I3: this used to record `.resumed` unconditionally,
+    // including on the `.abandonVideo` disposition below — where the render
+    // is NEVER actually resumed, the checkpoint is dropped. `abandoned`
+    // (`ReplayClassifier` treats it identically to `.resumed`: either way
+    // the checkpoint is closed out) names the OTHER outcome correctly; the
+    // caller computes the disposition once and passes it in so this
+    // function never has to re-derive it (and can't disagree with the
+    // abandon check that follows each call site).
+    func clearEpisodeState(abandoned: Bool) {
       resolved = true
       checkpointedVideo = nil
       if let videoJobId { videoJobTracker.markResumedFromPreemption(videoJobId) }
@@ -7675,25 +7708,32 @@ private actor WarmServerCoordinator {
       // call site — never the preemptor's id.
       if let jobId = activeJobId {
         lifecycleLedger.record(
-          jobId: jobId, kind: .resumed, jobKind: QueueJobKind.video.rawValue,
+          jobId: jobId, kind: abandoned ? .abandoned : .resumed, jobKind: QueueJobKind.video.rawValue,
           step: state.stepIndex, chunk: state.chunkIndex, reason: state.phase.rawValue)
       }
       // Idempotent: the checkpoint-fallback watchdog may have already
       // cleared this if it raced ahead of the yield.
       preemptionInFlight.clear()
     }
-    defer { if !resolved { clearEpisodeState() } }
+    defer {
+      if !resolved {
+        clearEpisodeState(abandoned: LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo)
+      }
+    }
 
     guard let claimed = pendingPreemptorBox.claim() else {
       // The checkpoint-fallback watchdog already handled this preemptor (it
       // raced ahead of the yield, or the render finished on its own before
       // the signal was observed) — nothing left to run. Resume immediately.
       logger.warning("#1479: video yielded but no preemptor was waiting (checkpoint-fallback watchdog already handled it) — resuming immediately")
-      clearEpisodeState()
       // comfybox#322: …unless the video itself was interrupted. There is no
       // preemptor to protect on this branch, so this is purely "do not bring
-      // a killed render back to life".
-      if LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo {
+      // a killed render back to life". Computed ONCE (PR #370 review I3) so
+      // `clearEpisodeState` and this check can never disagree about which
+      // outcome just happened.
+      let disposition = LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled)
+      clearEpisodeState(abandoned: disposition == .abandonVideo)
+      if disposition == .abandonVideo {
         logger.info("#1479/#322: video interrupted with no preemptor pending — checkpoint dropped, no resume.")
         throw CancellationError()
       }
@@ -7733,7 +7773,8 @@ private actor WarmServerCoordinator {
       rawBody: activeJobRawBody, kind: activeJobKindForPersistence,
       startedAt: currentJobStartedAt, renderStartedAt: activeRenderStartedAt
     )
-    activeJobId = claimed.jobId ?? UUID().uuidString  // AC-18: the async caller's id when it has one
+    let preemptorJobId = claimed.jobId ?? UUID().uuidString  // AC-18: the async caller's id when it has one
+    activeJobId = preemptorJobId
     activeJobSummary = "Render (preempting): \(claimed.payload.prompt.prefix(100))"
     activeJobSource = claimed.source
     activeJobRawBody = claimed.rawBody
@@ -7763,6 +7804,15 @@ private actor WarmServerCoordinator {
     // `throws` this stops compiling — louder than a `catch` that logs and
     // carries on.
     await runShieldedFromCancellation { await self.runGenerate(claimed.payload, continuation: claimed.continuation) }
+    // PR #370 review M: the preemptor bypasses the normal enqueue/admit path
+    // entirely (a mailbox handoff, not the FIFO — see WarmServer.swift's
+    // "Known limitations" note in the PR body), so it never reaches a
+    // terminal event through `record`, and its progress-throttle entry would
+    // otherwise never be cleared — one leaked dictionary entry per
+    // preemption for the life of the process. `preemptorJobId`, not
+    // `activeJobId` — `runGenerate`'s own `defer` already reset
+    // `activeJobId` to nil by the time this line runs.
+    lifecycleLedger.clearProgressThrottle(jobId: preemptorJobId)
 
     // Restore the video's identity — symmetric with the swap above, and done
     // BEFORE its (possibly long, synchronous) resume so /health, /v1/queue and
@@ -7780,7 +7830,11 @@ private actor WarmServerCoordinator {
     persistQueueState()
 
     // Clear BEFORE the resume, not in the defer (review I2) — see doc comment.
-    clearEpisodeState()
+    // Computed ONCE (PR #370 review I3), same reasoning as the other call
+    // site: `clearEpisodeState` and the abandon check right after it must
+    // never disagree about which outcome just happened.
+    let disposition = LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled)
+    clearEpisodeState(abandoned: disposition == .abandonVideo)
 
     // comfybox#322 (review r1, Critical): the operator may have interrupted the
     // video while the preemptor ran. The preemptor was protected above and has
@@ -7791,7 +7845,7 @@ private actor WarmServerCoordinator {
     // episode and are deliberately NOT reloaded: an operator who interrupted to
     // free the box gets the box. `CancellationError` propagates to the queue
     // case, which reports the job interrupted.
-    if LTX2PreemptionEpisode.disposition(videoInterrupted: Task.isCancelled) == .abandonVideo {
+    if disposition == .abandonVideo {
       logger.info("#1479/#322: video interrupted during the preemption episode — preemptor completed normally, video checkpoint dropped (no resume).")
       throw CancellationError()
     }
@@ -8305,6 +8359,14 @@ private actor WarmServerCoordinator {
       throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
     }
 
+    // comfybox#283/#217 (PR #370 review I6): resolve the id and the
+    // enqueue timestamp BEFORE constructing the box, so the completion
+    // handler (set at CONSTRUCTION — `ContinuationBox.onResume` is `let`)
+    // can be built with them.
+    let resolvedId = jobId ?? UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<GenerateResponse, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.generate.rawValue, source: source, enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
       // AC-18 (WP-E10 "E9b"): `jobId` is the CLIENT-VISIBLE id when the caller
       // has one (`/v1/generate/async`'s tracker id, or a persisted job's own
@@ -8312,8 +8374,8 @@ private actor WarmServerCoordinator {
       // and the status route all name the same job. nil → a fresh id (the
       // synchronous route, which never exposes one).
       let newJob = PendingJob(
-        id: jobId ?? UUID().uuidString, source: source,
-        operation: .generate(payload, ContinuationBox(continuation), progressHandler, latentPreviewHandler),
+        id: resolvedId, source: source,
+        operation: .generate(payload, ContinuationBox(continuation, onResume: onResume), progressHandler, latentPreviewHandler),
         rawBody: rawBody)
       pending.append(newJob)
       // comfybox#283/#217: read-only — see QueueLifecycleLedger.swift.
@@ -8330,6 +8392,10 @@ private actor WarmServerCoordinator {
       throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
     }
 
+    let resolvedId = jobId ?? UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<LoRASwapResponse, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.loraSwap.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
       // #339 review r3, item 1b: `jobId` lets `recoverPersistedQueue` name
       // this pending job with its ORIGINAL persisted id (mirroring
@@ -8337,7 +8403,7 @@ private actor WarmServerCoordinator {
       // that exact id becoming admitted instead of a fresh random one it
       // has no way to observe. nil (every live route) keeps the default
       // fresh UUID, unchanged.
-      let newJob = PendingJob(id: jobId ?? UUID().uuidString, operation: .swap(payload, ContinuationBox(continuation)), rawBody: rawBody)
+      let newJob = PendingJob(id: resolvedId, operation: .swap(payload, ContinuationBox(continuation, onResume: onResume)), rawBody: rawBody)
       pending.append(newJob)
       lifecycleLedger.record(jobId: newJob.id, kind: .enqueued, jobKind: QueueJobKind.loraSwap.rawValue, source: newJob.source)
       startProcessingIfNeeded()
@@ -8352,8 +8418,12 @@ private actor WarmServerCoordinator {
       throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
     }
 
+    let resolvedId = UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<GenerateResponse, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.controlnet.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
-      let newJob = PendingJob(operation: .controlGenerate(request, ContinuationBox(continuation)))
+      let newJob = PendingJob(id: resolvedId, operation: .controlGenerate(request, ContinuationBox(continuation, onResume: onResume)))
       pending.append(newJob)
       lifecycleLedger.record(jobId: newJob.id, kind: .enqueued, jobKind: QueueJobKind.controlnet.rawValue, source: newJob.source)
       startProcessingIfNeeded()
@@ -8414,8 +8484,12 @@ private actor WarmServerCoordinator {
     // out, and an unauthenticated client cannot grow the FIFO without limit.
     try checkModelOperationCapacity()
 
+    let resolvedId = UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<ModelOperationResult, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: op.kind, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
-      let newJob = PendingJob(operation: .modelOperation(op, ContinuationBox(continuation)))
+      let newJob = PendingJob(id: resolvedId, operation: .modelOperation(op, ContinuationBox(continuation, onResume: onResume)))
       pending.append(newJob)
       lifecycleLedger.record(jobId: newJob.id, kind: .enqueued, jobKind: op.kind, source: newJob.source)
       startProcessingIfNeeded()
@@ -8457,8 +8531,12 @@ private actor WarmServerCoordinator {
       throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
     }
 
+    let resolvedId = UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<Bool, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.modelSwitch.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
-      let newJob = PendingJob(operation: .modelSwitch(body, ContinuationBox(continuation)))
+      let newJob = PendingJob(id: resolvedId, operation: .modelSwitch(body, ContinuationBox(continuation, onResume: onResume)))
       pending.append(newJob)
       lifecycleLedger.record(jobId: newJob.id, kind: .enqueued, jobKind: QueueJobKind.modelSwitch.rawValue, source: newJob.source)
       startProcessingIfNeeded()
@@ -8484,8 +8562,13 @@ private actor WarmServerCoordinator {
       throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
     }
 
+    let resolvedId = UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<LTX2VideoResult, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.video.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
-      let newJob = PendingJob(operation: .localVideo(body, ContinuationBox(continuation), wantsAudio: wantsAudio, videoJobId: videoJobId))
+      let newJob = PendingJob(
+        id: resolvedId, operation: .localVideo(body, ContinuationBox(continuation, onResume: onResume), wantsAudio: wantsAudio, videoJobId: videoJobId))
       pending.append(newJob)
       // comfybox#283: `videoJobId` (the id `/v1/video/status/{id}` uses) can
       // differ from `newJob.id` (the id `/v1/queue` uses) — pre-existing, not
@@ -8505,8 +8588,12 @@ private actor WarmServerCoordinator {
     }
 
     shuttingDown = true
+    let resolvedId = UUID().uuidString
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<ShutdownResponse, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: resolvedId, jobKind: QueueJobKind.shutdown.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
-      let newJob = PendingJob(operation: .shutdown(ContinuationBox(continuation)))
+      let newJob = PendingJob(id: resolvedId, operation: .shutdown(ContinuationBox(continuation, onResume: onResume)))
       pending.append(newJob)
       lifecycleLedger.record(jobId: newJob.id, kind: .enqueued, jobKind: QueueJobKind.shutdown.rawValue, source: newJob.source)
       startProcessingIfNeeded()
@@ -8521,8 +8608,11 @@ private actor WarmServerCoordinator {
     if pending.count >= configuration.maxPendingRequests {
       throw ServerError.queueFull(maxPending: configuration.maxPendingRequests)
     }
+    let enqueuedAt = Date()
+    let onResume: @Sendable (Result<Bool, Error>) -> Void =
+      lifecycleCompletionHandler(jobId: id, jobKind: QueueJobKind.synthetic.rawValue, source: "api", enqueuedAt: enqueuedAt)
     return try await withCheckedThrowingContinuation { continuation in
-      let newJob = PendingJob(id: id, operation: .synthetic(durationMs: durationMs, ContinuationBox(continuation)))
+      let newJob = PendingJob(id: id, operation: .synthetic(durationMs: durationMs, ContinuationBox(continuation, onResume: onResume)))
       pending.append(newJob)
       lifecycleLedger.record(jobId: newJob.id, kind: .enqueued, jobKind: QueueJobKind.synthetic.rawValue, source: newJob.source)
       startProcessingIfNeeded()
@@ -8681,10 +8771,10 @@ private actor WarmServerCoordinator {
     // from shuttingDown — the server keeps running after a queue clear).
     for job in pending {
       Self.cancel(job.operation)
-      // comfybox#283/#217: read-only. These jobs never reached `processLoop`'s
-      // dequeue, so `attachLifecycleCompletionHook` never wired their
-      // continuation — recorded here explicitly, distinct from `.interrupted`
-      // (which stops a job already admitted/running).
+      // comfybox#283/#217: read-only. `Self.cancel` uses
+      // `resumeIgnoringLifecycleHook` for exactly this reason — recorded
+      // here explicitly, distinct from `.interrupted` (which stops a job
+      // already admitted/running).
       lifecycleLedger.record(jobId: job.id, kind: .dropped, jobKind: Self.kind(of: job.operation), source: job.source, reason: "queue cleared")
     }
     pending.removeAll()
@@ -8708,27 +8798,32 @@ private actor WarmServerCoordinator {
     return true
   }
 
+  /// comfybox#283/#217: uses `resumeIgnoringLifecycleHook` (not `resume`) —
+  /// see that method's doc comment. `cancel` is called ONLY for jobs still
+  /// in `pending` (`clearPending`/`cancelPending`/`drainQueueDeltas`'s
+  /// `.cancel` branch), never for the active job, and each of those three
+  /// call sites already records an explicit `.dropped` ledger event.
   private static func cancel(_ operation: QueuedOperation) {
     switch operation {
     case .generate(_, let cont, _, _):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     case .controlGenerate(_, let cont):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     case .swap(_, let cont):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     case .modelSwitch(_, let cont):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     case .modelOperation(_, let cont):
       // A `wait: false` load has no waiting caller — cancelling it is simply
       // dropping the job (C2).
-      cont?.resume(throwing: ServerError.cancelled)
+      cont?.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     case .localVideo(_, let cont, _, _):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     case .shutdown(let cont):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     #if DEBUG
     case .synthetic(_, let cont):
-      cont.resume(throwing: ServerError.cancelled)
+      cont.resumeIgnoringLifecycleHook(throwing: ServerError.cancelled)
     #endif
     }
   }
@@ -8928,18 +9023,17 @@ private actor WarmServerCoordinator {
     }
   }
 
-  /// comfybox#283/#217: wire `job`'s continuation so its ACTUAL terminal
-  /// outcome — completed, failed, or interrupted — is recorded exactly once,
-  /// from the one place every queued job kind's continuation already
-  /// resumes exactly once (`ContinuationBox.resume`). Called right after a
-  /// job is dequeued into the active slot, before any of its work runs.
-  ///
-  /// Read-only: this only arranges for the resume that was going to happen
-  /// anyway to also emit a ledger event afterward (`ContinuationBox.resume`
-  /// calls `onResume` THEN the real continuation) — it takes no other
-  /// action, and a hook that is never attached (there is no queue kind that
-  /// skips this call) simply means `onResume` stays nil, which
-  /// `ContinuationBox.resume` already treats as a no-op via `?.`.
+  /// comfybox#283/#217: the closure every `enqueue*` method passes to
+  /// `ContinuationBox`'s `onResume` AT CONSTRUCTION time (PR #370 review
+  /// I6 — `onResume` is `let`, so it must be supplied when the box is
+  /// built, not mutated in afterward from `processLoop`), so every queued
+  /// job kind's ACTUAL terminal outcome — completed, failed, or interrupted
+  /// — is recorded exactly once, from the one place every job's
+  /// continuation already resumes exactly once (`ContinuationBox.resume`).
+  /// `durationMs` measures from ENQUEUE, not from admission/render-start —
+  /// the box is built at enqueue time, before a job's `activeRenderStartedAt`
+  /// exists — so it is queue-wait-plus-render latency, a different (also
+  /// useful) number from `/health.last_render_duration_ms`.
   ///
   /// Interrupted vs failed uses the SAME `isRenderInterruption` classifier
   /// `VideoJobTracker.markFailed`/`localVideoCatchOutcome` already apply to
@@ -8948,40 +9042,25 @@ private actor WarmServerCoordinator {
   /// plus `ServerError.cancelled` (`clearPending`/`cancelPending`'s own
   /// cancellation error) for the render-already-admitted analogue of a
   /// pending job's `.dropped`.
-  private func attachLifecycleCompletionHook(for job: PendingJob) {
-    let jobId = job.id
-    let jobKind = Self.kind(of: job.operation)
-    let source = job.source
+  ///
+  /// Generic over the continuation's `Value` so one function serves every
+  /// queue-job kind's differently-typed `ContinuationBox<Value>`.
+  private func lifecycleCompletionHandler<T>(
+    jobId: String, jobKind: String, source: String, enqueuedAt: Date
+  ) -> @Sendable (Result<T, Error>) -> Void {
     let ledger = lifecycleLedger
-    let startedAt = currentJobStartedAt ?? Date()
-
-    func hook<T>(_ box: ContinuationBox<T>?) {
-      box?.onResume = { result in
-        let durationMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-        switch result {
-        case .success:
-          ledger.record(jobId: jobId, kind: .completed, jobKind: jobKind, source: source, durationMs: durationMs)
-        case .failure(let error):
-          let isInterrupt: Bool
-          if case ServerError.cancelled = error { isInterrupt = true } else { isInterrupt = isRenderInterruption(error) }
-          ledger.record(
-            jobId: jobId, kind: isInterrupt ? .interrupted : .failed, jobKind: jobKind, source: source,
-            reason: error.localizedDescription)
-        }
+    return { result in
+      let durationMs = Int(Date().timeIntervalSince(enqueuedAt) * 1000)
+      switch result {
+      case .success:
+        ledger.record(jobId: jobId, kind: .completed, jobKind: jobKind, source: source, durationMs: durationMs)
+      case .failure(let error):
+        let isInterrupt: Bool
+        if case ServerError.cancelled = error { isInterrupt = true } else { isInterrupt = isRenderInterruption(error) }
+        ledger.record(
+          jobId: jobId, kind: isInterrupt ? .interrupted : .failed, jobKind: jobKind, source: source,
+          reason: error.localizedDescription)
       }
-    }
-
-    switch job.operation {
-    case .generate(_, let cont, _, _): hook(cont)
-    case .controlGenerate(_, let cont): hook(cont)
-    case .swap(_, let cont): hook(cont)
-    case .modelSwitch(_, let cont): hook(cont)
-    case .modelOperation(_, let cont): hook(cont)
-    case .localVideo(_, let cont, _, _): hook(cont)
-    case .shutdown(let cont): hook(cont)
-    #if DEBUG
-    case .synthetic(_, let cont): hook(cont)
-    #endif
     }
   }
 
@@ -9026,7 +9105,6 @@ private actor WarmServerCoordinator {
       // active slot is exactly the "admitted" transition #283 finding 2 shows
       // no instrument reports (`queue_remaining` only ever counts `pending`).
       lifecycleLedger.record(jobId: job.id, kind: .admitted, jobKind: activeJobKindForPersistence, source: job.source)
-      attachLifecycleCompletionHook(for: job)
       // Publish is_rendering + job id BEFORE the synchronous GPU section begins,
       // so /health reflects the render for its whole (actor-blocking) duration (#217).
       publishHealth()
@@ -9096,10 +9174,11 @@ private actor WarmServerCoordinator {
         do {
           let result = try await runModelOperation(op)
           continuation?.resume(returning: result)
-          // comfybox#283/#217: a `wait: false` load has no continuation for
-          // `attachLifecycleCompletionHook` to have wired (it is nil) — record
-          // the completion directly so THIS kind's success is not silently
-          // invisible to the ledger the way it used to be to /health.
+          // comfybox#283/#217: a `wait: false` load has no `ContinuationBox`
+          // at all (`enqueueModelOperationDetached` never constructs one) —
+          // record the completion directly so THIS kind's success is not
+          // silently invisible to the ledger the way it used to be to
+          // /health.
           if continuation == nil {
             lifecycleLedger.record(jobId: job.id, kind: .completed, jobKind: op.kind, source: job.source)
           }
@@ -12481,18 +12560,30 @@ private enum QueuedOperation: Sendable {
 private final class ContinuationBox<Value>: @unchecked Sendable {
   private let continuation: CheckedContinuation<Value, Error>
   /// comfybox#283/#217: fired exactly once, right when the wrapped
-  /// continuation resumes, with the ACTUAL terminal outcome — set by
-  /// `WarmServerCoordinator.processLoop` right after a job is admitted (see
-  /// its `attachLifecycleCompletionHook`), so every queued job kind's true
-  /// completed/failed/interrupted result is observable from one place,
-  /// since every `enqueue*` method already wraps its continuation in this
-  /// box. Read-only: never influences what `resume` does, only observes it
-  /// — this line runs, then the real resume runs, unconditionally, exactly
-  /// as before this hook existed.
-  var onResume: (@Sendable (Result<Value, Error>) -> Void)?
+  /// continuation resumes, with the ACTUAL terminal outcome — every
+  /// `enqueue*` method on `WarmServerCoordinator` passes this at
+  /// CONSTRUCTION time (see `lifecycleCompletionHandler(jobId:jobKind:
+  /// source:enqueuedAt:)`), so every queued job kind's true
+  /// completed/failed/interrupted result is observable from one place.
+  /// Read-only: never influences what `resume` does, only observes it —
+  /// this line runs, then the real resume runs, unconditionally, exactly as
+  /// before this hook existed.
+  ///
+  /// PR #370 review I6: `let`, set once at construction, never mutated —
+  /// the prior version was a `var` mutated AFTER construction (from
+  /// `processLoop`, once a job was admitted), which is a real data race on
+  /// an `@unchecked Sendable` type: nothing enforced that the mutation
+  /// happened-before any concurrent read from `resume`. It happened to be
+  /// safe in practice (the write always preceded the render `Task` that
+  /// could call `resume`, and Swift's task-creation boundary is itself a
+  /// synchronization point) but that safety was implicit and fragile.
+  /// Setting it here, at construction, removes the race by construction
+  /// instead of by argument.
+  private let onResume: (@Sendable (Result<Value, Error>) -> Void)?
 
-  init(_ continuation: CheckedContinuation<Value, Error>) {
+  init(_ continuation: CheckedContinuation<Value, Error>, onResume: (@Sendable (Result<Value, Error>) -> Void)? = nil) {
     self.continuation = continuation
+    self.onResume = onResume
   }
 
   func resume(returning value: Value) {
@@ -12502,6 +12593,18 @@ private final class ContinuationBox<Value>: @unchecked Sendable {
 
   func resume(throwing error: Error) {
     onResume?(.failure(error))
+    continuation.resume(throwing: error)
+  }
+
+  /// Resume WITHOUT firing `onResume`'s lifecycle-completion hook. The ONLY
+  /// caller is `WarmServerCoordinator.cancel(_:)`, which cancels a job still
+  /// sitting in `pending` (never admitted) — its lifecycle already gets an
+  /// explicit `.dropped` event from `clearPending`/`cancelPending`/the sync
+  /// cancel path (`drainQueueDeltas`), and firing `onResume` too would
+  /// double-record the same cancellation as BOTH `.dropped` and
+  /// `.interrupted` (since `resume`'s hook classifies `ServerError.cancelled`
+  /// as an interrupt).
+  func resumeIgnoringLifecycleHook(throwing error: Error) {
     continuation.resume(throwing: error)
   }
 }
@@ -12788,6 +12891,16 @@ final class WarmServerQueueProbe: @unchecked Sendable {
     lifecycleLedger.events(jobId: jobId)
   }
 
+  /// comfybox#283/#217: the lifecycle events recorded for one queue-job
+  /// KIND, for a test whose job kind (e.g. `.modelSwitch` via
+  /// `enqueueFakeRender`) never surfaces its own internal id to the caller.
+  /// Fine for a fresh probe running one job of that kind at a time (every
+  /// caller in this file's tests) — not a substitute for `jobId` filtering
+  /// when several jobs of the same kind could be in flight together.
+  func lifecycleEvents(jobKind: String) -> [QueueLifecycleEvent] {
+    lifecycleLedger.events().filter { $0.jobKind == jobKind }
+  }
+
   /// Occupy the queue with an arbitrary body — the stand-in for a render.
   /// `.modelSwitch` is used because it is the one existing queue kind whose
   /// work is a caller-supplied closure; the loop treats it exactly like any
@@ -12935,6 +13048,12 @@ final class WarmServerQueueProbe: @unchecked Sendable {
 
   /// The summary of the job the loop is running, or nil when idle.
   var activeJobSummary: String? { liveHealthSnapshot.activeSummary }
+
+  /// comfybox#283/#217: the id of the job the loop is running, or nil when
+  /// idle — for a test that needs to query `lifecycleEvents(jobId:)` for a
+  /// job kind (e.g. `.modelSwitch` via `enqueueFakeRender`) that has no
+  /// caller-supplied id to hand.
+  var activeJobId: String? { liveHealthSnapshot.activeJobId }
 
   /// Nothing running and nothing waiting.
   ///

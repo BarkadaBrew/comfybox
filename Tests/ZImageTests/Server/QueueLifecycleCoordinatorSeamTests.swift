@@ -112,4 +112,80 @@ final class QueueLifecycleCoordinatorSeamTests: XCTestCase {
     XCTAssertEqual(aEvents.map { $0.kind }, [.enqueued, .admitted, .started, .completed])
     XCTAssertEqual(bEvents.map { $0.kind }, [.enqueued, .admitted, .started, .completed])
   }
+
+  // MARK: - PR #370 review round 1, M: `.failed`/`.interrupted` through the hook
+
+  /// A queue job that fails for an ordinary reason (not a cancellation)
+  /// records `.failed` — driven through `ContinuationBox.onResume`
+  /// (`lifecycleCompletionHandler`), not a mock.
+  func testAFailingModelOperationRecordsFailedThroughTheHook() async throws {
+    let probe = makeQueueProbe()
+    var caught: Error?
+    do {
+      _ = try await probe.enqueueModelOperation(.unload(modelId: "no-such-model-lifecycle-test"))
+    } catch {
+      caught = error
+    }
+    XCTAssertNotNil(caught, "unloading a model that was never loaded must throw")
+
+    // The job id is internal to `enqueueModelOperation` (a fresh UUID) — the
+    // ledger itself has no other job recorded in this fresh probe, so
+    // scanning by kind is unambiguous here.
+    let events = probe.lifecycleEvents(jobKind: ModelOperation.unload(modelId: "no-such-model-lifecycle-test").kind)
+    XCTAssertEqual(events.map { $0.kind }, [.enqueued, .admitted, .failed])
+  }
+
+  /// A queue job whose body throws a bare `CancellationError` is classified
+  /// `.interrupted`, not `.failed` — the SAME `isRenderInterruption`
+  /// classifier the video path uses, exercised here through `.modelSwitch`
+  /// (a caller-supplied body) so no model weights are needed.
+  func testAModelSwitchThrowingCancellationRecordsInterruptedThroughTheHook() async throws {
+    let probe = makeQueueProbe()
+    var caught: Error?
+    async let result: Bool = probe.enqueueFakeRender {
+      throw CancellationError()
+    }
+    do {
+      _ = try await result
+    } catch {
+      caught = error
+    }
+    XCTAssertNotNil(caught)
+
+    let events = probe.lifecycleEvents(jobKind: QueueJobKind.modelSwitch.rawValue)
+    XCTAssertEqual(events.map { $0.kind }, [.enqueued, .admitted, .interrupted])
+  }
+
+  /// The same job kind, but a genuine (non-cancellation) error — must land
+  /// as `.failed`, proving the classifier actually distinguishes the two
+  /// rather than treating every thrown error as an interrupt.
+  func testAModelSwitchThrowingAnOrdinaryErrorRecordsFailedThroughTheHook() async throws {
+    let probe = makeQueueProbe()
+    struct BoomError: Error {}
+    var caught: Error?
+    async let result: Bool = probe.enqueueFakeRender {
+      throw BoomError()
+    }
+    do {
+      _ = try await result
+    } catch {
+      caught = error
+    }
+    XCTAssertNotNil(caught)
+
+    let events = probe.lifecycleEvents(jobKind: QueueJobKind.modelSwitch.rawValue)
+    XCTAssertEqual(events.map { $0.kind }, [.enqueued, .admitted, .failed])
+  }
+
+  /// A queue job that SUCCEEDS records `.completed`, not `.failed`/
+  /// `.interrupted` — the positive case alongside the two negative ones
+  /// above, all through the same `.modelSwitch` seam.
+  func testAModelSwitchThatSucceedsRecordsCompletedThroughTheHook() async throws {
+    let probe = makeQueueProbe()
+    let finished = try await probe.enqueueFakeRender { true }
+    XCTAssertTrue(finished)
+
+    let events = probe.lifecycleEvents(jobKind: QueueJobKind.modelSwitch.rawValue)
+    XCTAssertEqual(events.map { $0.kind }, [.enqueued, .admitted, .completed])
+  }
 }

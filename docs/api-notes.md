@@ -222,8 +222,12 @@ Krea-2 models` — the route throws before any temp file is written).
 
 `GET /v1/queue/lifecycle?job_id=&limit=` — read-only, append-only record of
 what actually happened to queue jobs: `enqueued`, `admitted`, `started`,
-`progress` (bounded rate — see below), `checkpointed`, `resumed`,
-`interrupted`, `completed`, `failed`, `replayed_after_restart`, `dropped`.
+`progress` (bounded rate — see below), `checkpointed`, `resumed`, `abandoned`
+(a checkpointed video was NOT resumed — an operator interrupt arrived during
+the preemption episode, so the checkpoint was dropped instead; distinct from
+`resumed` since PR #370 review round 1, which found the original version
+recorded `resumed` even on this path), `interrupted`, `completed`, `failed`,
+`replayed_after_restart`, `dropped`.
 Built as the TELEMETRY that #283 (a restart re-enqueues the active job and
 re-renders it from step 1, and nothing reported that accurately) and #217
 (the Desktop queue/progress UI goes stale during a render) need before either
@@ -267,11 +271,35 @@ operator-visible signal #283 finding 1 says is missing; it does not by
 itself change whether a restart drops or resumes the job — that is #283's
 open decision, not this instrument's.
 
-Storage: an in-memory ring (default last 4000 events, actor-hop-free reads)
-plus `~/.comfybox/queue-lifecycle.jsonl` (append-only, survives a restart;
-honors `COMFYBOX_STATE_DIR` like every other engine state path). `progress`
-events are throttled to at most one per job per second — a fast-ticking
-render cannot flood either store.
+Storage: an in-memory ring (default last 4000 events, actor-hop-free reads,
+a real circular buffer — no per-insert array shift) plus
+`~/.comfybox/queue-lifecycle.jsonl` (append-only, survives a restart; honors
+`COMFYBOX_STATE_DIR` like every other engine state path). `progress` events
+are throttled to at most one per job per second — a fast-ticking render
+cannot flood either store.
+
+**Disk footprint and write path** (PR #370 review round 1, C1/C2). Writes
+are asynchronous: `record` appends to a bounded in-memory buffer (default
+2000 events) and returns immediately; a dedicated background queue drains
+that buffer to disk in batches, separately from the lock that guards the
+ring — so a slow or near-full disk can never stall a caller, including
+`GET /v1/queue`/`GET /v1/queue/lifecycle` answered by the sync control
+plane specifically so they stay responsive during a render (#217). If the
+writer ever falls behind that buffer's bound (a stalled disk), the OLDEST
+queued writes are dropped — counted, never silent, and the in-memory ring
+is completely unaffected (a dropped write only ever costs one event's
+durability, never its visibility for the life of the process).
+
+The file itself is bounded by rotation: it rotates once appending would
+push it past 20 MB, keeping 2 generations (`queue-lifecycle.jsonl` +
+`queue-lifecycle.jsonl.1`) — worst case **~40 MB** on disk. A fresh
+`QueueLifecycleLedger()` never reads this file at construction time (that
+would block `WarmServer.init`, i.e. engine startup, on however large the
+file has grown); instead it reseeds LAZILY, on the first real `record`/
+`events` call, and reads only the trailing 64 KB (not the whole file) —
+bounded regardless of how large the file gets between rotations, and
+tolerant of a truncated/malformed line at either end of that window (a
+crash mid-write, or the window simply starting mid-line).
 
 See `Sources/ZImage/Server/QueueLifecycleLedger.swift` for the full event
 schema and `ReplayClassifier`'s pure from-step-1-vs-resumed logic.
