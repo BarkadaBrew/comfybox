@@ -423,6 +423,11 @@ extension GeneratePayload {
       }
       if let loras = expansion.loras {
         out.loras = loras.map { LoRAEntry(path: $0.filename, scale: Float($0.scale), role: $0.role) }
+        // #282: mark the stack PRESET-owned. `loras` is one field with two
+        // possible owners, and the dequeue resolver must be able to tell them
+        // apart to report an honest `lora_stack_origin` — and, more to the
+        // point, so the warm default can never displace a preset's stack.
+        out.presetStackApplied = true
         log("Preset '\(expansion.presetId)': applying its resolved LoRA stack — "
           + PresetLoRAStack.describe(loras))
       }
