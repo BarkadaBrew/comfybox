@@ -34,6 +34,7 @@ public enum MCPToolRegistry {
     unloadModel.annotated(.additive),
     generateVideo.annotated(.additive),
     videoStatus.annotated(.readOnly),
+    getJob.annotated(.readOnly),
     composeMontage.annotated(.additive),
     renderStoryboard.annotated(.additive),
     rerenderVideo.annotated(.additive),
@@ -178,10 +179,70 @@ public enum MCPToolRegistry {
           "type": "string",
           "description": "neutral | banana | avocado (gates explicit tiers). Stamped into the rendered image's embedded metadata.",
         ] as [String: Any],
+        // comfybox#288: additive async submit. Default false keeps every
+        // existing caller synchronous, byte for byte.
+        "async": [
+          "type": "boolean",
+          "default": false,
+          "description": "Submit and return immediately with {job_id, kind, state, progress, poll_with} instead of blocking for the render. Poll it with get_job. Use this for anything slow or behind a busy queue — a blocking call can outlive the MCP client's tool timeout and lose a render that actually succeeded. Default: false (synchronous, unchanged).",
+        ] as [String: Any],
+        // comfybox#294: additive image content.
+        "return_image": [
+          "type": "boolean",
+          "default": false,
+          "description": "Also return the finished PNG as an MCP image content block (base64, image/png) next to the text result. Costs payload: a 1024x1024 render is ~1.3-2.0 MB on disk and ~1.7-2.7 MB once base64-encoded, all of it in the client's context. Images encoding past 8 MB are omitted with a note; output_path is always returned. Default: false.",
+        ] as [String: Any],
       ] as [String: Any],
       "required": ["prompt"] as [String],
     ] as [String: Any],
-    routes: [RouteRef(method: "POST", path: "/v1/generate")]
+    routes: [
+      RouteRef(method: "POST", path: "/v1/generate"),
+      // #288: `async: true` submits here instead (was a ParityExemption).
+      RouteRef(method: "POST", path: "/v1/generate/async"),
+      // #292: polled for progress while a progressToken is in flight.
+      RouteRef(method: "GET", path: "/v1/queue"),
+    ]
+  )
+
+  /// comfybox#289 — ONE job model. Before this there were three ways to ask
+  /// "is it done yet?" (`video_status`, `workflow_run_status`, and nothing at
+  /// all for images) and a small-model caller had to learn all of them.
+  ///
+  /// ADDITIVE: `video_status` and `workflow_run_status` keep working and keep
+  /// returning exactly what they return today (intent.md — the MCP tool
+  /// surface is production for Bree and Kira: version or shim, never silently
+  /// change). Workflow RUNS keep their own `run_id` namespace and tool; this
+  /// covers the job-id namespace the generation routes share.
+  static let getJob = MCPToolDefinition(
+    name: "get_job",
+    description: "Poll ANY render job by id — image, video, or storyboard — with one tool. Returns {job_id, kind, state, progress, result?, error?, retry_after_seconds?}; state is queued | running | completed | failed | unknown (everything but queued/running is terminal — stop polling; `unknown` means the engine reported a state this build does not know, named in `error`), progress is 0-100. Job ids come from generate_image (async: true), generate_video, render_storyboard, rerender_video and extend_video. Poll roughly every 2-5s; retry_after_seconds, when present, is the engine's own reschedule hint while it replays its queue after a restart.",
+    inputSchema: [
+      "type": "object",
+      "properties": [
+        "job_id": [
+          "type": "string",
+          "description": "Job id returned by an async submit.",
+        ] as [String: Any],
+        "kind": [
+          "type": "string",
+          "enum": MCPJobKind.selectableCases.map(\.rawValue),
+          "description": "What produced the job. Omit to probe image then video — pass it to save a call, and pass 'storyboard' explicitly (storyboards share the video tracker and are otherwise reported as 'video'). A LoRA-swap id, which only exists after a restart replay, resolves as 'image'.",
+        ] as [String: Any],
+        "return_image": [
+          "type": "boolean",
+          "default": false,
+          "description": "On a COMPLETED image job, also return the PNG as an MCP image content block (base64, image/png). Same payload cost as generate_image's flag: ~1.7-2.7 MB of context for a 1024x1024 render, omitted with a note above 8 MB encoded. Ignored for video results. Default: false.",
+        ] as [String: Any],
+      ] as [String: Any],
+      "required": ["job_id"] as [String],
+    ] as [String: Any],
+    routes: [
+      RouteRef(method: "GET", path: "/v1/generate/status/{id}"),
+      RouteRef(method: "GET", path: "/v1/video/status/{id}"),
+      // The live percent for a RUNNING image job: the image tracker carries
+      // none, and this snapshot is lock-based (answers during a render).
+      RouteRef(method: "GET", path: "/v1/queue"),
+    ]
   )
 
   static let swapLoras = MCPToolDefinition(

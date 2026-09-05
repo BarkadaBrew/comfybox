@@ -5,8 +5,22 @@
 
 import Foundation
 
+/// The HTTP surface `MCPToolExecutor` needs, behind a protocol so tool
+/// composites can be driven end-to-end in unit tests with a stub instead of a
+/// live engine (PR #367 review r1, item 5). `WarmServerClient` is the only
+/// production implementation.
+public protocol WarmServerTransport: Sendable {
+  func get(_ path: String) async throws -> (Int, Data)
+  func post(_ path: String, body: Data) async throws -> (Int, Data)
+  func put(_ path: String, body: Data) async throws -> (Int, Data)
+  func patch(_ path: String, body: Data) async throws -> (Int, Data)
+  func delete(_ path: String) async throws -> (Int, Data)
+  func send(method: String, path: String, body: Data, headers: [String: String]) async throws
+    -> (Int, Data, [String: String])
+}
+
 /// Lightweight HTTP client targeting the local WarmServer instance.
-public final class WarmServerClient: @unchecked Sendable {
+public final class WarmServerClient: WarmServerTransport, @unchecked Sendable {
   public let host: String
   public let port: UInt16
 

@@ -8,18 +8,26 @@ import Foundation
 
 /// Executes MCP tool calls by dispatching to WarmServer HTTP endpoints.
 public final class MCPToolExecutor: @unchecked Sendable {
-  private let client: WarmServerClient
+  private let client: WarmServerTransport
 
-  public init(client: WarmServerClient) {
+  public init(client: WarmServerTransport) {
     self.client = client
   }
 
   /// Execute a tool call. Returns an MCPToolResult.
-  public func execute(name: String, arguments: MCPParams?) async -> MCPToolResult {
+  ///
+  /// `progress` is non-nil only when the client supplied a `progressToken` in
+  /// the request's `_meta` (comfybox#292). It is optional with a default so
+  /// every existing call site is unchanged.
+  public func execute(
+    name: String, arguments: MCPParams?, progress: MCPProgressReporter? = nil
+  ) async -> MCPToolResult {
     do {
       switch name {
       case "generate_image":
-        return try await executeGenerateImage(arguments)
+        return try await executeGenerateImage(arguments, progress: progress)
+      case "get_job":
+        return try await executeGetJob(arguments)
       case "repair_image":
         return try await executeRepairImage(arguments)
       case "swap_loras":
@@ -249,7 +257,9 @@ public final class MCPToolExecutor: @unchecked Sendable {
     return MCPToolResult(text: String(data: outData, encoding: .utf8) ?? "{}")
   }
 
-  private func executeGenerateImage(_ params: MCPParams?) async throws -> MCPToolResult {
+  private func executeGenerateImage(
+    _ params: MCPParams?, progress: MCPProgressReporter? = nil
+  ) async throws -> MCPToolResult {
     guard let prompt = params?.string("prompt"), !prompt.isEmpty else {
       return MCPToolResult(error: "Error: 'prompt' is required")
     }
@@ -309,8 +319,65 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
 
     let jsonData = try JSONSerialization.data(withJSONObject: body)
-    let (status, data) = try await client.post("/v1/generate", body: jsonData)
-    return Self.mapHTTPResponse(status: status, data: data)
+    let returnImage = params?.bool(MCPImageAttachment.parameterName) ?? false
+    let client = self.client
+
+    // #288: additive async submit. `async: true` hands back a job_id from
+    // POST /v1/generate/async immediately instead of holding the MCP call
+    // open for the whole render — a slow render behind a busy queue used to
+    // sit inside the client's 300s tool timeout and lose a result the engine
+    // had actually produced. The DEFAULT is unchanged (synchronous).
+    if params?.bool("async") == true {
+      return try await Self.runSubmitImageJob(body: jsonData) { _, path, requestBody in
+        try await client.post(path, body: requestBody)
+      }
+    }
+
+    // #292: while the client supplied a progressToken, narrate the render
+    // from GET /v1/queue (lock-based — it answers even while a render holds
+    // the coordinator actor, comfybox#217). With no token this is a straight
+    // pass-through and the engine is never polled.
+    let (status, data) = try await Self.withProgressNotifications(
+      reporter: progress,
+      poll: {
+        guard let (queueStatus, queueData) = try? await client.get("/v1/queue"),
+          queueStatus == 200
+        else { return nil }
+        return MCPProgressScheduler.Snapshot(queuePayload: queueData)
+      }
+    ) {
+      try await client.post("/v1/generate", body: jsonData)
+    }
+    return Self.mapImageRenderResponse(status: status, data: data, returnImage: returnImage)
+  }
+
+  /// get_job -> the one polling tool (#289). Routes by kind to the image or
+  /// video tracker and returns the unified envelope; see `MCPJobModel`.
+  private func executeGetJob(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let jobId = params?.string("job_id"), !jobId.isEmpty else {
+      return MCPToolResult(error: "Error: 'job_id' is required")
+    }
+    var kind: MCPJobKind?
+    if let raw = params?.string("kind"), !raw.isEmpty {
+      // Only the SELECTABLE kinds: `swap` is not one, because a swap job id
+      // only exists after queue replay and resolves through the image
+      // tracker (review r1, item 3). Omitting `kind` finds it either way.
+      guard let parsed = MCPJobKind(rawValue: raw),
+        MCPJobKind.selectableCases.contains(parsed)
+      else {
+        return MCPToolResult(
+          error: "Error: unknown 'kind' \(raw) — expected one of "
+            + MCPJobKind.selectableCases.map(\.rawValue).joined(separator: ", ")
+            + " (omit it to probe image then video; LoRA-swap ids resolve as 'image')")
+      }
+      kind = parsed
+    }
+    let returnImage = params?.bool(MCPImageAttachment.parameterName) ?? false
+    let client = self.client
+    return try await Self.runGetJob(jobId: jobId, kind: kind, returnImage: returnImage) {
+      _, path in
+      try await client.get(path)
+    }
   }
 
   /// swap_loras -> POST /v1/lora/swap
@@ -1171,6 +1238,238 @@ public final class MCPToolExecutor: @unchecked Sendable {
   /// 200 -> success (text + structured fields), any other -> error text.
   /// `static` (no `self` use) so `runSetWarmPreset`'s injectable-call
   /// composite can share it without needing an executor instance.
+  // MARK: - One job model (#288, #289, #292, #294)
+
+  /// Submit an image render asynchronously and hand back the unified job
+  /// envelope. `call` is injectable so the route, the accepted-status
+  /// handling and the envelope are unit-testable without a server.
+  static func runSubmitImageJob(
+    body: Data,
+    call: (_ method: String, _ path: String, _ body: Data) async throws -> (Int, Data)
+  ) async throws -> MCPToolResult {
+    let (status, data) = try await call("POST", "/v1/generate/async", body)
+    guard status == 200 || status == 202 else {
+      return Self.mapHTTPResponse(status: status, data: data)
+    }
+    guard let accepted = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let envelope = MCPJobModel.submitEnvelope(kind: .image, status: accepted)
+    else {
+      // The engine accepted it but named no job — hand back exactly what it
+      // said rather than inventing an id the caller could never poll.
+      return MCPToolResult(text: String(data: data, encoding: .utf8) ?? "{}")
+    }
+    return Self.jobResult(envelope, returnImage: false)
+  }
+
+  /// The one polling path (#289). Reads the status route for `kind` (probing
+  /// image then video when the caller did not name one) and maps whatever
+  /// shape comes back onto the single envelope.
+  ///
+  /// A RUNNING image job costs one extra read of `GET /v1/queue`: the image
+  /// tracker carries no per-job percent, and the queue snapshot is the only
+  /// live number — but it describes the ACTIVE render, so it is used only
+  /// when that render is this job. Queued and finished jobs cost one call.
+  static func runGetJob(
+    jobId: String,
+    kind: MCPJobKind?,
+    returnImage: Bool = false,
+    call: (_ method: String, _ path: String) async throws -> (Int, Data)
+  ) async throws -> MCPToolResult {
+    guard !jobId.isEmpty else { return MCPToolResult(error: "Error: 'job_id' is required") }
+    let candidates = kind.map { [$0] } ?? MCPJobModel.probeOrder
+
+    let encodedId = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
+    // A probe that fails for a reason OTHER than "not mine" must not end the
+    // search — the job may still be in the next tracker. The failure is only
+    // surfaced if every probe fails (PR #367 review r1, item 4).
+    var lastFailure: (status: Int, data: Data)?
+
+    for candidate in candidates {
+      // Spelled out as literals rather than read off MCPJobKind so the §3.5
+      // anti-drift parity check — which extracts a tool's real routes by
+      // parsing THIS file — can see the paths get_job claims. The two agree
+      // by test (MCPJobModelTests drives this function per kind and compares
+      // the observed path against MCPJobKind.statusPathTemplate).
+      let statusPath: String
+      switch candidate {
+      case .image, .swap:
+        statusPath = "/v1/generate/status/\(encodedId)"
+      case .video, .storyboard:
+        statusPath = "/v1/video/status/\(encodedId)"
+      }
+      let (status, data) = try await call("GET", statusPath)
+      switch status {
+      case 200:
+        guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+          return MCPToolResult(error: "Error: unreadable status payload for job \(jobId)")
+        }
+        var queuePercent: Int?
+        let state = MCPJobModel.state(fromEngine: (payload["status"] as? String) ?? "")
+        if !candidate.carriesOwnProgressPercent, state == .running {
+          if let (queueStatus, queueData) = try? await call("GET", "/v1/queue"),
+            queueStatus == 200,
+            let snapshot = MCPProgressScheduler.Snapshot(queuePayload: queueData),
+            snapshot.activeJobId == jobId
+          {
+            queuePercent = snapshot.progressPercent
+          }
+        }
+        let envelope = MCPJobModel.unify(
+          kind: candidate, jobId: jobId, status: payload, queueProgressPercent: queuePercent)
+        return Self.jobResult(envelope, returnImage: returnImage)
+
+      case 404:
+        // Not this tracker's job — try the next candidate (or fall through
+        // to the not-found error below).
+        continue
+
+      case 503 where Self.isQueueRecoveryRefusal(data):
+        // DEFENSIVE. `QueueRecoveryGate` gates SUBMIT routes today, not the
+        // status reads this function makes, so no current engine build
+        // reaches here. It stays because the alternative — a future gate on
+        // the status route surfacing as a bare error — would read to a
+        // polling client as "your job died" when the job is merely queued
+        // behind a restart replay. Cheap insurance, one branch
+        // (PR #367 review r1, item 4).
+        return Self.jobResult(
+          MCPJobModel.recoveryEnvelope(
+            kind: candidate, jobId: jobId,
+            retryAfterSeconds: Self.parseRetryAfterSeconds(from: data)),
+          returnImage: returnImage)
+
+      default:
+        // Any OTHER status (including a 503 that retrying can never fix,
+        // e.g. "LTX-2 not configured") is a real error — but keep probing
+        // the remaining trackers first.
+        lastFailure = (status, data)
+        continue
+      }
+    }
+
+    if let lastFailure {
+      return Self.mapHTTPResponse(status: lastFailure.status, data: lastFailure.data)
+    }
+    let probed = candidates.map(\.rawValue).joined(separator: ", ")
+    return MCPToolResult(
+      error: "Error: no job \(jobId) tracked as \(probed). Finished jobs are pruned from the "
+        + "tracker an hour after they complete (both trackers, `pruneCompleted` TTL 3600s); "
+        + "check the id, or pass 'kind' explicitly.")
+  }
+
+  /// Run `work` while emitting MCP progress notifications (#292).
+  ///
+  /// With no reporter (no `progressToken` in `_meta`) this is a straight
+  /// pass-through — `poll` is never called. With one, a child task polls at
+  /// `interval` and is cancelled AND awaited before this returns, on success
+  /// and on error alike: nothing it starts outlives the request (intent.md).
+  static func withProgressNotifications<T>(
+    reporter: MCPProgressReporter?,
+    interval: TimeInterval = MCPProgressScheduler.defaultInterval,
+    maxDuration: TimeInterval = MCPProgressScheduler.maxDuration,
+    poll: @escaping @Sendable () async -> MCPProgressScheduler.Snapshot?,
+    work: () async throws -> T
+  ) async throws -> T {
+    guard let reporter else { return try await work() }
+
+    let start = Date()
+    let poller = Task<Void, Never> {
+      var lastEmitted: Double?
+      while !Task.isCancelled {
+        do {
+          try await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
+        } catch {
+          return  // cancelled while sleeping
+        }
+        if Task.isCancelled { return }
+        let snapshot = await poll()
+        switch MCPProgressScheduler.decide(
+          elapsed: Date().timeIntervalSince(start), maxDuration: maxDuration,
+          lastEmitted: lastEmitted, snapshot: snapshot)
+        {
+        case .emit(let progress, let total, let message):
+          lastEmitted = progress
+          await reporter.report(progress: progress, total: total, message: message)
+        case .skip:
+          continue
+        case .stop:
+          return
+        }
+      }
+    }
+
+    do {
+      let value = try await work()
+      poller.cancel()
+      await poller.value
+      return value
+    } catch {
+      poller.cancel()
+      await poller.value
+      throw error
+    }
+  }
+
+  /// Serialize a unified job envelope into a tool result, attaching the
+  /// rendered image when the caller asked for it and the job finished.
+  private static func jobResult(_ envelope: [String: Any], returnImage: Bool) -> MCPToolResult {
+    let data = (try? JSONSerialization.data(withJSONObject: envelope)) ?? Data("{}".utf8)
+    let base = MCPToolResult(
+      text: String(data: data, encoding: .utf8) ?? "{}", structuredJSON: data)
+    guard returnImage else { return base }
+
+    guard (envelope["state"] as? String) == MCPJobState.completed.rawValue else {
+      return Self.withNote(
+        "return_image: nothing to attach yet — job state is "
+          + "\((envelope["state"] as? String) ?? "unknown").",
+        on: base)
+    }
+    guard let path = (envelope["result"] as? [String: Any])?["output_path"] as? String,
+      !path.isEmpty
+    else {
+      return Self.withNote("return_image: this job reported no output path.", on: base)
+    }
+    return Self.attachImage(at: path, to: base)
+  }
+
+  /// `POST /v1/generate`'s response, plus the PNG as an MCP image block when
+  /// `return_image` is set (#294).
+  private static func mapImageRenderResponse(
+    status: Int, data: Data, returnImage: Bool
+  ) -> MCPToolResult {
+    let base = Self.mapHTTPResponse(status: status, data: data)
+    // A failed render has nothing to attach and stays an error untouched.
+    guard returnImage, !base.isError else { return base }
+    guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let path = payload["output_path"] as? String, !path.isEmpty
+    else {
+      return Self.withNote("return_image: this render reported no output path.", on: base)
+    }
+    return Self.attachImage(at: path, to: base)
+  }
+
+  /// Append the image content block, or a note saying why it was omitted —
+  /// never a silent drop. The text block's JSON and structuredContent are
+  /// unchanged; the note is appended after it.
+  private static func attachImage(at path: String, to base: MCPToolResult) -> MCPToolResult {
+    guard MCPImageAttachment.isAttachableImage(path: path) else {
+      return Self.withNote(
+        "return_image: \(path) is not an image — read output_path instead.", on: base)
+    }
+    // Goes through `attachment` so the per-result cap is genuinely enforced
+    // here rather than merely declared (PR #367 review r1, item 4).
+    let attachment = MCPImageAttachment.attachment(paths: [path])
+    var text = base.content.first?.text ?? "{}"
+    for note in attachment.notes { text += "\n" + note }
+    return MCPToolResult(
+      text: text, structuredJSON: base.structuredJSON, images: attachment.blocks)
+  }
+
+  private static func withNote(_ note: String, on base: MCPToolResult) -> MCPToolResult {
+    MCPToolResult(
+      text: (base.content.first?.text ?? "{}") + "\n" + note,
+      structuredJSON: base.structuredJSON, images: [])
+  }
+
   private static func mapHTTPResponse(status: Int, data: Data) -> MCPToolResult {
     let text = String(data: data, encoding: .utf8) ?? "{}"
     if status == 200 {

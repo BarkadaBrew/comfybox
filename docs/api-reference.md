@@ -43,9 +43,9 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | GET | `/v1/gallery/file` |  |  |
 | GET | `/v1/gallery/list` |  |  |
 | POST | `/v1/generate` | generate_image, repair_image |  |
-| POST | `/v1/generate/async` |  | Async job variant of /v1/generate; MCP agents call generate_image (a synchronous MCP call wrapping the same render). A dedicated async tool was deferred from the Phase 1 worklist. |
+| POST | `/v1/generate/async` | generate_image |  |
 | GET | `/v1/generate/preview` |  |  |
-| GET | `/v1/generate/status/{id}` |  |  |
+| GET | `/v1/generate/status/{id}` | get_job |  |
 | POST | `/v1/lora/swap` | swap_loras |  |
 | GET | `/v1/loras` |  |  |
 | POST | `/v1/loras/import` |  | Desktop drag-and-drop import (local file paths on the server host); agent flows discover LoRAs via lora_scan / nearline_stage instead. |
@@ -73,7 +73,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | DELETE | `/v1/presets/{id}` | delete_preset |  |
 | GET | `/v1/presets/{id}` |  |  |
 | GET | `/v1/providers/status` |  |  |
-| GET | `/v1/queue` |  |  |
+| GET | `/v1/queue` | generate_image, get_job |  |
 | POST | `/v1/queue/clear` |  | The clear_queue tool targets the ComfyUI-bridge queue path (POST /queue {"clear": true}, executeClearQueue) -- a pre-parity contract the old api-reference documented; the native /v1/queue/clear route currently has no agent caller. Declared reality (G1); re-point the tool in a behavior phase. |
 | POST | `/v1/queue/interrupt` | interrupt_render |  |
 | POST | `/v1/queue/pause` | pause_queue |  |
@@ -92,7 +92,7 @@ or carry a reasoned exemption (§3.5 assertion 3).
 | POST | `/v1/video/generate/async` | generate_video |  |
 | GET | `/v1/video/output` |  |  |
 | POST | `/v1/video/rerender` | rerender_video |  |
-| GET | `/v1/video/status/{id}` |  |  |
+| GET | `/v1/video/status/{id}` | get_job |  |
 | GET | `/v1/video/traces` |  |  |
 | POST | `/v1/video/traces/{id}/promote` |  | Video-trace curation is Desktop/gallery-driven today; promote_video_trace tool deferred from the Phase 1 worklist. |
 | POST | `/v1/video/traces/{id}/rating` |  | Video-trace curation is Desktop/gallery-driven today; rate_video_trace tool deferred from the Phase 1 worklist. |
