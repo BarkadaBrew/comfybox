@@ -339,6 +339,15 @@ public final class EngineService {
     public var lastGeneratedImagePath: String?
     public var lastError: String?
     public var lastDurationMs: Int?
+    /// #217: the id of the queue job THIS app submitted and is currently
+    /// polling, so a cancel can name it (`/v1/queue/interrupt` `target`, added
+    /// in comfybox#362) instead of stopping whatever happens to be running.
+    /// nil whenever no desktop-submitted render is in flight. With two
+    /// concurrent `generate()` calls this names the most recent submit (each
+    /// call only clears the id if it is still its own), which is why
+    /// `cancelActiveGeneration` is documented as cancelling THIS app's current
+    /// render rather than a specific one.
+    public private(set) var activeImageJobId: String?
 
     // Model pool state
     public var availableModels: [ModelInfo] = []
@@ -368,6 +377,10 @@ public final class EngineService {
     public var serverHost: String = "127.0.0.1"
     public var serverPort: UInt16 = 7870
     public var outputDirectory: String = NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath
+    /// Seconds between `GET /v1/generate/status/{id}` polls (#217). A property
+    /// rather than a literal so tests drive the submit→poll loop without
+    /// sleeping for real seconds.
+    public var imageStatusPollInterval: Double = 1.0
 
     /// Whether the connected engine is running on this Mac, vs. a remote
     /// server reached over the network. Several desktop-local operations
@@ -467,7 +480,10 @@ public final class EngineService {
 
     // MARK: - Private
 
-    private var client: WarmServerClient?
+    /// The HTTP transport. Typed as the PROTOCOL (not `WarmServerClient`) so the
+    /// submit→poll generation flow can be driven end-to-end in unit tests with a
+    /// fake — the same seam `MCPToolExecutor` uses (#217).
+    private var client: WarmServerTransport?
     // nonisolated(unsafe) so the nonisolated deinit can cancel it; Task.cancel()
     // is thread-safe, and all other accesses happen on the main actor.
     private nonisolated(unsafe) var healthPollTask: Task<Void, Never>?
@@ -525,6 +541,18 @@ public final class EngineService {
         }
     }
 
+    #if DEBUG
+    /// Test seam (#217): attach a fake `WarmServerTransport` and mark the
+    /// service connected, WITHOUT starting the health-poll task, so the
+    /// submit→poll generation flow can be driven end-to-end with no engine.
+    func attachTransportForTesting(_ transport: WarmServerTransport) {
+        healthPollTask?.cancel()
+        healthPollTask = nil
+        client = transport
+        connectionState = .connected
+    }
+    #endif
+
     /// Disconnect from the server (stops polling, does NOT shut down the server).
     public func disconnect() {
         healthPollTask?.cancel()
@@ -539,6 +567,7 @@ public final class EngineService {
         availableLoras = []
         activeLoraIds = []
         queueInfo = nil
+        activeImageJobId = nil
     }
 
     // MARK: - Generation
@@ -551,44 +580,12 @@ public final class EngineService {
         return out
     }
 
-    /// Submit a generation request to the server. Returns the output file path on success.
-    @discardableResult
-    public func generate(_ request: GenerationRequest, contentMode: ContentMode = .neutral) async throws -> String {
-        guard let client = client, connectionState.isConnected else {
-            throw EngineServiceError.notConnected
-        }
-        guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw EngineServiceError.emptyPrompt
-        }
-
-        activeGenerateCount += 1
-        lastError = nil
-        // Clear any stale frame from a previous render so the preview pane
-        // doesn't briefly show the last render's final denoising step.
-        livePreviewImage = nil
-
-        // Poll health quickly while the render runs so progress_percent updates
-        // smoothly (the idle poll is every 3s).
-        let progressPoll = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(700))
-                await self?.pollHealth()
-            }
-        }
-        defer { activeGenerateCount -= 1; progressPoll.cancel() }
-
-        // Build the output path.
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let outputFilename = "comfybox-\(timestamp).png"
-
-        // Ensure output directory exists.
-        try FileManager.default.createDirectory(
-            atPath: outputDirectory,
-            withIntermediateDirectories: true
-        )
-        let outputPath = (outputDirectory as NSString).appendingPathComponent(outputFilename)
-
-        // Build JSON payload matching the server API GeneratePayload.
+    /// The JSON body `/v1/generate` and `/v1/generate/async` share. Pure and
+    /// `nonisolated` so the wire shape is unit-testable without a server (#217):
+    /// the async migration must not quietly change a single field.
+    nonisolated static func generatePayload(
+        _ request: GenerationRequest, outputPath: String, contentMode: ContentMode
+    ) -> [String: Any] {
         var payloadDict: [String: Any] = [
             "source": "desktop",
             "prompt": request.prompt,
@@ -653,41 +650,165 @@ public final class EngineService {
             payloadDict["c2"] = request.c2
         }
 
-        payloadDict = Self.attachingContentMode(payloadDict, mode: contentMode)
+        return attachingContentMode(payloadDict, mode: contentMode)
+    }
 
-        let bodyData = try JSONSerialization.data(withJSONObject: payloadDict)
-        let (status, responseData) = try await client.post("/v1/generate", body: bodyData)
+    /// Live status of an async image job — decoded from
+    /// `GET /v1/generate/status/{id}`. Mirrors the server's `ImageJobStatus`,
+    /// carrying the additive flags recent work put on BOTH the sync response and
+    /// this one (`preset_unresolved*`, `preempt_refused`), so nothing the sync
+    /// path surfaced is lost by submitting asynchronously.
+    public struct ImageJobStatus: Sendable {
+        public let jobId: String
+        public let status: String            // queued | processing | succeeded | failed
+        public let outputPath: String?
+        public let error: String?
+        public let durationMs: Int?
+        public let elapsedMs: Int?
+        public let presetUnresolved: String?
+        public let presetUnresolvedReason: String?
+        public let preemptRefused: Bool?
 
-        guard status == 200 else {
-            let errorMessage: String
-            if let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-               let msg = json["error"] as? String {
-                errorMessage = msg
-            } else {
-                errorMessage = "Server returned status \(status)"
-            }
+        public var isTerminal: Bool { status == "succeeded" || status == "failed" }
+    }
+
+    /// Parse an `ImageJobStatus` off the wire. Hand-parsed (rather than
+    /// `Codable`) for the same reason `parseVideoJobStatus` is: the engine adds
+    /// additive fields to this payload regularly, and a strict decoder would
+    /// turn each addition into a client-side failure.
+    nonisolated static func parseImageJobStatus(_ data: Data) -> ImageJobStatus? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let jobId = json["job_id"] as? String,
+              let status = json["status"] as? String
+        else { return nil }
+        return ImageJobStatus(
+            jobId: jobId,
+            status: status,
+            outputPath: json["output_path"] as? String,
+            error: json["error"] as? String,
+            durationMs: json["duration_ms"] as? Int,
+            elapsedMs: json["elapsed_ms"] as? Int,
+            presetUnresolved: json["preset_unresolved"] as? String,
+            presetUnresolvedReason: json["preset_unresolved_reason"] as? String,
+            preemptRefused: json["preempt_refused"] as? Bool
+        )
+    }
+
+    /// Submit an image render to the QUEUE and return its job id immediately.
+    ///
+    /// `POST /v1/generate/async` answers `202` in milliseconds — the render runs
+    /// on the server's own queue. The blocking `POST /v1/generate` it replaces
+    /// held the actor for the whole render, which is what made `/health` (and so
+    /// the Desktop queue/progress UI) go stale mid-render (#217).
+    ///
+    /// Refusals are raised here with the SAME `(status, message)` mapping the
+    /// blocking call used, because both routes share the engine's one
+    /// decode/validate choke point (`decodedGenerateRequest`): a 409
+    /// preset/model conflict, a 413 memory-preflight refusal, a 429 full queue
+    /// and a 400 bad recipe name all arrive on the submit exactly as before.
+    public func submitImageJob(
+        _ request: GenerationRequest, outputPath: String, contentMode: ContentMode = .neutral
+    ) async throws -> ImageJobStatus {
+        guard let client = client, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        let payload = Self.generatePayload(request, outputPath: outputPath, contentMode: contentMode)
+        let bodyData = try JSONSerialization.data(withJSONObject: payload)
+        let (status, data) = try await client.post("/v1/generate/async", body: bodyData)
+        guard status == 202, let job = Self.parseImageJobStatus(data) else {
+            let errorMessage = parseErrorMessage(from: data) ?? "Server returned status \(status)"
             lastError = errorMessage
             throw EngineServiceError.serverError(status, errorMessage)
         }
+        return job
+    }
 
-        let response: ServerGenerateResponse
-        do {
-            response = try JSONDecoder().decode(ServerGenerateResponse.self, from: responseData)
-        } catch {
-            let msg = "Failed to decode server response: \(error.localizedDescription)"
+    /// Poll `GET /v1/generate/status/{id}` until the job reaches a terminal
+    /// state. `onProgress` fires on every poll. Mirrors `pollVideoStatus`.
+    public func pollImageStatus(
+        jobId: String,
+        pollInterval: Double? = nil,
+        onProgress: @MainActor (ImageJobStatus) -> Void = { _ in }
+    ) async throws -> ImageJobStatus {
+        guard let client = client else { throw EngineServiceError.notConnected }
+        let encoded = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
+        let interval = pollInterval ?? imageStatusPollInterval
+        while true {
+            let (status, data) = try await client.get("/v1/generate/status/\(encoded)")
+            guard status == 200, let job = Self.parseImageJobStatus(data) else {
+                let msg = parseErrorMessage(from: data) ?? "Image status poll failed"
+                lastError = msg
+                throw EngineServiceError.serverError(status, msg)
+            }
+            onProgress(job)
+            if job.isTerminal { return job }
+            try await Task.sleep(for: .seconds(interval))
+        }
+    }
+
+    /// Submit a generation request to the server. Returns the output file path on success.
+    ///
+    /// #217: submits via `POST /v1/generate/async` and polls
+    /// `GET /v1/generate/status/{id}`, exactly as the video path already does.
+    /// The blocking `POST /v1/generate` this replaces occupied the coordinator
+    /// actor for the whole render, so the Desktop's own progress/queue polling
+    /// was starved by its own render. The return type, the `lastError` /
+    /// `lastGeneratedImagePath` / `lastDurationMs` side effects and the thrown
+    /// error shapes are unchanged.
+    @discardableResult
+    public func generate(_ request: GenerationRequest, contentMode: ContentMode = .neutral) async throws -> String {
+        guard client != nil, connectionState.isConnected else {
+            throw EngineServiceError.notConnected
+        }
+        guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw EngineServiceError.emptyPrompt
+        }
+
+        activeGenerateCount += 1
+        lastError = nil
+        // Clear any stale frame from a previous render so the preview pane
+        // doesn't briefly show the last render's final denoising step.
+        livePreviewImage = nil
+
+        // Poll health quickly while the render runs so progress_percent updates
+        // smoothly (the idle poll is every 3s).
+        let progressPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(700))
+                await self?.pollHealth()
+            }
+        }
+        defer { activeGenerateCount -= 1; progressPoll.cancel() }
+
+        // Build the output path.
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let outputFilename = "comfybox-\(timestamp).png"
+
+        // Ensure output directory exists.
+        try FileManager.default.createDirectory(
+            atPath: outputDirectory,
+            withIntermediateDirectories: true
+        )
+        let outputPath = (outputDirectory as NSString).appendingPathComponent(outputFilename)
+
+        let submitted = try await submitImageJob(request, outputPath: outputPath, contentMode: contentMode)
+        activeImageJobId = submitted.jobId
+        defer { if activeImageJobId == submitted.jobId { activeImageJobId = nil } }
+
+        let job = try await pollImageStatus(jobId: submitted.jobId)
+
+        guard job.status == "succeeded", let path = job.outputPath else {
+            // A failed job carries the engine's own message — including the
+            // operator-interrupt sentence `/v1/queue/interrupt` produces, which
+            // is how a cancelled render reports itself on this path.
+            let msg = job.error ?? "Generation reported failure"
             lastError = msg
             throw EngineServiceError.generationFailed(msg)
         }
 
-        guard response.success else {
-            let msg = "Generation reported failure"
-            lastError = msg
-            throw EngineServiceError.generationFailed(msg)
-        }
-
-        lastGeneratedImagePath = response.outputPath
-        lastDurationMs = response.durationMs
-        return response.outputPath
+        lastGeneratedImagePath = path
+        lastDurationMs = job.durationMs
+        return path
     }
 
     // MARK: - Model Management
@@ -1757,12 +1878,43 @@ public final class EngineService {
     }
 
     /// Cancel the in-flight render (pending jobs continue).
-    public func interruptRender() async throws {
+    ///
+    /// `target` (comfybox#362, additive) names WHAT to stop; omitting it keeps
+    /// the historical body `{}` and the historical meaning — "whatever /health
+    /// shows as active" — which is what the Queue tab's stop button wants. An
+    /// explicit target that names nothing running answers 404, so only pass one
+    /// when you know the job is the active render.
+    public func interruptRender(target: String? = nil) async throws {
         guard let client = client, connectionState.isConnected else { throw EngineServiceError.notConnected }
-        let (status, data) = try await client.post("/v1/queue/interrupt", body: Data("{}".utf8))
+        let body: Data
+        if let target, !target.isEmpty {
+            body = try JSONSerialization.data(withJSONObject: ["target": target])
+        } else {
+            body = Data("{}".utf8)
+        }
+        let (status, data) = try await client.post("/v1/queue/interrupt", body: body)
         guard status == 200 else {
             throw EngineServiceError.serverError(status, parseErrorMessage(from: data) ?? "Interrupt failed")
         }
+    }
+
+    /// Cancel THIS app's in-flight render (#217).
+    ///
+    /// With `generate()` on the queue-submit path the desktop holds a job id, so
+    /// the cancel can name it rather than stopping whichever render happens to
+    /// be active — which, on a queue shared with Bree and Kira, may not be ours.
+    /// Returns false when nothing of ours is in flight. A job still QUEUED is
+    /// cancelled through `DELETE /v1/queue/{id}`, which is what the 404 from an
+    /// interrupt aimed at a pending id means.
+    @discardableResult
+    public func cancelActiveGeneration() async throws -> Bool {
+        guard let jobId = activeImageJobId else { return false }
+        if queueInfo?.currentJobId == jobId {
+            try await interruptRender(target: jobId)
+        } else {
+            try await cancelQueueJob(id: jobId)
+        }
+        return true
     }
 
     /// Cancel one pending job by id.
