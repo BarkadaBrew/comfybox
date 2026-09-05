@@ -899,7 +899,15 @@ public final class WarmServer {
       return .json(controlsResponse())
 
     case ("GET", "/v1/providers/status"):
-      let config = ComfyBoxServerConfig.loadOrMigrate()
+      // F4 (comfybox#324): read through ServerConfigStore, not a direct
+      // `ComfyBoxServerConfig`-level disk load — the store is the one
+      // authoritative in-memory document PUT/PATCH write through; a
+      // parallel direct read did no per-request I/O harm on a healthy
+      // install, but its own migrate-on-decode-failure branch can `save()`
+      // out of band, so a PATCH racing it would merge into (and overwrite)
+      // a document the store never saw. Same fix applied at every other
+      // direct config-load read site in this file (see git blame).
+      let config = ServerConfigStore.shared.current().config
       func status(_ endpoint: AIProviderEndpoint?) -> [String: Any] {
         guard let endpoint else { return ["configured": false] }
         return [
@@ -2399,6 +2407,35 @@ public final class WarmServer {
     LTX2VideoTuning.merging(query.tuning, twoPass: query.twoPass)
   }
 
+  /// F3 (comfybox#324, adversarial review of Phase 3 config): the ACTUAL
+  /// width/height `??` chain `prepareLocalVideo` (the real LTX-2 generate
+  /// prep path — NOT the `/v1/video/config/effective` preview above) applies
+  /// before aspect-matching/64-snapping — pulled out so a unit test can call
+  /// this exact merge with an injected `VideoDefaultValues` instead of
+  /// re-implementing the chain inline (the gap `ServerConfigStoreTests.
+  /// testMigrationIsVideoEngineNeutralDespiteDesktopValues` left: it asserted
+  /// against local `let ... = nil` shadows of this chain, never this
+  /// function). Priority: explicit width/height > named resolution > preset
+  /// dims > config.videoDefaults > 704x448 engine default.
+  static func resolvedLTX2RequestDims(
+    requestWidth: Int?, requestHeight: Int?,
+    namedWidth: Int?, namedHeight: Int?,
+    presetWidth: Int?, presetHeight: Int?,
+    videoConfigDefaults: VideoDefaultValues
+  ) -> (width: Int, height: Int) {
+    (
+      width: requestWidth ?? namedWidth ?? presetWidth ?? videoConfigDefaults.width ?? 704,
+      height: requestHeight ?? namedHeight ?? presetHeight ?? videoConfigDefaults.height ?? 448
+    )
+  }
+
+  /// F3: the frames half of the same real `prepareLocalVideo` chain —
+  /// `videoDefaults.frames` (migrated from the desktop's `videoFrames`) slots
+  /// between the request and the 97f engine default.
+  static func resolvedLTX2Frames(requestFrames: Int?, videoConfigDefaults: VideoDefaultValues) -> Int {
+    requestFrames ?? videoConfigDefaults.frames ?? 97
+  }
+
   /// comfybox#307 (review r1, item 2): the derived render plan for
   /// `POST /v1/video/config/effective` — pulled out of the route case,
   /// mirroring `prepareLocalVideo`'s dims/frames math step by step, so
@@ -2635,8 +2672,13 @@ public final class WarmServer {
     // from the desktop's local settings; steps stays untouched below).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
     let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
-    var renderWidth = req.width ?? namedDims?.width ?? videoPreset?.width ?? videoConfigDefaults.width ?? 704
-    var renderHeight = req.height ?? namedDims?.height ?? videoPreset?.height ?? videoConfigDefaults.height ?? 448
+    let requestedDims = Self.resolvedLTX2RequestDims(
+      requestWidth: req.width, requestHeight: req.height,
+      namedWidth: namedDims?.width, namedHeight: namedDims?.height,
+      presetWidth: videoPreset?.width, presetHeight: videoPreset?.height,
+      videoConfigDefaults: videoConfigDefaults)
+    var renderWidth = requestedDims.width
+    var renderHeight = requestedDims.height
     if req.width == nil, let nd = namedDims {
       logger.info("LTX-2: resolution '\(req.resolution ?? "")' -> \(nd.width)x\(nd.height) budget")
     }
@@ -2742,7 +2784,7 @@ public final class WarmServer {
     // false claim (Codex round 1, finding 3). `effectiveBeatSchedule` (not
     // `req.beatSchedule`) feeds this — an I2V-ignored schedule shouldn't
     // also cost enhancement quality for beats that will never apply.
-    let aiProviderConfig = ComfyBoxServerConfig.loadOrMigrate()
+    let aiProviderConfig = ServerConfigStore.shared.current().config
     let beatScheduleEnabled = LTX2ConfigResolver.resolveTyped(
       request: req.tuning, preset: videoPreset?.videoTuning
     ).beatScheduleEnabled
@@ -2794,7 +2836,7 @@ public final class WarmServer {
     // trained window (289f = 12s) into ONE chunk here, t2v included.
     // FDD §3.3, D3: `videoDefaults.frames` (migrated from the desktop's
     // `videoFrames`) slots between the request and the 97f engine default.
-    var foldedFramesPerChunk = req.frames ?? videoConfigDefaults.frames ?? 97
+    var foldedFramesPerChunk = Self.resolvedLTX2Frames(requestFrames: req.frames, videoConfigDefaults: videoConfigDefaults)
     var foldedExtendSeconds = req.extendToSeconds
       ?? Self.extendSecondsFromDuration(req.duration, framesPerChunk: foldedFramesPerChunk, fps: req.fps ?? 24)
     if foldedExtendSeconds > 0 {
@@ -3501,7 +3543,7 @@ public final class WarmServer {
   /// transition), so this answers during a render.
   private func syncStatsResponse() -> HTTPResponse {
     let (snap, _) = liveHealth.read()
-    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let config = ServerConfigStore.shared.current().config
     let snapshot = statsProvider.snapshot(
       memory: statsProvider.sampleMemoryStatus(),
       uptimeSeconds: StatsProvider.uptimeSeconds(startTime: serverStartTime),
@@ -3615,7 +3657,7 @@ public final class WarmServer {
       return .error(.error(status: 400, message: "'prompt' is required"))
     }
 
-    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let config = ServerConfigStore.shared.current().config
     guard let endpoint = config.providers.promptOptimization else {
       return .error(.error(
         status: 503,
@@ -3911,7 +3953,7 @@ public final class WarmServer {
 
   private func statsResponse() async -> RoutedResponse {
     let queue = await coordinator.queueStatus()
-    let config = ComfyBoxServerConfig.loadOrMigrate()
+    let config = ServerConfigStore.shared.current().config
     let snapshot = statsProvider.snapshot(
       memory: statsProvider.sampleMemoryStatus(),
       uptimeSeconds: StatsProvider.uptimeSeconds(startTime: serverStartTime),
@@ -9427,10 +9469,14 @@ private actor WarmServerCoordinator {
       // ServerConfigStore.engineSeed); an explicit override still applies.
       let krea2ConfigDefaults = ServerConfigStore.shared.renderDefaults(family: "krea2")
       let variant = k2.variant
-      let steps = variant.resolvedSteps(payload.steps ?? krea2ConfigDefaults.steps)
-      let guidance = variant.resolvedGuidance(payload.guidance ?? krea2ConfigDefaults.guidance.map(Float.init))
-      let width = payload.width ?? krea2ConfigDefaults.width ?? 1024
-      let height = payload.height ?? krea2ConfigDefaults.height ?? 1024
+      let merged = mergedKrea2RenderDefaults(
+        requestWidth: payload.width, requestHeight: payload.height,
+        requestSteps: payload.steps, requestGuidance: payload.guidance,
+        configDefaults: krea2ConfigDefaults)
+      let steps = variant.resolvedSteps(merged.steps)
+      let guidance = variant.resolvedGuidance(merged.guidance)
+      let width = merged.width
+      let height = merged.height
       // Krea-2 builds its requests straight from the payload rather than going
       // through makePipelineRequest, so resolve DyPE explicitly here.
       let krea2DyPE = payload.resolvedDyPEConfig(width: width, height: height)
@@ -11187,9 +11233,19 @@ extension GeneratePayload: Decodable {
     return outcome
   }
 
+  /// F3 (comfybox#324, adversarial review of Phase 3 config): `configDefaults`
+  /// defaults to a LIVE read of `ServerConfigStore.shared` — evaluated fresh
+  /// at each call with no argument, exactly like `validateImageMemoryPreflight`'s
+  /// `caps`/`availableBytes` above. Tests inject an explicit `RenderDefaultValues`
+  /// instead of depending on whatever config happens to be live on the runner
+  /// (or reaching into `.shared`, which a unit test must never mutate — see
+  /// `ComfyBoxStateDirectoryIsolation.swift`), so the `??` resolution chain
+  /// below is exercised at THIS real call site rather than re-implemented
+  /// inline in a test file.
   func makePipelineRequest(
     configuration: WarmServerConfiguration,
-    activeLoRAs: [LoRAConfiguration]
+    activeLoRAs: [LoRAConfiguration],
+    configDefaults: RenderDefaultValues = ServerConfigStore.shared.renderDefaults(family: "flux1")
   ) throws -> ZImageGenerationRequest {
     let outputURL = try resolvedOutputURL(
       configuration: configuration,
@@ -11207,7 +11263,6 @@ extension GeneratePayload: Decodable {
     // (lock, no disk I/O) and slotted BELOW request/preset, ABOVE the engine's
     // own hardcoded fallback. An unmigrated/empty config resolves every field
     // to nil, so `?? ZImageModelMetadata.recommendedX` below is unchanged.
-    let configDefaults = ServerConfigStore.shared.renderDefaults(family: "flux1")
 
     // Build DyPE config — auto-enable for high-res requests
     let resolvedWidth = width ?? configDefaults.width ?? ZImageModelMetadata.recommendedWidth
@@ -11248,9 +11303,12 @@ extension GeneratePayload: Decodable {
     )
   }
 
+  /// F3 (comfybox#324): `configDefaults` is injectable — see
+  /// `makePipelineRequest`'s doc comment for why.
   func makeImg2ImgRequest(
     configuration: WarmServerConfiguration,
-    activeLoRAs: [LoRAConfiguration]
+    activeLoRAs: [LoRAConfiguration],
+    configDefaults: RenderDefaultValues = ServerConfigStore.shared.renderDefaults(family: "flux1")
   ) throws -> Img2ImgRequest {
     guard let imagePath else {
       fatalError("makeImg2ImgRequest called without imagePath")
@@ -11287,7 +11345,6 @@ extension GeneratePayload: Decodable {
     // injecting a config default there would silently override that behavior.
     // Only the DyPE heuristic (which only ever affects an internal auto-enable
     // decision, never the output size) and steps/guidance are config-aware here.
-    let configDefaults = ServerConfigStore.shared.renderDefaults(family: "flux1")
     let resolvedWidth = width ?? configDefaults.width ?? ZImageModelMetadata.recommendedWidth
     let resolvedHeight = height ?? configDefaults.height ?? ZImageModelMetadata.recommendedHeight
     let dyPEConfig = resolvedDyPEConfig(width: resolvedWidth, height: resolvedHeight)
@@ -12338,6 +12395,31 @@ public enum WarmServerError: Error, LocalizedError {
       return "[\(code)] \(reason)"
     }
   }
+}
+
+/// F3 (comfybox#324, adversarial review of Phase 3 config): the exact
+/// config-layer `??` merge `WarmServerCoordinator.runKrea2Generate` applies
+/// to `payload.width/height/steps/guidance` BEFORE handing steps/guidance to
+/// `Krea2Variant.resolvedSteps/resolvedGuidance` — pulled out to a top-level,
+/// weight-free func (mirrors `isRenderInterruption`/`localVideoCatchOutcome`
+/// below: `WarmServerCoordinator` is `private` to this file, so a pure helper
+/// its methods call has to live at file scope to be reachable from a unit
+/// test) so a test can drive this REAL merge directly. `runKrea2Generate`
+/// itself needs a loaded `Krea2Pipeline` to run past this point, so it cannot
+/// be exercised end-to-end in a unit test — this is the testable slice of it.
+/// The prior test coverage (`ServerConfigStoreTests`) re-implemented this
+/// same `??` chain inline instead of calling production code; this is the
+/// call-site guard that closes that gap.
+func mergedKrea2RenderDefaults(
+  requestWidth: Int?, requestHeight: Int?, requestSteps: Int?, requestGuidance: Float?,
+  configDefaults: RenderDefaultValues
+) -> (width: Int, height: Int, steps: Int?, guidance: Float?) {
+  (
+    width: requestWidth ?? configDefaults.width ?? 1024,
+    height: requestHeight ?? configDefaults.height ?? 1024,
+    steps: requestSteps ?? configDefaults.steps,
+    guidance: requestGuidance ?? configDefaults.guidance.map(Float.init)
+  )
 }
 
 /// comfybox#322: is this error an operator interrupt rather than a failure?

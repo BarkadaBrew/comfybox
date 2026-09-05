@@ -34,6 +34,16 @@ struct MotionView: View {
     @State private var condFps: Double = 0
     @State private var steps: Double = 8
     @State private var didApplyDefaults = false
+    /// F5 (comfybox#324, adversarial review of Phase 3 config): set the
+    /// moment the user touches `resolution`/`seconds` through the UI (see
+    /// `resolutionBinding`/`secondsBinding` below) — NEVER by the
+    /// programmatic sets in `applyDefaults()`/`applyServerVideoDefaults()`
+    /// itself, which write the plain `@State` vars directly. Guards
+    /// `applyServerVideoDefaults()`'s overlay: without it, a user who edits
+    /// either control while the server fetch (fired from an async `Task`
+    /// with no interaction guard) is still in flight gets their edit
+    /// silently stomped the instant the fetch resolves.
+    @State private var userDidEditVideoSettings = false
     @State private var seedText: String = ""
     // 0.5 is the VALIDATED i2v strength at production config (2026-08-03:
     // 0.75 collapsed long single passes; 1.0 is the historical frame-0
@@ -131,6 +141,25 @@ struct MotionView: View {
         return min(36, max(3, Int(k.rounded()))) * 8 + 1
     }
 
+    /// F5 (comfybox#324): the decision `applyServerVideoDefaults()` makes,
+    /// pulled out to a static, view-free func so a unit test can drive it
+    /// directly. Once the user has edited EITHER control (`resolutionBinding`/
+    /// `secondsBinding`), the overlay must apply nothing at all — a partial
+    /// overlay (e.g. only frames, because the user only touched resolution)
+    /// would be just as much a silent stomp of the field they didn't touch.
+    static func resolvedServerVideoDefaultsOverlay(
+        userDidEditVideoSettings: Bool,
+        serverFrames: Int?, serverWidth: Int?, serverHeight: Int?
+    ) -> (frames: Int?, resolution: VideoResolution?) {
+        guard !userDidEditVideoSettings else { return (nil, nil) }
+        let frames = serverFrames.flatMap { frameOptions.contains($0) ? $0 : nil }
+        var resolution: VideoResolution? = nil
+        if let w = serverWidth, let h = serverHeight {
+            resolution = VideoResolution.allCases.first(where: { $0.size == (w, h) })
+        }
+        return (frames, resolution)
+    }
+
     private static func secondsForFrames(_ f: Int) -> Double {
         (Double(f) / playbackFps * 10).rounded() / 10
     }
@@ -173,7 +202,7 @@ struct MotionView: View {
                 referenceControl
 
                 labeled("Resolution") {
-                    Picker("", selection: $resolution) {
+                    Picker("", selection: resolutionBinding) {
                         ForEach(VideoResolution.allCases) { Text($0.rawValue).tag($0) }
                     }.labelsHidden()
                 }
@@ -181,7 +210,7 @@ struct MotionView: View {
                 // Duration is the primary length control; frames are derived
                 // and snapped to LTX's legal 1+8k counts. The read-out below
                 // shows exactly what will be rendered so the snap is visible.
-                NumericSliderField(label: "Duration (s)", value: $seconds, range: 1...12, step: 0.5, fractionDigits: 1)
+                NumericSliderField(label: "Duration (s)", value: secondsBinding, range: 1...12, step: 0.5, fractionDigits: 1)
                     .help("Clip length. Snapped to the nearest legal LTX frame count (1+8k, 25–289f). 289f (~12s) is the single-pass cap.")
                     .onChange(of: seconds) { _, s in
                         frames = Self.framesForSeconds(s)
@@ -408,6 +437,19 @@ struct MotionView: View {
         Task { await applyServerVideoDefaults() }
     }
 
+    /// F5: the Picker/duration control write through these instead of
+    /// `$resolution`/`$seconds` directly, so `applyServerVideoDefaults()` can
+    /// tell a genuine user edit apart from its own (and `applyDefaults()`'s)
+    /// programmatic prefill, which sets the plain `@State` vars and does NOT
+    /// go through these bindings.
+    private var resolutionBinding: Binding<VideoResolution> {
+        Binding(get: { resolution }, set: { resolution = $0; userDidEditVideoSettings = true })
+    }
+
+    private var secondsBinding: Binding<Double> {
+        Binding(get: { seconds }, set: { seconds = $0; userDidEditVideoSettings = true })
+    }
+
     /// Best-effort overlay of the server's `videoDefaults` (FDD-ui-api-parity
     /// §3.3) onto the Motion tab's initial state. Silently does nothing if the
     /// server is unreachable or the block is unset (fresh/pre-migration
@@ -417,13 +459,19 @@ struct MotionView: View {
         guard let config = try? await engine.fetchServerConfig() else { return }
         let video = config.videoDefaults.resolved(family: "ltx2")
         await MainActor.run {
-            if let f = video.frames, Self.frameOptions.contains(f) {
+            // F5: `userDidEditVideoSettings` is read HERE, as late as possible —
+            // right before applying — so an edit made anywhere during the
+            // `fetchServerConfig()` await above is seen, not just one that
+            // predates this function starting.
+            let overlay = Self.resolvedServerVideoDefaultsOverlay(
+                userDidEditVideoSettings: userDidEditVideoSettings,
+                serverFrames: video.frames, serverWidth: video.width, serverHeight: video.height)
+            if let f = overlay.frames {
                 frames = f
                 seconds = Self.secondsForFrames(f)
             }
-            if let w = video.width, let h = video.height,
-               let match = VideoResolution.allCases.first(where: { $0.size == (w, h) }) {
-                resolution = match
+            if let r = overlay.resolution {
+                resolution = r
             }
         }
     }
