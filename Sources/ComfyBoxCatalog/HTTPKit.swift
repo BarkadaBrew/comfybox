@@ -80,16 +80,24 @@ public enum HTTPKit {
     }
 
     /// Parse `?a=1&b=two%20words`. A key with no `=` yields "".
+    ///
+    /// RFC 3986 query decoding (comfybox#387), matching the engine's
+    /// `HTTPRequest.queryParameters` (comfybox#380/#381) — NOT
+    /// `application/x-www-form-urlencoded` decoding: a literal `+` stays
+    /// `+`, never becomes a space. A malformed escape (a trailing `%`, or a
+    /// `%` not followed by two hex digits) falls back to the raw substring
+    /// rather than dropping the parameter — `removingPercentEncoding`
+    /// returns nil for those, and nil must not read as "empty value".
     public static func queryParameters(of target: String) -> [String: String] {
         guard let qIndex = target.firstIndex(of: "?") else { return [:] }
         let raw = String(target[target.index(after: qIndex)...])
         var out: [String: String] = [:]
         for pair in raw.split(separator: "&") {
             let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            let key = String(parts[0]).removingPercentEncoding ?? String(parts[0])
-            let value = parts.count > 1
-                ? (String(parts[1]).replacingOccurrences(of: "+", with: " ").removingPercentEncoding ?? "")
-                : ""
+            let rawKey = String(parts[0])
+            let rawValue = parts.count > 1 ? String(parts[1]) : ""
+            let key = rawKey.removingPercentEncoding ?? rawKey
+            let value = rawValue.removingPercentEncoding ?? rawValue
             out[key] = value
         }
         return out
