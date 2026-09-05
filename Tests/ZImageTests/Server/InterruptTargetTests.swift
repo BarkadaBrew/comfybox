@@ -335,26 +335,42 @@ final class InterruptTargetIntegrationTests: XCTestCase {
   /// async fallback read the actor's `activeJobId`, a job-id `target` in that
   /// window got two different answers: cancelled-and-named vs a 404.
   func testSyncAndAsyncAgreeOnAJobIdTargetImmediatelyAfterAJobEnds() async throws {
+    // Each arm gets its OWN probe staged identically: an interrupt is
+    // destructive (review r2, item 5 — a second one on the same task now
+    // correctly reports nothing to cancel), so firing both at one probe would
+    // compare a first call against a second, not the two arms against each
+    // other.
+    func stage(
+      _ probe: WarmServerQueueProbe, id: String
+    ) async throws -> Task<Bool?, Never> {
+      let job = Task { try? await probe.enqueueSynthetic(durationMs: 3000, id: id) }
+      try await waitUntil("the synthetic job to become active") { probe.activeJobId == id }
+      // The exact state `runGenerate`'s defer leaves behind: the actor's
+      // `activeJobId` nil, the published snapshot still naming the job.
+      await probe.clearActiveJobIdWithoutPublishing()
+      return job
+    }
+
     try isolateComfyBoxStateDirectory()
-    let probe = makeQueueProbe()
+    let syncProbe = makeQueueProbe()
+    let asyncProbe = makeQueueProbe()
+    let syncJobId = "synthetic-window-sync-\(UUID().uuidString)"
+    let asyncJobId = "synthetic-window-async-\(UUID().uuidString)"
+    let syncJob = try await stage(syncProbe, id: syncJobId)
+    let asyncJob = try await stage(asyncProbe, id: asyncJobId)
 
-    let jobId = "synthetic-window-\(UUID().uuidString)"
-    let job = Task { try? await probe.enqueueSynthetic(durationMs: 3000, id: jobId) }
-    try await waitUntil("the synthetic job to become active") { probe.activeJobId == jobId }
+    let sync = syncProbe.controlInterrupt(target: syncJobId)
+    let async = await asyncProbe.coordinatorInterrupt(target: asyncJobId)
 
-    // The exact state `runGenerate`'s defer leaves behind.
-    await probe.clearActiveJobIdWithoutPublishing()
-
-    let sync = probe.controlInterrupt(target: jobId)
-    let async = await probe.coordinatorInterrupt(target: jobId)
     XCTAssertEqual(
       sync.interrupted, async.interrupted,
       "sync and async /v1/queue/interrupt must agree on whether a job-id target was interrupted")
     XCTAssertEqual(sync.unknownTarget, async.unknownTarget, "…and on whether it was a 404")
-    XCTAssertEqual(sync.jobId, async.jobId, "…and on interrupted_job_id")
     XCTAssertEqual(sync.kind, async.kind, "…and on interrupted_kind")
-    XCTAssertEqual(sync.jobId, jobId)
-    _ = await job.value
+    XCTAssertEqual(sync.jobId, syncJobId, "…and each names its own job, not nil")
+    XCTAssertEqual(async.jobId, asyncJobId)
+    _ = await syncJob.value
+    _ = await asyncJob.value
   }
 
   func testAnUnknownJobIdTargetIsReportedAsUnknownNotAsNothingToCancel() throws {
@@ -538,7 +554,11 @@ final class InterruptTargetIntegrationTests: XCTestCase {
 
     let workProbe = RenderProbe()
     let episode = Task {
-      await probe.runAsPublishedActiveRender(restoringTo: publication2) {
+      await probe.runAsPublishedActiveRender(
+        restoringTo: publication2,
+        preemptorIdentity: (jobId: "preemptor-job-id", kind: "generate"),
+        restoredIdentity: (jobId: "video-queue-id", kind: "video")
+      ) {
         workProbe.running = true
         let deadline = Date().addingTimeInterval(10)
         while !Task.isCancelled && Date() < deadline { usleep(2_000) }
@@ -546,14 +566,15 @@ final class InterruptTargetIntegrationTests: XCTestCase {
       }
     }
 
-    // Poll a DEFAULT-target interrupt until it lands on the shielded work —
-    // the episode publishes the work's own task, so once the interrupt
-    // reports anything other than the video's id it has taken effect. A
-    // bounded poll (rather than a fixed sleep) is what makes this
-    // deterministic.
-    try await waitUntil("the default-target interrupt to land on the shielded work") {
-      workProbe.running && probe.controlInterrupt(target: nil).jobId != "video-queue-id"
+    // Review r2, item 2: wait NON-destructively for the episode to publish
+    // the shielded work's own triple — polling a real interrupt fired one
+    // cancel per poll at whatever happened to be published, which is both a
+    // side effect and a race. `liveActiveRender` is the same lock-store read
+    // the sync route does, without the cancel.
+    try await waitUntil("the episode to publish the shielded work as the active render") {
+      probe.liveActiveRender.jobId == "preemptor-job-id"
     }
+    XCTAssertTrue(probe.controlInterrupt(target: nil).interrupted)
     await episode.value
 
     XCTAssertTrue(
@@ -571,6 +592,10 @@ final class InterruptTargetIntegrationTests: XCTestCase {
     XCTAssertEqual(after.kind, "video")
     _ = await videoTask2.value
     XCTAssertTrue(video2.observedCancellation)
+
+    // The probe publishes an active identity here (as the queue loop does),
+    // so clear it — `makeQueueProbe`'s teardown requires a drained queue.
+    await probe.setActiveRender(task: nil, jobId: nil, kind: nil)
   }
 
   /// Review r1, finding 3, end to end through the real publication path: a
@@ -609,6 +634,136 @@ final class InterruptTargetIntegrationTests: XCTestCase {
     XCTAssertTrue(videoProbe.observedCancellation)
     let succeeded = try await job.value
     XCTAssertTrue(succeeded, "the active preempting job must be untouched")
+  }
+
+  // MARK: - Review r2, item 1: the swap has no observable half-way state
+
+  /// Collects every published (health, interrupt-target) pair.
+  private final class PublicationSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var samples: [(health: String?, target: String?, kind: String?)] = []
+
+    func record(_ health: String?, _ target: String?, _ kind: String?) {
+      lock.lock(); samples.append((health, target, kind)); lock.unlock()
+    }
+    func reset() { lock.lock(); samples.removeAll(); lock.unlock() }
+    func all() -> [(health: String?, target: String?, kind: String?)] {
+      lock.lock(); defer { lock.unlock() }; return samples
+    }
+  }
+
+  /// Round 1 bundled the task with its identity, so the interrupt could no
+  /// longer cancel one job while reporting another's id. But the episode still
+  /// performed its identity swap — `activeJobId`, `publishHealth()`,
+  /// `persistQueueState()` — BEFORE the triple was published, and restored it
+  /// AFTER the triple was restored. Between those points a reader on another
+  /// thread saw `/health` naming the preempting IMAGE job while
+  /// `/v1/queue/interrupt` still pointed at the VIDEO: an operator
+  /// interrupting on what they could see would have killed the video. That is
+  /// comfybox#362 itself, narrowed to a window rather than removed.
+  ///
+  /// The invariant, checked over EVERY published state during a fake episode:
+  /// **whenever the interrupt triple names a job, health names the same job.**
+  /// (The converse is allowed and normal — the queue loop publishes a job's
+  /// identity before its render task exists, and an empty triple cancels
+  /// nothing, so it cannot disagree with anything.)
+  ///
+  /// This is a sequencing test, not a timing one: the observer fires on every
+  /// write to either published field, so if the atomic publish is ever split
+  /// back into two writes it records the intermediate state and this fails —
+  /// no thread racing required.
+  func testTheEpisodeSwapsHealthAndTheInterruptTargetWithNoObservableGap() async throws {
+    try isolateComfyBoxStateDirectory()
+    let probe = makeQueueProbe()
+
+    // Tag the ids so a concurrently-running test's publications cannot be
+    // mistaken for this one's.
+    let tag = UUID().uuidString
+    let videoJobId = "video-\(tag)"
+    let preemptorJobId = "preemptor-\(tag)"
+
+    let samples = PublicationSamples()
+    WarmServerQueueProbe.observePublications { health, target, kind in
+      samples.record(health, target, kind)
+    }
+    addTeardownBlock { WarmServerQueueProbe.observePublications(nil) }
+
+    // Stage the state a real episode starts from: the video is the published
+    // active render AND the published identity.
+    let videoProbe = RenderProbe()
+    let videoTask = Task {
+      videoProbe.running = true
+      let deadline = Date().addingTimeInterval(10)
+      while !Task.isCancelled && Date() < deadline { usleep(2_000) }
+      if Task.isCancelled { videoProbe.observedCancellation = true }
+    }
+    try await waitUntil("the fake video task to start") { videoProbe.running }
+    await probe.setActiveRender(
+      task: videoTask, jobId: videoJobId, statusJobId: "status-\(tag)", kind: "video")
+    let videoPublication = await probe.publishedActiveRender
+    samples.reset()
+
+    // The episode: identity swap + triple publish, then the mirror on restore.
+    let work = RenderProbe()
+    await probe.runAsPublishedActiveRender(
+      restoringTo: videoPublication,
+      preemptorIdentity: (jobId: preemptorJobId, kind: "generate"),
+      restoredIdentity: (jobId: videoJobId, kind: "video")
+    ) {
+      work.running = true
+    }
+
+    let recorded = samples.all().filter {
+      ($0.health?.hasSuffix(tag) ?? false) || ($0.target?.hasSuffix(tag) ?? false)
+    }
+    XCTAssertFalse(recorded.isEmpty, "the episode must publish something to observe")
+    for sample in recorded where sample.target != nil {
+      XCTAssertEqual(
+        sample.health, sample.target,
+        "observable half-way state: /health named \(sample.health ?? "nil") while "
+          + "/v1/queue/interrupt would have cancelled \(sample.target ?? "nil"). The identity "
+          + "swap and the interrupt triple must be published together.")
+    }
+
+    // Non-vacuity: the swap and the restore both actually happened.
+    XCTAssertTrue(
+      recorded.contains { $0.health == preemptorJobId && $0.target == preemptorJobId },
+      "the preemptor must have been published as both health's active job and the cancel target")
+    XCTAssertEqual(recorded.last?.health, videoJobId, "the video's identity must be restored")
+    XCTAssertEqual(recorded.last?.target, videoJobId, "…together with its interrupt triple")
+
+    videoTask.cancel()
+    _ = await videoTask.value
+    await probe.setActiveRender(task: nil, jobId: nil, kind: nil)
+  }
+
+  // MARK: - Review r2, item 5: an already-cancelled task is nothing to cancel
+
+  /// A second interrupt (or one landing after the render already stopped)
+  /// must not claim a cancellation it did not perform.
+  func testASecondInterruptOnAnAlreadyCancelledRenderReportsNothingToCancel() async throws {
+    try isolateComfyBoxStateDirectory()
+    let probe = makeQueueProbe()
+
+    let jobId = "synthetic-twice-\(UUID().uuidString)"
+    let job = Task { try? await probe.enqueueSynthetic(durationMs: 3000, id: jobId) }
+    try await waitUntil("the synthetic job to become active") { probe.activeJobId == jobId }
+
+    let first = probe.controlInterrupt(target: nil)
+    XCTAssertTrue(first.interrupted)
+    XCTAssertEqual(first.jobId, jobId)
+
+    let second = probe.controlInterrupt(target: nil)
+    XCTAssertFalse(second.interrupted, "the task was already cancelled — nothing left to stop")
+    XCTAssertFalse(second.unknownTarget, "…but the target was named correctly, so not a 404")
+    XCTAssertNil(second.jobId)
+
+    // Same by job id: the id still resolves (200 + interrupted:false), it does
+    // not become an unknown target.
+    let byId = probe.controlInterrupt(target: jobId)
+    XCTAssertFalse(byId.interrupted)
+    XCTAssertFalse(byId.unknownTarget)
+    _ = await job.value
   }
 
   // MARK: - Route level: request bytes in, response bytes out
@@ -716,6 +871,76 @@ final class InterruptTargetIntegrationTests: XCTestCase {
     XCTAssertNil(json["interruptedJobId"], "the wire is snake_case, not camelCase")
     XCTAssertNil(json["interruptedKind"])
     _ = await job.value
+  }
+
+  // MARK: - Review r2, items 3 + 4: route dispatch and the 404's response case
+
+  /// The dispatch half that was missing: `/v1/queue/interrupt` must be
+  /// classified SYNC-SERVABLE, which is what makes `serveControlPlaneSync`
+  /// reach `syncInterruptResponse` at all. If it ever falls out of the
+  /// classifier, the route silently goes back to queueing behind the actor —
+  /// i.e. it stops answering during a render, which is the whole point of the
+  /// 0.B-2 carve-out.
+  func testTheInterruptRouteIsClassifiedSyncServable() {
+    XCTAssertTrue(
+      ControlPlaneClassifier.isSyncServable(method: "POST", path: "/v1/queue/interrupt"))
+    XCTAssertFalse(
+      ControlPlaneClassifier.isSyncServable(method: "GET", path: "/v1/queue/interrupt"),
+      "only POST is the interrupt route")
+  }
+
+  /// The route driven as a whole `HTTPRequest` through the PRODUCTION handler
+  /// (`WarmServer.interruptRouteResponse`, which `syncInterruptResponse` is a
+  /// one-line call to) — including the audit event, which the byte-level
+  /// helpers above do not exercise.
+  func testTheSyncRouteHandlesAWholeRequestAndAuditsIt() async throws {
+    try isolateComfyBoxStateDirectory()
+    let probe = makeQueueProbe()
+
+    let jobId = "synthetic-route-\(UUID().uuidString)"
+    let job = Task { try? await probe.enqueueSynthetic(durationMs: 3000, id: jobId) }
+    try await waitUntil("the synthetic job to become active") { probe.activeJobId == jobId }
+
+    let request = HTTPRequest(
+      method: "POST", path: "/v1/queue/interrupt", queryString: nil,
+      headers: ["Content-Type": "application/json"],
+      body: Data(#"{"target":"active"}"#.utf8))
+    let response = probe.syncInterruptRoute(request: request)
+
+    XCTAssertEqual(response.status, 200)
+    let json = try routeJSON(response)
+    XCTAssertEqual(json["interrupted"] as? Bool, true)
+    XCTAssertEqual(json["interrupted_job_id"] as? String, jobId)
+
+    let audited = probe.recordedAuditEvents().filter { $0.kind == "queue.interrupt" }
+    XCTAssertEqual(audited.count, 1, "the route must record exactly one audit event")
+    XCTAssertEqual(
+      audited.first?.metadata?["target"], "active",
+      "the audit event must carry the target the caller asked for")
+    _ = await job.value
+  }
+
+  /// Item 4: the async arm's 404 travels as `RoutedResponse.error`, like every
+  /// other error on that dispatch table. `.error` and `.json` serialise
+  /// identically at the connection layer, so this pins the convention, not the
+  /// wire format — and the wire format is asserted alongside it.
+  func testTheAsyncArm404IsARoutedError() {
+    guard case .error(let response) = InterruptRoute.routedResponse(for: .unknownTarget) else {
+      return XCTFail("an unknown target must be a RoutedResponse.error")
+    }
+    XCTAssertEqual(response.status, 404)
+
+    guard case .json(let ok) = InterruptRoute.routedResponse(
+      for: .cancelled(jobId: "j", kind: "video"))
+    else {
+      return XCTFail("a successful cancel must stay RoutedResponse.json")
+    }
+    XCTAssertEqual(ok.status, 200)
+
+    guard case .json(let nothing) = InterruptRoute.routedResponse(for: .nothingToCancel) else {
+      return XCTFail("nothing-to-cancel is not an error — it is the legacy 200 body")
+    }
+    XCTAssertEqual(nothing.status, 200)
   }
 
   // MARK: - comfybox#362 second finding: the DEBUG admission bypass can be reset

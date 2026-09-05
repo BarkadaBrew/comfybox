@@ -411,17 +411,25 @@ enum InterruptCancelOutcome: Equatable {
 /// and then each decide what to cancel — they call THIS, with the two
 /// published triples, so there is no second implementation to drift.
 enum InterruptExecutor {
+  /// Review r2, item 5: a published task that is ALREADY cancelled is nothing
+  /// left to cancel. Without this, a second interrupt (or one that lands in
+  /// the window between a render finishing and the queue loop clearing the
+  /// slot) answered `interrupted: true` for a job it did not stop — the same
+  /// "claimed a cancellation it cannot guarantee" mistake `SyncCancelAccepted`
+  /// exists to avoid on the pending path. It reports the existing
+  /// nothing-to-cancel shape (200, `interrupted: false`), NOT a 404: the
+  /// target was named correctly, there is simply nothing running there.
   static func cancel(
     target: String?, active: PublishedRender, checkpointedVideo: PublishedRender
   ) -> InterruptCancelOutcome {
     switch InterruptTarget.resolve(
       target: target, active: active, checkpointedVideo: checkpointedVideo) {
     case .active:
-      guard let task = active.task else { return .nothingToCancel }
+      guard let task = active.task, !task.isCancelled else { return .nothingToCancel }
       task.cancel()
       return .cancelled(jobId: active.jobId, kind: active.kind)
     case .video:
-      if let task = checkpointedVideo.task {
+      if let task = checkpointedVideo.task, !task.isCancelled {
         // A preemption episode is in progress: `active` points at the
         // preemptor, so the video is reachable only through its own slot.
         task.cancel()
@@ -429,7 +437,7 @@ enum InterruptExecutor {
           jobId: checkpointedVideo.jobId ?? checkpointedVideo.statusJobId,
           kind: QueueJobKind.video.rawValue)
       }
-      if active.kind == QueueJobKind.video.rawValue, let task = active.task {
+      if active.kind == QueueJobKind.video.rawValue, let task = active.task, !task.isCancelled {
         // No episode: the video itself IS the active render.
         task.cancel()
         return .cancelled(jobId: active.jobId, kind: active.kind)
@@ -494,6 +502,15 @@ enum InterruptRoute {
   static func response(for outcome: InterruptCancelOutcome) -> HTTPResponse {
     let (status, body) = InterruptRouteResponse.build(from: outcome)
     return .json(status: status, payload: body)
+  }
+
+  /// The async arm's response. An `unknownTarget` 404 goes out as
+  /// `RoutedResponse.error`, like every other error on that dispatch table
+  /// (review r2, item 4) — `.error` and `.json` serialise identically at the
+  /// connection layer, so this is a consistency fix, not a wire change.
+  static func routedResponse(for outcome: InterruptCancelOutcome) -> RoutedResponse {
+    let response = self.response(for: outcome)
+    return outcome == .unknownTarget ? .error(response) : .json(response)
   }
 
   /// The audit-log line, shared so the two arms log the same event.
