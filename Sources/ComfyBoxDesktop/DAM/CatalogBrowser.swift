@@ -122,6 +122,30 @@ public final class CatalogBrowser {
         await apply(filter: activeFilter)
     }
 
+    /// Every id matching the CURRENT filter, ignoring `pageSize`/paging
+    /// entirely — what Select All actually needs (#271).
+    ///
+    /// Raising the page size and reloading (the old approach) fetches full
+    /// `CatalogAsset` rows — prompts, captions, paths, every column — for
+    /// however many thousand assets are in scope, just to read back their ids,
+    /// AND kept re-truncating in practice at whatever page clamp sat in front
+    /// of it. `CatalogStore.assetIDs(matching:)` is the dedicated ids-only
+    /// query this calls instead: no page to clamp, and no row payload heavier
+    /// than a `String` per asset.
+    ///
+    /// `hiddenAssetIDs` (the vault carve-out) is subtracted the same way
+    /// `resolve(_:)` does for the visible page, so Select All cannot select a
+    /// secured asset the grid never showed.
+    public func allMatchingIDs() async -> Set<String> {
+        do {
+            let ids = try await store.assetIDs(matching: activeFilter)
+            return Set(ids).subtracting(hiddenAssetIDs)
+        } catch {
+            self.error = error.localizedDescription
+            return []
+        }
+    }
+
     /// Classify one page ONCE. The grid asks "is this here or on the server?"
     /// for every visible cell; answering that per cell would be one actor
     /// round-trip and one stat(2) per cell per redraw.

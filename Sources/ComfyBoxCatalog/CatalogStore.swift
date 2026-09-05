@@ -516,10 +516,15 @@ public actor CatalogStore {
         guard sqlite3_prepare_v2(db, "SELECT id FROM assets", -1, &stmt, nil) == SQLITE_OK else {
             throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        // Count-critical and re-derives every asset's collection filing below —
+        // a mid-iteration step failure (#357) must not silently pass a truncated
+        // `ids` list on to a "refiled: N assets" report that names the wrong N.
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let c = sqlite3_column_text(stmt, 0) { ids.append(String(cString: c)) }
         }
+        let stepError = rc == SQLITE_DONE ? nil : String(cString: sqlite3_errmsg(db))
         sqlite3_finalize(stmt)
+        if let stepError { throw CatalogError.stepFailed(stepError) }
 
         // One transaction for the lot: a partial refile would leave the catalog
         // filed under a mix of the old and new rules with no way to tell which.
@@ -559,7 +564,14 @@ public actor CatalogStore {
 
     // MARK: - Read
 
-    public func search(_ query: CatalogQuery) throws -> [CatalogAsset] {
+    /// The `WHERE` clause and its positional binds for `query`, shared by
+    /// `search` (which adds `ORDER BY`/`LIMIT`/`OFFSET` on top) and
+    /// `assetIDs(matching:)` (which does not page at all — see its doc).
+    /// Extracted so the two can never drift into answering "which rows match"
+    /// differently (#271): Select All asking the ids-only path for "everything
+    /// matching this filter" must see exactly the same rows `search` would
+    /// have paged through.
+    private func whereClause(for query: CatalogQuery) -> (sql: String, binds: [CatalogBind]) {
         var wheres: [String] = []
         var binds: [CatalogBind] = []
         /// The 1-based placeholder index the NEXT appended bind will occupy.
@@ -619,13 +631,18 @@ public actor CatalogStore {
         date("created_at", "<=", query.until)
 
         let whereSQL = wheres.isEmpty ? "" : "WHERE " + wheres.joined(separator: " AND ")
+        return (whereSQL, binds)
+    }
+
+    public func search(_ query: CatalogQuery) throws -> [CatalogAsset] {
+        let (whereSQL, binds) = whereClause(for: query)
         let order: String
         switch query.orderBy {
         case .newest: order = "a.created_at DESC"
         case .oldest: order = "a.created_at ASC"
         case .rating: order = "a.rating DESC, a.created_at DESC"
         }
-        let limitIndex = next
+        let limitIndex = Int32(binds.count) + 1
         let offsetIndex = limitIndex + 1
 
         let sql = """
@@ -666,6 +683,54 @@ public actor CatalogStore {
             throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
         }
         return rows
+    }
+
+    /// A hard ceiling on `assetIDs(matching:)`, independent of any HTTP-layer
+    /// page clamp. Not the 500-row UI page size (`GalleryServer.maxLimit`) —
+    /// this is "every id matching a filter", the shape Select All actually
+    /// needs (#271), so it stays generous. It exists only so a filter that
+    /// matches most of a huge catalog cannot return an unbounded array; a
+    /// desktop library is nowhere near six figures today.
+    public static let idsHardCap = 100_000
+
+    /// Every asset id matching `query`, ignoring `query.limit`/`query.offset`
+    /// entirely — deliberately, not merely widened. A "select all" that pages
+    /// is the exact bug this exists to fix (#271: the gallery raised its page
+    /// size to 20k and still came back ~500 at a time because something kept
+    /// re-clamping it); the fix is a query shape with no page to clamp.
+    ///
+    /// Ids only, not full rows: selection is a set of ids, and fetching
+    /// `idsHardCap`-many full `CatalogAsset` rows (prompts, captions, paths)
+    /// just to read their primary keys is the wasted work a page size can
+    /// never fix.
+    ///
+    /// Count-critical (#357): the caller uses this list to decide what "all"
+    /// means, so a mid-iteration step failure throws rather than silently
+    /// handing back a truncated selection that LOOKS like the whole filtered
+    /// set.
+    public func assetIDs(matching query: CatalogQuery) throws -> [String] {
+        let (whereSQL, binds) = whereClause(for: query)
+        let sql = """
+            SELECT a.id FROM assets a
+            \(whereSQL)
+            ORDER BY a.created_at DESC
+            LIMIT \(Self.idsHardCap)
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw CatalogError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        for (i, b) in binds.enumerated() { b.apply(to: stmt, at: Int32(i + 1)) }
+
+        var ids: [String] = []
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+            if let id = text(stmt, 0) { ids.append(id) }
+        }
+        guard rc == SQLITE_DONE else {
+            throw CatalogError.stepFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        return ids
     }
 
     /// Turn free text into an FTS5 MATCH expression that cannot be a syntax
@@ -743,12 +808,21 @@ public actor CatalogStore {
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, realm?.rawValue)
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        // Read-only listing for the collections rail (#357): a mid-iteration
+        // step failure logs and returns whatever rows were seen rather than
+        // throwing — a short rail is a visible degradation, not a corrupted
+        // write, and the sidebar is not the place to turn a transient SQLITE_BUSY
+        // into a hard failure of browsing.
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             out.append(CatalogCollection(
                 id: text(stmt, 0) ?? "", slug: text(stmt, 1) ?? "", name: text(stmt, 2) ?? "",
                 parentID: text(stmt, 3),
                 realm: text(stmt, 4).flatMap { CatalogRealm(rawValue: $0) },
                 description: text(stmt, 5)))
+        }
+        if rc != SQLITE_DONE {
+            FileHandle.standardError.write(
+                Data("CatalogStore.collections: step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
         return out
     }
@@ -906,10 +980,16 @@ public actor CatalogStore {
         bindText(stmt, 1, assetID)
         bindText(stmt, 2, scope?.rawValue)
         var out: [AssetEdge] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let r = text(stmt, 2).flatMap({ AssetRelation(rawValue: $0) }) else { continue }
+        // Read-only listing (#357): a step failure logs and returns whatever
+        // edges were already collected rather than throwing.
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+            guard let r = text(stmt, 2).flatMap({ AssetRelation(rawValue: $0) }) else { return }
             out.append(AssetEdge(fromAssetID: text(stmt, 0) ?? "",
                                  toAssetID: text(stmt, 1) ?? "", relation: r))
+        }
+        if rc != SQLITE_DONE {
+            FileHandle.standardError.write(
+                Data("CatalogStore.edges: step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
         return out
     }
@@ -944,9 +1024,15 @@ public actor CatalogStore {
         bindText(stmt, 1, assetID)
         bindText(stmt, 2, scope?.rawValue)
         var out: [AssetLocation] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        // Read-only listing (#357): a step failure logs and returns whatever
+        // locations were already collected rather than throwing.
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             out.append(AssetLocation(host: text(stmt, 0) ?? "", path: text(stmt, 1) ?? "",
                                      mtime: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))))
+        }
+        if rc != SQLITE_DONE {
+            FileHandle.standardError.write(
+                Data("CatalogStore.locations: step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
         return out
     }
@@ -1123,8 +1209,16 @@ public actor CatalogStore {
         sqlite3_bind_int64(stmt, 2, Int64(limit))
         bindText(stmt, 3, scope?.rawValue)
         var out: [String] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        // Read-only, already `LIMIT`-capped heuristic lookup (#357): a step
+        // failure logs and returns whatever ids were already collected. Worst
+        // case, backfill sees an ambiguous filename as unambiguous and skips
+        // an edge it might otherwise have created — not data loss.
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let id = text(stmt, 0) { out.append(id) }
+        }
+        if rc != SQLITE_DONE {
+            FileHandle.standardError.write(
+                Data("CatalogStore.assetIDs(forFilename:): step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
         return out
     }
@@ -1173,9 +1267,15 @@ public actor CatalogStore {
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, scope?.rawValue)
         var out: [String: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let k = text(stmt, 0) else { continue }
+        // Read-only display counts (#357): a step failure logs and returns
+        // whatever counts were already collected rather than throwing.
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+            guard let k = text(stmt, 0) else { return }
             out[k] = Int(sqlite3_column_int(stmt, 1))
+        }
+        if rc != SQLITE_DONE {
+            FileHandle.standardError.write(
+                Data("CatalogStore.collectionCounts: step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
         return out
     }
@@ -1196,9 +1296,17 @@ public actor CatalogStore {
             }
             defer { sqlite3_finalize(stmt) }
             bindText(stmt, 1, scope?.rawValue)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let k = text(stmt, 0) else { continue }
+            // Read-only facet counts feeding filter-UI chips (#357): a step
+            // failure logs and returns whatever counts were already collected
+            // rather than throwing — an incomplete facet list under-populates a
+            // filter dropdown, it does not corrupt anything.
+            let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+                guard let k = text(stmt, 0) else { return }
                 f[keyPath: keyPath][k] = Int(sqlite3_column_int(stmt, 1))
+            }
+            if rc != SQLITE_DONE {
+                FileHandle.standardError.write(
+                    Data("CatalogStore.facets(\(column)): step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
             }
         }
         try count("lane", into: \.lane)
@@ -1223,9 +1331,14 @@ public actor CatalogStore {
         }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, scope?.rawValue)
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            guard let k = text(stmt, 0) else { continue }
+        // Read-only, same log-and-partial treatment as the facet loop above (#357).
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+            guard let k = text(stmt, 0) else { return }
             f.collection[k] = Int(sqlite3_column_int(stmt, 1))
+        }
+        if rc != SQLITE_DONE {
+            FileHandle.standardError.write(
+                Data("CatalogStore.facets(collection): step failed (code \(rc)): \(String(cString: sqlite3_errmsg(db)))\n".utf8))
         }
         return f
     }

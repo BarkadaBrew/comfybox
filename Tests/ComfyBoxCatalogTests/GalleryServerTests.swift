@@ -226,6 +226,52 @@ final class GalleryServerTests: XCTestCase {
         XCTAssertEqual(body["count"] as? Int, 1)
     }
 
+    /// `search` keeps its per-page clamp (#271: this is the endpoint that
+    /// stays capped) even when a caller explicitly asks for more than
+    /// `maxLimit` — the ids-only route below exists so a caller who genuinely
+    /// needs "everything matching this filter" has somewhere to ask instead
+    /// of this cap quietly growing.
+    func testSearchStaysClampedAtMaxLimitEvenWhenAskedForMore() async throws {
+        for i in 0..<600 {
+            try await store.upsert(CatalogAsset(id: "clamp-\(i)", filename: "c\(i).png",
+                                                absolutePath: "/tmp/c\(i).png", realm: .shared,
+                                                lane: "clamp-fixture"), explicitCollectionIDs: [])
+        }
+        let body = try await get("/v1/catalog/search?lane=clamp-fixture&limit=99999")
+        XCTAssertEqual(body["count"] as? Int, GalleryServer.maxLimit)
+    }
+
+    // MARK: - /v1/catalog/asset-ids (#271)
+
+    /// The whole point of the new route: unlike `/v1/catalog/search`, a filter
+    /// matching far more than `maxLimit` rows gets back every id.
+    func testAssetIdsRouteReturnsEveryMatchingIdUnclamped() async throws {
+        for i in 0..<600 {
+            try await store.upsert(CatalogAsset(id: "ids-\(i)", filename: "i\(i).png",
+                                                absolutePath: "/tmp/i\(i).png", realm: .shared,
+                                                lane: "ids-fixture"), explicitCollectionIDs: [])
+        }
+        let body = try await get("/v1/catalog/asset-ids?lane=ids-fixture")
+        XCTAssertEqual(body["count"] as? Int, 600)
+        let ids = try XCTUnwrap(body["ids"] as? [String])
+        XCTAssertEqual(Set(ids), Set((0..<600).map { "ids-\($0)" }))
+    }
+
+    /// `limit`/`offset` on the query string are accepted (so the same query
+    /// helper can build the request) but have no effect on this route — it
+    /// answers "every id", not a page of them.
+    func testAssetIdsRouteIgnoresLimitAndOffsetQueryParameters() async throws {
+        let body = try await get("/v1/catalog/asset-ids?limit=1&offset=0")
+        XCTAssertEqual(body["count"] as? Int, 3, "all three fixture rows, ignoring limit=1")
+    }
+
+    /// The realm lock applies exactly as it does to `/v1/catalog/search`.
+    func testAssetIdsRouteHonoursTheActorScope() async throws {
+        let body = try await get("/v1/catalog/asset-ids", actor: "kira")
+        let ids = try XCTUnwrap(body["ids"] as? [String])
+        XCTAssertEqual(Set(ids), ["k1", "k2"])
+    }
+
     // MARK: - Who is asking
 
     /// Absent stays unscoped: the desktop app and the backfill tooling send no
