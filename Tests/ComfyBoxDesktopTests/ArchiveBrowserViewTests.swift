@@ -124,6 +124,76 @@ struct ArchiveBrowserViewRestoreSummaryTests {
     }
 }
 
+@Suite("ArchiveBrowserView.compressAllowed / deleteAllowed (#223 (b)/(c) review round 2 — per-bundle race guards)")
+struct ArchiveBrowserViewRaceGuardTests {
+    // MARK: - compressAllowed
+
+    @Test("compress is allowed for an ordinary, not-yet-compressed, idle bundle")
+    func compressAllowedForOrdinaryBundle() {
+        #expect(ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: false
+        ))
+    }
+
+    @Test("compress is refused for an incomplete bundle")
+    func compressRefusedForIncomplete() {
+        #expect(!ArchiveBrowserView.compressAllowed(
+            isIncomplete: true, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: false
+        ))
+    }
+
+    @Test("compress is refused for an already-compressed, fully-cleaned-up bundle")
+    func compressRefusedForAlreadyCompressed() {
+        #expect(!ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: true, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: false
+        ))
+    }
+
+    @Test("compress IS allowed for a compressed row with cleanup pending — the idempotent-finish case")
+    func compressAllowedForCleanupPending() {
+        #expect(ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: true, compressionCleanupPending: true,
+            isCompressingThisBundle: false, isRestoringThisBundle: false
+        ))
+    }
+
+    @Test("compress is refused while THIS bundle is already compressing")
+    func compressRefusedWhileCompressingThisBundle() {
+        #expect(!ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: true, isRestoringThisBundle: false
+        ))
+    }
+
+    @Test("compress is refused while THIS bundle is being restored")
+    func compressRefusedWhileRestoringThisBundle() {
+        #expect(!ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: true
+        ))
+    }
+
+    // MARK: - deleteAllowed
+
+    @Test("delete is allowed when nothing is touching the bundle and the archiver is idle")
+    func deleteAllowedWhenIdle() {
+        #expect(ArchiveBrowserView.deleteAllowed(isCompressingThisBundle: false, archiverIsRunning: false))
+    }
+
+    @Test("delete is refused while THIS bundle is compressing — the new guard review round 2 asked for")
+    func deleteRefusedWhileCompressingThisBundle() {
+        #expect(!ArchiveBrowserView.deleteAllowed(isCompressingThisBundle: true, archiverIsRunning: false))
+    }
+
+    @Test("delete is still refused whenever the archiver is running anywhere — unchanged prior behavior")
+    func deleteRefusedWhileArchiverRunningAnywhere() {
+        #expect(!ArchiveBrowserView.deleteAllowed(isCompressingThisBundle: false, archiverIsRunning: true))
+    }
+}
+
 @Suite("ArchiveBrowserView delete-bundle guard (C2b)")
 struct ArchiveBrowserViewDeleteGuardTests {
     @Test("trashOrRemoveBundle removes the bundle directory")

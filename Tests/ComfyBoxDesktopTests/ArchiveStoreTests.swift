@@ -451,4 +451,144 @@ struct ArchiveStoreTests {
         #expect(!ArchiveStore.isCompressedArchivePath("/root/foo-20260101-000000.cbarchive"))
         #expect(!ArchiveStore.isCompressedArchivePath("/root/stray.zip"))
     }
+
+    // MARK: - Orphan pair recovery (#223 (b) review round 2)
+    //
+    // If the final directory removal in `performCompress` fails AFTER the
+    // verified rename, both the `.zip` and the `.cbarchive` directory are
+    // left on disk. This must be a recoverable, listed, idempotently
+    // finishable state — never a silent orphan.
+
+    @Test("performCompress propagates an injected removeBundleDirectory failure, leaving BOTH the zip and the directory on disk")
+    func performCompressLeavesRecoverablePairOnRemovalFailure() throws {
+        let root = makeTempDir("compress-orphan-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "orphan-20260101-000000.cbarchive", name: "Orphan")
+
+        struct InjectedFailure: Error {}
+        #expect(throws: InjectedFailure.self) {
+            try ArchiveStore.performCompress(bundlePath: bundlePath, removeBundleDirectory: { _ in throw InjectedFailure() })
+        }
+
+        #expect(FileManager.default.fileExists(atPath: bundlePath), "the directory must still be there")
+        #expect(FileManager.default.fileExists(atPath: bundlePath + ".zip"), "the verified zip must still be there too")
+    }
+
+    @Test("scan() recognizes the orphan pair as ONE row: isCompressed, compressionCleanupPending")
+    @MainActor
+    func scanRecognizesOrphanPairAsOneRow() async throws {
+        let root = makeTempDir("compress-orphan-scan-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "orphan2-20260101-000000.cbarchive", name: "Orphan2")
+
+        struct InjectedFailure: Error {}
+        #expect(throws: InjectedFailure.self) {
+            try ArchiveStore.performCompress(bundlePath: bundlePath, removeBundleDirectory: { _ in throw InjectedFailure() })
+        }
+
+        let store = ArchiveStore(roots: [root])
+        await store.reload()
+
+        #expect(store.archives.count == 1, "the pair must be ONE row, never two")
+        let row = try #require(store.archives.first)
+        #expect(row.isCompressed)
+        #expect(row.compressionCleanupPending)
+        #expect(row.bundlePath == bundlePath + ".zip")
+        #expect(row.manifest.name == "Orphan2")
+        #expect(store.error == nil)
+    }
+
+    @Test("compress(_:) on a compressionCleanupPending row finishes idempotently: re-verifies the zip, removes the directory")
+    @MainActor
+    func compressFinishesCleanupPendingRowIdempotently() async throws {
+        let root = makeTempDir("compress-orphan-finish-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "orphan3-20260101-000000.cbarchive", name: "Orphan3")
+
+        struct InjectedFailure: Error {}
+        #expect(throws: InjectedFailure.self) {
+            try ArchiveStore.performCompress(bundlePath: bundlePath, removeBundleDirectory: { _ in throw InjectedFailure() })
+        }
+
+        let store = ArchiveStore(roots: [root])
+        await store.reload()
+        let pendingRow = try #require(store.archives.first)
+        #expect(pendingRow.compressionCleanupPending)
+
+        let result = try await store.compress(pendingRow)
+        #expect(!FileManager.default.fileExists(atPath: bundlePath), "the leftover directory must be gone now")
+        #expect(FileManager.default.fileExists(atPath: result.zipPath))
+
+        // scan() must no longer flag it pending — cleanup is genuinely done.
+        await store.reload()
+        let finishedRow = try #require(store.archives.first)
+        #expect(finishedRow.isCompressed)
+        #expect(!finishedRow.compressionCleanupPending)
+
+        // Idempotent even if `compress(_:)` were called again on a stale
+        // Summary that still claims cleanup is pending (a directory
+        // already gone must be a clean no-op, not a throw).
+        var stalePendingRow = finishedRow
+        stalePendingRow.compressionCleanupPending = true
+        let secondResult = try await store.compress(stalePendingRow)
+        #expect(secondResult.originalBytes == 0, "nothing left to free — the directory was already gone")
+    }
+
+    @Test("finishPendingCleanup is idempotent when called directly a second time after the directory is already gone")
+    func finishPendingCleanupIsIdempotent() throws {
+        let root = makeTempDir("compress-finish-idempotent-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "orphan4-20260101-000000.cbarchive", name: "Orphan4")
+
+        struct InjectedFailure: Error {}
+        #expect(throws: InjectedFailure.self) {
+            try ArchiveStore.performCompress(bundlePath: bundlePath, removeBundleDirectory: { _ in throw InjectedFailure() })
+        }
+        let zipPath = bundlePath + ".zip"
+
+        let first = try ArchiveStore.finishPendingCleanup(zipPath: zipPath)
+        #expect(!FileManager.default.fileExists(atPath: bundlePath))
+        #expect(first.originalBytes > 0)
+
+        // Second call: the directory is already gone — must be a clean no-op,
+        // not throw, and must report zero bytes freed (nothing left to free).
+        let second = try ArchiveStore.finishPendingCleanup(zipPath: zipPath)
+        #expect(second.originalBytes == 0)
+        #expect(second.zipPath == zipPath)
+    }
+
+    @Test("finishPendingCleanup refuses (and removes nothing) when the zip itself no longer verifies readable")
+    func finishPendingCleanupRefusesOnUnverifiableZip() throws {
+        let root = makeTempDir("compress-finish-unverifiable-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "orphan5-20260101-000000.cbarchive", name: "Orphan5")
+        let zipPath = bundlePath + ".zip"
+        // A corrupt "zip" — not a real archive at all.
+        try Data("not a zip".utf8).write(to: URL(fileURLWithPath: zipPath))
+
+        #expect(throws: ArchiveStore.CompressError.self) {
+            try ArchiveStore.finishPendingCleanup(zipPath: zipPath)
+        }
+        #expect(FileManager.default.fileExists(atPath: bundlePath), "nothing was deleted")
+    }
+
+    @Test("finishPendingCleanup propagates an injected removeBundleDirectory failure without deleting the zip")
+    func finishPendingCleanupPropagatesInjectedFailure() throws {
+        let root = makeTempDir("compress-finish-inject-root")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let bundlePath = try makeCompressibleBundle(in: root, dirName: "orphan6-20260101-000000.cbarchive", name: "Orphan6")
+
+        struct InjectedFailure1: Error {}
+        #expect(throws: InjectedFailure1.self) {
+            try ArchiveStore.performCompress(bundlePath: bundlePath, removeBundleDirectory: { _ in throw InjectedFailure1() })
+        }
+        let zipPath = bundlePath + ".zip"
+
+        struct InjectedFailure2: Error {}
+        #expect(throws: InjectedFailure2.self) {
+            try ArchiveStore.finishPendingCleanup(zipPath: zipPath, removeBundleDirectory: { _ in throw InjectedFailure2() })
+        }
+        #expect(FileManager.default.fileExists(atPath: bundlePath), "still there — the injected failure means the retry can try again")
+        #expect(FileManager.default.fileExists(atPath: zipPath), "the zip itself is never touched by the directory-removal step")
+    }
 }

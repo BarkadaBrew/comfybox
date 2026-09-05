@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import ZImage
+import Darwin
 
 /// Generation parameters submitted to the server.
 public struct GenerationRequest: Sendable {
@@ -378,12 +379,59 @@ public final class EngineService {
     /// Pure host-string check, directly unit-testable without constructing
     /// an `EngineService`. Matches the loopback spellings macOS actually
     /// hands back for "this Mac" (`127.0.0.1`, `localhost`, the IPv6
-    /// loopback `::1`) — anything else, including a LAN IP of this same
-    /// Mac, is treated as remote (conservative: the point is "would a
-    /// FileManager call reach the right disk", and a LAN-IP round trip
-    /// still goes through the network stack).
-    public nonisolated static func isLocalHost(_ host: String) -> Bool {
-        ["127.0.0.1", "localhost", "::1"].contains(host)
+    /// loopback `::1`) PLUS any address this Mac's own network interfaces
+    /// currently answer to — a LAN IP or a Tailscale address pointed back
+    /// at itself (review round 2: FileManager calls against ANY of these
+    /// really do reach this Mac's own disk, so treating them as "remote"
+    /// disabled Archive for no reason the moment Todd typed his own LAN/
+    /// Tailscale address into Settings instead of `127.0.0.1`).
+    ///
+    /// `interfaceAddresses` is injectable — defaults to
+    /// `currentInterfaceAddresses()` (the real `getifaddrs(3)` list) in
+    /// production, and a fixed array in tests, so this stays deterministic
+    /// without touching real interfaces or requiring network entitlements
+    /// in a unit-test run.
+    public nonisolated static func isLocalHost(
+        _ host: String,
+        interfaceAddresses: [String] = EngineService.currentInterfaceAddresses()
+    ) -> Bool {
+        ["127.0.0.1", "localhost", "::1"].contains(host) || interfaceAddresses.contains(host)
+    }
+
+    /// This Mac's own network-interface addresses right now — IPv4 and
+    /// IPv6, every UP, non-loopback interface (`getifaddrs(3)`, numeric
+    /// host only via `getnameinfo`/`NI_NUMERICHOST`, never a reverse-DNS
+    /// lookup). A best-effort list: `getifaddrs` failing, or a single
+    /// interface's address failing to resolve, just means fewer entries —
+    /// `isLocalHost` still has its loopback check either way.
+    public nonisolated static func currentInterfaceAddresses() -> [String] {
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else { return [] }
+        defer { freeifaddrs(ifaddrPtr) }
+
+        var addresses: [String] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+
+            let flags = Int32(current.pointee.ifa_flags)
+            guard flags & IFF_UP == IFF_UP, flags & IFF_LOOPBACK == 0,
+                  let sockaddrPtr = current.pointee.ifa_addr
+            else { continue }
+
+            let family = sockaddrPtr.pointee.sa_family
+            guard family == sa_family_t(AF_INET) || family == sa_family_t(AF_INET6) else { continue }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let ok = getnameinfo(
+                sockaddrPtr, socklen_t(sockaddrPtr.pointee.sa_len),
+                &host, socklen_t(host.count),
+                nil, 0, NI_NUMERICHOST
+            )
+            guard ok == 0 else { continue }
+            addresses.append(String(cString: host))
+        }
+        return addresses
     }
 
     // MARK: - Private

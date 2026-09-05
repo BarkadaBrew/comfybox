@@ -120,18 +120,24 @@ public enum RemoteMediaCache {
     }
 
     /// A remote fetch failure, classified — never a raw HTTP status number
-    /// surfaced to the browse view (#223 (a)). `.unauthorized` is the one a
-    /// caller can act on: it means whatever session/password the request
-    /// carried is no good, and the fix is to re-open the unlock prompt, not
-    /// to show a dead-end error banner.
+    /// surfaced to the browse view (#223 (a)).
+    ///
+    /// `.unauthorized` (401/403) is NOT currently reachable through this
+    /// call path: `/v1/gallery/file` (the only route a remote fetch here
+    /// ever hits) carries no auth and can only 400 on a disallowed path.
+    /// It's kept — rather than merged into `.server` — because it IS a
+    /// real, documented status in HTTP and the one other real 401/403 in
+    /// this codebase (the catalog service's realm lock on :7871) could
+    /// plausibly sit behind a future auth-bearing gallery route; when that
+    /// day comes, this already renders a clean sentence instead of a bare
+    /// code, with no caller-side change needed.
     public enum FetchError: Error, LocalizedError, Equatable {
         case unauthorized
         case notFound
         case server(Int)
 
         /// Classifies an HTTP status code. A pure, directly unit-testable
-        /// mapping — the one place that decides which codes mean "the
-        /// unlock prompt should reopen".
+        /// mapping.
         public static func classify(statusCode: Int) -> FetchError {
             switch statusCode {
             case 401, 403: return .unauthorized
@@ -142,7 +148,7 @@ public enum RemoteMediaCache {
 
         public var errorDescription: String? {
             switch self {
-            case .unauthorized: return "This server rejected the session — enter the password again."
+            case .unauthorized: return "Not authorized by the server."
             case .notFound: return "The server no longer has this file."
             case .server(let code): return "The server couldn't provide this file (code \(code))."
             }

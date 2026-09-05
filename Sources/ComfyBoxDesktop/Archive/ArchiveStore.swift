@@ -25,10 +25,20 @@ public final class ArchiveStore {
         /// longer exists. Restore/Export/Compress-again are not offered for
         /// these rows (decompress-then-restore is a follow-up; see the PR body).
         public var isCompressed: Bool
+        /// True when the `.zip` AND the `.cbarchive` directory it should have
+        /// replaced BOTH still exist — the verified rename succeeded but the
+        /// final directory removal didn't (review round 2: a permissions
+        /// failure, a file still open, …). Recoverable, not a silent orphan:
+        /// `compress(_:)` on this row re-verifies the zip and finishes the
+        /// removal (`ArchiveStore.finishPendingCleanup`) instead of refusing
+        /// with "already compressed". Always false unless `isCompressed` is
+        /// also true.
+        public var compressionCleanupPending: Bool
 
         public init(
             id: String, bundlePath: String, manifest: ArchiveManifest,
-            isIncomplete: Bool, hasPendingRemoval: Bool, isCompressed: Bool = false
+            isIncomplete: Bool, hasPendingRemoval: Bool, isCompressed: Bool = false,
+            compressionCleanupPending: Bool = false
         ) {
             self.id = id
             self.bundlePath = bundlePath
@@ -36,6 +46,7 @@ public final class ArchiveStore {
             self.isIncomplete = isIncomplete
             self.hasPendingRemoval = hasPendingRemoval
             self.isCompressed = isCompressed
+            self.compressionCleanupPending = compressionCleanupPending
         }
     }
 
@@ -88,6 +99,13 @@ public final class ArchiveStore {
                 guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else { continue }
 
                 if entry.hasSuffix(".cbarchive"), isDir.boolValue {
+                    // Review round 2: if `compress(_:)` verified-and-renamed
+                    // the zip but then failed to remove THIS directory, both
+                    // exist — that pair is represented ONCE, by the
+                    // `.cbarchive.zip` branch below (with
+                    // `compressionCleanupPending`), not twice.
+                    guard !fm.fileExists(atPath: fullPath + ".zip") else { continue }
+
                     let manifestPath = (fullPath as NSString).appendingPathComponent("manifest.json")
                     let incompletePath = (fullPath as NSString).appendingPathComponent("INCOMPLETE.json")
                     let pendingRemovalPath = (fullPath as NSString).appendingPathComponent("PENDING_REMOVAL.json")
@@ -113,14 +131,23 @@ public final class ArchiveStore {
                         errors.append("Could not read manifest for \(entry)")
                     }
                 } else if isCompressedArchivePath(entry), !isDir.boolValue {
-                    // A `compress(_:)` (#223 (b)) output: the directory bundle
-                    // it replaced is gone, so there is no manifest.json to
-                    // read off disk directly — read it out of the zip itself.
+                    // A `compress(_:)` (#223 (b)) output. Usually the
+                    // directory bundle it replaced is already gone, so there
+                    // is no manifest.json to read off disk directly — read
+                    // it out of the zip itself either way (also re-validates
+                    // the zip is actually readable on every scan, not just
+                    // once at compress time).
                     let bundleDirName = (entry as NSString).deletingPathExtension
+                    let siblingDirPath = (root as NSString).appendingPathComponent(bundleDirName)
+                    var siblingIsDir: ObjCBool = false
+                    let cleanupPending = fm.fileExists(atPath: siblingDirPath, isDirectory: &siblingIsDir)
+                        && siblingIsDir.boolValue
+
                     if let manifest = try? readManifestFromZip(zipPath: fullPath, bundleDirName: bundleDirName) {
                         summaries.append(Summary(
                             id: fullPath, bundlePath: fullPath, manifest: manifest,
-                            isIncomplete: false, hasPendingRemoval: false, isCompressed: true
+                            isIncomplete: false, hasPendingRemoval: false, isCompressed: true,
+                            compressionCleanupPending: cleanupPending
                         ))
                     } else {
                         errors.append("Could not read manifest for \(entry)")
@@ -256,15 +283,29 @@ public final class ArchiveStore {
     /// in `ArchiveBrowserView` — incomplete / mid-removal — plus "already
     /// compressed").
     @discardableResult
+    /// A bundle carrying `compressionCleanupPending` (both the directory AND
+    /// its `.zip` exist — the orphan pair review round 2 asked for recovery
+    /// from) routes to `finishPendingCleanup` instead of the ineligibility
+    /// guards below: it IS eligible, its zip already verified readable at
+    /// `scan()` time, and the only remaining work is the directory removal
+    /// that didn't finish last time. `finishPendingCleanup` is itself
+    /// idempotent (re-verifies, then removes only if the directory is still
+    /// there), so calling this again after a second failure is always safe.
     public func compress(_ bundle: Summary) async throws -> CompressResult {
+        if bundle.isCompressed {
+            guard bundle.compressionCleanupPending else {
+                throw CompressError.notEligible("This archive is already compressed.")
+            }
+            let zipPath = bundle.bundlePath
+            return try await Task.detached(priority: .utility) {
+                try Self.finishPendingCleanup(zipPath: zipPath)
+            }.value
+        }
         guard !bundle.isIncomplete else {
             throw CompressError.notEligible("This archive never finished writing — delete it instead of compressing it.")
         }
         guard !bundle.hasPendingRemoval else {
             throw CompressError.notEligible("This archive is still finishing a prior operation — try again shortly.")
-        }
-        guard !bundle.isCompressed else {
-            throw CompressError.notEligible("This archive is already compressed.")
         }
         let bundlePath = bundle.bundlePath
         return try await Task.detached(priority: .utility) {
@@ -272,7 +313,16 @@ public final class ArchiveStore {
         }.value
     }
 
-    private nonisolated static func performCompress(bundlePath: String) throws -> CompressResult {
+    /// `removeBundleDirectory` is injectable (default: the real
+    /// `FileManager.removeItem`) purely so a test can simulate the final
+    /// removal failing — the exact case review round 2 asked to be
+    /// recoverable rather than left as a silent orphan pair. `internal`
+    /// (not `private`) so `ArchiveStoreTests` can call it directly with a
+    /// failing closure without going through the public `compress(_:)`.
+    nonisolated static func performCompress(
+        bundlePath: String,
+        removeBundleDirectory: (String) throws -> Void = { try FileManager.default.removeItem(atPath: $0) }
+    ) throws -> CompressResult {
         // Respect the traversal guard (#264) before anything else: refuse a
         // bundle whose entries.jsonl resolves outside its own root rather
         // than compressing (and thereby legitimizing) it.
@@ -305,8 +355,48 @@ public final class ArchiveStore {
         try fm.moveItem(atPath: partialPath, toPath: zipPath)
 
         // Only now — the destination is a verified-readable zip — remove the
-        // uncompressed source.
-        try fm.removeItem(atPath: bundlePath)
+        // uncompressed source. If THIS throws (permissions, a file still
+        // open, …), both the zip and the directory are left on disk: a
+        // recoverable pair, not a silent orphan — `scan()` lists it as one
+        // `compressionCleanupPending` row, and `compress(_:)` on that row
+        // re-enters through `finishPendingCleanup` rather than
+        // `notEligible`. Nothing here catches the throw; it propagates so
+        // the caller's `errorMessage` names the real failure.
+        try removeBundleDirectory(bundlePath)
+
+        let compressedBytes = (try? fm.attributesOfItem(atPath: zipPath))?[.size] as? Int64 ?? 0
+        return CompressResult(zipPath: zipPath, originalBytes: originalBytes, compressedBytes: compressedBytes)
+    }
+
+    /// Finishes a `compressionCleanupPending` row: re-verifies the zip is
+    /// still readable (never trust a previous verification blindly — the
+    /// zip is exactly the file a second, unrelated failure could also have
+    /// touched), then removes the leftover directory if it's still there.
+    /// Idempotent by construction: a directory already gone (this ran
+    /// successfully before, or something else cleaned it up) is simply
+    /// skipped, not an error. `removeBundleDirectory` is the same
+    /// injection point `performCompress` uses, for the same testing reason.
+    nonisolated static func finishPendingCleanup(
+        zipPath: String,
+        removeBundleDirectory: (String) throws -> Void = { try FileManager.default.removeItem(atPath: $0) }
+    ) throws -> CompressResult {
+        let fm = FileManager.default
+        // `compressedZipPath(for:)` only ever appends ".zip", so stripping
+        // the last path extension is exactly its inverse.
+        let bundlePath = (zipPath as NSString).deletingPathExtension
+        let bundleDirName = (bundlePath as NSString).lastPathComponent
+
+        guard (try? readManifestFromZip(zipPath: zipPath, bundleDirName: bundleDirName)) != nil else {
+            throw CompressError.verifyFailed(
+                "The compressed archive could not be verified readable — nothing was deleted."
+            )
+        }
+
+        let stillPresent = fm.fileExists(atPath: bundlePath)
+        let originalBytes = stillPresent ? directorySize(atPath: bundlePath) : 0
+        if stillPresent {
+            try removeBundleDirectory(bundlePath)
+        }
 
         let compressedBytes = (try? fm.attributesOfItem(atPath: zipPath))?[.size] as? Int64 ?? 0
         return CompressResult(zipPath: zipPath, originalBytes: originalBytes, compressedBytes: compressedBytes)

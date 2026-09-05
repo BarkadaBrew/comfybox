@@ -2266,25 +2266,28 @@ struct GalleryView: View {
         return "Orphan cleanup skipped: \(error.localizedDescription)"
     }
 
-    /// What the lightbox shows, and whether it should force `AppContentGate`
-    /// closed again, for a remote-fetch failure (#223 (a)): a raw HTTP status
-    /// number must never surface in the browse view, and an auth-shaped
-    /// failure means the session the gate is holding open isn't good any
-    /// more — re-locking routes the user back to the SAME unlock prompt that
-    /// already gives a wrong password a clean inline error, rather than
-    /// dead-ending on a banner in the grid/lightbox. Pure and directly
+    /// What the lightbox shows for a remote-fetch failure (#223 (a)): a raw
+    /// HTTP status number must never surface in the browse view. Just the
+    /// classified error's own description — `RemoteMediaCache.FetchError`
+    /// already never renders a bare code (see its tests). Pure and directly
     /// unit-testable — there is no ViewInspector in this repo, and
     /// `GalleryLightbox` (the caller) is file-private.
-    static func remoteLoadOutcome(for error: Error) -> (message: String, relock: Bool) {
-        guard let fetchError = error as? RemoteMediaCache.FetchError else {
-            return (error.localizedDescription, false)
-        }
-        switch fetchError {
-        case .unauthorized:
-            return ("This server rejected the session — content is locked again. Unlock (⌃⌥⌘U) and re-enter the password.", true)
-        case .notFound, .server:
-            return (fetchError.localizedDescription, false)
-        }
+    ///
+    /// Deliberately does NOT decide anything about `AppContentGate` — an
+    /// earlier version of this function re-locked the gate on
+    /// `.unauthorized`, on the theory that a 401/403 meant the app's own
+    /// gallery-password session had gone stale. Review round 2 traced the
+    /// path: every remote read here resolves to the engine's
+    /// `/v1/gallery/file`, which carries no auth at all (a disallowed path
+    /// gets a 400, never a 401/403) — the only real 401/403 in the codebase
+    /// is the catalog service's realm lock on :7871, which this view never
+    /// calls. So the mapping was reacting to a status this path cannot
+    /// receive, and would have re-locked the wrong, unrelated local gate if
+    /// it ever had. The classification itself is still the fix: whenever a
+    /// 401/403 DOES reach here in the future, it reads as a sentence, never
+    /// a bare number.
+    static func remoteLoadOutcome(for error: Error) -> String {
+        (error as? RemoteMediaCache.FetchError)?.errorDescription ?? error.localizedDescription
     }
 
     /// Resolves the "Edited from" source asset for an edit sidecar's `source_path`
@@ -2513,6 +2516,11 @@ private struct GalleryLightbox: View {
     /// Why there is nothing on screen (server unreachable, file gone). Beats a
     /// ProgressView that spins forever.
     @State private var loadError: String?
+    /// True only for a remote-fetch failure (`applyRemoteLoadFailure`) —
+    /// every one of those is a fetch that can simply be tried again, unlike
+    /// "this file isn't on this Mac" or the Rated-G lock, which Retry can't
+    /// fix.
+    @State private var canRetryLoad: Bool = false
     @FocusState private var focused: Bool
     @Environment(AppContentGate.self) private var contentGate
 
@@ -2565,6 +2573,11 @@ private struct GalleryLightbox: View {
                             .font(.callout).foregroundStyle(.white.opacity(0.85))
                             .multilineTextAlignment(.center)
                             .frame(maxWidth: 460)
+                        if canRetryLoad {
+                            Button("Retry") { Task { await load() } }
+                                .buttonStyle(.bordered)
+                                .tint(.white)
+                        }
                     }
                 } else {
                     VStack(spacing: 10) {
@@ -2739,6 +2752,7 @@ private struct GalleryLightbox: View {
         player = nil
         image = nil
         loadError = nil
+        canRetryLoad = false
         guard let asset else { return }
         let isVideo = asset.kind == "video"
 
@@ -2791,16 +2805,28 @@ private struct GalleryLightbox: View {
         }
     }
 
-    /// Shows a remote-fetch failure and, for one that's auth-shaped, re-locks
-    /// the content gate (#223 (a)) — never a raw HTTP status number left in
-    /// the browse view, and never an "optimistic" gate that stays open past a
-    /// session the server has stopped honoring. The NEXT unlock attempt
-    /// (⌃⌥⌘U / the NSFW password sheet) is where a wrong password already
-    /// gets a clean inline error — this just routes back to it instead of
-    /// dead-ending here.
+    /// Shows a remote-fetch failure as a clean sentence — never a raw HTTP
+    /// status number in the browse view (#223 (a)) — with Retry offered,
+    /// since every failure this reaches is a fetch that can simply be tried
+    /// again.
+    ///
+    /// This does NOT re-lock `AppContentGate`. It used to, on the theory
+    /// that a 401/403 meant the app's own gallery-password session had gone
+    /// stale — but the reviewer traced the actual path: `AssetMediaLocation`
+    /// resolves every remote read to the engine's `/v1/gallery/file`, which
+    /// carries no auth at all (it can 400 on a disallowed path; it cannot
+    /// 401/403). The only real 401/403 in the codebase is the CATALOG
+    /// service's realm lock on :7871, which this view never calls directly —
+    /// so the mapping was reacting to a status this code path cannot
+    /// actually receive, and re-locking the wrong (local, unrelated) gate in
+    /// response to it would have been the wrong prompt if it ever had fired.
+    /// `RemoteMediaCache.FetchError` classification is kept — the fix is a
+    /// clean message, not a bare status code, whenever a 401/403 does show
+    /// up here (a future auth-bearing route, a proxy in front of the
+    /// engine) — it just no longer drives a gate decision this view has no
+    /// business making.
     private func applyRemoteLoadFailure(_ error: Error) {
-        let outcome = GalleryView.remoteLoadOutcome(for: error)
-        loadError = outcome.message
-        if outcome.relock { contentGate.hide() }
+        loadError = GalleryView.remoteLoadOutcome(for: error)
+        canRetryLoad = true
     }
 }

@@ -480,18 +480,54 @@ struct QueueInfoTests {
 
 @Suite("EngineService.isLocalHost")
 struct EngineServiceIsLocalHostTests {
+    // `interfaceAddresses: []` is passed explicitly everywhere below —
+    // deterministic, independent of whatever real interfaces the machine
+    // running this test happens to have (never the live `getifaddrs()`
+    // default), per review round 2.
+
     @Test("recognizes every loopback spelling this Mac actually reports")
     func recognizesLoopback() {
-        #expect(EngineService.isLocalHost("127.0.0.1"))
-        #expect(EngineService.isLocalHost("localhost"))
-        #expect(EngineService.isLocalHost("::1"))
+        #expect(EngineService.isLocalHost("127.0.0.1", interfaceAddresses: []))
+        #expect(EngineService.isLocalHost("localhost", interfaceAddresses: []))
+        #expect(EngineService.isLocalHost("::1", interfaceAddresses: []))
     }
 
-    @Test("treats anything else, including this Mac's own LAN IP, as remote")
+    @Test("treats a host that is neither loopback nor a known interface address as remote")
     func treatsOtherHostsAsRemote() {
-        #expect(!EngineService.isLocalHost("10.0.100.232"))
-        #expect(!EngineService.isLocalHost("192.168.1.50"))
-        #expect(!EngineService.isLocalHost("comfybox.local"))
-        #expect(!EngineService.isLocalHost(""))
+        #expect(!EngineService.isLocalHost("10.0.100.232", interfaceAddresses: []))
+        #expect(!EngineService.isLocalHost("192.168.1.50", interfaceAddresses: []))
+        #expect(!EngineService.isLocalHost("comfybox.local", interfaceAddresses: []))
+        #expect(!EngineService.isLocalHost("", interfaceAddresses: []))
+    }
+
+    // MARK: - This Mac's own interface addresses (#223 (c) review round 2)
+
+    @Test("a host matching an injected interface address is local — a LAN IP of this same Mac")
+    func matchesInjectedLANAddress() {
+        let interfaces = ["10.0.100.232", "192.168.1.14"]
+        #expect(EngineService.isLocalHost("10.0.100.232", interfaceAddresses: interfaces))
+        #expect(EngineService.isLocalHost("192.168.1.14", interfaceAddresses: interfaces))
+    }
+
+    @Test("a Tailscale-shaped address matches too — it's just another interface address")
+    func matchesInjectedTailscaleAddress() {
+        #expect(EngineService.isLocalHost("100.101.102.103", interfaceAddresses: ["100.101.102.103"]))
+    }
+
+    @Test("a host absent from the injected interface list stays remote")
+    func hostNotInInjectedListStaysRemote() {
+        #expect(!EngineService.isLocalHost("10.0.100.232", interfaceAddresses: ["192.168.1.14"]))
+    }
+
+    @Test("loopback spellings are recognized regardless of what interface list is injected")
+    func loopbackWinsRegardlessOfInterfaceList() {
+        #expect(EngineService.isLocalHost("127.0.0.1", interfaceAddresses: ["192.168.1.14"]))
+    }
+
+    @Test("currentInterfaceAddresses never includes a loopback address")
+    func currentInterfaceAddressesExcludesLoopback() {
+        let addresses = EngineService.currentInterfaceAddresses()
+        #expect(!addresses.contains("127.0.0.1"))
+        #expect(!addresses.contains("::1"))
     }
 }
