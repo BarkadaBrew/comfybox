@@ -879,13 +879,15 @@ public final class WarmServer {
       struct NameBody: Decodable { let name: String }
       do {
         let body = try decode(NameBody.self, from: request.body)
-        let evicted = nearlineLibrary.evict(name: body.name)
+        let evicted = try nearlineLibrary.evict(name: body.name)
         if evicted {
           auditLog.append(kind: "nearline.evict", message: "Evicted \(body.name)")
         }
         return evicted
           ? nearlineListResponse()
           : .error(.error(status: 404, message: "Not staged: \(body.name)"))
+      } catch let error as NearlineError {
+        return .error(.error(status: Self.httpStatus(for: error), message: error.localizedDescription))
       } catch {
         return .error(.error(status: 400, message: "Invalid evict payload"))
       }
@@ -1934,6 +1936,9 @@ public final class WarmServer {
     switch error {
     case .insufficientCapacity: return 507
     case .unknownItem, .sourceMissing: return 404
+    // #273 fix round 2 (N2): evicting an anchored item is a conflict with
+    // its own pinned state, not a missing/malformed request.
+    case .anchored: return 409
     }
   }
 

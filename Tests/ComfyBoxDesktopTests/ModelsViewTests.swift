@@ -36,4 +36,24 @@ struct NearlineAnchorRowViewModelTests {
         let vm = NearlineAnchorRowViewModel(item: entry(anchored: true, staged: false))
         #expect(vm.buttonTitle == "Un-anchor")
     }
+
+    // MARK: - #273 fix round 2 (N2): Evict must not be offered on anchored rows
+
+    @Test("staged, unanchored item offers Evict")
+    func stagedUnanchoredOffersEvict() {
+        let vm = NearlineAnchorRowViewModel(item: entry(anchored: false, staged: true))
+        #expect(vm.evictButtonVisible == true)
+    }
+
+    @Test("staged, anchored item hides Evict — must un-anchor first")
+    func stagedAnchoredHidesEvict() {
+        let vm = NearlineAnchorRowViewModel(item: entry(anchored: true, staged: true))
+        #expect(vm.evictButtonVisible == false)
+    }
+
+    @Test("unstaged item hides Evict regardless of anchor state")
+    func unstagedHidesEvict() {
+        let vm = NearlineAnchorRowViewModel(item: entry(anchored: false, staged: false))
+        #expect(vm.evictButtonVisible == false)
+    }
 }

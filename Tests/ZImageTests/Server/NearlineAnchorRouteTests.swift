@@ -85,4 +85,10 @@ final class NearlineAnchorRouteTests: XCTestCase {
   func testSourceMissingMapsTo404() {
     XCTAssertEqual(WarmServer.httpStatus(for: .sourceMissing("/vol/x")), 404)
   }
+
+  // MARK: - #273 fix round 2 (N2): evicting an anchored item -> 409
+
+  func testAnchoredMapsTo409() {
+    XCTAssertEqual(WarmServer.httpStatus(for: .anchored("pinned.safetensors")), 409)
+  }
 }

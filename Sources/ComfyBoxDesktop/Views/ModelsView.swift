@@ -15,11 +15,16 @@ struct NearlineAnchorRowViewModel: Equatable {
     let buttonTitle: String
     /// The `anchored` value the next tap should send to the route.
     let nextAnchoredValue: Bool
+    /// #273 fix round 2 (N2): the server now refuses to evict an anchored
+    /// item (409) — offering the button at all just invites a failed tap
+    /// and a confusing error. Un-anchor first, then Evict.
+    let evictButtonVisible: Bool
 
     init(item: EngineService.NearlineEntry) {
         pinGlyphVisible = item.anchored
         buttonTitle = item.anchored ? "Un-anchor" : "Anchor"
         nextAnchoredValue = !item.anchored
+        evictButtonVisible = item.staged && !item.anchored
     }
 }
 
@@ -502,10 +507,10 @@ struct ModelsView: View {
             } else {
                 Button(anchorVM.buttonTitle) { Task { await nearlineAnchorAct(item, anchored: anchorVM.nextAnchoredValue) } }
                     .controlSize(.small)
-                if item.staged {
+                if anchorVM.evictButtonVisible {
                     Button("Evict") { Task { await nearlineAct("evict", item) } }
                         .controlSize(.small)
-                } else {
+                } else if !item.staged {
                     Button("Stage") { Task { await nearlineAct("stage", item) } }
                         .controlSize(.small)
                         .buttonStyle(.borderedProminent)

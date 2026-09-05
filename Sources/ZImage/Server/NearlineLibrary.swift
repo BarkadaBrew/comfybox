@@ -127,6 +127,13 @@ public final class NearlineLibrary: @unchecked Sendable {
   private var stagingGroups: [String: DispatchGroup] = [:]
   private var stagingResults: [String: Result<String, Error>] = [:]
 
+  /// #273 fix round 2 (M): number of `stage()` calls currently blocked on
+  /// `stagingGroups[name]`'s group, waiting to read `stagingResults[name]`.
+  /// Lets the copier (or the last waiter) know it's safe to prune the
+  /// `Result` entry — otherwise it would sit in `stagingResults` for the
+  /// life of the process once nobody remains to read it.
+  private var stagingWaiterCounts: [String: Int] = [:]
+
   /// Test-only seam (#273 fix round 1, I3): when set, called with the item
   /// about to be copied, from inside the (lock-free) copy step, so a test
   /// can simulate a slow/blocking copier for ONE name — e.g. to prove
@@ -136,6 +143,23 @@ public final class NearlineLibrary: @unchecked Sendable {
   /// block every other concurrent `stage()` call sharing this instance.
   /// Never set outside tests.
   var testCopyDelayHook: ((NearlineItem) -> Void)?
+
+  /// Test-only seam (#273 fix round 2, M): called synchronously, under
+  /// `lock`, right after a `stage()` call registers itself as a waiter on
+  /// someone else's in-flight copy for `name` — lets a test learn
+  /// deterministically that the waiter has reached the "wait for the
+  /// in-flight group" branch, instead of guessing with `Thread.sleep`.
+  /// Never set outside tests.
+  var testWaiterRegisteredHook: ((String) -> Void)?
+
+  /// Test-only seam (#273 fix round 2, M): the number of `Result` entries
+  /// currently held in `stagingResults` — a test can assert this drops back
+  /// to 0 once every waiter (if any) has read its result, proving the dict
+  /// doesn't leak an entry per name for the life of the process.
+  var stagingResultsCountForTesting: Int {
+    lock.lock(); defer { lock.unlock() }
+    return stagingResults.count
+  }
 
   /// `~/.comfybox/nearline.json`.
   public static func defaultStatePath() -> URL {
@@ -270,10 +294,27 @@ public final class NearlineLibrary: @unchecked Sendable {
     // Another caller is already staging this exact name — wait for it
     // instead of racing a second copy.
     if let group = stagingGroups[name] {
+      stagingWaiterCounts[name, default: 0] += 1
+      testWaiterRegisteredHook?(name)
       lock.unlock()
       group.wait()
       lock.lock()
       let result = stagingResults[name]
+      // #273 fix round 2 (M): the last waiter prunes its own entry so
+      // `stagingResults` doesn't hold one Result per name forever; also
+      // touch lastUsedAt on success — piggybacking on someone else's
+      // in-flight copy is still using the item, for LRU purposes.
+      let remaining = (stagingWaiterCounts[name] ?? 1) - 1
+      if remaining <= 0 {
+        stagingWaiterCounts.removeValue(forKey: name)
+        stagingResults.removeValue(forKey: name)
+      } else {
+        stagingWaiterCounts[name] = remaining
+      }
+      if case .success = result, let idx = state.items.firstIndex(where: { $0.name == name }) {
+        state.items[idx].lastUsedAt = Date()
+        persistLocked()
+      }
       lock.unlock()
       switch result {
       case .success(let path): return path
@@ -310,6 +351,14 @@ public final class NearlineLibrary: @unchecked Sendable {
     lock.lock()
     stagingResults[name] = result
     stagingGroups.removeValue(forKey: name)
+    // #273 fix round 2 (M): if nobody is waiting to read it, prune the
+    // Result immediately — the common case (no concurrent duplicate
+    // stage() calls) would otherwise leak one entry per staged name for
+    // the life of the process. A waiter that IS currently registered
+    // prunes it itself after reading it (see the waiting branch above).
+    if (stagingWaiterCounts[name] ?? 0) == 0 {
+      stagingResults.removeValue(forKey: name)
+    }
     if let idx2 = state.items.firstIndex(where: { $0.name == name }) {
       state.items[idx2].staging = false
       if case .success(let path) = result {
@@ -406,9 +455,18 @@ public final class NearlineLibrary: @unchecked Sendable {
   }
 
   /// Remove a staged copy (the attached-storage original is untouched).
+  ///
+  /// #273 fix round 2 (N2): refuses to evict an anchored item —
+  /// anchoring means "always resident on internal storage," so silently
+  /// removing the staged copy out from under it would leave `anchored: true`
+  /// pointing at a file that no longer exists. Un-anchor first
+  /// (``setAnchored``), then evict.
   @discardableResult
-  public func evict(name: String) -> Bool {
+  public func evict(name: String) throws -> Bool {
     lock.lock(); defer { lock.unlock() }
+    if let item = state.items.first(where: { $0.name == name }), item.anchored {
+      throw NearlineError.anchored(name)
+    }
     return evictLocked(name: name)
   }
 
@@ -465,6 +523,17 @@ public final class NearlineLibrary: @unchecked Sendable {
   /// is simply bigger than the whole budget — throws
   /// `NearlineError.insufficientCapacity` instead of letting `stage()`
   /// silently copy past the budget onto a volume that may be nearly full.
+  ///
+  /// #273 fix round 2 (N3): bytes reserved by OTHER in-flight `stage()`
+  /// copies (marked `staging` under this same lock, before it's released
+  /// for the copy) count as already-used too. Without this, two concurrent
+  /// `stage()` calls for different names can each pass this guard against
+  /// the same free space — neither sees the other's incoming file — and
+  /// both copies land even though combined they overflow the budget. Since
+  /// this method only ever runs under `lock`, and a `staging` flag is set
+  /// (still under `lock`) before that lock is ever released for the actual
+  /// copy, a second caller's check here is guaranteed to observe the
+  /// first's reservation.
   private func ensureCapacityLocked(forIncomingMB incoming: Double) throws {
     let limitMB = state.config.cacheLimitGB * 1024
     let staged = state.items.filter(\.staged)
@@ -473,7 +542,8 @@ public final class NearlineLibrary: @unchecked Sendable {
     }
 
     let usedAfter = state.items.filter(\.staged).reduce(0.0) { $0 + $1.sizeMB }
-    let freeMB = limitMB - usedAfter
+    let reservedByOthersMB = state.items.filter(\.staging).reduce(0.0) { $0 + $1.sizeMB }
+    let freeMB = limitMB - usedAfter - reservedByOthersMB
     guard incoming > freeMB else { return }
 
     let anchoredMB = state.items.filter { $0.staged && $0.anchored }.reduce(0.0) { $0 + $1.sizeMB }
@@ -498,6 +568,9 @@ public enum NearlineError: Error, LocalizedError, Equatable {
   /// #273 fix round 1 (C2): `stage()` could not free enough room even after
   /// evicting every evictable (non-anchored) staged item.
   case insufficientCapacity(needMB: Double, freeMB: Double, anchoredMB: Double)
+  /// #273 fix round 2 (N2): `evict(name:)` was called on an item that is
+  /// currently anchored — un-anchor it first.
+  case anchored(String)
 
   public var errorDescription: String? {
     switch self {
@@ -508,6 +581,8 @@ public enum NearlineError: Error, LocalizedError, Equatable {
     case .insufficientCapacity(let need, let free, let anchored):
       return "Nearline staging budget exceeded: need \(Int(need)) MB, only \(Int(free)) MB free"
         + " (\(Int(anchored)) MB pinned by anchored items)"
+    case .anchored(let name):
+      return "Cannot evict anchored item: \(name) — un-anchor it first"
     }
   }
 }

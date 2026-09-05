@@ -96,12 +96,40 @@ final class NearlineLibraryTests: XCTestCase {
     library.scan()
     let staged = try library.stage(name: "gone.safetensors")
 
-    XCTAssertTrue(library.evict(name: "gone.safetensors"))
+    XCTAssertTrue(try library.evict(name: "gone.safetensors"))
     XCTAssertFalse(FileManager.default.fileExists(atPath: staged))
     XCTAssertTrue(FileManager.default.fileExists(
       atPath: sourceDir.appendingPathComponent("gone.safetensors").path))
     XCTAssertEqual(library.item(named: "gone.safetensors")?.staged, false)
-    XCTAssertFalse(library.evict(name: "gone.safetensors"))  // already evicted
+    XCTAssertFalse(try library.evict(name: "gone.safetensors"))  // already evicted
+  }
+
+  // MARK: - #273 fix round 2 (N2): evict() refuses anchored items
+
+  func testEvictThrowsForAnAnchoredItemAndLeavesItStaged() throws {
+    try writeSource("pinned_evict.safetensors", megabytes: 1)
+    library.scan()
+    let staged = try library.setAnchored(name: "pinned_evict.safetensors", anchored: true).stagedPath
+
+    XCTAssertThrowsError(try library.evict(name: "pinned_evict.safetensors")) { error in
+      guard case NearlineError.anchored(let name) = error else {
+        return XCTFail("expected NearlineError.anchored, got \(error)")
+      }
+      XCTAssertEqual(name, "pinned_evict.safetensors")
+    }
+    XCTAssertEqual(library.item(named: "pinned_evict.safetensors")?.staged, true)
+    XCTAssertNotNil(staged)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: staged!))
+  }
+
+  func testEvictSucceedsOnceUnanchored() throws {
+    try writeSource("was_pinned.safetensors", megabytes: 1)
+    library.scan()
+    _ = try library.setAnchored(name: "was_pinned.safetensors", anchored: true)
+    _ = try library.setAnchored(name: "was_pinned.safetensors", anchored: false)
+
+    XCTAssertTrue(try library.evict(name: "was_pinned.safetensors"))
+    XCTAssertEqual(library.item(named: "was_pinned.safetensors")?.staged, false)
   }
 
   func testStagingSurvivesRescanAndReload() throws {
@@ -331,19 +359,151 @@ final class NearlineLibraryTests: XCTestCase {
     }
     wait(for: [copyStarted], timeout: 5.0)
 
+    // #273 fix round 2 (M): a deterministic hook fired when the second
+    // caller registers as a waiter — replaces a `Thread.sleep` guess about
+    // when it reached the "wait for in-flight group" branch.
+    let secondRegistered = XCTestExpectation(description: "second caller registered as a waiter")
+    library.testWaiterRegisteredHook = { name in
+      guard name == "shared.safetensors" else { return }
+      secondRegistered.fulfill()
+    }
+
     DispatchQueue.global().async {
       secondResult = try? self.library.stage(name: "shared.safetensors")
       secondDone.fulfill()
     }
-    // Give the second caller a moment to reach the "wait for in-flight
-    // group" branch before releasing the copy.
-    Thread.sleep(forTimeInterval: 0.1)
+    wait(for: [secondRegistered], timeout: 5.0)
     releaseCopy.signal()
 
     wait(for: [firstDone, secondDone], timeout: 5.0)
     XCTAssertEqual(copyCount, 1, "only one copy of the same file should ever run concurrently")
     XCTAssertNotNil(firstResult)
     XCTAssertEqual(firstResult, secondResult)
+  }
+
+  // MARK: - #273 fix round 2 (N3): capacity reservation gap between different names
+
+  func testConcurrentStageOfDifferentNamesReservesCapacityAndRejectsOverBudget() throws {
+    // Budget fits exactly ONE of the two 3 MB files, not both at once.
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 4.0 / 1024.0))
+    try writeSource("first.safetensors", megabytes: 3)
+    try writeSource("second.safetensors", megabytes: 3)
+    library.scan()
+
+    let firstCopyStarted = XCTestExpectation(description: "first copy started")
+    let releaseFirstCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { item in
+      guard item.name == "first.safetensors" else { return }
+      firstCopyStarted.fulfill()
+      releaseFirstCopy.wait()
+    }
+
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "first.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [firstCopyStarted], timeout: 5.0)
+
+    // "first" is mid-copy: its capacity check has already passed and
+    // reserved its 3 MB (lock released for the copy itself, per I3).
+    // Staging "second" — which alone fits the 4 MB budget but not
+    // alongside "first"'s reservation — must be rejected rather than also
+    // passing the guard and over-filling the cache once both copies land.
+    XCTAssertThrowsError(try library.stage(name: "second.safetensors")) { error in
+      guard case NearlineError.insufficientCapacity = error else {
+        return XCTFail("expected insufficientCapacity, got \(error)")
+      }
+    }
+
+    releaseFirstCopy.signal()
+    wait(for: [firstDone], timeout: 5.0)
+    XCTAssertEqual(library.item(named: "first.safetensors")?.staged, true)
+    XCTAssertEqual(library.item(named: "second.safetensors")?.staged, false)
+    XCTAssertLessThanOrEqual(library.stagedMB, 4.0)
+  }
+
+  // MARK: - #273 fix round 2 (M): stagingResults pruning + waiter lastUsedAt
+
+  func testStagingResultsIsPrunedWhenNoWaitersEverRegistered() throws {
+    try writeSource("solo.safetensors", megabytes: 1)
+    library.scan()
+
+    _ = try library.stage(name: "solo.safetensors")
+
+    XCTAssertEqual(library.stagingResultsCountForTesting, 0,
+                    "must not leak a Result entry when nobody was ever waiting on it")
+  }
+
+  func testStagingResultsIsPrunedAfterTheLastWaiterReadsIt() throws {
+    try writeSource("shared2.safetensors", megabytes: 1)
+    library.scan()
+
+    let copyStarted = XCTestExpectation(description: "copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { _ in
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "shared2.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [copyStarted], timeout: 5.0)
+
+    let registered = XCTestExpectation(description: "waiter registered")
+    library.testWaiterRegisteredHook = { _ in registered.fulfill() }
+    let secondDone = XCTestExpectation(description: "second stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "shared2.safetensors")
+      secondDone.fulfill()
+    }
+    wait(for: [registered], timeout: 5.0)
+
+    releaseCopy.signal()
+    wait(for: [firstDone, secondDone], timeout: 5.0)
+
+    XCTAssertEqual(library.stagingResultsCountForTesting, 0,
+                    "the last waiter must prune its own entry after reading the result")
+  }
+
+  func testWaiterOnAnInFlightCopyTouchesLastUsedAtOnSuccess() throws {
+    try writeSource("shared3.safetensors", megabytes: 1)
+    library.scan()
+    XCTAssertNil(library.item(named: "shared3.safetensors")?.lastUsedAt)
+
+    let copyStarted = XCTestExpectation(description: "copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { _ in
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "shared3.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [copyStarted], timeout: 5.0)
+
+    let registered = XCTestExpectation(description: "waiter registered")
+    library.testWaiterRegisteredHook = { _ in registered.fulfill() }
+    var secondResult: String?
+    let secondDone = XCTestExpectation(description: "second stage finished")
+    DispatchQueue.global().async {
+      secondResult = try? self.library.stage(name: "shared3.safetensors")
+      secondDone.fulfill()
+    }
+    wait(for: [registered], timeout: 5.0)
+
+    releaseCopy.signal()
+    wait(for: [firstDone, secondDone], timeout: 5.0)
+
+    XCTAssertNotNil(secondResult)
+    XCTAssertNotNil(library.item(named: "shared3.safetensors")?.lastUsedAt,
+                     "a waiter that piggybacks on someone else's in-flight copy is using the item too")
   }
 
   func testLRUEvictionNeverEvictsAnAnchoredItemEvenWhenOldest() throws {
