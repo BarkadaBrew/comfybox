@@ -9,8 +9,15 @@
 //
 // So this NEVER decides a role. It only recognizes that a filename LOOKS
 // like an accelerator, which makes the missing role a question for a human
-// rather than something to guess at. A preset that trips it is reported as
-// `needsReview` and nothing is written.
+// rather than something to guess at.
+//
+// Round 2 settled what that question costs: nothing that matters.
+// `PresetLoRAStack.declaredFamily` maps `raw-accel` and `raw-stock` both to
+// "krea2", so the split is a record for humans and the recipe matrix, not
+// something `decide` reads. A preset that trips this heuristic is still
+// written and still becomes expandable — `model` goes in either way; only
+// the `checkpoint_family` LABEL is deferred, and the run reports it as
+// "Updated (label pending)" with a note naming the LoRA to give a role.
 //
 // Pure, no I/O — the whole point is that the policy lives in one testable
 // place instead of inline in a view model.

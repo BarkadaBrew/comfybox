@@ -185,6 +185,64 @@ struct PresetModelFieldBuilderTests {
         #expect(result.model == "krea2-raw")
     }
 
+    @Test("a detection for a DIFFERENT spec is ignored, never applied to the new path")
+    func staleDetectionIsIgnored() {
+        // Round 3, item 1. `.task(id: model)` is async: repoint the preset and
+        // hit Save immediately and `detectedModelFamily` still holds the
+        // answer for the OLD path. Pairing the new `custom_model_path` with
+        // the old `model` would point the preset at a base nobody chose —
+        // silently, and reporting success.
+        let stale = detection(model: "/Users/todd/LocalModels/krea2-raw",
+                              family: "krea2", variant: "raw", spec: "krea2-raw")
+        let result = build(
+            "/Users/todd/LocalModels/some-other-checkpoint",
+            detection: stale,
+            fallbackModel: "krea2-raw",
+            fallbackCustomModelPath: "/Users/todd/LocalModels/krea2-raw")
+        #expect(result.customModelPath == "/Users/todd/LocalModels/some-other-checkpoint")
+        #expect(result.model == nil, "must never pair the new path with the old spec")
+        #expect(result.checkpointFamily == nil, "and the stale LABEL is not applied either")
+    }
+
+    @Test("a stale detection cannot label a bare spec it was not asked about")
+    func staleDetectionDoesNotLabelABareSpec() {
+        let stale = detection(model: "krea2", family: "krea2", variant: "turbo", spec: "krea2")
+        let result = build("z-image-base", detection: stale, fallbackCheckpointFamily: "zimage-base")
+        #expect(result.model == "z-image-base")
+        #expect(result.checkpointFamily == "zimage-base", "the preset's own declaration, not krea2 turbo")
+    }
+
+    @Test("a detection whose echoed model matches — modulo whitespace — is applied")
+    func matchingDetectionIsApplied() {
+        let result = build(
+            "  /Users/todd/LocalModels/krea2-raw ",
+            detection: detection(model: "/Users/todd/LocalModels/krea2-raw",
+                                 family: "krea2", variant: "raw", spec: "krea2-raw"))
+        #expect(result.model == "krea2-raw")
+        #expect(result.checkpointFamily == "raw-stock")
+    }
+
+    @Test("a preset whose PATH lives in model (no custom_model_path) does not lose it on save")
+    func pathOnlyInModelSurvivesADetectionMiss() {
+        // Round 3, item 2. `ServerPresetEditor` seeds its field from
+        // `customModelPath ?? model`, so a preset that carries a path in
+        // `model` alone shows that path — and `isUnchangedPath` used to
+        // compare it against a nil `customModelPath`, call it "changed", and
+        // clear `model` on a plain Save with the engine down.
+        let path = "/Users/todd/LocalModels/krea2-raw"
+        let result = build(path, detection: nil, fallbackModel: path, fallbackCustomModelPath: nil)
+        #expect(result.model == path)
+        #expect(result.customModelPath == path)
+    }
+
+    @Test("a path typed over a preset whose model was a bare ALIAS is a real change")
+    func typingAPathOverAnAliasStillClearsTheModel() {
+        let result = build(
+            "/Users/todd/LocalModels/krea2-raw",
+            detection: nil, fallbackModel: "krea2-raw", fallbackCustomModelPath: nil)
+        #expect(result.model == nil, "the alias never described this path")
+    }
+
     @Test("with no fallback model, a detection miss on a path behaves as it always did")
     func noFallbackModelStillYieldsNil() {
         let result = build("/Users/todd/LocalModels/krea2-raw", detection: nil)

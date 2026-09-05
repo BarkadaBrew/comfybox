@@ -268,6 +268,20 @@ public struct ModelFamilyInfo: Sendable, Equatable, Decodable {
     enum CodingKeys: String, CodingKey {
         case model, family, variant, spec, loadable, reason
     }
+
+    /// Is this answer about `spec`? `model` is the engine's verbatim echo of
+    /// what was queried, so a STALE `ModelFamilyInfo` — the reply for the path
+    /// a preset pointed at before the user repointed it — can be told apart
+    /// from a fresh one with no extra bookkeeping (comfybox#359, round 3).
+    /// Applying a stale one paired the new `custom_model_path` with the old
+    /// `model`: a base nobody chose, written silently.
+    ///
+    /// Compared trimmed — the caller queries with a trimmed spec, and the
+    /// editor's text field is trimmed before it is used.
+    public func answers(_ spec: String) -> Bool {
+        model.trimmingCharacters(in: .whitespacesAndNewlines)
+            == spec.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 // MARK: - LoRA Info

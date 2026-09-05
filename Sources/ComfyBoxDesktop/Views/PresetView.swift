@@ -604,10 +604,22 @@ private struct ServerPresetEditor: View {
             // the "engine-known alias" / `checkpoint_family` decision belongs
             // to `buildPreset()` on every save, not just an edit of one that
             // already exists.
-            guard let engine else { detectedModelFamily = nil; return }
+            //
+            // Round 3: drop the previous answer BEFORE awaiting. It described
+            // the path the field used to hold, and a Save landing in this
+            // window would otherwise pair the new `custom_model_path` with the
+            // old `model`. `PresetModelFieldBuilder` also checks
+            // `ModelFamilyInfo.answers(_:)` — belt and braces, because this
+            // clear alone cannot cover an answer that arrives for a spec the
+            // user has already typed past.
+            detectedModelFamily = nil
+            guard let engine else { return }
             let spec = model.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !spec.isEmpty else { detectedModelFamily = nil; return }
-            detectedModelFamily = await engine.fetchModelFamily(forSpec: spec)
+            guard !spec.isEmpty else { return }
+            let answer = await engine.fetchModelFamily(forSpec: spec)
+            // Only adopt an answer that is still about what the field holds.
+            guard spec == model.trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+            detectedModelFamily = answer
         }
         .alert("Save as New Preset", isPresented: $showingSaveAs) {
             TextField("New preset name", text: $saveAsName)

@@ -17,22 +17,35 @@
 // `checkpoint_family` says. `custom_model_path` is still written so the
 // desktop's own Apply/Set-as-Warm path is unchanged.
 //
-// FIX ROUND 2, two rules that matter more than they look:
+// FIX ROUND 2 — two rules that matter more than they look (r2 rulings 1
+// and 3):
 //
-//   1. (CRITICAL) A detection MISS must never erase a `model` that is
-//      already there. `buildPreset()` runs on every Save, and detection is
-//      nil whenever the engine is unreachable or the user saves before
-//      `.task(id: model)` answers. Writing nil then reverted a
-//      just-backfilled preset straight back to `no_model` — this PR's own
-//      bug, reintroduced by its own editor. So `model` is cleared ONLY when
-//      the user actually changed the path; otherwise `fallbackModel` (the
-//      preset's existing `model`) stands.
-//   3. An un-roled accelerator LoRA no longer gates anything. `model` is
-//      written whenever the engine says the spec is loadable; only the
-//      `checkpoint_family` LABEL is deferred, and only where the label
-//      genuinely depends on the role (Krea-2 "raw"). Expandability never
-//      waits on a label — `declaredFamily` maps `raw-accel` and `raw-stock`
-//      to the same "krea2" anyway.
+//   * (CRITICAL, r2 ruling 1) A detection MISS must never erase a `model`
+//     that is already there. `buildPreset()` runs on every Save, and
+//     detection is nil whenever the engine is unreachable or the user saves
+//     before `.task(id: model)` answers. Writing nil then reverted a
+//     just-backfilled preset straight back to `no_model` — this PR's own
+//     bug, reintroduced by its own editor. So `model` is cleared ONLY when
+//     the user actually changed the path; otherwise the preset's existing
+//     `model` stands.
+//   * (r2 ruling 3) An un-roled accelerator LoRA no longer gates anything.
+//     `model` is written whenever the engine says the spec is loadable; only
+//     the `checkpoint_family` LABEL is deferred, and only where the label
+//     genuinely depends on the role (Krea-2 "raw"). Expandability never
+//     waits on a label — `declaredFamily` maps `raw-accel` and `raw-stock`
+//     to the same "krea2" anyway.
+//
+// FIX ROUND 3 — two ways the round-2 guard was still wrong:
+//
+//   * (r3 item 1) `detection` is only trusted when its echoed `model` is the
+//     spec we are actually building from. `.task(id: model)` is async, so a
+//     repoint-then-Save left the OLD answer in hand; applying it paired the
+//     NEW `custom_model_path` with the OLD `model`, pointing the preset at a
+//     base nobody chose.
+//   * (r3 item 2) "Unchanged" is measured against `custom_model_path` OR the
+//     existing `model`. The editor seeds its field from
+//     `customModelPath ?? model`, so a preset carrying a path in `model`
+//     alone was read as "changed" and lost that model on a plain Save.
 
 import Foundation
 
@@ -78,6 +91,10 @@ public enum PresetModelFieldBuilder {
     ) -> Result {
         let modelValue = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
         let isPath = modelValue.hasPrefix("/") || modelValue.hasPrefix("~")
+        // r3 item 1: an answer about some OTHER spec is not an answer about
+        // this one. `ModelFamilyInfo.model` is the engine's verbatim echo of
+        // what was queried, so this is an exact identity check, not a guess.
+        let detection = detection.flatMap { $0.answers(modelValue) ? $0 : nil }
 
         var model: String?
         var customModelPath: String?
@@ -90,7 +107,7 @@ public enum PresetModelFieldBuilder {
                case let spec = detection.spec.trimmingCharacters(in: .whitespacesAndNewlines),
                !spec.isEmpty {
                 model = spec
-            } else if isUnchangedPath(modelValue, from: fallbackCustomModelPath) {
+            } else if isUnchangedPath(modelValue, from: fallbackCustomModelPath ?? fallbackModel) {
                 // Ruling 1: nothing fresh to write, and the user did not
                 // repoint the preset — keep whatever `model` it already has.
                 // Clearing here is what silently un-fixed a backfilled preset.
@@ -130,6 +147,13 @@ public enum PresetModelFieldBuilder {
     }
 
     /// Same path, modulo the whitespace the editor trims anyway.
+    ///
+    /// `stored` is `custom_model_path` when there is one, else the preset's
+    /// existing `model` — `ServerPresetEditor` seeds its field from
+    /// `customModelPath ?? model`, so for a preset that keeps its path in
+    /// `model` alone THAT is what "unchanged" has to be measured against
+    /// (r3 item 2). A path typed over a bare alias still compares unequal,
+    /// which is correct: the alias never described that path.
     private static func isUnchangedPath(_ typed: String, from stored: String?) -> Bool {
         guard let stored = stored?.trimmingCharacters(in: .whitespacesAndNewlines), !stored.isEmpty
         else { return false }
