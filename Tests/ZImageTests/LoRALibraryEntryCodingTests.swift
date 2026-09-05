@@ -75,4 +75,20 @@ final class LoRALibraryEntryCodingTests: XCTestCase {
     let redecoded = try JSONDecoder().decode(LoRALibraryEntry.self, from: reencoded)
     XCTAssertEqual(redecoded.compatibilitySource, .auto)
   }
+
+  // MARK: - #273 fix round 1 (C1): additive `anchored` field
+
+  func testMissingAnchoredDecodesAsFalse() throws {
+    let entry = try decode(entryJSON(extra: ""))
+    XCTAssertEqual(entry.anchored, false)
+  }
+
+  func testAnchoredTrueRoundTrips() throws {
+    let entry = try decode(entryJSON(extra: #", "anchored": true"#))
+    XCTAssertEqual(entry.anchored, true)
+
+    let reencoded = try JSONEncoder().encode(entry)
+    let redecoded = try JSONDecoder().decode(LoRALibraryEntry.self, from: reencoded)
+    XCTAssertEqual(redecoded.anchored, true)
+  }
 }

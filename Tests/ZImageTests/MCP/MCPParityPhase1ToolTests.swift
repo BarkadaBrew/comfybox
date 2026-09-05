@@ -31,9 +31,9 @@ final class MCPParityPhase1ToolTests: XCTestCase {
   /// convention as MCPVideoToolTests.testTotalToolCount). Bumped 52 -> 55 by
   /// Phase 3 (comfybox#300, FDD §3.3/§4.4, 2026-08-30): get_config,
   /// patch_config, update_config. Bumped 55 -> 56 by the job-model cluster
-  /// (comfybox#289): get_job.
+  /// (comfybox#289): get_job. Bumped 56 -> 57 by #273: nearline_anchor.
   func testTotalToolCountIncludesGapSet() {
-    XCTAssertEqual(MCPToolRegistry.tools.count, 56, "Expected 56 registered MCP tools after Phase 1 + Phase 3 + get_job")
+    XCTAssertEqual(MCPToolRegistry.tools.count, 57, "Expected 57 registered MCP tools after Phase 1 + Phase 3 + get_job + #273")
   }
 
   /// Every tool added in this session declares its route(s) (FDD §3.5 D5:

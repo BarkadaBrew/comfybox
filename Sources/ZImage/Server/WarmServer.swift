@@ -836,22 +836,58 @@ public final class WarmServer {
         auditLog.append(kind: "nearline.stage", message: "Staged \(body.name)", metadata: ["path": staged])
         return nearlineListResponse()
       } catch let error as NearlineError {
-        return .error(.error(status: 404, message: error.localizedDescription))
+        return .error(.error(status: Self.httpStatus(for: error), message: error.localizedDescription))
       } catch {
         return .error(.error(status: 500, message: "Stage failed: \(error.localizedDescription)"))
+      }
+
+    case ("POST", "/v1/nearline/anchor"):
+      do {
+        let body = try decode(NearlineAnchorBody.self, from: request.body)
+        guard let existing = nearlineLibrary.item(named: body.id) else {
+          return .error(.error(status: 404, message: "Nearline item not in catalog: \(body.id) (rescan?)"))
+        }
+        guard existing.kind == body.kind else {
+          return .error(.error(
+            status: 400,
+            message: "Kind mismatch for \(body.id): catalog has \(existing.kind), request said \(body.kind)"))
+        }
+        // #273 fix round 1 (C1): a "lora" kind also rewrites the matching
+        // LoRALibraryEntry's relativePath — the issue's actual problem —
+        // through LoRALibrary's own update API. "model" kind has no
+        // equivalent per-file registry today, so only the nearline flag
+        // applies.
+        if body.kind == "lora" {
+          try NearlineLoRAAnchoring.setAnchored(
+            name: body.id, anchored: body.anchored, loraLibrary: loraLibrary, nearlineLibrary: nearlineLibrary)
+        } else {
+          try nearlineLibrary.setAnchored(name: body.id, anchored: body.anchored)
+        }
+        auditLog.append(
+          kind: "nearline.anchor",
+          message: "\(body.anchored ? "Anchored" : "Un-anchored") \(body.id)")
+        return nearlineListResponse()
+      } catch let error as NearlineError {
+        return .error(.error(status: Self.httpStatus(for: error), message: error.localizedDescription))
+      } catch let error as LoRALibraryError {
+        return .error(.error(status: 404, message: error.localizedDescription))
+      } catch {
+        return .error(.error(status: 500, message: "Anchor failed: \(error.localizedDescription)"))
       }
 
     case ("POST", "/v1/nearline/evict"):
       struct NameBody: Decodable { let name: String }
       do {
         let body = try decode(NameBody.self, from: request.body)
-        let evicted = nearlineLibrary.evict(name: body.name)
+        let evicted = try nearlineLibrary.evict(name: body.name)
         if evicted {
           auditLog.append(kind: "nearline.evict", message: "Evicted \(body.name)")
         }
         return evicted
           ? nearlineListResponse()
           : .error(.error(status: 404, message: "Not staged: \(body.name)"))
+      } catch let error as NearlineError {
+        return .error(.error(status: Self.httpStatus(for: error), message: error.localizedDescription))
       } catch {
         return .error(.error(status: 400, message: "Invalid evict payload"))
       }
@@ -1884,6 +1920,45 @@ public final class WarmServer {
 
   // Nearline -------------------------------------------------------------------
 
+  /// #273: request body for `POST /v1/nearline/anchor`. A file-scope (not
+  /// switch-arm-local) type so its wire shape is directly unit-testable.
+  struct NearlineAnchorBody: Decodable {
+    let kind: String
+    let id: String
+    let anchored: Bool
+  }
+
+  /// #273 fix round 1 (C2): the HTTP status a `NearlineError` maps to
+  /// across the nearline routes — a pure function so the mapping (notably
+  /// `.insufficientCapacity` -> 507) is directly unit-tested without a
+  /// live server.
+  static func httpStatus(for error: NearlineError) -> Int {
+    switch error {
+    case .insufficientCapacity: return 507
+    case .unknownItem, .sourceMissing: return 404
+    // #273 fix round 2 (N2): evicting an anchored item is a conflict with
+    // its own pinned state, not a missing/malformed request.
+    case .anchored: return 409
+    }
+  }
+
+  /// The per-item JSON shape for `GET /v1/nearline`'s `items` array. A pure
+  /// function (no server, no lock) so the wire shape — notably the additive
+  /// `anchored` key (#273) — is directly unit-testable.
+  static func nearlineItemJSON(_ item: NearlineItem, iso: ISO8601DateFormatter) -> [String: Any] {
+    var dict: [String: Any] = [
+      "name": item.name,
+      "path": item.path,
+      "size_mb": item.sizeMB,
+      "kind": item.kind,
+      "staged": item.staged,
+      "anchored": item.anchored,
+    ]
+    if let stagedPath = item.stagedPath { dict["staged_path"] = stagedPath }
+    if let lastUsed = item.lastUsedAt { dict["last_used_at"] = iso.string(from: lastUsed) }
+    return dict
+  }
+
   /// GET /v1/nearline payload: config + full catalog with staging state.
   private func nearlineListResponse() -> RoutedResponse {
     let iso = ISO8601DateFormatter()
@@ -1892,18 +1967,7 @@ public final class WarmServer {
       "roots": config.roots,
       "cache_limit_gb": config.cacheLimitGB,
       "staged_mb": nearlineLibrary.stagedMB,
-      "items": nearlineLibrary.list().map { item -> [String: Any] in
-        var dict: [String: Any] = [
-          "name": item.name,
-          "path": item.path,
-          "size_mb": item.sizeMB,
-          "kind": item.kind,
-          "staged": item.staged,
-        ]
-        if let stagedPath = item.stagedPath { dict["staged_path"] = stagedPath }
-        if let lastUsed = item.lastUsedAt { dict["last_used_at"] = iso.string(from: lastUsed) }
-        return dict
-      },
+      "items": nearlineLibrary.list().map { Self.nearlineItemJSON($0, iso: iso) },
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
       return .error(.error(status: 500, message: "Failed to serialize nearline catalog"))
@@ -10953,6 +11017,7 @@ struct HTTPResponse {
     case 500: return "Internal Server Error"
     case 502: return "Bad Gateway"
     case 503: return "Service Unavailable"
+    case 507: return "Insufficient Storage"
     default: return "OK"
     }
   }

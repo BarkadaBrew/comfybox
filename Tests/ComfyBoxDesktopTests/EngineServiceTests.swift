@@ -178,6 +178,44 @@ struct ServerResponseDecodingTests {
     }
 }
 
+// MARK: - #273 Nearline anchoring
+
+@MainActor
+@Suite("EngineService nearline anchoring")
+struct NearlineAnchorParsingTests {
+    @Test("anchored true parses from GET /v1/nearline items")
+    func anchoredTrueParses() {
+        let json = Data("""
+            {"roots": [], "cache_limit_gb": 10, "staged_mb": 2,
+             "items": [{"name": "pinned.safetensors", "path": "/x/pinned.safetensors",
+                        "size_mb": 2, "kind": "lora", "staged": true, "anchored": true}]}
+            """.utf8)
+        let engine = EngineService()
+        let catalog = engine.parseNearline(json)
+        #expect(catalog?.items.first?.anchored == true)
+    }
+
+    @Test("anchored key absent (older server) defaults to false")
+    func anchoredAbsentDefaultsFalse() {
+        let json = Data("""
+            {"roots": [], "cache_limit_gb": 10, "staged_mb": 0,
+             "items": [{"name": "legacy.safetensors", "path": "/x/legacy.safetensors",
+                        "size_mb": 2, "kind": "lora", "staged": false}]}
+            """.utf8)
+        let engine = EngineService()
+        let catalog = engine.parseNearline(json)
+        #expect(catalog?.items.first?.anchored == false)
+    }
+
+    @Test("setNearlineAnchor throws notConnected when disconnected")
+    func setAnchorRequiresConnection() async {
+        let engine = EngineService()
+        await #expect(throws: EngineServiceError.self) {
+            _ = try await engine.setNearlineAnchor(kind: "lora", id: "x.safetensors", anchored: true)
+        }
+    }
+}
+
 @Suite("ServerConnectionState")
 struct ServerConnectionStateTests {
     @Test("disconnected state")

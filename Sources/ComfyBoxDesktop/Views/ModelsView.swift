@@ -7,6 +7,27 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// #273: pure, testable presentation logic for a nearline row's anchor
+/// control — kept separate from the SwiftUI body so it can be unit tested
+/// without a live server.
+struct NearlineAnchorRowViewModel: Equatable {
+    let pinGlyphVisible: Bool
+    let buttonTitle: String
+    /// The `anchored` value the next tap should send to the route.
+    let nextAnchoredValue: Bool
+    /// #273 fix round 2 (N2): the server now refuses to evict an anchored
+    /// item (409) — offering the button at all just invites a failed tap
+    /// and a confusing error. Un-anchor first, then Evict.
+    let evictButtonVisible: Bool
+
+    init(item: EngineService.NearlineEntry) {
+        pinGlyphVisible = item.anchored
+        buttonTitle = item.anchored ? "Un-anchor" : "Anchor"
+        nextAnchoredValue = !item.anchored
+        evictButtonVisible = item.staged && !item.anchored
+    }
+}
+
 struct ModelsView: View {
     @Bindable var engine: EngineService
 
@@ -454,11 +475,18 @@ struct ModelsView: View {
     }
 
     private func nearlineRow(_ item: EngineService.NearlineEntry) -> some View {
-        HStack(spacing: 8) {
+        let anchorVM = NearlineAnchorRowViewModel(item: item)
+        return HStack(spacing: 8) {
             Image(systemName: item.kind == "model" ? "cube" : "square.stack.3d.up")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 18)
+            if anchorVM.pinGlyphVisible {
+                Image(systemName: "pin.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("Anchored to internal storage")
+            }
             Text(item.name)
                 .font(.callout)
                 .lineLimit(1)
@@ -476,13 +504,17 @@ struct ModelsView: View {
                 .foregroundStyle(.secondary)
             if nearlineBusy == item.name {
                 ProgressView().controlSize(.small)
-            } else if item.staged {
-                Button("Evict") { Task { await nearlineAct("evict", item) } }
-                    .controlSize(.small)
             } else {
-                Button("Stage") { Task { await nearlineAct("stage", item) } }
+                Button(anchorVM.buttonTitle) { Task { await nearlineAnchorAct(item, anchored: anchorVM.nextAnchoredValue) } }
                     .controlSize(.small)
-                    .buttonStyle(.borderedProminent)
+                if anchorVM.evictButtonVisible {
+                    Button("Evict") { Task { await nearlineAct("evict", item) } }
+                        .controlSize(.small)
+                } else if !item.staged {
+                    Button("Stage") { Task { await nearlineAct("stage", item) } }
+                        .controlSize(.small)
+                        .buttonStyle(.borderedProminent)
+                }
             }
         }
         .padding(.horizontal, 10)
@@ -494,6 +526,16 @@ struct ModelsView: View {
         defer { nearlineBusy = nil }
         do {
             nearline = try await engine.nearlineAction(action, name: item.name)
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    private func nearlineAnchorAct(_ item: EngineService.NearlineEntry, anchored: Bool) async {
+        nearlineBusy = item.name
+        defer { nearlineBusy = nil }
+        do {
+            nearline = try await engine.setNearlineAnchor(kind: item.kind, id: item.name, anchored: anchored)
         } catch {
             actionError = error.localizedDescription
         }

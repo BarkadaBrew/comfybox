@@ -110,7 +110,7 @@ final class MCPJobToolSchemaTests: XCTestCase {
 
   func testToolCountGrewByExactlyOne() {
     XCTAssertEqual(
-      MCPToolRegistry.tools.count, 56,
-      "55 tools + get_job (#289). Update this pin and the two other pins in the same review.")
+      MCPToolRegistry.tools.count, 57,
+      "55 tools + get_job (#289) + nearline_anchor (#273). Update this pin and the two other pins in the same review.")
   }
 }

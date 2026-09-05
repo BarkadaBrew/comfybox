@@ -126,6 +126,13 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
   /// Reason for quarantine.
   public var quarantineReason: String?
 
+  /// #273 fix round 1 (C1): pinned to internal storage — `relativePath`
+  /// points at a location this library manages directly (never at a
+  /// detachable attached volume). Additive; absent (pre-existing
+  /// library.json entries) ⇒ false, never a load failure — same
+  /// tolerant-decode posture as `compatibilitySource` (#353).
+  public var anchored: Bool = false
+
   // MARK: Raw Metadata
 
   /// Raw metadata from the safetensors __metadata__ header.
@@ -178,6 +185,7 @@ public struct LoRALibraryEntry: Codable, Sendable, Identifiable {
     case dateAdded = "date_added"
     case quarantined
     case quarantineReason = "quarantine_reason"
+    case anchored
     case safetensorsMetadata = "safetensors_metadata"
   }
 }
@@ -216,6 +224,9 @@ extension LoRALibraryEntry {
     dateAdded = try c.decode(String.self, forKey: .dateAdded)
     quarantined = try c.decode(Bool.self, forKey: .quarantined)
     quarantineReason = try c.decodeIfPresent(String.self, forKey: .quarantineReason)
+    // Additive field (#273 fix round 1): absent (pre-existing library.json
+    // entries) or unrecognized ⇒ false, never a load failure.
+    anchored = (try? c.decodeIfPresent(Bool.self, forKey: .anchored)).flatMap { $0 } ?? false
     safetensorsMetadata = try c.decodeIfPresent([String: String].self, forKey: .safetensorsMetadata)
   }
 }
@@ -258,6 +269,14 @@ public struct LoRAEntryPatch: Sendable {
   /// `model_compatibility`) marks the entry `.manual` — sticky across every
   /// future `scan()`, even once the file itself changes.
   public var modelCompatibility: [String]?
+  /// #273 fix round 1 (C1): rewrite where the entry's file lives. Set by
+  /// anchoring to the nearline-staged internal path (an absolute path,
+  /// since it lives outside `libraryRoot`) — never written by hand.
+  public var relativePath: String?
+  /// #273 fix round 1 (C1): pin/unpin to internal storage. Anchoring sets
+  /// this alongside `relativePath`; un-anchoring clears it without touching
+  /// `relativePath` (the file is left where it is).
+  public var anchored: Bool?
 
   public init(
     triggerwords: [String]? = nil,
@@ -268,7 +287,9 @@ public struct LoRAEntryPatch: Sendable {
     sourceURL: String? = nil,
     civitaiModelId: Int? = nil,
     krea2Relative: Krea2Variant? = nil,
-    modelCompatibility: [String]? = nil
+    modelCompatibility: [String]? = nil,
+    relativePath: String? = nil,
+    anchored: Bool? = nil
   ) {
     self.triggerwords = triggerwords
     self.recommendedScale = recommendedScale
@@ -279,5 +300,7 @@ public struct LoRAEntryPatch: Sendable {
     self.civitaiModelId = civitaiModelId
     self.krea2Relative = krea2Relative
     self.modelCompatibility = modelCompatibility
+    self.relativePath = relativePath
+    self.anchored = anchored
   }
 }

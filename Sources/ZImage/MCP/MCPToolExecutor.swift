@@ -113,6 +113,8 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return try await executePostEmpty("/v1/nearline/scan")
       case "nearline_stage":
         return try await executeNearlineAction("/v1/nearline/stage", arguments)
+      case "nearline_anchor":
+        return try await executeNearlineAnchor(arguments)
       case "nearline_evict":
         return try await executeNearlineAction("/v1/nearline/evict", arguments)
       case "civitai_search":
@@ -1156,6 +1158,22 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     let jsonData = try JSONSerialization.data(withJSONObject: ["name": name])
     let (status, data) = try await client.post(path, body: jsonData)
+    return Self.mapHTTPResponse(status: status, data: data)
+  }
+
+  /// nearline_anchor -> POST /v1/nearline/anchor { kind, id, anchored }
+  private func executeNearlineAnchor(_ params: MCPParams?) async throws -> MCPToolResult {
+    guard let kind = params?.string("kind"), !kind.isEmpty else {
+      return MCPToolResult(error: "Error: 'kind' is required")
+    }
+    guard let id = params?.string("id"), !id.isEmpty else {
+      return MCPToolResult(error: "Error: 'id' is required")
+    }
+    guard let anchored = params?.bool("anchored") else {
+      return MCPToolResult(error: "Error: 'anchored' is required")
+    }
+    let jsonData = try JSONSerialization.data(withJSONObject: ["kind": kind, "id": id, "anchored": anchored])
+    let (status, data) = try await client.post("/v1/nearline/anchor", body: jsonData)
     return Self.mapHTTPResponse(status: status, data: data)
   }
 

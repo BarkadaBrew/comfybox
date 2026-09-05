@@ -96,12 +96,40 @@ final class NearlineLibraryTests: XCTestCase {
     library.scan()
     let staged = try library.stage(name: "gone.safetensors")
 
-    XCTAssertTrue(library.evict(name: "gone.safetensors"))
+    XCTAssertTrue(try library.evict(name: "gone.safetensors"))
     XCTAssertFalse(FileManager.default.fileExists(atPath: staged))
     XCTAssertTrue(FileManager.default.fileExists(
       atPath: sourceDir.appendingPathComponent("gone.safetensors").path))
     XCTAssertEqual(library.item(named: "gone.safetensors")?.staged, false)
-    XCTAssertFalse(library.evict(name: "gone.safetensors"))  // already evicted
+    XCTAssertFalse(try library.evict(name: "gone.safetensors"))  // already evicted
+  }
+
+  // MARK: - #273 fix round 2 (N2): evict() refuses anchored items
+
+  func testEvictThrowsForAnAnchoredItemAndLeavesItStaged() throws {
+    try writeSource("pinned_evict.safetensors", megabytes: 1)
+    library.scan()
+    let staged = try library.setAnchored(name: "pinned_evict.safetensors", anchored: true).stagedPath
+
+    XCTAssertThrowsError(try library.evict(name: "pinned_evict.safetensors")) { error in
+      guard case NearlineError.anchored(let name) = error else {
+        return XCTFail("expected NearlineError.anchored, got \(error)")
+      }
+      XCTAssertEqual(name, "pinned_evict.safetensors")
+    }
+    XCTAssertEqual(library.item(named: "pinned_evict.safetensors")?.staged, true)
+    XCTAssertNotNil(staged)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: staged!))
+  }
+
+  func testEvictSucceedsOnceUnanchored() throws {
+    try writeSource("was_pinned.safetensors", megabytes: 1)
+    library.scan()
+    _ = try library.setAnchored(name: "was_pinned.safetensors", anchored: true)
+    _ = try library.setAnchored(name: "was_pinned.safetensors", anchored: false)
+
+    XCTAssertTrue(try library.evict(name: "was_pinned.safetensors"))
+    XCTAssertEqual(library.item(named: "was_pinned.safetensors")?.staged, false)
   }
 
   func testStagingSurvivesRescanAndReload() throws {
@@ -121,5 +149,380 @@ final class NearlineLibraryTests: XCTestCase {
 
   func testStageUnknownThrows() {
     XCTAssertThrowsError(try library.stage(name: "never-scanned.safetensors"))
+  }
+
+  // MARK: - #273 anchoring
+
+  func testAnchoredDefaultsFalseAndDecodesTolerantlyFromLegacyJSON() throws {
+    // Legacy nearline.json entries (written before #273) have no "anchored"
+    // key at all — must decode to false, not fail the whole file.
+    let legacyJSON = """
+      {"name":"legacy.safetensors","path":"/x/legacy.safetensors","sizeMB":2.0,"kind":"lora"}
+      """
+    let decoded = try JSONDecoder().decode(NearlineItem.self, from: Data(legacyJSON.utf8))
+    XCTAssertEqual(decoded.anchored, false)
+  }
+
+  func testAnchoredRoundTripsThroughEncodeDecode() throws {
+    let item = NearlineItem(name: "a.safetensors", path: "/x/a.safetensors", sizeMB: 1, kind: "lora", anchored: true)
+    let encoder = JSONEncoder()
+    let data = try encoder.encode(item)
+    let decoded = try JSONDecoder().decode(NearlineItem.self, from: data)
+    XCTAssertEqual(decoded.anchored, true)
+  }
+
+  func testSetAnchoredStagesAnUnstagedItemSynchronously() throws {
+    try writeSource("anchor_me.safetensors", megabytes: 1)
+    library.scan()
+    XCTAssertEqual(library.item(named: "anchor_me.safetensors")?.staged, false)
+
+    let result = try library.setAnchored(name: "anchor_me.safetensors", anchored: true)
+    XCTAssertTrue(result.anchored)
+    XCTAssertTrue(result.staged)
+    XCTAssertEqual(library.item(named: "anchor_me.safetensors")?.anchored, true)
+    XCTAssertEqual(library.item(named: "anchor_me.safetensors")?.staged, true)
+  }
+
+  func testSetAnchoredOnAlreadyStagedItemJustSetsFlag() throws {
+    try writeSource("already.safetensors", megabytes: 1)
+    library.scan()
+    let staged = try library.stage(name: "already.safetensors")
+
+    let result = try library.setAnchored(name: "already.safetensors", anchored: true)
+    XCTAssertEqual(result.stagedPath, staged)
+    XCTAssertTrue(result.anchored)
+  }
+
+  func testUnanchoringOnlyClearsFlagAndDoesNotEvict() throws {
+    try writeSource("stay.safetensors", megabytes: 1)
+    library.scan()
+    _ = try library.setAnchored(name: "stay.safetensors", anchored: true)
+
+    let result = try library.setAnchored(name: "stay.safetensors", anchored: false)
+    XCTAssertFalse(result.anchored)
+    XCTAssertTrue(result.staged, "un-anchoring must not itself evict")
+  }
+
+  func testSetAnchoredOnUnknownItemThrows() {
+    XCTAssertThrowsError(try library.setAnchored(name: "never-scanned.safetensors", anchored: true)) { error in
+      XCTAssertTrue(error is NearlineError)
+    }
+  }
+
+  func testAnchoredSurvivesRescan() throws {
+    try writeSource("pinned.safetensors", megabytes: 1)
+    library.scan()
+    _ = try library.setAnchored(name: "pinned.safetensors", anchored: true)
+
+    library.scan()
+    XCTAssertEqual(library.item(named: "pinned.safetensors")?.anchored, true)
+  }
+
+  func testPlanEvictionSkipsAnchoredItems() {
+    let old = Date(timeIntervalSince1970: 0)
+    let newer = Date(timeIntervalSince1970: 1000)
+    let anchoredOld = NearlineItem(
+      name: "anchored.safetensors", path: "/x/anchored.safetensors", sizeMB: 4, kind: "lora",
+      stagedPath: "/cache/anchored.safetensors", lastUsedAt: old, anchored: true)
+    let unanchoredNewer = NearlineItem(
+      name: "free.safetensors", path: "/x/free.safetensors", sizeMB: 4, kind: "lora",
+      stagedPath: "/cache/free.safetensors", lastUsedAt: newer, anchored: false)
+
+    // Budget can't fit the incoming file without evicting something. Even
+    // though `anchoredOld` is the LRU candidate, it must never be selected —
+    // the non-anchored (newer-used) item is evicted instead.
+    let toEvict = NearlineLibrary.planEviction(
+      stagedItems: [anchoredOld, unanchoredNewer], limitMB: 5, incomingMB: 4)
+
+    XCTAssertEqual(toEvict.map(\.name), ["free.safetensors"])
+  }
+
+  func testPlanEvictionReturnsEmptyWhenAllStagedAreAnchoredAndOverBudget() {
+    let anchored = NearlineItem(
+      name: "anchored.safetensors", path: "/x/anchored.safetensors", sizeMB: 10, kind: "lora",
+      stagedPath: "/cache/anchored.safetensors", anchored: true)
+
+    // Nothing evictable — anchored items are the only staged items, and an
+    // over-budget incoming file must not evict them.
+    let toEvict = NearlineLibrary.planEviction(stagedItems: [anchored], limitMB: 5, incomingMB: 4)
+    XCTAssertEqual(toEvict, [])
+  }
+
+  // MARK: - #273 fix round 1 (C2): stage() throws instead of silently over-filling
+
+  func testStageThrowsInsufficientCapacityWhenAllStagedItemsAreAnchored() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 2.0 / 1024.0))  // 2 MB budget
+    try writeSource("pinned.safetensors", megabytes: 2)
+    try writeSource("incoming.safetensors", megabytes: 2)
+    library.scan()
+
+    _ = try library.setAnchored(name: "pinned.safetensors", anchored: true)  // fills the entire budget
+
+    XCTAssertThrowsError(try library.stage(name: "incoming.safetensors")) { error in
+      guard case NearlineError.insufficientCapacity(let needMB, let freeMB, let anchoredMB) = error else {
+        return XCTFail("expected insufficientCapacity, got \(error)")
+      }
+      XCTAssertEqual(needMB, 2, accuracy: 0.01)
+      XCTAssertEqual(freeMB, 0, accuracy: 0.01)
+      XCTAssertEqual(anchoredMB, 2, accuracy: 0.01)
+    }
+    // The failed stage must not have copied the file (no silent over-fill).
+    XCTAssertEqual(library.item(named: "incoming.safetensors")?.staged, false)
+    XCTAssertLessThanOrEqual(library.stagedMB, 2.0)
+  }
+
+  func testStageThrowsInsufficientCapacityWhenIncomingIsBiggerThanTheWholeBudget() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 1.0 / 1024.0))  // 1 MB budget
+    try writeSource("huge.safetensors", megabytes: 5)
+    library.scan()
+
+    XCTAssertThrowsError(try library.stage(name: "huge.safetensors")) { error in
+      guard case NearlineError.insufficientCapacity = error else {
+        return XCTFail("expected insufficientCapacity, got \(error)")
+      }
+    }
+  }
+
+  // MARK: - #273 fix round 1 (M): setAnchored persists only after stage() succeeds
+
+  func testSetAnchoredDoesNotPersistTheFlagWhenStagingFails() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 1.0 / 1024.0))
+    try writeSource("wont_fit.safetensors", megabytes: 5)
+    library.scan()
+
+    XCTAssertThrowsError(try library.setAnchored(name: "wont_fit.safetensors", anchored: true))
+
+    XCTAssertEqual(library.item(named: "wont_fit.safetensors")?.anchored, false,
+                    "a failed anchor-and-stage must not leave nearline.json claiming the item is anchored")
+    XCTAssertEqual(library.item(named: "wont_fit.safetensors")?.staged, false)
+  }
+
+  // MARK: - #273 fix round 1 (I3): lock released across the copy
+
+  func testStageForADifferentNameIsNotBlockedByAnInFlightCopy() throws {
+    try writeSource("slow.safetensors", megabytes: 1)
+    try writeSource("fast.safetensors", megabytes: 1)
+    library.scan()
+
+    let copyStarted = XCTestExpectation(description: "slow copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { item in
+      guard item.name == "slow.safetensors" else { return }
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    let slowStageDone = XCTestExpectation(description: "slow stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "slow.safetensors")
+      slowStageDone.fulfill()
+    }
+
+    wait(for: [copyStarted], timeout: 5.0)
+
+    // While "slow" is mid-copy (blocked on releaseCopy), staging a
+    // DIFFERENT item must complete promptly — the lock must not be held
+    // across the copy.
+    let start = Date()
+    let fastPath = try library.stage(name: "fast.safetensors")
+    let elapsed = Date().timeIntervalSince(start)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: fastPath))
+    XCTAssertLessThan(elapsed, 2.0, "stage() for an unrelated item must not block on another item's in-flight copy")
+
+    releaseCopy.signal()
+    wait(for: [slowStageDone], timeout: 5.0)
+    XCTAssertEqual(library.item(named: "slow.safetensors")?.staged, true)
+  }
+
+  func testConcurrentStageOfTheSameNameWaitsForTheInFlightCopyInsteadOfRacingIt() throws {
+    try writeSource("shared.safetensors", megabytes: 1)
+    library.scan()
+
+    let copyStarted = XCTestExpectation(description: "copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    var copyCount = 0
+    let copyCountLock = NSLock()
+    library.testCopyDelayHook = { _ in
+      copyCountLock.lock(); copyCount += 1; copyCountLock.unlock()
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    var firstResult: String?
+    var secondResult: String?
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    let secondDone = XCTestExpectation(description: "second stage finished")
+
+    DispatchQueue.global().async {
+      firstResult = try? self.library.stage(name: "shared.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [copyStarted], timeout: 5.0)
+
+    // #273 fix round 2 (M): a deterministic hook fired when the second
+    // caller registers as a waiter — replaces a `Thread.sleep` guess about
+    // when it reached the "wait for in-flight group" branch.
+    let secondRegistered = XCTestExpectation(description: "second caller registered as a waiter")
+    library.testWaiterRegisteredHook = { name in
+      guard name == "shared.safetensors" else { return }
+      secondRegistered.fulfill()
+    }
+
+    DispatchQueue.global().async {
+      secondResult = try? self.library.stage(name: "shared.safetensors")
+      secondDone.fulfill()
+    }
+    wait(for: [secondRegistered], timeout: 5.0)
+    releaseCopy.signal()
+
+    wait(for: [firstDone, secondDone], timeout: 5.0)
+    XCTAssertEqual(copyCount, 1, "only one copy of the same file should ever run concurrently")
+    XCTAssertNotNil(firstResult)
+    XCTAssertEqual(firstResult, secondResult)
+  }
+
+  // MARK: - #273 fix round 2 (N3): capacity reservation gap between different names
+
+  func testConcurrentStageOfDifferentNamesReservesCapacityAndRejectsOverBudget() throws {
+    // Budget fits exactly ONE of the two 3 MB files, not both at once.
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 4.0 / 1024.0))
+    try writeSource("first.safetensors", megabytes: 3)
+    try writeSource("second.safetensors", megabytes: 3)
+    library.scan()
+
+    let firstCopyStarted = XCTestExpectation(description: "first copy started")
+    let releaseFirstCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { item in
+      guard item.name == "first.safetensors" else { return }
+      firstCopyStarted.fulfill()
+      releaseFirstCopy.wait()
+    }
+
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "first.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [firstCopyStarted], timeout: 5.0)
+
+    // "first" is mid-copy: its capacity check has already passed and
+    // reserved its 3 MB (lock released for the copy itself, per I3).
+    // Staging "second" — which alone fits the 4 MB budget but not
+    // alongside "first"'s reservation — must be rejected rather than also
+    // passing the guard and over-filling the cache once both copies land.
+    XCTAssertThrowsError(try library.stage(name: "second.safetensors")) { error in
+      guard case NearlineError.insufficientCapacity = error else {
+        return XCTFail("expected insufficientCapacity, got \(error)")
+      }
+    }
+
+    releaseFirstCopy.signal()
+    wait(for: [firstDone], timeout: 5.0)
+    XCTAssertEqual(library.item(named: "first.safetensors")?.staged, true)
+    XCTAssertEqual(library.item(named: "second.safetensors")?.staged, false)
+    XCTAssertLessThanOrEqual(library.stagedMB, 4.0)
+  }
+
+  // MARK: - #273 fix round 2 (M): stagingResults pruning + waiter lastUsedAt
+
+  func testStagingResultsIsPrunedWhenNoWaitersEverRegistered() throws {
+    try writeSource("solo.safetensors", megabytes: 1)
+    library.scan()
+
+    _ = try library.stage(name: "solo.safetensors")
+
+    XCTAssertEqual(library.stagingResultsCountForTesting, 0,
+                    "must not leak a Result entry when nobody was ever waiting on it")
+  }
+
+  func testStagingResultsIsPrunedAfterTheLastWaiterReadsIt() throws {
+    try writeSource("shared2.safetensors", megabytes: 1)
+    library.scan()
+
+    let copyStarted = XCTestExpectation(description: "copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { _ in
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "shared2.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [copyStarted], timeout: 5.0)
+
+    let registered = XCTestExpectation(description: "waiter registered")
+    library.testWaiterRegisteredHook = { _ in registered.fulfill() }
+    let secondDone = XCTestExpectation(description: "second stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "shared2.safetensors")
+      secondDone.fulfill()
+    }
+    wait(for: [registered], timeout: 5.0)
+
+    releaseCopy.signal()
+    wait(for: [firstDone, secondDone], timeout: 5.0)
+
+    XCTAssertEqual(library.stagingResultsCountForTesting, 0,
+                    "the last waiter must prune its own entry after reading the result")
+  }
+
+  func testWaiterOnAnInFlightCopyTouchesLastUsedAtOnSuccess() throws {
+    try writeSource("shared3.safetensors", megabytes: 1)
+    library.scan()
+    XCTAssertNil(library.item(named: "shared3.safetensors")?.lastUsedAt)
+
+    let copyStarted = XCTestExpectation(description: "copy started")
+    let releaseCopy = DispatchSemaphore(value: 0)
+    library.testCopyDelayHook = { _ in
+      copyStarted.fulfill()
+      releaseCopy.wait()
+    }
+
+    let firstDone = XCTestExpectation(description: "first stage finished")
+    DispatchQueue.global().async {
+      _ = try? self.library.stage(name: "shared3.safetensors")
+      firstDone.fulfill()
+    }
+    wait(for: [copyStarted], timeout: 5.0)
+
+    let registered = XCTestExpectation(description: "waiter registered")
+    library.testWaiterRegisteredHook = { _ in registered.fulfill() }
+    var secondResult: String?
+    let secondDone = XCTestExpectation(description: "second stage finished")
+    DispatchQueue.global().async {
+      secondResult = try? self.library.stage(name: "shared3.safetensors")
+      secondDone.fulfill()
+    }
+    wait(for: [registered], timeout: 5.0)
+
+    releaseCopy.signal()
+    wait(for: [firstDone, secondDone], timeout: 5.0)
+
+    XCTAssertNotNil(secondResult)
+    XCTAssertNotNil(library.item(named: "shared3.safetensors")?.lastUsedAt,
+                     "a waiter that piggybacks on someone else's in-flight copy is using the item too")
+  }
+
+  func testLRUEvictionNeverEvictsAnAnchoredItemEvenWhenOldest() throws {
+    library.updateConfiguration(.init(roots: [sourceDir.path], cacheLimitGB: 5.0 / 1024.0))
+    try writeSource("keep_anchored.safetensors", megabytes: 2)
+    try writeSource("second.safetensors", megabytes: 2)
+    try writeSource("third.safetensors", megabytes: 2)
+    library.scan()
+
+    _ = try library.setAnchored(name: "keep_anchored.safetensors", anchored: true)  // oldest use
+    Thread.sleep(forTimeInterval: 0.02)
+    _ = try library.stage(name: "second.safetensors")
+    Thread.sleep(forTimeInterval: 0.02)
+    _ = try library.stage(name: "third.safetensors")  // forces an eviction
+
+    let items = library.list()
+    XCTAssertEqual(items.first { $0.name == "keep_anchored.safetensors" }?.staged, true,
+                    "anchored item must survive LRU pressure despite being the oldest use")
+    XCTAssertEqual(items.first { $0.name == "second.safetensors" }?.staged, false, "the non-anchored LRU item is evicted instead")
+    XCTAssertEqual(items.first { $0.name == "third.safetensors" }?.staged, true)
   }
 }
