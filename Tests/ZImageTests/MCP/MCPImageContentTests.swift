@@ -52,6 +52,30 @@ final class MCPImageContentTests: XCTestCase {
     }
   }
 
+  /// PR #367 review r1, item 2: the cap must be enforced BEFORE the bytes are
+  /// read. Reading a 12 MB render into memory only to discard it wastes the
+  /// one resource intent.md says is shared (this process sits next to LM
+  /// Studio and a 30 GB model).
+  func testOversizedFileIsNeverRead() throws {
+    let path = try tempFile(bytes: 4096)
+    var loads: [String] = []
+    let outcome = MCPImageAttachment.encode(
+      path: path, limitBytes: 1024,
+      load: { loads.append($0); return Data(repeating: 0, count: 4096) })
+    guard case .skippedTooLarge = outcome else {
+      return XCTFail("expected a size refusal, got \(outcome)")
+    }
+    XCTAssertEqual(loads, [], "the file must not be read once the size alone disqualifies it")
+  }
+
+  func testUnderSizedFileIsReadExactlyOnce() throws {
+    let path = try tempFile(bytes: 64)
+    var loads: [String] = []
+    _ = MCPImageAttachment.encode(
+      path: path, load: { loads.append($0); return Data(repeating: 0, count: 64) })
+    XCTAssertEqual(loads.count, 1)
+  }
+
   func testMissingFileIsUnreadableNotACrash() {
     guard case .unreadable = MCPImageAttachment.encode(path: "/nope/missing.png") else {
       return XCTFail("expected .unreadable")
@@ -136,5 +160,44 @@ final class MCPImageContentTests: XCTestCase {
     XCTAssertEqual(offAndDone, 0, "return_image defaults off — no image block")
     XCTAssertEqual(onAndDone, 1)
     XCTAssertEqual(onAndRunning, 0, "nothing to attach until the render completes")
+  }
+
+  /// PR #367 review r1, item 4: asking for an image and silently getting none
+  /// is the worst outcome — the caller cannot tell "not ready" from "too big"
+  /// from "wrong kind of job". Every ignored `return_image` says why.
+  func testIgnoredReturnImageAlwaysExplainsItself() async throws {
+    let running = try await MCPToolExecutor.runGetJob(
+      jobId: "J-1", kind: .image, returnImage: true
+    ) { _, path in
+      if path == "/v1/queue" { return (200, Data("{}".utf8)) }
+      return (200, try JSONSerialization.data(withJSONObject: ["job_id": "J-1", "status": "processing"]))
+    }
+    let runningText = try XCTUnwrap(running.content.first?.text)
+    XCTAssertTrue(runningText.contains("return_image"), runningText)
+
+    let video = try await MCPToolExecutor.runGetJob(
+      jobId: "V-1", kind: .video, returnImage: true
+    ) { _, _ in
+      (200, try JSONSerialization.data(withJSONObject: [
+        "job_id": "V-1", "status": "succeeded", "output_path": "/tmp/clip.mp4",
+      ] as [String: Any]))
+    }
+    let videoText = try XCTUnwrap(video.content.first?.text)
+    XCTAssertTrue(videoText.contains("return_image"), videoText)
+    XCTAssertEqual(video.content.filter { $0.type == "image" }.count, 0)
+  }
+
+  /// The per-result cap is enforced by the code that actually builds tool
+  /// results, not only by the standalone `blocks(paths:)` helper.
+  func testAttachmentHelperHonoursTheCapAndReportsOmissions() throws {
+    let small = try tempFile(bytes: 64)
+    let big = try tempFile(bytes: 4096)
+    let capped = MCPImageAttachment.attachment(paths: [small, small])
+    XCTAssertEqual(capped.blocks.count, MCPImageAttachment.maxImagesPerResult)
+
+    let refused = MCPImageAttachment.attachment(paths: [big], limitBytes: 1024)
+    XCTAssertEqual(refused.blocks.count, 0)
+    XCTAssertEqual(refused.notes.count, 1)
+    XCTAssertTrue(try XCTUnwrap(refused.notes.first).contains("return_image"))
   }
 }

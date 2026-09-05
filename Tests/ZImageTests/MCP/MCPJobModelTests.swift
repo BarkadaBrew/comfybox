@@ -79,6 +79,49 @@ final class MCPJobModelTests: XCTestCase {
     XCTAssertNil(MCPJobModel.state(fromEngine: "banana"))
   }
 
+  // MARK: - Unmapped states (PR #367 review r1, item 1)
+
+  /// An engine state this build does not know must NOT be coerced to
+  /// `running` — that is exactly the infinite-poll bug this model exists to
+  /// prevent. It surfaces as a TERMINAL `unknown` naming the raw value, so a
+  /// client stops and a human can see what the engine actually said.
+  func testFutureEngineStateIsTerminalUnknownNamingTheRawValue() throws {
+    let out = MCPJobModel.unify(
+      kind: .video, jobId: "V-9", status: ["job_id": "V-9", "status": "vacuuming"])
+    XCTAssertEqual(out["state"] as? String, "unknown")
+    let error = try XCTUnwrap(out["error"] as? String)
+    XCTAssertTrue(error.hasPrefix("unmapped_state:"), error)
+    XCTAssertTrue(error.contains("vacuuming"), error)
+    XCTAssertTrue(MCPJobState.unknown.isTerminal, "a client must stop polling an unknown state")
+  }
+
+  func testAbsentStatusKeyIsTerminalUnknown() throws {
+    let out = MCPJobModel.unify(kind: .image, jobId: "J-9", status: ["job_id": "J-9"])
+    XCTAssertEqual(out["state"] as? String, "unknown")
+    XCTAssertTrue(try XCTUnwrap(out["error"] as? String).contains("unmapped_state:"))
+  }
+
+  /// An unmapped state that ALSO carries an engine error keeps both: the
+  /// marker (so the cause is unambiguous) and what the engine said.
+  func testUnmappedStateKeepsTheEngineErrorToo() throws {
+    let out = MCPJobModel.unify(
+      kind: .video, jobId: "V-9",
+      status: ["status": "vacuuming", "error": "disk full"])
+    let error = try XCTUnwrap(out["error"] as? String)
+    XCTAssertTrue(error.hasPrefix("unmapped_state:"), error)
+    XCTAssertTrue(error.contains("disk full"), error)
+  }
+
+  func testGetJobReturnsAnUnknownStateInsteadOfPollingForever() async throws {
+    let result = try await MCPToolExecutor.runGetJob(jobId: "V-9", kind: .video) { _, _ in
+      (200, self.json(["job_id": "V-9", "status": "vacuuming"]))
+    }
+    XCTAssertFalse(result.isError, "an unmapped state is reported, not thrown away")
+    let obj = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try XCTUnwrap(result.structuredJSON)) as? [String: Any])
+    XCTAssertEqual(obj["state"] as? String, "unknown")
+  }
+
   // MARK: - Image job mapping
 
   func testUnifyImageSucceeded() throws {
@@ -356,6 +399,31 @@ final class MCPJobModelTests: XCTestCase {
       (503, self.json(["error": "LTX-2 not configured"]))
     }
     XCTAssertTrue(result.isError)
+  }
+
+  /// PR #367 review r1, item 4: a probe that fails for a reason OTHER than
+  /// "not mine" (404) must not end the search — the job may still be in the
+  /// next tracker. The earlier failure is only surfaced if every probe fails.
+  func testGetJobKeepsProbingPastANonNotFoundImageError() async throws {
+    let log = CallLog()
+    let result = try await MCPToolExecutor.runGetJob(jobId: "V-7", kind: nil) { method, path in
+      await log.record(method, path)
+      if path.hasPrefix("/v1/generate/status/") {
+        return (500, self.json(["error": "image tracker exploded"]))
+      }
+      return (200, self.json(["job_id": "V-7", "status": "processing", "progress_percent": 4]))
+    }
+    XCTAssertFalse(result.isError, "the video tracker had it")
+    let calls = await log.all()
+    XCTAssertEqual(calls, ["GET /v1/generate/status/V-7", "GET /v1/video/status/V-7"])
+  }
+
+  func testGetJobSurfacesTheProbeErrorWhenEveryProbeFails() async throws {
+    let result = try await MCPToolExecutor.runGetJob(jobId: "V-8", kind: nil) { _, _ in
+      (500, self.json(["error": "tracker exploded"]))
+    }
+    XCTAssertTrue(result.isError)
+    XCTAssertTrue(result.content.first?.text?.contains("exploded") == true)
   }
 
   // MARK: - Async submit (#288)

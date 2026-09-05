@@ -36,6 +36,15 @@ public enum MCPJobKind: String, CaseIterable, Sendable {
   case swap
   case storyboard
 
+  /// The kinds a CALLER can name. `swap` is excluded: LoRA swaps are
+  /// synchronous (`POST /v1/lora/swap` returns the result), so no caller ever
+  /// holds a swap job id to poll. The only swap ids that exist come from
+  /// queue replay, and they live in the image tracker keyed by id — so they
+  /// resolve through the image probe and report as `image`. The case stays
+  /// for that internal mapping; advertising it would be dead surface
+  /// (PR #367 review r1, item 3).
+  public static let selectableCases: [MCPJobKind] = [.image, .video, .storyboard]
+
   /// Status route template, in the parity parser's `{id}` normalization.
   public var statusPathTemplate: String {
     switch self {
@@ -74,9 +83,18 @@ public enum MCPJobState: String, Sendable {
   case running
   case completed
   case failed
+  /// The engine reported a state this build does not know (or none at all).
+  ///
+  /// TERMINAL on purpose. The old behaviour — coercing anything unrecognized
+  /// to `running` — is precisely the infinite-poll failure this model exists
+  /// to prevent: a client would poll a job that will never move again, and
+  /// the reason would be invisible. Reporting it terminal stops the client
+  /// and puts the raw engine value in `error` where a human can see it
+  /// (PR #367 review r1, item 1).
+  case unknown
 
   public var isTerminal: Bool {
-    self == .completed || self == .failed
+    self == .completed || self == .failed || self == .unknown
   }
 }
 
@@ -122,7 +140,7 @@ public enum MCPJobModel {
     kind: MCPJobKind, jobId: String, status: [String: Any], queueProgressPercent: Int? = nil
   ) -> [String: Any] {
     let rawState = (status["status"] as? String) ?? (status["state"] as? String) ?? ""
-    let state = Self.state(fromEngine: rawState) ?? .running
+    let state = Self.state(fromEngine: rawState) ?? .unknown
     let ownPercent = kind.carriesOwnProgressPercent ? intValue(status["progress_percent"]) : nil
 
     var envelope: [String: Any] = [
@@ -135,8 +153,15 @@ public enum MCPJobModel {
     if state == .completed, let result = result(kind: kind, status: status), !result.isEmpty {
       envelope["result"] = result
     }
-    if let error = status["error"] as? String, !error.isEmpty {
-      envelope["error"] = error
+    let engineError = (status["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    if state == .unknown {
+      // Name the raw value so the fix is one grep away, and keep whatever the
+      // engine itself said alongside it.
+      let raw = rawState.isEmpty ? "(absent)" : rawState
+      envelope["error"] = engineError.map { "unmapped_state:\(raw) — \($0)" }
+        ?? "unmapped_state:\(raw)"
+    } else if let engineError {
+      envelope["error"] = engineError
     }
     if let retry = intValue(status["retry_after_seconds"]) {
       envelope["retry_after_seconds"] = retry
@@ -179,7 +204,7 @@ public enum MCPJobModel {
     switch state {
     case .completed: return 100
     case .queued: return 0
-    case .running, .failed: return clamp(percent ?? 0)
+    case .running, .failed, .unknown: return clamp(percent ?? 0)
     }
   }
 

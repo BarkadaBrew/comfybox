@@ -199,6 +199,8 @@ public enum MCPToolRegistry {
       RouteRef(method: "POST", path: "/v1/generate"),
       // #288: `async: true` submits here instead (was a ParityExemption).
       RouteRef(method: "POST", path: "/v1/generate/async"),
+      // #292: polled for progress while a progressToken is in flight.
+      RouteRef(method: "GET", path: "/v1/queue"),
     ]
   )
 
@@ -213,7 +215,7 @@ public enum MCPToolRegistry {
   /// covers the job-id namespace the generation routes share.
   static let getJob = MCPToolDefinition(
     name: "get_job",
-    description: "Poll ANY render job by id — image, video, LoRA swap, or storyboard — with one tool. Returns {job_id, kind, state, progress, result?, error?, retry_after_seconds?}; state is queued | running | completed | failed, progress is 0-100. Job ids come from generate_image (async: true), generate_video, render_storyboard, rerender_video and extend_video. Poll roughly every 2-5s; retry_after_seconds, when present, is the engine's own reschedule hint while it replays its queue after a restart.",
+    description: "Poll ANY render job by id — image, video, or storyboard — with one tool. Returns {job_id, kind, state, progress, result?, error?, retry_after_seconds?}; state is queued | running | completed | failed | unknown (everything but queued/running is terminal — stop polling; `unknown` means the engine reported a state this build does not know, named in `error`), progress is 0-100. Job ids come from generate_image (async: true), generate_video, render_storyboard, rerender_video and extend_video. Poll roughly every 2-5s; retry_after_seconds, when present, is the engine's own reschedule hint while it replays its queue after a restart.",
     inputSchema: [
       "type": "object",
       "properties": [
@@ -223,8 +225,8 @@ public enum MCPToolRegistry {
         ] as [String: Any],
         "kind": [
           "type": "string",
-          "enum": MCPJobKind.allCases.map(\.rawValue),
-          "description": "What produced the job. Omit to probe image then video — pass it to save a call, and pass it explicitly for 'swap' or 'storyboard', which share the image and video trackers respectively and are otherwise reported as 'image'/'video'.",
+          "enum": MCPJobKind.selectableCases.map(\.rawValue),
+          "description": "What produced the job. Omit to probe image then video — pass it to save a call, and pass 'storyboard' explicitly (storyboards share the video tracker and are otherwise reported as 'video'). A LoRA-swap id, which only exists after a restart replay, resolves as 'image'.",
         ] as [String: Any],
         "return_image": [
           "type": "boolean",

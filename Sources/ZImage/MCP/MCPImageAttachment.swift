@@ -44,20 +44,40 @@ public enum MCPImageAttachment {
     case unreadable(path: String)
   }
 
+  /// Encoded length of `n` raw bytes as base64 (`ceil(n/3) * 4`). The cap is
+  /// measured on THIS, not on the file size — that is what actually crosses
+  /// the wire, and a file just under the cap would otherwise inflate past it.
+  public static func encodedLength(ofBytes count: Int) -> Int {
+    ((count + 2) / 3) * 4
+  }
+
   /// Read a rendered file and decide whether it can ride along.
   ///
-  /// The size check is on the ENCODED length (`ceil(n/3) * 4`), because that
-  /// is what actually crosses the wire — checking the file size would let a
-  /// file just under the cap inflate past it.
+  /// The size is checked from the filesystem metadata FIRST, so an oversized
+  /// render is refused without ever being read into memory (PR #367 review
+  /// r1, item 2). This process sits next to LM Studio and a 30 GB model
+  /// (intent.md: memory is a shared resource) — pulling in 12 MB only to
+  /// throw it away is not free.
   public static func encode(
     path: String,
     limitBytes: Int = MCPImageAttachment.defaultLimitBytes,
+    fileSize: (String) -> Int? = { path in
+      (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
+    },
     load: (String) -> Data? = { FileManager.default.contents(atPath: $0) }
   ) -> Outcome {
     let resolved = (path as NSString).expandingTildeInPath
-    guard !resolved.isEmpty, let data = load(resolved) else { return .unreadable(path: path) }
-    let encodedBytes = ((data.count + 2) / 3) * 4
-    guard encodedBytes <= limitBytes else {
+    guard !resolved.isEmpty else { return .unreadable(path: path) }
+
+    // Pre-check: refuse on metadata alone when the size is knowable.
+    if let bytes = fileSize(resolved), encodedLength(ofBytes: bytes) > limitBytes {
+      return .skippedTooLarge(fileBytes: bytes, limitBytes: limitBytes)
+    }
+
+    guard let data = load(resolved) else { return .unreadable(path: path) }
+    // Belt and braces: the file could have grown between stat and read, or
+    // `fileSize` could have returned nil (unusual filesystem, test stub).
+    guard encodedLength(ofBytes: data.count) <= limitBytes else {
       return .skippedTooLarge(fileBytes: data.count, limitBytes: limitBytes)
     }
     return .attached(
@@ -75,24 +95,38 @@ public enum MCPImageAttachment {
     }
   }
 
-  /// Content blocks for the given output paths, capped at
-  /// `maxImagesPerResult`. Paths that cannot be read or are over the cap are
-  /// simply omitted — `note(for:)` turns those into caller-visible prose.
+  /// Image blocks for the given output paths — capped at
+  /// `maxImagesPerResult` — together with a note for every path that was
+  /// asked for and could not be attached. This is the ONE place tool results
+  /// get image content, so the cap is really enforced rather than merely
+  /// declared (PR #367 review r1, item 4).
+  public static func attachment(
+    paths: [String],
+    limitBytes: Int = MCPImageAttachment.defaultLimitBytes,
+    maxImages: Int = MCPImageAttachment.maxImagesPerResult,
+    load: (String) -> Data? = { FileManager.default.contents(atPath: $0) }
+  ) -> (blocks: [MCPContentBlock], notes: [String]) {
+    var blocks: [MCPContentBlock] = []
+    var notes: [String] = []
+    for path in paths.prefix(max(0, maxImages)) {
+      let outcome = encode(path: path, limitBytes: limitBytes, load: load)
+      if case .attached(let base64, let mimeType, _) = outcome {
+        blocks.append(MCPContentBlock(imageBase64: base64, mimeType: mimeType))
+      } else if let note = note(for: outcome) {
+        notes.append(note)
+      }
+    }
+    return (blocks, notes)
+  }
+
+  /// Convenience wrapper for callers that only want the blocks.
   public static func blocks(
     paths: [String],
     limitBytes: Int = MCPImageAttachment.defaultLimitBytes,
     maxImages: Int = MCPImageAttachment.maxImagesPerResult,
     load: (String) -> Data? = { FileManager.default.contents(atPath: $0) }
   ) -> [MCPContentBlock] {
-    var blocks: [MCPContentBlock] = []
-    for path in paths.prefix(max(0, maxImages)) {
-      if case .attached(let base64, let mimeType, _) = encode(
-        path: path, limitBytes: limitBytes, load: load)
-      {
-        blocks.append(MCPContentBlock(imageBase64: base64, mimeType: mimeType))
-      }
-    }
-    return blocks
+    attachment(paths: paths, limitBytes: limitBytes, maxImages: maxImages, load: load).blocks
   }
 
   /// Whether this output path is an image at all. Guards the video/storyboard

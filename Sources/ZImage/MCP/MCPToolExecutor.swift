@@ -8,9 +8,9 @@ import Foundation
 
 /// Executes MCP tool calls by dispatching to WarmServer HTTP endpoints.
 public final class MCPToolExecutor: @unchecked Sendable {
-  private let client: WarmServerClient
+  private let client: WarmServerTransport
 
-  public init(client: WarmServerClient) {
+  public init(client: WarmServerTransport) {
     self.client = client
   }
 
@@ -359,10 +359,16 @@ public final class MCPToolExecutor: @unchecked Sendable {
     }
     var kind: MCPJobKind?
     if let raw = params?.string("kind"), !raw.isEmpty {
-      guard let parsed = MCPJobKind(rawValue: raw) else {
+      // Only the SELECTABLE kinds: `swap` is not one, because a swap job id
+      // only exists after queue replay and resolves through the image
+      // tracker (review r1, item 3). Omitting `kind` finds it either way.
+      guard let parsed = MCPJobKind(rawValue: raw),
+        MCPJobKind.selectableCases.contains(parsed)
+      else {
         return MCPToolResult(
           error: "Error: unknown 'kind' \(raw) — expected one of "
-            + MCPJobKind.allCases.map(\.rawValue).joined(separator: ", "))
+            + MCPJobKind.selectableCases.map(\.rawValue).joined(separator: ", ")
+            + " (omit it to probe image then video; LoRA-swap ids resolve as 'image')")
       }
       kind = parsed
     }
@@ -1273,6 +1279,10 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let candidates = kind.map { [$0] } ?? MCPJobModel.probeOrder
 
     let encodedId = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
+    // A probe that fails for a reason OTHER than "not mine" must not end the
+    // search — the job may still be in the next tracker. The failure is only
+    // surfaced if every probe fails (PR #367 review r1, item 4).
+    var lastFailure: (status: Int, data: Data)?
 
     for candidate in candidates {
       // Spelled out as literals rather than read off MCPJobKind so the §3.5
@@ -1314,21 +1324,31 @@ public final class MCPToolExecutor: @unchecked Sendable {
         continue
 
       case 503 where Self.isQueueRecoveryRefusal(data):
-        // The engine is replaying its persisted queue after a restart. The
-        // job is not lost; report it queued with the server's own hint.
+        // DEFENSIVE. `QueueRecoveryGate` gates SUBMIT routes today, not the
+        // status reads this function makes, so no current engine build
+        // reaches here. It stays because the alternative — a future gate on
+        // the status route surfacing as a bare error — would read to a
+        // polling client as "your job died" when the job is merely queued
+        // behind a restart replay. Cheap insurance, one branch
+        // (PR #367 review r1, item 4).
         return Self.jobResult(
           MCPJobModel.recoveryEnvelope(
             kind: candidate, jobId: jobId,
             retryAfterSeconds: Self.parseRetryAfterSeconds(from: data)),
-          returnImage: false)
+          returnImage: returnImage)
 
       default:
         // Any OTHER status (including a 503 that retrying can never fix,
-        // e.g. "LTX-2 not configured") is a real error, surfaced as one.
-        return Self.mapHTTPResponse(status: status, data: data)
+        // e.g. "LTX-2 not configured") is a real error — but keep probing
+        // the remaining trackers first.
+        lastFailure = (status, data)
+        continue
       }
     }
 
+    if let lastFailure {
+      return Self.mapHTTPResponse(status: lastFailure.status, data: lastFailure.data)
+    }
     let probed = candidates.map(\.rawValue).joined(separator: ", ")
     return MCPToolResult(
       error: "Error: no job \(jobId) tracked as \(probed). Finished jobs are pruned from the "
@@ -1395,12 +1415,19 @@ public final class MCPToolExecutor: @unchecked Sendable {
     let data = (try? JSONSerialization.data(withJSONObject: envelope)) ?? Data("{}".utf8)
     let base = MCPToolResult(
       text: String(data: data, encoding: .utf8) ?? "{}", structuredJSON: data)
-    guard returnImage,
-      (envelope["state"] as? String) == MCPJobState.completed.rawValue,
-      let result = envelope["result"] as? [String: Any],
-      let path = result["output_path"] as? String,
-      MCPImageAttachment.isAttachableImage(path: path)
-    else { return base }
+    guard returnImage else { return base }
+
+    guard (envelope["state"] as? String) == MCPJobState.completed.rawValue else {
+      return Self.withNote(
+        "return_image: nothing to attach yet — job state is "
+          + "\((envelope["state"] as? String) ?? "unknown").",
+        on: base)
+    }
+    guard let path = (envelope["result"] as? [String: Any])?["output_path"] as? String,
+      !path.isEmpty
+    else {
+      return Self.withNote("return_image: this job reported no output path.", on: base)
+    }
     return Self.attachImage(at: path, to: base)
   }
 
@@ -1410,25 +1437,37 @@ public final class MCPToolExecutor: @unchecked Sendable {
     status: Int, data: Data, returnImage: Bool
   ) -> MCPToolResult {
     let base = Self.mapHTTPResponse(status: status, data: data)
-    guard returnImage, !base.isError,
-      let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let path = payload["output_path"] as? String,
-      MCPImageAttachment.isAttachableImage(path: path)
-    else { return base }
+    // A failed render has nothing to attach and stays an error untouched.
+    guard returnImage, !base.isError else { return base }
+    guard let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let path = payload["output_path"] as? String, !path.isEmpty
+    else {
+      return Self.withNote("return_image: this render reported no output path.", on: base)
+    }
     return Self.attachImage(at: path, to: base)
   }
 
   /// Append the image content block, or a note saying why it was omitted —
-  /// never a silent drop. The text block and structuredContent are unchanged.
+  /// never a silent drop. The text block's JSON and structuredContent are
+  /// unchanged; the note is appended after it.
   private static func attachImage(at path: String, to base: MCPToolResult) -> MCPToolResult {
-    let outcome = MCPImageAttachment.encode(path: path)
-    var text = base.content.first?.text ?? "{}"
-    if let note = MCPImageAttachment.note(for: outcome) { text += "\n" + note }
-    var images: [MCPContentBlock] = []
-    if case .attached(let base64, let mimeType, _) = outcome {
-      images = [MCPContentBlock(imageBase64: base64, mimeType: mimeType)]
+    guard MCPImageAttachment.isAttachableImage(path: path) else {
+      return Self.withNote(
+        "return_image: \(path) is not an image — read output_path instead.", on: base)
     }
-    return MCPToolResult(text: text, structuredJSON: base.structuredJSON, images: images)
+    // Goes through `attachment` so the per-result cap is genuinely enforced
+    // here rather than merely declared (PR #367 review r1, item 4).
+    let attachment = MCPImageAttachment.attachment(paths: [path])
+    var text = base.content.first?.text ?? "{}"
+    for note in attachment.notes { text += "\n" + note }
+    return MCPToolResult(
+      text: text, structuredJSON: base.structuredJSON, images: attachment.blocks)
+  }
+
+  private static func withNote(_ note: String, on base: MCPToolResult) -> MCPToolResult {
+    MCPToolResult(
+      text: (base.content.first?.text ?? "{}") + "\n" + note,
+      structuredJSON: base.structuredJSON, images: [])
   }
 
   private static func mapHTTPResponse(status: Int, data: Data) -> MCPToolResult {

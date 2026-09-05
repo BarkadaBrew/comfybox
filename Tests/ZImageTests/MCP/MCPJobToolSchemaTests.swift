@@ -49,12 +49,26 @@ final class MCPJobToolSchemaTests: XCTestCase {
     XCTAssertEqual(def.annotations?.destructiveHint, false)
   }
 
-  func testGetJobRequiresJobIdAndOffersEveryKind() throws {
+  /// PR #367 review r1, item 3: `swap` is NOT selectable. LoRA swaps are
+  /// synchronous (`POST /v1/lora/swap` returns the result), so no caller ever
+  /// holds a swap job id to poll; the only swap ids that exist come from
+  /// queue replay and live in the image tracker, where they answer as
+  /// `image`. Advertising a kind nobody can use is dead surface.
+  func testGetJobRequiresJobIdAndOffersOnlySelectableKinds() throws {
     let def = try XCTUnwrap(MCPToolRegistry.tool(named: "get_job"))
     XCTAssertEqual(def.inputSchema["required"] as? [String], ["job_id"])
     let kind = try XCTUnwrap(try properties(of: "get_job")["kind"] as? [String: Any])
-    XCTAssertEqual(kind["enum"] as? [String], MCPJobKind.allCases.map(\.rawValue))
-    XCTAssertEqual(kind["enum"] as? [String], ["image", "video", "swap", "storyboard"])
+    XCTAssertEqual(kind["enum"] as? [String], MCPJobKind.selectableCases.map(\.rawValue))
+    XCTAssertEqual(kind["enum"] as? [String], ["image", "video", "storyboard"])
+    XCTAssertFalse(MCPJobKind.selectableCases.contains(.swap))
+  }
+
+  /// #294 payload discipline: `generate_image`'s progress polling reads the
+  /// queue snapshot, so the tool claims that route too (§3.5 declared
+  /// reality).
+  func testGenerateImageClaimsTheQueueRouteItPollsForProgress() throws {
+    let def = try XCTUnwrap(MCPToolRegistry.tool(named: "generate_image"))
+    XCTAssertTrue(def.routes.contains(RouteRef(method: "GET", path: "/v1/queue")))
   }
 
   func testGetJobClaimsTheThreeRoutesItReads() throws {

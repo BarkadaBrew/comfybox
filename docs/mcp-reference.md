@@ -105,7 +105,7 @@ share.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `job_id` | string | **Yes** | Job id from an async submit |
-| `kind` | string | No | `image` \| `video` \| `swap` \| `storyboard`. Omit to probe image then video |
+| `kind` | string | No | `image` \| `video` \| `storyboard`. Omit to probe image then video |
 | `return_image` | boolean | No | On a completed image job, also return the PNG as MCP image content (default: false) |
 
 **Returns:**
@@ -122,7 +122,8 @@ apply — they are never present as `null`.
 
 | Field | Notes |
 |-------|-------|
-| `state` | `queued` \| `running` \| `completed` \| `failed`. Only `completed` and `failed` are terminal |
+| `state` | `queued` \| `running` \| `completed` \| `failed` \| `unknown`. Everything except `queued` and `running` is **terminal** — stop polling |
+| `unknown` | The engine reported a state this build does not know (or none at all). Terminal on purpose: the alternative is a client polling forever. `error` names the raw value as `unmapped_state:<raw>` |
 | `progress` | 0-100. Video reports its own percent; an image job's live percent comes from the engine's queue snapshot, and is 0 until the job is the active render |
 | `result` | Present only when `state` is `completed`. Image: `output_path`, `duration_ms`. Video: plus `file_size_bytes`, `video_duration_seconds`, `frame_count` |
 | `error` | Present when the job failed. An operator interrupt reports `failed` with a plain-English reason — never a state your client does not know |
@@ -133,12 +134,16 @@ apply — they are never present as `null`.
 | Submitted by | `kind` |
 |---|---|
 | `generate_image` with `async: true` | `image` |
-| `swap_loras` (a swap job replayed after a restart) | `swap` |
 | `generate_video`, `rerender_video`, `extend_video` | `video` |
 | `render_storyboard` | `storyboard` |
 
-`swap` and `storyboard` share the image and video trackers respectively — pass
-`kind` explicitly for those, or they are reported as `image` / `video`.
+Storyboards share the video tracker — pass `kind: "storyboard"` explicitly or
+they are reported as `video`.
+
+There is no `swap` kind. LoRA swaps are synchronous (`swap_loras` returns the
+result), so no caller ever holds a swap job id to poll; the only swap ids that
+exist come from queue replay after a restart, they live in the image tracker,
+and they resolve as `image`.
 
 **Polling:** every 2-5 s is plenty. A queued or finished job costs one HTTP
 call; a *running image* job costs one extra (the queue snapshot that carries
@@ -195,8 +200,13 @@ Every byte lands in the client's context. Rules:
 
 - Default is **false**. Leave it off for batch work and for anything a human
   will open from the path.
-- Cap is 8 MB **encoded**. Over it, the image is omitted and the text result
-  says so — `output_path` is always returned, and it is the durable artifact.
+- Cap is 8 MB **encoded**. It is checked against the file's size on disk
+  before the bytes are read, so an oversized render costs a `stat`, not a
+  12 MB read. Over the cap the image is omitted and the text result says so —
+  `output_path` is always returned, and it is the durable artifact.
+- An ignored `return_image` **always** explains itself in the text result:
+  not finished yet, no output path, not an image, or over the cap. It is never
+  a silent omission.
 - At most **one** image per result: the engine renders one image per request
   (`POST /v1/generate` has no batch `count`).
 - Video results are never inlined; use `output_path`.
