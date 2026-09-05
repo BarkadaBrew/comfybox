@@ -335,9 +335,19 @@ public enum CatalogBackfill {
 
     /// Resolve a sidecar's `source_image` — recorded on the SERVER — to a local
     /// asset id.
+    ///
+    /// `filenameLookup` is a test-only seam (defaults to the real
+    /// `store.assetIDs(forFilename:)` call): it lets a test drive this
+    /// function's basename fallback and its step-failure handling through a
+    /// STUBBED step sequence — the same reason `drainSQLiteRows` itself takes
+    /// `step` as a closure — without needing a real corrupted database, which
+    /// is impractical to engineer deterministically (see
+    /// `SQLiteRowDrainTests`'s header comment). Production never passes it.
     static func resolveSource(_ remote: String, scope: CatalogRealm?,
                               trees: [BackfillTree],
-                              store: CatalogStore) async throws -> String? {
+                              store: CatalogStore,
+                              filenameLookup: ((String, CatalogRealm?) async throws -> [String])? = nil
+                              ) async throws -> String? {
         guard !isVaultPath(remote) else { return nil }
         var candidates = [remote]
         for t in trees {
@@ -358,7 +368,30 @@ public enum CatalogBackfill {
         // (or the reverse) purely because two files happen to share a name.
         let base = (remote as NSString).lastPathComponent
         guard !base.isEmpty else { return nil }
-        let ids = try await store.assetIDs(forFilename: base, scope: scope)
+        let lookup = filenameLookup ?? { name, scope in try await store.assetIDs(forFilename: name, scope: scope) }
+        // `assetIDs(forFilename:)` now THROWS on a step failure rather than
+        // returning a possibly-truncated list (#357 R1 review): a dropped
+        // second match would otherwise make an ambiguous filename look
+        // unique here and mint a wrong edge. Treat the failure exactly like
+        // an ambiguous match — skip this edge — rather than letting it abort
+        // the whole backfill sweep over one unreadable row.
+        //
+        // Logged (R1 re-review): a silent `return nil` here is indistinguishable
+        // from genuine ambiguity in the report — `edgesUnresolved` reads the
+        // same either way. A real query failure is an operational problem
+        // (disk error, corruption) an operator needs to see; ambiguity is
+        // routine and expected. Named on stderr, matching the style
+        // `CatalogStore`'s read-only listing methods use for their own
+        // log-and-partial failures.
+        let ids: [String]
+        do {
+            ids = try await lookup(base, scope)
+        } catch {
+            let message = "CatalogBackfill.resolveSource: filename lookup failed for '\(base)' "
+                + "(treating as ambiguous, not resolving): \(error)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            return nil
+        }
         return ids.count == 1 ? ids[0] : nil
     }
 

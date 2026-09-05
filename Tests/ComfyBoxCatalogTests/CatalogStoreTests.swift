@@ -609,6 +609,90 @@ final class CatalogStoreTests: XCTestCase {
         XCTAssertEqual(full.absolutePath, "/tmp/k1.png")
     }
 
+    // MARK: - assetIDs(matching:) — #271
+
+    /// The literal #271 acceptance test: a filter matching far more rows than
+    /// any page clamp in this codebase (500 for the HTTP listing, 20k for the
+    /// desktop's old fixed "full scope" raise) must return every one of them,
+    /// not a truncated prefix.
+    func testAssetIDsMatchingSelectsAllOf1200SyntheticRows() async throws {
+        for i in 0..<1200 {
+            try await store.upsert(make("select-all-\(i)", realm: .shared, lane: "select-all-fixture"),
+                                   explicitCollectionIDs: [])
+        }
+        let result = try await store.assetIDs(matching: CatalogQuery(lane: "select-all-fixture"))
+        XCTAssertEqual(result.ids.count, 1200)
+        XCTAssertEqual(Set(result.ids), Set((0..<1200).map { "select-all-\($0)" }))
+        XCTAssertFalse(result.truncated, "1,200 rows is well under idsHardCap")
+    }
+
+    /// R1 review correction: the hard cap must not truncate silently. `cap:`
+    /// lets this pin the behaviour without inserting `idsHardCap + 1` real
+    /// rows.
+    func testAssetIDsMatchingReportsTruncationWhenTheCapCutsRows() async throws {
+        // Exactly cap + 1: the smallest input that can possibly be truncated,
+        // and the exact boundary the `LIMIT cap + 1` lookahead trick exists to
+        // get right — a larger margin could pass even if the lookahead were
+        // off by more than one.
+        for i in 0..<6 {
+            try await store.upsert(make("cap-\(i)", realm: .shared, lane: "cap-fixture"),
+                                   explicitCollectionIDs: [])
+        }
+        let result = try await store.assetIDs(matching: CatalogQuery(lane: "cap-fixture"), cap: 5)
+        XCTAssertTrue(result.truncated)
+        XCTAssertEqual(result.ids.count, 5, "truncated to exactly the cap, not the cap-plus-lookahead row")
+    }
+
+    /// The negative case for the same knob: a filter that matches EXACTLY the
+    /// cap is complete, not truncated — the "+1 lookahead row" must not turn
+    /// an exact fit into a false truncation report.
+    func testAssetIDsMatchingIsNotTruncatedWhenCountExactlyMeetsTheCap() async throws {
+        for i in 0..<5 {
+            try await store.upsert(make("exact-\(i)", realm: .shared, lane: "exact-fixture"),
+                                   explicitCollectionIDs: [])
+        }
+        let result = try await store.assetIDs(matching: CatalogQuery(lane: "exact-fixture"), cap: 5)
+        XCTAssertFalse(result.truncated)
+        XCTAssertEqual(result.ids.count, 5)
+    }
+
+    /// Unlike `search`, which pages, `assetIDs(matching:)` ignores
+    /// `query.limit`/`query.offset` entirely — that is the whole point (#271):
+    /// a query built with a small limit must still get back every matching id.
+    func testAssetIDsMatchingIgnoresQueryLimitAndOffset() async throws {
+        for i in 0..<10 {
+            try await store.upsert(make("ignore-limit-\(i)", realm: .shared, lane: "ignore-limit"),
+                                   explicitCollectionIDs: [])
+        }
+        var q = CatalogQuery(lane: "ignore-limit")
+        q.limit = 1
+        q.offset = 5
+        let result = try await store.assetIDs(matching: q)
+        XCTAssertEqual(result.ids.count, 10, "limit/offset must not clamp the ids-only query")
+    }
+
+    /// The realm lock applies here exactly as it does to `search` — an
+    /// ids-only query is still a way to enumerate the catalog, and a confined
+    /// caller's select-all must not reach into another realm.
+    func testAssetIDsMatchingHonoursRealmScope() async throws {
+        try await store.upsert(make("kira-only", realm: .kira, lane: "mixed"), explicitCollectionIDs: [])
+        try await store.upsert(make("shared-only", realm: .shared, lane: "mixed"), explicitCollectionIDs: [])
+        let result = try await store.assetIDs(matching: CatalogQuery(scope: .kira, lane: "mixed"))
+        XCTAssertEqual(result.ids, ["kira-only"])
+    }
+
+    /// Built from the same `whereClause` helper as `search` (#271), so a
+    /// caller cannot get a different answer to "what matches" depending on
+    /// which of the two it asks.
+    func testAssetIDsMatchingAgreesWithSearchOnWhatMatches() async throws {
+        try await store.upsert(make("agree-1", realm: .shared, tier: "neutral"), explicitCollectionIDs: [])
+        try await store.upsert(make("agree-2", realm: .shared, tier: "avocado"), explicitCollectionIDs: [])
+        let query = CatalogQuery(tier: "neutral")
+        let searchIDs = Set(try await store.search(query).map(\.id))
+        let idsOnly = Set(try await store.assetIDs(matching: query).ids)
+        XCTAssertEqual(searchIDs, idsOnly)
+    }
+
     /// The realm-scoped ORACLES must not carry a defaulted `scope`.
     ///
     /// `edges` and `locations` had their defaults dropped for this exact reason

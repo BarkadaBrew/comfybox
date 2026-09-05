@@ -82,6 +82,29 @@ public enum GalleryServer {
                 let rows = try await store.search(q)
                 return .json(["count": rows.count, "items": rows.map(dict(for:))])
 
+            // Ids-only, deliberately additive alongside `/v1/catalog/search`
+            // rather than a change to it (#271). `search` keeps its per-page
+            // clamp (`maxLimit`, 500) unconditionally — that limit exists to
+            // stop a client paging the WHOLE catalog's rows (prompts, paths,
+            // every column) out in one response, and a generous `limit=20000`
+            // query parameter used to look like it worked and then silently
+            // come back at 500 anyway. Select All needs "every id matching
+            // this filter", not a page of rows, so it gets its own route
+            // instead of a bigger clamp on the one that returns full rows.
+            // Same filters as `/v1/catalog/search`; `limit`/`offset` in the
+            // query string are accepted but ignored — `CatalogStore.assetIDs`
+            // ignores them by design and caps at `idsHardCap` (100k) instead.
+            case ("GET", "/v1/catalog/asset-ids"):
+                let q = query(from: request, scope: scope, ceiling: ceiling)
+                let result = try await store.assetIDs(matching: q)
+                // `truncated` (R1 review correction): the 100k hard cap can
+                // still cut off a filter matching more than that — silently
+                // is no better than the 500-row clamp this route exists to
+                // route around. A caller MUST be able to tell "this is
+                // everything" from "this is the first 100k".
+                return .json(["count": result.ids.count, "ids": result.ids,
+                              "truncated": result.truncated])
+
             case ("GET", "/v1/catalog/facets"):
                 let f = try await store.facets(scope: scope)
                 return .json([

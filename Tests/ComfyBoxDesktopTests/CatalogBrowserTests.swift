@@ -191,6 +191,51 @@ final class CatalogBrowserTests: XCTestCase {
                        "fresh.png")
     }
 
+    // MARK: - Select All (#271)
+
+    /// The literal #271 acceptance test at the desktop's actual call site: a
+    /// filter matching far more rows than the browser's own page size
+    /// (`pageSize`, 500 by default) must still select every one of them.
+    /// `allMatchingIDs` is what `GalleryView.selectAll()` calls instead of
+    /// raising the page size and hoping the reload's limit does not get
+    /// clamped again somewhere between here and the database.
+    func testAllMatchingIDsSelectsAllOf1200SyntheticRowsBeyondThePageSize() async throws {
+        for i in 0..<1200 {
+            try await store.upsert(CatalogAsset(id: "select-all-\(i)", filename: "s\(i).png",
+                                                absolutePath: "/tmp/s\(i).png", realm: .shared,
+                                                lane: "select-all-fixture"),
+                                   explicitCollectionIDs: [])
+        }
+        let b = CatalogBrowser(store: store)
+        b.pageSize = 500   // the grid's normal page — deliberately smaller than the fixture
+        await b.apply(filter: CatalogQuery(lane: "select-all-fixture", limit: b.pageSize))
+        XCTAssertEqual(b.items.count, 500, "precondition: the loaded PAGE is still clamped")
+
+        let result = await b.allMatchingIDs()
+        XCTAssertEqual(result.ids.count, 1200, "allMatchingIDs must not inherit the page's limit")
+        XCTAssertEqual(result.ids, Set((0..<1200).map { "select-all-\($0)" }))
+        XCTAssertFalse(result.truncated, "1,200 rows is well under idsHardCap")
+    }
+
+    /// `allMatchingIDs` subtracts `hiddenAssetIDs` the same way the loaded
+    /// page does (`resolve(_:)`) — Select All must not be a way to select a
+    /// secured asset the grid never showed.
+    func testAllMatchingIDsWithholdsHiddenAssetIDs() async throws {
+        try await store.upsert(CatalogAsset(id: "visible", filename: "v.png",
+                                            absolutePath: "/tmp/v.png", realm: .shared,
+                                            lane: "vault-fixture"), explicitCollectionIDs: [])
+        try await store.upsert(CatalogAsset(id: "vaulted", filename: "h.png",
+                                            absolutePath: "/tmp/h.png", realm: .shared,
+                                            lane: "vault-fixture"), explicitCollectionIDs: [])
+        let b = CatalogBrowser(store: store)
+        b.hiddenAssetIDs = ["vaulted"]
+        await b.apply(filter: CatalogQuery(lane: "vault-fixture"))
+
+        let result = await b.allMatchingIDs()
+        XCTAssertEqual(result.ids, ["visible"])
+        XCTAssertFalse(result.truncated)
+    }
+
     func testAPathWithASpaceStreamsAsAValidURL() async throws {
         try await store.upsert(CatalogAsset(id: "spacey", filename: "a b.png",
                                             absolutePath: "/home/todd/.kira/a b.png",

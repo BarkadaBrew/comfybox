@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import ComfyBoxCatalog
 
 final class CatalogBackfillTests: XCTestCase {
@@ -406,6 +407,110 @@ final class CatalogBackfillTests: XCTestCase {
         let stillID = try XCTUnwrap(foundStillID)
         let edges = try await store.edges(for: clipID, scope: nil)
         XCTAssertEqual(edges.first?.toAssetID, stillID)
+    }
+
+    /// Critical R1 review fix: `assetIDs(forFilename:)` now THROWS on a query
+    /// failure instead of returning a possibly-truncated list, because a
+    /// truncated list there would make an AMBIGUOUS filename look UNIQUE and
+    /// mint a WRONG i2v edge. `resolveSource` must treat that thrown error
+    /// exactly like genuine ambiguity — return nil — not propagate it and
+    /// abort the whole sweep over one unreadable lookup.
+    ///
+    /// Deterministic without fault-injecting `sqlite3_step`: dropping the
+    /// `filename` column via a separate raw connection to the same file makes
+    /// the fallback query's PREPARE fail with a real error, isolated to
+    /// exactly that query. `assetID(forPath:)` — which `resolveSource` tries
+    /// first, and which must still run and correctly return nil, since no
+    /// exact path matches — never references `filename`, so it is unaffected.
+    func testResolveSourceTreatsAQueryFailureAsAmbiguousNotFatal() async throws {
+        try await store.upsert(CatalogAsset(
+            id: "still-1", filename: "unresolvable-still.png",
+            absolutePath: root + "/kira/gallery/Kira/generated/unresolvable-still.png",
+            realm: .kira), explicitCollectionIDs: [])
+
+        var raw: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(dbPath, &raw), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(raw, "ALTER TABLE assets DROP COLUMN filename", nil, nil, nil),
+                       SQLITE_OK, "precondition: the fallback query's column must actually be gone")
+        sqlite3_close(raw)
+
+        let resolved = try await CatalogBackfill.resolveSource(
+            "/home/todd/.kira/studio/gallery/Deep/Elsewhere/unresolvable-still.png",
+            scope: .kira, trees: trees(), store: store)
+        XCTAssertNil(resolved, "a query failure must be treated exactly like ambiguity, "
+                     + "not propagate or crash the sweep")
+    }
+
+    /// R1 re-review: the previous test covers a PREPARE failure (the query
+    /// never runs at all). This covers the MID-DRAIN case specifically —
+    /// `sqlite3_step` returns a real row and only THEN fails — via
+    /// `resolveSource`'s `filenameLookup` test seam, since forcing a live
+    /// SQLite connection to fail mid-step deterministically is impractical
+    /// (see `SQLiteRowDrainTests`'s header comment; this is the same
+    /// established reason `drainSQLiteRows` itself takes `step` as a
+    /// closure). The stub drives the REAL `drainSQLiteRows` primitive through
+    /// a fabricated `[SQLITE_ROW, SQLITE_IOERR]` sequence, so this exercises
+    /// exactly the code path `assetIDs(forFilename:)` would hit for a genuine
+    /// mid-iteration failure — only the sqlite mechanics are faked, not
+    /// `resolveSource`'s own catch-and-log logic.
+    ///
+    /// Asserts both halves of the R1 re-review ask: no edge is resolved from
+    /// the row seen before the failure, AND the failure is actually logged
+    /// (naming the filename and the error) rather than swallowed — the exact
+    /// gap flagged: "a real query failure is indistinguishable from genuine
+    /// ambiguity" without this.
+    func testResolveSourceLogsAndSkipsOnAMidDrainStepFailure() async throws {
+        var stepsRemaining = [SQLITE_ROW, SQLITE_IOERR]
+        let stubbedLookup: (String, CatalogRealm?) async throws -> [String] = { _, _ in
+            var ids: [String] = []
+            let rc = drainSQLiteRows(step: { stepsRemaining.removeFirst() }) {
+                // Must never surface as the resolved id: a mid-drain failure
+                // has to look like ambiguity, never like the one row it
+                // happened to see before failing.
+                ids.append("row-seen-before-the-failure")
+            }
+            guard rc == SQLITE_DONE else {
+                throw CatalogError.stepFailed("stubbed SQLITE_IOERR after one row")
+            }
+            return ids
+        }
+
+        var resolved: String?
+        let logged = try await Self.capturingStderr {
+            resolved = try await CatalogBackfill.resolveSource(
+                "/home/todd/.kira/studio/gallery/Deep/Elsewhere/mid-drain-still.png",
+                scope: .kira, trees: trees(), store: store, filenameLookup: stubbedLookup)
+        }
+
+        XCTAssertNil(resolved, "no edge — a step failure must not resolve to the row seen before it")
+        XCTAssertTrue(logged.contains("mid-drain-still.png"),
+                      "the warning must name the filename; got: \(logged)")
+        XCTAssertTrue(logged.contains("stepFailed") || logged.contains("stubbed SQLITE_IOERR"),
+                      "the warning must carry the underlying error; got: \(logged)")
+    }
+
+    /// Redirects fd 2 to a pipe for the duration of `body`, returning
+    /// whatever was written to stderr. Used only to prove a warning was
+    /// actually logged, not swallowed — `resolveSource` writes via
+    /// `FileHandle.standardError`, same as every other log-and-partial site
+    /// in this module, so this is the only way to observe it from a test.
+    private static func capturingStderr(_ body: () async throws -> Void) async rethrows -> String {
+        let pipe = Pipe()
+        let savedStderr = dup(2)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, 2)
+        do {
+            try await body()
+        } catch {
+            dup2(savedStderr, 2)
+            close(savedStderr)
+            pipe.fileHandleForWriting.closeFile()
+            throw error
+        }
+        dup2(savedStderr, 2)
+        close(savedStderr)
+        pipe.fileHandleForWriting.closeFile()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(decoding: data, as: UTF8.self)
     }
 
     // MARK: - Provenance and precedence

@@ -201,7 +201,7 @@ public enum CatalogSchema {
     /// FTS5 has no ALTER. Rebuild the virtual table with the caption column and
     /// repopulate from `assets`, which is the source of truth for the text.
     private static func migrateFTS(db: OpaquePointer?) throws {
-        if ftsHasCaption(db: db) { return }
+        if try ftsHasCaption(db: db) { return }
         try exec(db, "DROP TABLE IF EXISTS assets_fts")
         try exec(db, """
             CREATE VIRTUAL TABLE assets_fts USING fts5(
@@ -221,6 +221,13 @@ public enum CatalogSchema {
     /// partially-applied migration (e.g. one column silently dropped by a
     /// failure mode the duplicate-column check doesn't recognize) can never
     /// pass unnoticed.
+    ///
+    /// The row loop itself now goes through `drainSQLiteRows` (#357): a plain
+    /// `while sqlite3_step(stmt) == SQLITE_ROW` cannot distinguish "PRAGMA
+    /// finished" from "the step failed partway through reading it", and the
+    /// latter used to surface as a bogus `missingColumns` error naming columns
+    /// that are actually present — the true cause (a step failure) never
+    /// reached the caller.
     private static func verifyNewColumnsPresent(db: OpaquePointer?) throws {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "PRAGMA table_info(assets)", -1, &stmt, nil) == SQLITE_OK else {
@@ -229,8 +236,12 @@ public enum CatalogSchema {
         }
         defer { sqlite3_finalize(stmt) }
         var existing = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
             if let c = sqlite3_column_text(stmt, 1) { existing.insert(String(cString: c)) }
+        }
+        guard rc == SQLITE_DONE else {
+            throw CatalogSchemaError.execFailed(
+                "PRAGMA table_info(assets)", String(cString: sqlite3_errmsg(db)))
         }
         let missing = newColumns.map(\.0).filter { !existing.contains($0) }
         if !missing.isEmpty {
@@ -238,16 +249,26 @@ public enum CatalogSchema {
         }
     }
 
-    private static func ftsHasCaption(db: OpaquePointer?) -> Bool {
+    /// Whether `assets_fts` already carries the `caption` column, deciding
+    /// whether `migrateFTS` needs to rebuild it. Now throws on a mid-read
+    /// step failure (#357) instead of reporting "no, rebuild it" — a false
+    /// negative here silently drops and recreates the FTS index on every
+    /// startup rather than surfacing the real I/O problem.
+    private static func ftsHasCaption(db: OpaquePointer?) throws -> Bool {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "PRAGMA table_info(assets_fts)", -1, &stmt, nil) == SQLITE_OK else {
             return false
         }
         defer { sqlite3_finalize(stmt) }
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let c = sqlite3_column_text(stmt, 1), String(cString: c) == "caption" { return true }
+        var found = false
+        let rc = drainSQLiteRows(step: { sqlite3_step(stmt) }) {
+            if let c = sqlite3_column_text(stmt, 1), String(cString: c) == "caption" { found = true }
         }
-        return false
+        guard rc == SQLITE_DONE else {
+            throw CatalogSchemaError.execFailed(
+                "PRAGMA table_info(assets_fts)", String(cString: sqlite3_errmsg(db)))
+        }
+        return found
     }
 
     private static func seed(db: OpaquePointer?) throws {

@@ -75,6 +75,11 @@ struct GalleryView: View {
     /// Separate from `errorMessage`, which a successful load clears: a refused
     /// orphan sweep is the one thing the user must still see afterwards.
     @State private var pruneWarning: String?
+    /// Set when Select All's filter matched more than
+    /// `CatalogStore.idsHardCap` assets — the selection is a prefix, not
+    /// everything, and that must be visible rather than presented as complete
+    /// (R1 review correction on #271).
+    @State private var selectAllTruncatedWarning: String?
 
     // Multi-selection (compare, bulk delete)
     @State private var selectedIds: Set<String> = []
@@ -238,6 +243,9 @@ struct GalleryView: View {
                 }
                 if let warning = pruneWarning {
                     errorBanner(warning) { pruneWarning = nil }
+                }
+                if let warning = selectAllTruncatedWarning {
+                    errorBanner(warning) { selectAllTruncatedWarning = nil }
                 }
 
                 // Gallery grid
@@ -1945,12 +1953,42 @@ struct GalleryView: View {
         filteredAssets.filter { selectedIds.contains($0.id) }
     }
 
-    /// Select every asset in the current view. The grid normally loads one
-    /// page (`loadLimit`); if that page is full there may be more rows in
-    /// scope, so raise the limit to the full scope and reload first — a
-    /// "select all" that silently stops at the page boundary selects an
-    /// arbitrary 500 of a 3,000-image gallery.
+    /// Select every asset in the current view.
+    ///
+    /// Catalog-backed (#271): a fixed page size was never the right shape for
+    /// "select all" — raising it to a bigger fixed number (`fullScopeLimit`,
+    /// below) just moves the same truncation to a bigger gallery, and
+    /// `CatalogStore`'s HTTP layer additionally clamped any page fetched over
+    /// the network at 500 regardless of the limit asked for. `allMatchingIDs`
+    /// asks the dedicated ids-only query instead — no page, no clamp, just
+    /// every id the current filter matches (up to `CatalogStore.idsHardCap`,
+    /// 100k) — and that COUNT sizes the reload, so the grid still gets full
+    /// `DAMAsset` rows for the client-side filters below (folder, favorites,
+    /// NSFW, persona, color label, content mode, character) to run over.
+    /// `.intersection(ids)` keeps the final selection to exactly what the
+    /// server said matched, belt and braces alongside those client filters.
+    ///
+    /// `result.truncated` (R1 review correction): `idsHardCap` itself can cut
+    /// off a filter matching more than 100k assets. That must surface as a
+    /// visible warning, not a selection that quietly looks complete — the
+    /// same silent-truncation failure #271 exists to fix, one layer down.
+    ///
+    /// Local-store fallback (no catalog): unchanged — raise to the full scope
+    /// and reload first, since there is no ids-only query to ask instead.
     private func selectAll() async {
+        if let browser {
+            let result = await browser.allMatchingIDs()
+            if loadLimit < result.ids.count {
+                loadLimit = result.ids.count
+                await loadAssets()
+            }
+            selectedIds = Set(filteredAssets.map(\.id)).intersection(result.ids)
+            selectAllTruncatedWarning = result.truncated
+                ? "Select All matched more than \(CatalogStore.idsHardCap) assets — "
+                  + "only the first \(CatalogStore.idsHardCap) are selected."
+                : nil
+            return
+        }
         if loadLimit < Self.fullScopeLimit && assets.count >= loadLimit {
             loadLimit = Self.fullScopeLimit
             await loadAssets()
