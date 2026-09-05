@@ -663,10 +663,14 @@ public struct LoRAApplicator {
         } else {
             logger?.info("Dynamic LoRA applied to \(appliedCount) layers")
         }
-        // A LoRA can be 100% LoKr (no plain lora_down/lora_up pairs at all), in
-        // which case appliedCount is legitimately 0 here even though applyLoKr
-        // above matched every layer — check hasLoKr too before warning.
-        if appliedCount == 0 && !loraWeights.hasLoKr {
+        // Only the low-rank PAIR path can be "incompatible" here: a file that
+        // offered lora_up/down pairs, none of which matched a module. A file
+        // with no pairs at all (offered == 0) is not a mismatch — it is a pure
+        // LoKr adapter (applied in-place above), a densified LoKr routed to the
+        // delta path (lokrWeights emptied by LoKrDensifier, so hasLoKr is false
+        // yet deltas carry it), or a pure bare-parameter .diff file like Kroma.
+        // Warn only when pairs were genuinely offered and all failed to bind.
+        if appliedCount == 0 && offered > 0 && !loraWeights.hasLoKr {
             logger?.warning("LoRA loaded but 0 layers matched the base model. The LoRA may be incompatible with this model architecture.")
         }
         if !unbound.isEmpty {
