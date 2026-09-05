@@ -22,7 +22,8 @@ enum TestData {
         contentMode: String? = nil,
         characterName: String? = nil,
         width: Int? = 1024,
-        height: Int? = 1024
+        height: Int? = 1024,
+        source: String? = nil
     ) -> DAMAsset {
         DAMAsset(
             id: id,
@@ -46,7 +47,8 @@ enum TestData {
             rating: rating,
             favorite: favorite,
             contentMode: contentMode,
-            characterName: characterName
+            characterName: characterName,
+            source: source
         )
     }
 

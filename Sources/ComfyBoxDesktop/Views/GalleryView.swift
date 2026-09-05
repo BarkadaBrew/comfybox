@@ -1751,7 +1751,16 @@ struct GalleryView: View {
     }
 
     private func toggleFavorite(_ asset: DAMAsset) async {
-        let updated = DAMAsset(
+        await updateAsset(Self.toggledFavorite(asset))
+    }
+
+    /// `asset` with `favorite` flipped and `modifiedAt` bumped, every other
+    /// field carried over unchanged — including `source` (#268: this rebuild
+    /// used to omit it, dropping a favorited Kira/Bree render out of its
+    /// persona section back into the main gallery). A static, pure transform
+    /// so the field-preservation is directly unit-testable without a store.
+    static func toggledFavorite(_ asset: DAMAsset, now: Date = Date()) -> DAMAsset {
+        DAMAsset(
             id: asset.id,
             kind: asset.kind,
             filename: asset.filename,
@@ -1761,7 +1770,7 @@ struct GalleryView: View {
             width: asset.width,
             height: asset.height,
             createdAt: asset.createdAt,
-            modifiedAt: Date(),
+            modifiedAt: now,
             ingestedAt: asset.ingestedAt,
             orphaned: asset.orphaned,
             prompt: asset.prompt,
@@ -1773,9 +1782,9 @@ struct GalleryView: View {
             rating: asset.rating,
             favorite: !asset.favorite,
             contentMode: asset.contentMode,
-            characterName: asset.characterName
+            characterName: asset.characterName,
+            source: asset.source
         )
-        await updateAsset(updated)
     }
 
     private func revealInFinder(_ asset: DAMAsset) {
