@@ -213,17 +213,7 @@ public actor DAMStore {
         sqlite3_bind_text(stmt, 1, (asset.absolutePath as NSString).utf8String, -1, SQLITE_TRANSIENT)
         guard sqlite3_step(stmt) == SQLITE_ROW,
               let id = columnText(stmt, 0), id != asset.id else { return asset }
-        return DAMAsset(
-            id: id, kind: asset.kind, filename: asset.filename,
-            absolutePath: asset.absolutePath, fileSize: asset.fileSize,
-            sha256: asset.sha256, width: asset.width, height: asset.height,
-            createdAt: asset.createdAt, modifiedAt: asset.modifiedAt,
-            ingestedAt: asset.ingestedAt, orphaned: asset.orphaned,
-            prompt: asset.prompt, negativePrompt: asset.negativePrompt,
-            seed: asset.seed, steps: asset.steps, guidance: asset.guidance,
-            modelFamily: asset.modelFamily, rating: asset.rating, favorite: asset.favorite,
-            contentMode: asset.contentMode, characterName: asset.characterName,
-            source: asset.source)
+        return asset.copy(with: DAMAsset.Mutation(id: .value(id)))
     }
 
     /// Delete rows whose backing file no longer exists (deleted out from
@@ -896,31 +886,24 @@ public actor DAMStore {
             return asset
         }
 
-        return DAMAsset(
-            id: existing.id,
-            kind: asset.kind,
-            filename: asset.filename,
-            absolutePath: asset.absolutePath,
-            fileSize: asset.fileSize,
-            sha256: asset.sha256 ?? existing.sha256,
-            width: asset.width ?? existing.width,
-            height: asset.height ?? existing.height,
-            createdAt: asset.createdAt,
-            modifiedAt: asset.modifiedAt,
-            ingestedAt: existing.ingestedAt,
-            orphaned: asset.orphaned,
-            prompt: asset.prompt ?? existing.prompt,
-            negativePrompt: asset.negativePrompt ?? existing.negativePrompt,
-            seed: asset.seed ?? existing.seed,
-            steps: asset.steps ?? existing.steps,
-            guidance: asset.guidance ?? existing.guidance,
-            modelFamily: asset.modelFamily ?? existing.modelFamily,
-            rating: existing.rating,
-            favorite: existing.favorite,
-            contentMode: asset.contentMode ?? existing.contentMode,
-            characterName: asset.characterName ?? existing.characterName,
-            source: asset.source ?? existing.source
-        )
+        return asset.copy(with: DAMAsset.Mutation(
+            id: .value(existing.id),
+            sha256: .value(asset.sha256 ?? existing.sha256),
+            width: .value(asset.width ?? existing.width),
+            height: .value(asset.height ?? existing.height),
+            ingestedAt: .value(existing.ingestedAt),
+            prompt: .value(asset.prompt ?? existing.prompt),
+            negativePrompt: .value(asset.negativePrompt ?? existing.negativePrompt),
+            seed: .value(asset.seed ?? existing.seed),
+            steps: .value(asset.steps ?? existing.steps),
+            guidance: .value(asset.guidance ?? existing.guidance),
+            modelFamily: .value(asset.modelFamily ?? existing.modelFamily),
+            rating: .value(existing.rating),
+            favorite: .value(existing.favorite),
+            contentMode: .value(asset.contentMode ?? existing.contentMode),
+            characterName: .value(asset.characterName ?? existing.characterName),
+            source: .value(asset.source ?? existing.source)
+        ))
     }
 
     private var lastError: String {

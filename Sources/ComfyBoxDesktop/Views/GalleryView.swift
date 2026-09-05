@@ -1768,31 +1768,10 @@ struct GalleryView: View {
     /// persona section back into the main gallery). A static, pure transform
     /// so the field-preservation is directly unit-testable without a store.
     static func toggledFavorite(_ asset: DAMAsset, now: Date = Date()) -> DAMAsset {
-        DAMAsset(
-            id: asset.id,
-            kind: asset.kind,
-            filename: asset.filename,
-            absolutePath: asset.absolutePath,
-            fileSize: asset.fileSize,
-            sha256: asset.sha256,
-            width: asset.width,
-            height: asset.height,
-            createdAt: asset.createdAt,
-            modifiedAt: now,
-            ingestedAt: asset.ingestedAt,
-            orphaned: asset.orphaned,
-            prompt: asset.prompt,
-            negativePrompt: asset.negativePrompt,
-            seed: asset.seed,
-            steps: asset.steps,
-            guidance: asset.guidance,
-            modelFamily: asset.modelFamily,
-            rating: asset.rating,
-            favorite: !asset.favorite,
-            contentMode: asset.contentMode,
-            characterName: asset.characterName,
-            source: asset.source
-        )
+        asset.copy(with: DAMAsset.Mutation(
+            modifiedAt: .value(now),
+            favorite: .value(!asset.favorite)
+        ))
     }
 
     private func revealInFinder(_ asset: DAMAsset) {
