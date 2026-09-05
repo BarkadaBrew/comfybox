@@ -5597,6 +5597,11 @@ public final class WarmServer {
     for (key, value) in [
       ("model", payload.model as Any?), ("steps", payload.steps as Any?),
       ("guidance", payload.guidance as Any?), ("vae", payload.vae as Any?),
+      // #154: a preset-owned schedule shift must survive a crash-recovery
+      // replay, exactly like the preset-owned model/steps/guidance/vae — a
+      // replayed body that dropped it would silently render on the model's
+      // own schedule instead.
+      ("shift", payload.shift as Any?),
     ] where object[key] == nil {
       if let value {
         object[key] = value
@@ -7263,6 +7268,10 @@ public struct ImageJobStatus: Codable, Sendable {
   /// #282 review r1: the same additive markers the sync response carries.
   public let warmDefaultSkipped: String?
   public let loraReload: Bool?
+  /// #154: `applied_shift` — the same flat echo the sync response carries, so
+  /// an async caller can verify its schedule the same way. Absent until the
+  /// job succeeds, and absent on a render that used the model's own schedule.
+  public let appliedShift: Float?
   /// comfybox#283/#217: the last 5 recorded lifecycle events for this job id
   /// (see QueueLifecycleLedger.swift), newest last. `var` with an in-line
   /// default (rather than an `init` parameter) so every existing call site
@@ -7283,7 +7292,8 @@ public struct ImageJobStatus: Codable, Sendable {
     presetStackMismatch: Bool? = nil,
     memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
     loraStackOrigin: String? = nil,
-    warmDefaultSkipped: String? = nil, loraReload: Bool? = nil
+    warmDefaultSkipped: String? = nil, loraReload: Bool? = nil,
+    appliedShift: Float? = nil
   ) {
     self.jobId = jobId
     self.status = status
@@ -7304,6 +7314,7 @@ public struct ImageJobStatus: Codable, Sendable {
     self.loraStackOrigin = loraStackOrigin
     self.warmDefaultSkipped = warmDefaultSkipped
     self.loraReload = loraReload
+    self.appliedShift = appliedShift
   }
 }
 
@@ -7337,6 +7348,8 @@ private final class ImageJob: @unchecked Sendable {
   var loraStackOrigin: String?
   var warmDefaultSkipped: String?
   var loraReload: Bool?
+  /// #154: set from the result on success — the schedule shift that applied.
+  var appliedShift: Float?
 
   init(id: String, source: String) {
     self.id = id
@@ -7358,7 +7371,8 @@ private final class ImageJob: @unchecked Sendable {
       presetStackMismatch: presetStackMismatch,
       memoryEstimateBytes: memoryEstimateBytes, memoryAvailableBytes: memoryAvailableBytes,
       loraStackOrigin: loraStackOrigin,
-      warmDefaultSkipped: warmDefaultSkipped, loraReload: loraReload
+      warmDefaultSkipped: warmDefaultSkipped, loraReload: loraReload,
+      appliedShift: appliedShift
     )
   }
 }
@@ -7519,6 +7533,7 @@ final class ImageJobTracker: @unchecked Sendable {
       job.loraStackOrigin = result.loraStackOrigin ?? job.loraStackOrigin
       job.warmDefaultSkipped = result.warmDefaultSkipped ?? job.warmDefaultSkipped
       job.loraReload = result.loraReload ?? job.loraReload
+      job.appliedShift = result.appliedShift ?? job.appliedShift
       job.completedAt = Date()
     }
     lock.unlock()
@@ -10695,7 +10710,11 @@ private actor WarmServerCoordinator {
           memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
           loraStackOrigin: payload.loraStackOrigin,
           warmDefaultSkipped: payload.warmDefaultSkipped,
-          loraReload: payload.loraReload
+          loraReload: payload.loraReload,
+          // #154: echo the explicit ModelSamplingAuraFlow shift this render
+          // applied — from the request or from its named preset. nil (the
+          // key absent) means the model's own schedule ran, as before #154.
+          appliedShift: payload.shift
         )
       )
     } catch {
@@ -11110,7 +11129,11 @@ private actor WarmServerCoordinator {
         memoryEstimateBytes: payload.memoryEstimateBytes, memoryAvailableBytes: payload.memoryAvailableBytes,
         loraStackOrigin: payload.loraStackOrigin,
         warmDefaultSkipped: payload.warmDefaultSkipped,
-        loraReload: payload.loraReload))
+        loraReload: payload.loraReload,
+        // #154: the same flat answer the other families give. On Krea 2 the
+        // value is `mu` (ModelSamplingFlux), and `applied.shift` /
+        // `applied.shift_source` beside it carry the full provenance.
+        appliedShift: payload.shift))
     } catch {
       failedRenderCount += 1
       lastError = error.localizedDescription
@@ -11400,7 +11423,9 @@ private actor WarmServerCoordinator {
           outputPath: outputURL.path,
           durationMs: durationMs,
           // I4: the ControlNet pipeline is what rendered — read ITS adapters.
-          appliedLoras: appliedLoRAStates(from: control)
+          appliedLoras: appliedLoRAStates(from: control),
+          // #154: the ControlNet arm runs the same flow schedule.
+          appliedShift: request.shift
         )
       )
     } catch {
@@ -12192,11 +12217,24 @@ struct GeneratePayload: Sendable {
   /// sampler (`validateKrea2TierGates`), never a silent drop. Absent/false is
   /// byte-identical to today.
   let bongmath: Bool?
-  /// Explicit schedule shift (FDD-krea2-raw-recipe D3, Addendum A.1). Krea 2
-  /// only: nil = the resolution-dependent default; a value IS `mu` (ComfyUI's
-  /// `ModelSamplingFlux(shift=…)` parameterisation — `1.15` reproduces the
-  /// published grid). Validated by `validateShift(_:family:)` → 400, never clamped.
-  let shift: Float?
+  /// Explicit schedule shift. nil = the model's own resolution-dependent
+  /// default; a value is validated by `validateShift(_:family:)` → 400, never
+  /// clamped, and refused on a family that does not read it.
+  ///
+  /// The two families that honour it mean DIFFERENT things by it:
+  ///
+  /// - Krea 2 (FDD-krea2-raw-recipe D3, Addendum A.1): the value IS `mu`,
+  ///   ComfyUI's `ModelSamplingFlux(shift=…)` **log**-shift (`1.15`
+  ///   reproduces the published grid).
+  /// - Z-Image / Flux 1 (comfybox#154, the family Zeta Chroma runs on): the
+  ///   value is the LINEAR shift of ComfyUI's `ModelSamplingAuraFlow`,
+  ///   `σ' = shift·σ / (1 + (shift − 1)·σ)`. `1.0` is the identity; Zeta
+  ///   Chroma's author recommends `3.0`. It replaces the model's own shift and
+  ///   the resolution-dependent `mu` for that render.
+  ///
+  /// `var` since #154, the same rule as `steps`/`guidance`/`vae`: filled from
+  /// the named `preset`'s DECLARED `shift` when the request carried none.
+  var shift: Float?
   let dype: String?
   // Phase 3: Inpainting data (set by bridge, not by HTTP API)
   let inpaintImageData: Data?
@@ -13296,6 +13334,28 @@ struct GenerateResponse: Encodable, Sendable {
   /// MEASURE the churn that per-request correctness costs.
   let loraReload: Bool?
 
+  /// #154: `applied_shift` — the explicit schedule shift this render actually
+  /// applied, whether it came from the request or from its named preset.
+  ///
+  /// ABSENT means the render used the model's own schedule (the
+  /// resolution-dependent `mu`, or the `scheduler_config.json` shift) — which
+  /// is every render made before #154 and every render that names no shift, so
+  /// the key's absence is the old contract, unchanged.
+  ///
+  /// A flat field rather than a second `applied` block: `applied`
+  /// (``RenderRecipe``) is Krea 2 only by D12, and the family this ticket is
+  /// about (`.flux1`, where Zeta Chroma runs) emits none. Krea 2 sets BOTH —
+  /// `applied.shift` with its `applied.shift_source`, and this — so "did my
+  /// shift apply?" has one answer on every family that honours the field.
+  ///
+  /// There is deliberately no `applied_shift_source` twin here: on the flat
+  /// path the server cannot see the model's `scheduler_config.json` without a
+  /// new return channel from the pipeline, and a guessed `"dynamic"` label
+  /// would be exactly the confident-but-unverified claim this codebase keeps
+  /// out of its records. `applied.shift_source` remains the place that
+  /// question is answered, for the family that reads back a full recipe.
+  let appliedShift: Float?
+
   /// The record itself, for Swift readers that do not care about the
   /// absent-vs-null distinction.
   var appliedRecord: RenderRecipe? { applied?.record }
@@ -13306,7 +13366,8 @@ struct GenerateResponse: Encodable, Sendable {
        presetStackMismatch: Bool? = nil,
        memoryEstimateBytes: UInt64? = nil, memoryAvailableBytes: UInt64? = nil,
        loraStackOrigin: String? = nil,
-       warmDefaultSkipped: String? = nil, loraReload: Bool? = nil) {
+       warmDefaultSkipped: String? = nil, loraReload: Bool? = nil,
+       appliedShift: Float? = nil) {
     self.success = success
     self.outputPath = outputPath
     self.durationMs = durationMs
@@ -13322,6 +13383,7 @@ struct GenerateResponse: Encodable, Sendable {
     self.loraStackOrigin = loraStackOrigin
     self.warmDefaultSkipped = warmDefaultSkipped
     self.loraReload = loraReload
+    self.appliedShift = appliedShift
   }
 }
 
