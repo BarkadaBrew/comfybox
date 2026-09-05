@@ -2672,12 +2672,59 @@ struct ZImageCLI {
       }
     }
 
+    // comfybox#153: this bridge NEVER starts a server — launchd
+    // (com.barkadabrew.comfybox) owns the engine lifecycle. Connect to
+    // whatever answers on --port (healthy or not); fail loudly instead of
+    // spawning anything when nothing does.
+    let portOccupied = MCPPortProbe.isOccupied(host: host, port: port)
+    let decision = MCPBridgeStartupPolicy.decide(port: port, portOccupied: portOccupied)
+
+    switch decision.action {
+    case .connect:
+      fputs("[comfybox-mcp] \(decision.detail)\n", stderr)
+      fputs("[comfybox-mcp] \(host):\(port) — \(fetchHealthSummary(host: host, port: port))\n", stderr)
+
+    case .failLoudly:
+      fputs("[comfybox-mcp] \(decision.detail)\n", stderr)
+      _exit(1)
+    }
+
     // Print server info to stderr (stdout is reserved for JSON-RPC)
     fputs("ComfyBox MCP server v\(MCPServer.version)\n", stderr)
     fputs("Bridging to WarmServer at \(host):\(port)\n", stderr)
 
     let server = MCPServer(host: host, port: port)
     server.run()
+  }
+
+  /// Best-effort human-readable summary of whatever answered `/health` on
+  /// `host:port`, for the connect-path stderr report (the bridge never
+  /// spawns, but it still says what it found — comfybox#153).
+  private static func fetchHealthSummary(host: String, port: UInt16) -> String {
+    let client = WarmServerClient(host: host, port: port)
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = Box("no response before timeout")
+    let task = Task {
+      defer { semaphore.signal() }
+      do {
+        let (status, data) = try await client.get("/health")
+        if status == 200 {
+          var summary = "responded 200 OK"
+          if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+             let model = json["model"] as? String {
+            summary += " (model: \(model))"
+          }
+          box.value = summary
+        } else {
+          box.value = "responded HTTP \(status) (unhealthy or unrecognized)"
+        }
+      } catch {
+        box.value = "connected but /health failed: \(error.localizedDescription)"
+      }
+    }
+    _ = semaphore.wait(timeout: .now() + 2.0)
+    task.cancel()
+    return box.value
   }
 
   private static func printMCPUsage() {
@@ -2692,6 +2739,13 @@ struct ZImageCLI {
 
     The MCP server reads JSON-RPC requests from stdin and writes responses
     to stdout. All logging goes to stderr. Runs until stdin closes.
+
+    This bridge NEVER starts a server (comfybox#153): launchd
+    (com.barkadabrew.comfybox) owns the engine lifecycle. If a server is
+    already listening on --port, healthy or not, the bridge connects to it.
+    If nothing is listening, the bridge fails loudly to stderr and exits —
+    it does not spawn one. Start the managed engine with:
+      launchctl kickstart -k gui/$(id -u)/com.barkadabrew.comfybox
 
     Registration:
       claude mcp add comfybox -- comfybox mcp --port 7870

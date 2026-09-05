@@ -30,6 +30,16 @@ ssh user@mac-host "cd /path/to/comfybox && .build/release/ComfyBox mcp --port 78
 
 The daemon spawns this command as a child process. Tools are registered as `mcp_comfybox__<tool_name>`.
 
+### The bridge never starts a server (comfybox#153)
+
+`ComfyBox mcp` is connect-only. At startup it checks `--port`: if anything is listening — healthy or not — it connects to that and reports what it found to stderr. If nothing is listening, it fails loudly to stderr and exits immediately. It never spawns a `ComfyBox serve` process itself, under any flag or environment variable.
+
+Lifecycle ownership of the engine belongs to launchd (`com.barkadabrew.comfybox`) alone. This is what fixes comfybox#153 (the bridge racing a manual server restart and colliding with it, or masking a freshly-rebuilt manual server behind one it started itself) — the bridge has no path that can start a second engine, so there is nothing left to race. If the port is free, start the managed engine with:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.barkadabrew.comfybox
+```
+
 ## Tools
 
 ### Generation
