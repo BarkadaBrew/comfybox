@@ -148,35 +148,58 @@ What a bridge client should know:
   this fix, a plain interrupt silently abandoned the invisible video instead,
   even though `/health` and `/v1/queue` showed the image job as active the
   whole time. See `/v1/queue/interrupt`'s `target` field below to reach the
-  video specifically.
+  video specifically — the bridge's own `/interrupt` has no `target` and
+  always means "the active render".
 - **The queue proceeds immediately** to the next job, and the interrupted
   render leaves no output file behind.
 
 ### `/v1/queue/interrupt` gains an optional `target` (comfybox#362)
 
-`POST /v1/queue/interrupt` (and the bridge's `POST /interrupt`) now accepts an
-optional JSON body:
+`POST /v1/queue/interrupt` now accepts an optional JSON body:
 
 ```json
 {"target": "active"}
 ```
 
-- **`target` omitted, `null`, or `"active"` (default)** — cancel whatever
-  `/health`/`/v1/queue` currently report as the active render. Outside a
-  preemption episode this is the render itself, exactly as before. DURING an
-  episode it is the preempting IMAGE job, not the checkpointed video
-  underneath it — the two now always agree.
+> **The bridge's own `POST /interrupt` takes no body.** It stays exactly
+> ComfyUI-shaped — Krita and every other ComfyUI client send an empty POST and
+> would not know what to put in one — so it always acts on the DEFAULT target
+> (whatever `/health` shows as active), which is what a Cancel button wants
+> anyway. `target` is a `/v1/queue/interrupt` feature only; a body sent to the
+> bridge's `/interrupt` is ignored.
+
+- **`target` omitted, `null`, `""`, or `"active"` (default)** — cancel
+  whatever `/health`/`/v1/queue` currently report as the active render.
+  Outside a preemption episode this is the render itself, exactly as before.
+  DURING an episode it is the preempting IMAGE job, not the checkpointed video
+  underneath it — the two now always agree. With nothing rendering, the
+  response is the pre-#362 body unchanged (`200`, `interrupted: false`).
 - **`target: "video"`** — cancel the checkpointed/running video specifically,
   even while an episode has swapped `active` to a preempting image job. This
   is the pre-#362 (accidental) behaviour, now explicit and opt-in: the video
   is abandoned (its checkpoint dropped, not resumed) and the active image job
-  is left alone.
+  is left alone. If there is no video anywhere — no episode and no video
+  render — this returns **HTTP 404**: an *explicit* target that names nothing
+  is a client error, and only the default target keeps the legacy
+  `interrupted: false` body.
 - **`target: "<job id>"`** — a job id resolves to whichever of the two it
   actually names (the active job's id behaves like `"active"`; the
-  checkpointed video's own id behaves like `"video"`). A job id that matches
+  checkpointed video's ids behave like `"video"`). A job id that matches
   neither — including a merely-*pending* job's id, which this route never
   touches (`DELETE /v1/queue/{id}` cancels those) — returns HTTP 404 instead
   of a silent `interrupted: false`.
+
+  **A video answers to BOTH of its ids.** comfybox#283 documents that a video
+  job's queue id (the one `/v1/queue` and `/health.active_job_id` show) is not
+  the same as its `/v1/video/status/{id}` id (the one the client that
+  submitted it holds). Either one targets the video. `interrupted_job_id` in
+  the response always reports the **queue** id, whichever id you targeted with.
+
+**Target vocabulary.** `"active"` and `"video"` are reserved words, matched
+case-insensitively and with surrounding whitespace trimmed (`" VIDEO "`
+works). Everything else is a job id, matched **exactly** after trimming — ids
+are opaque and their case is significant (a `UUID` renders upper-case), so
+they are never case-folded.
 
 The response gains two additive fields, present only when something was
 actually cancelled:
@@ -187,7 +210,8 @@ actually cancelled:
 
 `interrupted_kind` is a `QueueJobKind` value (`"generate"`, `"video"`, …). A
 client that only reads `success`/`interrupted` sees no change from before
-#362.
+#362: with no body and nothing running, the response is byte-identical to what
+it has always been.
 
 ### Workflow Format
 

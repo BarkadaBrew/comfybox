@@ -278,6 +278,51 @@ struct SyncCancelAccepted: Codable, Sendable {
 // `WarmServerCoordinator.cancelActiveRender`, the async fallback used when
 // `ControlPlaneSyncFlag` is off) both consult, so they cannot disagree.
 
+/// One published render slot: the cancellable task AND the identity that
+/// names it, as a single value.
+///
+/// Review r1, finding 1 (atomic triple): the task handle and the job identity
+/// used to be separate fields, published by separate writes — the identity
+/// swap at the top of a preemption episode and the task republish that
+/// followed it were seconds apart on the actor, and the sync interrupt route
+/// reads the lock store from another thread entirely. In that window a default
+/// interrupt cancelled the VIDEO while reporting the PREEMPTOR's id. Bundling
+/// them means `InterruptExecutor` consumes one value read under one lock, so
+/// the task it cancels and the id it reports can never describe different jobs.
+///
+/// Finding 3 (id namespaces): a video answers to TWO ids — `jobId` is the
+/// queue id (`/v1/queue`, `/health.active_job_id`) and `statusJobId` is the
+/// `/v1/video/status/{id}` id clients actually hold. comfybox#283 documents
+/// that they differ; both are published here so `target: <id>` matches either.
+struct PublishedRender: Sendable, Equatable {
+  /// The cancellable handle. `nil` means nothing is published in this slot.
+  let task: Task<Void, Never>?
+  /// The queue id — what `/v1/queue` and `/health.active_job_id` show, and
+  /// what `interrupted_job_id` reports.
+  let jobId: String?
+  /// comfybox#283: the `/v1/video/status/{id}` id, when it differs from
+  /// `jobId` (video jobs only; `nil` everywhere else).
+  let statusJobId: String?
+  /// `QueueJobKind` raw value ("generate", "video", …).
+  let kind: String?
+
+  static let none = PublishedRender(task: nil, jobId: nil, statusJobId: nil, kind: nil)
+
+  init(task: Task<Void, Never>?, jobId: String?, statusJobId: String? = nil, kind: String?) {
+    self.task = task
+    self.jobId = jobId
+    self.statusJobId = statusJobId
+    self.kind = kind
+  }
+
+  /// Does `id` name this render? Ids are opaque and matched EXACTLY (a UUID's
+  /// case is part of it) — only the reserved words `active`/`video` are
+  /// case-insensitive.
+  func matches(_ id: String) -> Bool {
+    (jobId != nil && id == jobId) || (statusJobId != nil && id == statusJobId)
+  }
+}
+
 /// What `/v1/queue/interrupt` should stop, resolved from the request's
 /// `target` against what is actually running. Pure — no `Task` in sight — so
 /// it is unit-testable without a render anywhere near it.
@@ -297,22 +342,44 @@ enum InterruptTargetResolution: Equatable {
   case unknownJobId
 }
 
+/// The `target` VOCABULARY (review r1, finding 6 — documented here because
+/// this enum is the only place that defines it):
+///
+/// - **omitted / `null` / `""` / `"active"`** — the active render, i.e.
+///   whatever `/health` and `/v1/queue` currently show. `""` is folded into
+///   the default rather than treated as a job id nothing can ever match.
+/// - **`"video"`** — the checkpointed (or directly running) video.
+/// - **anything else** — a job id, matched against the published renders.
+///
+/// The two reserved words are matched CASE-INSENSITIVELY and after trimming
+/// surrounding whitespace (`" VIDEO "` is `"video"`). Job ids are NOT: they
+/// are opaque identifiers whose case is significant (Foundation renders a
+/// `UUID` upper-case), so they are matched exactly, against the trimmed
+/// string.
 enum InterruptTarget {
-  /// `target` is the request body's raw (optional) field, verbatim. `nil` and
-  /// the literal `"active"` both mean "whatever health shows as active";
-  /// `"video"` is reserved for the checkpointed video; any other string is
-  /// treated as a job id and matched against what is actually running.
+  /// Normalise the request's raw `target` field: trim, and fold an empty
+  /// string into "absent" (both mean the default target).
+  static func normalize(_ target: String?) -> String? {
+    guard let target else { return nil }
+    let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// Resolve `target` against the two published render slots. Consumes the
+  /// whole `PublishedRender` values (review r1, finding 1) so the identity a
+  /// caller matched on and the task it will cancel come from one read.
   static func resolve(
-    target: String?, activeJobId: String?, checkpointedVideoJobId: String?
+    target: String?, active: PublishedRender, checkpointedVideo: PublishedRender
   ) -> InterruptTargetResolution {
-    switch target {
-    case nil, "active":
+    guard let name = normalize(target) else { return .active }
+    switch name.lowercased() {
+    case "active":
       return .active
     case "video":
       return .video
-    case let jobId?:
-      if let activeJobId, jobId == activeJobId { return .active }
-      if let checkpointedVideoJobId, jobId == checkpointedVideoJobId { return .video }
+    default:
+      if active.matches(name) { return .active }
+      if checkpointedVideo.matches(name) { return .video }
       return .unknownJobId
     }
   }
@@ -324,13 +391,57 @@ enum InterruptTarget {
 enum InterruptCancelOutcome: Equatable {
   /// Something was cancelled. `kind` is a `QueueJobKind` raw value.
   case cancelled(jobId: String?, kind: String?)
-  /// The resolved target (default "active", or an explicit "video") named a
-  /// real category but nothing is currently running there — not an error,
-  /// same as the pre-#362 `interrupted: false`.
+  /// The DEFAULT target (absent/`""`/`"active"`) with nothing rendering — not
+  /// an error, and byte-for-byte the pre-#362 response, which is what keeps
+  /// every existing client (none of which sends `target`) unchanged.
   case nothingToCancel
-  /// `target` was a job id that matched neither the active job nor the
-  /// checkpointed video — a 404, not a silent false.
+  /// `target` named something that is not there: a job id matching neither
+  /// published render, or an explicit `"video"` with no video anywhere. A 404,
+  /// not a silent false — an explicit target that names nothing is a client
+  /// error, while the legacy default target keeps the legacy body.
   case unknownTarget
+}
+
+/// Resolve `target` and cancel the matching task — the ONE implementation both
+/// `/v1/queue/interrupt` arms run (review r1, finding 2).
+///
+/// `LiveHealthState.cancelActiveRender` (the sync, no-actor-hop path) and
+/// `WarmServerCoordinator.cancelActiveRender` (the async fallback used when
+/// `ControlPlaneSyncFlag` is off) do not merely "consult the same resolver"
+/// and then each decide what to cancel — they call THIS, with the two
+/// published triples, so there is no second implementation to drift.
+enum InterruptExecutor {
+  static func cancel(
+    target: String?, active: PublishedRender, checkpointedVideo: PublishedRender
+  ) -> InterruptCancelOutcome {
+    switch InterruptTarget.resolve(
+      target: target, active: active, checkpointedVideo: checkpointedVideo) {
+    case .active:
+      guard let task = active.task else { return .nothingToCancel }
+      task.cancel()
+      return .cancelled(jobId: active.jobId, kind: active.kind)
+    case .video:
+      if let task = checkpointedVideo.task {
+        // A preemption episode is in progress: `active` points at the
+        // preemptor, so the video is reachable only through its own slot.
+        task.cancel()
+        return .cancelled(
+          jobId: checkpointedVideo.jobId ?? checkpointedVideo.statusJobId,
+          kind: QueueJobKind.video.rawValue)
+      }
+      if active.kind == QueueJobKind.video.rawValue, let task = active.task {
+        // No episode: the video itself IS the active render.
+        task.cancel()
+        return .cancelled(jobId: active.jobId, kind: active.kind)
+      }
+      // `"video"` is an EXPLICIT target, so naming a video that does not
+      // exist is a 404 — the same answer an unrecognised job id gets. Only
+      // the default target keeps the legacy `interrupted: false` body.
+      return .unknownTarget
+    case .unknownJobId:
+      return .unknownTarget
+    }
+  }
 }
 
 /// `/v1/queue/interrupt` request body. Entirely optional — an absent body (the
@@ -361,5 +472,34 @@ enum InterruptRouteResponse {
     case .unknownTarget:
       return (404, InterruptResponseBody(success: false, interrupted: false, interruptedJobId: nil, interruptedKind: nil))
     }
+  }
+}
+
+/// The `/v1/queue/interrupt` WIRE shape: request bytes in, response bytes out
+/// (review r1, finding 5). Both route arms — `WarmServer.syncInterruptResponse`
+/// and the async fallback in `respond(to:)` — run these, so the bytes on the
+/// wire cannot depend on which dispatch path served the request.
+enum InterruptRoute {
+  /// Decode the optional `target`. An ABSENT body (the pre-#362 shape), a
+  /// non-JSON body, `{}`, or `{"target": null}` all decode to `nil`, i.e. the
+  /// default target — this route has never required a body and still doesn't.
+  static func decodeTarget(from body: Data) -> String? {
+    guard !body.isEmpty else { return nil }
+    return (try? JSONDecoder().decode(InterruptRequestBody.self, from: body))?.target
+  }
+
+  /// The response, encoded exactly as the routes serve it (`HTTPResponse.json`
+  /// applies `.convertToSnakeCase`, so the additive fields go out as
+  /// `interrupted_job_id`/`interrupted_kind`).
+  static func response(for outcome: InterruptCancelOutcome) -> HTTPResponse {
+    let (status, body) = InterruptRouteResponse.build(from: outcome)
+    return .json(status: status, payload: body)
+  }
+
+  /// The audit-log line, shared so the two arms log the same event.
+  static func auditMessage(for body: InterruptResponseBody) -> String {
+    body.interrupted
+      ? "Interrupted \(body.interruptedKind ?? "active") render \(body.interruptedJobId ?? "")"
+      : "No matching active render"
   }
 }

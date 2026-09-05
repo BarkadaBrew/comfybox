@@ -92,12 +92,6 @@ extension XCTestCase {
       maxPendingRequests: maxPendingRequests, maxPendingModelOps: maxPendingModelOps,
       modelSpec: modelSpec)
     addTeardownBlock {
-      // comfybox#362: reset the DEBUG-only #218 admission bypass. Each probe
-      // owns a fresh coordinator (so this never leaked ACROSS tests), but
-      // nothing previously reset it WITHIN a test that flips it on for one
-      // assertion and needs the real gate for a later one — do it
-      // defensively here so no future test has to remember.
-      await probe.bypassVideoAdmission(false)
       // Bounded wait: a job that is legitimately finishing gets a moment; a
       // test that forgot to await its own work fails loudly rather than
       // silently reaching through to the live path.
@@ -112,6 +106,17 @@ extension XCTestCase {
           + "the loop's persistQueueState() delete the LIVE ~/.comfybox/queue-state.json. "
           + "Await every operation the test enqueues.",
         file: file, line: line)
+      // comfybox#362 (review r1, finding 6): reset the DEBUG-only #218
+      // admission bypass AFTER the drain, not before it. A `.localVideo` job
+      // still in flight — exactly the case the drain wait exists for — is
+      // admitted through `admitVideoForRender`, so clearing the bypass first
+      // could put the REAL ~65-80GB gate in front of a job this teardown is
+      // waiting to finish, turning a clean drain into a 20s timeout and a
+      // spurious failure. Each probe owns a fresh coordinator (so the bypass
+      // never leaked ACROSS tests); this reset is for the test that flips it
+      // on for one assertion and needs the real gate for a later one, and it
+      // is defensive so no future test has to remember.
+      await probe.bypassVideoAdmission(false)
     }
     return probe
   }
