@@ -32,7 +32,7 @@ final class ControlSurfaceParityTests: XCTestCase {
   /// assertions demand. (Counting tuples, not lines: `:1641`-style multi-tuple
   /// arms count once per tuple — the v1 line-count pin would have silently
   /// dropped `/v1/queue/resume`.)
-  private static let expectedWarmServerTuples = 91
+  private static let expectedWarmServerTuples = 93
   private static let expectedBridgeTuples = 17
 
   private static let repoRoot: URL = {
