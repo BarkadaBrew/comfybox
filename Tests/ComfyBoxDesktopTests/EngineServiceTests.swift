@@ -90,6 +90,24 @@ struct EngineServiceTests {
         let engine = EngineService()
         #expect(engine.queueInfo == nil)
     }
+
+    // MARK: - isLocalHost (#223 (c): Archive Gallery is local-server-only)
+
+    @Test("a freshly constructed EngineService (default 127.0.0.1) reports isLocalHost true")
+    func defaultEngineIsLocal() {
+        let engine = EngineService()
+        engine.serverHost = "127.0.0.1"
+        #expect(engine.isLocalHost)
+    }
+
+    @Test("EngineService.isLocalHost tracks serverHost changes")
+    func isLocalHostTracksServerHostChanges() {
+        let engine = EngineService()
+        engine.serverHost = "127.0.0.1"
+        #expect(engine.isLocalHost)
+        engine.serverHost = "10.0.100.232"
+        #expect(!engine.isLocalHost)
+    }
 }
 
 @Suite("Server response decoding")
@@ -449,5 +467,31 @@ struct QueueInfoTests {
         )
         #expect(info.currentJobId == "job-1")
         #expect(info.progressPercent == 42.0)
+    }
+}
+
+// MARK: - isLocalHost (#223 (c): Archive Gallery is local-server-only)
+//
+// The static check is pure — needs no MainActor and no EngineService
+// instance — so it stands alone here rather than inside the `@MainActor`
+// `EngineServiceTests` suite above (which also carries the two
+// instance-level `isLocalHost` tests, since those construct an
+// `EngineService` and do need that isolation).
+
+@Suite("EngineService.isLocalHost")
+struct EngineServiceIsLocalHostTests {
+    @Test("recognizes every loopback spelling this Mac actually reports")
+    func recognizesLoopback() {
+        #expect(EngineService.isLocalHost("127.0.0.1"))
+        #expect(EngineService.isLocalHost("localhost"))
+        #expect(EngineService.isLocalHost("::1"))
+    }
+
+    @Test("treats anything else, including this Mac's own LAN IP, as remote")
+    func treatsOtherHostsAsRemote() {
+        #expect(!EngineService.isLocalHost("10.0.100.232"))
+        #expect(!EngineService.isLocalHost("192.168.1.50"))
+        #expect(!EngineService.isLocalHost("comfybox.local"))
+        #expect(!EngineService.isLocalHost(""))
     }
 }

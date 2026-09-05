@@ -574,6 +574,8 @@ struct GalleryView: View {
                         Label("Archive \(selectedIds.count)", systemImage: "archivebox")
                     }
                     .controlSize(.small)
+                    .disabled(!archiveAvailable)
+                    .help(archiveUnavailableReason ?? "")
                 }
 
                 // Bulk delete
@@ -1048,6 +1050,7 @@ struct GalleryView: View {
                             requestArchive(isSelectMode && selectedIds.contains(asset.id)
                                 ? selectedAssetsList : [asset], folder: nil)
                         }
+                        .disabled(!archiveAvailable)
                         Divider()
                         Button("Delete…", role: .destructive) {
                             requestDelete([asset])
@@ -1329,6 +1332,7 @@ struct GalleryView: View {
                                         let ids = Set(folderAssignments.filter { $0.value == folder.id }.keys)
                                         Task { await requestArchiveFolder(ids: ids, folder: folder) }
                                     }
+                                    .disabled(!archiveAvailable)
                                     Button("Delete Folder", role: .destructive) {
                                         Task { await deleteFolder(folder) }
                                     }
@@ -1932,6 +1936,32 @@ struct GalleryView: View {
         filteredAssets.filter { selectedIds.contains($0.id) }
     }
 
+    // MARK: - Archive availability (#223 (c))
+
+    /// "Archive Gallery is local-server-only" — `GalleryArchiver` moves files
+    /// via `FileManager`/`ingestor.deleteAsset` against the CONNECTED engine's
+    /// own disk, not over the network, so a Desktop pointed at a remote
+    /// server cannot actually archive anything today: there is no server
+    /// route to route the move through (filed as a follow-up; see the PR
+    /// body). Rather than let the action silently no-op against the wrong
+    /// filesystem, every Archive entry point is disabled while remote, with
+    /// `archiveUnavailableReason` as its tooltip. `engine == nil` (previews,
+    /// tests that omit it) defaults to available — there is no remote
+    /// connection to be wary of.
+    private var archiveAvailable: Bool { Self.archiveAllowed(engineIsLocal: engine?.isLocalHost) }
+
+    private var archiveUnavailableReason: String? {
+        archiveAvailable ? nil : "Archiving isn't available yet for a remote server — only for this Mac's own gallery."
+    }
+
+    /// The decision itself, isolated from the view host so it's directly
+    /// unit-testable (there is no ViewInspector in this repo). `nil` means
+    /// no `EngineService` is attached (previews, tests) — defaults to
+    /// available, since there is no remote connection to be wary of.
+    static func archiveAllowed(engineIsLocal: Bool?) -> Bool {
+        engineIsLocal ?? true
+    }
+
     /// Select every asset in the current view.
     ///
     /// Catalog-backed (#271): a fixed page size was never the right shape for
@@ -2179,9 +2209,12 @@ struct GalleryView: View {
     // MARK: - Archiving
 
     /// Stage assets (and, for a folder archive, the folder itself) and show
-    /// the archive sheet.
+    /// the archive sheet. Re-checks `archiveAvailable` at the mutation point
+    /// (not just at whichever menu/button happened to be disabled) so a
+    /// server-connection change racing a click can't slip a remote archive
+    /// through — belt and braces alongside the `.disabled` entry points.
     private func requestArchive(_ toArchive: [DAMAsset], folder: DAMFolder?) {
-        guard !toArchive.isEmpty else { return }
+        guard !toArchive.isEmpty, archiveAvailable else { return }
         archiveTargets = toArchive
         archiveFolder = folder
         showArchiveSheet = true
@@ -2231,6 +2264,27 @@ struct GalleryView: View {
             return damError.localizedDescription
         }
         return "Orphan cleanup skipped: \(error.localizedDescription)"
+    }
+
+    /// What the lightbox shows, and whether it should force `AppContentGate`
+    /// closed again, for a remote-fetch failure (#223 (a)): a raw HTTP status
+    /// number must never surface in the browse view, and an auth-shaped
+    /// failure means the session the gate is holding open isn't good any
+    /// more — re-locking routes the user back to the SAME unlock prompt that
+    /// already gives a wrong password a clean inline error, rather than
+    /// dead-ending on a banner in the grid/lightbox. Pure and directly
+    /// unit-testable — there is no ViewInspector in this repo, and
+    /// `GalleryLightbox` (the caller) is file-private.
+    static func remoteLoadOutcome(for error: Error) -> (message: String, relock: Bool) {
+        guard let fetchError = error as? RemoteMediaCache.FetchError else {
+            return (error.localizedDescription, false)
+        }
+        switch fetchError {
+        case .unauthorized:
+            return ("This server rejected the session — content is locked again. Unlock (⌃⌥⌘U) and re-enter the password.", true)
+        case .notFound, .server:
+            return (fetchError.localizedDescription, false)
+        }
     }
 
     /// Resolves the "Edited from" source asset for an edit sidecar's `source_path`
@@ -2713,21 +2767,40 @@ private struct GalleryLightbox: View {
                     guard !Task.isCancelled else { return }
                     player = AVPlayer(url: file)
                 } catch {
-                    loadError = "Couldn't fetch this video from the server: \(error.localizedDescription)"
+                    applyRemoteLoadFailure(error)
                 }
             } else {
-                guard let (data, response) = try? await URLSession.shared.data(from: url),
-                      (response as? HTTPURLResponse)?.statusCode ?? 200 == 200,
-                      let fetched = NSImage(data: data) else {
-                    loadError = "Couldn't fetch this image from the server."
-                    return
+                do {
+                    let (data, response) = try await URLSession.shared.data(from: url)
+                    if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                        throw RemoteMediaCache.FetchError.classify(statusCode: http.statusCode)
+                    }
+                    guard let fetched = NSImage(data: data) else {
+                        loadError = "Couldn't open this image."
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    image = fetched
+                } catch {
+                    applyRemoteLoadFailure(error)
                 }
-                guard !Task.isCancelled else { return }
-                image = fetched
             }
 
         case .missing:
             loadError = "This asset's file isn't on this Mac, and no server copy is known."
         }
+    }
+
+    /// Shows a remote-fetch failure and, for one that's auth-shaped, re-locks
+    /// the content gate (#223 (a)) — never a raw HTTP status number left in
+    /// the browse view, and never an "optimistic" gate that stays open past a
+    /// session the server has stopped honoring. The NEXT unlock attempt
+    /// (⌃⌥⌘U / the NSFW password sheet) is where a wrong password already
+    /// gets a clean inline error — this just routes back to it instead of
+    /// dead-ending here.
+    private func applyRemoteLoadFailure(_ error: Error) {
+        let outcome = GalleryView.remoteLoadOutcome(for: error)
+        loadError = outcome.message
+        if outcome.relock { contentGate.hide() }
     }
 }

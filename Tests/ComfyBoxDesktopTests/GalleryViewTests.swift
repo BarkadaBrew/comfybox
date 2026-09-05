@@ -232,3 +232,66 @@ struct GalleryViewPruneSweepWarningTests {
         #expect(warning.contains("Orphan cleanup skipped"))
     }
 }
+
+// MARK: - remoteLoadOutcome (#223 (a): optimistic client-side password lock)
+
+@Suite("GalleryView.remoteLoadOutcome")
+struct GalleryViewRemoteLoadOutcomeTests {
+    @Test("an unauthorized remote fetch relocks the gate and never shows a raw status code")
+    func unauthorizedRelocksAndIsFriendly() {
+        let outcome = GalleryView.remoteLoadOutcome(for: RemoteMediaCache.FetchError.unauthorized)
+        #expect(outcome.relock)
+        #expect(!outcome.message.contains("401"))
+        #expect(!outcome.message.isEmpty)
+    }
+
+    @Test("a 403 (also auth-shaped) relocks the gate the same way a 401 does")
+    func forbiddenAlsoRelocks() {
+        let outcome = GalleryView.remoteLoadOutcome(
+            for: RemoteMediaCache.FetchError.classify(statusCode: 403)
+        )
+        #expect(outcome.relock)
+    }
+
+    @Test("a not-found or generic server failure is shown but does NOT relock the gate")
+    func nonAuthFailuresDoNotRelock() {
+        let notFound = GalleryView.remoteLoadOutcome(for: RemoteMediaCache.FetchError.notFound)
+        #expect(!notFound.relock)
+        #expect(!notFound.message.isEmpty)
+
+        let serverError = GalleryView.remoteLoadOutcome(for: RemoteMediaCache.FetchError.server(500))
+        #expect(!serverError.relock)
+        #expect(!serverError.message.contains("500") || serverError.message.count > 3,
+                "the 500 rendered as part of a sentence, not a bare code")
+    }
+
+    @Test("a non-FetchError (e.g. a network failure) is shown via its own description and does not relock")
+    func genericErrorDoesNotRelock() {
+        struct OtherError: LocalizedError {
+            var errorDescription: String? { "The Internet connection appears to be offline." }
+        }
+        let outcome = GalleryView.remoteLoadOutcome(for: OtherError())
+        #expect(!outcome.relock)
+        #expect(outcome.message == "The Internet connection appears to be offline.")
+    }
+}
+
+// MARK: - archiveAllowed (#223 (c): Archive Gallery is local-server-only)
+
+@Suite("GalleryView.archiveAllowed")
+struct GalleryViewArchiveAllowedTests {
+    @Test("allowed when the connected engine is local")
+    func allowedWhenLocal() {
+        #expect(GalleryView.archiveAllowed(engineIsLocal: true))
+    }
+
+    @Test("refused — not a silent no-op — when the connected engine is remote")
+    func refusedWhenRemote() {
+        #expect(!GalleryView.archiveAllowed(engineIsLocal: false))
+    }
+
+    @Test("no EngineService attached (previews, tests) defaults to allowed")
+    func defaultsToAllowedWithNoEngine() {
+        #expect(GalleryView.archiveAllowed(engineIsLocal: nil))
+    }
+}

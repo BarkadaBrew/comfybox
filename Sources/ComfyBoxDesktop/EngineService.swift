@@ -368,6 +368,24 @@ public final class EngineService {
     public var serverPort: UInt16 = 7870
     public var outputDirectory: String = NSString(string: "~/Pictures/ComfyBox").expandingTildeInPath
 
+    /// Whether the connected engine is running on this Mac, vs. a remote
+    /// server reached over the network. Several desktop-local operations
+    /// (LoRA import from a path on the ENGINE's disk in ModelsView, gallery
+    /// archiving via local FileManager calls — #223) only make sense when
+    /// this is true; they must be disabled, not silently no-op, otherwise.
+    public var isLocalHost: Bool { EngineService.isLocalHost(serverHost) }
+
+    /// Pure host-string check, directly unit-testable without constructing
+    /// an `EngineService`. Matches the loopback spellings macOS actually
+    /// hands back for "this Mac" (`127.0.0.1`, `localhost`, the IPv6
+    /// loopback `::1`) — anything else, including a LAN IP of this same
+    /// Mac, is treated as remote (conservative: the point is "would a
+    /// FileManager call reach the right disk", and a LAN-IP round trip
+    /// still goes through the network stack).
+    public nonisolated static func isLocalHost(_ host: String) -> Bool {
+        ["127.0.0.1", "localhost", "::1"].contains(host)
+    }
+
     // MARK: - Private
 
     private var client: WarmServerClient?
