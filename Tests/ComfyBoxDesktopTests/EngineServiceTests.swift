@@ -530,4 +530,49 @@ struct EngineServiceIsLocalHostTests {
         #expect(!addresses.contains("127.0.0.1"))
         #expect(!addresses.contains("::1"))
     }
+
+    @Test("currentInterfaceAddresses never includes a link-local address either")
+    func currentInterfaceAddressesExcludesLinkLocal() {
+        // Can't force a link-local interface to exist on the test machine —
+        // this just confirms none of whatever IS real ever slips through.
+        // isLinkLocalAddress (below) is where the actual filtering logic
+        // is pinned with injected addresses.
+        let addresses = EngineService.currentInterfaceAddresses()
+        #expect(!addresses.contains { EngineService.isLinkLocalAddress($0) })
+    }
+
+    // MARK: - isLinkLocalAddress (round-1 re-review)
+
+    @Test("isLinkLocalAddress recognizes the whole IPv4 169.254.0.0/16 block")
+    func recognizesIPv4LinkLocal() {
+        #expect(EngineService.isLinkLocalAddress("169.254.0.1"))
+        #expect(EngineService.isLinkLocalAddress("169.254.255.254"))
+        #expect(EngineService.isLinkLocalAddress("169.254.1.5"))
+    }
+
+    @Test("isLinkLocalAddress does not flag an ordinary LAN or Tailscale IPv4 address")
+    func doesNotFlagOrdinaryIPv4() {
+        #expect(!EngineService.isLinkLocalAddress("10.0.100.232"))
+        #expect(!EngineService.isLinkLocalAddress("192.168.1.14"))
+        #expect(!EngineService.isLinkLocalAddress("100.101.102.103"))
+        #expect(!EngineService.isLinkLocalAddress("169.253.1.1"), "one below the block — must not be flagged")
+        #expect(!EngineService.isLinkLocalAddress("169.255.1.1"), "one above the block — must not be flagged")
+    }
+
+    @Test("isLinkLocalAddress recognizes fe80::/10, including with a zone index appended")
+    func recognizesIPv6LinkLocal() {
+        #expect(EngineService.isLinkLocalAddress("fe80::1"))
+        #expect(EngineService.isLinkLocalAddress("fe80::abcd:1234:5678:9abc"))
+        #expect(EngineService.isLinkLocalAddress("FE80::1"), "case-insensitive")
+        #expect(EngineService.isLinkLocalAddress("fe80::1%en0"), "zone index stripped before checking")
+        #expect(EngineService.isLinkLocalAddress("febf::1"), "top of the /10 range")
+    }
+
+    @Test("isLinkLocalAddress does not flag an ordinary IPv6 address, even one starting with fe")
+    func doesNotFlagOrdinaryIPv6() {
+        #expect(!EngineService.isLinkLocalAddress("fec0::1"), "one above the /10 range")
+        #expect(!EngineService.isLinkLocalAddress("fe70::1"), "one below the /10 range")
+        #expect(!EngineService.isLinkLocalAddress("::1"), "loopback, not link-local")
+        #expect(!EngineService.isLinkLocalAddress("2001:db8::1"), "an ordinary global-unicast address")
+    }
 }

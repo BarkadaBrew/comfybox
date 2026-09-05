@@ -58,6 +58,12 @@ struct ArchiveBrowserView: View {
     /// flight, anywhere.
     @State private var restoringBundleIds: Set<String> = []
 
+    /// Bundles CURRENTLY being deleted — see `deleteBundle`. Round-1
+    /// re-review: Compress must not race a Delete on the SAME bundle any
+    /// more than Delete may race a Compress on it (which `deleteAllowed`
+    /// already guarded); `compressAllowed` checks this set, symmetrically.
+    @State private var deletingBundleIds: Set<String> = []
+
     var body: some View {
         HStack(spacing: 0) {
             sidebar
@@ -206,7 +212,8 @@ struct ArchiveBrowserView: View {
                 isIncomplete: bundle.isIncomplete, isCompressed: bundle.isCompressed,
                 compressionCleanupPending: bundle.compressionCleanupPending,
                 isCompressingThisBundle: compressingBundleIds.contains(bundle.id),
-                isRestoringThisBundle: restoringBundleIds.contains(bundle.id)
+                isRestoringThisBundle: restoringBundleIds.contains(bundle.id),
+                isDeletingThisBundle: deletingBundleIds.contains(bundle.id)
             ))
             Divider()
             Button("Delete Archive…", role: .destructive) { requestDeleteBundle(bundle) }
@@ -599,7 +606,8 @@ struct ArchiveBrowserView: View {
             isIncomplete: bundle.isIncomplete, isCompressed: bundle.isCompressed,
             compressionCleanupPending: bundle.compressionCleanupPending,
             isCompressingThisBundle: compressingBundleIds.contains(bundle.id),
-            isRestoringThisBundle: restoringBundleIds.contains(bundle.id)
+            isRestoringThisBundle: restoringBundleIds.contains(bundle.id),
+            isDeletingThisBundle: deletingBundleIds.contains(bundle.id)
         ) else { return }
         compressSummary = nil
         errorMessage = nil
@@ -649,12 +657,21 @@ struct ArchiveBrowserView: View {
     /// review round 2: a verified rename whose directory removal then
     /// failed) is still eligible, so Compress re-enters as an idempotent
     /// finish rather than being refused.
+    ///
+    /// `isDeletingThisBundle` (round-1 re-review) is the symmetric
+    /// counterpart to `deleteAllowed`'s `isCompressingThisBundle`: Delete
+    /// removes the bundle's directory outright, so a Compress starting
+    /// mid-delete would either `ditto` a directory being trashed out from
+    /// under it or race the traversal-guard read against files that are
+    /// disappearing — refused here for the same reason Delete refuses a
+    /// concurrent Compress.
     static func compressAllowed(
         isIncomplete: Bool, isCompressed: Bool, compressionCleanupPending: Bool,
-        isCompressingThisBundle: Bool, isRestoringThisBundle: Bool
+        isCompressingThisBundle: Bool, isRestoringThisBundle: Bool, isDeletingThisBundle: Bool
     ) -> Bool {
         let alreadyDoneAndClean = isCompressed && !compressionCleanupPending
-        return !isIncomplete && !alreadyDoneAndClean && !isCompressingThisBundle && !isRestoringThisBundle
+        return !isIncomplete && !alreadyDoneAndClean
+            && !isCompressingThisBundle && !isRestoringThisBundle && !isDeletingThisBundle
     }
 
     /// Whether "Delete Archive…" may run for `bundle` right now. Delete
@@ -662,7 +679,11 @@ struct ArchiveBrowserView: View {
     /// that is mid-`ditto`/mid-verify on the SAME bundle, or it could yank
     /// the source directory out from under it. `archiver.isRunning` is kept
     /// too (unchanged behavior: a restore anywhere still blocks every
-    /// delete) — only `isCompressingThisBundle` is new.
+    /// delete) — only `isCompressingThisBundle` is new. (Delete does not
+    /// need its own `isDeletingThisBundle` check — a second delete on a
+    /// bundle already mid-delete is a no-op race at worst, not a
+    /// destructive one, and the confirmation dialog itself already prevents
+    /// a double-click from issuing two delete Tasks for the same row.)
     static func deleteAllowed(isCompressingThisBundle: Bool, archiverIsRunning: Bool) -> Bool {
         !isCompressingThisBundle && !archiverIsRunning
     }
@@ -696,6 +717,12 @@ struct ArchiveBrowserView: View {
             errorMessage = Self.archiveInProgressMessage
             return
         }
+        // Tracked per-bundle for the same reason compressingBundleIds/
+        // restoringBundleIds are: compressAllowed checks this set so a
+        // Compress on THIS bundle can't start while a Delete is mid-flight
+        // on it.
+        deletingBundleIds.insert(bundle.id)
+        defer { deletingBundleIds.remove(bundle.id) }
         let path = bundle.bundlePath
         let success = await Task.detached(priority: .utility) {
             Self.trashOrRemoveBundle(atPath: path)

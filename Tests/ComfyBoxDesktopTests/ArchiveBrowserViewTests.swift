@@ -132,7 +132,7 @@ struct ArchiveBrowserViewRaceGuardTests {
     func compressAllowedForOrdinaryBundle() {
         #expect(ArchiveBrowserView.compressAllowed(
             isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
-            isCompressingThisBundle: false, isRestoringThisBundle: false
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: false
         ))
     }
 
@@ -140,7 +140,7 @@ struct ArchiveBrowserViewRaceGuardTests {
     func compressRefusedForIncomplete() {
         #expect(!ArchiveBrowserView.compressAllowed(
             isIncomplete: true, isCompressed: false, compressionCleanupPending: false,
-            isCompressingThisBundle: false, isRestoringThisBundle: false
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: false
         ))
     }
 
@@ -148,7 +148,7 @@ struct ArchiveBrowserViewRaceGuardTests {
     func compressRefusedForAlreadyCompressed() {
         #expect(!ArchiveBrowserView.compressAllowed(
             isIncomplete: false, isCompressed: true, compressionCleanupPending: false,
-            isCompressingThisBundle: false, isRestoringThisBundle: false
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: false
         ))
     }
 
@@ -156,7 +156,7 @@ struct ArchiveBrowserViewRaceGuardTests {
     func compressAllowedForCleanupPending() {
         #expect(ArchiveBrowserView.compressAllowed(
             isIncomplete: false, isCompressed: true, compressionCleanupPending: true,
-            isCompressingThisBundle: false, isRestoringThisBundle: false
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: false
         ))
     }
 
@@ -164,7 +164,7 @@ struct ArchiveBrowserViewRaceGuardTests {
     func compressRefusedWhileCompressingThisBundle() {
         #expect(!ArchiveBrowserView.compressAllowed(
             isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
-            isCompressingThisBundle: true, isRestoringThisBundle: false
+            isCompressingThisBundle: true, isRestoringThisBundle: false, isDeletingThisBundle: false
         ))
     }
 
@@ -172,7 +172,15 @@ struct ArchiveBrowserViewRaceGuardTests {
     func compressRefusedWhileRestoringThisBundle() {
         #expect(!ArchiveBrowserView.compressAllowed(
             isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
-            isCompressingThisBundle: false, isRestoringThisBundle: true
+            isCompressingThisBundle: false, isRestoringThisBundle: true, isDeletingThisBundle: false
+        ))
+    }
+
+    @Test("compress is refused while THIS bundle is being deleted — round-1 re-review: symmetric with deleteAllowed")
+    func compressRefusedWhileDeletingThisBundle() {
+        #expect(!ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: true
         ))
     }
 
@@ -191,6 +199,25 @@ struct ArchiveBrowserViewRaceGuardTests {
     @Test("delete is still refused whenever the archiver is running anywhere — unchanged prior behavior")
     func deleteRefusedWhileArchiverRunningAnywhere() {
         #expect(!ArchiveBrowserView.deleteAllowed(isCompressingThisBundle: false, archiverIsRunning: true))
+    }
+
+    // MARK: - Both directions of the Compress <-> Delete guard (round-1 re-review)
+
+    @Test("Compress <-> Delete is mutually exclusive on the SAME bundle, in both directions")
+    func compressAndDeleteAreMutuallyExclusiveBothWays() {
+        // Delete already in flight on this bundle -> Compress refused.
+        #expect(!ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: true
+        ))
+        // Compress already in flight on this bundle -> Delete refused.
+        #expect(!ArchiveBrowserView.deleteAllowed(isCompressingThisBundle: true, archiverIsRunning: false))
+        // Neither in flight -> both allowed.
+        #expect(ArchiveBrowserView.compressAllowed(
+            isIncomplete: false, isCompressed: false, compressionCleanupPending: false,
+            isCompressingThisBundle: false, isRestoringThisBundle: false, isDeletingThisBundle: false
+        ))
+        #expect(ArchiveBrowserView.deleteAllowed(isCompressingThisBundle: false, archiverIsRunning: false))
     }
 }
 

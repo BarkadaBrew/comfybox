@@ -399,11 +399,20 @@ public final class EngineService {
     }
 
     /// This Mac's own network-interface addresses right now — IPv4 and
-    /// IPv6, every UP, non-loopback interface (`getifaddrs(3)`, numeric
-    /// host only via `getnameinfo`/`NI_NUMERICHOST`, never a reverse-DNS
-    /// lookup). A best-effort list: `getifaddrs` failing, or a single
-    /// interface's address failing to resolve, just means fewer entries —
-    /// `isLocalHost` still has its loopback check either way.
+    /// IPv6, every UP, non-loopback, non-link-local interface
+    /// (`getifaddrs(3)`, numeric host only via `getnameinfo`/
+    /// `NI_NUMERICHOST`, never a reverse-DNS lookup). A best-effort list:
+    /// `getifaddrs` failing, or a single interface's address failing to
+    /// resolve, just means fewer entries — `isLocalHost` still has its
+    /// loopback check either way.
+    ///
+    /// Link-local addresses (`169.254.0.0/16`, `fe80::/10` — `isLinkLocalAddress`)
+    /// are filtered out (round-1 re-review): they're autoconfigured per-link
+    /// fallbacks assigned to EVERY interface with no DHCP/router present,
+    /// not addresses that identify "this Mac" the way a routable LAN or
+    /// Tailscale address does, and macOS hands out the same `169.254.x.x`
+    /// shape to plenty of machines on an unconfigured segment — treating
+    /// one as "local" would be a false positive on a LAN full of them.
     public nonisolated static func currentInterfaceAddresses() -> [String] {
         var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else { return [] }
@@ -429,9 +438,31 @@ public final class EngineService {
                 nil, 0, NI_NUMERICHOST
             )
             guard ok == 0 else { continue }
-            addresses.append(String(cString: host))
+            let address = String(cString: host)
+            guard !isLinkLocalAddress(address) else { continue }
+            addresses.append(address)
         }
         return addresses
+    }
+
+    /// True for an IPv4 address in `169.254.0.0/16` or an IPv6 address in
+    /// `fe80::/10` — pure and directly unit-testable (injected strings,
+    /// no real interfaces needed), which is how `currentInterfaceAddresses`'s
+    /// filtering is actually exercised in tests.
+    ///
+    /// The IPv6 check strips any zone index (`%en0`, which `getnameinfo`
+    /// appends to a link-local address on macOS) before parsing, then
+    /// checks the leading hextet against the half-open range `0xFE80...0xFEBF`
+    /// — `fe80::/10`'s first 10 bits fix the top of that hextet and leave
+    /// its low 6 bits free, i.e. exactly that range, not just a literal
+    /// `"fe80"` prefix match.
+    public nonisolated static func isLinkLocalAddress(_ address: String) -> Bool {
+        if address.hasPrefix("169.254.") { return true }
+        let withoutZone = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
+        guard let firstHextet = withoutZone.split(separator: ":", maxSplits: 1).first,
+              let value = UInt16(firstHextet, radix: 16)
+        else { return false }
+        return value >= 0xFE80 && value <= 0xFEBF
     }
 
     // MARK: - Private
