@@ -302,6 +302,67 @@ already go through), so a replay reports `vae_source: "payload"` even for an
 originally preset-sourced render — the price of replaying a frozen body
 instead of re-resolving a preset that may have changed since.
 
+## Schedule shift — `shift` (comfybox#154, and Krea 2's D3)
+
+`shift` is one request field with a **family-dependent meaning**, because
+ComfyUI has two different nodes for it and the engine reproduces both faithfully
+rather than averaging them. It is validated as a positive finite number and
+REFUSED (400, naming the field and the family) on a family that does not read
+it — never silently ignored.
+
+| Family | ComfyUI node | What `shift` is | Neutral value |
+|---|---|---|---|
+| Z-Image / Flux 1 (`flux1`) | `ModelSamplingAuraFlow` | the LINEAR shift `σ' = shift·σ / (1 + (shift − 1)·σ)` | `1.0` (exact identity) |
+| Krea 2 (`krea2`) | `ModelSamplingFlux` | `mu`, a LOG-shift: `σ' = e^shift / (e^shift + 1/σ − 1)` | `1.15` reproduces the published grid |
+| `flux2`, `fibo`, `chroma` | — | not read; refused | — |
+
+```json
+{"prompt": "…", "shift": 3.0}
+```
+
+**Z-Image family — what the shift does.** It is ComfyUI's
+`ModelSamplingAuraFlow` node, which patches the model's whole `model_sampling`
+object; ComfyBox reproduces that as a value
+(`ZImageSchedulerConfig.applyingExplicitShift`). Higher shift holds more noise
+into the early steps, which is what recovers structural coherence on
+flow-matching art models. Zeta Chroma's author (Lodestone) publishes
+**shift 3.00, sampler Euler, schedule `simple`/`normal`, CFG 4.5–5.5**.
+
+**Precedence — an explicit shift REPLACES the model's schedule, it never
+composes with it.** That is what the node does upstream (there is no ComfyUI
+graph where `ModelSamplingAuraFlow` and `ModelSamplingFlux` both apply), and
+composing them would double-warp a grid whose `mu` the caller cannot see:
+
+| # | Source | When it wins |
+|---|---|---|
+| 1 | the request's own `shift` | whenever the key is present |
+| 2 | the named `preset`'s DECLARED `shift` | when the request sent none and the preset was expandable |
+| 3 | the model's own schedule | `use_dynamic_shifting` + the resolution-dependent `mu`, else `scheduler_config.json`'s `shift` — the no-regression default |
+
+Omitting `shift` is **byte-identical** to the pre-#154 engine: the same sigma
+grid, bit for bit (`ModelSamplingShiftTests`). Because the shift is applied to
+the scheduler CONFIG rather than to one schedule's formula, the schedules that
+index the model's discrete sigma table — `simple`, `beta`, `beta57`, and the
+`karras`/`exponential` bounds — pick it up too, exactly as they read the patched
+`model_sampling` in ComfyUI.
+
+**The response says what applied**, as a flat `applied_shift` on both
+`POST /v1/generate` and `GET /v1/generate/status/{id}`:
+
+```json
+{"success": true, "output_path": "…", "applied_shift": 3.0}
+```
+
+The key is **absent** when the render used the model's own schedule — which is
+every render that names no shift, so its absence is the unchanged contract.
+Krea 2 additionally carries the full `applied.shift` / `applied.shift_source`
+recipe echo (`RenderRecipe` is Krea 2 only, D12); the flat field exists so the
+question has one answer on every family that honours it.
+
+**Bridge (Krita / ComfyUI clients).** A workflow carrying a
+`ModelSamplingAuraFlow` node has its `shift` input read and applied — see
+`bridge-developer-guide.md`.
+
 ## Gallery output filenames
 
 Default render filenames (no `output_path` in the request) are built by

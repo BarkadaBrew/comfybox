@@ -69,18 +69,26 @@ final class GeneratePayloadDecodeTests: XCTestCase {
 
     /// A non-positive shift is a 400 naming the field, and so is `shift` on a
     /// family whose schedule does not consult it — never silently ignored.
+    ///
+    /// comfybox#154 ADDED `.flux1` to the families that consult it: the field
+    /// used to be Krea 2's alone (where it is `mu`, `ModelSamplingFlux`), and
+    /// is now also the Z-Image family's linear `ModelSamplingAuraFlow` shift.
+    /// The refusal case moved to a family that still reads neither.
     func testShiftValidation() {
         XCTAssertNil(GeneratePayload.validateShift(nil, family: .flux1))
         XCTAssertNil(GeneratePayload.validateShift(nil, family: .krea2))
         XCTAssertNil(GeneratePayload.validateShift(1.15, family: .krea2))
-        for bad: Float in [0, -1] {
-            let msg = GeneratePayload.validateShift(bad, family: .krea2)
-            XCTAssertNotNil(msg)
-            XCTAssertTrue(msg?.contains("shift") == true, "names the field: \(msg ?? "nil")")
+        XCTAssertNil(GeneratePayload.validateShift(3.0, family: .flux1), "#154")
+        for family: WarmModelFamily in [.krea2, .flux1] {
+            for bad: Float in [0, -1] {
+                let msg = GeneratePayload.validateShift(bad, family: family)
+                XCTAssertNotNil(msg)
+                XCTAssertTrue(msg?.contains("shift") == true, "names the field: \(msg ?? "nil")")
+            }
         }
-        let wrongFamily = GeneratePayload.validateShift(1.15, family: .flux1)
+        let wrongFamily = GeneratePayload.validateShift(1.15, family: .chroma)
         XCTAssertNotNil(wrongFamily)
-        XCTAssertTrue(wrongFamily?.contains("shift") == true && wrongFamily?.contains("flux1") == true,
+        XCTAssertTrue(wrongFamily?.contains("shift") == true && wrongFamily?.contains("chroma") == true,
                       "names the field and the family: \(wrongFamily ?? "nil")")
     }
 }

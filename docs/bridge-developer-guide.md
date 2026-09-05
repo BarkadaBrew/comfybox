@@ -280,8 +280,33 @@ The bridge recognizes these ComfyUI node types:
 | `LoadImage` | Img2img source |
 | `LoraLoader` | LoRA path and scale |
 | `ImageUpscaleWithModel` | SeedVR2/ESRGAN upscale |
+| `ModelSamplingAuraFlow` | Flow-matching schedule `shift` (comfybox#154) |
 
 Unsupported nodes are silently ignored — the bridge extracts what it can and generates with those parameters.
+
+#### `ModelSamplingAuraFlow` — schedule shift (comfybox#154)
+
+A workflow carrying a `ModelSamplingAuraFlow` node has its `shift` input read
+and applied as the flow schedule's linear shift,
+`σ' = shift·σ / (1 + (shift − 1)·σ)` — ComfyUI's `time_snr_shift`
+(`comfy/model_sampling.py`). It is what Zeta Chroma needs (its author publishes
+**shift 3.00**, Euler, `simple`/`normal`, CFG 4.5–5.5); `1.0` is the exact
+identity, and a workflow with no such node renders exactly as it did before.
+
+- The node is advertised in `GET /object_info` under category `model/patch`
+  with upstream's own default (`1.73`), so a client can place it and set it.
+- On a multi-pass graph the **lowest node id wins**, the same deterministic rule
+  the bridge uses for schedulers and controlnets; the others are logged and
+  ignored.
+- A `shift` that is not a positive finite number is logged and DROPPED — the
+  graph renders on the model's own schedule rather than failing with a 400 a
+  Krita user would never see.
+- The shift is refused (400) if the resident model family does not read it —
+  see the `shift` table in [`api-notes.md`](api-notes.md).
+- **`ModelSamplingSD3` and `ModelSamplingFlux` are deliberately NOT mapped.**
+  Same sigma warp, different parameterisations (a 1000× timestep `multiplier`,
+  and a log-shift) that the engine has no seam for; reading either as AuraFlow
+  would be a silent substitution. They remain structural glue.
 
 ## Path 3: MCP (For AI Assistants)
 

@@ -2,7 +2,7 @@
 
 **Repo:** `BarkadaBrew/comfybox` (`~/Projects/zimage.swift`, Swift/MLX)
 **Maintained:** living reference — update as pipelines are ported/verified.
-**Last updated:** 2026-07-23
+**Last updated:** 2026-09-05
 
 > **Framing.** ComfyBox is *not* "ComfyUI + MLX." ComfyUI is a general node-graph engine plus an unbounded custom-node ecosystem on PyTorch/CUDA. ComfyBox is a **curated set of pipelines hand-ported to mlx-swift** — a capability exists only if it was ported *and* verified against the reference. It is a vertically-integrated, Apple-Silicon-native **subset** that is faster and better-integrated for the models it covers, not a superset. Parity is per-feature and never automatic (see the LTX-2 fps-RoPE bug, `FDD-ltx2-temporal-motion.md`).
 
@@ -18,7 +18,7 @@
 | Chroma (Flux-based) | ported, wired | 🟡 Loadable, unverified |
 | FIBO | ported, wired | 🟡 Loadable, unverified |
 | Flux.1 dev/schnell | fallback family | 🟡 Supported path, unproven |
-| Zeta-Chroma (Z-Image art model) | — | ⬜ Planned, not ported |
+| Zeta-Chroma (Z-Image art model) | — | ⬜ Planned, not ported (its schedule shift IS ported — #154) |
 | SD 1.5 / SDXL / SD3 | — | ⬜ Not ported (different lineage) |
 
 ## Conditioning & control
@@ -56,6 +56,8 @@
 | Capability | Status |
 |---|---|
 | Euler (FlowMatch), DDIM, DEIS, DPM++ 2M, DPM++ 2S-ancestral, Heun, RES2s | ✅ Working set |
+| `ModelSamplingAuraFlow` / SD3 schedule shift (`shift`, `time_snr_shift`) | ✅ Working — request/preset/bridge (#154); unit-pinned, live-unverified |
+| `ModelSamplingFlux` log-shift (`mu`) | ✅ Working (Krea 2, same `shift` field) |
 | CFG++ / `euler_ancestral_cfg_pp` (video) | ✅ Working |
 | STG (spatiotemporal guidance) | 🟡 Optional; +50% motion but artifact-prone |
 

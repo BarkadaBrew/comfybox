@@ -66,6 +66,20 @@ The plugin queries options from these nodes to discover available models:
 - `UNETLoader` / `NunchakuZImageDiTLoader` (diffusion model)
 - `CLIPLoader` with `type: "lumina2"` (Z-Image text encoder)
 
+### Schedule-shift node (comfybox#154)
+
+`ModelSamplingAuraFlow` is advertised and its `shift` input is read:
+
+```json
+{"ModelSamplingAuraFlow": {
+  "input": {"required": {"model": ["MODEL", {}], "shift": ["FLOAT", {"default": 1.73}]}},
+  "output": ["MODEL"], "category": "model/patch"}}
+```
+
+It maps to the engine's `shift` request field (the flow schedule's linear
+shift). `ModelSamplingSD3` / `ModelSamplingFlux` are accepted in a graph but
+NOT read — different parameterisations, no seam.
+
 ### Response format per node
 
 ```json

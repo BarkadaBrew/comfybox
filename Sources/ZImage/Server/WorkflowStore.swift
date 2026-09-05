@@ -101,6 +101,8 @@ public final class WorkflowStore: @unchecked Sendable {
     "ModelPatchLoader", "ZImageFunControlnet", "UpscaleModelLoader",
     "ImageUpscaleWithModel", "UNETLoader", "NunchakuZImageDiTLoader",
     "CheckpointLoaderSimple", "VAEEncode",
+    // comfybox#154: the parser reads this node's `shift` input.
+    "ModelSamplingAuraFlow",
     // Normalized away at import:
     "LoadImage", "SaveImage",
   ]
@@ -110,7 +112,12 @@ public final class WorkflowStore: @unchecked Sendable {
   static let glueNodeTypes: Set<String> = [
     "VAEDecode", "VAELoader", "CLIPLoader", "DualCLIPLoader", "TripleCLIPLoader",
     "ConditioningZeroOut", "ConditioningCombine", "ConditioningConcat",
-    "ModelSamplingSD3", "ModelSamplingAuraFlow", "ModelSamplingFlux",
+    // comfybox#154 moved `ModelSamplingAuraFlow` out of here and into
+    // `mappedNodeTypes` — its `shift` is now read, not ignored. `SD3` and
+    // `Flux` stay glue: same sigma warp, different parameterisations
+    // (a 1000× timestep `multiplier`, and a log-shift) that the engine has no
+    // seam for, and mapping either as AuraFlow would be a silent substitution.
+    "ModelSamplingSD3", "ModelSamplingFlux",
     "FluxGuidance", "Note", "MarkdownNote", "PrimitiveNode", "Reroute",
   ]
 

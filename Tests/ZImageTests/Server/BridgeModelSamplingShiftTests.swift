@@ -118,6 +118,39 @@ final class BridgeModelSamplingShiftTests: XCTestCase {
     XCTAssertEqual(payload.sigmaSchedule, "normal")
   }
 
+  // MARK: - Discovery
+
+  /// The node is advertised so a Krita/ComfyUI client can place it, under
+  /// upstream's own category and default.
+  func testObjectInfoAdvertisesTheNode() throws {
+    // Asserted on the SERIALIZED response — the `required` block is an
+    // insertion-ordered container in memory, and what a client parses is the
+    // JSON, not the Swift value.
+    let data = try XCTUnwrap(orderedJSONData(ComfyBridgeObjectInfo.build()))
+    let info = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let node = try XCTUnwrap(info["ModelSamplingAuraFlow"] as? [String: Any],
+                             "ModelSamplingAuraFlow must be advertised")
+    XCTAssertEqual(node["category"] as? String, "model/patch")
+    let input = try XCTUnwrap(node["input"] as? [String: Any])
+    let required = try XCTUnwrap(input["required"] as? [String: Any])
+    let shift = try XCTUnwrap(required["shift"] as? [Any])
+    XCTAssertEqual(shift.first as? String, "FLOAT")
+    XCTAssertEqual((shift.last as? [String: Any])?["default"] as? Double, 1.73)
+    XCTAssertNotNil(required["model"])
+    XCTAssertEqual(node["output"] as? [String], ["MODEL"])
+  }
+
+  /// The imported-workflow compat report must call the node MAPPED, not glue —
+  /// it stopped being "ignored safely" the moment its `shift` was read.
+  func testWorkflowStoreCountsTheNodeAsMapped() {
+    XCTAssertTrue(WorkflowStore.mappedNodeTypes.contains("ModelSamplingAuraFlow"))
+    XCTAssertFalse(WorkflowStore.glueNodeTypes.contains("ModelSamplingAuraFlow"))
+    // The two the engine deliberately does NOT read stay glue.
+    XCTAssertTrue(WorkflowStore.glueNodeTypes.contains("ModelSamplingSD3"))
+    XCTAssertTrue(WorkflowStore.glueNodeTypes.contains("ModelSamplingFlux"))
+  }
+
   // MARK: - The family gate this shift must pass
 
   func testShiftIsAcceptedOnTheZImageFamilyAndRefusedElsewhere() {
