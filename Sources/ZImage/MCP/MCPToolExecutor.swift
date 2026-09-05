@@ -145,6 +145,15 @@ public final class MCPToolExecutor: @unchecked Sendable {
         return MCPToolResult(error: "Unknown tool: \(name)")
       }
     } catch let error as WarmServerClientError {
+      // comfybox#153 review round 2, point 1: the bridge no longer exits
+      // when nothing is listening at startup — it warns once and serves
+      // anyway. Every tool call made before the engine comes up must fail
+      // with that SAME message (port + launchctl kickstart command), not
+      // the generic "WarmServer not running" text, via the one shared
+      // builder both call sites use.
+      if case .connectionRefused(let host, let port) = error {
+        return MCPToolResult(error: MCPBridgeStartupPolicy.nothingListeningMessage(host: host, port: port))
+      }
       return MCPToolResult(error: "Error: \(error.errorDescription ?? String(describing: error))")
     } catch {
       return MCPToolResult(error: "Error: \(error.localizedDescription)")

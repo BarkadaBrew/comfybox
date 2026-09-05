@@ -30,6 +30,20 @@ ssh user@mac-host "cd /path/to/comfybox && .build/release/ComfyBox mcp --port 78
 
 The daemon spawns this command as a child process. Tools are registered as `mcp_comfybox__<tool_name>`.
 
+### The bridge never starts a server (comfybox#153)
+
+`ComfyBox mcp` is connect-only. At startup it checks `--port`: if anything is listening — healthy or not — it connects to that and reports what it found to stderr (worst case ~2.25s: a 250ms port probe plus a 2s `/health` fetch before it gives up and reports "no response"). It never spawns a `ComfyBox serve` process itself, under any flag or environment variable.
+
+If nothing is listening, the bridge does **not** exit. launchd's `RunAtLoad` and the MCP host commonly race at login, so a bridge that starts before the engine must keep serving — it prints one warning to stderr (naming the port and the command below) and starts anyway. Every tool call made before the engine comes up fails with that same "nothing is listening" message (surfaced by `MCPToolExecutor`, not a generic connection error), so a client sees one consistent, actionable error until the engine answers — and the MCP host never sees the bridge itself as dead.
+
+Lifecycle ownership of the engine belongs to launchd (`com.barkadabrew.comfybox`) alone. This is what fixes comfybox#153 (the bridge racing a manual server restart and colliding with it, or masking a freshly-rebuilt manual server behind one it started itself) — the bridge has no path that can start a second engine, so there is nothing left to race. If the port is free, start the managed engine with:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.barkadabrew.comfybox
+```
+
+The port check is IPv4-only by design: `WarmServer` and the bridge's own `--host` both default to the literal `127.0.0.1`, never `localhost`, so there is no dual-stack case to handle.
+
 ## Tools
 
 ### Generation
