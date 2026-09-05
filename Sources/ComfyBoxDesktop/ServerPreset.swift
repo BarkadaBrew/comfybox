@@ -336,6 +336,19 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         migrationNotes = try c.decodeIfPresent([String].self, forKey: .migrationNotes)
     }
 
+    /// #359: the spec this preset would use to pick a model — custom path
+    /// first (what `Apply`/`setAsWarm` have always preferred), else the
+    /// catalog/CivitAI id. nil when neither is declared. This is what
+    /// `GET /v1/model/family` is queried with for the "expandable" badge and
+    /// the backfill action: `checkpoint_family` describes THIS spec, not
+    /// necessarily `model` alone.
+    public var effectiveModelSpec: String? {
+        let path = customModelPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let path, !path.isEmpty { return path }
+        let m = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (m?.isEmpty == false) ? m : nil
+    }
+
     /// Map to the local apply-to-Generate shape.
     public func toGenerationPreset() -> GenerationPreset {
         GenerationPreset(

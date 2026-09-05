@@ -91,6 +91,27 @@ struct ServerPresetTests {
         #expect(p.toGenerationPreset().modelId == "/models/custom.safetensors")
     }
 
+    // MARK: comfybox#359 — effectiveModelSpec
+
+    @Test("effectiveModelSpec prefers customModelPath over model, like Apply/Warm")
+    func effectiveModelSpecPrefersCustomPath() {
+        let p = ServerPreset(id: "y", name: "Y", model: "z-image-turbo",
+                             customModelPath: "/models/custom.safetensors")
+        #expect(p.effectiveModelSpec == "/models/custom.safetensors")
+    }
+
+    @Test("effectiveModelSpec falls back to model when there is no custom path")
+    func effectiveModelSpecFallsBackToModel() {
+        let p = ServerPreset(id: "y", name: "Y", model: "krea2-raw")
+        #expect(p.effectiveModelSpec == "krea2-raw")
+    }
+
+    @Test("effectiveModelSpec is nil when neither is declared, or both are blank")
+    func effectiveModelSpecNilWhenNeitherDeclared() {
+        #expect(ServerPreset(id: "y", name: "Y").effectiveModelSpec == nil)
+        #expect(ServerPreset(id: "y", name: "Y", model: "  ", customModelPath: " ").effectiveModelSpec == nil)
+    }
+
     /// WP-E8: the tenth dial. `ServerPreset` has a HAND-WRITTEN encoder, so
     /// any engine field missing from it is silently erased by the next
     /// desktop save (upsert replaces the whole document — the `videoTuning`

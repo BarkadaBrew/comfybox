@@ -217,6 +217,24 @@ public struct PoolModelInfo: Sendable, Identifiable {
     public let lastUsed: String
 }
 
+/// `GET /v1/model/family` (comfybox#359): the engine's own detection for a
+/// model spec — alias, catalog id, or a literal `custom_model_path`
+/// directory. Powers `checkpoint_family` on save and the preset backfill;
+/// see `CheckpointFamilyResolver`, which turns this plus a preset's own
+/// declared LoRA roles into one of the five `checkpoint_family` labels the
+/// server accepts.
+public struct ModelFamilyInfo: Sendable, Equatable, Decodable {
+    public let model: String
+    public let family: String?
+    public let variant: String?
+
+    public init(model: String, family: String?, variant: String?) {
+        self.model = model
+        self.family = family
+        self.variant = variant
+    }
+}
+
 // MARK: - LoRA Info
 
 /// Information about a LoRA in the server's library.
@@ -1694,6 +1712,28 @@ public final class EngineService {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(ResolvedPreset.self, from: data)
+    }
+
+    /// `GET /v1/model/family?model=<spec>` (comfybox#359): what family/variant
+    /// the engine detects for a model spec (alias, catalog id, or a literal
+    /// `custom_model_path` directory) — file-existence checks only, safe to
+    /// call once per preset in a batch backfill. nil when unreachable or the
+    /// response can't be decoded; a decoded `ModelFamilyInfo` with nil
+    /// `family` means the ENGINE itself could not classify the spec.
+    public func fetchModelFamily(forSpec spec: String) async -> ModelFamilyInfo? {
+        guard let client = client, connectionState.isConnected else { return nil }
+        let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+")
+        let enc = trimmed.addingPercentEncoding(withAllowedCharacters: allowed) ?? trimmed
+        do {
+            let (status, data) = try await client.get("/v1/model/family?model=\(enc)")
+            guard status == 200 else { return nil }
+            return try JSONDecoder().decode(ModelFamilyInfo.self, from: data)
+        } catch {
+            return nil
+        }
     }
 
     public func savePreset(_ preset: ServerPreset) async throws {
