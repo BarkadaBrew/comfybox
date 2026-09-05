@@ -6583,7 +6583,12 @@ private final class LiveHealthState: @unchecked Sendable {
   /// prolonged, in which case degraded mode (item 1b) already gives liveness
   /// and repeated background attempts add nothing but log noise.
   static let backgroundHealMaxAttempts = 5
-  static let backgroundHealRetryDelaySeconds: TimeInterval = 1.0
+  /// `var`, not `let` (review round 5, item 2): a test driving the
+  /// multi-failure heal chain (`testBackgroundHealRetriesThroughMultipleFailuresBeforeSucceeding`)
+  /// needs to shrink this to avoid burning several real seconds per run —
+  /// tests lower it and MUST restore it afterward (nothing resets this
+  /// automatically; there is no per-instance override).
+  static var backgroundHealRetryDelaySeconds: TimeInterval = 1.0
   /// Guards against stacking more than one heal CHAIN at once — a burst of
   /// several failed writes in quick succession must not spawn several
   /// independent retry chains. Touched only under `lock`; cleared when a
@@ -6633,6 +6638,23 @@ private final class LiveHealthState: @unchecked Sendable {
     consecutiveFailureCount = 0
   }
 
+  #if DEBUG
+  /// comfybox#386 review round 5, item 3 test seam: directly stamp the
+  /// failure-streak fields. `persistDeltaSidecarLocked` always uses the real
+  /// wall clock to record actual failures, so this is the only way to
+  /// construct "first failure old, last failure recent" (the TIME half's
+  /// positive case: `firstUnresolvedFailureAt` past the window while
+  /// `lastFailureAt` is still within it, i.e. NOT aged out) on demand,
+  /// without a real multi-second sleep. No legitimate production use.
+  func testSeamStampFailureStreak(first: Date, last: Date, count: Int) {
+    lock.lock()
+    firstUnresolvedFailureAt = first
+    lastFailureAt = last
+    consecutiveFailureCount = count
+    lock.unlock()
+  }
+  #endif
+
   func recordDelta(_ delta: QueueControlCommand) {
     lock.lock()
     deltaGeneration += 1
@@ -6680,16 +6702,26 @@ private final class LiveHealthState: @unchecked Sendable {
   /// path here was the last wedge of this class: a stuck/slow disk write
   /// (from a totally unrelated `recordDelta` call, or this same call on a
   /// previous drain pass) would park the render loop behind `sidecarLock`.
-  /// Memory (`deltas`) is trimmed ABOVE regardless of the write's outcome —
-  /// unlike `clearDeltas`, this is safe: the drained commands were already
-  /// durable when `peekDeltas` handed them to the drain (or degraded mode
-  /// explicitly accepted the WAL risk — see `drainQueueDeltas`), so there is
-  /// nothing left in `deltas` for a future boot to double-apply even if THIS
-  /// particular rewrite fails. A failed/skipped attempt here just leaves
-  /// `lastPersistedDeltaGeneration` behind; the drain's own item-1a retry
-  /// (next pass, `peekDeltas` empty because the marker lags) or the
-  /// background self-heal (item 3) catches the sidecar back up to the
-  /// now-shorter truth.
+  ///
+  /// Review round 5 correction: memory (`deltas`) is trimmed ABOVE
+  /// regardless of this write's outcome. That is safe — but NOT because
+  /// "nothing is left on disk to double-apply": a failed/skipped rewrite
+  /// here leaves the SIDECAR FILE still listing the just-drained commands,
+  /// exactly like any other failed write would. The actual guarantee is the
+  /// WAL replay ordering `drainQueueDeltas`'s own doc comment already
+  /// establishes (F-2): canonical `persistQueueState()` always runs BEFORE
+  /// this call, so by the time anything ever replays that stale sidecar (a
+  /// crash here, then `recoverPersistedQueue` on the next boot), the
+  /// canonical state it folds against ALREADY reflects the drained
+  /// command's effect — replaying an already-applied `.cancel` there is the
+  /// documented no-op (the id is already absent from the recovered jobs).
+  /// (`.move`'s replay parity against an already-moved canonical order isn't
+  /// separately proven by this argument — a pre-existing characteristic of
+  /// the F-2 design this round didn't touch, not something introduced here.)
+  /// A failed/skipped attempt here just leaves `lastPersistedDeltaGeneration`
+  /// behind; the drain's own item-1a retry (next pass, `peekDeltas` empty
+  /// because the marker lags) or the background self-heal (item 3) catches
+  /// the sidecar back up to the now-shorter truth.
   func commitDrainedDeltas(_ count: Int) {
     lock.lock()
     deltas.removeFirst(min(count, deltas.count))
@@ -6718,9 +6750,30 @@ private final class LiveHealthState: @unchecked Sendable {
   /// successful write sends (every snapshot is the whole undrained list,
   /// never an increment) — so a later write recovers everything a failed one
   /// missed.
-  private func persistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) {
+  @discardableResult
+  private func persistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) -> Bool {
     sidecarLock.lock(); defer { sidecarLock.unlock() }
-    persistDeltaSidecarLocked(generation: generation, snapshot: snapshot)
+    return persistDeltaSidecarLocked(generation: generation, snapshot: snapshot)
+  }
+
+  /// comfybox#386 review round 5 (critical): what a non-blocking attempt
+  /// actually accomplished — distinct from a plain `Bool`, which conflated
+  /// "we acquired `sidecarLock`" with "the write succeeded." `runBackgroundHeal`
+  /// used to treat `sidecarLock.try()` SUCCEEDING as "done" regardless of
+  /// whether `QueueDeltaStore.save` then failed: a sustained outage (lock
+  /// always free, write always failing) got exactly ONE real attempt before
+  /// the chain incorrectly declared victory and stopped — the ≤5 cap only
+  /// ever applied to LOST TRY-LOCK RACES, never to actual write failures.
+  private enum SidecarWriteOutcome {
+    /// `sidecarLock` was already held elsewhere; nothing was attempted.
+    case lockBusy
+    /// The write landed, or this generation was already covered by an
+    /// even-newer persisted one — either way the sidecar now reflects
+    /// something at least as fresh as `snapshot` as of when this call ran.
+    case wroteOK
+    /// The lock was acquired, an attempt was made, and `QueueDeltaStore.save`
+    /// reported failure.
+    case writeFailed
   }
 
   /// Non-blocking sibling of `persistDeltaSidecar`. Every caller that can run
@@ -6730,20 +6783,19 @@ private final class LiveHealthState: @unchecked Sendable {
   /// retry), `commitDrainedDeltas` (the drain's own WAL commit — review round
   /// 4, item 1: this was the last blocking call site reachable from the
   /// actor), and `runBackgroundHeal` (review round 4, item 3's off-actor
-  /// self-heal). Actor code in particular must never block waiting for
-  /// `sidecarLock` — a single slow/stuck disk write from a totally unrelated
-  /// caller would otherwise stall the ENTIRE render loop behind it, trading a
-  /// `/health`-only liveness bug for a much worse one. `NSLock.try()` gives
-  /// up immediately if another write already holds `sidecarLock`; each of
-  /// these callers has its own way of trying again (the drain's next
-  /// scheduling point, the heal chain's next delayed attempt), so nothing is
-  /// lost by not blocking.
-  @discardableResult
-  private func tryPersistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) -> Bool {
-    guard sidecarLock.`try`() else { return false }
+  /// self-heal — which MUST branch on `.wroteOK` specifically, per the
+  /// round-5 critical fix above). Actor code in particular must never block
+  /// waiting for `sidecarLock` — a single slow/stuck disk write from a
+  /// totally unrelated caller would otherwise stall the ENTIRE render loop
+  /// behind it, trading a `/health`-only liveness bug for a much worse one.
+  /// `NSLock.try()` gives up immediately if another write already holds
+  /// `sidecarLock`; each of these callers has its own way of trying again
+  /// (the drain's next scheduling point, the heal chain's next delayed
+  /// attempt), so nothing is lost by not blocking.
+  private func tryPersistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) -> SidecarWriteOutcome {
+    guard sidecarLock.`try`() else { return .lockBusy }
     defer { sidecarLock.unlock() }
-    persistDeltaSidecarLocked(generation: generation, snapshot: snapshot)
-    return true
+    return persistDeltaSidecarLocked(generation: generation, snapshot: snapshot) ? .wroteOK : .writeFailed
   }
 
   /// The check-then-write-then-publish body shared by `persistDeltaSidecar`
@@ -6770,11 +6822,17 @@ private final class LiveHealthState: @unchecked Sendable {
   /// long after the last one starts a FRESH streak, not a continuation of
   /// ancient history (`resetFailureStreakIfStaleLocked`). Review round 4,
   /// item 3: a failure also schedules the bounded background self-heal.
-  private func persistDeltaSidecarLocked(generation: Int, snapshot: [QueueControlCommand]) {
+  /// Returns whether the sidecar now reflects `snapshot` (or something even
+  /// fresher) — `true` for a successful write OR a stale no-op (already
+  /// covered by a newer persisted generation), `false` only when
+  /// `QueueDeltaStore.save` itself reported failure. This is what
+  /// `tryPersistDeltaSidecar` maps onto `.wroteOK`/`.writeFailed`.
+  @discardableResult
+  private func persistDeltaSidecarLocked(generation: Int, snapshot: [QueueControlCommand]) -> Bool {
     lock.lock()
     let isStale = generation <= lastPersistedDeltaGeneration
     lock.unlock()
-    guard !isStale else { return }
+    guard !isStale else { return true }
 
     let succeeded = QueueDeltaStore.save(snapshot)
 
@@ -6801,6 +6859,8 @@ private final class LiveHealthState: @unchecked Sendable {
       sidecarLogger.error(
         "comfybox#386: failed to persist queue-deltas.json sidecar (generation \(generation)) — undrained deltas will not survive a restart until a write succeeds")
     }
+
+    return succeeded
   }
 
   /// comfybox#386 review round 4, item 3: schedule (at most one concurrent
@@ -6820,6 +6880,10 @@ private final class LiveHealthState: @unchecked Sendable {
     }
   }
 
+  /// `attempt` counts real attempts MADE so far — the call this invocation is
+  /// about to make is attempt number `attempt`, and `backgroundHealMaxAttempts`
+  /// bounds how many of those actually happen (attempts `1...maxAttempts`
+  /// each get to try; there is no `maxAttempts + 1`th call).
   private func runBackgroundHeal(attempt: Int) async {
     try? await Task.sleep(nanoseconds: UInt64(Self.backgroundHealRetryDelaySeconds * 1_000_000_000))
 
@@ -6829,23 +6893,38 @@ private final class LiveHealthState: @unchecked Sendable {
     let snapshot = deltas.map { $0.command }
     lock.unlock()
 
-    // Durable already (something else — a route handler's write, the drain's
-    // own retry — beat us to it) or the cap is reached: end this chain.
-    guard !alreadyDurable, attempt <= Self.backgroundHealMaxAttempts else {
+    // Durable already (something else — a route handler's write, the
+    // drain's own retry — beat us to it): end this chain without spending an
+    // attempt.
+    guard !alreadyDurable else {
       lock.lock(); backgroundHealScheduled = false; lock.unlock()
       return
     }
 
-    if tryPersistDeltaSidecar(generation: generation, snapshot: snapshot) {
+    // comfybox#386 review round 5 (critical): MUST branch on `.wroteOK`
+    // specifically, not merely "the call returned something" — the prior
+    // `if tryPersistDeltaSidecar(...)` (a plain `Bool`) treated ACQUIRING
+    // `sidecarLock` as success regardless of whether `QueueDeltaStore.save`
+    // then failed, so a sustained outage (lock always free, write always
+    // failing) got exactly ONE real attempt before this incorrectly declared
+    // victory and stopped — the cap below never actually applied to a real
+    // write failure, only to a lost try-lock race.
+    switch tryPersistDeltaSidecar(generation: generation, snapshot: snapshot) {
+    case .wroteOK:
       lock.lock(); backgroundHealScheduled = false; lock.unlock()
       return
+    case .writeFailed, .lockBusy:
+      // Still failing, or lost the try-lock race to a concurrent write —
+      // either way this was a real attempt at healing and counts against
+      // the cap. Under the cap: keep the chain's `backgroundHealScheduled`
+      // claim and reschedule rather than clearing and re-setting it (which
+      // would let a second chain slip in during the gap).
+      guard attempt < Self.backgroundHealMaxAttempts else {
+        lock.lock(); backgroundHealScheduled = false; lock.unlock()
+        return
+      }
+      await runBackgroundHeal(attempt: attempt + 1)
     }
-
-    // Still failing (or lost the try-lock race to a concurrent write) and
-    // under the cap: keep the chain's `backgroundHealScheduled` claim and
-    // reschedule rather than clearing and re-setting it (which would let a
-    // second chain slip in during the gap).
-    await runBackgroundHeal(attempt: attempt + 1)
   }
 
   /// comfybox#386 review round 3, item 1a: re-attempt persisting whatever is
@@ -6859,11 +6938,15 @@ private final class LiveHealthState: @unchecked Sendable {
   /// NON-BLOCKING (`tryPersistDeltaSidecar`): this can run on the actor
   /// itself, which must never stall behind `sidecarLock` contention — if
   /// another write is already in flight, this attempt is simply skipped
-  /// (`false`) rather than parked, and the drain's own guard falls through to
-  /// the degraded-mode check or gives up for this pass, trying again next
-  /// time. Returns whether the current generation is durable once this call
-  /// returns (`true` also when there was nothing to persist, it was already
-  /// durable, or this attempt won the race and actually wrote it).
+  /// rather than parked, and the drain's own guard falls through to the
+  /// degraded-mode check or gives up for this pass, trying again next time.
+  /// comfybox#386 review round 5: branches on `SidecarWriteOutcome.wroteOK`
+  /// specifically (not merely "the call returned"), so this can never
+  /// mistake "we acquired the lock" for "the write actually landed" — the
+  /// exact conflation that made `runBackgroundHeal` declare victory after a
+  /// single failed write (see its own doc comment). Returns whether the
+  /// current generation is durable once this call returns (`true` also when
+  /// there was nothing to persist or it was already durable).
   @discardableResult
   func retryPendingSidecarWrite() -> Bool {
     lock.lock()
@@ -6872,9 +6955,10 @@ private final class LiveHealthState: @unchecked Sendable {
     let snapshot = deltas.map { $0.command }
     lock.unlock()
     guard !alreadyDurable else { return true }
-    _ = tryPersistDeltaSidecar(generation: generation, snapshot: snapshot)
-    lock.lock(); defer { lock.unlock() }
-    return generation <= lastPersistedDeltaGeneration
+    switch tryPersistDeltaSidecar(generation: generation, snapshot: snapshot) {
+    case .wroteOK: return true
+    case .writeFailed, .lockBusy: return false
+    }
   }
 
   /// Clear the in-memory deltas (recovery already folded them into the
@@ -14263,9 +14347,23 @@ final class WarmServerQueueProbe: @unchecked Sendable {
 
   /// comfybox#386 review round 4, item 3: the background self-heal's retry
   /// delay and attempt cap, exposed so a test can bound its own wait without
-  /// duplicating the constants.
-  static var backgroundHealRetryDelaySeconds: TimeInterval { LiveHealthState.backgroundHealRetryDelaySeconds }
+  /// duplicating the constants. Round 5, item 2: settable — a test driving
+  /// the heal through several real failures shrinks this so the run doesn't
+  /// burn several real seconds; nothing resets it automatically, so a test
+  /// that lowers it MUST restore it (`defer`).
+  static var backgroundHealRetryDelaySeconds: TimeInterval {
+    get { LiveHealthState.backgroundHealRetryDelaySeconds }
+    set { LiveHealthState.backgroundHealRetryDelaySeconds = newValue }
+  }
   static var backgroundHealMaxAttempts: Int { LiveHealthState.backgroundHealMaxAttempts }
+
+  #if DEBUG
+  /// comfybox#386 review round 5, item 3 test seam: directly stamp the
+  /// failure-streak state (see `LiveHealthState.testSeamStampFailureStreak`).
+  func stampFailureStreak(first: Date, last: Date, count: Int) {
+    liveHealth.testSeamStampFailureStreak(first: first, last: last, count: count)
+  }
+  #endif
 
   /// Pending ids as `GET /v1/queue` composes them (snapshot + undrained deltas) —
   /// a just-cancelled job is already absent here.

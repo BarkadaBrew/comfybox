@@ -153,6 +153,14 @@ enum QueueDeltaStore {
   /// `LiveHealthState.persistDeltaSidecar` never advances
   /// `lastPersistedDeltaGeneration` on a failed write (review round 2, item 2).
   nonisolated(unsafe) static var forcedSaveResult: Bool?
+
+  /// comfybox#386 review round 5 test seam: like `forcedSaveResult`, but
+  /// invoked FRESH on every `save` call and takes precedence over it — a
+  /// fixed `forcedSaveResult` can't model "fails N times then recovers"
+  /// (the exact shape of a real transient outage), which is what pins the
+  /// round-5 critical fix (`runBackgroundHeal` retrying through more than
+  /// one real write failure, not just lost try-lock races).
+  nonisolated(unsafe) static var forcedSaveResultProvider: (@Sendable () -> Bool)?
   #endif
 
   static var path: URL {
@@ -168,6 +176,7 @@ enum QueueDeltaStore {
   static func save(_ deltas: [QueueControlCommand]) -> Bool {
     #if DEBUG
     blockingWriteHook?()
+    if let provider = forcedSaveResultProvider { return provider() }
     if let forced = forcedSaveResult { return forced }
     #endif
     guard !deltas.isEmpty else {

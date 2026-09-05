@@ -26,6 +26,12 @@ final class ControlPlaneTests: XCTestCase {
   override func tearDown() {
     QueueDeltaStore.blockingWriteHook = nil
     QueueDeltaStore.forcedSaveResult = nil
+    QueueDeltaStore.forcedSaveResultProvider = nil
+    // comfybox#386 review round 5, item 2: a safety net alongside each
+    // test's own `defer` — `backgroundHealRetryDelaySeconds` has no
+    // per-instance override, so a test that lowers it and fails before its
+    // own restore must not leak a fast delay into every later test.
+    WarmServerQueueProbe.backgroundHealRetryDelaySeconds = 1.0
     super.tearDown()
   }
 
@@ -797,6 +803,9 @@ final class ControlPlaneTests: XCTestCase {
   /// possibly make this durable.
   func testBackgroundSelfHealRecoversWithoutAnyDrainOrEnqueueActivity() async throws {
     let probe = makeQueueProbe()
+    let originalDelay = WarmServerQueueProbe.backgroundHealRetryDelaySeconds
+    WarmServerQueueProbe.backgroundHealRetryDelaySeconds = 0.05
+    defer { WarmServerQueueProbe.backgroundHealRetryDelaySeconds = originalDelay }
 
     QueueDeltaStore.forcedSaveResult = false
     probe.recordCancelDeltaOnly(id: "parked-heal")
@@ -808,5 +817,90 @@ final class ControlPlaneTests: XCTestCase {
       "background heal lands with no drain/enqueue activity",
       timeout: WarmServerQueueProbe.backgroundHealRetryDelaySeconds * Double(WarmServerQueueProbe.backgroundHealMaxAttempts) + 5
     ) { probe.peekedDrainableDeltaCount == 1 }
+  }
+
+  // MARK: - comfybox#386 review round 5 (critical): the heal must branch on wroteOK
+
+  /// Thread-safe call counter that fails the first `failuresBeforeSuccess`
+  /// calls and succeeds every call after — models a real transient outage
+  /// (fails for a while, then recovers), which a fixed `forcedSaveResult`
+  /// cannot: it's the same value on every call.
+  private final class CountingResultProvider: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCount = 0
+    private let failuresBeforeSuccess: Int
+    init(failuresBeforeSuccess: Int) { self.failuresBeforeSuccess = failuresBeforeSuccess }
+    func next() -> Bool {
+      lock.lock(); defer { lock.unlock() }
+      callCount += 1
+      return callCount > failuresBeforeSuccess
+    }
+    var attempts: Int { lock.lock(); defer { lock.unlock() }; return callCount }
+  }
+
+  /// THE regression test for the round-5 critical: `tryPersistDeltaSidecar`
+  /// used to return a plain `Bool` that was `true` whenever `sidecarLock` was
+  /// merely ACQUIRED — `runBackgroundHeal`'s `if tryPersistDeltaSidecar(...)`
+  /// then treated a failed-but-attempted write as "done", so a sustained
+  /// outage (lock always free, write always failing) got exactly ONE real
+  /// retry before the chain incorrectly declared victory and stopped; the
+  /// ≤5 cap only ever applied to lost try-lock races, never to real write
+  /// failures. This test fails a real save N times (via
+  /// `forcedSaveResultProvider`, which — unlike `forcedSaveResult` — can
+  /// change its answer across calls) then lets it succeed, and asserts the
+  /// heal chain actually retries through all N failures to land the
+  /// (N+1)th, with the marker advancing to prove it. Against the pre-fix
+  /// `Bool`-returning `tryPersistDeltaSidecar`, this fails: the chain stops
+  /// after the second overall `save` call (the first heal attempt), leaving
+  /// `provider.attempts == 2` regardless of `failuresBeforeSuccess`, and
+  /// `peekedDrainableDeltaCount` never reaches 1 (`waitUntil` times out).
+  func testBackgroundHealRetriesThroughMultipleFailuresBeforeSucceeding() async throws {
+    let probe = makeQueueProbe()
+    let originalDelay = WarmServerQueueProbe.backgroundHealRetryDelaySeconds
+    WarmServerQueueProbe.backgroundHealRetryDelaySeconds = 0.05
+    defer {
+      WarmServerQueueProbe.backgroundHealRetryDelaySeconds = originalDelay
+      QueueDeltaStore.forcedSaveResultProvider = nil
+    }
+
+    let failuresBeforeSuccess = 3
+    let provider = CountingResultProvider(failuresBeforeSuccess: failuresBeforeSuccess)
+    QueueDeltaStore.forcedSaveResultProvider = { provider.next() }
+
+    probe.recordCancelDeltaOnly(id: "sustained-outage")   // attempt #1 (fails) — also schedules the heal chain
+    XCTAssertEqual(probe.peekedDrainableDeltaCount, 0, "attempt #1 (recordDelta's own) failed")
+
+    // No further recordDelta/drainNow/retrySidecarWrite calls — only the
+    // background heal chain (attempts #2, #3, #4 — the last one succeeds)
+    // can possibly land this.
+    try await waitUntil(
+      "the heal chain retries through every failure and eventually lands",
+      timeout: WarmServerQueueProbe.backgroundHealRetryDelaySeconds * Double(WarmServerQueueProbe.backgroundHealMaxAttempts + 2) + 5
+    ) { probe.peekedDrainableDeltaCount == 1 }
+
+    XCTAssertEqual(provider.attempts, failuresBeforeSuccess + 1,
+                   "exactly N failures then the (N+1)th succeeds — no early stop on a failed-but-attempted write")
+  }
+
+  /// A positive test for the TIME half of the degraded window, filling the
+  /// gap the round-4 tests left (lone failure never trips it; a stale streak
+  /// ages out) — the one case that SHOULD trip it: the first failure is past
+  /// the window, the most recent failure is still within it (so the streak
+  /// has NOT aged out), and there have been at least 2 failures. Uses the
+  /// direct state-stamp seam since `persistDeltaSidecarLocked` always
+  /// records real failures with the real clock — there is no way to make a
+  /// REAL first failure "old" and a REAL last failure "recent" without
+  /// actually waiting close to the window.
+  func testTimeHalfOfDegradedWindowTripsWhenFirstFailureIsOldButLastIsRecent() {
+    let probe = makeQueueProbe()
+    let now = Date()
+    let firstFailure = now.addingTimeInterval(-(WarmServerQueueProbe.degradedModeWindowSeconds + 1))
+    let lastFailure = now.addingTimeInterval(-1)
+
+    probe.stampFailureStreak(first: firstFailure, last: lastFailure, count: 2)
+
+    XCTAssertTrue(
+      probe.isDeltaSidecarDegraded(asOf: now),
+      "first failure older than the window + last failure within it (not aged out) + count >= 2 -> degraded via the time half")
   }
 }
