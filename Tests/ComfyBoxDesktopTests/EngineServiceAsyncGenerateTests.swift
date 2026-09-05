@@ -803,6 +803,106 @@ struct EngineServiceAsyncGenerateTests {
         #expect(engine.lastError == nil, "a stop the user pressed is not an error")
     }
 
+    /// PR #384 review r4, item 1: the QUEUE TAB's stop went straight to
+    /// `interruptRender`, so it was unbounded — a wedged engine held the button
+    /// on `WarmServerClient`'s 300s timeout — and had no dequeued fallback. Both
+    /// surfaces now call `cancelRender(jobId:)`, which is what this drives.
+    @Test("the queue-tab stop path is bounded against a wedged engine")
+    func queueTabStopIsBounded() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.cancelBestEffortTimeout = 0.15
+        transport.always("/v1/queue/interrupt", .init(200, #"{"interrupted":true}"#))
+        transport.hangs("/v1/queue/interrupt")
+
+        let started = Date()
+        let result = try await engine.cancelRender(jobId: "SOMEONE-ELSE")
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(result == .abandoned(jobId: "SOMEONE-ELSE"))
+        #expect(elapsed < 3.0, "took \(elapsed)s — the queue-tab stop must not inherit the HTTP timeout")
+        #expect(transport.requestCount("POST", "/v1/queue/interrupt") == 1)
+    }
+
+    /// The untargeted default ("stop whatever is active", used when the engine
+    /// reports no active job id at all) goes through the same bounded path and
+    /// reports the same way.
+    @Test("an untargeted stop is bounded and reports alreadyFinished when nothing stopped")
+    func untargetedStopIsBoundedAndHonest() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        transport.always("/v1/queue/interrupt", .init(200, #"{"interrupted":false}"#))
+
+        let result = try await engine.cancelRender(jobId: nil)
+        #expect(result == .alreadyFinished(jobId: "active"))
+        #expect(result.message == EngineService.InterruptOutcome.alreadyFinishedMessage)
+        // No target field: the legacy body, byte-identical to every other client.
+        let request = try #require(transport.requests.last(where: { $0.path == "/v1/queue/interrupt" }))
+        #expect(String(decoding: request.body, as: UTF8.self) == "{}")
+        // Nothing to fall back to without an id — no stray queue delete.
+        #expect(transport.requests.filter { $0.method == "DELETE" }.isEmpty)
+    }
+
+    /// PR #384 review r4, item 3: `/v1/queue` can report no `active_job_id`. When
+    /// it also says the active render is OURS, our own in-flight id is the right
+    /// target — otherwise the stop falls back to the untargeted default and our
+    /// render unwinds as a failure banner instead of a cancel.
+    @Test("interruptTarget falls back to our own job only when the render is ours")
+    func interruptTargetFallback() {
+        // The engine told us the id — always use it.
+        #expect(EngineService.interruptTarget(
+            activeJobId: "ENGINE", activeSource: "bree", ourInFlightJobId: "OURS") == "ENGINE")
+        // No id, but the queue says the active render came from this app.
+        #expect(EngineService.interruptTarget(
+            activeJobId: nil, activeSource: "desktop", ourInFlightJobId: "OURS") == "OURS")
+        #expect(EngineService.interruptTarget(
+            activeJobId: "", activeSource: "Desktop", ourInFlightJobId: "OURS") == "OURS")
+        // No id and somebody ELSE is rendering: guessing our id would aim the
+        // cancel at our QUEUED job. Fall back to the untargeted default.
+        #expect(EngineService.interruptTarget(
+            activeJobId: nil, activeSource: "bree", ourInFlightJobId: "OURS") == nil)
+        #expect(EngineService.interruptTarget(
+            activeJobId: nil, activeSource: nil, ourInFlightJobId: "OURS") == nil)
+        // Nothing of ours in flight.
+        #expect(EngineService.interruptTarget(
+            activeJobId: nil, activeSource: "desktop", ourInFlightJobId: nil) == nil)
+    }
+
+    /// …and end to end: the queue surface resolves the fallback target, so the
+    /// stop is recorded as a user cancel and the render unwinds as `.cancelled`.
+    @Test("a queue-tab stop with no active_job_id still unwinds our render as .cancelled")
+    func queueTabStopWithMissingActiveIdStillCancels() async throws {
+        let transport = FakeEngineTransport()
+        let engine = makeEngine(transport, outputDirectory: scratchDirectory())
+        engine.imageStatusPollInterval = 0.02
+        transport.script("/v1/generate/async", [.init(202, #"{"job_id":"MINE2","status":"queued","source":"desktop","elapsed_ms":0}"#)])
+        transport.always("/v1/queue/interrupt", .init(200, #"{"interrupted":true,"interrupted_job_id":"MINE2"}"#))
+        transport.script("/v1/generate/status/MINE2", [
+            .init(200, #"{"job_id":"MINE2","status":"processing","source":"desktop","elapsed_ms":10}"#),
+            .init(200, #"{"job_id":"MINE2","status":"failed","source":"desktop","error":"Render interrupted by /v1/queue/interrupt","elapsed_ms":300}"#),
+        ])
+
+        let render = Task { try await engine.generate(GenerationRequest(prompt: "x")) }
+        var waited = 0
+        while engine.activeImageJobId == nil && waited < 400 {
+            try await Task.sleep(for: .milliseconds(5)); waited += 1
+        }
+
+        // Exactly what the queue surfaces do when /v1/queue omits active_job_id.
+        let target = EngineService.interruptTarget(
+            activeJobId: nil, activeSource: "desktop", ourInFlightJobId: engine.activeImageJobId)
+        #expect(target == "MINE2")
+        _ = try await engine.cancelRender(jobId: target)
+
+        var thrown: Error?
+        do { _ = try await render.value } catch { thrown = error }
+        guard case EngineServiceError.cancelled? = thrown as? EngineServiceError else {
+            Issue.record("expected .cancelled, got \(String(describing: thrown))")
+            return
+        }
+        #expect(engine.lastError == nil)
+    }
+
     // MARK: - Reporting rule (PR #384 review r3, item 1)
 
     /// The batch loop used to set `engine.lastError` unconditionally, so a

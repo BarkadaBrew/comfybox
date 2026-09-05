@@ -78,17 +78,19 @@ struct QueuePanel: View {
                     if jobs.isRendering {
                         Button {
                             Task {
-                                // PR #384 review, item 2b: target the row's own
-                                // job (comfybox#362) so this cannot stop Bree's
-                                // or Kira's render by racing the queue.
+                                // PR #384 review r2 item 2b / r4 item 1: target
+                                // the row's own job (comfybox#362) so this cannot
+                                // stop Bree's or Kira's render by racing the
+                                // queue, and route it through `cancelRender` so
+                                // it is BOUNDED (3s) and gets the dequeued
+                                // fallback and the honest result wording.
                                 do {
-                                    let outcome = try await engine.interruptRender(target: jobs.activeJobId)
+                                    let target = EngineService.interruptTarget(
+                                        activeJobId: jobs.activeJobId, activeSource: jobs.activeSource,
+                                        ourInFlightJobId: engine.activeImageJobId)
+                                    let result = try await engine.cancelRender(jobId: target)
                                     await reloadJobs()
-                                    // comfybox#378: `interrupted: false` stopped
-                                    // nothing — say so rather than implying success.
-                                    if !outcome.interrupted {
-                                        actionError = EngineService.InterruptOutcome.alreadyFinishedMessage
-                                    }
+                                    actionError = result.message
                                 } catch { actionError = error.localizedDescription }
                             }
                         } label: {
@@ -97,7 +99,10 @@ struct QueuePanel: View {
                         }
                         .buttonStyle(.borderless)
                         .foregroundStyle(.orange)
-                        .help(jobs.activeJobId.map { "Cancel this render (job \($0.prefix(8)))" }
+                        .help(EngineService.interruptTarget(
+                                activeJobId: jobs.activeJobId, activeSource: jobs.activeSource,
+                                ourInFlightJobId: engine.activeImageJobId)
+                              .map { "Cancel this render (job \($0.prefix(8)))" }
                               ?? "Cancel whichever render is active")
                     }
                     if !jobs.pending.isEmpty {

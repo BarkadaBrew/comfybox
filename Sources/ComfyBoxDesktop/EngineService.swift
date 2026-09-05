@@ -756,7 +756,8 @@ public final class EngineService {
         /// hourly prune dropped it. TERMINAL — retrying can only 404 again.
         case unknownJob(String)
         /// A transport blip, a non-200 that is not 404, or an undecodable body.
-        /// Retried up to `imageStatusTransientFailureLimit` consecutive times.
+        /// Retried while consecutive failure has lasted less than
+        /// `imageStatusTransientFailureBudget` seconds.
         case transient(String)
     }
 
@@ -787,6 +788,27 @@ public final class EngineService {
         } catch {
             return .transient(error.localizedDescription)
         }
+    }
+
+    /// Which job id a queue surface's "stop this render" should name, as a pure
+    /// function so the fallback is testable (PR #384 review r4, item 3).
+    ///
+    /// `/v1/queue` normally reports `active_job_id`, but it can be absent (an
+    /// older engine, or the gap between a job being dequeued and the snapshot
+    /// being republished). When it is, and the queue says the active render came
+    /// from THIS app, our own in-flight id is the right target — without it the
+    /// stop falls back to the untargeted default and the user-cancel note is
+    /// skipped, so our own render unwinds as a failure banner.
+    ///
+    /// The `desktop` check is what keeps this safe: guessing our id whenever
+    /// `active_job_id` is missing would aim a cancel at our QUEUED job while
+    /// somebody else's render is the one actually running.
+    nonisolated static func interruptTarget(
+        activeJobId: String?, activeSource: String?, ourInFlightJobId: String?
+    ) -> String? {
+        if let activeJobId, !activeJobId.isEmpty { return activeJobId }
+        guard activeSource?.lowercased() == "desktop" else { return nil }
+        return ourInFlightJobId
     }
 
     /// How a thrown generation error should be REPORTED, as a pure function so
@@ -2192,11 +2214,21 @@ public final class EngineService {
     /// sent a queue-delete that quietly did nothing.
     @discardableResult
     public func cancelImageJob(id: String) async throws -> CancelResult {
-        noteUserCancelled(id)
-        // BOUNDED (PR #384 review r3, item 2): a user cancels precisely when the
-        // engine is wedged, and `WarmServerClient`'s request timeout is 300s.
-        // Every caller — the Cancel button as much as the poll loop's
-        // Task-cancellation path — must come back in ~`cancelBestEffortTimeout`.
+        try await cancelRender(jobId: id)
+    }
+
+    /// Cancel a render, bounded (PR #384 review r3 item 2, r4 item 1).
+    ///
+    /// `jobId` nil means the legacy untargeted interrupt — "whatever /health
+    /// shows as active" — which the queue surfaces still need when the engine
+    /// reports no active job id at all. Either way the request is bounded by
+    /// `cancelBestEffortTimeout`: a user cancels precisely when the engine is
+    /// wedged, and `WarmServerClient`'s request timeout is 300s. EVERY caller —
+    /// the Generate tab's Cancel button, both Queue surfaces' per-row stop, and
+    /// the poll loop's Task-cancellation path — comes back in ~the budget.
+    @discardableResult
+    public func cancelRender(jobId: String?) async throws -> CancelResult {
+        if let jobId { noteUserCancelled(jobId) }
         let budget = cancelBestEffortTimeout
         let box = CancelOutcomeBox()
         await Task.detached { [weak self] in
@@ -2204,7 +2236,7 @@ public final class EngineService {
                 group.addTask { @MainActor in
                     guard let self else { return }
                     do {
-                        box.set(.success(try await self.performCancel(id: id)))
+                        box.set(.success(try await self.performCancel(id: jobId)))
                     } catch {
                         // A cancellation here is OUR OWN deadline tearing the
                         // request down (`group.cancelAll()` below), not a fault
@@ -2223,12 +2255,12 @@ public final class EngineService {
         switch box.get() {
         case .success(let result): return result
         case .failure(let error): throw error
-        case nil: return .abandoned(jobId: id)
+        case nil: return .abandoned(jobId: jobId ?? "active")
         }
     }
 
     /// The cancel itself, unbounded — only ever called inside
-    /// `cancelImageJob`'s race.
+    /// `cancelRender`'s race.
     ///
     /// The route is DISCOVERED, not guessed: try the targeted interrupt first,
     /// and fall back to `DELETE /v1/queue/{id}` only on the 404 that means "that
@@ -2236,7 +2268,15 @@ public final class EngineService {
     /// `queueInfo?.currentJobId` raced the queue — health is polled every
     /// 700ms-3s, so a job that started rendering in between was sent a
     /// queue-delete that quietly did nothing.
-    private func performCancel(id: String) async throws -> CancelResult {
+    ///
+    /// With no id there is nothing to fall back TO: the untargeted interrupt
+    /// either stopped the active render or there was none.
+    private func performCancel(id: String?) async throws -> CancelResult {
+        guard let id else {
+            let outcome = try await interruptRender(target: nil)
+            let named = outcome.jobId ?? "active"
+            return outcome.interrupted ? .interrupted(jobId: named) : .alreadyFinished(jobId: named)
+        }
         do {
             let outcome = try await interruptRender(target: id)
             return outcome.interrupted ? .interrupted(jobId: id) : .alreadyFinished(jobId: id)
