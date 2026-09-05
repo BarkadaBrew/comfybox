@@ -396,7 +396,10 @@ render.
 and applied — but only when the resident family is Z-Image. On any other family
 the workflow is **refused** with a 400 naming the node and the family, because
 the node's linear shift and Krea 2's log-shift `mu` are different quantities
-wearing the same number. See `bridge-developer-guide.md`.
+wearing the same number. (A ControlNet workflow takes an earlier branch that
+already refuses every non-Z-Image family with `controlNetNotSupported`, so on
+that path the client sees that error instead.) See
+`bridge-developer-guide.md`.
 
 ## Gallery output filenames
 

@@ -4374,12 +4374,18 @@ public final class WarmServer {
         // ControlNet arm too.
         //
         // This arm returns before `bridgeGenerate`'s family switch and its
-        // `auraFlowNodeGate`, and does not need it: it renders through
-        // `ZImageControlPipeline` whatever family happens to be resident, so
-        // the shift is always the Z-Image LINEAR one the node means — there is
-        // no krea2 `mu` reading to guard against. It also leaves
-        // `sigmaSchedule` at its `.flow` default, which reads the shift, so
-        // `applied_shift` here always reports a value that reached the grid.
+        // `auraFlowNodeGate`, and does not need it, because `runControlGenerate`
+        // REFUSES the request outright on krea2 / flux2 / fibo / chroma
+        // (`WarmServerError.controlNetNotSupported`) before any render — so the
+        // only family that can reach a ControlNet render is `.flux1`, where the
+        // node's LINEAR shift is exactly what `shift` means. The refusal a
+        // client sees on the ControlNet path is therefore `controlNetNotSupported`,
+        // NOT the node-named 400 the txt2img path returns; that is a
+        // pre-existing property of this arm, not something #154 introduced.
+        //
+        // It also leaves `sigmaSchedule` at its `.flow` default, which reads the
+        // shift, so `applied_shift` here always reports a value that reached the
+        // grid.
         shift: request.shift
       )
 
@@ -10603,6 +10609,24 @@ private actor WarmServerCoordinator {
     }
     #endif
 
+    // #154 (review r2, minor 4): resolve the recipe NAMES once, HERE, and let
+    // their own 400 fire before any gate reads them.
+    //
+    // `decodedGeneratePayload` already validated them, so in practice this
+    // cannot throw — but a `try?` would silently WIDEN the shift gate below on
+    // an unresolvable schedule name (nil is read as `.flow`, which honours the
+    // shift), which is the exact failure these gates exist to prevent. The
+    // family-capability gate further down reuses this value for the same
+    // reason: it used to `try?` and SKIP itself on a name it could not resolve.
+    let recipeNames: ResolvedRecipeNames
+    do {
+      recipeNames = try payload.validateRecipeNames()
+    } catch {
+      lastError = error.localizedDescription
+      continuation.resume(throwing: error)
+      return
+    }
+
     // D3 `shift`: refuse before dispatch so no family can silently ignore it.
     if let message = GeneratePayload.validateShift(payload.shift, family: currentModelFamily) {
       lastError = message
@@ -10613,7 +10637,7 @@ private actor WarmServerCoordinator {
     // `applied_shift` would report a number that never reached the grid.
     if let message = GeneratePayload.validateShiftSchedule(
       payload.shift,
-      sigmaSchedule: (try? payload.validateRecipeNames())?.sigmaSchedule,
+      sigmaSchedule: recipeNames.sigmaSchedule,
       family: currentModelFamily) {
       lastError = message
       continuation.resume(throwing: WarmServerError.invalidRequest(message: message))
@@ -10638,8 +10662,9 @@ private actor WarmServerCoordinator {
     // I5: the family capability gate. The name resolved at decode (unknown
     // names are already 400 by then); whether THIS family's loop can honour
     // it is decided here, from the one matrix (D18: family gates at dispatch).
-    if let names = try? payload.validateRecipeNames(),
-       let error = GeneratePayload.validateFamilyRecipe(names, family: currentModelFamily) {
+    // Reads the `recipeNames` resolved above rather than re-running a `try?`
+    // that would skip this gate entirely on a name it could not resolve.
+    if let error = GeneratePayload.validateFamilyRecipe(recipeNames, family: currentModelFamily) {
       lastError = error.localizedDescription ?? "unsupported sampler"
       continuation.resume(throwing: error)
       return

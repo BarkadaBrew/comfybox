@@ -312,6 +312,14 @@ identity, and a workflow with no such node renders exactly as it did before.
   matters: its `shift` is a log-shift `mu`, so the node's `3.0` would mean
   `e³ ≈ 20`, and applying it would be a different grid under the caller's
   number.
+- **The ControlNet path returns a different error.** A workflow that also
+  carries a ControlNet node takes an earlier branch, which refuses every
+  non-Z-Image family outright with `controlNetNotSupported` before any render.
+  So a Krea-2-resident client sending a ControlNet + `ModelSamplingAuraFlow`
+  graph sees the ControlNet refusal, not the node-named 400 above. That is
+  pre-existing behaviour of the ControlNet arm, not something the shift field
+  introduced — and it means the only family that can reach a ControlNet render
+  is Z-Image, where the node's shift is exactly what `shift` means.
 - A `shift` asked for alongside a sigma schedule that ignores it (`krea2`,
   `bong_tangent`) is likewise a 400 — see the `shift` section in
   [`api-notes.md`](api-notes.md).

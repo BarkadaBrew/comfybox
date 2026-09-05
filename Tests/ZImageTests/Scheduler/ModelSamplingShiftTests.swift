@@ -215,41 +215,76 @@ final class ModelSamplingShiftTests: XCTestCase {
   /// `testFlowMatchEulerSchedulerHonoursExplicitShift` below pins.
   func testMultiplierCancelsOutOfTheSigmaGrid() {
     let shift: Float = 3.0
-    let trainTimesteps = 1000
     let steps = 9
 
-    /// ComfyUI's `normal_scheduler` at an arbitrary multiplier.
-    func comfyNormalScheduler(multiplier: Double) -> [Float] {
-      let table = SigmaSchedule.discreteFlowSigmaTable(
-        shift: shift, numTrainTimesteps: trainTimesteps)
-      let sigmaMin = Double(table[0]), sigmaMax = Double(table[table.count - 1])
-      let start = sigmaMin * multiplier, end = sigmaMax * multiplier
-      // linspace(timestep(σ_max) → timestep(σ_min)) — upstream walks high→low.
-      let hi = end, lo = start
-      var out: [Float] = (0..<steps).map { i in
-        let t = hi + (lo - hi) * Double(i) / Double(steps - 1)
-        let x = t / multiplier                       // model_sampling.sigma(t)
+    // `ModelSamplingDiscreteFlow`, transcribed. Each instance is built from its
+    // OWN multiplier and knows nothing about the other — nothing here divides
+    // by `M` "by construction"; `timestep` multiplies by it and `sigma`
+    // divides by it, exactly as upstream, and the cancellation is the RESULT.
+    struct ModelSamplingDiscreteFlowOracle {
+      let shift: Float
+      let multiplier: Double
+      let sigmas: [Float]                       // register_buffer('sigmas', ts)
+
+      init(shift: Float, multiplier: Double, timesteps: Int = 1000) {
+        self.shift = shift
+        self.multiplier = multiplier
+        // ts = self.sigma((arange(1, timesteps+1) / timesteps) * multiplier)
+        self.sigmas = (0..<timesteps).map { i in
+          let t = (Double(i + 1) / Double(timesteps)) * multiplier
+          let x = t / multiplier
+          return x == 0 ? 0 : Float(Double(shift) * x / (1 + (Double(shift) - 1) * x))
+        }
+      }
+
+      var sigmaMin: Float { sigmas[0] }              // @property sigma_min
+      var sigmaMax: Float { sigmas[sigmas.count - 1] }
+      func timestep(_ sigma: Float) -> Double {      // sigma * self.multiplier
+        Double(sigma) * multiplier
+      }
+      func sigma(_ timestep: Double) -> Float {      // time_snr_shift(shift, t/mult)
+        let x = timestep / multiplier
         return Float(Double(shift) * x / (1 + (Double(shift) - 1) * x))
       }
-      out.append(0.0)
-      return out
     }
 
-    let aura = comfyNormalScheduler(multiplier: 1.0)      // ModelSamplingAuraFlow
-    let sd3 = comfyNormalScheduler(multiplier: 1000.0)    // ModelSamplingSD3
-    XCTAssertEqual(aura.count, sd3.count)
-    for i in 0..<aura.count {
-      XCTAssertEqual(aura[i], sd3[i], accuracy: 1e-6,
+    // `comfy/samplers.py` `normal_scheduler`, transcribed.
+    func normalScheduler(_ ms: ModelSamplingDiscreteFlowOracle, steps: Int) -> [Float] {
+      let start = ms.timestep(ms.sigmaMax)
+      let end = ms.timestep(ms.sigmaMin)
+      var sigs: [Float] = (0..<steps).map { i in
+        let ts = start + (end - start) * Double(i) / Double(steps - 1)  // torch.linspace
+        return ms.sigma(ts)
+      }
+      sigs.append(0.0)
+      return sigs
+    }
+
+    let auraFlow = ModelSamplingDiscreteFlowOracle(shift: shift, multiplier: 1.0)
+    let sd3 = ModelSamplingDiscreteFlowOracle(shift: shift, multiplier: 1000.0)
+
+    // The two objects genuinely disagree about timesteps — the multiplier is
+    // not inert, it just does not survive into the grid.
+    XCTAssertEqual(auraFlow.timestep(auraFlow.sigmaMax), 1.0, accuracy: 1e-9)
+    XCTAssertEqual(sd3.timestep(sd3.sigmaMax), 1000.0, accuracy: 1e-9)
+    XCTAssertNotEqual(auraFlow.timestep(auraFlow.sigmaMax), sd3.timestep(sd3.sigmaMax))
+
+    // …and yet produce the same sigmas.
+    let auraGrid = normalScheduler(auraFlow, steps: steps)
+    let sd3Grid = normalScheduler(sd3, steps: steps)
+    XCTAssertEqual(auraGrid.count, sd3Grid.count)
+    for i in 0..<auraGrid.count {
+      XCTAssertEqual(auraGrid[i], sd3Grid[i], accuracy: 1e-6,
                      "multiplier changed the grid at index \(i) — it must cancel")
     }
 
-    // …and both are the engine's grid.
-    let config = FlowMatchSchedulerTests.makeConfig(numTrainTimesteps: trainTimesteps)
+    // …which are the engine's grid.
+    let config = FlowMatchSchedulerTests.makeConfig(numTrainTimesteps: 1000)
     let engine = SigmaSchedule.flow(
       numSteps: steps, config: config.applyingExplicitShift(shift))
-    XCTAssertEqual(engine.count, aura.count)
+    XCTAssertEqual(engine.count, auraGrid.count)
     for i in 0..<engine.count {
-      XCTAssertEqual(engine[i], aura[i], accuracy: 1e-6, "engine grid differs at index \(i)")
+      XCTAssertEqual(engine[i], auraGrid[i], accuracy: 1e-6, "engine grid differs at index \(i)")
     }
   }
 

@@ -31,21 +31,53 @@ final class PresetShiftExpansionTests: XCTestCase {
     return .resolved(ResolvedPreset(preset: preset), declared: preset)
   }
 
-  /// `krea-kira-avocado` as it stands in the live `~/.comfybox/presets.json`
-  /// TODAY: a krea2 raw-stock preset that declares `shift: 1.15`.
-  ///
-  /// On `main` that number is desktop-display-only — nothing on the image path
-  /// reads it. Expanding it for every family would silently turn it into a real
-  /// `ModelSamplingFlux` `mu` on Kira's production renders the moment this
-  /// deploys. Four live presets are in this state (krea-kira, krea-kira-sfw,
-  /// krea-kira-avocado, krea2-base).
-  private func kreaKiraAvocado(shift: Double? = 1.15) -> PresetLoRAStack.Lookup {
-    let preset = ImagePreset(
-      id: "krea-kira-avocado", name: "Kira Avocado", mediaKind: "image",
-      model: "krea2-raw", steps: 30, guidance: 3.5,
+  // MARK: The four live krea2 presets that already declare `shift: 1.15`
+  //
+  // On `main` that number is desktop-display-only — nothing on the image path
+  // reads it. Expanding it for every family would silently turn it into a real
+  // `ModelSamplingFlux` `mu` on Kira's production renders the moment this
+  // deploys. These are the shapes as read from `~/.comfybox/presets.json` on
+  // 2026-09-05, ids included so a change to the store's shape is caught HERE
+  // rather than in production.
+  //
+  // Both declaration routes are covered on purpose, because the gate must hold
+  // whichever way a krea2 preset identifies itself and the store has been both
+  // shapes: `checkpoint_family` present (what the four carry today —
+  // `raw-accel` ×3, `raw-stock` ×1), and `checkpoint_family` ABSENT with only
+  // `model: "krea2-raw"` to go on.
+
+  /// (id, checkpointFamily, sampler, sigmaSchedule, steps, guidance) for each
+  /// live preset, plus the `checkpoint_family: nil` variant of each.
+  private static let liveKrea2Presets:
+    [(id: String, checkpointFamily: String?, sampler: String, sigmaSchedule: String?,
+      steps: Int, guidance: Double)] = [
+    ("krea-kira", "raw-accel", "res_2s", "beta57", 12, 1.0),
+    ("krea-kira-sfw", "raw-accel", "euler", nil, 8, 1.0),
+    ("krea-kira-avocado", "raw-stock", "res_3s", "bong_tangent", 20, 3.5),
+    ("krea2-base", "raw-accel", "res_2s", "beta57", 15, 1.0),
+    // The same four with no `checkpoint_family` at all — `model: "krea2-raw"`
+    // is then the ONLY signal, and the gate must still hold.
+    ("krea-kira", nil, "res_2s", "beta57", 12, 1.0),
+    ("krea-kira-sfw", nil, "euler", nil, 8, 1.0),
+    ("krea-kira-avocado", nil, "res_3s", "bong_tangent", 20, 3.5),
+    ("krea2-base", nil, "res_2s", "beta57", 15, 1.0),
+  ]
+
+  private func liveKrea2Preset(
+    _ row: (id: String, checkpointFamily: String?, sampler: String, sigmaSchedule: String?,
+            steps: Int, guidance: Double),
+    shift: Double? = 1.15
+  ) -> ImagePreset {
+    ImagePreset(
+      id: row.id, name: row.id, mediaKind: "image",
+      model: "krea2-raw", steps: row.steps, guidance: row.guidance,
       loras: [LoraReference(filename: "Girly_Tiana.safetensors", scale: 0.6)],
-      checkpointFamily: "raw-stock",
-      sampler: "res_2s", sigmaSchedule: "krea2", shift: shift)
+      checkpointFamily: row.checkpointFamily,
+      sampler: row.sampler, sigmaSchedule: row.sigmaSchedule, shift: shift)
+  }
+
+  private func kreaKiraAvocado(shift: Double? = 1.15) -> PresetLoRAStack.Lookup {
+    let preset = liveKrea2Preset(Self.liveKrea2Presets[2], shift: shift)
     return .resolved(ResolvedPreset(preset: preset), declared: preset)
   }
 
@@ -70,59 +102,76 @@ final class PresetShiftExpansionTests: XCTestCase {
     XCTAssertNil(e.shift, "the preset's shift is not adopted — the request already named one")
   }
 
-  /// CRITICAL, review r1 (1): a krea2 preset's declared `shift` must NOT be
-  /// expanded. `shift` is `mu` on that family — a log-shift into
+  /// CRITICAL, review r1 (1) / r2 (1): a krea2 preset's declared `shift` must
+  /// NOT be expanded. `shift` is `mu` on that family — a log-shift into
   /// `ModelSamplingFlux` — and applying the four live presets' 1.15 would
   /// change Kira's renders on deploy. Krea 2 keeps taking its shift from the
   /// REQUEST only, exactly as it did before #154.
-  func testKrea2PresetShiftIsNotExpanded() throws {
-    let e = try expansion(PresetLoRAStack.decide(
-      presetId: "krea-kira-avocado", lookup: kreaKiraAvocado(), requestLoras: nil))
-    XCTAssertNil(e.shift, "a krea2 preset's shift must never become mu behind the caller")
-    // Everything else the preset contributes is unaffected by the gate.
-    XCTAssertEqual(e.model, "krea2-raw")
-    XCTAssertEqual(e.steps, 30)
-    XCTAssertEqual(e.guidance, 3.5)
-    XCTAssertEqual(e.loras?.count, 1)
-  }
-
-  /// End-to-end at the `/v1/generate` seam: the payload's mu path is untouched
-  /// and nothing can echo an `applied_shift` for that render.
-  func testKrea2PresetLeavesThePayloadMuPathUntouched() throws {
-    let payload = try decode(#"{"prompt":"a portrait","preset":"krea-kira-avocado"}"#)
-    let out = try GeneratePayload.expandingPreset(payload) { _ in self.kreaKiraAvocado() }
-    XCTAssertNil(out.shift, "no shift on the payload ⇒ Krea 2's resolution-dependent mu stands")
-    XCTAssertNil(out.presetUnresolved, "the preset still expands — only its shift is gated")
-    XCTAssertEqual(out.model, "krea2-raw")
-
-    // And the replay body is not rewritten with a shift either.
-    let original = #"{"prompt":"a portrait","preset":"krea-kira-avocado"}"#.data(using: .utf8)!
-    let rewritten = WarmServer.rawBody(original, expandedWith: out)
-    let object = try XCTUnwrap(
-      try JSONSerialization.jsonObject(with: rewritten) as? [String: Any])
-    XCTAssertNil(object["shift"])
-
-    // The response for such a render carries no `applied_shift` key at all.
+  ///
+  /// Run END TO END over every live preset shape (both declaration routes),
+  /// asserting all four things at once for each: the expansion carries no
+  /// shift, the PAYLOAD carries no shift (so Krea 2's resolution-dependent mu
+  /// path stands), the rewritten crash-replay body carries no shift, and the
+  /// response encodes no `applied_shift` key.
+  func testLiveKrea2PresetsNeverContributeAShift() throws {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
-    let response = GenerateResponse(
-      success: true, outputPath: "/tmp/a.png", durationMs: 10, appliedShift: out.shift)
-    let json = try XCTUnwrap(
-      try JSONSerialization.jsonObject(with: encoder.encode(response)) as? [String: Any])
-    XCTAssertNil(json["applied_shift"])
+
+    for row in Self.liveKrea2Presets {
+      let declaredAs = row.checkpointFamily ?? "(no checkpoint_family — model spec only)"
+      let where_ = "\(row.id) [\(declaredAs)]"
+      let preset = liveKrea2Preset(row)
+      let lookup = PresetLoRAStack.Lookup.resolved(
+        ResolvedPreset(preset: preset), declared: preset)
+
+      // 1. the expansion contributes no shift…
+      let e = try expansion(PresetLoRAStack.decide(
+        presetId: row.id, lookup: lookup, requestLoras: nil))
+      XCTAssertNil(e.shift, "\(where_): a krea2 preset's shift must never become mu")
+      // …while everything else it declares is unaffected by the gate.
+      XCTAssertEqual(e.model, "krea2-raw", where_)
+      XCTAssertEqual(e.steps, row.steps, where_)
+      XCTAssertEqual(e.guidance, row.guidance, where_)
+      XCTAssertEqual(e.loras?.count, 1, where_)
+
+      // 2. …so the payload's mu path is untouched.
+      let body = #"{"prompt":"a portrait","preset":"\#(row.id)"}"#.data(using: .utf8)!
+      let payload = try JSONDecoder().decode(GeneratePayload.self, from: body)
+      let out = try GeneratePayload.expandingPreset(payload) { _ in lookup }
+      XCTAssertNil(out.shift,
+                   "\(where_): no shift on the payload ⇒ Krea 2's mu stands")
+      XCTAssertNil(out.presetUnresolved,
+                   "\(where_): the preset still expands — only its shift is gated")
+      XCTAssertEqual(out.model, "krea2-raw", where_)
+
+      // 3. the crash-replay body is not rewritten with a shift either.
+      let object = try XCTUnwrap(
+        try JSONSerialization.jsonObject(
+          with: WarmServer.rawBody(body, expandedWith: out)) as? [String: Any])
+      XCTAssertNil(object["shift"], where_)
+
+      // 4. and the response for such a render carries no `applied_shift` key.
+      let response = GenerateResponse(
+        success: true, outputPath: "/tmp/a.png", durationMs: 10, appliedShift: out.shift)
+      let json = try XCTUnwrap(
+        try JSONSerialization.jsonObject(with: encoder.encode(response)) as? [String: Any])
+      XCTAssertNil(json["applied_shift"], where_)
+    }
   }
 
-  /// A krea2 preset's shift is gated whichever way the family is declared —
-  /// by `checkpoint_family` (above) or by the `model` spec alone.
-  func testKrea2PresetShiftIsNotExpandedWithoutACheckpointFamily() throws {
-    let preset = ImagePreset(
-      id: "krea2-base", name: "Krea 2 base", mediaKind: "image",
-      model: "krea2-raw", loras: [], shift: 1.15)
-    let e = try expansion(PresetLoRAStack.decide(
-      presetId: "krea2-base",
-      lookup: .resolved(ResolvedPreset(preset: preset), declared: preset),
-      requestLoras: nil))
-    XCTAssertNil(e.shift)
+  /// The store shape this pins is real, not invented: all four ids are covered,
+  /// under both declaration routes. If a preset is renamed or the store starts
+  /// omitting `checkpoint_family`, this list is where it must be updated.
+  func testLiveKrea2PresetTableCoversAllFourIds() {
+    let ids = Set(Self.liveKrea2Presets.map(\.id))
+    XCTAssertEqual(ids, ["krea-kira", "krea-kira-sfw", "krea-kira-avocado", "krea2-base"])
+    let families = Set(Self.liveKrea2Presets.map { $0.checkpointFamily })
+    XCTAssertTrue(families.contains(nil), "the no-checkpoint_family route must be covered")
+    XCTAssertTrue(families.contains("raw-accel"))
+    XCTAssertTrue(families.contains("raw-stock"))
+    for row in Self.liveKrea2Presets {
+      XCTAssertEqual(liveKrea2Preset(row).shift, 1.15, row.id)
+    }
   }
 
   /// Either declaration route works: `checkpoint_family` (the fixture above)
