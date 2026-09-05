@@ -16,6 +16,13 @@ struct AcceleratorLoRAHeuristicTests {
             "dmd2_4step.safetensors",
             "Hyper-SD-8steps.safetensors",
             "lcm_lora_v1.safetensors",
+            // Round 2 additions.
+            "krea2_8step.safetensors",
+            "someLora_4Step_v2.safetensors",
+            "sdxl-flash-lora.safetensors",
+            "TCD_adapter.safetensors",
+            "pcm_deterministic_4s.safetensors",
+            "generic_step_reducer.safetensors",
         ]
         for name in names {
             #expect(AcceleratorLoRAHeuristic.looksLikeAccelerator(filename: name), "\(name)")

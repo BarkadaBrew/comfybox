@@ -224,10 +224,22 @@ not expand `~`, so an unexpanded tilde path in `model` would fail to load.
 engine would accept the spec, not that the render will succeed — a truncated
 or incomplete checkpoint still reads as loadable here.
 
-`family`/`variant` are the broad half. The five `checkpoint_family` policy
-labels are a CLIENT decision: the `raw-accel` vs `raw-stock` split within
-Krea-2 "raw" depends on whether the preset's own `loras[]` declares
-`role: "accel"`, which the engine does not see on this route.
+`family`/`variant` are the broad half, and `variant` is **never guessed from
+text**. Only a declared alias (after the `-q4`/`-q8`/`-bf16` suffixes
+`parseModelSpec` strips) or a readable Krea-2 model root yields a variant; a
+checkpoint that merely *names* z-image comes back `family: "z-image",
+variant: null`. `cyberrealisticZImage_v50.safetensors` is served as BASE and
+its filename says neither "base" nor "turbo" — reading turbo off the spelling
+put the wrong recipe under the right name, which is what F3 and #286 exist to
+prevent.
+
+A null `variant` costs nothing that matters: the five `checkpoint_family`
+policy labels are a CLIENT decision (the `raw-accel` vs `raw-stock` split
+within Krea-2 "raw" depends on whether the preset's own `loras[]` declares
+`role: "accel"`, which the engine does not see here), and
+`PresetLoRAStack.declaredFamily` maps `raw-accel` and `raw-stock` to the same
+`"krea2"`. The label is a record; `model` is what makes a preset expandable,
+and it is written either way.
 
 **Scope note (deliberate):** `model` may be any local path, and the route will
 stat it. The warm server is a localhost-trusted process on the Mac; the probe

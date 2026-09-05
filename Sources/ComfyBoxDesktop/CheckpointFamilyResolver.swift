@@ -47,4 +47,15 @@ public enum CheckpointFamilyResolver {
     public static func resolve(family: String?, variant: String?, loras: [ServerPresetLora]) -> String? {
         resolve(family: family, variant: variant, hasAccelLora: loras.contains { $0.role == "accel" })
     }
+
+    /// Does the label for this (family, variant) actually DEPEND on whether a
+    /// LoRA declares `role: "accel"`?
+    ///
+    /// Round 2: only Krea-2 "raw" splits into `raw-accel` / `raw-stock`.
+    /// Krea-2 turbo is `turbo` and Z-Image is `zimage-*` whatever the roles
+    /// say, so an un-roled accelerator-looking LoRA is not ambiguity there and
+    /// must not defer a label we can derive with certainty.
+    public static func dependsOnAccelRole(family: String?, variant: String?) -> Bool {
+        family == "krea2" && variant == "raw"
+    }
 }

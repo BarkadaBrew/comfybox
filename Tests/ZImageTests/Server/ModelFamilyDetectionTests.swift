@@ -88,10 +88,41 @@ final class ModelFamilyDetectionTests: XCTestCase {
     }
   }
 
-  func testZImageCatalogAndHuggingFaceIdsReadVariantFromText() {
+  func testQuantizationSuffixesStillResolveToTheirAlias() {
+    // Not a text guess: `-q4`/`-q8`/`-bf16` are the quantization suffixes
+    // `WarmServer.parseModelSpec` already strips, and what is left is an
+    // EXACT alias.
     XCTAssertEqual(ModelFamilyDetector.detect(spec: "z-image-turbo-bf16").variant, "turbo")
     XCTAssertEqual(ModelFamilyDetector.detect(spec: "z-image-base-bf16").variant, "base")
-    XCTAssertEqual(ModelFamilyDetector.detect(spec: "Tongyi-MAI/Z-Image-Turbo-BF16").variant, "turbo")
+    XCTAssertEqual(ModelFamilyDetector.detect(spec: "z-image-turbo-q8").variant, "turbo")
+  }
+
+  // MARK: - Round 2, ruling 5: NEVER guess the z-image variant from text
+  //
+  // `cyberrealisticZImage_v50.safetensors` is served as BASE
+  // (kira-model-is-zimage-base), and its filename contains neither "base" nor
+  // "turbo" — the old "not base ⇒ turbo" fallback labelled it `zimage-turbo`,
+  // which is the wrong recipe under the right name. Unknown variant now means
+  // NO label; `model` is still written, which is what makes a preset
+  // expandable anyway.
+
+  func testCyberrealisticPathIsZImageWithNoVariantGuess() {
+    let spec = "/Users/todd/Models-working/cyberrealistic-z-image/cyberrealisticZImage_v50.safetensors"
+    let result = ModelFamilyDetector.detect(spec: spec)
+    XCTAssertEqual(result.family, "z-image", "the spec does name z-image")
+    XCTAssertNil(result.variant, "served as BASE — a filename must never decide turbo vs base")
+  }
+
+  func testAHuggingFaceIdIsNotAVariantDeclaration() {
+    let result = ModelFamilyDetector.detect(spec: "Tongyi-MAI/Z-Image-Turbo-BF16")
+    XCTAssertEqual(result.family, "z-image")
+    XCTAssertNil(result.variant, "a repo name is text, not a declared alias")
+  }
+
+  func testAnArbitraryZImageCheckpointNameYieldsNoVariant() {
+    for spec in ["some-zimage-merge-v3", "moodyPornMix_zit_v7", "/models/z-image/mix.safetensors"] {
+      XCTAssertNil(ModelFamilyDetector.detect(spec: spec).variant, spec)
+    }
   }
 
   // MARK: unclassifiable

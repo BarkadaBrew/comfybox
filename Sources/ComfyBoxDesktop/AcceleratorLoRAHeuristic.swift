@@ -25,8 +25,16 @@ public enum AcceleratorLoRAHeuristic {
     /// Ordered as the controller specified them; kept as a stored list so a
     /// future addition is one edit with one test, not a scattered `contains`
     /// chain.
+    ///
+    /// Round 2 widened this (`step`/`4step`/`8step`/`flash`/`tcd`/`pcm`). A
+    /// false positive is now cheap: it no longer blocks the backfill, it only
+    /// defers the `checkpoint_family` LABEL until a role is declared, and
+    /// `model` — the field that makes the preset expandable — is written
+    /// either way. `4step`/`8step` are already covered by `step`; they are
+    /// listed anyway so this reads as the rule it implements.
     public static let markers: [String] = [
         "turbo", "distill", "lightning", "accel", "dmd", "hyper", "lcm",
+        "step", "4step", "8step", "flash", "tcd", "pcm",
     ]
 
     /// Does this filename look like an accelerator? Matches on the file's

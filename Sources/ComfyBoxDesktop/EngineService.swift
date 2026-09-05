@@ -1752,9 +1752,17 @@ public final class EngineService {
     /// `GET /v1/model/family?model=<spec>` (comfybox#359): what family/variant
     /// the engine detects for a model spec (alias, catalog id, or a literal
     /// `custom_model_path` directory) — file-existence checks only, safe to
-    /// call once per preset in a batch backfill. nil when unreachable or the
-    /// response can't be decoded; a decoded `ModelFamilyInfo` with nil
-    /// `family` means the ENGINE itself could not classify the spec.
+    /// call once per preset in a batch backfill.
+    ///
+    /// Round 2, ruling 7: nil means UNREACHABLE and nothing else — no client,
+    /// a transport error, or a body that will not decode. An engine that
+    /// answered with an error status has said something useful, so its
+    /// message is returned as a non-loadable `ModelFamilyInfo` and surfaces
+    /// verbatim in the backfill's Failed row instead of being flattened into
+    /// "could not reach the engine".
+    ///
+    /// A decoded result with nil `family` means the engine could not classify
+    /// the spec; `loadable == false` means it would not accept it as `model`.
     public func fetchModelFamily(forSpec spec: String) async -> ModelFamilyInfo? {
         guard let client = client, connectionState.isConnected else { return nil }
         let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1764,11 +1772,22 @@ public final class EngineService {
         let enc = trimmed.addingPercentEncoding(withAllowedCharacters: allowed) ?? trimmed
         do {
             let (status, data) = try await client.get("/v1/model/family?model=\(enc)")
-            guard status == 200 else { return nil }
-            return try JSONDecoder().decode(ModelFamilyInfo.self, from: data)
+            if status == 200 {
+                return try JSONDecoder().decode(ModelFamilyInfo.self, from: data)
+            }
+            return Self.refusal(spec: trimmed, status: status,
+                                message: parseErrorMessage(from: data))
         } catch {
             return nil
         }
+    }
+
+    /// The engine answered, but not with a detection — keep its own words.
+    static func refusal(spec: String, status: Int, message: String?) -> ModelFamilyInfo {
+        ModelFamilyInfo(
+            model: spec, family: nil, variant: nil, spec: spec, loadable: false,
+            reason: message.map { "the engine refused to classify '\(spec)' (HTTP \(status)): \($0)" }
+                ?? "the engine refused to classify '\(spec)' (HTTP \(status))")
     }
 
     public func savePreset(_ preset: ServerPreset) async throws {

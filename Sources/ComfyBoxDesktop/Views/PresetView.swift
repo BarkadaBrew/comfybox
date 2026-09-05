@@ -23,7 +23,10 @@ struct PresetView: View {
     @State private var warmModelSpec: String?
     /// #359: "Make expandable" (one preset) / "Backfill all" (below).
     @State private var backfillViewModel = PresetBackfillViewModel()
-    @State private var backfillResults: [PresetBackfillViewModel.Outcome]?
+    /// Minted ONCE, when a run finishes — computing `id = UUID()` inside the
+    /// `.sheet(item:)` getter gave the box a new identity on every SwiftUI
+    /// evaluation, which re-presents the sheet.
+    @State private var backfillResults: BackfillResultsBox?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -68,23 +71,18 @@ struct PresetView: View {
                 onCancel: { editing = nil }
             )
         }
-        .sheet(item: backfillResultsBinding) { results in
+        .sheet(item: $backfillResults) { results in
             BackfillResultsView(results: results.items) { backfillResults = nil }
         }
     }
 
     /// `.sheet(item:)` needs an `Identifiable` — wraps the array so an empty
     /// (but non-nil) result set still shows "nothing to backfill" instead of
-    /// silently not presenting.
-    private struct BackfillResultsBox: Identifiable {
+    /// silently not presenting. The id is fixed at construction, not
+    /// recomputed per render.
+    struct BackfillResultsBox: Identifiable {
         let id = UUID()
         let items: [PresetBackfillViewModel.Outcome]
-    }
-    private var backfillResultsBinding: Binding<BackfillResultsBox?> {
-        Binding(
-            get: { backfillResults.map(BackfillResultsBox.init) },
-            set: { backfillResults = $0?.items }
-        )
     }
 
     private var header: some View {
@@ -246,9 +244,9 @@ struct PresetView: View {
         switch outcome.status {
         case .failed(let message):
             loadError = "Could not make '\(preset.name)' expandable: \(message)"
-        case .needsReview(let message):
-            // Not an error — a question. Same wording the batch sheet uses.
-            loadError = "'\(preset.name)' needs review first: \(message)"
+        case .updated(_, nil, let note):
+            // Expandable now; only the checkpoint_family label is outstanding.
+            loadError = note.map { "'\(preset.name)' is expandable — \($0)" }
         case .updated, .skipped:
             loadError = nil
         }
@@ -263,7 +261,7 @@ struct PresetView: View {
             detectFamily: { spec in await engine.fetchModelFamily(forSpec: spec) },
             save: { updated in try await engine.savePreset(updated) }
         )
-        backfillResults = results
+        backfillResults = BackfillResultsBox(items: results)
         await reload()
     }
 
@@ -853,13 +851,17 @@ private struct ServerPresetEditor: View {
         // stays in `custom_model_path`; see `PresetModelFieldBuilder`.
         // `detectedModelFamily` is the engine's answer (`GET
         // /v1/model/family`) for the CURRENT `model` text, kept fresh by
-        // `.task(id: model)`; a miss leaves `model` alone for a path and
-        // falls back to whatever `checkpoint_family` this preset already had,
-        // so a transient detection failure never erases a valid declaration.
+        // `.task(id: model)`. On a MISS nothing is erased: `model` keeps its
+        // existing value as long as the typed path is unchanged (round 2
+        // ruling 1 — writing nil here reverted a just-backfilled preset to
+        // `no_model`), and `checkpoint_family` falls back to whatever this
+        // preset already declared.
         let modelFields = PresetModelFieldBuilder.build(
             modelText: model,
             loras: loras,
             detection: detectedModelFamily,
+            fallbackModel: original.model,
+            fallbackCustomModelPath: original.customModelPath,
             fallbackCheckpointFamily: original.checkpointFamily
         )
         p.model = modelFields.model
@@ -988,10 +990,11 @@ struct SavePresetSheet: View {
 
 /// One-shot summary sheet for "Make Expandable" (a single-item list) and
 /// "Make All Expandable (N)…" (the whole batch) — per-preset
-/// updated/skipped/needs-review/failed, so a batch run is auditable rather
-/// than a single toast. `needsReview` is its own bucket on purpose: those
-/// presets were NOT written and are waiting on Todd to declare an
-/// accelerator LoRA's role.
+/// Updated / Updated (label pending) / Failed, so a batch run is auditable
+/// rather than a single toast. "Label pending" means the preset IS expandable
+/// now — `model` was written — and only the `checkpoint_family` label is
+/// outstanding, because it turns on an accelerator LoRA whose role nobody has
+/// declared (or on a variant the engine refuses to guess).
 private struct BackfillResultsView: View {
     let results: [PresetBackfillViewModel.Outcome]
     let onDismiss: () -> Void
@@ -1028,15 +1031,15 @@ private struct BackfillResultsView: View {
     @ViewBuilder
     private func icon(for status: PresetBackfillViewModel.Outcome.Status) -> some View {
         switch status {
-        case .updated:
+        case .updated(_, .some, _):
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .updated(_, nil, _):
+            // Written and expandable — the checkpoint_family LABEL is still
+            // outstanding (an accelerator LoRA with no role, or a variant the
+            // engine will not guess). Not a failure.
+            Image(systemName: "checkmark.circle").foregroundStyle(.orange)
         case .skipped:
             Image(systemName: "minus.circle").foregroundStyle(.secondary)
-        case .needsReview:
-            // A question, not a failure — nothing was written, and Todd has
-            // to set the accelerator LoRA's role before this preset can be
-            // labelled raw-accel vs raw-stock.
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
         case .failed:
             Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
@@ -1044,11 +1047,11 @@ private struct BackfillResultsView: View {
 
     private func detail(for status: PresetBackfillViewModel.Outcome.Status) -> String {
         switch status {
-        case .updated(let model, let family):
-            let familyPart = family.map { ", checkpoint_family \"\($0)\"" } ?? ""
-            return "model set to \"\(model)\"\(familyPart) — now expands"
+        case .updated(let model, let label, let note):
+            let head = "model set to \"\(model)\" — now expands"
+            if let label { return head + ", checkpoint_family \"\(label)\"" }
+            return note.map { "\(head). \($0)" } ?? head
         case .skipped(let reason): return reason
-        case .needsReview(let reason): return "Needs review: \(reason)"
         case .failed(let reason): return reason
         }
     }

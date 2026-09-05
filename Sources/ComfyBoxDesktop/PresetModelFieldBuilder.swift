@@ -15,9 +15,24 @@
 // That is the field `PresetLoRAStack.decide` reads first; without it a
 // path-only preset stays a `no_model` label no matter what
 // `checkpoint_family` says. `custom_model_path` is still written so the
-// desktop's own Apply/Set-as-Warm path is unchanged, and `model` is only
-// written when the engine said the spec is `loadable` — a preset that names
-// a base the engine would refuse is worse than one that names none.
+// desktop's own Apply/Set-as-Warm path is unchanged.
+//
+// FIX ROUND 2, two rules that matter more than they look:
+//
+//   1. (CRITICAL) A detection MISS must never erase a `model` that is
+//      already there. `buildPreset()` runs on every Save, and detection is
+//      nil whenever the engine is unreachable or the user saves before
+//      `.task(id: model)` answers. Writing nil then reverted a
+//      just-backfilled preset straight back to `no_model` — this PR's own
+//      bug, reintroduced by its own editor. So `model` is cleared ONLY when
+//      the user actually changed the path; otherwise `fallbackModel` (the
+//      preset's existing `model`) stands.
+//   3. An un-roled accelerator LoRA no longer gates anything. `model` is
+//      written whenever the engine says the spec is loadable; only the
+//      `checkpoint_family` LABEL is deferred, and only where the label
+//      genuinely depends on the role (Krea-2 "raw"). Expandability never
+//      waits on a label — `declaredFamily` maps `raw-accel` and `raw-stock`
+//      to the same "krea2" anyway.
 
 import Foundation
 
@@ -42,17 +57,23 @@ public enum PresetModelFieldBuilder {
     ///   - detection: the engine's answer (`GET /v1/model/family`) for the
     ///     spec THIS builder is about to derive from `modelText`, kept fresh
     ///     by `ServerPresetEditor`'s `.task(id: model)`. nil when not yet
-    ///     resolved or the engine was unreachable — in which case a typed
-    ///     path is stored as `custom_model_path` only, exactly as before this
-    ///     change, and the preset's existing `checkpoint_family` survives.
+    ///     resolved or the engine was unreachable.
+    ///   - fallbackModel: `original.model` — the preset's existing `model`,
+    ///     kept when detection can't supply a fresh one AND the typed path is
+    ///     unchanged. This is the ruling-1 guard against erasing a backfill.
+    ///   - fallbackCustomModelPath: `original.customModelPath` — what
+    ///     "unchanged" is measured against.
     ///   - fallbackCheckpointFamily: `original.checkpointFamily` — carried
-    ///     through UNCHANGED when detection can't resolve one, so an already
+    ///     through UNCHANGED when no label can be derived, so an already
     ///     valid, manually-declared value (or one an earlier backfill wrote)
-    ///     is never clobbered by a transient detection miss.
+    ///     is never clobbered by a transient detection miss or by a deferred
+    ///     accel/stock decision.
     public static func build(
         modelText: String,
         loras: [ServerPresetLora],
         detection: ModelFamilyInfo?,
+        fallbackModel: String?,
+        fallbackCustomModelPath: String?,
         fallbackCheckpointFamily: String?
     ) -> Result {
         let modelValue = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -65,22 +86,53 @@ public enum PresetModelFieldBuilder {
             // The canonical spec the engine gave us for THIS path — an alias
             // when the path is a declared install, else the standardized
             // absolute path. Only when the engine said it would load it.
-            if let detection, detection.loadable {
-                let spec = detection.spec.trimmingCharacters(in: .whitespacesAndNewlines)
-                model = spec.isEmpty ? nil : spec
+            if let detection, detection.loadable,
+               case let spec = detection.spec.trimmingCharacters(in: .whitespacesAndNewlines),
+               !spec.isEmpty {
+                model = spec
+            } else if isUnchangedPath(modelValue, from: fallbackCustomModelPath) {
+                // Ruling 1: nothing fresh to write, and the user did not
+                // repoint the preset — keep whatever `model` it already has.
+                // Clearing here is what silently un-fixed a backfilled preset.
+                model = fallbackModel
+            } else {
+                // The path genuinely changed and we have no answer for the new
+                // one; the old base no longer describes this preset.
+                model = nil
             }
         } else {
+            // A bare spec IS the model, exactly as typed — including when it
+            // is empty, which is an explicit "clear this field", not a miss.
             model = modelValue.isEmpty ? nil : modelValue
             customModelPath = nil
         }
 
-        let resolvedFamily = CheckpointFamilyResolver.resolve(
-            family: detection?.family, variant: detection?.variant, loras: loras)
-
         return Result(
             model: model,
             customModelPath: customModelPath,
-            checkpointFamily: resolvedFamily ?? fallbackCheckpointFamily
+            checkpointFamily: derivedLabel(detection: detection, loras: loras)
+                ?? fallbackCheckpointFamily
         )
+    }
+
+    /// The `checkpoint_family` label this save can derive with certainty, or
+    /// nil to fall back to whatever the preset already declared.
+    private static func derivedLabel(detection: ModelFamilyInfo?, loras: [ServerPresetLora]) -> String? {
+        guard let detection else { return nil }
+        // Ruling 3: defer the label — never guess it — but only where it
+        // actually turns on the role.
+        if CheckpointFamilyResolver.dependsOnAccelRole(family: detection.family, variant: detection.variant),
+           !AcceleratorLoRAHeuristic.unroledAcceleratorCandidates(loras).isEmpty {
+            return nil
+        }
+        return CheckpointFamilyResolver.resolve(
+            family: detection.family, variant: detection.variant, loras: loras)
+    }
+
+    /// Same path, modulo the whitespace the editor trims anyway.
+    private static func isUnchangedPath(_ typed: String, from stored: String?) -> Bool {
+        guard let stored = stored?.trimmingCharacters(in: .whitespacesAndNewlines), !stored.isEmpty
+        else { return false }
+        return typed == stored
     }
 }

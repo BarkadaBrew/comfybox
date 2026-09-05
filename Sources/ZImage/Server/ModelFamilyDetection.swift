@@ -52,7 +52,12 @@ struct ModelFamilyDetectionResponse: Encodable, Sendable, Equatable {
   let family: String?
   /// The physical/declared variant within that family: krea2 `"turbo"` |
   /// `"raw"`; z-image `"turbo"` | `"base"`. nil when `family` is nil, or the
-  /// spec resolves to the family but not to a determinable variant.
+  /// spec resolves to the family but not to a DECLARED variant.
+  ///
+  /// Round 2, ruling 5: never inferred from a filename. A z-image variant
+  /// comes only from an exact alias; a krea2 variant only from a readable
+  /// model root. `cyberrealisticZImage_v50.safetensors` is served as BASE,
+  /// and its name says neither — a text guess labelled it turbo.
   let variant: String?
   /// FIX ROUND 1 — the field that makes this route useful at all.
   ///
@@ -86,17 +91,57 @@ enum ModelFamilyDetector {
   private static let baseAliases: Set<String> = ["z-image-base", "zimage-base"]
   private static let turboAliases: Set<String> = ["z-image-turbo", "zimage-turbo", "z-image"]
 
-  /// nil when `spec` does not name z-image at all.
-  static func zImageVariant(for spec: String) -> String? {
+  /// Does this spec name z-image at all? Family classification only — the
+  /// same substring rule `PresetLoRAStack.modelFamily` already applies to a
+  /// request's `model`.
+  static func namesZImage(_ spec: String) -> Bool {
     let lower = spec.lowercased()
+    if baseAliases.contains(lower) || turboAliases.contains(lower) { return true }
+    return lower.contains("z-image") || lower.contains("zimage")
+  }
+
+  /// The DECLARED z-image variant, or nil.
+  ///
+  /// ROUND 2, RULING 5 — this used to read "base" vs "turbo" off the text
+  /// itself, defaulting to turbo for anything that did not say "base". Todd's
+  /// `cyberrealisticZImage_v50.safetensors` is served as BASE and its
+  /// filename says neither, so that fallback labelled it `zimage-turbo`: the
+  /// wrong recipe under the right name, which is the exact class of bug F3
+  /// and #286 exist to prevent.
+  ///
+  /// Only an EXACT alias counts now — after stripping the quantization
+  /// suffixes `WarmServer.parseModelSpec` itself strips, so
+  /// `z-image-turbo-bf16` still resolves through its alias rather than
+  /// through its spelling. Everything else is nil: the family label is then
+  /// omitted, and `model` — the field that actually makes a preset
+  /// expandable — is still written.
+  ///
+  /// Deliberately NOT wired in: `CivitAICheckpoint.inspect` can read a
+  /// variant out of a checkpoint's tensor names. It would cost a safetensors
+  /// header read per preset in a batch backfill (this route promises file
+  /// existence only), and its own tail defaults to `.turbo` for an
+  /// unrecognized checkpoint — a second guess in the place we just removed
+  /// one. If that read is ever wanted, it belongs behind an explicit opt-in.
+  static func zImageVariant(for spec: String) -> String? {
+    let lower = stripQuantizationSuffix(spec.lowercased())
     if baseAliases.contains(lower) { return "base" }
     if turboAliases.contains(lower) { return "turbo" }
-    guard lower.contains("z-image") || lower.contains("zimage") else { return nil }
-    // An id that names z-image but neither alias exactly (e.g. a HF id like
-    // "Tongyi-MAI/Z-Image-Turbo-BF16", or a catalog id like
-    // "z-image-base-bf16") — read "base" vs "turbo" off the text itself,
-    // same as the alias table above, just not an exact match.
-    return lower.contains("base") ? "base" : "turbo"
+    return nil
+  }
+
+  /// `-q4` / `-q8` / `-bf16`, repeatedly — mirroring `parseModelSpec`'s own
+  /// suffix loop so an alias and its quantized spelling agree.
+  private static func stripQuantizationSuffix(_ lower: String) -> String {
+    var out = lower
+    var changed = true
+    while changed {
+      changed = false
+      for suffix in ["-q4", "-q8", "-bf16"] where out.hasSuffix(suffix) {
+        out.removeLast(suffix.count)
+        changed = true
+      }
+    }
+    return out
   }
 
   /// Detect a spec's family + variant without loading it. Deliberately does
@@ -124,9 +169,12 @@ enum ModelFamilyDetector {
         model: spec, family: "krea2", variant: nil,
         spec: canonical.spec, loadable: canonical.loadable, reason: canonical.reason)
     }
-    if let variant = zImageVariant(for: trimmed) {
+    if namesZImage(trimmed) {
+      // Variant may be nil (ruling 5): a checkpoint that merely NAMES z-image
+      // does not declare turbo vs base, and guessing is how a base model gets
+      // rendered on a turbo recipe.
       return ModelFamilyDetectionResponse(
-        model: spec, family: "z-image", variant: variant,
+        model: spec, family: "z-image", variant: zImageVariant(for: trimmed),
         spec: canonical.spec, loadable: canonical.loadable, reason: canonical.reason)
     }
     return ModelFamilyDetectionResponse(
@@ -207,9 +255,11 @@ enum ModelFamilyDetector {
       }
       return (trimmed, true, nil)
     }
-    if zImageVariant(for: trimmed) != nil {
+    if namesZImage(trimmed) {
       // A z-image alias or an id that names z-image — resolved from the HF
       // cache (or downloaded) by `ModelResolution`, which the engine accepts.
+      // Loadability is about the FAMILY being ours, not about the variant,
+      // so this deliberately uses `namesZImage` and not `zImageVariant`.
       return (trimmed, true, nil)
     }
 
