@@ -196,6 +196,25 @@ final class HealthSinkTests: XCTestCase {
     return url
   }
 
+  /// comfybox#386 review round 4, minor: pin the two additive `/health` keys
+  /// the liveness-over-durability tradeoff (`WarmServerCoordinator.drainQueueDeltas`)
+  /// surfaces. Defaults must read as an ordinary healthy sidecar (`false`/`0`)
+  /// — required so every pre-existing `HealthResponse(...)` call site in this
+  /// file (and production) that never mentions them keeps compiling and
+  /// keeps reporting healthy — and explicit values must round-trip.
+  func testQueueDeltaSidecarTelemetryKeysDefaultToHealthyAndCarryExplicitValues() throws {
+    let healthy = try encode(sample(lastRecipe: nil, alias: nil))
+    XCTAssertEqual(healthy["queue_delta_sidecar_degraded"] as? Bool, false)
+    XCTAssertEqual(healthy["queue_delta_non_durable_count"] as? Int, 0)
+
+    var degraded = sample(lastRecipe: nil, alias: nil)
+    degraded.queueDeltaSidecarDegraded = true
+    degraded.queueDeltaNonDurableCount = 2
+    let degradedJSON = try encode(degraded)
+    XCTAssertEqual(degradedJSON["queue_delta_sidecar_degraded"] as? Bool, true)
+    XCTAssertEqual(degradedJSON["queue_delta_non_durable_count"] as? Int, 2)
+  }
+
   /// `build_sha` is a git short sha (7–40 hex, optional `-dirty`) or the
   /// committed placeholder — never empty, never a version string.
   func testBuildShaFormat() {
