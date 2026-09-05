@@ -6443,11 +6443,45 @@ private final class LiveHealthState: @unchecked Sendable {
 
   // MARK: delta mailbox
 
+  /// comfybox#386: the sidecar write below must never run while holding
+  /// `lock` — `lock` is also what `read()` (the sync-servable `/health` and
+  /// `/v1/queue` routes' only dependency) needs, and `QueueDeltaStore.save` is
+  /// disk I/O that can stall on a slow or nearly-full volume. Every mutator
+  /// here follows the same shape: mutate + snapshot + stamp a generation
+  /// number while holding `lock`, release it, THEN persist through
+  /// `persistDeltaSidecar`, which uses a SEPARATE lock (`sidecarLock`) that
+  /// `read()` never touches.
+  ///
+  /// `recordDelta` (off-actor, the sync cancel/move routes — can run
+  /// concurrently on several connection threads) and `commitDrainedDeltas`
+  /// (the coordinator actor's drain) both write this same sidecar file and can
+  /// genuinely race each other. Ordering fix, chosen per the #386 ruling: a
+  /// dedicated writer lock (`sidecarLock`) plus a monotonic generation counter
+  /// (`deltaGeneration`, itself stamped under `lock` so it is ordered exactly
+  /// like the mutations are) rather than a background queue — a background
+  /// queue would make these methods return before the sidecar reflects their
+  /// effect, which the existing WAL/recovery tests assert synchronously.
+  /// Inside `sidecarLock`, a write only actually happens if its generation is
+  /// still newer than the last one THIS lock persisted; a write that lost the
+  /// race to reach the lock is therefore a stale no-op rather than a
+  /// regression — it can never clobber a fresher write with older content.
+  /// Because each snapshot is the FULL undrained-delta list (never an
+  /// increment), the worst a stale skip can do is leave a transient state
+  /// unpersisted: the on-disk content always converges on the true latest
+  /// state, so no delta is ever lost or double-applied.
+  private let sidecarLock = NSLock()
+  private var deltaGeneration = 0
+  private var lastPersistedDeltaGeneration = 0  // touched ONLY under sidecarLock
+
   func recordDelta(_ delta: QueueControlCommand) {
-    lock.lock(); defer { lock.unlock() }
+    lock.lock()
     deltas.append(delta)
     if deltas.count > Self.maxDeltas { deltas.removeFirst(deltas.count - Self.maxDeltas) }
-    QueueDeltaStore.save(deltas)  // under the lock: serialized, ordered
+    deltaGeneration += 1
+    let generation = deltaGeneration
+    let snapshot = deltas
+    lock.unlock()
+    persistDeltaSidecar(generation: generation, snapshot: snapshot)
   }
 
   func undrainedDeltas() -> [QueueControlCommand] {
@@ -6469,9 +6503,26 @@ private final class LiveHealthState: @unchecked Sendable {
   /// `count` deltas — the ones the drain applied — and rewrite the sidecar to
   /// the remainder, so deltas recorded DURING the drain survive to the next one.
   func commitDrainedDeltas(_ count: Int) {
-    lock.lock(); defer { lock.unlock() }
+    lock.lock()
     deltas.removeFirst(min(count, deltas.count))
-    QueueDeltaStore.save(deltas)
+    deltaGeneration += 1
+    let generation = deltaGeneration
+    let snapshot = deltas
+    lock.unlock()
+    persistDeltaSidecar(generation: generation, snapshot: snapshot)
+  }
+
+  /// Persist `snapshot` to the sidecar — OUTSIDE `lock`, so nothing blocked on
+  /// `lock` (in particular `read()`) ever waits on this disk write, however
+  /// slow. `sidecarLock` is a dedicated lock touched ONLY here, so it is what
+  /// makes the generation check-then-persist atomic relative to any other
+  /// in-flight sidecar write, without involving `lock` at all — see the
+  /// class-level comment on `recordDelta` for the race this closes.
+  private func persistDeltaSidecar(generation: Int, snapshot: [QueueControlCommand]) {
+    sidecarLock.lock(); defer { sidecarLock.unlock() }
+    guard generation > lastPersistedDeltaGeneration else { return }
+    QueueDeltaStore.save(snapshot)
+    lastPersistedDeltaGeneration = generation
   }
 
   /// Clear the in-memory deltas without a take (recovery already folded them into

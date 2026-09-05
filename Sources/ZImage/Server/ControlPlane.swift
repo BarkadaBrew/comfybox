@@ -129,6 +129,13 @@ enum QueueDeltaStore {
   /// `persistQueueState()` write and the sidecar commit — the crash window the
   /// WAL ordering protects. Tests assert queue-deltas.json still exists here.
   nonisolated(unsafe) static var drainCrashWindowHook: (@Sendable () -> Void)?
+
+  /// comfybox#386 test seam: fires synchronously at the top of `save`, before
+  /// any encoding or I/O. A test can make this block (simulating a slow or
+  /// nearly-full disk) to prove that whatever runs `save` under
+  /// `LiveHealthState`'s dedicated sidecar lock never blocks `read()`, which
+  /// only ever needs the separate state lock.
+  nonisolated(unsafe) static var blockingWriteHook: (@Sendable () -> Void)?
   #endif
 
   static var path: URL {
@@ -139,6 +146,9 @@ enum QueueDeltaStore {
   /// the file, exactly like `QueueStateStore.save` — no stale sidecar survives a
   /// clean drain.
   static func save(_ deltas: [QueueControlCommand]) {
+    #if DEBUG
+    blockingWriteHook?()
+    #endif
     guard !deltas.isEmpty else {
       try? FileManager.default.removeItem(at: path)
       return

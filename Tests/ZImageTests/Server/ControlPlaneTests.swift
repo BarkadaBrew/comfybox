@@ -395,4 +395,51 @@ final class ControlPlaneTests: XCTestCase {
     XCTAssertTrue(finished, "started job completed — a cancel delta for an active id no-ops")
     try await waitUntil("delta consumed") { probe.undrainedDeltaCount == 0 }
   }
+
+  // MARK: - comfybox#386: sidecar write must never block read()
+
+  /// `LiveHealthState.recordDelta`/`commitDrainedDeltas` persist the
+  /// undrained-delta sidecar (`queue-deltas.json`). Before the fix that write
+  /// ran while holding the SAME `NSLock` `read()` needs — so a slow or
+  /// nearly-full disk stalls the sync-servable `/health` and `/v1/queue`
+  /// routes behind unrelated disk I/O. Block the sidecar writer mid-write
+  /// (via `QueueDeltaStore.blockingWriteHook`, simulating that slow disk) and
+  /// prove `read()` (driven here through `probe.isPaused`, which calls
+  /// straight into `LiveHealthState.read()`) still returns within a tight
+  /// bound instead of queuing behind the stuck writer.
+  func testReadNeverBlocksBehindAStuckSidecarWrite() throws {
+    let probe = makeQueueProbe()
+    defer { QueueDeltaStore.blockingWriteHook = nil }
+
+    let writerEntered = DispatchSemaphore(value: 0)
+    let releaseWriter = DispatchSemaphore(value: 0)
+    defer { releaseWriter.signal() }  // never leave the writer thread parked past this test
+    QueueDeltaStore.blockingWriteHook = {
+      writerEntered.signal()
+      releaseWriter.wait()
+    }
+
+    // Off the test thread: record a delta. The in-memory mutation completes
+    // immediately; the sidecar write it triggers blocks in the hook above,
+    // simulating a disk stuck mid-write.
+    Thread.detachNewThread {
+      probe.recordCancelDeltaOnly(id: "comfybox-386-blocked-write")
+    }
+    XCTAssertEqual(writerEntered.wait(timeout: .now() + 5), .success,
+                   "the sidecar writer must have entered the blocking hook")
+
+    // read() must not queue behind the stuck writer — run it on its own
+    // thread and bound the wait so a regression fails instead of hanging CI.
+    let readDone = DispatchSemaphore(value: 0)
+    let start = Date()
+    Thread.detachNewThread {
+      _ = probe.isPaused   // LiveHealthState.read() — the only thing /health and /v1/queue need
+      readDone.signal()
+    }
+
+    XCTAssertEqual(readDone.wait(timeout: .now() + 0.5), .success,
+                   "read() must return within a tight bound while the sidecar writer is stuck on disk")
+    XCTAssertLessThan(Date().timeIntervalSince(start), 0.5,
+                      "read() must not wait on the sidecar's disk write")
+  }
 }
