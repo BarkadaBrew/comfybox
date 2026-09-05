@@ -476,7 +476,8 @@ public final class WarmServer {
     // Wire interrupt handler so ComfyUI /interrupt cancels the in-flight render
     // task — the pipelines observe cancellation in their denoise loops.
     self.comfyBridge.interruptHandler = { [unowned self] in
-      await self.coordinator.cancelActiveRender()
+      if case .cancelled = await self.coordinator.cancelActiveRender() { return true }
+      return false
     }
   }
 
@@ -1754,10 +1755,18 @@ public final class WarmServer {
       return .json(.rawJSON(status: 200, data: data))
 
     case ("POST", "/v1/queue/interrupt"):
-      struct InterruptResult: Encodable { let success: Bool; let interrupted: Bool }
-      let cancelled = await coordinator.cancelActiveRender()
-      auditLog.append(kind: "queue.interrupt", message: cancelled ? "Interrupted active render" : "No active render")
-      return .json(status: 200, payload: InterruptResult(success: true, interrupted: cancelled))
+      // comfybox#362: `target` is additive — an absent/empty body (the
+      // pre-#362 shape) still means "whatever health shows as active". See
+      // `InterruptTarget` for the full vocabulary. Same `InterruptRoute`
+      // decode/encode as the sync arm above (review r1, finding 5).
+      let target = InterruptRoute.decodeTarget(from: request.body)
+      let outcome = await coordinator.cancelActiveRender(target: target)
+      let (_, body) = InterruptRouteResponse.build(from: outcome)
+      auditLog.append(
+        kind: "queue.interrupt",
+        message: InterruptRoute.auditMessage(for: body),
+        metadata: target.map { ["target": $0] } ?? [:])
+      return InterruptRoute.routedResponse(for: outcome)
 
     case ("POST", "/v1/queue/clear"):
       struct ClearResult: Encodable { let success: Bool; let cleared: Int }
@@ -3525,7 +3534,7 @@ public final class WarmServer {
     case ("POST", "/v1/queue/pause"):     return syncPauseResponse(paused: true)
     case ("POST", "/v1/queue/resume"):    return syncPauseResponse(paused: false)
     case ("POST", "/v1/queue/clear"):     return syncClearResponse()
-    case ("POST", "/v1/queue/interrupt"): return syncInterruptResponse()
+    case ("POST", "/v1/queue/interrupt"): return syncInterruptResponse(request: request)
     case ("POST", _) where request.path.hasPrefix("/v1/queue/") && request.path.hasSuffix("/move"):
       return syncMoveResponse(request: request)
     case ("DELETE", _) where request.path.hasPrefix("/v1/queue/"):
@@ -3733,11 +3742,33 @@ public final class WarmServer {
     return .json(status: 200, payload: ClearResult(success: true, cleared: pending.count))
   }
 
-  private func syncInterruptResponse() -> HTTPResponse {
-    struct InterruptResult: Encodable { let success: Bool; let interrupted: Bool }
-    let cancelled = liveHealth.cancelActiveRender()
-    auditLog.append(kind: "queue.interrupt", message: cancelled ? "Interrupted active render" : "No active render")
-    return .json(status: 200, payload: InterruptResult(success: true, interrupted: cancelled))
+  private func syncInterruptResponse(request: HTTPRequest) -> HTTPResponse {
+    Self.interruptRouteResponse(request: request, liveHealth: liveHealth, auditLog: auditLog)
+  }
+
+  /// The whole sync `/v1/queue/interrupt` route, as a function of the only two
+  /// things it needs — the lock store it cancels through and the audit log it
+  /// records to.
+  ///
+  /// comfybox#362 review r2, item 3: `WarmServerQueueProbe.syncInterruptRoute`
+  /// calls THIS, so the route test drives the same decode → cancel → audit →
+  /// encode chain the server runs, rather than a copy of it that could drift.
+  /// It is static because a unit test cannot construct a `WarmServer`:
+  /// `init` starts the local-video readiness monitor and scans the LIVE
+  /// `~/Models/loras` library, which agents must not touch.
+  ///
+  /// `target` is additive — see `InterruptTarget` for the vocabulary.
+  fileprivate static func interruptRouteResponse(
+    request: HTTPRequest, liveHealth: LiveHealthState, auditLog: AuditLog
+  ) -> HTTPResponse {
+    let target = InterruptRoute.decodeTarget(from: request.body)
+    let outcome = liveHealth.cancelActiveRender(target: target)
+    let (_, body) = InterruptRouteResponse.build(from: outcome)
+    auditLog.append(
+      kind: "queue.interrupt",
+      message: InterruptRoute.auditMessage(for: body),
+      metadata: target.map { ["target": $0] } ?? [:])
+    return InterruptRoute.response(for: outcome)
   }
 
   private func syncMoveResponse(request: HTTPRequest) -> HTTPResponse {
@@ -6211,10 +6242,28 @@ private final class LiveHealthState: @unchecked Sendable {
   // between-items gate) and DRAINS `deltas` at its scheduling points.
   private var paused: Bool
   private var deltas: [QueueControlCommand] = []
-  /// The in-flight render's task, published here (Task is Sendable) so the SYNC
-  /// `/v1/queue/interrupt` can cancel it with no actor hop. Set/cleared by the
-  /// process loop around each render.
-  private var activeRenderTask: Task<Void, Never>?
+  /// The in-flight render's task AND the identity that names it, published
+  /// here (both `Sendable`) so the SYNC `/v1/queue/interrupt` can resolve and
+  /// cancel with no actor hop. Set/cleared by the process loop around each
+  /// render, as ONE write.
+  ///
+  /// comfybox#362: during a preemption episode this holds the PREEMPTING IMAGE
+  /// job's own task and id, not the checkpointed video underneath it — the
+  /// coordinator republishes it for the episode's duration
+  /// (`runAsPublishedActiveRender`) so this slot and `/health`'s active job
+  /// agree, and a plain `/v1/queue/interrupt` (no `target`) cancels what an
+  /// operator actually sees as active instead of silently abandoning the video
+  /// that is no longer the visible render.
+  ///
+  /// Review r1, finding 1: the task and the identity are one value on purpose
+  /// — see `PublishedRender`. The interrupt route must never be able to read a
+  /// half-swapped pair.
+  private var activeRender = PublishedRender.none
+  /// comfybox#362: the checkpointed video's OWN task + ids, published
+  /// separately from `activeRender` for the span of a preemption episode so
+  /// `target: "video"` can still reach it even while `activeRender` holds the
+  /// preempting image job. `PublishedRender.none` outside an episode.
+  private var checkpointedVideo = PublishedRender.none
 
   /// Cap on undrained deltas. Deltas drain promptly (every processLoop
   /// iteration + every startProcessingIfNeeded), so this is only reached under a
@@ -6232,8 +6281,60 @@ private final class LiveHealthState: @unchecked Sendable {
     self.paused = FileManager.default.fileExists(atPath: WarmServerCoordinator.pauseSentinelPath)
   }
 
-  func publish(_ s: HealthSnapshot) { lock.lock(); snapshot = s; lock.unlock() }
+  func publish(_ s: HealthSnapshot) {
+    lock.lock(); snapshot = s; lock.unlock()
+    notifyPublication()
+  }
+
+  /// comfybox#362 review r2, item 1: publish the health snapshot AND the
+  /// interrupt triple in ONE lock acquisition.
+  ///
+  /// The preemption episode swaps which job is "active" in two observable
+  /// places — `/health`'s `active_job_id` and the task `/v1/queue/interrupt`
+  /// cancels. As two separate writes there is always a moment, however short,
+  /// where a reader on another thread sees one swapped and the other not: with
+  /// health first, an operator's interrupt kills the VIDEO while health names
+  /// the image job (the original #362 bug, in miniature); with the triple
+  /// first, it kills the IMAGE job while health still names the video. One
+  /// lock, one write, no window either way.
+  func publish(_ s: HealthSnapshot, activeRender publication: PublishedRender) {
+    lock.lock(); snapshot = s; activeRender = publication; lock.unlock()
+    notifyPublication()
+  }
+
   func setProgress(_ p: Int?) { lock.lock(); progressPercent = p; lock.unlock() }
+
+  /// The published interrupt triple — a NON-destructive read of what
+  /// `/v1/queue/interrupt`'s default target would reach, for tests that need
+  /// to wait for a publication without cancelling it.
+  func activeRenderPublication() -> PublishedRender {
+    lock.lock(); defer { lock.unlock() }; return activeRender
+  }
+
+  #if DEBUG
+  /// comfybox#362 review r2, item 1 test seam. Fired after EVERY write that
+  /// changes either observable state — the health snapshot or the interrupt
+  /// triple — with the pair as a reader would then see it.
+  ///
+  /// The invariant it exists to pin: **whenever the triple names a job, health
+  /// must name the SAME job.** If someone ever splits the atomic publish above
+  /// back into two writes, this fires twice per transition and the middle
+  /// sample violates that, so the sequencing test fails instead of the bug
+  /// shipping.
+  nonisolated(unsafe) static var publicationObserver:
+    (@Sendable (_ healthJobId: String?, _ targetJobId: String?, _ targetKind: String?) -> Void)?
+
+  private func notifyPublication() {
+    guard let observer = Self.publicationObserver else { return }
+    lock.lock()
+    let healthJobId = snapshot.activeJobId
+    let target = activeRender
+    lock.unlock()
+    observer(healthJobId, target.jobId, target.kind)
+  }
+  #else
+  private func notifyPublication() {}
+  #endif
 
   /// Read the published snapshot with the AUTHORITATIVE pause overlaid (§3.1.5:
   /// "the read path composes lockStore.isPaused with the actor-authored
@@ -6303,17 +6404,34 @@ private final class LiveHealthState: @unchecked Sendable {
 
   // MARK: active-render interrupt (sync /v1/queue/interrupt)
 
-  func setActiveRenderTask(_ task: Task<Void, Never>?) {
-    lock.lock(); activeRenderTask = task; lock.unlock()
+  /// Publish (or clear, with `.none`) the active render — task and identity in
+  /// ONE write under the lock (review r1, finding 1).
+  func setActiveRender(_ publication: PublishedRender) {
+    lock.lock(); activeRender = publication; lock.unlock()
+    notifyPublication()
   }
 
-  /// Cancel the in-flight render if one is published. `Task.cancel` is Sendable,
-  /// so the sync interrupt route calls this with no actor hop.
-  func cancelActiveRender() -> Bool {
-    lock.lock(); let task = activeRenderTask; lock.unlock()
-    guard let task else { return false }
-    task.cancel()
-    return true
+  /// comfybox#362: publish (or clear, with `.none`) the checkpointed video's
+  /// own task + ids for the span of a preemption episode. See
+  /// `checkpointedVideo`'s doc comment.
+  func setCheckpointedVideo(_ publication: PublishedRender) {
+    lock.lock(); checkpointedVideo = publication; lock.unlock()
+  }
+
+  /// Cancel per `target` (comfybox#362) — see `InterruptTarget` for the target
+  /// vocabulary. `Task.cancel` is Sendable, so the sync interrupt route calls
+  /// this with no actor hop.
+  ///
+  /// Both slots are read under ONE lock acquisition, so the pair handed to
+  /// `InterruptExecutor` is a consistent snapshot; and `InterruptExecutor` is
+  /// literally the same function the async fallback runs (review r1, finding
+  /// 2), not a parallel implementation of the same rules.
+  func cancelActiveRender(target: String? = nil) -> InterruptCancelOutcome {
+    lock.lock()
+    let active = activeRender
+    let video = checkpointedVideo
+    lock.unlock()
+    return InterruptExecutor.cancel(target: target, active: active, checkpointedVideo: video)
   }
 }
 
@@ -7305,7 +7423,17 @@ private actor WarmServerCoordinator {
   /// Handle for the in-flight render — retained so /interrupt can cancel it.
   /// The pipelines observe cancellation via Task.checkCancellation() in their
   /// denoise loops; the render's continuation then resumes with CancellationError.
-  private var activeRenderTask: Task<Void, Never>?
+  ///
+  /// comfybox#362: during a preemption episode this holds the PREEMPTING IMAGE
+  /// job's own task and identity — see `runAsPublishedActiveRender` for the
+  /// swap, and `LiveHealthState.checkpointedVideo` for the video's own handle
+  /// during that span.
+  ///
+  /// Written ONLY through `publishActiveRender`, which mirrors it into
+  /// `liveHealth` in the same breath. This field is the actor's bookkeeping
+  /// copy (what a preemption episode captures to restore afterwards); the
+  /// AUTHORITY both interrupt paths read is the `liveHealth` publication.
+  private var activeRender = PublishedRender.none
   /// Live progress (0-100) of the active render; nil when idle. Updated from the
   /// pipeline denoising callback, read by `queueStatus()`.
   private let progressTracker = RenderProgressTracker()
@@ -7573,6 +7701,105 @@ private actor WarmServerCoordinator {
   /// `WarmServerQueueProbe` can set it.
   var bypassVideoAdmissionForTests = false
   func setBypassVideoAdmission(_ value: Bool) { bypassVideoAdmissionForTests = value }
+
+  /// comfybox#362 test seam: stage a fake "checkpointed video" exactly as
+  /// `runPreemptionEpisode` publishes it for the span of a real episode —
+  /// lets a test drive `target: "video"` resolution (and the
+  /// default-target/health-agreement behaviour of `runAsPublishedActiveRender`)
+  /// without a real LTX-2 checkpoint or model weights. `statusJobId` is the
+  /// `/v1/video/status/{id}` id (comfybox#283: it differs from the queue id).
+  func setCheckpointedVideoForTest(
+    task: Task<Void, Never>?, jobId: String?, statusJobId: String? = nil
+  ) {
+    liveHealth.setCheckpointedVideo(
+      task.map {
+        PublishedRender(
+          task: $0, jobId: jobId, statusJobId: statusJobId, kind: QueueJobKind.video.rawValue)
+      } ?? .none)
+  }
+
+  /// comfybox#362 test seam: publish an active render directly, as the queue
+  /// loop does around every job — lets a test stage a REAL published active
+  /// task (rather than leaving the slot empty, which made the "the video was
+  /// not cancelled" assertion vacuous; review r1, finding 6).
+  /// Sets the identity fields too, and publishes both atomically — the state
+  /// the queue loop leaves behind for a running job, so a sequencing test
+  /// starts from a consistent published pair rather than a triple that names
+  /// a job `/health` has never heard of.
+  func setActiveRenderForTest(
+    task: Task<Void, Never>?, jobId: String?, statusJobId: String? = nil, kind: String?
+  ) {
+    activeJobId = jobId
+    activeJobKindForPersistence = kind
+    publishActiveRenderAndHealth(
+      task.map { PublishedRender(task: $0, jobId: jobId, statusJobId: statusJobId, kind: kind) }
+        ?? .none)
+  }
+
+  /// comfybox#362 test seam: the currently published active render, so a test
+  /// can capture it and hand it back as `restoringTo` exactly as
+  /// `runPreemptionEpisode` does.
+  var activeRenderForTest: PublishedRender { activeRender }
+
+  /// comfybox#362 test seam: the PRODUCTION function `runPreemptionEpisode`
+  /// wraps its preempting image job in — publishes `work`'s own task as the
+  /// active render (`activeRender` + `liveHealth`) for its duration, then
+  /// restores `restoringTo`. A test drives this with fake tasks instead of a
+  /// real checkpoint/render to prove the publish/restore sequence in
+  /// isolation from model weights.
+  /// `preemptorIdentity`/`restoredIdentity` stand in for
+  /// `runPreemptionEpisode`'s identity swap and restore, so the test drives
+  /// the REAL `runAsPublishedActiveRender` — including the ordering review r2
+  /// item 1 is about — with no model weights anywhere.
+  func runAsPublishedActiveRenderForTest(
+    restoringTo restoreTo: PublishedRender,
+    preemptorIdentity: (jobId: String, kind: String)? = nil,
+    restoredIdentity: (jobId: String?, kind: String?)? = nil,
+    _ work: @escaping @Sendable () async -> Void
+  ) async {
+    await runAsPublishedActiveRender(
+      restoringTo: restoreTo,
+      swapIdentity: {
+        if let preemptorIdentity {
+          activeJobId = preemptorIdentity.jobId
+          activeJobKindForPersistence = preemptorIdentity.kind
+        }
+      },
+      restoreIdentity: {
+        if let restoredIdentity {
+          activeJobId = restoredIdentity.jobId
+          activeJobKindForPersistence = restoredIdentity.kind
+        }
+      },
+      work)
+  }
+
+  /// comfybox#362 test seam: the ASYNC `/v1/queue/interrupt` fallback path
+  /// (`ControlPlaneSyncFlag` off) — exposed so a test can prove it agrees
+  /// with the sync path (`WarmServerQueueProbe.controlInterrupt(target:)`)
+  /// rather than assuming parity.
+  func cancelActiveRenderForTest(target: String? = nil) -> InterruptCancelOutcome {
+    cancelActiveRender(target: target)
+  }
+
+  /// comfybox#362: read back the DEBUG-only admission bypass — lets a test
+  /// prove `setBypassVideoAdmission(false)` (the reset `makeQueueProbe`'s
+  /// teardown now performs) actually took effect, rather than assuming it.
+  var bypassVideoAdmissionForTestsValue: Bool { bypassVideoAdmissionForTests }
+
+  /// comfybox#362 review r1, finding 2 — reproduces the window `runGenerate`'s
+  /// `defer` opens, without model weights.
+  ///
+  /// That `defer` (see `runGenerate`) sets `activeJobId = nil` and does NOT
+  /// call `publishHealth()`, so between a render finishing and the queue
+  /// loop's own `defer` running, the ACTOR's `activeJobId` is nil while the
+  /// PUBLISHED snapshot still names the job. While the two interrupt
+  /// implementations sourced the job id from those two different places, a
+  /// job-id `target` got two different answers in that window (the sync path
+  /// cancelled and named the job; the async fallback 404'd). Both now read the
+  /// one published triple, and `testSyncAndAsyncAgreeOnAJobIdTarget…` proves
+  /// it by driving exactly this state.
+  func clearActiveJobIdWithoutPublishingForTest() { activeJobId = nil }
   #endif
 
   /// The admission decision for a `.localVideo` job, in one place so the queue
@@ -7684,8 +7911,115 @@ private actor WarmServerCoordinator {
   /// Exposed to `WarmServerQueueProbe` (DEBUG) so a test can prove the shielded
   /// work does NOT observe the caller's cancellation.
   func runShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) async {
-    let shielded = Task { await work() }
-    await shielded.value
+    await startShieldedFromCancellation(work).value
+  }
+
+  /// Starts `work` in a new unstructured task that inherits no cancellation
+  /// (see `runShieldedFromCancellation`'s doc comment) and returns the task
+  /// WITHOUT awaiting it.
+  ///
+  /// comfybox#362: split out of `runShieldedFromCancellation` so
+  /// `runAsPublishedActiveRender` can publish the task's own handle as the
+  /// active render BEFORE waiting on it — `runShieldedFromCancellation`
+  /// itself still exists unchanged (as a thin wrapper) for
+  /// `WarmServerQueueProbe`'s existing shield-only test.
+  private func startShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+    Task { await work() }
+  }
+
+  /// comfybox#362: run `work` (shielded from the caller's cancellation, exactly
+  /// like `runShieldedFromCancellation`) as the PUBLISHED active render for its
+  /// duration, then restore `restoringTo` as the published active render
+  /// afterward.
+  ///
+  /// This is what makes `/health`, `/v1/queue` and `/v1/queue/interrupt`'s
+  /// default target agree during a preemption episode: without it,
+  /// `activeRenderTask`/`liveHealth` kept pointing at the checkpointed video's
+  /// own task for the ENTIRE episode (including while the preempting image job
+  /// — the thing health actually shows as active — was running), so a plain
+  /// interrupt cancelled the invisible video instead of the visible image
+  /// render. `runPreemptionEpisode` is the one caller, publishing the video's
+  /// own task as `restoringTo` so it flows straight back into
+  /// `resumeCheckpointedVideo`'s time.
+  ///
+  /// The checkpointed-video slot is left untouched here — that is
+  /// `runPreemptionEpisode`'s responsibility (set once for the whole episode,
+  /// not once per shielded call), so `target: "video"` can still reach the
+  /// video while this function's task is what `target: "active"` reaches.
+  ///
+  /// Review r1, finding 1: the publish and the restore are each ONE write of a
+  /// complete `PublishedRender`. The preemptor's identity (`activeJobId` /
+  /// `activeJobKindForPersistence`) has already been swapped in by the caller
+  /// when this runs, so the triple published here names the preemptor and
+  /// cancels the preemptor — an interrupt can never cancel one job while
+  /// reporting another's id.
+  /// Review r2, item 1: the identity swap and the triple publish are ONE step.
+  ///
+  /// Round 1 bundled the task with its identity, which closed the "cancel one
+  /// job, report another's id" hole — but the episode still swapped
+  /// `activeJobId`/`activeJobSummary`/… and called `publishHealth()` +
+  /// `persistQueueState()` BEFORE this function published the triple, and
+  /// restored them AFTER it restored the triple. Between those two points a
+  /// reader saw health naming the preemptor while the interrupt still pointed
+  /// at the video — the #362 failure itself, just narrowed to a window.
+  ///
+  /// So the caller hands its identity swap/restore in as `swapIdentity` /
+  /// `restoreIdentity`, and each runs immediately before the corresponding
+  /// publication, with no `await` in between (both closures are synchronous
+  /// and actor-isolated, so `work` — which is unstructured and hops onto this
+  /// actor at its own first `await` — cannot interleave). The publication
+  /// itself is atomic: `publishActiveRenderAndHealth` writes the snapshot and
+  /// the triple under one lock.
+  private func runAsPublishedActiveRender(
+    restoringTo restoreTo: PublishedRender,
+    swapIdentity: () -> Void = {},
+    restoreIdentity: () -> Void = {},
+    _ work: @escaping @Sendable () async -> Void
+  ) async {
+    // Start the shielded task FIRST so its handle exists for the publication
+    // below — it cannot enter this actor until the `await` further down, so
+    // everything between here and there is one indivisible step.
+    let task = startShieldedFromCancellation(work)
+    swapIdentity()
+    publishActiveRenderAndHealth(
+      PublishedRender(task: task, jobId: activeJobId, kind: activeJobKindForPersistence))
+    persistQueueState()
+    await task.value
+    restoreIdentity()
+    publishActiveRenderAndHealth(restoreTo)
+    persistQueueState()
+  }
+
+  /// The ONE writer of the active-render publication: the actor's bookkeeping
+  /// copy and the lock-store publication, always together, always a complete
+  /// triple (review r1, finding 1).
+  private func publishActiveRender(_ publication: PublishedRender) {
+    activeRender = publication
+    liveHealth.setActiveRender(publication)
+  }
+
+  /// Publish the triple AND the health snapshot it must agree with, atomically
+  /// (review r2, item 1) — used wherever the two change together, i.e. the
+  /// preemption episode's swap and restore.
+  private func publishActiveRenderAndHealth(_ publication: PublishedRender) {
+    activeRender = publication
+    liveHealth.publish(makeHealthSnapshot(), activeRender: publication)
+  }
+
+  /// Publish `task` as the active render, taking the identity from the fields
+  /// the queue loop has ALREADY set for this job (`activeJobId`,
+  /// `activeJobKindForPersistence`) — so the published id/kind and the
+  /// persisted/health identity are the same values by construction, not by
+  /// two call sites agreeing to pass the same thing. `nil` clears the slot.
+  /// `statusJobId` is the `/v1/video/status/{id}` id for a video job
+  /// (comfybox#283: it differs from the queue id).
+  private func publishActiveRender(task: Task<Void, Never>?, statusJobId: String? = nil) {
+    publishActiveRender(
+      task.map {
+        PublishedRender(
+          task: $0, jobId: activeJobId, statusJobId: statusJobId,
+          kind: activeJobKindForPersistence)
+      } ?? .none)
   }
 
   /// The full preemption episode: checkpoint received -> evict the video
@@ -7750,6 +8084,19 @@ private actor WarmServerCoordinator {
     assert(checkpointedVideo == nil, "#1479: hold exactly one checkpoint at a time (spec) — runPreemptionEpisode entered with one already held")
     checkpointedVideo = state
     if let videoJobId { videoJobTracker.markPausedForPreemption(videoJobId) }
+    // comfybox#362: capture the video's whole published triple BEFORE
+    // anything below can touch it (the identity swap further down), and
+    // republish it as the checkpointed-video slot for the episode's duration
+    // — this is what lets `target: "video"` still reach the video once the
+    // active slot is republished to the preemptor.
+    //
+    // Review r1, finding 3: the captured triple already carries BOTH of the
+    // video's ids — the queue id (`jobId`) and the `/v1/video/status/{id}` id
+    // (`statusJobId`), which comfybox#283 documents as different — because
+    // the `.localVideo` queue case published both. So `target: <id>` matches
+    // whichever one the client happens to hold, and it is one write, not two.
+    let videoPublication = activeRender
+    liveHealth.setCheckpointedVideo(videoPublication)
     publishHealth()
 
     var resolved = false
@@ -7764,6 +8111,10 @@ private actor WarmServerCoordinator {
     func clearEpisodeState(abandoned: Bool) {
       resolved = true
       checkpointedVideo = nil
+      // comfybox#362: symmetric with the publish at the top of this function
+      // — the episode is over (resumed or abandoned) either way, so the
+      // separately-published "video" interrupt target goes away with it.
+      liveHealth.setCheckpointedVideo(.none)
       if let videoJobId { videoJobTracker.markResumedFromPreemption(videoJobId) }
       // comfybox#283/#217: read-only. `activeJobId` here is always the VIDEO
       // job's own id — either this runs from the early-return branch (before
@@ -7838,15 +8189,15 @@ private actor WarmServerCoordinator {
       startedAt: currentJobStartedAt, renderStartedAt: activeRenderStartedAt
     )
     let preemptorJobId = claimed.jobId ?? UUID().uuidString  // AC-18: the async caller's id when it has one
-    activeJobId = preemptorJobId
-    activeJobSummary = "Render (preempting): \(claimed.payload.prompt.prefix(100))"
-    activeJobSource = claimed.source
-    activeJobRawBody = claimed.rawBody
-    activeJobKindForPersistence = "generate"
-    currentJobStartedAt = Date()
-    activeRenderStartedAt = nil
-    publishHealth()
-    persistQueueState()
+    //
+    // comfybox#362 review r2, item 1: the swap is NOT performed here. It is
+    // handed to `runAsPublishedActiveRender` as `swapIdentity`, which runs it
+    // immediately before publishing the interrupt triple + health snapshot
+    // atomically. Performing it here (with its own `publishHealth()` +
+    // `persistQueueState()`) left a real window in which `/health` named the
+    // preemptor while `/v1/queue/interrupt` still pointed at the video — an
+    // operator interrupting on what they saw would have killed the video,
+    // which is #362 itself. The restore below is handed over the same way.
 
     // Run the image job exactly as a normal render — the same actor method
     // every non-preempting `.generate` job runs, including its own
@@ -7867,7 +8218,43 @@ private actor WarmServerCoordinator {
     // shield takes a non-throwing closure, so if `runGenerate` ever grows a
     // `throws` this stops compiling — louder than a `catch` that logs and
     // carries on.
-    await runShieldedFromCancellation { await self.runGenerate(claimed.payload, continuation: claimed.continuation) }
+    //
+    // comfybox#362: `runAsPublishedActiveRender` (not the bare
+    // `runShieldedFromCancellation`) — it ALSO republishes this shielded
+    // task's own handle as `activeRenderTask`/`liveHealth`'s active render for
+    // its duration, restoring `videoTask` afterward. Before this, those
+    // handles kept pointing at the video's own task for the whole episode, so
+    // a plain `/v1/queue/interrupt` (no explicit target) — the exact request
+    // an operator sends after watching `/health` show the image job active —
+    // cancelled the invisible video instead of the visible image render.
+    await runAsPublishedActiveRender(
+      restoringTo: videoPublication,
+      swapIdentity: {
+        activeJobId = preemptorJobId
+        activeJobSummary = "Render (preempting): \(claimed.payload.prompt.prefix(100))"
+        activeJobSource = claimed.source
+        activeJobRawBody = claimed.rawBody
+        activeJobKindForPersistence = "generate"
+        currentJobStartedAt = Date()
+        activeRenderStartedAt = nil
+      },
+      // Restore the video's identity — symmetric with the swap, and done
+      // BEFORE its (possibly long, synchronous) resume so /health, /v1/queue
+      // and the persisted snapshot all go back to describing the video job.
+      // The preemptor is finished by now, so leaving it in the persisted
+      // active slot would replay a completed image job on the next restart.
+      restoreIdentity: {
+        activeJobId = videoIdentity.id
+        activeJobSummary = videoIdentity.summary
+        activeJobSource = videoIdentity.source
+        activeJobRawBody = videoIdentity.rawBody
+        activeJobKindForPersistence = videoIdentity.kind
+        currentJobStartedAt = videoIdentity.startedAt
+        activeRenderStartedAt = videoIdentity.renderStartedAt
+      }
+    ) {
+      await self.runGenerate(claimed.payload, continuation: claimed.continuation)
+    }
     // PR #370 review M: the preemptor bypasses the normal enqueue/admit path
     // entirely (a mailbox handoff, not the FIFO — see WarmServer.swift's
     // "Known limitations" note in the PR body), so it never reaches a
@@ -7877,21 +8264,6 @@ private actor WarmServerCoordinator {
     // `activeJobId` — `runGenerate`'s own `defer` already reset
     // `activeJobId` to nil by the time this line runs.
     lifecycleLedger.clearProgressThrottle(jobId: preemptorJobId)
-
-    // Restore the video's identity — symmetric with the swap above, and done
-    // BEFORE its (possibly long, synchronous) resume so /health, /v1/queue and
-    // the persisted snapshot all go back to describing the video job. The
-    // preemptor is finished by now, so leaving it in the persisted active slot
-    // would replay a completed image job on the next restart.
-    activeJobId = videoIdentity.id
-    activeJobSummary = videoIdentity.summary
-    activeJobSource = videoIdentity.source
-    activeJobRawBody = videoIdentity.rawBody
-    activeJobKindForPersistence = videoIdentity.kind
-    currentJobStartedAt = videoIdentity.startedAt
-    activeRenderStartedAt = videoIdentity.renderStartedAt
-    publishHealth()
-    persistQueueState()
 
     // Clear BEFORE the resume, not in the defer (review I2) — see doc comment.
     // Computed ONCE (PR #370 review I3), same reasoning as the other call
@@ -8724,7 +9096,14 @@ private actor WarmServerCoordinator {
   /// the render start time falls back to `currentJobStartedAt` so the age/stale
   /// signal is correct throughout the synchronous GPU section.
   private func publishHealth() {
-    let snap = HealthSnapshot(
+    liveHealth.publish(makeHealthSnapshot())
+  }
+
+  /// The health snapshot, built but not published — split out (comfybox#362
+  /// review r2, item 1) so `publishActiveRenderAndHealth` can hand it to
+  /// `LiveHealthState` in the SAME lock acquisition as the interrupt triple.
+  private func makeHealthSnapshot() -> HealthSnapshot {
+    HealthSnapshot(
       shuttingDown: shuttingDown,
       model: activePoolModelSpec ?? configuration.modelSpec ?? ZImageRepository.id,
       modelFamily: currentModelFamily.rawValue,
@@ -8767,7 +9146,6 @@ private actor WarmServerCoordinator {
       },
       maxPending: configuration.maxPendingRequests
     )
-    liveHealth.publish(snap)
   }
 
   /// #339 review r1: set (or clear, with `[]`) the not-yet-admitted tail of
@@ -8820,12 +9198,22 @@ private actor WarmServerCoordinator {
     )
   }
 
-  /// Cancel the in-flight render, if any (ComfyUI /interrupt).
-  /// Returns true if a render task was cancelled. Pending jobs are unaffected.
-  func cancelActiveRender() -> Bool {
-    guard let task = activeRenderTask else { return false }
-    task.cancel()
-    return true
+  /// Cancel the in-flight render, if any (ComfyUI /interrupt) — the ASYNC
+  /// fallback path (`ControlPlaneSyncFlag` off). Pending jobs are unaffected.
+  ///
+  /// comfybox#362 review r1, finding 2: this delegates to
+  /// `LiveHealthState.cancelActiveRender` — the SAME function the sync path
+  /// runs, reading the SAME published triples — rather than re-deriving the
+  /// answer from the actor's own `activeJobId`/`activeJobKindForPersistence`.
+  /// Those fields are not a second source of truth: `runGenerate`'s `defer`
+  /// nils `activeJobId` without republishing, so between a render finishing
+  /// and the queue loop's `defer` running they disagreed with the publication,
+  /// and the two arms of ONE route answered a job-id target differently. The
+  /// actor hop this method still costs is the fallback's whole point (it
+  /// queues behind the actor exactly as it did before the 0.B-2 carve-out);
+  /// only the decision is shared.
+  func cancelActiveRender(target: String? = nil) -> InterruptCancelOutcome {
+    liveHealth.cancelActiveRender(target: target)
   }
 
   /// Clear all pending jobs from the queue. Active job continues.
@@ -9186,20 +9574,16 @@ private actor WarmServerCoordinator {
         let renderTask = Task {
           await self.runGenerate(payload, continuation: continuation, progressHandler: progressHandler, latentPreviewHandler: latentPreviewHandler)
         }
-        activeRenderTask = renderTask
-        liveHealth.setActiveRenderTask(renderTask)  // 0.B-2: sync /interrupt handle
+        publishActiveRender(task: renderTask)  // 0.B-2: sync /interrupt handle
         await renderTask.value
-        activeRenderTask = nil
-        liveHealth.setActiveRenderTask(nil)
+        publishActiveRender(task: nil)
       case .controlGenerate(let request, let continuation):
         let renderTask = Task {
           await self.runControlGenerate(request, continuation: continuation)
         }
-        activeRenderTask = renderTask
-        liveHealth.setActiveRenderTask(renderTask)  // 0.B-2: sync /interrupt handle
+        publishActiveRender(task: renderTask)  // 0.B-2: sync /interrupt handle
         await renderTask.value
-        activeRenderTask = nil
-        liveHealth.setActiveRenderTask(nil)
+        publishActiveRender(task: nil)
       #if DEBUG
       case .synthetic(let durationMs, let continuation):
         // 0.B-2 test seam (FDD §4.1). Runs through the retained-task path (so
@@ -9218,11 +9602,9 @@ private actor WarmServerCoordinator {
           }
           continuation.resume(returning: !Task.isCancelled)
         }
-        activeRenderTask = renderTask
-        liveHealth.setActiveRenderTask(renderTask)
+        publishActiveRender(task: renderTask)
         await renderTask.value
-        activeRenderTask = nil
-        liveHealth.setActiveRenderTask(nil)
+        publishActiveRender(task: nil)
       #endif
       case .swap(let payload, let continuation):
         await runSwap(payload, continuation: continuation)
@@ -9398,11 +9780,12 @@ private actor WarmServerCoordinator {
             continuation.resume(throwing: error)
           }
         }
-        activeRenderTask = renderTask
-        liveHealth.setActiveRenderTask(renderTask)
+        // comfybox#362 review r1, finding 3: publish the `/v1/video/status/{id}`
+        // id alongside the queue id, so `target: <id>` matches whichever of
+        // the two a client holds (comfybox#283: they differ).
+        publishActiveRender(task: renderTask, statusJobId: videoJobId)
         await renderTask.value
-        activeRenderTask = nil
-        liveHealth.setActiveRenderTask(nil)
+        publishActiveRender(task: nil)
       case .shutdown(let continuation):
         continuation.resume(
           returning: ShutdownResponse(
@@ -12940,6 +13323,11 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// `QueueStateStore`) — a test that points it at a temp directory before
   /// constructing this probe gets an isolated `queue-lifecycle.jsonl` too.
   private let lifecycleLedger = QueueLifecycleLedger()
+  /// comfybox#362 review r2, item 3: the audit log the production sync route
+  /// records to. Default path, which honours `COMFYBOX_STATE_DIR` — so a test
+  /// that called `isolateComfyBoxStateDirectory()` never appends to the live
+  /// `~/.comfybox/audit-log.jsonl`.
+  private let probeAuditLog = AuditLog()
   private var liveHealthSnapshot: HealthSnapshot { liveHealth.read().0 }
 
   /// `modelSpec` is stored on the configuration only — nothing is resolved or
@@ -13200,9 +13588,28 @@ final class WarmServerQueueProbe: @unchecked Sendable {
     Task { await coordinator.drainControlDeltas() }
   }
 
-  /// The sync `/v1/queue/interrupt` path.
+  /// The sync `/v1/queue/interrupt` path, default target (whatever health
+  /// shows as active).
   @discardableResult
-  func controlInterrupt() -> Bool { liveHealth.cancelActiveRender() }
+  func controlInterrupt() -> Bool {
+    if case .cancelled = liveHealth.cancelActiveRender() { return true }
+    return false
+  }
+
+  /// comfybox#362: the sync `/v1/queue/interrupt` path with an explicit
+  /// `target` — returns enough for a test to assert the response body's
+  /// additive `interrupted_job_id`/`interrupted_kind` agree with what was
+  /// actually cancelled, and to distinguish "nothing running there" from "no
+  /// such target" (the 404 case).
+  func controlInterrupt(
+    target: String?
+  ) -> (interrupted: Bool, jobId: String?, kind: String?, unknownTarget: Bool) {
+    switch liveHealth.cancelActiveRender(target: target) {
+    case .cancelled(let jobId, let kind): return (true, jobId, kind, false)
+    case .nothingToCancel: return (false, nil, nil, false)
+    case .unknownTarget: return (false, nil, nil, true)
+    }
+  }
 
   /// Record a cancel delta WITHOUT the drain nudge — lets tests hold a delta
   /// in the undrained window deterministically (F-2 crash-window test).
@@ -13233,7 +13640,17 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// interrupt aimed at the video does not cancel a preemptor — not to re-test
   /// admission, which `HeavyModelAdmissionTests` already covers with injected
   /// byte figures.
-  func bypassVideoAdmission() async { await coordinator.setBypassVideoAdmission(true) }
+  ///
+  /// comfybox#362: takes an explicit `enabled` (default `true`, so every
+  /// existing `bypassVideoAdmission()` call site is unchanged) so a test can
+  /// also flip it back to `false` — each `WarmServerQueueProbe` already owns
+  /// a fresh coordinator per test (`makeQueueProbe`), so this never leaked
+  /// ACROSS tests, but nothing previously let a single test turn admission
+  /// back on for a later assertion, and `makeQueueProbe`'s teardown now
+  /// resets it defensively for the same reason.
+  func bypassVideoAdmission(_ enabled: Bool = true) async {
+    await coordinator.setBypassVideoAdmission(enabled)
+  }
 
   /// Enqueue a `.localVideo` job through the REAL queue case — the same
   /// `enqueueLocalVideo` seam `/v1/video/generate` uses. `body` receives the
@@ -13256,6 +13673,116 @@ final class WarmServerQueueProbe: @unchecked Sendable {
   /// the cancellation nor stops early.
   func runShieldedFromCancellation(_ work: @escaping @Sendable () async -> Void) async {
     await coordinator.runShieldedFromCancellation(work)
+  }
+
+  // MARK: - comfybox#362 interrupt-target probe surface
+
+  /// The PRODUCTION function `runPreemptionEpisode` wraps its preempting
+  /// image job in (`runAsPublishedActiveRender`) — the same function, not a
+  /// copy — so a test can drive the exact publish/restore sequence that makes
+  /// `/health` and `/v1/queue/interrupt`'s default target agree during an
+  /// episode, using fake tasks instead of a real checkpoint/render.
+  func runAsPublishedActiveRender(
+    restoringTo restoreTo: PublishedRender,
+    preemptorIdentity: (jobId: String, kind: String)? = nil,
+    restoredIdentity: (jobId: String?, kind: String?)? = nil,
+    _ work: @escaping @Sendable () async -> Void
+  ) async {
+    await coordinator.runAsPublishedActiveRenderForTest(
+      restoringTo: restoreTo, preemptorIdentity: preemptorIdentity,
+      restoredIdentity: restoredIdentity, work)
+  }
+
+  /// comfybox#362 review r2, item 2: the PUBLISHED interrupt triple, read
+  /// non-destructively from `LiveHealthState` (no actor hop, no cancel) — so
+  /// a test can wait for a publication instead of polling a destructive
+  /// interrupt until one lands.
+  var liveActiveRender: PublishedRender { liveHealth.activeRenderPublication() }
+
+  /// comfybox#362 review r2, item 1: install/remove the publication observer.
+  /// See `LiveHealthState.publicationObserver`.
+  static func observePublications(
+    _ observer: (@Sendable (String?, String?, String?) -> Void)?
+  ) {
+    LiveHealthState.publicationObserver = observer
+  }
+
+  /// comfybox#362 test seam: stage a fake "checkpointed video" exactly as
+  /// `runPreemptionEpisode` publishes it for the span of a real episode,
+  /// without needing a real LTX-2 checkpoint. `statusJobId` is the
+  /// `/v1/video/status/{id}` id (comfybox#283: it differs from the queue id).
+  func setCheckpointedVideo(
+    task: Task<Void, Never>?, jobId: String?, statusJobId: String? = nil
+  ) async {
+    await coordinator.setCheckpointedVideoForTest(
+      task: task, jobId: jobId, statusJobId: statusJobId)
+  }
+
+  /// comfybox#362 test seam: publish an active render directly, as the queue
+  /// loop does around every job.
+  func setActiveRender(
+    task: Task<Void, Never>?, jobId: String?, statusJobId: String? = nil, kind: String?
+  ) async {
+    await coordinator.setActiveRenderForTest(
+      task: task, jobId: jobId, statusJobId: statusJobId, kind: kind)
+  }
+
+  /// comfybox#362 test seam: the currently published active render — what
+  /// `runPreemptionEpisode` captures and hands back as `restoringTo`.
+  var publishedActiveRender: PublishedRender {
+    get async { await coordinator.activeRenderForTest }
+  }
+
+  /// comfybox#362 review r1, finding 5: the EXACT chain
+  /// `WarmServer.syncInterruptResponse` runs — `InterruptRoute.decodeTarget`,
+  /// `LiveHealthState.cancelActiveRender`, `InterruptRoute.response` — so a
+  /// test can drive the sync route from request BYTES to response BYTES. Only
+  /// the audit-log line (which needs a `WarmServer`) is left out.
+  func syncInterruptRoute(body: Data) -> HTTPResponse {
+    syncInterruptRoute(
+      request: HTTPRequest(
+        method: "POST", path: "/v1/queue/interrupt", queryString: nil, headers: [:], body: body))
+  }
+
+  /// The PRODUCTION sync route (`WarmServer.interruptRouteResponse`, which
+  /// `WarmServer.syncInterruptResponse` is a one-line call to) driven with a
+  /// full `HTTPRequest` — review r2, item 3. The audit log is a scratch one
+  /// under `COMFYBOX_STATE_DIR`, so nothing touches the live file.
+  func syncInterruptRoute(request: HTTPRequest) -> HTTPResponse {
+    WarmServer.interruptRouteResponse(
+      request: request, liveHealth: liveHealth, auditLog: probeAuditLog)
+  }
+
+  /// Audit events this probe's route calls recorded, so a route test can
+  /// assert the route logged what it did.
+  func recordedAuditEvents() -> [(kind: String, metadata: [String: String]?)] {
+    probeAuditLog.recent(limit: 50).map { ($0.kind.rawValue, $0.metadata) }
+  }
+
+  /// The ASYNC `/v1/queue/interrupt` fallback path (`ControlPlaneSyncFlag`
+  /// off) — see `controlInterrupt(target:)` for the sync path this must
+  /// agree with.
+  func coordinatorInterrupt(
+    target: String? = nil
+  ) async -> (interrupted: Bool, jobId: String?, kind: String?, unknownTarget: Bool) {
+    switch await coordinator.cancelActiveRenderForTest(target: target) {
+    case .cancelled(let jobId, let kind): return (true, jobId, kind, false)
+    case .nothingToCancel: return (false, nil, nil, false)
+    case .unknownTarget: return (false, nil, nil, true)
+    }
+  }
+
+  /// Read back the DEBUG-only admission bypass — see
+  /// `WarmServerCoordinator.bypassVideoAdmissionForTestsValue`.
+  func bypassVideoAdmissionValueForTest() async -> Bool {
+    await coordinator.bypassVideoAdmissionForTestsValue
+  }
+
+  /// comfybox#362 review r1, finding 2: reproduce the `runGenerate`-defer
+  /// window (actor `activeJobId` nil, published snapshot still naming the
+  /// job). See `WarmServerCoordinator.clearActiveJobIdWithoutPublishingForTest`.
+  func clearActiveJobIdWithoutPublishing() async {
+    await coordinator.clearActiveJobIdWithoutPublishingForTest()
   }
 }
 #endif

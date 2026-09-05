@@ -632,6 +632,16 @@ final class ComfyBridge {
   // MARK: - POST /interrupt
 
   private func handleInterrupt() async -> RoutedResponse {
+    // comfybox#362: this route deliberately parses NO body and has no
+    // `target`. It is the ComfyUI protocol's `/interrupt`, and ComfyUI clients
+    // (Krita included) send an empty POST — so it stays ComfyUI-shaped and
+    // always acts on the DEFAULT target, which is what a Cancel button means.
+    // `target` is a `/v1/queue/interrupt` feature only; see
+    // docs/bridge-developer-guide.md. Do not "fix" this to read `target`
+    // without a client that actually sends one — adding a body requirement to
+    // a protocol-emulation route is exactly the silent contract change
+    // intent.md forbids.
+    //
     // Broadcast execution_interrupted for the active prompt(s), then cancel the
     // in-flight render task so the pipeline's denoise loop actually stops.
     let hadActive = executor?.interrupt() ?? false
