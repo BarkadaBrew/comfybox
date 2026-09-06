@@ -74,7 +74,20 @@ metallib="$ROOT/.build/release/mlx.metallib"
 [[ -f "$metallib" ]] || metallib="$HOME/Projects/zimage.swift/.build/release/mlx.metallib"
 [[ -f "$metallib" ]] || fail "mlx.metallib not found (a clean .build never regenerates it — copy from the desktop app bundle)"
 /bin/cp -f "$metallib" "$BIN_DIR/mlx.metallib"
-codesign --force --sign - "$BIN_DIR/ComfyBox-$sha" 2>&1 | tail -1 || true
+# Sign with the STABLE Developer ID identity and a STABLE identifier so macOS
+# permission grants (Removable Volumes, Local Network) persist across deploys.
+# An ad-hoc signature with the sha in the identifier is a NEW code identity every
+# deploy: on 2026-09-05 that silently dropped the Removable-Volumes grant and the
+# engine blocked forever in open() on /Volumes/Bolt with nobody there to approve
+# the prompt (comfybox#395). Same policy as scripts/deploy-server.sh.
+IDENT="Developer ID Application: Todd Walderman (STHPB624H2)"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENT"; then
+  codesign --force --sign "$IDENT" --identifier "$LABEL" "$BIN_DIR/ComfyBox-$sha" 2>&1 | tail -1 || true
+  say "   signed with the stable identity ($LABEL)"
+else
+  codesign --force --sign - --identifier "$LABEL" "$BIN_DIR/ComfyBox-$sha" 2>&1 | tail -1 || true
+  print -P "%F{red}[deploy $sha] WARN: stable identity missing — ad-hoc signed; Removable-Volumes/Local-Network grants will re-prompt%f" >&2
+fi
 prev=$(readlink "$BIN_DIR/current" 2>/dev/null || echo none)
 ln -sfn "ComfyBox-$sha" "$BIN_DIR/current"
 say "   current -> ComfyBox-$sha (previous: $prev)"
