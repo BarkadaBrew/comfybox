@@ -112,4 +112,10 @@ health >/dev/null || fail "engine did not come back within 360s (cold krea2 load
 say "7) smoke"; smoke
 if (( PAUSED )); then say "8) resuming queue"; queue_resume && PAUSED=0 || fail "RESUME FAILED — resume manually, pause persists across restarts"; fi
 health | python3 -c 'import sys,json; d=json.load(sys.stdin); print("  is_paused", d.get("is_paused"), "status", d.get("status"))'
+# Provenance: tag the deployed commit (annotated, best-effort push). Pairs with
+# /health build_sha so a deploy can be found in git history without the ledger.
+tag="deploy-$(date +%Y-%m-%d)-$sha"
+if git -C "$ROOT" tag -a "$tag" -m "engine deployed $(date -Iseconds) as ComfyBox-$sha" 2>/dev/null; then
+  git -C "$ROOT" push -q origin "$tag" 2>/dev/null && say "   tagged $tag (pushed)" || say "   tagged $tag (push failed — push it later)"
+fi
 say "done"

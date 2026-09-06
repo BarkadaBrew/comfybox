@@ -9,6 +9,12 @@ cd "$(dirname "$0")/.."
 swift build -c release --product ComfyBoxDesktop
 pkill -f "CoffeeShop Desktop" 2>/dev/null || true; sleep 1
 /bin/cp -f .build/release/ComfyBoxDesktop "$APP/Contents/MacOS/ComfyBoxDesktop"
+# Stamp the bundle so the app can say which build it is (Branding.swift reads
+# CFBundleShortVersionString): short version = deploy date, build = git sha.
+# Done BEFORE codesign so the signature covers the plist.
+SHA=$(git rev-parse --short HEAD)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(date +%Y.%-m.%-d)" -c "Set :CFBundleVersion $SHA" "$APP/Contents/Info.plist" \
+  && echo "Stamped $(date +%Y.%-m.%-d) ($SHA)"
 security unlock-keychain -p coffeeshop-local "$KC" 2>/dev/null || true
 if security find-identity "$KC" 2>/dev/null | grep -q "$IDENT"; then
   codesign --force --deep --sign "$IDENT" --keychain "$KC" "$APP"
