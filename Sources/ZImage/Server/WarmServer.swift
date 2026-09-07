@@ -108,6 +108,24 @@ enum WarmModelFamily: String, Sendable, CaseIterable {
   case fibo
   case chroma
   case krea2
+
+  /// #402 — the canonical `LoRACompatibility.checkFamily` group this warm
+  /// family targets. `.flux1` maps to `"z-image"`, NOT `"flux1"`: this case
+  /// is the engine's internal name for the Z-Image/Lumina2 family (comfybox
+  /// #154), while a LoRA's own `"flux1"` compatibility tag
+  /// (`LoRAScanner.knownCompatibilityTags`) means the real Flux.1-dev/schnell
+  /// architecture — a different thing this engine does not run (comfybox
+  /// #393). Passing `rawValue` straight through would let a genuine Flux.1
+  /// LoRA silently pass the guard for a Z-Image request.
+  var loraCompatibilityFamily: String {
+    switch self {
+    case .flux1: return "z-image"
+    case .flux2: return "flux2-klein"
+    case .fibo: return "fibo"
+    case .chroma: return "chroma"
+    case .krea2: return "krea2"
+    }
+  }
 }
 
 enum WarmServerOutputPathValidator {
@@ -807,6 +825,20 @@ public final class WarmServer {
       do {
         var payload = try decode(LoRASwapPayload.self, from: request.body)
         payload = stageNearlineLoras(in: payload)
+        // #402 fix round 1/2 (Critical 1): prefer the swap's OWN declared
+        // family (checkpoint_family/model); fall back to whatever base is
+        // RESIDENT right now (RequestStackResolver's WarmDefaultTag doc) —
+        // but only when `hasEverLoadedModel` is true. `residentFamily`
+        // alone cannot say whether that's real: `.flux1` is both the
+        // coordinator's code-level default AND what a genuine Z-Image load
+        // sets it to (see `loraSwapTargetFamily`'s doc).
+        let residentFamily = await coordinator.modelFamily
+        let hasLoadedModel = await coordinator.hasEverLoadedModel
+        try Self.validateLoRASwapCompatibility(
+          entries: payload.loras, checkpointFamily: payload.checkpointFamily, model: payload.model,
+          residentFamily: residentFamily, hasLoadedModel: hasLoadedModel,
+          lookup: { [loraLibrary] name in loraLibrary?.entry(for: name) },
+          log: { line in self.logger.info("LoRACompatibility: \(line)") })
         let result = try await coordinator.enqueueSwap(payload, rawBody: request.body)
         return .json(status: 200, payload: result)
       } catch {
@@ -2010,7 +2042,7 @@ public final class WarmServer {
       // Krea-2 distill adapters whose names do not contain `turbo_lora`).
       return LoRAEntry(path: staged, scale: entry.scale, role: entry.role)
     }
-    return LoRASwapPayload(loras: entries)
+    return LoRASwapPayload(loras: entries, checkpointFamily: payload.checkpointFamily, model: payload.model)
   }
 
   // Local video (LTX-2) ---------------------------------------------------------
@@ -2754,6 +2786,17 @@ public final class WarmServer {
       loraEntries = [LoRAEntry(path: parts[0], scale: scale)]
       logger.info("LTX-2: applying default video LoRA \(parts[0]) @ \(scale) (--ltx2-lora)")
     }
+    // #402 fix round 1 (Critical 3): the same cross-family guard the image
+    // path runs post-expansion, here on the FULLY resolved video LoRA stack
+    // (request `loras[]`, the video preset's stack, or the `--ltx2-lora`
+    // config default — whichever won above) against the one video family
+    // this engine has (`intent.md`: LTX-2 is the only video path). An image
+    // LoRA reaching this bind used to fail only inside the pipeline, wasting
+    // a render cycle (coffeeshop-server#1681).
+    try Self.validateLoRAFamilyCompatibility(
+      entries: loraEntries, targetFamily: "ltx",
+      lookup: { [loraLibrary] name in loraLibrary?.entry(for: name) },
+      log: { line in self.logger.info("LoRACompatibility: \(line)") })
     let resolvedLoRAs: [LTX2LoRAReference] = try loraEntries.map { entry in
       let config = try entry.makeConfiguration()
       guard case .local(let url) = config.source else {
@@ -4019,7 +4062,8 @@ public final class WarmServer {
   }
 
   private func upsertPresetResponse(body: Data) -> RoutedResponse {
-    let (response, saved) = Self.upsertPreset(store: presetStore, body: body)
+    let (response, saved) = Self.upsertPreset(
+      store: presetStore, body: body, loraLookup: { [loraLibrary] name in loraLibrary?.entry(for: name) })
     if let saved {
       auditLog.append(kind: "preset.upsert", message: "Upserted preset \(saved.id)", metadata: ["id": saved.id])
     }
@@ -4028,15 +4072,22 @@ public final class WarmServer {
 
   /// `POST`/`PUT /v1/presets` (WP-E20, AC-44b): decode, validate through
   /// `PresetStore.upsert` (recipe-name resolution, range checks, the
-  /// deprecated-kroma migration) and persist. A refused preset is a 400
-  /// naming the preset and the field; nothing is stored. Returns the saved
-  /// preset for the audit log.
-  static func upsertPreset(store: PresetStore, body: Data) -> (RoutedResponse, saved: ImagePreset?) {
+  /// deprecated-kroma migration, #402's cross-family LoRA guard) and
+  /// persist. A refused preset is a 400 naming the preset and the field;
+  /// nothing is stored. Returns the saved preset for the audit log.
+  ///
+  /// `loraLookup` defaults to "nothing known" (#402: every LoRA reads as
+  /// declared-unknown, so the guard only ever warns) — tests exercise it
+  /// without a library; the live route above always passes the real one.
+  static func upsertPreset(
+    store: PresetStore, body: Data,
+    loraLookup: (String) -> LoRALibraryEntry? = { _ in nil }
+  ) -> (RoutedResponse, saved: ImagePreset?) {
     do {
       let decoder = JSONDecoder()
       decoder.keyDecodingStrategy = .convertFromSnakeCase
       let preset = try decoder.decode(ImagePreset.self, from: body)
-      let saved = try store.upsert(preset)
+      let saved = try store.upsert(preset, loraLookup: loraLookup)
       return (.json(status: 200, payload: saved), saved)
     } catch let error as PresetStoreError {
       return (presetErrorResponse(error), nil)
@@ -5435,7 +5486,8 @@ public final class WarmServer {
       from: body, store: presetStore, configuration: configuration,
       stageNearline: { entries in self.stageNearlineLoras(in: LoRASwapPayload(loras: entries)).loras },
       log: { line in self.logger.info("\(line)") },
-      gateSubmission: gateSubmission, warmFamily: warmFamily)
+      gateSubmission: gateSubmission, warmFamily: warmFamily,
+      loraLookup: { [loraLibrary] name in loraLibrary?.entry(for: name) })
   }
 
   /// The generate routes' decode, over an EXPLICIT store and configuration so
@@ -5453,7 +5505,8 @@ public final class WarmServer {
     loraExists: (LoRAEntry) -> Bool = WarmServer.loRASourceExists,
     log: (String) -> Void = { _ in },
     gateSubmission: Bool = true,
-    warmFamily: WarmModelFamily? = nil
+    warmFamily: WarmModelFamily? = nil,
+    loraLookup: (String) -> LoRALibraryEntry? = { _ in nil }
   ) throws -> GeneratePayload {
     var payload = try decode(GeneratePayload.self, from: body)
     // Bytes-uploaded img2img init image (init_image_base64) — write it to a
@@ -5552,6 +5605,18 @@ public final class WarmServer {
     // family they are gated as. `gateSubmission: false` (replay) skips this
     // entirely — deleting this call makes the 6000×6000 wiring test fail.
     if gateSubmission {
+      // #402: cross-family LoRA guard — runs on the FULLY RESOLVED stack
+      // (request-owned or preset-expanded alike, `RequestStackResolver`'s
+      // three origins) against the same family `ImageMemoryPreflight` is
+      // about to gate on, so a preset that changes `model` is checked
+      // against the family it actually renders as. `gateSubmission: false`
+      // (crash-recovery replay) skips it, same as the memory preflight below
+      // — a job already accepted must never be re-refused by a gate that did
+      // not exist (or answered differently) when it was submitted.
+      let targetFamily = ImageMemoryPreflight.resolvedFamily(model: expanded.model, warmFamily: warmFamily)
+      try validateLoRAFamilyCompatibility(
+        entries: expanded.loras ?? [], targetFamily: targetFamily.loraCompatibilityFamily,
+        lookup: loraLookup, log: { line in log("LoRACompatibility: \(line)") })
       try expanded.validateImageMemoryPreflight(
         warmFamily: warmFamily, log: { line in log("ImageMemoryPreflight: \(line)") })
     }
@@ -6032,6 +6097,11 @@ public final class WarmServer {
           success: false, error: "[\(code)] \(reason)", errorCode: code,
           estimateBytes: estimate, availableBytes: available, capBytes: cap))
       case .loraSwapNotSupported, .controlNetNotSupported:
+        return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
+      // #402: a confidently mismatched LoRA family is the caller's error,
+      // named in full — same 400 treatment as every other fail-loud recipe
+      // refusal beside it.
+      case .loraFamilyMismatch:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
       case .invalidOutputPath, .invalidRequest:
         return .error(status: 400, message: error.localizedDescription ?? error.localizedDescription)
@@ -7968,6 +8038,19 @@ private actor WarmServerCoordinator {
   private var chromaTokenizer: ChromaTokenizer?
   /// Which model family is loaded — determines generation routing.
   private var currentModelFamily: WarmModelFamily = .flux1
+  /// #402 fix round 2 (review of PR #411): `currentModelFamily` cannot, on
+  /// its own, tell "nothing has ever been loaded" from "a real Z-Image
+  /// model IS resident" — `.flux1` is both this property's code-level
+  /// default AND what a genuine Z-Image load sets it to (below). Without
+  /// this flag, `WarmServer.loraSwapTargetFamily`'s cold-swap skip was
+  /// silently swallowing the common case: 89 of 135 live library entries
+  /// are `z-image`-tagged, so a swap against a genuinely resident Z-Image
+  /// pipeline was never actually gated. Set `true` at every load path this
+  /// coordinator has (the initial-prepare branches and `poolActivate`);
+  /// never reset in `poolUnload` — unloading the ACTIVE model is refused
+  /// (`ModelPoolError.cannotUnloadActive`), so `poolUnload` can only ever
+  /// remove a model this flag was never tracking.
+  private var hasLoadedModel = false
   /// Detected Flux 2 model info (variant, configs) — nil when running Flux 1.
   private var detectedFlux2Model: Flux2DetectedModel?
   /// Detected FIBO model info — nil when running Flux 1/2.
@@ -9074,6 +9157,7 @@ private actor WarmServerCoordinator {
     if isKrea2, let spec = modelSpec {
       // --- Krea-2 path (native port) — variant read off disk, fail-closed (WP-E5) ---
       currentModelFamily = .krea2
+      hasLoadedModel = true
       let paths = try Krea2ModelDetection.resolve(spec: spec)
       logger.info(
         "Detected Krea-2 \(paths.variant.rawValue) (\(paths.transformerFile.path)) — 8-bit transformer, estimated GPU memory: ~22GB")
@@ -9084,6 +9168,7 @@ private actor WarmServerCoordinator {
     } else if isChroma, let snapshot = snapshotURL {
       // --- Chroma path ---
       currentModelFamily = .chroma
+      hasLoadedModel = true
 
       guard let detected = ChromaModelDetection.detect(at: snapshot) else {
         throw WarmServerError.chromaDetectionFailed(modelSpec ?? "unknown")
@@ -9114,6 +9199,7 @@ private actor WarmServerCoordinator {
     } else if isFibo, let snapshot = snapshotURL {
       // --- FIBO path ---
       currentModelFamily = .fibo
+      hasLoadedModel = true
 
       guard let detected = FiboModelDetection.detect(at: snapshot) else {
         throw WarmServerError.fiboDetectionFailed(modelSpec ?? "unknown")
@@ -9134,6 +9220,7 @@ private actor WarmServerCoordinator {
     } else if isFlux2, let snapshot = snapshotURL {
       // --- Flux 2 Klein path ---
       currentModelFamily = .flux2
+      hasLoadedModel = true
 
       guard let detected = Flux2ModelDetection.detect(at: snapshot) else {
         throw WarmServerError.flux2DetectionFailed(modelSpec ?? "unknown")
@@ -9163,6 +9250,7 @@ private actor WarmServerCoordinator {
     } else {
       // --- Flux 1 / Z-Image path ---
       currentModelFamily = .flux1
+      hasLoadedModel = true
 
       // Detect Z-Image variant (Base vs Turbo)
       if let spec = modelSpec, let variant = ZImageVariant.fromModelSpec(spec) {
@@ -9263,6 +9351,14 @@ private actor WarmServerCoordinator {
   /// Expose the current model family for routing decisions outside the actor.
   var modelFamily: WarmModelFamily {
     currentModelFamily
+  }
+
+  /// #402 fix round 2: has ANY model ever actually been loaded/activated,
+  /// as opposed to `modelFamily` merely holding its code-level default? See
+  /// `hasLoadedModel`'s doc comment — `/v1/lora/swap`'s guard needs this to
+  /// tell a genuinely resident Z-Image pipeline from a cold coordinator.
+  var hasEverLoadedModel: Bool {
+    hasLoadedModel
   }
 
   /// Active LoRA identifiers (bare filenames without path or extension) for the library API.
@@ -9374,6 +9470,9 @@ private actor WarmServerCoordinator {
 
     // Sync coordinator state from pool entry.
     currentModelFamily = entry.family
+    // #402 fix round 2: a real model is now active, whatever its family —
+    // see `hasLoadedModel`'s doc comment.
+    hasLoadedModel = true
     // An image model is now resident and active — clear the video-eviction flag
     // so a later render doesn't redundantly reload (#218).
     imageModelsEvicted = false
@@ -13728,6 +13827,18 @@ struct UpscaleResponse: Encodable, Sendable {
 
 private struct LoRASwapPayload: Decodable, Sendable {
   let loras: [LoRAEntry]
+  /// #402 fix round 1: the client's declared target family — same wire keys
+  /// and same resolution (`PresetStore.resolvedLoRAFamily`) as a preset's
+  /// `checkpoint_family`/`model`. Optional: absent means "whatever's
+  /// resident" (see `WarmServer.loraSwapTargetFamily`).
+  let checkpointFamily: String?
+  let model: String?
+
+  init(loras: [LoRAEntry], checkpointFamily: String? = nil, model: String? = nil) {
+    self.loras = loras
+    self.checkpointFamily = checkpointFamily
+    self.model = model
+  }
 
   func makeConfigurations() throws -> [LoRAConfiguration] {
     try loras.map { try $0.makeConfiguration() }
@@ -13738,6 +13849,110 @@ private struct LoRASwapResponse: Encodable, Sendable {
   let success: Bool
   let loraCount: Int
   let loras: [LoRAState]
+}
+
+extension WarmServer {
+  /// #402 — the cross-family LoRA guard shared by `POST /v1/lora/swap` and
+  /// the `/v1/generate` / `/v1/generate/async` choke point
+  /// (`decodedGeneratePayload`). Pure given `lookup` — no I/O, no actor hop —
+  /// so it is unit-testable without a warm server, mirroring
+  /// `WarmServer.loRASourceExists`'s shape.
+  ///
+  /// Looks each entry up in the LoRA library by its resolved filename (the
+  /// same lookup `triggerword` resolution already uses elsewhere in this
+  /// file), reads its DECLARED `model_compatibility`, and runs
+  /// `LoRACompatibility.checkFamily`. An entry the library has never scanned
+  /// (`lookup` returns nil) is treated exactly like a declared-but-unknown
+  /// entry: allowed, with a warning, never a refusal (#402 ruling 2) — a
+  /// stale/never-scanned library must not turn into an outage.
+  ///
+  /// Throws `WarmServerError.loraFamilyMismatch` on the FIRST confident
+  /// mismatch, naming the LoRA and both families.
+  static func validateLoRAFamilyCompatibility(
+    entries: [LoRAEntry],
+    targetFamily: String,
+    lookup: (String) -> LoRALibraryEntry?,
+    log: (String) -> Void = { _ in }
+  ) throws {
+    for entry in entries {
+      let name = (entry.path as NSString).lastPathComponent
+      let declared = lookup(entry.path) ?? lookup(name)
+      let rawTags = declared?.modelCompatibility ?? []
+      let decision = LoRACompatibility.checkFamily(modelCompatibility: rawTags, targetFamily: targetFamily)
+      if let warning = decision.warning {
+        log("'\(name)': \(warning)")
+      }
+      guard decision.allowed else {
+        throw WarmServerError.loraFamilyMismatch(
+          loraPath: entry.path, libraryId: declared?.id, declaredTags: rawTags,
+          loraFamilies: decision.loraFamilies, targetFamily: targetFamily)
+      }
+    }
+  }
+
+  /// #402 fix round 1 (Critical 1, review of PR #411): the TARGET family for
+  /// `POST /v1/lora/swap`'s guard.
+  ///
+  /// Prefers a family the SWAP REQUEST ITSELF declares (`checkpoint_family`
+  /// / `model`), resolved through the exact same table
+  /// `PresetStore.resolvedLoRAFamily` uses for a preset — so a caller that
+  /// wants to pre-stage a krea2 stack can say so explicitly, before krea2 is
+  /// resident.
+  ///
+  /// Falls back to `residentFamily` — but ONLY when `hasLoadedModel` is
+  /// true. `residentFamily` alone cannot answer "has anything actually been
+  /// loaded?": `.flux1` is BOTH `WarmModelFamily`'s code-level default AND
+  /// what a genuine Z-Image load sets it to (fix round 2, review of PR
+  /// #411 — the round 1 version of this function used `residentFamily ==
+  /// .flux1` as its own proxy for "cold", which made the guard silently
+  /// inert for the common case of a REAL resident Z-Image pipeline: 89 of
+  /// 135 live library entries are z-image-tagged). `hasLoadedModel` is the
+  /// coordinator's own record of whether any load/activate has actually
+  /// run — see its doc comment.
+  ///
+  /// Skipping when `hasLoadedModel` is false (and no family was declared)
+  /// still matters: production legitimately swaps the Kira LoRA stack
+  /// (real krea2-tagged entries, e.g. `Filipina_Pinay_Women.safetensors`)
+  /// BEFORE krea2 becomes resident (`SwapResidencyRestore`, 30735df) — on a
+  /// coordinator that has genuinely loaded nothing yet, `residentFamily` is
+  /// not a fact about anything, so there is nothing honest to validate
+  /// against.
+  static func loraSwapTargetFamily(
+    checkpointFamily: String?, model: String?, residentFamily: WarmModelFamily, hasLoadedModel: Bool
+  ) -> String? {
+    if let declared = PresetStore.resolvedLoRAFamily(checkpointFamily: checkpointFamily, model: model) {
+      return declared
+    }
+    return hasLoadedModel ? residentFamily.loraCompatibilityFamily : nil
+  }
+
+  /// #402 fix round 1 — `POST /v1/lora/swap`'s guard entry point. Pure given
+  /// `lookup` (and `residentFamily`/`hasLoadedModel`, passed by the route
+  /// rather than read from the actor), so the three required scenarios
+  /// (cold/no-family swap, declared-family swap, resident-family swap) are
+  /// unit-testable without a coordinator.
+  static func validateLoRASwapCompatibility(
+    entries: [LoRAEntry],
+    checkpointFamily: String?,
+    model: String?,
+    residentFamily: WarmModelFamily,
+    hasLoadedModel: Bool,
+    lookup: (String) -> LoRALibraryEntry?,
+    log: (String) -> Void = { _ in }
+  ) throws {
+    guard let targetFamily = loraSwapTargetFamily(
+      checkpointFamily: checkpointFamily, model: model,
+      residentFamily: residentFamily, hasLoadedModel: hasLoadedModel
+    ) else {
+      for entry in entries {
+        let name = (entry.path as NSString).lastPathComponent
+        log("'\(name)': no target family declared (checkpoint_family/model) and no model has ever been "
+          + "loaded on this coordinator — LoRA family compatibility not enforced")
+      }
+      return
+    }
+    try validateLoRAFamilyCompatibility(entries: entries, targetFamily: targetFamily, lookup: lookup, log: log)
+  }
 }
 
 struct LoRAEntry: Codable, Sendable {
@@ -14249,6 +14464,25 @@ public enum WarmServerError: Error, LocalizedError {
     code: String, reason: String,
     estimateBytes: UInt64?, availableBytes: UInt64?, capBytes: UInt64?)
 
+  /// #402 — a LoRA's declared `model_compatibility` resolves to a KNOWN
+  /// family group that is not the one this request/swap targets (an image
+  /// LoRA on a video request, a video LoRA on an image request, a krea2 LoRA
+  /// on the Z-Image family, …). Never thrown for unrecognized/absent
+  /// compatibility — that is a warning, not a refusal (ruling 2).
+  ///
+  /// #402 fix round 1 (ruling 5): carries every field the 400 must name —
+  /// `loraPath` is the FULL path as given on the wire (never trimmed to a
+  /// bare filename), `libraryId` is the matched `LoRALibraryEntry.id` when
+  /// the library resolved one (nil when the LoRA was never scanned, which
+  /// can only reach here via a CONFIDENT mismatch, so this is never nil in
+  /// practice — a library miss is unknown/allow, not a throw),
+  /// `declaredTags` is the entry's raw `model_compatibility` list exactly as
+  /// stored (before `LoRACompatibility.familyGroup` normalizes it), and
+  /// `loraFamilies` is that normalized result.
+  case loraFamilyMismatch(
+    loraPath: String, libraryId: String?, declaredTags: [String],
+    loraFamilies: [String], targetFamily: String)
+
   public var errorDescription: String? {
     switch self {
     case .invalidPort(let port):
@@ -14319,6 +14553,10 @@ public enum WarmServerError: Error, LocalizedError {
       return QueueRecoveryGate.reason
     case .imageMemoryPreflightRefused(let code, let reason, _, _, _):
       return "[\(code)] \(reason)"
+    case .loraFamilyMismatch(let loraPath, let libraryId, let declaredTags, let loraFamilies, let targetFamily):
+      let idPart = libraryId.map { " (library id '\($0)')" } ?? ""
+      return "LoRA '\(loraPath)'\(idPart) declares model_compatibility \(declaredTags) "
+        + "(\(loraFamilies.joined(separator: "/"))), not '\(targetFamily)' — remove it or target a compatible family"
     }
   }
 }

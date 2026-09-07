@@ -164,3 +164,60 @@ final class LoRAScannerCompatibilityTests: XCTestCase {
       ["unknown"])
   }
 }
+
+// MARK: - #402 fix round 1 (Critical 2): the flux1/klein-9b mistag
+
+extension LoRAScannerCompatibilityTests {
+
+  /// The real vault file this bug was found on: `ss_base_model_version:
+  /// "flux2_klein_9b"` (the "2" this switch was missing) with
+  /// `modelspec.architecture: "flux-2/lora"` — before this fix, neither
+  /// metadata field was recognized and it fell all the way through to a
+  /// confident (wrong) `["flux1"]` via the generic `contains("flux")`
+  /// fallback. Fixed at the SOURCE: the `ss_base_model_version` switch now
+  /// accepts the "2" spelling directly.
+  func testFlux2Klein9bSpellingClassifiesAsKlein9b() {
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(
+        metadata: ["ss_base_model_version": "flux2_klein_9b", "modelspec.architecture": "flux-2/lora"],
+        sampleKeys: []),
+      ["klein-9b"])
+  }
+
+  func testFlux2Klein4bSpellingClassifiesAsKlein4b() {
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(metadata: ["ss_base_model_version": "flux2_klein_4b"], sampleKeys: []),
+      ["klein-4b"])
+  }
+
+  /// Defense in depth: even with NO `ss_base_model_version` at all, a bare
+  /// `modelspec.architecture: "flux-2/lora"` (no klein_9b/klein_4b marker)
+  /// must not fall into the generic flux1 branch — it falls through to key
+  /// heuristics, which land on "unknown" for a key shape they don't
+  /// recognize (never a guessed "flux1").
+  func testModelspecFlux2WithNoKleinMarkerNeverConfidentlyFlux1() {
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(
+        metadata: ["modelspec.architecture": "flux-2/lora"], sampleKeys: ["something.else.lora_A.weight"]),
+      ["unknown"])
+  }
+
+  /// An EXPLICIT Flux.1 marker (real Flux.1-dev/schnell) still classifies
+  /// confidently — the fallback was narrowed, not removed.
+  func testModelspecExplicitFlux1MarkerStillClassifiesAsFlux1() {
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(
+        metadata: ["modelspec.architecture": "flux-1-dev/lora"], sampleKeys: []),
+      ["flux1"])
+  }
+
+  /// `ss_base_model_version: "flux1"` (the direct, explicit metadata form —
+  /// unaffected by this fix, which only touched the GENERIC `contains("flux")`
+  /// fallback) still classifies confidently, real vault files
+  /// (chroma-unlocked-v47…, sweet-asian-flux) both use this exact form.
+  func testExplicitSSBaseModelVersionFlux1StillConfident() {
+    XCTAssertEqual(
+      LoRAScanner.detectCompatibility(metadata: ["ss_base_model_version": "flux1"], sampleKeys: []),
+      ["flux1"])
+  }
+}
