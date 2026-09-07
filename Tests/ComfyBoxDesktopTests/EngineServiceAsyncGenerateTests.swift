@@ -210,6 +210,21 @@ struct EngineServiceAsyncGenerateTests {
         #expect(active["c2"] as? Float == 0.66)
     }
 
+    /// #419: `shift` rides the Generate path only when an applied preset (or
+    /// the panel) set one — absent stays absent, byte-identical to before,
+    /// and the wire key is the engine's single word.
+    @Test("generatePayload emits shift only when set and positive")
+    func payloadEmitsShiftWhenSet() {
+        var request = GenerationRequest(prompt: "p")
+        #expect(EngineService.generatePayload(request, outputPath: "/tmp/a.png", contentMode: .neutral)["shift"] == nil)
+        request.shift = 1.15
+        let body = EngineService.generatePayload(request, outputPath: "/tmp/a.png", contentMode: .neutral)
+        #expect(body["shift"] as? Float == 1.15)
+        // A non-positive shift is not a request the engine accepts; never sent.
+        request.shift = 0
+        #expect(EngineService.generatePayload(request, outputPath: "/tmp/a.png", contentMode: .neutral)["shift"] == nil)
+    }
+
     // MARK: - Failure shapes
 
     @Test("a failed job throws the engine's own message")

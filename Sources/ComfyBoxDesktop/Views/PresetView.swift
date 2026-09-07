@@ -468,6 +468,11 @@ private struct ServerPresetEditor: View {
     @State private var editableLoras: [EditableLora]
     @State private var sampler: String
     @State private var sigmaSchedule: String
+    // #419: the rest of the recipe — one value type (`PresetSamplingEditorState`)
+    // seeded from `original` and written back verbatim by `buildPreset()`,
+    // so the seed → edit → write cycle is unit-testable without a view.
+    // Neutral sentinels mean "model default" and are written as nil.
+    @State private var sampling: PresetSamplingEditorState
     @State private var saveAsName: String = ""
     @State private var showingSaveAs = false
 
@@ -494,23 +499,41 @@ private struct ServerPresetEditor: View {
             .map { EditableLora(filename: $0.filename, scale: $0.scale, role: $0.role) })
         _sampler = State(initialValue: original.sampler ?? original.scheduler ?? "")
         _sigmaSchedule = State(initialValue: original.sigmaSchedule ?? "")
+        _sampling = State(initialValue: PresetSamplingEditorState(original: original))
     }
 
+    /// The family the sampling gates key on (#419, review B2): the ENGINE's
+    /// answer for the current `model` text (`GET /v1/model/family`, kept
+    /// fresh by `.task(id: model)`) and nothing else. A family inferred from
+    /// the text can be WRONG — "/Models/zeta-chroma.safetensors" reads as
+    /// chroma but is Z-Image-based (#154) — and a wrong guess would grey and
+    /// block what the engine actually accepts. nil (pending, offline, or the
+    /// engine has no answer) is permissive: loaded values stay untouched,
+    /// the option lists show the union, and the engine validates on save.
     private var samplingModelFamily: String? {
-        let edited = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !edited.isEmpty { return edited }
-        return original.customModelPath ?? original.model
+        guard let family = detectedModelFamily?.family, !family.isEmpty else { return nil }
+        return family
     }
 
+    /// #419: the whole recipe as the editor currently holds it, with the
+    /// neutral sentinels already collapsed to nil. `buildPreset()` writes
+    /// exactly this; `samplingValidationError` validates exactly this.
+    private var samplingDraft: PresetSamplingDraft {
+        sampling.draft(modelFamily: samplingModelFamily, sampler: sampler, sigmaSchedule: sigmaSchedule)
+    }
+
+    /// nil = the engine would accept this recipe on the preset's family.
+    /// Non-nil blocks Save (and Save as New) with the engine's own wording.
+    /// This — not a silent reset — is what happens to a loaded value a
+    /// closed gate refuses: the control is greyed, Clear sits beside it, and
+    /// Save waits for the user to decide.
     private var samplingValidationError: String? {
-        guard !sampler.isEmpty || !sigmaSchedule.isEmpty else { return nil }
-        guard !SamplingRecipeCatalog.supports(
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
-            forModelFamily: samplingModelFamily
-        ) else { return nil }
-        let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "this model"
-        return "The selected sampler/scheduler pair is not supported by \(family)."
+        PresetSamplingValidator.validationError(samplingDraft)
+    }
+
+    private var stage2EtaStatus: SamplingGate.Status {
+        SamplingGate.stage2Eta(
+            modelFamily: samplingModelFamily, stage2Sampler: sampling.stage2Sampler, stage1Sampler: sampler)
     }
 
     var body: some View {
@@ -537,12 +560,12 @@ private struct ServerPresetEditor: View {
                         TextField("Guidance", text: $guidanceText).frame(width: 90)
                         Spacer()
                     }
-                    SamplingRecipePicker(
-                        sampler: $sampler,
-                        sigmaSchedule: $sigmaSchedule,
-                        modelFamily: samplingModelFamily,
-                        showsExplanation: true
-                    )
+                }
+                Section("Sampling") {
+                    samplingSection
+                }
+                Section("Detail pass (stage 2)") {
+                    stage2Section
                 }
                 Section("LoRAs") {
                     loraRows
@@ -571,7 +594,7 @@ private struct ServerPresetEditor: View {
             }
             .padding()
         }
-        .frame(minWidth: 560, idealWidth: 620, minHeight: 590, idealHeight: 680)
+        .frame(minWidth: 560, idealWidth: 640, minHeight: 720, idealHeight: 860)
         .task {
             // #277 / review r2 (I5): cross-check against the live engine
             // once per sheet appearance, by actually COMPARING its resolved
@@ -636,6 +659,154 @@ private struct ServerPresetEditor: View {
         }
     }
 
+    // MARK: - Sampling (#419)
+
+    /// Sampler + schedule (the existing family-aware picker), then the shared
+    /// RES4LYF knobs — the SAME `SamplingAdvancedControls` the Generate panel
+    /// shows, so the eta/bongmath gate exists once — plus the Krea 2 VAE
+    /// override. A refused value is greyed with Clear beside it and blocks
+    /// Save (`samplingValidationError`); nothing is reset except on the
+    /// user's own sampler change.
+    @ViewBuilder
+    private var samplingSection: some View {
+        SamplingRecipePicker(
+            sampler: $sampler,
+            sigmaSchedule: $sigmaSchedule,
+            modelFamily: samplingModelFamily,
+            showsExplanation: true,
+            // The one automatic reset, on the user's OWN pick only (the
+            // picker's proxy binding, not `.onChange`, so a programmatic
+            // write can never trigger it).
+            onUserChange: { newSampler in
+                sampling.samplerDidChange(to: newSampler, modelFamily: samplingModelFamily)
+            }
+        )
+        SamplingAdvancedControls(
+            shift: $sampling.shift,
+            projectorScale: $sampling.projectorScale,
+            eta: $sampling.eta,
+            bongmath: $sampling.bongmath,
+            noiseType: $sampling.noiseType,
+            noiseAlpha: $sampling.noiseAlpha,
+            implicitSteps: $sampling.implicitSteps,
+            c2: $sampling.c2,
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            modelFamily: samplingModelFamily
+        )
+        vaeRow
+        // The pair error is the picker's own to show (above); this label
+        // covers every OTHER rule so a refusal is never reported twice.
+        if let error = samplingValidationError, pairIsSupported {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
+    }
+
+    /// Review B3: rendered whenever the family honours a VAE override OR the
+    /// preset already carries one — a value the family refuses is greyed
+    /// with Clear, never hidden while it blocks Save.
+    @ViewBuilder
+    private var vaeRow: some View {
+        let status = SamplingGate.vae(modelFamily: samplingModelFamily)
+        let hasValue = !sampling.vae.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if status.isHonoured || hasValue {
+            HStack(spacing: 6) {
+                TextField("VAE (path; empty = model directory's VAE)", text: $sampling.vae)
+                    .disabled(status.isRefused)
+                    .help("Krea 2 decode VAE override — e.g. the Wan 2.1 VAE. Empty = the model directory's own VAE.")
+                if status.isRefused, hasValue {
+                    Button("Clear VAE") { sampling.vae = "" }.controlSize(.small)
+                }
+            }
+            if status.isRefused, hasValue, let note = status.note {
+                Label(note, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var pairIsSupported: Bool {
+        SamplingRecipeCatalog.supports(
+            sampler: sampler.isEmpty ? nil : sampler,
+            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+            forModelFamily: samplingModelFamily)
+    }
+
+    /// The optional second stage (WP-E17, Krea 2 only): re-noises the latent
+    /// to the stretched tail and solves again. Needs steps AND denoise; its
+    /// sampler/schedule default to the render's; `stage2.eta` follows the
+    /// RES4LYF rule on whichever sampler the stage actually runs, with
+    /// `stage2.eta ?? eta` as the effective value (the engine's rule).
+    /// `stage2.bongmath` has no control — the engine 400s it as
+    /// unimplemented — but a stored value is shown with Clear, not dropped.
+    @ViewBuilder
+    private var stage2Section: some View {
+        let status = SamplingGate.stage2(modelFamily: samplingModelFamily)
+        Toggle("Run a detail pass after the main render", isOn: $sampling.stage2Enabled)
+            // Turning OFF is always possible (it is the Clear for a refused
+            // stage); turning ON is what the family gate withholds.
+            .disabled(status.isRefused && !sampling.stage2Enabled)
+        if status.isRefused, let note = status.note {
+            if sampling.stage2Enabled {
+                Label(note, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.orange)
+            } else {
+                Text(note).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        if sampling.stage2Enabled {
+            Group {
+                HStack {
+                    TextField("Steps", text: $sampling.stage2StepsText).frame(width: 90)
+                    TextField("Denoise (0–1]", text: $sampling.stage2DenoiseText).frame(width: 110)
+                    Spacer()
+                }
+                Text("Steps and denoise are both required. Denoise is the fraction of the schedule the stage re-runs (e.g. 0.2).")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                SamplingRecipePicker(
+                    sampler: $sampling.stage2Sampler,
+                    sigmaSchedule: $sampling.stage2SigmaSchedule,
+                    modelFamily: samplingModelFamily,
+                    showsExplanation: false,
+                    onUserChange: { newSampler in
+                        sampling.stage2SamplerDidChange(
+                            to: newSampler, stage1Sampler: sampler, modelFamily: samplingModelFamily)
+                    }
+                )
+                Text("Model Default here means the main render's sampler / scheduler; an empty eta inherits the main render's eta.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                NumericSliderField(label: "Eta (SDE)", value: $sampling.stage2Eta, range: 0...1, step: 0.05, fractionDigits: 2)
+                    .disabled(stage2EtaStatus.isRefused)
+                if let note = stage2EtaStatus.note {
+                    HStack(alignment: .top, spacing: 6) {
+                        if stage2EtaStatus.isRefused, (sampling.stage2Eta != 0 || sampling.eta != 0) {
+                            Label(note, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption2).foregroundStyle(.orange)
+                            Spacer(minLength: 0)
+                            if sampling.stage2Eta != 0 {
+                                Button("Clear stage 2 eta") { sampling.stage2Eta = 0 }.controlSize(.small)
+                            }
+                        } else {
+                            Text(note).font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+                if sampling.stage2Bongmath == true {
+                    HStack(alignment: .top, spacing: 6) {
+                        Label("This preset declares stage2.bongmath — the engine refuses it (parity tier T3, not implemented yet).",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption2).foregroundStyle(.orange)
+                        Spacer(minLength: 0)
+                        Button("Clear") { sampling.stage2Bongmath = nil }.controlSize(.small)
+                    }
+                }
+            }
+            .disabled(status.isRefused)
+        }
+    }
+
     // MARK: - Effective recipe (#277)
 
     /// What `POST /v1/generate {"preset": id}` would actually run for the
@@ -674,6 +845,20 @@ private struct ServerPresetEditor: View {
                 let recipeLine = [recipe.sampler, recipe.sigmaSchedule].compactMap { $0 }.joined(separator: " / ")
                 if !recipeLine.isEmpty {
                     LabeledContent("Sampler / schedule", value: recipeLine)
+                }
+                // #419: the rest of the recipe `ResolvedPreset` carries.
+                if let shift = recipe.shift {
+                    LabeledContent(SamplingRecipeCatalog.shiftLabel(forModelFamily: samplingModelFamily),
+                                   value: String(format: "%g", shift))
+                }
+                if let eta = recipe.eta, eta != 0 {
+                    LabeledContent("Eta (SDE)", value: String(format: "%g", eta))
+                }
+                if recipe.bongmath == true {
+                    LabeledContent("Bongmath", value: "on")
+                }
+                if let stage2 = recipe.stage2 {
+                    LabeledContent("Detail pass", value: PresetEffectiveRecipePresenter.stage2Summary(stage2))
                 }
                 if recipe.loraStack.isEmpty {
                     Text("No LoRAs applied").font(.caption2).foregroundStyle(.secondary)
@@ -888,6 +1073,10 @@ private struct ServerPresetEditor: View {
         // Keep the legacy sampler spelling synchronized for older preset
         // consumers; modern engine validation and Generate use `sampler`.
         p.scheduler = p.sampler
+        // #419: the rest of the recipe — what the user sees is what is
+        // saved, no family involved (neutral sentinels are written as nil;
+        // a stored `stage2.bongmath` is preserved until the user clears it).
+        sampling.write(into: &p)
         // Todd 2026-09-04: kroma is a regular LoRA — `loras[]` (editableLoras)
         // is the single source. Review r2, C1 (Critical): `p.kroma` is a
         // DEPRECATED, derived, read-only echo — carrying `original.kroma`
@@ -922,6 +1111,12 @@ struct SavePresetSheet: View {
     var height: Int
     var sampler: String = ""
     var sigmaSchedule: String = ""
+    /// #419: the RES4LYF knobs the Generate panel already holds — shown so
+    /// the user sees they are part of what gets saved. 0 / false / nil =
+    /// model default (not shown).
+    var eta: Double = 0
+    var bongmath: Bool = false
+    var shift: Double? = nil
     /// (name, negativePrompt) — the sheet lets the user edit the negative
     /// prompt before saving, so the callback returns the edited value.
     var onSave: (String, String) -> Void
@@ -953,6 +1148,15 @@ struct SavePresetSheet: View {
                     LabeledContent("Resolution", value: "\(width) x \(height)")
                     LabeledContent("Sampler", value: sampler.isEmpty ? "Model Default" : sampler)
                     LabeledContent("Scheduler", value: sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)
+                    if let shift {
+                        LabeledContent("Shift", value: String(format: "%g", shift))
+                    }
+                    if eta != 0 {
+                        LabeledContent("Eta (SDE)", value: String(format: "%g", eta))
+                    }
+                    if bongmath {
+                        LabeledContent("Bongmath", value: "on")
+                    }
                     if let model = modelId {
                         LabeledContent("Model", value: model)
                     }
@@ -988,7 +1192,7 @@ struct SavePresetSheet: View {
             }
             .padding()
         }
-        .frame(width: 420, height: 440)
+        .frame(width: 420, height: 500)
         .onAppear {
             if !didSeedNegative {
                 editedNegative = negativePrompt

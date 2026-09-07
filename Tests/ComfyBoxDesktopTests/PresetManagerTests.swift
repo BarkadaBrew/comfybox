@@ -41,6 +41,26 @@ struct GenerationPresetTests {
         #expect(decoded.loras.first?.role == "kroma")
     }
 
+    /// #419: the trio Apply carries onto Generate survives the local JSON
+    /// store, and a file written before the fields existed still decodes.
+    @Test("eta / bongmath / shift round-trip and decode as nil when absent")
+    func recipeTrioCodable() throws {
+        var preset = TestData.makePreset()
+        preset.eta = 0.5; preset.bongmath = true; preset.shift = 1.15
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(GenerationPreset.self, from: try encoder.encode(preset))
+        #expect(decoded.eta == 0.5)
+        #expect(decoded.bongmath == true)
+        #expect(decoded.shift == 1.15)
+
+        let legacy = #"{"id":"old","name":"Old","promptTemplate":"","loras":[],"steps":9,"guidance":3.5,"width":1024,"height":1024,"createdAt":"2024-01-01T00:00:00Z","modifiedAt":"2024-01-01T00:00:00Z"}"#
+        let old = try decoder.decode(GenerationPreset.self, from: Data(legacy.utf8))
+        #expect(old.eta == nil)
+        #expect(old.bongmath == nil)
+        #expect(old.shift == nil)
+    }
+
     @Test("identifiable via id")
     func identifiable() {
         let preset = GenerationPreset(id: "unique", name: "Test")

@@ -11,6 +11,13 @@ struct SamplingRecipePicker: View {
     /// either and maps it to the same family capability table used at render.
     var modelFamily: String?
     var showsExplanation: Bool = true
+    /// #419 (review): called ONLY when the user picks a sampler in this
+    /// control — never for a programmatic write to `sampler` (a preset
+    /// being applied, a model switch settling). Callers hang their one
+    /// automatic reset (eta/bongmath on a sampler that refuses them) here,
+    /// so a value an applied preset just set cannot be judged against the
+    /// family that is still resident while its model loads.
+    var onUserChange: ((String) -> Void)? = nil
 
     private var samplerNames: [String] {
         SamplingRecipeCatalog.samplerNames(forModelFamily: modelFamily)
@@ -29,7 +36,7 @@ struct SamplingRecipePicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            samplingRow(title: "Sampler", selection: $sampler, names: samplerNames) {
+            samplingRow(title: "Sampler", selection: Self.userEditBinding($sampler, onUserChange: onUserChange), names: samplerNames) {
                 let value = SamplingRecipeCatalog.defaultSamplerName(forModelFamily: modelFamily)
                 return "Model Default (\(Self.displayName(value)))"
             }
@@ -99,6 +106,22 @@ struct SamplingRecipePicker: View {
                 ? defaultLabel()
                 : "Wire value: \(selection.wrappedValue)")
         }
+    }
+
+    /// A proxy the Picker writes through: a Picker only ever calls `set` for
+    /// a user selection, so routing the callback through the proxy — and
+    /// NOT through `.onChange(of:)`, which cannot tell a user pick from an
+    /// assignment made by `applyPreset` — is what makes "user-initiated"
+    /// true by construction. Static and internal so the distinction is
+    /// unit-testable.
+    static func userEditBinding(_ base: Binding<String>, onUserChange: ((String) -> Void)?) -> Binding<String> {
+        Binding(
+            get: { base.wrappedValue },
+            set: { newValue in
+                base.wrappedValue = newValue
+                onUserChange?(newValue)
+            }
+        )
     }
 
     private static func optionLabel(_ raw: String) -> String {

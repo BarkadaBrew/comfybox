@@ -90,6 +90,16 @@ struct GenerationView: View {
     @SceneStorage("gen.noiseAlpha") private var noiseAlpha: Double = 0
     @SceneStorage("gen.implicitSteps") private var implicitSteps: Double = 0
     @SceneStorage("gen.c2") private var c2: Double = 0.5
+    /// #419: explicit schedule shift (krea2 = mu, Z-Image = linear). 0 =
+    /// model default — `shift` must be > 0 on the wire, so 0 is a safe
+    /// "unset" sentinel for `@SceneStorage`, which cannot hold an Optional.
+    @SceneStorage("gen.shift") private var shiftStorage: Double = 0
+    private var shift: Binding<Double?> {
+        Binding(
+            get: { shiftStorage > 0 ? shiftStorage : nil },
+            set: { shiftStorage = $0 ?? 0 }
+        )
+    }
     /// Empty = let the active model choose its native recipe.
     @SceneStorage("gen.sampler") private var sampler: String = ""
     @SceneStorage("gen.sigmaSchedule") private var sigmaSchedule: String = ""
@@ -129,19 +139,33 @@ struct GenerationView: View {
     /// Persisted LoRA stack (JSON) so it survives leaving/returning to the tab.
     @SceneStorage("gen.lorasJSON") private var lorasJSON: String = ""
 
+    /// #419 (review): the ENGINE's `/health` model_family answer only —
+    /// never text inference from the model id (a path containing "chroma"
+    /// can be a Z-Image checkpoint, #154). nil while unknown = permissive,
+    /// same as the preset editor.
     private var samplingModelFamily: String? {
-        engine.currentModelFamily ?? engine.currentModel
+        guard let family = engine.currentModelFamily, !family.isEmpty else { return nil }
+        return family
     }
 
+    /// #419: the same validator the preset editor uses — sampler/schedule
+    /// pair, shift (incl. the flux1 schedule rule), eta/bongmath tier gates,
+    /// noise ranges — so Generate refuses locally exactly what the engine
+    /// would 400 on, with the engine's wording.
     private var samplingValidationError: String? {
-        guard !sampler.isEmpty || !sigmaSchedule.isEmpty else { return nil }
-        guard !SamplingRecipeCatalog.supports(
-            sampler: sampler.isEmpty ? nil : sampler,
-            sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
-            forModelFamily: samplingModelFamily
-        ) else { return nil }
-        let family = SamplingRecipeCatalog.canonicalFamily(samplingModelFamily) ?? "the active model"
-        return "Sampler '\(sampler.isEmpty ? "Model Default" : sampler)' and scheduler '\(sigmaSchedule.isEmpty ? "Model Default" : sigmaSchedule)' are not supported together by \(family)."
+        PresetSamplingValidator.validationError(PresetSamplingDraft(
+            modelFamily: samplingModelFamily,
+            sampler: sampler,
+            sigmaSchedule: sigmaSchedule,
+            shift: shift.wrappedValue,
+            eta: eta == 0 ? nil : eta,
+            bongmath: bongmath ? true : nil,
+            noiseType: noiseType == "gaussian" ? nil : noiseType,
+            noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
+            implicitSteps: implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
+            c2: c2 == 0.5 ? nil : c2,
+            projectorScale: projectorScale == 1.0 ? nil : projectorScale
+        ))
     }
 
     // Sidebar sections
@@ -273,6 +297,9 @@ struct GenerationView: View {
                 height: effectiveHeight,
                 sampler: sampler,
                 sigmaSchedule: sigmaSchedule,
+                eta: eta,
+                bongmath: bongmath,
+                shift: shift.wrappedValue,
                 onSave: { name, editedNegative in
                     // Save to the canonical server preset store (shared with
                     // Bree/Telegram), not the old device-local list.
@@ -286,10 +313,11 @@ struct GenerationView: View {
                         negativePrompt: editedNegative.isEmpty ? nil : editedNegative,
                         steps: Int(steps),
                         guidance: guidance,
-                        projectorScale: projectorScale,
+                        // Neutral values stay absent — never freeze a default.
+                        projectorScale: projectorScale == 1.0 ? nil : projectorScale,
                         noiseType: noiseType == "gaussian" ? nil : noiseType,
                         noiseAlpha: noiseAlpha == 0 ? nil : noiseAlpha,
-                        implicitSteps: implicitSteps == 0 ? nil : Int(implicitSteps),
+                        implicitSteps: implicitSteps.rounded() == 0 ? nil : Int(implicitSteps.rounded()),
                         c2: c2 == 0.5 ? nil : c2,
                         width: effectiveWidth,
                         height: effectiveHeight,
@@ -305,7 +333,13 @@ struct GenerationView: View {
                         // the authoritative Krea 2 recipe.
                         scheduler: sampler.isEmpty ? nil : sampler,
                         sampler: sampler.isEmpty ? nil : sampler,
-                        sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule
+                        sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
+                        // #419: the panel's RES4LYF knobs used to be dropped
+                        // here — a Clownshark session saved as an ODE preset.
+                        // Neutral values stay absent (never freeze a default).
+                        shift: shift.wrappedValue,
+                        eta: eta == 0 ? nil : eta,
+                        bongmath: bongmath ? true : nil
                     )
                     var withModel = preset
                     if let model = engine.currentModel {
@@ -826,56 +860,48 @@ struct GenerationView: View {
             // Guidance
             NumericSliderField(label: "Guidance", value: $guidance, range: 0...20, step: 0.5, fractionDigits: 1)
 
-            // Projector scale — CFG-free prompt-adherence gain (Krea2). 1.0 = off.
-            NumericSliderField(label: "Projector Scale", value: $projectorScale, range: 0...3, step: 0.05, fractionDigits: 2)
-
             // Sampler = solver; Scheduler = sigma/noise schedule. Options are
             // sourced from the engine's family capability matrix.
             SamplingRecipePicker(
                 sampler: $sampler,
                 sigmaSchedule: $sigmaSchedule,
-                modelFamily: samplingModelFamily
-            )
-            .disabled(backend != .local)
-
-            // RES4LYF SDE / bongmath (the Clownshark recipe): eta>0 turns on SDE
-            // noise re-injection, bongmath aligns substeps. Both need a RES4LYF
-            // sampler (res_*/ralston_*/deis_*) — harmless no-ops otherwise.
-            NumericSliderField(label: "Eta (SDE)", value: $eta, range: 0...1, step: 0.05, fractionDigits: 2)
-            Toggle("Bongmath", isOn: $bongmath)
-                .font(.caption)
-                .disabled(backend != .local)
-
-            HStack(spacing: 8) {
-                Text("Noise Type")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 76, alignment: .leading)
-                Picker("Noise Type", selection: $noiseType) {
-                    Text("Gaussian").tag("gaussian")
-                    Text("Fractal").tag("fractal")
-                    Text("Pyramid").tag("pyramid")
+                modelFamily: samplingModelFamily,
+                // The one automatic reset, on the user's OWN pick only. An
+                // `.onChange(of: sampler)` here fired for `applyPreset` too and
+                // judged the preset's sampler against the family still
+                // resident while its model loaded (~70 s) — a Z-Image preset
+                // with ddim + eta 0.6 applied over krea2 lost its eta. Also
+                // suppressed while an apply / model switch is in flight.
+                onUserChange: { newSampler in
+                    let outcome = SamplingGate.userSamplerChange(
+                        to: newSampler, modelFamily: samplingModelFamily,
+                        eta: eta, bongmath: bongmath, applyInFlight: isApplyingPreset)
+                    eta = outcome.eta
+                    bongmath = outcome.bongmath
                 }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .disabled(backend != .local)
-            NumericSliderField(
-                label: "Noise Alpha", value: $noiseAlpha,
-                range: -2...2, step: 0.1, fractionDigits: 1
             )
             .disabled(backend != .local)
-            NumericSliderField(
-                label: "Implicit Steps", value: $implicitSteps,
-                range: 0...8, step: 1
+
+            // #419: shift + projector scale + the RES4LYF SDE / bongmath /
+            // noise knobs (the Clownshark recipe) — the SAME family-aware
+            // subview the preset editor shows, so the eta/bongmath gate
+            // exists once. A refused value is greyed with Clear beside it and
+            // `samplingValidationError` refuses the render locally; nothing is
+            // reset when the model changes underneath a loaded value.
+            SamplingAdvancedControls(
+                shift: shift,
+                projectorScale: $projectorScale,
+                eta: $eta,
+                bongmath: $bongmath,
+                noiseType: $noiseType,
+                noiseAlpha: $noiseAlpha,
+                implicitSteps: $implicitSteps,
+                c2: $c2,
+                sampler: sampler,
+                sigmaSchedule: sigmaSchedule,
+                modelFamily: samplingModelFamily,
+                isEnabled: backend == .local
             )
-            .disabled(backend != .local)
-            NumericSliderField(
-                label: "C2", value: $c2,
-                range: 0.05...1, step: 0.05, fractionDigits: 2
-            )
-            .disabled(backend != .local)
 
             // Seed field
             VStack(alignment: .leading, spacing: 4) {
@@ -955,7 +981,7 @@ struct GenerationView: View {
                 : selectedLoras.map {
                     "\($0.filename.replacingOccurrences(of: ".safetensors", with: "")) @\(String(format: "%g", $0.scale))"
                   }.joined(separator: ", "))
-            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · sampler \(sampler.isEmpty ? "default" : sampler) · scheduler \(sigmaSchedule.isEmpty ? "default" : sigmaSchedule) · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
+            summaryRow("Params", "\(Int(steps)) steps · g\(String(format: "%g", guidance)) · sampler \(sampler.isEmpty ? "default" : sampler) · scheduler \(sigmaSchedule.isEmpty ? "default" : sigmaSchedule)\(shift.wrappedValue.map { " · shift \(String(format: "%g", $0))" } ?? "")\(eta > 0 ? " · eta \(String(format: "%g", eta))" : "")\(bongmath ? " · bongmath" : "") · \(effectiveWidth)×\(effectiveHeight) · seed \(seedText.isEmpty ? "random" : seedText) · \(contentMode.rawValue)")
             if let warning = samplingValidationError, backend == .local {
                 Text(warning).foregroundStyle(.orange)
             }
@@ -1234,8 +1260,9 @@ struct GenerationView: View {
             bongmath: bongmath,
             noiseType: noiseType,
             noiseAlpha: Float(noiseAlpha),
-            implicitSteps: Int(implicitSteps),
+            implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
+            shift: shift.wrappedValue.map { Float($0) },
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1287,8 +1314,9 @@ struct GenerationView: View {
             bongmath: bongmath,
             noiseType: noiseType,
             noiseAlpha: Float(noiseAlpha),
-            implicitSteps: Int(implicitSteps),
+            implicitSteps: Int(implicitSteps.rounded()),
             c2: Float(c2),
+            shift: shift.wrappedValue.map { Float($0) },
             sampler: sampler.isEmpty ? nil : sampler,
             sigmaSchedule: sigmaSchedule.isEmpty ? nil : sigmaSchedule,
             seed: seed,
@@ -1828,6 +1856,12 @@ struct GenerationView: View {
         c2 = Double(preset.c2 ?? 0.5)
         sampler = preset.sampler ?? ""
         sigmaSchedule = preset.sigmaSchedule ?? ""
+        // #419: eta / bongmath / shift used to be dropped here, so applying
+        // a Clownshark preset (res_2s + eta 0.5, shift 1.15) rendered the
+        // default ODE at the default shift. Absent = model default.
+        eta = preset.eta ?? 0
+        bongmath = preset.bongmath ?? false
+        shiftStorage = preset.shift ?? 0
 
         // Find a matching resolution preset, else carry the preset's exact
         // dimensions through the custom fields.

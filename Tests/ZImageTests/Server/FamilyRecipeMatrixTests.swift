@@ -247,4 +247,141 @@ final class FamilyRecipeMatrixTests: XCTestCase {
       SamplingRecipeCatalog.supports(
         sampler: "uni_pc", sigmaSchedule: nil, forModelFamily: "krea2"))
   }
+
+  // MARK: - #419: the family gates the desktop editor enables knobs from
+  //
+  // Every assertion here pins a catalog answer to the ENGINE function it
+  // claims to mirror, across every family and sampler — never to a
+  // hand-written "isKrea2".
+
+  private func payload(_ json: String) throws -> GeneratePayload {
+    try JSONDecoder().decode(GeneratePayload.self, from: Data(json.utf8))
+  }
+
+  /// What the engine does with `eta`/`bongmath` at dispatch: the tier gate
+  /// runs under `if family == .krea2` (WarmServer.swift, `enqueueGenerate`
+  /// and the bridge's krea2 arm); every other family forwards the value with
+  /// no gate. `true` = the request would be refused.
+  private func engineRefusesTierField(_ payload: GeneratePayload, family: WarmModelFamily) -> Bool {
+    guard family == .krea2 else { return false }
+    return (try? payload.validateKrea2TierGates(try payload.validateRecipeNames())) == nil
+  }
+
+  func testCatalogRES4LYFSamplerMatchesTheEnum() {
+    for kind in SchedulerKind.allCases {
+      XCTAssertEqual(
+        SamplingRecipeCatalog.isRES4LYFSampler(kind.rawValue), kind.isRES4LYFFamily, kind.rawValue)
+    }
+    XCTAssertTrue(SamplingRecipeCatalog.isRES4LYFSampler("exponential/res_2s"))
+    XCTAssertTrue(SamplingRecipeCatalog.isRES4LYFSampler("multistep/deis_3m"))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler("dpmpp_2m"))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler(nil))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler(""))
+    XCTAssertFalse(SamplingRecipeCatalog.isRES4LYFSampler("uni_pc"))
+    // The list the refusals and the UI quote is the enum's RES4LYF set.
+    let listed = Set(SamplingRecipeCatalog.res4lyfSamplerList.components(separatedBy: " / "))
+    XCTAssertEqual(listed, Set(SchedulerKind.allCases.filter(\.isRES4LYFFamily).map(\.rawValue)))
+  }
+
+  /// `etaStatus.isRefused` ⇔ the engine's tier gate throws for that family +
+  /// sampler; on flux1 `.honoured` ⇔ `SchedulerFactory` hands the value to a
+  /// scheduler that reads it (`readsAncestralEta`), else `.inert`.
+  func testCatalogEtaStatusMatchesTheEngine() throws {
+    for family in WarmModelFamily.allCases {
+      for kind in SchedulerKind.allCases {
+        let p = try payload(#"{"prompt":"x","scheduler":"\#(kind.rawValue)","eta":0.5}"#)
+        let status = SamplingRecipeCatalog.etaStatus(sampler: kind.rawValue, forModelFamily: family.rawValue)
+        XCTAssertEqual(
+          status.isRefused, engineRefusesTierField(p, family: family),
+          "\(family.rawValue) \(kind.rawValue)")
+        switch family {
+        case .krea2:
+          XCTAssertEqual(status.isHonoured, kind.isRES4LYFFamily, "\(kind.rawValue)")
+        case .flux1:
+          XCTAssertEqual(status.isHonoured, kind.readsAncestralEta, "\(kind.rawValue)")
+          XCTAssertFalse(status.isRefused, "no eta gate exists on Z-Image: \(kind.rawValue)")
+        case .chroma, .flux2, .fibo:
+          XCTAssertFalse(status.isRefused); XCTAssertFalse(status.isHonoured)
+        }
+      }
+      // Absent sampler = euler, the same answer the gate gives.
+      let bare = try payload(#"{"prompt":"x","eta":0.5}"#)
+      XCTAssertEqual(
+        SamplingRecipeCatalog.etaStatus(sampler: nil, forModelFamily: family.rawValue).isRefused,
+        engineRefusesTierField(bare, family: family), family.rawValue)
+    }
+    XCTAssertTrue(SamplingRecipeCatalog.etaStatus(sampler: "ddim", forModelFamily: "Tongyi-MAI/Z-Image-Turbo").isHonoured)
+    XCTAssertTrue(SamplingRecipeCatalog.etaStatus(sampler: "dpmpp_2s_ancestral", forModelFamily: "flux1").isHonoured)
+    XCTAssertEqual(SamplingRecipeCatalog.etaStatus(sampler: "res_2s", forModelFamily: "flux1").isRefused, false)
+    XCTAssertTrue(SamplingRecipeCatalog.etaStatus(sampler: "euler", forModelFamily: nil).isHonoured)
+    // The refusal wording is the engine's own.
+    XCTAssertThrowsError(
+      try payload(#"{"prompt":"x","eta":0.5}"#).validateKrea2TierGates(ResolvedRecipeNames(
+        scheduler: nil, schedulerRequested: nil, sigmaSchedule: nil, sigmaScheduleRequested: nil))
+    ) { error in
+      let engine = "\(error)"
+      let ours = SamplingRecipeCatalog.etaStatus(sampler: nil, forModelFamily: "krea2").note ?? ""
+      XCTAssertTrue(engine.contains("parity tier T2") && ours.contains("parity tier T2"), engine)
+    }
+  }
+
+  /// `bongmathStatus.isRefused` ⇔ the tier gate throws; honoured only on
+  /// Krea 2 + RES4LYF; inert (no gate, no reader) everywhere else.
+  func testCatalogBongmathStatusMatchesTheEngine() throws {
+    for family in WarmModelFamily.allCases {
+      for kind in SchedulerKind.allCases {
+        let p = try payload(#"{"prompt":"x","scheduler":"\#(kind.rawValue)","bongmath":true}"#)
+        let status = SamplingRecipeCatalog.bongmathStatus(sampler: kind.rawValue, forModelFamily: family.rawValue)
+        XCTAssertEqual(
+          status.isRefused, engineRefusesTierField(p, family: family),
+          "\(family.rawValue) \(kind.rawValue)")
+        XCTAssertEqual(
+          status.isHonoured, family == .krea2 && kind.isRES4LYFFamily,
+          "\(family.rawValue) \(kind.rawValue)")
+      }
+    }
+  }
+
+  /// `stage2Status` / `vaeStatus` ⇔ `stage2Gate` / `vaeGate`; the noise
+  /// recipe has no family gate anywhere (dispatch reads it on krea2 only),
+  /// so it is never refused; shift ⇔ `validateShift` + `validateShiftSchedule`.
+  func testCatalogFamilyGatesMatchTheEngineGates() throws {
+    for family in WarmModelFamily.allCases {
+      let raw = family.rawValue
+      let stage2 = try payload(#"{"prompt":"x","stage2":{"steps":2,"denoise":0.2}}"#)
+      XCTAssertEqual(
+        SamplingRecipeCatalog.stage2Status(forModelFamily: raw).isRefused,
+        GeneratePayload.stage2Gate(stage2, family: family) != nil, raw)
+      XCTAssertEqual(
+        SamplingRecipeCatalog.vaeStatus(forModelFamily: raw).isRefused,
+        GeneratePayload.vaeGate("/vae/Wan2_1_VAE_fp32.safetensors", family: family) != nil, raw)
+      XCTAssertFalse(SamplingRecipeCatalog.noiseRecipeStatus(forModelFamily: raw).isRefused, raw)
+      XCTAssertEqual(SamplingRecipeCatalog.noiseRecipeStatus(forModelFamily: raw).isHonoured, family == .krea2, raw)
+      XCTAssertEqual(
+        SamplingRecipeCatalog.shiftStatus(sigmaSchedule: nil, forModelFamily: raw).isRefused,
+        GeneratePayload.validateShift(1.15, family: family) != nil, raw)
+      for schedule in SigmaScheduleKind.allCases {
+        let engineRefuses = GeneratePayload.validateShift(1.5, family: family) != nil
+          || GeneratePayload.validateShiftSchedule(1.5, sigmaSchedule: schedule, family: family) != nil
+        XCTAssertEqual(
+          SamplingRecipeCatalog.shiftStatus(sigmaSchedule: schedule.rawValue, forModelFamily: raw).isRefused,
+          engineRefuses, "\(raw) \(schedule.rawValue)")
+      }
+    }
+    // Unknown family: honoured everywhere (editable while disconnected).
+    for status in [
+      SamplingRecipeCatalog.etaStatus(sampler: "euler", forModelFamily: nil),
+      SamplingRecipeCatalog.bongmathStatus(sampler: "euler", forModelFamily: nil),
+      SamplingRecipeCatalog.noiseRecipeStatus(forModelFamily: nil),
+      SamplingRecipeCatalog.stage2Status(forModelFamily: nil),
+      SamplingRecipeCatalog.vaeStatus(forModelFamily: nil),
+      SamplingRecipeCatalog.shiftStatus(sigmaSchedule: "krea2", forModelFamily: nil),
+      SamplingRecipeCatalog.shiftStatus(sigmaSchedule: nil, forModelFamily: "/Models/mystery.safetensors"),
+    ] {
+      XCTAssertTrue(status.isHonoured)
+    }
+    XCTAssertEqual(SamplingRecipeCatalog.shiftLabel(forModelFamily: "krea2-raw"), "Shift (mu)")
+    XCTAssertEqual(SamplingRecipeCatalog.shiftLabel(forModelFamily: "Tongyi-MAI/Z-Image-Turbo"), "Shift (linear)")
+    XCTAssertEqual(SamplingRecipeCatalog.shiftLabel(forModelFamily: nil), "Shift")
+  }
 }

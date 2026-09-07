@@ -138,6 +138,13 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     /// would silently erase a declared look.
     public var style: String?
     public var phoneLook: Bool?
+    /// #419: the engine's Tier-A video tuning block (`LTX2VideoTuning`,
+    /// preset-level overrides for the LTX lane). Passthrough, verbatim — the
+    /// desktop never edits it, but an upsert REPLACES the stored document,
+    /// so before this field existed every desktop save of a video preset
+    /// silently erased its tuning. Typed as the engine's own struct so a
+    /// field added there round-trips here without a second mirror to drift.
+    public var videoTuning: LTX2VideoTuning?
 
     // Read-only validity flag the engine attaches on GET (WP-E20, AC-44c).
     // Never sent back: the engine recomputes it on every save.
@@ -196,7 +203,8 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         bongmath: Bool? = nil,
         stage2: ServerPresetStage? = nil,
         style: String? = nil,
-        phoneLook: Bool? = nil
+        phoneLook: Bool? = nil,
+        videoTuning: LTX2VideoTuning? = nil
     ) {
         self.id = id
         self.name = name
@@ -238,6 +246,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         self.stage2 = stage2
         self.style = style
         self.phoneLook = phoneLook
+        self.videoTuning = videoTuning
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -254,6 +263,9 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         // #399: the StylePack dials — listed here AND encoded AND decoded, or
         // a desktop save drops the preset's look.
         case style, phoneLook
+        // #419: listed AND encoded AND decoded — the `videoTuning` lesson,
+        // this time on the desktop mirror.
+        case videoTuning
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -303,6 +315,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         try c.encodeIfPresent(stage2, forKey: .stage2)
         try c.encodeIfPresent(style, forKey: .style)
         try c.encodeIfPresent(phoneLook, forKey: .phoneLook)
+        try c.encodeIfPresent(videoTuning, forKey: .videoTuning)
         // `invalid` / `invalidReason` are deliberately NOT encoded.
     }
 
@@ -348,6 +361,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
         stage2 = try c.decodeIfPresent(ServerPresetStage.self, forKey: .stage2)
         style = try c.decodeIfPresent(String.self, forKey: .style)
         phoneLook = try c.decodeIfPresent(Bool.self, forKey: .phoneLook)
+        videoTuning = try c.decodeIfPresent(LTX2VideoTuning.self, forKey: .videoTuning)
         invalid = try c.decodeIfPresent(Bool.self, forKey: .invalid)
         invalidReason = try c.decodeIfPresent(String.self, forKey: .invalidReason)
         kromaDeprecated = try c.decodeIfPresent(Bool.self, forKey: .kromaDeprecated)
@@ -390,6 +404,12 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             noiseAlpha: noiseAlpha.map { Float($0) },
             implicitSteps: implicitSteps,
             c2: c2.map { Float($0) },
+            // #419: Apply used to drop these three, so a Clownshark preset
+            // (res_2s + eta 0.5, shift 1.15) landed on Generate as a plain
+            // ODE render at the default shift.
+            eta: eta,
+            bongmath: bongmath,
+            shift: shift,
             width: width ?? 1024,
             height: height ?? 1024,
             // `scheduler` is the legacy preset spelling for the sampler.
@@ -406,7 +426,7 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
     /// runs, on the editor's current (possibly unsaved) field values, with no
     /// wire round trip (#277).
     public func toImagePreset() -> ImagePreset {
-        ImagePreset(
+        var preset = ImagePreset(
             id: id,
             name: name,
             description: description,
@@ -437,6 +457,8 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
             upscale: upscale.map { PresetUpscale(enabled: $0.enabled, mode: $0.mode, scale: $0.scale) },
             vae: vae,
             checkpointFamily: checkpointFamily,
+            phoneLook: phoneLook,
+            style: style,
             kroma: kroma.map { KromaPolicy(strength: $0.strength, file: $0.file) },
             bypass: bypass.map { BypassPolicy(strength: $0.strength, file: $0.file) },
             sampler: sampler,
@@ -450,5 +472,9 @@ public struct ServerPreset: Codable, Sendable, Equatable, Identifiable {
                     denoise: $0.denoise, eta: $0.eta, bongmath: $0.bongmath)
             }
         )
+        // Not in the engine's memberwise init (it is set after decode there
+        // too); carried so the panel's `ImagePreset` is the whole document.
+        preset.videoTuning = videoTuning
+        return preset
     }
 }

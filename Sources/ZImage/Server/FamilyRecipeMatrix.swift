@@ -369,6 +369,159 @@ public enum SamplingRecipeCatalog {
     family(raw) == .krea2 ? SigmaScheduleKind.krea2.rawValue : SigmaScheduleKind.flow.rawValue
   }
 
+  // MARK: - Family-aware field gates (#419)
+  //
+  // The desktop preset editor and the Generate panel enable/disable/label
+  // the RES4LYF and stage-2 knobs from THESE answers, so the gating logic
+  // lives beside the capability matrix the warm server validates against,
+  // not in a second table inside the UI. Each answer names the engine gate
+  // it mirrors; the tests pin every one of them to that gate's actual
+  // behaviour. An UNKNOWN family (nil / unrecognised / the engine has not
+  // answered yet) is `.honoured` everywhere — the same "editable while
+  // disconnected" rule `samplerNames(forModelFamily:)` follows — and the
+  // engine's own validation remains the authority on save.
+
+  /// What a family does with a recipe field: reads it, accepts-and-ignores
+  /// it (no gate, no effect — the UI labels it), or 400s on it (the UI
+  /// greys the control, offers Clear, and blocks Save).
+  public enum RecipeFieldStatus: Equatable, Sendable {
+    case honoured
+    case inert(String)
+    case refused(String)
+
+    public var isRefused: Bool { if case .refused = self { return true }; return false }
+    public var isHonoured: Bool { self == .honoured }
+    /// The label / message text, nil when honoured.
+    public var note: String? {
+      switch self {
+      case .honoured: return nil
+      case .inert(let why), .refused(let why): return why
+      }
+    }
+  }
+
+  /// The RES4LYF ports, as the engine's own refusal lists them.
+  public static let res4lyfSamplerList =
+    "res_2s / res_3s / ralston_2s / ralston_3s / ralston_4s / heun_2s / heun_3s / deis_2m / deis_3m / deis_4m"
+
+  /// Whether the named sampler (raw value, declared alias, or RES4LYF
+  /// `exponential/`-style prefixed spelling) is one of the RES4LYF ports.
+  /// `nil`/empty (model default = euler) and unknown names answer false.
+  public static func isRES4LYFSampler(_ name: String?) -> Bool {
+    resolvedSampler(name)?.isRES4LYFFamily ?? false
+  }
+
+  /// `eta` — `WarmServer.validateKrea2TierGates` (run under `family ==
+  /// .krea2` only): on Krea 2 it is RES4LYF's SDE, refused on any other
+  /// sampler. On Z-Image there is no gate: the value is forwarded and read
+  /// by DDIM / DPM++ 2S-A (`SchedulerKind.readsAncestralEta`) and ignored by
+  /// every other sampler. The remaining families forward nothing that reads it.
+  public static func etaStatus(sampler: String?, forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    let kind = resolvedSampler(sampler) ?? .euler
+    switch family {
+    case .krea2:
+      return kind.isRES4LYFFamily
+        ? .honoured
+        : .refused("eta is RES4LYF's SDE (parity tier T2) and applies to the RES4LYF samplers only; "
+          + "'\(kind.rawValue)' is not one of them. Send eta 0, or a sampler from " + res4lyfSamplerList)
+    case .flux1:
+      return kind.readsAncestralEta
+        ? .honoured
+        : .inert("eta is not read by '\(kind.rawValue)' on Z-Image (only DDIM and DPM++ 2S Ancestral use it); it is accepted and ignored")
+    case .chroma, .flux2, .fibo:
+      return .inert("eta is not read by \(family.rawValue); it is accepted and ignored")
+    }
+  }
+
+  /// `bongmath` — the eta arm's twin in `validateKrea2TierGates`: Krea 2 +
+  /// RES4LYF sampler only. No other family has a gate or a reader for it.
+  public static func bongmathStatus(sampler: String?, forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    let kind = resolvedSampler(sampler) ?? .euler
+    switch family {
+    case .krea2:
+      return kind.isRES4LYFFamily
+        ? .honoured
+        : .refused("bongmath is RES4LYF's fixed point (parity tier T3) over its own tableau rows "
+          + "and applies to the RES4LYF samplers only; '\(kind.rawValue)' is not one of them. "
+          + "Send bongmath false, or a sampler from " + res4lyfSamplerList)
+    case .flux1, .chroma, .flux2, .fibo:
+      return .inert("bongmath is a Krea 2 RES4LYF setting; \(family.rawValue) accepts and ignores it")
+    }
+  }
+
+  /// The RES4LYF spatial-noise / implicit-RK / substep recipe (`noise_type`,
+  /// `noise_alpha`, `implicit_steps`, `c2`) and the projector-scale gain:
+  /// decoded and range-checked on every family, read by the Krea 2 loop only
+  /// — no family gate exists, so elsewhere they are inert, never refused.
+  public static func noiseRecipeStatus(forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    return family == .krea2
+      ? .honoured
+      : .inert("Noise, implicit steps, C2 and projector scale are Krea 2 settings; \(family.rawValue) accepts and ignores them")
+  }
+
+  /// `stage2` — `GeneratePayload.stage2Gate`: a Krea 2 mechanism (WP-E17),
+  /// refused by name on every other family.
+  public static func stage2Status(forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    return family == .krea2
+      ? .honoured
+      : .refused("a second stage inside one render is a Krea 2 mechanism (WP-E17); "
+        + "\(family.rawValue) has no such seam — load a krea2 model, or remove stage2")
+  }
+
+  /// `vae` — `GeneratePayload.vaeGate` (WP-E9): a Krea 2 request field,
+  /// refused by name on every other family.
+  public static func vaeStatus(forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    return family == .krea2
+      ? .honoured
+      : .refused("VAE selection is a Krea 2 request field (WP-E9); \(family.rawValue) decodes through its own VAE and does not honour it — remove it")
+  }
+
+  /// `shift` — `GeneratePayload.validateShift` (krea2 reads it as `mu`,
+  /// flux1 as a linear warp, the fixed-schedule families refuse it) and, on
+  /// flux1, `validateShiftSchedule` (comfybox#154): the `krea2` and
+  /// `bong_tangent` grids are defined by mu / by construction and would drop
+  /// it, so the pairing is a 400. `nil`/empty schedule = the family default.
+  public static func shiftStatus(sigmaSchedule: String?, forModelFamily raw: String?) -> RecipeFieldStatus {
+    guard let family = family(raw) else { return .honoured }
+    switch family {
+    case .krea2:
+      return .honoured
+    case .flux1:
+      guard let name = normalized(sigmaSchedule),
+        let schedule = try? RecipeNameResolver.resolveSigmaScheduleKind(name)
+      else { return .honoured }
+      return SchedulerFactory.honoursExplicitShift(schedule: schedule, modelSampling: .discreteFlow)
+        ? .honoured
+        : .refused("shift is not read by sigma schedule '\(schedule.rawValue)' (it is defined by mu / by index "
+          + "arithmetic, not by the model's shift) — drop shift, or ask for a schedule that honours it "
+          + "(flow/normal, simple, beta, beta57, karras, exponential)")
+    case .chroma, .flux2, .fibo:
+      return .refused("shift is a schedule field for the krea2 and flux1 (Z-Image) families and is not "
+        + "honoured by model family '\(family.rawValue)'; remove it")
+    }
+  }
+
+  /// The label the UI shows for `shift`, naming what the number MEANS on
+  /// this family: Krea 2 reads it as `mu` (a log-shift feeding
+  /// `ModelSamplingFlux`), Z-Image as the linear `σ' = shift·σ / (1 + (shift−1)·σ)`.
+  public static func shiftLabel(forModelFamily raw: String?) -> String {
+    switch family(raw) {
+    case .krea2: return "Shift (mu)"
+    case .flux1: return "Shift (linear)"
+    default: return "Shift"
+    }
+  }
+
+  private static func resolvedSampler(_ name: String?) -> SchedulerKind? {
+    guard let name = normalized(name) else { return nil }
+    return try? RecipeNameResolver.resolveSchedulerKind(name)
+  }
+
   private static func normalized(_ value: String?) -> String? {
     guard let value else { return nil }
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
