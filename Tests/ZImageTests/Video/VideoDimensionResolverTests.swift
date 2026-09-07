@@ -329,6 +329,8 @@ final class VideoDimensionResolverTests: XCTestCase {
     let r = VideoDimensionResolver.resolve(
       requestWidth: 704, requestHeight: 448,
       sourceWidth: 10, sourceHeight: 9999, hasInitImage: true)
+    // Review round 3, item 3: assert the literal result, not just the bound.
+    XCTAssertEqual([r.width, r.height], [256, 2048])
     XCTAssertLessThanOrEqual(
       max(r.width, r.height), VideoDimensionResolver.maxVideoLongEdge,
       "long edge must be capped")
@@ -505,6 +507,106 @@ final class VideoDimensionResolverTests: XCTestCase {
       width: 832, height: 448, reason: .sourceAspect,
       budgetWidth: 832, budgetHeight: 480)
     XCTAssertNil(single.stage1Width)
+  }
+
+  // MARK: - The refine gate drives the prediction (review round 3, item 1)
+
+  func testAGateSkippedRefinePredictsTheGeneratorDims() {
+    // 1344x768 at 289f: latent 42x24x37 -> at scale 1.5 the pre-refine volume
+    // is 37 * 36 * 63 = 83 916, far past refine_max_vol (12 000). The refine
+    // will NOT run, so the output is the generator dims — predicting 1.5x
+    // would name a size the file never has.
+    let volume = LTX2RefineGate.preRefineVolume(
+      width: 1344, height: 768, frames: 289, refineScale: 1.5)
+    XCTAssertEqual(volume, 83_916)
+    XCTAssertTrue(LTX2RefineGate.willSkip(
+      twoStage: true, upsamplerAvailable: true,
+      width: 1344, height: 768, frames: 289,
+      refineScale: 1.5, refineMaxVolume: 12_000))
+
+    let predicted = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 1344, generatorHeight: 768, twoStage: true, refineScale: 1.5,
+      refineWillSkip: true)
+    XCTAssertEqual([predicted.width, predicted.height], [1344, 768])
+  }
+
+  func testAnInBudgetRenderStillPredictsTheScaledOutput() {
+    // 512x320 at 49f: latent 16x10x7 -> at 1.35 that is 7 * 14 * 22 = 2156,
+    // comfortably inside refine_max_vol, so the refine runs.
+    XCTAssertEqual(
+      LTX2RefineGate.preRefineVolume(width: 512, height: 320, frames: 49, refineScale: 1.35),
+      2_156)
+    XCTAssertFalse(LTX2RefineGate.willSkip(
+      twoStage: true, upsamplerAvailable: true,
+      width: 512, height: 320, frames: 49,
+      refineScale: 1.35, refineMaxVolume: 12_000))
+  }
+
+  func testAMissingUpsamplerAlsoSkipsTheRefine() {
+    XCTAssertTrue(LTX2RefineGate.willSkip(
+      twoStage: true, upsamplerAvailable: false,
+      width: 512, height: 320, frames: 49,
+      refineScale: 1.35, refineMaxVolume: 12_000),
+      "two_stage with no upsampler cannot refine")
+    let predicted = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: 512, generatorHeight: 320, twoStage: true, refineScale: 1.35,
+      refineWillSkip: true)
+    XCTAssertEqual([predicted.width, predicted.height], [512, 320])
+  }
+
+  func testSingleScaleNeverSkips() {
+    XCTAssertFalse(LTX2RefineGate.willSkip(
+      twoStage: false, upsamplerAvailable: false,
+      width: 4096, height: 4096, frames: 289,
+      refineScale: 2.0, refineMaxVolume: 1),
+      "a non-two-stage render has no refine to skip")
+  }
+
+  func testTheGateVolumeMatchesThePipelinesOwnArithmetic() {
+    // The pipeline computes the gate from LATENT dims; the server from PIXEL
+    // dims. Same number, or the prediction and the render disagree.
+    let latent = LTX2RefineGate.preRefineVolume(
+      latentFrames: 7, latentHeight: 10, latentWidth: 16, refineScale: 1.35)
+    let pixels = LTX2RefineGate.preRefineVolume(
+      width: 512, height: 320, frames: 49, refineScale: 1.35)
+    XCTAssertEqual(latent, pixels)
+
+    // And the resize target the pipeline uses is the same one the gate measures.
+    let scaled = LTX2RefineGate.scaledLatentDims(
+      latentHeight: 10, latentWidth: 16, refineScale: 1.35)
+    XCTAssertEqual([scaled.height, scaled.width], [14, 22])
+    XCTAssertEqual(latent, 7 * scaled.height * scaled.width)
+  }
+
+  // MARK: - The ceiling is configurable and records itself (round 3, item 2)
+
+  func testTheCeilingIsOverridableForADeliberateHighResProbe() {
+    // Default: a 1920x1088 two-stage render at 2.0 is pulled under 2048.
+    let defaulted = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
+      generatorWidth: 1920, generatorHeight: 1088, twoStage: true, refineScale: 2.0)
+    XCTAssertLessThan(defaulted.width, 1920)
+
+    // Raised ceiling: the same request is left alone. LTX-2's RoPE
+    // extrapolates past its trained 2048px extent (the shimmer mode) rather
+    // than failing, so an out-of-distribution probe must be possible.
+    let raised = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
+      generatorWidth: 1920, generatorHeight: 1088, twoStage: true, refineScale: 2.0,
+      maxLongEdge: 4096, maxPixels: 4096 * 4096)
+    XCTAssertEqual([raised.width, raised.height], [1920, 1088])
+  }
+
+  func testCeilingPreClampIsCarriedOnTheResolvedDims() {
+    let reduced = ResolvedVideoDimensions(
+      width: 1024, height: 576, reason: .explicit,
+      budgetWidth: 1920, budgetHeight: 1088,
+      ceilingPreClamp: (width: 1920, height: 1088))
+    XCTAssertEqual(reduced.ceilingPreClamp?.width, 1920)
+    XCTAssertEqual(reduced.ceilingPreClamp?.height, 1088)
+
+    let untouched = ResolvedVideoDimensions(
+      width: 832, height: 448, reason: .sourceAspect,
+      budgetWidth: 832, budgetHeight: 480)
+    XCTAssertNil(untouched.ceilingPreClamp, "no reduction, no record")
   }
 
   // MARK: - i2v with an unreadable init image (review round 2, item 4)

@@ -93,6 +93,14 @@ public enum LTX2ConfigResolver {
     // Tier B — machine-shaped
     Entry(name: "plain_decode_max_vol", envKey: "LTX2_PLAIN_DECODE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "4500"),
     Entry(name: "refine_max_vol", envKey: "LTX2_REFINE_MAX_VOL", tier: "B", kind: .int(1...1_000_000), builtin: "12000"),
+    // comfybox#405 (review round 3, item 2): the render's per-axis pixel
+    // ceiling. 2048 is LTX-2's TRAINED spatial extent — `createPositionGrid`
+    // builds the RoPE grid in PIXEL space (`h * spatialCompression`) and
+    // `LTX2RoPE` divides each axis by `maxPos` = 2048 before scaling to
+    // [-1, 1]. Past it nothing crashes: RoPE extrapolates out of [-1, 1],
+    // which is the documented shimmer/decorrelation mode. Overridable so a
+    // deliberate high-resolution probe is not silently shrunk.
+    Entry(name: "max_long_edge", envKey: "LTX2_MAX_LONG_EDGE", tier: "B", kind: .int(256...16_384), builtin: "2048"),
     Entry(name: "decode_mode", envKey: "LTX2_DECODE_MODE", tier: "B", kind: .string, builtin: "auto"),
     Entry(name: "decode_tile", envKey: "LTX2_DECODE_TILE", tier: "B", kind: .string, builtin: ""),
     Entry(name: "upsampler_path", envKey: "LTX2_UPSAMPLER_PATH", tier: "B", kind: .path, builtin: ""),
@@ -309,6 +317,9 @@ public struct LTX2ResolvedVideoConfig: Sendable {
   // Tier B
   public let plainDecodeMaxVol: Int
   public let refineMaxVol: Int
+  /// comfybox#405: per-axis pixel ceiling for a render (LTX-2's trained
+  /// spatial extent, 2048 by default). See the entry table for why.
+  public let maxLongEdge: Int
   public let decodeMode: String
   public let decodeTile: String
   public let upsamplerPath: String
@@ -431,6 +442,7 @@ extension LTX2ConfigResolver {
       beatScheduleEnabled: b("beat_schedule_enabled"),
       plainDecodeMaxVol: i("plain_decode_max_vol"),
       refineMaxVol: i("refine_max_vol"),
+      maxLongEdge: i("max_long_edge"),
       decodeMode: str("decode_mode"),
       decodeTile: str("decode_tile"),
       upsamplerPath: str("upsampler_path"),

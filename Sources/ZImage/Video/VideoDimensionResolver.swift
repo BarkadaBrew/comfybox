@@ -81,6 +81,15 @@ public enum VideoDimensionReason: String, Equatable, Sendable {
 /// The resolver's full answer: the dims to render at, why, and the budget and
 /// source it reasoned from (both echoed so a trace is self-explaining).
 public struct ResolvedVideoDimensions: Equatable, Sendable {
+  public static func == (a: ResolvedVideoDimensions, b: ResolvedVideoDimensions) -> Bool {
+    a.width == b.width && a.height == b.height && a.reason == b.reason
+      && a.budgetWidth == b.budgetWidth && a.budgetHeight == b.budgetHeight
+      && a.sourceWidth == b.sourceWidth && a.sourceHeight == b.sourceHeight
+      && a.stage1Width == b.stage1Width && a.stage1Height == b.stage1Height
+      && a.ceilingPreClamp?.width == b.ceilingPreClamp?.width
+      && a.ceilingPreClamp?.height == b.ceilingPreClamp?.height
+  }
+
   public let width: Int
   public let height: Int
   public let reason: VideoDimensionReason
@@ -95,12 +104,19 @@ public struct ResolvedVideoDimensions: Equatable, Sendable {
   /// nil for a single-scale render, where generator and output agree.
   public let stage1Width: Int?
   public let stage1Height: Int?
+  /// Non-nil ONLY when the upper ceiling actually reduced this render: the
+  /// dims it would have used otherwise. Review round 3, item 2 — a silent
+  /// shrink is exactly the class of bug #405 is about, so when the ceiling
+  /// fires it is recorded on the trace (`ceiling_applied` + `ceiling_pre_clamp`)
+  /// as well as logged.
+  public let ceilingPreClamp: (width: Int, height: Int)?
 
   public init(
     width: Int, height: Int, reason: VideoDimensionReason,
     budgetWidth: Int, budgetHeight: Int,
     sourceWidth: Int? = nil, sourceHeight: Int? = nil,
-    stage1Width: Int? = nil, stage1Height: Int? = nil
+    stage1Width: Int? = nil, stage1Height: Int? = nil,
+    ceilingPreClamp: (width: Int, height: Int)? = nil
   ) {
     self.width = width
     self.height = height
@@ -111,6 +127,7 @@ public struct ResolvedVideoDimensions: Equatable, Sendable {
     self.sourceHeight = sourceHeight
     self.stage1Width = stage1Width
     self.stage1Height = stage1Height
+    self.ceilingPreClamp = ceilingPreClamp
   }
 
   /// True when the resolver moved the dims off the requested budget — the
@@ -124,28 +141,36 @@ public enum VideoDimensionResolver {
   public static let defaultWidth = 704
   public static let defaultHeight = 448
 
-  /// Upper ceiling for a VIDEO render, in pixels per spatial axis.
+  /// Upper ceiling for a VIDEO render, in pixels per spatial axis — LTX-2's
+  /// TRAINED spatial extent.
+  ///
+  /// This is not a guess and not a conservative reading. `LTX2Pipeline
+  /// .createPositionGrid` builds the RoPE position grid in PIXEL space
+  /// (`hStart = Float(h) * spatialScale`, `spatialScale = spatialCompression`),
+  /// and `LTX2RoPE` then divides each axis by its `maxPos` — `[20, 2048, 2048]`
+  /// — before scaling to [-1, 1]. So 2048 is exactly the pixel extent the
+  /// spatial RoPE was trained over.
+  ///
+  /// Past it nothing crashes: the fractional positions simply leave [-1, 1]
+  /// and RoPE extrapolates — the same out-of-distribution regime the temporal
+  /// axis documents as the shimmer/decorrelation mode. That is a quality
+  /// cliff, not a failure, which is why the ceiling is OVERRIDABLE
+  /// (`max_long_edge` / `LTX2_MAX_LONG_EDGE`, Tier B): a deliberate
+  /// high-resolution probe must not be silently shrunk, and when the ceiling
+  /// does fire it is recorded on the trace, not just logged.
   ///
   /// The first cut used `imageMemoryCaps` (4096 / 4096², PR #363) — the IMAGE
-  /// path's cap. No LTX-2 render survives 4096×4096, so it was not a ceiling
-  /// in any useful sense.
+  /// path's cap, which no LTX-2 render survives, so it bounded nothing.
   ///
-  /// The numeral comes from the LTX-2 transformer's own spatial position
-  /// ceiling, `positionalEmbeddingMaxPos: [20, 2048, 2048]`
-  /// (`LTX2Transformer.swift`) — the only hard architectural limit the video
-  /// stack states about spatial extent. **Read here in PIXEL space, not latent
-  /// space, which is deliberately conservative**: in latent units 2048 would
-  /// be 65 536 px, a ceiling that bounds nothing. 2048 px is 1.5× the largest
-  /// render in 474 logged production lines (1344×768), so it is a verified
-  /// no-op on real traffic while still rejecting a degenerate 256×17792.
+  /// For the record, on why this is not derived from the LTX volume gates:
+  /// `plain_decode_max_vol` (4500) and `refine_max_vol` (12000) are
+  /// frame-count-dependent decode/refine PATH-SELECTION gates, not admission
+  /// caps — a logged 1344x768x289f render is 37 296 latent units, far past
+  /// both, and renders fine via the streamed decode. Either as a dimension
+  /// clamp would shrink shapes that ship today.
   ///
-  /// This is a judgement call and is flagged as one: the engine has NO
-  /// video max-dims constant to inherit. The two existing LTX volume gates
-  /// (`plain_decode_max_vol` 4500, `refine_max_vol` 12000) are frame-count-
-  /// dependent decode/refine PATH-SELECTION gates, not admission caps — a
-  /// logged 1344×768×289f render is 37 296 latent units, far past both, and
-  /// renders fine via the streamed decode. Using either as a dimension clamp
-  /// would shrink shapes that ship today.
+  /// Verified no-op on real traffic: 0/474 logged shapes and 0/474 predicted
+  /// outputs (largest 2016x1152 from a 1344x768 two-stage render).
   public static let maxVideoLongEdge = 2048
   /// Companion area ceiling — `maxVideoLongEdge²`, i.e. the square case.
   public static let maxVideoPixels = 2048 * 2048
@@ -390,31 +415,6 @@ public enum VideoDimensionResolver {
       callerSizedBudget ? .explicit : .default)
   }
 
-  /// PREDICTED output dims for a render, given the dims the generator will be
-  /// handed and the resolved refine configuration.
-  ///
-  /// This is a prediction and is named as one. The first cut of #405 hardcoded
-  /// x2 — the two-stage halving convention's own assumption — but that is
-  /// wrong at the shipping configuration in two independent ways:
-  ///
-  ///  * `refine_scale`'s builtin is **1.5**, not 2 (`LTX2ConfigResolver`), and
-  ///    the pipeline clamps it to [1, 2] (`LTX2Pipeline`). The refine upsamples
-  ///    the LATENT grid by that factor and the VAE decodes at
-  ///    `spatialCompression` per latent unit, so the pixel result is
-  ///    `round(dim / spatialCompression * scale) * spatialCompression` — NOT
-  ///    `dim * scale`, because the latent rounding quantises it.
-  ///  * `LTX2RefineGate` can skip the refine entirely (volume gate, missing
-  ///    upsampler), in which case the output is the generator dims unchanged.
-  ///
-  /// So a two-stage render's real output is one of three sizes, and only the
-  /// encoder knows which. `LTX2VideoResult.outputWidth/outputHeight` carry the
-  /// MEASURED pair; this function exists for the submitted event, which has to
-  /// commit to a number before the render runs.
-  ///
-  /// - Parameters:
-  ///   - refineScale: the RESOLVED scale (`LTX2ResolvedVideoConfig.refineScale`),
-  ///     clamped here exactly as `LTX2Pipeline` clamps it.
-  ///   - refineWillSkip: pass true when the refine is already known not to run.
   /// Reduce the GENERATOR dims until their predicted output fits the ceiling.
   ///
   /// Review round 2, item 2: the clamp has to bound the FINAL output, not only
@@ -452,6 +452,31 @@ public enum VideoDimensionResolver {
       floor64(Double(generatorHeight) * scale))
   }
 
+  /// PREDICTED output dims for a render, given the dims the generator will be
+  /// handed and the resolved refine configuration.
+  ///
+  /// This is a prediction and is named as one. The first cut of #405 hardcoded
+  /// x2 — the two-stage halving convention's own assumption — but that is
+  /// wrong at the shipping configuration in two independent ways:
+  ///
+  ///  * `refine_scale`'s builtin is **1.5**, not 2 (`LTX2ConfigResolver`), and
+  ///    the pipeline clamps it to [1, 2] (`LTX2Pipeline`). The refine upsamples
+  ///    the LATENT grid by that factor and the VAE decodes at
+  ///    `spatialCompression` per latent unit, so the pixel result is
+  ///    `round(dim / spatialCompression * scale) * spatialCompression` — NOT
+  ///    `dim * scale`, because the latent rounding quantises it.
+  ///  * `LTX2RefineGate` can skip the refine entirely (volume gate, missing
+  ///    upsampler), in which case the output is the generator dims unchanged.
+  ///
+  /// So a two-stage render's real output is one of three sizes, and only the
+  /// encoder knows which. `LTX2VideoResult.outputWidth/outputHeight` carry the
+  /// MEASURED pair; this function exists for the submitted event, which has to
+  /// commit to a number before the render runs.
+  ///
+  /// - Parameters:
+  ///   - refineScale: the RESOLVED scale (`LTX2ResolvedVideoConfig.refineScale`),
+  ///     clamped here exactly as `LTX2Pipeline` clamps it.
+  ///   - refineWillSkip: pass true when the refine is already known not to run.
   public static func predictedOutputDims(
     generatorWidth: Int, generatorHeight: Int,
     twoStage: Bool, refineScale: Float,

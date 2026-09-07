@@ -2844,6 +2844,8 @@ public final class WarmServer {
     // the fix — see the resolver's `resolve` doc comment).
     let namedDims = Self.videoDims(resolution: req.resolution, aspectRatio: req.aspectRatio)
     let videoConfigDefaults = ServerConfigStore.shared.videoDefaults()
+    let resolvedVideoCeiling = LTX2ConfigResolver.resolveTyped(
+      request: effectiveTuning, preset: videoPreset?.videoTuning).maxLongEdge
     let sourceSize = effectiveInitImage.flatMap { Self.imagePixelSize(atPath: $0) }
     let resolvedDims = VideoDimensionResolver.resolve(
       requestWidth: req.width, requestHeight: req.height,
@@ -2854,7 +2856,10 @@ public final class WarmServer {
       aspectRatio: req.aspectRatio,
       // Review round 2, item 4: "is this i2v" is whether an init image was
       // SUPPLIED, not whether its size could be read.
-      hasInitImage: effectiveInitImage != nil)
+      hasInitImage: effectiveInitImage != nil,
+      // Review round 3, item 2: the same configurable trained-extent ceiling
+      // the output check below uses.
+      maxLongEdge: resolvedVideoCeiling, maxPixels: resolvedVideoCeiling * resolvedVideoCeiling)
     var renderWidth = resolvedDims.width
     var renderHeight = resolvedDims.height
     if req.width == nil, let nd = namedDims {
@@ -2926,26 +2931,22 @@ public final class WarmServer {
     // are themselves under it. Clamping the PREDICTION alone would only make
     // the reported number wrong — the encoder would still write whatever it
     // wrote — so the reduction lands on the generator dims, where it binds.
+    // `max_long_edge` (Tier B, default 2048 = LTX-2's trained spatial extent)
+    // is overridable, so a deliberate high-resolution probe is not silently
+    // shrunk (review round 3, item 2).
+    let videoCeiling = resolvedVideoCeiling
     let fitted = VideoDimensionResolver.generatorDimsFittingOutputCeiling(
       generatorWidth: renderWidth, generatorHeight: renderHeight,
-      twoStage: resolvedTwoStage, refineScale: resolvedVideoConfig.refineScale)
+      twoStage: resolvedTwoStage, refineScale: resolvedVideoConfig.refineScale,
+      maxLongEdge: videoCeiling, maxPixels: videoCeiling * videoCeiling)
+    var ceilingPreClamp: (width: Int, height: Int)? = nil
     if fitted.width != renderWidth || fitted.height != renderHeight {
       logger.warning(
-        "LTX-2 dims: \(renderWidth)x\(renderHeight) would refine past the \(VideoDimensionResolver.maxVideoLongEdge)px video ceiling — painting \(fitted.width)x\(fitted.height) instead (#405)")
+        "LTX-2 dims: \(renderWidth)x\(renderHeight) would refine past the \(videoCeiling)px trained spatial extent — painting \(fitted.width)x\(fitted.height) instead. Raise LTX2_MAX_LONG_EDGE for a deliberate out-of-distribution probe (#405).")
+      ceilingPreClamp = (renderWidth, renderHeight)
       renderWidth = fitted.width
       renderHeight = fitted.height
     }
-    let predicted = VideoDimensionResolver.predictedOutputDims(
-      generatorWidth: renderWidth, generatorHeight: renderHeight,
-      twoStage: resolvedTwoStage,
-      refineScale: resolvedVideoConfig.refineScale)
-    let renderDimensions = ResolvedVideoDimensions(
-      width: predicted.width, height: predicted.height,
-      reason: resolvedDims.reason,
-      budgetWidth: resolvedDims.budgetWidth, budgetHeight: resolvedDims.budgetHeight,
-      sourceWidth: resolvedDims.sourceWidth, sourceHeight: resolvedDims.sourceHeight,
-      stage1Width: resolvedTwoStage ? renderWidth : nil,
-      stage1Height: resolvedTwoStage ? renderHeight : nil)
     if let requestedSteps = req.steps, requestedSteps != 8 {
       logger.warning(
         "LTX-2: steps=\(requestedSteps) requested, but the distilled pipeline uses a fixed 8-step sigma schedule — the value is currently ignored (#219)")
@@ -3069,6 +3070,41 @@ public final class WarmServer {
       }
     }
 
+    // comfybox#405 (review round 3, item 1): the predicted output size needs
+    // to know whether the refine will actually RUN, and that gate is a
+    // function of the FRAME COUNT — so it is computed here, after the fold,
+    // not up with the dims. `LTX2RefineGate.willSkip` is the same decision
+    // `LTX2Pipeline` applies, from the same inputs (the shared
+    // `preRefineVolume`), so the prediction and the render cannot disagree
+    // about whether a clip refines.
+    //
+    // The upsampler predicate mirrors the generator's own lazy load
+    // (`LTX2VideoGenerator`: non-empty `upsamplerPath` that exists on disk).
+    let upsamplerAvailable = !resolvedVideoConfig.upsamplerPath.isEmpty
+      && FileManager.default.fileExists(atPath: resolvedVideoConfig.upsamplerPath)
+    let refineWillSkip = LTX2RefineGate.willSkip(
+      twoStage: resolvedTwoStage, upsamplerAvailable: upsamplerAvailable,
+      width: renderWidth, height: renderHeight, frames: foldedFramesPerChunk,
+      refineScale: resolvedVideoConfig.refineScale,
+      refineMaxVolume: resolvedVideoConfig.refineMaxVol)
+    if resolvedTwoStage, refineWillSkip {
+      logger.info(
+        "LTX-2 dims: two-stage requested but the refine is gated off for this render — predicting the unrefined \(renderWidth)x\(renderHeight) (#405)")
+    }
+    let predicted = VideoDimensionResolver.predictedOutputDims(
+      generatorWidth: renderWidth, generatorHeight: renderHeight,
+      twoStage: resolvedTwoStage,
+      refineScale: resolvedVideoConfig.refineScale,
+      refineWillSkip: refineWillSkip)
+    let renderDimensions = ResolvedVideoDimensions(
+      width: predicted.width, height: predicted.height,
+      reason: resolvedDims.reason,
+      budgetWidth: resolvedDims.budgetWidth, budgetHeight: resolvedDims.budgetHeight,
+      sourceWidth: resolvedDims.sourceWidth, sourceHeight: resolvedDims.sourceHeight,
+      stage1Width: resolvedTwoStage ? renderWidth : nil,
+      stage1Height: resolvedTwoStage ? renderHeight : nil,
+      ceilingPreClamp: ceilingPreClamp)
+
     let videoRequest = Self.buildLocalVideoRequest(
       req: req, videoPreset: videoPreset,
       effectivePrompt: effectivePrompt, effectiveInitImage: effectiveInitImage,
@@ -3149,6 +3185,12 @@ public final class WarmServer {
     if let s1w = prep.resolvedDimensions.stage1Width,
        let s1h = prep.resolvedDimensions.stage1Height {
       tracePayload["stage1_size"] = "\(s1w)x\(s1h)"
+    }
+    // Review round 3, item 2: a ceiling reduction is recorded, not just
+    // logged — a silent shrink is the bug class this ticket exists for.
+    if let pre = prep.resolvedDimensions.ceilingPreClamp {
+      tracePayload["ceiling_applied"] = "true"
+      tracePayload["ceiling_pre_clamp"] = "\(pre.width)x\(pre.height)"
     }
     if let initImage = prep.request.initImagePath {
       tracePayload["image_path"] = initImage

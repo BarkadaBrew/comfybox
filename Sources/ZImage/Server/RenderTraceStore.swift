@@ -185,10 +185,12 @@ public final class RenderTraceStore: @unchecked Sendable {
     /// pair, read from the terminal event the encoder produced.
     /// `dimensionSource` says which pair `outputWidth`/`outputHeight` carries
     /// — `"measured"` once the render has finished, `"predicted"` while it is
-    /// still running or if the engine that wrote the trace predates this
-    /// field. A prediction can be wrong: `refine_scale`'s builtin is 1.5 (not
-    /// the 2 the two-stage convention assumes) and the refine can be
-    /// gate-skipped, so never present a prediction as the file's resolution.
+    /// still running, and `"none"` when neither exists (a trace written by an
+    /// engine that predates these fields, or a non-video task). Review round
+    /// 3, item 3: `"predicted"` must never be claimed for a trace that carries
+    /// no prediction. A prediction can be wrong — `refine_scale`'s builtin is
+    /// 1.5 (not the 2 the two-stage convention assumes) and the refine can be
+    /// gate-skipped — so never present one as the file's resolution.
     public let outputWidth: String?
     public let outputHeight: String?
     public let dimensionSource: String?
@@ -236,7 +238,9 @@ public final class RenderTraceStore: @unchecked Sendable {
         // which, so no caller mistakes a prediction for the file's size.
         outputWidth: terminal?.payload["output_width"] ?? submitted?.payload["predicted_width"],
         outputHeight: terminal?.payload["output_height"] ?? submitted?.payload["predicted_height"],
-        dimensionSource: terminal?.payload["output_width"] != nil ? "measured" : "predicted",
+        dimensionSource: terminal?.payload["output_width"] != nil
+          ? "measured"
+          : (submitted?.payload["predicted_width"] != nil ? "predicted" : "none"),
         predictedWidth: submitted?.payload["predicted_width"],
         predictedHeight: submitted?.payload["predicted_height"],
         dimensionReason: submitted?.payload["dimension_reason"],

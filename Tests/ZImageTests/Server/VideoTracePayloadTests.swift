@@ -40,7 +40,8 @@ final class VideoTracePayloadTests: XCTestCase {
     predicted: (Int, Int) = (768, 480),
     stage1: (Int, Int)? = (512, 320),
     reason: VideoDimensionReason = .sourceAspect,
-    initImage: String? = "/tmp/kira-405.png"
+    initImage: String? = "/tmp/kira-405.png",
+    preClamp: (Int, Int)? = nil
   ) -> WarmServer.PreparedLocalVideo {
     let request = LTX2VideoRequest(
       prompt: "a test clip",
@@ -61,7 +62,8 @@ final class VideoTracePayloadTests: XCTestCase {
         width: predicted.0, height: predicted.1, reason: reason,
         budgetWidth: 832, budgetHeight: 480,
         sourceWidth: 576, sourceHeight: 1024,
-        stage1Width: stage1?.0, stage1Height: stage1?.1))
+        stage1Width: stage1?.0, stage1Height: stage1?.1,
+        ceilingPreClamp: preClamp.map { (width: $0.0, height: $0.1) }))
   }
 
   private func makeResult(
@@ -202,6 +204,42 @@ final class VideoTracePayloadTests: XCTestCase {
     XCTAssertEqual(summary.dimensionSource, "predicted")
     XCTAssertEqual(summary.outputWidth, "768")
     XCTAssertNil(summary.refineApplied, "there is no refine verdict before the render finishes")
+  }
+
+  // MARK: - Round 3, item 3: never claim a prediction that does not exist
+
+  func testATraceWithNoDimensionFieldsReportsNoneNotPredicted() {
+    // A trace written by an engine that predates these fields (or any other
+    // task kind) carries no prediction. Saying "predicted" there would be a
+    // claim about a number that is not present.
+    store.append(RenderTraceEvent(
+      renderId: "legacy", event: .submitted, taskKind: .videoRender,
+      payload: ["prompt": "an older engine wrote this"]))
+    store.append(RenderTraceEvent(
+      renderId: "legacy", event: .terminal, taskKind: .videoRender,
+      payload: ["status": "succeeded", "output_path": "/tmp/legacy.mp4"]))
+    store.flush()
+
+    guard let summary = store.recentSummaries().first(where: { $0.renderId == "legacy" })
+    else { return XCTFail("missing trace") }
+    XCTAssertEqual(summary.dimensionSource, "none")
+    XCTAssertNil(summary.outputWidth)
+    XCTAssertNil(summary.predictedWidth)
+  }
+
+  // MARK: - Round 3, item 2: a ceiling reduction is recorded, not just logged
+
+  func testCeilingReductionIsRecordedOnTheSubmittedEvent() {
+    let prep = makePrep(preClamp: (1920, 1088))
+    let payload = WarmServer.videoTracePayload(prep: prep, body: Data("{}".utf8))
+    XCTAssertEqual(payload["ceiling_applied"], "true")
+    XCTAssertEqual(payload["ceiling_pre_clamp"], "1920x1088")
+
+    // A render the ceiling never touched must carry neither key — an absent
+    // field is the signal that nothing was reduced.
+    let untouched = WarmServer.videoTracePayload(prep: makePrep(), body: Data("{}".utf8))
+    XCTAssertNil(untouched["ceiling_applied"])
+    XCTAssertNil(untouched["ceiling_pre_clamp"])
   }
 
   // MARK: - Helpers
