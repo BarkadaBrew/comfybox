@@ -416,6 +416,64 @@ already go through), so a replay reports `vae_source: "payload"` even for an
 originally preset-sourced render — the price of replaying a frozen body
 instead of re-resolving a preset that may have changed since.
 
+## Preset sampler recipe on `/v1/generate` (comfybox#419)
+
+A named `preset` now supplies its whole **sampler recipe**, not only its
+stack: `sampler` (or the legacy `scheduler` key — the daemon still reads that
+spelling, and a preset carrying only it still names a sampler), `sigma_schedule`,
+`eta`, `bongmath`, `stage2`, `noise_type`, `noise_alpha`, `implicit_steps`,
+`c2` and `projector_scale`. Before #419 `{"preset": "krea-kira"}` rendered on
+the engine's default sampler while the preset said `res_2s + beta57`, and
+reported success; only the daemon, which reads presets.json itself and sends
+every field explicitly, ever got the recipe. **Precedence is the `shift` rule,
+per field: the request's own value always wins, the preset's DECLARED value
+fills in only where the request sent none, and nothing is ever manufactured
+from a default** — so a request that sends `preset` *and* the recipe spelled
+out (the daemon's shape) is unchanged. `stage2` is adopted as one object
+(never field-merged with a request stage), and because the wire's `stage2`
+requires `steps` and `denoise`, a preset stage missing either is a **400
+naming the preset**, not a guess; so is a preset sampler/schedule name the
+engine does not resolve. There is no family gate at expansion for the
+names — the family capability matrix and the `stage2` family gate run at
+dispatch on the **expanded** values, so a
+preset naming a combination its family refuses gets the same 400 the explicit
+request does. `shift` (next section) is unchanged: on Krea 2 it is `mu` and
+stays request-only.
+
+**A preset-sourced `eta` or `bongmath` follows the daemon's rule (#1797),
+engine-side.** On the Krea 2 family a non-zero `eta` or a `bongmath: true`
+declared by the preset is adopted only when the *effective* stage-1 sampler —
+the request's if it sent one, else the preset's, else euler — is a RES4LYF
+sampler; otherwise it is left off and recorded, not turned into a 400,
+because the preset is the only layer that asked for it. The same holds for
+the preset's `stage2.eta` against the effective stage-2 sampler (the stage's
+own, else the render's). A **request** `eta` / `bongmath` is untouched and
+still hits the existing sampler gate. Z-Image `eta` is a different, shipped
+parameter and is adopted as declared.
+
+**Switching stage 2 off explicitly.** Omitting `stage2` lets a preset's
+declared stage in; to refuse it, send `"detail_pass": false` (the MCP tool
+schema's own spelling of "no detail pass", now accepted as exactly that) or an
+explicit `"stage2": null`. Either way no second stage runs and the preset's is
+not adopted. `"detail_pass": true` with no `stage2` of its own asks for the
+named preset's stage — a 400 naming the preset if it declares none, and the
+original AC-68a 400 with no preset at all; beside a request `stage2` object,
+`detail_pass: false` is a contradiction (400). `detail_denoise` is still
+refused by name.
+
+The response and `GET /v1/generate/status/{id}` carry two additive arrays:
+`preset_recipe_applied` — the wire keys the render took from the preset
+(`["scheduler", "sigma_schedule", "eta", …]`; a field the request sent is
+never listed) — and `preset_recipe_skipped` — declared fields the expansion
+did NOT adopt, each with its reason (`"eta (non-RES4LYF sampler 'euler')"`,
+`"bongmath (non-RES4LYF sampler 'euler')"`, `"stage2 (detail_pass=false)"`,
+`"stage2 (stage2=null)"`), so a dropped field
+is visible, never silent. A crash-recovery replay carries the accepted recipe
+as explicit request fields (the `vae_source` rule; a JSON `null` in the
+original body counts as absent for that merge) and keeps the off switch
+as sent, so a replayed job renders the same recipe and reports none of it as
+preset-sourced.
+
 ## Schedule shift — `shift` (comfybox#154, and Krea 2's D3)
 
 `shift` is one request field with a **family-dependent meaning**, because

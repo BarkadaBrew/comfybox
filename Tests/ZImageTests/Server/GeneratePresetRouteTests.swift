@@ -601,4 +601,106 @@ final class GeneratePresetRouteTests: XCTestCase {
     XCTAssertEqual((object["loras"] as? [[String: Any]])?.count, 1)
     XCTAssertEqual(object["model"] as? String, "krea2-raw")
   }
+
+  // MARK: #419 — the preset's sampler recipe, through THE route
+
+  /// The exact body Kira's daemon would post if it stopped reading
+  /// presets.json itself: before #419 the route left every one of these nil
+  /// and the render ran euler over the family default under the preset's
+  /// name. `PresetSamplerExpansionTests` covers the seam per field; this is
+  /// the route over a real store, plus the replay body.
+  func testPresetOnlyRequestGetsThePresetsSamplerRecipe() throws {
+    let store = try makeStore()
+    try store.upsert(ImagePreset(
+      id: "krea-clown", name: "Clown", mediaKind: "image", model: "krea2-raw", steps: 12,
+      projectorScale: 1.2, noiseType: "fractal", noiseAlpha: 0.3, implicitSteps: 2, c2: 0.4,
+      loras: [LoraReference(filename: "a.safetensors", scale: 0.6)],
+      checkpointFamily: "raw-accel",
+      sampler: "res_2s", sigmaSchedule: "beta57", shift: 1.15, eta: 0.5, bongmath: true,
+      stage2: PresetStage(sampler: "res_3s", sigmaSchedule: "bong_tangent", steps: 6, denoise: 0.4)))
+
+    let original = Data(#"{"prompt":"a portrait","preset":"krea-clown"}"#.utf8)
+    let payload = try WarmServer.decodedGeneratePayload(
+      from: original, store: store, configuration: configuration, loraExists: { _ in true })
+    XCTAssertEqual(payload.scheduler, "res_2s")
+    XCTAssertEqual(payload.sigmaSchedule, "beta57")
+    XCTAssertEqual(payload.eta, 0.5)
+    XCTAssertEqual(payload.bongmath, true)
+    XCTAssertEqual(payload.stage2, Stage2Payload(
+      steps: 6, denoise: 0.4, scheduler: "res_3s", sigmaSchedule: "bong_tangent"))
+    XCTAssertEqual(payload.noiseType, "fractal")
+    XCTAssertEqual(payload.noiseAlpha, 0.3)
+    XCTAssertEqual(payload.implicitSteps, 2)
+    XCTAssertEqual(payload.c2, 0.4)
+    XCTAssertEqual(payload.projectorScale, 1.2)
+    XCTAssertNil(payload.shift, "#154: a krea2 preset's shift is still request-only")
+    XCTAssertEqual(payload.presetRecipeApplied, PresetExpansion.recipeWireKeys)
+
+    let object = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: WarmServer.rawBody(original, expandedWith: payload))
+        as? [String: Any])
+    XCTAssertEqual(object["scheduler"] as? String, "res_2s")
+    XCTAssertEqual(object["sigma_schedule"] as? String, "beta57")
+    XCTAssertEqual((object["stage2"] as? [String: Any])?["steps"] as? Int, 6)
+  }
+
+  /// The daemon's actual shape — `preset` PLUS the recipe spelled out — is
+  /// unchanged by #419: every explicit field wins and nothing is recorded as
+  /// preset-sourced, even where the preset disagrees.
+  func testPresetPlusExplicitRecipeKeepsTheRequestsRecipe() throws {
+    let store = try makeStore()
+    try store.upsert(ImagePreset(
+      id: "krea-clown", name: "Clown", mediaKind: "image", model: "krea2-raw",
+      loras: [], checkpointFamily: "raw-accel",
+      sampler: "res_3s", sigmaSchedule: "bong_tangent", eta: 0.9, bongmath: true))
+    let payload = try expand(#"""
+      {"prompt":"a portrait","preset":"krea-clown","scheduler":"res_2s","sigma_schedule":"beta57",
+       "eta":0.5,"bongmath":false}
+      """#, store: store)
+    XCTAssertEqual(payload.scheduler, "res_2s")
+    XCTAssertEqual(payload.sigmaSchedule, "beta57")
+    XCTAssertEqual(payload.eta, 0.5)
+    XCTAssertEqual(payload.bongmath, false)
+    XCTAssertNil(payload.presetRecipeApplied)
+  }
+
+  /// `PresetStore.validate` checks `sampler` but not the legacy `scheduler`
+  /// key, so a stored preset can carry a name the engine does not resolve.
+  /// The route refuses it with a 400 that names the PRESET — never euler by
+  /// coercion, and never a dequeue-time failure on a job already accepted.
+  func testPresetWithUnresolvableLegacySchedulerIsA400NamingThePreset() throws {
+    let store = try makeStore()
+    try store.upsert(ImagePreset(
+      id: "legacy", name: "Legacy", mediaKind: "image", model: "krea2-raw",
+      loras: [], scheduler: "not-a-sampler", checkpointFamily: "raw-accel"))
+    XCTAssertThrowsError(
+      try expand(#"{"prompt":"x","preset":"legacy"}"#, store: store)
+    ) { error in
+      guard let warm = error as? WarmServerError,
+            case .presetRecipeInvalid(let preset, let field, _) = warm
+      else { return XCTFail("expected .presetRecipeInvalid, got \(error)") }
+      XCTAssertEqual(preset, "legacy")
+      XCTAssertEqual(field, "sampler")
+      let response = WarmServer.errorResponse(for: error)
+      XCTAssertEqual(response.status, 400)
+      XCTAssertTrue(String(decoding: response.body, as: UTF8.self).contains("not-a-sampler"))
+    }
+    // …and an explicit request sampler sidesteps it: the preset's is never read.
+    let payload = try expand(#"{"prompt":"x","preset":"legacy","scheduler":"euler"}"#, store: store)
+    XCTAssertEqual(payload.scheduler, "euler")
+  }
+
+  /// A preset stage missing `denoise` is a 400 at the route, not a guess.
+  func testPresetStage2WithoutDenoiseIsA400AtTheRoute() throws {
+    let store = try makeStore()
+    try store.upsert(ImagePreset(
+      id: "half", name: "Half", mediaKind: "image", model: "krea2-raw",
+      loras: [], checkpointFamily: "raw-accel", stage2: PresetStage(steps: 6)))
+    XCTAssertThrowsError(try expand(#"{"prompt":"x","preset":"half"}"#, store: store)) { error in
+      guard case .presetRecipeInvalid(_, let field, _)? = error as? WarmServerError
+      else { return XCTFail("expected .presetRecipeInvalid, got \(error)") }
+      XCTAssertEqual(field, "stage2")
+      XCTAssertEqual(WarmServer.errorResponse(for: error).status, 400)
+    }
+  }
 }
